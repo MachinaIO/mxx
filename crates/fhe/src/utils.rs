@@ -242,11 +242,21 @@ pub fn modswitch_steps() -> usize {
 pub mod gpu {
     use super::*;
     use crate::BgvParams;
-    use mxx_backends::{GpuRuntime, RuntimeValue, poly::dcrt::gpu::GpuDCRTPolyParams};
+    use mxx_backends::{
+        GpuExecutionResult, GpuRuntime, RuntimeValue, poly::dcrt::gpu::GpuDCRTPolyParams,
+    };
     use std::collections::BTreeMap;
 
     pub fn bgv_gpu_parameters(bgv: &BgvParams) -> Vec<GpuDCRTPolyParams> {
-        let rings = bgv.runtime_parameters().expect("BGV runtime parameters");
+        related_gpu_parameters(bgv.runtime_parameters().expect("BGV runtime parameters"))
+    }
+
+    /// One GPU context per distinct ordered ring, all sharing the first ring's
+    /// execution so a graph can mix their operations on one device.
+    pub fn related_gpu_parameters(
+        rings: impl IntoIterator<Item = DCRTPolyParams>,
+    ) -> Vec<GpuDCRTPolyParams> {
+        let rings = rings.into_iter().collect::<Vec<_>>();
         let mut parameters: Vec<GpuDCRTPolyParams> = Vec::with_capacity(rings.len());
         for ring in rings {
             let dimension = ring.ring_dimension();
@@ -281,6 +291,24 @@ pub mod gpu {
 
     pub fn input(values: &[i64]) -> RuntimeValue {
         RuntimeValue::integer_values(values.iter().map(|v| BigInt::from(*v)).collect())
+    }
+
+    /// Copy every output out of its plan so it survives the plan's next
+    /// execute and can be bound as another plan's input.
+    pub fn copy_outputs(
+        runtime: &GpuRuntime,
+        result: &GpuExecutionResult<'_>,
+    ) -> BTreeMap<String, RuntimeValue> {
+        result
+            .output_names()
+            .map(|name| {
+                let output = result.output(name).expect("listed GPU output");
+                let copied = runtime
+                    .copy_output(&output)
+                    .unwrap_or_else(|error| panic!("copy GPU output {name}: {error}"));
+                (name.to_owned(), copied)
+            })
+            .collect()
     }
 
     pub fn integers(

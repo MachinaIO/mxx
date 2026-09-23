@@ -1053,7 +1053,6 @@ where
         last_release_fence_node_count: 0,
         has_pending_releases: false,
         execution_started: Instant::now(),
-        last_progress_report: None,
     };
     let mut instance = match executor.execute_instance(
         &FrozenGraphScopeId::Root,
@@ -1141,7 +1140,6 @@ struct Executor<'a, S: SessionStore> {
     last_release_fence_node_count: usize,
     has_pending_releases: bool,
     execution_started: Instant,
-    last_progress_report: Option<Instant>,
 }
 
 struct PreimageProgress {
@@ -2007,41 +2005,6 @@ impl<S: SessionStore> Executor<'_, S> {
         wire: WireRef,
     ) -> Result<ConcreteMatrixType, ExecutionError> {
         self.matrix_type(scope_id, path, env, wire)
-    }
-
-    fn trapdoor_sigma(
-        &self,
-        scope_id: &FrozenGraphScopeId,
-        path: &[InstantiationFrame],
-        env: &ParamEnv,
-        wire: WireRef,
-    ) -> Result<f64, ExecutionError> {
-        let id = WireId { instantiation_path: path.to_vec(), wire };
-        match self.resolved_wire_type(scope_id, wire, env)? {
-            ConcreteWireType::Trapdoor { sigma, .. } => sigma
-                .evaluate_f64_with_rings(
-                    &ParamEnv::default(),
-                    crate::openfhe_guard::gen_modulus_and_warmup,
-                )
-                .map_err(|error| self.expression_error(wire.node, error)),
-            _ => Err(ExecutionError::MissingMetadata(id)),
-        }
-    }
-
-    fn trapdoor_layout(
-        &self,
-        scope_id: &FrozenGraphScopeId,
-        path: &[InstantiationFrame],
-        env: &ParamEnv,
-        wire: WireRef,
-    ) -> Result<(BigInt, usize), ExecutionError> {
-        let id = WireId { instantiation_path: path.to_vec(), wire };
-        match self.resolved_wire_type(scope_id, wire, env)? {
-            ConcreteWireType::Trapdoor { gadget_base, digit_count, .. } => {
-                Ok((gadget_base, digit_count))
-            }
-            _ => Err(ExecutionError::MissingMetadata(id)),
-        }
     }
 
     fn child_inputs(

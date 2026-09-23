@@ -96,7 +96,7 @@ fn run_shape_case(
     let mut plan = runtime.plan(graph, &bindings).unwrap();
     let result =
         runtime.execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [7; 32]).unwrap();
-    let actual = runtime.download_matrix(&result.outputs["result"]).unwrap();
+    let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input));
 }
 
@@ -185,7 +185,7 @@ fn run_crt_case_with_prime(
     let mut plan = runtime.plan(graph, &bindings).unwrap();
     let result =
         runtime.execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [9; 32]).unwrap();
-    let actual = runtime.download_matrix(&result.outputs["result"]).unwrap();
+    let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input, destination));
 }
 
@@ -254,7 +254,7 @@ fn run_manual_matrix_case(
     let result = runtime
         .execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [11; 32])
         .unwrap();
-    let actual = runtime.download_matrix(&result.outputs["result"]).unwrap();
+    let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input));
 }
 
@@ -665,7 +665,9 @@ fn run_loop_index_matrix_scale_case_impl(
         }
         let result = result.unwrap();
         for index in 0..3 {
-            let actual = runtime.download_matrix_member(&result.outputs["scaled"], index).unwrap();
+            let actual = runtime
+                .download_matrix_member_output(&result.output("scaled").unwrap(), index)
+                .unwrap();
             let modulus = BigInt::from(parameters.modulus().as_ref().clone());
             let scalar = expected_scalar.expect("successful run has a CPU oracle")(index);
             let residue = ((scalar % &modulus) + &modulus) % &modulus;
@@ -898,7 +900,7 @@ fn crt_recompose_matches_independent_cpu_formula() {
     let mut plan = runtime.plan(graph, &inputs).unwrap();
     let result =
         runtime.execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [13; 32]).unwrap();
-    let actual = runtime.download_matrix(&result.outputs["result"]).unwrap();
+    let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values("CRT recompose", &actual, &expected);
 }
 
@@ -941,6 +943,6 @@ fn hash_sample_matches_cpu_for_fixed_key_and_tag() {
     let mut plan = runtime.plan(graph, &inputs).unwrap();
     let result =
         runtime.execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [17; 32]).unwrap();
-    let actual = runtime.download_matrix(&result.outputs["result"]).unwrap();
+    let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values("hash sample", &actual, &expected);
 }

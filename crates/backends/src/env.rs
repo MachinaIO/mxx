@@ -28,30 +28,12 @@ fn positive_usize(name: &str, default: usize) -> Result<usize, String> {
     }
 }
 
-/// `MXX_GPU_VRAM_PERCENT`: percentage of each GPU's total VRAM available to
-/// one GPU operation. Default: 80.
-pub fn gpu_vram_percent() -> Result<u32, String> {
-    let percent = positive_usize("MXX_GPU_VRAM_PERCENT", 80)?;
-    if percent <= 100 {
-        Ok(percent as u32)
-    } else {
-        Err(format!("MXX_GPU_VRAM_PERCENT must be between 1 and 100, got {percent}"))
-    }
-}
-
 /// Maximum number of sampler attempts for each target-column tile.
 ///
 /// This is intentionally fail-closed: malformed or zero values are errors,
 /// rather than silently selecting an unbounded retry policy.
 pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
     positive_usize("MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS", 64)
-}
-
-/// Repetitions of paired compact-operation library measurements. Each sample
-/// includes submission and result completion; setup and validation are separate.
-#[cfg(all(test, feature = "gpu"))]
-pub(crate) fn compact_operation_test_repeats() -> usize {
-    positive_usize("MXX_PRIMITIVE_TEST_REPEATS", 3).unwrap()
 }
 
 #[cfg(test)]
@@ -69,7 +51,7 @@ pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{gpu_vram_percent, positive_usize};
+    use super::positive_usize;
 
     #[test]
     #[serial_test::serial]
@@ -83,23 +65,6 @@ mod tests {
         assert!(positive_usize(name, 64).is_err());
         unsafe { std::env::set_var(name, "-1") };
         assert!(positive_usize(name, 64).is_err());
-        unsafe { std::env::remove_var(name) };
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn gpu_vram_percent_accepts_only_one_through_one_hundred() {
-        let name = "MXX_GPU_VRAM_PERCENT";
-        unsafe { std::env::remove_var(name) };
-        assert_eq!(gpu_vram_percent().unwrap(), 80);
-        for value in ["1", "37", "100"] {
-            unsafe { std::env::set_var(name, value) };
-            assert_eq!(gpu_vram_percent().unwrap(), value.parse::<u32>().unwrap());
-        }
-        for value in ["0", "101", "-1", "invalid"] {
-            unsafe { std::env::set_var(name, value) };
-            assert!(gpu_vram_percent().is_err());
-        }
         unsafe { std::env::remove_var(name) };
     }
 }

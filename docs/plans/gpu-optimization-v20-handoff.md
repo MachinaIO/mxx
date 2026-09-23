@@ -1,6 +1,33 @@
-# GPU optimization v20: paused implementation handoff
+# GPU optimization v20: implementation handoff
 
-Status: paused at the user's request on 2026-09-23. This is a handoff, not a claim that the implementation or validation is complete. No worker or test command was left running at the pause point.
+Status (2026-09-23): the five handoff work items below are implemented on this branch and the
+authorized validation passes. This file is kept as a historical record; the current design is in
+`docs/architecture.md`, section 6.
+
+Resolved since the pause:
+
+- Borrowed `GpuExecutionResult<'plan>` with plan-owned output storage and `GpuRuntime::copy_output`.
+- Tiled Preimage `C=1, t=2`, `SequentialLoop` Int-carry interval closure, and typed Select/family contexts.
+- Loop scheduling: sibling root parallel loops, nested parallel loops (one lane template per
+  enclosing lane, rebinding every template alias per occurrence), parallel loops inside device
+  bodies, sequential loops inside wave templates and inside device bodies (device-side index
+  restart; sibling conditionals inside one body are serialized).
+- The eager GPU matrix/poly/sampler API, persistent native `is_ntt`/format state, the unused VRAM
+  budget, and the dead CUDA entry points were removed; GPU benches now call `GpuRuntime`.
+- W/C trials use a geometric candidate grid.
+
+Validation on the final tree: warning-free `cargo check --workspace --all-targets` with and without
+`--features gpu`; the full CPU workspace lib gate; `mxx-backends` GPU lib tests including ignored
+(263), `gpu_control_resident` (13), `gpu_direct_node_semantics` (34); `mxx-fhe` GPU lib (23),
+`gpu_bgv`, and `gpu_ring_gsw`. Tall and WE GPU integration targets were compiled, not run. Lean
+verification was not run.
+
+Known remaining limitations: planning uses one device per plan (multi-device shard plans are not
+implemented, and only a single-GPU machine was available); non-vectorized parallel loops must
+return matrix families; plan time is dominated by full per-candidate trials (for example about 34 s
+for a 16384-degree trapdoor plus preimage); per-execute binding patch cost is not deduplicated.
+
+The original pause notes follow.
 
 ## Source, workspace, and goal
 

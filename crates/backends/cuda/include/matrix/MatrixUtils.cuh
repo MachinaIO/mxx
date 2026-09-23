@@ -2,14 +2,9 @@
 
 #include "matrix/Matrix.cuh"
 
-// Exact for every uint128 input. For 1 < modulus < 2^63, reciprocal is
-// floor(2^128/modulus); wider moduli retain the general remainder operation.
-__device__ __forceinline__ uint64_t matrix_reduce_barrett_u128(
-    unsigned __int128 value, uint64_t modulus, uint64_t reciprocal_lo, uint64_t reciprocal_hi);
-
 int set_error(const char *msg);
 int set_error(cudaError_t err);
-bool parse_format(int format, GpuPolyFormat &out);
+
 size_t matrix_poly_count(const GpuMatrix *mat);
 int matrix_limb_device(const GpuMatrix *mat, const dim3 &limb_id, int *out_device);
 int matrix_limb_stream(const GpuMatrix *mat, const dim3 &limb_id, cudaStream_t *out_stream);
@@ -31,23 +26,7 @@ int matrix_wait_limb_stream(
     int consumer_device,
     cudaStream_t consumer_stream,
     bool device_already_selected = false, bool read_only = false);
-// Optional completion must already cover the consumer on consumer_device.
-// It remains caller-owned and must stay valid until this call has queued its wait.
-int matrix_track_limb_consumer(
-    const GpuMatrix *src,
-    const dim3 &limb_id,
-    int consumer_device,
-    cudaStream_t consumer_stream,
-    cudaEvent_t completion = nullptr, bool device_already_selected = false);
-// Register a read-only consumer without modifying the source's producer event.
-// Source release and reuse streams wait on consumer completion. The writer
-// event stays unchanged, so independent readers can share a const/Arc owner.
-int matrix_track_limb_consumer_readonly(
-    const GpuMatrix *src,
-    const dim3 &limb_id,
-    int consumer_device,
-    cudaStream_t consumer_stream,
-    cudaEvent_t completion = nullptr, bool device_already_selected = false);
+
 int matrix_record_limb_write(
     GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream,
     bool device_already_selected = false);
@@ -56,22 +35,9 @@ int matrix_record_limb_write(
 int matrix_wait_all_limb_streams(
     const GpuMatrix *src, int consumer_device, cudaStream_t consumer_stream,
     bool device_already_selected = false, bool read_only = false);
-int matrix_track_all_limb_consumers(
-    const GpuMatrix *src, int consumer_device, cudaStream_t consumer_stream,
-    cudaEvent_t completion = nullptr, bool device_already_selected = false,
-    bool read_only = false);
+
 int matrix_record_all_limb_writes(
     GpuMatrix *dst, cudaStream_t stream, bool device_already_selected = false);
-bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr);
-size_t matrix_align_up_size(size_t value, size_t alignment);
-int matrix_acquire_aux_workspace(
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id,
-    size_t bytes,
-    void **out_ptr,
-    bool *out_shared,
-    cudaStream_t stream);
-int matrix_release_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream);
 
 __host__ __device__ __forceinline__ uint64_t matrix_load_packed_u64_at(
     const uint8_t *ptr,

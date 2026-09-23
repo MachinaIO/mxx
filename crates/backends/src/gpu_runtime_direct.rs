@@ -20,9 +20,7 @@ use crate::{
         KernelArg, PhysicalEncoding, PhysicalValueId,
     },
     gpu_io_worker::{FrameGeneration, IoCompletion},
-    gpu_physical_control::{
-        finite_loop_count, pack_resident_family, static_family_member, wave_family_member,
-    },
+    gpu_physical_control::{static_family_member, wave_family_member},
     gpu_physical_lowering::{
         ImportTemplate, PhysicalFrame, plan_physical_graph, single_root_physical_plan,
     },
@@ -59,13 +57,6 @@ use std::{
 
 pub use crate::env::{GpuRuntimeConfigError, GpuRuntimeOptions};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GpuPreparedBackendContract {
-    pub logical_to_physical_devices: Vec<i32>,
-    pub execution_owner_ids: Vec<u64>,
-    pub context_generations: Vec<u64>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum GpuPlanError {
     #[error("invalid planning input: {0}")]
@@ -88,6 +79,10 @@ pub enum GpuRuntimeError {
     Execution(String),
     #[error("GPU graph launch completion is uncertain: {0}")]
     LaunchUncertain(String),
+    /// A joined launch reported a data-dependent failure through a device
+    /// status word. Outputs are suppressed and the plan remains reusable.
+    #[error("GPU device reported a failure: {0}")]
+    DeviceStatus(String),
     #[error("artifact operation failed: {0}")]
     Artifact(String),
     #[error("session operation failed: {0}")]
@@ -137,17 +132,16 @@ impl<'plan> GpuExecutionResult<'plan> {
     pub fn output_names(&self) -> impl Iterator<Item = &str> {
         self.outputs.keys().map(String::as_str)
     }
+}
 
-    pub fn materialize_output<S: ArtifactStore>(
-        &mut self,
-        name: &str,
-        _backend: &GpuDcrtBackend,
-        _store: &mut S,
-    ) -> Result<GpuOutputRef<'_>, GpuRuntimeError> {
-        self.outputs
-            .get(name)
-            .map(|value| GpuOutputRef { value })
-            .ok_or_else(|| GpuRuntimeError::Execution(format!("missing output {name}")))
+impl GpuOutputRef<'_> {
+    /// The concrete type of a device-resident output; `None` for host values.
+    pub fn resident_type(&self) -> Option<&mxx_ir_core::types::ConcreteWireType> {
+        match self.value {
+            RuntimeValue::Resident(resident) => Some(resident.wire_type()),
+            RuntimeValue::Matrix(matrix) if matrix.as_gpu().is_some() => Some(matrix.wire_type()),
+            _ => None,
+        }
     }
 }
 
@@ -245,13 +239,36 @@ fn wave_groups(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<WaveGro
     Ok(groups)
 }
 
-/// Measure the same finite Graph replay count as execution. Artifact bytes are
-/// absent at plan time, so this measures compute only with already allocated
-/// owners; execute loads each selected payload at its first consumer.
+/// Run every Graph region once (external-I/O loop bodies for their full
+/// count) and return each region's accumulated elapsed seconds. Artifact bytes
+/// are absent at plan time, so this measures compute only with already
+/// allocated owners; execute loads each selected payload at its first consumer.
+/// Trial candidates for a bound `maximum`: the values `value(1), value(2),
+/// value(4), ...` up to `value(maximum)`, deduplicated in ascending order.
+/// Doubling keeps both extremes (full width and one column, one and the
+/// maximal wave) while bounding the trials to a logarithmic count.
+fn geometric_candidates(maximum: usize, value: impl Fn(usize) -> usize) -> Vec<usize> {
+    let mut candidates = std::iter::successors(Some(1usize), |step| step.checked_mul(2))
+        .take_while(|step| *step < maximum)
+        .chain([maximum])
+        .map(value)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
 fn run_trial_regions(
     graph: &mut DirectGraph,
     frame: &PhysicalFrame,
-) -> Result<(), GpuRuntimeError> {
+) -> Result<Vec<f64>, GpuRuntimeError> {
+    let mut seconds = vec![0.0; graph.regions.len()];
+    let mut timed = |graph: &mut DirectGraph, region: usize| -> Result<(), GpuRuntimeError> {
+        let started = Instant::now();
+        graph.launch_region(frame, region)?.wait()?;
+        seconds[region] += started.elapsed().as_secs_f64();
+        Ok(())
+    };
     let mut region = 0usize;
     let mut next_loop = 0usize;
     while region < graph.regions.len() {
@@ -278,7 +295,7 @@ fn run_trial_regions(
                         .and_then(|()| loop_body.index_owner.wait_until_ready())
                         .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
                     for body_region in region..end {
-                        graph.launch_region(frame, body_region)?.wait()?;
+                        timed(graph, body_region)?;
                     }
                 }
                 region = end;
@@ -291,7 +308,7 @@ fn run_trial_regions(
                 ));
             }
         }
-        graph.launch_region(frame, region)?.wait()?;
+        timed(graph, region)?;
         region += 1;
     }
     if next_loop != frame.external_io_loops.len() {
@@ -299,7 +316,35 @@ fn run_trial_regions(
             "trial external-I/O loop did not reach its Graph region".into(),
         ));
     }
-    Ok(())
+    Ok(seconds)
+}
+
+/// Production launch count of each region: a region inside a wave group body
+/// replays once per wave for every active parent occurrence of its innermost
+/// group; other regions run once.
+fn region_replay_counts(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<f64>, String> {
+    let groups = wave_groups(frame, graph)?;
+    Ok(graph
+        .regions
+        .iter()
+        .map(|region| {
+            groups
+                .iter()
+                .filter(|group| {
+                    group.body_start <= region.start_operation &&
+                        region.start_operation < group.body_end
+                })
+                .min_by_key(|group| group.body_end - group.body_start)
+                .map_or(1.0, |group| {
+                    let invocations = if group.parent_template.is_some() {
+                        group.active_parent_occurrences.len()
+                    } else {
+                        1
+                    };
+                    (group.waves.len() * invocations) as f64
+                })
+        })
+        .collect())
 }
 
 impl DirectGraph {
@@ -517,9 +562,11 @@ impl DirectGraph {
         Ok(graph)
     }
 
+    /// The program is immutable after its plan-time validation; only the
+    /// owners bound to each value are checked here, once per value.
     fn bind(&mut self, frame: &PhysicalFrame) -> Result<(), GpuRuntimeError> {
-        frame.program.validate().map_err(|error| GpuRuntimeError::Execution(error.into()))?;
         let mut values = Vec::with_capacity(frame.program.bindings.len());
+        let mut checked = BTreeSet::new();
         for source in &frame.program.bindings {
             let address = match *source {
                 GpuBindingSource::PhysicalPart { value, part, limb } => {
@@ -534,7 +581,7 @@ impl DirectGraph {
                     let planned = frame.program.values.get(value.0 as usize).ok_or_else(|| {
                         GpuRuntimeError::Execution("physical graph value is missing".into())
                     })?;
-                    if owner.physical().as_ref() != planned {
+                    if checked.insert(value) && owner.physical().as_ref() != planned {
                         return Err(GpuRuntimeError::Execution(
                             "rebound physical metadata differs from plan".into(),
                         ));
@@ -989,8 +1036,7 @@ pub struct GpuExecutionPlan {
     logical: FrozenGpuPlan,
     report: GpuWarmupReport,
     measured_costs: GpuMeasuredCostCache,
-    contract: crate::gpu_execution_plan::GpuPlanContract,
-    integer_input_ranges: BTreeMap<String, std::ops::RangeInclusive<BigInt>>,
+    backend_execution_identity: u64,
     frame: PhysicalFrame,
     graph: DirectGraph,
     launches: AtomicUsize,
@@ -1053,6 +1099,26 @@ impl GpuRuntime {
     }
     pub fn measured_costs(&self) -> &GpuMeasuredCostCache {
         &self.measured_costs
+    }
+
+    /// Copy an output into storage owned by the returned value, so it stays
+    /// valid after the next execute of its plan and can be bound as another
+    /// plan's input. Device outputs are copied on the device.
+    pub fn copy_output(&self, output: &GpuOutputRef<'_>) -> Result<RuntimeValue, GpuRuntimeError> {
+        let copy = |resident: &Arc<crate::backend::GpuResidentValue>| {
+            resident.deep_copy(&self.backend).map(Arc::new).map_err(GpuRuntimeError::Execution)
+        };
+        Ok(match output.value {
+            RuntimeValue::Resident(resident) => RuntimeValue::Resident(copy(resident)?),
+            RuntimeValue::Matrix(matrix) => match matrix.as_gpu() {
+                Some(resident) => RuntimeValue::Matrix(
+                    crate::backend::PolyMatrix::gpu(matrix.wire_type().clone(), copy(resident)?)
+                        .map_err(|error| GpuRuntimeError::Execution(error.to_owned()))?,
+                ),
+                None => output.value.clone(),
+            },
+            host => host.clone(),
+        })
     }
 
     pub fn download_integer_family_output(
@@ -1123,14 +1189,20 @@ impl GpuRuntime {
         for event in resident.ready_events() {
             event.wait()?;
         }
-        let count = match &resident.physical().ty {
-            mxx_ir_core::types::ConcreteWireType::Int |
-            mxx_ir_core::types::ConcreteWireType::ConstantInt => 1,
-            mxx_ir_core::types::ConcreteWireType::IndexedFamily { element, count }
-                if **element == mxx_ir_core::types::ConcreteWireType::Int =>
-            {
-                *count
-            }
+        use mxx_ir_core::types::ConcreteWireType;
+        // Bool values decode as 0/1 from their one-word BoolI64 encoding.
+        let scalar = |ty: &ConcreteWireType| {
+            matches!(
+                ty,
+                ConcreteWireType::Int |
+                    ConcreteWireType::ConstantInt |
+                    ConcreteWireType::Bool |
+                    ConcreteWireType::ConstantBool
+            )
+        };
+        let (count, family_axes) = match &resident.physical().ty {
+            ty if scalar(ty) => (1, 0),
+            ConcreteWireType::IndexedFamily { element, count } if scalar(element) => (*count, 1),
             _ => {
                 return Err(GpuRuntimeError::Execution(
                     "resident value is not an integer family".into(),
@@ -1139,10 +1211,12 @@ impl GpuRuntime {
         };
         let mut decoded = vec![None; count];
         for part in resident.physical().parts.iter() {
-            let Some(crate::gpu_execution_plan::PhysicalEncoding::Signed(encoding)) =
-                resident.physical().encodings.get(part.leaf as usize)
-            else {
-                return Err(GpuRuntimeError::Execution("integer part is not signed".into()));
+            let encoding = match resident.physical().encodings.get(part.leaf as usize) {
+                Some(crate::gpu_execution_plan::PhysicalEncoding::Signed(encoding)) => *encoding,
+                Some(crate::gpu_execution_plan::PhysicalEncoding::BoolI64) => {
+                    crate::poly::dcrt::gpu::GpuSignedValuesEncoding::CanonicalU64
+                }
+                _ => return Err(GpuRuntimeError::Execution("integer part is not signed".into())),
             };
             let storage = resident.storage(part.storage).ok_or_else(|| {
                 GpuRuntimeError::Execution("integer part has no bound storage".into())
@@ -1152,33 +1226,44 @@ impl GpuRuntime {
             let bytes_per_value = words
                 .checked_mul(8)
                 .ok_or_else(|| GpuRuntimeError::Execution("integer word width overflows".into()))?;
-            let scalar_view = view.origin.len() == 2 &&
-                view.extent.len() == 2 &&
-                view.origin[1] == 0 &&
-                view.extent[1] == words as u64 &&
-                view.byte_strides.as_ref() == [bytes_per_value as u64, 8];
-            let family_view = view.origin.len() == 3 &&
-                view.extent.len() == 3 &&
-                view.origin[1] == 0 &&
-                view.extent[1] == 1 &&
-                view.origin[2] == 0 &&
-                view.extent[2] == words as u64 &&
-                view.byte_strides.as_ref() ==
-                    [bytes_per_value as u64, bytes_per_value as u64, 8];
-            if !(scalar_view || family_view) ||
+            // Axes: [family], value index, then a word axis for signed words.
+            let signed = matches!(
+                resident.physical().encodings.get(part.leaf as usize),
+                Some(crate::gpu_execution_plan::PhysicalEncoding::Signed(_))
+            );
+            let axes = family_axes + 1 + usize::from(signed);
+            let contiguous = view.origin.iter().skip(1).all(|&origin| origin == 0) &&
+                view.extent[1..family_axes + 1].iter().all(|&extent| extent == 1) &&
+                (!signed || view.extent.last() == Some(&(words as u64))) &&
+                (view.extent[0] == 1 || view.byte_strides[0] == bytes_per_value as u64) &&
+                (!signed || view.byte_strides.last() == Some(&8));
+            if view.origin.len() != axes ||
+                !contiguous ||
                 view.element_bytes != 8 ||
                 view.validate_in_allocation(storage.bytes, 8).is_err() ||
                 storage.device != part.device
             {
-                return Err(GpuRuntimeError::Execution(
-                    "integer part has an invalid physical view".into(),
-                ));
+                return Err(GpuRuntimeError::Execution(format!(
+                    "integer part has an invalid physical view: {view:?}"
+                )));
             }
-            let mut bytes = vec![0u8; bytes_per_value];
-            for row in 0..view.extent[0] {
-                let index = view.origin[0]
-                    .checked_add(row)
-                    .and_then(|index| usize::try_from(index).ok())
+            let values = usize::try_from(view.extent[0])
+                .map_err(|_| GpuRuntimeError::Execution("integer part is too large".into()))?;
+            let mut bytes = vec![
+                0u8;
+                values.checked_mul(bytes_per_value).ok_or_else(|| {
+                    GpuRuntimeError::Execution("integer part byte length overflows".into())
+                })?
+            ];
+            let address = storage
+                .address
+                .checked_add(view.byte_offset)
+                .ok_or_else(|| GpuRuntimeError::Execution("integer address overflows".into()))?;
+            self.backend.download_device_bytes(part.device, address, &mut bytes)?;
+            for (row, value) in bytes.chunks_exact(bytes_per_value).enumerate() {
+                let index = usize::try_from(view.origin[0])
+                    .ok()
+                    .and_then(|origin| origin.checked_add(row))
                     .filter(|index| *index < count)
                     .ok_or_else(|| {
                         GpuRuntimeError::Execution("integer family index is out of range".into())
@@ -1188,19 +1273,8 @@ impl GpuRuntime {
                         "integer family has overlapping physical parts".into(),
                     ));
                 }
-                let offset = row
-                    .checked_mul(view.byte_strides[0])
-                    .and_then(|offset| view.byte_offset.checked_add(offset))
-                    .ok_or_else(|| {
-                        GpuRuntimeError::Execution("integer address offset overflows".into())
-                    })?;
-                let address = storage.address.checked_add(offset).ok_or_else(|| {
-                    GpuRuntimeError::Execution("integer address overflows".into())
-                })?;
-                self.backend.download_device_bytes(part.device, address, &mut bytes)?;
-                decoded[index] = Some(
-                    decode_signed_words(*encoding, &bytes).map_err(GpuRuntimeError::Execution)?,
-                );
+                decoded[index] =
+                    Some(decode_signed_words(encoding, value).map_err(GpuRuntimeError::Execution)?);
             }
         }
         decoded
@@ -1492,35 +1566,16 @@ impl GpuRuntime {
             })
             .max()
             .unwrap_or(1);
-        let root = validated
-            .source
-            .scope(&mxx_ir_core::graph::FrozenGraphScopeId::Root)
-            .ok_or_else(|| GpuPlanError::InvalidInput("GPU root scope is missing".into()))?;
-        let mut loop_count = None;
-        for (index, node) in root.nodes().iter().enumerate() {
-            if matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)) {
-                if loop_count.is_some() {
-                    return Err(GpuPlanError::InvalidInput(
-                        "direct GPU W/C planning needs one root parallel loop".into(),
-                    ));
-                }
-                let node_id = mxx_ir_core::types::NodeId(u64::try_from(index).map_err(|_| {
-                    GpuPlanError::InvalidInput("GPU root has too many nodes".into())
-                })?);
-                let count = finite_loop_count(
-                    &mxx_ir_core::graph::FrozenGraphScopeId::Root,
-                    node_id,
-                    node.kind(),
-                    &validated.bindings,
-                )
-                .map_err(GpuPlanError::InvalidInput)?;
-                loop_count = Some(usize::try_from(count).map_err(|_| {
-                    GpuPlanError::InvalidInput("GPU loop count exceeds host address space".into())
-                })?);
-            }
-        }
-        let maximum_w =
-            loop_count.unwrap_or(1).max(1).min(self.options.max_parallel_instances.get());
+        // Candidate W is shared by every wave loop site; a probe plan with an
+        // unbounded W caps each site at its own finite count.
+        let maximum_w = single_root_physical_plan(&validated, contract.clone(), 1, usize::MAX)
+            .map_err(GpuPlanError::InvalidInput)?
+            .loops
+            .iter()
+            .map(|choice| choice.loop_count)
+            .max()
+            .unwrap_or(1)
+            .min(self.options.max_parallel_instances.get());
         let mut best = None::<(usize, usize, f64)>;
         let mut measured = GpuMeasuredCostCache::default();
         let mut rejected = Vec::new();
@@ -1531,10 +1586,12 @@ impl GpuRuntime {
                     "fixed test tile width is outside the concrete output".into(),
                 ));
             }
-            None => (1..=columns.max(1)).collect::<Vec<_>>(),
+            None => geometric_candidates(columns.max(1), |tiles| columns.max(1).div_ceil(tiles)),
         };
-        for (candidate_w, candidate_c) in
-            (1..=maximum_w).flat_map(|w| candidate_columns.iter().copied().map(move |c| (w, c)))
+        let candidate_waves = geometric_candidates(maximum_w, |width| width);
+        for (candidate_w, candidate_c) in candidate_waves
+            .iter()
+            .flat_map(|&w| candidate_columns.iter().copied().map(move |c| (w, c)))
         {
             let trial = (|| -> Result<f64, GpuPlanError> {
                 let logical = single_root_physical_plan(
@@ -1568,35 +1625,36 @@ impl GpuRuntime {
                     .ok_or_else(|| {
                         GpuPlanError::Measurement("measurement count overflows".into())
                     })?;
+                let replays =
+                    region_replay_counts(&frame, &graph).map_err(GpuPlanError::Measurement)?;
                 let mut measured_seconds = 0.0;
                 for trial_index in 0..total_trials {
                     for control in &frame.control_resets {
                         control.reset_for_replay().map_err(GpuPlanError::Measurement)?;
                     }
                     reset_preimage_replays(&frame).map_err(GpuPlanError::Measurement)?;
-                    let started = Instant::now();
                     let trial_result = run_trial_regions(&mut graph, &frame);
-                    if let Err(error) = trial_result {
-                        self.backend.drain_uncertain_launches().map_err(|drain| {
-                            GpuPlanError::Measurement(format!(
-                                "trial failed ({error}) and GPU drain failed ({drain})"
-                            ))
-                        })?;
-                        return Err(GpuPlanError::Measurement(error.to_string()));
-                    }
-                    // Trial artifact destinations contain no store data. A
-                    // selector can therefore report a data-dependent error;
-                    // feasibility measures the Graph, while execute checks
-                    // status before reading any selected artifact.
-                    if frame.external_io_loops.is_empty() && frame.external_io_imports.is_empty() {
-                        for control in &frame.control_resets {
-                            control.check_completed().map_err(GpuPlanError::Measurement)?;
+                    let region_seconds = match trial_result {
+                        Ok(region_seconds) => region_seconds,
+                        Err(error) => {
+                            self.backend.drain_uncertain_launches().map_err(|drain| {
+                                GpuPlanError::Measurement(format!(
+                                    "trial failed ({error}) and GPU drain failed ({drain})"
+                                ))
+                            })?;
+                            return Err(GpuPlanError::Measurement(error.to_string()));
                         }
-                    }
-                    check_preimage_replays(&frame).map_err(GpuPlanError::Measurement)?;
-                    check_dynamic_exports(&frame).map_err(GpuPlanError::Measurement)?;
+                    };
+                    // Trial inputs and artifact destinations are not production
+                    // data, so device status words (integer control, preimage
+                    // retries, dynamic exports) are data-dependent and belong to
+                    // execute; a trial only measures the joined Graph.
                     if trial_index >= self.options.measurement_warmups {
-                        measured_seconds += started.elapsed().as_secs_f64();
+                        measured_seconds += region_seconds
+                            .iter()
+                            .zip(&replays)
+                            .map(|(seconds, replays)| seconds * replays)
+                            .sum::<f64>();
                     }
                     for slot in &frame.slots {
                         // SAFETY: this trial's GPU completion has been joined
@@ -1609,9 +1667,7 @@ impl GpuRuntime {
                     unsafe { reset_dynamic_exports_after_completion(&frame) }
                         .map_err(GpuPlanError::Measurement)?;
                 }
-                let wave_count = frame.waves.len().max(1);
-                Ok(measured_seconds / self.options.measurement_iterations.get() as f64 *
-                    wave_count as f64)
+                Ok(measured_seconds / self.options.measurement_iterations.get() as f64)
             })();
             match trial {
                 Ok(seconds) if seconds.is_finite() => {
@@ -1666,8 +1722,7 @@ impl GpuRuntime {
             logical,
             report,
             measured_costs: measured,
-            contract,
-            integer_input_ranges: self.options.integer_input_ranges.clone(),
+            backend_execution_identity: self.backend.execution_identity(),
             frame,
             graph,
             launches: AtomicUsize::new(0),
@@ -1705,33 +1760,17 @@ impl GpuRuntime {
         if plan.poisoned {
             return Err(GpuRuntimeError::LaunchUncertain("plan requires a device drain".into()));
         }
-        let contract = self
-            .backend
-            .physical_plan_contract(&plan.validated, &inputs)
-            .map_err(|_| GpuRuntimeError::StalePlan)?;
-        if contract != plan.contract {
+        // Inputs are a trusted caller contract (docs/architecture.md). Rebinding
+        // checks only what addressing needs: the exact input set, resident
+        // layouts, and host integer ranges while encoding them.
+        if self.backend.execution_identity() != plan.backend_execution_identity {
             return Err(GpuRuntimeError::StalePlan);
         }
-        for (name, range) in &plan.integer_input_ranges {
-            let value = inputs.get(name).ok_or(GpuRuntimeError::StalePlan)?;
-            let within_range = match value {
-                RuntimeValue::Int(value) => range.contains(value),
-                RuntimeValue::IndexedFamily { values, .. } => values
-                    .iter()
-                    .all(|item| matches!(item, RuntimeValue::Int(value) if range.contains(value))),
-                // The caller supplied this guarantee for resident data at
-                // planning; its contents are not downloaded at replay.
-                RuntimeValue::Resident(_) => true,
-                _ => false,
-            };
-            if !within_range {
-                return Err(GpuRuntimeError::StalePlan);
-            }
-        }
-        plan.frame.rebind_inputs(&inputs).map_err(GpuRuntimeError::Execution)?;
+        plan.frame.rebind_inputs(&inputs).map_err(|_| GpuRuntimeError::StalePlan)?;
         upload_bytes_inputs(&plan.frame, &inputs).map_err(GpuRuntimeError::Execution)?;
         wait_for_bound_inputs(&plan.frame).map_err(GpuRuntimeError::Execution)?;
         plan.frame.bind_return_outputs(&self.backend).map_err(GpuRuntimeError::Execution)?;
+
         if plan.completed_runs > 0 {
             for slot in &plan.frame.slots {
                 // SAFETY: execute borrows the plan exclusively, and the prior
@@ -1785,20 +1824,13 @@ impl GpuRuntime {
                 })?;
                 return Err(error);
             }
+            // The Graph has joined and this path owns no export slots, so a
+            // reported status leaves the plan reusable after the next reset.
             for control in &plan.frame.control_resets {
-                if let Err(error) = control.check_completed() {
-                    plan.poisoned = true;
-                    return Err(GpuRuntimeError::Execution(error));
-                }
+                control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
             }
-            if let Err(error) = check_preimage_replays(&plan.frame) {
-                plan.poisoned = true;
-                return Err(GpuRuntimeError::Execution(error));
-            }
-            if let Err(error) = check_dynamic_exports(&plan.frame) {
-                plan.poisoned = true;
-                return Err(GpuRuntimeError::Execution(error));
-            }
+            check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
+            check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
             plan.completed_runs += 1;
             return Ok(GpuExecutionPayload {
                 outputs: returned_values(&plan.frame).map_err(GpuRuntimeError::Execution)?,
@@ -1896,12 +1928,19 @@ impl GpuRuntime {
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
     ) -> Result<(), GpuRuntimeError> {
         let interval = plan.graph.region_interval(start, end)?;
+        let active_site = active_wave.map(|wave| plan.frame.waves[wave.wave_index].loop_site);
+        // The active wave's own body starts at `start`; only nested groups are
+        // dispatched from inside it.
+        let nested = |group: &WaveGroup, operation: u32| {
+            group.body_start == operation &&
+                group.body_end <= end &&
+                active_site.is_none_or(|site| site != group.site)
+        };
         let mut region = interval.start;
         while region < interval.end {
             let operation = plan.graph.regions[region].start_operation;
             let candidate = groups.iter().enumerate().find(|(_, group)| {
-                group.body_start == operation &&
-                    group.body_end <= end &&
+                nested(group, operation) &&
                     match (group.parent_template, active_wave) {
                         (None, None) => true,
                         (Some((site, _)), Some(parent)) => {
@@ -1942,7 +1981,7 @@ impl GpuRuntime {
                     });
                     if active {
                         for control in &plan.frame.control_resets {
-                            control.check_completed().map_err(GpuRuntimeError::Execution)?;
+                            control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
                         }
                         let mut path = active_wave
                             .map(|parent| parent.logical_path.clone())
@@ -1969,7 +2008,7 @@ impl GpuRuntime {
                 region = plan.graph.region_interval(group.body_start, group.body_end)?.end;
                 continue;
             }
-            if groups.iter().any(|group| group.body_start == operation && group.body_end <= end) {
+            if groups.iter().any(|group| nested(group, operation)) {
                 return Err(GpuRuntimeError::Execution(
                     "wave region has no reached parent invocation".into(),
                 ));
@@ -2025,10 +2064,8 @@ impl GpuRuntime {
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
     ) -> Result<(), GpuRuntimeError> {
         let group = &groups[group_index];
-        let mut members = BTreeMap::<
-            PhysicalValueId,
-            BTreeMap<usize, Arc<crate::backend::GpuResidentValue>>,
-        >::new();
+        // Each wave's `owner_bindings` hold its plan-owned output members, and
+        // the family owner was packed from those same members at plan time.
         for &wave_index in &group.waves {
             let wave = &plan.frame.waves[wave_index];
             let mut logical_path = parent_path.to_vec();
@@ -2072,10 +2109,6 @@ impl GpuRuntime {
                 }
                 plan.frame.owners.insert(id, owner);
             }
-            let fresh = plan
-                .frame
-                .fresh_wave_output_owners(&self.backend, wave_index)
-                .map_err(GpuRuntimeError::Execution)?;
             for control in &plan.frame.control_resets {
                 control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
             }
@@ -2109,56 +2142,11 @@ impl GpuRuntime {
                 pump,
             )?;
             for control in &plan.frame.control_resets {
-                control.check_completed().map_err(GpuRuntimeError::Execution)?;
+                control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
             }
-            check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::Execution)?;
-            check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::Execution)?;
+            check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
+            check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
             check_wave_export_slots(&plan.frame, wave_index).map_err(GpuRuntimeError::Execution)?;
-            for (&family_id, sites) in &plan.frame.waves[wave_index].family_outputs {
-                for &(member_index, value_id) in sites {
-                    let owner = fresh.get(&value_id).ok_or_else(|| {
-                        GpuRuntimeError::Execution("wave member has no fresh output owner".into())
-                    })?;
-                    if members
-                        .entry(family_id)
-                        .or_default()
-                        .insert(member_index, Arc::clone(owner))
-                        .is_some()
-                    {
-                        return Err(GpuRuntimeError::Execution(
-                            "wave repeats a family member".into(),
-                        ));
-                    }
-                }
-            }
-        }
-        for (family_id, selected) in members {
-            let planned = plan.frame.program.values.get(family_id.0 as usize).ok_or_else(|| {
-                GpuRuntimeError::Execution("wave family producer has no physical plan".into())
-            })?;
-            let mxx_ir_core::types::ConcreteWireType::IndexedFamily { count, .. } = &planned.ty
-            else {
-                return Err(GpuRuntimeError::Execution(
-                    "wave family producer has a nonfamily type".into(),
-                ));
-            };
-            let ordered = (0..*count)
-                .map(|index| {
-                    selected.get(&index).cloned().ok_or_else(|| {
-                        GpuRuntimeError::Execution(format!(
-                            "wave family producer is missing member {index}"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let family = pack_resident_family(planned.ty.clone(), &ordered, plan.frame.device)
-                .map_err(GpuRuntimeError::Execution)?;
-            if family.physical().as_ref() != planned {
-                return Err(GpuRuntimeError::Execution(
-                    "wave family layout differs from its frozen producer".into(),
-                ));
-            }
-            plan.frame.owners.insert(family_id, family);
         }
         Ok(())
     }
@@ -2185,19 +2173,22 @@ impl GpuRuntime {
             &mut pump,
         );
         if let Err(error) = run {
-            plan.poisoned = true;
-            self.backend.drain_uncertain_launches().map_err(|drain| {
-                GpuRuntimeError::LaunchUncertain(format!(
-                    "wave launch failed ({error}) and device drain failed ({drain})"
-                ))
-            })?;
+            // A device status is read only after its region joined.
+            if !matches!(error, GpuRuntimeError::DeviceStatus(_)) {
+                plan.poisoned = true;
+                self.backend.drain_uncertain_launches().map_err(|drain| {
+                    GpuRuntimeError::LaunchUncertain(format!(
+                        "wave launch failed ({error}) and device drain failed ({drain})"
+                    ))
+                })?;
+            }
             return Err(error);
         }
         for control in &plan.frame.control_resets {
-            control.check_completed().map_err(GpuRuntimeError::Execution)?;
+            control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
         }
-        check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::Execution)?;
-        check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::Execution)?;
+        check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
+        check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
         if pump.is_none() {
             plan.completed_runs += 1;
         }
@@ -2224,7 +2215,7 @@ impl GpuRuntime {
         // The selector's producer Graph region has joined. A failed integer
         // operation must suppress the artifact read even if it left index 0.
         for control in &plan.frame.control_resets {
-            control.check_completed().map_err(GpuRuntimeError::Execution)?;
+            control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
         }
         let selector = plan.frame.owners.get(&import.selector).ok_or_else(|| {
             GpuRuntimeError::Execution("selected artifact import has no resident selector".into())
@@ -2396,7 +2387,7 @@ impl GpuRuntime {
                 .try_for_each(|control| control.check_completed())
                 .and_then(|()| check_preimage_replays(&plan.frame))
                 .and_then(|()| check_dynamic_exports(&plan.frame))
-                .map_err(GpuRuntimeError::Execution)
+                .map_err(GpuRuntimeError::DeviceStatus)
         } else {
             Ok(())
         };
@@ -2566,5 +2557,21 @@ fn artifact_payload_kind(artifact: &ArtifactType) -> u8 {
         ArtifactType::Int | ArtifactType::Bytes { .. } => 2,
         ArtifactType::Trapdoor { .. } => 3,
         ArtifactType::TypedBlob { .. } => 4,
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::geometric_candidates;
+
+    #[test]
+    fn geometric_candidates_keep_both_extremes_without_duplicates() {
+        assert_eq!(geometric_candidates(1, |value| value), vec![1]);
+        assert_eq!(geometric_candidates(6, |value| value), vec![1, 2, 4, 6]);
+        assert_eq!(geometric_candidates(8, |value| value), vec![1, 2, 4, 8]);
+        assert_eq!(
+            geometric_candidates(50, |tiles| 50usize.div_ceil(tiles)),
+            vec![1, 2, 4, 7, 13, 25, 50]
+        );
     }
 }

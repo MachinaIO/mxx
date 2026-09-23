@@ -99,41 +99,6 @@ __global__ void mxx_dynamic_export_publish_kernel(
 }
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
-__global__ void mxx_preimage_retry_gate_kernel(
-    MxxPreimageStatus *status,
-    uint32_t max_attempts,
-    cudaGraphConditionalHandle handle,
-    void *fixed_scratch,
-    void *device_control)
-{
-    (void)fixed_scratch;
-    (void)device_control;
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    if (status->accepted == 1U)
-    {
-        cudaGraphSetConditional(handle, 0U);
-        return;
-    }
-    if (status->accepted > 1U || status->error_code != MXX_PREIMAGE_SUCCESS)
-    {
-        // A malformed multi-accept or an upstream sampler error must never
-        // turn into an unbounded conditional loop.
-        status->error_code = status->error_code == MXX_PREIMAGE_SUCCESS
-            ? MXX_PREIMAGE_EXHAUSTED
-            : status->error_code;
-        cudaGraphSetConditional(handle, 0U);
-        return;
-    }
-    if (status->attempts >= max_attempts)
-    {
-        status->error_code = MXX_PREIMAGE_EXHAUSTED;
-        cudaGraphSetConditional(handle, 0U);
-        return;
-    }
-    auto *control = static_cast<MxxPreimageLaunchControl *>(device_control);
-    if (control) control->attempt = status->attempts;
-    cudaGraphSetConditional(handle, 1U);
-}
 
 __global__ void mxx_if_gate_kernel(const uint64_t *predicate,
     cudaGraphConditionalHandle handle)
@@ -158,34 +123,7 @@ __global__ void mxx_while_gate_kernel(uint64_t *index,
     cudaGraphSetConditional(handle, *index < requested && *status == 0U);
 }
 
-
 #endif
-
-__global__ void mxx_gpu_gather_u64_kernel(
-    const uint64_t *source,
-    const uint64_t *indices,
-    uint64_t *destination,
-    size_t count,
-    size_t source_count)
-{
-    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= count)
-    {
-        return;
-    }
-    // Index families are stored as signed i64 words.  Valid DSL indices are
-    // non-negative and within the source family; guard the device access so a
-    // malformed runtime index cannot turn into an out-of-bounds load.  The
-    // gather remains fully asynchronous: invalid entries produce the neutral
-    // zero value and no host readback is introduced here.
-    const int64_t selected = static_cast<int64_t>(indices[index]);
-    if (selected < 0 || static_cast<uint64_t>(selected) >= source_count)
-    {
-        destination[index] = 0;
-        return;
-    }
-    destination[index] = source[static_cast<size_t>(selected)];
-}
 
 struct PinnedHostReclaimer
 {
@@ -856,51 +794,6 @@ namespace
         }
     }
 
-    size_t minimum_device_memory_budget_bytes(
-        const std::vector<int> &gpu_list,
-        uint32_t percent)
-    {
-        int original_device = 0;
-        cudaError_t err = cudaGetDevice(&original_device);
-        if (err != cudaSuccess)
-        {
-            throw std::runtime_error(cudaGetErrorString(err));
-        }
-
-        size_t minimum_budget = std::numeric_limits<size_t>::max();
-        for (int device : gpu_list)
-        {
-            err = cudaSetDevice(device);
-            if (err == cudaSuccess)
-            {
-                size_t free_bytes = 0;
-                size_t total_bytes = 0;
-                err = cudaMemGetInfo(&free_bytes, &total_bytes);
-                if (err == cudaSuccess)
-                {
-                    // Split the calculation before multiplication to preserve
-                    // floor(total_bytes * percent / 100) without overflowing.
-                    const size_t budget =
-                        (total_bytes / 100) * static_cast<size_t>(percent) +
-                        ((total_bytes % 100) * static_cast<size_t>(percent)) / 100;
-                    minimum_budget = std::min(minimum_budget, budget);
-                    continue;
-                }
-            }
-
-            const std::string error = cudaGetErrorString(err);
-            cudaSetDevice(original_device);
-            throw std::runtime_error(error);
-        }
-
-        err = cudaSetDevice(original_device);
-        if (err != cudaSuccess)
-        {
-            throw std::runtime_error(cudaGetErrorString(err));
-        }
-        return minimum_budget;
-    }
-
     GpuNttDeviceConstants make_empty_ntt_device_constants(
         int device,
         size_t limb_count,
@@ -1118,7 +1011,6 @@ extern "C"
         const int *gpu_ids,
         size_t gpu_ids_len,
         size_t stream_pool_size,
-        uint32_t vram_percent,
         const GpuContext *related_context,
         GpuContext **out_ctx)
     {
@@ -1142,10 +1034,6 @@ extern "C"
             {
                 return set_error("logN must be between 1 and 30");
             }
-            if (vram_percent == 0 || vram_percent > 100)
-            {
-                return set_error("GPU VRAM percentage must be between 1 and 100");
-            }
 
             std::vector<int> gpu_list;
             if (gpu_ids_len == 0 || !gpu_ids)
@@ -1159,13 +1047,10 @@ extern "C"
 
             validate_gpu_list(gpu_list);
             if (related_context &&
-                (!related_context->execution || related_context->gpu_ids != gpu_list ||
-                 related_context->execution->vram_percent != vram_percent))
+                (!related_context->execution || related_context->gpu_ids != gpu_list))
             {
-                return set_error("related GPU rings must share device placement and VRAM policy");
+                return set_error("related GPU rings must share device placement");
             }
-            const size_t vram_budget_bytes =
-                minimum_device_memory_budget_bytes(gpu_list, vram_percent);
             configure_default_mempool_release_threshold(gpu_list);
             const uint32_t resolved_dnum =
                 dnum == 0 ? static_cast<uint32_t>(gpu_list.size()) : dnum;
@@ -1264,8 +1149,6 @@ extern "C"
                     std::memory_order_relaxed));
                 gpu_ctx->execution->identity = identity;
                 gpu_ctx->execution->gpu_ids = gpu_list;
-                gpu_ctx->execution->vram_budget_bytes = vram_budget_bytes;
-                gpu_ctx->execution->vram_percent = vram_percent;
                 gpu_ctx->execution->pinned_host_reclaimer = new PinnedHostReclaimer();
             }
             gpu_ctx->moduli = std::move(moduli_vec);
@@ -1290,7 +1173,6 @@ extern "C"
             gpu_ctx->gpu_ids = std::move(gpu_list);
             gpu_ctx->dnum = resolved_dnum;
             gpu_ctx->max_aux_limbs = GPU_RUNTIME_MAX_LIMBS;
-            gpu_ctx->vram_budget_bytes = gpu_ctx->execution->vram_budget_bytes;
             gpu_ctx->garner_inverse_table = std::move(inverse_table);
             gpu_ctx->limb_gpu_ids = std::move(limb_gpu_ids);
             gpu_ctx->limb_prime_ids = std::move(limb_prime_ids);
@@ -1517,16 +1399,6 @@ extern "C"
         return 0;
     }
 
-    int gpu_context_get_vram_budget_bytes(const GpuContext *ctx, size_t *out_bytes)
-    {
-        if (!ctx || !out_bytes)
-        {
-            return set_error("invalid gpu_context_get_vram_budget_bytes arguments");
-        }
-        *out_bytes = ctx->vram_budget_bytes;
-        return 0;
-    }
-
     int gpu_default_mempool_get_usage(
         int device,
         size_t *out_used_current_bytes,
@@ -1591,32 +1463,6 @@ extern "C"
             ? count
             : std::numeric_limits<size_t>::max();
         *out_generation = generation_after;
-        return 0;
-    }
-
-    int gpu_default_mempool_reset_used_high(int device)
-    {
-        if (device < 0 || static_cast<size_t>(device) >= MAX_TRACKED_GPU_DEVICES)
-        {
-            return set_error("invalid gpu_default_mempool_reset_used_high device");
-        }
-        if (live_context_counts[static_cast<size_t>(device)].load(std::memory_order_acquire) != 1)
-        {
-            return set_error(
-                "default mempool high-water reset requires exactly one live mxx context");
-        }
-        cudaMemPool_t pool = nullptr;
-        cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
-        if (err != cudaSuccess)
-        {
-        return set_error(err);
-        }
-        uint64_t reset = 0;
-        err = cudaMemPoolSetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &reset);
-        if (err != cudaSuccess)
-        {
-        return set_error(err);
-        }
         return 0;
     }
 
@@ -1771,16 +1617,6 @@ extern "C"
         return 0;
     }
 
-    int gpu_device_reset()
-    {
-        cudaError_t err = cudaDeviceReset();
-        if (err != cudaSuccess)
-        {
-        return set_error(err);
-        }
-        return 0;
-    }
-
     const char *gpu_last_error()
     {
         return last_error.c_str();
@@ -1876,18 +1712,6 @@ extern "C"
         header->flags = 0;
         __atomic_store_n(&header->ready, 0ULL, __ATOMIC_RELEASE);
         return 0;
-    }
-
-    int gpu_export_slot_publish(void *device_header, uint64_t occurrence,
-        uint64_t artifact_offset, uint64_t payload_bytes, uint32_t site,
-        uint32_t flags, void *stream)
-    {
-        if (!device_header || !stream || (flags & ~1U) != 0)
-            return set_error("invalid export slot publication arguments");
-        mxx_export_slot_publish_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-            static_cast<MxxExportSlotHeader *>(device_header), occurrence,
-            artifact_offset, payload_bytes, site, flags);
-        return cudaPeekAtLastError() == cudaSuccess ? 0 : set_error(cudaPeekAtLastError());
     }
 
     int gpu_device_buffer_alloc(void *stream_raw, size_t bytes, MxxGpuDeviceBuffer **out)
@@ -2044,41 +1868,6 @@ extern "C"
         return status == cudaSuccess ? 0 : set_error(status);
     }
 
-    int gpu_device_buffer_track_compiled_consumer(
-        const MxxGpuDeviceBuffer *buffer,
-        int consumer_device,
-        void *consumer_stream_raw,
-        void *completion_event_raw,
-        bool read_only)
-    {
-        (void)consumer_stream_raw;
-        (void)read_only;
-        if (!buffer || !completion_event_raw || consumer_device < 0)
-            return set_error("invalid gpu_device_buffer_track_compiled_consumer arguments");
-        cudaError_t status = cudaSetDevice(buffer->device);
-        if (status == cudaSuccess)
-            status = cudaStreamWaitEvent(
-                buffer->allocation_stream,
-                reinterpret_cast<cudaEvent_t>(completion_event_raw),
-                0);
-        return status == cudaSuccess ? 0 : set_error(status);
-    }
-
-    int gpu_device_buffer_record_compiled_write(
-        MxxGpuDeviceBuffer *buffer,
-        void *stream_raw)
-    {
-        if (!buffer || !stream_raw)
-            return set_error("invalid gpu_device_buffer_record_compiled_write arguments");
-        cudaError_t status = cudaEventRecord(
-            buffer->producer,
-            reinterpret_cast<cudaStream_t>(stream_raw));
-        if (status != cudaSuccess)
-            return set_error(status);
-        buffer->producer_valid = true;
-        return 0;
-    }
-
     int gpu_device_buffer_wait(const MxxGpuDeviceBuffer *buffer)
     {
         if (!buffer || !buffer->producer_valid)
@@ -2087,131 +1876,6 @@ extern "C"
         if (status == cudaSuccess)
             status = cudaEventSynchronize(buffer->producer);
         return status == cudaSuccess ? 0 : set_error(status);
-    }
-
-    int gpu_device_buffer_gather_u64(
-        const MxxGpuDeviceBuffer *source,
-        size_t source_offset,
-        size_t source_count,
-        const MxxGpuDeviceBuffer *indices,
-        size_t indices_offset,
-        size_t index_count,
-        MxxGpuDeviceBuffer *destination,
-        size_t destination_offset,
-        void *stream_raw)
-    {
-        if (!source || !indices || !destination || !stream_raw ||
-            source_offset > source->bytes ||
-            source_count > (source->bytes - source_offset) / sizeof(uint64_t) ||
-            indices_offset > indices->bytes ||
-            index_count > (indices->bytes - indices_offset) / sizeof(uint64_t) ||
-            destination_offset > destination->bytes ||
-            index_count > (destination->bytes - destination_offset) / sizeof(uint64_t))
-        {
-            return set_error("invalid gpu_device_buffer_gather_u64 arguments");
-        }
-        cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
-        cudaError_t status = cudaSetDevice(destination->device);
-        if (status == cudaSuccess && source->producer_valid)
-            status = cudaStreamWaitEvent(stream, source->producer, 0);
-        if (status == cudaSuccess && indices->producer_valid)
-            status = cudaStreamWaitEvent(stream, indices->producer, 0);
-        if (status == cudaSuccess && index_count != 0)
-        {
-            const int threads = 256;
-            const int blocks = static_cast<int>((index_count + threads - 1) / threads);
-            mxx_gpu_gather_u64_kernel<<<blocks, threads, 0, stream>>>(
-                reinterpret_cast<const uint64_t *>(source->address) +
-                    source_offset / sizeof(uint64_t),
-                reinterpret_cast<const uint64_t *>(indices->address) +
-                    indices_offset / sizeof(uint64_t),
-                reinterpret_cast<uint64_t *>(destination->address) +
-                    destination_offset / sizeof(uint64_t),
-                index_count,
-                source_count);
-            status = cudaGetLastError();
-        }
-        if (status == cudaSuccess)
-            status = cudaEventRecord(destination->producer, stream);
-        if (status != cudaSuccess)
-            return set_error(status);
-        destination->producer_valid = true;
-        return 0;
-    }
-
-    int gpu_device_buffer_copy_range(
-        const MxxGpuDeviceBuffer *source,
-        size_t source_offset,
-        MxxGpuDeviceBuffer *destination,
-        size_t destination_offset,
-        size_t bytes,
-        void *stream_raw)
-    {
-        if (!source || !destination || !stream_raw ||
-            source_offset > source->bytes || bytes > source->bytes - source_offset ||
-            destination_offset > destination->bytes ||
-            bytes > destination->bytes - destination_offset)
-        {
-            return set_error("invalid gpu_device_buffer_copy_range arguments");
-        }
-        cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
-        cudaError_t status = cudaSetDevice(destination->device);
-        if (status == cudaSuccess && destination->producer_valid &&
-            stream != destination->allocation_stream)
-        {
-            status = cudaStreamWaitEvent(stream, destination->producer, 0);
-        }
-        if (status == cudaSuccess && source->producer_valid)
-        {
-            // CUDA permits a stream on the destination device to wait on an
-            // event recorded by a peer device.  This preserves the producer
-            // dependency without a host synchronization or staging buffer.
-            status = cudaStreamWaitEvent(stream, source->producer, 0);
-        }
-        if (status == cudaSuccess && source->device != destination->device)
-        {
-            int can_access = 0;
-            status = cudaDeviceCanAccessPeer(&can_access, destination->device, source->device);
-            if (status == cudaSuccess && !can_access)
-                return set_error("peer access is unavailable for device values copy");
-            if (status == cudaSuccess)
-            {
-                status = cudaDeviceEnablePeerAccess(source->device, 0);
-                if (status == cudaErrorPeerAccessAlreadyEnabled)
-                {
-                    cudaGetLastError();
-                    status = cudaSuccess;
-                }
-            }
-        }
-        if (status == cudaSuccess)
-        {
-            if (source->device == destination->device)
-            {
-                status = cudaMemcpyAsync(
-                    destination->address + destination_offset,
-                    source->address + source_offset,
-                    bytes,
-                    cudaMemcpyDeviceToDevice,
-                    stream);
-            }
-            else
-            {
-                status = cudaMemcpyPeerAsync(
-                    destination->address + destination_offset,
-                    destination->device,
-                    source->address + source_offset,
-                    source->device,
-                    bytes,
-                    stream);
-            }
-        }
-        if (status == cudaSuccess)
-            status = cudaEventRecord(destination->producer, stream);
-        if (status != cudaSuccess)
-            return set_error(status);
-        destination->producer_valid = true;
-        return 0;
     }
 
     int gpu_context_get_compute_stream(
@@ -2298,28 +1962,44 @@ extern "C"
         cudaGraph_t graph = nullptr;
         cudaGraph_t root_graph = nullptr;
         bool conditional_body_active = false;
-        cudaGraphNode_t conditional_node = nullptr;
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
-        cudaGraphConditionalHandle conditional_handle = 0;
-#endif
         MxxPreimageRetrySpec retry_spec{};
         void *retry_scratch = nullptr;
         void *retry_control = nullptr;
         void *retry_status = nullptr;
-        uint64_t *loop_index = nullptr;
-        const uint64_t *loop_limit = nullptr;
-        uint32_t *loop_status = nullptr;
-        uint64_t loop_max_iterations = 0;
-        uint32_t loop_index_binding = 0;
-        uint32_t loop_limit_binding = 0;
-        uint32_t loop_status_binding = 0;
-        bool generic_while_active = false;
         bool generic_body_mode = false;
-        uint32_t parent_operation_index = 0;
-        std::vector<cudaGraphNode_t> parent_frontier;
-        std::vector<cudaGraphNode_t> parent_operation_nodes;
-        std::vector<MxxGraphBindingMapEntry> parent_binding_map;
         std::vector<cudaGraphNode_t> body_terminals;
+        // Last conditional node emitted into the open conditional body.
+        // Concurrent sibling conditionals inside one body graph do not
+        // complete on the device, so each is ordered after the previous one.
+        cudaGraphNode_t last_body_conditional = nullptr;
+        // One frame per open conditional body, innermost last. A body may
+        // itself contain conditional operations, so the enclosing scope's
+        // graph, operation state and WHILE control are restored on finish.
+        struct ConditionalFrame
+        {
+            cudaGraph_t parent_graph = nullptr;
+            cudaGraphNode_t conditional_node = nullptr;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
+            cudaGraphConditionalHandle handle = 0;
+#endif
+            uint32_t parent_operation_index = 0;
+            std::vector<cudaGraphNode_t> parent_operation_nodes;
+            std::vector<MxxGraphBindingMapEntry> parent_binding_map;
+            std::vector<cudaGraphNode_t> parent_body_terminals;
+            bool parent_conditional_body_active = false;
+            bool parent_generic_body_mode = false;
+            cudaGraphNode_t parent_last_body_conditional = nullptr;
+            // WHILE control advanced by the body's tail gate; absent for IF.
+            bool is_while = false;
+            uint64_t *loop_index = nullptr;
+            const uint64_t *loop_limit = nullptr;
+            uint32_t *loop_status = nullptr;
+            uint64_t loop_max_iterations = 0;
+            uint32_t loop_index_binding = 0;
+            uint32_t loop_limit_binding = 0;
+            uint32_t loop_status_binding = 0;
+        };
+        std::vector<ConditionalFrame> conditional_frames;
         bool operation_active = false;
         uint32_t operation_index = 0;
         std::vector<cudaGraphNode_t> frontier;
@@ -2520,23 +2200,6 @@ extern "C"
             }
         }
         builder->resident_addresses.push_back({address, bytes, binding});
-        return 0;
-    }
-
-    int mxx_gpu_graph_builder_set_binding_map(MxxGpuGraphBuilder *builder,
-        const MxxGraphBindingMapEntry *entries, size_t entry_count)
-    {
-        if (!builder || !builder->operation_active || (entry_count && !entries))
-            return set_error("invalid explicit graph binding map");
-        builder->binding_map.clear();
-        for (size_t index = 0; index < entry_count; ++index)
-        {
-            const auto entry = entries[index];
-            if (std::any_of(builder->binding_map.begin(), builder->binding_map.end(),
-                [entry](const auto &other) { return other.local_binding == entry.local_binding; }))
-                return set_error("duplicate explicit graph local binding");
-            builder->binding_map.push_back(entry);
-        }
         return 0;
     }
 
@@ -2782,83 +2445,6 @@ extern "C"
             publish_patches, std::size(publish_patches));
     }
 
-    int mxx_gpu_graph_builder_begin_preimage_retry(MxxGpuGraphBuilder *builder,
-        const MxxPreimageRetrySpec *spec, void *fixed_scratch,
-        void *device_control, void *device_status)
-    {
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
-        if (!builder || !builder->operation_active || builder->conditional_body_active ||
-            !spec || !spec->max_attempts || !fixed_scratch || !device_control || !device_status)
-            return set_error("invalid explicit preimage retry body");
-        cudaGraphConditionalHandle handle = 0;
-        cudaError_t error = cudaGraphConditionalHandleCreate(&handle,
-            builder->root_graph, 1U, cudaGraphCondAssignDefault);
-        if (error != cudaSuccess) return set_error(error);
-        cudaGraphNodeParams parameters{};
-        parameters.type = cudaGraphNodeTypeConditional;
-        parameters.conditional.handle = handle;
-        parameters.conditional.type = cudaGraphCondTypeWhile;
-        parameters.conditional.size = 1;
-        parameters.conditional.phGraph_out = nullptr;
-        cudaGraphNode_t conditional = nullptr;
-        error = cudaGraphAddNode(&conditional, builder->root_graph,
-            builder->frontier.data(), nullptr, builder->frontier.size(), &parameters);
-        if (error != cudaSuccess) return set_error(error);
-        if (!parameters.conditional.phGraph_out ||
-            !parameters.conditional.phGraph_out[0])
-            return set_error("CUDA returned no explicit conditional body graph");
-        builder->conditional_node = conditional;
-        builder->conditional_handle = handle;
-        builder->retry_spec = *spec;
-        builder->retry_scratch = fixed_scratch;
-        builder->retry_control = device_control;
-        builder->retry_status = device_status;
-        builder->graph = parameters.conditional.phGraph_out[0];
-        builder->frontier.clear();
-        builder->conditional_body_active = true;
-        return 0;
-#else
-        (void)builder; (void)spec; (void)fixed_scratch; (void)device_control; (void)device_status;
-        return GPU_STATUS_CONDITIONAL_UNSUPPORTED;
-#endif
-    }
-
-    int mxx_gpu_graph_builder_finish_preimage_retry(MxxGpuGraphBuilder *builder)
-    {
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
-        if (!builder || !builder->operation_active || !builder->conditional_body_active ||
-            builder->frontier.empty())
-            return set_error("invalid explicit preimage retry completion");
-        auto *status = static_cast<MxxPreimageStatus *>(builder->retry_status);
-        const uint32_t max_attempts = builder->retry_spec.max_attempts;
-        const auto handle = builder->conditional_handle;
-        void *scratch = builder->retry_scratch;
-        void *control = builder->retry_control;
-        const void *arguments[] = {&status, &max_attempts, &handle, &scratch, &control};
-        const size_t sizes[] = {sizeof(status), sizeof(max_attempts), sizeof(handle),
-            sizeof(scratch), sizeof(control)};
-        const MxxGraphPatch patches[] = {
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(status),
-                builder->retry_spec.status_binding_index, 0},
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 4, 0, sizeof(control),
-                builder->retry_spec.control_binding_index, 0},
-        };
-        const int gate_status = mxx_gpu_graph_builder_add_kernel(builder,
-            reinterpret_cast<const void *>(mxx_preimage_retry_gate_kernel),
-            1, 1, 1, 1, 1, 1, 0, arguments, sizes, 5, patches, 2);
-        if (gate_status != 0) return gate_status;
-        builder->graph = builder->root_graph;
-        builder->frontier.assign(1, builder->conditional_node);
-        builder->operation_nodes.push_back(builder->conditional_node);
-        builder->conditional_node = nullptr;
-        builder->conditional_body_active = false;
-        return 0;
-#else
-        (void)builder;
-        return GPU_STATUS_CONDITIONAL_UNSUPPORTED;
-#endif
-    }
-
     static MxxGraphPatch mxx_direct_pointer_patch(uint32_t argument_index,
         uint32_t binding)
     {
@@ -2867,7 +2453,8 @@ extern "C"
     }
 
     static int mxx_gpu_graph_builder_enter_generic_body(MxxGpuGraphBuilder *builder,
-        cudaGraphConditionalHandle handle, cudaGraphConditionalNodeType type)
+        cudaGraphConditionalHandle handle, cudaGraphConditionalNodeType type,
+        const MxxGpuGraphBuilder::ConditionalFrame *loop)
     {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
         cudaGraphNodeParams parameters{};
@@ -2876,42 +2463,73 @@ extern "C"
         parameters.conditional.type = type;
         parameters.conditional.size = 1;
         cudaGraphNode_t conditional = nullptr;
-        const cudaError_t error = cudaGraphAddNode(&conditional, builder->root_graph,
+        // The node joins the scope that is open now: the root graph, or the
+        // body graph of an enclosing conditional.
+        const cudaError_t error = cudaGraphAddNode(&conditional, builder->graph,
             builder->frontier.data(), nullptr, builder->frontier.size(), &parameters);
         if (error != cudaSuccess) return set_error(error);
         if (!parameters.conditional.phGraph_out ||
             !parameters.conditional.phGraph_out[0])
             return set_error("CUDA returned no direct conditional body graph");
-        builder->conditional_node = conditional;
-        builder->conditional_handle = handle;
-        builder->parent_operation_index = builder->operation_index;
-        builder->parent_frontier = std::move(builder->frontier);
-        builder->parent_operation_nodes = std::move(builder->operation_nodes);
-        builder->parent_binding_map = std::move(builder->binding_map);
+        MxxGpuGraphBuilder::ConditionalFrame frame;
+        frame.parent_graph = builder->graph;
+        frame.conditional_node = conditional;
+        frame.handle = handle;
+        frame.parent_operation_index = builder->operation_index;
+        frame.parent_operation_nodes = std::move(builder->operation_nodes);
+        frame.parent_binding_map = std::move(builder->binding_map);
+        frame.parent_body_terminals = std::move(builder->body_terminals);
+        frame.parent_conditional_body_active = builder->conditional_body_active;
+        frame.parent_generic_body_mode = builder->generic_body_mode;
+        frame.parent_last_body_conditional = builder->last_body_conditional;
+        if (loop)
+        {
+            frame.is_while = true;
+            frame.loop_index = loop->loop_index;
+            frame.loop_limit = loop->loop_limit;
+            frame.loop_status = loop->loop_status;
+            frame.loop_max_iterations = loop->loop_max_iterations;
+            frame.loop_index_binding = loop->loop_index_binding;
+            frame.loop_limit_binding = loop->loop_limit_binding;
+            frame.loop_status_binding = loop->loop_status_binding;
+        }
+        builder->conditional_frames.push_back(std::move(frame));
         builder->graph = parameters.conditional.phGraph_out[0];
         builder->frontier.clear();
         builder->operation_nodes.clear();
         builder->binding_map.clear();
         builder->body_terminals.clear();
+        builder->last_body_conditional = nullptr;
         builder->operation_active = false;
         builder->conditional_body_active = true;
         builder->generic_body_mode = true;
         return 0;
 #else
-        (void)builder; (void)handle; (void)type;
+        (void)builder; (void)handle; (void)type; (void)loop;
         return GPU_STATUS_CONDITIONAL_UNSUPPORTED;
 #endif
+    }
+
+    static void mxx_gpu_graph_builder_order_body_conditional(MxxGpuGraphBuilder *builder)
+    {
+        const auto previous = builder->last_body_conditional;
+        if (builder->conditional_body_active && previous &&
+            std::find(builder->frontier.begin(), builder->frontier.end(), previous) ==
+                builder->frontier.end())
+            builder->frontier.push_back(previous);
     }
 
     int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder,
         const uint64_t *predicate, uint32_t predicate_binding)
     {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
-        if (!builder || !builder->operation_active || builder->conditional_body_active ||
+        if (!builder || !builder->operation_active ||
+            (builder->conditional_body_active && !builder->generic_body_mode) ||
             !predicate) return set_error("invalid direct IF body");
+        mxx_gpu_graph_builder_order_body_conditional(builder);
         cudaGraphConditionalHandle handle = 0;
         cudaError_t error = cudaGraphConditionalHandleCreate(&handle,
-            builder->root_graph, 1U, cudaGraphCondAssignDefault);
+            builder->graph, 1U, cudaGraphCondAssignDefault);
         if (error != cudaSuccess) return set_error(error);
         const void *arguments[] = {&predicate, &handle};
         const size_t sizes[] = {sizeof(predicate), sizeof(handle)};
@@ -2920,7 +2538,8 @@ extern "C"
             reinterpret_cast<const void *>(mxx_if_gate_kernel),
             1, 1, 1, 1, 1, 1, 0, arguments, sizes, 2, &patch, 1);
         if (status != 0) return status;
-        return mxx_gpu_graph_builder_enter_generic_body(builder, handle, cudaGraphCondTypeIf);
+        return mxx_gpu_graph_builder_enter_generic_body(
+            builder, handle, cudaGraphCondTypeIf, nullptr);
 #else
         (void)builder; (void)predicate; (void)predicate_binding;
         return GPU_STATUS_CONDITIONAL_UNSUPPORTED;
@@ -2933,12 +2552,14 @@ extern "C"
         uint32_t status_binding)
     {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
-        if (!builder || !builder->operation_active || builder->conditional_body_active ||
+        if (!builder || !builder->operation_active ||
+            (builder->conditional_body_active && !builder->generic_body_mode) ||
             !index || !limit || !status_word || !max_iterations)
             return set_error("invalid direct WHILE body");
+        mxx_gpu_graph_builder_order_body_conditional(builder);
         cudaGraphConditionalHandle handle = 0;
         cudaError_t error = cudaGraphConditionalHandleCreate(&handle,
-            builder->root_graph, 1U, cudaGraphCondAssignDefault);
+            builder->graph, 1U, cudaGraphCondAssignDefault);
         if (error != cudaSuccess) return set_error(error);
         const bool advance = false;
         const void *arguments[] = {
@@ -2953,15 +2574,16 @@ extern "C"
             reinterpret_cast<const void *>(mxx_while_gate_kernel),
             1, 1, 1, 1, 1, 1, 0, arguments, sizes, 6, patches, 3);
         if (result != 0) return result;
-        builder->loop_index = index;
-        builder->loop_limit = limit;
-        builder->loop_status = status_word;
-        builder->loop_max_iterations = max_iterations;
-        builder->loop_index_binding = index_binding;
-        builder->loop_limit_binding = limit_binding;
-        builder->loop_status_binding = status_binding;
-        builder->generic_while_active = true;
-        return mxx_gpu_graph_builder_enter_generic_body(builder, handle, cudaGraphCondTypeWhile);
+        MxxGpuGraphBuilder::ConditionalFrame loop;
+        loop.loop_index = index;
+        loop.loop_limit = limit;
+        loop.loop_status = status_word;
+        loop.loop_max_iterations = max_iterations;
+        loop.loop_index_binding = index_binding;
+        loop.loop_limit_binding = limit_binding;
+        loop.loop_status_binding = status_binding;
+        return mxx_gpu_graph_builder_enter_generic_body(
+            builder, handle, cudaGraphCondTypeWhile, &loop);
 #else
         (void)builder; (void)index; (void)limit; (void)max_iterations;
         (void)status_word; (void)index_binding; (void)limit_binding; (void)status_binding;
@@ -2983,40 +2605,45 @@ extern "C"
             if (error != cudaSuccess) return set_error(error);
             builder->body_terminals.push_back(empty);
         }
-        if (builder->generic_while_active)
+        if (builder->conditional_frames.empty())
+            return set_error("direct conditional body has no open frame");
+        auto frame = std::move(builder->conditional_frames.back());
+        builder->conditional_frames.pop_back();
+        if (frame.is_while)
         {
+            // The tail gate lives in the body but patches control bound by
+            // the enclosing WHILE operation.
             builder->frontier = builder->body_terminals;
-            builder->binding_map = builder->parent_binding_map;
+            builder->binding_map = frame.parent_binding_map;
             builder->operation_active = true;
-            const auto handle = builder->conditional_handle;
+            const auto handle = frame.handle;
             const bool advance = true;
-            const void *arguments[] = {&builder->loop_index, &builder->loop_limit,
-                &builder->loop_max_iterations, &builder->loop_status, &handle, &advance};
-            const size_t sizes[] = {sizeof(builder->loop_index), sizeof(builder->loop_limit),
-                sizeof(builder->loop_max_iterations), sizeof(builder->loop_status),
+            const void *arguments[] = {&frame.loop_index, &frame.loop_limit,
+                &frame.loop_max_iterations, &frame.loop_status, &handle, &advance};
+            const size_t sizes[] = {sizeof(frame.loop_index), sizeof(frame.loop_limit),
+                sizeof(frame.loop_max_iterations), sizeof(frame.loop_status),
                 sizeof(handle), sizeof(advance)};
             const MxxGraphPatch patches[] = {
-                mxx_direct_pointer_patch(0, builder->loop_index_binding),
-                mxx_direct_pointer_patch(1, builder->loop_limit_binding),
-                mxx_direct_pointer_patch(3, builder->loop_status_binding)};
+                mxx_direct_pointer_patch(0, frame.loop_index_binding),
+                mxx_direct_pointer_patch(1, frame.loop_limit_binding),
+                mxx_direct_pointer_patch(3, frame.loop_status_binding)};
             const int result = mxx_gpu_graph_builder_add_kernel(builder,
                 reinterpret_cast<const void *>(mxx_while_gate_kernel),
                 1, 1, 1, 1, 1, 1, 0, arguments, sizes, 6, patches, 3);
             if (result != 0) return result;
         }
-        builder->graph = builder->root_graph;
-        builder->frontier.assign(1, builder->conditional_node);
-        builder->operation_nodes = std::move(builder->parent_operation_nodes);
-        builder->operation_nodes.push_back(builder->conditional_node);
-        builder->binding_map = std::move(builder->parent_binding_map);
-        builder->operation_index = builder->parent_operation_index;
+        builder->graph = frame.parent_graph;
+        builder->frontier.assign(1, frame.conditional_node);
+        builder->operation_nodes = std::move(frame.parent_operation_nodes);
+        builder->operation_nodes.push_back(frame.conditional_node);
+        builder->binding_map = std::move(frame.parent_binding_map);
+        builder->body_terminals = std::move(frame.parent_body_terminals);
+        builder->operation_index = frame.parent_operation_index;
         builder->operation_active = true;
-        builder->conditional_body_active = false;
-        builder->generic_body_mode = false;
-        builder->generic_while_active = false;
-        builder->conditional_node = nullptr;
-        builder->body_terminals.clear();
-        builder->parent_frontier.clear();
+        builder->conditional_body_active = frame.parent_conditional_body_active;
+        builder->generic_body_mode = frame.parent_generic_body_mode;
+        builder->last_body_conditional = builder->conditional_body_active ?
+            frame.conditional_node : nullptr;
         return 0;
 #else
         (void)builder;
@@ -3070,40 +2697,6 @@ extern "C"
         auto *builder = owner.explicit_builder;
         return builder && builder->operation_active &&
             builder->stream == reinterpret_cast<cudaStream_t>(stream) ? builder : nullptr;
-    }
-
-    void *mxx_gpu_graph_builder_dispatch_stream(GpuContext *ctx, int device,
-        void *ordinary_stream)
-    {
-        if (!ctx || !ctx->execution) return ordinary_stream;
-        auto &owner = *ctx->execution;
-        std::lock_guard<std::mutex> lock(owner.graph_mutex);
-        auto *builder = owner.explicit_builder;
-        if (!builder || !builder->operation_active) return ordinary_stream;
-        if (builder->device != device)
-        {
-            set_error("explicit graph operation targets a different GPU");
-            return nullptr;
-        }
-        return reinterpret_cast<void *>(builder->stream);
-    }
-
-    int mxx_gpu_graph_builder_find_binding(MxxGpuGraphBuilder *builder,
-        uint64_t address, uint32_t *out_binding)
-    {
-        if (!builder || !address || !out_binding)
-            return set_error("invalid explicit graph binding lookup");
-        bool found = false;
-        for (const auto &owner : builder->resident_addresses)
-        {
-            if (address >= owner.address && address - owner.address < owner.bytes)
-            {
-                if (found) return set_error("ambiguous explicit graph binding address");
-                *out_binding = owner.binding;
-                found = true;
-            }
-        }
-        return found ? 0 : set_error("explicit graph address has no registered binding");
     }
 
     int mxx_gpu_graph_dispatch_kernel(GpuContext *ctx, void *stream,
@@ -3411,26 +3004,6 @@ extern "C"
         return 0;
     }
 
-    int mxx_gpu_native_event_query(MxxGpuNativeEvent *event, int *out_complete)
-    {
-        if (!event || !event->event || !out_complete)
-            return set_error("invalid CUDA graph event query arguments");
-        cudaError_t error = cudaSetDevice(event->device);
-        if (error == cudaSuccess) error = cudaEventQuery(event->event);
-        if (error == cudaSuccess)
-        {
-            *out_complete = 1;
-            return 0;
-        }
-        if (error == cudaErrorNotReady)
-        {
-            *out_complete = 0;
-            cudaGetLastError();
-            return 0;
-        }
-        return set_error(error);
-    }
-
     void mxx_gpu_native_event_destroy(MxxGpuNativeEvent *event)
     {
         if (!event) return;
@@ -3443,34 +3016,50 @@ extern "C"
         delete event;
     }
 
-    int mxx_gpu_graph_memory_snapshot(
-        int physical_device,
-        MxxGraphMemorySnapshot *out_snapshot)
+    int gpu_device_buffer_copy_from_address(
+        const void *source,
+        int source_device,
+        MxxGpuDeviceBuffer *destination,
+        size_t bytes,
+        void *stream_raw,
+        MxxGpuNativeEvent **out_event)
     {
-        if (!out_snapshot || physical_device < 0)
-            return set_error("invalid mxx_gpu_graph_memory_snapshot arguments");
-        size_t used_current = 0;
-        size_t used_high = 0;
-        size_t reserved_current = 0;
-        if (gpu_default_mempool_get_usage(
-                physical_device, &used_current, &used_high, &reserved_current) != 0)
+        if (!source || !destination || !stream_raw || !out_event ||
+            bytes > destination->bytes)
         {
-            return 1;
+            return set_error("invalid gpu_device_buffer_copy_from_address arguments");
         }
-        cudaMemPool_t pool = nullptr;
-        cudaError_t error = cudaSetDevice(physical_device);
-        if (error == cudaSuccess) error = cudaDeviceGetDefaultMemPool(&pool, physical_device);
-        uint64_t reserved_high = 0;
-        if (error == cudaSuccess)
+        *out_event = nullptr;
+        auto *event = new (std::nothrow) MxxGpuNativeEvent();
+        if (!event) return set_error("failed to allocate device copy completion state");
+        event->device = destination->device;
+        const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+        cudaError_t status = cudaSetDevice(destination->device);
+        if (status == cudaSuccess)
+            status = cudaEventCreateWithFlags(&event->event, cudaEventDisableTiming);
+        if (status == cudaSuccess && destination->producer_valid &&
+            stream != destination->allocation_stream)
         {
-            error = cudaMemPoolGetAttribute(
-                pool, cudaMemPoolAttrReservedMemHigh, &reserved_high);
+            status = cudaStreamWaitEvent(stream, destination->producer, 0);
         }
-        if (error != cudaSuccess) return set_error(error);
-        out_snapshot->used_current = used_current;
-        out_snapshot->used_high = used_high;
-        out_snapshot->reserved_current = reserved_current;
-        out_snapshot->reserved_high = reserved_high;
+        if (status == cudaSuccess)
+        {
+            status = source_device == destination->device ?
+                cudaMemcpyAsync(destination->address, source, bytes,
+                    cudaMemcpyDeviceToDevice, stream) :
+                cudaMemcpyPeerAsync(destination->address, destination->device,
+                    source, source_device, bytes, stream);
+        }
+        if (status == cudaSuccess) status = cudaEventRecord(destination->producer, stream);
+        if (status == cudaSuccess) status = cudaEventRecord(event->event, stream);
+        if (status != cudaSuccess)
+        {
+            mxx_gpu_native_event_destroy(event);
+            return set_error(status);
+        }
+        destination->producer_valid = true;
+        *out_event = event;
         return 0;
     }
+
 }

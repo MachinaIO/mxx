@@ -10,7 +10,7 @@ use mxx_fhe::{
     BgvCiphertext, FheScheme,
     utils::{
         self,
-        gpu::{self, input, integers},
+        gpu::{self, copy_outputs, input, integers},
     },
 };
 use mxx_ir_core::ParamEnv;
@@ -78,7 +78,8 @@ fn test_gpu_bgv_round_trip() {
     let keygen_result =
         runtime.execute(&mut keygen_plan, BTreeMap::new(), &mut keygen_store, [0; 32]).unwrap();
     record_timing("keygen", started, &mut timings);
-    let keys = keygen_result.outputs;
+    let keys = copy_outputs(&runtime, &keygen_result);
+    drop(keygen_result);
 
     // Build two encryption programs so the x and y production execution boundaries are measured
     // independently. Graph construction and plan compilation happen before each timer starts.
@@ -106,7 +107,7 @@ fn test_gpu_bgv_round_trip() {
     let started = Instant::now();
     let lhs_result = runtime.execute(&mut lhs_plan, lhs_inputs, &mut lhs_store, [0; 32]).unwrap();
     record_timing("encrypt_x", started, &mut timings);
-    let encrypted_lhs = lhs_result.outputs;
+    let encrypted_lhs = copy_outputs(&runtime, &lhs_result);
 
     let rhs_template = bgv
         .encrypt(
@@ -132,7 +133,7 @@ fn test_gpu_bgv_round_trip() {
     let started = Instant::now();
     let rhs_result = runtime.execute(&mut rhs_plan, rhs_inputs, &mut rhs_store, [0; 32]).unwrap();
     record_timing("encrypt_y", started, &mut timings);
-    let encrypted_rhs = rhs_result.outputs;
+    let encrypted_rhs = copy_outputs(&runtime, &rhs_result);
     runtime.options_mut().integer_input_ranges.clear();
 
     // Build separate evaluation programs so each production operation has one measured execute
@@ -173,7 +174,7 @@ fn test_gpu_bgv_round_trip() {
         .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .unwrap();
     let relinearize_inputs = BTreeMap::from([
-        ("quadratic".into(), multiply_result.outputs["quadratic"].clone()),
+        ("quadratic".into(), copy_outputs(&runtime, &multiply_result)["quadratic"].clone()),
         ("rk".into(), keys["rk"].clone()),
     ]);
     let mut relinearize_plan = runtime.plan(relinearize_graph, &relinearize_inputs).unwrap();
@@ -199,7 +200,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap();
     let modswitch_inputs = BTreeMap::from([(
         "relinearized".into(),
-        relinearize_result.outputs["relinearized"].clone(),
+        copy_outputs(&runtime, &relinearize_result)["relinearized"].clone(),
     )]);
     let mut modswitch_plan = runtime.plan(modswitch_graph, &modswitch_inputs).unwrap();
     let mut modswitch_store = MemoryArtifactStore::default();
@@ -226,7 +227,7 @@ fn test_gpu_bgv_round_trip() {
         .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .unwrap();
     let decryption_inputs = BTreeMap::from([
-        ("ct".into(), evaluation_result.outputs["ct"].clone()),
+        ("ct".into(), copy_outputs(&runtime, &evaluation_result)["ct"].clone()),
         ("sk".into(), keys["sk"].clone()),
     ]);
     let mut decryption_plan = runtime.plan(decryption_graph, &decryption_inputs).unwrap();
@@ -241,7 +242,7 @@ fn test_gpu_bgv_round_trip() {
         .zip(&y)
         .map(|(&a, &b)| BigInt::from((a as u128 * b as u128 % plaintext_modulus as u128) as u64))
         .collect::<Vec<_>>();
-    assert_eq!(integers(&runtime, &decryption_result.outputs, "slots"), expected);
+    assert_eq!(integers(&runtime, &copy_outputs(&runtime, &decryption_result), "slots"), expected);
     let total_ms = timings.iter().map(|(_, milliseconds)| milliseconds).sum::<f64>();
     println!("BGV_TIMING_SUMMARY total_execute_ms={total_ms:.3} stages={}", timings.len());
 }

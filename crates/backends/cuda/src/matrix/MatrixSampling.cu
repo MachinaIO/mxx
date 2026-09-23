@@ -235,440 +235,6 @@ __device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t
     return -static_cast<int64_t>(neg);
 }
 
-__device__ __forceinline__ void matrix_sample_distribution_multi_limb_kernel_body(
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t local_ncol,
-    size_t full_ncol,
-    size_t col_offset,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    GpuRngSeed seed)
-{
-    constexpr size_t kSamplesPerThread = 4;
-    const size_t chunks_per_poly = (n + kSamplesPerThread - 1) / kSamplesPerThread;
-    const size_t chunk_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total_chunks = poly_count * chunks_per_poly;
-    if (chunk_idx >= total_chunks)
-    {
-        return;
-    }
-    const size_t local_poly_idx = chunk_idx / chunks_per_poly;
-    const size_t coeff_start =
-        (chunk_idx - local_poly_idx * chunks_per_poly) * kSamplesPerThread;
-    const size_t row_idx = local_poly_idx / local_ncol;
-    const size_t local_col_idx = local_poly_idx - row_idx * local_ncol;
-    const size_t global_poly_idx = row_idx * full_ncol + (col_offset + local_col_idx);
-
-    const uint64_t domain = dist_type == GPU_MATRIX_DIST_UNIFORM ?
-        0x6f70656e66686531ULL :
-        (dist_type == GPU_MATRIX_DIST_GAUSS ? 0x6f70656e66686532ULL :
-         (dist_type == GPU_MATRIX_DIST_BIT ? 0x6f70656e66686533ULL :
-                                            0x6f70656e66686534ULL));
-    const uint64_t limb_domain =
-        dist_type == GPU_MATRIX_DIST_UNIFORM ? static_cast<uint64_t>(limb_idx + 1) : 0;
-    DeviceChaChaRng rng;
-    rng_init(
-        rng,
-        seed,
-        static_cast<uint64_t>(global_poly_idx + 1),
-        static_cast<uint64_t>(coeff_start + 1),
-        limb_domain,
-        domain);
-    const uint64_t uniform_rejection_threshold =
-        dist_type == GPU_MATRIX_DIST_UNIFORM && modulus != 0 ?
-        static_cast<uint64_t>(-modulus) % modulus : 0;
-
-    for (size_t lane = 0; lane < kSamplesPerThread; ++lane)
-    {
-        const size_t coeff_idx = coeff_start + lane;
-        if (coeff_idx >= n) break;
-        uint64_t sample = 0;
-        if (dist_type == GPU_MATRIX_DIST_UNIFORM)
-        {
-            sample = sample_uniform_mod(rng, modulus, uniform_rejection_threshold);
-        }
-        else if (dist_type == GPU_MATRIX_DIST_GAUSS)
-        {
-            int64_t z;
-            do
-            {
-                z = sample_integer_karney(rng, 0.0, sigma);
-            } while (centered_sample_abs_i64(z, coefficient_modulus) > max_coefficient_bound);
-            sample = signed_mod_i64(z, modulus);
-        }
-        else if (dist_type == GPU_MATRIX_DIST_BIT)
-        {
-            sample = rng_next_u64(rng) & 1ULL;
-        }
-        else if (dist_type == GPU_MATRIX_DIST_TERNARY)
-        {
-            const uint64_t pick = rng_next_u64(rng) % 3ULL;
-            const int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
-            sample = signed_mod_i64(z, modulus);
-        }
-
-        matrix_store_limb_u64(
-            dst_base,
-            local_poly_idx,
-            coeff_idx,
-            dst_stride_bytes,
-            dst_coeff_bytes,
-            sample);
-    }
-}
-
-__global__ void matrix_sample_distribution_multi_limb_kernel(
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t local_ncol,
-    size_t full_ncol,
-    size_t col_offset,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    GpuRngSeed seed)
-{
-    matrix_sample_distribution_multi_limb_kernel_body(
-        dst_base, poly_count, local_ncol, full_ncol, col_offset, n,
-        dst_stride_bytes, dst_coeff_bytes, modulus, limb_idx, dist_type,
-        sigma, max_coefficient_bound, coefficient_modulus, seed);
-}
-
-__global__ void matrix_sample_distribution_multi_limb_device_seed_kernel(
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t local_ncol,
-    size_t full_ncol,
-    size_t col_offset,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    const GpuRngSeed *device_seed)
-{
-    if (device_seed == nullptr)
-        return;
-    matrix_sample_distribution_multi_limb_kernel_body(
-        dst_base, poly_count, local_ncol, full_ncol, col_offset, n,
-        dst_stride_bytes, dst_coeff_bytes, modulus, limb_idx, dist_type,
-        sigma, max_coefficient_bound, coefficient_modulus, *device_seed);
-}
-
-int launch_sample_distribution_multi_limb_kernel(
-    GpuContext *,
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t local_ncol,
-    size_t full_ncol,
-    size_t col_offset,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    GpuRngSeed seed,
-    uint32_t,
-    cudaStream_t stream)
-{
-    if (!dst_base)
-    {
-        return set_error("null output base pointer in matrix_sample_distribution_multi_limb_kernel");
-    }
-    if (poly_count == 0 || n == 0)
-    {
-        return 0;
-    }
-
-    const int threads = 256;
-    constexpr size_t kSamplesPerThread = 4;
-    const size_t chunks_per_poly = (n + kSamplesPerThread - 1) / kSamplesPerThread;
-    const size_t total_chunks = poly_count * chunks_per_poly;
-    const int blocks = static_cast<int>((total_chunks + threads - 1) / threads);
-    matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
-        dst_base,
-        poly_count,
-        local_ncol,
-        full_ncol,
-        col_offset,
-        n,
-        dst_stride_bytes,
-        dst_coeff_bytes,
-        modulus,
-        limb_idx,
-        dist_type,
-        sigma,
-        max_coefficient_bound,
-        coefficient_modulus,
-        seed);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    // The sampled output is allocated inside the captured fixed operation and
-    // remains graph-owned.  The replay destination owner is populated by the
-    // capture adapter's post-operation copy, so its pointer is not a resident
-    // graph binding here.
-    return 0;
-}
-
-static int gpu_matrix_sample_distribution_impl(
-    GpuMatrix *out,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    GpuRngSeed seed,
-    size_t full_ncol,
-    size_t col_offset)
-{
-    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
-    if (!out)
-    {
-        return set_error("invalid gpu_matrix_sample_distribution arguments");
-    }
-    if (dist_type < GPU_MATRIX_DIST_UNIFORM || dist_type > GPU_MATRIX_DIST_TERNARY)
-    {
-        return set_error("invalid dist_type in gpu_matrix_sample_distribution");
-    }
-    if (dist_type == GPU_MATRIX_DIST_GAUSS && !(sigma > 0.0))
-    {
-        return set_error("sigma must be positive in gpu_matrix_sample_distribution");
-    }
-    if (col_offset > full_ncol || out->cols > full_ncol - col_offset)
-    {
-        return set_error("column range out of bounds in gpu_matrix_sample_distribution");
-    }
-    const GpuPolyFormat requested_format = out->format;
-    if (requested_format != GPU_POLY_FORMAT_COEFF && requested_format != GPU_POLY_FORMAT_EVAL)
-    {
-        return set_error("invalid output format in gpu_matrix_sample_distribution");
-    }
-
-    const size_t count = out->rows * out->cols;
-    if (count == 0)
-    {
-        return 0;
-    }
-
-    const int level = out->level;
-    if (level < 0)
-    {
-        return set_error("invalid level in gpu_matrix_sample_distribution");
-    }
-    if (out->ctx->moduli.size() < static_cast<size_t>(level + 1))
-    {
-        return set_error("unexpected modulus count in gpu_matrix_sample_distribution");
-    }
-
-    auto &limb_map = out->ctx->limb_gpu_ids;
-    if (limb_map.size() < static_cast<size_t>(level + 1))
-    {
-        return set_error("unexpected limb mapping size in gpu_matrix_sample_distribution");
-    }
-    int status = 0;
-    for (int limb = 0; limb <= level; ++limb)
-    {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int limb_device = -1;
-        cudaStream_t limb_stream = nullptr;
-        status = matrix_limb_device(out, limb_id, &limb_device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(out, limb_id, &limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        if (limb_device < 0 || !limb_stream)
-        {
-            return set_error("invalid limb metadata in gpu_matrix_sample_distribution");
-        }
-        uint8_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
-        if (!dst_base)
-        {
-            return set_error("null output limb base pointer in gpu_matrix_sample_distribution");
-        }
-        size_t dst_stride_bytes = 0;
-        uint8_t dst_coeff_bytes = 0;
-        if (!matrix_limb_metadata_by_id(out, limb_id, &dst_stride_bytes, &dst_coeff_bytes))
-        {
-            return set_error("invalid output limb metadata in gpu_matrix_sample_distribution");
-        }
-        cudaError_t err = cudaSetDevice(limb_device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        status = launch_sample_distribution_multi_limb_kernel(
-            out->ctx,
-            dst_base,
-            count,
-            out->cols,
-            full_ncol,
-            col_offset,
-            static_cast<size_t>(out->ctx->N),
-            dst_stride_bytes,
-            dst_coeff_bytes,
-            out->ctx->moduli[static_cast<size_t>(limb)],
-            static_cast<uint32_t>(limb),
-            dist_type,
-            sigma,
-            max_coefficient_bound,
-            coefficient_modulus,
-            seed,
-            static_cast<uint32_t>(limb),
-            limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_record_limb_write(out, limb_id, limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-
-    out->format = GPU_POLY_FORMAT_COEFF;
-    if (requested_format == GPU_POLY_FORMAT_EVAL)
-    {
-        status = gpu_matrix_ntt_all(out);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-    out->format = requested_format;
-    return 0;
-}
-
-
-extern "C" int gpu_matrix_sample_distribution(
-    GpuMatrix *out,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    GpuRngSeed seed)
-{
-    return gpu_matrix_sample_distribution_impl(
-        out,
-        dist_type,
-        sigma,
-        max_coefficient_bound,
-        coefficient_modulus,
-        seed,
-        out ? out->cols : 0,
-        0);
-}
-
-extern "C" int gpu_matrix_sample_distribution_columns(
-    GpuMatrix *out,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    GpuRngSeed seed,
-    size_t full_ncol,
-    size_t col_offset)
-{
-    return gpu_matrix_sample_distribution_impl(
-        out,
-        dist_type,
-        sigma,
-        max_coefficient_bound,
-        coefficient_modulus,
-        seed,
-        full_ncol,
-        col_offset);
-}
-
-extern "C" int gpu_matrix_sample_distribution_columns_device_seed(
-    GpuMatrix *out,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    const GpuRngSeed *device_seed,
-    size_t full_ncol,
-    size_t col_offset,
-    cudaStream_t body_stream)
-{
-    if (!out || !device_seed || !body_stream)
-        return set_error("invalid device-seed sampling arguments");
-    if (dist_type < GPU_MATRIX_DIST_UNIFORM || dist_type > GPU_MATRIX_DIST_TERNARY)
-        return set_error("invalid dist_type in device-seed sampling");
-    if (col_offset > full_ncol || out->cols > full_ncol - col_offset)
-        return set_error("column range out of bounds in device-seed sampling");
-    if (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL)
-        return set_error("invalid output format in device-seed sampling");
-    if (out->level < 0 || out->ctx->moduli.size() < static_cast<size_t>(out->level + 1) ||
-        out->ctx->limb_gpu_ids.size() < static_cast<size_t>(out->level + 1))
-        return set_error("invalid device-seed sampling level");
-    const GpuPolyFormat requested_format = out->format;
-    out->format = GPU_POLY_FORMAT_COEFF;
-    const size_t count = out->rows * out->cols;
-    for (int limb = 0; limb <= out->level; ++limb)
-    {
-        const dim3 limb_id = out->ctx->limb_gpu_ids[static_cast<size_t>(limb)];
-        int device = -1;
-        int status = matrix_limb_device(out, limb_id, &device);
-        if (status != 0) return status;
-        if (device < 0) return set_error("invalid device-seed limb metadata");
-        uint8_t *dst = matrix_limb_ptr_by_id(out, 0, limb_id);
-        size_t stride = 0;
-        uint8_t coeff_bytes = 0;
-        if (!dst || !matrix_limb_metadata_by_id(out, limb_id, &stride, &coeff_bytes))
-            return set_error("invalid device-seed output metadata");
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess) return set_error(err);
-        const size_t chunks = (out->ctx->N + 3) / 4;
-        const size_t total = count * chunks;
-        if (total != 0)
-        {
-            matrix_sample_distribution_multi_limb_device_seed_kernel<<<
-                static_cast<int>((total + 255) / 256), 256, 0, body_stream>>>(
-                dst, count, out->cols, full_ncol, col_offset, out->ctx->N,
-                stride, coeff_bytes, out->ctx->moduli[static_cast<size_t>(limb)],
-                static_cast<uint32_t>(limb), dist_type, sigma, max_coefficient_bound,
-                coefficient_modulus, device_seed);
-            err = cudaGetLastError();
-            if (err != cudaSuccess) return set_error(err);
-        }
-        status = matrix_record_limb_write(out, limb_id, body_stream);
-        if (status != 0) return status;
-    }
-    if (requested_format == GPU_POLY_FORMAT_EVAL)
-        return gpu_matrix_ntt_all(out);
-    return 0;
-}
-
 namespace
 {
     __global__ void raw_matrix_sample_kernel(
@@ -677,6 +243,7 @@ namespace
         uint64_t column_origin, uint64_t full_columns,
         uint32_t degree, int distribution, double sigma,
         uint64_t max_coefficient_bound, uint64_t coefficient_modulus,
+        int64_t interval_minimum, uint64_t interval_span,
         uint64_t chunk_offset, uint64_t sample_domain)
     {
         if (!device_seed) return;
@@ -695,8 +262,9 @@ namespace
         const uint64_t domain = distribution == GPU_MATRIX_DIST_UNIFORM ?
             0x6f70656e66686531ULL :
             (distribution == GPU_MATRIX_DIST_GAUSS ? 0x6f70656e66686532ULL :
-             (distribution == GPU_MATRIX_DIST_BIT ? 0x6f70656e66686533ULL :
-                                                0x6f70656e66686534ULL));
+                                                 0x6f70656e66686535ULL);
+        // Non-uniform draws share one integer stream across CRT limbs so every
+        // limb reduces the same signed coefficient.
         const uint64_t limb_domain = distribution == GPU_MATRIX_DIST_UNIFORM ?
             static_cast<uint64_t>(destination.crt_limb_index + 1) : 0;
         DeviceChaChaRng rng;
@@ -704,7 +272,9 @@ namespace
             coefficient_start + 1, limb_domain, domain ^ sample_domain);
         const uint64_t modulus = destination.modulus;
         const uint64_t rejection_threshold = distribution == GPU_MATRIX_DIST_UNIFORM ?
-            static_cast<uint64_t>(-modulus) % modulus : 0;
+            static_cast<uint64_t>(-modulus) % modulus :
+            (distribution == GPU_MATRIX_DIST_INTERVAL && interval_span != 0 ?
+                static_cast<uint64_t>(-interval_span) % interval_span : 0);
         for (uint64_t lane = 0; lane < samples_per_thread; ++lane)
         {
             const uint64_t coefficient = coefficient_start + lane;
@@ -722,12 +292,13 @@ namespace
                     max_coefficient_bound);
                 sample = signed_mod_i64(signed_sample, modulus);
             }
-            else if (distribution == GPU_MATRIX_DIST_BIT)
-                sample = rng_next_u64(rng) & 1ULL;
             else
             {
-                const uint64_t pick = rng_next_u64(rng) % 3ULL;
-                sample = signed_mod_i64(pick == 0 ? 0 : (pick == 1 ? 1 : -1), modulus);
+                // interval_span == 0 encodes the full 2^64 span of [i64::MIN, i64::MAX].
+                const uint64_t offset = interval_span == 0 ? rng_next_u64(rng) :
+                    sample_uniform_mod(rng, interval_span, rejection_threshold);
+                sample = signed_mod_i64(static_cast<int64_t>(
+                    static_cast<uint64_t>(interval_minimum) + offset), modulus);
             }
             raw_matrix_store(destination, poly, coefficient, columns, sample);
         }
@@ -737,12 +308,14 @@ namespace
 extern "C" int gpu_raw_matrix_sample(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *destination, int distribution, double sigma,
     uint64_t max_coefficient_bound, uint64_t coefficient_modulus,
+    int64_t interval_minimum, int64_t interval_maximum,
     const void *device_seed, uint64_t full_columns, uint64_t sample_domain,
     uint32_t destination_binding_base, uint32_t seed_binding)
 {
     if (validate_raw_view(ctx, destination, stream_raw) != 0 || !device_seed ||
-        distribution < GPU_MATRIX_DIST_UNIFORM ||
-        distribution > GPU_MATRIX_DIST_TERNARY ||
+        (distribution != GPU_MATRIX_DIST_UNIFORM && distribution != GPU_MATRIX_DIST_GAUSS &&
+            distribution != GPU_MATRIX_DIST_INTERVAL) ||
+        (distribution == GPU_MATRIX_DIST_INTERVAL && interval_minimum > interval_maximum) ||
         (distribution == GPU_MATRIX_DIST_GAUSS && !(sigma > 0.0)) ||
         destination->column_origin > full_columns ||
         destination->columns > full_columns - destination->column_origin ||
@@ -780,7 +353,9 @@ extern "C" int gpu_raw_matrix_sample(GpuContext *ctx, void *stream_raw,
                 destination->rows, destination->columns,
                 destination->row_origin, destination->column_origin,
                 full_columns, destination->degree, distribution, sigma,
-                max_coefficient_bound, coefficient_modulus, offset, sample_domain);
+                max_coefficient_bound, coefficient_modulus, interval_minimum,
+                static_cast<uint64_t>(interval_maximum) - static_cast<uint64_t>(interval_minimum) + 1,
+                offset, sample_domain);
             if (status != 0) return status;
         }
     }

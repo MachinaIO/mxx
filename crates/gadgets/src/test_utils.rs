@@ -374,6 +374,17 @@ pub fn execute_circuit_with_shape(
 ) -> Vec<DCRTPolyMatrix> {
     assert!(inputs.iter().all(|input| input.size() == shape), "runtime input shape mismatch");
     let graph = build_circuit_graph(name, parameters, circuit, inputs.len(), shape);
+    // A circuit input that no output reads is not part of the built graph.
+    let declared = graph
+        .source
+        .root_scope()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            mxx_ir_core::node::NodeKind::Input { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     let result = execute(
         &graph,
         &mut cpu_backend([parameters.clone()]),
@@ -381,6 +392,7 @@ pub fn execute_circuit_with_shape(
             .iter()
             .enumerate()
             .map(|(index, value)| (format!("input-{index}"), RuntimeValue::matrix(value.clone())))
+            .filter(|(name, _)| declared.contains(name))
             .collect::<BTreeMap<_, _>>(),
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,

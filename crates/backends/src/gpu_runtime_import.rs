@@ -6,7 +6,6 @@ use crate::{
     gpu_io_worker::{FrameGeneration, IoCompletion},
     gpu_physical_lowering::{ImportDestination, ImportTemplate},
     gpu_runtime_io::{ProducerIoPump, RuntimeIoOperation},
-    matrix::SmallPolyMatrix,
     poly::{PolyParams, dcrt::gpu::GpuSignedValuesEncoding},
 };
 use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
@@ -138,19 +137,6 @@ unsafe fn upload_selected_payload(
                     .ok_or("integer import exceeds its planned u64 range")?]),
             }
             .map_err(|error| error.to_string())?;
-            owner.wait_until_ready().map_err(|error| error.to_string())?;
-            Ok(())
-        }
-        (
-            ArtifactType::Bytes { length: 32 },
-            ImportDestination::Bytes32(owner),
-            ArtifactPayload::Bytes(bytes),
-        ) => {
-            let exact: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| "Bytes32 import length differs from its type")?;
-            owner.upload(&exact).map_err(|error| error.to_string())?;
             owner.wait_until_ready().map_err(|error| error.to_string())?;
             Ok(())
         }

@@ -10,22 +10,19 @@ use crate::{
         BoundStorage, GpuResidentValue, PolyMatrix, RuntimeValue,
         poly_gpu::{GpuDcrtBackend, PhysicalExport},
     },
-    gpu_column_policy::{
-        ColumnCapability, ColumnRange, EffectiveGpuOperation,
-        map_output_range_to_inputs_with_output,
-    },
     gpu_execution_plan::{
-        CompiledGpuOp, CompiledGpuProgram, FrozenGpuPlan, GpuBindingSource, GpuExecutionSiteKey,
-        GpuHashResourceSpec, GpuImplementation, GpuImplementationRegistry, GpuLayout,
-        GpuLoopChoice, GpuLoopSiteKey, GpuNodeChoice, GpuPlanContract, GpuPreparedWorkspaceKind,
-        KernelArg, PhysicalEncoding, PhysicalPart, PhysicalValue, PhysicalValueId, PhysicalView,
-        StorageRef, reserve_gpu_export_slots, scope_shape_class,
+        ColumnRange, CompiledGpuOp, CompiledGpuProgram, FrozenGpuPlan, GpuBindingSource,
+        GpuExecutionSiteKey, GpuHashResourceSpec, GpuImplementation, GpuImplementationRegistry,
+        GpuLayout, GpuLoopChoice, GpuLoopSiteKey, GpuNodeChoice, GpuPlanContract,
+        GpuPreparedWorkspaceKind, KernelArg, PhysicalEncoding, PhysicalPart, PhysicalValue,
+        PhysicalValueId, PhysicalView, StorageRef, reserve_gpu_export_slots, scope_shape_class,
     },
     gpu_physical_control::{
         ControlReset, ExternalIoImport, ExternalIoLoop, PhysicalWave, allocate_real_value,
         allocate_return_integer_family_value, allocate_return_integer_value,
         emit_integer_operation, emit_real_operation, finite_loop_count, fixed_child_env,
         lower_control_node, lower_wave_family_artifact_export, pack_resident_family,
+        static_family_member,
     },
     gpu_schedule::GpuColumnInterval,
     matrix::gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix, GpuSmallMatrixOutputDescriptor},
@@ -87,7 +84,6 @@ pub(crate) enum ImportDestination {
         owner: Arc<GpuSignedValues>,
         ty: ConcreteWireType,
     },
-    Bytes32(Arc<GpuDeviceSeed>),
     Bytes {
         owner: Arc<GpuDeviceBytes>,
         length: usize,
@@ -360,7 +356,7 @@ fn append_matrix_candidate(
     layouts: &mut Vec<GpuLayout>,
     nodes: &mut Vec<GpuNodeChoice>,
 ) -> Result<(), String> {
-    let NodeKind::MatrixBinary(kind) = node.kind() else {
+    let NodeKind::MatrixBinary(_) = node.kind() else {
         return Err("GPU candidate expected a matrix binary node".into());
     };
     let scope = validated
@@ -387,15 +383,6 @@ fn append_matrix_candidate(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let identity = root_matrix_operation_identity(node.kind(), &argument_types, &output_type, env)?;
-    let (effective_operation, column_capability) = match kind {
-        MatrixBinaryOp::Add => (EffectiveGpuOperation::MatrixAdd, ColumnCapability::SameColumns),
-        MatrixBinaryOp::Subtract => {
-            (EffectiveGpuOperation::MatrixSubtract, ColumnCapability::SameColumns)
-        }
-        MatrixBinaryOp::Multiply => {
-            (EffectiveGpuOperation::MatrixMultiply, ColumnCapability::FixedOperandColumns)
-        }
-    };
     let layout_id =
         u32::try_from(layouts.len()).map_err(|_| "too many GPU candidate layouts".to_owned())?;
     layouts.push(GpuLayout {
@@ -412,8 +399,6 @@ fn append_matrix_candidate(
         key: GpuExecutionSiteKey { site: node_id.0, shape_class, instance_class },
         loop_site,
         operation_identity: identity,
-        effective_operation,
-        column_capability,
         output_layouts: vec![layout_id],
         columns_per_job: vec![columns_per_job],
         implementation_variant: "direct".into(),
@@ -462,8 +447,6 @@ fn append_preimage_candidate(
             matrix.columns,
         ))
         .map_err(|error| error.to_string())?,
-        effective_operation: EffectiveGpuOperation::PreimageSample,
-        column_capability: ColumnCapability::FixedOperandColumns,
         output_layouts: vec![layout_id],
         columns_per_job: vec![columns_per_job],
         implementation_variant: "direct".into(),
@@ -616,7 +599,17 @@ fn append_fixed_child_candidates(
                     visited,
                 )?;
             }
-            NodeKind::ParallelLoop(loop_node) if matches!(scope_id, FrozenGraphScopeId::Root) => {
+            NodeKind::ParallelLoop(_)
+                if crate::gpu_physical_control::is_vectorized_scalar_loop(
+                    &validated.source,
+                    scope_id,
+                    node_id,
+                    node,
+                ) =>
+            {
+                // All lanes lower at once; there is no wave choice to freeze.
+            }
+            NodeKind::ParallelLoop(loop_node) => {
                 let count =
                     usize::try_from(finite_loop_count(scope_id, node_id, node.kind(), env)?)
                         .map_err(|_| "GPU loop count exceeds host address space".to_owned())?;
@@ -625,9 +618,12 @@ fn append_fixed_child_candidates(
                     // sampled/exported side effect to materialize.
                     continue;
                 }
-                if wave_instances == 0 || wave_instances > count {
-                    return Err("GPU loop W must be between one and its finite count".into());
+                if wave_instances == 0 {
+                    return Err("GPU loop W must be positive".into());
                 }
+                // One candidate W is shared by every loop site and capped by
+                // each site's own finite count.
+                let site_wave = wave_instances.min(count);
                 let key = GpuLoopSiteKey {
                     site: node_id.0,
                     shape_class: scope_shape_class(validated, scope_id)
@@ -637,8 +633,8 @@ fn append_fixed_child_candidates(
                 loops.push(GpuLoopChoice {
                     key,
                     loop_count: count,
-                    wave_instances,
-                    tail_instances: count % wave_instances,
+                    wave_instances: site_wave,
+                    tail_instances: count % site_wave,
                 });
                 let child_id = validated
                     .source
@@ -736,7 +732,6 @@ fn append_fixed_child_candidates(
                     visited,
                 )?;
             }
-            kind => return Err(format!("GPU fixed child candidate cannot lower {kind:?}")),
         }
     }
     Ok(())
@@ -785,6 +780,10 @@ impl PhysicalFrame {
         if inputs.len() != self.input_ids.len() {
             return Err("GPU input set differs from the physical plan".into());
         }
+        // Plan values viewing a previous input (slices, members, lane views)
+        // share its allocations; they are re-derived over the new input.
+        let mut replaced = Vec::new();
+        let mut ready = Vec::new();
         for (name, id) in &self.input_ids {
             let value = inputs.get(name).ok_or_else(|| format!("missing GPU input {name}"))?;
             let planned = self
@@ -833,7 +832,26 @@ impl PhysicalFrame {
             if planned != resident.physical().as_ref() {
                 return Err(format!("GPU input {name} changed its physical layout"));
             }
-            self.owners.insert(*id, resident);
+            if let Some(previous) = self.owners.insert(*id, Arc::clone(&resident)) {
+                for (slot, bound) in previous.storages() {
+                    let replacement = resident
+                        .storage(*slot)
+                        .ok_or_else(|| format!("GPU input {name} lost a storage slot"))?;
+                    replaced.push((Arc::as_ptr(&bound.owner).cast::<()>(), replacement.clone()));
+                }
+                ready.extend(resident.ready_events().iter().cloned());
+            }
+        }
+        if !replaced.is_empty() {
+            let inputs = self.input_ids.values().copied().collect::<BTreeSet<_>>();
+            for (id, owner) in self.owners.iter_mut() {
+                if inputs.contains(id) {
+                    continue;
+                }
+                if let Some(rebound) = owner.rebound(&replaced, &ready).map_err(str::to_owned)? {
+                    *owner = Arc::new(rebound);
+                }
+            }
         }
         Ok(())
     }
@@ -866,56 +884,6 @@ impl PhysicalFrame {
             }
         }
         Ok(())
-    }
-
-    /// Give every returned loop member a fresh owner before its wave launches.
-    /// The plan-time owners remain prototypes for immutable Graph metadata.
-    pub(crate) fn fresh_wave_output_owners(
-        &mut self,
-        backend: &GpuDcrtBackend,
-        wave_index: usize,
-    ) -> Result<BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>, String> {
-        let wave = self
-            .waves
-            .get(wave_index)
-            .ok_or_else(|| "GPU output wave index is outside the frozen plan".to_owned())?;
-        let mut ids = wave
-            .family_members
-            .values()
-            .flat_map(|members| members.iter().map(|(_, id)| *id))
-            .collect::<BTreeSet<_>>();
-        ids.extend(
-            wave.family_outputs.values().flat_map(|members| members.iter().map(|(_, id)| *id)),
-        );
-        let mut fresh = BTreeMap::new();
-        for id in ids {
-            let planned = self
-                .program
-                .values
-                .get(id.0 as usize)
-                .ok_or_else(|| "GPU wave output is absent from the physical plan".to_owned())?;
-            let ty = planned
-                .ty
-                .matrix_type()
-                .ok_or_else(|| "GPU wave output is not a matrix".to_owned())?;
-            let part = planned
-                .parts
-                .first()
-                .ok_or_else(|| "GPU wave output has no physical part".to_owned())?;
-            let encoding = planned
-                .encodings
-                .first()
-                .cloned()
-                .ok_or_else(|| "GPU wave output has no encoding".to_owned())?;
-            let native = backend.allocate_physical_matrix(ty, part.device, encoding.clone())?;
-            let (physical, owner) = physical_matrix(ty, encoding, part.storage, native)?;
-            if &physical != planned {
-                return Err("GPU wave return allocation changed its physical layout".into());
-            }
-            self.owners.insert(id, Arc::clone(&owner));
-            fresh.insert(id, owner);
-        }
-        Ok(fresh)
     }
 
     /// Call only after the compiled Graph completion event has succeeded.
@@ -989,13 +957,24 @@ fn with_declared_integer_range(
     if !integer {
         return Ok(resident);
     }
-    let range =
-        range.ok_or_else(|| "GPU resident integer input has no declared range".to_owned())?;
+    // A producer-guaranteed range is accepted when it lies within the declared
+    // one; a value without a proven range needs a declared range.
+    let proven = resident.physical().integer_ranges.get(&0).cloned();
+    let range = match (range, &proven) {
+        (Some(declared), Some(proven))
+            if declared.start() > proven.start() || declared.end() < proven.end() =>
+        {
+            return Err("GPU resident integer input's proven range exceeds the declared one".into());
+        }
+        (Some(declared), _) => declared.clone(),
+        (None, Some(proven)) => proven.clone(),
+        (None, None) => return Err("GPU resident integer input has no declared range".into()),
+    };
     if range.start() > range.end() {
         return Err("GPU resident integer input has an empty declared range".into());
     }
     let mut physical = resident.physical().as_ref().clone();
-    physical.integer_ranges = BTreeMap::from([(0, range.clone())]);
+    physical.integer_ranges = BTreeMap::from([(0, range)]);
     resident.with_physical_view(Arc::new(physical)).map(Arc::new).map_err(str::to_owned)
 }
 
@@ -1217,10 +1196,17 @@ pub(super) struct PhysicalLoweringContext<'a> {
         &'a mut BTreeMap<u32, (Arc<GpuDynamicExportTable>, Arc<GpuExportStatus>)>,
     /// Device-owned loop index values in the current native control body.
     pub device_loop_indices: BTreeMap<u32, PhysicalValueId>,
+    /// Lane count of a vectorized scalar loop body: each non-constant scalar
+    /// holds one value per lane on its value-index axis. One outside it.
+    pub lanes: usize,
     /// Current reusable parallel template, identified by site and static lane.
     /// Logical occurrence is supplied by the replay scheduler, not frozen here.
     pub active_parallel_template: Option<(GpuLoopSiteKey, usize)>,
     pub active_parallel_instances: Vec<(usize, ParamEnv)>,
+    /// Lowering a device-resident body (conditional branch, retry or
+    /// sequential loop) whose operations replay without the host, so a
+    /// parallel loop inside runs every occurrence in one template.
+    pub device_body: bool,
     pub preimage_replays: &'a mut Vec<PreimageReplay>,
     pub trapdoor_public_ids: &'a mut BTreeMap<PhysicalValueId, PhysicalValueId>,
     pub waves: &'a mut Vec<PhysicalWave>,
@@ -1228,6 +1214,14 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub external_io_loops: &'a mut Vec<ExternalIoLoop>,
     pub external_io_imports: &'a mut Vec<ExternalIoImport>,
     pub crt_resource_next: &'a mut u32,
+    /// A full CRT matrix value and its counterpart in the other full encoding.
+    /// A conversion is emitted once per value and shared by later consumers
+    /// of the same operation list; a body context starts its own table.
+    pub converted: &'a mut BTreeMap<PhysicalValueId, PhysicalValueId>,
+    /// The status word every direct integer operation reports into. Errors
+    /// are first-wins and each replay resets it once, instead of one host
+    /// reset and readback per operation.
+    pub integer_status: &'a mut Option<PhysicalValueId>,
 }
 
 /// Reserve one reusable lane input for a selected artifact member. The caller
@@ -1453,6 +1447,22 @@ pub(super) fn lower_matrix_node(
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
     choice: &GpuNodeChoice,
 ) -> Result<(), String> {
+    let arguments = scope
+        .arguments(node)
+        .ok_or_else(|| "GPU matrix arguments are outside the root scope".to_owned())?;
+    let [left_wire, right_wire] = arguments.as_slice() else {
+        return Err("GPU matrix operation has the wrong arity".into());
+    };
+    let left = *ctx
+        .wire_ids
+        .get(left_wire)
+        .ok_or_else(|| "GPU left argument has no physical value".to_owned())?;
+    let right = *ctx
+        .wire_ids
+        .get(right_wire)
+        .ok_or_else(|| "GPU right argument has no physical value".to_owned())?;
+    let left = full_eval_value(ctx, left)?;
+    let right = full_eval_value(ctx, right)?;
     let PhysicalLoweringContext {
         backend,
         logical,
@@ -1474,18 +1484,6 @@ pub(super) fn lower_matrix_node(
     if node.output_types().len() != 1 {
         return Err("GPU matrix operation has multiple outputs".into());
     }
-    let arguments = scope
-        .arguments(node)
-        .ok_or_else(|| "GPU matrix arguments are outside the root scope".to_owned())?;
-    let [left_wire, right_wire] = arguments.as_slice() else {
-        return Err("GPU matrix operation has the wrong arity".into());
-    };
-    let left = *wire_ids
-        .get(left_wire)
-        .ok_or_else(|| "GPU left argument has no physical value".to_owned())?;
-    let right = *wire_ids
-        .get(right_wire)
-        .ok_or_else(|| "GPU right argument has no physical value".to_owned())?;
     let left_ty = values[left.0 as usize]
         .ty
         .matrix_type()
@@ -1512,8 +1510,8 @@ pub(super) fn lower_matrix_node(
     };
     let implementation = implementations.register(implementation).map_err(str::to_owned)?;
     let owner = backend.allocate_physical_matrix(output_ty, device, PhysicalEncoding::FullEval)?;
-    let storage = StorageRef::Output(
-        u32::try_from(values.len()).map_err(|_| "too many GPU output storages".to_owned())?,
+    let storage = StorageRef::Scratch(
+        u32::try_from(values.len()).map_err(|_| "too many GPU scratch storages".to_owned())?,
     );
     let (physical, resident) =
         physical_matrix(output_ty, PhysicalEncoding::FullEval, storage, owner)?;
@@ -1521,12 +1519,7 @@ pub(super) fn lower_matrix_node(
     values.push(physical);
     owners.insert(output, resident);
     wire_ids.insert(wire, output);
-    let effective = match kind {
-        MatrixBinaryOp::Add => EffectiveGpuOperation::MatrixAdd,
-        MatrixBinaryOp::Subtract => EffectiveGpuOperation::MatrixSubtract,
-        MatrixBinaryOp::Multiply => EffectiveGpuOperation::MatrixMultiply,
-    };
-    if choice.effective_operation != effective || choice.output_layouts.len() != 1 {
+    if choice.output_layouts.len() != 1 {
         return Err("GPU matrix choice differs from the validated operation".into());
     }
     let layout = logical
@@ -1544,7 +1537,11 @@ pub(super) fn lower_matrix_node(
     }
     let schedule =
         layout.schedule(&choice.columns_per_job, 0).map_err(|error| error.to_string())?;
-    let argument_types = [values[left.0 as usize].ty.clone(), values[right.0 as usize].ty.clone()];
+    let left_columns = values[left.0 as usize]
+        .ty
+        .matrix_type()
+        .ok_or_else(|| "GPU matrix left operand is not a matrix".to_owned())?
+        .columns;
     let mut tile_producers = Vec::new();
     for jobs in schedule.waves() {
         let [job] = jobs.as_slice() else {
@@ -1554,29 +1551,13 @@ pub(super) fn lower_matrix_node(
             return Err("GPU column job chose an unexpected device".into());
         }
         let output_range = ColumnRange { start: job.start, end: job.end };
-        let input_ranges = map_output_range_to_inputs_with_output(
-            node.kind(),
-            &argument_types,
-            output_ty.columns,
-            output_range,
-        )
-        .map_err(|error| error.to_string())?;
-        if input_ranges.len() != 2 ||
-            input_ranges.iter().map(|range| range.operand).collect::<BTreeSet<_>>() !=
-                BTreeSet::from([0, 1])
-        {
-            return Err("GPU column mapper did not cover both matrix operands".into());
-        }
-        let left_range = input_ranges
-            .iter()
-            .find(|range| range.operand == 0)
-            .expect("checked operand zero")
-            .range;
-        let right_range = input_ranges
-            .iter()
-            .find(|range| range.operand == 1)
-            .expect("checked operand one")
-            .range;
+        // Output columns read the same columns of an elementwise operand, and
+        // the whole left operand of a product.
+        let left_range = match kind {
+            MatrixBinaryOp::Add | MatrixBinaryOp::Subtract => output_range,
+            MatrixBinaryOp::Multiply => ColumnRange { start: 0, end: left_columns },
+        };
+        let right_range = output_range;
         let left_tile = matrix_column_view(values, owners, left, left_range)?;
         let right_tile = matrix_column_view(values, owners, right, right_range)?;
         let output_tile = matrix_column_view(values, owners, output, output_range)?;
@@ -1634,8 +1615,8 @@ pub(super) fn lower_zero_matrix_node(
         .ok_or_else(|| "GPU zero output has no concrete matrix type".to_owned())?;
     let native =
         ctx.backend.allocate_physical_matrix(ty, ctx.device, PhysicalEncoding::FullEval)?;
-    let storage = StorageRef::Output(
-        u32::try_from(ctx.values.len()).map_err(|_| "too many GPU output storages".to_owned())?,
+    let storage = StorageRef::Scratch(
+        u32::try_from(ctx.values.len()).map_err(|_| "too many GPU scratch storages".to_owned())?,
     );
     let (physical, resident) = physical_matrix(ty, PhysicalEncoding::FullEval, storage, native)?;
     let bytes = resident
@@ -1682,6 +1663,7 @@ pub(super) fn lower_sample_matrix_node(
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
 ) -> Result<(), String> {
+    let mut interval = (0i64, 0i64);
     let (implementation, sigma, max_bound, coefficient_modulus) = match node.kind() {
         NodeKind::UniformResidueSample { .. } => (GpuImplementation::sample(false), 0.0, 0, 1),
         NodeKind::UniformIntervalSample { range, .. } => {
@@ -1693,10 +1675,14 @@ pub(super) fn lower_sample_matrix_node(
                 .maximum
                 .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
                 .map_err(|error| error.to_string())?;
-            if minimum != BigInt::from(0) || maximum != BigInt::from(1) {
-                return Err("GPU direct interval sample currently supports exactly [0, 1]".into());
+            let (Some(minimum), Some(maximum)) = (minimum.to_i64(), maximum.to_i64()) else {
+                return Err("GPU interval sample bounds exceed the native i64 sampler".into());
+            };
+            if minimum > maximum {
+                return Err("GPU interval sample has an empty range".into());
             }
-            (GpuImplementation::sample_bit(), 0.0, 0, 1)
+            interval = (minimum, maximum);
+            (GpuImplementation::sample_interval(), 0.0, 0, 1)
         }
         NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
             let sigma = sigma
@@ -1811,6 +1797,8 @@ pub(super) fn lower_sample_matrix_node(
             KernelArg::F64(sigma),
             KernelArg::U64(max_bound),
             KernelArg::U64(coefficient_modulus),
+            KernelArg::I64(interval.0),
+            KernelArg::I64(interval.1),
             KernelArg::U64(ty.columns as u64),
             KernelArg::U64(0),
             KernelArg::U32(coefficient_binding),
@@ -2782,6 +2770,29 @@ fn compact_column_view(
     Ok(id)
 }
 
+/// `id` in full-Eval encoding. A full-Coeff matrix gets one forward NTT that
+/// `ctx.converted` shares with every later consumer; other values pass through.
+pub(super) fn full_eval_value(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    id: PhysicalValueId,
+) -> Result<PhysicalValueId, String> {
+    let physical = &ctx.values[id.0 as usize];
+    let (Some(ty), [PhysicalEncoding::FullCoeff]) =
+        (physical.ty.matrix_type(), physical.encodings.as_ref())
+    else {
+        return Ok(id);
+    };
+    if let Some(&converted) = ctx.converted.get(&id) {
+        return Ok(converted);
+    }
+    let ty = ty.clone();
+    let evaluation = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
+    emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[id], evaluation)?;
+    ctx.converted.insert(id, evaluation);
+    ctx.converted.insert(evaluation, id);
+    Ok(evaluation)
+}
+
 pub(super) fn emit_matrix_operation(
     ctx: &mut PhysicalLoweringContext<'_>,
     implementation: GpuImplementation,
@@ -3098,6 +3109,8 @@ fn emit_fresh_matrix_sample_parts(
             KernelArg::F64(gaussian_sigma.unwrap_or(0.0)),
             KernelArg::U64(if gaussian_sigma.is_some() { u64::MAX } else { 0 }),
             KernelArg::U64(if gaussian_sigma.is_some() { 0 } else { 1 }),
+            KernelArg::I64(0),
+            KernelArg::I64(0),
             KernelArg::U64(ty.columns as u64),
             KernelArg::U64(0),
             KernelArg::U32(coefficient_binding),
@@ -4295,9 +4308,6 @@ pub(super) fn lower_preimage_sample_node(
             )
             .map_err(|error| error.to_string())?,
         );
-        let loop_status = Arc::new(
-            GpuExportStatus::new(&control_params, ctx.device).map_err(|error| error.to_string())?,
-        );
         let attempt_id = allocate_preimage_control(
             ctx,
             8,
@@ -4309,13 +4319,23 @@ pub(super) fn lower_preimage_sample_node(
             BoundStorage::from_preimage_status(Arc::clone(&status))?,
         )?;
         let limit_id = allocate_preimage_control(ctx, 8, BoundStorage::from_signed_values(limit)?)?;
-        let loop_status_id = allocate_preimage_control(
-            ctx,
-            4,
-            BoundStorage::from_export_status(Arc::clone(&loop_status))?,
-        )?;
+        // The retry WHILE continues only while the status latch word
+        // (`MxxPreimageStatus::reserved`, byte 12) is zero, so the first
+        // accepted attempt ends the loop instead of resampling until the bound.
+        let latch_id = {
+            let mut latch = ctx.values[status_id.0 as usize].clone();
+            latch.ty = ConcreteWireType::Bytes { length: 4 };
+            latch.parts[0].view.byte_offset = 12;
+            latch.parts[0].view.extent = Box::new([4]);
+            let owner = ctx.owners.get(&status_id).ok_or("GPU preimage status owner is absent")?;
+            let resident =
+                owner.with_physical_view(Arc::new(latch.clone())).map_err(str::to_owned)?;
+            let id = value_id(ctx.values.len())?;
+            ctx.values.push(latch);
+            ctx.owners.insert(id, Arc::new(resident));
+            id
+        };
         ctx.preimage_replays.push(PreimageReplay { attempt, status, planned_max: max_attempts });
-        ctx.control_resets.push(ControlReset::IntegerStatus(loop_status));
         let gq_workspace = register_preimage_workspace(
             ctx.bindings,
             GpuPreparedWorkspaceKind::Gq,
@@ -4332,7 +4352,7 @@ pub(super) fn lower_preimage_sample_node(
         let status_binding = register_preimage_control_binding(ctx, status_id)?;
         let output_binding = register_preimage_control_binding(ctx, output)?;
         let limit_binding = register_preimage_control_binding(ctx, limit_id)?;
-        let loop_status_binding = register_preimage_control_binding(ctx, loop_status_id)?;
+        let latch_binding = register_preimage_control_binding(ctx, latch_id)?;
         let mut body = Vec::<CompiledGpuOp>::new();
         let mut body_producer = BTreeMap::<PhysicalValueId, Vec<(ColumnRange, u32)>>::new();
         {
@@ -4358,8 +4378,10 @@ pub(super) fn lower_preimage_sample_node(
                 indexed_tables: &mut *ctx.indexed_tables,
                 dynamic_export_resources: &mut *ctx.dynamic_export_resources,
                 device_loop_indices: ctx.device_loop_indices.clone(),
+                lanes: ctx.lanes,
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
+                device_body: true,
                 preimage_replays: &mut *ctx.preimage_replays,
                 trapdoor_public_ids: &mut *ctx.trapdoor_public_ids,
                 waves: &mut *ctx.waves,
@@ -4367,6 +4389,8 @@ pub(super) fn lower_preimage_sample_node(
                 external_io_loops: &mut *ctx.external_io_loops,
                 external_io_imports: &mut *ctx.external_io_imports,
                 crt_resource_next: &mut *ctx.crt_resource_next,
+                converted: &mut BTreeMap::new(),
+                integer_status: &mut *ctx.integer_status,
             };
             let p2_seed = derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 0)?;
             let (p2_coeff, p2_eval) = emit_fresh_matrix_sample_parts(
@@ -4638,12 +4662,12 @@ pub(super) fn lower_preimage_sample_node(
                 KernelArg::U32(0),
                 KernelArg::Value(limit_id),
                 KernelArg::U32(0),
-                KernelArg::Value(loop_status_id),
+                KernelArg::Value(latch_id),
                 KernelArg::U32(0),
                 KernelArg::U64(max_attempts as u64),
                 KernelArg::U32(attempt_binding),
                 KernelArg::U32(limit_binding),
-                KernelArg::U32(loop_status_binding),
+                KernelArg::U32(latch_binding),
             ]),
             Box::new([]),
             predecessors.into_boxed_slice(),
@@ -4758,6 +4782,339 @@ fn activate_matrix_import(
     producer.insert(eval, vec![(ColumnRange { start: 0, end: columns }, index)]);
     import.before_operation = index;
     templates.push(import);
+    Ok(())
+}
+
+/// Stage artifact writes: one pre-allocated host slot per raw fragment and
+/// member, a Graph copy into it, and a publish the I/O worker observes during
+/// execution. Family members (`Some(index)`, in order) share one site per
+/// fragment as consecutive occurrences.
+#[allow(clippy::too_many_arguments)]
+fn emit_artifact_export(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    slots: &mut Vec<Arc<GpuExportSlot>>,
+    export_templates: &mut Vec<ExportTemplate>,
+    name: &str,
+    members: &[(Option<usize>, PhysicalValueId)],
+    artifact_type: ArtifactType,
+    availability: ArtifactAvailability,
+    public_export_source: Option<PhysicalValueId>,
+) -> Result<(), String> {
+    if members.is_empty() || (public_export_source.is_some() && members.len() != 1) {
+        return Err("GPU artifact export needs members, and a trapdoor exactly one".into());
+    }
+    let mut staged = Vec::with_capacity(members.len());
+    for &(index, export_source) in members {
+        let physical = Arc::new(ctx.values[export_source.0 as usize].clone());
+        let selected_parts = (0..physical.parts.len()).collect::<Vec<_>>();
+        let mut export = PhysicalExport::from_parts(physical, &selected_parts)?;
+        if let Some(public) = public_export_source {
+            let public_physical = Arc::new(ctx.values[public.0 as usize].clone());
+            let selected = (0..public_physical.parts.len()).collect::<Vec<_>>();
+            export = export.with_trapdoor_public(public_physical, &selected)?;
+        }
+        let source_binding_base = if public_export_source.is_some() {
+            register_all_parts(ctx.bindings, ctx.values, export_source)?
+        } else if ctx.values[export_source.0 as usize].ty.matrix_type().is_some() {
+            register_bindings(ctx.bindings, ctx.values, export_source)?
+        } else {
+            // A scalar leaf is one contiguous part.
+            let binding = u32::try_from(ctx.bindings.len())
+                .map_err(|_| "too many GPU graph bindings".to_owned())?;
+            ctx.bindings.push(GpuBindingSource::PhysicalPart {
+                value: export_source,
+                part: 0,
+                limb: 0,
+            });
+            binding
+        };
+        staged.push((index, export_source, Arc::new(export), source_binding_base));
+    }
+    let public_binding_base = public_export_source
+        .map(|id| register_bindings(ctx.bindings, ctx.values, id))
+        .transpose()?;
+    let fragment_count = staged[0].2.fragments.len();
+    if staged.iter().any(|(_, _, export, _)| export.fragments.len() != fragment_count) {
+        return Err("GPU artifact family members have different raw layouts".into());
+    }
+    let copy =
+        ctx.implementations.register(GpuImplementation::export_copy()).map_err(str::to_owned)?;
+    let publish =
+        ctx.implementations.register(GpuImplementation::export_publish()).map_err(str::to_owned)?;
+    for fragment_index in 0..fragment_count {
+        let site = u32::try_from(export_templates.len())
+            .map_err(|_| "too many GPU artifact export sites".to_owned())?;
+        for (index, export_source, export, source_binding_base) in &staged {
+            let occurrence = index.unwrap_or(0);
+            let fragment = &export.fragments[fragment_index];
+            let slot = slots.len();
+            let payload_bytes = usize::try_from(fragment.raw_bytes)
+                .map_err(|_| "GPU artifact fragment exceeds host address space".to_owned())?;
+            slots.push(Arc::new(
+                GpuExportSlot::new(ctx.device, payload_bytes).map_err(|error| error.to_string())?,
+            ));
+            let payload_binding = u32::try_from(ctx.bindings.len())
+                .map_err(|_| "too many GPU graph bindings".to_owned())?;
+            ctx.bindings.push(GpuBindingSource::ExportSlotPayload { slot });
+            let header_binding = u32::try_from(ctx.bindings.len())
+                .map_err(|_| "too many GPU graph bindings".to_owned())?;
+            ctx.bindings.push(GpuBindingSource::ExportSlotHeader { slot });
+            let copy_index = u32::try_from(ctx.operations.len())
+                .map_err(|_| "too many GPU operations".to_owned())?;
+            let source_parts = ctx.values[export_source.0 as usize].parts.len();
+            let (copy_source, part_index, binding_base) = match public_export_source {
+                Some(public) if fragment_index >= source_parts => (
+                    public,
+                    u32::try_from(fragment_index - source_parts)
+                        .map_err(|_| "GPU public export part index exceeds u32".to_owned())?,
+                    public_binding_base
+                        .ok_or_else(|| "GPU trapdoor public binding is missing".to_owned())?,
+                ),
+                _ => (
+                    *export_source,
+                    u32::try_from(fragment_index)
+                        .map_err(|_| "GPU export fragment index exceeds u32".to_owned())?,
+                    *source_binding_base,
+                ),
+            };
+            let source_binding = binding_base
+                .checked_add(part_index)
+                .ok_or_else(|| "GPU export source binding overflows".to_owned())?;
+            let slot_index =
+                u32::try_from(slot).map_err(|_| "GPU export slot index exceeds u32".to_owned())?;
+            ctx.operations.push(CompiledGpuOp {
+                implementation: copy,
+                arguments: Box::new([
+                    KernelArg::Value(copy_source),
+                    KernelArg::U32(part_index),
+                    KernelArg::U32(slot_index),
+                    KernelArg::U64(fragment.raw_bytes),
+                    KernelArg::U32(source_binding),
+                    KernelArg::U32(payload_binding),
+                ]),
+                outputs: Box::new([]),
+                device: ctx.device,
+                grid: [0; 3],
+                block: [0; 3],
+                shared_bytes: 0,
+                predecessors: all_predecessors(ctx.producer, copy_source),
+                body: None,
+            });
+            let final_chunk = fragment_index + 1 == fragment_count;
+            let occurrence = u64::try_from(occurrence)
+                .map_err(|_| "GPU export occurrence exceeds u64".to_owned())?;
+            ctx.operations.push(CompiledGpuOp {
+                implementation: publish,
+                arguments: Box::new([
+                    KernelArg::U32(slot_index),
+                    KernelArg::U64(occurrence),
+                    KernelArg::U64(fragment.raw_offset),
+                    KernelArg::U64(fragment.raw_bytes),
+                    KernelArg::U32(site),
+                    KernelArg::U32(u32::from(final_chunk)),
+                    KernelArg::U32(header_binding),
+                ]),
+                outputs: Box::new([]),
+                device: ctx.device,
+                grid: [0; 3],
+                block: [0; 3],
+                shared_bytes: 0,
+                predecessors: Box::new([copy_index]),
+                body: None,
+            });
+            export_templates.push(ExportTemplate {
+                name: name.to_owned(),
+                index: *index,
+                occurrence,
+                site,
+                slot,
+                fragment_index,
+                final_chunk,
+                artifact_type: artifact_type.clone(),
+                availability,
+                export: Arc::clone(export),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Let full scratch matrices with disjoint lifetimes share allocations
+/// (spec 7.3). A value group is every physical value viewing one allocation.
+/// Its lifetime spans the top-level operations that reference it; an
+/// operation with a nested body counts as one reference, and a value read
+/// inside a replayed wave or external-I/O body stays live to that body's end.
+/// An allocation is reused only when every operation that referenced its
+/// previous occupant is already an ancestor of every writer of the new one,
+/// so the frozen dependency structure, and with it the measured concurrency,
+/// is unchanged. Protected values (inputs, outputs, wave-bound members,
+/// imports, table candidates) and values read before any write keep their
+/// own allocations.
+fn share_scratch_allocations(
+    values: &[PhysicalValue],
+    owners: &mut BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    operations: &[CompiledGpuOp],
+    replayed: &[(u32, u32)],
+    protected: &BTreeSet<PhysicalValueId>,
+) -> Result<(), String> {
+    use crate::backend::BoundStorage;
+    fn visit(op: &CompiledGpuOp, each: &mut dyn FnMut(PhysicalValueId, bool)) {
+        for argument in op.arguments.iter() {
+            if let KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) = argument {
+                each(*id, false);
+            }
+        }
+        for output in op.outputs.iter() {
+            each(*output, true);
+        }
+        for inner in op.body.iter().flatten() {
+            visit(inner, each);
+        }
+    }
+    // Allocation of each full scratch matrix; any other value touching an
+    // allocation makes it ineligible.
+    let mut allocation_of = BTreeMap::<PhysicalValueId, *const ()>::new();
+    let mut bound_of = BTreeMap::<*const (), BoundStorage>::new();
+    let mut ineligible = BTreeSet::<*const ()>::new();
+    for (id, owner) in owners.iter() {
+        let physical = &values[id.0 as usize];
+        let storages = owner.storages().collect::<Vec<_>>();
+        let qualifies = physical.ty.matrix_type().is_some() &&
+            matches!(
+                physical.encodings.as_ref(),
+                [PhysicalEncoding::FullCoeff] | [PhysicalEncoding::FullEval]
+            ) &&
+            storages.len() == 1 &&
+            matches!(storages[0].0, StorageRef::Scratch(_)) &&
+            !protected.contains(id);
+        for (_, bound) in &storages {
+            let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+            bound_of.entry(pointer).or_insert_with(|| (*bound).clone());
+            if qualifies {
+                allocation_of.insert(*id, pointer);
+            } else {
+                ineligible.insert(pointer);
+            }
+        }
+    }
+    struct Group {
+        members: Vec<PhysicalValueId>,
+        first_write: Option<usize>,
+        first_reference: usize,
+        last_reference: usize,
+        references: BTreeSet<usize>,
+        writers: BTreeSet<usize>,
+    }
+    let mut groups = BTreeMap::<*const (), Group>::new();
+    for (&id, &pointer) in &allocation_of {
+        if ineligible.contains(&pointer) {
+            continue;
+        }
+        groups
+            .entry(pointer)
+            .or_insert_with(|| Group {
+                members: Vec::new(),
+                first_write: None,
+                first_reference: usize::MAX,
+                last_reference: 0,
+                references: BTreeSet::new(),
+                writers: BTreeSet::new(),
+            })
+            .members
+            .push(id);
+    }
+    for (index, op) in operations.iter().enumerate() {
+        visit(op, &mut |id, written| {
+            let Some(group) = allocation_of.get(&id).and_then(|pointer| groups.get_mut(pointer))
+            else {
+                return;
+            };
+            group.first_reference = group.first_reference.min(index);
+            group.last_reference = group.last_reference.max(index);
+            group.references.insert(index);
+            if written {
+                group.writers.insert(index);
+                group.first_write = Some(group.first_write.map_or(index, |first| first.min(index)));
+            }
+        });
+    }
+    for group in groups.values_mut() {
+        for &(start, end) in replayed {
+            let (start, end) = (start as usize, end as usize);
+            if group.first_reference < start && group.references.range(start..end).next().is_some()
+            {
+                group.last_reference = group.last_reference.max(end - 1);
+            }
+        }
+    }
+    // The allocation's layout, independent of its storage slot.
+    let layout = |group: &Group| {
+        let mut physical = values[group.members[0].0 as usize].clone();
+        for part in physical.parts.iter_mut() {
+            part.storage = StorageRef::Scratch(0);
+        }
+        physical
+    };
+    let mut order = groups
+        .iter()
+        .filter(|(_, group)| group.first_write.is_some_and(|write| write <= group.first_reference))
+        .map(|(pointer, group)| (group.first_write.unwrap_or(0), *pointer))
+        .collect::<Vec<_>>();
+    order.sort_unstable();
+    // Does every op in `targets` precede `writer` through explicit edges?
+    let precedes = |targets: &BTreeSet<usize>, writer: usize| {
+        let lowest = *targets.first().unwrap_or(&writer);
+        let mut pending = vec![writer];
+        let mut seen = BTreeSet::new();
+        let mut found = 0;
+        while let Some(index) = pending.pop() {
+            for &predecessor in operations[index].predecessors.iter() {
+                let predecessor = predecessor as usize;
+                if predecessor >= lowest && seen.insert(predecessor) {
+                    found += usize::from(targets.contains(&predecessor));
+                    pending.push(predecessor);
+                }
+            }
+        }
+        found == targets.len()
+    };
+    // Kept allocations per layout: (allocation, last reference, references).
+    type Pool = Vec<(*const (), usize, BTreeSet<usize>)>;
+    let mut pools = Vec::<(PhysicalValue, Pool)>::new();
+    let mut replacements = BTreeMap::<*const (), *const ()>::new();
+    for (first_write, pointer) in order {
+        let group = &groups[&pointer];
+        let key = layout(group);
+        let pool = match pools.iter().position(|(existing, _)| *existing == key) {
+            Some(index) => &mut pools[index].1,
+            None => {
+                pools.push((key, Vec::new()));
+                &mut pools.last_mut().expect("pushed pool").1
+            }
+        };
+        let reusable = pool.iter().position(|(_, last, references)| {
+            *last < first_write && group.writers.iter().all(|&writer| precedes(references, writer))
+        });
+        match reusable {
+            Some(slot) => {
+                replacements.insert(pointer, pool[slot].0);
+                pool[slot].1 = group.last_reference;
+                pool[slot].2 = group.references.clone();
+            }
+            None => pool.push((pointer, group.last_reference, group.references.clone())),
+        }
+    }
+    for (pointer, shared) in replacements {
+        let replacement = [(pointer, bound_of[&shared].clone())];
+        for id in &groups[&pointer].members {
+            let owner = owners.get_mut(id).ok_or("GPU shared scratch owner is missing")?;
+            if let Some(rebound) =
+                owner.rebound(&replacement, owner.ready_events()).map_err(str::to_owned)?
+            {
+                *owner = Arc::new(rebound);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5238,39 +5595,51 @@ pub(crate) fn plan_physical_graph(
     let mut external_io_loops = Vec::<ExternalIoLoop>::new();
     let mut external_io_imports = Vec::<ExternalIoImport>::new();
     let mut crt_resource_next = 0u32;
-    for (wire, key, descriptor, ty) in deferred_trapdoor_imports {
-        let mut ctx = PhysicalLoweringContext {
-            validated,
-            integer_input_ranges,
-            artifact_payload_sizes,
-            backend,
-            logical,
-            device,
-            values: &mut values,
-            owners: &mut owners,
-            wire_ids: &mut wire_ids,
-            implementations: &mut implementations,
-            operations: &mut operations,
-            bindings: &mut bindings,
-            producer: &mut producer,
-            family_member_producers: &mut family_member_producers,
-            control_resets: &mut control_resets,
-            sample_seeds: &mut sample_seeds,
-            hash_resources: &mut hash_resources,
-            real_owners: &mut real_owners,
-            indexed_tables: &mut indexed_tables,
-            dynamic_export_resources: &mut dynamic_export_resources,
-            device_loop_indices: BTreeMap::new(),
-            active_parallel_template: None,
-            active_parallel_instances: Vec::new(),
-            preimage_replays: &mut preimage_replays,
-            trapdoor_public_ids: &mut trapdoor_public_ids,
-            waves: &mut waves,
-            import_templates: &mut import_templates,
-            external_io_loops: &mut external_io_loops,
-            external_io_imports: &mut external_io_imports,
-            crt_resource_next: &mut crt_resource_next,
+    let mut converted = BTreeMap::new();
+    let mut integer_status = None;
+    // Every root node lowers against the same plan tables.
+    macro_rules! root_context {
+        () => {
+            PhysicalLoweringContext {
+                validated,
+                integer_input_ranges,
+                artifact_payload_sizes,
+                backend,
+                logical,
+                device,
+                values: &mut values,
+                owners: &mut owners,
+                wire_ids: &mut wire_ids,
+                implementations: &mut implementations,
+                operations: &mut operations,
+                bindings: &mut bindings,
+                producer: &mut producer,
+                family_member_producers: &mut family_member_producers,
+                control_resets: &mut control_resets,
+                sample_seeds: &mut sample_seeds,
+                hash_resources: &mut hash_resources,
+                real_owners: &mut real_owners,
+                indexed_tables: &mut indexed_tables,
+                dynamic_export_resources: &mut dynamic_export_resources,
+                device_loop_indices: BTreeMap::new(),
+                lanes: 1,
+                active_parallel_template: None,
+                active_parallel_instances: Vec::new(),
+                device_body: false,
+                preimage_replays: &mut preimage_replays,
+                trapdoor_public_ids: &mut trapdoor_public_ids,
+                waves: &mut waves,
+                import_templates: &mut import_templates,
+                external_io_loops: &mut external_io_loops,
+                external_io_imports: &mut external_io_imports,
+                crt_resource_next: &mut crt_resource_next,
+                converted: &mut converted,
+                integer_status: &mut integer_status,
+            }
         };
+    }
+    for (wire, key, descriptor, ty) in deferred_trapdoor_imports {
+        let mut ctx = root_context!();
         let (destination, graph_value, upload_owner, before_operation) =
             allocate_typed_import_destination(&mut ctx, &ty, &key, None)?;
         ctx.wire_ids.insert(wire, graph_value);
@@ -5390,38 +5759,7 @@ pub(crate) fn plan_physical_graph(
                 )?;
             }
         }
-        let mut ctx = PhysicalLoweringContext {
-            validated,
-            integer_input_ranges,
-            artifact_payload_sizes,
-            backend,
-            logical,
-            device,
-            values: &mut values,
-            owners: &mut owners,
-            wire_ids: &mut wire_ids,
-            implementations: &mut implementations,
-            operations: &mut operations,
-            bindings: &mut bindings,
-            producer: &mut producer,
-            family_member_producers: &mut family_member_producers,
-            control_resets: &mut control_resets,
-            sample_seeds: &mut sample_seeds,
-            hash_resources: &mut hash_resources,
-            real_owners: &mut real_owners,
-            indexed_tables: &mut indexed_tables,
-            dynamic_export_resources: &mut dynamic_export_resources,
-            device_loop_indices: BTreeMap::new(),
-            active_parallel_template: None,
-            active_parallel_instances: Vec::new(),
-            preimage_replays: &mut preimage_replays,
-            trapdoor_public_ids: &mut trapdoor_public_ids,
-            waves: &mut waves,
-            import_templates: &mut import_templates,
-            external_io_loops: &mut external_io_loops,
-            external_io_imports: &mut external_io_imports,
-            crt_resource_next: &mut crt_resource_next,
-        };
+        let mut ctx = root_context!();
         if matches!(node.kind(), NodeKind::MatrixBinary(_)) {
             let choices = logical
                 .nodes
@@ -5566,8 +5904,44 @@ pub(crate) fn plan_physical_graph(
                 ConcreteWireType::ConstantBool
         ) || integer_family
         {
-            if output_root.availability.is_some() {
-                return Err("GPU integer artifact output needs a direct scalar export site".into());
+            if let Some(availability) = output_root.availability {
+                // Each family member is its own indexed Int artifact.
+                let members = match &scalar_type {
+                    ConcreteWireType::IndexedFamily { count, .. } => {
+                        (0..*count).map(Some).collect()
+                    }
+                    ConcreteWireType::Int | ConcreteWireType::ConstantInt => vec![None],
+                    _ => return Err(format!("GPU output {name} is not artifact-compatible")),
+                };
+                let source_owner = Arc::clone(&owners[&source]);
+                let mut ctx = root_context!();
+                let mut exported = Vec::with_capacity(members.len());
+                for index in members {
+                    let export_source = match index {
+                        None => source,
+                        Some(index) => {
+                            let member = static_family_member(&source_owner, index)?;
+                            let id = value_id(ctx.values.len())?;
+                            ctx.values.push(member.physical().as_ref().clone());
+                            ctx.owners.insert(id, member);
+                            if let Some(writers) = ctx.producer.get(&source).cloned() {
+                                ctx.producer.insert(id, writers);
+                            }
+                            id
+                        }
+                    };
+                    exported.push((index, export_source));
+                }
+                emit_artifact_export(
+                    &mut ctx,
+                    &mut slots,
+                    &mut export_templates,
+                    name,
+                    &exported,
+                    ArtifactType::Int,
+                    availability,
+                    None,
+                )?;
             }
             let range =
                 if matches!(scalar_type, ConcreteWireType::Bool | ConcreteWireType::ConstantBool) {
@@ -5579,38 +5953,7 @@ pub(crate) fn plan_physical_graph(
                         .cloned()
                         .ok_or_else(|| format!("GPU integer output {name} has no proven range"))?
                 };
-            let mut ctx = PhysicalLoweringContext {
-                validated,
-                integer_input_ranges,
-                artifact_payload_sizes,
-                backend,
-                logical,
-                device,
-                values: &mut values,
-                owners: &mut owners,
-                wire_ids: &mut wire_ids,
-                implementations: &mut implementations,
-                operations: &mut operations,
-                bindings: &mut bindings,
-                producer: &mut producer,
-                family_member_producers: &mut family_member_producers,
-                control_resets: &mut control_resets,
-                sample_seeds: &mut sample_seeds,
-                hash_resources: &mut hash_resources,
-                real_owners: &mut real_owners,
-                indexed_tables: &mut indexed_tables,
-                dynamic_export_resources: &mut dynamic_export_resources,
-                device_loop_indices: BTreeMap::new(),
-                active_parallel_template: None,
-                active_parallel_instances: Vec::new(),
-                preimage_replays: &mut preimage_replays,
-                trapdoor_public_ids: &mut trapdoor_public_ids,
-                waves: &mut waves,
-                import_templates: &mut import_templates,
-                external_io_loops: &mut external_io_loops,
-                external_io_imports: &mut external_io_imports,
-                crt_resource_next: &mut crt_resource_next,
-            };
+            let mut ctx = root_context!();
             let returned = if integer_family {
                 allocate_return_integer_family_value(&mut ctx, scalar_type, range)?
             } else {
@@ -5630,38 +5973,7 @@ pub(crate) fn plan_physical_graph(
         }
         if matches!(values[source.0 as usize].ty, ConcreteWireType::IndexedFamily { .. }) {
             if let Some(availability) = output_root.availability {
-                let mut ctx = PhysicalLoweringContext {
-                    validated,
-                    integer_input_ranges,
-                    artifact_payload_sizes,
-                    backend,
-                    logical,
-                    device,
-                    values: &mut values,
-                    owners: &mut owners,
-                    wire_ids: &mut wire_ids,
-                    implementations: &mut implementations,
-                    operations: &mut operations,
-                    bindings: &mut bindings,
-                    producer: &mut producer,
-                    family_member_producers: &mut family_member_producers,
-                    control_resets: &mut control_resets,
-                    sample_seeds: &mut sample_seeds,
-                    hash_resources: &mut hash_resources,
-                    real_owners: &mut real_owners,
-                    indexed_tables: &mut indexed_tables,
-                    dynamic_export_resources: &mut dynamic_export_resources,
-                    device_loop_indices: BTreeMap::new(),
-                    active_parallel_template: None,
-                    active_parallel_instances: Vec::new(),
-                    preimage_replays: &mut preimage_replays,
-                    trapdoor_public_ids: &mut trapdoor_public_ids,
-                    waves: &mut waves,
-                    import_templates: &mut import_templates,
-                    external_io_loops: &mut external_io_loops,
-                    external_io_imports: &mut external_io_imports,
-                    crt_resource_next: &mut crt_resource_next,
-                };
+                let mut ctx = root_context!();
                 lower_wave_family_artifact_export(
                     &mut ctx,
                     name,
@@ -5821,38 +6133,7 @@ pub(crate) fn plan_physical_graph(
             if output_root.availability.is_some() {
                 return Err("GPU real artifact output needs a direct scalar export site".into());
             }
-            let mut ctx = PhysicalLoweringContext {
-                validated,
-                integer_input_ranges,
-                artifact_payload_sizes,
-                backend,
-                logical,
-                device,
-                values: &mut values,
-                owners: &mut owners,
-                wire_ids: &mut wire_ids,
-                implementations: &mut implementations,
-                operations: &mut operations,
-                bindings: &mut bindings,
-                producer: &mut producer,
-                family_member_producers: &mut family_member_producers,
-                control_resets: &mut control_resets,
-                sample_seeds: &mut sample_seeds,
-                hash_resources: &mut hash_resources,
-                real_owners: &mut real_owners,
-                indexed_tables: &mut indexed_tables,
-                dynamic_export_resources: &mut dynamic_export_resources,
-                device_loop_indices: BTreeMap::new(),
-                active_parallel_template: None,
-                active_parallel_instances: Vec::new(),
-                preimage_replays: &mut preimage_replays,
-                trapdoor_public_ids: &mut trapdoor_public_ids,
-                waves: &mut waves,
-                import_templates: &mut import_templates,
-                external_io_loops: &mut external_io_loops,
-                external_io_imports: &mut external_io_imports,
-                crt_resource_next: &mut crt_resource_next,
-            };
+            let mut ctx = root_context!();
             let returned = allocate_real_value(&mut ctx, scalar_type)?;
             emit_real_operation(
                 &mut ctx,
@@ -5890,38 +6171,7 @@ pub(crate) fn plan_physical_graph(
             let returned = value_id(values.len())?;
             values.push(physical);
             owners.insert(returned, Arc::new(resident));
-            let mut ctx = PhysicalLoweringContext {
-                validated,
-                integer_input_ranges,
-                artifact_payload_sizes,
-                backend,
-                logical,
-                device,
-                values: &mut values,
-                owners: &mut owners,
-                wire_ids: &mut wire_ids,
-                implementations: &mut implementations,
-                operations: &mut operations,
-                bindings: &mut bindings,
-                producer: &mut producer,
-                family_member_producers: &mut family_member_producers,
-                control_resets: &mut control_resets,
-                sample_seeds: &mut sample_seeds,
-                hash_resources: &mut hash_resources,
-                real_owners: &mut real_owners,
-                indexed_tables: &mut indexed_tables,
-                dynamic_export_resources: &mut dynamic_export_resources,
-                device_loop_indices: BTreeMap::new(),
-                active_parallel_template: None,
-                active_parallel_instances: Vec::new(),
-                preimage_replays: &mut preimage_replays,
-                trapdoor_public_ids: &mut trapdoor_public_ids,
-                waves: &mut waves,
-                import_templates: &mut import_templates,
-                external_io_loops: &mut external_io_loops,
-                external_io_imports: &mut external_io_imports,
-                crt_resource_next: &mut crt_resource_next,
-            };
+            let mut ctx = root_context!();
             emit_matrix_operation(
                 &mut ctx,
                 GpuImplementation::matrix_copy_view(),
@@ -5937,38 +6187,7 @@ pub(crate) fn plan_physical_graph(
         {
             let trapdoor_ty = values[source.0 as usize].ty.clone();
             let leaf_types = trapdoor_leaf_types(&trapdoor_ty)?;
-            let mut ctx = PhysicalLoweringContext {
-                validated,
-                integer_input_ranges,
-                artifact_payload_sizes,
-                backend,
-                logical,
-                device,
-                values: &mut values,
-                owners: &mut owners,
-                wire_ids: &mut wire_ids,
-                implementations: &mut implementations,
-                operations: &mut operations,
-                bindings: &mut bindings,
-                producer: &mut producer,
-                family_member_producers: &mut family_member_producers,
-                control_resets: &mut control_resets,
-                sample_seeds: &mut sample_seeds,
-                hash_resources: &mut hash_resources,
-                real_owners: &mut real_owners,
-                indexed_tables: &mut indexed_tables,
-                dynamic_export_resources: &mut dynamic_export_resources,
-                device_loop_indices: BTreeMap::new(),
-                active_parallel_template: None,
-                active_parallel_instances: Vec::new(),
-                preimage_replays: &mut preimage_replays,
-                trapdoor_public_ids: &mut trapdoor_public_ids,
-                waves: &mut waves,
-                import_templates: &mut import_templates,
-                external_io_loops: &mut external_io_loops,
-                external_io_imports: &mut external_io_imports,
-                crt_resource_next: &mut crt_resource_next,
-            };
+            let mut ctx = root_context!();
             let mut leaves = Vec::with_capacity(6);
             for ty in &leaf_types {
                 leaves.push(allocate_scratch_matrix(&mut ctx, ty, PhysicalEncoding::FullEval)?);
@@ -5992,38 +6211,7 @@ pub(crate) fn plan_physical_graph(
             let export_source = if let Some(&coefficient) = coefficient_exports.get(&source) {
                 coefficient
             } else if matches!(values[source.0 as usize].ty, ConcreteWireType::Trapdoor { .. }) {
-                let mut ctx = PhysicalLoweringContext {
-                    validated,
-                    integer_input_ranges,
-                    artifact_payload_sizes,
-                    backend,
-                    logical,
-                    device,
-                    values: &mut values,
-                    owners: &mut owners,
-                    wire_ids: &mut wire_ids,
-                    implementations: &mut implementations,
-                    operations: &mut operations,
-                    bindings: &mut bindings,
-                    producer: &mut producer,
-                    family_member_producers: &mut family_member_producers,
-                    control_resets: &mut control_resets,
-                    sample_seeds: &mut sample_seeds,
-                    hash_resources: &mut hash_resources,
-                    real_owners: &mut real_owners,
-                    indexed_tables: &mut indexed_tables,
-                    dynamic_export_resources: &mut dynamic_export_resources,
-                    device_loop_indices: BTreeMap::new(),
-                    active_parallel_template: None,
-                    active_parallel_instances: Vec::new(),
-                    preimage_replays: &mut preimage_replays,
-                    trapdoor_public_ids: &mut trapdoor_public_ids,
-                    waves: &mut waves,
-                    import_templates: &mut import_templates,
-                    external_io_loops: &mut external_io_loops,
-                    external_io_imports: &mut external_io_imports,
-                    crt_resource_next: &mut crt_resource_next,
-                };
+                let mut ctx = root_context!();
                 let coefficient = inverse_trapdoor_for_export(&mut ctx, source)?;
                 coefficient_exports.insert(source, coefficient);
                 coefficient
@@ -6090,38 +6278,7 @@ pub(crate) fn plan_physical_graph(
                     if let Some(&coefficient) = coefficient_exports.get(&public) {
                         Some(coefficient)
                     } else {
-                        let mut ctx = PhysicalLoweringContext {
-                            validated,
-                            integer_input_ranges,
-                            artifact_payload_sizes,
-                            backend,
-                            logical,
-                            device,
-                            values: &mut values,
-                            owners: &mut owners,
-                            wire_ids: &mut wire_ids,
-                            implementations: &mut implementations,
-                            operations: &mut operations,
-                            bindings: &mut bindings,
-                            producer: &mut producer,
-                            family_member_producers: &mut family_member_producers,
-                            control_resets: &mut control_resets,
-                            sample_seeds: &mut sample_seeds,
-                            hash_resources: &mut hash_resources,
-                            real_owners: &mut real_owners,
-                            indexed_tables: &mut indexed_tables,
-                            dynamic_export_resources: &mut dynamic_export_resources,
-                            device_loop_indices: BTreeMap::new(),
-                            active_parallel_template: None,
-                            active_parallel_instances: Vec::new(),
-                            preimage_replays: &mut preimage_replays,
-                            trapdoor_public_ids: &mut trapdoor_public_ids,
-                            waves: &mut waves,
-                            import_templates: &mut import_templates,
-                            external_io_loops: &mut external_io_loops,
-                            external_io_imports: &mut external_io_imports,
-                            crt_resource_next: &mut crt_resource_next,
-                        };
+                        let mut ctx = root_context!();
                         let coefficient = inverse_matrix_for_export(&mut ctx, public)?;
                         coefficient_exports.insert(public, coefficient);
                         Some(coefficient)
@@ -6129,171 +6286,24 @@ pub(crate) fn plan_physical_graph(
                 } else {
                     None
                 };
-            let physical = Arc::new(values[export_source.0 as usize].clone());
-            let selected_parts = (0..physical.parts.len()).collect::<Vec<_>>();
-            let mut export = PhysicalExport::from_parts(physical, &selected_parts)?;
-            if let Some(public) = public_export_source {
-                let public_physical = Arc::new(values[public.0 as usize].clone());
-                let selected = (0..public_physical.parts.len()).collect::<Vec<_>>();
-                export = export.with_trapdoor_public(public_physical, &selected)?;
-            }
-            let export = Arc::new(export);
             let artifact_type = ArtifactType::from_wire_type(&values[source.0 as usize].ty)
                 .ok_or_else(|| "GPU artifact output has no artifact type".to_owned())?;
-            let source_binding_base = if public_export_source.is_some() {
-                register_all_parts(&mut bindings, &values, export_source)?
-            } else {
-                register_bindings(&mut bindings, &values, export_source)?
-            };
-            let public_binding_base = public_export_source
-                .map(|id| register_bindings(&mut bindings, &values, id))
-                .transpose()?;
-            for (fragment_index, fragment) in export.fragments.iter().enumerate() {
-                let site = u32::try_from(export_templates.len())
-                    .map_err(|_| "too many GPU artifact export sites".to_owned())?;
-                let slot = slots.len();
-                let payload_bytes = usize::try_from(fragment.raw_bytes)
-                    .map_err(|_| "GPU artifact fragment exceeds host address space".to_owned())?;
-                slots.push(Arc::new(
-                    GpuExportSlot::new(device, payload_bytes).map_err(|error| error.to_string())?,
-                ));
-                let payload_binding = u32::try_from(bindings.len())
-                    .map_err(|_| "too many GPU graph bindings".to_owned())?;
-                bindings.push(GpuBindingSource::ExportSlotPayload { slot });
-                let header_binding = u32::try_from(bindings.len())
-                    .map_err(|_| "too many GPU graph bindings".to_owned())?;
-                bindings.push(GpuBindingSource::ExportSlotHeader { slot });
-                let copy = implementations
-                    .register(GpuImplementation::export_copy())
-                    .map_err(str::to_owned)?;
-                let publish = implementations
-                    .register(GpuImplementation::export_publish())
-                    .map_err(str::to_owned)?;
-                let copy_index = u32::try_from(operations.len())
-                    .map_err(|_| "too many GPU operations".to_owned())?;
-                let (copy_source, part_index, binding_base) = if let Some(public) =
-                    public_export_source
-                {
-                    if fragment_index >= values[export_source.0 as usize].parts.len() {
-                        (
-                            public,
-                            u32::try_from(
-                                fragment_index - values[export_source.0 as usize].parts.len(),
-                            )
-                            .map_err(|_| "GPU public export part index exceeds u32".to_owned())?,
-                            public_binding_base.ok_or_else(|| {
-                                "GPU trapdoor public binding is missing".to_owned()
-                            })?,
-                        )
-                    } else {
-                        (
-                            export_source,
-                            u32::try_from(fragment_index).map_err(|_| {
-                                "GPU secret export part index exceeds u32".to_owned()
-                            })?,
-                            source_binding_base,
-                        )
-                    }
-                } else {
-                    (
-                        export_source,
-                        u32::try_from(fragment_index)
-                            .map_err(|_| "GPU export fragment index exceeds u32".to_owned())?,
-                        source_binding_base,
-                    )
-                };
-                let source_binding = binding_base
-                    .checked_add(part_index)
-                    .ok_or_else(|| "GPU export source binding overflows".to_owned())?;
-                let slot_index = u32::try_from(slot)
-                    .map_err(|_| "GPU export slot index exceeds u32".to_owned())?;
-                operations.push(CompiledGpuOp {
-                    implementation: copy,
-                    arguments: Box::new([
-                        KernelArg::Value(copy_source),
-                        KernelArg::U32(part_index),
-                        KernelArg::U32(slot_index),
-                        KernelArg::U64(fragment.raw_bytes),
-                        KernelArg::U32(source_binding),
-                        KernelArg::U32(payload_binding),
-                    ]),
-                    outputs: Box::new([]),
-                    device,
-                    grid: [0; 3],
-                    block: [0; 3],
-                    shared_bytes: 0,
-                    predecessors: all_predecessors(&producer, copy_source),
-                    body: None,
-                });
-                let final_chunk = fragment_index + 1 == export.fragments.len();
-                operations.push(CompiledGpuOp {
-                    implementation: publish,
-                    arguments: Box::new([
-                        KernelArg::U32(slot_index),
-                        KernelArg::U64(0),
-                        KernelArg::U64(fragment.raw_offset),
-                        KernelArg::U64(fragment.raw_bytes),
-                        KernelArg::U32(site),
-                        KernelArg::U32(u32::from(final_chunk)),
-                        KernelArg::U32(header_binding),
-                    ]),
-                    outputs: Box::new([]),
-                    device,
-                    grid: [0; 3],
-                    block: [0; 3],
-                    shared_bytes: 0,
-                    predecessors: Box::new([copy_index]),
-                    body: None,
-                });
-                export_templates.push(ExportTemplate {
-                    name: name.clone(),
-                    index: None,
-                    occurrence: 0,
-                    site,
-                    slot,
-                    fragment_index,
-                    final_chunk,
-                    artifact_type: artifact_type.clone(),
-                    availability,
-                    export: Arc::clone(&export),
-                });
-            }
+            let mut ctx = root_context!();
+            emit_artifact_export(
+                &mut ctx,
+                &mut slots,
+                &mut export_templates,
+                name,
+                &[(None, export_source)],
+                artifact_type,
+                availability,
+                public_export_source,
+            )?;
         }
         if matches!(values[source.0 as usize].ty, ConcreteWireType::Trapdoor { .. }) {
             let trapdoor_ty = values[source.0 as usize].ty.clone();
             let leaf_types = trapdoor_leaf_types(&trapdoor_ty)?;
-            let mut ctx = PhysicalLoweringContext {
-                validated,
-                integer_input_ranges,
-                artifact_payload_sizes,
-                backend,
-                logical,
-                device,
-                values: &mut values,
-                owners: &mut owners,
-                wire_ids: &mut wire_ids,
-                implementations: &mut implementations,
-                operations: &mut operations,
-                bindings: &mut bindings,
-                producer: &mut producer,
-                family_member_producers: &mut family_member_producers,
-                control_resets: &mut control_resets,
-                sample_seeds: &mut sample_seeds,
-                hash_resources: &mut hash_resources,
-                real_owners: &mut real_owners,
-                indexed_tables: &mut indexed_tables,
-                dynamic_export_resources: &mut dynamic_export_resources,
-                device_loop_indices: BTreeMap::new(),
-                active_parallel_template: None,
-                active_parallel_instances: Vec::new(),
-                preimage_replays: &mut preimage_replays,
-                trapdoor_public_ids: &mut trapdoor_public_ids,
-                waves: &mut waves,
-                import_templates: &mut import_templates,
-                external_io_loops: &mut external_io_loops,
-                external_io_imports: &mut external_io_imports,
-                crt_resource_next: &mut crt_resource_next,
-            };
+            let mut ctx = root_context!();
             let mut leaves = Vec::with_capacity(6);
             for ty in &leaf_types {
                 leaves.push(allocate_scratch_matrix(&mut ctx, ty, PhysicalEncoding::FullEval)?);
@@ -6413,6 +6423,25 @@ pub(crate) fn plan_physical_graph(
             return Err("GPU selected artifact import selector is not a signed scalar".into());
         }
     }
+    let protected = input_ids
+        .values()
+        .chain(output_ids.values())
+        .chain(waves.iter().flat_map(|wave| wave.owner_bindings.keys()))
+        .chain(import_templates.iter().map(|import| &import.destination))
+        .chain(external_io_imports.iter().map(|import| &import.destination))
+        .chain(external_io_loops.iter().flat_map(|body| {
+            body.carried_ids.iter().chain(body.imports.iter().map(|import| &import.destination))
+        }))
+        .chain(indexed_tables.iter().flat_map(|table| table.candidates.iter().map(|(id, _)| id)))
+        .chain(trapdoor_public_ids.iter().flat_map(|(secret, public)| [secret, public]))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let replayed = waves
+        .iter()
+        .map(|wave| (wave.body_start, wave.body_end))
+        .chain(external_io_loops.iter().map(|body| (body.body_start, body.body_end)))
+        .collect::<Vec<_>>();
+    share_scratch_allocations(&values, &mut owners, &operations, &replayed, &protected)?;
     let program = CompiledGpuProgram {
         values: values.into_boxed_slice(),
         implementations,
@@ -6456,10 +6485,7 @@ mod tests {
         backend::{poly::cpu_backend, poly_gpu::gpu_backend_on},
         executor::{ExecutionConfig, execute_in_session},
         gpu_runtime::GpuRuntime,
-        matrix::{
-            CpuSmallMatrix, PolyMatrix, SmallPolyMatrix, dcrt_poly::DCRTPolyMatrix,
-            gpu_dcrt_poly::GpuSmallMatrix,
-        },
+        matrix::{CpuSmallMatrix, PolyMatrix, SmallPolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{
@@ -6648,16 +6674,19 @@ mod tests {
             .to_canonical_coefficients()
             .unwrap();
         let payload = cpu_small.to_canonical_coefficients().unwrap();
-        let native = Arc::new(
-            GpuSmallMatrix::from_canonical_coefficients(
-                &source_gpu,
-                1,
-                2,
-                num_bigint::BigUint::from(7u8),
-                &payload,
-            )
-            .unwrap(),
-        );
+        let native = GpuSmallMatrixOutputDescriptor::for_shape_in_domain(
+            &source_gpu,
+            1,
+            2,
+            num_bigint::BigUint::from(7u8),
+            CoefficientBoundDomain::Global,
+        )
+        .and_then(|descriptor| descriptor.allocate())
+        .unwrap();
+        native
+            .upload_canonical_coefficients_in_place(CoefficientBoundDomain::Global, &payload)
+            .unwrap();
+        let native = Arc::new(native);
         let binding = native.binding_descriptor().unwrap();
         let width = binding.magnitude_bytes + 1;
         let column_stride = 32 * width;
@@ -6739,7 +6768,7 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA GPU"]
     #[serial_test::serial(gpu_context)]
-    fn direct_add_reuses_frame_but_returns_distinct_owners() {
+    fn direct_add_reuses_plan_owned_output() {
         let device = detected_gpu_device_ids()[0];
         let narrow = DCRTPolyParams::new(32, 1, 28, 8, None, None).to_crt().0[0];
         let wide = DCRTPolyParams::new(32, 1, 50, 8, None, None).to_crt().0[0];
@@ -6806,6 +6835,63 @@ mod tests {
         assert_eq!(plan.compiled_launch_count(), 2);
     }
 
+    /// A chain of dependent doublings keeps only a few live intermediates, so
+    /// its scratch matrices share allocations and still produce 2^k·x.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_dependent_chain_shares_scratch_allocations() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 1, 28, 8, None, None);
+        let modulus = cpu.to_crt().0[0];
+        let parameters = GpuDCRTPolyParams::new(32, vec![modulus], 8, None);
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
+        let steps = 8;
+        let mut value = ring.uniform_residue((2, 2));
+        let source = value.clone();
+        for _ in 0..steps {
+            value = value.clone() + value;
+        }
+        let validated = DslContext::new("direct-shared-scratch-chain")
+            .output("source", source)
+            .unwrap()
+            .output("doubled", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let frame = plan.physical_frame_for_test();
+        let scratch = frame
+            .owners
+            .iter()
+            .filter(|(id, _)| {
+                let physical = &frame.program.values[id.0 as usize];
+                physical.encodings.as_ref() == [PhysicalEncoding::FullEval] &&
+                    physical
+                        .parts
+                        .iter()
+                        .all(|part| matches!(part.storage, StorageRef::Scratch(_)))
+            })
+            .collect::<Vec<_>>();
+        let allocations = scratch
+            .iter()
+            .flat_map(|(_, owner)| owner.storages().map(|(_, bound)| bound.address))
+            .collect::<BTreeSet<_>>();
+        assert!(scratch.len() >= steps, "every doubling has a scratch result");
+        assert!(allocations.len() < scratch.len(), "dependent intermediates share allocations");
+        let mut store = MemoryArtifactStore::default();
+        let result =
+            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let source = runtime.download_matrix_output(&result.output("source").unwrap()).unwrap();
+        let doubled = runtime.download_matrix_output(&result.output("doubled").unwrap()).unwrap();
+        let scale =
+            DCRTPoly::from_biguint_to_constant(&cpu, num_bigint::BigUint::from(1u32 << steps));
+        assert_eq!(doubled, source.multiply_poly_out_of_place(&scale));
+    }
+
     #[test]
     #[ignore = "requires a CUDA GPU"]
     #[serial_test::serial(gpu_context)]
@@ -6829,13 +6915,15 @@ mod tests {
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
         let first = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [11; 32]).unwrap();
-        let RuntimeValue::Matrix(first_public) = &first.output_value_for_test("public").unwrap() else {
+        let RuntimeValue::Matrix(first_public) = &first.output_value_for_test("public").unwrap()
+        else {
             panic!("public matrix output");
         };
         let first_owner = Arc::clone(first_public.as_gpu().expect("resident public"));
         drop(first);
         let second = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [12; 32]).unwrap();
-        let RuntimeValue::Matrix(second_public) = &second.output_value_for_test("public").unwrap() else {
+        let RuntimeValue::Matrix(second_public) = &second.output_value_for_test("public").unwrap()
+        else {
             panic!("public matrix output");
         };
         let second_owner = second_public.as_gpu().expect("resident public");
@@ -6868,7 +6956,8 @@ mod tests {
         let result = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [13; 32]).unwrap();
         assert!(result.production_id.is_some());
         assert_eq!(result.artifact_handles["secret"].len(), 1);
-        let RuntimeValue::Resident(secret) = &result.output_value_for_test("secret").unwrap() else {
+        let RuntimeValue::Resident(secret) = &result.output_value_for_test("secret").unwrap()
+        else {
             panic!("GPU trapdoor must remain resident");
         };
         assert_eq!(secret.physical().encodings.len(), 6);
@@ -6923,15 +7012,16 @@ mod tests {
         let first = runtime
             .execute(&mut plan, BTreeMap::from([("key".to_owned(), key_a)]), &mut store, [0x41; 32])
             .unwrap();
-        let actual_a = runtime
-            .download_matrix_output(&first.output("hash").unwrap())
-            .unwrap();
+        let actual_a = runtime.download_matrix_output(&first.output("hash").unwrap()).unwrap();
         drop(first);
         let second = runtime
             .execute(&mut plan, BTreeMap::from([("key".to_owned(), key_b)]), &mut store, [0x42; 32])
             .unwrap();
         assert_eq!(actual_a, expected_a);
-        assert_eq!(runtime.download_matrix_output(&second.output("hash").unwrap()).unwrap(), expected_b);
+        assert_eq!(
+            runtime.download_matrix_output(&second.output("hash").unwrap()).unwrap(),
+            expected_b
+        );
         assert_eq!(plan.compiled_launch_count(), 2);
     }
 
@@ -6986,7 +7076,17 @@ mod tests {
             runtime.plan(validated, &BTreeMap::from([("key".to_owned(), key_a.clone())])).unwrap();
         let mut store = MemoryArtifactStore::default();
         let mut returned = Vec::new();
-        for (key, expected) in [(key_a, expected_a), (key_b, expected_b)] {
+        let mut copied = None;
+        let download = |owner: &Arc<GpuResidentValue>| {
+            let [part] = owner.physical().parts.as_ref() else {
+                panic!("GPU bounded hash has more than one compact part");
+            };
+            let storage = owner.storage(part.storage).expect("compact payload storage");
+            let mut actual = vec![0u8; storage.bytes as usize];
+            gpu.download_device_bytes(device, storage.address, &mut actual).unwrap();
+            actual
+        };
+        for (key, expected) in [(key_a, expected_a.clone()), (key_b, expected_b)] {
             let result = runtime
                 .execute(
                     &mut plan,
@@ -6995,23 +7095,27 @@ mod tests {
                     rand::random(),
                 )
                 .unwrap();
-            let RuntimeValue::Resident(owner) = &result.output_value_for_test("hash").unwrap() else {
+            let RuntimeValue::Resident(owner) = &result.output_value_for_test("hash").unwrap()
+            else {
                 panic!("GPU bounded hash is not resident");
             };
             assert!(matches!(
                 owner.physical().encodings.as_ref(),
                 [PhysicalEncoding::CompactCoeffPerCrtLimb { .. }]
             ));
-            let [part] = owner.physical().parts.as_ref() else {
-                panic!("GPU bounded hash has more than one compact part");
-            };
-            let storage = owner.storage(part.storage).expect("compact payload storage");
-            let mut actual = vec![0u8; storage.bytes as usize];
-            gpu.download_device_bytes(device, storage.address, &mut actual).unwrap();
-            assert_eq!(actual, expected);
+            assert_eq!(download(owner), expected);
             returned.push(Arc::clone(owner));
+            if copied.is_none() {
+                copied = Some(runtime.copy_output(&result.output("hash").unwrap()).unwrap());
+            }
         }
-        assert!(!Arc::ptr_eq(&returned[0], &returned[1]));
+        assert!(Arc::ptr_eq(&returned[0], &returned[1]));
+        // The explicit copy survives the replay that overwrote plan storage.
+        let Some(RuntimeValue::Resident(copied)) = copied else {
+            panic!("copied GPU bounded hash is not resident");
+        };
+        assert!(!Arc::ptr_eq(&copied, &returned[0]));
+        assert_eq!(download(&copied), expected_a);
         assert_eq!(plan.compiled_launch_count(), 2);
     }
 
@@ -7103,6 +7207,9 @@ mod tests {
         let mut store = MemoryArtifactStore::default();
         let first =
             runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let first_public = first.output_value_for_test("public").unwrap().clone();
+        let first_preimage = first.output_value_for_test("preimage").unwrap().clone();
+        drop(first);
         let frame = plan.physical_frame_for_test();
         let retry = frame
             .program
@@ -7136,7 +7243,7 @@ mod tests {
             .unwrap();
         let gadget = DCRTPolyMatrix::gadget_matrix(&cpu, 1, None);
         assert_eq!(&gadget * &z, residual, "raw GQ must solve the gadget equation");
-        let public = runtime.download_matrix(&first.output_value_for_test("public").unwrap()).unwrap();
+        let public = runtime.download_matrix(&first_public).unwrap();
         let secret_id = *frame
             .trapdoor_public_ids
             .keys()
@@ -7205,7 +7312,7 @@ mod tests {
             DCRTPolyMatrix::zero(&cpu, 1, 1),
             "corrected candidate must solve the public relation"
         );
-        let RuntimeValue::Resident(first_owner) = &first.output_value_for_test("preimage").unwrap() else {
+        let RuntimeValue::Resident(first_owner) = &first_preimage else {
             panic!("preimage output is not resident");
         };
         assert!(matches!(
@@ -7222,10 +7329,23 @@ mod tests {
         assert_eq!(&public * &decoded, DCRTPolyMatrix::zero(&cpu, 1, 1));
         let second =
             runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
-        let RuntimeValue::Resident(second_owner) = &second.output_value_for_test("preimage").unwrap() else {
+        let RuntimeValue::Resident(second_owner) =
+            second.output_value_for_test("preimage").unwrap()
+        else {
             panic!("preimage output is not resident");
         };
-        assert!(!Arc::ptr_eq(first_owner, second_owner));
+        assert!(Arc::ptr_eq(first_owner, second_owner), "replay must reuse plan-owned output");
+        let second_decoded = download_compact_preimage_for_oracle(
+            &download_parameters,
+            device,
+            &cpu,
+            second_owner,
+            1_000_000,
+        );
+        let second_public =
+            runtime.download_matrix(second.output_value_for_test("public").unwrap()).unwrap();
+        assert_eq!(&second_public * &second_decoded, DCRTPolyMatrix::zero(&cpu, 1, 1));
+        drop(second);
         assert_eq!(plan.compiled_launch_count(), 2);
     }
 
@@ -7258,17 +7378,21 @@ mod tests {
         let mut store = MemoryArtifactStore::default();
         let first =
             runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
-        let public = runtime.download_matrix(&first.output_value_for_test("public").unwrap()).unwrap();
-        let RuntimeValue::Resident(first_owner) = &first.output_value_for_test("preimage").unwrap() else {
+        let public =
+            runtime.download_matrix(first.output_value_for_test("public").unwrap()).unwrap();
+        let RuntimeValue::Resident(first_owner) = first.output_value_for_test("preimage").unwrap()
+        else {
             panic!("preimage output is not resident");
         };
+        let first_owner = Arc::clone(first_owner);
         let decoded = download_compact_preimage_for_oracle(
             &download_parameters,
             device,
             &cpu,
-            first_owner,
+            &first_owner,
             1_000_000,
         );
+        drop(first);
         let frame = plan.physical_frame_for_test();
         let retries = frame
             .program
@@ -7326,10 +7450,12 @@ mod tests {
         assert_eq!(&public * &decoded, DCRTPolyMatrix::zero(&cpu, 1, 2));
         let second =
             runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
-        let RuntimeValue::Resident(second_owner) = &second.output_value_for_test("preimage").unwrap() else {
+        let RuntimeValue::Resident(second_owner) =
+            second.output_value_for_test("preimage").unwrap()
+        else {
             panic!("replayed preimage output is not resident");
         };
-        assert!(!Arc::ptr_eq(first_owner, second_owner));
+        assert!(Arc::ptr_eq(&first_owner, second_owner), "replay must reuse plan-owned output");
         let second_decoded = download_compact_preimage_for_oracle(
             &download_parameters,
             device,
@@ -7337,7 +7463,10 @@ mod tests {
             second_owner,
             1_000_000,
         );
-        assert_eq!(&public * &second_decoded, DCRTPolyMatrix::zero(&cpu, 1, 2));
+        // The replay samples a new trapdoor from its new nonce.
+        let second_public =
+            runtime.download_matrix(second.output_value_for_test("public").unwrap()).unwrap();
+        assert_eq!(&second_public * &second_decoded, DCRTPolyMatrix::zero(&cpu, 1, 2));
         assert_eq!(plan.compiled_launch_count(), 2);
     }
 
@@ -7373,13 +7502,16 @@ mod tests {
         for _ in 0..2 {
             let result =
                 runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
-            let public = runtime.download_matrix(&result.output_value_for_test("public").unwrap()).unwrap();
-            let target = runtime.download_matrix(&result.output_value_for_test("target").unwrap()).unwrap();
-            let RuntimeValue::Resident(owner) = &result.output_value_for_test("preimage").unwrap() else {
+            let public =
+                runtime.download_matrix(&result.output_value_for_test("public").unwrap()).unwrap();
+            let target =
+                runtime.download_matrix(&result.output_value_for_test("target").unwrap()).unwrap();
+            let RuntimeValue::Resident(owner) = &result.output_value_for_test("preimage").unwrap()
+            else {
                 panic!("public gadget preimage is not GPU resident");
             };
             if let Some(previous) = previous.replace(Arc::clone(owner)) {
-                assert!(!Arc::ptr_eq(&previous, owner));
+                assert!(Arc::ptr_eq(&previous, owner));
             }
             let decoded = download_compact_preimage_for_oracle(
                 &download_parameters,

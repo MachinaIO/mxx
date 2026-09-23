@@ -11,7 +11,6 @@ use mxx_backends::{
     GpuExecutionResult, GpuRuntime, RuntimeValue,
     artifact::MemoryArtifactStore,
     backend::poly_gpu::gpu_backend,
-    gpu_column_policy::is_resident_control_operation,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
@@ -57,13 +56,34 @@ fn gpu_matrix_value(parameters: &DCRTPolyParams, matrix: GpuDCRTPolyMatrix) -> R
 
 fn gpu_integer_family(parameters: &GpuDCRTPolyParams, values: &[BigInt]) -> RuntimeValue {
     let owner = Arc::new(
-        GpuSignedValues::from_bigints(parameters, 0, values).expect("upload signed integer family"),
+        GpuSignedValues::from_bigints_with_words(
+            parameters,
+            0,
+            values,
+            values.iter().map(|value| value.bits().div_ceil(64) as usize).max().unwrap_or(1).max(1),
+        )
+        .expect("upload signed integer family"),
     );
+    bind_integer_family(owner, values.len())
+}
+
+/// A resident input binds directly, so replays with values of different sizes
+/// upload one fixed word width, that of the declared range.
+fn gpu_integer_family_with_words(
+    parameters: &GpuDCRTPolyParams,
+    values: &[BigInt],
+    words: usize,
+) -> RuntimeValue {
+    let owner = Arc::new(
+        GpuSignedValues::from_bigints_with_words(parameters, 0, values, words)
+            .expect("upload signed integer family"),
+    );
+    bind_integer_family(owner, values.len())
+}
+
+fn bind_integer_family(owner: Arc<GpuSignedValues>, count: usize) -> RuntimeValue {
     RuntimeValue::gpu_signed_family(
-        ConcreteWireType::IndexedFamily {
-            element: Box::new(ConcreteWireType::Int),
-            count: values.len(),
-        },
+        ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count },
         owner,
     )
     .expect("bind exact signed integer family")
@@ -82,8 +102,15 @@ fn gpu_boolean_family(parameters: &GpuDCRTPolyParams, values: &[BigInt]) -> Runt
             }
         })
         .collect::<Vec<_>>();
-    let owner =
-        Arc::new(GpuSignedValues::upload(parameters, 0, &bits).expect("upload boolean family"));
+    let owner = GpuSignedValues::allocate(
+        parameters,
+        0,
+        bits.len(),
+        mxx_backends::poly::dcrt::gpu::GpuSignedValuesEncoding::SignedI64,
+    )
+    .expect("allocate boolean family");
+    owner.upload_i64(&bits).expect("upload boolean family");
+    let owner = Arc::new(owner);
     RuntimeValue::gpu_signed_family(
         ConcreteWireType::IndexedFamily {
             element: Box::new(ConcreteWireType::Bool),
@@ -101,7 +128,6 @@ fn control_graph(moduli: &[u64], ring_dimension: u32) -> mxx_dsl::BuiltGraph {
 #[test]
 #[serial_test::serial]
 fn matrix_partial_slice_concat_replays_with_fresh_owners() {
-    use mxx_backends::poly::dcrt::gpu::GpuDCRTPoly;
     use mxx_ir_core::node::{ConcatAxis, IndexRange};
     let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
     let (moduli, _, _) = parameters.to_crt();
@@ -121,20 +147,21 @@ fn matrix_partial_slice_concat_replays_with_fresh_owners() {
         .unwrap()
         .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .unwrap();
-    let make = |scalar: u64| {
-        GpuDCRTPolyMatrix::identity(
-            &gpu_parameters,
+    let make_cpu = |scalar: u64| {
+        DCRTPolyMatrix::identity(
+            &parameters,
             4,
-            Some(GpuDCRTPoly::from_usize_to_constant(&gpu_parameters, scalar as usize)),
+            Some(DCRTPoly::from_usize_to_constant(&parameters, scalar as usize)),
         )
     };
+    let make = |scalar: u64| GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &make_cpu(scalar));
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
     let mut plan = runtime
         .plan(graph, &BTreeMap::from([("matrix".into(), gpu_matrix_value(&parameters, make(1)))]))
         .unwrap();
     for scalar in [3, 7] {
         let source = make(scalar);
-        let expected = make(2 * scalar).slice(0, 2, 0, 4).to_cpu_matrix();
+        let expected = make_cpu(2 * scalar).slice(0, 2, 0, 4);
         let result = runtime
             .execute(
                 &mut plan,
@@ -143,7 +170,7 @@ fn matrix_partial_slice_concat_replays_with_fresh_owners() {
                 [scalar as u8; 32],
             )
             .unwrap();
-        let actual = runtime.download_matrix(&result.outputs["matrix"]).unwrap();
+        let actual = runtime.download_matrix_output(&result.output("matrix").unwrap()).unwrap();
         assert_eq!(actual, expected);
     }
 }
@@ -211,9 +238,15 @@ fn typed_real_boundary_and_trapdoor_public_output_execute() {
         let result = runtime
             .execute(&mut plan, BTreeMap::new(), &mut MemoryArtifactStore::default(), [seed; 32])
             .unwrap();
-        assert!(matches!(result.outputs["real"], RuntimeValue::Real(value) if value == 10.0));
-        assert!(matches!(result.outputs["public"], RuntimeValue::Matrix(_)));
-        assert!(matches!(result.outputs["trapdoor"], RuntimeValue::Resident(_)));
+        assert_eq!(runtime.download_real_output(&result.output("real").unwrap()).unwrap(), 10.0);
+        assert!(matches!(
+            runtime.copy_output(&result.output("public").unwrap()).unwrap(),
+            RuntimeValue::Matrix(_)
+        ));
+        assert!(matches!(
+            runtime.copy_output(&result.output("trapdoor").unwrap()).unwrap(),
+            RuntimeValue::Resident(_)
+        ));
     }
 }
 
@@ -297,7 +330,7 @@ fn resident_pack_invalid_bit_and_out_of_range_suppress_publication() {
                 [1; 32],
             )
             .err()
-            .expect("invalid pack must not publish");
+            .unwrap_or_else(|| panic!("invalid pack case {invalid_case} must not publish"));
         assert!(error.to_string().contains("outputs suppressed"), "{error}");
     }
 }
@@ -365,10 +398,16 @@ fn resident_multiword_polynomial_primitives_rebind_and_decode() {
             .collect::<Vec<_>>()
     };
     let first = make_values(1);
+    let bound: BigInt = (&modulus << 192usize) * 2;
+    let words = bound.bits().div_ceil(64) as usize;
+    declare_values_range(&mut runtime, bound);
     let mut plan = runtime
         .plan(
             graph,
-            &BTreeMap::from([("values".into(), gpu_integer_family(&gpu_parameters, &first))]),
+            &BTreeMap::from([(
+                "values".into(),
+                gpu_integer_family_with_words(&gpu_parameters, &first, words),
+            )]),
         )
         .unwrap();
     for shift in [1, 3] {
@@ -376,14 +415,19 @@ fn resident_multiword_polynomial_primitives_rebind_and_decode() {
         let result = runtime
             .execute(
                 &mut plan,
-                BTreeMap::from([("values".into(), gpu_integer_family(&gpu_parameters, &values))]),
+                BTreeMap::from([(
+                    "values".into(),
+                    gpu_integer_family_with_words(&gpu_parameters, &values, words),
+                )]),
                 &mut MemoryArtifactStore::default(),
                 [shift as u8; 32],
             )
             .unwrap();
         let canonical: Vec<_> =
             values.iter().map(|value| ((value % &modulus) + &modulus) % &modulus).collect();
-        let read = |name: &str| runtime.download_integer_family(&result.outputs[name]).unwrap();
+        let read = |name: &str| {
+            runtime.download_integer_family_output(&result.output(name).unwrap()).unwrap()
+        };
         assert_eq!(read("values"), canonical);
         assert_eq!(read("evaluations"), canonical);
         assert_eq!(read("coefficient"), vec![canonical[1].clone()]);
@@ -494,14 +538,6 @@ fn resident_control_regression_graph_covers_scalar_and_family_operations() {
     assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)));
     assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::Select { .. })));
     assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::BoolToInt)));
-    assert!(
-        nodes.iter().all(|node| {
-            matches!(node.kind(), NodeKind::Input { .. }) ||
-                is_resident_control_operation(node.kind())
-        }),
-        "control graph contains a non-resident/non-control operation"
-    );
-
     for operation in [
         IntBinaryOp::Add,
         IntBinaryOp::Subtract,
@@ -555,6 +591,7 @@ fn resident_control_parallel_tail_replays_bounded_wave() {
         .expect("validate tail resident graph");
     let anchor = gpu_anchor(&parameters, &gpu_parameters);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
+    declare_values_range(&mut runtime, 16);
     let input_values = [1, 2, 3, 4, 5, 6];
     let inputs = gpu_control_inputs(&gpu_parameters, &anchor, &input_values);
     let mut plan = runtime.plan(graph, &inputs).expect("plan tail resident graph");
@@ -583,12 +620,21 @@ fn resident_control_sequential_carried_counts_publish_final_state() {
         let result = runtime
             .execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [10 + nonce as u8; 32])
             .expect("execute sequential resident graph");
-        assert!(matches!(result.outputs["result"], RuntimeValue::Resident(_)));
+        assert!(matches!(
+            runtime.copy_output(&result.output("result").unwrap()).unwrap(),
+            RuntimeValue::Resident(_)
+        ));
         let actual = runtime
-            .download_integer_family(&result.outputs["result"])
+            .download_integer_family_output(&result.output("result").unwrap())
             .expect("read sequential result");
         assert_eq!(actual, [BigInt::from((count * (count + 1) / 2) as i64)]);
     }
+}
+
+/// Raw uploads carry no proven range, so the caller declares one.
+fn declare_values_range(runtime: &mut GpuRuntime, bound: impl Into<BigInt>) {
+    let bound = bound.into();
+    runtime.options_mut().integer_input_ranges.insert("values".into(), -bound.clone()..=bound);
 }
 
 fn gpu_control_inputs(
@@ -624,6 +670,7 @@ fn resident_control_replay_uses_new_family_values_and_signed_semantics() {
     let backend = gpu_backend([gpu_parameters.clone()]);
     let anchor = gpu_anchor(&parameters, &gpu_parameters);
     let mut runtime = GpuRuntime::new(backend).expect("construct resident control runtime");
+    declare_values_range(&mut runtime, 16);
     let planning_values = [1, 2, 3, 4, 5, 6];
     let planning_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &planning_values);
     let mut plan = runtime.plan(graph, &planning_inputs).expect("prepare resident control plan");
@@ -647,9 +694,12 @@ fn resident_control_replay_uses_new_family_values_and_signed_semantics() {
 }
 
 fn resident_output(runtime: &GpuRuntime, result: GpuExecutionResult) -> Vec<BigInt> {
-    assert!(matches!(result.outputs["result"], RuntimeValue::Resident(_)));
+    assert!(matches!(
+        runtime.copy_output(&result.output("result").unwrap()).unwrap(),
+        RuntimeValue::Resident(_)
+    ));
     runtime
-        .download_integer_family(&result.outputs["result"])
+        .download_integer_family_output(&result.output("result").unwrap())
         .expect("gather resident control result")
 }
 
@@ -676,6 +726,7 @@ fn test_gpu_resident_invalid_index_suppresses_outputs() {
         .unwrap();
     let anchor = gpu_anchor(&parameters, &gpu_parameters);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
+    declare_values_range(&mut runtime, 16);
     let planning_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &[0, 1, 0, 1, 0, 0]);
     let mut plan = runtime.plan(graph, &planning_inputs).unwrap();
     let invalid_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &[0, 2, 0, 1, 0, 0]);
@@ -691,4 +742,197 @@ fn test_gpu_resident_invalid_index_suppresses_outputs() {
         .execute(&mut plan, valid_inputs, &mut MemoryArtifactStore::default(), [3; 32])
         .unwrap();
     assert_eq!(resident_output(&mut runtime, recovered), [20, 10, 20, 10].map(BigInt::from));
+}
+
+/// Runs `graph` on one resident `(1, 1)` anchor holding the constant `1` and
+/// returns the constant term of each member of the matrix-family `output`.
+/// `max_waves` bounds the planner's wave-width candidates.
+fn matrix_family_constants(
+    graph: mxx_ir_core::ValidatedGraph,
+    output: &str,
+    count: usize,
+    max_waves: Option<usize>,
+) -> Vec<u64> {
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+    let (moduli, _, _) = parameters.to_crt();
+    let gpu_parameters =
+        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
+    let inputs = BTreeMap::from([("anchor".to_owned(), gpu_anchor(&parameters, &gpu_parameters))]);
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
+    if let Some(max_waves) = max_waves {
+        runtime.options_mut().max_parallel_instances = max_waves.try_into().unwrap();
+    }
+    let mut plan = runtime.plan(graph, &inputs).unwrap();
+    // Every execute, including the first after planning, must agree: later
+    // runs rebind every occurrence after another one ran.
+    let runs = (0..3u8)
+        .map(|nonce| {
+            let result = runtime
+                .execute(
+                    &mut plan,
+                    inputs.clone(),
+                    &mut MemoryArtifactStore::default(),
+                    [nonce; 32],
+                )
+                .unwrap();
+            let output = result.output(output).unwrap();
+            (0..count)
+                .map(|member| {
+                    runtime
+                        .download_matrix_member_output(&output, member)
+                        .unwrap()
+                        .entry(0, 0)
+                        .coeffs_biguints()[0]
+                        .to_u64_digits()
+                        .first()
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(runs.windows(2).all(|pair| pair[0] == pair[1]), "executes disagree: {runs:?}");
+    runs.into_iter().next().unwrap()
+}
+
+/// `scaled[k] = (k + 1) * anchor`. Each case reads the inner index, the outer
+/// index, or both inside the inner body, and selects one or all inner members.
+#[test]
+#[serial_test::serial]
+fn nested_matrix_parallel_loops_bind_every_inner_and_outer_occurrence() {
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+    let cases: [(usize, Vec<u64>); 5] =
+        [(0, vec![6, 6]), (1, vec![3, 6]), (2, vec![9, 12]), (3, vec![4, 5]), (4, vec![2, 3])];
+    for max_waves in [Some(1), None] {
+        for (case, expected) in &cases {
+            let context = DslContext::new("nested-matrix-parallel");
+            let anchor = test_ring(&parameters).input("anchor", (1, 1));
+            let scaled =
+                Family::pack(vec![anchor.clone(), anchor.clone() * 2, anchor.clone() * 3]).unwrap();
+            let result = parallel(2, |outer| {
+                let inner = parallel(3, |inner| match case {
+                    0 => Ok(scaled.at(inner) * 1),
+                    1 => Ok(scaled.at(outer.clone()) * 1),
+                    _ => Ok(scaled.at(inner) + scaled.at(outer.clone())),
+                })?;
+                Ok(match case {
+                    3 => inner.at(Int::constant(2)) * 1,
+                    4 => inner.at(Int::constant(0)) * 1,
+                    _ => {
+                        inner.at(Int::constant(0)) +
+                            inner.at(Int::constant(1)) +
+                            inner.at(Int::constant(2))
+                    }
+                })
+            })
+            .unwrap();
+            let graph = context
+                .output("result", result)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .unwrap();
+            assert_eq!(
+                &matrix_family_constants(graph, "result", 2, max_waves),
+                expected,
+                "case {case}, max waves {max_waves:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn sibling_root_matrix_parallel_loops_share_one_plan() {
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+    for max_waves in [Some(1), None] {
+        let context = DslContext::new("sibling-matrix-parallel");
+        let anchor = test_ring(&parameters).input("anchor", (1, 1));
+        let scaled =
+            Family::pack(vec![anchor.clone(), anchor.clone() * 2, anchor.clone() * 3]).unwrap();
+        let first = parallel(3, |index| Ok(scaled.at(index) * 5)).unwrap();
+        let second = parallel(2, |index| Ok(first.at(index.clone()) + scaled.at(index))).unwrap();
+        let graph = context
+            .output("first", first)
+            .unwrap()
+            .output("second", second)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        // second[index] = 5 * (index + 1) + (index + 1).
+        assert_eq!(matrix_family_constants(graph, "second", 2, max_waves), vec![6, 12]);
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn parallel_loops_inside_sequential_device_loops_run_every_lane() {
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+    for max_waves in [Some(1), None] {
+        let context = DslContext::new("parallel-in-sequential");
+        let anchor = test_ring(&parameters).input("anchor", (1, 1));
+        let scaled = Family::pack(vec![anchor.clone(), anchor.clone() * 2]).unwrap();
+        // Each step maps s to (2s + 1) + (2s + 2) = 4s + 3 through two lanes.
+        let step = |state: mxx_dsl::Mat| {
+            let lanes = parallel(2, |lane| Ok(state.clone() * 2 + scaled.at(lane)))?;
+            Ok(lanes.at(Int::constant(0)) + lanes.at(Int::constant(1)))
+        };
+        let root = iterate(3, anchor.clone(), |_, state| step(state)).unwrap();
+        let nested =
+            parallel(2, |outer| iterate(3, scaled.at(outer), |_, state| step(state))).unwrap();
+        let wrapped = parallel(1, |_| Ok(root.clone() * 1)).unwrap();
+        let graph = context
+            .output("root", wrapped)
+            .unwrap()
+            .output("nested", nested)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let nested_graph = graph.clone();
+        // 1 -> 7 -> 31 -> 127 and 2 -> 11 -> 47 -> 191.
+        assert_eq!(matrix_family_constants(graph, "root", 1, max_waves), vec![127]);
+        assert_eq!(matrix_family_constants(nested_graph, "nested", 2, max_waves), vec![127, 191]);
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn sequential_loops_nested_in_device_bodies_restart_every_invocation() {
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+    for max_waves in [Some(1), None] {
+        let context = DslContext::new("sequential-in-sequential");
+        let anchor = test_ring(&parameters).input("anchor", (1, 1));
+        // Inner: two doublings. Outer: three times (inner(s) + anchor).
+        let double_twice = |state: mxx_dsl::Mat| iterate(2, state, |_, inner| Ok(inner * 2));
+        let outer =
+            iterate(3, anchor.clone(), |_, state| Ok(double_twice(state)? + anchor.clone()))
+                .unwrap();
+        // A sequential loop inside a device-body parallel loop inside a
+        // sequential loop: every lane restarts its own inner index.
+        let lanes = iterate(2, anchor.clone(), |_, state| {
+            let family = parallel(2, |_| double_twice(state.clone()))?;
+            Ok(family.at(Int::constant(0)) + family.at(Int::constant(1)))
+        })
+        .unwrap();
+        let wrapped = parallel(1, |_| Ok(outer.clone() * 1)).unwrap();
+        let wrapped_lanes = parallel(1, |_| Ok(lanes.clone() * 1)).unwrap();
+        let graph = context
+            .output("outer", wrapped)
+            .unwrap()
+            .output("lanes", wrapped_lanes)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let lanes_graph = graph.clone();
+        // 1 -> 5 -> 21 -> 85 and 1 -> 8 -> 64.
+        assert_eq!(matrix_family_constants(graph, "outer", 1, max_waves), vec![85]);
+        assert_eq!(matrix_family_constants(lanes_graph, "lanes", 1, max_waves), vec![64]);
+    }
 }

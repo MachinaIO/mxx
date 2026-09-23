@@ -11,21 +11,6 @@ int set_error(cudaError_t err)
     return gpu_set_last_error_cuda(static_cast<int>(err));
 }
 
-bool parse_format(int format, GpuPolyFormat &out)
-{
-    switch (format)
-    {
-    case GPU_POLY_FORMAT_COEFF:
-        out = GPU_POLY_FORMAT_COEFF;
-        return true;
-    case GPU_POLY_FORMAT_EVAL:
-        out = GPU_POLY_FORMAT_EVAL;
-        return true;
-    default:
-        return false;
-    }
-}
-
 size_t matrix_poly_count(const GpuMatrix *mat)
 {
     if (!mat)
@@ -60,53 +45,6 @@ namespace
 
     thread_local ThreadLocalConsumerEventState g_thread_local_consumer_event;
 
-    int matrix_get_thread_local_consumer_event(int device, cudaEvent_t *out_event)
-    {
-        if (device < 0 || !out_event)
-        {
-            return set_error("invalid matrix_get_thread_local_consumer_event arguments");
-        }
-
-        auto &tls = g_thread_local_consumer_event;
-        if (tls.event && tls.device == device)
-        {
-            *out_event = tls.event;
-            return 0;
-        }
-
-        if (tls.event)
-        {
-            cudaError_t err = cudaSetDevice(tls.device);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-            err = cudaEventDestroy(tls.event);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-            tls.event = nullptr;
-            tls.device = -1;
-        }
-
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        err = cudaEventCreateWithFlags(&tls.event, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            tls.event = nullptr;
-            tls.device = -1;
-            return set_error(err);
-        }
-        tls.device = device;
-        *out_event = tls.event;
-        return 0;
-    }
-
     const GpuMatrix::LimbExecState *matrix_limb_state_const(
         const GpuMatrix *mat,
         const dim3 &limb_id,
@@ -140,7 +78,6 @@ namespace
             matrix_limb_state_const(mat, limb_id, context));
     }
 }
-
 
 int matrix_limb_device(const GpuMatrix *mat, const dim3 &limb_id, int *out_device)
 {
@@ -305,173 +242,6 @@ int matrix_wait_limb_stream(
     return 0;
 }
 
-int matrix_track_limb_consumer(
-    const GpuMatrix *src,
-    const dim3 &limb_id,
-    int consumer_device,
-    cudaStream_t consumer_stream,
-    cudaEvent_t completion, bool device_already_selected)
-{
-    if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
-    {
-        return set_error("invalid matrix_track_limb_consumer arguments");
-    }
-    auto *state = matrix_limb_state(
-        const_cast<GpuMatrix *>(src),
-        limb_id,
-        "invalid limb index in matrix_track_limb_consumer");
-    if (!state)
-    {
-        return 1;
-    }
-    if (state->device != consumer_device)
-    {
-        return set_error("device mismatch in matrix_track_limb_consumer");
-    }
-    if (!state->stream)
-    {
-        return set_error("null producer stream in matrix_track_limb_consumer");
-    }
-    cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(consumer_device);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-
-    // A shared-stream matrix may still alias its partition's initial event.
-    // Acquire this limb's owned event before recording a separate completion.
-    if (!state->write_done)
-    {
-        err = cudaEventCreateWithFlags(&state->write_done, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            // The consumer kernel is already queued. Its old completion alias
-            // cannot protect source cleanup when lazy event allocation fails.
-            cudaStreamSynchronize(consumer_stream);
-            return set_error(err);
-        }
-    }
-
-    const cudaStream_t producer_stream = state->stream;
-
-    // Fast path: consumer already runs on the producer stream.
-    if (producer_stream == consumer_stream)
-    {
-        err = cudaEventRecord(state->write_done, consumer_stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        state->completion_owner = limb_id.y;
-        state->last_write_stream = consumer_stream;
-        state->write_done_valid = true;
-        return 0;
-    }
-
-    cudaEvent_t consumer_done = completion;
-    if (!consumer_done)
-    {
-        const int status = matrix_get_thread_local_consumer_event(consumer_device, &consumer_done);
-        if (status != 0)
-        {
-            return status;
-        }
-        err = cudaEventRecord(consumer_done, consumer_stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-    }
-    err = cudaStreamWaitEvent(producer_stream, consumer_done, 0);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-
-    // Fold consumer completion into write_done so later waits/free use one event.
-    err = cudaEventRecord(state->write_done, producer_stream);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    state->completion_owner = limb_id.y;
-    state->last_write_stream = producer_stream;
-    state->write_done_valid = true;
-    return 0;
-}
-
-int matrix_track_limb_consumer_readonly(
-    const GpuMatrix *src,
-    const dim3 &limb_id,
-    int consumer_device,
-    cudaStream_t consumer_stream,
-    cudaEvent_t completion, bool device_already_selected)
-{
-    if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
-    {
-        return set_error("invalid matrix_track_limb_consumer_readonly arguments");
-    }
-    const auto *state = matrix_limb_state_const(
-        src,
-        limb_id,
-        "invalid limb index in matrix_track_limb_consumer_readonly");
-    if (!state)
-    {
-        return 1;
-    }
-    if (state->device != consumer_device || !state->stream)
-    {
-        return set_error("invalid source placement in matrix_track_limb_consumer_readonly");
-    }
-    cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(consumer_device);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    const cudaStream_t producer_stream = state->stream;
-    const cudaStream_t release_base =
-        limb_id.x < src->ctx->execution->release_streams_by_partition.size() &&
-                src->ctx->execution->release_streams_by_partition[limb_id.x]
-            ? src->ctx->execution->release_streams_by_partition[limb_id.x]
-            : state->stream;
-    const cudaStream_t release_stream = release_base;
-    cudaEvent_t consumer_done = completion;
-    if (!consumer_done)
-    {
-        err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
-        if (err == cudaSuccess) err = cudaEventRecord(consumer_done, consumer_stream);
-    }
-    if (err == cudaSuccess)
-    {
-        if (release_stream != consumer_stream)
-        {
-            err = cudaStreamWaitEvent(release_stream, consumer_done, 0);
-        }
-    }
-    if (err == cudaSuccess && producer_stream != consumer_stream &&
-        producer_stream != release_stream)
-    {
-        // Writes reuse the allocation on its producer stream. Join the read
-        // there as well as on release, but leave write_done untouched: other
-        // read-only consumers still wait only for the original input writer.
-        err = cudaStreamWaitEvent(producer_stream, consumer_done, 0);
-    }
-    const cudaError_t destroy_err = !completion && consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
-    if (err == cudaSuccess)
-    {
-        err = destroy_err;
-    }
-    if (err != cudaSuccess)
-    {
-        // The caller may release the source immediately after an error.  A
-        // synchronous error-path fence keeps that release safe without
-        // changing the producer's write_done event.
-        cudaStreamSynchronize(consumer_stream);
-        return set_error(err);
-    }
-    return 0;
-}
-
 int matrix_record_limb_write(
     GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream, bool device_already_selected)
 {
@@ -583,59 +353,6 @@ int matrix_wait_all_limb_streams(
     return 0;
 }
 
-int matrix_track_all_limb_consumers(
-    const GpuMatrix *src, int consumer_device, cudaStream_t consumer_stream,
-    cudaEvent_t completion, bool device_already_selected, bool read_only)
-{
-    if (!matrix_has_active_limb_states(src) || consumer_device < 0 || !consumer_stream)
-        return set_error("invalid matrix_track_all_limb_consumers arguments");
-    const auto &ids = src->ctx->limb_gpu_ids;
-    if (read_only)
-    {
-        // Const readers join allocation release without rewriting producer
-        // events or serializing independent consumer streams. Each partition
-        // owns one release stream; distinct producer streams must also join.
-        unsigned int partitions[GPU_RUNTIME_MAX_LIMBS];
-        cudaStream_t streams[GPU_RUNTIME_MAX_LIMBS];
-        size_t partition_count = 0;
-        for (int limb = 0; limb <= src->level; ++limb)
-        {
-            const auto id = ids[static_cast<size_t>(limb)];
-            const auto *state = matrix_limb_state_const(src, id, "missing read-only limb state");
-            if (!state) return 1;
-            const cudaStream_t producer_stream = state->stream;
-            bool seen = false;
-            for (size_t index = 0; index < partition_count; ++index)
-                if (partitions[index] == id.x && streams[index] == producer_stream) seen = true;
-            if (seen) continue;
-            const int status = matrix_track_limb_consumer_readonly(
-                src, id, consumer_device, consumer_stream, completion, device_already_selected);
-            if (status != 0) return status;
-            streams[partition_count] = producer_stream;
-            partitions[partition_count++] = id.x;
-        }
-        return 0;
-    }
-    if (!matrix_has_uniform_limb_producer(src))
-    {
-        for (int limb = 0; limb <= src->level; ++limb)
-        {
-            const int status = matrix_track_limb_consumer(
-                src, ids[static_cast<size_t>(limb)], consumer_device, consumer_stream,
-                completion, device_already_selected);
-            if (status != 0) return status;
-        }
-        return 0;
-    }
-    // The ordinary helper retains the producer-stream bridge when needed.
-    // Its recorded event dominates this consumer's work across all limbs.
-    const int status = matrix_track_limb_consumer(
-        src, ids[0], consumer_device, consumer_stream, completion, device_already_selected);
-    if (status != 0) return status;
-    matrix_alias_active_completions(const_cast<GpuMatrix *>(src));
-    return 0;
-}
-
 int matrix_record_all_limb_writes(
     GpuMatrix *dst, cudaStream_t stream, bool device_already_selected)
 {
@@ -659,124 +376,6 @@ int matrix_record_all_limb_writes(
     return 0;
 }
 
-bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr)
-{
-    if (!out_ptr)
-    {
-        return false;
-    }
-    *out_ptr = nullptr;
-    if (!mat || limb_id.x >= mat->shared_aux_buffers.size() ||
-        limb_id.x >= mat->shared_limb_buffers.size())
-    {
-        return false;
-    }
-
-    const auto &aux_buffer = mat->shared_aux_buffers[limb_id.x];
-    const auto &limb_buffer = mat->shared_limb_buffers[limb_id.x];
-    if (!aux_buffer.ptr || limb_buffer.limb_count == 0 || limb_id.y >= limb_buffer.limb_count)
-    {
-        return false;
-    }
-
-    size_t total_bytes = 0;
-    if (aux_buffer.slots_total > static_cast<size_t>(-1) / sizeof(void *))
-    {
-        return false;
-    }
-    total_bytes = aux_buffer.slots_total * sizeof(void *);
-    if (total_bytes == 0)
-    {
-        return false;
-    }
-
-    const size_t limbs = limb_buffer.limb_count;
-    const size_t alignment = alignof(void *);
-    size_t bytes_per_limb = total_bytes / limbs;
-    bytes_per_limb -= bytes_per_limb % alignment;
-    if (bytes_per_limb == 0 || bytes > bytes_per_limb)
-    {
-        return false;
-    }
-
-    const size_t limb_offset = static_cast<size_t>(limb_id.y) * bytes_per_limb;
-    if (limb_offset > total_bytes || total_bytes - limb_offset < bytes)
-    {
-        return false;
-    }
-
-    auto *base = reinterpret_cast<uint8_t *>(aux_buffer.ptr);
-    *out_ptr = static_cast<void *>(base + limb_offset);
-    return true;
-}
-
-size_t matrix_align_up_size(size_t value, size_t alignment)
-{
-    if (alignment == 0)
-    {
-        return value;
-    }
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
-int matrix_acquire_aux_workspace(
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id,
-    size_t bytes,
-    void **out_ptr,
-    bool *out_shared,
-    cudaStream_t stream)
-{
-    if (!out_ptr || !out_shared)
-    {
-        return set_error("invalid matrix_acquire_aux_workspace arguments");
-    }
-    *out_ptr = nullptr;
-    *out_shared = false;
-    if (bytes == 0)
-    {
-        return 0;
-    }
-    if (aux_owner && aux_limb_id)
-    {
-        if (matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
-        {
-            *out_shared = true;
-            return 0;
-        }
-        return set_error("preallocated matrix auxiliary workspace is insufficient");
-    }
-    if (!stream)
-    {
-        return set_error("null stream in matrix_acquire_aux_workspace");
-    }
-    cudaError_t err = cudaMallocAsync(out_ptr, bytes, stream);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    return 0;
-}
-
-int matrix_release_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream)
-{
-    if (!ptr || from_shared)
-    {
-        return 0;
-    }
-    if (!stream)
-    {
-        return set_error("null stream in matrix_release_aux_workspace");
-    }
-    cudaError_t err = cudaFreeAsync(ptr, stream);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    return 0;
-}
-
-
 uint32_t bit_width_u64(uint64_t v)
 {
     if (v == 0)
@@ -791,79 +390,10 @@ __host__ __device__ __forceinline__ size_t matrix_index(size_t row, size_t col, 
     return row * cols + col;
 }
 
-__device__ __forceinline__ uint32_t mul_mod_u32(uint32_t a, uint32_t b, uint32_t mod)
-{
-    uint64_t prod = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
-    return static_cast<uint32_t>(prod % mod);
-}
-
 __device__ __forceinline__ uint64_t mul_mod_u64(uint64_t a, uint64_t b, uint64_t mod)
 {
     unsigned __int128 prod = static_cast<unsigned __int128>(a) * static_cast<unsigned __int128>(b);
     return static_cast<uint64_t>(prod % mod);
-}
-
-// Returns floor(2^64 / modulus), which fits in uint64_t for modulus > 1. This
-// reciprocal is used only by the narrow-matrix multiplication fast path. Keep
-// the general 64-bit modular multiplication above for CRT moduli wider than 32
-// bits and for callers that do not guarantee canonical inputs.
-bool matrix_barrett_u32_reciprocal(uint64_t modulus, uint64_t *out_reciprocal)
-{
-    if (!out_reciprocal || modulus <= 1 || modulus > UINT32_MAX)
-    {
-        return false;
-    }
-    const unsigned __int128 two_to_64 = static_cast<unsigned __int128>(1) << 64U;
-    *out_reciprocal = static_cast<uint64_t>(two_to_64 / modulus);
-    return true;
-}
-
-bool matrix_lazy_dot_u64(size_t inner, uint64_t modulus)
-{
-    if (modulus <= 1 || modulus > UINT32_MAX)
-    {
-        return false;
-    }
-    const unsigned __int128 maximum = static_cast<unsigned __int128>(modulus - 1) *
-                                      static_cast<unsigned __int128>(modulus - 1) *
-                                      static_cast<unsigned __int128>(inner);
-    return maximum <= UINT64_MAX;
-}
-
-__device__ __forceinline__ uint64_t reduce_barrett_u32(
-    uint64_t value,
-    uint64_t modulus,
-    uint64_t reciprocal)
-{
-    const uint64_t quotient = __umul64hi(value, reciprocal);
-    const uint64_t remainder = value - quotient * modulus;
-    return remainder >= modulus ? remainder - modulus : remainder;
-}
-
-// Preconditions: 1 < modulus <= UINT32_MAX, a < modulus, b < modulus, and
-// reciprocal = floor(2^64 / modulus). Then product = a*b fits in uint64_t.
-// The reciprocal quotient underestimates floor(product/modulus) by at most one,
-// so a single conditional subtraction produces the canonical residue.
-__device__ __forceinline__ uint64_t mul_mod_barrett_u32(
-    uint64_t a,
-    uint64_t b,
-    uint64_t modulus,
-    uint64_t reciprocal)
-{
-    const uint64_t product = a * b;
-    const uint64_t quotient = __umul64hi(product, reciprocal);
-    const uint64_t remainder = product - quotient * modulus;
-    return remainder >= modulus ? remainder - modulus : remainder;
-}
-
-__device__ __forceinline__ uint32_t add_mod_u32(uint32_t a, uint32_t b, uint32_t mod)
-{
-    uint64_t sum = static_cast<uint64_t>(a) + static_cast<uint64_t>(b);
-    if (sum >= mod)
-    {
-        sum -= mod;
-    }
-    return static_cast<uint32_t>(sum);
 }
 
 __device__ __forceinline__ uint64_t add_mod_u64(uint64_t a, uint64_t b, uint64_t mod)
@@ -876,25 +406,3 @@ __device__ __forceinline__ uint64_t add_mod_u64(uint64_t a, uint64_t b, uint64_t
     return static_cast<uint64_t>(sum);
 }
 
-// Let k=floor(value*floor(2^128/q)/2^128). Its error relative to
-// floor(value/q) is at most one, so 0 <= value-k*q < 2*q < 2^64.
-// Only the low word of k is needed to recover this residual exactly.
-__device__ __forceinline__ uint64_t matrix_reduce_barrett_u128(
-    unsigned __int128 value, uint64_t modulus, uint64_t reciprocal_lo, uint64_t reciprocal_hi)
-{
-    if (modulus <= 1 || modulus >= (uint64_t{1} << 63))
-        return static_cast<uint64_t>(value % modulus);
-    const uint64_t lo = static_cast<uint64_t>(value);
-    const uint64_t hi = static_cast<uint64_t>(value >> 64);
-    const uint64_t low_product_high = __umul64hi(lo, reciprocal_lo);
-    const uint64_t cross_a = lo * reciprocal_hi;
-    const uint64_t cross_b = hi * reciprocal_lo;
-    const uint64_t middle_a = cross_a + low_product_high;
-    const uint64_t carry_a = middle_a < cross_a;
-    const uint64_t middle_b = middle_a + cross_b;
-    const uint64_t carry_b = middle_b < middle_a;
-    const uint64_t quotient_low = hi * reciprocal_hi +
-        __umul64hi(lo, reciprocal_hi) + __umul64hi(hi, reciprocal_lo) + carry_a + carry_b;
-    const uint64_t residual = lo - quotient_low * modulus;
-    return residual >= modulus ? residual - modulus : residual;
-}

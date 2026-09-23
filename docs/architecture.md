@@ -1,111 +1,1082 @@
-# Workspace architecture
+# mxx architecture
 
-This repository is a virtual Cargo workspace with no root facade crate. Consumers depend directly
-on the crate that owns an abstraction.
+This document is the design entry point for the `mxx` workspace. It is meant to be read top-down:
+the first sections give the mental model and the crate boundaries, and later sections go into each
+layer in the order data flows through it. Every type and path named here exists in the current
+source tree; paths are relative to the repository root. When the code and this document disagree,
+the code is authoritative and this document should be corrected.
 
-## Dependency layers
+Contents:
+
+1. [What mxx is and the mental model](#1-what-mxx-is-and-the-mental-model)
+2. [Workspace crate map and dependency direction](#2-workspace-crate-map-and-dependency-direction)
+3. [`mxx-ir-core`: the executable graph IR](#3-mxx-ir-core-the-executable-graph-ir)
+4. [`mxx-dsl`: building graphs](#4-mxx-dsl-building-graphs)
+5. [`mxx-backends`: values, primitives, and CPU execution](#5-mxx-backends-values-primitives-and-cpu-execution)
+6. [`mxx-backends`: the GPU runtime](#6-mxx-backends-the-gpu-runtime)
+7. [Application crates](#7-application-crates)
+8. [Testing, validation, and where to look next](#8-testing-validation-and-where-to-look-next)
+
+## 1. What mxx is and the mental model
+
+`mxx` is a Rust and CUDA workspace for lattice-cryptography research. It provides polynomial and
+matrix arithmetic over RNS (CRT) rings `Z_q[X]/(X^N + 1)`, bounded samplers (uniform, Gaussian,
+hash-derived, lattice trapdoors and preimages), and constructions built from them: BGG+ encodings,
+circuit gadgets, leveled BGV and Ring-GSW, and Diamond witness encryption.
+
+Cryptographic algorithms are not written as eager function calls. They are written once as a
+typed dataflow graph and then interpreted by several consumers. The life of a computation is:
 
 ```text
-mxx-backends             -> mxx-ir-core
-mxx-dsl                  -> mxx-ir-core
-mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-backends
-mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-backends
-mxx-fhe                  -> mxx-dsl, mxx-ir-core, mxx-backends
-mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-backends
-mxx-func-enc/io          -> interface-only crates with no dependencies
+ Rust construction code (mxx-dsl: DslContext, Ring, Mat, Int, Family, parallel/iterate/select)
+        |  builds immutable node handles
+        v
+ Graph (mxx-ir-core)      Graph::freeze keeps reachable nodes, one scope per body
+        |  validate(graph, ParamEnv, CRT-basis resolver) [+ artifact manifests]
+        v
+ ValidatedGraph           concrete wire types, rings, execution order, liveness
+        |
+        +--> CPU executor:  mxx_backends::execute(..., &mut CpuDcrtBackend, ...)
+        |
+        +--> GPU runtime:   GpuRuntime::plan(validated, inputs) -> GpuExecutionPlan
+        |                   GpuRuntime::execute(&mut plan, inputs, store, nonce)
+        |
+        +--> Lean exporter: mxx_ir_core::lean (execution relations, linked correctness claims)
+        v
+ Outputs, artifacts, sessions (ArtifactStore / SessionStore, ProductionId, Manifest)
 ```
 
-Application crates never depend on one another. Diamond WE is active in `mxx-we`; functional
-encryption and iO protocol implementations have been removed during the DSL migration.
+Key ideas that recur throughout the code:
 
-## Responsibilities
+- **Construction is not execution.** DSL expressions such as `&a + &b` create graph nodes. No
+  matrix arithmetic or sampling happens until a backend executes the validated graph.
+  `crates/fhe/src/lib.rs` states this explicitly for FHE: its methods build graphs, and key
+  generation, sampling, arithmetic, and decryption run in `mxx-backends`.
+- **Compile parameters versus runtime values.** Shapes, loop counts, moduli, and sampler
+  parameters are compile expressions (`IntExpr`, `RealExpr`) resolved by a `ParamEnv` during
+  validation. Runtime `Int`/`Bool` values can select family members or candidates but never
+  change a shape or a loop count.
+- **Structure is kept, not unrolled.** Subgraph bodies and loop bodies are stored once in the
+  frozen graph and validated once. Executors instantiate them per call or per loop index;
+  runtime identities carry an instantiation path (`InstantiationFrame` in
+  `crates/ir-core/src/types.rs`).
+- **Sampler placement is semantics.** A sampler outside a loop is shared by every instance; a
+  sampler inside a loop body produces a fresh value per executed instance. Sampler nodes carry
+  their authoritative integer coefficient cutoffs.
+- **Artifacts link stages.** A graph can export outputs as persisted artifacts, identified by a
+  `ProductionId` (graph specification hash plus execution nonce). Another graph imports them by
+  that identity. Protocol declarations in `mxx_ir_core::protocol` link stages, ideal
+  specifications, and requirements for correctness checking.
+- **One GPU path.** All GPU computation goes through `GpuRuntime`, which lowers a validated graph
+  to explicit CUDA Graph regions. There is no separate eager GPU matrix, polynomial, or sampler
+  API.
 
-### `mxx-backends`
+## 2. Workspace crate map and dependency direction
 
-Owns polynomial and matrix representations, OpenFHE integration, concrete sampling, native CUDA,
-and CPU/GPU graph execution. It also owns runtime values, transcripts, sessions, and artifacts.
-CPU Gaussian sampling resamples individual coefficients outside the authoritative integer
-cutoff. CPU preimage sampling rejects a whole candidate outside its cutoff so `B * K = P` is
-preserved. GPU Gaussian sampling enforces the same cutoff per coefficient in CUDA. Batched GPU
-preimage sampling rejects a whole GPU-generated candidate after full-CRT centered-norm checking,
-preserving both the preimage equation and the authoritative cutoff.
+The repository is a virtual Cargo workspace (`Cargo.toml`) with no root facade crate; `Cargo.toml`
+is the authoritative member list. Consumers depend directly on the crate that owns an
+abstraction.
 
-### `mxx-ir-core`
+| Crate (path) | Package | Responsibility |
+| --- | --- | --- |
+| `crates/ir-core` | `mxx-ir-core` | Executable typed graph IR, compile expressions, rings, validation, canonical hashing, artifact manifests, protocol declarations, Lean export. |
+| `crates/dsl` | `mxx-dsl` | Typed, declarative Rust DSL that builds `mxx-ir-core` graphs. |
+| `crates/backends` | `mxx-backends` | Polynomial/matrix primitives (OpenFHE via cxx), samplers, runtime values, CPU executor, GPU runtime and native CUDA, artifacts, sessions, transcripts. |
+| `crates/gadgets` | `mxx-gadgets` | Reusable, BGG-independent circuits and circuit gadgets (nested RNS arithmetic, NTT, FHE gadgets, noise refresh, input injector). |
+| `crates/bgg` | `mxx-bgg` | BGG+ public keys, encodings, circuit lowering, lookups, slot transfer, Tall encodings, WEE25 commitments. |
+| `crates/fhe` | `mxx-fhe` | Ring Regev/Ring-GSW and leveled BGV graph builders. |
+| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. |
+| `crates/func-enc` | `mxx-func-enc` | Functional-encryption interface trait only (`FuncEnc`). |
+| `crates/io` | `mxx-io` | Indistinguishability-obfuscation interface trait only (`Obfuscation`). |
 
-Owns the canonical executable graph, compile expressions, artifact metadata, parameter/type/shape
-validation, execution ordering, and liveness. `derive_param_constraints` is the shared source of
-decidable compile-parameter conditions consumed by concrete validation. Sampler
-nodes serialize required integer coefficient cutoffs. Subgraph and parallel-loop bodies are
-structural and stored once.
+### Crate boundaries and dependency direction
 
-`protocol` owns protocol declarations, input contracts, frozen graph annotations, sampler-free
-ideal/predicate specifications, and structural validation of linked workflows. These are core
-graph data and checks, independent of the DSL used to construct a graph. There is no separate
-correctness crate and no generic symbolic noise simulator.
+Normal (non-dev) dependencies, taken from each `crates/*/Cargo.toml`:
 
-The Lean exporter owns primitive execution-relation generation and application-independent linked
-claim assembly. It receives explicit graph connections and endpoint semantics, not a WE protocol
-implementation, and does not infer noise bounds or expand structural families into individual lanes.
-`lean::protocol` converts a protocol declaration into exported roots and a linked claim;
-`lean::claim` renders the final proposition. Applications supply backend bindings and decoder
-semantics, while their mathematical bounds and proofs remain application-owned.
+```text
+mxx-ir-core   -> (no workspace crates)
+mxx-dsl       -> mxx-ir-core
+mxx-backends  -> mxx-ir-core                      (dev: mxx-dsl)
+mxx-gadgets   -> mxx-dsl, mxx-ir-core, mxx-backends   (dev: mxx-bgg)
+mxx-bgg       -> mxx-ir-core, mxx-dsl, mxx-gadgets, mxx-backends
+mxx-fhe       -> mxx-dsl, mxx-ir-core, mxx-backends
+mxx-we        -> mxx-backends, mxx-gadgets, mxx-bgg, mxx-dsl, mxx-ir-core
+mxx-func-enc  -> (no dependencies)
+mxx-io        -> (no dependencies)
+```
 
-### `mxx-dsl`
+Rules that follow from this layout:
 
-Creates immutable core nodes immediately. It has no symbolic reinterpretation layer.
-The constructed graphs feed core-owned `IdealSpec` and `PurePredicateSpec` validation.
-Indexed `Family<T>` values preserve composite element schemas. `parallel` and `iterate` create
-structural loops; lexical reads become explicit core dependencies with inferred member indexing.
+- `mxx-ir-core` is the bottom layer. It knows nothing about the DSL or any backend; the CRT basis
+  resolver it needs is passed in as a function pointer (`ResolveCrtBasis`).
+- `mxx-dsl` and `mxx-backends` are siblings over `mxx-ir-core`. The backend executes core graphs
+  and does not depend on the DSL (it uses the DSL only in tests).
+- Application crates (`mxx-fhe`, `mxx-we`, `mxx-func-enc`, `mxx-io`) never depend on one another.
+  Shared application code moves down to the lowest natural layer.
+- Reusable gadgets live in `crates/gadgets/`; circuit gadgets live in
+  `crates/gadgets/src/circuit_gadgets/`. `mxx-bgg` is the BGG+-specific layer above gadgets,
+  and `mxx-we` builds on it.
+- The `gpu` feature is owned by `mxx-backends` (`crates/backends/Cargo.toml`). `mxx-gadgets`,
+  `mxx-fhe`, and `mxx-we` forward their `gpu` feature to it (`mxx-we` also forwards to
+  `mxx-gadgets`). The `gpu` features of `mxx-func-enc` and `mxx-io` are empty.
+- Native CUDA sources, GPU wrappers, and the GPU runtime are owned by `mxx-backends` under
+  `crates/backends/cuda/` and `crates/backends/src/`; higher crates use its public API.
 
-### `mxx-gadgets` and `mxx-bgg`
+Diamond iO and AKY24 iO, and the AKY24 functional-encryption implementation, were removed from
+this branch during the DSL migration; `README.md` links the `main`-branch implementations.
 
-`mxx-gadgets` owns BGG-independent circuits and reusable circuit gadgets.
-`mxx-bgg` owns BGG+-specific keys, encodings, sampling, evaluation, lookup, decoding, artifacts,
-slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
+## 3. `mxx-ir-core`: the executable graph IR
 
-### Application crates
+`crates/ir-core/src/lib.rs` describes the crate as owning "executable graph structure, compile
+expressions, concrete type validation, canonical identities, and runtime artifact metadata". It
+has no dependency on any other workspace crate.
 
-`mxx-fhe` builds Ring Regev/Ring-GSW and leveled BGV graphs, including CRT modulus
-switching, hybrid RNS key switching over QP, relinearization, and rotations. BGV encrypt/decrypt exchange SIMD slots
-by default, with internal encoding and zero-padding of short inputs. Cryptographic arithmetic
-and sampling execute through validated backend graphs.
-It tracks coefficient noise bounds per ciphertext and reuses primitive ring parameters and DSL
-matrix handles. Bootstrapping is out of scope. CPU and GPU backends share the same
-FHE graphs. GPU centered basis conversion uses native unsigned CRT residues and
-stream-ordered INTT/lift/NTT operations without a host coefficient round trip.
-Hybrid RNS ModUp/ModDown use dedicated graph nodes with an explicit ordered
-source basis, checked by the runtime against registered parameters. CPU and CUDA
-primitives fuse CRT accumulation between one input INTT and one output NTT per
-digit, preserving the approximate centered-sum semantics and noise bounds.
-FHE artifacts stay in memory or enter the protocol as direct runtime inputs.
+| Module | Owns |
+| --- | --- |
+| `graph.rs` | Node/value handles, construction scopes, subgraph sealing and captures, `Graph::freeze`, frozen scopes, serialization. |
+| `node.rs` | `NodeKind` and its payload types (`ConstantMatrix`, `ParallelLoop`, `SequentialLoop`, `LoopInputMode`, `HashVariant`, ...). |
+| `types.rs` | `NodeId`, `Port`, `WireRef`, `WireId`, `MatrixType`, `WireType`, `ConcreteWireType`, `CoefficientBoundDomain`. |
+| `ring.rs` | Symbolic rings (`RingRef`/`RingExpr`), concrete rings (`ConcreteRing`), CRT basis resolution. |
+| `expr.rs` | `IntExpr`, `RealExpr`, `Rational`, `ParamEnv`, `ExprError`, `IndexExpr`. |
+| `validate.rs`, `checks.rs`, `constraints.rs` | Structural and concrete validation, `ValidatedGraph`, liveness, parameter constraints. |
+| `encoding.rs` | Canonical JSON, SHA-256 hashing, `spec_hash`, `IR_VERSION`. |
+| `artifact.rs` | `SpecHash`, `ProductionId`, `Manifest`, `ManifestArtifact`, `ArtifactType`, `ArtifactAvailability`. |
+| `protocol/` | Protocol declarations linking stages (`declaration.rs`), closed protocol bundles (`bundle.rs`), pure specifications (`spec.rs`). |
+| `lean/` | Lean export of execution relations (`mod.rs`) and linked correctness claims (`claim.rs`, `protocol.rs`). |
+| `inventory.rs` | Structural snapshot (`GraphInventory`) for checkers, without evaluation. |
 
-`mxx-we` owns the implementation-independent witness-encryption declaration/runtime traits and the
-Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and
-previous-layer indices as public runtime families. Encryption and decryption consume the same
-circuit assignment; witness bits are decryption-only inputs. Parameter search uses deterministic
-worst-case bounds and accepts a candidate only after Lean checks the generated theorem for the
-same frozen workflow, backend layout, and concrete parameter environment. The selected candidate
-retains its checked artifact; numerical rejection and checker failures remain distinct.
+### 3.1 Handles, scopes, and freezing
 
-`mxx-func-enc` and `mxx-io` expose only their common interface traits. The disabled AKY24 FE,
-AKY24 iO, and Diamond iO modules and their exclusive BGG helpers have been removed. See the
-README for the `main` branch containing the latest iO implementations. Reusable implementations
-in `mxx-gadgets` remain available.
+Graph construction uses immutable, reference-counted handles (`crates/ir-core/src/graph.rs`):
 
-Tall's old-simulator-dependent parameter search and noisy verification modes are explicitly
-unavailable pending a Tall-specific correctness implementation. The independent noiseless runtime
-round-trip remains available; it is not a substitute for a proved noisy bound.
+- `NodeHandle` wraps a node: its `NodeKind`, argument `ValueHandle`s, output `WireType`s, source
+  location, construction scope, and optionally a structural child (a subgraph or loop body).
+  Equality is by identity, so cloning a handle shares the node rather than duplicating it.
+- `ValueHandle` is a `(node, port)` pair. Constructors are `NodeHandle::new`,
+  `NodeHandle::subgraph_call`, `NodeHandle::parallel_loop`, and `NodeHandle::sequential_loop`.
+- Construction scopes (`ConstructionScopeId`, `with_new_construction_scope`,
+  `current_construction_scope`) are a thread-local lexical stack. A body may read values from
+  ancestor scopes but never from a completed sibling or child scope.
+- `SubgraphHandle::seal(..., CapturePolicy)` turns a body into a sealed definition. With
+  `CapturePolicy::Lexical`, every outer value the body reads becomes a `__capture_N` input
+  placeholder (`CapturedValue { outer, placeholder, mode }`). The capture mode is a
+  `LoopInputMode`: `Broadcast` by default; a `FamilyGetDynamic` read indexed by the parallel
+  binder (optionally plus a nonnegative constant) becomes `Zip` or `ZipOffset { offset }`, so the
+  loop receives one member per instance instead of the whole family.
 
-## Generated Lean artifacts
+`Graph::freeze(name, parameters, outputs, retained_roots, effect_roots, real_constants)` produces
+the immutable `Graph` and a `FreezeMap`:
 
-Each crate keeps its handwritten Lean modules directly under `lean/`, without a nested package-name
-directory. Shared modules have crate-qualified filenames such as `PrimitivesBounds.lean` and
-`RuntimeMatrixOps.lean`, avoiding collisions when several packages share one Lean search path.
-Lake libraries list their module roots explicitly. The `MxxPrimitives.lean`, `MxxRuntime.lean`,
-`MxxIR.lean`, `MxxGadgets.lean`, and `MxxBgg.lean` entry modules collect reusable imports; mathematical
-namespaces and theorem names are independent of this file layout.
+- Only nodes reachable from outputs, retained roots, and effect roots are kept; a node shared by
+  several handles is frozen once. `NodeId`s are postorder indices within a scope.
+- Scopes are keyed by `FrozenGraphScopeId`: `Root`, `Subgraph { canonical_name }`,
+  `ParallelBody { parent, owner }`, and `SequentialBody { parent, owner }`. A named subgraph has
+  exactly one scope regardless of how many call sites it has, and each loop body is one scope
+  owned by its loop node; bodies are never unrolled.
+- Freezing rejects cycles, foreign-scope edges, invalid ports, duplicate input names, and two
+  different subgraph definitions with the same name (`FreezeError`).
+- `FreezeMap::resolve_unique` maps a construction handle to its frozen `ScopedWireRef`, rejecting
+  handles reachable along more than one structural path.
+- Outputs are `GraphOutput { value, availability: Option<ArtifactAvailability> }` during
+  construction and `OutputRoot { value: WireRef, availability }` after freezing.
 
-Diamond parameter search generates and checks Lean artifacts through the production library API;
-the GPU integration test uses that same search. No separate example executable is required.
-Crates do not contain example targets: reusable extraction fixtures live in ordinary unit-test
-modules, and generated files belong under ignored `test_data` or temporary artifact directories.
+A `Graph` serializes to JSON with a ring table (`{"ring_table": [...], "graph": ...}`); rings
+are interned and referenced as `{"$ring": i}`. Source locations, construction scopes, and
+benchmark roles are not serialized. Deserialization checks that node ids are contiguous, edges
+point backward, and ports exist; this is a structural consistency check, not an authentication
+of provenance.
+
+### 3.2 Node kinds
+
+`NodeKind` (`crates/ir-core/src/node.rs`) is the complete executable vocabulary:
+
+| Category | Variants |
+| --- | --- |
+| Inputs and constants | `Input { name, wire_type, artifact }`, `ConstantInt`, `EvaluateInt(IntExpr)`, `ConstantReal`, `ConstantBool`, `ConstantMatrix { matrix_type, value }` |
+| Trapdoor structure | `GadgetTrapdoor { matrix_type, base }`, `TrapdoorPublic` |
+| Scalar arithmetic | `IntBinary(Add/Subtract/Multiply/Divide/Remainder)`, `IntCompare(Equal/Less/LessEqual)`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt` |
+| Matrix arithmetic | `MatrixBinary(Add/Subtract/Multiply)`, `MatrixMulAccumulate { coefficients, has_bias }`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism { index }` |
+| Ring and modulus conversion | `ModulusSwitch`, `ModulusReduce`, `CenteredRebase` (each with a destination `RingRef`), `CenteredRoundDivide { divisor }`, `RnsModUp { destination, digit_size, normalize }`, `RnsModDown { destination, plaintext_modulus }`, `BlockModSwitch { destination, plaintext_modulus }` |
+| Shape | `Transpose`, `Slice { rows, columns }`, `Tensor`, `Concat { axis: Rows/Columns/Diagonal }` |
+| Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample { sigma, max_coefficient_bound }`, `HashSample { variant: Plain/Decomposed/SmallDecomposed, tag_prefix, tag_components, base, digit_count }`, `TrapdoorSample`, `PreimageSample { max_coefficient_bound }` |
+| Decomposition and coefficients | `GadgetDecompose { base, small, digit_count }`, `ExtractCoefficient`, `LiftIntegerToConstantPolynomial`, `PackPolynomialCoefficients`, `PolynomialFromValues { evaluation }`, `PolynomialValues { evaluation }` |
+| Decoding and CRT | `ThresholdDecode { plaintext_modulus, length, output_bool }`, `CrtRecompose` |
+| Control | `SubgraphCall`, `ParallelLoop`, `SequentialLoop`, `Select { count }` |
+| Families | `FamilyPack { count }`, `FamilyGetStatic { index }`, `FamilyGetDynamic` |
+
+`ConstantMatrix` covers `Zero`, `Identity`, `UnitRow`, `UnitColumn`, `Gadget { base, small }`,
+`PowerOfBase`, `Rotation`, and `Polynomial`. Hash-tag components are typed
+(`HashTagComponent::{Bytes, Integer, Decimal, U64Le, Operand}`) so different framings cannot
+collide.
+
+The ring-conversion nodes are fused CRT operations with explicit destination rings. They are
+not a generic, implicit modulus-changing mechanism: nested-RNS level switching, for example,
+remains a circuit gadget in `mxx-gadgets`.
+
+Control nodes carry their own metadata:
+
+- `ParallelLoop { count, minimum_count, index_slot, bindings, input_modes }`: independent
+  instances over `0..count`; each argument has a `LoopInputMode` (`Broadcast`, `Zip`,
+  `ZipOffset { offset }`). Outputs are indexed families.
+- `SequentialLoop { count, index_slot, bindings, carried_count }`: the first `carried_count`
+  arguments are the carried state; the rest are captures.
+- `SubgraphCall { definition, bindings, canonical_input_exclusive_uppers }`: calls a named body,
+  optionally with per-argument canonical-coefficient upper bounds for matrix arguments.
+- `Select { count }`: eager selection of one candidate by a runtime selector. Both candidates are
+  part of the graph; selection is not lazy branching.
+
+### 3.3 Wire types, rings, and CRT bases
+
+`WireType` (`crates/ir-core/src/types.rs`) has `ConstantInt`, `ConstantReal`, `ConstantBool`,
+`Int`, `Real`, `Bool`, `Bytes { length }`, `TypedBlob { type_name, schema_hash }`,
+`Matrix(MatrixType)`, `Trapdoor { matrix, sigma, gadget_base, digit_count,
+preimage_max_coefficient_bound }`, `SmallMatrix { matrix, max_coefficient_bound, bound_domain }`,
+`Preimage { .. }` (same fields, distinct semantics), and `IndexedFamily { element, count }`.
+`ConcreteWireType` mirrors it with resolved sizes. `MatrixType { ring, rows, columns }` refers to
+a ring, not a single modulus. `CoefficientBoundDomain` says whether a bounded coefficient is a
+single `Global` integer or a signed residue per CRT limb (`PerCrtLimb`).
+
+Rings are ordered CRT bases (`crates/ir-core/src/ring.rs`):
+
+- `RingRef` wraps a `RingExpr`: `Generated { crt_bits, crt_depth, ring_dimension }`,
+  `Explicit { crt_moduli, ring_dimension }`, `Slice { source, start, end }`,
+  `Select { source, indices }`, or `Concat { left, right }`. Basis order is significant.
+- Validation resolves each ring to a `ConcreteRing` (ordered `u64` primes plus dimension).
+  `ConcreteRing` requires a power-of-two dimension, a nonempty basis, and distinct primes
+  `2 < q < 2^60` with `q = 1 mod 2N`.
+- The actual prime generation or checking is delegated to a `ResolveCrtBasis` callback,
+  `fn(ring_dimension, crt_depth, crt_bits, explicit_moduli) -> Result<Vec<u64>, String>`.
+  Production callers pass `mxx_backends::openfhe_guard::gen_modulus_and_warmup`. For an explicit
+  basis the resolver must return it unchanged and in the same order.
+
+### 3.4 Compile expressions and parameters
+
+`IntExpr` (`crates/ir-core/src/expr.rs`) has `Const`, `Var`, `LoopIndex`, `Add`, `Sub`, `Mul`,
+`Div` (exact: a nonzero remainder is an error), `FloorDiv`, `Rem` (floor remainder),
+`RoundDiv` (nearest, ties toward positive infinity, positive denominator), `Log2Ceil`,
+`Select { selector, branches }`, and ring properties `RingModulus`, `RingCrtDepth`,
+`RingCrtModulus { ring, index }`. Serialization always goes through a canonical polynomial normal
+form, so equivalent expressions encode identically.
+
+`RealExpr` has `Rational`, `Var`, `FromInt`, `Add`, `Sub`, `Mul`, `Div`, and `Sqrt`, evaluated as
+exact rationals where possible (`evaluate_rational`, `evaluate_f64`, `close`). `Rational` holds a
+normalized `BigInt` numerator and denominator.
+
+`ParamEnv { integers, reals, loop_indices }` binds named integer parameters (`BigInt`), real
+parameters (`Rational`), and loop-index slots (managed by executors). Compile parameters are
+declared on the graph (`CompileParameter`). `derive_param_constraints`
+(`crates/ir-core/src/constraints.rs`) collects the parameter-only conditions (`ParamConstraint`)
+that concrete validation also enforces.
+
+Runtime integer division is different from `IntExpr` division: see section 4.3.
+
+### 3.5 Validation
+
+`validate(graph, bindings, resolve_basis)` and `validate_with_manifests(graph, bindings,
+manifests, resolve_basis)` (`crates/ir-core/src/validate.rs`) produce a `ValidatedGraph`:
+
+```text
+ValidatedGraph { source: Graph, bindings: ParamEnv,
+                 scopes: BTreeMap<FrozenGraphScopeId, ValidatedScope>,
+                 warnings, resolved_rings }
+ValidatedScope { execution_order, liveness: LivenessSchedule { last_use, retained },
+                 wire_types: BTreeMap<WireRef, ConcreteWireType>, artifact_inputs }
+```
+
+The steps are: structural validation (`validate_structure`: topological order, declared compile
+variables, legal loop-index use, dynamic family access in loop-dependent reads, subgraph bound
+arity), manifest checks, parameter bindings and constraints, then per-scope concrete type
+checking of every node, ring resolution, and checks that call and loop boundaries agree with
+their child scopes. Each scope, including every loop and subgraph body, is checked once as a
+template rather than per instance. `execution_order` is the frozen postorder, and
+`LivenessSchedule::last_use` lets executors release intermediates after their last reader.
+
+Validation proves structural and type correctness under concrete parameters. It does not prove
+cryptographic norm bounds; those are application-owned.
+
+### 3.6 Hashing, artifacts, and manifests
+
+- `encoding::spec_hash(graph, bindings)` hashes canonical JSON of `{ir_version, graph, integer and
+  real bindings}` with SHA-256 (`IR_VERSION` in `crates/ir-core/src/encoding.rs`). It commits to
+  every binding, so artifacts produced under different dimensions or moduli cannot be swapped. It
+  depends on the serialized structure (node kinds, postorder ids, canonical expressions, rings,
+  graph name), not on allocation addresses, source locations, or construction order. The graph
+  caches one `(ParamEnv, SpecHash)` pair in a `OnceLock`; other bindings are recomputed.
+- `artifact::ProductionId { spec_hash, execution_nonce }` identifies one execution of one graph
+  instantiation. A `Manifest { ir_version, production_id, artifacts }` lists each exported
+  `ManifestArtifact` (artifact type, optional family count, availability, layout).
+- `ArtifactAvailability::Transferred` means the consumer receives the payload from an external
+  producer; `Cached` means the consumer could regenerate it deterministically from public context
+  and uses stored bytes as a cache. Availability is about transport, not secrecy.
+- `export_validated_manifest` builds the manifest for outputs that declare an availability.
+
+### 3.7 Protocol declarations and pure specifications
+
+`mxx_ir_core::protocol` (`crates/ir-core/src/protocol/`) links several executable graphs:
+
+- `ProtocolDecl { params, bundle: ClosedProtocolBundle }` with `ProtocolStage { id, graph,
+  bindings: Vec<ArtifactBinding> }`. Validation checks each artifact binding's name, type, and
+  availability against the producer, parameter agreement across graphs, and reachability.
+- `ClosedProtocolBundle` holds the workflow, an `IdealSpec`, requirement `PurePredicateSpec`s, a
+  comparator, endpoint bindings, operational decoder targets, input contracts
+  (`InputValueContract`), and input bindings.
+- `IdealSpec::new(Graph)` and `PurePredicateSpec::new(Graph)` (`protocol/spec.rs`) reject every
+  sampler kind in every scope; a predicate must have exactly one Boolean output.
+- `OutputRef { stage, output }` names an executable result. `OperationalDecoderKind` is
+  `ThresholdDecode { plaintext_modulus }` or `BooleanInterval`; validation checks the decoder's
+  executable node chain against the residual it names.
+
+There is no separate correctness crate and no generic symbolic noise simulator; correctness
+evidence comes from application-owned bounds and generated Lean claims.
+
+### 3.8 Lean export
+
+- `lean::export(&ValidatedGraph, &ExportOptions) -> LeanArtifact` (`crates/ir-core/src/lean/mod.rs`)
+  emits one Lean relation per frozen scope, referencing backend-owned primitive relations
+  (`PrimitiveNames`) and concrete CRT layouts (`BackendLayout`). Loops are not unrolled;
+  families remain functions on `Fin N`.
+- `lean::claim::assemble_claim` renders an application-independent linked claim
+  (`LinkedClaim`, `ClaimBackend`, `ClaimSemantics`, `Endpoint`). The Boolean-interval renderer
+  requires a scalar-polynomial residual.
+- `lean::protocol::export_claim` exports every stage, requirement, and ideal graph of a
+  `ProtocolDecl` and writes the final `Claim.lean`. It infers no noise bounds; applications
+  supply decoder semantics and proofs.
+- The handwritten Lean package `crates/ir-core/lean/` (`MxxIR`) supplies shared definitions such
+  as `IterRuns` for sequential loops; `crates/ir-core/lean/README.md` explains the fixture tests
+  that generate `test_data/lean_ir_fixtures/`.
+
+## 4. `mxx-dsl`: building graphs
+
+`mxx-dsl` (`crates/dsl/src/`) is a Rust embedded DSL. Running the Rust construction code builds
+core nodes immediately; there is no separate parser or symbolic reinterpretation layer. Ordinary
+Rust (`if`, `for`, functions, tuples, vectors) organizes construction, but it runs once at
+construction time and cannot branch on a graph `Bool`.
+
+### 4.1 A first graph
+
+```rust
+use mxx_dsl::{DslContext, Ring};
+use mxx_ir_core::ParamEnv;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Ring dimension 8 with a generated basis of two 30-bit CRT primes.
+    let ring = Ring::new(30, 2, 8);
+    let input = ring.input("input", (2, 2));
+    let doubled = &input + &input;
+    let built = DslContext::new("double").output("result", doubled)?.build()?;
+    // The CRT-basis resolver is supplied by the backend; mxx-dsl itself does not depend on it.
+    let _validated =
+        built.validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)?;
+    Ok(())
+}
+```
+
+The three stages are construction (Rust builds handles; `build()` freezes reachable outputs and
+runs structural validation), validation (`validate` resolves parameters, rings, and concrete
+types), and execution or analysis (a backend or the Lean exporter consumes the
+`ValidatedGraph`).
+
+### 4.2 Context, values, and rings
+
+- `DslContext` (`crates/dsl/src/lib.rs`): `new(name)`, `int_parameter(name)`,
+  `real_parameter(name)`, `input::<V>(name, schema)`, `evaluate_int(expr)`,
+  `int_family_input(name, count)`, `output(name, value)`, `transferred_output`, `cached_output`,
+  `transferred_trapdoor_output`, `transferred_trapdoor_family_output`, and `build()`. Output
+  methods consume and return the context. Composite outputs are flattened as `x.0`, `x.1`, ...;
+  names must be unique after flattening.
+- `BuiltGraph { graph }` has `validate(bindings, resolve_basis)` and
+  `validate_with_manifests(bindings, manifests, resolve_basis)`.
+- `Ring` wraps a `RingRef`: `Ring::new(crt_bits, crt_depth, ring_dimension)` (generated basis),
+  `Ring::from_crt_moduli(moduli, ring_dimension)` (explicit ordered basis), and `from_ref`. Basis
+  operations `slice_crt`, `prefix`, `select_crt`, and `concat_crt` build related rings;
+  `modulus()`, `crt_depth()`, and `crt_modulus(i)` return compile expressions. Applications
+  derive a DSL ring from backend parameters, for example `mxx_gadgets::ring_from_params`.
+- Ring methods declare inputs (`input`, `bool_input`, `bytes_input`, `small_matrix_input`,
+  `preimage_input`, family variants, and `*_with_domain` variants taking a
+  `CoefficientBoundDomain`), artifact inputs (`artifact_input`, `family_artifact_input`,
+  `trapdoor_artifact_input`, bounded and bytes variants), constants (`zero`, `identity`,
+  `gadget`, `constant`, `polynomial`, `pack_polynomial_coefficients`, `from_coefficients`,
+  `from_evaluations`), samplers (`uniform_residue`, `uniform_interval`, `gaussian`,
+  `hash_matrix`, `hash_decomposed`, `hash_small_decomposed`, `sample_trapdoor`), and the
+  public deterministic `gadget_trapdoor`.
+- Value handles: `Mat`, `SmallMatrix`, `Preimage`, `Trapdoor`, `Int`, `Bool`, `Bytes`, and
+  `Family<T>`. Cloning a handle shares the value; it never re-samples. Schemas (`MatType`,
+  `SmallMatrixType`, `PreimageType`, `TrapdoorType`, `IntType`, `BoolType`, `BytesType`,
+  `FamilyType`) and the `GraphValue`/`GraphValueSchema` traits (`crates/dsl/src/value.rs`) let
+  tuples, vectors, and domain records flatten into wires.
+
+### 4.3 Operations
+
+- `Mat` supports `+`, `-`, `*`, unary `-` for owned and borrowed operands; a `1 x 1` matrix
+  multiplies as a scalar, and `mat * scalar` scales by a constant polynomial. Other operations
+  include `Mat::multi_row_gemm_accumulate`, `mul_small_rhs`, `ring_automorphism`, `transpose`,
+  `slice`, `tensor`, `decompose`/`small_decompose` (returning `Preimage`), `extract_coefficient`,
+  `canonical_coefficient_bits`, `threshold_decode_ints`/`threshold_decode_bools`, `concat` (with
+  the `concat_rows!`, `concat_cols!`, `concat_diag!` macros), `crt_recompose`, `coefficients`,
+  and `evaluations`.
+- Ring conversions take a destination `&Ring`: `modulus_switch` (scale and round),
+  `reduce_modulus` (reduce into a divisor ring without scaling), `centered_rebase`,
+  `block_mod_switch`, `rns_mod_up(dest, digit_size, normalize)`, and
+  `rns_mod_down(dest, plaintext_modulus)`; `centered_round_divide(divisor)` rounds a centered
+  quotient.
+- `Trapdoor::sample_preimage(target, shape)` returns a `Preimage` whose cutoff comes from the
+  trapdoor schema. Gaussian and preimage samplers always take explicit integer cutoffs.
+- `Int` supports `+ - * / %` and `equal`, `less`, `less_equal`, `bit`, `lift_to_constant_polynomial`,
+  and `expression()` (recovering a compile expression when possible). Runtime division computes
+  `q = floor(a / |b|)` and `r = a - |b| q`, so `0 <= r < |b|`; division by zero is a runtime
+  error. `Bool` supports `& | ^ !` and `to_int`. Rust `==`, `<`, `&&`, `||` are not graph
+  operators.
+- Hash tags (`HashTag`, `tag!`, `HashTagPart`) preserve component order and type framing, which
+  are part of sampled-value identity.
+
+### 4.4 Families and control flow
+
+`crates/dsl/src/family.rs` and `crates/dsl/src/control.rs`:
+
+- `Family<T>` is an ordered collection with one element schema. `family.at(i)` lowers to
+  `FamilyGetStatic` when `i` is compile-known and loop-independent, and to `FamilyGetDynamic`
+  otherwise. `Family::pack`, `count`, and `field` (structural projection of existing fields) are
+  also available. Nested families (families of families) are not supported, but an `iterate`
+  state, `select` candidate, or subgraph argument may be a whole family.
+- `parallel(count, |i| body)` builds a `ParallelLoop` whose instances are independent and
+  returns a `Family<T>` in index order. The closure runs once, inside a new construction scope,
+  with `i` bound to a loop-index slot. The body is sealed with lexical captures: outer values
+  become explicit arguments, `inputs.at(i)` becomes a `Zip` member input (`ZipOffset` for
+  `i + c`), and other outer values are `Broadcast`. An indirect read such as
+  `table.at(indices.at(i))` keeps the whole table as a `Broadcast` input plus an in-body dynamic
+  lookup.
+- `iterate(count, initial, |i, state| body)` builds a `SequentialLoop` that carries a state of
+  invariant schema; a zero count returns the initial state.
+- `select(selector, candidates)` builds one eager `Select` per leaf. A `Bool` selects candidate
+  0 for false and 1 for true; an `Int` selects a zero-based candidate.
+- `Subgraph::define(name, schema, body)` and `subgraph.call(input)` (`crates/dsl/src/subgraph.rs`)
+  define a reusable named body; `call_with_canonical_input_exclusive_uppers` attaches canonical
+  upper bounds to matrix arguments.
+
+Sampler placement follows the scopes: a sampler outside a loop is shared by all instances; a
+sampler inside a body samples once per executed instance, and a zero-count loop samples nothing.
+
+### 4.5 Errors
+
+`DslError` covers compile-time index recovery (`CompileTimeIndex`), freezing (`Freeze`),
+duplicate outputs, schema errors, subgraph bound errors, `FamilyCountMismatch`, structural
+validation, and specification errors. `ValidationBuildError::Core` wraps concrete validation
+errors. Numerical failures (division by zero, a dynamic index out of range, artifact mismatches,
+sampler failures) are runtime errors reported by the executor.
+
+## 5. `mxx-backends`: values, primitives, and CPU execution
+
+`mxx-backends` (`crates/backends/src/lib.rs`) is the only crate with concrete arithmetic. It has
+two layers:
+
+- **Primitive layer:** `element`, `poly`, `matrix`, `sampler`, `modulus`, `openfhe_guard`,
+  `utils`, `env`. Polynomials, matrices, samplers, and codecs over OpenFHE.
+- **Execution layer:** `backend` (runtime values and the CPU/GPU backends), `executor` (CPU
+  executor), `artifact`, `session`, `transcript`, `authority`, `host_control`, `lean`, and, under
+  the `gpu` feature, `gpu_runtime` (section 6).
+
+### 5.1 Runtime value model
+
+`RuntimeValue` (`crates/backends/src/backend.rs`) is what executors accept as inputs and return as
+outputs:
+
+| Variant | Meaning |
+| --- | --- |
+| `Int(BigInt)`, `Real(f64)`, `Bool(bool)`, `Bytes(Arc<[u8]>)` | Host scalars and byte strings. |
+| `TypedBlob { type_name, schema_hash, bytes }` | Opaque typed payload. |
+| `Matrix(PolyMatrix)` | A matrix with its concrete wire type; also used for `SmallMatrix` and `Preimage` wires. |
+| `Trapdoor(TrapdoorValue)` | Public matrix plus secret `DCRTTrapdoor`. |
+| `Resident(Arc<GpuResidentValue>)` (`gpu` only) | A non-matrix value resident on the device (integer/bool families, reals, bytes). |
+| `IndexedFamily { element_type, values }` | An in-memory family. |
+| `LazyArtifact`, `LazyArtifactFamily` | An artifact reference not yet loaded from the store. |
+| `StagedArtifact`, `StagedArtifactFamily` | Family members streamed to the store during execution. |
+
+`PolyMatrix` (the runtime struct in `backend.rs`, distinct from the `matrix::PolyMatrix` trait)
+pairs a `ConcreteWireType` with shared storage: `CpuFull(DCRTPolyMatrix)`,
+`CpuCompact(CpuSmallMatrix<DCRTPolyMatrix>)` for bounded matrices, `Gpu(GpuResidentValue)` under
+the `gpu` feature, or `Encoded(bytes)`. Constructors (`cpu_full`, `cpu_compact`, `encoded`, `gpu`)
+check that the storage agrees with the wire type: shape, ring dimension, ordered CRT basis, and
+bounded-matrix bound and domain. Clones are shallow.
+
+Helpers: `RuntimeValue::matrix`, `small_matrix`, `preimage`, `integer_values`, `indexed_family`,
+`matches_wire_type`, and under `gpu` `RuntimeValue::gpu_matrix` (binds an evaluation-domain
+`GpuDCRTPolyMatrix`, for example one created by `GpuDCRTPolyMatrix::from_cpu_matrix`, as a
+resident input) and `RuntimeValue::gpu_signed_family`.
+
+`TrapdoorValue::new` requires a secret and checks that the public matrix type and the secret's
+ordered ring match the trapdoor wire type.
+
+Lazy and staged values are materialized by `ExecutionResult::materialize_output(name, backend,
+store)`; staged family members are removed with `ExecutionResult::cleanup_staged(store)`.
+
+### 5.2 Polynomial and matrix primitives
+
+- `poly::PolyParams` and `poly::Poly` (`crates/backends/src/poly/mod.rs`) are the parameter and
+  polynomial traits. `DCRTPolyParams` (`crates/backends/src/poly/dcrt/params.rs`) holds the ring
+  dimension, CRT depth and bit width, the exact ordered basis `moduli`, gadget base bits, and
+  dropped moduli. `try_new` validates capability limits (power-of-two dimension, CRT width at
+  most 60 bits, `base_bits <= crt_bits / 2`) and generates or checks the basis through
+  `openfhe_guard::gen_modulus_and_warmup`.
+- `DCRTPoly` (`crates/backends/src/poly/dcrt/poly.rs`) wraps an OpenFHE `DCRTPoly`. The OpenFHE
+  Rust bindings come from the `openfhe` crate; repository-owned C++ adapters in
+  `crates/backends/native/ExactBasis.{h,cc}` are bridged with `cxx` in
+  `crates/backends/src/poly/dcrt/native.rs` (exact-basis sampling, NTT tables, RNS conversions,
+  matrix entry copies). `crates/backends/native/openfhe/README.md` explains the vendored
+  declaration header. `crates/backends/build.rs` compiles the bridge and links OpenFHE and
+  OpenMP.
+- `matrix::PolyMatrix` (`crates/backends/src/matrix/mod.rs`) is the primitive matrix trait:
+  arithmetic, batch operations, automorphisms, slicing, concatenation, tensor products,
+  decomposition, modulus conversions, and the compact byte codec (`to_compact_bytes`,
+  `from_compact_bytes`, `validate_compact_bytes`). `DCRTPolyMatrix = BaseMatrix<DCRTPoly>`
+  (`crates/backends/src/matrix/dcrt_poly.rs`, `crates/backends/src/matrix/base/memory.rs`)
+  implements it with Rayon-parallel entry loops. `CpuSmallMatrix<M>` stores a bounded matrix with
+  its `max_coefficient_bound` and `CoefficientBoundDomain`.
+- `modulus::modulus_raise` is the exact centered lift into a larger ring.
+
+### 5.3 Samplers
+
+`crates/backends/src/sampler/`:
+
+- `DCRTPolyUniformSampler` (`uniform.rs`) draws uniform residues, bits, ternary values, and
+  Gaussians. With a cutoff, Gaussian sampling resamples individual coefficients whose centered
+  magnitude exceeds the cutoff; it never clips.
+- `DCRTPolyHashSampler<H>` (`hash.rs`) derives matrices from `H(key || tag)` with per-entry and
+  per-column framing, so column windows are consistent with whole-matrix sampling.
+- `DCRTPolyTrapdoorSampler` (`trapdoor/sampler.rs`) samples gadget trapdoors (`DCRTTrapdoor`) and
+  preimages. CPU preimage sampling rejects and redraws a whole candidate that exceeds its cutoff,
+  so the preimage equation always holds.
+- `bounds.rs` defines the authoritative cutoffs: `hard_cutoff_from_sigma_bound` is
+  `floor(6.5 * sigma_bound)`, and `default_preimage_cutoff` gives the minimum preimage cutoff for
+  concrete parameters (`TrapdoorPreimageCutoffPolicy` rejects explicit cutoffs below it).
+
+Correctness uses these enforced integer cutoffs and deterministic worst-case bounds. Lattice-
+security estimation separately models the ordinary untruncated distributions.
+
+The executor encodes `HashSample` tags as the fixed prefix followed by typed, length-framed
+components, so tags such as `(1, 23)` and `(12, 3)` differ. Changing the tag encoding changes
+every hash-derived value: rebuild serialized graphs and hash-derived artifacts together.
+
+### 5.4 CPU backend and executor
+
+`CpuDcrtBackend` (`crates/backends/src/backend/poly.rs`) is a concrete struct, not a trait
+implementation. It is constructed from the `DCRTPolyParams` of every ring the graph will use
+(`CpuDcrtBackend::new(params)`); rings are looked up by ordered CRT basis and dimension, and a
+missing ring is a `MissingParameters` error. It implements every node's primitive (sampling,
+arithmetic, conversions, codecs).
+
+Entry points (`crates/backends/src/executor.rs`):
+
+```rust
+pub fn execute<S: SessionStore>(validated: &ValidatedGraph, backend: &mut CpuDcrtBackend,
+    inputs: BTreeMap<String, RuntimeValue>, artifact_store: &mut S,
+    sampling_mode: SamplingMode<'_>, config: ExecutionConfig)
+    -> Result<ExecutionResult, ExecutionError>;
+```
+
+- `execute_in_session(..., execution_nonce, config)` opens or resumes a durable session for the
+  `ProductionId(spec_hash, nonce)` and binds it to a digest of the inputs.
+- `execute_prepared` uses a session when the graph exports artifacts and plain `execute`
+  otherwise.
+- `execute_with_trace` additionally returns every intermediate value (`ExecutionTrace`).
+- `SamplingMode` (`crates/backends/src/transcript.rs`) is `Fresh`, `Record(&mut
+  TranscriptRecorder)`, or `Replay(&TranscriptReplayer)`; transcripts key sampled values by
+  `DrawSite` (instantiation path, node, port).
+
+`ExecutionConfig { max_parallel_instances (default 64), preimage_progress,
+release_fence_interval }` controls execution. The executor (`crates/backends/src/executor/cpu.rs`):
+
+1. walks each scope's validated `execution_order`, releasing values at their liveness
+   `last_use` unless retained (trace mode retains everything);
+2. executes subgraph calls and sequential loops by instantiating the body scope with extended
+   instantiation paths and loop-index bindings;
+3. executes a `ParallelLoop` in waves of at most `max_parallel_instances` instances.
+   `Broadcast` inputs are materialized once, `Zip` inputs supply one member per instance, and
+   the instances of one wave run node by node in lockstep so arithmetic and preimage sampling are
+   issued as batched backend requests. Artifact-typed family outputs are streamed per wave to the
+   store as staged artifacts; scalar families accumulate in memory;
+4. applies dispatch-only fusions on validated root plans (row sums, tensor row sums,
+   concatenation/slice aliases), cached per thread in `executor/plan_cache.rs`. Fusions never
+   change the graph, its identity, or its outputs, and are disabled in trace mode.
+
+Parallelism lives in the primitives: matrix operations, samplers, and bound checks use Rayon.
+The executor itself orders nodes deterministically.
+
+`ExecutionError` reports missing inputs or wires, value-kind mismatches, runtime integer errors
+(`DivisionByZero`, `SelectIndexOutOfRange`), backend, artifact, transcript, and manifest errors.
+
+### 5.5 Artifacts, sessions, transcripts, and authorities
+
+- `ArtifactStore` (`crates/backends/src/artifact.rs`) loads manifests and payloads
+  (`ArtifactKey { production, name, index }`, `ArtifactPayload`), reports payload sizes without
+  loading them, stores payloads, and manages staged family chunks. `MemoryArtifactStore` and
+  `FileArtifactStore` (alias `FilesystemArtifactStore`) implement it and `SessionStore`.
+- `SessionStore` (`crates/backends/src/session.rs`) adds durable sessions: `SessionDescriptor
+  { production_id, graph_name, ir_version, input_digest }`, `SessionStatus::{Running, Finalized}`,
+  transcript recording, artifact commits, and finalization (payloads, then commit, then the
+  manifest last). Stable aliases (`SessionAliasDescriptor`) resolve to a durable nonce.
+- `ExecutionAuthority<S>` (`crates/backends/src/authority.rs`) is the prepare-then-run boundary
+  used by applications: `prepare(validated, &inputs)` then `run(&mut prepared, inputs, store,
+  nonce)`. `CpuExecution` implements it with `execute_prepared`; under `gpu`, `GpuRuntime`
+  implements it with `Prepared = GpuExecutionPlan` and a borrowed result type.
+- `host_control.rs` holds the shared dispatch of structural nodes and host primitives, used both
+  by the executor and by setup-time measurement so the two cannot drift.
+
+### 5.6 Caller and storage contracts
+
+These contracts apply to both CPU and GPU execution:
+
+- Execution accepts trusted, complete inputs prepared for the exact validated graph and bindings.
+  Every declared non-artifact input must be supplied before execution starts, including session
+  execution. Matrix dimensions, ring dimension, ordered CRT basis, representation, and bounded-
+  matrix metadata must match the concrete wire type; for host-staged matrices, both the embedded
+  metadata and the payload must describe the same value. These apply recursively to family
+  elements.
+- A supplied trapdoor must have the validated matrix type, sigma, gadget base, digit count, and
+  preimage cutoff, and its public matrix and secret must come from the same construction.
+  Execution does not copy resident matrices to the host or scan their contents to re-validate
+  them; producers enforce these properties.
+- GPU execution checks only what addressing needs: the exact input set, the physical layout of
+  each resident input, and the declared range of each host integer while encoding it. Integer
+  inputs to GPU plans need a range, either the resident value's producer-proven range or
+  `GpuRuntimeOptions::integer_input_ranges`; ranges are never inferred from sample values.
+- A session nonce binds an immutable, complete input map. A failed execution can leave a durable
+  session descriptor; changing inputs requires a new nonce (and a new alias). Retrying with the
+  original nonce resumes the original inputs.
+- Artifact stores must return intact payloads produced by the matching backend codec, schema, and
+  parameters. The compact matrix decoder is not an untrusted-data parser: malformed payloads can
+  panic. Manifests do not authenticate payload integrity; applications reading untrusted storage
+  must establish integrity first. Serialized graphs must come from the graph serializer and pass
+  validation before execution.
+
+### 5.7 Backend Lean layout
+
+`crates/backends/src/lean/` exports concrete CRT gadget layouts (`export_dcrt_layouts`,
+`render_backend_context`) taken from the actual `DCRTPolyParams`. The handwritten Lean packages
+in `crates/backends/lean/` provide `MxxPrimitives` (bounds, CRT decomposition, radix, negacyclic
+arithmetic, preimage and sampling facts) and `MxxRuntime` (successful-sampling relations and
+matrix operations used by generated scope relations).
+
+## 6. `mxx-backends`: the GPU runtime
+
+The GPU runtime is compiled only with the `gpu` feature. Its public module is
+`mxx_backends::gpu_runtime` (source file `crates/backends/src/gpu_runtime_direct.rs`); the planning
+metadata in `gpu_execution_plan.rs`, `gpu_schedule.rs`, and `gpu_warmup`
+(`gpu_runtime_metrics.rs`) is always compiled. The lowering and I/O modules
+(`gpu_physical_lowering.rs`, `gpu_physical_control.rs`, `gpu_io_worker.rs`, `gpu_runtime_io.rs`,
+`gpu_runtime_import.rs`, `gpu_runtime_digest.rs`) are crate-private.
+
+Two principles define the design:
+
+- **GPU computation runs only through `GpuRuntime`.** The old eager GPU matrix, polynomial, and
+  sampler API has been removed: no GPU type implements `Poly` or `matrix::PolyMatrix`, and there
+  is no GPU sampler type. `GpuDCRTPolyMatrix` (`crates/backends/src/matrix/gpu_dcrt_poly.rs`) is
+  only a device allocation that plans bind; `GpuDCRTPolyMatrix::from_cpu_matrix` uploads a CPU
+  matrix as evaluation-domain residues, and downloads go through `GpuRuntime::download_*`.
+- **Matrix encodings belong to the plan.** Whether a matrix is in coefficient or evaluation form
+  is a property of the plan's `PhysicalValue`, not of its native allocation. NTT and inverse NTT
+  are planned operations.
+
+### 6.1 Lifecycle: plan once, execute many times
+
+```rust
+let backend = mxx_backends::backend::poly_gpu::gpu_backend(gpu_params); // or gpu_backend_on(params, devices)
+let mut runtime = GpuRuntime::new(backend)?;          // reads GpuRuntimeOptions::from_env()
+let mut plan = runtime.plan(validated, &inputs)?;     // or plan_with_store(validated, &inputs, &mut store)
+let result = runtime.execute(&mut plan, inputs, &mut store, nonce)?;
+let out = result.output("result").unwrap();
+let matrix = runtime.download_matrix_output(&out)?;   // or runtime.copy_output(&out)
+```
+
+- `GpuRuntime::plan(validated, &inputs)` lowers the graph, allocates it, compiles it to CUDA
+  Graph regions, measures candidates, and returns a `GpuExecutionPlan`. `plan_with_store` also
+  queries the store for artifact payload sizes (never payload bytes) so that integer and
+  typed-blob imports get fixed, pointer-stable destinations.
+- `GpuRuntime::execute(&mut plan, inputs, store, nonce)` rebinds new inputs and replays the frozen
+  program. It does not plan, measure, or re-validate. A plan executes only on the backend
+  instance that planned it (`GpuRuntimeError::StalePlan` otherwise).
+- The result, `GpuExecutionResult<'plan>`, borrows the plan mutably. Its outputs live in
+  plan-owned storage and may be overwritten by the next execution, so Rust prevents executing the
+  plan again while the result is alive. `result.output(name)` returns a non-cloneable
+  `GpuOutputRef`. Callers either download it (`download_matrix_output`,
+  `download_matrix_member_output`, `download_integer_family_output`, `download_bool_output`,
+  `download_real_output`, `download_bytes_output`) or call `GpuRuntime::copy_output`, which copies
+  a device output on the device into storage owned by the returned `RuntimeValue`. A copied
+  output survives the next execution and can be bound as an input of another plan.
+- `GpuExecutionPlan::report()` returns the `GpuWarmupReport` selected during planning; reading it
+  performs no measurement. `compiled_region_count` and `compiled_launch_count` expose compiled
+  structure.
+- Applications normally use the `ExecutionAuthority` implementation for `GpuRuntime`
+  (`crates/backends/src/authority.rs`), which maps `prepare` to planning and `run` to
+  `execute`.
+
+`GpuRuntimeOptions` (`crates/backends/src/runtime_env.rs`) is read once by `GpuRuntime::new` and
+can be adjusted with `options_mut`:
+
+| Field | Environment variable | Default |
+| --- | --- | --- |
+| `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 64 |
+| `measurement_warmups` | `MXX_GPU_MEASUREMENT_WARMUPS` | 1 |
+| `measurement_iterations` | `MXX_GPU_MEASUREMENT_ITERATIONS` | 2 |
+| `release_fence_interval` | `MXX_GPU_RELEASE_FENCE_INTERVAL` | unset |
+| `integer_input_ranges` | (set in code) | empty |
+
+`crates/backends/src/env.rs` also defines `MXX_CUDA_STREAM_POOL_SIZE` (compute streams per
+context and device, default 32) and `MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS` (GPU preimage retry
+bound per column tile, default 64; zero or malformed values are errors).
+
+Errors: planning returns `GpuPlanError` (`InvalidInput`, `Resource`, `Measurement`,
+`GraphCompile`, `InvalidCompiledSchedule`). Execution returns `GpuRuntimeError`: `StalePlan`,
+`Execution`, `LaunchUncertain`, `DeviceStatus`, `Artifact`, `Session`. A data-dependent failure
+reported by a device status word after its launch joined (for example integer division by zero,
+an invalid selected index, or exhausted preimage retries) is `DeviceStatus`: outputs are
+suppressed and the plan remains reusable. An uncertain launch drains the device and poisons the
+plan; later executions fail with `LaunchUncertain`.
+
+### 6.2 Planning: measured W/C candidates
+
+Planning (`GpuRuntime::plan_with_payload_sizes` in `gpu_runtime_direct.rs`) chooses two numbers:
+
+- **W**, the wave width: the number of parallel-loop instances one replay of a wave template
+  handles. One W is shared by every wave loop site of the plan; each site uses
+  `min(W, count)` lanes and a tail wave for the remainder (`GpuLoopChoice { key:
+  GpuLoopSiteKey, loop_count, wave_instances, tail_instances }` in `gpu_execution_plan.rs`). The
+  largest candidate is the largest finite loop count found by a probe lowering, capped at
+  `max_parallel_instances`.
+- **C**, the column tile width: the number of matrix columns processed per job, derived from the
+  widest matrix (or matrix-family) output.
+
+Both use a geometric grid (`geometric_candidates`): W in `1, 2, 4, ...` plus the maximum itself,
+and C in `ceil(columns / t)` for `t = 1, 2, 4, ...` plus `t = columns`, so both extremes are always
+tried. For every `(W, C)` pair the planner lowers the graph (`single_root_physical_plan`,
+`plan_physical_graph`), actually allocates the physical frame, checks the device budget, compiles
+the CUDA Graph regions, and runs `measurement_warmups + measurement_iterations` trials. Each
+region's measured time is weighted by how often production replays it (waves times active parent
+occurrences). The feasible candidate with the smallest measured time is re-lowered and frozen;
+if no candidate is feasible, planning fails with the collected rejection reasons. Trials measure
+time only; device status words are data-dependent and are checked by `execute`.
+
+The frozen, value-only record of these choices is `FrozenGpuPlan { contract: GpuPlanContract,
+layouts, loops: Vec<GpuLoopChoice>, nodes: Vec<GpuNodeChoice> }`. It never owns device buffers,
+pointers, or command objects.
+
+### 6.3 Physical lowering
+
+Lowering (`gpu_physical_lowering.rs` for the frame and matrix operations,
+`gpu_physical_control.rs` for control flow, scalars, and families) turns the validated graph into
+a `PhysicalFrame`: a `CompiledGpuProgram` plus the resident owners, export slots, import
+templates, control resets, and wave descriptors needed to run it.
+
+- **Physical values.** `PhysicalValue { ty, encodings, parts, integer_ranges }` describes a value
+  as one or more `PhysicalPart { leaf, storage: StorageRef, device, view: PhysicalView }`.
+  `StorageRef` is `Input(i)`, `Output(i)`, or `Scratch(i)`: an allocation slot local to the plan
+  or to a resident value. `PhysicalView` is an origin/extent/stride view into that allocation.
+  `PhysicalEncoding` covers `FullCoeff` and `FullEval` matrices, compact bounded coefficients
+  (`CompactCoeff`, `CompactCoeffPerCrtLimb`), signed integers (`Signed`), `BoolI64`, `RealF64`,
+  `Bytes`, `TypedBlobLengthPrefixed`, and the public-only gadget trapdoor `PublicGadgetEval`.
+- **Compiled operations.** `CompiledGpuOp { implementation, arguments, outputs, device, grid,
+  block, shared_bytes, predecessors, body }` is one native launch with explicit dependency edges.
+  `body` holds the nested operations of a CUDA conditional node (`GpuNativePrimitive::BranchIf`
+  or `LoopWhile`). `GpuNativePrimitive` enumerates the native operations (NTTs, arithmetic,
+  RNS conversions, samplers, preimage stages, copies, exports, control, ...).
+- **Explicit CUDA Graph regions.** `DirectGraph::compile` splits the operation list into
+  `GraphRegion`s at wave-body boundaries, import points, and external-I/O loop bodies, and builds
+  each region with `GpuNativeGraphBuilder` (`crates/backends/src/poly/dcrt/gpu.rs`). Unrelated
+  operations keep independent paths because each operation declares its predecessors. At bind
+  time a region rejects any owner whose physical descriptor differs from the planned one.
+- **Waves.** A `ParallelLoop`, at the root or nested inside another loop body, lowers to a
+  reusable W-lane wave template (`PhysicalWave` in `gpu_physical_control.rs`) that is replayed
+  once per wave with fresh lane bindings; nested wave templates lie inside their parent's body
+  and are replayed for every active parent occurrence. Every template of one plan uses the same
+  per-site W choice from section 6.2. Each member returned by a wave has its own owner.
+- **Vectorized scalar loops.** A parallel loop whose body contains only scalar `Int`/`Bool`
+  arithmetic, comparisons, selection, and family reads (`is_vectorized_scalar_loop`) is not
+  replayed in waves. It lowers once, with one elementwise operation per body node over all lanes.
+- **Integer control and status words.** Runtime `Int`/`Bool` operations, `Select`, and
+  sequential loops execute on the device. Integer operations report errors (division by zero,
+  overflow, invalid index, inexact division, invalid ring property; `MxxGpuControlStatus` in
+  `crates/backends/cuda/include/Control.cuh`) into resident status words. Errors are first-wins, each
+  replay resets a status word once, and status words are checked only after the launch joins,
+  instead of one host reset and readback per operation.
+- **Preimage retry loop.** Each preimage column tile is a device `LoopWhile` body that derives a
+  per-attempt seed (`crates/backends/cuda/src/matrix/MatrixPreimageSeed.cu`), samples a
+  candidate, and checks its cutoff, repeating until acceptance or until the frozen
+  `preimage_max_attempts` bound (`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`) is reached. Exhaustion is
+  a `DeviceStatus` error after the join.
+- **NTT insertion only when encodings differ.** `full_eval_value` returns an operand unchanged if
+  it is already `FullEval`; a `FullCoeff` matrix gets exactly one forward NTT into a scratch
+  value, which is cached and shared by all later consumers. Coefficient-domain kernels
+  (conversions, decompositions) emit the inverse and forward NTTs they need explicitly.
+- **Scratch sharing.** `share_scratch_allocations` lets full-matrix scratch values with disjoint
+  lifetimes share one allocation. An allocation is reused only when every operation that
+  referenced its previous occupant is already an ancestor of every writer of the new occupant,
+  so sharing adds no dependency and preserves the measured concurrency. Inputs, outputs,
+  wave-bound members, imports, and values read before any write keep their own allocations.
+
+### 6.4 Artifact I/O
+
+- **On-demand import.** An artifact input is not read at planning time. The plan records an
+  `ImportTemplate` with the operation before which the payload is needed; at execution the region
+  boundary joins the preceding work and `load_import_template` (`gpu_runtime_import.rs`) uploads
+  the payload into a plan-owned destination. Selected family members
+  (`family.at(dynamic_index)`) are imported individually by selector, without loading the whole
+  family.
+- **Preallocated export slots.** Exported outputs write into export slots reserved at planning
+  time (`reserve_gpu_export_slots` in `gpu_execution_plan.rs`, `PlannedExportSlot` in
+  `gpu_runtime_io.rs`). An observer thread watches for ready slots during the launch and forwards
+  references to the I/O worker; commits happen only after the whole launch succeeds.
+- **I/O worker.** `with_scoped_producer_io_worker` (`gpu_io_worker.rs`) runs one scoped worker
+  thread that owns the `SessionStore` and serializes imports, export slots, commits, transcoding,
+  and session finalization (`IoCommand`). Before reusing input or scratch storage, the runtime
+  joins both the previous GPU launch and all artifact readers.
+- Producer executions open a session keyed by `ProductionId(spec_hash, nonce)` and a digest of
+  the canonical inputs (`gpu_runtime_digest.rs`), mirroring CPU `execute_in_session`.
+
+### 6.5 Backend, fleet, and related contexts
+
+- `GpuDcrtBackend` (`crates/backends/src/backend/poly_gpu/fleet.rs`) is the set of registered CUDA
+  contexts: one placement per physical device, each holding one `GpuDCRTPolyParams` per ring,
+  selected by ordered CRT basis and ring dimension. It carries a unique execution identity used to
+  bind plans to their backend.
+- `gpu_backend(params)` uses every device from `detected_gpu_device_ids()`
+  (`crates/backends/src/poly/dcrt/gpu.rs`); `gpu_backend_on(params, device_ids)` restricts the
+  fleet (`crates/backends/src/backend/poly_gpu.rs`).
+- **Related contexts.** On each device, the first registered ring is the anchor and the others
+  are created as related contexts (`GpuDCRTPolyParams::params_for_device(device, related)`, native
+  `gpu_context_create` in `crates/backends/cuda/src/Runtime.cu`). Related rings with different
+  bases share one execution owner: identity, stream pool, release streams, and Graph builder, so
+  operations mixing rings (for example RNS mod up/down) stay on one ordered execution.
+
+### 6.6 Native CUDA layer
+
+Native code lives in `crates/backends/cuda/`. Headers in `include/` declare only cross-file and
+Rust-facing functions; bodies live in `src/`.
+
+| File | Role |
+| --- | --- |
+| `src/Runtime.cu`, `include/Runtime.cuh` | C ABI for contexts, execution owners, streams, memory, export slots, the explicit Graph builder (including conditional `if`/`while` nodes), binding, launch, and events. |
+| `src/Control.cu`, `include/Control.cuh` | Device integer control operations and status codes. |
+| `src/Primitive.cu`, `include/Primitive.cuh` | Scalar-polynomial primitives (polynomial values, coefficient extraction, packing, threshold decoding). |
+| `src/Real.cu`, `include/Real.cuh` | Device `f64` operations with their own status word. |
+| `src/ChaCha.cu`, `include/ChaCha.cuh` | Device ChaCha RNG (included by the matrix unity build). |
+| `src/matrix/Matrix.cu` | Unity build of the matrix layer: includes `../ChaCha.cu`, `MatrixUtils.cu`, `MatrixNTT.cu`, `MatrixData.cu`, `MatrixDecompose.cu`, `MatrixSampling.cu`, `MatrixTrapdoor.cu`, `MatrixSerde.cu`, `MatrixCrt.cu`, `MatrixRawRns.cu`, `MatrixSmallRhs.cu`, `MatrixPreimageRaw.cu`, `MatrixPolynomialValues.cu`, `MatrixRawRemaining.cu`, `MatrixIndexed.cu`, `MatrixPreimageSeed.cu`, and `MatrixHash.cu`. |
+| `include/matrix/*.cuh` | Matrix structure (`Matrix.cuh`), CRT, data, NTT, serialization, compact small-RHS, and utility declarations. |
+
+`crates/backends/build.rs` compiles exactly `Runtime.cu`, `Primitive.cu`, `Control.cu`,
+`Real.cu`, and `matrix/Matrix.cu` into the `gpupoly` library when the `gpu` feature is enabled
+(`CUDA_ARCH`, default `89`; `CUDA_HOME`; `CUDA_LIB_DIR`; `NVCC`), and embeds a hash of the CUDA
+sources as `MXX_NATIVE_KERNEL_BUILD_REVISION`. The matrix sources included by `Matrix.cu` are not
+compiled on their own. GPU-specific Rust code lives in files whose names contain `gpu`, as
+required by `GPU.md`.
+
+### 6.7 Current limitations
+
+These restrictions are explicit errors in the current code:
+
+- **One device per plan.** `single_root_physical_plan` rejects a backend with more than one
+  device ("root physical candidate needs one device and positive W/C"), and multi-device matrices
+  need a shard plan that does not exist yet ("GPU physical lowering needs an explicit
+  multi-device shard plan"). Use `gpu_backend_on(params, [device])` for planning on a multi-GPU
+  machine.
+- **Nested device loops.** A parallel loop inside a device body (a sequential-loop, retry, or
+  branch body) runs all of its occurrences in one template. A sequential loop inside a device body
+  restarts its index on the device, and it cannot read artifacts per iteration ("GPU
+  artifact-reading sequential loop cannot run inside a device body"). Sibling conditional nodes
+  inside one conditional body are ordered one after another, because concurrently executing
+  nested conditionals did not complete on the device.
+- **Parallel-loop bodies** cannot import scoped artifacts ("GPU device body artifact import needs
+  an on-demand region boundary"); nested loop counts and types cannot depend on the enclosing
+  index; matrix-valued loop outputs must be homogeneous matrix families ("GPU loop can return only
+  matrix members", "GPU parallel loop needs a homogeneous matrix family"); a vectorized scalar
+  loop cannot be nested in another vectorized body.
+- **External I/O and waves** cannot be combined: external-I/O loops and selected artifact imports
+  cannot be nested in a wave schedule (`DirectGraph::compile`).
+- **Artifacts.** Integer and typed-blob artifact inputs need `plan_with_store` for payload sizes;
+  host `Int` inputs need an entry in `integer_input_ranges` ("has no declared range"); matrix
+  exports need a `FullEval` source; raw transcoding does not support every wire type ("raw
+  artifact transcode does not support this wire type yet" in `fleet.rs`).
+- **Trapdoors and preimages** require the exact regular gadget layout, sigma, and shapes.
+
+The GPU planner is under active development (support for more loop structures is being added),
+so check the current error messages in `gpu_physical_lowering.rs`, `gpu_physical_control.rs`,
+and `gpu_runtime_direct.rs` before relying on this list.
+
+## 7. Application crates
+
+All application-level crates build graphs through `mxx-dsl` and execute them through
+`mxx-backends`; none performs cryptographic arithmetic eagerly.
+
+### 7.1 `mxx-gadgets`: circuits and reusable gadgets
+
+`crates/gadgets/src/` is BGG-independent:
+
+- `circuit/`: the circuit model and its lowering. `PolyCircuit<P>` (`circuit/poly_circuit/`) with
+  `PolyGate`/`PolyGateKind` (`circuit/gate.rs`), sub-circuit calls, and serialization
+  (`circuit/serde.rs`); Boolean circuits (`circuit/boolean.rs`: `BooleanCircuitShape`,
+  `BooleanCircuitData`, `BooleanGateKind` with constant false/true, copy, not, and, xor);
+  DSL-level Boolean circuit families and their validity and satisfaction predicates
+  (`circuit/boolean_dsl.rs`); public lookup programs (`circuit/public_lut.rs`). The lowering
+  framework (`circuit/lowering.rs`) defines `GateInstance` (call path, local gate, operation
+  occurrence) and the traits a concrete encoding scheme implements
+  (`CircuitLoweringTypes`, `ArithmeticCircuitLowering`, `SlotOperationLowering`,
+  `PublicLookupLowering`, `StructuredCircuitLowering`), driven by `lower_circuit`.
+- `circuit_gadgets/`: gadgets written as circuits or DSL graphs.
+  - `arith/`: modular arithmetic contexts (`ModularArithmeticContext`, `CrtWindow`), lane-packed
+    nested RNS arithmetic (`arith/nested_rns/`: `NestedRnsPolyContext`, `NestedRnsPoly`), and
+    carry/Montgomery arithmetic (`arith/carry_montgomery/`).
+  - `conv_mul/`: negacyclic convolution without NTT.
+  - `ntt/`: radix-2 NTT and inverse NTT over `NestedRnsPoly`.
+  - `mod_switch/nested_rns.rs`: nested-RNS modulus switching and its error bounds.
+  - `fhe/`: Ring-GSW gadgets (`ring_gsw.rs`, `ring_gsw_nested_rns.rs`); `ckks.rs` is present but
+    not compiled (commented out in `fhe/mod.rs`).
+  - `fhe_prg/goldreich.rs`: a Goldreich PRG evaluated over Ring-GSW bits.
+  - `secret_ip.rs`: secret inner products.
+- `decoder/`: mask decryption and PRG helpers.
+- `input_injector.rs`: the Diamond input injector (`DiamondInputConfig`, `DiamondInputInjector`).
+- `noise_refresh/`: BGG-independent noise-refresh circuits (decrypt, merge, PRG) and material.
+- `ring_from_params` (`crates/gadgets/src/lib.rs`) converts `DCRTPolyParams` to a DSL `Ring` with
+  the same ordered basis. The `test-support` feature exposes `test_utils` to dependent crates'
+  tests.
+
+### 7.2 `mxx-bgg`: BGG+ encodings
+
+`crates/bgg/src/` implements BGG+ on top of the gadget lowering traits:
+
+- `public_key.rs` (`BggPublicKeyCompiler`, `BggPublicKeySampler`) and `encoding.rs`
+  (`BggEncodingCompiler`, `BggEncodingSampler`, `BggSamplerLayout`) define the wires, schemas,
+  and samplers.
+- `circuit.rs`: `PolyCircuitCompiler` lowers a `PolyCircuit` to public-key or encoding graphs
+  (`compile_public_keys`, `compile_encodings`, naive and Tall variants, each with a
+  `*_with_lowerings` form). `compile_encodings` takes a decomposition provider called with each
+  `GateInstance`; it returns the preprocessing-produced `Preimage` for each multiplication, so the
+  online encoding graph never builds public-key matrices or gadget decompositions. The producer
+  must bind each cached decomposition to the right gate; shapes and bounds alone do not establish
+  that binding.
+- `boolean.rs`: BGG+ evaluation of dynamic Boolean circuit families
+  (`evaluate_boolean_public_key_layers`, `evaluate_boolean_encoding_layers`).
+- `lwe_lookup.rs`: LWE-based public lookup tables with preprocessing artifacts.
+- `naive_vec.rs`, `slot_operation.rs`: per-slot vectors, slot transfer, and rotation.
+- `tall_encoding.rs`, `tall_rotation_encoding.rs`: Tall encodings with one row per slot and
+  their linear-transform preprocessing.
+- `wee25_commitment.rs`, `wee25_opening.rs`, `wee25_public_parameters.rs`: WEE25 commitments and
+  public parameters. The commitment-backed lookup evaluator is intentionally absent.
+
+### 7.3 `mxx-fhe`: BGV and Ring-GSW
+
+`crates/fhe/src/` builds FHE graphs; bootstrapping is not implemented. Graph handles are not
+authenticated cryptographic objects, and key/ciphertext compatibility beyond ring and shape is the
+caller's responsibility.
+
+- `FheCommonParams { ring: DCRTPolyParams, secret_range, error_sigma, error_cutoff }`
+  (`params.rs`). Level zero keeps the first CRT prime and higher levels keep longer prefixes.
+  `FheScheme` (`lib.rs`) is the shared `keygen`/`encrypt`/`decrypt`/`add`/`mul` interface.
+- **Ring Regev / Ring-GSW** (`ring_gsw.rs`): `RingGswParams::new(common, scale, plaintext_bound)`;
+  `RingCiphertext` (aliases `RingRegevCiphertext`, `RingGswCiphertext`) with phase
+  `b - s*a = scale*m + e`; `encrypt_gsw`, `external_product`, and `can_decrypt`.
+- **BGV** (`bgv.rs`): `BgvParams::new(common, plaintext_modulus, hybrid: Option<BgvHybridParams>)`
+  and `BgvCiphertext { components, correction_factor, noise_bound }`. Messages are SIMD slots
+  (`Family<Int>`, 1 to N values modulo a prime `t = 1 mod 2N`); encoding lifts the inverse NTT
+  modulo `t` into `R_Q`. Supported operations: addition, `mul` (with relinearization) or
+  `mul_unrelinearized` plus `relinearize`, `mod_switch_to` (CRT modulus reduction),
+  `rotate_rows`, and `swap_rows`. Key switching is hybrid RNS key switching (ePrint 2021/204,
+  Appendix B.2.3) over `Q_level * P`, using the fused `RnsModUp`/`RnsModDown` graph nodes. With
+  `None`, the hybrid parameters default to about three digits and 60-bit auxiliary primes.
+  `runtime_parameters()` lists every ring the runtime must register, in tower order, and
+  `key_switch_parameters(level)` gives the ring for importing evaluation keys. Security must be
+  assessed at `Q * P`.
+- Noise bounds are public declarations propagated by the evaluator; `can_decrypt` checks a
+  conservative sufficient condition and does not inspect secret values. A matrix artifact alone
+  does not carry correction factors or bounds; carry them alongside when connecting stages.
+- `utils.rs` provides parameter helpers and GPU helpers used by the GPU tests; default error
+  cutoffs come from `mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound`.
+
+Execution follows the general pattern: build with `DslContext`, validate with the backend CRT
+resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV) with the
+backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactStore`.
+`docs/plans/fhe.md` records the formulas and design, and `README.md` summarizes the FHE API.
+
+### 7.4 `mxx-we`: Diamond witness encryption
+
+`crates/we/src/` defines implementation-independent WE interfaces and the Diamond construction:
+
+- `lib.rs`: `WitnessEncryptionProtocolDecl` (a validated `ProtocolDecl` with its interface),
+  `WitnessEncryptionProtocol`, and `WitnessEncryptionRuntime`.
+- `diamond/graph.rs`: `DiamondWeProtocolFamily` (the parameter-independent protocol declaration,
+  fixed only by its BGG domain tag, so changing a runtime `ParamEnv` does not change the protocol
+  hash) and `DiamondWeCompiler`, which builds the encryption and decryption graphs
+  (`build_encryption`, `build_decryption`). Both stages declare `instance_width`,
+  `witness_width`, `depth`, and `max_layer_width` as compile parameters, while gate opcodes and
+  predecessor indices are runtime families (`BooleanCircuitData` from `mxx_gadgets::circuit`).
+  Layers run in one carried-state `SequentialLoop`, gates in structural `ParallelLoop`s with
+  dynamic predecessor reads. The encryption stage exports input-injector transitions, BGG+ public
+  keys, and witness projection preimages as family artifacts; the decryption stage imports them.
+  Witness bits are decryption-only inputs.
+- `diamond/runtime.rs`: `DiamondWeRuntime<E: ExecutionAuthority<S>, S: SessionStore>` runs
+  encryption and decryption through any execution authority, including `GpuRuntime` under the
+  `gpu` feature (`DiamondBooleanOutput` abstracts the Boolean result).
+- `diamond/parameter_search.rs`: `DiamondParameterSearch` fixes the circuit shape and searches ring
+  dimension and CRT depth. Correctness uses deterministic worst-case bounds with sampler cutoffs
+  `floor(6.5 * sigma)` (`diamond/config.rs`); lattice security is estimated with untruncated
+  distributions. A candidate is accepted only after Lean checks a freshly generated theorem for
+  the same frozen workflow, backend layout, and parameters; the selected result keeps its
+  verified certificate. Numerical rejection and checker failures are distinct errors, and the
+  search is a heuristic, not a minimality claim.
+- `lean.rs`, `lean/`: WE decoder semantics and backend bindings for
+  `mxx_ir_core::lean::protocol::export_claim`, Lean checking (`lean/check.rs`), and numeric
+  certificates (`lean/numeric.rs`). Handwritten proofs live in `crates/we/lean/`; the audit entry
+  point is `crates/we/lean/Certificate.lean` (`DiamondCertificate.correctness`). To edit proofs
+  against a generated candidate, select it with `scripts/select_we_lean_candidate.py` and follow
+  `crates/we/lean/README.md`.
+
+### 7.5 `mxx-func-enc` and `mxx-io`
+
+`crates/func-enc/src/lib.rs` defines only the `FuncEnc` trait and `crates/io/src/lib.rs` only the
+`Obfuscation` trait. Their former implementations were removed during the DSL migration.
+
+## 8. Testing, validation, and where to look next
+
+### 8.1 Test layout
+
+- **Unit tests** live next to the code they test (`#[cfg(test)]` modules) and run with
+  `cargo test -r --workspace --lib`. GPU unit tests live in files whose names contain `gpu` and
+  compile only with `--features gpu`; `crates/fhe/src/tests_gpu.rs` is one example. Tests that
+  need a real CUDA device and are not safe to run by default carry `#[ignore = "requires a CUDA
+  GPU"]` (in `crates/backends/src/gpu_physical_lowering.rs` and `gpu_physical_control.rs`).
+  Tests that need Lean or long runs are also `#[ignore]` (for example in `crates/we/src/lean/`
+  and `crates/fhe/src/bgv.rs`).
+- **Integration tests** are all GPU tests:
+
+  | Test target | Gate |
+  | --- | --- |
+  | `crates/backends/tests/gpu_control_resident.rs` | `#![cfg(feature = "gpu")]` |
+  | `crates/backends/tests/gpu_direct_node_semantics.rs` | `#![cfg(feature = "gpu")]`; compares direct GPU nodes with the CPU backend |
+  | `crates/fhe/tests/gpu_bgv.rs`, `crates/fhe/tests/gpu_ring_gsw.rs` | `required-features = ["gpu"]` in `crates/fhe/Cargo.toml` |
+  | `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs` | `#![cfg(feature = "gpu")]`; long modes are `#[ignore]` |
+  | `crates/we/tests/test_gpu_diamond_we.rs` | `#![cfg(feature = "gpu")]` and `#[ignore]`; Lean-checked parameter search plus a GPU round trip |
+
+  `AGENTS.md` requires an explicit request before running integration tests.
+- **Benchmarks** are `harness = false` targets in `crates/backends/benches/`
+  (`bench_matrix_mul_cpu`, `bench_matrix_mul_gpu`, `bench_preimage_cpu`, `bench_preimage_gpu`).
+- Test parameters are overridable through environment variables with small defaults, for
+  example `MXX_PRIMITIVE_TEST_*` (`crates/backends/src/env.rs`), `FHE_TEST_*` (`crates/fhe`),
+  `MXX_TALL_NESTED_RNS_*`, and `MXX_DIAMOND_WE_GPU_*`. Each test writes to its own directory under
+  `test_data/`.
+- `scripts/run_tests.sh` is the reference validation script: Python unit tests under
+  `scripts/lib/tests`, `cargo +nightly fmt --all`, `cargo test -r --workspace --lib --features gpu
+  --no-run`, `cargo test -r --workspace --lib`, and a conditional repeated GPU run
+  (`scripts/lib/repo_validation.py`).
+- Lean fixtures are generated by ordinary unit tests (`lean::fixtures` in `mxx-ir-core` and
+  `mxx-backends`) into `test_data/`; see `crates/ir-core/lean/README.md`.
+
+### 8.2 Where to look next
+
+| Document | Use it for |
+| --- | --- |
+| `AGENTS.md` | Repository rules, scope, and which guide applies to a task. |
+| `BUILDER.md` | Implementation, debugging, design style, testing, and benchmark rules. |
+| `REVIEWER.md` | Review criteria and result format. |
+| `GPU.md` | GPU dataflow, synchronization, memory complexity, and GPU validation requirements. |
+| `README.md` | Project overview, FHE API summary, and requirements (OpenFHE, OpenMP, CUDA). |
+| `docs/correctness/` | Correctness specifications, for example `docs/correctness/operational-protocol-inventory.md`. |
+| `docs/plans/` | Design plans and progress records, for example `docs/plans/fhe.md`. Plans are historical context and may be ahead of or behind the code. |
+| `crates/ir-core/lean/README.md`, `crates/we/lean/README.md` | Lean packages and fixture workflows. |
+| `references/` | Read-only specifications and papers. |

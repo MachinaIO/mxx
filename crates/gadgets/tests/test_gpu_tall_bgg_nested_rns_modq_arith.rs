@@ -1270,28 +1270,20 @@ fn prepare_gpu_graph(
 }
 
 fn matrix_family_output(
-    result: &mut GpuExecutionResult,
+    result: &GpuExecutionResult<'_>,
     name: &str,
     runtime: &GpuRuntime,
-    store: &mut MemoryArtifactStore,
 ) -> Result<Vec<DCRTPolyMatrix>, String> {
-    let RuntimeValue::Resident(family) = result
-        .materialize_output(name, runtime.backend(), store)
-        .map_err(|error| error.to_string())?
-    else {
+    let output = result.output(name).ok_or_else(|| format!("missing output {name}"))?;
+    let Some(ConcreteWireType::IndexedFamily { count, element }) = output.resident_type() else {
         return Err(format!("output {name} is not a resident GPU family"));
-    };
-    let ConcreteWireType::IndexedFamily { count, element } = family.wire_type() else {
-        return Err(format!("output {name} is not an indexed family"));
     };
     if !matches!(element.as_ref(), ConcreteWireType::Matrix(_)) {
         return Err(format!("output family {name} contains non-matrix members"));
     }
     (0..*count)
         .map(|index| {
-            runtime
-                .download_matrix_member(&RuntimeValue::Resident(Arc::clone(family)), index)
-                .map_err(|error| error.to_string())
+            runtime.download_matrix_member_output(&output, index).map_err(|error| error.to_string())
         })
         .collect()
 }
@@ -1565,20 +1557,15 @@ fn expected_alternating_transforms(
         .collect()
 }
 
-fn expected_product_on_gpu(
+fn expected_product(
     selected: &PreparedCandidate,
-    gpu_parameters: &GpuDCRTPolyParams,
     operands: &[Vec<BigUint>],
 ) -> Result<Vec<BigUint>, String> {
-    let mut matrices = operands.iter().map(|coefficients| {
-        let polynomial = DCRTPoly::from_biguints_eval(&selected.parameters, coefficients);
-        let cpu = DCRTPolyMatrix::from_poly_vec_row(&selected.parameters, vec![polynomial]);
-        GpuDCRTPolyMatrix::from_cpu_matrix(gpu_parameters, &cpu)
-    });
-    let first = matrices.next().ok_or_else(|| "expected at least one operand".to_owned())?;
-    let product = matrices.fold(first, |left, right| left * right);
-    product.wait_until_ready();
-    Ok(product.to_cpu_matrix().entry(0, 0).eval_slots())
+    let mut polynomials = operands
+        .iter()
+        .map(|coefficients| DCRTPoly::from_biguints_eval(&selected.parameters, coefficients));
+    let first = polynomials.next().ok_or_else(|| "expected at least one operand".to_owned())?;
+    Ok(polynomials.fold(first, |left, right| left * right).eval_slots())
 }
 
 fn encoding_inputs(
@@ -1750,15 +1737,15 @@ fn end_to_end_processing(
             let preprocessing_report = prepared.report().clone();
             let started = Instant::now();
             let launches_before = prepared.compiled_launch_count();
-            let preprocessing_result = preprocessing_runtime
+            let production = preprocessing_runtime
                 .execute(&mut prepared, preprocessing_inputs, &mut preprocessing_store, [0x71; 32])
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+                .production_id;
             if prepared.compiled_launch_count() <= launches_before {
                 return Err("Tall preprocessing did not submit the compiled production path".into());
             }
             info!(elapsed = ?started.elapsed(), "timed preprocessing execution");
-            let production = preprocessing_result
-                .production_id
+            let production = production
                 .ok_or_else(|| "preprocessing execution returned no production id".to_owned())?;
             (production, preprocessing_report)
         };
@@ -1786,7 +1773,7 @@ fn end_to_end_processing(
 
     let started = Instant::now();
     let operands = random_operands(selected, config);
-    let product_slots = expected_product_on_gpu(selected, gpu_parameters, &operands)?;
+    let product_slots = expected_product(selected, &operands)?;
     let active_product_slots = product_slots
         .get(..selected.encoding_ring_dimension)
         .ok_or_else(|| "GPU product oracle omitted the compact Tall slot prefix".to_owned())?;
@@ -1842,22 +1829,16 @@ fn end_to_end_processing(
         "Tall GPU protocol predicted warmup time"
     );
     let launches_before = prepared_encoding.compiled_launch_count();
-    let mut encoding_result = runtime
+    let encoding_result = runtime
         .execute(&mut prepared_encoding, inputs, &mut store, [0; 32])
         .map_err(|error| error.to_string())?;
+    let encoding_rows = matrix_family_output(&encoding_result, "encoding_rows", &runtime)?;
+    let output_plaintexts = matrix_family_output(&encoding_result, "output_plaintexts", &runtime)?;
+    let residuals = matrix_family_output(&encoding_result, TALL_OPERATIONAL_RESIDUAL, &runtime)?;
+    drop(encoding_result);
     if prepared_encoding.compiled_launch_count() <= launches_before {
         return Err("Tall encoding did not submit the compiled production path".into());
     }
-    let encoding_rows =
-        matrix_family_output(&mut encoding_result, "encoding_rows", &runtime, &mut store)?;
-    let output_plaintexts =
-        matrix_family_output(&mut encoding_result, "output_plaintexts", &runtime, &mut store)?;
-    let residuals = matrix_family_output(
-        &mut encoding_result,
-        TALL_OPERATIONAL_RESIDUAL,
-        &runtime,
-        &mut store,
-    )?;
     info!(elapsed = ?started.elapsed(), "timed TallBggEncoding end-to-end evaluation");
     info!(elapsed = ?encoding_pass_started.elapsed(), "timed encoding-pass total");
     Ok(EndToEndOutputs { encoding_rows, output_plaintexts, residuals, expected_output_slots })

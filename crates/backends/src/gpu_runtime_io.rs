@@ -11,7 +11,7 @@ use crate::{
     backend::poly_gpu::PhysicalExport,
     gpu_io_worker::{
         FrameGeneration, IoCompletion, IoReplyReceiver, IoRequest, IoSubmitError, IoWorkerError,
-        ProducerIoClient, RuntimeOwnedPayload, TransientIoClient, submit_export_slot,
+        ProducerIoClient, submit_export_slot,
     },
     poly::dcrt::gpu::GpuExportSlot,
     session::{
@@ -39,19 +39,7 @@ use thiserror::Error;
 /// production during replay.
 #[derive(Debug)]
 pub enum RuntimeIoOperation {
-    Import {
-        key: ArtifactKey,
-        descriptor: ManifestArtifact,
-        staged: bool,
-    },
-    Export {
-        key: ArtifactKey,
-        artifact_type: ArtifactType,
-        availability: ArtifactAvailability,
-        layout: Option<String>,
-        payload: RuntimeOwnedPayload,
-        commit_to_session: bool,
-    },
+    Import { key: ArtifactKey, descriptor: ManifestArtifact, staged: bool },
 }
 
 #[derive(Debug, Error)]
@@ -106,14 +94,6 @@ struct ExportObserver<E: std::error::Error + Send + Sync + 'static> {
     thread: JoinHandle<Result<Vec<ObservedExport<E>>, String>>,
 }
 
-#[derive(Debug, Error)]
-pub enum IoPumpRunError<E: std::error::Error + 'static> {
-    #[error("I/O pump failed while draining requests: {0}")]
-    Pump(#[source] IoPumpError<E>),
-    #[error("I/O worker failed while joining: {0}")]
-    Worker(#[source] IoWorkerError<E>),
-}
-
 /// A completion paired with its operation index.
 #[derive(Debug)]
 pub struct IoPumpCompletion {
@@ -129,35 +109,6 @@ trait IoSubmitter<'scope, E: std::error::Error + 'static> {
 }
 
 impl<'scope, E: std::error::Error + 'static> IoSubmitter<'scope, E>
-    for TransientIoClient<'scope, E>
-{
-    fn submit_operation(
-        &self,
-        frame: FrameGeneration,
-        operation: RuntimeIoOperation,
-    ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
-        match operation {
-            RuntimeIoOperation::Import { key, descriptor, staged } => {
-                self.try_import(frame, key, descriptor, staged)
-            }
-            RuntimeIoOperation::Export {
-                key,
-                artifact_type,
-                availability,
-                layout,
-                payload,
-                commit_to_session,
-            } => {
-                if commit_to_session {
-                    return Err(IoSubmitError::ProducerCapabilityRequired);
-                }
-                self.try_export(frame, key, artifact_type, availability, layout, payload)
-            }
-        }
-    }
-}
-
-impl<'scope, E: std::error::Error + 'static> IoSubmitter<'scope, E>
     for ProducerIoClient<'scope, E>
 {
     fn submit_operation(
@@ -169,14 +120,6 @@ impl<'scope, E: std::error::Error + 'static> IoSubmitter<'scope, E>
             RuntimeIoOperation::Import { key, descriptor, staged } => {
                 self.try_import(frame, key, descriptor, staged)
             }
-            RuntimeIoOperation::Export {
-                key,
-                artifact_type,
-                availability,
-                layout,
-                payload,
-                ..
-            } => self.try_export(frame, key, artifact_type, availability, layout, payload),
         }
     }
 }
@@ -244,40 +187,6 @@ impl<'scope, E: std::error::Error + 'static, C: IoSubmitter<'scope, E>> IoPumpCo
             self.done(frame, operation)?;
         }
         Ok(())
-    }
-}
-
-/// Transient pump. It can import/export/read keys but has no transcript or
-/// session transition capability.
-pub struct TransientIoPump<'scope, E: std::error::Error + 'static> {
-    core: IoPumpCore<'scope, E, TransientIoClient<'scope, E>>,
-    _scope: PhantomData<&'scope ()>,
-}
-
-impl<'scope, E: std::error::Error + 'static> TransientIoPump<'scope, E> {
-    pub fn new(client: TransientIoClient<'scope, E>, window: NonZeroUsize) -> Self {
-        Self { core: IoPumpCore::new(client, window), _scope: PhantomData }
-    }
-
-    pub fn ready(
-        &mut self,
-        frame: FrameGeneration,
-        operation: u32,
-        request: RuntimeIoOperation,
-    ) -> Result<(), IoPumpError<E>> {
-        self.core.ready(frame, operation, request)
-    }
-
-    pub fn done(
-        &mut self,
-        frame: FrameGeneration,
-        operation: u32,
-    ) -> Result<IoPumpCompletion, IoPumpError<E>> {
-        self.core.done(frame, operation)
-    }
-
-    pub fn drain(&mut self) -> Result<(), IoPumpError<E>> {
-        self.core.drain()
     }
 }
 
@@ -422,26 +331,7 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
         operation: u32,
         request: RuntimeIoOperation,
     ) -> Result<(), IoPumpError<E>> {
-        let commit = match &request {
-            RuntimeIoOperation::Export {
-                key,
-                artifact_type,
-                availability,
-                layout,
-                commit_to_session: true,
-                ..
-            } => Some(ArtifactHandle {
-                key: key.clone(),
-                artifact_type: artifact_type.clone(),
-                availability: *availability,
-                layout: layout.clone(),
-            }),
-            _ => None,
-        };
         self.core.ready(frame, operation, request)?;
-        if let Some(handle) = commit {
-            self.pending_commits.push((frame, handle));
-        }
         Ok(())
     }
 
@@ -515,23 +405,6 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> Drop for ProducerIoPu
     }
 }
 
-/// Run a transient pump for one worker scope.
-pub fn with_transient_io_pump<S, R>(
-    store: &mut S,
-    window: NonZeroUsize,
-    run: impl for<'scope> FnOnce(&mut TransientIoPump<'scope, S::Error>) -> R,
-) -> Result<R, IoPumpRunError<S::Error>>
-where
-    S: SessionStore + Send,
-{
-    let result = crate::gpu_io_worker::with_scoped_transient_io_worker(store, window, |client| {
-        let mut pump = TransientIoPump::new(client, window);
-        let result = run(&mut pump);
-        pump.drain().map(|()| result).map_err(IoPumpRunError::Pump)
-    });
-    result.map_err(IoPumpRunError::Worker).and_then(|nested| nested)
-}
-
 /// Check the producer input digest before launching the worker.
 pub fn with_checked_producer_io_pump<S, R>(
     store: &mut S,
@@ -570,7 +443,7 @@ pub enum CheckedProducerIoError<E: std::error::Error + 'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::{ArtifactPayload, MemoryArtifactStore};
+    use crate::artifact::MemoryArtifactStore;
     use mxx_ir_core::artifact::SpecHash;
 
     fn production() -> ProductionId {
@@ -579,26 +452,6 @@ mod tests {
 
     fn descriptor() -> SessionDescriptor {
         SessionDescriptor::new(production(), "pump", [3; 32])
-    }
-
-    #[test]
-    fn transient_pump_rejects_session_commit_before_queueing() {
-        let mut store = MemoryArtifactStore::default();
-        let result = with_transient_io_pump(&mut store, NonZeroUsize::new(1).unwrap(), |pump| {
-            pump.ready(
-                FrameGeneration::new(2, 1),
-                7,
-                RuntimeIoOperation::Export {
-                    key: ArtifactKey { production: production(), name: "out".into(), index: None },
-                    artifact_type: ArtifactType::Bytes { length: 0 },
-                    availability: ArtifactAvailability::Transferred,
-                    layout: None,
-                    payload: RuntimeOwnedPayload::new(ArtifactPayload::Bytes(Vec::new())),
-                    commit_to_session: true,
-                },
-            )
-        });
-        assert!(matches!(result, Ok(Err(IoPumpError::ProducerCapabilityRequired))));
     }
 
     #[test]

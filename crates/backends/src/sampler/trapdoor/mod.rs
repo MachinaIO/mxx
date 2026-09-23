@@ -1,5 +1,3 @@
-#[cfg(feature = "gpu")]
-pub use crate::sampler::gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler};
 use crate::{
     matrix::{
         CompactMatrixDecodeError, PolyMatrix,
@@ -15,8 +13,6 @@ use crate::{
     },
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
 };
-#[cfg(feature = "gpu")]
-pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
 use std::{
@@ -26,8 +22,6 @@ use std::{
 use tracing::debug;
 use utils::{gen_dgg_int_vec, gen_int_karney, split_int64_mat_to_elems};
 
-#[cfg(feature = "gpu")]
-pub mod gpu;
 pub mod sampler;
 pub mod utils;
 

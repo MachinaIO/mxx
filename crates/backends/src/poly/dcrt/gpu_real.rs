@@ -29,7 +29,7 @@ unsafe extern "C" {
 /// execution; uploads happen only between sequential executions.
 pub struct GpuDeviceReal {
     buffer: GpuDeviceBuffer,
-    params: GpuDCRTPolyParams,
+    _params: GpuDCRTPolyParams,
     physical_device: i32,
 }
 
@@ -41,7 +41,7 @@ impl GpuDeviceReal {
         let stream = params.native_launch_stream(physical_device)?;
         let buffer = GpuDeviceBuffer::allocate(&stream, 8)?;
         buffer.upload(0, &0f64.to_le_bytes())?;
-        Ok(Self { buffer, params: params.clone(), physical_device })
+        Ok(Self { buffer, _params: params.clone(), physical_device })
     }
 
     pub fn upload_f64(&self, value: f64) -> Result<(), GpuNativeGraphError> {
@@ -49,17 +49,6 @@ impl GpuDeviceReal {
             return Err(GpuNativeGraphError::Native("resident real must be finite".into()));
         }
         self.buffer.upload(0, &value.to_le_bytes())
-    }
-
-    /// Read only after the producer Graph completion event has been joined.
-    pub fn read_f64(&self) -> Result<f64, GpuNativeGraphError> {
-        let mut bytes = [0u8; 8];
-        self.params.download_device_bytes(
-            self.physical_device,
-            self.device_address(),
-            &mut bytes,
-        )?;
-        Ok(f64::from_le_bytes(bytes))
     }
 
     pub fn physical_device(&self) -> i32 {
@@ -205,6 +194,14 @@ mod tests {
     use num_bigint::BigInt;
     use serial_test::serial;
 
+    fn read_f64(real: &GpuDeviceReal) -> f64 {
+        let mut bytes = [0u8; 8];
+        real._params
+            .download_device_bytes(real.physical_device, real.device_address(), &mut bytes)
+            .unwrap();
+        f64::from_le_bytes(bytes)
+    }
+
     #[test]
     #[serial]
     fn real_graph_replays_arithmetic_and_rejects_invalid_domain() {
@@ -259,7 +256,7 @@ mod tests {
             .unwrap();
         graph.launch(&stream).unwrap().wait().unwrap();
         assert_eq!(status.read().unwrap(), 0);
-        assert_eq!(output.read_f64().unwrap(), 3.0);
+        assert_eq!(read_f64(&output), 3.0);
 
         right.upload_f64(-0.0).unwrap();
         status.reset().unwrap();
@@ -267,7 +264,7 @@ mod tests {
         status.prepare_graph_launch(&stream).unwrap();
         graph.launch(&stream).unwrap().wait().unwrap();
         assert_eq!(status.read().unwrap(), 2);
-        assert_eq!(output.read_f64().unwrap(), 0.0);
+        assert_eq!(read_f64(&output), 0.0);
 
         let integer = GpuSignedValues::from_bigints_with_words(
             &params,
@@ -316,7 +313,7 @@ mod tests {
         status.prepare_graph_launch(&stream).unwrap();
         integer_graph.launch(&stream).unwrap().wait().unwrap();
         assert_eq!(status.read().unwrap(), 0);
-        assert_eq!(output.read_f64().unwrap(), 9_007_199_254_740_992.0);
+        assert_eq!(read_f64(&output), 9_007_199_254_740_992.0);
 
         left.upload_f64(-1.0).unwrap();
         status.reset().unwrap();
@@ -362,6 +359,6 @@ mod tests {
         status.prepare_graph_launch(&stream).unwrap();
         sqrt_graph.launch(&stream).unwrap().wait().unwrap();
         assert_eq!(status.read().unwrap(), 0);
-        assert_eq!(output.read_f64().unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(read_f64(&output).to_bits(), (-0.0f64).to_bits());
     }
 }

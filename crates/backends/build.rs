@@ -66,9 +66,6 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArith.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixArithBatch.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTTBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
@@ -83,9 +80,7 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/include/Real.cuh");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSmallRhs.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixCrt.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSmallRhs.cu");
         println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
         println!("cargo::rerun-if-changed=cuda/include/Primitive.cuh");
         println!("cargo::rerun-if-changed=cuda/include/Control.cuh");
@@ -94,15 +89,9 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixUtils.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixData.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixArith.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixDecompose.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixNTT.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSampling.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixTrapdoor.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSerde.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixCrt.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
 
         let cuda_arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "89".to_string());
         let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());

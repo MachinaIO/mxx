@@ -396,15 +396,27 @@ fn compiled_raw_integer_part(
         _ => return Err(invalid("integer operation requires signed or BoolI64 encoding")),
     };
     let count = if matches!(physical_encoding, PhysicalEncoding::BoolI64) {
-        if !matches!(owner.wire_type(), ConcreteWireType::Bool | ConcreteWireType::ConstantBool) ||
-            part.view.origin.as_ref() != [0] ||
-            part.view.extent.as_ref() != [1] ||
-            part.view.byte_strides.as_ref() != [8] ||
+        // One i64 per value: a scalar, a lane vector, or a family template.
+        let contiguous = part
+            .view
+            .extent
+            .iter()
+            .zip(part.view.byte_strides.iter())
+            .rev()
+            .try_fold(8u64, |stride, (&extent, &actual)| {
+                (actual == stride).then(|| stride * extent)
+            });
+        if part.view.origin.iter().any(|&origin| origin != 0) ||
+            contiguous.is_none() ||
             part.view.element_bytes != 8
         {
-            return Err(invalid("boolean integer output has an invalid scalar layout"));
+            return Err(invalid("boolean integer value has an invalid layout"));
         }
-        1
+        part.view
+            .extent
+            .iter()
+            .try_fold(1u64, |count, &extent| count.checked_mul(extent))
+            .ok_or_else(|| invalid("boolean value count overflows"))?
     } else {
         if part.view.extent.len() < 2 ||
             part.view.origin.last() != Some(&0) ||
@@ -4348,9 +4360,10 @@ pub(crate) fn emit_compiled_gpu_op(
                 modulus.count != 1 ||
                 length.count != 1 ||
                 output.count == 0 ||
-                (*output_bool == 0 &&
-                    !matches!(output.encoding, GpuSignedValuesEncoding::SignedWords(_))) ||
-                (*output_bool == 1 && output.encoding != GpuSignedValuesEncoding::CanonicalU64)
+                *output_bool > 1 ||
+                // The decoder writes SignedWords; Boolean outputs are copied
+                // into BoolI64 by later Graph operations.
+                !matches!(output.encoding, GpuSignedValuesEncoding::SignedWords(_))
             {
                 return Err(invalid("threshold decode physical shape disagrees"));
             }
@@ -4422,11 +4435,16 @@ pub(crate) fn emit_compiled_gpu_op(
             if !matches!(source.encoding, GpuSignedValuesEncoding::SignedWords(_)) {
                 return Err(invalid("polynomial coefficients require signed words"));
             }
-            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
-                destination_owner,
-                *destination_part,
-                PhysicalEncoding::FullCoeff,
-            )?;
+            // Residues are written as given: coefficients into a FullCoeff
+            // destination, canonical evaluation slots into a FullEval one.
+            let encoding = match destination_owner.physical().encodings.as_ref() {
+                [encoding @ (PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval)] => {
+                    encoding.clone()
+                }
+                _ => return Err(invalid("polynomial destination is not a full CRT matrix")),
+            };
+            let (destination_ty, destination, destination_bindings) =
+                compiled_raw_matrix_part(destination_owner, *destination_part, encoding)?;
             if (destination_ty.rows, destination_ty.columns) != (1, 1) ||
                 source.count != destination_ty.ring.ring_dimension() as usize ||
                 destination.physical_device != op.device
@@ -4457,7 +4475,7 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(status_owner));
         }
         GpuNativePrimitive::SampleUniform |
-        GpuNativePrimitive::SampleBit |
+        GpuNativePrimitive::SampleInterval |
         GpuNativePrimitive::SampleGaussian => {
             let [
                 KernelArg::Value(destination_id),
@@ -4467,6 +4485,8 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::F64(sigma),
                 KernelArg::U64(max_bound),
                 KernelArg::U64(coefficient_modulus),
+                KernelArg::I64(interval_minimum),
+                KernelArg::I64(interval_maximum),
                 KernelArg::U64(full_columns),
                 KernelArg::U64(sample_domain),
                 KernelArg::U32(destination_binding),
@@ -4508,7 +4528,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
             let distribution = match implementation.primitive {
                 GpuNativePrimitive::SampleGaussian => 1,
-                GpuNativePrimitive::SampleBit => 2,
+                GpuNativePrimitive::SampleInterval => 4,
                 GpuNativePrimitive::SampleUniform => 0,
                 _ => unreachable!("sample match excludes other primitives"),
             };
@@ -4519,6 +4539,8 @@ pub(crate) fn emit_compiled_gpu_op(
                 *sigma,
                 *max_bound,
                 *coefficient_modulus,
+                *interval_minimum,
+                *interval_maximum,
                 seed_address,
                 *full_columns,
                 *sample_domain,
@@ -6035,6 +6057,12 @@ impl GpuDcrtBackend {
         Self { devices, execution_identity: NEXT_BACKEND.fetch_add(1, Ordering::Relaxed) }
     }
 
+    /// Distinguishes backend instances; a frozen plan executes only on the
+    /// backend that planned it.
+    pub(crate) fn execution_identity(&self) -> u64 {
+        self.execution_identity
+    }
+
     pub fn physical_device_ids(&self) -> Vec<i32> {
         self.devices.iter().map(|(physical, _)| *physical).collect()
     }
@@ -6284,11 +6312,14 @@ impl GpuDcrtBackend {
             .map(|q| 64 - q.leading_zeros())
             .max()
             .ok_or("resident matrix has an empty CRT basis")?;
+        // The registered ring carries the gadget base of the CPU parameters.
+        let device = value.physical().parts.first().map_or(-1, |part| part.device);
+        let base_bits = self.parameters_on_physical_device(device, matrix)?.base_bits();
         let params = DCRTPolyParams::try_new(
             matrix.ring.ring_dimension(),
             moduli.len(),
             bits as usize,
-            8,
+            base_bits,
             Some(moduli.to_vec()),
             None,
         )

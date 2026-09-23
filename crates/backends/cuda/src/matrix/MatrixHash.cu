@@ -546,7 +546,7 @@ extern "C" int gpu_raw_hash_sample_emit(
         !destination || !destination->limbs || !destination->rows ||
         !destination->columns || !destination->degree ||
         destination->physical_device != plan->device ||
-        destination->degree != ctx->N ||
+        destination->degree != static_cast<uint32_t>(ctx->N) ||
         destination->limb_count != plan->moduli.size() ||
         destination_binding_base > UINT32_MAX - destination->limb_count ||
         destination->rows > UINT64_MAX / destination->columns ||

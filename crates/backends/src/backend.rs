@@ -465,6 +465,65 @@ impl GpuResidentValue {
         Self::new(physical, self.storage.clone(), self.ready.clone())
     }
 
+    pub(crate) fn storages(
+        &self,
+    ) -> impl Iterator<Item = (&crate::gpu_execution_plan::StorageRef, &BoundStorage)> {
+        self.storage.iter()
+    }
+
+    /// The same view over new allocations: every storage owned by one of the
+    /// `replaced` allocations is swapped for its replacement, and `ready`
+    /// becomes the replacements' producers. `None` if nothing aliases them.
+    pub(crate) fn rebound(
+        &self,
+        replaced: &[(*const (), BoundStorage)],
+        ready: &[Arc<crate::poly::dcrt::gpu::GpuNativeEvent>],
+    ) -> Result<Option<Self>, &'static str> {
+        let replacement = |bound: &BoundStorage| {
+            let owner = Arc::as_ptr(&bound.owner).cast::<()>();
+            replaced.iter().find(|(old, _)| *old == owner).map(|(_, new)| new)
+        };
+        if self.storage.values().all(|bound| replacement(bound).is_none()) {
+            return Ok(None);
+        }
+        let storage = self
+            .storage
+            .iter()
+            .map(|(slot, bound)| (*slot, replacement(bound).unwrap_or(bound).clone()))
+            .collect();
+        Self::new(Arc::clone(&self.physical), storage, ready.into()).map(Some)
+    }
+
+    /// Copy every bound allocation into new device storage with the same
+    /// physical descriptor, so the copy outlives the plan that produced
+    /// `self`. The copies wait for this value's producers on the device.
+    pub(crate) fn deep_copy(
+        &self,
+        backend: &crate::backend::poly_gpu::GpuDcrtBackend,
+    ) -> Result<Self, String> {
+        let mut storage = BTreeMap::new();
+        let mut ready = Vec::with_capacity(self.storage.len());
+        for (&slot, bound) in &self.storage {
+            let parameters = backend.control_parameters_on_device(bound.device)?;
+            let bytes = usize::try_from(bound.bytes)
+                .map_err(|_| "GPU resident copy exceeds host address space".to_owned())?;
+            let copy = Arc::new(
+                crate::poly::dcrt::gpu::GpuDeviceBytes::new(&parameters, bound.device, bytes)
+                    .map_err(|error| error.to_string())?,
+            );
+            for event in self.ready.iter() {
+                event.enqueue_wait(copy.launch_stream()).map_err(|error| error.to_string())?;
+            }
+            ready.push(Arc::new(
+                copy.copy_from_resident(bound.device, bound.address)
+                    .map_err(|error| error.to_string())?,
+            ));
+            storage.insert(slot, BoundStorage::from_device_bytes(copy)?);
+        }
+        Self::new(Arc::clone(&self.physical), storage, ready.into_boxed_slice())
+            .map_err(str::to_owned)
+    }
+
     pub(crate) fn new(
         physical: Arc<crate::gpu_execution_plan::PhysicalValue>,
         storage: BTreeMap<crate::gpu_execution_plan::StorageRef, BoundStorage>,
@@ -613,6 +672,8 @@ impl RuntimeValue {
         Ok(Self::Resident(Arc::new(resident)))
     }
 
+    /// Bind an evaluation-domain (`FullEval`) GPU owner, such as one built by
+    /// `GpuDCRTPolyMatrix::from_cpu_matrix`, as a resident matrix input.
     #[cfg(feature = "gpu")]
     pub fn gpu_matrix(
         ty: ConcreteWireType,
@@ -629,11 +690,9 @@ impl RuntimeValue {
         {
             return Err("GPU matrix owner disagrees with its concrete wire type".into());
         }
-        let encoding =
-            if owner.is_ntt() { PhysicalEncoding::FullEval } else { PhysicalEncoding::FullCoeff };
         let (_, resident) = crate::gpu_physical_lowering::physical_matrix(
             matrix,
-            encoding,
+            PhysicalEncoding::FullEval,
             StorageRef::Input(0),
             owner,
         )?;

@@ -23,8 +23,8 @@ samplers implement the current runtime-correspondence contract; GPU cutoff enfor
 as a follow-up. Lattice-security estimation intentionally continues to model the corresponding
 ordinary untruncated distributions separately.
 
-See `docs/architecture.md`, `docs/dsl.md`, `docs/ir-core.md`, `docs/runtime.md`, and
-`docs/correctness/operational-protocol-inventory.md`.
+See `docs/architecture.md` (the design entry point, covering the IR, DSL, CPU executor, and GPU
+runtime) and `docs/correctness/operational-protocol-inventory.md`.
 
 ## FHE graphs
 

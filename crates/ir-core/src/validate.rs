@@ -749,8 +749,12 @@ fn validate_node(
         }
         NodeKind::MatrixNegate | NodeKind::MatrixScale { .. } => {
             require_arity(scope, node, 1)?;
+            // A loop-dependent scalar is evaluated per instance at run time;
+            // the index-zero template value says nothing about other lanes.
             if let NodeKind::MatrixScale { scalar } = node.kind {
-                scalar.evaluate_with_rings(env, resolve_basis)?;
+                if !scalar.contains_loop_index() {
+                    scalar.evaluate_with_rings(env, resolve_basis)?;
+                }
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }

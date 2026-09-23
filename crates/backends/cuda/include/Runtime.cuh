@@ -125,14 +125,6 @@ struct MxxGraphBindingMapEntry
     uint32_t global_binding;
 };
 
-struct MxxGraphMemorySnapshot
-{
-    uint64_t used_current;
-    uint64_t used_high;
-    uint64_t reserved_current;
-    uint64_t reserved_high;
-};
-
 int gpu_context_create(
     uint32_t logN,
     uint32_t L,
@@ -142,14 +134,12 @@ int gpu_context_create(
     const int *gpu_ids,
     size_t gpu_ids_len,
     size_t stream_pool_size,
-    uint32_t vram_percent,
     const GpuContext *related_context,
     GpuContext **out_ctx);
 
 void gpu_context_destroy(GpuContext *ctx);
 int gpu_context_fence_releases(const GpuContext *ctx);
 int gpu_context_get_N(const GpuContext *ctx, int *out_N);
-int gpu_context_get_vram_budget_bytes(const GpuContext *ctx, size_t *out_bytes);
 int gpu_context_get_compute_stream(const GpuContext *ctx, int physical_device, void **out_stream);
 uint64_t gpu_context_execution_identity(const GpuContext *ctx);
 int gpu_default_mempool_get_usage(
@@ -157,7 +147,7 @@ int gpu_default_mempool_get_usage(
     size_t *out_used_current_bytes,
     size_t *out_used_high_bytes,
     size_t *out_reserved_current_bytes);
-int gpu_default_mempool_reset_used_high(int device);
+
 int gpu_device_context_state(int device, size_t *out_count, uint64_t *out_generation);
 int gpu_device_get_identity(
     int device,
@@ -189,7 +179,6 @@ void gpu_event_set_destroy(GpuEventSet *events);
 int gpu_device_count(int *out_count);
 int gpu_device_mem_info(int device, size_t *out_free, size_t *out_total);
 int gpu_device_synchronize();
-int gpu_device_reset();
 
 const char *gpu_last_error();
 
@@ -215,9 +204,6 @@ int gpu_export_slot_alloc(int physical_device, size_t payload_capacity,
     void **out_host, void **out_device);
 int gpu_export_slot_ready(const void *host_header, int *out_ready);
 int gpu_export_slot_reset(void *host_header);
-int gpu_export_slot_publish(void *device_header, uint64_t occurrence,
-    uint64_t artifact_offset, uint64_t payload_bytes, uint32_t site,
-    uint32_t flags, void *stream);
 
 // Stream-ordered device buffer owners used by allocation-free graph bodies.
 // The opaque owner retains the allocation and its producer completion event;
@@ -244,37 +230,9 @@ int gpu_device_buffer_wait_compiled_inputs(
     int consumer_device,
     void *consumer_stream,
     bool read_only);
-int gpu_device_buffer_track_compiled_consumer(
-    const MxxGpuDeviceBuffer *buffer,
-    int consumer_device,
-    void *consumer_stream,
-    void *completion_event,
-    bool read_only);
-int gpu_device_buffer_record_compiled_write(
-    MxxGpuDeviceBuffer *buffer,
-    void *stream);
+
 int gpu_device_buffer_wait(const MxxGpuDeviceBuffer *buffer);
-int gpu_device_buffer_gather_u64(
-    const MxxGpuDeviceBuffer *source,
-    size_t source_offset,
-    size_t source_count,
-    const MxxGpuDeviceBuffer *indices,
-    size_t indices_offset,
-    size_t index_count,
-    MxxGpuDeviceBuffer *destination,
-    size_t destination_offset,
-    void *stream);
-// Enqueue a device-to-device range copy on the caller-provided stream.  The
-// destination producer event is updated so later owners retain the copy
-// dependency.  Different physical devices use CUDA peer copy; no host
-// staging is permitted by this API.
-int gpu_device_buffer_copy_range(
-    const MxxGpuDeviceBuffer *source,
-    size_t source_offset,
-    MxxGpuDeviceBuffer *destination,
-    size_t destination_offset,
-    size_t bytes,
-    void *stream);
+
 // Blocking D2H read of device memory after the runtime has validated its
 // owner/view bounds and awaited its producer completion event.
 int gpu_context_download_address(
@@ -546,6 +504,7 @@ int gpu_raw_centered_round_divide_dynamic_emit(
 int gpu_raw_matrix_sample(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *destination, int distribution, double sigma,
     uint64_t max_coefficient_bound, uint64_t coefficient_modulus,
+    int64_t interval_minimum, int64_t interval_maximum,
     const void *device_seed, uint64_t full_columns, uint64_t sample_domain,
     uint32_t destination_binding_base, uint32_t seed_binding);
 int gpu_raw_polynomial_from_values(GpuContext *ctx, void *stream,
@@ -558,7 +517,6 @@ int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *destination,
     uint32_t source_binding, uint32_t destination_binding_base);
 
-
 // Explicit graph construction. Operation predecessors are terminal tokens
 // returned by finish_operation; each operation's internal nodes are ordered.
 int mxx_gpu_graph_builder_create(GpuContext *ctx, int physical_device,
@@ -569,8 +527,7 @@ int mxx_gpu_graph_builder_finish_operation(MxxGpuGraphBuilder *builder,
     uint32_t *out_terminal);
 int mxx_gpu_graph_builder_bind_resident_address(MxxGpuGraphBuilder *builder,
     uint64_t address, size_t bytes, uint32_t binding);
-int mxx_gpu_graph_builder_set_binding_map(MxxGpuGraphBuilder *builder,
-    const MxxGraphBindingMapEntry *entries, size_t entry_count);
+
 int mxx_gpu_graph_builder_add_kernel(MxxGpuGraphBuilder *builder, const void *function,
     uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
     uint32_t block_x, uint32_t block_y, uint32_t block_z,
@@ -593,10 +550,7 @@ int mxx_gpu_graph_builder_add_dynamic_export(
     uint32_t table_binding, uint32_t claims_binding,
     uint32_t claim_result_binding, uint32_t occurrence_binding,
     uint32_t source_binding, uint32_t status_binding);
-int mxx_gpu_graph_builder_begin_preimage_retry(MxxGpuGraphBuilder *builder,
-    const MxxPreimageRetrySpec *spec, void *fixed_scratch,
-    void *device_control, void *device_status);
-int mxx_gpu_graph_builder_finish_preimage_retry(MxxGpuGraphBuilder *builder);
+
 int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder,
     const uint64_t *predicate, uint32_t predicate_binding);
 int mxx_gpu_graph_builder_begin_while(MxxGpuGraphBuilder *builder,
@@ -607,10 +561,7 @@ int mxx_gpu_graph_builder_finish_generic_body(MxxGpuGraphBuilder *builder);
 int mxx_gpu_graph_builder_finish(MxxGpuGraphBuilder *builder, MxxGpuGraphExec **out_exec);
 void mxx_gpu_graph_builder_destroy(MxxGpuGraphBuilder *builder);
 MxxGpuGraphBuilder *mxx_gpu_graph_builder_for_stream(GpuContext *ctx, void *stream);
-void *mxx_gpu_graph_builder_dispatch_stream(GpuContext *ctx, int device,
-    void *ordinary_stream);
-int mxx_gpu_graph_builder_find_binding(MxxGpuGraphBuilder *builder,
-    uint64_t address, uint32_t *out_binding);
+
 int mxx_gpu_graph_dispatch_kernel(GpuContext *ctx, void *stream,
     const void *function, uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
     uint32_t block_x, uint32_t block_y, uint32_t block_z, size_t shared_bytes,
@@ -637,12 +588,18 @@ int mxx_gpu_native_event_enqueue_wait(
 int mxx_gpu_native_event_raw(
     MxxGpuNativeEvent *event,
     void **out_event);
-int mxx_gpu_native_event_query(MxxGpuNativeEvent *event, int *out_complete);
-void mxx_gpu_native_event_destroy(MxxGpuNativeEvent *event);
 
-int mxx_gpu_graph_memory_snapshot(
-    int physical_device,
-    MxxGraphMemorySnapshot *out_snapshot);
+void mxx_gpu_native_event_destroy(MxxGpuNativeEvent *event);
+// Enqueue a device-to-device copy from a validated resident address into an
+// owned buffer after the caller has enqueued the source producer dependencies
+// on `stream`. The returned event completes with the copy; the host never waits.
+int gpu_device_buffer_copy_from_address(
+    const void *source,
+    int source_device,
+    MxxGpuDeviceBuffer *destination,
+    size_t bytes,
+    void *stream,
+    MxxGpuNativeEvent **out_event);
 
 // Explicit graph node patches bind addresses at replay.
 enum MxxGraphPatchTarget
@@ -701,8 +658,6 @@ struct GpuExecutionOwner
 {
     uint64_t identity = 0;
     std::vector<int> gpu_ids;
-    size_t vram_budget_bytes = 0;
-    uint32_t vram_percent = 0;
     bool registered = false;
     std::vector<std::vector<cudaStream_t>> compute_streams_by_partition;
     std::vector<cudaStream_t> release_streams_by_partition;
@@ -732,7 +687,6 @@ struct GpuContext
     std::vector<int> gpu_ids;
     uint32_t dnum;
     size_t max_aux_limbs;
-    size_t vram_budget_bytes;
     std::vector<uint64_t> garner_inverse_table;
     std::vector<dim3> limb_gpu_ids;
     std::vector<int> limb_prime_ids;

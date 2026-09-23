@@ -5,8 +5,6 @@ use crate::{
 use num_bigint::BigUint;
 
 pub mod bounds;
-#[cfg(feature = "gpu")]
-pub mod gpu;
 pub mod hash;
 pub mod trapdoor;
 pub mod uniform;

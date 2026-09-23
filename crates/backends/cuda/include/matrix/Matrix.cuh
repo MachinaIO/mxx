@@ -12,18 +12,14 @@ extern "C" {
 
 typedef struct GpuMatrix GpuMatrix;
 
-typedef enum GpuPolyFormat
-{
-    GPU_POLY_FORMAT_COEFF = 0,
-    GPU_POLY_FORMAT_EVAL = 1,
-} GpuPolyFormat;
-
 typedef enum GpuMatrixSampleDist
 {
     GPU_MATRIX_DIST_UNIFORM = 0,
     GPU_MATRIX_DIST_GAUSS = 1,
     GPU_MATRIX_DIST_BIT = 2,
     GPU_MATRIX_DIST_TERNARY = 3,
+    // Uniform over an inclusive signed interval; raw Graph sampler only.
+    GPU_MATRIX_DIST_INTERVAL = 4,
 } GpuMatrixSampleDist;
 
 #ifdef __cplusplus
@@ -37,7 +33,6 @@ struct GpuMatrix
     size_t rows;
     size_t cols;
     int level;
-    GpuPolyFormat format;
     struct LimbExecState
     {
         int device;
@@ -86,13 +81,9 @@ struct GpuMatrix
 };
 #endif
 
-#include "matrix/MatrixArith.cuh"
 #include "matrix/MatrixCrt.cuh"
 #include "matrix/MatrixData.cuh"
-#include "matrix/MatrixDecompose.cuh"
 #include "matrix/MatrixNTT.cuh"
-#include "matrix/MatrixSampling.cuh"
 #include "matrix/MatrixSerde.cuh"
-#include "matrix/MatrixTrapdoor.cuh"
 #include "matrix/MatrixUtils.cuh"
 #include "matrix/MatrixSmallRhs.cuh"

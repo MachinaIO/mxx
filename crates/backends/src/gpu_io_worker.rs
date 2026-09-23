@@ -23,7 +23,7 @@ use crate::{
 };
 #[cfg(test)]
 use mxx_ir_core::artifact::ProductionId;
-use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact};
+use mxx_ir_core::artifact::{Manifest, ManifestArtifact};
 use std::{
     marker::PhantomData,
     num::NonZeroUsize,
@@ -155,15 +155,6 @@ pub(crate) enum IoCommand<E: std::error::Error + 'static> {
         staged: bool,
         reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
     },
-    Export {
-        frame: FrameGeneration,
-        key: ArtifactKey,
-        artifact_type: ArtifactType,
-        availability: ArtifactAvailability,
-        layout: Option<String>,
-        payload: RuntimeOwnedPayload,
-        reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
-    },
     ExportSlot {
         frame: FrameGeneration,
         key: ArtifactKey,
@@ -257,46 +248,8 @@ pub(crate) fn submit_export_slot<E: std::error::Error + 'static>(
     Ok(receiver)
 }
 
-/// The transient capability.  It intentionally has no methods for opening,
-/// finalizing, or reading/writing a transcript.
-pub struct TransientIoClient<'scope, E: std::error::Error + 'static> {
-    core: IoClientCore<'scope, E>,
-}
-
-impl<'scope, E: std::error::Error + 'static> TransientIoClient<'scope, E> {
-    pub fn try_import(
-        &self,
-        frame: FrameGeneration,
-        key: ArtifactKey,
-        descriptor: ManifestArtifact,
-        staged: bool,
-    ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
-        self.core.submit_with(|reply| IoCommand::Import { frame, key, descriptor, staged, reply })
-    }
-
-    pub fn try_export(
-        &self,
-        frame: FrameGeneration,
-        key: ArtifactKey,
-        artifact_type: ArtifactType,
-        availability: ArtifactAvailability,
-        layout: Option<String>,
-        payload: RuntimeOwnedPayload,
-    ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
-        self.core.submit_with(|reply| IoCommand::Export {
-            frame,
-            key,
-            artifact_type,
-            availability,
-            layout,
-            payload,
-            reply,
-        })
-    }
-}
-
-/// Producer capability. It has the transient operations plus the transcript
-/// record operation required by a resumable producer session.
+/// Producer capability: on-demand imports, artifact slot writes and commits,
+/// and the transcript record operation required by a resumable session.
 pub struct ProducerIoClient<'scope, E: std::error::Error + 'static> {
     core: IoClientCore<'scope, E>,
 }
@@ -312,30 +265,7 @@ impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
         descriptor: ManifestArtifact,
         staged: bool,
     ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
-        TransientIoClient {
-            core: IoClientCore { sender: self.core.sender.clone(), _scope: PhantomData },
-        }
-        .try_import(frame, key, descriptor, staged)
-    }
-
-    pub fn try_export(
-        &self,
-        frame: FrameGeneration,
-        key: ArtifactKey,
-        artifact_type: ArtifactType,
-        availability: ArtifactAvailability,
-        layout: Option<String>,
-        payload: RuntimeOwnedPayload,
-    ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
-        self.core.submit_with(|reply| IoCommand::Export {
-            frame,
-            key,
-            artifact_type,
-            availability,
-            layout,
-            payload,
-            reply,
-        })
+        self.core.submit_with(|reply| IoCommand::Import { frame, key, descriptor, staged, reply })
     }
 
     pub fn try_commit(
@@ -386,30 +316,6 @@ impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
     }
 }
 
-/// Run a worker with only transient capabilities.
-pub fn with_scoped_transient_io_worker<S, R>(
-    store: &mut S,
-    window: NonZeroUsize,
-    run: impl for<'scope> FnOnce(TransientIoClient<'scope, S::Error>) -> R,
-) -> Result<R, IoWorkerError<S::Error>>
-where
-    S: SessionStore + Send,
-{
-    thread::scope(|scope| {
-        // `window` reserves one command per possible export slot. Keep one
-        // additional entry for the on-demand import currently at a DSL load.
-        let (sender, receiver) = mpsc::sync_channel(window.get().saturating_add(1));
-        let worker = scope.spawn(move || worker_loop(store, receiver));
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            run(TransientIoClient { core: IoClientCore { sender, _scope: PhantomData } })
-        }));
-        match (result, worker.join()) {
-            (Ok(result), Ok(())) => Ok(result),
-            _ => Err(IoWorkerError::Panicked),
-        }
-    })
-}
-
 /// Run a worker with producer capabilities, including transcript recording.
 /// The mutable store is borrowed only for this scope and is always joined
 /// before the function returns.
@@ -456,27 +362,6 @@ where
                     payload: RuntimeOwnedPayload::new(payload),
                 })
                 .map_err(IoWorkerError::Store);
-                failed = result.is_err();
-                let _ = reply.send(result);
-            }
-            IoCommand::Export {
-                frame,
-                key,
-                artifact_type,
-                availability,
-                layout,
-                payload,
-                reply,
-            } => {
-                if failed {
-                    let _ = reply.send(Err(IoWorkerError::PriorFailure));
-                    continue;
-                }
-                let artifact_payload = payload.into_payload();
-                let result = store
-                    .store(key, &artifact_type, availability, layout.as_deref(), artifact_payload)
-                    .map(|()| IoCompletion::Exported { frame })
-                    .map_err(IoWorkerError::Store);
                 failed = result.is_err();
                 let _ = reply.send(result);
             }
@@ -634,28 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transient_worker_tags_completion() {
-        let mut store = MemoryArtifactStore::default();
-        open_store(&mut store);
-        with_scoped_transient_io_worker(&mut store, NonZeroUsize::new(1).unwrap(), |client| {
-            let first = client
-                .try_export(
-                    FrameGeneration::new(4, 9),
-                    key(),
-                    descriptor().artifact_type.clone(),
-                    descriptor().availability,
-                    None,
-                    RuntimeOwnedPayload::new(ArtifactPayload::Bytes(vec![1, 2, 3])),
-                )
-                .expect("first command fits");
-            let completion = first.wait().expect("export completion");
-            assert_eq!(completion.frame(), FrameGeneration::new(4, 9));
-        })
-        .expect("worker join");
-    }
-
-    #[test]
-    fn producer_transcript_and_replay_commands_are_distinct_from_transient_api() {
+    fn producer_worker_records_transcript_entries() {
         let mut store = MemoryArtifactStore::default();
         open_store(&mut store);
         with_scoped_producer_io_worker(&mut store, NonZeroUsize::new(2).unwrap(), |client| {
@@ -695,17 +559,10 @@ mod tests {
     fn worker_drain_and_join_releases_the_store_borrow() {
         let mut store = MemoryArtifactStore::default();
         open_store(&mut store);
-        with_scoped_transient_io_worker(&mut store, NonZeroUsize::new(2).unwrap(), |client| {
+        with_scoped_producer_io_worker(&mut store, NonZeroUsize::new(2).unwrap(), |client| {
             let request = client
-                .try_export(
-                    FrameGeneration::new(1, 0),
-                    key(),
-                    descriptor().artifact_type.clone(),
-                    descriptor().availability,
-                    None,
-                    RuntimeOwnedPayload::new(ArtifactPayload::Bytes(vec![1, 2, 3])),
-                )
-                .expect("export command");
+                .try_import(FrameGeneration::new(1, 0), key(), descriptor(), false)
+                .expect("import command");
             drop(request);
         })
         .expect("worker drains dropped reply and joins");

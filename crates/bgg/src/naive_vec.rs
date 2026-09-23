@@ -822,7 +822,7 @@ mod tests {
             &parameters,
             vec![row(&parameters, columns, 2).get_row(0), row(&parameters, columns, 4).get_row(0)],
         );
-        let plaintext = row(&parameters, 1, 6);
+        // The product does not read the plaintext, so it is not a graph input.
         let target = DCRTPolyMatrix::unit_column_vector(&parameters, 2, 1);
         let result = execute_graph(
             graph,
@@ -830,7 +830,6 @@ mod tests {
             BTreeMap::from([
                 ("vector".to_owned(), RuntimeValue::matrix(vector.clone())),
                 ("public".to_owned(), RuntimeValue::matrix(public.clone())),
-                ("plaintext".to_owned(), RuntimeValue::matrix(plaintext)),
                 ("target".to_owned(), RuntimeValue::matrix(target.clone())),
             ]),
         );

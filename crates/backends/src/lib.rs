@@ -8,13 +8,10 @@
 
 pub mod element;
 pub mod env;
-#[cfg(feature = "gpu")]
-pub mod gpu_memory;
 pub mod matrix;
 pub mod modulus;
 pub mod openfhe_guard;
 pub mod poly;
-pub mod rlwe_enc;
 pub mod sampler;
 pub mod utils;
 
@@ -23,7 +20,6 @@ pub mod artifact;
 pub mod authority;
 pub mod backend;
 pub mod executor;
-pub mod gpu_column_policy;
 pub mod gpu_execution_plan;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_io_worker;
@@ -77,6 +73,6 @@ pub use session::{
 
 #[cfg(feature = "gpu")]
 pub use gpu_runtime::{
-    GpuExecutionPlan, GpuExecutionResult, GpuOutputRef, GpuPlanError, GpuPreparedBackendContract,
-    GpuRuntime, GpuRuntimeConfigError, GpuRuntimeError, GpuRuntimeOptions,
+    GpuExecutionPlan, GpuExecutionResult, GpuOutputRef, GpuPlanError, GpuRuntime,
+    GpuRuntimeConfigError, GpuRuntimeError, GpuRuntimeOptions,
 };

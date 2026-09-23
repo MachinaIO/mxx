@@ -1,11 +1,12 @@
 //! End-to-end Ring-GSW GPU round-trip.
 //!
-//! The test builds DSL programs, plans them on one [`GpuRuntime`], passes each
-//! execution's resident GPU owners into the next program, and checks decryption.
+//! The test builds DSL programs, plans them on one [`GpuRuntime`], copies each
+//! execution's resident outputs on the device into the next program's inputs,
+//! and checks decryption.
 
 use mxx_fhe::utils::{
     self,
-    gpu::{input, integers},
+    gpu::{copy_outputs, input, integers},
 };
 
 use mxx_backends::{
@@ -129,10 +130,10 @@ fn test_gpu_ring_gsw() {
     let keygen_result = runtime
         .execute(&mut keygen, BTreeMap::new(), &mut keygen_store, [0; 32])
         .expect("GPU execution");
-    // A plain graph output is returned as a resident owner.  In particular,
-    // no producer-session artifact (and hence no host serialization) may be
-    // created for this intermediate key material.
-    let keys = keygen_result.outputs.clone();
+    // A plain graph output is a resident value borrowed from its plan; the
+    // device copy keeps it for later programs without any producer-session
+    // artifact or host serialization of this intermediate key material.
+    let keys = copy_outputs(&runtime, &keygen_result);
 
     let exponent = rand::rng().random_range(0..2 * n);
     let mut message = vec![0i64; n];
@@ -165,7 +166,7 @@ fn test_gpu_ring_gsw() {
     let encryption_result = runtime
         .execute(&mut encryption, encryption_inputs, &mut encryption_store, [0; 32])
         .expect("GPU execution");
-    let encrypted = encryption_result.outputs.clone();
+    let encrypted = copy_outputs(&runtime, &encryption_result);
     runtime.options_mut().integer_input_ranges.clear();
 
     let evaluator_graph = DslContext::new("integration-ring-gsw-external-product")
@@ -187,7 +188,7 @@ fn test_gpu_ring_gsw() {
     let evaluator_result = runtime
         .execute(&mut evaluator, encrypted, &mut evaluator_store, [0; 32])
         .expect("GPU execution");
-    let evaluated = evaluator_result.outputs.clone();
+    let evaluated = copy_outputs(&runtime, &evaluator_result);
 
     // Decryption is the final DSL program: it consumes the evaluated
     // ciphertext and produces the value checked by the round-trip assertion.
@@ -217,7 +218,7 @@ fn test_gpu_ring_gsw() {
     let decryption_result = runtime
         .execute(&mut decryption, decryption_inputs, &mut decryption_store, [0; 32])
         .expect("GPU execution");
-    let decoded = decryption_result.outputs;
+    let decoded = copy_outputs(&runtime, &decryption_result);
     let expected = message
         .iter()
         .map(|v| BigInt::from(v * bit_value).mod_floor(&BigInt::from(q.as_ref().clone())))

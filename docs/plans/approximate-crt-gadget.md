@@ -89,7 +89,7 @@ parallelism inside the implementation or the test parameters.
 
 - CPU/GPU CRT parameter fields, shortened regular gadget dimensions, CPU shared
   correction, GPU-resident correction, and compact digit output are implemented.
-- `cargo test -r -p mxx-primitives --lib test_matrix_approximate_gadget_reconstruction`
+- `cargo test -r -p mxx-backends --lib test_matrix_approximate_gadget_reconstruction`
   passed (one test covering `k=0,1,2`, digit/residual bounds and chunk/compact agreement).
 - GPU release workspace unit binaries compiled successfully. The new
   `test_gpu_approximate_gadget_reconstruction` passed three consecutive executions

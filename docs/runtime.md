@@ -1,6 +1,6 @@
 # Graph runtime
 
-`mxx-runtime` executes a validated `mxx-ir-core` plan. It does not accept a
+`mxx-backends` executes a validated `mxx-ir-core` plan. It does not accept a
 mutable builder or reinterpret symbolic annotations as executable operations.
 
 The liveness plan releases intermediates after their last use unless trace mode
@@ -22,6 +22,12 @@ mutated. The warmup report on the prepared value is the timing and resource
 estimate for that graph execution. Applications form whole-protocol estimates
 by summing the reports of the prepared protocol steps; reading or serializing a
 report performs no measurement or additional GPU execution.
+
+GPU execution returns an opaque result borrowing the prepared plan. Resident
+outputs remain in plan-owned storage and may be overwritten by the next run of
+that plan. Callers must explicitly download or copy any output they need to
+keep before releasing the result and running the plan again. The runtime joins
+GPU readers and artifact transfers before reusing input or scratch storage.
 
 Artifacts are supplied and returned through the runtime artifact interfaces.
 Final applications decide how artifact payloads are persisted.

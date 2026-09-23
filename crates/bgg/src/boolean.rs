@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn public_key_and_encoding_candidates_have_uniform_selected_schemas() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let public_key =
             BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 4.into() };
 
@@ -254,7 +254,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        public_graph.validate(&bindings()).unwrap();
+        public_graph
+            .validate(&bindings(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
 
         let (encoding_context, encoding_params) =
             BooleanCircuitFamilyParams::declare(DslContext::new("dynamic-bgg-encoding"));
@@ -306,7 +308,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        encoding_graph.validate(&bindings()).unwrap();
+        encoding_graph
+            .validate(&bindings(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
         let decomposition_count = encoding_graph
             .graph
             .scopes()

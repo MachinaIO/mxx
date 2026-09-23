@@ -1,11 +1,11 @@
 //! Executable DSL graphs for Ring Regev, Ring-GSW, and leveled BGV.
 //!
 //! Methods construct graphs; randomness and cryptographic arithmetic run in
-//! `mxx-runtime`. Parameters do not imply a security level. Bootstrapping is not
+//! `mxx-backends`. Parameters do not imply a security level. Bootstrapping is not
 //! provided. Ciphertext/key compatibility beyond ring and shape is the caller's
 //! responsibility: graph handles are not authenticated cryptographic objects.
 //! Runtime inputs are passed directly; staged FHE artifacts use
-//! `mxx_runtime::MemoryArtifactStore`, with no file persistence.
+//! `mxx_backends::MemoryArtifactStore`, with no file persistence.
 
 mod bgv;
 mod params;

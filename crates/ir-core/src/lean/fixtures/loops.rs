@@ -7,7 +7,6 @@ use crate::{
     lean::{ExportOptions, export},
     node::{NodeKind, ParallelLoop, SequentialLoop},
     types::WireType,
-    validate,
 };
 use std::collections::BTreeMap;
 
@@ -120,7 +119,7 @@ fn render(n: usize, l: usize, m: usize) -> String {
     )
     .unwrap()
     .0;
-    let checked = validate(&graph, &ParamEnv::default()).unwrap();
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let artifact = export(
         &checked,
         &ExportOptions {

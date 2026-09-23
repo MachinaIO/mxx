@@ -10,7 +10,7 @@ Resolve routine implementation choices from the current code and task. Ask befor
 
 - Prefer extending existing functions and types over parallel variants (`new_with_*`, `*_with_shared_inputs`) or wrapper layers. Use optional arguments for genuinely optional behavior, not invalid state combinations.
 - When replacing a format or API, remove the superseded path and its version markers in the scoped migration; do not add compatibility shims. Do not delete unrelated legacy code.
-- Reuse existing environment variables; define primitive-operation env vars in `crates/primitives/src/env.rs`, gadget-level env vars in `crates/gadgets/src/env.rs`, and application-specific env vars in the owning crate, with explanatory comments.
+- Reuse existing environment variables; define primitive-operation env vars in `crates/backends/src/env.rs`, gadget-level env vars in `crates/gadgets/src/env.rs`, and application-specific env vars in the owning crate, with explanatory comments.
 - Inline small private helpers when this improves local readability; retain helpers that clarify ownership or a meaningful operation. Keep files under roughly 2000 lines excluding tests.
 - Delete unused code, arguments, and imports immediately; never silence warnings with `_`. Remove all debug-only scaffolding (extra syncs, flags, timing logs) before finishing.
 - Rename anything misleading; names must describe what the value or bound is, not which paper theorem it came from.

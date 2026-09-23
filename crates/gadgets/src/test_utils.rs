@@ -13,19 +13,20 @@ use crate::{
         conv_mul::{NegacyclicConvolutionContext, RingGswConvolution},
     },
 };
-use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph, parallel, select};
-use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
-use mxx_primitives::{
+use mxx_backends::{
+    ExecutionConfig, RuntimeValue,
+    artifact::MemoryArtifactStore,
+    backend::poly::cpu_backend,
+    execute,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
+    transcript::SamplingMode,
 };
-use mxx_runtime::{
-    ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
-    execute, transcript::SamplingMode,
-};
+use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph, parallel, select};
+use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
 use num_bigint::{BigInt, BigUint};
 use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
 
@@ -391,7 +392,7 @@ pub fn execute_circuit_with_shape(
             let RuntimeValue::Matrix(value) = &result.outputs[&format!("output-{index}")] else {
                 panic!("gadget output must be a matrix")
             };
-            value.as_ref().clone()
+            value.as_cpu_full().expect("CPU gadget matrix").clone()
         })
         .collect()
 }
@@ -409,10 +410,7 @@ pub(crate) fn build_circuit_graph(
         "each concrete input must correspond to one circuit input wire"
     );
     assert_eq!(shape.0, shape.1, "runtime test wires use square matrices");
-    let ring = Ring::new(
-        BigInt::from(parameters.modulus().as_ref().clone()),
-        parameters.ring_dimension() as usize,
-    );
+    let ring = crate::ring_from_params(&parameters);
     let input_wires = (0..input_count)
         .map(|index| ring.input(format!("input-{index}"), shape))
         .collect::<Vec<_>>();
@@ -432,7 +430,7 @@ pub(crate) fn build_circuit_graph(
     context
         .build()
         .expect("build runtime unit-test graph")
-        .validate(&ParamEnv::default())
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .expect("validate runtime unit-test graph")
 }
 

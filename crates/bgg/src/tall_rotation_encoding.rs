@@ -96,10 +96,8 @@ pub const TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT: &str = "bgg_tall_anchor_reduce_mat
 /// Compiler for tall rotation encoding preprocessing and artifact import.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TallRotationEncodingCompiler {
-    /// Ciphertext modulus.
-    pub modulus: IntExpr,
-    /// Polynomial ring dimension.
-    pub ring_dimension: IntExpr,
+    /// Ordered ciphertext CRT ring.
+    pub ring: Ring,
     /// Secret row width.
     pub secret_size: usize,
     /// Exact number of slots served by this compiler.
@@ -538,7 +536,7 @@ impl TallRotationEncodingCompiler {
     }
 
     pub(crate) fn ring(&self) -> Ring {
-        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+        self.ring.clone()
     }
 
     fn gadget_columns(&self) -> usize {

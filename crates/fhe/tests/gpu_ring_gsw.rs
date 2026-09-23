@@ -8,18 +8,28 @@ use mxx_fhe::utils::{
     gpu::{input, integers},
 };
 
+use mxx_backends::{
+    GpuRuntime, MemoryArtifactStore,
+    backend::poly_gpu::gpu_backend,
+    poly::{
+        PolyParams,
+        dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
+    },
+};
 use mxx_dsl::DslContext;
 use mxx_fhe::{FheCommonParams, FheScheme, RingCiphertext};
 use mxx_ir_core::ParamEnv;
-use mxx_primitives::poly::{
-    PolyParams,
-    dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
-};
-use mxx_runtime::{GpuRuntime, MemoryArtifactStore, backend::poly_gpu::gpu_backend};
 use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use rand::Rng;
 use std::collections::BTreeMap;
+
+fn ring(parameters: &DCRTPolyParams) -> mxx_dsl::Ring {
+    mxx_dsl::Ring::from_crt_moduli(
+        parameters.to_crt().0.into_iter().map(Into::into).collect(),
+        parameters.ring_dimension(),
+    )
+}
 
 fn ring_gsw_ring_parameters(common: &FheCommonParams) -> Vec<DCRTPolyParams> {
     let (primes, _, depth) = common.ring.to_crt();
@@ -66,7 +76,7 @@ fn test_gpu_ring_gsw() {
     let scheme = utils::ring_gsw_params();
     let common = &scheme.common;
     let n = common.ring.ring_dimension() as usize;
-    let ring = mxx_dsl::Ring::new(common.ring.modulus().as_ref().clone(), n);
+    let ring = ring(&common.ring);
     let q = common.ring.modulus();
     // Construct the symbolic encryption program first; its named inputs become
     // the bindings supplied when this graph is executed on the GPU.
@@ -109,7 +119,7 @@ fn test_gpu_ring_gsw() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default())
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .expect("valid integration graph");
     // Plan fixes the executable GPU path; execute returns the key material that
     // is passed as inputs to the encryption graph below.
@@ -135,9 +145,19 @@ fn test_gpu_ring_gsw() {
         ("message".into(), input(&message)),
         ("bit".into(), input(&bit)),
     ]);
+    runtime
+        .options_mut()
+        .integer_input_ranges
+        .insert("message".into(), BigInt::from(-1)..=BigInt::from(1));
+    runtime
+        .options_mut()
+        .integer_input_ranges
+        .insert("bit".into(), BigInt::from(0)..=BigInt::from(1));
     let mut encryption = runtime
         .plan(
-            encryption.validate(&ParamEnv::default()).expect("valid integration graph"),
+            encryption
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .expect("valid integration graph"),
             &encryption_inputs,
         )
         .expect("production-equivalent GPU warmup");
@@ -146,6 +166,7 @@ fn test_gpu_ring_gsw() {
         .execute(&mut encryption, encryption_inputs, &mut encryption_store, [0; 32])
         .expect("GPU execution");
     let encrypted = encryption_result.outputs.clone();
+    runtime.options_mut().integer_input_ranges.clear();
 
     let evaluator_graph = DslContext::new("integration-ring-gsw-external-product")
         .output("a", product.a.clone())
@@ -156,7 +177,9 @@ fn test_gpu_ring_gsw() {
         .unwrap();
     let mut evaluator = runtime
         .plan(
-            evaluator_graph.validate(&ParamEnv::default()).expect("valid integration graph"),
+            evaluator_graph
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .expect("valid integration graph"),
             &encrypted,
         )
         .expect("production-equivalent GPU warmup");
@@ -180,7 +203,7 @@ fn test_gpu_ring_gsw() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default())
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .expect("valid integration graph");
     let decryption_inputs = BTreeMap::from([
         ("sk".into(), keys["sk"].clone()),
@@ -200,5 +223,5 @@ fn test_gpu_ring_gsw() {
         .map(|v| BigInt::from(v * bit_value).mod_floor(&BigInt::from(q.as_ref().clone())))
         .collect::<Vec<_>>();
     // The decoded coefficients are the sole semantic check for the round-trip.
-    assert_eq!(integers(runtime.backend_mut(), &decoded, "decoded"), expected);
+    assert_eq!(integers(&runtime, &decoded, "decoded"), expected);
 }

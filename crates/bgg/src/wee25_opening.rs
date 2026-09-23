@@ -2,6 +2,8 @@
 
 use crate::{Wee25CommitmentCompiler, Wee25CommitmentError};
 use mxx_dsl::{Family, Mat, Preimage};
+#[cfg(test)]
+use mxx_ir_core::types::CoefficientBoundDomain;
 use mxx_ir_core::{
     IntExpr,
     artifact::{ArtifactAvailability, ProductionId},
@@ -419,20 +421,21 @@ fn checked_range(
 mod tests {
     use super::*;
     use crate::Wee25PublicParameterCompiler;
-    use mxx_dsl::DslContext;
-    use mxx_ir_core::{ParamEnv, artifact::SpecHash, node::NodeKind, types::WireType};
-    use mxx_primitives::{
+    use mxx_backends::{
+        ExecutionConfig, RuntimeValue,
+        artifact::MemoryArtifactStore,
+        backend::poly::cpu_backend,
+        execute,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
+        transcript::SamplingMode,
     };
-    use mxx_runtime::{
-        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
-        execute, transcript::SamplingMode,
-    };
+    use mxx_dsl::DslContext;
+    use mxx_ir_core::{ParamEnv, artifact::SpecHash, node::NodeKind, types::WireType};
     use num_bigint::{BigInt, BigUint};
     use std::collections::{BTreeMap, HashMap};
 
@@ -441,8 +444,7 @@ mod tests {
     #[test]
     fn imported_top_is_preimage_and_bottom_is_matrix_with_explicit_rhs_node() {
         let compiler = Wee25CommitmentCompiler {
-            modulus: 17.into(),
-            ring_dimension: 8.into(),
+            ring: mxx_dsl::Ring::from_crt_moduli(vec![17.into()], 8),
             secret_size: 1,
             tree_base: 2,
             digit_count: 2,
@@ -477,8 +479,8 @@ mod tests {
             matches!(node.kind(), NodeKind::Input { name, .. } if name.starts_with("artifact:wee25_t_top")) &&
                 node.output_types().iter().any(|wire| {
                     matches!(wire, WireType::IndexedFamily { element, .. } if matches!(element.as_ref(), WireType::Preimage {
-                        max_coefficient_bound, ..
-                    } if *max_coefficient_bound == 31.into()))
+                        max_coefficient_bound, bound_domain, ..
+                    } if *max_coefficient_bound == 31.into() && *bound_domain == CoefficientBoundDomain::Global))
                 })
         }));
         assert!(nodes.iter().any(|node| {
@@ -699,8 +701,7 @@ mod tests {
     fn partial_range_opening_and_verifier_match_direct_recursive_oracles() {
         let parameters = DCRTPolyParams::new(4, 1, 12, 4, None, None);
         let compiler = Wee25CommitmentCompiler {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(&parameters),
             secret_size: 1,
             tree_base: 2,
             digit_count: parameters.modulus_digits(),
@@ -731,8 +732,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let ring = compiler.ring();
-        let mut inputs =
-            BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]);
+        let mut inputs = BTreeMap::from([(
+            "hash-key".to_owned(),
+            RuntimeValue::Bytes(hash_key.to_vec().into()),
+        )]);
         let blocks = message_values
             .iter()
             .enumerate()
@@ -748,10 +751,10 @@ mod tests {
         let mut top_families = Vec::with_capacity(compiler.public_parameter_top_family_count());
         for family in 0..compiler.public_parameter_top_family_count() {
             let name = format!("top-family-{family}");
-            let values = (0..compiler.public_parameter_block_count())
+            let values: Vec<RuntimeValue> = (0..compiler.public_parameter_block_count())
                 .map(|block| {
-                    RuntimeValue::Preimage(std::sync::Arc::new(
-                        mxx_primitives::matrix::CpuSmallMatrix::new(
+                    RuntimeValue::preimage(
+                        mxx_backends::matrix::CpuSmallMatrix::new(
                             t_top_values[block *
                                 compiler.gadget_rows() *
                                 compiler.public_parameter_part_count() +
@@ -760,10 +763,17 @@ mod tests {
                             BigUint::from(1_000_000u32),
                         )
                         .unwrap(),
-                    ))
+                    )
                 })
                 .collect();
-            inputs.insert(name.clone(), RuntimeValue::IndexedFamily(values));
+            let element_type = match &values[0] {
+                RuntimeValue::Matrix(matrix) => matrix.wire_type().clone(),
+                _ => panic!("top family must contain preimages"),
+            };
+            inputs.insert(
+                name.clone(),
+                RuntimeValue::indexed_family(element_type, values).expect("top preimage family"),
+            );
             top_families.push(ring.preimage_input_family(
                 name,
                 compiler.public_parameter_block_count(),
@@ -794,7 +804,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default())
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
         let result = execute(
             &graph,
@@ -834,8 +844,11 @@ mod tests {
         let RuntimeValue::Matrix(actual_verifier) = &result.outputs["verifier"] else {
             panic!("verifier output")
         };
-        assert_eq!(actual_opening.as_ref(), &concat(&expected_openings));
-        assert_eq!(actual_verifier.as_ref(), &concat(&expected_verifiers));
+        assert_eq!(actual_opening.as_cpu_full().expect("CPU opening"), &concat(&expected_openings));
+        assert_eq!(
+            actual_verifier.as_cpu_full().expect("CPU verifier"),
+            &concat(&expected_verifiers)
+        );
     }
 
     #[test]
@@ -843,8 +856,7 @@ mod tests {
     fn generated_parameters_opening_and_verifier_have_zero_residual() {
         let parameters = DCRTPolyParams::new(4, 1, 12, 4, None, None);
         let compiler = Wee25CommitmentCompiler {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(&parameters),
             secret_size: 1,
             tree_base: 2,
             digit_count: parameters.modulus_digits(),
@@ -887,7 +899,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = built.validate(&ParamEnv::default()).unwrap();
+        let validated = built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
         let block = |offset| {
             DCRTPolyMatrix::from_poly_vec(
                 &parameters,
@@ -901,7 +915,7 @@ mod tests {
             )
         };
         let inputs = BTreeMap::from([
-            ("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x45; 32])),
+            ("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x45; 32].into())),
             ("block-0".to_owned(), RuntimeValue::matrix(block(1))),
             ("block-1".to_owned(), RuntimeValue::matrix(block(1 + compiler.public_columns()))),
         ]);
@@ -916,7 +930,7 @@ mod tests {
         .unwrap();
         let RuntimeValue::Matrix(actual) = &result.outputs["residual"] else { panic!("matrix") };
         assert_eq!(
-            actual.as_ref(),
+            actual.as_cpu_full().expect("CPU residual"),
             &DCRTPolyMatrix::zero(&parameters, 1, 2 * compiler.public_columns())
         );
     }

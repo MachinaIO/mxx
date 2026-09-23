@@ -2,13 +2,13 @@ use crate::{
     FheCommonParams, FheError, FheScheme,
     utils::{check_matrix, scalar},
 };
+use mxx_backends::poly::PolyParams;
 use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
     node::{ConcatAxis, IndexRange},
     types::WireType,
 };
-use mxx_primitives::poly::PolyParams;
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 
@@ -307,14 +307,17 @@ mod tests {
             .mul_small_rhs(common.ring().gadget(2, base, digits));
         ctx = ctx.output("original", column).unwrap().output("recomposed", recomposed).unwrap();
         let result = execute_graph(ctx.build().unwrap(), &common, inputs, &[]);
-        let mxx_runtime::RuntimeValue::Matrix(original) = &result.outputs["original"] else {
+        let mxx_backends::RuntimeValue::Matrix(original) = &result.outputs["original"] else {
             panic!("matrix")
         };
-        let mxx_runtime::RuntimeValue::Matrix(recomposed) = &result.outputs["recomposed"] else {
+        let mxx_backends::RuntimeValue::Matrix(recomposed) = &result.outputs["recomposed"] else {
             panic!("matrix")
         };
-        assert_eq!(original, recomposed);
-        use mxx_primitives::{
+        assert_eq!(
+            original.as_cpu_full().expect("CPU original"),
+            recomposed.as_cpu_full().expect("CPU recomposed")
+        );
+        use mxx_backends::{
             element::PolyElem,
             poly::{Poly, dcrt::poly::DCRTPoly},
         };
@@ -392,7 +395,7 @@ mod tests {
             scheme
                 .encrypt_gsw(
                     &ring.zero((1, 1)),
-                    &mxx_dsl::Ring::new(97, common.ring.ring_dimension()).zero((1, 1))
+                    &crate::utils::plaintext_ring(97, common.ring.ring_dimension()).zero((1, 1))
                 )
                 .is_err()
         );

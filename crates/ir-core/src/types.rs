@@ -1,5 +1,6 @@
 use crate::{
     expr::{IntExpr, RealExpr},
+    ring::{ConcreteRing, RingRef},
     serde_support,
 };
 use num_bigint::BigInt;
@@ -30,25 +31,25 @@ pub struct WireId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct MatrixType {
-    pub modulus: IntExpr,
-    pub ring_dimension: IntExpr,
-    pub rows: IntExpr,
-    pub columns: IntExpr,
+pub struct MatrixType<R = RingRef, D = IntExpr> {
+    pub ring: R,
+    pub rows: D,
+    pub columns: D,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct ConcreteMatrixType {
-    #[serde(with = "serde_support::bigint")]
-    pub modulus: BigInt,
-    pub ring_dimension: usize,
-    pub rows: usize,
-    pub columns: usize,
+pub type ConcreteMatrixType = MatrixType<ConcreteRing, usize>;
+
+/// The domain in which a bounded compact coefficient is interpreted.
+/// Per-CRT-limb digits retain one signed residue per ordered CRT tower.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum CoefficientBoundDomain {
+    Global,
+    PerCrtLimb,
 }
 
-impl ConcreteMatrixType {
-    pub fn scalar(modulus: BigInt, ring_dimension: usize) -> Self {
-        Self { modulus, ring_dimension, rows: 1, columns: 1 }
+impl MatrixType<ConcreteRing, usize> {
+    pub fn scalar(ring: ConcreteRing) -> Self {
+        Self { ring, rows: 1, columns: 1 }
     }
 
     pub fn is_scalar(&self) -> bool {
@@ -83,10 +84,12 @@ pub enum WireType {
     SmallMatrix {
         matrix: MatrixType,
         max_coefficient_bound: IntExpr,
+        bound_domain: CoefficientBoundDomain,
     },
     Preimage {
         matrix: MatrixType,
         max_coefficient_bound: IntExpr,
+        bound_domain: CoefficientBoundDomain,
     },
     IndexedFamily {
         element: Box<WireType>,
@@ -124,11 +127,13 @@ pub enum ConcreteWireType {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
+        bound_domain: CoefficientBoundDomain,
     },
     Preimage {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
+        bound_domain: CoefficientBoundDomain,
     },
     IndexedFamily {
         element: Box<ConcreteWireType>,

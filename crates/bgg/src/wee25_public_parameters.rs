@@ -208,25 +208,22 @@ mod tests {
     use crate::test_utils::{execute_graph, matrix_output};
     use mxx_dsl::DslContext;
 
-    use mxx_primitives::{
+    use mxx_backends::{
+        ExecutionResult, RuntimeValue,
         matrix::{CpuSmallMatrix, PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
-    use mxx_runtime::{ExecutionResult, RuntimeValue, backend::poly::CpuDcrtBackend};
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
     type HashSampler = DCRTPolyHashSampler<keccak_asm::Keccak256>;
 
-    fn preimage_output(
-        result: &ExecutionResult<CpuDcrtBackend>,
-        name: &str,
-    ) -> CpuSmallMatrix<DCRTPolyMatrix> {
-        let RuntimeValue::Preimage(value) = &result.outputs[name] else {
+    fn preimage_output(result: &ExecutionResult, name: &str) -> CpuSmallMatrix<DCRTPolyMatrix> {
+        let RuntimeValue::Matrix(value) = &result.outputs[name] else {
             panic!("{name} must be a preimage output")
         };
-        value.as_ref().clone()
+        value.as_cpu_compact().expect("CPU preimage output").clone()
     }
 
     fn direct_j_block(
@@ -279,8 +276,7 @@ mod tests {
     fn runtime_parameters_preserve_every_chunk_relation_against_direct_j_and_hash_oracles() {
         let parameters = DCRTPolyParams::new(4, 1, 12, 4, None, None);
         let layout = Wee25CommitmentCompiler {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(&parameters),
             secret_size: 1,
             tree_base: 2,
             digit_count: parameters.modulus_digits(),
@@ -318,7 +314,10 @@ mod tests {
         let result = execute_graph(
             context.build().unwrap(),
             parameters.clone(),
-            BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]),
+            BTreeMap::from([(
+                "hash-key".to_owned(),
+                RuntimeValue::Bytes(hash_key.to_vec().into()),
+            )]),
         );
         let b = matrix_output(&result, "b");
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_size, None);

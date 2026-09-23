@@ -10,7 +10,11 @@ use crate::{
         ConcatAxis, ConstantMatrix, HashVariant, IntBinaryOp, LoopInputMode, MatrixBinaryOp,
         NodeKind,
     },
-    types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireRef, WireType},
+    ring::{ConcreteRing, ResolveCrtBasis, RingRef, resolve_ring},
+    types::{
+        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port,
+        WireRef, WireType,
+    },
 };
 use num_bigint::BigInt;
 use num_integer::Integer;
@@ -38,6 +42,7 @@ pub struct ValidatedGraph {
     pub bindings: ParamEnv,
     pub scopes: BTreeMap<FrozenGraphScopeId, ValidatedScope>,
     pub warnings: Vec<ElaborationWarning>,
+    pub resolved_rings: BTreeMap<(FrozenGraphScopeId, RingRef), ConcreteRing>,
 }
 
 impl ValidatedGraph {
@@ -190,10 +195,9 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
     for (scope_id, scope) in graph.scopes() {
         let allowed_slots = structural_loop_slots(graph, scope_id);
         for (position, node) in scope.nodes().iter().enumerate() {
-            let kind = serde_json::to_value(node.kind()).expect("NodeKind is serializable");
             let mut variables = BTreeSet::new();
             let mut loop_slots = BTreeSet::new();
-            collect_expression_references(&kind, &mut variables, &mut loop_slots);
+            collect_serialized_references(node.kind(), &mut variables, &mut loop_slots);
             let declared = &declared_by_scope[scope_id];
             if let Some(name) = variables.iter().find(|name| !declared.contains(*name)) {
                 return Err(ValidationError::UndeclaredCompileVariable(name.clone()));
@@ -201,11 +205,9 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
             let mut node_allowed_slots = allowed_slots.clone();
             match node.kind() {
                 NodeKind::ParallelLoop(loop_spec) => {
-                    let value =
-                        serde_json::to_value(&loop_spec.count).expect("IntExpr is serializable");
                     let mut ignored = BTreeSet::new();
                     let mut count_slots = BTreeSet::new();
-                    collect_expression_references(&value, &mut ignored, &mut count_slots);
+                    collect_serialized_references(&loop_spec.count, &mut ignored, &mut count_slots);
                     if count_slots.contains(&loop_spec.index_slot) {
                         return Err(ValidationError::IllegalLoopIndex {
                             scope: scope_id.clone(),
@@ -215,11 +217,9 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                     node_allowed_slots.insert(loop_spec.index_slot);
                 }
                 NodeKind::SequentialLoop(loop_spec) => {
-                    let value =
-                        serde_json::to_value(&loop_spec.count).expect("IntExpr is serializable");
                     let mut ignored = BTreeSet::new();
                     let mut count_slots = BTreeSet::new();
-                    collect_expression_references(&value, &mut ignored, &mut count_slots);
+                    collect_serialized_references(&loop_spec.count, &mut ignored, &mut count_slots);
                     if count_slots.contains(&loop_spec.index_slot) {
                         return Err(ValidationError::IllegalLoopIndex {
                             scope: scope_id.clone(),
@@ -252,10 +252,9 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                 );
             }
             for wire_type in node.output_types() {
-                let value = serde_json::to_value(wire_type).expect("WireType is serializable");
                 let mut ignored = BTreeSet::new();
                 let mut structural_slots = BTreeSet::new();
-                collect_expression_references(&value, &mut ignored, &mut structural_slots);
+                collect_serialized_references(wire_type, &mut ignored, &mut structural_slots);
                 if let Some(slot) = structural_slots.into_iter().next() {
                     return Err(ValidationError::StructuralLoopIndex {
                         scope: scope_id.clone(),
@@ -322,6 +321,19 @@ fn collect_expression_references(
     }
 }
 
+fn collect_serialized_references<T: serde::Serialize>(
+    value: &T,
+    variables: &mut BTreeSet<String>,
+    loop_slots: &mut BTreeSet<u32>,
+) {
+    let (value, ring_table) =
+        crate::ring::serialize_with_ring_table(value).expect("IR is serializable");
+    collect_expression_references(&value, variables, loop_slots);
+    for entry in ring_table {
+        collect_expression_references(&entry, variables, loop_slots);
+    }
+}
+
 fn child_loop_dependencies(
     parent: &BTreeSet<String>,
     bindings: &[(String, IntExpr)],
@@ -333,10 +345,9 @@ fn child_loop_dependencies(
         .cloned()
         .collect::<BTreeSet<_>>();
     for (name, expression) in bindings {
-        let value = serde_json::to_value(expression).expect("IntExpr is serializable");
         let mut variables = BTreeSet::new();
         let mut loop_slots = BTreeSet::new();
-        collect_expression_references(&value, &mut variables, &mut loop_slots);
+        collect_serialized_references(expression, &mut variables, &mut loop_slots);
         if !loop_slots.is_empty() || variables.iter().any(|variable| parent.contains(variable)) {
             child.insert(name.clone());
         }
@@ -344,14 +355,30 @@ fn child_loop_dependencies(
     child
 }
 
-pub fn validate(graph: &Graph, bindings: &ParamEnv) -> Result<ValidatedGraph, ValidationError> {
-    validate_with_manifests(graph, bindings, &BTreeMap::new())
+pub fn validate(
+    graph: &Graph,
+    bindings: &ParamEnv,
+    resolve_basis: ResolveCrtBasis,
+) -> Result<ValidatedGraph, ValidationError> {
+    validate_with_manifests(graph, bindings, &BTreeMap::new(), resolve_basis)
 }
 
 pub fn validate_with_manifests(
     graph: &Graph,
     bindings: &ParamEnv,
     manifests: &BTreeMap<ProductionId, Manifest>,
+    resolve_basis: ResolveCrtBasis,
+) -> Result<ValidatedGraph, ValidationError> {
+    crate::ring::with_resolution_cache(|| {
+        validate_with_manifests_inner(graph, bindings, manifests, resolve_basis)
+    })
+}
+
+fn validate_with_manifests_inner(
+    graph: &Graph,
+    bindings: &ParamEnv,
+    manifests: &BTreeMap<ProductionId, Manifest>,
+    resolve_basis: ResolveCrtBasis,
 ) -> Result<ValidatedGraph, ValidationError> {
     validate_structure(graph)?;
     check_manifests(manifests)?;
@@ -360,7 +387,7 @@ pub fn validate_with_manifests(
     // This is the single source for parameter-only validity used by operational checking.
     // The remaining validation derives concrete types, checks wire flow and
     // shapes, and constructs execution/liveness data.
-    crate::constraints::evaluate_param_constraints(graph, bindings)?;
+    crate::constraints::evaluate_param_constraints(graph, bindings, resolve_basis)?;
 
     let mut warnings = Vec::new();
     let mut scopes = BTreeMap::new();
@@ -375,11 +402,42 @@ pub fn validate_with_manifests(
         let scope_env = scope_bindings
             .get(scope_id)
             .ok_or_else(|| ValidationError::MissingScope { scope: scope_id.clone() })?;
-        let validated = validate_scope(scope_id, scope, scope_env, manifests, &mut warnings)?;
+        let validated =
+            validate_scope(scope_id, scope, scope_env, manifests, &mut warnings, resolve_basis)?;
         scopes.insert(scope_id.clone(), validated);
     }
+    let mut resolved_rings = BTreeMap::new();
+    for (scope_id, scope) in graph.scopes() {
+        let scope_env = &scope_bindings[scope_id];
+        let mut rings = BTreeSet::new();
+        for node in scope.nodes() {
+            let (_, node_entries) =
+                crate::ring::serialize_with_ring_table(node.kind()).expect("serializable node");
+            rings.extend(crate::ring::ring_table_refs(node_entries).expect("valid ring table"));
+            let (_, type_entries) = crate::ring::serialize_with_ring_table(&node.output_types())
+                .expect("serializable output types");
+            rings.extend(crate::ring::ring_table_refs(type_entries).expect("valid ring table"));
+        }
+        for ring in rings {
+            // Loop-dependent rings have no single concrete value for this scope.
+            // Validation checks the template at index zero, but that value must
+            // not be exported as though it held for every loop instance.
+            if !ring.expression().contains_loop_index() {
+                resolved_rings.insert(
+                    (scope_id.clone(), ring.clone()),
+                    resolve_ring(&ring, scope_env, resolve_basis)?,
+                );
+            }
+        }
+    }
     validate_structural_boundaries(graph, bindings, &scopes)?;
-    Ok(ValidatedGraph { source: graph.clone(), bindings: bindings.clone(), scopes, warnings })
+    Ok(ValidatedGraph {
+        source: graph.clone(),
+        bindings: bindings.clone(),
+        scopes,
+        warnings,
+        resolved_rings,
+    })
 }
 
 fn collect_scope_bindings(
@@ -438,6 +496,7 @@ fn validate_scope(
     bindings: &ParamEnv,
     manifests: &BTreeMap<ProductionId, Manifest>,
     warnings: &mut Vec<ElaborationWarning>,
+    resolve_basis: ResolveCrtBasis,
 ) -> Result<ValidatedScope, ValidationError> {
     let mut wire_types = BTreeMap::new();
     let mut artifact_inputs = BTreeMap::new();
@@ -456,6 +515,7 @@ fn validate_scope(
             &mut wire_types,
             &mut artifact_inputs,
             warnings,
+            resolve_basis,
         )?;
     }
     let retained = if *scope_id == FrozenGraphScopeId::Root {
@@ -487,11 +547,12 @@ fn validate_node(
     values: &mut BTreeMap<WireRef, ConcreteWireType>,
     artifact_inputs: &mut BTreeMap<WireRef, ManifestArtifact>,
     warnings: &mut Vec<ElaborationWarning>,
+    resolve_basis: ResolveCrtBasis,
 ) -> Result<(), ValidationError> {
     let inferred = match node.kind {
         NodeKind::Input { wire_type, artifact, .. } => {
             require_arity(scope, node, 0)?;
-            let declared = concretize_wire_type(wire_type, env, scope, node.id)?;
+            let declared = concretize_wire_type(wire_type, env, scope, node.id, resolve_basis)?;
             if let Some(artifact) = artifact {
                 let manifest = manifests.get(&artifact.production_id).ok_or_else(|| {
                     ValidationError::MissingManifest(artifact.production_id.clone())
@@ -528,13 +589,13 @@ fn validate_node(
         NodeKind::ConstantInt(_) | NodeKind::EvaluateInt(_) => {
             require_arity(scope, node, 0)?;
             if let NodeKind::EvaluateInt(value) = node.kind {
-                value.evaluate(env)?;
+                value.evaluate_with_rings(env, resolve_basis)?;
             }
             vec![ConcreteWireType::ConstantInt]
         }
         NodeKind::ConstantReal(value) => {
             require_arity(scope, node, 0)?;
-            value.evaluate_f64(env)?;
+            value.evaluate_f64_with_rings(env, resolve_basis)?;
             vec![ConcreteWireType::ConstantReal]
         }
         NodeKind::ConstantBool(_) => {
@@ -543,14 +604,14 @@ fn validate_node(
         }
         NodeKind::ConstantMatrix { matrix_type, value } => {
             require_arity(scope, node, 0)?;
-            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            validate_constant(value, &matrix, env, scope, node.id)?;
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
+            validate_constant(value, &matrix, env, scope, node.id, resolve_basis)?;
             vec![ConcreteWireType::Matrix(matrix)]
         }
         NodeKind::GadgetTrapdoor { matrix_type, base } => {
             require_arity(scope, node, 0)?;
-            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let gadget_base = base.evaluate(env)?;
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
+            let gadget_base = base.evaluate_with_rings(env, resolve_basis)?;
             if gadget_base <= BigInt::one() ||
                 matrix.rows == 0 ||
                 !matrix.columns.is_multiple_of(matrix.rows)
@@ -562,7 +623,7 @@ fn validate_node(
             vec![ConcreteWireType::Trapdoor {
                 matrix,
                 sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone()))
-                    .close(env)?,
+                    .close_with_rings(env, resolve_basis)?,
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
@@ -593,7 +654,7 @@ fn validate_node(
         NodeKind::BitExtract { bit } => {
             require_arity(scope, node, 1)?;
             require_scalar(scope, values, node, 0, is_integer, "integer")?;
-            if bit.evaluate(env)?.is_negative() {
+            if bit.evaluate_with_rings(env, resolve_basis)?.is_negative() {
                 return node_error(scope, node.id, "bit position must be nonnegative");
             }
             vec![ConcreteWireType::Bool]
@@ -643,7 +704,7 @@ fn validate_node(
             require_arity(scope, node, coefficients.len() * 2 + usize::from(*has_bias))?;
             let mut output = None;
             for (product, coefficient) in coefficients.iter().enumerate() {
-                coefficient.evaluate(env)?;
+                coefficient.evaluate_with_rings(env, resolve_basis)?;
                 let left = matrix_argument(scope, values, node, 2 * product)?;
                 let right = matrix_argument(scope, values, node, 2 * product + 1)?;
                 let product_type = multiplication_type(&left, &right)?;
@@ -664,7 +725,7 @@ fn validate_node(
             require_arity(scope, node, 2)?;
             let lhs = matrix_argument(scope, values, node, 0)?;
             let (rhs, bound) = bounded_matrix_argument(scope, values, node, 1)?;
-            if lhs.modulus != rhs.modulus || lhs.ring_dimension != rhs.ring_dimension {
+            if lhs.ring != rhs.ring {
                 return Err(ValidationError::Check(crate::checks::CheckError::RingMismatch));
             }
             if lhs.columns != rhs.rows {
@@ -689,41 +750,55 @@ fn validate_node(
         NodeKind::MatrixNegate | NodeKind::MatrixScale { .. } => {
             require_arity(scope, node, 1)?;
             if let NodeKind::MatrixScale { scalar } = node.kind {
-                scalar.evaluate(env)?;
+                scalar.evaluate_with_rings(env, resolve_basis)?;
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
-        NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
+        NodeKind::ModulusSwitch { destination } | NodeKind::ModulusReduce { destination } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
-            let modulus = modulus.evaluate(env)?;
-            if modulus <= BigInt::one() ||
-                (&input.modulus % &modulus) != BigInt::zero() ||
-                (matches!(node.kind, NodeKind::ModulusSwitch { .. }) &&
-                    ((&input.modulus % 2u8).is_zero() || (&modulus % 2u8).is_zero()))
+            let destination = resolve_ring(destination, env, resolve_basis)?;
+            if input.ring.ring_dimension() != destination.ring_dimension() ||
+                !destination.crt_moduli().iter().all(|q| input.ring.crt_moduli().contains(q))
             {
                 return node_error(
                     scope,
                     node.id,
-                    "modulus conversion requires a divisor ring; nearest switching requires odd moduli",
+                    "modulus conversion requires a nonempty subset of the input CRT basis with the same dimension",
                 );
             }
-            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { ring: destination, ..input })]
         }
-        NodeKind::CenteredRebase { modulus } => {
+        NodeKind::CenteredRebase { destination } => {
             require_arity(scope, node, 1)?;
-            let modulus = modulus.evaluate(env)?;
-            if modulus <= BigInt::one() {
-                return node_error(scope, node.id, "centered rebase destination must exceed one");
-            }
+            let destination = resolve_ring(destination, env, resolve_basis)?;
             let input = argument(scope, values, node, 0)?.clone();
             match input {
                 ConcreteWireType::Matrix(matrix) => {
-                    vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..matrix })]
+                    if matrix.ring.ring_dimension() != destination.ring_dimension() {
+                        return node_error(scope, node.id, "centered rebase ring dimensions differ");
+                    }
+                    vec![ConcreteWireType::Matrix(ConcreteMatrixType {
+                        ring: destination,
+                        ..matrix
+                    })]
                 }
-                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
-                ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-                    if (&modulus % &matrix.modulus) != BigInt::zero() &&
+                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } |
+                ConcreteWireType::Preimage { matrix, max_coefficient_bound, bound_domain } => {
+                    if matrix.ring.ring_dimension() != destination.ring_dimension() {
+                        return node_error(scope, node.id, "centered rebase ring dimensions differ");
+                    }
+                    if bound_domain == CoefficientBoundDomain::PerCrtLimb &&
+                        matrix.ring != destination
+                    {
+                        return node_error(
+                            scope,
+                            node.id,
+                            "per-CRT-limb bounded digits cannot change their ordered CRT basis",
+                        );
+                    }
+                    let modulus = destination.modulus();
+                    if (&modulus % matrix.ring.modulus()) != BigInt::zero() &&
                         max_coefficient_bound > (&modulus >> 1)
                     {
                         return node_error(
@@ -733,8 +808,9 @@ fn validate_node(
                         );
                     }
                     vec![ConcreteWireType::SmallMatrix {
-                        matrix: ConcreteMatrixType { modulus, ..matrix },
+                        matrix: ConcreteMatrixType { ring: destination, ..matrix },
                         max_coefficient_bound,
+                        bound_domain,
                     }]
                 }
                 _ => {
@@ -748,50 +824,20 @@ fn validate_node(
         }
         NodeKind::CenteredRoundDivide { divisor } => {
             require_arity(scope, node, 1)?;
-            let divisor = divisor.evaluate(env)?;
+            let divisor = divisor.evaluate_with_rings(env, resolve_basis)?;
             if divisor <= BigInt::zero() {
                 return node_error(scope, node.id, "centered round divisor must be positive");
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
-        NodeKind::BlockModSwitch { modulus, source_moduli, plaintext_modulus } => {
+        NodeKind::BlockModSwitch { destination, plaintext_modulus } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
-            let destination = modulus.evaluate(env)?;
-            let plaintext = plaintext_modulus.evaluate(env)?;
-            if source_moduli.is_empty() {
-                return node_error(
-                    scope,
-                    node.id,
-                    "block modulus switch requires a nonempty source basis",
-                );
-            }
-            let mut source_product = BigInt::one();
-            let mut destination_product = BigInt::one();
-            let mut destination_members = 0usize;
-            for prime in source_moduli {
-                let prime_value = BigInt::from(*prime);
-                if *prime <= 2 ||
-                    (*prime - 1) as u128 % (2 * input.ring_dimension as u128) != 0 ||
-                    !source_product.gcd(&prime_value).is_one()
-                {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "block modulus switch requires distinct coprime NTT-compatible odd source moduli",
-                    );
-                }
-                source_product *= &prime_value;
-                if (&destination % &prime_value).is_zero() {
-                    destination_product *= &prime_value;
-                    destination_members += 1;
-                }
-            }
-            if source_product != input.modulus ||
-                destination <= BigInt::one() ||
-                destination_product != destination ||
-                destination_members == 0 ||
-                destination_members == source_moduli.len() ||
+            let destination = resolve_ring(destination, env, resolve_basis)?;
+            let plaintext = plaintext_modulus.evaluate_with_rings(env, resolve_basis)?;
+            if input.ring.ring_dimension() != destination.ring_dimension() ||
+                destination.crt_depth() >= input.ring.crt_depth() ||
+                !destination.crt_moduli().iter().all(|q| input.ring.crt_moduli().contains(q)) ||
                 plaintext <= BigInt::zero()
             {
                 return node_error(
@@ -800,7 +846,12 @@ fn validate_node(
                     "block modulus switch requires a strict nonempty CRT subset and positive correction factor",
                 );
             }
-            let dropped_product = &source_product / &destination;
+            let dropped_product = input
+                .ring
+                .crt_moduli()
+                .iter()
+                .filter(|q| !destination.crt_moduli().contains(q))
+                .fold(BigInt::one(), |acc, q| acc * q);
             if !plaintext.gcd(&dropped_product).is_one() {
                 return node_error(
                     scope,
@@ -808,10 +859,9 @@ fn validate_node(
                     "block modulus switch correction factor must be coprime to the dropped basis",
                 );
             }
-            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus: destination, ..input })]
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { ring: destination, ..input })]
         }
-        NodeKind::RnsModUp { modulus, source_moduli, .. } |
-        NodeKind::RnsModDown { modulus, source_moduli, .. } => {
+        NodeKind::RnsModUp { destination, .. } | NodeKind::RnsModDown { destination, .. } => {
             require_arity(scope, node, 1)?;
             let input = match argument(scope, values, node, 0)? {
                 ConcreteWireType::Matrix(matrix) => matrix.clone(),
@@ -819,57 +869,52 @@ fn validate_node(
                     return node_error(scope, node.id, "RNS conversion requires an ordinary matrix")
                 }
             };
-            let modulus = modulus.evaluate(env)?;
-            let mut product = BigInt::one();
-            for prime in source_moduli {
-                if *prime <= 2 ||
-                    (*prime - 1) as u128 % (2 * input.ring_dimension as u128) != 0 ||
-                    !product.gcd(&BigInt::from(*prime)).is_one()
-                {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "RNS basis requires distinct coprime NTT-compatible odd moduli",
-                    );
-                }
-                product *= *prime;
-            }
-            if source_moduli.is_empty() || product != input.modulus || modulus <= BigInt::one() {
-                return node_error(
-                    scope,
-                    node.id,
-                    "RNS basis product must equal the input modulus and destination must exceed one",
-                );
+            let destination = resolve_ring(destination, env, resolve_basis)?;
+            if destination.ring_dimension() != input.ring.ring_dimension() {
+                return node_error(scope, node.id, "RNS conversion ring dimensions differ");
             }
             let mut rows = input.rows;
             match &node.kind {
                 NodeKind::RnsModUp { digit_size, .. } => {
-                    if *digit_size == 0 || (&modulus % &product) != BigInt::zero() {
+                    if *digit_size == 0 ||
+                        !input
+                            .ring
+                            .crt_moduli()
+                            .iter()
+                            .all(|q| destination.crt_moduli().contains(q))
+                    {
                         return node_error(
                             scope,
                             node.id,
                             "RNS ModUp requires nonzero digit size and a multiple destination modulus",
                         );
                     }
-                    rows = rows.checked_mul(source_moduli.len().div_ceil(*digit_size)).ok_or_else(
-                        || ValidationError::Node {
+                    rows = rows
+                        .checked_mul(input.ring.crt_depth().div_ceil(*digit_size))
+                        .ok_or_else(|| ValidationError::Node {
                             scope: scope.clone(),
                             node: node.id,
                             message: "RNS ModUp row count overflows".into(),
-                        },
-                    )?;
+                        })?;
                 }
                 NodeKind::RnsModDown { plaintext_modulus, .. } => {
-                    let plain = plaintext_modulus.evaluate(env)?;
-                    if modulus >= product ||
-                        (&product % &modulus) != BigInt::zero() ||
-                        plain < BigInt::from(2u8) ||
-                        !plain.gcd(&(&product / &modulus)).is_one() ||
-                        source_moduli
+                    let plain = plaintext_modulus.evaluate_with_rings(env, resolve_basis)?;
+                    if destination.crt_depth() >= input.ring.crt_depth() ||
+                        !destination
+                            .crt_moduli()
                             .iter()
-                            .filter(|prime| (&modulus % **prime).is_zero())
-                            .fold(BigInt::one(), |product, prime| product * prime) !=
-                            modulus
+                            .all(|q| input.ring.crt_moduli().contains(q)) ||
+                        plain < BigInt::from(2u8) ||
+                        !plain
+                            .gcd(
+                                &input
+                                    .ring
+                                    .crt_moduli()
+                                    .iter()
+                                    .filter(|q| !destination.crt_moduli().contains(q))
+                                    .fold(BigInt::one(), |acc, q| acc * q),
+                            )
+                            .is_one()
                     {
                         return node_error(
                             scope,
@@ -880,7 +925,7 @@ fn validate_node(
                 }
                 _ => unreachable!(),
             }
-            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, rows, ..input })]
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { ring: destination, rows, ..input })]
         }
         NodeKind::RingAutomorphism { index } => {
             require_arity(scope, node, 1)?;
@@ -897,15 +942,15 @@ fn validate_node(
                     )
                 }
             };
-            if !input.ring_dimension.is_power_of_two() {
+            if !input.ring.ring_dimension().is_power_of_two() {
                 return node_error(
                     scope,
                     node.id,
                     "ring automorphism requires a power-of-two ring dimension",
                 );
             }
-            let index = index.evaluate(env)?;
-            let upper = BigInt::from(input.ring_dimension) * BigInt::from(2_u8);
+            let index = index.evaluate_with_rings(env, resolve_basis)?;
+            let upper = BigInt::from(input.ring.ring_dimension()) * BigInt::from(2_u8);
             if index <= BigInt::from(0_u8) || index >= upper || (&index % 2_u8).is_zero() {
                 return node_error(
                     scope,
@@ -942,8 +987,7 @@ fn validate_node(
             let right = matrix_argument(scope, values, node, 1)?;
             crate::checks::check_same_ring(&left, &right)?;
             vec![ConcreteWireType::Matrix(ConcreteMatrixType {
-                modulus: left.modulus,
-                ring_dimension: left.ring_dimension,
+                ring: left.ring,
                 rows: left.rows.saturating_mul(right.rows),
                 columns: left.columns.saturating_mul(right.columns),
             })]
@@ -956,16 +1000,22 @@ fn validate_node(
         }
         NodeKind::UniformResidueSample { matrix_type } => {
             require_arity(scope, node, 0)?;
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+            vec![ConcreteWireType::Matrix(concrete_matrix(
+                matrix_type,
+                env,
+                scope,
+                node.id,
+                resolve_basis,
+            )?)]
         }
         NodeKind::UniformIntervalSample { matrix_type, range } => {
             require_arity(scope, node, 0)?;
-            let minimum = range.minimum.evaluate(env)?;
-            let maximum = range.maximum.evaluate(env)?;
+            let minimum = range.minimum.evaluate_with_rings(env, resolve_basis)?;
+            let maximum = range.maximum.evaluate_with_rings(env, resolve_basis)?;
             if minimum > maximum {
                 return node_error(scope, node.id, "uniform sample range is empty");
             }
-            let matrix_type = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let matrix_type = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
             let is_ternary = minimum == BigInt::from(-1) && maximum == BigInt::from(1);
             let is_bit = minimum == BigInt::from(0) && maximum == BigInt::from(1);
             if !is_ternary && !is_bit {
@@ -979,12 +1029,24 @@ fn validate_node(
         }
         NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
             require_arity(scope, node, 0)?;
-            require_nonnegative_real(sigma.evaluate_f64(env)?, scope, node.id, "Gaussian sigma")?;
-            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+            require_nonnegative_real(
+                sigma.evaluate_f64_with_rings(env, resolve_basis)?,
+                scope,
+                node.id,
+                "Gaussian sigma",
+            )?;
+            let max_coefficient_bound =
+                max_coefficient_bound.evaluate_with_rings(env, resolve_basis)?;
             if max_coefficient_bound.is_negative() {
                 return node_error(scope, node.id, "Gaussian coefficient bound must be nonnegative");
             }
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+            vec![ConcreteWireType::Matrix(concrete_matrix(
+                matrix_type,
+                env,
+                scope,
+                node.id,
+                resolve_basis,
+            )?)]
         }
         NodeKind::HashSample {
             matrix_type, variant, tag_components, base, digit_count, ..
@@ -1001,10 +1063,10 @@ fn validate_node(
                     HashTagComponent::Bytes(_) => {}
                     HashTagComponent::Integer(expression) |
                     HashTagComponent::Decimal(expression) => {
-                        expression.evaluate(env)?;
+                        expression.evaluate_with_rings(env, resolve_basis)?;
                     }
                     HashTagComponent::U64Le(expression) => {
-                        if expression.evaluate(env)?.to_u64().is_none() {
+                        if expression.evaluate_with_rings(env, resolve_basis)?.to_u64().is_none() {
                             return node_error(
                                 scope,
                                 node.id,
@@ -1017,7 +1079,7 @@ fn validate_node(
                     }
                 }
             }
-            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
             let bound = match variant {
                 HashVariant::Plain if base.is_none() && digit_count.is_none() => None,
                 HashVariant::Plain => {
@@ -1031,7 +1093,7 @@ fn validate_node(
                     let Some(base) = base else {
                         return node_error(scope, node.id, "decomposed hash requires a gadget base")
                     };
-                    let base = base.evaluate(env)?;
+                    let base = base.evaluate_with_rings(env, resolve_basis)?;
                     if base <= BigInt::one() {
                         return node_error(scope, node.id, "gadget base must be greater than one");
                     }
@@ -1039,7 +1101,7 @@ fn validate_node(
                         return node_error(scope, node.id, "decomposed hash requires a digit count")
                     };
                     let count = positive_usize(
-                        count.evaluate(env)?,
+                        count.evaluate_with_rings(env, resolve_basis)?,
                         "decomposition digit count",
                         scope,
                         node.id,
@@ -1051,16 +1113,20 @@ fn validate_node(
                             "hash output rows must be divisible by decomposition digit count",
                         );
                     }
-                    Some(if matches!(variant, HashVariant::SmallDecomposed) {
-                        base - BigInt::one()
-                    } else {
-                        (base + BigInt::one()) / 2
-                    })
+                    Some((base + BigInt::one()) / 2)
                 }
             };
             match bound {
                 Some(max_coefficient_bound) => {
-                    vec![ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound }]
+                    vec![ConcreteWireType::SmallMatrix {
+                        matrix,
+                        max_coefficient_bound,
+                        bound_domain: if matches!(variant, HashVariant::SmallDecomposed) {
+                            CoefficientBoundDomain::PerCrtLimb
+                        } else {
+                            CoefficientBoundDomain::Global
+                        },
+                    }]
                 }
                 None => vec![ConcreteWireType::Matrix(matrix)],
             }
@@ -1073,24 +1139,29 @@ fn validate_node(
             preimage_max_coefficient_bound,
         } => {
             require_arity(scope, node, 0)?;
-            let sigma = sigma.close(env)?;
+            let sigma = sigma.close_with_rings(env, resolve_basis)?;
             require_positive_real(
                 sigma.evaluate_f64(&ParamEnv::default())?,
                 scope,
                 node.id,
                 "trapdoor sigma",
             )?;
-            let gadget_base = gadget_base.evaluate(env)?.abs();
+            let gadget_base = gadget_base.evaluate_with_rings(env, resolve_basis)?.abs();
             if gadget_base <= BigInt::one() {
                 return node_error(scope, node.id, "gadget base must be greater than one");
             }
-            let digit_count =
-                positive_usize(digit_count.evaluate(env)?, "trapdoor digit count", scope, node.id)?;
-            let preimage_max_coefficient_bound = preimage_max_coefficient_bound.evaluate(env)?;
+            let digit_count = positive_usize(
+                digit_count.evaluate_with_rings(env, resolve_basis)?,
+                "trapdoor digit count",
+                scope,
+                node.id,
+            )?;
+            let preimage_max_coefficient_bound =
+                preimage_max_coefficient_bound.evaluate_with_rings(env, resolve_basis)?;
             if preimage_max_coefficient_bound.is_negative() {
                 return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
             }
-            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
             let expected_columns = matrix
                 .rows
                 .checked_mul(digit_count.saturating_add(2))
@@ -1119,7 +1190,7 @@ fn validate_node(
         }
         NodeKind::PreimageSample { matrix_type, max_coefficient_bound } => {
             require_arity(scope, node, 3)?;
-            if max_coefficient_bound.evaluate(env)?.is_negative() {
+            if max_coefficient_bound.evaluate_with_rings(env, resolve_basis)?.is_negative() {
                 return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
             }
             let public = matrix_argument(scope, values, node, 0)?;
@@ -1132,20 +1203,24 @@ fn validate_node(
                 );
             }
             let target = matrix_argument(scope, values, node, 2)?;
-            let output = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let output = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
             check_add_shape(&multiplication_type(&trapdoor, &output)?, &target)?;
-            let bound = max_coefficient_bound.evaluate(env)?;
-            vec![ConcreteWireType::Preimage { matrix: output, max_coefficient_bound: bound }]
+            let bound = max_coefficient_bound.evaluate_with_rings(env, resolve_basis)?;
+            vec![ConcreteWireType::Preimage {
+                matrix: output,
+                max_coefficient_bound: bound,
+                bound_domain: CoefficientBoundDomain::Global,
+            }]
         }
         NodeKind::GadgetDecompose { base, digit_count, small } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
-            let base = base.evaluate(env)?;
+            let base = base.evaluate_with_rings(env, resolve_basis)?;
             if base <= BigInt::one() {
                 return node_error(scope, node.id, "gadget base must be greater than one");
             }
             let digits = positive_usize(
-                digit_count.evaluate(env)?,
+                digit_count.evaluate_with_rings(env, resolve_basis)?,
                 "decomposition digit count",
                 scope,
                 node.id,
@@ -1155,19 +1230,27 @@ fn validate_node(
                 node: node.id,
                 message: "gadget decomposition row count overflow".to_owned(),
             })?;
-            let max_coefficient_bound =
-                if *small { base - BigInt::one() } else { (base + BigInt::one()) / 2 };
+            let max_coefficient_bound = (base + BigInt::one()) / 2;
             vec![ConcreteWireType::Preimage {
                 matrix: ConcreteMatrixType { rows, ..input },
                 max_coefficient_bound,
+                bound_domain: if *small {
+                    CoefficientBoundDomain::PerCrtLimb
+                } else {
+                    CoefficientBoundDomain::Global
+                },
             }]
         }
         NodeKind::ExtractCoefficient { position, .. } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
-            let position =
-                nonnegative_usize(position.evaluate(env)?, "coefficient position", scope, node.id)?;
-            if !input.is_scalar() || position >= input.ring_dimension {
+            let position = nonnegative_usize(
+                position.evaluate_with_rings(env, resolve_basis)?,
+                "coefficient position",
+                scope,
+                node.id,
+            )?;
+            if !input.is_scalar() || position >= input.ring.ring_dimension() as usize {
                 return node_error(scope, node.id, "coefficient extraction position is invalid");
             }
             vec![ConcreteWireType::Int]
@@ -1177,9 +1260,8 @@ fn validate_node(
             if !is_integer(argument(scope, values, node, 0)?) {
                 return node_error(scope, node.id, "constant-polynomial lift requires an integer");
             }
-            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            if !matrix.is_scalar() || matrix.modulus <= BigInt::zero() || matrix.ring_dimension == 0
-            {
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
+            if !matrix.is_scalar() {
                 return node_error(
                     scope,
                     node.id,
@@ -1191,10 +1273,15 @@ fn validate_node(
         NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
-            let count = positive_usize(length.evaluate(env)?, "decode length", scope, node.id)?;
+            let count = positive_usize(
+                length.evaluate_with_rings(env, resolve_basis)?,
+                "decode length",
+                scope,
+                node.id,
+            )?;
             if !input.is_scalar() ||
-                count > input.ring_dimension ||
-                plaintext_modulus.evaluate(env)? <= BigInt::one()
+                count > input.ring.ring_dimension() as usize ||
+                plaintext_modulus.evaluate_with_rings(env, resolve_basis)? <= BigInt::one()
             {
                 return node_error(scope, node.id, "invalid threshold decoding parameters");
             }
@@ -1208,7 +1295,7 @@ fn validate_node(
                 return node_error(scope, node.id, "CRT metadata count does not match inputs");
             }
             let first = matrix_argument(scope, values, node, 0)?;
-            let modulus = modulus.evaluate(env)?;
+            let modulus = modulus.evaluate_with_rings(env, resolve_basis)?;
             if modulus <= BigInt::one() {
                 return node_error(scope, node.id, "invalid CRT output modulus");
             }
@@ -1223,7 +1310,7 @@ fn validate_node(
                 let input = matrix_argument(scope, values, node, index)?;
                 if input.rows != first.rows ||
                     input.columns != first.columns ||
-                    input.ring_dimension != first.ring_dimension
+                    input.ring.ring_dimension() != first.ring.ring_dimension()
                 {
                     return node_error(
                         scope,
@@ -1233,28 +1320,41 @@ fn validate_node(
                 }
             }
             for (index, plaintext) in plaintext_moduli.iter().enumerate() {
-                let value = plaintext.evaluate(env)?;
+                let value = plaintext.evaluate_with_rings(env, resolve_basis)?;
                 let input = matrix_argument(scope, values, node, index)?;
-                if value <= BigInt::one() || value > input.modulus {
+                if value <= BigInt::one() || value > input.ring.modulus() {
                     return node_error(scope, node.id, "invalid CRT plaintext modulus");
                 }
             }
             for coefficient in reconstruction_coefficients {
-                let value = coefficient.evaluate(env)?;
+                let value = coefficient.evaluate_with_rings(env, resolve_basis)?;
                 if value.is_negative() || value >= modulus {
                     return node_error(scope, node.id, "invalid CRT reconstruction coefficient");
                 }
             }
-            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..first })]
+            let [WireType::Matrix(declared)] = node.output_types else {
+                return node_error(
+                    scope,
+                    node.id,
+                    "CRT recompose requires one declared matrix output",
+                );
+            };
+            let destination = resolve_ring(&declared.ring, env, resolve_basis)?;
+            if destination.modulus() != modulus ||
+                destination.ring_dimension() != first.ring.ring_dimension()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "CRT recompose declared ring does not match output modulus or dimension",
+                );
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { ring: destination, ..first })]
         }
         NodeKind::PolynomialFromValues { matrix_type, .. } => {
             require_arity(scope, node, 1)?;
-            let ring = concrete_matrix(matrix_type, env, scope, node.id)?;
-            if !ring.is_scalar() ||
-                ring.modulus <= BigInt::one() ||
-                ring.ring_dimension < 2 ||
-                !ring.ring_dimension.is_power_of_two()
-            {
+            let ring = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
+            if !ring.is_scalar() || ring.ring.ring_dimension() < 2 {
                 return node_error(
                     scope,
                     node.id,
@@ -1263,7 +1363,7 @@ fn validate_node(
             }
             match argument(scope, values, node, 0)? {
                 ConcreteWireType::IndexedFamily { element, count }
-                    if is_integer(element) && *count == ring.ring_dimension => {}
+                    if is_integer(element) && *count == ring.ring.ring_dimension() as usize => {}
                 _ => {
                     return node_error(
                         scope,
@@ -1282,35 +1382,34 @@ fn validate_node(
             }
             vec![ConcreteWireType::IndexedFamily {
                 element: Box::new(ConcreteWireType::Int),
-                count: ring.ring_dimension,
+                count: ring.ring.ring_dimension() as usize,
             }]
         }
         NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
             require_arity(scope, node, 1)?;
-            let output = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let output = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
             if !output.is_scalar() {
                 return node_error(scope, node.id, "packed polynomial output must be a 1x1 matrix");
             }
             let coefficient_bits = positive_usize(
-                coefficient_bits.evaluate(env)?,
+                coefficient_bits.evaluate_with_rings(env, resolve_basis)?,
                 "coefficient bit width",
                 scope,
                 node.id,
             )?;
-            if (BigInt::one() << coefficient_bits) < output.modulus {
+            if (BigInt::one() << coefficient_bits) < output.ring.modulus() {
                 return node_error(
                     scope,
                     node.id,
                     "coefficient bit width does not cover the modulus",
                 );
             }
-            let expected_count =
-                output.ring_dimension.checked_mul(coefficient_bits).ok_or_else(|| {
-                    ValidationError::Node {
-                        scope: scope.clone(),
-                        node: node.id,
-                        message: "packed polynomial bit count overflow".to_owned(),
-                    }
+            let expected_count = (output.ring.ring_dimension() as usize)
+                .checked_mul(coefficient_bits)
+                .ok_or_else(|| ValidationError::Node {
+                    scope: scope.clone(),
+                    node: node.id,
+                    message: "packed polynomial bit count overflow".to_owned(),
                 })?;
             match argument(scope, values, node, 0)? {
                 ConcreteWireType::IndexedFamily { element, count }
@@ -1328,10 +1427,15 @@ fn validate_node(
         NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => node
             .output_types
             .iter()
-            .map(|ty| concretize_wire_type(ty, env, scope, node.id))
+            .map(|ty| concretize_wire_type(ty, env, scope, node.id, resolve_basis))
             .collect::<Result<Vec<_>, _>>()?,
         NodeKind::FamilyPack { count } => {
-            let count = positive_usize(count.evaluate(env)?, "family count", scope, node.id)?;
+            let count = positive_usize(
+                count.evaluate_with_rings(env, resolve_basis)?,
+                "family count",
+                scope,
+                node.id,
+            )?;
             if node.args.len() != count || count == 0 {
                 return node_error(scope, node.id, "family pack argument count mismatch");
             }
@@ -1357,7 +1461,13 @@ fn validate_node(
             else {
                 return node_error(scope, node.id, "family access requires an indexed family");
             };
-            if nonnegative_usize(index.evaluate(env)?, "family index", scope, node.id)? >= count {
+            if nonnegative_usize(
+                index.evaluate_with_rings(env, resolve_basis)?,
+                "family index",
+                scope,
+                node.id,
+            )? >= count
+            {
                 return node_error(scope, node.id, "family index is out of range");
             }
             vec![*element]
@@ -1375,8 +1485,12 @@ fn validate_node(
         }
         NodeKind::Select { count } => {
             require_scalar(scope, values, node, 0, is_integer, "integer")?;
-            let count =
-                positive_usize(count.evaluate(env)?, "select branch count", scope, node.id)?;
+            let count = positive_usize(
+                count.evaluate_with_rings(env, resolve_basis)?,
+                "select branch count",
+                scope,
+                node.id,
+            )?;
             if node.args.len() != count.saturating_add(1) {
                 return node_error(scope, node.id, "select branch count does not match arguments");
             }
@@ -1394,7 +1508,7 @@ fn validate_node(
     let declared = node
         .output_types
         .iter()
-        .map(|ty| concretize_wire_type(ty, env, scope, node.id))
+        .map(|ty| concretize_wire_type(ty, env, scope, node.id, resolve_basis))
         .collect::<Result<Vec<_>, _>>()?;
     if inferred != declared {
         return node_error(
@@ -1639,8 +1753,8 @@ fn bounded_matrix_argument(
     index: usize,
 ) -> Result<(ConcreteMatrixType, BigInt), ValidationError> {
     match argument(scope, values, node, index)? {
-        ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
-        ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+        ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound, .. } |
+        ConcreteWireType::Preimage { matrix, max_coefficient_bound, .. } => {
             Ok((matrix.clone(), max_coefficient_bound.clone()))
         }
         _ => node_error(scope, node.id, "expected SmallMatrix or Preimage right-hand side"),
@@ -1700,6 +1814,19 @@ pub fn concretize_wire_type(
     env: &ParamEnv,
     scope: &FrozenGraphScopeId,
     node: NodeId,
+    resolve_basis: ResolveCrtBasis,
+) -> Result<ConcreteWireType, ValidationError> {
+    crate::ring::with_resolution_cache(|| {
+        concretize_wire_type_inner(ty, env, scope, node, resolve_basis)
+    })
+}
+
+fn concretize_wire_type_inner(
+    ty: &WireType,
+    env: &ParamEnv,
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+    resolve_basis: ResolveCrtBasis,
 ) -> Result<ConcreteWireType, ValidationError> {
     Ok(match ty {
         WireType::ConstantInt => ConcreteWireType::ConstantInt,
@@ -1709,32 +1836,41 @@ pub fn concretize_wire_type(
         WireType::Real => ConcreteWireType::Real,
         WireType::Bool => ConcreteWireType::Bool,
         WireType::Bytes { length } => ConcreteWireType::Bytes {
-            length: nonnegative_usize(length.evaluate(env)?, "byte length", scope, node)?,
+            length: nonnegative_usize(
+                length.evaluate_with_rings(env, resolve_basis)?,
+                "byte length",
+                scope,
+                node,
+            )?,
         },
         WireType::TypedBlob { type_name, schema_hash } => {
             ConcreteWireType::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash }
         }
         WireType::Matrix(matrix) => {
-            ConcreteWireType::Matrix(concrete_matrix(matrix, env, scope, node)?)
+            ConcreteWireType::Matrix(concrete_matrix(matrix, env, scope, node, resolve_basis)?)
         }
-        WireType::SmallMatrix { matrix, max_coefficient_bound } => {
-            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+        WireType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => {
+            let max_coefficient_bound =
+                max_coefficient_bound.evaluate_with_rings(env, resolve_basis)?;
             if max_coefficient_bound.is_negative() {
                 return node_error(scope, node, "small RHS coefficient bound must be nonnegative");
             }
             ConcreteWireType::SmallMatrix {
-                matrix: concrete_matrix(matrix, env, scope, node)?,
+                matrix: concrete_matrix(matrix, env, scope, node, resolve_basis)?,
                 max_coefficient_bound,
+                bound_domain: *bound_domain,
             }
         }
-        WireType::Preimage { matrix, max_coefficient_bound } => {
-            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+        WireType::Preimage { matrix, max_coefficient_bound, bound_domain } => {
+            let max_coefficient_bound =
+                max_coefficient_bound.evaluate_with_rings(env, resolve_basis)?;
             if max_coefficient_bound.is_negative() {
                 return node_error(scope, node, "preimage coefficient bound must be nonnegative");
             }
             ConcreteWireType::Preimage {
-                matrix: concrete_matrix(matrix, env, scope, node)?,
+                matrix: concrete_matrix(matrix, env, scope, node, resolve_basis)?,
                 max_coefficient_bound,
+                bound_domain: *bound_domain,
             }
         }
         WireType::Trapdoor {
@@ -1744,20 +1880,31 @@ pub fn concretize_wire_type(
             digit_count,
             preimage_max_coefficient_bound,
         } => ConcreteWireType::Trapdoor {
-            matrix: concrete_matrix(matrix, env, scope, node)?,
-            sigma: sigma.close(env)?,
-            gadget_base: gadget_base.evaluate(env)?,
-            digit_count: positive_usize(digit_count.evaluate(env)?, "digit count", scope, node)?,
-            preimage_max_coefficient_bound: preimage_max_coefficient_bound.evaluate(env)?,
+            matrix: concrete_matrix(matrix, env, scope, node, resolve_basis)?,
+            sigma: sigma.close_with_rings(env, resolve_basis)?,
+            gadget_base: gadget_base.evaluate_with_rings(env, resolve_basis)?,
+            digit_count: positive_usize(
+                digit_count.evaluate_with_rings(env, resolve_basis)?,
+                "digit count",
+                scope,
+                node,
+            )?,
+            preimage_max_coefficient_bound: preimage_max_coefficient_bound
+                .evaluate_with_rings(env, resolve_basis)?,
         },
         WireType::IndexedFamily { element, count } => {
-            let element = concretize_wire_type(element, env, scope, node)?;
+            let element = concretize_wire_type(element, env, scope, node, resolve_basis)?;
             if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
                 return node_error(scope, node, "nested indexed families are unsupported");
             }
             ConcreteWireType::IndexedFamily {
                 element: Box::new(element),
-                count: nonnegative_usize(count.evaluate(env)?, "family count", scope, node)?,
+                count: nonnegative_usize(
+                    count.evaluate_with_rings(env, resolve_basis)?,
+                    "family count",
+                    scope,
+                    node,
+                )?,
             }
         }
     })
@@ -1768,21 +1915,23 @@ fn concrete_matrix(
     env: &ParamEnv,
     scope: &FrozenGraphScopeId,
     node: NodeId,
+    resolve_basis: ResolveCrtBasis,
 ) -> Result<ConcreteMatrixType, ValidationError> {
-    let modulus = matrix.modulus.evaluate(env)?;
-    if modulus <= BigInt::one() {
-        return node_error(scope, node, "matrix modulus must exceed one");
-    }
+    let ring = resolve_ring(&matrix.ring, env, resolve_basis)?;
     Ok(ConcreteMatrixType {
-        modulus,
-        ring_dimension: positive_usize(
-            matrix.ring_dimension.evaluate(env)?,
-            "ring dimension",
+        ring,
+        rows: positive_usize(
+            matrix.rows.evaluate_with_rings(env, resolve_basis)?,
+            "matrix rows",
             scope,
             node,
         )?,
-        rows: positive_usize(matrix.rows.evaluate(env)?, "matrix rows", scope, node)?,
-        columns: positive_usize(matrix.columns.evaluate(env)?, "matrix columns", scope, node)?,
+        columns: positive_usize(
+            matrix.columns.evaluate_with_rings(env, resolve_basis)?,
+            "matrix columns",
+            scope,
+            node,
+        )?,
     })
 }
 
@@ -1792,6 +1941,7 @@ fn validate_constant(
     env: &ParamEnv,
     scope: &FrozenGraphScopeId,
     node: NodeId,
+    resolve_basis: ResolveCrtBasis,
 ) -> Result<(), ValidationError> {
     match value {
         ConstantMatrix::Zero => Ok(()),
@@ -1803,8 +1953,12 @@ fn validate_constant(
             node_error(scope, node, "unit-row constant requires exactly one row")
         }
         ConstantMatrix::UnitRow { index }
-            if nonnegative_usize(index.evaluate(env)?, "unit-row index", scope, node)? >=
-                matrix.columns =>
+            if nonnegative_usize(
+                index.evaluate_with_rings(env, resolve_basis)?,
+                "unit-row index",
+                scope,
+                node,
+            )? >= matrix.columns =>
         {
             node_error(scope, node, "unit-row index is out of range")
         }
@@ -1812,15 +1966,21 @@ fn validate_constant(
             node_error(scope, node, "unit-column constant requires exactly one column")
         }
         ConstantMatrix::UnitColumn { index }
-            if nonnegative_usize(index.evaluate(env)?, "unit-column index", scope, node)? >=
-                matrix.rows =>
+            if nonnegative_usize(
+                index.evaluate_with_rings(env, resolve_basis)?,
+                "unit-column index",
+                scope,
+                node,
+            )? >= matrix.rows =>
         {
             node_error(scope, node, "unit-column index is out of range")
         }
         ConstantMatrix::Gadget { .. } if !matrix.columns.is_multiple_of(matrix.rows) => {
             node_error(scope, node, "gadget constant columns must be a multiple of rows")
         }
-        ConstantMatrix::Gadget { base, .. } if base.evaluate(env)?.abs() <= BigInt::one() => {
+        ConstantMatrix::Gadget { base, .. }
+            if base.evaluate_with_rings(env, resolve_basis)?.abs() <= BigInt::one() =>
+        {
             node_error(scope, node, "gadget base must exceed one")
         }
         ConstantMatrix::Gadget { .. } => Ok(()),
@@ -1828,7 +1988,8 @@ fn validate_constant(
             node_error(scope, node, "power-of-base constant requires a 1x1 matrix")
         }
         ConstantMatrix::PowerOfBase { base, exponent }
-            if base.evaluate(env)?.is_zero() || exponent.evaluate(env)?.is_negative() =>
+            if base.evaluate_with_rings(env, resolve_basis)?.is_zero() ||
+                exponent.evaluate_with_rings(env, resolve_basis)?.is_negative() =>
         {
             node_error(scope, node, "invalid power-of-base constant")
         }
@@ -1837,8 +1998,12 @@ fn validate_constant(
             node_error(scope, node, "rotation constant requires a 1x1 matrix")
         }
         ConstantMatrix::Rotation { exponent }
-            if nonnegative_usize(exponent.evaluate(env)?, "rotation exponent", scope, node)? >=
-                matrix.ring_dimension =>
+            if nonnegative_usize(
+                exponent.evaluate_with_rings(env, resolve_basis)?,
+                "rotation exponent",
+                scope,
+                node,
+            )? >= matrix.ring.ring_dimension() as usize =>
         {
             node_error(scope, node, "rotation exponent is out of range")
         }
@@ -1847,13 +2012,13 @@ fn validate_constant(
             node_error(scope, node, "polynomial constant requires a 1x1 matrix")
         }
         ConstantMatrix::Polynomial { coefficients }
-            if coefficients.len() > matrix.ring_dimension =>
+            if coefficients.len() > matrix.ring.ring_dimension() as usize =>
         {
             node_error(scope, node, "constant polynomial exceeds the ring dimension")
         }
         ConstantMatrix::Polynomial { coefficients } => {
             for coefficient in coefficients {
-                coefficient.evaluate(env)?;
+                coefficient.evaluate_with_rings(env, resolve_basis)?;
             }
             Ok(())
         }
@@ -2018,8 +2183,7 @@ mod tests {
 
     fn matrix_type(modulus: i64, rows: i64, columns: i64) -> MatrixType {
         MatrixType {
-            modulus: IntExpr::constant(modulus),
-            ring_dimension: IntExpr::constant(8),
+            ring: crate::ring::test_ring(modulus, 8),
             rows: IntExpr::constant(rows),
             columns: IntExpr::constant(columns),
         }
@@ -2046,11 +2210,13 @@ mod tests {
             WireType::Preimage {
                 matrix: matrix_type,
                 max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+                bound_domain: CoefficientBoundDomain::Global,
             }
         } else {
             WireType::SmallMatrix {
                 matrix: matrix_type,
                 max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+                bound_domain: CoefficientBoundDomain::Global,
             }
         };
         NodeHandle::new(
@@ -2071,8 +2237,11 @@ mod tests {
             vec![preimage],
             vec![WireType::Matrix(matrix)],
         );
-        let error = validate(&graph("automorphism-preimage", automorphism), &ParamEnv::default())
-            .expect_err("typed preimages must not enter a ring automorphism");
+        let error = crate::ring::test_validate(
+            &graph("automorphism-preimage", automorphism),
+            &ParamEnv::default(),
+        )
+        .expect_err("typed preimages must not enter a ring automorphism");
         assert_eq!(node_message(error), "ring automorphism requires an ordinary matrix argument");
     }
 
@@ -2088,11 +2257,13 @@ mod tests {
             WireType::Preimage {
                 matrix: matrix_type,
                 max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+                bound_domain: CoefficientBoundDomain::Global,
             }
         } else {
             WireType::SmallMatrix {
                 matrix: matrix_type,
                 max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+                bound_domain: CoefficientBoundDomain::Global,
             }
         };
         let value = NodeHandle::new(
@@ -2149,14 +2320,16 @@ mod tests {
                     Box::new(IntExpr::constant(2)),
                 )
                 .canonicalize(),
+                bound_domain: CoefficientBoundDomain::Global,
             },
             (HashVariant::SmallDecomposed, Some(base)) => WireType::SmallMatrix {
                 matrix: matrix_type.clone(),
-                max_coefficient_bound: IntExpr::Sub(
+                max_coefficient_bound: IntExpr::RoundDiv(
                     Box::new(base.clone()),
-                    Box::new(IntExpr::constant(1)),
+                    Box::new(IntExpr::constant(2)),
                 )
                 .canonicalize(),
+                bound_domain: CoefficientBoundDomain::PerCrtLimb,
             },
             _ => WireType::Matrix(matrix_type.clone()),
         };
@@ -2214,7 +2387,7 @@ mod tests {
         )
         .output(0)
         .expect("constant matrix output");
-        validate(&graph("constant-shape", output), &ParamEnv::default())
+        crate::ring::test_validate(&graph("constant-shape", output), &ParamEnv::default())
             .map(|_| ())
             .map_err(node_message)
     }
@@ -2352,7 +2525,7 @@ mod tests {
         )
         .output(0)
         .unwrap();
-        validate(&graph("binder-lift", output), &ParamEnv::default()).unwrap();
+        crate::ring::test_validate(&graph("binder-lift", output), &ParamEnv::default()).unwrap();
 
         let invalid = value(
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix.clone() },
@@ -2361,7 +2534,11 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("noninteger-lift", invalid), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(
+                    &graph("noninteger-lift", invalid),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             )
             .contains("requires an integer")
         );
@@ -2377,19 +2554,19 @@ mod tests {
             vec![WireType::Matrix(matrix_type(17, 1, 2))],
         );
         assert!(matches!(
-            validate(&graph("shape-mismatch", sum), &ParamEnv::default()),
+            crate::ring::test_validate(&graph("shape-mismatch", sum), &ParamEnv::default()),
             Err(ValidationError::Check(CheckError::ShapeMismatch { .. }))
         ));
 
         let left = input("left", matrix_type(17, 1, 1));
-        let right = input("right", matrix_type(19, 1, 1));
+        let right = input("right", matrix_type(97, 1, 1));
         let product = value(
             NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
             vec![left, right],
             vec![WireType::Matrix(matrix_type(17, 1, 1))],
         );
         assert!(matches!(
-            validate(&graph("ring-mismatch", product), &ParamEnv::default()),
+            crate::ring::test_validate(&graph("ring-mismatch", product), &ParamEnv::default()),
             Err(ValidationError::Check(CheckError::RingMismatch))
         ));
     }
@@ -2403,7 +2580,8 @@ mod tests {
             vec![lhs, rhs],
             vec![WireType::Matrix(matrix_type(17, 2, 4))],
         );
-        let validated = validate(&graph("small-rhs", product), &ParamEnv::default()).unwrap();
+        let validated =
+            crate::ring::test_validate(&graph("small-rhs", product), &ParamEnv::default()).unwrap();
         assert!(validated.root_scope().wire_types.values().any(|ty| {
             matches!(
                 ty,
@@ -2420,7 +2598,7 @@ mod tests {
             ],
             vec![WireType::Matrix(matrix_type(17, 2, 4))],
         );
-        validate(&graph("preimage-rhs", preimage), &ParamEnv::default()).unwrap();
+        crate::ring::test_validate(&graph("preimage-rhs", preimage), &ParamEnv::default()).unwrap();
 
         let ordinary_rhs = input("ordinary-rhs", matrix_type(17, 3, 4));
         let product = value(
@@ -2430,10 +2608,76 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("ordinary-rhs", product), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(&graph("ordinary-rhs", product), &ParamEnv::default())
+                    .unwrap_err()
             )
             .contains("SmallMatrix or Preimage")
         );
+    }
+
+    #[test]
+    fn small_gadget_decomposition_uses_balanced_digit_bound() {
+        let matrix = matrix_type(17, 1, 1);
+        let result = value(
+            NodeKind::GadgetDecompose {
+                base: IntExpr::constant(8),
+                digit_count: IntExpr::constant(2),
+                small: true,
+            },
+            vec![input("source", matrix.clone())],
+            vec![WireType::Preimage {
+                matrix: MatrixType { rows: IntExpr::constant(2), ..matrix },
+                max_coefficient_bound: IntExpr::constant(4),
+                bound_domain: CoefficientBoundDomain::PerCrtLimb,
+            }],
+        );
+        let validated = crate::ring::test_validate(
+            &graph("balanced-small-gadget", result.clone()),
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            validated.root_scope().wire_types.get(&validated.source.outputs()["output"].value),
+            Some(ConcreteWireType::Preimage {
+                max_coefficient_bound,
+                bound_domain: CoefficientBoundDomain::PerCrtLimb,
+                ..
+            }) if max_coefficient_bound == &BigInt::from(4)
+        ));
+    }
+
+    #[test]
+    fn per_limb_centered_rebase_preserves_only_the_ordered_basis() {
+        let source_type = WireType::SmallMatrix {
+            matrix: matrix_type(17 * 97, 1, 1),
+            max_coefficient_bound: IntExpr::constant(4),
+            bound_domain: CoefficientBoundDomain::PerCrtLimb,
+        };
+        let make_graph = |destination: RingRef| {
+            let source = value(
+                NodeKind::Input {
+                    name: "digits".into(),
+                    wire_type: source_type.clone(),
+                    artifact: None,
+                },
+                vec![],
+                vec![source_type.clone()],
+            );
+            let output_type = WireType::SmallMatrix {
+                matrix: MatrixType { ring: destination.clone(), rows: 1.into(), columns: 1.into() },
+                max_coefficient_bound: IntExpr::constant(4),
+                bound_domain: CoefficientBoundDomain::PerCrtLimb,
+            };
+            graph(
+                "per-limb-rebase",
+                value(NodeKind::CenteredRebase { destination }, vec![source], vec![output_type]),
+            )
+        };
+        let same = make_graph(crate::ring::test_ring(17 * 97, 8));
+        crate::ring::test_validate(&same, &ParamEnv::default()).unwrap();
+        let different = make_graph(crate::ring::test_ring(17 * 193, 8));
+        let error = crate::ring::test_validate(&different, &ParamEnv::default()).unwrap_err();
+        assert!(node_message(error).contains("cannot change their ordered CRT basis"));
     }
 
     #[test]
@@ -2446,8 +2690,11 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("plain-with-base", plain_with_base), &ParamEnv::default())
-                    .unwrap_err()
+                crate::ring::test_validate(
+                    &graph("plain-with-base", plain_with_base),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             )
             .contains("plain hash cannot have decomposition metadata")
         );
@@ -2460,8 +2707,11 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("plain-with-digits", plain_with_digits), &ParamEnv::default())
-                    .unwrap_err()
+                crate::ring::test_validate(
+                    &graph("plain-with-digits", plain_with_digits),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             )
             .contains("plain hash cannot have decomposition metadata")
         );
@@ -2474,7 +2724,7 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(
+                crate::ring::test_validate(
                     &graph("decomposed-without-base", decomposed_without_base),
                     &ParamEnv::default()
                 )
@@ -2491,7 +2741,7 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(
+                crate::ring::test_validate(
                     &graph("decomposed-without-digits", decomposed_without_digits),
                     &ParamEnv::default()
                 )
@@ -2508,7 +2758,7 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(
+                crate::ring::test_validate(
                     &graph("nonpositive-hash-digits", nonpositive_digits),
                     &ParamEnv::default()
                 )
@@ -2525,8 +2775,11 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("invalid-hash-base", invalid_base), &ParamEnv::default())
-                    .unwrap_err()
+                crate::ring::test_validate(
+                    &graph("invalid-hash-base", invalid_base),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             )
             .contains("gadget base must be greater than one")
         );
@@ -2539,8 +2792,11 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("nondivisible-hash-rows", nondivisible_rows), &ParamEnv::default())
-                    .unwrap_err()
+                crate::ring::test_validate(
+                    &graph("nondivisible-hash-rows", nondivisible_rows),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             )
             .contains("hash output rows must be divisible")
         );
@@ -2552,7 +2808,11 @@ mod tests {
             Some(IntExpr::constant(2)),
         );
         assert!(
-            validate(&graph("valid-balanced-hash", valid_balanced), &ParamEnv::default()).is_ok()
+            crate::ring::test_validate(
+                &graph("valid-balanced-hash", valid_balanced),
+                &ParamEnv::default()
+            )
+            .is_ok()
         );
 
         let valid_unsigned = hash_sample(
@@ -2562,7 +2822,11 @@ mod tests {
             Some(IntExpr::constant(2)),
         );
         assert!(
-            validate(&graph("valid-unsigned-hash", valid_unsigned), &ParamEnv::default()).is_ok()
+            crate::ring::test_validate(
+                &graph("valid-unsigned-hash", valid_unsigned),
+                &ParamEnv::default()
+            )
+            .is_ok()
         );
     }
 
@@ -2577,14 +2841,18 @@ mod tests {
             vec![WireType::Matrix(matrix_type(17, 2, 1))],
         );
         assert!(matches!(
-            validate(&graph("small-rhs-shape", product), &ParamEnv::default()),
+            crate::ring::test_validate(&graph("small-rhs-shape", product), &ParamEnv::default()),
             Err(ValidationError::Check(CheckError::ShapeMismatch { .. }))
         ));
 
         let negative = bounded_input("negative", matrix_type(17, 1, 1), -1, false);
         assert!(
             node_message(
-                validate(&graph("negative-bound", negative), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(
+                    &graph("negative-bound", negative),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             )
             .contains("small RHS coefficient bound")
         );
@@ -2596,30 +2864,33 @@ mod tests {
             NodeKind::MatrixMulSmallRhs,
             vec![
                 input("lhs", matrix_type(17, 2, 3)),
-                bounded_input("rhs", matrix_type(19, 3, 4), 1, false),
+                bounded_input("rhs", matrix_type(97, 3, 4), 1, false),
             ],
             vec![WireType::Matrix(matrix_type(17, 2, 4))],
         );
         assert!(matches!(
-            validate(&graph("small-rhs-modulus-mismatch", modulus_mismatch), &ParamEnv::default()),
+            crate::ring::test_validate(
+                &graph("small-rhs-modulus-mismatch", modulus_mismatch),
+                &ParamEnv::default()
+            ),
             Err(ValidationError::Check(CheckError::RingMismatch))
         ));
 
         let ring_dimension_mismatch = value(
             NodeKind::MatrixMulSmallRhs,
             vec![
-                input("lhs", matrix_type(17, 2, 3)),
+                input("lhs", matrix_type(97, 2, 3)),
                 bounded_input(
                     "rhs",
-                    MatrixType { ring_dimension: IntExpr::constant(16), ..matrix_type(17, 3, 4) },
+                    MatrixType { ring: crate::ring::test_ring(97, 16), ..matrix_type(97, 3, 4) },
                     1,
                     false,
                 ),
             ],
-            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+            vec![WireType::Matrix(matrix_type(97, 2, 4))],
         );
         assert!(matches!(
-            validate(
+            crate::ring::test_validate(
                 &graph("small-rhs-ring-dimension-mismatch", ring_dimension_mismatch),
                 &ParamEnv::default()
             ),
@@ -2635,45 +2906,49 @@ mod tests {
                 "kind",
                 ArtifactType::Preimage {
                     matrix: crate::types::ConcreteMatrixType {
-                        modulus: BigInt::from(17),
-                        ring_dimension: 8,
+                        ring: crate::ring::test_concrete_ring(17, 8),
                         rows: 1,
                         columns: 1,
                     },
                     max_coefficient_bound: BigInt::from(3),
+                    bound_domain: CoefficientBoundDomain::Global,
                 },
             ),
             (
                 "bound",
                 ArtifactType::SmallMatrix {
                     matrix: crate::types::ConcreteMatrixType {
-                        modulus: BigInt::from(17),
-                        ring_dimension: 8,
+                        ring: crate::ring::test_concrete_ring(17, 8),
                         rows: 1,
                         columns: 1,
                     },
                     max_coefficient_bound: BigInt::from(4),
+                    bound_domain: CoefficientBoundDomain::Global,
                 },
             ),
             (
                 "shape",
                 ArtifactType::SmallMatrix {
                     matrix: crate::types::ConcreteMatrixType {
-                        modulus: BigInt::from(17),
-                        ring_dimension: 8,
+                        ring: crate::ring::test_concrete_ring(17, 8),
                         rows: 2,
                         columns: 1,
                     },
                     max_coefficient_bound: BigInt::from(3),
+                    bound_domain: CoefficientBoundDomain::Global,
                 },
             ),
         ];
         for (label, artifact_type) in cases {
             let (input, manifests) =
                 bounded_artifact_input(matrix.clone(), 3, false, artifact_type);
-            let error =
-                validate_with_manifests(&graph(label, input), &ParamEnv::default(), &manifests)
-                    .expect_err("manifest mismatch must be rejected");
+            let error = validate_with_manifests(
+                &graph(label, input),
+                &ParamEnv::default(),
+                &manifests,
+                crate::ring::test_resolve_basis,
+            )
+            .expect_err("manifest mismatch must be rejected");
             assert!(node_message(error).contains("artifact type does not match manifest"));
         }
     }
@@ -2692,7 +2967,11 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("negative-gaussian", gaussian), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(
+                    &graph("negative-gaussian", gaussian),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             )
             .contains("Gaussian sigma")
         );
@@ -2708,7 +2987,8 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(&graph("empty-uniform", uniform), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(&graph("empty-uniform", uniform), &ParamEnv::default())
+                    .unwrap_err()
             )
             .contains("uniform range")
         );
@@ -2724,7 +3004,7 @@ mod tests {
         );
         assert!(
             node_message(
-                validate(
+                crate::ring::test_validate(
                     &graph("unsupported-uniform-interval", unsupported_interval),
                     &ParamEnv::default()
                 )
@@ -2739,7 +3019,10 @@ mod tests {
             Vec::new(),
             vec![WireType::Matrix(residue_type)],
         );
-        assert!(validate(&graph("uniform-residue", residue), &ParamEnv::default()).is_ok());
+        assert!(
+            crate::ring::test_validate(&graph("uniform-residue", residue), &ParamEnv::default())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2755,7 +3038,10 @@ mod tests {
             vec![WireType::Matrix(matrix_type(257, 1, 2))],
         );
         assert_eq!(
-            node_message(validate(&graph("invalid-crt", crt), &ParamEnv::default()).unwrap_err()),
+            node_message(
+                crate::ring::test_validate(&graph("invalid-crt", crt), &ParamEnv::default())
+                    .unwrap_err()
+            ),
             "CRT metadata count does not match inputs"
         );
 
@@ -2772,7 +3058,8 @@ mod tests {
         .expect("decode output");
         assert!(
             node_message(
-                validate(&graph("invalid-decode", decode), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(&graph("invalid-decode", decode), &ParamEnv::default())
+                    .unwrap_err()
             )
             .contains("plaintext modulus")
         );
@@ -2788,17 +3075,24 @@ mod tests {
             (vec![17, 17], 1, 17 * 97 * 113, 4, false),
             (vec![17, 97], 1, 113, 4, false),
         ] {
+            let mut source_type = matrix_type(17 * 97, 2, 3);
+            source_type.ring = RingRef::new(crate::RingExpr::Explicit {
+                crt_moduli: basis.into_iter().map(IntExpr::constant).collect(),
+                ring_dimension: 8,
+            });
             let result = value(
                 NodeKind::RnsModUp {
-                    modulus: IntExpr::constant(destination),
-                    source_moduli: basis,
+                    destination: crate::ring::test_ring(destination, 8),
                     digit_size,
                     normalize: true,
                 },
-                vec![input("source", matrix_type(17 * 97, 2, 3))],
+                vec![input("source", source_type)],
                 vec![WireType::Matrix(matrix_type(destination, rows, 3))],
             );
-            assert_eq!(validate(&graph("mod-up", result), &ParamEnv::default()).is_ok(), valid);
+            assert_eq!(
+                crate::ring::test_validate(&graph("mod-up", result), &ParamEnv::default()).is_ok(),
+                valid
+            );
         }
     }
 
@@ -2814,27 +3108,33 @@ mod tests {
         ] {
             let result = value(
                 NodeKind::RnsModDown {
-                    modulus: IntExpr::constant(destination),
-                    source_moduli: vec![17, 97],
+                    destination: crate::ring::test_ring(destination, 8),
                     plaintext_modulus: IntExpr::constant(plaintext),
                 },
                 vec![input("source", matrix_type(17 * 97, 2, 3))],
                 vec![WireType::Matrix(matrix_type(destination, 2, 3))],
             );
-            assert_eq!(validate(&graph("mod-down", result), &ParamEnv::default()).is_ok(), valid);
+            assert_eq!(
+                crate::ring::test_validate(&graph("mod-down", result), &ParamEnv::default())
+                    .is_ok(),
+                valid
+            );
         }
     }
 
     #[test]
     fn test_centered_rebase_validates_destination_and_preserves_shape() {
-        for (modulus, valid) in [(13, true), (257, true), (1, false), (0, false)] {
+        for (modulus, valid) in [(97, true), (257, true), (1, false), (0, false)] {
             let source = input("source", matrix_type(17, 2, 3));
             let rebased = value(
-                NodeKind::CenteredRebase { modulus: IntExpr::constant(modulus) },
+                NodeKind::CenteredRebase { destination: crate::ring::test_ring(modulus, 8) },
                 vec![source],
                 vec![WireType::Matrix(matrix_type(modulus, 2, 3))],
             );
-            assert_eq!(validate(&graph("rebase", rebased), &ParamEnv::default()).is_ok(), valid);
+            assert_eq!(
+                crate::ring::test_validate(&graph("rebase", rebased), &ParamEnv::default()).is_ok(),
+                valid
+            );
         }
     }
 
@@ -2848,7 +3148,11 @@ mod tests {
                 vec![WireType::Matrix(matrix_type(257, 2, 3))],
             );
             assert_eq!(
-                validate(&graph("centered-round-divide", divided), &ParamEnv::default()).is_ok(),
+                crate::ring::test_validate(
+                    &graph("centered-round-divide", divided),
+                    &ParamEnv::default()
+                )
+                .is_ok(),
                 valid
             );
         }
@@ -2859,15 +3163,22 @@ mod tests {
         for (bound, destination, valid) in [(40, 17, false), (8, 17, true), (40, 97 * 17, true)] {
             for preimage in [false, true] {
                 let rebased = value(
-                    NodeKind::CenteredRebase { modulus: IntExpr::constant(destination) },
+                    NodeKind::CenteredRebase {
+                        destination: crate::ring::test_ring(destination, 8),
+                    },
                     vec![bounded_input("source", matrix_type(97, 2, 3), bound, preimage)],
                     vec![WireType::SmallMatrix {
                         matrix: matrix_type(destination, 2, 3),
                         max_coefficient_bound: IntExpr::constant(bound),
+                        bound_domain: CoefficientBoundDomain::Global,
                     }],
                 );
                 assert_eq!(
-                    validate(&graph("compact-domain", rebased), &ParamEnv::default()).is_ok(),
+                    crate::ring::test_validate(
+                        &graph("compact-domain", rebased),
+                        &ParamEnv::default()
+                    )
+                    .is_ok(),
                     valid
                 );
             }
@@ -2879,15 +3190,17 @@ mod tests {
         for preimage in [false, true] {
             let source = bounded_input("source", matrix_type(17, 2, 3), 7, preimage);
             let rebased = value(
-                NodeKind::CenteredRebase { modulus: IntExpr::constant(257) },
+                NodeKind::CenteredRebase { destination: crate::ring::test_ring(257, 8) },
                 vec![source],
                 vec![WireType::SmallMatrix {
                     matrix: matrix_type(257, 2, 3),
                     max_coefficient_bound: IntExpr::constant(7),
+                    bound_domain: CoefficientBoundDomain::Global,
                 }],
             );
-            let validated = validate(&graph("compact-rebase", rebased), &ParamEnv::default())
-                .expect("compact centered rebase should preserve its bound");
+            let validated =
+                crate::ring::test_validate(&graph("compact-rebase", rebased), &ParamEnv::default())
+                    .expect("compact centered rebase should preserve its bound");
             assert!(validated.root_scope().wire_types.values().any(|ty| {
                 matches!(
                     ty,
@@ -2901,28 +3214,27 @@ mod tests {
 
     #[test]
     fn block_mod_switch_requires_strict_source_basis_subset_and_coprime_t() {
-        let source_basis = vec![17, 97];
         let valid = value(
             NodeKind::BlockModSwitch {
-                modulus: IntExpr::constant(97),
-                source_moduli: source_basis.clone(),
+                destination: crate::ring::test_ring(97, 8),
                 plaintext_modulus: IntExpr::constant(3),
             },
             vec![input("source", matrix_type(17 * 97, 2, 3))],
             vec![WireType::Matrix(matrix_type(97, 2, 3))],
         );
-        assert!(validate(&graph("block-mod-switch", valid), &ParamEnv::default()).is_ok());
+        assert!(
+            crate::ring::test_validate(&graph("block-mod-switch", valid), &ParamEnv::default())
+                .is_ok()
+        );
 
-        for (destination, basis, plaintext, expected) in [
-            (17 * 97, vec![17, 97], 3, "strict nonempty CRT subset"),
-            (17, vec![17, 97], 97, "correction factor"),
-            (97, vec![17, 17], 3, "distinct coprime"),
-            (19, vec![17, 97], 3, "strict nonempty CRT subset"),
+        for (destination, plaintext, expected) in [
+            (17 * 97, 3, "strict nonempty CRT subset"),
+            (17, 97, "correction factor"),
+            (113, 3, "strict nonempty CRT subset"),
         ] {
             let candidate = value(
                 NodeKind::BlockModSwitch {
-                    modulus: IntExpr::constant(destination),
-                    source_moduli: basis,
+                    destination: crate::ring::test_ring(destination, 8),
                     plaintext_modulus: IntExpr::constant(plaintext),
                 },
                 vec![input("source", matrix_type(17 * 97, 2, 3))],
@@ -2930,8 +3242,11 @@ mod tests {
             );
             assert!(
                 node_message(
-                    validate(&graph("invalid-block-mod-switch", candidate), &ParamEnv::default())
-                        .unwrap_err()
+                    crate::ring::test_validate(
+                        &graph("invalid-block-mod-switch", candidate),
+                        &ParamEnv::default()
+                    )
+                    .unwrap_err()
                 )
                 .contains(expected)
             );
@@ -2939,45 +3254,86 @@ mod tests {
     }
 
     #[test]
-    fn modulus_conversion_validates_divisor_ring_and_preserves_shape() {
-        let original = input("original", matrix_type(105, 2, 3));
+    fn modulus_conversion_validates_crt_subset_and_preserves_shape() {
+        let original = input("original", matrix_type(17 * 97 * 113, 2, 3));
         let switched = value(
-            NodeKind::ModulusSwitch { modulus: IntExpr::constant(15) },
+            NodeKind::ModulusSwitch { destination: crate::ring::test_ring(17 * 97, 8) },
             vec![original.clone()],
-            vec![WireType::Matrix(matrix_type(15, 2, 3))],
+            vec![WireType::Matrix(matrix_type(17 * 97, 2, 3))],
         );
         let reduced = value(
-            NodeKind::ModulusReduce { modulus: IntExpr::constant(5) },
+            NodeKind::ModulusReduce { destination: crate::ring::test_ring(17, 8) },
             vec![switched],
-            vec![WireType::Matrix(matrix_type(5, 2, 3))],
-        );
-        assert!(validate(&graph("mixed-rings", reduced), &ParamEnv::default()).is_ok());
-        for (source_modulus, destination_modulus) in [(105, 7), (105, 105)] {
-            let source = input("source", matrix_type(source_modulus, 1, 3));
-            let output = value(
-                NodeKind::ModulusSwitch { modulus: IntExpr::constant(destination_modulus) },
-                vec![source],
-                vec![WireType::Matrix(matrix_type(destination_modulus, 1, 3))],
-            );
-            assert!(validate(&graph("valid-switch", output), &ParamEnv::default()).is_ok());
-        }
-        for (source_modulus, destination_modulus) in [(105, 11), (105, 1), (30, 15), (30, 10)] {
-            let source = input("source", matrix_type(source_modulus, 1, 3));
-            let output = value(
-                NodeKind::ModulusSwitch { modulus: IntExpr::constant(destination_modulus) },
-                vec![source],
-                vec![WireType::Matrix(matrix_type(destination_modulus, 1, 3))],
-            );
-            assert!(validate(&graph("invalid-switch", output), &ParamEnv::default()).is_err());
-        }
-        let mismatched = value(
-            NodeKind::ModulusSwitch { modulus: IntExpr::constant(15) },
-            vec![original],
-            vec![WireType::Matrix(matrix_type(105, 2, 3))],
+            vec![WireType::Matrix(matrix_type(17, 2, 3))],
         );
         assert!(
-            validate(&graph("wrong-destination-type", mismatched), &ParamEnv::default()).is_err()
+            crate::ring::test_validate(&graph("mixed-rings", reduced), &ParamEnv::default())
+                .is_ok()
         );
+        for destination_modulus in [97, 17 * 97 * 113] {
+            let source_modulus = 17 * 97 * 113;
+            let source = input("source", matrix_type(source_modulus, 1, 3));
+            let output = value(
+                NodeKind::ModulusSwitch {
+                    destination: crate::ring::test_ring(destination_modulus, 8),
+                },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(destination_modulus, 1, 3))],
+            );
+            assert!(
+                crate::ring::test_validate(&graph("valid-switch", output), &ParamEnv::default())
+                    .is_ok()
+            );
+        }
+        for destination_modulus in [241, 1, 17 * 241] {
+            let source_modulus = 17 * 97 * 113;
+            let source = input("source", matrix_type(source_modulus, 1, 3));
+            let output = value(
+                NodeKind::ModulusSwitch {
+                    destination: crate::ring::test_ring(destination_modulus, 8),
+                },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(destination_modulus, 1, 3))],
+            );
+            assert!(
+                crate::ring::test_validate(&graph("invalid-switch", output), &ParamEnv::default())
+                    .is_err()
+            );
+        }
+        let mismatched = value(
+            NodeKind::ModulusSwitch { destination: crate::ring::test_ring(17 * 97, 8) },
+            vec![original],
+            vec![WireType::Matrix(matrix_type(17 * 97 * 113, 2, 3))],
+        );
+        assert!(
+            crate::ring::test_validate(
+                &graph("wrong-destination-type", mismatched),
+                &ParamEnv::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn modulus_switch_retains_declared_destination_order() {
+        let source_type = matrix_type(17 * 97, 1, 1);
+        let destination = RingRef::new(crate::RingExpr::Select {
+            source: source_type.ring.clone(),
+            indices: vec![IntExpr::constant(1), IntExpr::constant(0)],
+        });
+        let output_type = MatrixType { ring: destination.clone(), ..source_type.clone() };
+        let switched = value(
+            NodeKind::ModulusSwitch { destination },
+            vec![input("source", source_type)],
+            vec![WireType::Matrix(output_type)],
+        );
+        let graph = graph("reordered-crt", switched);
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let output = graph.outputs()["output"].value;
+        let ConcreteWireType::Matrix(matrix) = &validated.root_scope().wire_types[&output] else {
+            panic!("matrix output")
+        };
+        assert_eq!(matrix.ring.crt_moduli(), &[97, 17]);
     }
 
     #[test]
@@ -3003,8 +3359,11 @@ mod tests {
         );
         assert_eq!(
             node_message(
-                validate(&graph("invalid-packed-polynomial", packed), &ParamEnv::default())
-                    .unwrap_err()
+                crate::ring::test_validate(
+                    &graph("invalid-packed-polynomial", packed),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             ),
             "coefficient bit width does not cover the modulus"
         );
@@ -3024,8 +3383,11 @@ mod tests {
         );
         assert_eq!(
             node_message(
-                validate(&graph("heterogeneous-family", heterogeneous), &ParamEnv::default())
-                    .unwrap_err()
+                crate::ring::test_validate(
+                    &graph("heterogeneous-family", heterogeneous),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             ),
             "family members must have one non-family type"
         );
@@ -3048,7 +3410,9 @@ mod tests {
             vec![family, index],
             vec![WireType::Matrix(matrix_type(17, 1, 1))],
         );
-        let validated = validate(&graph("dynamic-family", selected), &ParamEnv::default()).unwrap();
+        let validated =
+            crate::ring::test_validate(&graph("dynamic-family", selected), &ParamEnv::default())
+                .unwrap();
         assert_eq!(validated.warnings.len(), 1);
         assert_eq!(validated.warnings[0].kind, WarningKind::RuntimeSelectBoundsCheck);
     }
@@ -3134,13 +3498,19 @@ mod tests {
 
         let static_parallel = graph("static-parallel", parallel(false, false));
         assert_eq!(
-            node_message(validate(&static_parallel, &ParamEnv::default()).unwrap_err()),
+            node_message(
+                crate::ring::test_validate(&static_parallel, &ParamEnv::default()).unwrap_err()
+            ),
             "loop-dependent family access must use FamilyGetDynamic"
         );
-        validate(&graph("dynamic-parallel", parallel(true, false)), &ParamEnv::default()).unwrap();
+        crate::ring::test_validate(
+            &graph("dynamic-parallel", parallel(true, false)),
+            &ParamEnv::default(),
+        )
+        .unwrap();
         assert_eq!(
             node_message(
-                validate(
+                crate::ring::test_validate(
                     &graph("aliased-static-parallel", parallel(false, true)),
                     &ParamEnv::default()
                 )
@@ -3224,14 +3594,19 @@ mod tests {
 
         let static_sequential = graph("static-sequential", sequential(false, false));
         assert_eq!(
-            node_message(validate(&static_sequential, &ParamEnv::default()).unwrap_err()),
+            node_message(
+                crate::ring::test_validate(&static_sequential, &ParamEnv::default()).unwrap_err()
+            ),
             "loop-dependent family access must use FamilyGetDynamic"
         );
-        validate(&graph("dynamic-sequential", sequential(true, false)), &ParamEnv::default())
-            .unwrap();
+        crate::ring::test_validate(
+            &graph("dynamic-sequential", sequential(true, false)),
+            &ParamEnv::default(),
+        )
+        .unwrap();
         assert_eq!(
             node_message(
-                validate(
+                crate::ring::test_validate(
                     &graph("aliased-static-sequential", sequential(false, true)),
                     &ParamEnv::default()
                 )
@@ -3271,7 +3646,8 @@ mod tests {
                 .expect("output");
         assert_eq!(
             node_message(
-                validate(&graph("missing-upper", missing), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(&graph("missing-upper", missing), &ParamEnv::default())
+                    .unwrap_err()
             ),
             "canonical input exclusive upper bound count does not match call arguments"
         );
@@ -3284,7 +3660,10 @@ mod tests {
         .output(0)
         .expect("output");
         assert_eq!(
-            node_message(validate(&graph("zero-upper", zero), &ParamEnv::default()).unwrap_err()),
+            node_message(
+                crate::ring::test_validate(&graph("zero-upper", zero), &ParamEnv::default())
+                    .unwrap_err()
+            ),
             "canonical input exclusive upper bounds must be positive"
         );
     }
@@ -3329,7 +3708,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             node_message(
-                validate(&graph("invalid-sequential", output), &ParamEnv::default()).unwrap_err()
+                crate::ring::test_validate(
+                    &graph("invalid-sequential", output),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
             ),
             "invalid sequential carried count"
         );

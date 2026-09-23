@@ -14,6 +14,27 @@ pub mod wee25_opening;
 pub mod wee25_public_parameters;
 
 #[cfg(test)]
+pub(crate) fn ring_from_params(
+    parameters: &mxx_backends::poly::dcrt::params::DCRTPolyParams,
+) -> mxx_dsl::Ring {
+    use mxx_backends::poly::PolyParams;
+    mxx_dsl::Ring::from_crt_moduli(
+        parameters.to_crt().0.into_iter().map(Into::into).collect(),
+        parameters.ring_dimension(),
+    )
+}
+
+pub(crate) fn static_ring_modulus(ring: &mxx_ir_core::RingRef) -> Option<num_bigint::BigUint> {
+    use mxx_ir_core::{IntExpr, RingExpr};
+    use num_bigint::BigUint;
+    let RingExpr::Explicit { crt_moduli, .. } = ring.expression() else { return None };
+    crt_moduli.iter().try_fold(BigUint::from(1u8), |product, prime| {
+        let IntExpr::Const(prime) = prime else { return None };
+        Some(product * prime.to_biguint()?)
+    })
+}
+
+#[cfg(test)]
 mod test_utils;
 
 pub use boolean::{

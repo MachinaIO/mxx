@@ -1,13 +1,16 @@
 #![cfg(feature = "gpu")]
 
+use mxx_backends::{
+    GpuRuntime,
+    artifact::MemoryArtifactStore,
+    poly::{
+        PolyParams,
+        dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+    },
+};
 use mxx_gadgets::circuit::{
     BooleanCircuitData, BooleanCircuitShape, BooleanGateData, BooleanGateKind,
 };
-use mxx_primitives::poly::{
-    PolyParams,
-    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
-};
-use mxx_runtime::{GpuRuntime, artifact::MemoryArtifactStore};
 use mxx_we::diamond::{DiamondParameterSearch, DiamondWeRuntime};
 use std::{env, time::Instant};
 use tracing::info;
@@ -21,7 +24,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn install_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("mxx_we=debug,mxx_runtime=debug,info"));
+        .unwrap_or_else(|_| EnvFilter::new("mxx_we=debug,mxx_backends=debug,info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).with_test_writer().try_init();
 }
 
@@ -90,7 +93,7 @@ fn test_gpu_diamond_we_parameter_search_and_round_trip() {
         None,
     );
     let runtime_started = Instant::now();
-    let backend = mxx_runtime::backend::poly_gpu::gpu_backend_on(
+    let backend = mxx_backends::backend::poly_gpu::gpu_backend_on(
         [gpu_parameters.clone()],
         device_ids.iter().copied(),
     );

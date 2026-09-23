@@ -504,7 +504,7 @@ impl<P: Poly> PolyCircuit<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+    use mxx_backends::poly::dcrt::poly::DCRTPoly;
 
     #[test]
     fn depth_and_non_free_depth_follow_the_documented_gate_rules() {

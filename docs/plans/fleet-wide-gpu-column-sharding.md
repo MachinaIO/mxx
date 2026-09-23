@@ -116,16 +116,16 @@ meanings and remain independent of this percentage.
 
 ## Ownership and crate boundary
 
-`mxx-runtime` owns the fleet matrix representation, fleet scheduler, calibration
+`mxx-backends` owns the fleet matrix representation, fleet scheduler, calibration
 signature and profile types, the reusable calibration registry, and the
 production-equivalent warmup that freezes an execution plan. The report returned
 by that warmup is the sole estimate for the planned run, preserving the dependency
 direction in `docs/architecture.md` without a separate estimator package.
 
 Native memory-pool high-water queries and reset operations belong to
-`mxx-primitives` and its CUDA implementation. CUDA headers expose only the
+`mxx-backends` and its CUDA implementation. CUDA headers expose only the
 cross-file or Rust-facing declarations; implementation bodies remain under
-`crates/primitives/cuda/src/`.
+`crates/backends/cuda/src/`.
 
 ## Fleet matrix representation
 
@@ -640,7 +640,7 @@ diagnostics.
 
 1. **Configuration and CUDA probes**
    - Replace the small-matrix percentage variable with
-     `MXX_GPU_VRAM_PERCENT` in `crates/primitives/src/env.rs`.
+     `MXX_GPU_VRAM_PERCENT` in `crates/backends/src/env.rs`.
    - Cache checked per-device total and budget bytes in GPU contexts.
    - Add context-local CUDA memory-pool current/high-water query and reset APIs.
    - Remove every column-width environment control and compatibility alias.
@@ -724,8 +724,8 @@ Required focused tests include:
 - event-safe early drops and repeated execution without implicit synchronization.
 
 After focused tests, run CPU and GPU workspace unit-test builds with no new
-warnings attributable to this change and the full allowed `mxx-primitives` and
-`mxx-runtime` unit suites. Run the built GPU
+warnings attributable to this change and the full allowed `mxx-backends` and
+`mxx-backends` unit suites. Run the built GPU
 test binaries repeatedly with identical multithreaded commands as required by
 `GPU.md`. Do not use synchronization to hide intermittent failures.
 

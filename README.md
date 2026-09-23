@@ -8,10 +8,9 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 
 | Crate | Responsibility |
 | --- | --- |
-| `mxx-primitives` | Polynomial/matrix operations, CPU/GPU kernels, and concrete samplers. |
+| `mxx-backends` | Polynomial/matrix operations, CPU/GPU kernels and execution, concrete samplers, transcripts, sessions, and artifacts. |
 | `mxx-ir-core` | Executable DAG, protocol declarations, structural validation, artifact manifests, and Lean claim generation. |
 | `mxx-dsl` | Typed graph construction and sampler-free ideal/predicate builders. |
-| `mxx-runtime` | CPU execution; measured GPU warmup, frozen planning and execution; transcripts, sessions, and artifacts. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
 | `mxx-fhe` | DSL-based Ring Regev/Ring-GSW and leveled BGV, SIMD, rotations, and ciphertext noise tracking. |
@@ -31,7 +30,7 @@ See `docs/architecture.md`, `docs/dsl.md`, `docs/ir-core.md`, `docs/runtime.md`,
 
 `mxx-fhe` constructs cryptographic graphs; its methods do not encrypt eagerly.
 Key generation, sampling, polynomial arithmetic, and decryption execute when
-`mxx-runtime` runs the validated graph. CPU and GPU backends use the same FHE DSL.
+`mxx-backends` runs the validated graph. CPU and GPU backends use the same FHE DSL.
 Bootstrapping is not implemented.
 
 | API | Representation and behavior |

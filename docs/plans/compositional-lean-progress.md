@@ -35,9 +35,9 @@ specification or the compositional implementation plan.
 The interrupted CrtRadix edits were repaired in the current checkpoint. The
 following dependent package builds now pass with the shared cache:
 
-- `crates/primitives/lean`: 1809 jobs.
+- `crates/backends/lean`: 1809 jobs.
 - `crates/gadgets/lean`: 1811 jobs.
-- `crates/runtime/lean`: 1813 jobs.
+- `crates/backends/lean`: 1813 jobs.
 
 The new capacity declarations report only the standard Lean foundations
 (`propext`, `Classical.choice`, and `Quot.sound`) under `#print axioms`. The
@@ -46,7 +46,7 @@ without adding semantic placeholders. Final coherent package validation is track
 
 ## Runtime public-gadget API checkpoint
 
-`crates/runtime/lean/RuntimePrimitives.lean` now separates the two runtime
+`crates/backends/lean/RuntimePrimitives.lean` now separates the two runtime
 paths:
 
 - `preimageRuns` remains the sampled-secret relation used by existing fixtures.

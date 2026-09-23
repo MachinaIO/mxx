@@ -196,16 +196,16 @@ separate columns. Empty mxx device-time fields mean unmeasured. Additional expli
 The audit identified repeated metadata uploads and host bookkeeping in the
 shared runtime/CUDA path. The resulting changes are:
 
-- [Arithmetic wrappers](../crates/primitives/cuda/src/matrix/MatrixArith.cu)
+- [Arithmetic wrappers](../crates/backends/cuda/src/matrix/MatrixArith.cu)
   pass metadata by value for the context's validated maximum of 64 CRT limbs.
   CUDA owns the launch arguments after enqueue; temporary pinned buffers,
   metadata device allocations, uploads, and reclamation jobs are removed.
   Source-consumer and output-completion events remain in place.
-- [Ordinary NTT](../crates/primitives/cuda/src/matrix/MatrixNTT.cu) reads existing
+- [Ordinary NTT](../crates/backends/cuda/src/matrix/MatrixNTT.cu) reads existing
   matrix-owned device descriptors. Forward radix-2 DIF directly produces
   OpenFHE's bit-reversed evaluation order, removing two permutation passes;
   at N8192, forward launch count falls from 16 to 14. Inverse DIT is preserved.
-- [Batched NTT](../crates/primitives/cuda/src/matrix/MatrixNTTBatch.cu) passes
+- [Batched NTT](../crates/backends/cuda/src/matrix/MatrixNTTBatch.cu) passes
   descriptor references in groups of at most 224 independently allocated
   matrices, within the portable 4KB CUDA argument limit. Each stage uses
   `ceil(matrix_count / 224)` launches. Larger batches therefore trade additional
@@ -214,13 +214,13 @@ shared runtime/CUDA path. The resulting changes are:
 - [Graph identity](../crates/ir-core/src/encoding.rs) reuses an immutable graph's
   bounded `OnceLock` entry only when the complete parameter environment matches.
   A different environment computes its own hash; no parameter binding is erased.
-- [GPU operation identity](../crates/runtime/src/gpu_calibration.rs) uses a
+- [GPU operation identity](../crates/backends/src/gpu_calibration.rs) uses a
   thread-local 64-entry LRU with full node, argument-type, output-type, and
-  environment equality. [Root graph execution](../crates/runtime/src/executor.rs)
+  environment equality. [Root graph execution](../crates/backends/src/executor.rs)
   reuses the already validated concrete types when the environment matches,
   avoiding repeated type concretization. Cache eviction and changed inputs keep
   their existing identity semantics.
-- [Release policy](../crates/runtime/src/executor.rs) performs a final drain only
+- [Release policy](../crates/backends/src/executor.rs) performs a final drain only
   when `release_fence_interval` explicitly requests it. Default asynchronous
   release retains allocation lifetime events and context-teardown guarantees;
   queued-memory and later-error-observation implications are described above.
@@ -495,15 +495,15 @@ The working tree reduces allocation and dispatch overhead for BGV multiplication
 
 ### Implementation
 
-- **Tensor row sums.** The runtime recognizes a Tensor whose consumers are all covered by one eligible row-sum plan. It captures both operands at the original Tensor position and evaluates the selected tensor rows directly, avoiding the materialized tensor and separate row-sum allocation. Traced execution, an exported or retained tensor, mixed consumers, and multiple plans sharing the tensor retain the original tensor boundary. Argument materialization order, original node progress and liveness processing, and output staging remain intact. See [runtime planning and dispatch](../crates/runtime/src/executor.rs), [generic matrix interface](../crates/primitives/src/matrix/mod.rs), and [CUDA arithmetic](../crates/primitives/cuda/src/matrix/MatrixArith.cu).
-- **Independent calibration.** The fused operation has its own canonical identity covering both operand types, output type, and ordered row groups. The FHE test helper registers explicit output-column capacities for that identity. Production calibration does not borrow another operation's measured profile. See [calibration identities](../crates/runtime/src/gpu_calibration.rs), [cached operation preparation](../crates/runtime/src/executor/gpu_plan.rs), and [GPU fixture calibration](../crates/fhe/src/utils.rs).
-- **One allocation for data and auxiliary storage.** Each matrix partition allocates its coefficient data, aligned auxiliary pointer slots, and device descriptors together. The data buffer owns the allocation; the auxiliary pointer is a non-owning interior view. Accounting includes alignment padding, while peer copies retain the logical coefficient-data size and exclude auxiliary pointers. Existing completion dependencies protect the single asynchronous free. See [matrix allocation and destruction](../crates/primitives/cuda/src/matrix/MatrixData.cu).
-- **Less repeated host work.** The guarded root plan stores resolved argument WireRefs. Singleton execution borrows batch metadata instead of allocating singleton vectors and cloning parameter bindings; its calibration dispatch also avoids allocating group/index vectors. Private scratch production identity is initialized only when a streamed family is registered, once per execution. Public production identity remains unchanged. See [executor](../crates/runtime/src/executor.rs).
-- **Reuse of an existing completion event.** The grouped arithmetic path can supply its already-recorded output completion to consumer tracking, avoiding redundant temporary event records. Source producer-stream joins and source lifetime protection remain in place; this does not introduce a matrix allocation cache. See [consumer tracking](../crates/primitives/cuda/src/matrix/MatrixUtils.cu) and [grouped arithmetic dispatch](../crates/primitives/cuda/src/matrix/MatrixArith.cu).
+- **Tensor row sums.** The runtime recognizes a Tensor whose consumers are all covered by one eligible row-sum plan. It captures both operands at the original Tensor position and evaluates the selected tensor rows directly, avoiding the materialized tensor and separate row-sum allocation. Traced execution, an exported or retained tensor, mixed consumers, and multiple plans sharing the tensor retain the original tensor boundary. Argument materialization order, original node progress and liveness processing, and output staging remain intact. See [runtime planning and dispatch](../crates/backends/src/executor.rs), [generic matrix interface](../crates/backends/src/matrix/mod.rs), and [CUDA arithmetic](../crates/backends/cuda/src/matrix/MatrixArith.cu).
+- **Independent calibration.** The fused operation has its own canonical identity covering both operand types, output type, and ordered row groups. The FHE test helper registers explicit output-column capacities for that identity. Production calibration does not borrow another operation's measured profile. See [calibration identities](../crates/backends/src/gpu_calibration.rs), [cached operation preparation](../crates/backends/src/executor/gpu_plan.rs), and [GPU fixture calibration](../crates/fhe/src/utils.rs).
+- **One allocation for data and auxiliary storage.** Each matrix partition allocates its coefficient data, aligned auxiliary pointer slots, and device descriptors together. The data buffer owns the allocation; the auxiliary pointer is a non-owning interior view. Accounting includes alignment padding, while peer copies retain the logical coefficient-data size and exclude auxiliary pointers. Existing completion dependencies protect the single asynchronous free. See [matrix allocation and destruction](../crates/backends/cuda/src/matrix/MatrixData.cu).
+- **Less repeated host work.** The guarded root plan stores resolved argument WireRefs. Singleton execution borrows batch metadata instead of allocating singleton vectors and cloning parameter bindings; its calibration dispatch also avoids allocating group/index vectors. Private scratch production identity is initialized only when a streamed family is registered, once per execution. Public production identity remains unchanged. See [executor](../crates/backends/src/executor.rs).
+- **Reuse of an existing completion event.** The grouped arithmetic path can supply its already-recorded output completion to consumer tracking, avoiding redundant temporary event records. Source producer-stream joins and source lifetime protection remain in place; this does not introduce a matrix allocation cache. See [consumer tracking](../crates/backends/cuda/src/matrix/MatrixUtils.cu) and [grouped arithmetic dispatch](../crates/backends/cuda/src/matrix/MatrixArith.cu).
 
 ### NTT scope
 
-The ordinary matrix NTT path at ring dimension 8192 uses two fused kernel launches per transform. This behavior predates the changes summarized above. The separate batched NTT implementation has not been converted to that fused path. Standalone multiplication starts and finishes in evaluation representation and performs **zero NTTs**; its improvements must not be attributed to NTT fusion. See [ordinary NTT](../crates/primitives/cuda/src/matrix/MatrixNTT.cu) and [batched NTT](../crates/primitives/cuda/src/matrix/MatrixNTTBatch.cu).
+The ordinary matrix NTT path at ring dimension 8192 uses two fused kernel launches per transform. This behavior predates the changes summarized above. The separate batched NTT implementation has not been converted to that fused path. Standalone multiplication starts and finishes in evaluation representation and performs **zero NTTs**; its improvements must not be attributed to NTT fusion. See [ordinary NTT](../crates/backends/cuda/src/matrix/MatrixNTT.cu) and [batched NTT](../crates/backends/cuda/src/matrix/MatrixNTTBatch.cu).
 
 ### Validation and measurements
 

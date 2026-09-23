@@ -621,7 +621,7 @@ mod tests {
         },
         utils::gen_biguint_for_modulus,
     };
-    use mxx_primitives::{
+    use mxx_backends::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,

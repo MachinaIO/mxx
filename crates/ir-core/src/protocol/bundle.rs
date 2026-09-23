@@ -684,7 +684,7 @@ impl ClosedProtocolBundle {
                             matches!(
                                 (decoder_input, output_type(&residual_stage.graph, residual.value)),
                                 (WireType::Matrix(decoder_type), _)
-                                    if decoder_type.modulus == residual_matrix_type.modulus
+                                    if decoder_type.ring == residual_matrix_type.ring
                             )
                         });
                     let residual_family_witness_matches = !matches!(
@@ -819,7 +819,7 @@ fn boolean_interval_decoder_matches(
 
     let expected_quarter = IntExpr::RoundDiv(
         Box::new(IntExpr::Sub(
-            Box::new(residual_type.modulus.clone()),
+            Box::new(IntExpr::RingModulus(residual_type.ring.clone())),
             Box::new(IntExpr::constant(2)),
         )),
         Box::new(IntExpr::constant(4)),
@@ -1253,7 +1253,7 @@ mod tests {
             .unwrap()
             .0
         }
-        let modulus = matrix_type(1, 1).modulus;
+        let modulus = IntExpr::RingModulus(matrix_type(1, 1).ring);
         let original = IntExpr::RoundDiv(
             Box::new(IntExpr::Sub(Box::new(modulus.clone()), Box::new(IntExpr::constant(2)))),
             Box::new(IntExpr::constant(4)),
@@ -1278,8 +1278,7 @@ mod tests {
 
     fn matrix_type(rows: i64, columns: i64) -> MatrixType {
         MatrixType {
-            modulus: 17.into(),
-            ring_dimension: 1.into(),
+            ring: crate::ring::test_ring(17, 1),
             rows: rows.into(),
             columns: columns.into(),
         }

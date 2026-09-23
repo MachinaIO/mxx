@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 pub fn export_claim(
     protocol: &WitnessEncryptionProtocolDecl,
     bindings: &ParamEnv,
-    backend: &mxx_runtime::lean::LeanBackendArtifact,
+    backend: &mxx_backends::lean::LeanBackendArtifact,
     manifests: &BTreeMap<mxx_ir_core::artifact::ProductionId, mxx_ir_core::artifact::Manifest>,
     directory: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -35,6 +35,7 @@ pub fn export_claim(
         },
         manifests,
         directory,
+        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
     )
 }
 
@@ -45,9 +46,12 @@ mod tests {
 
     #[test]
     fn test_export_claim_rejects_stage_ids_before_writing_files() {
-        let mut protocol = crate::diamond::DiamondWeProtocolFamily::new(b"stage-id-test".to_vec())
-            .protocol_decl()
-            .unwrap();
+        let mut protocol = crate::diamond::DiamondWeProtocolFamily::new(
+            b"stage-id-test".to_vec(),
+            mxx_dsl::Ring::from_crt_moduli(vec![257.into()], 8),
+        )
+        .protocol_decl()
+        .unwrap();
         // The first stage can export, so validating names only during emission would leave a file.
         protocol.protocol.bundle.workflow.stages[0].graph =
             mxx_dsl::DslContext::new("stage-id-test")
@@ -57,7 +61,7 @@ mod tests {
                 .unwrap()
                 .graph;
         let backend =
-            mxx_runtime::lean::render_backend_context(&[], "Backend", "TestBackend").unwrap();
+            mxx_backends::lean::render_backend_context(&[], "Backend", "TestBackend").unwrap();
         for name in
             ["", "decoder-stage", "decoder.stage", "decoder/stage", "decoder\\stage", "復号"]
         {

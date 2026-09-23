@@ -1,7 +1,7 @@
 use crate::{
     encoding::IR_VERSION,
     serde_support,
-    types::{ConcreteMatrixType, ConcreteWireType, WireId},
+    types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, WireId},
     validate::ValidatedGraph,
 };
 use num_bigint::BigInt;
@@ -41,6 +41,7 @@ pub struct ConcreteBoundedMatrixSchema {
     pub matrix: ConcreteMatrixType,
     #[serde(with = "serde_support::bigint")]
     pub max_coefficient_bound: BigInt,
+    pub bound_domain: CoefficientBoundDomain,
 }
 
 /// Artifact semantics carried outside the shared compact matrix owner.
@@ -60,11 +61,13 @@ pub enum ArtifactType {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
+        bound_domain: CoefficientBoundDomain,
     },
     Preimage {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
+        bound_domain: CoefficientBoundDomain,
     },
     Bytes {
         length: usize,
@@ -89,16 +92,20 @@ impl ArtifactType {
         match wire_type {
             ConcreteWireType::ConstantInt | ConcreteWireType::Int => Some(Self::Int),
             ConcreteWireType::Matrix(matrix) => Some(Self::Matrix(matrix.clone())),
-            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } => {
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => {
                 Some(Self::SmallMatrix {
                     matrix: matrix.clone(),
                     max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
                 })
             }
-            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => Some(Self::Preimage {
-                matrix: matrix.clone(),
-                max_coefficient_bound: max_coefficient_bound.clone(),
-            }),
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound, bound_domain } => {
+                Some(Self::Preimage {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
+                })
+            }
             ConcreteWireType::Bytes { length } => Some(Self::Bytes { length: *length }),
             ConcreteWireType::Trapdoor {
                 matrix,
@@ -128,17 +135,19 @@ impl ArtifactType {
         &self,
     ) -> Option<(ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind)> {
         match self {
-            Self::SmallMatrix { matrix, max_coefficient_bound } => Some((
+            Self::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => Some((
                 ConcreteBoundedMatrixSchema {
                     matrix: matrix.clone(),
                     max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
                 },
                 SmallMatrixSemanticKind::Generic,
             )),
-            Self::Preimage { matrix, max_coefficient_bound } => Some((
+            Self::Preimage { matrix, max_coefficient_bound, bound_domain } => Some((
                 ConcreteBoundedMatrixSchema {
                     matrix: matrix.clone(),
                     max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
                 },
                 SmallMatrixSemanticKind::Preimage,
             )),
@@ -288,31 +297,46 @@ mod tests {
 
     #[test]
     fn bounded_artifact_kinds_remain_distinct() {
-        let matrix = ConcreteMatrixType::scalar(BigInt::from(257), 8);
+        let matrix = ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8));
         let small = ConcreteWireType::SmallMatrix {
             matrix: matrix.clone(),
             max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         let preimage = ConcreteWireType::Preimage {
             matrix: matrix.clone(),
             max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         assert_eq!(
             ArtifactType::from_wire_type(&small),
             Some(ArtifactType::SmallMatrix {
                 matrix: matrix.clone(),
                 max_coefficient_bound: BigInt::from(3),
+                bound_domain: CoefficientBoundDomain::Global,
             })
         );
         assert_eq!(
             ArtifactType::from_wire_type(&preimage),
-            Some(ArtifactType::Preimage { matrix, max_coefficient_bound: BigInt::from(3) })
+            Some(ArtifactType::Preimage {
+                matrix,
+                max_coefficient_bound: BigInt::from(3),
+                bound_domain: CoefficientBoundDomain::Global,
+            })
         );
         assert_ne!(ArtifactType::from_wire_type(&small), ArtifactType::from_wire_type(&preimage));
 
-        let schema = ConcreteBoundedMatrixSchema {
-            matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
+        let per_limb = ConcreteWireType::SmallMatrix {
+            matrix: ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8)),
             max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::PerCrtLimb,
+        };
+        assert_ne!(ArtifactType::from_wire_type(&small), ArtifactType::from_wire_type(&per_limb));
+
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8)),
+            max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         assert_eq!(
             ArtifactType::from_wire_type(&small).unwrap().bounded_matrix_schema(),
@@ -333,8 +357,9 @@ mod tests {
                 "negative".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::SmallMatrix {
-                        matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
+                        matrix: ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8)),
                         max_coefficient_bound: BigInt::from(-1),
+                        bound_domain: CoefficientBoundDomain::Global,
                     },
                     family_count: None,
                     availability: ArtifactAvailability::Transferred,

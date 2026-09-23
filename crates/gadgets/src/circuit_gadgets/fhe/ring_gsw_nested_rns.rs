@@ -903,10 +903,9 @@ mod tests {
         circuit_gadgets::fhe::ring_gsw::MUL_COLUMN_SUBCIRCUIT_BATCH,
         test_utils::{build_circuit_graph, diagonal_matrix, execute_circuit_with_shape},
     };
+    use mxx_backends::poly::PolyParams;
     use mxx_dsl::DslContext;
     use mxx_ir_core::node::NodeKind;
-    use mxx_primitives::poly::PolyParams;
-    use num_bigint::BigInt;
     use num_traits::ToPrimitive;
     use rand::Rng;
     use std::sync::Arc;
@@ -1029,8 +1028,7 @@ mod tests {
             }
         }
 
-        let modulus: std::sync::Arc<BigUint> = params.modulus();
-        let ring = Ring::new(BigInt::from(modulus.as_ref().clone()), RING_DIMENSION as usize);
+        let ring = crate::ring_from_params(&params);
         let declared = declare_native_ring_gsw_dsl_inputs(
             &ring,
             "ring-gsw-seed",
@@ -1054,7 +1052,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        graph
+            .validate(
+                &mxx_ir_core::ParamEnv::default(),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .unwrap();
     }
 
     #[test]

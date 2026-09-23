@@ -2,7 +2,7 @@
 
 Apply these requirements to GPU implementation and review. Passing tests does not establish the required ownership, asynchronous execution, or memory complexity; check the production path as well.
 
-Native CUDA sources, CUDA build configuration, and primitive GPU wrappers are owned by `mxx-primitives` under `crates/primitives/cuda/` and `crates/primitives/src/`. Higher-level GPU implementations remain in their owning crate and depend on primitive GPU APIs.
+Native CUDA sources, GPU wrappers, and the concrete GPU runtime are owned by `mxx-backends` under `crates/backends/cuda/` and `crates/backends/src/`. Higher-level application graphs use its public APIs.
 
 1. Minimize memory transfers (and transfer frequency) between the device and the host.
 2. Minimize synchronization. Do not use `cudaDeviceSynchronize`. Use per-stream events and avoid `cudaStreamSynchronize` in asynchronous wrappers. Use `cudaMallocAsync`, `cudaFreeAsync`, and `cudaMemcpyAsync` rather than `cudaMalloc`, `cudaFree`, and `cudaMemcpy`.
@@ -21,7 +21,7 @@ Native CUDA sources, CUDA build configuration, and primitive GPU wrappers are ow
 - Multi-GPU: enumerate devices via `detected_gpu_device_ids`, not a fixed `gpu_id` in parameters. Distribute work evenly, keep all limbs of a matrix on one device, and load shared data onto each device once before loops.
 - Matrices stay in evaluation format by default. Align NTT formats before comparing or concatenating them.
 - Peak VRAM/RAM must scale with configured parallelism, not `num_slots` or total gate count. Matrices of order `d x m_b` or `d x m_g` are acceptable; `m_b^2`, `m_g^2`, and `m_b x m_g` are not. Chunk, stream, and store to disk; release large data promptly and pipeline load, compute, and store.
-- CUDA headers (`.cuh`) declare only cross-file and Rust-facing functions; put bodies in `crates/primitives/cuda/src/*.cu`.
+- CUDA headers (`.cuh`) declare only cross-file and Rust-facing functions; put bodies in `crates/backends/cuda/src/*.cu`.
 
 ## Runtime Validation
 

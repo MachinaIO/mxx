@@ -3,7 +3,7 @@ import BggMultiplication
 
 /- Small semantic regression checks, not parameter-security or runtime acceptance tests.
    All matrices inhabit the actual negacyclic quotient, with one row and one column.
-   With the existing package dependencies built, run from crates/runtime/lean:
+   With the existing package dependencies built, run from crates/backends/lean:
    lake env bash -c 'LEAN_PATH=../../bgg/lean/.lake/build/lib/lean:$LEAN_PATH \
      lean ../../we/lean/tests/SemanticCounterexamples.lean'
    No generated graph, GPU execution, or integration test is needed. -/

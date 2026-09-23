@@ -60,15 +60,15 @@ Paths are relative to the repository root.
 
 | File / existing symbols | Change |
 | --- | --- |
-| `crates/runtime/src/backend.rs`: `GpuWarmupProfileKey` | Reduce the existing key. |
+| `crates/backends/src/backend.rs`: `GpuWarmupProfileKey` | Reduce the existing key. |
 | Same file: `GpuWarmupProfilePoint`, `GpuWarmupProfileTable`, `GpuWarmupSessionProfileCache` | Keep storage and expose time-only reuse. |
 | Same file: `GpuWarmupProfileRequest`, `GpuWarmupProfile`, `GpuWarmupProfileProvider` | Keep exact requests/results; adapt existing provider methods. |
-| `crates/runtime/src/gpu_measurement.rs`: `profile_key`, `profile_context_words`, `profile_shape` | Consolidate key construction using existing serialization/hash helpers. |
-| `crates/runtime/src/gpu_warmup.rs`: `measure_profile_for_session`, `record_canonical_point` | Share time while rebuilding current-job resource evidence. |
+| `crates/backends/src/gpu_measurement.rs`: `profile_key`, `profile_context_words`, `profile_shape` | Consolidate key construction using existing serialization/hash helpers. |
+| `crates/backends/src/gpu_warmup.rs`: `measure_profile_for_session`, `record_canonical_point` | Share time while rebuilding current-job resource evidence. |
 | Same file: width collection, stage costs, wave/union functions | Preserve candidate generation and schedule composition. |
-| `crates/runtime/src/gpu_column_policy.rs` | Reuse typed operation variants, mapping, routes, and fused union jobs. |
-| `crates/runtime/src/backend/poly_gpu/fleet.rs` | Reuse dispatch, cache preparation, and resource queries. |
-| `crates/primitives/src/sampler/trapdoor/gpu.rs` | Share existing attempt body between measurement and production retries. |
+| `crates/backends/src/gpu_column_policy.rs` | Reuse typed operation variants, mapping, routes, and fused union jobs. |
+| `crates/backends/src/backend/poly_gpu/fleet.rs` | Reuse dispatch, cache preparation, and resource queries. |
+| `crates/backends/src/sampler/trapdoor/gpu.rs` | Share existing attempt body between measurement and production retries. |
 
 Today planner and provider construct keys independently. Keys contain graph,
 device, range, port, retry/cache, and liveness information. Also, `exact_profile()`

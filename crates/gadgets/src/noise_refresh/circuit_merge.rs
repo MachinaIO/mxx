@@ -52,20 +52,21 @@ mod graph_tests {
         ArithmeticCircuitLowering, CircuitLoweringTypes, GateInstance, PolyGateKind,
         PublicLookupLowering, SlotOperationLowering, lower_circuit,
     };
-    use mxx_dsl::{DslContext, Mat, Ring};
-    use mxx_ir_core::{IntExpr, ParamEnv};
-    use mxx_primitives::{
+    use mxx_backends::{
+        ExecutionConfig, RuntimeValue,
+        artifact::MemoryArtifactStore,
+        backend::poly::cpu_backend,
+        execute,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
-            Poly, PolyParams,
+            Poly,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
+        transcript::SamplingMode,
     };
-    use mxx_runtime::{
-        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
-        execute, transcript::SamplingMode,
-    };
-    use num_bigint::{BigInt, BigUint};
+    use mxx_dsl::{DslContext, Mat};
+    use mxx_ir_core::ParamEnv;
+    use num_bigint::BigUint;
     use std::{collections::BTreeMap, convert::Infallible};
 
     struct MatrixLowering;
@@ -165,10 +166,7 @@ mod graph_tests {
             assert_eq!(gate.input_gates, vec![input_gates[index], input_gates[3 + index]]);
         }
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
-        let ring = Ring::new(
-            IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            IntExpr::constant(parameters.ring_dimension()),
-        );
+        let ring = crate::ring_from_params(&parameters);
         let shape = (1, 1);
         let one = ring.identity(1);
         let inputs =
@@ -183,7 +181,9 @@ mod graph_tests {
                 .expect("unique output");
         }
         let built = context.build().expect("build merge Graph IR");
-        let validated = built.validate(&ParamEnv::default()).expect("valid merge Graph IR");
+        let validated = built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid merge Graph IR");
         let input_values = (0..6)
             .map(|index| {
                 DCRTPolyMatrix::from_poly_vec_row(
@@ -211,7 +211,10 @@ mod graph_tests {
             let RuntimeValue::Matrix(actual) = &result.outputs[&format!("output_{index}")] else {
                 panic!("merge output must be a matrix")
             };
-            assert_eq!(actual.as_ref(), &(input_values[index].clone() + &input_values[3 + index]));
+            assert_eq!(
+                actual.as_cpu_full().expect("CPU merge matrix"),
+                &(input_values[index].clone() + &input_values[3 + index])
+            );
         }
     }
 }

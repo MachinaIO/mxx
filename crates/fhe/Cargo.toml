@@ -16,13 +16,12 @@ required-features = ["gpu"]
 
 [features]
 default = []
-gpu = ["mxx-primitives/gpu", "dep:mxx-runtime", "mxx-runtime/gpu"]
+gpu = ["mxx-backends/gpu"]
 
 [dependencies]
 mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
-mxx-primitives.workspace = true
-mxx-runtime = { workspace = true, optional = true }
+mxx-backends.workspace = true
 num-bigint.workspace = true
 num-integer.workspace = true
 num-traits.workspace = true
@@ -31,6 +30,5 @@ thiserror.workspace = true
 [dev-dependencies]
 bigdecimal.workspace = true
 sha2.workspace = true
-mxx-runtime.workspace = true
 rand.workspace = true
 serde_json.workspace = true

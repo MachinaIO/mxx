@@ -12,7 +12,7 @@ frames to the scoped wire identity.
 
 Validation resolves compile parameters and artifact manifests, checks wire
 types and structural constraints, and builds the execution and liveness plans
-consumed by `mxx-runtime`. The graph specification hash depends on semantics,
+consumed by `mxx-backends`. The graph specification hash depends on semantics,
 not allocation addresses, construction scheduling, source locations, or
 unreachable expressions.
 

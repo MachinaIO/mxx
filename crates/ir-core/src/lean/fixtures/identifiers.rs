@@ -4,7 +4,6 @@ use crate::{
     graph::{CompileParameter, CompileParameterKind, SubgraphHandle, with_new_construction_scope},
     lean::{ExportOptions, export},
     node::NodeKind,
-    validate,
 };
 use std::collections::BTreeMap;
 
@@ -40,7 +39,8 @@ fn export_keyword_identifier_fixture() {
     let mut bindings = ParamEnv::default();
     bindings.integers.insert("match".into(), 3.into());
     let artifact =
-        export(&validate(&graph, &bindings).unwrap(), &ExportOptions::default()).unwrap();
+        export(&crate::ring::test_validate(&graph, &bindings).unwrap(), &ExportOptions::default())
+            .unwrap();
     assert!(artifact.source.contains("«match» : Int"));
     assert!(artifact.source.contains("«namespace» : Int"));
     assert!(artifact.source.contains("params.«namespace»"));

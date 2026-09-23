@@ -3,13 +3,13 @@
 use crate::FheError;
 #[cfg(feature = "gpu")]
 use crate::{BgvHybridParams, BgvParams, FheCommonParams, RingGswParams};
+use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 #[cfg(test)]
 use mxx_dsl::{DslError, select};
 use mxx_dsl::{Family, Int, Mat, Ring};
 use mxx_ir_core::IntExpr;
 #[cfg(feature = "gpu")]
 use mxx_ir_core::node::SampleRange;
-use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::BigInt;
 #[cfg(any(test, feature = "gpu"))]
 use num_bigint::BigUint;
@@ -74,9 +74,7 @@ pub(crate) fn check_matrix(
     columns: usize,
 ) -> Result<(), FheError> {
     let ty = value.matrix_type();
-    if ty.modulus != IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())) ||
-        ty.ring_dimension != IntExpr::constant(parameters.ring_dimension())
-    {
+    if ty.ring != ring(parameters).as_ref().clone() {
         return Err(FheError::LevelMismatch);
     }
     if ty.rows != IntExpr::constant(rows) || ty.columns != IntExpr::constant(columns) {
@@ -86,11 +84,18 @@ pub(crate) fn check_matrix(
 }
 
 pub(crate) fn scalar(parameters: &DCRTPolyParams, value: impl Into<BigInt>) -> Mat {
-    Ring::new(
-        IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
+    ring(parameters).polynomial([IntExpr::constant(value.into())])
+}
+
+pub(crate) fn ring(parameters: &DCRTPolyParams) -> Ring {
+    Ring::from_crt_moduli(
+        parameters.to_crt().0.into_iter().map(IntExpr::from).collect(),
         parameters.ring_dimension(),
     )
-    .polynomial([IntExpr::constant(value.into())])
+}
+
+pub(crate) fn plaintext_ring(modulus: u64, ring_dimension: u32) -> Ring {
+    Ring::from_crt_moduli(vec![IntExpr::from(modulus)], ring_dimension)
 }
 
 #[cfg(test)]
@@ -139,7 +144,7 @@ fn common_params(
     let sigma_bound = sigma.parse().expect("positive decimal sigma");
     let error_sigma: f64 = sigma.parse().expect("finite positive sigma");
     assert!(error_sigma.is_finite() && error_sigma > 0.0, "finite positive sigma required");
-    let error_cutoff = mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound);
+    let error_cutoff = mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound);
     let binary = match env::var("FHE_TEST_SECRET_DISTRIBUTION").as_deref() {
         Ok("binary") => true,
         Ok("ternary") => false,
@@ -237,18 +242,19 @@ pub fn modswitch_steps() -> usize {
 pub mod gpu {
     use super::*;
     use crate::BgvParams;
-    use mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams;
-    use mxx_runtime::{Backend, RuntimeValue, backend::poly_gpu::GpuDcrtBackend};
+    use mxx_backends::{GpuRuntime, RuntimeValue, poly::dcrt::gpu::GpuDCRTPolyParams};
     use std::collections::BTreeMap;
 
     pub fn bgv_gpu_parameters(bgv: &BgvParams) -> Vec<GpuDCRTPolyParams> {
         let rings = bgv.runtime_parameters().expect("BGV runtime parameters");
         let mut parameters: Vec<GpuDCRTPolyParams> = Vec::with_capacity(rings.len());
         for ring in rings {
+            let dimension = ring.ring_dimension();
+            let crt_moduli = ring.to_crt().0;
             let parameter = if let Some(related) = parameters.first() {
                 GpuDCRTPolyParams::new_with_gpu(
-                    ring.ring_dimension(),
-                    ring.to_crt().0,
+                    dimension,
+                    crt_moduli,
                     ring.base_bits(),
                     related.gpu_ids().to_vec(),
                     Some(1),
@@ -256,116 +262,51 @@ pub mod gpu {
                     None,
                 )
             } else {
-                GpuDCRTPolyParams::new(
-                    ring.ring_dimension(),
-                    ring.to_crt().0,
-                    ring.base_bits(),
-                    None,
-                )
+                GpuDCRTPolyParams::new(dimension, crt_moduli, ring.base_bits(), None)
             };
+            if let Some(existing) = parameters.iter().find(|existing| {
+                existing.ring_dimension() == dimension &&
+                    existing.to_crt().0 == parameter.to_crt().0
+            }) {
+                assert_eq!(
+                    existing, &parameter,
+                    "BGV GPU parameters disagree for one exact ordered CRT ring"
+                );
+                continue;
+            }
             parameters.push(parameter);
         }
         parameters
     }
 
-    pub fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
-        RuntimeValue::IndexedFamily(
-            values.iter().map(|v| RuntimeValue::Int(BigInt::from(*v))).collect(),
-        )
+    pub fn input(values: &[i64]) -> RuntimeValue {
+        RuntimeValue::integer_values(values.iter().map(|v| BigInt::from(*v)).collect())
     }
 
     pub fn integers(
-        backend: &mut GpuDcrtBackend,
-        outputs: &BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
+        runtime: &GpuRuntime,
+        outputs: &BTreeMap<String, RuntimeValue>,
         name: &str,
     ) -> Vec<BigInt> {
-        let RuntimeValue::IntegerValues(values) = &outputs[name] else {
-            panic!("integer family {name}")
-        };
-        backend
-            .integer_values_to_host(values)
+        runtime
+            .download_integer_family(&outputs[name])
             .unwrap_or_else(|error| panic!("download integer family {name}: {error}"))
-    }
-
-    pub fn configure_widths(backend: &mut GpuDcrtBackend, graph: &mxx_ir_core::ValidatedGraph) {
-        use mxx_runtime::{
-            executor::gpu_effective_site_metadata, gpu_calibration::GpuColumnWidths,
-        };
-        // Correctness fixtures allocate their complete output widths explicitly.
-        // Avoid measuring the shared CUDA pool while another test owns a context,
-        // without serializing tests or fabricating a measured calibration profile.
-        let mut widths = BTreeMap::<[u8; 32], usize>::new();
-        for (scope_id, validated) in &graph.scopes {
-            // Consume the executor's effective lowering. Rebuilding identities
-            // from logical nodes misses fused row-block, compact-RHS, and row-sum
-            // sites and lets dynamic execution start a legacy pilot.
-            if *scope_id != mxx_ir_core::FrozenGraphScopeId::Root {
-                continue;
-            }
-            for index in 0..validated.execution_order.len() {
-                let node = mxx_ir_core::types::NodeId(index as u64);
-                let Ok((outputs, Some(identity))) =
-                    gpu_effective_site_metadata(graph, scope_id, node)
-                else {
-                    continue;
-                };
-                let width = outputs
-                    .iter()
-                    .filter_map(|ty| ty.matrix_type())
-                    .map(|ty| ty.columns)
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
-                widths.entry(identity).and_modify(|old| *old = (*old).max(width)).or_insert(width);
-            }
-        }
-        for (node, plan) in mxx_runtime::executor::root_row_sum_plans(graph) {
-            let validated = graph.root_scope();
-            let source = validated.wire_types[&plan.source].matrix_type().unwrap();
-            let output = validated.wire_types
-                [&mxx_ir_core::types::WireRef { node, port: mxx_ir_core::types::Port(0) }]
-                .matrix_type()
-                .unwrap();
-            let identity = if let Some([left, right]) = plan.tensor_operands {
-                mxx_runtime::gpu_calibration::gpu_tensor_sum_rows_operation_identity(
-                    validated.wire_types[&left].matrix_type().unwrap(),
-                    validated.wire_types[&right].matrix_type().unwrap(),
-                    output,
-                    &plan.rows,
-                )
-            } else {
-                mxx_runtime::gpu_calibration::gpu_sum_rows_operation_identity(
-                    source, output, &plan.rows,
-                )
-            }
-            .unwrap();
-            let width = output.columns.max(1);
-            widths.entry(identity).and_modify(|old| *old = (*old).max(width)).or_insert(width);
-        }
-        for (identity, width) in widths {
-            backend.set_column_widths_for_operation(
-                identity,
-                GpuColumnWidths { gpu0: width, nonzero: Some(width) },
-            );
-        }
     }
 }
 
 #[cfg(all(test, not(feature = "gpu")))]
 use crate::FheCommonParams;
 #[cfg(test)]
+use mxx_backends::{
+    ExecutionConfig, ExecutionResult, MemoryArtifactStore, RuntimeValue,
+    backend::poly::cpu_backend, execute, transcript::SamplingMode,
+};
+#[cfg(test)]
 use mxx_dsl::BuiltGraph;
 #[cfg(test)]
 use mxx_ir_core::ParamEnv;
 #[cfg(all(test, not(feature = "gpu")))]
 use mxx_ir_core::node::SampleRange;
-#[cfg(test)]
-use mxx_runtime::{
-    ExecutionConfig, ExecutionResult, MemoryArtifactStore, RuntimeValue,
-    backend::poly::{CpuDcrtBackend, cpu_backend},
-    execute,
-    transcript::SamplingMode,
-};
 #[cfg(test)]
 use std::collections::BTreeMap;
 
@@ -386,7 +327,7 @@ pub(crate) fn common() -> FheCommonParams {
     let error_cutoff = std::env::var("FHE_TEST_ERROR_CUTOFF")
         .map(|value| value.parse::<BigUint>().expect("integer error cutoff"))
         .unwrap_or_else(|_| {
-            mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound)
+            mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound)
         });
     FheCommonParams {
         ring: DCRTPolyParams::new(
@@ -407,9 +348,9 @@ pub(crate) fn common() -> FheCommonParams {
 pub(crate) fn execute_graph(
     graph: BuiltGraph,
     common: &FheCommonParams,
-    inputs: BTreeMap<String, RuntimeValue<CpuDcrtBackend>>,
+    inputs: BTreeMap<String, RuntimeValue>,
     extra_parameters: &[DCRTPolyParams],
-) -> ExecutionResult<CpuDcrtBackend> {
+) -> ExecutionResult {
     // Register prefix rings for ciphertext levels and single-prime rings for
     // modswitch corrections; a modulus alone does not specify CRT tower order.
     let (moduli, _, depth) = common.ring.to_crt();
@@ -417,7 +358,9 @@ pub(crate) fn execute_graph(
         (0..depth).map(|level| common.parameters_at(level).unwrap()).collect::<Vec<_>>();
     parameters
         .extend(moduli.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
-    let validated = graph.validate(&ParamEnv::default()).expect("valid FHE DSL graph");
+    let validated = graph
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .expect("valid FHE DSL graph");
     parameters.extend_from_slice(extra_parameters);
     let mut backend = cpu_backend(parameters);
     let mut store = MemoryArtifactStore::default();
@@ -440,15 +383,13 @@ pub(crate) fn execute_graph(
 }
 
 #[cfg(test)]
-pub(crate) fn int_input(values: &[i64]) -> RuntimeValue<CpuDcrtBackend> {
-    RuntimeValue::IndexedFamily(
-        values.iter().map(|v| RuntimeValue::Int(BigInt::from(*v))).collect(),
-    )
+pub(crate) fn int_input(values: &[i64]) -> RuntimeValue {
+    RuntimeValue::integer_values(values.iter().map(|v| BigInt::from(*v)).collect())
 }
 
 #[cfg(test)]
-pub(crate) fn integers(result: &ExecutionResult<CpuDcrtBackend>, name: &str) -> Vec<BigInt> {
-    let RuntimeValue::IndexedFamily(values) = &result.outputs[name] else {
+pub(crate) fn integers(result: &ExecutionResult, name: &str) -> Vec<BigInt> {
+    let RuntimeValue::IndexedFamily { values, .. } = &result.outputs[name] else {
         panic!("expected integer family {name}")
     };
     values

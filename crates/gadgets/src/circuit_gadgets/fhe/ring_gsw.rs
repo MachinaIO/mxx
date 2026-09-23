@@ -939,7 +939,7 @@ mod tests {
     use crate::test_utils::{
         ScalarArithmeticContext, ScalarArithmeticEntry, constant_matrix, execute_circuit,
     };
-    use mxx_primitives::poly::{
+    use mxx_backends::poly::{
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };

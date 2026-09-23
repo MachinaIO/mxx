@@ -270,7 +270,7 @@ temporary storage returned to the allocator.
 The enqueue sequence uses scalar launch arguments and one final completion event,
 not C-sized device pointer/event arrays, so its metadata remains bounded.
 
-In `crates/primitives/src/env.rs`, add exactly one sampler control,
+In `crates/backends/src/env.rs`, add exactly one sampler control,
 `MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`, parsed as a positive integer by
 `gpu_preimage_max_tile_attempts()`.  An unset variable defaults to `64`,
 deliberately replacing the current unbounded retry loop; a zero, negative, or
@@ -488,11 +488,11 @@ Raw final samples were:
 The exact build command in both trees was:
 
 ```text
-cargo bench -p mxx-primitives --bench bench_small_rhs_gpu --features gpu --no-run -j8
+cargo bench -p mxx-backends --bench bench_small_rhs_gpu --features gpu --no-run -j8
 ```
 
 The resulting binary was executed five times without changing its environment.
-The benchmark entry point is `crates/primitives/benches/bench_small_rhs_gpu.rs`.
+The benchmark entry point is `crates/backends/benches/bench_small_rhs_gpu.rs`.
 
 ## Producers, artifacts, and semantics
 
@@ -583,8 +583,8 @@ its gate, and records the exact result for the next daily review.
    plus `MatrixMulSmallRhs`; delete `Preimage::as_mat`; update graph schemas,
    shape checks, serde, and the DSL's `SmallMatrix`/`Preimage` family,
    artifact-input, public-output, and import APIs.
-2. **CPU small-owner foundation:** `crates/primitives/src/matrix/mod.rs`,
-   `crates/primitives/src/matrix/dcrt_poly.rs`, and their focused tests.
+2. **CPU small-owner foundation:** `crates/backends/src/matrix/mod.rs`,
+   `crates/backends/src/matrix/dcrt_poly.rs`, and their focused tests.
    Add companion `SmallPolyMatrix` and `PolyMatrixSmallRhs` traits, the thin
    semantic-kind-free `CpuSmallMatrix<M>` owner, canonical signed coefficient
    payload encode/decode, CPU gadget/hash/preimage producers where their
@@ -595,14 +595,14 @@ its gate, and records the exact result for the next daily review.
    once with checked arithmetic; do not add an SMR1 header, semantic-kind
    field, duplicate matrix clone, or compatibility serializer.  GPU storage
    and runtime orchestration are deliberately deferred to slices 3 and 4.
-3. **Backend/runtime ownership:** `crates/runtime/src/backend.rs`,
+3. **Backend/runtime ownership:** `crates/backends/src/backend.rs`,
    `backend/poly.rs`, `backend/poly_gpu.rs`, `backend.rs`'s runtime-value
    implementations, `executor.rs`, `artifact.rs`, `session.rs`, and
    `transcript.rs` where value kind/hash handling is shared.  Add the
    associated `SmallMatrix` API, `RuntimeValue::SmallMatrix`, placement and
    family/staging paths, direct compact artifact codecs, and explicit node
    execution.  Remove matrix-only matches that would erase Preimage.
-4. **GPU compact owner/FFI:** `crates/primitives/src/matrix/gpu_dcrt_poly.rs`,
+4. **GPU compact owner/FFI:** `crates/backends/src/matrix/gpu_dcrt_poly.rs`,
    `poly/dcrt/gpu.rs`, `env.rs`, CUDA declarations in
    `cuda/include/matrix/Matrix*.cuh`, and implementations in
    `cuda/src/matrix/Matrix*.cu` (keep CUDA bodies in `src`).  Add the compact

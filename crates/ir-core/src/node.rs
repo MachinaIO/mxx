@@ -1,6 +1,7 @@
 use crate::{
     artifact::{ArtifactAvailability, ProductionId},
     expr::{IntExpr, RealExpr},
+    ring::RingRef,
     types::WireType,
 };
 use num_bigint::{BigInt, BigUint};
@@ -73,15 +74,15 @@ pub enum NodeKind {
     },
     /// Coefficientwise exact nearest scaling into a divisor ring.
     ModulusSwitch {
-        modulus: IntExpr,
+        destination: RingRef,
     },
     /// Ordinary coefficient-ring reduction, preserving small integer values.
     ModulusReduce {
-        modulus: IntExpr,
+        destination: RingRef,
     },
     /// Re-encodes the centered coefficients of a source CRT basis in another ring.
     CenteredRebase {
-        modulus: IntExpr,
+        destination: RingRef,
     },
     /// Divides centered coefficients by a positive compile-time divisor and rounds
     /// to the nearest integer, preserving the matrix ring and shape.
@@ -90,23 +91,20 @@ pub enum NodeKind {
     },
     /// Fused centered CRT digit extension into a multiple modulus.
     RnsModUp {
-        modulus: IntExpr,
-        source_moduli: Vec<u64>,
+        destination: RingRef,
         digit_size: usize,
         normalize: bool,
     },
     /// Fused BGV plaintext-preserving removal of the auxiliary CRT basis.
     RnsModDown {
-        modulus: IntExpr,
-        source_moduli: Vec<u64>,
+        destination: RingRef,
         plaintext_modulus: IntExpr,
     },
     /// Exact block CRT modulus switching. `source_moduli` is the complete
     /// source basis; `modulus` is the product of a strict non-empty subset.
     /// The plaintext modulus is the positive correction factor `t`.
     BlockModSwitch {
-        modulus: IntExpr,
-        source_moduli: Vec<u64>,
+        destination: RingRef,
         plaintext_modulus: IntExpr,
     },
     Transpose,

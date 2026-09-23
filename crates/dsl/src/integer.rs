@@ -197,24 +197,6 @@ impl Int {
     }
 }
 
-pub(super) fn has_loop_index(value: &IntExpr) -> bool {
-    match value {
-        IntExpr::LoopIndex(_) => true,
-        IntExpr::Const(_) | IntExpr::Var(_) => false,
-        IntExpr::Add(a, b) |
-        IntExpr::Sub(a, b) |
-        IntExpr::Mul(a, b) |
-        IntExpr::Div(a, b) |
-        IntExpr::FloorDiv(a, b) |
-        IntExpr::Rem(a, b) |
-        IntExpr::RoundDiv(a, b) => has_loop_index(a) || has_loop_index(b),
-        IntExpr::Log2Ceil(value) => has_loop_index(value),
-        IntExpr::Select { selector, branches } => {
-            has_loop_index(selector) || branches.iter().any(has_loop_index)
-        }
-    }
-}
-
 impl From<IntExpr> for Int {
     fn from(value: IntExpr) -> Self {
         Self::evaluate(value)

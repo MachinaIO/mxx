@@ -6,12 +6,12 @@ on the crate that owns an abstraction.
 ## Dependency layers
 
 ```text
-mxx-runtime              -> mxx-ir-core, mxx-primitives
+mxx-backends             -> mxx-ir-core
 mxx-dsl                  -> mxx-ir-core
-mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
-mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
-mxx-fhe                  -> mxx-dsl, mxx-ir-core, mxx-primitives
-mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
+mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-backends
+mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-backends
+mxx-fhe                  -> mxx-dsl, mxx-ir-core, mxx-backends
+mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-backends
 mxx-func-enc/io          -> interface-only crates with no dependencies
 ```
 
@@ -20,10 +20,11 @@ encryption and iO protocol implementations have been removed during the DSL migr
 
 ## Responsibilities
 
-### `mxx-primitives`
+### `mxx-backends`
 
-Owns polynomial and matrix representations, OpenFHE integration, concrete sampling, and native
-CUDA. CPU Gaussian sampling resamples individual coefficients outside the authoritative integer
+Owns polynomial and matrix representations, OpenFHE integration, concrete sampling, native CUDA,
+and CPU/GPU graph execution. It also owns runtime values, transcripts, sessions, and artifacts.
+CPU Gaussian sampling resamples individual coefficients outside the authoritative integer
 cutoff. CPU preimage sampling rejects a whole candidate outside its cutoff so `B * K = P` is
 preserved. GPU Gaussian sampling enforces the same cutoff per coefficient in CUDA. Batched GPU
 preimage sampling rejects a whole GPU-generated candidate after full-CRT centered-norm checking,
@@ -56,13 +57,6 @@ The constructed graphs feed core-owned `IdealSpec` and `PurePredicateSpec` valid
 Indexed `Family<T>` values preserve composite element schemas. `parallel` and `iterate` create
 structural loops; lexical reads become explicit core dependencies with inferred member indexing.
 
-### `mxx-runtime`
-
-Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
-transcripts, sessions, artifacts, bounded parallel waves, and production-equivalent GPU warmup.
-The warmup that freezes a GPU execution plan is also the sole source of its timing and resource
-report; reporting never launches a second measurement run.
-
 ### `mxx-gadgets` and `mxx-bgg`
 
 `mxx-gadgets` owns BGG-independent circuits and reusable circuit gadgets.
@@ -74,7 +68,7 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 `mxx-fhe` builds Ring Regev/Ring-GSW and leveled BGV graphs, including CRT modulus
 switching, hybrid RNS key switching over QP, relinearization, and rotations. BGV encrypt/decrypt exchange SIMD slots
 by default, with internal encoding and zero-padding of short inputs. Cryptographic arithmetic
-and sampling execute through the DSL runtime; runtime is a test-only dependency.
+and sampling execute through validated backend graphs.
 It tracks coefficient noise bounds per ciphertext and reuses primitive ring parameters and DSL
 matrix handles. Bootstrapping is out of scope. CPU and GPU backends share the same
 FHE graphs. GPU centered basis conversion uses native unsigned CRT residues and

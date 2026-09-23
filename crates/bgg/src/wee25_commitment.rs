@@ -12,8 +12,7 @@ const HASH_TAG_PREFIX: &[u8] = b"wee25_w_block_";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Wee25CommitmentCompiler {
-    pub modulus: IntExpr,
-    pub ring_dimension: IntExpr,
+    pub ring: Ring,
     pub secret_size: usize,
     pub tree_base: usize,
     pub digit_count: usize,
@@ -39,7 +38,7 @@ pub struct Wee25CommitmentTreeWire {
 
 impl Wee25CommitmentCompiler {
     pub fn ring(&self) -> Ring {
-        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+        self.ring.clone()
     }
 
     pub fn public_columns(&self) -> usize {
@@ -216,22 +215,20 @@ impl Wee25CommitmentCompiler {
 mod tests {
     use super::*;
     use keccak_asm::Keccak256;
-    use mxx_ir_core::ParamEnv;
-    use mxx_primitives::{
+    use mxx_backends::{
+        ExecutionConfig, RuntimeValue,
+        artifact::MemoryArtifactStore,
+        backend::poly::cpu_backend,
+        execute,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
-    };
-    use mxx_runtime::{
-        ExecutionConfig, RuntimeValue,
-        artifact::MemoryArtifactStore,
-        backend::poly::{CpuDcrtBackend, cpu_backend},
-        execute,
         transcript::SamplingMode,
     };
+    use mxx_ir_core::ParamEnv;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
@@ -270,8 +267,7 @@ mod tests {
     #[test]
     fn commitment_tree_is_composable_inside_parallel_body() {
         let compiler = Wee25CommitmentCompiler {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
+            ring: Ring::from_crt_moduli(vec![257.into()], 8),
             secret_size: 1,
             tree_base: 2,
             digit_count: 2,
@@ -294,15 +290,18 @@ mod tests {
             .expect("family output")
             .build()
             .expect("build");
-        built.validate(&ParamEnv::default()).expect("validate");
-        built.validate(&ParamEnv::default()).expect("elaborate");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("validate");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("elaborate");
     }
 
     #[test]
     fn rejects_non_power_block_count() {
         let compiler = Wee25CommitmentCompiler {
-            modulus: 17.into(),
-            ring_dimension: 4.into(),
+            ring: Ring::from_crt_moduli(vec![17.into()], 4),
             secret_size: 1,
             tree_base: 2,
             digit_count: 3,
@@ -319,8 +318,7 @@ mod tests {
     fn commitment_root_and_cache_order_match_the_concrete_formula() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let compiler = Wee25CommitmentCompiler {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(&parameters),
             secret_size: 1,
             tree_base: 2,
             digit_count: parameters.modulus_digits(),
@@ -328,10 +326,8 @@ mod tests {
         };
         let key = [0x37; 32];
         let ring = compiler.ring();
-        let mut inputs = BTreeMap::from([(
-            "hash-key".to_owned(),
-            RuntimeValue::<CpuDcrtBackend>::Bytes(key.to_vec()),
-        )]);
+        let mut inputs =
+            BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(key.to_vec().into()))]);
         let blocks = (0..4)
             .map(|index| {
                 let value = DCRTPolyMatrix::from_poly_vec(
@@ -364,7 +360,9 @@ mod tests {
                 context.output(format!("cache-{index}"), tree.cached_nodes.at(index)).unwrap();
         }
         let built = context.build().unwrap();
-        let validated = built.validate(&ParamEnv::default()).unwrap();
+        let validated = built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
         let result = execute(
             &validated,
             &mut cpu_backend([parameters.clone()]),
@@ -382,7 +380,7 @@ mod tests {
             [("root", &root), ("cache-0", &root), ("cache-1", &left), ("cache-2", &right)]
         {
             let RuntimeValue::Matrix(actual) = &result.outputs[name] else { panic!("matrix") };
-            assert_eq!(actual.as_ref(), expected, "{name}");
+            assert_eq!(actual.as_cpu_full().expect("CPU matrix"), expected, "{name}");
         }
     }
 }

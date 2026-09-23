@@ -3,20 +3,20 @@ use crate::{
     FheCommonParams, FheError, FheScheme,
     utils::{self, check_family, check_matrix, is_prime, pow_mod},
 };
-use mxx_dsl::{
-    DslError, Family, GraphValue, GraphValueSchema, Int, Mat, MatType, Ring, concat_rows, parallel,
-};
-use mxx_ir_core::{
-    IntExpr, ValueHandle,
-    node::{ConcatAxis, IndexRange},
-    types::WireType,
-};
-use mxx_primitives::{
+use mxx_backends::{
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
     utils::mod_inverse,
+};
+use mxx_dsl::{
+    DslError, Family, GraphValue, GraphValueSchema, Int, Mat, MatType, concat_rows, parallel,
+};
+use mxx_ir_core::{
+    IntExpr, ValueHandle,
+    node::{ConcatAxis, IndexRange},
+    types::WireType,
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
@@ -262,27 +262,19 @@ impl BgvParams {
         let q = self.common.parameters_at(level)?;
         let (extended, width) = self.key_switch_parameters(level)?;
         check_matrix(&extended, key, 2, width)?;
-        let digits = value.clone().rns_mod_up(
-            extended.modulus().as_ref().clone(),
-            q.to_crt().0,
-            self.hybrid.digit_size,
-            true,
-        );
+        let extended_ring = utils::ring(&extended);
+        let q_ring = utils::ring(&q);
+        let digits = value.clone().rns_mod_up(&extended_ring, self.hybrid.digit_size, true);
         let accumulated = key * &digits;
         // The key target contains P. Dividing by P cancels it, so the
         // ciphertext correction factor is unchanged (unlike level dropping).
-        Ok(accumulated.rns_mod_down(
-            q.modulus().as_ref().clone(),
-            extended.to_crt().0,
-            self.plaintext_modulus,
-        ))
+        Ok(accumulated.rns_mod_down(&q_ring, self.plaintext_modulus))
     }
 
     pub(crate) fn level_of(&self, matrix: &Mat) -> Result<usize, FheError> {
         for level in 0..self.common.ring.to_crt().2 {
             let params = self.common.parameters_at(level)?;
-            if matrix.matrix_type().modulus == IntExpr::constant(params.modulus().as_ref().clone())
-            {
+            if matrix.matrix_type().ring == utils::ring(&params).as_ref().clone() {
                 return Ok(level);
             }
         }
@@ -317,19 +309,13 @@ impl BgvParams {
         let params = self.common.parameters_at(level)?;
         utils::check_matrix(&params, target, 1, 1)?;
         let (extended, width) = self.key_switch_parameters(level)?;
-        let ring = Ring::new(extended.modulus().as_ref().clone(), extended.ring_dimension());
+        let ring = utils::ring(&extended);
+        let first_prime = self.common.ring.to_crt().0[0];
+        let first_ring = utils::plaintext_ring(first_prime, self.common.ring.ring_dimension());
         // The secret is ternary: lifting one tower recovers its actual integer
         // coefficients. A target lift need only agree modulo Q since it is scaled by P.
-        let s = secret
-            .clone()
-            .reduce_modulus(self.common.ring.to_crt().0[0])
-            .centered_rebase(extended.modulus().as_ref().clone());
-        let target = target.clone().rns_mod_up(
-            extended.modulus().as_ref().clone(),
-            params.to_crt().0,
-            params.crt_depth(),
-            false,
-        );
+        let s = secret.clone().reduce_modulus(&first_ring).centered_rebase(&ring);
+        let target = target.clone().rns_mod_up(&ring, params.crt_depth(), false);
         let p = extended.modulus().as_ref() / params.modulus().as_ref();
         let targets = params
             .to_crt()
@@ -351,7 +337,7 @@ impl BgvParams {
     pub fn relinearization_key(&self, secret: &Mat, level: usize) -> Result<Mat, FheError> {
         let params = self.common.parameters_at(level)?;
         utils::check_matrix(&self.common.ring, secret, 1, 1)?;
-        let s = secret.clone().reduce_modulus(params.modulus().as_ref().clone());
+        let s = secret.clone().reduce_modulus(&utils::ring(&params));
         self.key_switch_key(secret, level, &(&s * &s))
     }
     pub fn mul_unrelinearized(
@@ -452,11 +438,8 @@ impl BgvParams {
             // RNS ModDown applies the centered correction to both components.
             // Keep level drops sequential: centering modulo a product instead
             // would choose a different correction and need a different bound.
-            let components = output.components.rns_mod_down(
-                dest.modulus().as_ref().clone(),
-                source.to_crt().0,
-                self.plaintext_modulus,
-            );
+            let components =
+                output.components.rns_mod_down(&utils::ring(&dest), self.plaintext_modulus);
             // Division by p also scales the plaintext phase modulo t; retain
             // that public factor so decryption can undo it after later operations.
             let factor = ((output.correction_factor as u128 *
@@ -494,9 +477,10 @@ impl FheScheme for BgvParams {
         // Slot values are coefficients in R_t. Reconstruct that polynomial first,
         // then lift its centered coefficients to R_Q; the two rings have
         // different NTT roots, so lifting the evaluations would be incorrect.
-        let message = Ring::new(self.plaintext_modulus, self.common.ring.ring_dimension())
-            .from_coefficients(&coefficients)
-            .centered_rebase(self.common.ring.modulus().as_ref().clone());
+        let message =
+            utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
+                .from_coefficients(&coefficients)
+                .centered_rebase(&self.common.ring());
         let u = self.common.sample_secret();
         let t = utils::scalar(&self.common.ring, self.plaintext_modulus);
         // The phase noise is e_pk*u + e_b - s*e_a. Both secret polynomials
@@ -515,7 +499,7 @@ impl FheScheme for BgvParams {
         let rows = self.ciphertext_rows(ct)?;
         utils::check_matrix(&self.common.ring, secret, 1, 1)?;
         let params = self.common.parameters_at(self.level_of(&ct.components)?)?;
-        let minus_s = -secret.clone().reduce_modulus(params.modulus().as_ref().clone());
+        let minus_s = -secret.clone().reduce_modulus(&utils::ring(&params));
         // Horner evaluation supports both ordinary pairs and unrelinearized
         // triples with the same descending-in-minus-s component convention.
         let mut phase = row(&ct.components, 0);
@@ -526,9 +510,11 @@ impl FheScheme for BgvParams {
         // to recover m even after modulus switching has made f different from 1.
         let inverse = mod_inverse(ct.correction_factor, self.plaintext_modulus)
             .ok_or(FheError::InvalidCorrectionFactor)?;
-        let plaintext = phase.centered_rebase(self.plaintext_modulus) *
-            Ring::new(self.plaintext_modulus, params.ring_dimension())
-                .polynomial([IntExpr::constant(inverse)]);
+        let plaintext = phase.centered_rebase(&utils::plaintext_ring(
+            self.plaintext_modulus,
+            params.ring_dimension(),
+        )) * utils::plaintext_ring(self.plaintext_modulus, params.ring_dimension())
+            .polynomial([IntExpr::constant(inverse)]);
         self.decode_slots(&plaintext.coefficients())
     }
     fn add(&self, lhs: &BgvCiphertext, rhs: &BgvCiphertext) -> Result<BgvCiphertext, FheError> {
@@ -633,7 +619,9 @@ impl BgvParams {
         }
         let indices = Family::pack(inverse.into_iter().map(Int::constant).collect())?;
         let native = parallel(n, |i| Ok(slots.at(indices.at(i))))?;
-        Ok(Ring::new(self.plaintext_modulus, n).from_evaluations(&native).coefficients())
+        Ok(utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
+            .from_evaluations(&native)
+            .coefficients())
     }
 
     /// Decodes coefficients through the primitive forward NTT at modulus t.
@@ -643,7 +631,9 @@ impl BgvParams {
         let indices =
             Family::pack(self.batching_indices()?.into_iter().map(Int::constant).collect())?;
         let native =
-            Ring::new(self.plaintext_modulus, n).from_coefficients(coefficients).evaluations();
+            utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
+                .from_coefficients(coefficients)
+                .evaluations();
         Ok(parallel(n, |i| Ok(native.at(indices.at(i))))?)
     }
 
@@ -653,10 +643,8 @@ impl BgvParams {
         let index = self.rotation_index(steps);
         let parameters = self.common.parameters_at(level)?;
         check_matrix(&self.common.ring, secret, 1, 1)?;
-        let target = secret
-            .clone()
-            .reduce_modulus(parameters.modulus().as_ref().clone())
-            .ring_automorphism(index);
+        let target =
+            secret.clone().reduce_modulus(&utils::ring(&parameters)).ring_automorphism(index);
         self.key_switch_key(secret, level, &target)
     }
 
@@ -666,10 +654,8 @@ impl BgvParams {
         let parameters = self.common.parameters_at(level)?;
         check_matrix(&self.common.ring, secret, 1, 1)?;
         let index = 2 * u64::from(self.common.ring.ring_dimension()) - 1;
-        let target = secret
-            .clone()
-            .reduce_modulus(parameters.modulus().as_ref().clone())
-            .ring_automorphism(index);
+        let target =
+            secret.clone().reduce_modulus(&utils::ring(&parameters)).ring_automorphism(index);
         self.key_switch_key(secret, level, &target)
     }
 
@@ -805,8 +791,8 @@ mod tests {
             let mut context = DslContext::new("fhe-hybrid-key-phase");
             for level in 0..common.ring.crt_depth() {
                 let q = common.parameters_at(level).unwrap();
-                let ring = Ring::new(q.modulus().as_ref().clone(), q.ring_dimension());
-                let target = secret.clone().reduce_modulus(q.modulus().as_ref().clone());
+                let ring = utils::ring(&q);
+                let target = secret.clone().reduce_modulus(&ring);
                 let key = bgv.key_switch_key(&secret, level, &target).unwrap();
                 let value = ring.uniform_residue((1, 1));
                 let switched = bgv.key_switch(&value, &key, level).unwrap();
@@ -894,8 +880,7 @@ mod tests {
         for (name, ct, level, rows) in &cases {
             assert!(bgv.can_decrypt(ct).unwrap(), "insufficient test modulus for {name}");
             let parameters = common.parameters_at(*level).unwrap();
-            let minus_secret =
-                -secret.clone().reduce_modulus(parameters.modulus().as_ref().clone());
+            let minus_secret = -secret.clone().reduce_modulus(&utils::ring(&parameters));
             let mut phase = row(&ct.components, 0);
             for index in 1..*rows {
                 phase = phase * &minus_secret + row(&ct.components, index);
@@ -1043,7 +1028,7 @@ mod tests {
         let quadratic = bgv.mul_unrelinearized(&ct, &ct).unwrap();
         assert!(bgv.relinearize(&quadratic, &common.ring().zero((2, 1))).is_err());
         let wrong_modulus = BgvCiphertext {
-            components: Ring::new(97, common.ring.ring_dimension()).zero((2, 1)),
+            components: utils::plaintext_ring(97, common.ring.ring_dimension()).zero((2, 1)),
             correction_factor: 1,
             noise_bound: BigUint::from(0u8),
         };
@@ -1053,11 +1038,11 @@ mod tests {
     }
     #[test]
     fn test_bgv_staged_evaluator_without_secret_input() {
-        use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
-        use mxx_runtime::{
+        use mxx_backends::{
             ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore,
             backend::poly::cpu_backend, execute, transcript::SamplingMode,
         };
+        use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
         use num_traits::ToPrimitive;
         let common = common();
         let n = common.ring.ring_dimension() as usize;
@@ -1087,7 +1072,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&env)
+            .validate(&env, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
         let mut message = vec![0i64; n];
         message[0] = 3;
@@ -1120,7 +1105,7 @@ mod tests {
             noise_bound: exported_encryption_noise.to_biguint().unwrap(),
         };
         let (key_params, key_width) = bgv.key_switch_parameters(top).unwrap();
-        let input_key = Ring::new(key_params.modulus().as_ref().clone(), n).artifact_input(
+        let input_key = utils::ring(&key_params).artifact_input(
             encryption_id.clone(),
             "evaluation_key",
             (2, key_width),
@@ -1140,7 +1125,11 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate_with_manifests(&env, &manifests)
+            .validate_with_manifests(
+                &env,
+                &manifests,
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
             .unwrap();
         // The evaluator imports only the ciphertext and public evaluation key.
         let evaluation = execute(
@@ -1163,7 +1152,7 @@ mod tests {
         let evaluation_id = evaluation.production_id.unwrap();
         manifests.insert(evaluation_id.clone(), store.manifest(&evaluation_id).unwrap().clone());
         let lower = common.parameters_at(top - 1).unwrap();
-        let lower_ring = Ring::new(lower.modulus().as_ref().clone(), n);
+        let lower_ring = utils::ring(&lower);
         let imported = BgvCiphertext {
             components: lower_ring.artifact_input(
                 evaluation_id.clone(),
@@ -1188,7 +1177,11 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate_with_manifests(&env, &manifests)
+            .validate_with_manifests(
+                &env,
+                &manifests,
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
             .unwrap();
         let mut result = execute(
             &decryption,
@@ -1215,14 +1208,18 @@ mod tests {
                 .unwrap()
                 .build()
                 .unwrap()
-                .validate_with_manifests(&env, &manifests)
+                .validate_with_manifests(
+                    &env,
+                    &manifests,
+                    mxx_backends::openfhe_guard::gen_modulus_and_warmup
+                )
                 .is_err()
         );
     }
 
     #[test]
     fn test_bgv_wide_rns_modswitch_no_coefficient_nodes() {
-        use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
+        use mxx_backends::poly::dcrt::params::DCRTPolyParams;
         let mut common = common();
         let depth = std::env::var("FHE_TEST_WIDE_CRT_DEPTH")
             .ok()
@@ -1288,15 +1285,14 @@ mod tests {
 
     #[test]
     fn test_bgv_wide_rns_modswitch_matches_native_mod_reduce() {
-        use mxx_primitives::{
+        use mxx_backends::{
+            RuntimeValue,
             matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
             poly::{
                 Poly,
                 dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
             },
         };
-        use mxx_runtime::RuntimeValue;
-        use std::sync::Arc;
 
         let mut common = common();
         let depth = std::env::var("FHE_TEST_WIDE_CRT_DEPTH")
@@ -1371,7 +1367,7 @@ mod tests {
             let result = execute_graph(
                 context.build().unwrap(),
                 &common,
-                BTreeMap::from([("ciphertext".into(), RuntimeValue::Matrix(Arc::new(input)))]),
+                BTreeMap::from([("ciphertext".into(), RuntimeValue::matrix(input))]),
                 &bgv.runtime_parameters().unwrap(),
             );
             // Compare each complete DSL reduction against the native primitive
@@ -1383,6 +1379,7 @@ mod tests {
                 else {
                     panic!("matrix output")
                 };
+                let actual = actual.as_cpu_full().expect("CPU matrix output");
                 assert_eq!(actual.params(), &common.parameters_at(level).unwrap());
                 for (row, oracle) in expected.iter().enumerate() {
                     // Native polynomial equality checks the format, ordered tower
@@ -1405,11 +1402,11 @@ mod simd_tests {
         FheScheme,
         utils::{common, execute_graph, int_input, integers},
     };
-    use mxx_dsl::{DslContext, Ring};
-    use mxx_primitives::poly::{
+    use mxx_backends::poly::{
         Poly,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
+    use mxx_dsl::DslContext;
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
 
@@ -1617,7 +1614,7 @@ mod simd_tests {
         assert!(!is_prime(341550071728321));
         let t = bgv.plaintext_modulus;
         assert!(BgvParams::new(bgv.common.clone(), t * t, None).is_err());
-        let ring = Ring::new(bgv.common.ring.modulus().as_ref().clone(), n);
+        let ring = bgv.common.ring();
         let ct = BgvCiphertext {
             components: ring.input("ct", (2, 1)),
             correction_factor: 1,
@@ -1634,12 +1631,12 @@ mod simd_tests {
 #[cfg(test)]
 mod benchmarks {
     use super::*;
-    use mxx_dsl::DslContext;
-    use mxx_ir_core::ParamEnv;
-    use mxx_runtime::{
+    use mxx_backends::{
         ExecutionConfig, MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
     };
+    use mxx_dsl::DslContext;
+    use mxx_ir_core::ParamEnv;
     use std::{collections::BTreeMap, time::Instant};
     #[test]
     #[ignore = "manual CPU key-switch timing; excludes key generation"]
@@ -1659,7 +1656,7 @@ mod benchmarks {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default())
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
         let mut backend = cpu_backend(bgv.runtime_parameters().unwrap());
         let mut store = MemoryArtifactStore::default();
@@ -1675,7 +1672,7 @@ mod benchmarks {
         let key = prepared.materialize_output("key", &backend, &mut store).unwrap().clone();
         let value = prepared.materialize_output("value", &backend, &mut store).unwrap().clone();
         let (kp, width) = bgv.key_switch_parameters(level).unwrap();
-        let kr = Ring::new(kp.modulus().as_ref().clone(), n);
+        let kr = utils::ring(&kp);
         let switched = bgv
             .key_switch(&common.ring().input("value", (1, 1)), &kr.input("key", (2, width)), level)
             .unwrap();
@@ -1684,7 +1681,7 @@ mod benchmarks {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default())
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
         let repeats =
             std::env::var("FHE_BENCH_REPEATS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);

@@ -10,7 +10,6 @@ use crate::{
     lean::{BackendLayout, ExportOptions, PrimitiveNames, export},
     node::{MatrixBinaryOp, NodeKind},
     types::MatrixType,
-    validate,
 };
 use std::collections::BTreeMap;
 
@@ -32,8 +31,7 @@ fn geometry(name: &str) -> Geometry {
 
 fn matrix_type(rows: u32, columns: u32) -> MatrixType {
     MatrixType {
-        modulus: 17.into(),
-        ring_dimension: 2.into(),
+        ring: crate::ring::test_ring(17, 2),
         rows: (rows as usize).into(),
         columns: (columns as usize).into(),
     }
@@ -98,7 +96,11 @@ fn render(selected: Geometry) -> String {
             max_coefficient_bound: 4.into(),
         },
         vec![b.clone(), trapdoor, target.clone()],
-        vec![WireType::Preimage { matrix: preimage_type, max_coefficient_bound: 4.into() }],
+        vec![WireType::Preimage {
+            matrix: preimage_type,
+            max_coefficient_bound: 4.into(),
+            bound_domain: crate::types::CoefficientBoundDomain::Global,
+        }],
     )
     .output(0)
     .unwrap();
@@ -137,7 +139,7 @@ fn render(selected: Geometry) -> String {
     )
     .unwrap()
     .0;
-    let checked = validate(&graph, &ParamEnv::default()).unwrap();
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let primitives = PrimitiveNames {
         matrix_add: "(fun x y => x + y)".into(),
         matrix_mul: "(fun x y => x * y)".into(),

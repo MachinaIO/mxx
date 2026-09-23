@@ -43,8 +43,6 @@ struct DiamondGraphParams {
 }
 
 impl DiamondGraphParams {
-    const MODULUS: &'static str = "diamond_modulus";
-    const RING_DIMENSION: &'static str = "diamond_ring_dimension";
     const INPUT_COUNT: &'static str = "diamond_input_count";
     const DIGIT_BASE: &'static str = "diamond_digit_base";
     const BATCH_BITS: &'static str = "diamond_batch_bits";
@@ -55,10 +53,8 @@ impl DiamondGraphParams {
     const ERROR_BOUND: &'static str = "diamond_error_max_coefficient_bound";
     const PREIMAGE_BOUND: &'static str = "diamond_preimage_max_coefficient_bound";
 
-    fn declare(mut context: DslContext) -> (DslContext, Self) {
+    fn declare(mut context: DslContext, ring: &mxx_dsl::Ring) -> (DslContext, Self) {
         for name in [
-            Self::MODULUS,
-            Self::RING_DIMENSION,
             Self::INPUT_COUNT,
             Self::DIGIT_BASE,
             Self::BATCH_BITS,
@@ -76,8 +72,7 @@ impl DiamondGraphParams {
             context,
             Self {
                 input: DiamondInputParams {
-                    modulus: var(Self::MODULUS),
-                    ring_dimension: var(Self::RING_DIMENSION),
+                    ring: ring.clone(),
                     input_count: var(Self::INPUT_COUNT),
                     digit_base: var(Self::DIGIT_BASE),
                     batch_bits: var(Self::BATCH_BITS),
@@ -99,8 +94,8 @@ fn diamond_parameter_validity_predicate(
     params: &DiamondGraphParams,
 ) -> Result<PurePredicateSpec, DslError> {
     let evaluate = Int::from;
-    let modulus = evaluate(params.input.modulus.clone());
-    let ring_dimension = evaluate(params.input.ring_dimension.clone());
+    let modulus = evaluate(params.input.ring.modulus());
+    let ring_dimension = Int::constant(params.input.ring.ring_dimension());
     let input_count = evaluate(params.input.input_count.clone());
     let digit_base = evaluate(params.input.digit_base.clone());
     let batch_bits = evaluate(params.input.batch_bits.clone());
@@ -173,11 +168,12 @@ pub struct DiamondWeCompiler {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiamondWeProtocolFamily {
     bgg_tag: Vec<u8>,
+    ring: mxx_dsl::Ring,
 }
 
 impl DiamondWeProtocolFamily {
-    pub fn new(bgg_tag: impl Into<Vec<u8>>) -> Self {
-        Self { bgg_tag: bgg_tag.into() }
+    pub fn new(bgg_tag: impl Into<Vec<u8>>, ring: mxx_dsl::Ring) -> Self {
+        Self { bgg_tag: bgg_tag.into(), ring }
     }
 }
 
@@ -234,8 +230,6 @@ impl DiamondWeCompiler {
                     BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER.to_owned(),
                     analysis.maximum_layer_width.into(),
                 ),
-                (DiamondGraphParams::MODULUS.to_owned(), self.config.modulus.clone()),
-                (DiamondGraphParams::RING_DIMENSION.to_owned(), self.config.ring_dimension.into()),
                 (DiamondGraphParams::INPUT_COUNT.to_owned(), self.config.input_count.into()),
                 (DiamondGraphParams::DIGIT_BASE.to_owned(), self.config.digit_base.into()),
                 (DiamondGraphParams::BATCH_BITS.to_owned(), self.config.batch_bits.into()),
@@ -277,7 +271,9 @@ impl DiamondWeCompiler {
     pub fn build_encryption(&self) -> Result<DiamondEncryptionGraph, DiamondCompileError> {
         self.config.validate()?;
         self.shape.validate()?;
-        Ok(DiamondWeProtocolFamily::new(self.config.bgg_tag.clone()).build_encryption()?.graph)
+        Ok(DiamondWeProtocolFamily::new(self.config.bgg_tag.clone(), self.config.ring())
+            .build_encryption()?
+            .graph)
     }
 
     pub fn build_decryption(
@@ -286,13 +282,14 @@ impl DiamondWeCompiler {
     ) -> Result<DiamondDecryptionGraph, DiamondCompileError> {
         self.config.validate()?;
         self.shape.validate()?;
-        Ok(DiamondWeProtocolFamily::new(self.config.bgg_tag.clone())
+        Ok(DiamondWeProtocolFamily::new(self.config.bgg_tag.clone(), self.config.ring())
             .build_decryption(encryption)?
             .graph)
     }
 
     pub fn protocol_decl(&self) -> Result<WitnessEncryptionProtocolDecl, DiamondCompileError> {
-        DiamondWeProtocolFamily::new(self.config.bgg_tag.clone()).protocol_decl()
+        DiamondWeProtocolFamily::new(self.config.bgg_tag.clone(), self.config.ring())
+            .protocol_decl()
     }
 }
 
@@ -300,7 +297,7 @@ impl DiamondWeProtocolFamily {
     fn build_encryption(&self) -> Result<DiamondEncryptionBuild, DiamondCompileError> {
         let (context, circuit_params) =
             BooleanCircuitFamilyParams::declare(DslContext::new("diamond-we-encryption"));
-        let (context, graph_params) = DiamondGraphParams::declare(context);
+        let (context, graph_params) = DiamondGraphParams::declare(context, &self.ring);
         let ring = graph_params.input.ring();
         let circuit_data = BooleanCircuitFamilyInputs::protocol_inputs(&context, &circuit_params);
         let instance = context
@@ -390,7 +387,7 @@ impl DiamondWeProtocolFamily {
         // The decoder subtracts the K encoding.  Sampling K against ceil(q / 2) therefore
         // leaves the canonical Boolean-one center floor(q / 2) modulo q for both even and odd q.
         let half_modulus = IntExpr::RoundDiv(
-            Box::new(graph_params.input.modulus.clone()),
+            Box::new(graph_params.input.ring.modulus()),
             Box::new(mxx_ir_core::IntExpr::constant(2)),
         );
         let half_modulus_polynomial = ring.polynomial([half_modulus.into()]);
@@ -436,7 +433,7 @@ impl DiamondWeProtocolFamily {
     ) -> Result<DiamondDecryptionBuild, DiamondCompileError> {
         let (context, circuit_params) =
             BooleanCircuitFamilyParams::declare(DslContext::new("diamond-we-decryption"));
-        let (context, graph_params) = DiamondGraphParams::declare(context);
+        let (context, graph_params) = DiamondGraphParams::declare(context, &self.ring);
         let ring = graph_params.input.ring();
         let circuit_data = BooleanCircuitFamilyInputs::protocol_inputs(&context, &circuit_params);
         let instance = context
@@ -584,7 +581,8 @@ impl DiamondWeProtocolFamily {
         let projected_difference = r_decomposed.mul_small_rhs(one_minus_circuit);
         let k_plus_projection = k_vector + projected_difference;
         let noisy_plaintext = decoder - k_plus_projection;
-        let decoded = decode_boolean_interval(noisy_plaintext.clone(), graph_params.input.modulus);
+        let decoded =
+            decode_boolean_interval(noisy_plaintext.clone(), graph_params.input.ring.modulus());
         let graph = context
             .output(NOISY_PLAINTEXT_OUTPUT, noisy_plaintext)?
             .output(DECODED_OUTPUT, decoded)?
@@ -602,8 +600,7 @@ impl DiamondWeProtocolFamily {
 
     fn sampler_layout(params: &DiamondGraphParams) -> BggSamplerLayout {
         BggSamplerLayout {
-            modulus: params.input.modulus.clone(),
-            ring_dimension: params.input.ring_dimension.clone(),
+            ring: params.input.ring.clone(),
             secret_dimension: 1,
             digit_count: 1,
             gadget_base: params.input.gadget_base.clone(),
@@ -653,22 +650,27 @@ impl DiamondWeProtocolFamily {
         let encryption = encryption_build.graph.graph;
         let decryption = decryption_build.graph.graph;
 
-        let (valid_context, _) =
-            DiamondGraphParams::declare(DslContext::new("diamond-we-valid-circuit-data"));
+        let (valid_context, _) = DiamondGraphParams::declare(
+            DslContext::new("diamond-we-valid-circuit-data"),
+            &self.ring,
+        );
         let valid = boolean_circuit_validity_predicate(valid_context)?;
-        let (satisfied_context, _) =
-            DiamondGraphParams::declare(DslContext::new("diamond-we-satisfied-circuit"));
+        let (satisfied_context, _) = DiamondGraphParams::declare(
+            DslContext::new("diamond-we-satisfied-circuit"),
+            &self.ring,
+        );
         let satisfied = boolean_circuit_satisfaction_predicate(satisfied_context)?;
         let (parameter_context, parameter_circuit) =
             BooleanCircuitFamilyParams::declare(DslContext::new("diamond-we-valid-parameters"));
-        let (parameter_context, parameter_values) = DiamondGraphParams::declare(parameter_context);
+        let (parameter_context, parameter_values) =
+            DiamondGraphParams::declare(parameter_context, &self.ring);
         let valid_parameters = diamond_parameter_validity_predicate(
             parameter_context,
             &parameter_circuit,
             &parameter_values,
         )?;
         let (ideal_context, ideal_params) =
-            DiamondGraphParams::declare(DslContext::new("diamond-we-ideal"));
+            DiamondGraphParams::declare(DslContext::new("diamond-we-ideal"), &self.ring);
         let ideal_ring = ideal_params.input.ring();
         let (ideal_context, _) = BooleanCircuitFamilyParams::declare(ideal_context);
         let ideal = mxx_dsl::IdealSpec::new(
@@ -828,7 +830,6 @@ impl DiamondWeProtocolFamily {
                         BooleanCircuitFamilyParams::WITNESS_WIDTH_PARAMETER,
                         BooleanCircuitFamilyParams::DEPTH_PARAMETER,
                         BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER,
-                        DiamondGraphParams::RING_DIMENSION,
                         DiamondGraphParams::INPUT_COUNT,
                         DiamondGraphParams::DIGIT_BASE,
                         DiamondGraphParams::BATCH_BITS,
@@ -838,7 +839,6 @@ impl DiamondWeProtocolFamily {
                 (
                     ParameterKind::Integer,
                     &[
-                        DiamondGraphParams::MODULUS,
                         DiamondGraphParams::GADGET_BASE,
                         DiamondGraphParams::ERROR_BOUND,
                         DiamondGraphParams::PREIMAGE_BOUND,
@@ -944,23 +944,22 @@ fn decode_boolean_interval(noisy_plaintext: Mat, modulus: IntExpr) -> Bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mxx_backends::{
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, poly::dcrt::params::DCRTPolyParams, transcript::SamplingMode,
+    };
     use mxx_ir_core::{
         RealExpr,
         artifact::{ProductionId, SpecHash, export_validated_manifest},
         node::NodeKind,
         types::ConcreteWireType,
     };
-    use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
-    use mxx_runtime::{
-        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
-        execute, transcript::SamplingMode,
-    };
     use std::collections::BTreeMap;
 
     fn compiler() -> DiamondWeCompiler {
         DiamondWeCompiler::new(
             DiamondWeConfig {
-                modulus: 257.into(),
+                crt_moduli: vec![257],
                 ring_dimension: 8,
                 input_count: 1,
                 digit_base: 2,
@@ -988,7 +987,9 @@ mod tests {
         let compiler = compiler();
         let encryption = compiler.build_encryption().unwrap().graph;
         let bindings = compiler.circuit_bindings().unwrap();
-        let validated = encryption.validate(&bindings).unwrap();
+        let validated = encryption
+            .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
         let output_type = |name: &str| {
             let wire = encryption.graph.outputs()[name].value;
             validated.root_scope().wire_types.get(&wire).expect("validated encryption output")
@@ -1000,14 +1001,16 @@ mod tests {
         ] {
             assert!(matches!(
                 output_type(artifact),
-                ConcreteWireType::Preimage { max_coefficient_bound, .. }
-                    if *max_coefficient_bound == 26.into()
+                ConcreteWireType::Preimage { max_coefficient_bound, bound_domain, .. }
+                    if *max_coefficient_bound == 26.into() &&
+                        *bound_domain == mxx_ir_core::types::CoefficientBoundDomain::Global
             ));
         }
         assert!(matches!(
             output_type(DiamondArtifactNames::R_DECOMPOSED),
-            ConcreteWireType::Preimage { max_coefficient_bound, .. }
-                if *max_coefficient_bound == 2.into()
+            ConcreteWireType::Preimage { max_coefficient_bound, bound_domain, .. }
+                if *max_coefficient_bound == 2.into() &&
+                    *bound_domain == mxx_ir_core::types::CoefficientBoundDomain::Global
         ));
         for artifact in [DiamondArtifactNames::TRANSITIONS, DiamondArtifactNames::WITNESS_PREIMAGES]
         {
@@ -1015,8 +1018,9 @@ mod tests {
                 output_type(artifact),
                 ConcreteWireType::IndexedFamily { element, .. }
                     if matches!(element.as_ref(), ConcreteWireType::Preimage {
-                        max_coefficient_bound, ..
-                    } if *max_coefficient_bound == 26.into())
+                        max_coefficient_bound, bound_domain, ..
+                    } if *max_coefficient_bound == 26.into() &&
+                        *bound_domain == mxx_ir_core::types::CoefficientBoundDomain::Global)
             ));
         }
         let r_output = encryption.graph.outputs()[DiamondArtifactNames::R_DECOMPOSED].value;
@@ -1070,7 +1074,11 @@ mod tests {
             NodeKind::IntCompare(mxx_ir_core::node::IntCompareOp::Equal)
         ));
         let validated_decryption = decryption
-            .validate_with_manifests(&bindings, &BTreeMap::from([(production, manifest)]))
+            .validate_with_manifests(
+                &bindings,
+                &BTreeMap::from([(production, manifest)]),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
             .unwrap();
         let decryption_nodes = validated_decryption
             .source
@@ -1096,8 +1104,6 @@ mod tests {
                 vec!["instance_width", "witness_width", "depth", "max_layer_width"]
                     .into_iter()
                     .chain([
-                        DiamondGraphParams::MODULUS,
-                        DiamondGraphParams::RING_DIMENSION,
                         DiamondGraphParams::INPUT_COUNT,
                         DiamondGraphParams::DIGIT_BASE,
                         DiamondGraphParams::BATCH_BITS,
@@ -1142,7 +1148,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default())
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
         let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
         let mut store = MemoryArtifactStore::default();
@@ -1155,7 +1161,7 @@ mod tests {
             ExecutionConfig::default(),
         )
         .unwrap();
-        let RuntimeValue::IndexedFamily(indices) =
+        let RuntimeValue::IndexedFamily { values: indices, .. } =
             result.materialize_output("indices", &backend, &mut store).unwrap()
         else {
             panic!("indices output must be an integer family")
@@ -1175,10 +1181,18 @@ mod tests {
     fn parameter_predicate_enforces_dynamic_layout_invariants() {
         let (context, circuit) =
             BooleanCircuitFamilyParams::declare(DslContext::new("diamond-parameter-validity"));
-        let (context, params) = DiamondGraphParams::declare(context);
+        let (context, params) = DiamondGraphParams::declare(
+            context,
+            &mxx_dsl::Ring::from_crt_moduli(vec![257.into()], 8),
+        );
         let predicate = diamond_parameter_validity_predicate(context, &circuit, &params).unwrap();
         let execute_with = |bindings: &ParamEnv| {
-            let validated = mxx_ir_core::validate(&predicate.graph, bindings).unwrap();
+            let validated = mxx_ir_core::validate(
+                &predicate.graph,
+                bindings,
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .unwrap();
             let result = execute(
                 &validated,
                 &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
@@ -1209,7 +1223,7 @@ mod tests {
         let compiler = compiler();
         let declaration = compiler.protocol_decl().unwrap();
         assert_eq!(declaration.protocol().bundle.requirements.len(), 3);
-        assert_eq!(declaration.protocol().params.len(), 15);
+        assert_eq!(declaration.protocol().params.len(), 13);
         assert_eq!(
             declaration
                 .protocol()

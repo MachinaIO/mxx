@@ -1,15 +1,15 @@
 use super::{DiamondCompileError, DiamondConfigError, DiamondWeCompiler};
 use crate::WitnessEncryptionRuntime;
+#[cfg(feature = "gpu")]
+use mxx_backends::{GpuExecutionResult, GpuRuntime};
+use mxx_backends::{
+    RuntimeValue, SessionStore, authority::ExecutionAuthority, executor::ExecutionResult,
+};
 use mxx_gadgets::circuit::{
     BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitData, BooleanCircuitError,
     BooleanCircuitShape,
 };
 use mxx_ir_core::{artifact::ProductionId, encoding::spec_hash};
-use mxx_runtime::{
-    Backend, RuntimeValue, SessionStore, authority::ExecutionAuthority, executor::ExecutionResult,
-};
-#[cfg(feature = "gpu")]
-use mxx_runtime::{GpuExecutionResult, backend::poly_gpu::GpuDcrtBackend};
 use rand::random;
 use std::{collections::BTreeMap, time::Instant};
 use thiserror::Error;
@@ -22,26 +22,27 @@ use super::graph::{DECODED_OUTPUT, HASH_KEY_INPUT, MESSAGE_INPUT};
 /// Diamond only needs the boolean value produced by its decryption graph, so
 /// keep that result contract local to the protocol caller instead of exposing
 /// executor-specific fields through `ExecutionAuthority`.
-pub trait DiamondBooleanOutput<B: Backend> {
-    fn boolean_output(&self, name: &str) -> Option<bool>;
+pub trait DiamondBooleanOutput<E> {
+    fn boolean_output(&self, execution: &E, name: &str) -> Result<Option<bool>, String>;
 }
 
-impl<B: Backend> DiamondBooleanOutput<B> for ExecutionResult<B> {
-    fn boolean_output(&self, name: &str) -> Option<bool> {
-        match self.outputs.get(name) {
+impl<E> DiamondBooleanOutput<E> for ExecutionResult {
+    fn boolean_output(&self, _execution: &E, name: &str) -> Result<Option<bool>, String> {
+        Ok(match self.outputs.get(name) {
             Some(RuntimeValue::Bool(value)) => Some(*value),
             _ => None,
-        }
+        })
     }
 }
 
 #[cfg(feature = "gpu")]
-impl DiamondBooleanOutput<GpuDcrtBackend> for GpuExecutionResult {
-    fn boolean_output(&self, name: &str) -> Option<bool> {
-        match self.outputs.get(name) {
-            Some(RuntimeValue::Bool(value)) => Some(*value),
-            _ => None,
-        }
+impl DiamondBooleanOutput<GpuRuntime> for GpuExecutionResult<'_> {
+    fn boolean_output(&self, execution: &GpuRuntime, name: &str) -> Result<Option<bool>, String> {
+        self.output(name)
+            .map(|output| {
+                execution.download_bool_output(&output).map_err(|error| error.to_string())
+            })
+            .transpose()
     }
 }
 
@@ -91,8 +92,7 @@ impl<E, S> DiamondWeRuntime<E, S>
 where
     S: SessionStore,
     E: ExecutionAuthority<S>,
-    E::Backend: Backend,
-    E::Result: DiamondBooleanOutput<E::Backend>,
+    for<'a> E::Result<'a>: DiamondBooleanOutput<E>,
 {
     pub fn new(
         compiler: DiamondWeCompiler,
@@ -125,7 +125,7 @@ where
         let validation_started = Instant::now();
         let bindings = self.compiler.circuit_bindings()?;
         let validated = built
-            .validate(&bindings)
+            .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         debug!(
             elapsed_seconds = validation_started.elapsed().as_secs_f64(),
@@ -142,14 +142,14 @@ where
             "constructed Diamond encryption production identity"
         );
         let inputs_started = Instant::now();
-        let mut inputs = circuit_inputs::<E::Backend>(circuit, &self.compiler.shape);
+        let mut inputs = circuit_inputs(circuit, &self.compiler.shape);
         insert_boolean_family_input(
             &mut inputs,
             BOOLEAN_INSTANCE_INPUT,
             instance,
             self.compiler.shape.analyze()?.maximum_layer_width,
         );
-        inputs.insert(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.to_vec()));
+        inputs.insert(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.to_vec().into()));
         inputs.insert(MESSAGE_INPUT.to_owned(), RuntimeValue::Bool(message));
         debug!(
             elapsed_seconds = inputs_started.elapsed().as_secs_f64(),
@@ -195,7 +195,10 @@ where
             .compiler
             .build_encryption()?
             .graph
-            .validate(&self.compiler.circuit_bindings()?)
+            .validate(
+                &self.compiler.circuit_bindings()?,
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         let graph_hash = spec_hash(&encryption_graph.source, &encryption_graph.bindings)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
@@ -229,6 +232,7 @@ where
             .validate_with_manifests(
                 &self.compiler.circuit_bindings()?,
                 &BTreeMap::from([(ciphertext.encryption.clone(), manifest)]),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
             )
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         debug!(
@@ -237,7 +241,7 @@ where
         );
         let inputs_started = Instant::now();
         let maximum_width = self.compiler.shape.analyze()?.maximum_layer_width;
-        let mut inputs = circuit_inputs::<E::Backend>(circuit, &self.compiler.shape);
+        let mut inputs = circuit_inputs(circuit, &self.compiler.shape);
         insert_boolean_family_input(&mut inputs, BOOLEAN_INSTANCE_INPUT, instance, maximum_width);
         insert_boolean_family_input(&mut inputs, BOOLEAN_WITNESS_INPUT, witness, maximum_width);
         debug!(
@@ -252,8 +256,10 @@ where
             .execution
             .run(&mut prepared, inputs, &mut self.store, [0; 32])
             .map_err(DiamondRuntimeError::Execution)?;
-        let decoded =
-            result.boolean_output(DECODED_OUTPUT).ok_or(DiamondRuntimeError::DecodeOutput)?;
+        let decoded = result
+            .boolean_output(&self.execution, DECODED_OUTPUT)
+            .map_err(DiamondRuntimeError::Execution)?
+            .ok_or(DiamondRuntimeError::DecodeOutput)?;
         info!(
             execution_elapsed_seconds = execution_started.elapsed().as_secs_f64(),
             total_elapsed_seconds = total_started.elapsed().as_secs_f64(),
@@ -275,14 +281,12 @@ where
     }
 }
 
-fn circuit_inputs<B: Backend>(
+fn circuit_inputs(
     circuit: &BooleanCircuitData,
     shape: &BooleanCircuitShape,
-) -> BTreeMap<String, RuntimeValue<B>> {
+) -> BTreeMap<String, RuntimeValue> {
     let maximum_width = shape.analyze().expect("validated Boolean shape").maximum_layer_width;
-    let family = |values: Vec<num_bigint::BigInt>| {
-        RuntimeValue::IndexedFamily(values.into_iter().map(RuntimeValue::Int).collect())
-    };
+    let family = RuntimeValue::integer_values;
     let mut active_gate_counts = Vec::with_capacity(circuit.layers.len());
     let mut kinds = Vec::with_capacity(circuit.layers.len() * maximum_width);
     let mut left = Vec::with_capacity(circuit.layers.len() * maximum_width);
@@ -305,8 +309,8 @@ fn circuit_inputs<B: Backend>(
     ])
 }
 
-fn insert_boolean_family_input<B: Backend>(
-    inputs: &mut BTreeMap<String, RuntimeValue<B>>,
+fn insert_boolean_family_input(
+    inputs: &mut BTreeMap<String, RuntimeValue>,
     name: &str,
     values: &[bool],
     maximum_width: usize,
@@ -314,18 +318,14 @@ fn insert_boolean_family_input<B: Backend>(
     let mut padded =
         values.iter().map(|value| num_bigint::BigInt::from(*value)).collect::<Vec<_>>();
     padded.resize(maximum_width, 0.into());
-    inputs.insert(
-        name.to_owned(),
-        RuntimeValue::IndexedFamily(padded.into_iter().map(RuntimeValue::Int).collect()),
-    );
+    inputs.insert(name.to_owned(), RuntimeValue::integer_values(padded));
 }
 
 impl<E, S> WitnessEncryptionRuntime for DiamondWeRuntime<E, S>
 where
     S: SessionStore,
     E: ExecutionAuthority<S>,
-    E::Backend: Backend,
-    E::Result: DiamondBooleanOutput<E::Backend>,
+    for<'a> E::Result<'a>: DiamondBooleanOutput<E>,
 {
     type Ciphertext = DiamondWeCiphertext;
     type Message = bool;
@@ -361,33 +361,20 @@ mod tests {
     use crate::diamond::{
         DiamondArtifactNames, DiamondWeConfig, default_preimage_max_coefficient_bound,
     };
-    use keccak_asm::Keccak256;
+    use mxx_backends::{
+        artifact::MemoryArtifactStore,
+        backend::poly::cpu_backend,
+        poly::{PolyParams, dcrt::params::DCRTPolyParams},
+    };
     use mxx_gadgets::circuit::{BooleanGateData, BooleanGateKind};
     use mxx_ir_core::{RealExpr, artifact::SpecHash};
-    use mxx_primitives::{
-        matrix::dcrt_poly::DCRTPolyMatrix,
-        poly::{PolyParams, dcrt::params::DCRTPolyParams},
-        sampler::{
-            hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
-            uniform::DCRTPolyUniformSampler,
-        },
-    };
-    use mxx_runtime::artifact::MemoryArtifactStore;
     use num_bigint::BigInt;
     use std::collections::BTreeSet;
 
-    type TestBackend = mxx_runtime::backend::poly::PolyBackend<
-        DCRTPolyMatrix,
-        DCRTPolyUniformSampler,
-        DCRTPolyHashSampler<Keccak256>,
-        DCRTPolyTrapdoorSampler,
-    >;
-    type TestRuntime =
-        DiamondWeRuntime<mxx_runtime::authority::CpuExecution<TestBackend>, MemoryArtifactStore>;
+    type TestRuntime = DiamondWeRuntime<mxx_backends::authority::CpuExecution, MemoryArtifactStore>;
 
     fn runtime() -> TestRuntime {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
-        let modulus: std::sync::Arc<num_bigint::BigUint> = parameters.modulus();
         let trapdoor_sigma = RealExpr::from_f64_exact(4.578).unwrap();
         let gadget_base = BigInt::from(1u64 << parameters.base_bits());
         let preimage_max_coefficient_bound = default_preimage_max_coefficient_bound(
@@ -399,8 +386,8 @@ mod tests {
         .unwrap();
         let compiler = DiamondWeCompiler::new(
             DiamondWeConfig {
-                modulus: BigInt::from(modulus.as_ref().clone()),
-                ring_dimension: parameters.ring_dimension() as usize,
+                crt_moduli: parameters.to_crt().0,
+                ring_dimension: parameters.ring_dimension(),
                 input_count: 1,
                 digit_base: 2,
                 batch_bits: 1,
@@ -422,7 +409,7 @@ mod tests {
         .unwrap();
         TestRuntime::new(
             compiler,
-            mxx_runtime::authority::CpuExecution::new(TestBackend::new_for_execution([parameters])),
+            mxx_backends::authority::CpuExecution::new(cpu_backend([parameters])),
             MemoryArtifactStore::default(),
         )
         .unwrap()

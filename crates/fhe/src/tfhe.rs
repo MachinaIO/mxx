@@ -269,7 +269,10 @@ impl GraphValueSchema for BootstrappingKeySchema {
 
 /// Flat key-switch material. `a_values` contains one contiguous LWE vector for
 /// every ring-secret coefficient and base digit; `b_values` stores the matching
-/// scalar components.
+/// scalar components. Digit `j` of `digit_count` encrypts the ring-secret
+/// coefficient times `2^(log2 q - base_bits * digit_count) * base^j`, so a key
+/// with fewer digits than `log2 q / base_bits` decomposes only the rounded
+/// leading bits of each coefficient.
 #[derive(Clone)]
 pub struct KeySwitchKey {
     pub a_values: Family<Int>,
@@ -464,6 +467,8 @@ impl TfheParams {
         lwe_modulus: BigUint,
         lwe_error_sigma: f64,
         lwe_error_cutoff: BigUint,
+        key_switch_base_bits: usize,
+        key_switch_digits: usize,
     ) -> Result<Self, FheError> {
         common.validate()?;
         if common.secret_range.minimum != IntExpr::constant(0) ||
@@ -505,10 +510,19 @@ impl TfheParams {
                 "LWE noise must fit the signed encoding and q must be below ring Q",
             ));
         }
-        // The security profile uses binary key switching independently of the
-        // larger ring-GSW gadget base.
-        let key_switch_base_bits = 1usize;
-        let key_switch_digits = (&lwe_modulus - BigUint::one()).bits() as usize;
+        // The key switch decomposes the leading `base_bits * digits` bits of
+        // each coefficient, independently of the ring-GSW gadget base.
+        let modulus_bits = (&lwe_modulus - BigUint::one()).bits() as usize;
+        if key_switch_base_bits == 0 ||
+            key_switch_digits == 0 ||
+            key_switch_base_bits
+                .checked_mul(key_switch_digits)
+                .is_none_or(|bits| bits > modulus_bits)
+        {
+            return Err(FheError::InvalidParameters(
+                "TFHE key switching needs a positive base and digit count within log2 q bits",
+            ));
+        }
         Ok(Self {
             common,
             lwe_dimension,
@@ -530,6 +544,20 @@ impl TfheParams {
 
     pub fn key_switch_base_bits(&self) -> usize {
         self.key_switch_base_bits
+    }
+
+    /// The low bits of `q` that key switching rounds away before decomposing.
+    pub fn key_switch_dropped_bits(&self) -> usize {
+        (&self.lwe_modulus - BigUint::one()).bits() as usize -
+            self.key_switch_base_bits * self.key_switch_digits
+    }
+
+    /// The gadget value encrypted by each key-switch digit, low digit first.
+    pub fn key_switch_gadget(&self) -> Vec<BigUint> {
+        let base = BigUint::one() << self.key_switch_base_bits;
+        (0..self.key_switch_digits)
+            .map(|digit| base.pow(digit as u32) << self.key_switch_dropped_bits())
+            .collect()
     }
 
     /// Registers the ordered CRT prefixes and single-prime rings used by the
@@ -589,9 +617,10 @@ impl TfheParams {
             modulus_expr,
         );
         let ring_secret_coefficients = ring_secret.coefficients();
-        let base = BigUint::from(1u8) << self.key_switch_base_bits;
-        let powers = (0..self.key_switch_digits)
-            .map(|digit| Int::constant(BigInt::from(base.pow(digit as u32))))
+        let powers = self
+            .key_switch_gadget()
+            .into_iter()
+            .map(|power| Int::constant(BigInt::from(power)))
             .collect::<Vec<_>>();
         // Independent Gaussian errors, sampled as whole polynomials outside the
         // loop so its body reads only scalars.
@@ -859,11 +888,19 @@ impl TfheParams {
         let powers = (0..self.key_switch_digits)
             .map(|digit| Int::constant(BigInt::from(base.pow(digit as u32))))
             .collect::<Vec<_>>();
-        // The base digits of every extracted coefficient, in key order
-        // `coefficient * digits + digit`, then both sums as one product each
-        // with the flat key arrays.
+        let dropped = self.key_switch_dropped_bits();
+        let kept = BigInt::one() << (self.key_switch_base_bits * self.key_switch_digits);
+        // The base digits of every extracted coefficient rounded to its leading
+        // bits, in key order `coefficient * digits + digit`, then both sums as
+        // one product each with the flat key arrays.
         let digits = parallel(ring_dimension * self.key_switch_digits, |entry| {
-            let coefficient = extracted.a.at(entry.clone().div(self.key_switch_digits));
+            let mut coefficient = extracted.a.at(entry.clone().div(self.key_switch_digits));
+            if dropped > 0 {
+                coefficient = coefficient
+                    .add(Int::constant(BigInt::one() << (dropped - 1)))
+                    .div(Int::constant(BigInt::one() << dropped))
+                    .rem(Int::constant(kept.clone()));
+            }
             let power = select(entry.rem(self.key_switch_digits), powers.clone())?;
             Ok(coefficient.div(power).rem(base.clone()))
         })?;
@@ -873,10 +910,15 @@ impl TfheParams {
         let a = parallel(self.lwe_dimension, |coordinate| {
             Ok(Int::constant(0).sub(a_sum.at(coordinate)).rem(q.clone()))
         })?;
+        // Key noise from every digit term, plus the rounding of each binary
+        // secret coefficient's dropped low bits.
+        let ring_dimension = BigUint::from(self.common.ring.ring_dimension() as usize);
+        let rounding = if dropped > 0 { BigUint::one() << (dropped - 1) } else { BigUint::zero() };
         let key_noise = &key.noise_bound *
-            BigUint::from(self.common.ring.ring_dimension() as usize) *
+            &ring_dimension *
             BigUint::from(self.key_switch_digits) *
-            (base - 1u8);
+            (base - 1u8) +
+            ring_dimension * rounding;
         Ok(LweCiphertext {
             a,
             b,
@@ -1112,7 +1154,10 @@ mod tests {
         } else {
             BigUint::one() << (common.ring.modulus().bits() - 1) as usize
         };
-        TfheParams::new(common, 2, lwe_modulus, 1.0, BigUint::from(16u8)).unwrap()
+        {
+            let bits = (&lwe_modulus - BigUint::one()).bits() as usize;
+            TfheParams::new(common, 2, lwe_modulus, 1.0, BigUint::from(16u8), 1, bits).unwrap()
+        }
     }
 
     fn exact_key_switch_key(
@@ -1124,9 +1169,10 @@ mod tests {
         let flat_a_count = key_count * parameters.lwe_dimension;
         let a_values = parallel(flat_a_count, |_| Ok(Int::constant(0)))?;
         let coefficients = ring_secret.coefficients();
-        let base = BigUint::from(1u8) << parameters.key_switch_base_bits();
-        let powers = (0..parameters.key_switch_digit_count())
-            .map(|digit| Int::constant(BigInt::from(base.pow(digit as u32))))
+        let powers = parameters
+            .key_switch_gadget()
+            .into_iter()
+            .map(|power| Int::constant(BigInt::from(power)))
             .collect::<Vec<_>>();
         let b_values = parallel(key_count, |index| {
             let coefficient = index.clone().div(parameters.key_switch_digit_count());
@@ -1272,7 +1318,8 @@ mod tests {
             error_cutoff: BigUint::from(16u8),
         };
         let parameters =
-            TfheParams::new(common, 8, BigUint::from(256u16), 1.0, BigUint::from(16u8)).unwrap();
+            TfheParams::new(common, 8, BigUint::from(256u16), 1.0, BigUint::from(16u8), 1, 8)
+                .unwrap();
         let context = DslContext::new("tfhe-nearest-exponent-rounding");
         let lwe_secret = context.int_family_input("lwe-secret", 8);
         let ring_coefficients = context.int_family_input("ring-secret-coefficients", 8);
@@ -1336,7 +1383,7 @@ mod tests {
         if q >= *common.ring.modulus() {
             return;
         }
-        let parameters = TfheParams::new(common, 2, q, 1.0, BigUint::from(16u8)).unwrap();
+        let parameters = TfheParams::new(common, 2, q, 1.0, BigUint::from(16u8), 1, 32).unwrap();
         assert_eq!(parameters.key_switch_digit_count(), 32);
     }
 
@@ -1349,8 +1396,8 @@ mod tests {
             error_sigma: 0.0625,
             error_cutoff: BigUint::one(),
         };
-        let error =
-            TfheParams::new(common, 2, BigUint::from(16u8), 0.0625, BigUint::one()).unwrap_err();
+        let error = TfheParams::new(common, 2, BigUint::from(16u8), 0.0625, BigUint::one(), 1, 4)
+            .unwrap_err();
         assert!(matches!(
             error,
             FheError::InvalidParameters(

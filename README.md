@@ -39,7 +39,7 @@ TFHE implements NAND bootstrapping; BGV is leveled and has no bootstrapping.
 | `FheScheme` | Shared matrix-plaintext `keygen`, `encrypt`, `decrypt`, `add`, and `mul` graph builders, with scheme-specific plaintext, multiplication operand, and evaluation-key types. BGV implements it; TFHE has its own integer LWE API. |
 | `TfheParams` | `new(common, lwe_dimension, lwe_modulus, lwe_error_sigma, lwe_error_cutoff)`; integer LWE over a power-of-two modulus q with binary secrets, plus the CRT ring R_Q for blind rotation. Gaussian cutoffs must be at least 16 sigma. |
 | `LweCiphertext` | `Family<Int>` vector `a` and `Int` `b` with phase `b - <a, s>` mod q; a bit is encoded as `+floor(q/8)` (true) or `-floor(q/8)` (false). |
-| `TfheKeys` | Output of `keygen(hash_key)`: LWE and ring secrets, a `BootstrappingKey` (ring-GSW encryptions of each LWE secret coordinate, stored as `RingCiphertext`s), and a flat `KeySwitchKey` (base 2, log2(q) digits). |
+| `TfheKeys` | Output of `keygen(hash_key)`: LWE and ring secrets, a `BootstrappingKey` (ring-GSW encryptions of each LWE secret coordinate, stored as `RingCiphertext`s), and a flat `KeySwitchKey` (base `2^b` with `d` digits of the rounded leading `b * d` bits of each coefficient, both set in `TfheParams::new`). |
 | `BgvParams` | `new(common, plaintext_modulus)`; messages are `Family<Int>` with 1 to N SIMD slots modulo t. Supports addition, multiplication with relinearization, CRT modulus switching, SIMD, and rotations. |
 | `BgvCiphertext` | Components are descending coefficients in `-s`: `(a,b)` for ordinary ciphertexts or three rows before relinearization. `correction_factor` tracks the plaintext multiplier modulo t, while `noise_bound` tracks coefficient noise. |
 

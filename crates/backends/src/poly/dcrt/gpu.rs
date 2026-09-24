@@ -2683,7 +2683,7 @@ impl PolyParams for GpuDCRTPolyParams {
             return None;
         }
         let crt_bits = moduli.iter().map(|prime| bits_in_u64(*prime)).max()?;
-        if self.base_bits as usize > crt_bits / 2 {
+        if self.base_bits as usize > crt_bits.div_ceil(2) {
             return None;
         }
         Some(Self::new_with_gpu(
@@ -2817,8 +2817,8 @@ impl GpuDCRTPolyParams {
         let dropped_moduli = dropped_moduli.unwrap_or(0);
         assert!(dropped_moduli < crt_depth, "dropped_moduli must be less than crt_depth");
         assert!(
-            base_bits > 0 && base_bits as usize <= crt_bits / 2,
-            "base_bits must be positive and <= crt_bits / 2"
+            base_bits > 0 && base_bits as usize <= crt_bits.div_ceil(2),
+            "base_bits must be positive and <= ceil(crt_bits / 2)"
         );
         let modulus = moduli.iter().fold(BigUint::one(), |acc, m| acc * m);
         let dnum =

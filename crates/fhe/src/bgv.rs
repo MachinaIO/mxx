@@ -825,9 +825,9 @@ mod tests {
         let common = common();
         let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
         let p = bgv.hybrid.auxiliary_primes[0];
-        if common.ring.base_bits() > 3 {
+        if common.ring.base_bits() > 4 {
             // 97 is a compatible prime for the default N=8, but its seven
-            // bits cannot support the inherited four-bit primitive base.
+            // bits support a primitive base of at most ceil(7 / 2) = 4 bits.
             assert!(
                 BgvParams::new(
                     common.clone(),

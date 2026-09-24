@@ -63,6 +63,17 @@ fn run_shape_case(
     expected: impl FnOnce(&DCRTPolyMatrix) -> DCRTPolyMatrix,
 ) -> usize {
     let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let input = cpu_input(&parameters);
+    run_shape_case_on(label, &parameters, input, expression, expected)
+}
+
+fn run_shape_case_on(
+    label: &str,
+    parameters: &DCRTPolyParams,
+    input: DCRTPolyMatrix,
+    expression: impl FnOnce(Mat) -> Mat,
+    expected: impl FnOnce(&DCRTPolyMatrix) -> DCRTPolyMatrix,
+) -> usize {
     let gpu_parameters = GpuDCRTPolyParams::new(
         parameters.ring_dimension(),
         parameters.moduli().to_vec(),
@@ -80,7 +91,6 @@ fn run_shape_case(
         .unwrap()
         .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .unwrap();
-    let input = cpu_input(&parameters);
     let input_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: parameters.ring_dimension(),
@@ -392,6 +402,40 @@ fn gadget_decompose_and_small_rhs_multiply_reconstruct_input() {
         move |source| {
             let ring = Ring::from_ref(source.matrix_type().ring.clone());
             source.decompose(16, digit_count).mul_small_rhs(ring.gadget(2, 16, digit_count))
+        },
+        |source| source.clone(),
+    );
+}
+
+/// A base of `ceil(crt_bits / 2)` bits leaves two digits per limb; residues
+/// across the whole limb range still reconstruct exactly.
+#[test]
+#[serial_test::serial]
+fn two_digit_gadget_decompose_reconstructs_full_range_input() {
+    let parameters = DCRTPolyParams::new(8, 2, 17, 9, None, None);
+    let digit_count = parameters.modulus_digits();
+    assert_eq!(digit_count, 4);
+    let modulus = parameters.modulus().as_ref().clone();
+    let entry = |offset: u64| {
+        let coefficients = (0..parameters.ring_dimension() as u64)
+            .map(|index| {
+                let value = (&modulus / 2u8 + BigUint::from(index * 7919 + offset)) % &modulus;
+                if index % 2 == 0 { value } else { &modulus - 1u8 - value }
+            })
+            .collect::<Vec<_>>();
+        DCRTPoly::from_biguints(&parameters, &coefficients)
+    };
+    let input = DCRTPolyMatrix::from_poly_vec(
+        &parameters,
+        vec![vec![entry(0), entry(1)], vec![entry(12_345), entry(99_999)]],
+    );
+    run_shape_case_on(
+        "direct-two-digit-gadget-decompose",
+        &parameters,
+        input,
+        move |source| {
+            let ring = Ring::from_ref(source.matrix_type().ring.clone());
+            source.decompose(512, digit_count).mul_small_rhs(ring.gadget(2, 512, digit_count))
         },
         |source| source.clone(),
     );

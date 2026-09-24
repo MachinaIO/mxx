@@ -233,8 +233,21 @@ pub fn tfhe_params() -> TfheParams {
     let lwe_modulus = env::var("FHE_TEST_TFHE_LWE_MODULUS")
         .map(|value| value.parse().expect("power-of-two LWE modulus"))
         .unwrap_or_else(|_| BigUint::one() << 32usize);
-    TfheParams::new(common, lwe_dimension, lwe_modulus, lwe_error_sigma, lwe_error_cutoff)
-        .expect("valid TFHE parameters")
+    let key_switch_base_bits = integer("FHE_TEST_TFHE_KS_BASE_BITS", 1);
+    let key_switch_digits = integer(
+        "FHE_TEST_TFHE_KS_DIGITS",
+        (&lwe_modulus - BigUint::one()).bits() as usize / key_switch_base_bits,
+    );
+    TfheParams::new(
+        common,
+        lwe_dimension,
+        lwe_modulus,
+        lwe_error_sigma,
+        lwe_error_cutoff,
+        key_switch_base_bits,
+        key_switch_digits,
+    )
+    .expect("valid TFHE parameters")
 }
 
 #[cfg(feature = "gpu")]

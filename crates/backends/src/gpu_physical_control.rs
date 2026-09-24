@@ -5614,7 +5614,7 @@ fn lower_concat(
     let mut total_rows = 0usize;
     let mut total_columns = 0usize;
     let mut first_shape = None;
-    for wire in arguments {
+    for &wire in &arguments {
         let id = *ctx
             .wire_ids
             .get(&wire)
@@ -5650,7 +5650,7 @@ fn lower_concat(
         total_columns = total_columns
             .checked_add(ty.columns)
             .ok_or_else(|| "GPU concat column count overflows".to_owned())?;
-        inputs.push((id, ty.rows, ty.columns));
+        inputs.push((wire, id, ty.rows, ty.columns));
     }
     let (first_rows, first_columns) =
         first_shape.ok_or_else(|| "GPU concat has no input shape".to_owned())?;
@@ -5705,14 +5705,12 @@ fn lower_concat(
     } else {
         None
     };
-    // Every piece copies into its window of the output in one operation.
-    let implementation = ctx
-        .implementations
-        .register(GpuImplementation::matrix_copy_views(inputs.len()))
-        .map_err(str::to_owned)?;
+    // A piece whose writers are elementwise or product operations, and which
+    // nothing else reads, is written straight into its window; every other
+    // piece is copied into its window by one operation.
     let index = u32::try_from(ctx.operations.len())
         .map_err(|_| "too many GPU concat operations".to_owned())?;
-    let mut arguments = Vec::with_capacity(6 * inputs.len());
+    let mut copy_arguments = Vec::with_capacity(6 * inputs.len());
     let mut outputs = Vec::with_capacity(inputs.len());
     let mut predecessors = zero.into_iter().collect::<std::collections::BTreeSet<_>>();
     let mut row_start = 0usize;
@@ -5721,11 +5719,13 @@ fn lower_concat(
     if let Some(index) = zero {
         written.push((ColumnRange { start: 0, end: output_ty.columns }, index));
     }
-    for (source, rows, columns) in inputs {
-        let owner = ctx
-            .owners
-            .get(&output_id)
-            .ok_or_else(|| "GPU concat output owner is missing".to_owned())?;
+    for (wire, source, rows, columns) in inputs {
+        let writers = concat_piece_writers(ctx, scope, scope_id, &arguments, wire, source);
+        let owner = Arc::clone(
+            ctx.owners
+                .get(&output_id)
+                .ok_or_else(|| "GPU concat output owner is missing".to_owned())?,
+        );
         let mut window = ctx.values[output_id.0 as usize].clone();
         let (row, column) = match axis {
             ConcatAxis::Rows => (row_start, 0),
@@ -5757,6 +5757,55 @@ fn lower_concat(
             part.view.origin[1] = column;
             part.view.extent[1] = columns_u64;
         }
+        let range = if matches!(axis, ConcatAxis::Rows) {
+            ColumnRange { start: 0, end: output_ty.columns }
+        } else {
+            ColumnRange { start: column_start, end: column_start + columns }
+        };
+        if let Some((aliases, writers)) = writers.filter(|_| {
+            // Moving the piece into the window keeps its layout only when the
+            // output window has the piece's strides.
+            let piece = &ctx.values[source.0 as usize];
+            piece.parts.len() == window.parts.len() &&
+                piece.parts.iter().zip(window.parts.iter()).all(|(piece, window)| {
+                    piece.view.byte_strides == window.view.byte_strides &&
+                        piece.view.element_bytes == window.view.element_bytes
+                })
+        }) {
+            // Every view of the piece moves into the window: the same view
+            // over the output allocation, displaced by the window offset, so
+            // the writers (and their registered bindings) target the output.
+            for alias in aliases {
+                let mut moved = ctx.values[alias.0 as usize].clone();
+                for (part, window_part) in moved.parts.iter_mut().zip(window.parts.iter()) {
+                    part.storage = window_part.storage;
+                    part.view.byte_offset = part
+                        .view
+                        .byte_offset
+                        .checked_add(window_part.view.byte_offset)
+                        .ok_or_else(|| "GPU concat piece offset overflows".to_owned())?;
+                }
+                let moved_owner =
+                    owner.with_physical_view(Arc::new(moved.clone())).map_err(str::to_owned)?;
+                ctx.values[alias.0 as usize] = moved;
+                ctx.owners.insert(alias, Arc::new(moved_owner));
+            }
+            for (range, writer) in writers {
+                let range = if matches!(axis, ConcatAxis::Rows) {
+                    range
+                } else {
+                    ColumnRange { start: column_start + range.start, end: column_start + range.end }
+                };
+                written.push((range, writer));
+            }
+            row_start = row_start
+                .checked_add(rows)
+                .ok_or_else(|| "GPU concat row offset overflows".to_owned())?;
+            column_start = column_start
+                .checked_add(columns)
+                .ok_or_else(|| "GPU concat column offset overflows".to_owned())?;
+            continue;
+        }
         let window_owner =
             owner.with_physical_view(Arc::new(window.clone())).map_err(str::to_owned)?;
         let window_id = value_id(ctx.values.len())?;
@@ -5765,7 +5814,7 @@ fn lower_concat(
         let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
         let destination_binding = register_bindings(ctx.bindings, ctx.values, window_id)?;
         predecessors.extend(all_predecessors(ctx.producer, source).iter().copied());
-        arguments.extend([
+        copy_arguments.extend([
             KernelArg::Value(source),
             KernelArg::U32(0),
             KernelArg::Value(window_id),
@@ -5774,11 +5823,6 @@ fn lower_concat(
             KernelArg::U32(destination_binding),
         ]);
         outputs.push(window_id);
-        let range = if matches!(axis, ConcatAxis::Rows) {
-            ColumnRange { start: 0, end: output_ty.columns }
-        } else {
-            ColumnRange { start: column_start, end: column_start + columns }
-        };
         written.push((range, index));
         row_start = row_start
             .checked_add(rows)
@@ -5787,20 +5831,113 @@ fn lower_concat(
             .checked_add(columns)
             .ok_or_else(|| "GPU concat column offset overflows".to_owned())?;
     }
-    ctx.operations.push(CompiledGpuOp {
-        implementation,
-        arguments: arguments.into_boxed_slice(),
-        outputs: outputs.into_boxed_slice(),
-        device: ctx.device,
-        grid: [1; 3],
-        block: [1; 3],
-        shared_bytes: 0,
-        predecessors: predecessors.into_iter().collect(),
-        body: None,
-    });
+    if !outputs.is_empty() {
+        let implementation = ctx
+            .implementations
+            .register(GpuImplementation::matrix_copy_views(outputs.len()))
+            .map_err(str::to_owned)?;
+        ctx.operations.push(CompiledGpuOp {
+            implementation,
+            arguments: copy_arguments.into_boxed_slice(),
+            outputs: outputs.into_boxed_slice(),
+            device: ctx.device,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_bytes: 0,
+            predecessors: predecessors.into_iter().collect(),
+            body: None,
+        });
+    }
     ctx.producer.insert(output_id, written);
     ctx.wire_ids.insert(output_wire, output_id);
     Ok(())
+}
+
+/// The writers of concat piece `source` (the value of `wire`) when the
+/// piece can be written straight into its output window: elementwise or
+/// product operations of this scope that write only views of the piece's own
+/// unshared scratch allocations, which nothing but this concat reads.
+/// Returns every value viewing the piece's allocations with the writers.
+fn concat_piece_writers(
+    ctx: &PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    concat_arguments: &[WireRef],
+    wire: WireRef,
+    source: PhysicalValueId,
+) -> Option<(Vec<PhysicalValueId>, Vec<(ColumnRange, u32)>)> {
+    use crate::gpu_execution_plan::GpuNativePrimitive as P;
+    if ctx.wire_ids.get(&wire) != Some(&source) ||
+        concat_arguments.iter().filter(|argument| **argument == wire).count() != 1 ||
+        matches!(scope_id, FrozenGraphScopeId::Root) &&
+            ctx.validated.source.outputs().values().any(|output| output.value == wire)
+    {
+        return None;
+    }
+    let readers = scope
+        .nodes()
+        .iter()
+        .filter_map(|node| scope.arguments(node))
+        .flatten()
+        .filter(|argument| *argument == wire)
+        .count();
+    if readers != 1 {
+        return None;
+    }
+    let value = ctx.values.get(source.0 as usize)?;
+    let owner = ctx.owners.get(&source)?;
+    let storages = owner.storages().collect::<Vec<_>>();
+    if value.parts.iter().any(|part| part.view.byte_offset != 0) ||
+        storages.len() != value.parts.len() ||
+        storages.iter().any(|(storage, _)| !matches!(storage, StorageRef::Scratch(_)))
+    {
+        return None;
+    }
+    let allocations = storages
+        .iter()
+        .map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>())
+        .collect::<Vec<_>>();
+    let aliases = ctx
+        .owners
+        .iter()
+        .filter(|(_, other)| {
+            other
+                .storages()
+                .any(|(_, bound)| allocations.contains(&Arc::as_ptr(&bound.owner).cast::<()>()))
+        })
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    // Every aliasing value is a view of the piece with its strides.
+    if aliases.iter().any(|id| {
+        let alias = &ctx.values[id.0 as usize];
+        alias.parts.len() != value.parts.len() ||
+            alias.parts.iter().zip(value.parts.iter()).any(|(alias, own)| {
+                alias.storage != own.storage || alias.view.byte_strides != own.view.byte_strides
+            })
+    }) {
+        return None;
+    }
+    let writers = ctx.producer.get(&source)?.clone();
+    for (_, writer) in &writers {
+        let op = ctx.operations.get(*writer as usize)?;
+        let primitive = ctx.implementations.resolve(op.implementation).ok()?.primitive;
+        if op.body.is_some() ||
+            op.outputs.iter().any(|output| !aliases.contains(output)) ||
+            !matches!(
+                primitive,
+                P::MatrixAdd |
+                    P::MatrixSub |
+                    P::MatrixMul |
+                    P::MatrixTensor |
+                    P::MatrixScale |
+                    P::MultiplyMonomial |
+                    P::RingAutomorphism
+            )
+        {
+            return None;
+        }
+    }
+    Some((aliases, writers))
 }
 
 /// Copy one exact full-Eval matrix without borrowing its source allocation as

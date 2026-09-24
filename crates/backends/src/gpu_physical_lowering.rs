@@ -6814,6 +6814,40 @@ pub(crate) fn plan_physical_graph(
         {
             return Err("GPU return output needs all ordered full-Eval CRT parts".into());
         }
+        // A whole plan-owned matrix is returned in place: its scratch storage
+        // becomes return storage (which scratch sharing never reuses), so the
+        // producer writes the result where the caller reads it.
+        if source_value.parts.iter().all(|part| matches!(part.storage, StorageRef::Output(_))) {
+            output_ids.insert(name.clone(), source);
+            continue;
+        }
+        let owner = owners.get(&source).ok_or("GPU return source has no owner")?;
+        if !input_ids.values().any(|id| *id == source) &&
+            source_value.parts.iter().all(|part| {
+                part.view.byte_offset == 0 && matches!(part.storage, StorageRef::Scratch(_))
+            }) &&
+            owner.storages().count() == source_value.parts.len()
+        {
+            let mut physical = source_value.clone();
+            let relabel = |storage: StorageRef| match storage {
+                StorageRef::Scratch(number) => StorageRef::Output(number),
+                other => other,
+            };
+            for part in physical.parts.iter_mut() {
+                part.storage = relabel(part.storage);
+            }
+            let storage = owner
+                .storages()
+                .map(|(storage, bound)| (relabel(*storage), bound.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let ready = owner.ready_events().iter().cloned().collect::<Vec<_>>();
+            let returned = GpuResidentValue::new(Arc::new(physical.clone()), storage, ready.into())
+                .map_err(str::to_owned)?;
+            values[source.0 as usize] = physical;
+            owners.insert(source, Arc::new(returned));
+            output_ids.insert(name.clone(), source);
+            continue;
+        }
         let storage = StorageRef::Output(
             u32::try_from(values.len()).map_err(|_| "too many GPU return storages".to_owned())?,
         );
@@ -7373,6 +7407,61 @@ mod tests {
         let scale =
             DCRTPoly::from_biguint_to_constant(&cpu, num_bigint::BigUint::from(1u32 << steps));
         assert_eq!(doubled, source.multiply_poly_out_of_place(&scale));
+    }
+
+    /// Concat pieces with a single elementwise or product writer and no
+    /// other reader are written straight into their windows, and a whole
+    /// returned matrix is returned in place, so only the shared piece is
+    /// copied.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_concat_pieces_and_returns_are_written_in_place() {
+        use crate::gpu_execution_plan::GpuNativePrimitive;
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 1, 28, 8, None, None);
+        let modulus = cpu.to_crt().0[0];
+        let parameters = GpuDCRTPolyParams::new(32, vec![modulus], 8, None);
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
+        let x = ring.uniform_residue((1, 1));
+        let y = ring.uniform_residue((1, 1));
+        let joined = mxx_dsl::Mat::concat(
+            mxx_ir_core::node::ConcatAxis::Rows,
+            vec![x.clone() * y.clone(), x.clone() + y.clone(), x.clone()],
+        );
+        let validated = DslContext::new("direct-concat-in-place")
+            .output("x", x)
+            .unwrap()
+            .output("y", y)
+            .unwrap()
+            .output("joined", joined)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let frame = plan.physical_frame_for_test();
+        let copies = frame
+            .program
+            .operations
+            .iter()
+            .filter(|op| {
+                frame.program.implementations.resolve(op.implementation).unwrap().primitive ==
+                    GpuNativePrimitive::MatrixCopyView
+            })
+            .map(|op| op.outputs.len())
+            .collect::<Vec<_>>();
+        assert_eq!(copies, vec![1], "only the shared piece x is copied");
+        let mut store = MemoryArtifactStore::default();
+        let result =
+            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let x = runtime.download_matrix_output(&result.output("x").unwrap()).unwrap();
+        let y = runtime.download_matrix_output(&result.output("y").unwrap()).unwrap();
+        let joined = runtime.download_matrix_output(&result.output("joined").unwrap()).unwrap();
+        let expected = (x.clone() * y.clone()).concat_rows(&[&(x.clone() + y), &x]);
+        assert_eq!(joined, expected);
     }
 
     #[test]

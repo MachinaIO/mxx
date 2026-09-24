@@ -539,7 +539,7 @@ store)`; staged family members are removed with `ExecutionResult::cleanup_staged
   polynomial traits. `DCRTPolyParams` (`crates/backends/src/poly/dcrt/params.rs`) holds the ring
   dimension, CRT depth and bit width, the exact ordered basis `moduli`, gadget base bits, and
   dropped moduli. `try_new` validates capability limits (power-of-two dimension, CRT width at
-  most 60 bits, `base_bits <= crt_bits / 2`) and generates or checks the basis through
+  most 60 bits, `base_bits <= ceil(crt_bits / 2)`) and generates or checks the basis through
   `openfhe_guard::gen_modulus_and_warmup`.
 - `DCRTPoly` (`crates/backends/src/poly/dcrt/poly.rs`) wraps an OpenFHE `DCRTPoly`. The OpenFHE
   Rust bindings come from the `openfhe` crate; repository-owned C++ adapters in
@@ -732,7 +732,10 @@ let matrix = runtime.download_matrix_output(&out)?;   // or runtime.copy_output(
   `crates/backends/src/backend.rs`). A member or view of a family
   (`GpuResidentValue::with_physical_view`) binds only the storages its parts use, so it does not
   carry or rebind every allocation of the family. Input ready events are waited once per event,
-  and a `GpuNativeEvent` caches completion after a successful host wait.
+  and a `GpuNativeEvent` caches completion after a successful host wait. Binding a compiled
+  graph (`mxx_gpu_graph_bind` in `crates/backends/cuda/src/Runtime.cu`) updates only nodes whose
+  patched argument bytes changed; nodes start bound to their build-time arguments, and an update
+  of a conditional body, which reconciles the whole executable, reapplies every top-level node.
 - The result, `GpuExecutionResult<'plan>`, borrows the plan mutably. Its outputs live in
   plan-owned storage and may be overwritten by the next execution, so Rust prevents executing the
   plan again while the result is alive. `result.output(name)` returns a non-cloneable
@@ -885,8 +888,15 @@ templates, control resets, and wave descriptors needed to run it.
   vectorized, and the operand ranges and the proven output range must fit in `int64`, so the
   kernel accumulates exactly without widening.
 - **Slices and concatenation.** A matrix `Slice` that is not a root graph output is a view: the
-  window retyped to the output shape over the source allocation, with no copy. `Concat` lowers to
-  one `MatrixCopyView` operation that copies every piece into its window of the output.
+  window retyped to the output shape over the source allocation, with no copy. A `Concat` piece
+  whose writers are elementwise or product operations (add, subtract, multiply, tensor, scale,
+  monomial, automorphism), and which nothing else reads, is written straight into its window:
+  every view of the piece's scratch allocation moves into the output at the window offset when
+  the strides agree (`concat_piece_writers` in `gpu_physical_control.rs`). The remaining pieces
+  are copied into their windows by one `MatrixCopyView` operation.
+- **Returned matrices.** A root output that is a whole plan-owned scratch matrix is returned in
+  place: its storage is relabeled as return storage, which scratch sharing never reuses, instead
+  of being copied into a separate return allocation.
 - **Preimage retry loop.** Each preimage column tile is a device `LoopWhile` body that derives a
   per-attempt seed (`crates/backends/cuda/src/matrix/MatrixPreimageSeed.cu`), samples a
   candidate, and checks its cutoff, repeating until acceptance or until the frozen
@@ -1171,8 +1181,10 @@ caller's responsibility.
   `+floor(q/8)` (true) or `-floor(q/8)` (false). `RingCiphertext` holds ring-LWE `(1,1)` values and ring-GSW `(1,2L)` key entries.
   `keygen(hash_key)` returns `TfheKeys { lwe_secret, ring_secret, bootstrapping_key,
   key_switch_key }`: a `BootstrappingKey` of GSW encryptions of each LWE secret coordinate and a
-  flat `KeySwitchKey` (base 2, `log2(q)` digits). `encrypt`, `decrypt`, and `can_decrypt` work on
-  single bits. Bootstrapping is four public stages, `pre_blind_rotation`, `blind_rotation`
+  flat `KeySwitchKey` (base `2^b` with `d` digits, both set in `TfheParams::new`; digit `j`
+  encrypts the coefficient times `2^(log2 q - b d + b j)`, and `key_switch` rounds each
+  coefficient to its leading `b d` bits before decomposing). `encrypt`, `decrypt`, and
+  `can_decrypt` work on single bits. Bootstrapping is four public stages, `pre_blind_rotation`, `blind_rotation`
   (external products), `sample_extract` (with rounded `Q -> q` modulus switching), and
   `key_switch`; `bootstrap` chains them and `nand` applies them to `nand_input` (`floor(q/8) -
   ct1 - ct2`) with the `nand_accumulator` sign LUT. LWE `a` vectors come from
@@ -1264,7 +1276,7 @@ backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactSt
   | `crates/backends/tests/gpu_control_resident.rs` | `#![cfg(feature = "gpu")]` |
   | `crates/backends/tests/gpu_direct_node_semantics.rs` | `#![cfg(feature = "gpu")]`; compares direct GPU nodes with the CPU backend |
   | `crates/fhe/tests/gpu_bgv.rs` | `required-features = ["gpu"]` in `crates/fhe/Cargo.toml` |
-  | `crates/fhe/tests/gpu_tfhe.rs` | `required-features = ["gpu"]`; fixed 128-bit-target parameters (LWE `n = 1024`, `q = 2^32`, sigma 32768; ring `N = 2048`, `Q = 33550337 * 33538049`, sigma 1048576; gadget base `2^4`; KSK base 2 with 32 digits). Each bootstrap stage is its own plan and execute with keys kept resident; checks the NAND truth table and repeated gates (`FHE_TFHE_REPEATED_GATES`, default 4) |
+  | `crates/fhe/tests/gpu_tfhe.rs` | `required-features = ["gpu"]`; the TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (LWE `n = 630`, `q = 2^32`, sigma `2^17`; ring `N = 1024`, double-CRT `Q = 65537 * 79873`, sigma 156, about `2^-25` of `Q`; gadget base `2^9`, two digits per limb; KSK base `2^2` with 8 digits). Each bootstrap stage is its own plan and execute with keys kept resident; checks the NAND truth table and repeated gates (`FHE_TFHE_REPEATED_GATES`, default 4) |
   | `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs` | `#![cfg(feature = "gpu")]`; long modes are `#[ignore]` |
   | `crates/we/tests/test_gpu_diamond_we.rs` | `#![cfg(feature = "gpu")]` and `#[ignore]`; Lean-checked parameter search plus a GPU round trip |
 

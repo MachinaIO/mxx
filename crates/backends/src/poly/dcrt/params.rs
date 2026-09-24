@@ -39,7 +39,7 @@ pub enum DCRTPolyParamsError {
     UnsupportedCrtBits,
     #[error("gadget base width must be in 1..=31 for primitive u32 decomposition")]
     UnsupportedBaseBits,
-    #[error("base_bits must be positive and <= crt_bits / 2")]
+    #[error("base_bits must be positive and <= ceil(crt_bits / 2)")]
     BaseBitsExceedCrtBits,
     #[error("DCRT digit count overflows usize")]
     DigitCountOverflow,
@@ -170,7 +170,7 @@ impl DCRTPolyParams {
         if base_bits == 0 || base_bits > MAX_PRIMITIVE_BASE_BITS {
             return Err(DCRTPolyParamsError::UnsupportedBaseBits);
         }
-        if base_bits as usize > crt_bits / 2 {
+        if base_bits as usize > crt_bits.div_ceil(2) {
             return Err(DCRTPolyParamsError::BaseBitsExceedCrtBits);
         }
         if crt_bits.div_ceil(base_bits as usize).checked_mul(crt_depth).is_none() {
@@ -328,9 +328,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "base_bits must be positive and <= crt_bits / 2")]
+    #[should_panic(expected = "base_bits must be positive and <= ceil(crt_bits / 2)")]
     fn test_approximate_params_preserve_base_constraint() {
-        DCRTPolyParams::new(8, 2, 17, 9, None, Some(1));
+        DCRTPolyParams::new(8, 2, 17, 10, None, Some(1));
     }
 
     #[test]

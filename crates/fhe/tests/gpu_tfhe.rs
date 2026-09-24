@@ -23,35 +23,37 @@ use std::{collections::BTreeMap, env, time::Instant};
 /// Resident outputs copied out of their plan, so they outlive its next execute.
 type GpuValues = BTreeMap<String, RuntimeValue>;
 
-const LWE_DIMENSION: usize = 1024;
+const LWE_DIMENSION: usize = 630;
 const LWE_MODULUS: u64 = 1u64 << 32;
-const LWE_SIGMA: f64 = 32_768.0;
-const LWE_ERROR_CUTOFF: u64 = 1u64 << 19; // 16 sigma
-const RING_DIMENSION: u32 = 2048;
-const RING_MODULI: [u64; 2] = [33_550_337, 33_538_049];
-const RING_SIGMA: f64 = 1_048_576.0;
-const RING_ERROR_CUTOFF: u64 = 1u64 << 24; // 16 sigma
-const GADGET_BASE_BITS: u32 = 4;
+const LWE_SIGMA: f64 = 131_072.0; // 2^-15 of q
+const LWE_ERROR_CUTOFF: u64 = 1u64 << 21; // 16 sigma
+const RING_DIMENSION: u32 = 1024;
+const RING_MODULI: [u64; 2] = [65_537, 79_873];
+const RING_CRT_BITS: usize = 17;
+const RING_SIGMA: f64 = 156.0; // about 2^-25 of Q
+const RING_ERROR_CUTOFF: u64 = 1u64 << 12; // above 16 sigma
+const GADGET_BASE_BITS: u32 = 9;
+const KEY_SWITCH_BASE_BITS: usize = 2;
+const KEY_SWITCH_DIGITS: usize = 8;
 
-/// This fixed profile was evaluated with the lattice-estimator ADPS16 model,
-/// estimator revision 2a799b25fb3ee968b4a43f14ac7691f4dc949a15, binary
-/// secrets and infinite samples. Its modeled quantum lattice-reduction costs
-/// use 0.265β. The minimum reported estimates were 147.275 classical / 135.145
-/// quantum bits for LWE and 187.316 classical / 170.940 quantum bits for the
-/// ring basis. The KSK uses base 2 with 32 levels. These are estimator outputs,
-/// not unconditional quantum security proofs.
-/// The test keeps these cryptographic parameters fixed so its correctness run
-/// cannot silently stop exercising the estimator-validated profile.
+/// The TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (the original TFHE
+/// library set): n = 630, N = 1024, k = 1, LWE noise 2^-15 and ring noise
+/// 2^-25 of their moduli, and a base 2^2, 8-digit key switch of the leading
+/// 16 bits of q = 2^32. The torus 2^32 of the ring is replaced by the
+/// double-CRT modulus Q = 65537 * 79873 (about 2^32.3) with the same relative
+/// noise; its exact per-limb decomposition uses two base 2^9 digits per 17-bit
+/// limb, four in total, in place of the profile's three approximate base 2^7
+/// torus digits.
 fn tfhe_params() -> TfheParams {
     let ring = DCRTPolyParams::try_new(
         RING_DIMENSION,
         RING_MODULI.len(),
-        25,
+        RING_CRT_BITS,
         GADGET_BASE_BITS,
         Some(RING_MODULI.to_vec()),
         None,
     )
-    .expect("estimator-validated exact CRT basis");
+    .expect("TFHE Boolean profile CRT basis");
     let common = FheCommonParams {
         ring,
         secret_range: SampleRange { minimum: 0.into(), maximum: 1.into() },
@@ -64,8 +66,10 @@ fn tfhe_params() -> TfheParams {
         BigUint::from(LWE_MODULUS),
         LWE_SIGMA,
         BigUint::from(LWE_ERROR_CUTOFF),
+        KEY_SWITCH_BASE_BITS,
+        KEY_SWITCH_DIGITS,
     )
-    .expect("estimator-validated TFHE parameters")
+    .expect("TFHE Boolean profile parameters")
 }
 
 fn gpu_parameters(tfhe: &TfheParams) -> Vec<GpuDCRTPolyParams> {
@@ -368,8 +372,8 @@ fn test_gpu_tfhe_hash_int_family_rebind() {
 #[test]
 fn test_gpu_tfhe_noisy_nand_and_repeated_gates() {
     let tfhe = tfhe_params();
-    assert_eq!(tfhe.key_switch_base_bits(), 1, "validated KSK uses base 2");
-    assert_eq!(tfhe.key_switch_digit_count(), 32, "validated KSK has 32 digits");
+    assert_eq!(tfhe.key_switch_base_bits(), 2, "the KSK uses base 4");
+    assert_eq!(tfhe.key_switch_digit_count(), 8, "the KSK has 8 digits");
     let keygen_hash_key = tfhe_ring().bytes_input("keygen_hash_key", 32);
     let key_handles = tfhe.keygen(&keygen_hash_key).expect("build TFHE key generation graph");
     let keygen_graph_built = DslContext::new("gpu-tfhe-keygen")

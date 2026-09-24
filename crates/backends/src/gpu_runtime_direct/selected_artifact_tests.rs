@@ -116,7 +116,11 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
         for member in 0..3 {
             assert_eq!(after[member] - before[member], usize::from(member == index));
         }
+        // A consumer that only imports opens no producer session.
+        assert!(result.production_id.is_none());
     }
+    // Reusing a nonce is valid for a consumer, since it records no session.
+    runtime.execute_with_artifacts(&mut plan, bind(0), &mut store, [0x61; 32]).unwrap();
 }
 
 #[test]
@@ -664,9 +668,21 @@ fn run_family_consumed_by_later_loop(publish: bool) {
     assert_eq!(sum.entry(0, 0).coeffs_biguints()[0], num_bigint::BigUint::from(18u8));
     if publish {
         let production = result.production_id.clone().expect("producer identity");
+        let handles = result.artifact_handles.clone();
         drop(result);
         let manifest = store.load_finalized_manifest(&production).unwrap();
         assert_eq!(manifest.artifacts.len(), 1);
+        // The same nonce replays the finalized production: the outputs are
+        // recomputed and the committed artifacts are returned, not rewritten.
+        let replay = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x71; 32])
+            .unwrap();
+        assert_eq!(replay.production_id.as_ref(), Some(&production));
+        assert_eq!(replay.artifact_handles, handles);
+        let sum =
+            runtime.download_matrix_output(&replay.output("sum").expect("sum output")).unwrap();
+        assert_eq!(sum.entry(0, 0).coeffs_biguints()[0], num_bigint::BigUint::from(18u8));
+        assert_eq!(store.load_finalized_manifest(&production).unwrap(), manifest);
     }
 }
 

@@ -29,7 +29,9 @@ use crate::{
         stage_canonical_resident_input,
     },
     gpu_runtime_import::load_import_template,
-    gpu_runtime_io::{PlannedExportSlot, ProducerIoPump, with_checked_producer_io_pump},
+    gpu_runtime_io::{
+        PlannedExportSlot, ProducerIoPump, with_checked_producer_io_pump, with_transient_io_pump,
+    },
     gpu_warmup::{GpuMeasuredCostCache, GpuWarmupReport},
     matrix::dcrt_poly::DCRTPolyMatrix,
     poly::dcrt::gpu::{
@@ -2104,15 +2106,6 @@ impl GpuRuntime {
                 artifact_handles: BTreeMap::new(),
             });
         }
-        let digest = runtime_inputs_digest(&plan.validated, &self.backend, &inputs)
-            .map_err(GpuRuntimeError::Session)?;
-        let specification_hash =
-            mxx_ir_core::encoding::spec_hash(&plan.validated.source, &plan.validated.bindings)
-                .map_err(|error| GpuRuntimeError::Session(error.to_string()))?;
-        let production = mxx_ir_core::artifact::production_id(specification_hash, execution_nonce);
-        let manifest =
-            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &plan.validated)
-                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
         let requests =
             plan.frame
                 .slots
@@ -2129,56 +2122,105 @@ impl GpuRuntime {
                 })?;
         let window = NonZeroUsize::new(requests.max(1))
             .ok_or_else(|| GpuRuntimeError::Artifact("producer I/O window is zero".into()))?;
+        // Only a graph that exports artifacts is a producer with a durable
+        // session; a consumer that only imports reads the store directly.
+        if plan.frame.export_templates.is_empty() {
+            return with_transient_io_pump(store, window, |pump| {
+                self.execute_io(plan, &inputs, execution_nonce, pump, None)
+            })
+            .map_err(|error| GpuRuntimeError::Session(error.to_string()))?;
+        }
+        let digest = runtime_inputs_digest(&plan.validated, &self.backend, &inputs)
+            .map_err(GpuRuntimeError::Session)?;
+        let specification_hash =
+            mxx_ir_core::encoding::spec_hash(&plan.validated.source, &plan.validated.bindings)
+                .map_err(|error| GpuRuntimeError::Session(error.to_string()))?;
+        let production = mxx_ir_core::artifact::production_id(specification_hash, execution_nonce);
+        let manifest =
+            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &plan.validated)
+                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
         let descriptor = SessionDescriptor::new(
             production.clone(),
             plan.validated.source.name().to_owned(),
             digest,
         );
-        with_checked_producer_io_pump(store, descriptor, digest, window, |pump| {
-            if !plan.frame.waves.is_empty() {
-                let frame = FrameGeneration::new(0, plan.completed_runs);
-                let planned = planned_export_slots(&plan.frame, &manifest, &production, frame)?;
-                let handles = finalized_export_handles(&plan.frame, &manifest, &production)?;
-                let has_exports = !planned.is_empty();
-                if has_exports {
-                    pump.start_export_observer(planned)
-                        .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
-                }
-                let run = self.execute_waves(plan, &inputs, execution_nonce, Some(pump));
-                if has_exports {
-                    if let Err(error) = pump.finish_export_observer(run.is_ok()) {
-                        plan.poisoned = true;
-                        return Err(GpuRuntimeError::Artifact(error.to_string()));
-                    }
-                }
-                let mut result = run?;
-                let completion = match pump
-                    .finalize(frame, manifest)
-                    .map_err(|error| GpuRuntimeError::Session(error.to_string()))
-                    .and_then(|request| {
-                        request.wait().map_err(|error| GpuRuntimeError::Session(error.to_string()))
-                    }) {
-                    Ok(completion) => completion,
-                    Err(error) => {
-                        plan.poisoned = true;
-                        return Err(error);
-                    }
-                };
-                if !matches!(completion, IoCompletion::SessionFinalized { .. }) {
-                    plan.poisoned = true;
-                    return Err(GpuRuntimeError::Session(
-                        "wave import session finalized with wrong completion".into(),
-                    ));
-                }
-                plan.completed_runs += 1;
-                result.production_id = Some(production);
-                result.artifact_handles = handles;
-                Ok(result)
-            } else {
-                self.execute_producer(plan, pump, production, manifest)
-            }
+        with_checked_producer_io_pump(store, descriptor, digest, window, |pump, finalized| {
+            // A finalized production is replayed: the GPU recomputes the
+            // outputs, and its artifacts are the ones already committed.
+            let handles = finalized_export_handles(
+                &plan.frame,
+                finalized.as_ref().unwrap_or(&manifest),
+                &production,
+            )?;
+            let persist = finalized.is_none().then(|| (production.clone(), manifest));
+            let mut result = self.execute_io(plan, &inputs, execution_nonce, pump, persist)?;
+            result.production_id = Some(production);
+            result.artifact_handles = handles;
+            Ok(result)
         })
         .map_err(|error| GpuRuntimeError::Session(error.to_string()))?
+    }
+
+    /// Run a plan whose artifacts go through `pump`. `persist` names the
+    /// production and manifest whose exports are written and finalized;
+    /// without it nothing is written, as for a consumer or a finalized replay.
+    fn execute_io<E: std::error::Error + Send + Sync + 'static>(
+        &mut self,
+        plan: &mut GpuExecutionPlan,
+        inputs: &BTreeMap<String, RuntimeValue>,
+        execution_nonce: [u8; 32],
+        pump: &mut ProducerIoPump<'_, E>,
+        persist: Option<(ProductionId, Manifest)>,
+    ) -> Result<GpuExecutionPayload, GpuRuntimeError> {
+        let frame = FrameGeneration::new(0, plan.completed_runs);
+        let planned = match &persist {
+            Some((production, manifest)) => {
+                planned_export_slots(&plan.frame, manifest, production, frame)?
+            }
+            None => Vec::new(),
+        };
+        let has_exports = !planned.is_empty();
+        if has_exports {
+            pump.start_export_observer(planned)
+                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
+        }
+        let run = if plan.frame.waves.is_empty() {
+            self.execute_producer(plan, pump, frame)
+        } else {
+            self.execute_waves(plan, inputs, execution_nonce, Some(pump))
+        };
+        if has_exports {
+            let observed = pump
+                .finish_export_observer(run.is_ok())
+                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()));
+            if let Err(error) = observed {
+                plan.poisoned = true;
+                return Err(error);
+            }
+        }
+        let result = run?;
+        if let Some((_, manifest)) = persist {
+            let completion = match pump
+                .finalize(frame, manifest)
+                .map_err(|error| GpuRuntimeError::Session(error.to_string()))
+                .and_then(|request| {
+                    request.wait().map_err(|error| GpuRuntimeError::Session(error.to_string()))
+                }) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    plan.poisoned = true;
+                    return Err(error);
+                }
+            };
+            if !matches!(completion, IoCompletion::SessionFinalized { .. }) {
+                plan.poisoned = true;
+                return Err(GpuRuntimeError::Session(
+                    "producer finalize returned wrong completion".into(),
+                ));
+            }
+        }
+        plan.completed_runs += 1;
+        Ok(result)
     }
 
     fn run_wave_region_range<E: std::error::Error + Send + Sync + 'static>(
@@ -2618,78 +2660,38 @@ impl GpuRuntime {
         Ok(())
     }
 
+    /// Launch the Graph regions of a plan with imports and exports and check
+    /// its device status; a failed launch drains the device before the export
+    /// observer stops.
     fn execute_producer<E: std::error::Error + Send + Sync + 'static>(
         &mut self,
         plan: &mut GpuExecutionPlan,
         pump: &mut ProducerIoPump<'_, E>,
-        production: ProductionId,
-        manifest: Manifest,
+        frame: FrameGeneration,
     ) -> Result<GpuExecutionPayload, GpuRuntimeError> {
-        let frame = FrameGeneration::new(0, plan.completed_runs);
-        let planned = planned_export_slots(&plan.frame, &manifest, &production, frame)?;
-        let handles = finalized_export_handles(&plan.frame, &manifest, &production)?;
-        pump.start_export_observer(planned)
-            .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
-        let gpu_result = self.execute_producer_regions(plan, pump, frame);
-        if gpu_result.is_err() {
+        if let Err(error) = self.execute_producer_regions(plan, pump, frame) {
             plan.poisoned = true;
             self.backend.drain_uncertain_launches().map_err(|drain| {
                 GpuRuntimeError::LaunchUncertain(format!(
                     "failed GPU producer could not be drained before observer stop: {drain}"
                 ))
             })?;
-        }
-        let status_result = if gpu_result.is_ok() {
-            plan.frame
-                .control_resets
-                .iter()
-                .try_for_each(|control| control.check_completed())
-                .and_then(|()| check_preimage_replays(&plan.frame))
-                .map_err(GpuRuntimeError::DeviceStatus)
-        } else {
-            Ok(())
-        };
-        if status_result.is_err() {
-            plan.poisoned = true;
-        }
-        let observer_result = pump
-            .finish_export_observer(gpu_result.is_ok() && status_result.is_ok())
-            .map_err(|error| GpuRuntimeError::Artifact(error.to_string()));
-        if let Err(error) = gpu_result {
-            observer_result?;
             return Err(error);
         }
-        if let Err(error) = status_result {
-            observer_result?;
-            return Err(error);
-        }
-        if let Err(error) = observer_result {
+        if let Err(error) = plan
+            .frame
+            .control_resets
+            .iter()
+            .try_for_each(|control| control.check_completed())
+            .and_then(|()| check_preimage_replays(&plan.frame))
+        {
             plan.poisoned = true;
-            return Err(error);
+            return Err(GpuRuntimeError::DeviceStatus(error));
         }
-        let completion = match pump
-            .finalize(frame, manifest)
-            .map_err(|error| GpuRuntimeError::Session(error.to_string()))
-            .and_then(|request| {
-                request.wait().map_err(|error| GpuRuntimeError::Session(error.to_string()))
-            }) {
-            Ok(completion) => completion,
-            Err(error) => {
-                plan.poisoned = true;
-                return Err(error);
-            }
-        };
-        if !matches!(completion, IoCompletion::SessionFinalized { .. }) {
-            plan.poisoned = true;
-            return Err(GpuRuntimeError::Session(
-                "producer finalize returned wrong completion".into(),
-            ));
-        }
-        plan.completed_runs += 1;
         Ok(GpuExecutionPayload {
             outputs: returned_values(&plan.frame).map_err(GpuRuntimeError::Execution)?,
-            production_id: Some(production),
-            artifact_handles: handles,
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
         })
     }
 }

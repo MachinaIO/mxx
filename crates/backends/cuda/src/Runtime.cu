@@ -2012,6 +2012,10 @@ extern "C"
         {
             return set_error("GPU context has no compute stream for physical device");
         }
+        // Callers allocate on the stream or add Graph nodes that do not select
+        // a device themselves, so the stream's device becomes current.
+        if (mxx_set_device(physical_device) != cudaSuccess)
+            return set_error(cudaGetLastError());
         const size_t index = ctx->execution->next_compute_stream.fetch_add(
             1, std::memory_order_relaxed) %
             ctx->execution->compute_streams_by_partition[partition].size();

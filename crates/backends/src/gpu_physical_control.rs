@@ -902,6 +902,22 @@ pub(super) fn lower_control_node(
                 .ok_or_else(|| "GPU integer rhs has no physical value".to_owned())?;
             let a = integer_range(ctx, lhs)?;
             let b = integer_range(ctx, rhs)?;
+            // Operands with one possible value fold into a constant written
+            // when the plan is built, so no operation or binding remains.
+            let folded = match operation {
+                _ if a.start() != a.end() || b.start() != b.end() => None,
+                mxx_ir_core::node::IntBinaryOp::Add => Some(a.start() + b.start()),
+                mxx_ir_core::node::IntBinaryOp::Subtract => Some(a.start() - b.start()),
+                mxx_ir_core::node::IntBinaryOp::Multiply => Some(a.start() * b.start()),
+                _ => None,
+            };
+            if let Some(value) = folded {
+                let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+                let id =
+                    allocate_integer_value(ctx, ty, value.clone()..=value.clone(), Some(&value))?;
+                ctx.wire_ids.insert(output, id);
+                return Ok(());
+            }
             let range = integer_binary_output_range(*operation, &a, &b)?;
             let opcode = match operation {
                 mxx_ir_core::node::IntBinaryOp::Add => GpuIntegerOperation::Add,
@@ -1451,6 +1467,29 @@ pub(super) fn lower_control_node(
                 let range = lower
                     .ok_or_else(|| "GPU integer family has no lower bound".to_owned())?..=
                     upper.ok_or_else(|| "GPU integer family has no upper bound".to_owned())?;
+                // Members with one possible value each form a constant family,
+                // written once when the plan is built, with no per-member
+                // operation or binding.
+                let constants = ids
+                    .iter()
+                    .map(|id| {
+                        integer_range(ctx, *id).map(|range| {
+                            (range.start() == range.end()).then(|| range.start().clone())
+                        })
+                    })
+                    .collect::<Result<Option<Vec<_>>, _>>()?;
+                if let Some(constants) = constants {
+                    let id = allocate_integer_family_value_with_storage(
+                        ctx,
+                        expected,
+                        range,
+                        false,
+                        false,
+                        Some(&constants),
+                    )?;
+                    ctx.wire_ids.insert(output, id);
+                    return Ok(());
+                }
                 let id = allocate_integer_family_value(ctx, expected, range)?;
                 for (index, member) in ids.into_iter().enumerate() {
                     emit_integer_operation(
@@ -1640,7 +1679,8 @@ fn lower_hash_int_family(
     // A family below 2^64 is stored compactly, one word per member.
     let range = BigInt::from(0u8)..=modulus - 1u8;
     let canonical = range.end().bits() <= 64;
-    let family = allocate_integer_family_value_with_storage(ctx, ty, range, false, canonical)?;
+    let family =
+        allocate_integer_family_value_with_storage(ctx, ty, range, false, canonical, None)?;
     let binding = register_preimage_control_binding(ctx, family)?;
     let sample = push_hash_sample(ctx, resource_id, key, family, binding, &operands)?;
     ctx.producer.insert(family, vec![(ColumnRange { start: 0, end: 1 }, sample)]);
@@ -2464,7 +2504,7 @@ fn allocate_integer_family_value(
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
 ) -> Result<PhysicalValueId, String> {
-    allocate_integer_family_value_with_storage(ctx, ty, range, false, false)
+    allocate_integer_family_value_with_storage(ctx, ty, range, false, false, None)
 }
 
 /// A returned family is stored as `CanonicalU64` when `canonical` (its range
@@ -2475,18 +2515,20 @@ pub(super) fn allocate_return_integer_family_value(
     range: RangeInclusive<BigInt>,
     canonical: bool,
 ) -> Result<PhysicalValueId, String> {
-    allocate_integer_family_value_with_storage(ctx, ty, range, true, canonical)
+    allocate_integer_family_value_with_storage(ctx, ty, range, true, canonical, None)
 }
 
 /// `canonical` stores one `u64` word per member instead of a sign word and
 /// magnitude words; the range must then lie in `[0, 2^64)`. Only producers
-/// and consumers that read any one-word encoding may request it.
+/// and consumers that read any one-word encoding may request it. `constants`
+/// holds every member's value, written once when the plan is built.
 fn allocate_integer_family_value_with_storage(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
     returned: bool,
     canonical: bool,
+    constants: Option<&[BigInt]>,
 ) -> Result<PhysicalValueId, String> {
     let ConcreteWireType::IndexedFamily { element, count } = &ty else {
         return Err("GPU integer family allocation needs an indexed family".into());
@@ -2508,8 +2550,14 @@ fn allocate_integer_family_value_with_storage(
         GpuSignedValuesEncoding::SignedWords(words)
     };
     let owner = Arc::new(
-        GpuSignedValues::allocate(&params, ctx.device, count, encoding)
-            .map_err(|error| error.to_string())?,
+        match constants {
+            Some(values) if !canonical && values.len() == count => {
+                GpuSignedValues::from_bigints_with_words(&params, ctx.device, values, words)
+            }
+            Some(_) => return Err("GPU constant family differs from its layout".into()),
+            None => GpuSignedValues::allocate(&params, ctx.device, count, encoding),
+        }
+        .map_err(|error| error.to_string())?,
     );
     let element_words = encoding.words_per_value();
     let stride = u64::try_from(

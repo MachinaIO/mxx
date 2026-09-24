@@ -1,7 +1,7 @@
 //! BGV graph builders with RNS hybrid key switching and modulus reduction.
 use crate::{
     FheCommonParams, FheError, FheScheme,
-    utils::{self, check_family, check_matrix, is_prime, pow_mod},
+    utils::{self, check_matrix, is_prime, pow_mod},
 };
 use mxx_backends::{
     poly::{
@@ -473,14 +473,10 @@ impl FheScheme for BgvParams {
     /// A single integer occupies slot zero rather than being broadcast.
     fn encrypt(&self, key: &Mat, slots: &Family<Int>) -> Result<BgvCiphertext, FheError> {
         utils::check_matrix(&self.common.ring, key, 2, 1)?;
-        let coefficients = self.encode_slots(slots)?;
-        // Slot values are coefficients in R_t. Reconstruct that polynomial first,
-        // then lift its centered coefficients to R_Q; the two rings have
-        // different NTT roots, so lifting the evaluations would be incorrect.
-        let message =
-            utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
-                .from_coefficients(&coefficients)
-                .centered_rebase(&self.common.ring());
+        // Slot values are evaluations of a polynomial in R_t. Lift its centered
+        // coefficients to R_Q; the two rings have different NTT roots, so
+        // lifting the evaluations would be incorrect.
+        let message = self.encode_slots(slots)?.centered_rebase(&self.common.ring());
         let u = self.common.sample_secret();
         let t = utils::scalar(&self.common.ring, self.plaintext_modulus);
         // The phase noise is e_pk*u + e_b - s*e_a. Both secret polynomials
@@ -515,7 +511,7 @@ impl FheScheme for BgvParams {
             params.ring_dimension(),
         )) * utils::plaintext_ring(self.plaintext_modulus, params.ring_dimension())
             .polynomial([IntExpr::constant(inverse)]);
-        self.decode_slots(&plaintext.coefficients())
+        self.decode_slots(&plaintext)
     }
     fn add(&self, lhs: &BgvCiphertext, rhs: &BgvCiphertext) -> Result<BgvCiphertext, FheError> {
         let rows = self.ciphertext_rows(lhs)?;
@@ -598,8 +594,9 @@ impl BgvParams {
             .collect())
     }
 
-    /// Encodes row-major slots through the primitive inverse NTT at modulus t.
-    fn encode_slots(&self, slots: &Family<Int>) -> Result<Family<Int>, FheError> {
+    /// Encodes row-major slots as the plaintext polynomial in R_t, through the
+    /// primitive inverse NTT at modulus t.
+    fn encode_slots(&self, slots: &Family<Int>) -> Result<Mat, FheError> {
         let n = self.common.ring.ring_dimension() as usize;
         let count = slots
             .count()
@@ -610,9 +607,13 @@ impl BgvParams {
             .ok_or(FheError::ShapeMismatch)?;
         // Padding at graph construction needs no runtime length or ciphertext
         // metadata. Decryption always returns N slots, also after rotations.
-        let slots = Family::pack(
-            (0..n).map(|i| if i < count { slots.at(i) } else { Int::constant(0) }).collect(),
-        )?;
+        let slots = if count == n {
+            slots.clone()
+        } else {
+            Family::pack(
+                (0..n).map(|i| if i < count { slots.at(i) } else { Int::constant(0) }).collect(),
+            )?
+        };
         let mut inverse = vec![0; n];
         for (slot, native) in self.batching_indices()?.into_iter().enumerate() {
             inverse[native] = slot;
@@ -620,20 +621,16 @@ impl BgvParams {
         let indices = Family::pack(inverse.into_iter().map(Int::constant).collect())?;
         let native = parallel(n, |i| Ok(slots.at(indices.at(i))))?;
         Ok(utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
-            .from_evaluations(&native)
-            .coefficients())
+            .from_evaluations(&native))
     }
 
-    /// Decodes coefficients through the primitive forward NTT at modulus t.
-    fn decode_slots(&self, coefficients: &Family<Int>) -> Result<Family<Int>, FheError> {
+    /// Decodes the row-major slots of a plaintext polynomial in R_t through the
+    /// primitive forward NTT at modulus t.
+    fn decode_slots(&self, plaintext: &Mat) -> Result<Family<Int>, FheError> {
         let n = self.common.ring.ring_dimension() as usize;
-        check_family(coefficients, n)?;
         let indices =
             Family::pack(self.batching_indices()?.into_iter().map(Int::constant).collect())?;
-        let native =
-            utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
-                .from_coefficients(coefficients)
-                .evaluations();
+        let native = plaintext.evaluations();
         Ok(parallel(n, |i| Ok(native.at(indices.at(i))))?)
     }
 
@@ -1425,10 +1422,10 @@ mod simd_tests {
         let slots = (0..n).map(|i| i as i64).collect::<Vec<_>>();
         let context = DslContext::new("fhe-simd-encoding");
         let input = context.int_family_input("slots", n);
-        let coefficients = bgv.encode_slots(&input).unwrap();
-        let decoded = bgv.decode_slots(&coefficients).unwrap();
+        let plaintext = bgv.encode_slots(&input).unwrap();
+        let decoded = bgv.decode_slots(&plaintext).unwrap();
         let graph = context
-            .transferred_output("coefficients", coefficients)
+            .transferred_output("coefficients", plaintext.coefficients())
             .unwrap()
             .transferred_output("slots", decoded)
             .unwrap()

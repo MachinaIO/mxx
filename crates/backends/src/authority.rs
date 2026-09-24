@@ -110,7 +110,7 @@ mod gpu {
         S: SessionStore + Send,
     {
         type Prepared = GpuExecutionPlan;
-        type Result<'a> = crate::gpu_runtime::GpuExecutionResult<'a>;
+        type Result<'a> = crate::gpu_runtime::GpuExecutionResult;
 
         fn prepare(
             &mut self,
@@ -127,7 +127,7 @@ mod gpu {
             store: &mut S,
             execution_nonce: [u8; 32],
         ) -> Result<Self::Result<'a>, String> {
-            self.execute(prepared, inputs, store, execution_nonce)
+            self.execute_with_artifacts(prepared, inputs, store, execution_nonce)
                 .map_err(|error| error.to_string())
         }
     }

@@ -104,22 +104,21 @@ struct GpuExecutionPayload {
     artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
 }
 
-/// Outputs borrow the executed plan. A further execution may overwrite every
-/// resident output; explicitly download or copy the needed data first.
-pub struct GpuExecutionResult<'plan> {
+/// The outputs of one execute, keyed by their graph names; a composite
+/// output is one `RuntimeValue::Composite`. Outputs are owned: a later execute
+/// of the same plan writes into fresh storage while a caller keeps them.
+pub struct GpuExecutionResult {
     outputs: BTreeMap<String, RuntimeValue>,
     pub production_id: Option<ProductionId>,
     pub artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
-    _plan: std::marker::PhantomData<&'plan mut GpuExecutionPlan>,
 }
 
-/// A non-cloneable view of one output. The resident owner cannot escape the
-/// plan borrow through this public API.
+/// A view of one output for downloads and type inspection.
 pub struct GpuOutputRef<'a> {
     value: &'a RuntimeValue,
 }
 
-impl<'plan> GpuExecutionResult<'plan> {
+impl GpuExecutionResult {
     #[cfg(test)]
     pub(crate) fn output_value_for_test(&self, name: &str) -> Option<&RuntimeValue> {
         self.outputs.get(name)
@@ -131,6 +130,18 @@ impl<'plan> GpuExecutionResult<'plan> {
 
     pub fn output_names(&self) -> impl Iterator<Item = &str> {
         self.outputs.keys().map(String::as_str)
+    }
+
+    pub fn into_outputs(self) -> BTreeMap<String, RuntimeValue> {
+        self.outputs
+    }
+}
+
+impl std::ops::Index<&str> for GpuExecutionResult {
+    type Output = RuntimeValue;
+
+    fn index(&self, name: &str) -> &RuntimeValue {
+        self.outputs.get(name).unwrap_or_else(|| panic!("no GPU output named {name}"))
     }
 }
 
@@ -567,8 +578,14 @@ impl DirectGraph {
                 .map_err(|error| {
                 GpuPlanError::GraphCompile(format!("region operations {start}..{end}: {error}"))
             })?;
-            let executable =
+            let mut executable =
                 builder.finish().map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
+            // Upload the executable now, so its first production launch does
+            // not pay the device-side graph setup.
+            let launch_stream = executable.launch_stream().clone();
+            executable
+                .upload(&launch_stream)
+                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
             let peer_streams = peer_devices
                 .iter()
                 .map(|&device| device_launch_stream(backend, device))
@@ -1176,26 +1193,6 @@ impl GpuRuntime {
         &self.measured_costs
     }
 
-    /// Copy an output into storage owned by the returned value, so it stays
-    /// valid after the next execute of its plan and can be bound as another
-    /// plan's input. Device outputs are copied on the device.
-    pub fn copy_output(&self, output: &GpuOutputRef<'_>) -> Result<RuntimeValue, GpuRuntimeError> {
-        let copy = |resident: &Arc<crate::backend::GpuResidentValue>| {
-            resident.deep_copy(&self.backend).map(Arc::new).map_err(GpuRuntimeError::Execution)
-        };
-        Ok(match output.value {
-            RuntimeValue::Resident(resident) => RuntimeValue::Resident(copy(resident)?),
-            RuntimeValue::Matrix(matrix) => match matrix.as_gpu() {
-                Some(resident) => RuntimeValue::Matrix(
-                    crate::backend::PolyMatrix::gpu(matrix.wire_type().clone(), copy(resident)?)
-                        .map_err(|error| GpuRuntimeError::Execution(error.to_owned()))?,
-                ),
-                None => output.value.clone(),
-            },
-            host => host.clone(),
-        })
-    }
-
     pub fn download_integer_family_output(
         &self,
         output: &GpuOutputRef<'_>,
@@ -1462,12 +1459,62 @@ impl GpuRuntime {
         })?;
         Ok(bytes)
     }
+    /// Freeze a plan for `graph` (a validated graph, or a built DSL graph
+    /// validated here) against example `inputs`. A composite input value
+    /// binds every leaf its graph declares.
     pub fn plan(
         &mut self,
-        validated: ValidatedGraph,
+        graph: impl mxx_ir_core::IntoValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue>,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
-        self.plan_with_payload_sizes(validated, inputs, &BTreeMap::new(), None)
+        let validated = graph
+            .into_validated_graph(crate::openfhe_guard::gen_modulus_and_warmup)
+            .map_err(GpuPlanError::InvalidInput)?;
+        let inputs = crate::backend::expand_composite_values(inputs.clone());
+        let inputs = self.distinct_planning_inputs(inputs).map_err(GpuPlanError::InvalidInput)?;
+        self.plan_with_payload_sizes(validated, &inputs, &BTreeMap::new(), None)
+    }
+
+    /// Input rebinding redirects every plan value viewing an input's planning
+    /// allocation, so two inputs must not plan on one allocation (e.g. the same
+    /// example ciphertext for both operands). A repeated resident allocation is
+    /// planned on a device copy.
+    fn distinct_planning_inputs(
+        &self,
+        inputs: BTreeMap<String, RuntimeValue>,
+    ) -> Result<BTreeMap<String, RuntimeValue>, String> {
+        let mut seen = std::collections::HashSet::new();
+        inputs
+            .into_iter()
+            .map(|(name, value)| {
+                let resident = match &value {
+                    RuntimeValue::Resident(resident) => Some(Arc::clone(resident)),
+                    RuntimeValue::Matrix(matrix) => matrix.as_gpu().cloned(),
+                    _ => None,
+                };
+                let Some(resident) = resident else {
+                    return Ok((name, value));
+                };
+                let shared = resident
+                    .storages()
+                    .map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .fold(false, |shared, pointer| !seen.insert(pointer) || shared);
+                if !shared {
+                    return Ok((name, value));
+                }
+                let copy = Arc::new(resident.deep_copy(&self.backend)?);
+                let value = match value {
+                    RuntimeValue::Matrix(matrix) => RuntimeValue::Matrix(
+                        crate::backend::PolyMatrix::gpu(matrix.wire_type().clone(), copy)
+                            .map_err(str::to_owned)?,
+                    ),
+                    _ => RuntimeValue::Resident(copy),
+                };
+                Ok((name, value))
+            })
+            .collect()
     }
 
     /// Exercise a particular physical tile width through the production
@@ -1830,19 +1877,43 @@ impl GpuRuntime {
     /// Execute into plan-owned reusable storage. The returned borrow prevents
     /// another execute until the caller has downloaded or copied the outputs.
     /// Scratch may be reused only after the prior GPU and artifact I/O join.
-    pub fn execute<'plan, S: SessionStore + Send>(
+    /// Execute `plan` on `inputs` with fresh sampling randomness. A composite
+    /// input binds every leaf its graph declares. Plans that import or export
+    /// artifacts use `execute_with_artifacts`.
+    pub fn execute(
         &mut self,
-        plan: &'plan mut GpuExecutionPlan,
+        plan: &mut GpuExecutionPlan,
+        inputs: BTreeMap<String, RuntimeValue>,
+    ) -> Result<GpuExecutionResult, GpuRuntimeError> {
+        let frame = &plan.frame;
+        if !frame.import_templates.is_empty() ||
+            !frame.export_templates.is_empty() ||
+            !frame.external_io_imports.is_empty() ||
+            !frame.external_io_loops.is_empty()
+        {
+            return Err(GpuRuntimeError::Execution(
+                "a plan with artifact inputs or outputs runs through execute_with_artifacts".into(),
+            ));
+        }
+        let mut store = crate::MemoryArtifactStore::default();
+        self.execute_with_artifacts(plan, inputs, &mut store, rand::random())
+    }
+
+    /// Execute `plan` with an artifact `store` for its artifact inputs and
+    /// outputs and an explicit `execution_nonce` for its sampling randomness.
+    pub fn execute_with_artifacts<S: SessionStore + Send>(
+        &mut self,
+        plan: &mut GpuExecutionPlan,
         inputs: BTreeMap<String, RuntimeValue>,
         store: &mut S,
         execution_nonce: [u8; 32],
-    ) -> Result<GpuExecutionResult<'plan>, GpuRuntimeError> {
+    ) -> Result<GpuExecutionResult, GpuRuntimeError> {
+        let inputs = crate::backend::expand_composite_values(inputs);
         let payload = self.execute_inner(plan, inputs, store, execution_nonce)?;
         Ok(GpuExecutionResult {
-            outputs: payload.outputs,
+            outputs: crate::backend::group_composite_values(payload.outputs),
             production_id: payload.production_id,
             artifact_handles: payload.artifact_handles,
-            _plan: std::marker::PhantomData,
         })
     }
 
@@ -1862,12 +1933,14 @@ impl GpuRuntime {
         if self.backend.execution_identity() != plan.backend_execution_identity {
             return Err(GpuRuntimeError::StalePlan);
         }
+        // Held outputs move to fresh storage before inputs rebind, so an input
+        // that is a previous output of this plan keeps its own storage.
+        plan.frame.bind_return_outputs(&self.backend).map_err(GpuRuntimeError::Execution)?;
         plan.frame.rebind_inputs(&inputs).map_err(|error| {
             GpuRuntimeError::Execution(format!("input rebinding failed: {error}"))
         })?;
         upload_bytes_inputs(&plan.frame, &inputs).map_err(GpuRuntimeError::Execution)?;
         wait_for_bound_inputs(&plan.frame).map_err(GpuRuntimeError::Execution)?;
-        plan.frame.bind_return_outputs(&self.backend).map_err(GpuRuntimeError::Execution)?;
 
         if plan.completed_runs > 0 {
             for slot in &plan.frame.slots {

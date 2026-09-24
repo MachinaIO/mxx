@@ -1738,7 +1738,12 @@ fn end_to_end_processing(
             let started = Instant::now();
             let launches_before = prepared.compiled_launch_count();
             let production = preprocessing_runtime
-                .execute(&mut prepared, preprocessing_inputs, &mut preprocessing_store, [0x71; 32])
+                .execute_with_artifacts(
+                    &mut prepared,
+                    preprocessing_inputs,
+                    &mut preprocessing_store,
+                    [0x71; 32],
+                )
                 .map_err(|error| error.to_string())?
                 .production_id;
             if prepared.compiled_launch_count() <= launches_before {
@@ -1830,7 +1835,7 @@ fn end_to_end_processing(
     );
     let launches_before = prepared_encoding.compiled_launch_count();
     let encoding_result = runtime
-        .execute(&mut prepared_encoding, inputs, &mut store, [0; 32])
+        .execute_with_artifacts(&mut prepared_encoding, inputs, &mut store, [0; 32])
         .map_err(|error| error.to_string())?;
     let encoding_rows = matrix_family_output(&encoding_result, "encoding_rows", &runtime)?;
     let output_plaintexts = matrix_family_output(&encoding_result, "output_plaintexts", &runtime)?;

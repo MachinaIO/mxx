@@ -5907,12 +5907,23 @@ fn concat_piece_writers(
         })
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
-    // Every aliasing value is a view of the piece with its strides.
+    // Every aliasing value is a view within the piece with its strides; a
+    // piece that is itself a view into a larger value (one row of a product)
+    // does not move.
+    let end = |part: &crate::gpu_execution_plan::PhysicalPart| {
+        part.view.extent.iter().zip(part.view.byte_strides.iter()).try_fold(
+            part.view.byte_offset + u64::from(part.view.element_bytes),
+            |end, (&extent, &stride)| extent.checked_sub(1)?.checked_mul(stride)?.checked_add(end),
+        )
+    };
     if aliases.iter().any(|id| {
         let alias = &ctx.values[id.0 as usize];
         alias.parts.len() != value.parts.len() ||
             alias.parts.iter().zip(value.parts.iter()).any(|(alias, own)| {
-                alias.storage != own.storage || alias.view.byte_strides != own.view.byte_strides
+                alias.storage != own.storage ||
+                    alias.view.byte_strides != own.view.byte_strides ||
+                    end(alias).is_none() ||
+                    end(alias) > end(own)
             })
     }) {
         return None;
@@ -8193,8 +8204,9 @@ mod tests {
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
         for _ in 0..2 {
-            let result =
-                runtime.execute(&mut plan, BTreeMap::new(), &mut store, [0x29; 32]).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x29; 32])
+                .unwrap();
             assert_eq!(
                 runtime.download_integer_family_output(&result.output("sum").unwrap()).unwrap(),
                 vec![BigInt::from(5)],
@@ -8229,8 +8241,9 @@ mod tests {
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
         for _ in 0..2 {
-            let result =
-                runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
             assert_eq!(
                 runtime.download_integer_family_output(&result.output("power").unwrap()).unwrap(),
                 vec![step.pow(3)],
@@ -8301,7 +8314,8 @@ mod tests {
         ranges.insert("v".into(), BigInt::from(0)..=BigInt::from(16));
         let mut plan = runtime.plan(validated, &inputs).unwrap();
         let mut store = MemoryArtifactStore::default();
-        let result = runtime.execute(&mut plan, inputs, &mut store, rand::random()).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, rand::random()).unwrap();
         for name in ["gathered", "eval_coeff", "eval_eval", "coeff_eval", "coeff_coeff"] {
             let RuntimeValue::IndexedFamily { values: expected, .. } =
                 cpu.materialize_output(name, &cpu_backend, &mut cpu_store).unwrap()
@@ -8483,7 +8497,7 @@ mod tests {
         for (replay, offset) in [0usize, 20].into_iter().enumerate() {
             let mut store = MemoryArtifactStore::default();
             let result = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut plan,
                     BTreeMap::from([("source".into(), resident(offset))]),
                     &mut store,
@@ -8561,7 +8575,8 @@ mod tests {
         assert!((1..=2).contains(&stage.wave_instances));
         assert!(stage.columns_per_job.iter().all(|width| *width > 0));
         let mut store = MemoryArtifactStore::default();
-        let result = runtime.execute(&mut plan, inputs, &mut store, rand::random()).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, rand::random()).unwrap();
         let family = result.output("sum").unwrap();
         for index in 0..3 {
             let actual = runtime.download_matrix_member_output(&family, index).unwrap();
@@ -8657,7 +8672,7 @@ mod tests {
         let expected = (left.clone() * &right) + &(left * &right);
         for replay in 0..2u8 {
             let result = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut plan,
                     inputs.clone(),
                     &mut MemoryArtifactStore::default(),
@@ -8729,7 +8744,8 @@ mod tests {
         let mut plan = runtime.plan(validated, &inputs).unwrap();
         assert!((1..=2).contains(&plan.report().stages[0].wave_instances));
         let mut store = MemoryArtifactStore::default();
-        let result = runtime.execute(&mut plan, inputs, &mut store, [0x73; 32]).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0x73; 32]).unwrap();
         let production = result.production_id.expect("family production identity");
         assert_eq!(result.artifact_handles["sum"].len(), 3);
         let manifest = store.load_finalized_manifest(&production).unwrap();
@@ -8859,7 +8875,7 @@ mod tests {
         for replay in 0..2 {
             let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
             let consumed = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut consumer_plan,
                     BTreeMap::from([("initial".into(), initial_value.clone())]),
                     &mut store,
@@ -8917,7 +8933,7 @@ mod tests {
             .unwrap();
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
         let error = runtime
-            .execute(
+            .execute_with_artifacts(
                 &mut bad_plan,
                 BTreeMap::from([("initial".into(), initial_value)]),
                 &mut store,

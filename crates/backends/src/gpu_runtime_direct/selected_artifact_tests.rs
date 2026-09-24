@@ -103,8 +103,9 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
 
     for (replay, index) in [2, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
-        let result =
-            runtime.execute(&mut plan, bind(index), &mut store, [0x61 + replay as u8; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, bind(index), &mut store, [0x61 + replay as u8; 32])
+            .unwrap();
         let matrix = runtime
             .download_matrix_output(&result.output("selected").expect("selected output"))
             .unwrap();
@@ -250,8 +251,9 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
-        let result =
-            runtime.execute(&mut plan, bind(index), &mut store, [0x81 + replay as u8; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, bind(index), &mut store, [0x81 + replay as u8; 32])
+            .unwrap();
         assert_eq!(
             runtime
                 .download_bytes_output(&result.output("selected").expect("selected output"))
@@ -387,8 +389,9 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
-        let result =
-            runtime.execute(&mut plan, bind(index), &mut store, [0xa1 + replay as u8; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, bind(index), &mut store, [0xa1 + replay as u8; 32])
+            .unwrap();
         assert_eq!(
             runtime
                 .download_integer_family_output(
@@ -510,8 +513,9 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     for (replay, index) in [1, 0].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
         {
-            let result =
-                runtime.execute(&mut plan, bind(index), &mut store, rand::random()).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, bind(index), &mut store, rand::random())
+                .unwrap();
             assert!(result.output("selected").is_some(), "selected trapdoor output");
         }
         let frame = plan.physical_frame_for_test();

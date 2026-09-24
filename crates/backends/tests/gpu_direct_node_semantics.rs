@@ -112,8 +112,9 @@ fn run_shape_case_on(
         .map(|node| node.columns_per_job.iter().filter(|width| **width > 0).count())
         .max()
         .unwrap_or(0);
-    let result =
-        runtime.execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [7; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, bindings, &mut MemoryArtifactStore::default(), [7; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input));
     devices
@@ -202,8 +203,9 @@ fn run_crt_case_with_prime(
     let bindings = BTreeMap::from([("source".to_owned(), value)]);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_full, gpu_single])).unwrap();
     let mut plan = runtime.plan(graph, &bindings).unwrap();
-    let result =
-        runtime.execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [9; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, bindings, &mut MemoryArtifactStore::default(), [9; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input, destination));
 }
@@ -271,7 +273,7 @@ fn run_manual_matrix_case(
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
     let mut plan = runtime.plan(graph, &bindings).unwrap();
     let result = runtime
-        .execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [11; 32])
+        .execute_with_artifacts(&mut plan, bindings, &mut MemoryArtifactStore::default(), [11; 32])
         .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input));
@@ -520,7 +522,12 @@ fn multiply_monomial_matches_cpu_for_runtime_exponents() {
     let period = 2 * parameters.ring_dimension() as i64;
     for k in [0, 1, 3, 7, 8, 9, 15, -1, -9, 1 << 35, -(1 << 35) - 5] {
         let result = runtime
-            .execute(&mut plan, bind(k), &mut MemoryArtifactStore::default(), [5; 32])
+            .execute_with_artifacts(
+                &mut plan,
+                bind(k),
+                &mut MemoryArtifactStore::default(),
+                [5; 32],
+            )
             .unwrap();
         let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
         let expected = input.multiply_monomial_out_of_place(k.rem_euclid(period) as usize);
@@ -808,7 +815,7 @@ fn run_loop_index_matrix_scale_case_impl(
     let mut plan = runtime.plan(graph, &bind(&first)).unwrap();
     let replays = if expected_scalar.is_none() { vec![first] } else { vec![first, second] };
     for (replay, matrix) in replays.into_iter().enumerate() {
-        let result = runtime.execute(
+        let result = runtime.execute_with_artifacts(
             &mut plan,
             bind(&matrix),
             &mut MemoryArtifactStore::default(),
@@ -1054,8 +1061,9 @@ fn crt_recompose_matches_independent_cpu_formula() {
     ]);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_full, gpu_left, gpu_right])).unwrap();
     let mut plan = runtime.plan(graph, &inputs).unwrap();
-    let result =
-        runtime.execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [13; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), [13; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values("CRT recompose", &actual, &expected);
 }
@@ -1097,8 +1105,9 @@ fn hash_sample_matches_cpu_for_fixed_key_and_tag() {
     let inputs = BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from(key)))]);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
     let mut plan = runtime.plan(graph, &inputs).unwrap();
-    let result =
-        runtime.execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [17; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), [17; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values("hash sample", &actual, &expected);
 }

@@ -44,7 +44,7 @@ TFHE implements NAND bootstrapping; BGV is leveled and has no bootstrapping.
 | `BgvCiphertext` | Components are descending coefficients in `-s`: `(a,b)` for ordinary ciphertexts or three rows before relinearization. `correction_factor` tracks the plaintext multiplier modulo t, while `noise_bound` tracks coefficient noise. |
 
 TFHE `encrypt(secret, bit, hash_key)` and `decrypt(secret, ciphertext)` work on
-single bits. `nand(lhs, rhs, accumulator, bootstrapping_key, key_switch_key)`
+single bits. `nand(lhs, rhs, bootstrapping_key, key_switch_key)`
 forms `nand_input` (`floor(q/8) - ct1 - ct2`) and bootstraps it with the
 `nand_accumulator` sign LUT. `bootstrap` runs four public stages that can also
 be built as separate graphs: `pre_blind_rotation`, `blind_rotation` (one
@@ -133,9 +133,11 @@ Start with the runtime unit tests in `crates/fhe/src/tfhe.rs` (NAND truth
 tables and LWE round trips) and `crates/fhe/src/bgv.rs` (slot arithmetic,
 measured noise, and staged evaluation). `crates/fhe/src/tests_gpu.rs` executes
 the BGV production graphs on GPU, including a public evaluator that receives no
-secret key. The integration test `crates/fhe/tests/gpu_tfhe.rs` runs TFHE NAND
-bootstrapping on GPU with fixed 128-bit-target parameters, one plan per
-bootstrap stage and keys kept resident between plans. The BGV design and
+secret key. The integration test `crates/fhe/tests/gpu_tfhe.rs` is a TFHE round trip on
+GPU with the standard TFHE Boolean profile (`utils::tfhe_params`): it
+generates keys, encrypts bits, evaluates the NAND truth table and chained
+bootstrapped gates, and decrypts every result, with keys kept resident
+between plans. The BGV design and
 formulas are documented in `docs/plans/fhe.md`.
 
 ```sh

@@ -1,10 +1,7 @@
 //! GPU execution of the production FHE graphs; all artifacts stay in memory.
 use crate::{
     BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme,
-    utils::{
-        common,
-        gpu::{copy_outputs, integers},
-    },
+    utils::{common, gpu::integers},
 };
 use mxx_backends::{
     GpuRuntime, MemoryArtifactStore, RuntimeValue,
@@ -49,7 +46,7 @@ fn test_gpu_integer_family_permutation_across_waves() {
     let inputs = BTreeMap::from([("values".into(), input(&input_values))]);
     let mut plan = runtime.plan(graph, &inputs).unwrap();
     let mut store = MemoryArtifactStore::default();
-    let result = runtime.execute(&mut plan, inputs, &mut store, [0; 32]).unwrap();
+    let result = runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0; 32]).unwrap();
     assert_eq!(
         runtime.download_integer_family_output(&result.output("result").unwrap()).unwrap(),
         input_values.iter().rev().map(|value| BigInt::from(*value)).collect::<Vec<_>>()
@@ -72,8 +69,7 @@ fn backend(common: &FheCommonParams, bgv: Option<&BgvParams>) -> GpuDcrtBackend 
     gpu_backend(gpu_parameters(common, bgv))
 }
 
-/// Execute once and copy every output out of the plan, as a caller must
-/// before the plan's storage can be reused.
+/// Execute once and return every output with the production id.
 fn prepare_and_run(
     graph: mxx_ir_core::ValidatedGraph,
     runtime: &mut GpuRuntime,
@@ -82,10 +78,11 @@ fn prepare_and_run(
 ) -> (BTreeMap<String, RuntimeValue>, Option<mxx_ir_core::artifact::ProductionId>) {
     let mut plan = runtime.plan(graph, &inputs).expect("prepare FHE GPU graph");
     let launches_before = plan.compiled_launch_count();
-    let result = runtime.execute(&mut plan, inputs, store, [0; 32]).expect("execute FHE GPU graph");
-    let outputs = copy_outputs(runtime, &result);
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, store, [0; 32])
+        .expect("execute FHE GPU graph");
     let production_id = result.production_id.clone();
-    drop(result);
+    let outputs = result.into_outputs();
     assert!(
         plan.compiled_launch_count() > launches_before,
         "FHE GPU execution must submit the compiled production path"
@@ -139,7 +136,8 @@ fn test_gpu_compiled_matrix_product_rebinds_sources() {
         coefficients[0] = coefficient;
         let inputs = BTreeMap::from([("values".into(), input(&coefficients))]);
         let launches = plan.compiled_launch_count();
-        let result = runtime.execute(&mut plan, inputs, &mut store, [0; 32]).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0; 32]).unwrap();
         let modulus = BigInt::from(common.ring.modulus().as_ref().clone());
         let mut expected = vec![BigInt::from(0); n];
         expected[0] = BigInt::from(coefficient).mod_floor(&modulus);

@@ -942,17 +942,17 @@ impl TfheParams {
         self.key_switch(&extracted, key_switch_key)
     }
 
-    /// NANDs two encrypted bits using `Δ - ct1 - ct2` and the sign accumulator.
+    /// NANDs two encrypted bits: bootstraps the phase `Δ - ct1 - ct2` with
+    /// the sign accumulator of `nand_accumulator`.
     pub fn nand(
         &self,
         lhs: &LweCiphertext,
         rhs: &LweCiphertext,
-        accumulator: &Mat,
         bootstrapping_key: &BootstrappingKey,
         key_switch_key: &KeySwitchKey,
     ) -> Result<LweCiphertext, FheError> {
         let input = self.nand_input(lhs, rhs)?;
-        self.bootstrap(&input, accumulator, bootstrapping_key, key_switch_key)
+        self.bootstrap(&input, &self.nand_accumulator(), bootstrapping_key, key_switch_key)
     }
 
     fn validate_lwe(
@@ -1255,12 +1255,9 @@ mod tests {
         let lhs = input_ciphertext(&context, "lhs", &parameters);
         let rhs = input_ciphertext(&context, "rhs", &parameters);
         let true_value = input_ciphertext(&context, "true", &parameters);
-        let accumulator = parameters.nand_accumulator();
-        let first =
-            parameters.nand(&lhs, &rhs, &accumulator, &bootstrapping_key, &key_switch_key).unwrap();
-        let repeated = parameters
-            .nand(&first, &true_value, &accumulator, &bootstrapping_key, &key_switch_key)
-            .unwrap();
+        let first = parameters.nand(&lhs, &rhs, &bootstrapping_key, &key_switch_key).unwrap();
+        let repeated =
+            parameters.nand(&first, &true_value, &bootstrapping_key, &key_switch_key).unwrap();
         let graph = context
             .output("nand", parameters.decrypt(&lwe_secret, &first).unwrap())
             .unwrap()
@@ -1419,10 +1416,8 @@ mod tests {
         let right_hash_key = ring.bytes_input("right-hash-key", 32);
         let left = parameters.encrypt(&keys.lwe_secret, &left_message, &left_hash_key).unwrap();
         let right = parameters.encrypt(&keys.lwe_secret, &right_message, &right_hash_key).unwrap();
-        let accumulator = parameters.nand_accumulator();
-        let output = parameters
-            .nand(&left, &right, &accumulator, &keys.bootstrapping_key, &keys.key_switch_key)
-            .unwrap();
+        let output =
+            parameters.nand(&left, &right, &keys.bootstrapping_key, &keys.key_switch_key).unwrap();
         let decrypted = parameters.decrypt(&keys.lwe_secret, &output).unwrap();
         let graph = context.output("nand", decrypted).unwrap().build().unwrap();
 

@@ -128,6 +128,11 @@ pub(crate) struct PhysicalFrame {
     pub waves: Vec<PhysicalWave>,
     pub external_io_loops: Vec<ExternalIoLoop>,
     pub external_io_imports: Vec<ExternalIoImport>,
+    /// One caller handle per output, reused while the output's plan owner is
+    /// unchanged (keyed by that owner's address). A handle with another strong
+    /// reference is held by a caller: the next execute writes that output into
+    /// fresh storage and drops the handle.
+    pub output_handles: std::sync::Mutex<BTreeMap<PhysicalValueId, (usize, Arc<GpuResidentValue>)>>,
 }
 
 pub(crate) struct SampleSeed {
@@ -914,7 +919,53 @@ impl PhysicalFrame {
     /// Keep plan-owned output storage bound across replays. The public API
     /// borrows results from this plan, so a subsequent execute may overwrite
     /// these exact owners after the previous GPU/I/O completion gate.
-    pub(crate) fn bind_return_outputs(&mut self, _backend: &GpuDcrtBackend) -> Result<(), String> {
+    pub(crate) fn bind_return_outputs(&mut self, backend: &GpuDcrtBackend) -> Result<(), String> {
+        // Outputs still held by a caller (a kept result, or one bound as an
+        // input of this very execute) move to fresh storage, together with
+        // every plan value viewing their old allocations.
+        let held = {
+            let mut handles =
+                self.output_handles.lock().map_err(|_| "GPU output handles are poisoned")?;
+            let held = handles
+                .iter()
+                .filter(|(_, (_, handle))| Arc::strong_count(handle) > 1)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for id in &held {
+                handles.remove(id);
+            }
+            held
+        };
+        if held.is_empty() {
+            return self.check_return_outputs();
+        }
+        let mut replaced = std::collections::HashMap::new();
+        for id in &held {
+            let owner = self.owners.get(id).ok_or("GPU held output has no owner")?;
+            for (_, bound) in owner.storages() {
+                let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+                if replaced.contains_key(&pointer) {
+                    continue;
+                }
+                let parameters = backend.control_parameters_on_device(bound.device)?;
+                let bytes = usize::try_from(bound.bytes)
+                    .map_err(|_| "GPU output storage exceeds host address space".to_owned())?;
+                let fresh = Arc::new(
+                    crate::poly::dcrt::gpu::GpuDeviceBytes::new(&parameters, bound.device, bytes)
+                        .map_err(|error| error.to_string())?,
+                );
+                replaced.insert(pointer, crate::backend::BoundStorage::from_device_bytes(fresh)?);
+            }
+        }
+        for owner in self.owners.values_mut() {
+            if let Some(rebound) = owner.rebound(&replaced, &[]).map_err(str::to_owned)? {
+                *owner = Arc::new(rebound);
+            }
+        }
+        self.check_return_outputs()
+    }
+
+    fn check_return_outputs(&self) -> Result<(), String> {
         for id in self.output_ids.values() {
             let planned =
                 self.program.values.get(id.0 as usize).ok_or_else(|| {
@@ -943,6 +994,8 @@ impl PhysicalFrame {
 
     /// Call only after the compiled Graph completion event has succeeded.
     pub(crate) fn output_values(&self) -> Result<BTreeMap<String, RuntimeValue>, String> {
+        let mut handles =
+            self.output_handles.lock().map_err(|_| "GPU output handles are poisoned")?;
         self.output_ids
             .iter()
             .map(|(name, id)| {
@@ -957,11 +1010,25 @@ impl PhysicalFrame {
                     .ok_or_else(|| format!("GPU output {name} has no physical metadata"))?
                     .ty
                     .clone();
+                // The caller gets the output's handle, whose reference count
+                // the next execute checks before overwriting this storage.
+                let key = Arc::as_ptr(resident) as usize;
+                let handed = match handles.get(id) {
+                    Some((owner, handle)) if *owner == key => Arc::clone(handle),
+                    _ => {
+                        let handle = Arc::new(
+                            resident
+                                .with_physical_view(Arc::clone(resident.physical()))
+                                .map_err(str::to_owned)?,
+                        );
+                        handles.insert(*id, (key, Arc::clone(&handle)));
+                        handle
+                    }
+                };
                 let value = if !matches!(ty, ConcreteWireType::Matrix(_)) {
-                    RuntimeValue::Resident(Arc::clone(resident))
+                    RuntimeValue::Resident(handed)
                 } else {
-                    let matrix =
-                        PolyMatrix::gpu(ty, Arc::clone(resident)).map_err(str::to_owned)?;
+                    let matrix = PolyMatrix::gpu(ty, handed).map_err(str::to_owned)?;
                     RuntimeValue::Matrix(matrix)
                 };
                 Ok((name.clone(), value))
@@ -5529,9 +5596,29 @@ fn share_scratch_allocations(
             }
         }
     }
-    // The allocation's layout, independent of its storage slot.
+    // The allocation's layout, independent of its storage slot: the member
+    // reaching furthest into it, since other members may be windows (a concat
+    // piece written in place) that cover only part of it.
+    let reach = |id: &PhysicalValueId| {
+        values[id.0 as usize]
+            .parts
+            .iter()
+            .map(|part| {
+                part.view.extent.iter().zip(part.view.byte_strides.iter()).fold(
+                    part.view.byte_offset + u64::from(part.view.element_bytes),
+                    |end, (&extent, &stride)| end + extent.saturating_sub(1) * stride,
+                )
+            })
+            .max()
+            .unwrap_or(0)
+    };
     let layout = |group: &Group| {
-        let mut physical = values[group.members[0].0 as usize].clone();
+        let widest = group
+            .members
+            .iter()
+            .max_by_key(|id| (reach(id), std::cmp::Reverse(**id)))
+            .expect("a sharing group has members");
+        let mut physical = values[widest.0 as usize].clone();
         for part in physical.parts.iter_mut() {
             part.storage = StorageRef::Scratch(0);
         }
@@ -5958,9 +6045,19 @@ pub(crate) fn plan_physical_graph(
             .ok_or_else(|| format!("GPU input {name} has no validated type"))?;
         let supplied = inputs.get(name).ok_or_else(|| format!("missing GPU input {name}"))?;
         if let Some(integers) = host_integer_values(supplied, expected)? {
-            let range = integer_input_ranges
-                .get(name)
-                .ok_or_else(|| format!("GPU host integer input {name} has no declared range"))?;
+            // An undeclared range is the full signed range of the fewest
+            // 64-bit words (at least one) holding the planning values.
+            let default_range;
+            let range = match integer_input_ranges.get(name) {
+                Some(range) => range,
+                None => {
+                    let bits = integers.iter().map(|value| value.bits()).max().unwrap_or(0);
+                    let words = bits.div_ceil(64).max(1);
+                    let limit = (BigInt::from(1u8) << (64 * words)) - 1u8;
+                    default_range = -&limit..=limit;
+                    &default_range
+                }
+            };
             let storage = StorageRef::Input(
                 u32::try_from(values.len())
                     .map_err(|_| "too many GPU integer input storages".to_owned())?,
@@ -6991,12 +7088,18 @@ pub(crate) fn plan_physical_graph(
         waves,
         external_io_loops,
         external_io_imports,
+        output_handles: std::sync::Mutex::new(BTreeMap::new()),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device address of the first allocation of a resident value.
+    fn storage_address(value: &GpuResidentValue) -> u64 {
+        value.storages().next().expect("resident value has a storage").1.address
+    }
     use crate::{
         artifact::MemoryArtifactStore,
         backend::{poly::cpu_backend, poly_gpu::gpu_backend_on},
@@ -7264,7 +7367,9 @@ mod tests {
         let mut store = MemoryArtifactStore::default();
         let mut owners = Vec::new();
         for inputs in [input.clone(), input] {
-            let result = runtime.execute(&mut plan, inputs, &mut store, rand::random()).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, inputs, &mut store, rand::random())
+                .unwrap();
             let output = result.output_value_for_test("rebased").unwrap();
             let RuntimeValue::Resident(owner) = output else {
                 panic!("compact output is not GPU resident")
@@ -7278,7 +7383,11 @@ mod tests {
             assert_eq!(actual, expected);
             owners.push(Arc::clone(owner));
         }
-        assert!(Arc::ptr_eq(&owners[0], &owners[1]));
+        assert_ne!(
+            storage_address(&owners[0]),
+            storage_address(&owners[1]),
+            "a held output keeps its storage"
+        );
     }
 
     /// Runs only when a CUDA device is deliberately selected for validation.
@@ -7333,23 +7442,30 @@ mod tests {
         let mut runtime = GpuRuntime::new(backend).unwrap();
         let mut plan = runtime.plan(validated, &inputs).unwrap();
         let mut store = MemoryArtifactStore::default();
-        let first = runtime.execute(&mut plan, inputs.clone(), &mut store, [1; 32]).unwrap();
+        let first =
+            runtime.execute_with_artifacts(&mut plan, inputs.clone(), &mut store, [1; 32]).unwrap();
         let output_owner = |result: &crate::gpu_runtime::GpuExecutionResult| {
             let RuntimeValue::Matrix(matrix) = &result.output_value_for_test("sum").unwrap() else {
                 panic!("matrix output");
             };
             Arc::clone(matrix.as_gpu().expect("GPU resident result"))
         };
-        let first_owner = output_owner(&first);
+        let first_address = storage_address(&output_owner(&first));
+        // A released result's storage is written again by the replay.
         drop(first);
-        let second = runtime.execute(&mut plan, inputs.clone(), &mut store, [2; 32]).unwrap();
+        let second =
+            runtime.execute_with_artifacts(&mut plan, inputs.clone(), &mut store, [2; 32]).unwrap();
         let second_owner = output_owner(&second);
-        assert!(Arc::ptr_eq(&first_owner, &second_owner));
+        assert_eq!(storage_address(&second_owner), first_address, "a released output is reused");
+        // A held result keeps its storage; the next replay writes fresh storage.
+        let third =
+            runtime.execute_with_artifacts(&mut plan, inputs.clone(), &mut store, [3; 32]).unwrap();
+        assert_ne!(storage_address(&output_owner(&third)), first_address, "a held output is kept");
         let RuntimeValue::Resident(left_owner) = &inputs["left"] else {
             panic!("resident input");
         };
-        assert!(!Arc::ptr_eq(&first_owner, left_owner));
-        assert_eq!(plan.compiled_launch_count(), 2);
+        assert_ne!(storage_address(&second_owner), storage_address(left_owner));
+        assert_eq!(plan.compiled_launch_count(), 3);
     }
 
     /// A chain of dependent doublings keeps only a few live intermediates, so
@@ -7400,8 +7516,9 @@ mod tests {
         assert!(scratch.len() >= steps, "every doubling has a scratch result");
         assert!(allocations.len() < scratch.len(), "dependent intermediates share allocations");
         let mut store = MemoryArtifactStore::default();
-        let result =
-            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
         let source = runtime.download_matrix_output(&result.output("source").unwrap()).unwrap();
         let doubled = runtime.download_matrix_output(&result.output("doubled").unwrap()).unwrap();
         let scale =
@@ -7455,8 +7572,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(copies, vec![1], "only the shared piece x is copied");
         let mut store = MemoryArtifactStore::default();
-        let result =
-            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
         let x = runtime.download_matrix_output(&result.output("x").unwrap()).unwrap();
         let y = runtime.download_matrix_output(&result.output("y").unwrap()).unwrap();
         let joined = runtime.download_matrix_output(&result.output("joined").unwrap()).unwrap();
@@ -7486,20 +7604,28 @@ mod tests {
         let mut runtime = GpuRuntime::new(backend).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
-        let first = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [11; 32]).unwrap();
+        let first = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [11; 32])
+            .unwrap();
         let RuntimeValue::Matrix(first_public) = &first.output_value_for_test("public").unwrap()
         else {
             panic!("public matrix output");
         };
         let first_owner = Arc::clone(first_public.as_gpu().expect("resident public"));
         drop(first);
-        let second = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [12; 32]).unwrap();
+        let second = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [12; 32])
+            .unwrap();
         let RuntimeValue::Matrix(second_public) = &second.output_value_for_test("public").unwrap()
         else {
             panic!("public matrix output");
         };
         let second_owner = second_public.as_gpu().expect("resident public");
-        assert!(Arc::ptr_eq(&first_owner, second_owner));
+        assert_ne!(
+            storage_address(&first_owner),
+            storage_address(second_owner),
+            "a held output keeps its storage"
+        );
         assert_eq!(first_owner.wire_type().matrix_type().unwrap().columns, digits + 2);
         assert_eq!(plan.compiled_launch_count(), 2);
     }
@@ -7525,7 +7651,9 @@ mod tests {
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
-        let result = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [13; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [13; 32])
+            .unwrap();
         assert!(result.production_id.is_some());
         assert_eq!(result.artifact_handles["secret"].len(), 1);
         let RuntimeValue::Resident(secret) = &result.output_value_for_test("secret").unwrap()
@@ -7582,12 +7710,22 @@ mod tests {
             runtime.plan(validated, &BTreeMap::from([("key".to_owned(), key_a.clone())])).unwrap();
         let mut store = MemoryArtifactStore::default();
         let first = runtime
-            .execute(&mut plan, BTreeMap::from([("key".to_owned(), key_a)]), &mut store, [0x41; 32])
+            .execute_with_artifacts(
+                &mut plan,
+                BTreeMap::from([("key".to_owned(), key_a)]),
+                &mut store,
+                [0x41; 32],
+            )
             .unwrap();
         let actual_a = runtime.download_matrix_output(&first.output("hash").unwrap()).unwrap();
         drop(first);
         let second = runtime
-            .execute(&mut plan, BTreeMap::from([("key".to_owned(), key_b)]), &mut store, [0x42; 32])
+            .execute_with_artifacts(
+                &mut plan,
+                BTreeMap::from([("key".to_owned(), key_b)]),
+                &mut store,
+                [0x42; 32],
+            )
             .unwrap();
         assert_eq!(actual_a, expected_a);
         assert_eq!(
@@ -7664,7 +7802,7 @@ mod tests {
         let mut store = MemoryArtifactStore::default();
         for (key, expected) in [(key_a, expected_a), (key_b, expected_b)] {
             let result = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut plan,
                     BTreeMap::from([("key".to_owned(), key)]),
                     &mut store,
@@ -7730,7 +7868,12 @@ mod tests {
             GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
         let mut plan = runtime.plan(validated, &inputs).unwrap();
         let result = runtime
-            .execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [0x41; 32])
+            .execute_with_artifacts(
+                &mut plan,
+                inputs,
+                &mut MemoryArtifactStore::default(),
+                [0x41; 32],
+            )
             .unwrap();
         for name in ["transposed", "direct"] {
             let RuntimeValue::IndexedFamily { values, .. } = &expected.outputs[name] else {
@@ -7801,7 +7944,6 @@ mod tests {
             runtime.plan(validated, &BTreeMap::from([("key".to_owned(), key_a.clone())])).unwrap();
         let mut store = MemoryArtifactStore::default();
         let mut returned = Vec::new();
-        let mut copied = None;
         let download = |owner: &Arc<GpuResidentValue>| {
             let [part] = owner.physical().parts.as_ref() else {
                 panic!("GPU bounded hash has more than one compact part");
@@ -7813,7 +7955,7 @@ mod tests {
         };
         for (key, expected) in [(key_a, expected_a.clone()), (key_b, expected_b)] {
             let result = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut plan,
                     BTreeMap::from([("key".to_owned(), key)]),
                     &mut store,
@@ -7830,17 +7972,11 @@ mod tests {
             ));
             assert_eq!(download(owner), expected);
             returned.push(Arc::clone(owner));
-            if copied.is_none() {
-                copied = Some(runtime.copy_output(&result.output("hash").unwrap()).unwrap());
-            }
         }
-        assert!(Arc::ptr_eq(&returned[0], &returned[1]));
-        // The explicit copy survives the replay that overwrote plan storage.
-        let Some(RuntimeValue::Resident(copied)) = copied else {
-            panic!("copied GPU bounded hash is not resident");
-        };
-        assert!(!Arc::ptr_eq(&copied, &returned[0]));
-        assert_eq!(download(&copied), expected_a);
+        // The first result, still held, keeps its value: the replay wrote its
+        // output into fresh storage.
+        assert!(!Arc::ptr_eq(&returned[0], &returned[1]));
+        assert_eq!(download(&returned[0]), expected_a);
         assert_eq!(plan.compiled_launch_count(), 2);
     }
 
@@ -7893,11 +8029,15 @@ mod tests {
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         assert_eq!(store.load_count(&key), 0);
-        let first = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [0x62; 32]).unwrap();
+        let first = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x62; 32])
+            .unwrap();
         assert_eq!(store.load_count(&key), 1);
         let first_matrix = runtime.download_matrix_output(&first.output("hash").unwrap()).unwrap();
         drop(first);
-        let second = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [0x63; 32]).unwrap();
+        let second = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x63; 32])
+            .unwrap();
         assert_eq!(store.load_count(&key), 2);
         assert_eq!(
             first_matrix,
@@ -7930,8 +8070,9 @@ mod tests {
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
-        let first =
-            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let first = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
         let first_public = first.output_value_for_test("public").unwrap().clone();
         let first_preimage = first.output_value_for_test("preimage").unwrap().clone();
         drop(first);
@@ -8052,14 +8193,19 @@ mod tests {
             1_000_000,
         );
         assert_eq!(&public * &decoded, DCRTPolyMatrix::zero(&cpu, 1, 1));
-        let second =
-            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let second = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
         let RuntimeValue::Resident(second_owner) =
             second.output_value_for_test("preimage").unwrap()
         else {
             panic!("preimage output is not resident");
         };
-        assert!(Arc::ptr_eq(first_owner, second_owner), "replay must reuse plan-owned output");
+        assert_ne!(
+            storage_address(first_owner),
+            storage_address(second_owner),
+            "a held output keeps its storage"
+        );
         let second_decoded = download_compact_preimage_for_oracle(
             &download_parameters,
             device,
@@ -8104,8 +8250,9 @@ mod tests {
             runtime.plan_with_fixed_columns_for_test(validated, &BTreeMap::new(), 1).unwrap();
         assert_eq!(plan.physical_frame_for_test().preimage_replays.len(), 2);
         let mut store = MemoryArtifactStore::default();
-        let first =
-            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let first = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
         let public =
             runtime.download_matrix(first.output_value_for_test("public").unwrap()).unwrap();
         let RuntimeValue::Resident(first_owner) = first.output_value_for_test("preimage").unwrap()
@@ -8178,14 +8325,19 @@ mod tests {
             );
         }
         assert_eq!(&public * &decoded, DCRTPolyMatrix::zero(&cpu, 1, 2));
-        let second =
-            runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+        let second = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
         let RuntimeValue::Resident(second_owner) =
             second.output_value_for_test("preimage").unwrap()
         else {
             panic!("replayed preimage output is not resident");
         };
-        assert!(Arc::ptr_eq(&first_owner, second_owner), "replay must reuse plan-owned output");
+        assert_ne!(
+            storage_address(&first_owner),
+            storage_address(second_owner),
+            "a held output keeps its storage"
+        );
         let second_decoded = download_compact_preimage_for_oracle(
             &download_parameters,
             device,
@@ -8230,8 +8382,9 @@ mod tests {
         let mut store = MemoryArtifactStore::default();
         let mut previous = None;
         for _ in 0..2 {
-            let result =
-                runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
             let public =
                 runtime.download_matrix(&result.output_value_for_test("public").unwrap()).unwrap();
             let target =
@@ -8241,7 +8394,11 @@ mod tests {
                 panic!("public gadget preimage is not GPU resident");
             };
             if let Some(previous) = previous.replace(Arc::clone(owner)) {
-                assert!(Arc::ptr_eq(&previous, owner));
+                assert_ne!(
+                    storage_address(&previous),
+                    storage_address(owner),
+                    "a held output keeps its storage"
+                );
             }
             let decoded = download_compact_preimage_for_oracle(
                 &download_parameters,
@@ -8302,7 +8459,9 @@ mod tests {
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_parameters], [device])).unwrap();
         let mut plan = runtime.plan(consumer, &BTreeMap::new()).unwrap();
         assert_eq!(store.load_count(&key), 0);
-        let result = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [0x52; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x52; 32])
+            .unwrap();
         assert_eq!(store.load_count(&key), 1);
         if cached_output {
             assert!(result.production_id.is_some());

@@ -38,8 +38,8 @@ typed dataflow graph and then interpreted by several consumers. The life of a co
         |
         +--> CPU executor:  mxx_backends::execute(..., &mut CpuDcrtBackend, ...)
         |
-        +--> GPU runtime:   GpuRuntime::plan(validated, inputs) -> GpuExecutionPlan
-        |                   GpuRuntime::execute(&mut plan, inputs, store, nonce)
+        +--> GPU runtime:   GpuRuntime::plan(graph, inputs) -> GpuExecutionPlan
+        |                   GpuRuntime::execute(&mut plan, inputs)
         |
         +--> Lean exporter: mxx_ir_core::lean (execution relations, linked correctness claims)
         v
@@ -665,9 +665,10 @@ These contracts apply to both CPU and GPU execution:
   Execution does not copy resident matrices to the host or scan their contents to re-validate
   them; producers enforce these properties.
 - GPU execution checks only what addressing needs: the exact input set, the physical layout of
-  each resident input, and the declared range of each host integer while encoding it. Integer
-  inputs to GPU plans need a range, either the resident value's producer-proven range or
-  `GpuRuntimeOptions::integer_input_ranges`; ranges are never inferred from sample values.
+  each resident input, and the frozen range of each host integer while encoding it. A resident
+  integer input carries its producer-proven range. A host integer input uses its entry in
+  `GpuRuntimeOptions::integer_input_ranges`, or else the full signed range of the fewest 64-bit
+  words (at least one) that hold its planning values.
 - A session nonce binds an immutable, complete input map. A failed execution can leave a durable
   session descriptor; changing inputs requires a new nonce (and a new alias). Retrying with the
   original nonce resumes the original inputs.
@@ -710,17 +711,26 @@ Two principles define the design:
 ```rust
 let backend = mxx_backends::backend::poly_gpu::gpu_backend(gpu_params); // or gpu_backend_on(params, devices)
 let mut runtime = GpuRuntime::new(backend)?;          // reads GpuRuntimeOptions::from_env()
-let mut plan = runtime.plan(validated, &inputs)?;     // or plan_with_store(validated, &inputs, &mut store)
-let result = runtime.execute(&mut plan, inputs, &mut store, nonce)?;
-let out = result.output("result").unwrap();
-let matrix = runtime.download_matrix_output(&out)?;   // or runtime.copy_output(&out)
+let mut plan = runtime.plan(graph, &inputs)?;         // a BuiltGraph or a ValidatedGraph
+let result = runtime.execute(&mut plan, inputs)?;     // or execute_with_artifacts(.., store, nonce)
+let next_inputs = BTreeMap::from([("ct".into(), result["ct"].clone())]);
+let matrix = runtime.download_matrix(&result["result"])?;
 ```
 
-- `GpuRuntime::plan(validated, &inputs)` lowers the graph, allocates it, compiles it to CUDA
+- `GpuRuntime::plan(graph, &inputs)` takes a `ValidatedGraph` or a DSL `BuiltGraph` (validated
+  with default parameters through `IntoValidatedGraph`), lowers the graph, allocates it, compiles it to CUDA
   Graph regions, measures candidates, and returns a `GpuExecutionPlan`. `plan_with_store` also
   queries the store for artifact payload sizes (never payload bytes) so that integer and
   typed-blob imports get fixed, pointer-stable destinations.
-- `GpuRuntime::execute(&mut plan, inputs, store, nonce)` rebinds new inputs and replays the frozen
+- Inputs and outputs are keyed by their DSL names. A composite DSL value (a ciphertext, a key)
+  flattens into the graph leaves `name.0`, `name.1`, ...; the runtime accepts and returns it as one
+  `RuntimeValue::Composite` (`expand_composite_values` and `group_composite_values` in
+  `crates/backends/src/backend.rs`). Two inputs that plan on one resident allocation (the same
+  example value for both operands) are planned on a device copy of the repeat, since input
+  rebinding redirects views by allocation.
+- `GpuRuntime::execute(&mut plan, inputs)` draws fresh sampling randomness and needs no artifact
+  store; a plan with artifact inputs or outputs runs through
+  `execute_with_artifacts(&mut plan, inputs, store, nonce)`. Both rebind new inputs and replay the frozen
   program. It does not plan, measure, or re-validate. A plan executes only on the backend
   instance that planned it (`GpuRuntimeError::StalePlan` otherwise). A resident input produced by
   another plan is moved into this plan's storage slots when it is rebound
@@ -736,14 +746,15 @@ let matrix = runtime.download_matrix_output(&out)?;   // or runtime.copy_output(
   graph (`mxx_gpu_graph_bind` in `crates/backends/cuda/src/Runtime.cu`) updates only nodes whose
   patched argument bytes changed; nodes start bound to their build-time arguments, and an update
   of a conditional body, which reconciles the whole executable, reapplies every top-level node.
-- The result, `GpuExecutionResult<'plan>`, borrows the plan mutably. Its outputs live in
-  plan-owned storage and may be overwritten by the next execution, so Rust prevents executing the
-  plan again while the result is alive. `result.output(name)` returns a non-cloneable
-  `GpuOutputRef`. Callers either download it (`download_matrix_output`,
-  `download_matrix_member_output`, `download_integer_family_output`, `download_bool_output`,
-  `download_real_output`, `download_bytes_output`) or call `GpuRuntime::copy_output`, which copies
-  a device output on the device into storage owned by the returned `RuntimeValue`. A copied
-  output survives the next execution and can be bound as an input of another plan.
+- The result, `GpuExecutionResult`, owns its outputs: `result[name]` (or `into_outputs`) gives
+  values that can be kept, downloaded, or bound as inputs of any plan, including the same plan.
+  Each output has one caller handle (`PhysicalFrame::output_handles`), reused while its plan
+  owner is unchanged; the next execute writes an output whose handle still has another reference
+  into fresh storage, together with every plan value viewing its old allocation, before inputs
+  rebind. An output the caller released is written in place with no allocation. Planning uploads
+  each compiled executable, so the first production launch pays no device-side graph setup. `result.output(name)` returns a `GpuOutputRef` for the typed downloads
+  (`download_matrix_output`, `download_matrix_member_output`, `download_integer_family_output`,
+  `download_bool_output`, `download_real_output`, `download_bytes_output`).
 - `GpuExecutionPlan::report()` returns the `GpuWarmupReport` selected during planning; reading it
   performs no measurement. `compiled_region_count` and `compiled_launch_count` expose compiled
   structure.
@@ -1090,7 +1101,7 @@ These restrictions are explicit errors in the current code:
 - **External I/O and waves** cannot be combined: external-I/O loops and selected artifact imports
   cannot be nested in a wave schedule (`DirectGraph::compile`).
 - **Artifacts.** Integer and typed-blob artifact inputs need `plan_with_store` for payload sizes;
-  host `Int` inputs need an entry in `integer_input_ranges` ("has no declared range"); matrix
+  host `Int` inputs without an `integer_input_ranges` entry get a signed word range; matrix
   exports need a `FullEval` source; raw transcoding does not support every wire type ("raw
   artifact transcode does not support this wire type yet" in `fleet.rs`).
 - **Trapdoors and preimages** require the exact regular gadget layout, sigma, and shapes.
@@ -1276,7 +1287,7 @@ backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactSt
   | `crates/backends/tests/gpu_control_resident.rs` | `#![cfg(feature = "gpu")]` |
   | `crates/backends/tests/gpu_direct_node_semantics.rs` | `#![cfg(feature = "gpu")]`; compares direct GPU nodes with the CPU backend |
   | `crates/fhe/tests/gpu_bgv.rs` | `required-features = ["gpu"]` in `crates/fhe/Cargo.toml` |
-  | `crates/fhe/tests/gpu_tfhe.rs` | `required-features = ["gpu"]`; the TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (LWE `n = 630`, `q = 2^32`, sigma `2^17`; ring `N = 1024`, double-CRT `Q = 65537 * 79873`, sigma 156, about `2^-25` of `Q`; gadget base `2^9`, two digits per limb; KSK base `2^2` with 8 digits). Each bootstrap stage is its own plan and execute with keys kept resident; checks the NAND truth table and repeated gates (`FHE_TFHE_REPEATED_GATES`, default 4) |
+  | `crates/fhe/tests/gpu_tfhe.rs` | `required-features = ["gpu"]`; the TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (LWE `n = 630`, `q = 2^32`, sigma `2^17`; ring `N = 1024`, double-CRT `Q = 65537 * 79873`, sigma 156, about `2^-25` of `Q`; gadget base `2^9`, two digits per limb; KSK base `2^2` with 8 digits). `test_gpu_tfhe_round_trip` mirrors the BGV round trip: key generation, encryption, one bootstrapped NAND program per gate, and decryption, each planned once with keys kept resident; checks the NAND truth table and four chained gates that feed each output back as the next left input (profile in `utils::tfhe_params`, overridable through `FHE_TEST_TFHE_*`) |
   | `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs` | `#![cfg(feature = "gpu")]`; long modes are `#[ignore]` |
   | `crates/we/tests/test_gpu_diamond_we.rs` | `#![cfg(feature = "gpu")]` and `#[ignore]`; Lean-checked parameter search plus a GPU round trip |
 

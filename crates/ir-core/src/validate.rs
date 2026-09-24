@@ -36,6 +36,22 @@ pub struct ValidatedScope {
     pub artifact_inputs: BTreeMap<WireRef, ManifestArtifact>,
 }
 
+/// A graph a runtime can plan: an already validated graph, or a built one
+/// that the runtime validates with default parameters and its ring-basis
+/// resolver.
+pub trait IntoValidatedGraph {
+    fn into_validated_graph(
+        self,
+        resolve_basis: crate::ResolveCrtBasis,
+    ) -> Result<ValidatedGraph, String>;
+}
+
+impl IntoValidatedGraph for ValidatedGraph {
+    fn into_validated_graph(self, _: crate::ResolveCrtBasis) -> Result<ValidatedGraph, String> {
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ValidatedGraph {
     pub source: Graph,

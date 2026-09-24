@@ -2216,6 +2216,11 @@ pub(crate) fn hash_runtime_value(
     hasher: &mut Sha256,
 ) -> Result<(), ExecutionError> {
     match value {
+        RuntimeValue::Composite(_) => {
+            return Err(ExecutionError::Backend(
+                "composite inputs are expanded into their leaves before hashing".into(),
+            ));
+        }
         RuntimeValue::Int(value) => {
             hasher.update([0]);
             hash_sized(hasher, value.to_string().as_bytes());

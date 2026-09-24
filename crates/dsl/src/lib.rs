@@ -2116,6 +2116,16 @@ impl BuiltGraph {
     }
 }
 
+impl mxx_ir_core::IntoValidatedGraph for BuiltGraph {
+    /// Validates with default parameter bindings.
+    fn into_validated_graph(
+        self,
+        resolve_basis: mxx_ir_core::ResolveCrtBasis,
+    ) -> Result<mxx_ir_core::validate::ValidatedGraph, String> {
+        self.validate(&ParamEnv::default(), resolve_basis).map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ValidationBuildError {
     #[error(transparent)]

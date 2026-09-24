@@ -4,11 +4,17 @@
 //! regions are compiled, each scratch allocation is either owned by the Graph
 //! or allocated once for the plan. A Graph-owned allocation is created by a
 //! memory node right before its first top-level operation is emitted and freed
-//! by one right after its last. All memory nodes of a region form one chain in
+//! by one right after its last. The memory nodes of a region form a chain in
 //! operation order, so a free precedes every later allocation and CUDA may
-//! place that allocation in the freed memory. An operation with a conditional body counts as one
-//! top-level operation, because CUDA forbids memory nodes inside such bodies:
-//! scratch used by a loop body lives across the whole loop.
+//! place that allocation in the freed memory. Inside a parallel loop, whose
+//! lanes are independent, every allocation follows only the chain at the
+//! loop's start and no memory is reused: a free joining several readers must
+//! not gate later work, or CUDA runs the lanes one after another. The chain
+//! joins every memory node of the loop when it ends, so memory freed by the
+//! W lanes is reused after them, and the loop's scratch peak grows with W. An
+//! operation with a conditional body counts as one top-level operation,
+//! because CUDA forbids memory nodes inside such bodies: scratch used by a
+//! loop body lives across the whole loop.
 
 use crate::{
     backend::{BoundStorage, GpuResidentValue, poly_gpu::GpuDcrtBackend},
@@ -22,6 +28,7 @@ use crate::{
 use mxx_ir_core::types::ConcreteMatrixType;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -109,6 +116,18 @@ pub(crate) struct GraphScratchPlan {
     allocate_before: BTreeMap<usize, Vec<usize>>,
     free_after: BTreeMap<usize, Vec<usize>>,
     referenced_by: BTreeMap<usize, Vec<usize>>,
+    /// Operation ranges of the parallel loops, ordered by start and, for
+    /// loops starting together, outermost first.
+    loops: Vec<Range<usize>>,
+    /// Memory nodes the next memory node outside a parallel loop follows.
+    chain: Vec<u32>,
+    /// Start of the region whose builder issued the `chain` tokens.
+    chain_region: Option<usize>,
+    /// The outermost open parallel loop: its end and the memory nodes
+    /// created inside it so far. Its nodes follow `chain`, frozen meanwhile.
+    open_loop: Option<(usize, Vec<u32>)>,
+    /// First loop of `loops` not reached yet.
+    next_loop: usize,
 }
 
 fn visit(op: &CompiledGpuOp, each: &mut dyn FnMut(PhysicalValueId, bool, i32)) {
@@ -233,11 +252,23 @@ pub(crate) fn plan_graph_scratch(
             .iter()
             .any(|&(body_start, body_end)| body_start <= start && start < body_end)
     };
+    let mut loops = frame
+        .parallel_lanes
+        .iter()
+        .filter_map(|lanes| Some(lanes.first()?.start as usize..lanes.last()?.end as usize))
+        .filter(|range| !range.is_empty())
+        .collect::<Vec<_>>();
+    loops.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
     let mut plan = GraphScratchPlan {
         allocations: Vec::new(),
         allocate_before: BTreeMap::new(),
         free_after: BTreeMap::new(),
         referenced_by: BTreeMap::new(),
+        loops,
+        chain: Vec::new(),
+        chain_region: None,
+        open_loop: None,
+        next_loop: 0,
     };
     let mut persistent = BTreeMap::<*const (), BoundStorage>::new();
     for (pointer, group) in groups {
@@ -303,11 +334,21 @@ const GRAPH_ALLOCATION_GRANULE: u64 = 2 << 20;
 
 impl GraphScratchPlan {
     /// Peak Graph-owned bytes live at once on each device: every allocation
-    /// counts, rounded up to CUDA's granule, from its first to its last use.
-    /// The memory-node chain lets CUDA reuse memory freed earlier, so no
-    /// point of the schedule needs more; a launch that could not fit would
-    /// leave its reservation behind, so plans are admitted on this peak.
+    /// counts, rounded up to CUDA's granule, from its first use until its
+    /// memory can be reused, which is after its last use, or after the
+    /// outermost parallel loop that contains its last use. The memory-node
+    /// chain lets CUDA reuse memory freed earlier, so no point of the schedule
+    /// needs more; a launch that could not fit would leave its reservation
+    /// behind, so plans are admitted on this peak.
     pub(crate) fn peak_bytes(&self) -> BTreeMap<i32, u64> {
+        let reusable_after = |last: usize| {
+            self.loops
+                .iter()
+                .filter(|range| range.contains(&last))
+                .map(|range| range.end)
+                .max()
+                .unwrap_or(last + 1)
+        };
         let mut events = BTreeMap::<(i32, usize), i128>::new();
         for allocation in &self.allocations {
             let (Some(&first), Some(&last)) =
@@ -318,7 +359,8 @@ impl GraphScratchPlan {
             let bytes = (allocation.bytes as u64).div_ceil(GRAPH_ALLOCATION_GRANULE) *
                 GRAPH_ALLOCATION_GRANULE;
             *events.entry((allocation.device, first)).or_default() += i128::from(bytes);
-            *events.entry((allocation.device, last + 1)).or_default() -= i128::from(bytes);
+            *events.entry((allocation.device, reusable_after(last))).or_default() -=
+                i128::from(bytes);
         }
         let mut live = BTreeMap::<i32, i128>::new();
         let mut peaks = BTreeMap::<i32, u64>::new();
@@ -329,6 +371,41 @@ impl GraphScratchPlan {
             *peak = (*peak).max(u64::try_from(*current).unwrap_or(0));
         }
         peaks
+    }
+
+    /// Move the memory-node chain to top-level operation `index` of the
+    /// region starting at `start`: a new region starts an empty chain, and a
+    /// parallel loop's end joins every memory node created inside it.
+    fn enter_operation(&mut self, start: usize, index: usize) {
+        if self.chain_region != Some(start) {
+            self.chain_region = Some(start);
+            self.chain.clear();
+            if let Some((_, created)) = &mut self.open_loop {
+                created.clear();
+            }
+        }
+        if let Some((end, _)) = &self.open_loop &&
+            index >= *end
+        {
+            let (_, created) = self.open_loop.take().expect("the loop is open");
+            self.chain.extend(created);
+        }
+        while let Some(range) = self.loops.get(self.next_loop) &&
+            range.start <= index
+        {
+            if self.open_loop.is_none() && index < range.end {
+                self.open_loop = Some((range.end, Vec::new()));
+            }
+            self.next_loop += 1;
+        }
+    }
+
+    /// Record a memory node created after `self.chain`.
+    fn push_memory_node(&mut self, token: u32) {
+        match &mut self.open_loop {
+            Some((_, created)) => created.push(token),
+            None => self.chain = vec![token],
+        }
     }
 
     /// Allocate the scratch whose first use is top-level operation `index`,
@@ -344,9 +421,13 @@ impl GraphScratchPlan {
         outliving: &mut Vec<u64>,
     ) -> Result<Vec<u32>, GpuNativeGraphError> {
         let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
-        for &allocation in self.allocate_before.get(&index).into_iter().flatten() {
+        self.enter_operation(start, index);
+        for allocation in self.allocate_before.get(&index).cloned().unwrap_or_default() {
+            let (device, bytes) =
+                (self.allocations[allocation].device, self.allocations[allocation].bytes);
+            let (token, address) = builder.add_memory_alloc(device, bytes, &self.chain)?;
+            self.push_memory_node(token);
             let allocation = &mut self.allocations[allocation];
-            let (token, address) = builder.add_memory_alloc(allocation.device, allocation.bytes)?;
             allocation.allocated = Some((address, start, token));
             if allocation.outlives_region {
                 outliving.push(address);
@@ -397,13 +478,13 @@ impl GraphScratchPlan {
     /// frees another Graph's allocation, so its address is appended to
     /// `host_frees` for the host to free after launching this region.
     pub(crate) fn after_operation(
-        &self,
+        &mut self,
         builder: &mut GpuNativeGraphBuilder,
         start: usize,
         index: usize,
         host_frees: &mut Vec<u64>,
     ) -> Result<(), GpuNativeGraphError> {
-        for &allocation in self.free_after.get(&index).into_iter().flatten() {
+        for allocation in self.free_after.get(&index).cloned().unwrap_or_default() {
             let allocation = &self.allocations[allocation];
             let (address, region, _) = allocation.allocated.ok_or_else(|| {
                 GpuNativeGraphError::Native("Graph scratch is freed before its allocation".into())
@@ -417,7 +498,8 @@ impl GraphScratchPlan {
                 .range(start..=index)
                 .map(|&reference| (reference - start) as u32)
                 .collect::<Vec<_>>();
-            builder.add_memory_free(address, &readers)?;
+            let token = builder.add_memory_free(address, &readers, &self.chain)?;
+            self.push_memory_node(token);
         }
         Ok(())
     }

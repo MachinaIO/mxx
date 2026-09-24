@@ -126,6 +126,9 @@ pub(crate) struct PhysicalFrame {
     pub waves: Vec<PhysicalWave>,
     pub external_io_loops: Vec<ExternalIoLoop>,
     pub external_io_imports: Vec<ExternalIoImport>,
+    /// Top-level operation ranges of the lanes of each parallel loop. Lanes
+    /// are independent, so their Graph scratch chains run concurrently.
+    pub parallel_lanes: Vec<Vec<std::ops::Range<u32>>>,
     /// One caller handle per output, reused while the output's plan owner is
     /// unchanged (keyed by that owner's address). A handle with another strong
     /// reference is held by a caller: the next execute writes that output into
@@ -1397,6 +1400,8 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub import_templates: &'a mut Vec<ImportTemplate>,
     pub external_io_loops: &'a mut Vec<ExternalIoLoop>,
     pub external_io_imports: &'a mut Vec<ExternalIoImport>,
+    /// Top-level operation ranges of the lanes of each parallel loop.
+    pub parallel_lanes: &'a mut Vec<Vec<std::ops::Range<u32>>>,
     pub crt_resource_next: &'a mut u32,
     /// A full CRT matrix value and its counterpart in the other full encoding.
     /// A conversion is emitted once per value and shared by later consumers
@@ -4918,6 +4923,7 @@ pub(super) fn lower_preimage_sample_node(
                 import_templates: &mut *ctx.import_templates,
                 external_io_loops: &mut *ctx.external_io_loops,
                 external_io_imports: &mut *ctx.external_io_imports,
+                parallel_lanes: &mut *ctx.parallel_lanes,
                 crt_resource_next: &mut *ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -5870,6 +5876,7 @@ pub(crate) fn plan_physical_graph(
     let mut import_templates = Vec::<ImportTemplate>::new();
     let mut external_io_loops = Vec::<ExternalIoLoop>::new();
     let mut external_io_imports = Vec::<ExternalIoImport>::new();
+    let mut parallel_lanes = Vec::new();
     let mut crt_resource_next = 0u32;
     let mut converted = BTreeMap::new();
     let mut integer_status = BTreeMap::new();
@@ -5907,6 +5914,7 @@ pub(crate) fn plan_physical_graph(
                 import_templates: &mut import_templates,
                 external_io_loops: &mut external_io_loops,
                 external_io_imports: &mut external_io_imports,
+                parallel_lanes: &mut parallel_lanes,
                 crt_resource_next: &mut crt_resource_next,
                 converted: &mut converted,
                 integer_status: &mut integer_status,
@@ -6751,6 +6759,7 @@ pub(crate) fn plan_physical_graph(
         waves,
         external_io_loops,
         external_io_imports,
+        parallel_lanes,
         output_handles: std::sync::Mutex::new(BTreeMap::new()),
         scratch_protected: protected,
     })

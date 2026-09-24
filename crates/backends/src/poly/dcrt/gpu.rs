@@ -1310,6 +1310,8 @@ unsafe extern "C" {
         builder: *mut MxxGpuGraphBuilderOpaque,
         device: c_int,
         bytes: usize,
+        after: *const u32,
+        after_count: usize,
         out_token: *mut u32,
         out_address: *mut u64,
     ) -> c_int;
@@ -1318,6 +1320,9 @@ unsafe extern "C" {
         address: u64,
         operations: *const u32,
         operation_count: usize,
+        after: *const u32,
+        after_count: usize,
+        out_token: *mut u32,
     ) -> c_int;
     fn mxx_gpu_graph_builder_set_pending_memory_dependencies(
         builder: *mut MxxGpuGraphBuilderOpaque,
@@ -5856,12 +5861,13 @@ impl GpuNativeGraphBuilder {
         std::mem::replace(&mut self.stream, stream)
     }
 
-    /// Allocate one graph-owned buffer on `device`, ordered after every
-    /// earlier graph memory node, and return its token and fixed address.
+    /// Allocate one graph-owned buffer on `device`, ordered after the memory
+    /// nodes `after`, and return its token and fixed address.
     pub fn add_memory_alloc(
         &mut self,
         device: i32,
         bytes: usize,
+        after: &[u32],
     ) -> Result<(u32, u64), GpuNativeGraphError> {
         let (mut token, mut address) = (0, 0);
         if unsafe {
@@ -5869,6 +5875,8 @@ impl GpuNativeGraphBuilder {
                 self.raw,
                 device,
                 bytes,
+                after.as_ptr(),
+                after.len(),
                 &mut token,
                 &mut address,
             )
@@ -5879,25 +5887,30 @@ impl GpuNativeGraphBuilder {
         Ok((token, address))
     }
 
-    /// Free one graph allocation after every earlier graph memory node and
-    /// after the emitted top-level `operations` that use it.
+    /// Free one graph allocation after the memory nodes `after` and after the
+    /// emitted top-level `operations` that use it, and return its token.
     pub fn add_memory_free(
         &mut self,
         address: u64,
         operations: &[u32],
-    ) -> Result<(), GpuNativeGraphError> {
+        after: &[u32],
+    ) -> Result<u32, GpuNativeGraphError> {
+        let mut token = 0;
         if unsafe {
             mxx_gpu_graph_builder_add_memory_free(
                 self.raw,
                 address,
                 operations.as_ptr(),
                 operations.len(),
+                after.as_ptr(),
+                after.len(),
+                &mut token,
             )
         } != 0
         {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
-        Ok(())
+        Ok(token)
     }
 
     /// Make the next top-level operation start after these allocations.

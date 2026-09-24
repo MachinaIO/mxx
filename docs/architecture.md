@@ -815,10 +815,14 @@ against the device budget, compiles the CUDA Graph regions, and runs
 `measurement_warmups + measurement_iterations` trials. A candidate whose allocation, compilation,
 or trial fails is rejected and the search continues with the next candidate; no VRAM requirement
 is predicted. Graph-owned scratch (section 6.3) is the one exception, because CUDA keeps the
-reservation of a Graph launch that runs out of memory and the process can then no longer
-allocate: before a compiled Graph's first launch, `admit_graph_scratch` compares its scheduled
-scratch peak (the sum of simultaneously live allocations, plus 1/32 for CUDA's rounding) with the
-memory currently free, and refuses the launch if it does not fit. After each candidate,
+reservation of a Graph upload or launch that runs out of memory and the process can then no
+longer allocate: `DirectGraph::compile` (`crates/backends/src/gpu_runtime_direct.rs`), after
+building all regions and before `executable.upload(...)` of any of them, calls
+`admit_graph_scratch`, which compares the scheduled scratch peak (the bytes of allocations whose
+memory cannot yet be reused, plus 1/32 for CUDA's rounding) with the memory currently free and
+fails compilation with `GpuPlanError::Resource` if it does not fit, so the candidate is rejected
+and the search continues. Uploading every region while planning means the first production launch
+does not pay the device-side Graph setup. After each candidate,
 `gpu_release_cached_memory` synchronizes the device, trims the Graph and default pools, and makes
 one whole-device `cudaMalloc` request that cannot succeed: the driver caches the device memory of
 destroyed Graph executables (several KiB per kernel node) and releases it only to `cudaMalloc`,
@@ -940,12 +944,29 @@ templates, control resets, and wave descriptors needed to run it.
   it is written before it is read, lives on one device, and stays within one region (or spans
   regions whose endpoints are not replayed). Each region's operations are emitted in order: a
   CUDA memory-allocation node precedes the first writer and a free node follows the last reader,
-  so CUDA reuses freed memory inside the Graph, as a caching allocator would. Memory nodes are not
-  allowed in conditional bodies, so scratch used inside a loop body is allocated before the loop
-  and freed after it. An allocation freed by a later region is recorded on the `DirectGraph`,
-  freed on the launch stream after that region's launch (or when the `DirectGraph` is dropped).
-  Every other scratch value, together with inputs, outputs, wave-bound members, and imports, is
-  materialized as a persistent allocation.
+  so CUDA reuses freed memory inside the Graph, as a caching allocator would. The builder keeps no
+  implicit chain: `mxx_gpu_graph_builder_add_memory_alloc` and `_free`
+  (`crates/backends/cuda/src/Runtime.cu`) take explicit `after` tokens, and `GraphScratchPlan`
+  (`enter_operation`, `push_memory_node`) supplies them. Outside parallel loops the memory nodes
+  form one chain in operation order, each following the previous one, which serializes them and
+  keeps the peak low; the column-parallel jobs of one operation write column views of one output
+  allocation with no memory nodes between them, so the chain does not serialize them. Lowering
+  records the top-level operation range of every lane of each parallel loop in
+  `PhysicalFrame::parallel_lanes` (`lower_parallel_loop` in
+  `crates/backends/src/gpu_physical_control.rs`; lanes lowered inside a device body are not
+  recorded, because the body is one top-level operation). Inside the outermost parallel loop every
+  memory node follows only the chain at the loop's start and no memory is reused: a free node joins
+  all readers of its allocation, and making later work depend on such joins made CUDA run the W
+  lanes one after another (a 64-lane keygen region went from about 4.4 ms to 62 ms). When the loop
+  ends, the chain joins every memory node created inside it, so memory freed by the W lanes is
+  reused by the next W-wave replay and by later operations, and the loop's scratch peak grows with
+  W. `peak_bytes` counts each allocation from its first use until its memory can be reused: after
+  its last use, or after the end of the outermost parallel loop containing its last use. Memory
+  nodes are not allowed in conditional bodies, so scratch used inside a loop body is allocated
+  before the loop and freed after it. An allocation freed by a later region is recorded on the
+  `DirectGraph`, freed on the launch stream after that region's launch (or when the `DirectGraph`
+  is dropped). Every other scratch value, together with inputs, outputs, wave-bound members, and
+  imports, is materialized as a persistent allocation.
 
 ### 6.4 Multiple GPUs
 

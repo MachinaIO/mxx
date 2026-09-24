@@ -2199,6 +2199,7 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                parallel_lanes: ctx.parallel_lanes,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -2256,6 +2257,7 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                parallel_lanes: ctx.parallel_lanes,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -6185,6 +6187,7 @@ fn lower_sequential_loop(
                 import_templates: &mut body_static_imports,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: &mut body_imports,
+                parallel_lanes: ctx.parallel_lanes,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -6920,7 +6923,10 @@ fn lower_parallel_loop(
     let mut result_ids = Vec::<Vec<PhysicalValueId>>::with_capacity(width);
     let mut index_lanes = Vec::with_capacity(width);
     let template_values_start = ctx.values.len();
+    let mut lane_operations = Vec::with_capacity(width);
     for lane in 0..width {
+        let lane_start = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU parallel body operations".to_owned())?;
         let lane_device = lane_devices[lane % lane_devices.len()];
         ctx.device = lane_device;
         let outer_indices = ctx.device_loop_indices.clone();
@@ -7102,9 +7108,18 @@ fn lower_parallel_loop(
             }
         }
         result_ids.push(outputs);
+        lane_operations.push(
+            lane_start..
+                u32::try_from(ctx.operations.len())
+                    .map_err(|_| "too many GPU parallel body operations".to_owned())?,
+        );
     }
     let body_end = u32::try_from(ctx.operations.len())
         .map_err(|_| "too many GPU parallel body operations".to_owned())?;
+    // A device body is one top-level operation; its lanes share no memory node.
+    if !ctx.device_body && width > 1 {
+        ctx.parallel_lanes.push(lane_operations);
+    }
     let template_values = template_values_start..ctx.values.len();
     if ctx.device_body {
         // Every occurrence is its own lane; the device body replays them all.

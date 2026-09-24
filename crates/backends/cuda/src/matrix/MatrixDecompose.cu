@@ -120,8 +120,7 @@ namespace
 static int raw_matrix_decompose_coeff_impl(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     uint32_t base_bits, size_t dropped_moduli,
-    uint32_t source_binding_base, uint32_t destination_binding_base,
-    bool full_basis_small)
+    uint32_t source_binding_base, uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, source, stream_raw) != 0 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
@@ -135,21 +134,13 @@ static int raw_matrix_decompose_coeff_impl(GpuContext *ctx, void *stream_raw,
         source_binding_base > UINT32_MAX - source->limb_count ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw coefficient decomposition views");
-    if (full_basis_small &&
-        (dropped_moduli != 0 || source->limb_count != ctx->moduli.size()))
-        return set_error("small balanced decomposition requires the full CRT basis");
-    // The small gadget has one shared digit row per source row. Each CRT limb
-    // independently carries its own balanced digit in that row. The ordinary
-    // gadget concatenates digit rows from the retained source limbs.
-    const size_t retained = full_basis_small ? 1 : source->limb_count - dropped_moduli;
+    // The gadget concatenates digit rows from the retained source limbs.
+    const size_t retained = source->limb_count - dropped_moduli;
     uint32_t max_bits = 0;
     for (size_t limb = 0; limb < source->limb_count; ++limb)
     {
         if (source->limbs[limb].crt_limb_index != destination->limbs[limb].crt_limb_index ||
-            source->limbs[limb].modulus != destination->limbs[limb].modulus ||
-            (full_basis_small &&
-                (source->limbs[limb].crt_limb_index != limb ||
-                    source->limbs[limb].modulus != ctx->moduli[limb])))
+            source->limbs[limb].modulus != destination->limbs[limb].modulus)
             return set_error("raw coefficient decomposition CRT basis mismatch");
         max_bits = std::max(max_bits, bit_width_u64(source->limbs[limb].modulus));
     }
@@ -169,8 +160,7 @@ static int raw_matrix_decompose_coeff_impl(GpuContext *ctx, void *stream_raw,
     std::vector<Pair> pairs;
     for (size_t input_limb = 0; input_limb < retained; ++input_limb)
         for (size_t output_limb = 0; output_limb < destination->limb_count; ++output_limb)
-            pairs.push_back({full_basis_small ? output_limb : input_limb, output_limb,
-                full_basis_small ? 0 : input_limb * digits});
+            pairs.push_back({input_limb, output_limb, input_limb * digits});
     for (size_t first = 0; first < pairs.size(); first += kDecomposePairs)
     {
         const size_t count = std::min(kDecomposePairs, pairs.size() - first);
@@ -215,15 +205,123 @@ extern "C" int gpu_raw_matrix_decompose_coeff(GpuContext *ctx, void *stream_raw,
 {
     return raw_matrix_decompose_coeff_impl(ctx, stream_raw, source, destination,
         base_bits, dropped_moduli, source_binding_base,
-        destination_binding_base, false);
+        destination_binding_base);
 }
 
-extern "C" int gpu_raw_matrix_decompose_small_balanced(
-    GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    uint32_t base_bits, uint32_t source_binding_base,
-    uint32_t destination_binding_base)
+namespace
 {
-    return raw_matrix_decompose_coeff_impl(ctx, stream_raw, source, destination,
-        base_bits, 0, source_binding_base, destination_binding_base, true);
+    // Signed balanced digits are modulus independent, so they are stored once
+    // per coefficient (global bound) or once per CRT limb (small gadget) in
+    // the compact sign-and-magnitude layout consumed by compact expansion.
+    __global__ void raw_matrix_decompose_compact_kernel(
+        MxxRawMatrixLimb source, MxxRawSmallMatrixView destination,
+        size_t source_columns, size_t degree, size_t output_digits_per_row,
+        size_t source_digit_offset, uint32_t base_bits, uint32_t digits_per_tower,
+        size_t destination_limb, size_t poly_offset)
+    {
+        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coefficient >= degree) return;
+        const size_t poly = poly_offset + blockIdx.y;
+        const uint64_t residue = raw_matrix_load(source, poly, coefficient, source_columns);
+        int64_t value = centered_lift_u64(residue, source.modulus);
+        const int64_t base = int64_t{1} << base_bits;
+        const size_t source_row = poly / source_columns;
+        const size_t source_column = poly - source_row * source_columns;
+        const size_t width = static_cast<size_t>(destination.magnitude_bytes) + 1;
+        const size_t depth = destination.bound_domain == 1 ? destination.crt_depth : 1;
+        for (uint32_t digit_index = 0; digit_index < digits_per_tower; ++digit_index)
+        {
+            int64_t next = 0;
+            const int64_t signed_digit = balanced_digit_step(value, base, &next);
+            value = next;
+            const size_t output_row = source_row * output_digits_per_row +
+                source_digit_offset + digit_index;
+            const size_t packed_poly = output_row * destination.storage_columns +
+                destination.column_offset + source_column;
+            auto *encoded = reinterpret_cast<uint8_t *>(destination.payload_address) +
+                ((packed_poly * destination.degree + coefficient) * depth + destination_limb) *
+                    width;
+            const uint64_t magnitude = signed_digit < 0
+                ? static_cast<uint64_t>(-(signed_digit + 1)) + 1
+                : static_cast<uint64_t>(signed_digit);
+            encoded[0] = signed_digit == 0 ? 0 : (signed_digit < 0 ? 2 : 1);
+            for (size_t byte = 0; byte < destination.magnitude_bytes; ++byte)
+                encoded[1 + byte] = byte < sizeof(uint64_t) ?
+                    static_cast<uint8_t>(magnitude >> (8 * byte)) : 0;
+        }
+    }
+}
+
+extern "C" int gpu_raw_matrix_decompose_compact(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *source, const MxxRawSmallMatrixView *destination,
+    uint32_t base_bits, size_t dropped_moduli, int full_basis_small,
+    uint32_t source_binding_base, uint32_t destination_binding)
+{
+    if (!destination || validate_raw_view(ctx, source, stream_raw) != 0 ||
+        source->physical_device != destination->physical_device ||
+        source->degree != destination->degree ||
+        source->columns != destination->columns ||
+        destination->column_offset > destination->storage_columns ||
+        destination->columns > destination->storage_columns - destination->column_offset ||
+        !destination->payload_address || destination->magnitude_bytes == 0 ||
+        destination->magnitude_bytes > 8 ||
+        (full_basis_small != 0 && full_basis_small != 1) ||
+        destination->bound_domain != static_cast<uint32_t>(full_basis_small) ||
+        (full_basis_small && destination->crt_depth != source->limb_count) ||
+        (!full_basis_small && destination->crt_depth != 1) ||
+        dropped_moduli >= source->limb_count ||
+        base_bits == 0 || base_bits >= 63 ||
+        base_bits > 8 * destination->magnitude_bytes ||
+        source_binding_base > UINT32_MAX - source->limb_count)
+        return set_error("invalid raw compact decomposition views");
+    if (full_basis_small &&
+        (dropped_moduli != 0 || source->limb_count != ctx->moduli.size()))
+        return set_error("small balanced decomposition requires the full CRT basis");
+    const size_t retained = full_basis_small ? 1 : source->limb_count - dropped_moduli;
+    uint32_t max_bits = 0;
+    for (size_t limb = 0; limb < source->limb_count; ++limb)
+    {
+        if (full_basis_small &&
+            (source->limbs[limb].crt_limb_index != limb ||
+                source->limbs[limb].modulus != ctx->moduli[limb]))
+            return set_error("raw compact decomposition CRT basis mismatch");
+        max_bits = std::max(max_bits, bit_width_u64(source->limbs[limb].modulus));
+    }
+    const size_t digits = (max_bits + base_bits - 1) / base_bits;
+    if (!digits || retained > SIZE_MAX / digits ||
+        source->rows > SIZE_MAX / (digits * retained) ||
+        source->rows > SIZE_MAX / source->columns ||
+        destination->rows != source->rows * digits * retained)
+        return set_error("raw compact decomposition output shape mismatch");
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
+        return set_error(cudaGetLastError());
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    const size_t poly_count = source->rows * source->columns;
+    // The ordinary gadget concatenates the digit rows of the retained source
+    // limbs; the small gadget stores each limb's own digits in its CRT slot.
+    const size_t passes = full_basis_small ? source->limb_count : retained;
+    for (size_t pass = 0; pass < passes; ++pass)
+    {
+        const MxxGraphPatch patches[] = {
+            decompose_pointer_patch(0, 0, static_cast<uint32_t>(source_binding_base + pass)),
+            decompose_pointer_patch(1, offsetof(MxxRawSmallMatrixView, payload_address),
+                destination_binding),
+        };
+        for (size_t poly_offset = 0; poly_offset < poly_count;
+             poly_offset += kDecomposeMaxGridY)
+        {
+            const size_t poly_chunk = std::min(kDecomposeMaxGridY, poly_count - poly_offset);
+            const dim3 grid(
+                static_cast<uint32_t>((source->degree + kDecomposeThreads - 1) / kDecomposeThreads),
+                static_cast<uint32_t>(poly_chunk));
+            const int status = mxx_gpu_launch_kernel(ctx, stream,
+                raw_matrix_decompose_compact_kernel, grid, dim3(kDecomposeThreads), 0,
+                patches, 2, source->limbs[pass], *destination, source->columns,
+                static_cast<size_t>(source->degree), digits * retained,
+                full_basis_small ? 0 : pass * digits, base_bits,
+                static_cast<uint32_t>(digits), full_basis_small ? pass : 0, poly_offset);
+            if (status != 0) return status;
+        }
+    }
+    return 0;
 }

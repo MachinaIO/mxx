@@ -474,6 +474,21 @@ namespace
         raw_matrix_store(destination, output_poly, coefficient, output_columns, sum);
     }
 
+    // Multiply every polynomial of `matrix` by the single polynomial of
+    // `scalar` in the evaluation domain.
+    __global__ void raw_matrix_mul_scalar_kernel(
+        MxxRawMatrixLimb matrix, MxxRawMatrixLimb scalar,
+        MxxRawMatrixLimb destination, size_t columns, size_t degree,
+        size_t poly_offset)
+    {
+        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coefficient >= degree) return;
+        const size_t poly = poly_offset + blockIdx.y;
+        raw_matrix_store(destination, poly, coefficient, columns,
+            mul_mod_u64(raw_matrix_load(matrix, poly, coefficient, columns),
+                raw_matrix_load(scalar, 0, coefficient, 1), destination.modulus));
+    }
+
     __global__ void raw_matrix_transpose_kernel(
         MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
         size_t source_columns, size_t destination_columns,
@@ -565,14 +580,17 @@ namespace
 }
 
 // Fill the views of `limbs` limbs from `first` for kernel argument
-// `argument`, with one address patch per limb.
+// `argument`, with one address patch per limb. The views start
+// `column_shift` columns after the bound address; the graph builder records
+// that offset from the captured address.
 static void raw_limb_set(const MxxRawMatrixView *view, size_t first, size_t limbs,
     uint32_t argument, uint32_t binding_base, RawLimbSet &set,
-    std::vector<MxxGraphPatch> &patches)
+    std::vector<MxxGraphPatch> &patches, size_t column_shift = 0)
 {
     for (size_t local = 0; local < limbs; ++local)
     {
         set.limb[local] = view->limbs[first + local];
+        set.limb[local].address += column_shift * set.limb[local].column_stride_bytes;
         patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, argument,
             static_cast<uint32_t>(local * sizeof(MxxRawMatrixLimb) +
                 offsetof(MxxRawMatrixLimb, address)),
@@ -850,8 +868,6 @@ static int raw_matrix_mul_impl(GpuContext *ctx, void *stream_raw,
         left->columns != (transpose_rhs ? right->columns : right->rows) ||
         (transpose_rhs ? right->rows : right->columns) != destination->columns ||
         left->row_origin != destination->row_origin ||
-        (transpose_rhs ? right->row_origin : right->column_origin) !=
-            destination->column_origin ||
         left->column_origin !=
             (transpose_rhs ? right->column_origin : right->row_origin) ||
         (accumulate != 0 && accumulate != 1) ||
@@ -907,6 +923,58 @@ extern "C" int gpu_raw_matrix_mul(GpuContext *ctx, void *stream_raw,
     return raw_matrix_mul_impl(ctx, stream_raw, left, right, destination,
         accumulate, false, left_binding_base, right_binding_base,
         destination_binding_base);
+}
+
+extern "C" int gpu_raw_matrix_mul_scalar(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *matrix, const MxxRawMatrixView *scalar,
+    const MxxRawMatrixView *destination, uint32_t matrix_binding_base,
+    uint32_t scalar_binding_base, uint32_t destination_binding_base)
+{
+    if (validate_raw_view(ctx, matrix, stream_raw) != 0 ||
+        validate_raw_view(ctx, scalar, stream_raw) != 0 ||
+        validate_raw_view(ctx, destination, stream_raw) != 0 ||
+        !same_raw_extent(matrix, destination) ||
+        scalar->rows != 1 || scalar->columns != 1 ||
+        matrix->physical_device != scalar->physical_device ||
+        matrix->degree != scalar->degree || matrix->limb_count != scalar->limb_count ||
+        matrix_binding_base > UINT32_MAX - matrix->limb_count ||
+        scalar_binding_base > UINT32_MAX - scalar->limb_count ||
+        destination_binding_base > UINT32_MAX - destination->limb_count)
+        return set_error("invalid raw scalar product views");
+    for (size_t limb = 0; limb < matrix->limb_count; ++limb)
+        if (matrix->limbs[limb].crt_limb_index != scalar->limbs[limb].crt_limb_index ||
+            matrix->limbs[limb].modulus != scalar->limbs[limb].modulus ||
+            scalar->limbs[limb].address == destination->limbs[limb].address)
+            return set_error("raw scalar product limb mismatch or alias");
+    if (mxx_set_device(matrix->physical_device) != cudaSuccess)
+        return set_error(cudaGetLastError());
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    const size_t poly_count = destination->rows * destination->columns;
+    for (size_t limb = 0; limb < matrix->limb_count; ++limb)
+    {
+        const MxxGraphPatch patches[] = {
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(void *),
+                static_cast<uint32_t>(matrix_binding_base + limb), 0},
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
+                static_cast<uint32_t>(scalar_binding_base + limb), 0},
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 2, 0, sizeof(void *),
+                static_cast<uint32_t>(destination_binding_base + limb), 0},
+        };
+        for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+        {
+            const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+            const dim3 grid(
+                static_cast<uint32_t>((destination->degree + kTransformThreads - 1) / kTransformThreads),
+                static_cast<uint32_t>(chunk));
+            const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_mul_scalar_kernel,
+                grid, dim3(kTransformThreads), 0, patches, 3,
+                matrix->limbs[limb], scalar->limbs[limb], destination->limbs[limb],
+                static_cast<size_t>(destination->columns),
+                static_cast<size_t>(destination->degree), offset);
+            if (status != 0) return status;
+        }
+    }
+    return 0;
 }
 
 extern "C" int gpu_raw_matrix_mul_transpose_rhs(GpuContext *ctx, void *stream_raw,

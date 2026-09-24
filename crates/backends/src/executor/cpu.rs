@@ -1969,10 +1969,12 @@ impl<S: SessionStore> Executor<'_, S> {
                         message: "family pack argument count mismatch".to_owned(),
                     });
                 }
+                // Imported members are loaded here: a packed family holds
+                // values of its element type, not artifact references.
                 let members = node
                     .args
                     .iter()
-                    .map(|wire| self.value(values, *wire))
+                    .map(|wire| self.materialize(values, *wire))
                     .collect::<Result<Vec<_>, _>>()?;
                 let family = self.indexed_family_output(scope_id, env, node.id, 0, members)?;
                 self.put(values, node.id, 0, family);

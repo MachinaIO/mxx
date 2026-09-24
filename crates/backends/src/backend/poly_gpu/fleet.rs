@@ -10,8 +10,7 @@ use crate::{
         PolyParams,
         dcrt::{
             gpu::{
-                CUDA_MEMCPY_DEFAULT, GpuDCRTPolyParams, GpuDynamicExportBindings,
-                GpuDynamicExportTable, GpuExportSlot, GpuExportStatus, GpuGraphPatch,
+                CUDA_MEMCPY_DEFAULT, GpuDCRTPolyParams, GpuExportSlot, GpuGraphPatch,
                 GpuHashSamplePlan, GpuIndexedMatrixTable, GpuIntegerOperation,
                 GpuModulusConversionPlan, GpuNativeEvent, GpuNativeGraphBuilder,
                 GpuNativeGraphError, GpuNativeLaunchStream, GpuRawControlStatusView,
@@ -602,7 +601,9 @@ fn compiled_raw_small_matrix_part(
             rows: part.view.extent[0],
             columns: part.view.extent[1],
             storage_columns: part.view.byte_strides[0] / column_stride,
-            column_offset: part.view.origin[1],
+            // `payload_address` already includes the view's byte offset, so
+            // the kernel must not shift the window by its origin again.
+            column_offset: 0,
             magnitude_bytes: u32::try_from(magnitude_bytes)
                 .map_err(|_| invalid("compact expansion magnitude width exceeds u32"))?,
             bound_domain,
@@ -630,7 +631,6 @@ pub(crate) struct GpuPreparedNativeResources {
     p1: BTreeMap<u32, (i32, Arc<GpuRawP1Workspace>)>,
     gq: BTreeMap<u32, (i32, Arc<GpuRawGqWorkspace>)>,
     cutoff: BTreeMap<u32, (i32, Arc<GpuRawPreimageCutoffPlan>)>,
-    dynamic_exports: BTreeMap<u32, (Arc<GpuDynamicExportTable>, Arc<GpuExportStatus>)>,
     indexed_matrices: BTreeMap<u32, Arc<GpuIndexedMatrixTable>>,
 }
 
@@ -680,13 +680,6 @@ impl GpuPreparedNativeResources {
                     .map(|(address, bytes)| (*device, address, bytes)),
             );
         }
-        for (table, status) in self.dynamic_exports.values() {
-            let device = table.physical_device();
-            ranges.extend(
-                table.binding_ranges().into_iter().map(|(address, bytes)| (device, address, bytes)),
-            );
-            ranges.push((device, status.device_address(), status.byte_len()));
-        }
         for table in self.indexed_matrices.values() {
             let (address, bytes) = table.allocation_range();
             ranges.push((table.physical_device(), address, bytes));
@@ -713,15 +706,6 @@ impl GpuPreparedNativeResources {
             GpuPreparedWorkspaceKind::Cutoff if component == 0 => {
                 let (device, workspace) = self.cutoff.get(&resource_id)?;
                 Some((*device, workspace.staging_address(), workspace.staging_bytes()))
-            }
-            GpuPreparedWorkspaceKind::DynamicExport => {
-                let (table, status) = self.dynamic_exports.get(&resource_id)?;
-                let (address, bytes) = match component {
-                    0..=2 => table.binding_ranges()[component as usize],
-                    3 => (status.device_address(), status.byte_len()),
-                    _ => return None,
-                };
-                Some((table.physical_device(), address, bytes))
             }
             _ => None,
         }
@@ -765,12 +749,6 @@ impl GpuPreparedNativeResources {
         for (device, plan) in self.cutoff.values() {
             if *device == physical_device {
                 plan.prepare_graph_launch(stream)?;
-            }
-        }
-        for (table, status) in self.dynamic_exports.values() {
-            if table.physical_device() == physical_device {
-                table.prepare_graph_launch(stream)?;
-                status.prepare_graph_launch(stream)?;
             }
         }
         Ok(())
@@ -841,7 +819,6 @@ pub(crate) fn prepare_compiled_gpu_program(
     backend: &GpuDcrtBackend,
     program: &CompiledGpuProgram,
     owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
-    dynamic_exports: &BTreeMap<u32, (Arc<GpuDynamicExportTable>, Arc<GpuExportStatus>)>,
     indexed_matrices: &BTreeMap<u32, Arc<GpuIndexedMatrixTable>>,
     hash_resources: &BTreeMap<u32, GpuHashResourceSpec>,
 ) -> Result<GpuPreparedNativeResources, GpuNativeGraphError> {
@@ -1720,7 +1697,6 @@ pub(crate) fn prepare_compiled_gpu_program(
         p1,
         gq,
         cutoff,
-        dynamic_exports: dynamic_exports.clone(),
         indexed_matrices: indexed_matrices.clone(),
     })
 }
@@ -1932,12 +1908,14 @@ pub(crate) fn emit_compiled_gpu_op(
                 *workspace_part,
                 PhysicalEncoding::FullCoeff,
             )?;
-            if compact_ty != workspace_ty ||
+            // The kernel reads the compact window at its own column offset and
+            // writes through the workspace view's addresses, so a compact
+            // column window may expand into a narrower workspace allocation.
+            if compact_ty.ring != workspace_ty.ring ||
                 compact.physical_device != op.device ||
                 workspace.physical_device != op.device ||
                 compact.rows != workspace.rows ||
-                compact.columns != workspace.columns ||
-                compact.column_offset != workspace.column_origin
+                compact.columns != workspace.columns
             {
                 return Err(invalid("compiled compact expansion layouts disagree"));
             }
@@ -1959,6 +1937,145 @@ pub(crate) fn emit_compiled_gpu_op(
             )?;
             builder.retain_owner(Arc::clone(compact_owner));
             builder.retain_owner(Arc::clone(workspace_owner));
+        }
+        GpuNativePrimitive::MatrixMulScalar => {
+            let [
+                KernelArg::Value(matrix_id),
+                KernelArg::U32(matrix_part),
+                KernelArg::Value(scalar_id),
+                KernelArg::U32(scalar_part),
+                KernelArg::Value(destination_id),
+                KernelArg::U32(destination_part),
+                KernelArg::U32(matrix_binding),
+                KernelArg::U32(scalar_binding),
+                KernelArg::U32(destination_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled scalar product has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*destination_id] {
+                return Err(invalid("compiled scalar product output does not match"));
+            }
+            let owner = |id: &PhysicalValueId| {
+                owners.get(id).ok_or_else(|| invalid("compiled scalar product owner is missing"))
+            };
+            let (matrix_owner, scalar_owner) = (owner(matrix_id)?, owner(scalar_id)?);
+            let destination_owner = owner(destination_id)?;
+            let (matrix_ty, matrix, matrix_bindings) =
+                compiled_raw_matrix_part(matrix_owner, *matrix_part, PhysicalEncoding::FullEval)?;
+            let (scalar_ty, scalar, scalar_bindings) =
+                compiled_raw_matrix_part(scalar_owner, *scalar_part, PhysicalEncoding::FullEval)?;
+            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
+                destination_owner,
+                *destination_part,
+                PhysicalEncoding::FullEval,
+            )?;
+            if matrix_ty.ring != scalar_ty.ring ||
+                matrix_ty.ring != destination_ty.ring ||
+                !same_raw_limbs(&matrix, &scalar) ||
+                !same_raw_limbs(&matrix, &destination) ||
+                matrix.physical_device != op.device ||
+                scalar.rows != 1 ||
+                scalar.columns != 1 ||
+                destination.rows != matrix.rows ||
+                destination.columns != matrix.columns
+            {
+                return Err(invalid("compiled scalar product layouts disagree"));
+            }
+            bind_raw_matrix_part(builder, *matrix_binding, &matrix_bindings)?;
+            bind_raw_matrix_part(builder, *scalar_binding, &scalar_bindings)?;
+            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+            let parameters = backend
+                .parameters_on_physical_device(op.device, &matrix_ty)
+                .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
+            parameters.emit_raw_matrix_mul_scalar(
+                builder.launch_stream(),
+                &matrix,
+                &scalar,
+                &destination,
+                *matrix_binding,
+                *scalar_binding,
+                *destination_binding,
+            )?;
+            for retained in [matrix_owner, scalar_owner, destination_owner] {
+                builder.retain_owner(Arc::clone(retained));
+            }
+        }
+        GpuNativePrimitive::MatrixMulSmallRhs => {
+            let [
+                KernelArg::Value(left_id),
+                KernelArg::U32(left_part),
+                KernelArg::Value(right_id),
+                KernelArg::U32(right_part),
+                KernelArg::Value(workspace_id),
+                KernelArg::U32(workspace_part),
+                KernelArg::Value(destination_id),
+                KernelArg::U32(destination_part),
+                KernelArg::U32(left_binding),
+                KernelArg::U32(right_binding),
+                KernelArg::U32(workspace_binding),
+                KernelArg::U32(destination_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled small-RHS product has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*destination_id, *workspace_id] {
+                return Err(invalid("compiled small-RHS product outputs do not match"));
+            }
+            let owner = |id: &PhysicalValueId| {
+                owners.get(id).ok_or_else(|| invalid("compiled small-RHS product owner is missing"))
+            };
+            let (left_owner, right_owner) = (owner(left_id)?, owner(right_id)?);
+            let (workspace_owner, destination_owner) =
+                (owner(workspace_id)?, owner(destination_id)?);
+            let (left_ty, left, left_bindings) =
+                compiled_raw_matrix_part(left_owner, *left_part, PhysicalEncoding::FullEval)?;
+            let (right_ty, right, right_bytes) =
+                compiled_raw_small_matrix_part(right_owner, *right_part)?;
+            let (workspace_ty, workspace, workspace_bindings) = compiled_raw_matrix_part(
+                workspace_owner,
+                *workspace_part,
+                PhysicalEncoding::FullEval,
+            )?;
+            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
+                destination_owner,
+                *destination_part,
+                PhysicalEncoding::FullEval,
+            )?;
+            if left_ty.ring != right_ty.ring ||
+                left_ty.ring != workspace_ty.ring ||
+                left_ty.ring != destination_ty.ring ||
+                !same_raw_limbs(&left, &workspace) ||
+                !same_raw_limbs(&left, &destination) ||
+                left.physical_device != op.device ||
+                left.columns != right.rows ||
+                workspace.rows != right.rows ||
+                destination.rows != left.rows ||
+                destination.columns != right.columns
+            {
+                return Err(invalid("compiled small-RHS product layouts disagree"));
+            }
+            bind_raw_matrix_part(builder, *left_binding, &left_bindings)?;
+            builder.bind_resident_address(right.payload_address, right_bytes, *right_binding)?;
+            bind_raw_matrix_part(builder, *workspace_binding, &workspace_bindings)?;
+            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+            let parameters = backend
+                .parameters_on_physical_device(op.device, &left_ty)
+                .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
+            parameters.emit_raw_matrix_mul_small_rhs(
+                builder.launch_stream(),
+                &left,
+                &right,
+                &workspace,
+                &destination,
+                *left_binding,
+                *right_binding,
+                *workspace_binding,
+                *destination_binding,
+            )?;
+            for retained in [left_owner, right_owner, workspace_owner, destination_owner] {
+                builder.retain_owner(Arc::clone(retained));
+            }
         }
         GpuNativePrimitive::MatrixSliceDynamic => {
             let [
@@ -2478,7 +2595,6 @@ pub(crate) fn emit_compiled_gpu_op(
                 left.columns != right.rows ||
                 destination.row_origin != left.row_origin ||
                 destination.rows != left.rows ||
-                destination.column_origin != right.column_origin ||
                 destination.columns != right.columns
             {
                 return Err(invalid(&format!(
@@ -3336,64 +3452,63 @@ pub(crate) fn emit_compiled_gpu_op(
                 builder.retain_owner(Arc::clone(owner));
             }
         }
-        GpuNativePrimitive::GadgetDecomposeSmallBalanced => {
+        GpuNativePrimitive::GadgetDecomposeCompact => {
             let [
                 KernelArg::Value(source_id),
                 KernelArg::U32(source_part),
                 KernelArg::Value(destination_id),
                 KernelArg::U32(destination_part),
                 KernelArg::U32(base_bits),
+                KernelArg::U32(dropped_moduli),
+                KernelArg::U32(small),
                 KernelArg::U32(source_binding),
                 KernelArg::U32(destination_binding),
             ] = op.arguments.as_ref()
             else {
-                return Err(invalid("compiled small balanced decomposition has wrong arguments"));
+                return Err(invalid("compiled compact decomposition has the wrong arguments"));
             };
-            if op.outputs.as_ref() != [*destination_id] || *base_bits == 0 {
+            if op.outputs.as_ref() != [*destination_id] || *small > 1 {
                 return Err(invalid(
-                    "compiled small balanced decomposition output or base is invalid",
+                    "compiled compact decomposition output or gadget kind is invalid",
                 ));
             }
             let source_owner = owners
                 .get(source_id)
-                .ok_or_else(|| invalid("small balanced decomposition source is absent"))?;
+                .ok_or_else(|| invalid("compiled compact decomposition source is missing"))?;
             let destination_owner = owners
                 .get(destination_id)
-                .ok_or_else(|| invalid("small balanced decomposition destination is absent"))?;
+                .ok_or_else(|| invalid("compiled compact decomposition destination is missing"))?;
             let (source_ty, source, source_bindings) =
                 compiled_raw_matrix_part(source_owner, *source_part, PhysicalEncoding::FullCoeff)?;
-            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
-                destination_owner,
-                *destination_part,
-                PhysicalEncoding::FullCoeff,
-            )?;
-            let max_bits = source_ty
-                .ring
-                .crt_moduli()
-                .iter()
-                .map(|modulus| u64::BITS - modulus.leading_zeros())
-                .max()
-                .ok_or_else(|| invalid("small balanced source has no CRT limbs"))?;
-            let digits = max_bits.div_ceil(*base_bits) as usize;
-            if source_ty.ring != destination_ty.ring ||
-                source_ty.columns != destination_ty.columns ||
-                source_ty.rows.checked_mul(digits) != Some(destination_ty.rows) ||
-                source.physical_device != op.device ||
+            let (destination_ty, destination, destination_bytes) =
+                compiled_raw_small_matrix_part(destination_owner, *destination_part)?;
+            if source.physical_device != op.device ||
                 destination.physical_device != op.device ||
-                !same_raw_limbs(&source, &destination)
+                source.columns != destination.columns ||
+                source.rows == 0 ||
+                destination.rows == 0 ||
+                *base_bits == 0 ||
+                source_ty.ring != destination_ty.ring
             {
-                return Err(invalid("small balanced decomposition layouts disagree"));
+                return Err(invalid("compiled compact decomposition layouts disagree"));
             }
             bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
-            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
-            let params = backend
+            builder.bind_resident_address(
+                destination.payload_address,
+                destination_bytes,
+                *destination_binding,
+            )?;
+            let parameters = backend
                 .parameters_on_physical_device(op.device, &source_ty)
-                .map_err(GpuNativeGraphError::Native)?;
-            params.emit_raw_gadget_decompose_small_balanced(
+                .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
+            parameters.emit_raw_matrix_decompose_compact(
                 builder.launch_stream(),
                 &source,
                 &destination,
                 *base_bits,
+                usize::try_from(*dropped_moduli)
+                    .map_err(|_| invalid("dropped modulus count exceeds usize"))?,
+                *small == 1,
                 *source_binding,
                 *destination_binding,
             )?;
@@ -3838,92 +3953,6 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(source_owner));
             builder.retain_owner(Arc::clone(destination_owner));
             builder.retain_owner(Arc::clone(status_owner));
-        }
-        GpuNativePrimitive::CompactPackPerCrtLimb => {
-            let [
-                KernelArg::Value(source_id),
-                KernelArg::U32(source_part),
-                KernelArg::Value(destination_id),
-                KernelArg::U32(destination_part),
-                KernelArg::Value(status_id),
-                KernelArg::U32(status_part),
-                KernelArg::U64(bound),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(destination_binding),
-                KernelArg::U32(status_binding),
-            ] = op.arguments.as_ref()
-            else {
-                return Err(invalid("per-CRT compact pack has wrong arguments"));
-            };
-            if op.outputs.as_ref() != [*destination_id] {
-                return Err(invalid("per-CRT compact pack has wrong output"));
-            }
-            let source_owner =
-                owners.get(source_id).ok_or_else(|| invalid("per-CRT pack source is absent"))?;
-            let destination_owner = owners
-                .get(destination_id)
-                .ok_or_else(|| invalid("per-CRT pack destination is absent"))?;
-            let status_owner =
-                owners.get(status_id).ok_or_else(|| invalid("per-CRT pack status is absent"))?;
-            let declared_bound = match destination_owner.wire_type() {
-                ConcreteWireType::SmallMatrix { max_coefficient_bound, bound_domain, .. } |
-                ConcreteWireType::Preimage { max_coefficient_bound, bound_domain, .. }
-                    if *bound_domain == mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb =>
-                {
-                    max_coefficient_bound.to_biguint()
-                }
-                _ => None,
-            }
-            .ok_or_else(|| invalid("per-CRT compact destination has invalid bound domain"))?;
-            if declared_bound != BigUint::from(*bound) {
-                return Err(invalid("per-CRT compact bound disagrees with type"));
-            }
-            let (source_ty, source, source_bindings) =
-                compiled_raw_matrix_part(source_owner, *source_part, PhysicalEncoding::FullCoeff)?;
-            let (destination_ty, destination, destination_bytes) =
-                compiled_raw_small_matrix_part(destination_owner, *destination_part)?;
-            let status = compiled_raw_control_status(
-                status_owner,
-                *status_part,
-                *status_binding,
-                op.device,
-            )?;
-            if source_ty != destination_ty ||
-                source.physical_device != op.device ||
-                destination.physical_device != op.device ||
-                source.rows != destination.rows ||
-                source.columns != destination.columns ||
-                source.row_origin != 0 ||
-                source.column_origin != 0 ||
-                destination.column_offset != 0 ||
-                destination.storage_columns != destination.columns ||
-                destination.bound_domain != 1 ||
-                destination.crt_depth as usize != source.limbs.len()
-            {
-                return Err(invalid("per-CRT compact physical layouts disagree"));
-            }
-            bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
-            builder.bind_resident_address(
-                destination.payload_address,
-                destination_bytes,
-                *destination_binding,
-            )?;
-            builder.bind_resident_address(status.address, 4, *status_binding)?;
-            let params = backend
-                .parameters_on_physical_device(op.device, &source_ty)
-                .map_err(GpuNativeGraphError::Native)?;
-            params.emit_raw_compact_pack_per_crt_limb(
-                builder.launch_stream(),
-                &source,
-                &destination,
-                status,
-                *bound,
-                *source_binding,
-                *destination_binding,
-            )?;
-            for owner in [source_owner, destination_owner, status_owner] {
-                builder.retain_owner(Arc::clone(owner));
-            }
         }
         GpuNativePrimitive::HashSample => {
             let [
@@ -5230,80 +5259,6 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(status_owner));
             builder.retain_owner(Arc::clone(plan));
         }
-        GpuNativePrimitive::ExportDynamic => {
-            let [
-                KernelArg::U32(resource_id),
-                KernelArg::Value(source_id),
-                KernelArg::U32(source_part),
-                KernelArg::Value(occurrence_id),
-                KernelArg::U32(occurrence_part),
-                KernelArg::U32(table_binding),
-                KernelArg::U32(claims_binding),
-                KernelArg::U32(claim_result_binding),
-                KernelArg::U32(occurrence_binding),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(status_binding),
-            ] = op.arguments.as_ref()
-            else {
-                return Err(invalid("compiled dynamic export has the wrong arguments"));
-            };
-            if !op.outputs.is_empty() {
-                return Err(invalid("compiled dynamic export has an unexpected output"));
-            }
-            let (table, status) = resources
-                .dynamic_exports
-                .get(resource_id)
-                .ok_or_else(|| invalid("compiled dynamic export resource is missing"))?;
-            if table.physical_device() != op.device || status.physical_device() != op.device {
-                return Err(invalid("compiled dynamic export resource is on another device"));
-            }
-            let source_owner = owners
-                .get(source_id)
-                .ok_or_else(|| invalid("compiled dynamic export source is missing"))?;
-            let occurrence_owner = owners
-                .get(occurrence_id)
-                .ok_or_else(|| invalid("compiled dynamic export occurrence is missing"))?;
-            let source_bytes = u64::try_from(table.maximum_payload_bytes())
-                .map_err(|_| invalid("dynamic export payload exceeds u64"))?;
-            let source_address =
-                compiled_raw_export_span(source_owner, *source_part, source_bytes, op.device)?;
-            let (occurrence, occurrence_bytes) = compiled_raw_integer_part(
-                occurrence_owner,
-                *occurrence_part,
-                *occurrence_binding,
-                op.device,
-            )?;
-            if occurrence.count != 1 ||
-                occurrence_bytes != 8 ||
-                occurrence.encoding != GpuSignedValuesEncoding::CanonicalU64
-            {
-                return Err(invalid("dynamic export occurrence must be canonical u64"));
-            }
-            builder.bind_resident_address(
-                source_address,
-                table.maximum_payload_bytes(),
-                *source_binding,
-            )?;
-            builder.bind_resident_address(occurrence.address, 8, *occurrence_binding)?;
-            builder.add_dynamic_export(
-                table,
-                source_address,
-                occurrence.address,
-                status,
-                GpuDynamicExportBindings {
-                    table: *table_binding,
-                    claims: *claims_binding,
-                    claim_result: *claim_result_binding,
-                    occurrence: *occurrence_binding,
-                    source: *source_binding,
-                    status: *status_binding,
-                },
-            )?;
-            builder.retain_owner(Arc::clone(source_owner));
-            builder.retain_owner(Arc::clone(occurrence_owner));
-            builder.retain_owner(Arc::clone(table));
-            builder.retain_owner(Arc::clone(status));
-        }
         GpuNativePrimitive::ExportCopy => {
             let [
                 KernelArg::Value(value_id),
@@ -6478,6 +6433,7 @@ impl GpuDcrtBackend {
     }
 
     pub(super) fn runtime_device_budgets(&self) -> Result<Vec<GpuDeviceBudget>, String> {
+        let fraction = crate::env::gpu_memory_fraction()?;
         self.devices
             .iter()
             .enumerate()
@@ -6485,7 +6441,7 @@ impl GpuDcrtBackend {
                 let memory = gpu_device_memory_usage(*physical)?;
                 Ok(GpuDeviceBudget {
                     device: logical,
-                    device_bytes: memory.total as u64,
+                    device_bytes: (memory.total as f64 * fraction) as u64,
                     pinned_host_bytes: 0,
                     host_bytes: 0,
                 })

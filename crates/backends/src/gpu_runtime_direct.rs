@@ -165,10 +165,35 @@ struct GraphRegion {
     /// Launch streams of the other devices this region's operations run on,
     /// which prepare their devices' resources before each launch.
     peer_streams: Vec<GpuNativeLaunchStream>,
+    /// Graph-owned allocations of earlier regions whose last use is here,
+    /// freed on the launch stream after each launch.
+    host_frees: Vec<u64>,
+    /// Allocations this region's Graph makes that a later region frees.
+    outliving: Vec<u64>,
+}
+
+impl Drop for DirectGraph {
+    /// Free the allocations of launched regions whose freeing region never
+    /// launched; no Graph of this plan can free them any more. The frees are
+    /// ordered on a region's launch stream after its submitted work.
+    fn drop(&mut self) {
+        let Some(region) = self.regions.first() else {
+            return;
+        };
+        let stream = region.executable.launch_stream();
+        for &address in &self.live_allocations {
+            if let Err(error) = stream.free_graph_allocation(address) {
+                tracing::warn!(%error, "leaked a Graph-owned scratch allocation");
+            }
+        }
+    }
 }
 
 struct DirectGraph {
     regions: Vec<GraphRegion>,
+    /// Allocations a launched region made that no later launch has freed
+    /// yet, for example after a failed launch; dropping the Graph frees them.
+    live_allocations: BTreeSet<u64>,
 }
 
 #[derive(Clone)]
@@ -389,7 +414,7 @@ impl DirectGraph {
         Ok(first..last + 1)
     }
 
-    fn compile(backend: &GpuDcrtBackend, frame: &PhysicalFrame) -> Result<Self, GpuPlanError> {
+    fn compile(backend: &GpuDcrtBackend, frame: &mut PhysicalFrame) -> Result<Self, GpuPlanError> {
         frame.program.validate().map_err(|error| GpuPlanError::GraphCompile(error.into()))?;
         let params = match frame.program.values.iter().find_map(|value| value.ty.matrix_type()) {
             Some(matrix) => backend.physical_matrix_parameters(matrix, frame.device),
@@ -408,7 +433,7 @@ impl DirectGraph {
                     "empty physical Graph has scheduled work".into(),
                 ));
             }
-            return Ok(Self { regions: Vec::new() });
+            return Ok(Self { regions: Vec::new(), live_allocations: BTreeSet::new() });
         }
         if !frame.external_io_loops.is_empty() && !frame.waves.is_empty() {
             return Err(GpuPlanError::GraphCompile(
@@ -515,6 +540,8 @@ impl DirectGraph {
         }
         starts.sort_unstable();
         starts.dedup();
+        let mut scratch = crate::gpu_graph_memory::plan_graph_scratch(backend, frame, &starts)
+            .map_err(GpuPlanError::Resource)?;
         let mut regions = Vec::with_capacity(starts.len());
         let indexed_tables = frame
             .indexed_tables
@@ -562,30 +589,48 @@ impl DirectGraph {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
+            let mut builder = params
+                .begin_graph(frame.device)
+                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
             let resources = prepare_compiled_gpu_program(
                 backend,
                 &program,
                 &frame.owners,
-                &frame.dynamic_export_resources,
                 &indexed_tables,
                 &frame.hash_resources,
             )
             .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
-            let mut builder = params
-                .begin_graph(frame.device)
-                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
-            emit_direct_operations(backend, &mut builder, frame, &resources, &program.operations)
-                .map_err(|error| {
-                GpuPlanError::GraphCompile(format!("region operations {start}..{end}: {error}"))
-            })?;
-            let mut executable =
+            // Graph-owned scratch is allocated right before its first
+            // operation and freed right after its last one.
+            let (mut host_frees, mut outliving) = (Vec::new(), Vec::new());
+            for (offset, operation) in program.operations.iter().enumerate() {
+                let index = start + offset;
+                scratch
+                    .before_operation(&mut builder, frame, start, index, &mut outliving)
+                    .and_then(|tokens| {
+                        if !tokens.is_empty() {
+                            builder.set_pending_memory_dependencies(&tokens)?;
+                        }
+                        emit_direct_operation(
+                            backend,
+                            &mut builder,
+                            frame,
+                            &resources,
+                            offset,
+                            operation,
+                        )
+                    })
+                    .and_then(|()| {
+                        scratch.after_operation(&mut builder, start, index, &mut host_frees)
+                    })
+                    .map_err(|error| {
+                        GpuPlanError::GraphCompile(format!(
+                            "region operations {start}..{end}: {error}"
+                        ))
+                    })?;
+            }
+            let executable =
                 builder.finish().map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
-            // Upload the executable now, so its first production launch does
-            // not pay the device-side graph setup.
-            let launch_stream = executable.launch_stream().clone();
-            executable
-                .upload(&launch_stream)
-                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
             let peer_streams = peer_devices
                 .iter()
                 .map(|&device| device_launch_stream(backend, device))
@@ -598,9 +643,23 @@ impl DirectGraph {
                 resources,
                 device: frame.device,
                 peer_streams,
+                host_frees,
+                outliving,
             });
         }
-        let graph = Self { regions };
+        // Upload maps the Graph-owned scratch, and CUDA keeps the reservation
+        // of an upload that runs out of memory, so admit the scheduled peak
+        // first. Upload now, so the first production launch does not pay the
+        // device-side graph setup.
+        admit_graph_scratch(&scratch.peak_bytes()).map_err(GpuPlanError::Resource)?;
+        for region in &mut regions {
+            let launch_stream = region.executable.launch_stream().clone();
+            region
+                .executable
+                .upload(&launch_stream)
+                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
+        }
+        let graph = Self { regions, live_allocations: BTreeSet::new() };
         wave_groups(frame, &graph).map_err(GpuPlanError::GraphCompile)?;
         Ok(graph)
     }
@@ -758,6 +817,15 @@ impl DirectGraph {
             peer.record_event()?.enqueue_wait(&stream)?;
         }
         let completion = region.executable.launch(&stream)?;
+        self.live_allocations.extend(region.outliving.iter().copied());
+        for &address in &region.host_frees {
+            stream.free_graph_allocation(address).map_err(|error| {
+                GpuRuntimeError::LaunchUncertain(format!(
+                    "native graph launched but a Graph allocation could not be freed: {error}"
+                ))
+            })?;
+            self.live_allocations.remove(&address);
+        }
         for (device, stream) in std::iter::once((region.device, &stream))
             .chain(region.peer_streams.iter().map(|peer| (peer.physical_device(), peer)))
         {
@@ -817,6 +885,38 @@ fn control_address(
         .ok_or_else(|| invalid("control address overflows"))
 }
 
+/// The distinct device IDs a plan contract places work on.
+fn contract_devices(
+    contract: &crate::gpu_execution_plan::GpuPlanContract,
+) -> Result<BTreeSet<i32>, GpuPlanError> {
+    contract
+        .logical_to_physical_devices
+        .iter()
+        .map(|&device| {
+            i32::try_from(device)
+                .map_err(|_| GpuPlanError::Resource("physical device ID overflows".into()))
+        })
+        .collect()
+}
+
+/// Refuse a Graph whose scheduled scratch peak, with a small margin for
+/// CUDA's rounding, exceeds the memory now free. CUDA keeps the reservation
+/// of a Graph upload or launch that runs out of memory, which leaves the
+/// process unable to allocate, so an unfit Graph is never uploaded.
+fn admit_graph_scratch(peaks: &BTreeMap<i32, u64>) -> Result<(), String> {
+    for (&device, &peak) in peaks {
+        let free = crate::poly::dcrt::gpu::gpu_memory_info(device)?.free as u64;
+        let required = peak.saturating_add(peak / 32);
+        if required > free {
+            return Err(format!(
+                "Graph scratch needs {required} bytes on GPU {device}, {free} bytes are free"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check the plan's persistent allocations against each device budget.
 fn validate_allocated_budget(
     frame: &PhysicalFrame,
     contract: &crate::gpu_execution_plan::GpuPlanContract,
@@ -835,6 +935,10 @@ fn validate_allocated_budget(
             let storage = owner
                 .storage(part.storage)
                 .ok_or_else(|| GpuPlanError::Resource("allocated storage is missing".into()))?;
+            // Graph-owned scratch is admitted when the Graph is compiled.
+            if crate::gpu_graph_memory::is_graph_managed(storage) {
+                continue;
+            }
             allocations
                 .entry((storage.device, storage.address))
                 .and_modify(|bytes| *bytes = (*bytes).max(storage.bytes))
@@ -871,6 +975,7 @@ fn validate_allocated_budget(
             .filter(|((owner_device, _), _)| *owner_device == device)
             .try_fold(0u64, |total, (_, bytes)| total.checked_add(*bytes))
             .ok_or_else(|| GpuPlanError::Resource("actual allocation size overflows".into()))?;
+        tracing::debug!(device, used, budget = budget.device_bytes, "GPU plan allocation check");
         if used > budget.device_bytes {
             return Err(GpuPlanError::Resource(format!(
                 "actual allocations use {used} bytes on GPU {device}, over {}-byte budget",
@@ -961,65 +1066,6 @@ fn check_preimage_replays(frame: &PhysicalFrame) -> Result<(), String> {
     Ok(())
 }
 
-fn check_dynamic_exports(frame: &PhysicalFrame) -> Result<(), String> {
-    for (&resource_id, (_, status)) in &frame.dynamic_export_resources {
-        let code = status.read().map_err(|error| error.to_string())?;
-        if code != 0 {
-            let reason = match code {
-                1 => "occurrence is outside the planned slot table",
-                2 => "occurrence was published more than once",
-                3 => "planned slot metadata is invalid",
-                _ => "unknown device export error",
-            };
-            return Err(format!(
-                "GPU dynamic export resource {resource_id} failed: {reason} (status {code})"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn check_wave_export_slots(frame: &PhysicalFrame, wave_index: usize) -> Result<(), String> {
-    let wave = frame.waves.get(wave_index).ok_or("GPU export wave is missing")?;
-    for &index in &wave.export_template_indices {
-        let site = frame.export_templates.get(index).ok_or("GPU export template is missing")?;
-        let fragment = site
-            .export
-            .fragments
-            .get(site.fragment_index)
-            .ok_or("GPU export fragment is missing")?;
-        let slot = frame.slots.get(site.slot).ok_or("GPU export slot is missing")?;
-        let ready = slot.ready().map_err(|error| error.to_string())?.ok_or_else(|| {
-            format!(
-                "GPU export {}[{:?}] site {} was not published",
-                site.name, site.index, site.site
-            )
-        })?;
-        if ready.header.site != site.site ||
-            ready.header.occurrence != site.occurrence ||
-            ready.header.artifact_offset != fragment.raw_offset ||
-            ready.header.payload_bytes != fragment.raw_bytes ||
-            (ready.header.flags & 1 != 0) != site.final_chunk
-        {
-            return Err(format!(
-                "GPU export {}[{:?}] site {} published different metadata",
-                site.name, site.index, site.site
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Reuse a table only after the preceding Graph and every observer reader of
-/// its mapped slots have completed. The caller owns that sequential join.
-unsafe fn reset_dynamic_exports_after_completion(frame: &PhysicalFrame) -> Result<(), String> {
-    for (table, status) in frame.dynamic_export_resources.values() {
-        unsafe { table.reset_after_completion() }.map_err(|error| error.to_string())?;
-        status.reset().map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
 fn emit_direct_operations(
     backend: &GpuDcrtBackend,
     builder: &mut GpuNativeGraphBuilder,
@@ -1027,100 +1073,111 @@ fn emit_direct_operations(
     resources: &GpuPreparedNativeResources,
     operations: &[CompiledGpuOp],
 ) -> Result<(), GpuNativeGraphError> {
-    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
     for (index, operation) in operations.iter().enumerate() {
-        let implementation =
-            frame.program.implementations.resolve(operation.implementation).map_err(invalid)?;
-        let index = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
-        // An operation on another device adds its nodes to this graph through
-        // that device's stream.
-        let home = (operation.device != builder.launch_stream().physical_device())
-            .then(|| {
-                device_launch_stream(backend, operation.device)
-                    .map(|stream| builder.replace_launch_stream(stream))
-            })
-            .transpose()?;
-        let emitted = match implementation.primitive {
-            GpuNativePrimitive::BranchIf => {
-                let [KernelArg::Value(predicate), KernelArg::U32(part), KernelArg::U32(binding)] =
-                    operation.arguments.as_ref()
-                else {
-                    return Err(invalid("invalid IF arguments"));
-                };
-                let body =
-                    operation.body.as_deref().ok_or_else(|| invalid("IF body is missing"))?;
-                let address = control_address(frame, *predicate, *part, 8)?;
-                builder.begin_operation(index, &operation.predecessors)?;
-                builder.bind_resident_address(address, 8, *binding)?;
-                builder
-                    .add_if_with_body(address, *binding, |body_builder| {
-                        emit_direct_operations(backend, body_builder, frame, resources, body)
-                    })
-                    .and_then(|()| builder.finish_operation().map(|_| ()))
-            }
-            GpuNativePrimitive::LoopWhile => {
-                let [
-                    KernelArg::Value(index_value),
-                    KernelArg::U32(index_part),
-                    KernelArg::Value(limit_value),
-                    KernelArg::U32(limit_part),
-                    KernelArg::Value(status_value),
-                    KernelArg::U32(status_part),
-                    KernelArg::U64(max_iterations),
-                    KernelArg::U32(index_binding),
-                    KernelArg::U32(limit_binding),
-                    KernelArg::U32(status_binding),
-                ] = operation.arguments.as_ref()
-                else {
-                    return Err(invalid("invalid WHILE arguments"));
-                };
-                let body =
-                    operation.body.as_deref().ok_or_else(|| invalid("WHILE body is missing"))?;
-                let index_address = control_address(frame, *index_value, *index_part, 8)?;
-                let limit_address = control_address(frame, *limit_value, *limit_part, 8)?;
-                let status_address = control_address(frame, *status_value, *status_part, 4)?;
-                builder.begin_operation(index, &operation.predecessors)?;
-                builder.bind_resident_address(index_address, 8, *index_binding)?;
-                builder.bind_resident_address(limit_address, 8, *limit_binding)?;
-                builder.bind_resident_address(status_address, 4, *status_binding)?;
-                builder
-                    .add_while_with_body(
-                        index_address,
-                        limit_address,
-                        *max_iterations,
-                        status_address,
-                        *index_binding,
-                        *limit_binding,
-                        *status_binding,
-                        |body_builder| {
-                            emit_direct_operations(backend, body_builder, frame, resources, body)
-                        },
-                    )
-                    .and_then(|()| builder.finish_operation().map(|_| ()))
-            }
-            _ => emit_compiled_gpu_op(
-                backend,
-                builder,
-                index,
-                operation,
-                implementation,
-                resources,
-                &frame.owners,
-                &frame.slots,
-            )
-            .map_err(|error| {
-                GpuNativeGraphError::Native(format!(
-                    "operation {index} {:?} {:?}: {error}",
-                    implementation.primitive, operation.arguments
-                ))
-            }),
-        };
-        if let Some(home) = home {
-            builder.replace_launch_stream(home);
-        }
-        emitted?;
+        emit_direct_operation(backend, builder, frame, resources, index, operation)?;
     }
     Ok(())
+}
+
+/// Emit operation `index` of the operation list being built, including its
+/// conditional body.
+fn emit_direct_operation(
+    backend: &GpuDcrtBackend,
+    builder: &mut GpuNativeGraphBuilder,
+    frame: &PhysicalFrame,
+    resources: &GpuPreparedNativeResources,
+    index: usize,
+    operation: &CompiledGpuOp,
+) -> Result<(), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let implementation =
+        frame.program.implementations.resolve(operation.implementation).map_err(invalid)?;
+    let index = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
+    // An operation on another device adds its nodes to this graph through
+    // that device's stream.
+    let home = (operation.device != builder.launch_stream().physical_device())
+        .then(|| {
+            device_launch_stream(backend, operation.device)
+                .map(|stream| builder.replace_launch_stream(stream))
+        })
+        .transpose()?;
+    let emitted = match implementation.primitive {
+        GpuNativePrimitive::BranchIf => {
+            let [KernelArg::Value(predicate), KernelArg::U32(part), KernelArg::U32(binding)] =
+                operation.arguments.as_ref()
+            else {
+                return Err(invalid("invalid IF arguments"));
+            };
+            let body = operation.body.as_deref().ok_or_else(|| invalid("IF body is missing"))?;
+            let address = control_address(frame, *predicate, *part, 8)?;
+            builder.begin_operation(index, &operation.predecessors)?;
+            builder.bind_resident_address(address, 8, *binding)?;
+            builder
+                .add_if_with_body(address, *binding, |body_builder| {
+                    emit_direct_operations(backend, body_builder, frame, resources, body)
+                })
+                .and_then(|()| builder.finish_operation().map(|_| ()))
+        }
+        GpuNativePrimitive::LoopWhile => {
+            let [
+                KernelArg::Value(index_value),
+                KernelArg::U32(index_part),
+                KernelArg::Value(limit_value),
+                KernelArg::U32(limit_part),
+                KernelArg::Value(status_value),
+                KernelArg::U32(status_part),
+                KernelArg::U64(max_iterations),
+                KernelArg::U32(index_binding),
+                KernelArg::U32(limit_binding),
+                KernelArg::U32(status_binding),
+            ] = operation.arguments.as_ref()
+            else {
+                return Err(invalid("invalid WHILE arguments"));
+            };
+            let body = operation.body.as_deref().ok_or_else(|| invalid("WHILE body is missing"))?;
+            let index_address = control_address(frame, *index_value, *index_part, 8)?;
+            let limit_address = control_address(frame, *limit_value, *limit_part, 8)?;
+            let status_address = control_address(frame, *status_value, *status_part, 4)?;
+            builder.begin_operation(index, &operation.predecessors)?;
+            builder.bind_resident_address(index_address, 8, *index_binding)?;
+            builder.bind_resident_address(limit_address, 8, *limit_binding)?;
+            builder.bind_resident_address(status_address, 4, *status_binding)?;
+            builder
+                .add_while_with_body(
+                    index_address,
+                    limit_address,
+                    *max_iterations,
+                    status_address,
+                    *index_binding,
+                    *limit_binding,
+                    *status_binding,
+                    |body_builder| {
+                        emit_direct_operations(backend, body_builder, frame, resources, body)
+                    },
+                )
+                .and_then(|()| builder.finish_operation().map(|_| ()))
+        }
+        _ => emit_compiled_gpu_op(
+            backend,
+            builder,
+            index,
+            operation,
+            implementation,
+            resources,
+            &frame.owners,
+            &frame.slots,
+        )
+        .map_err(|error| {
+            GpuNativeGraphError::Native(format!(
+                "operation {index} {:?} {:?}: {error}",
+                implementation.primitive, operation.arguments
+            ))
+        }),
+    };
+    if let Some(home) = home {
+        builder.replace_launch_stream(home);
+    }
+    emitted
 }
 
 pub struct GpuExecutionPlan {
@@ -1756,7 +1813,7 @@ impl GpuRuntime {
                 validate_allocated_budget(&frame, &contract, None)?;
                 wait_for_bound_inputs(&frame).map_err(GpuPlanError::Measurement)?;
                 frame.bind_return_outputs(&self.backend).map_err(GpuPlanError::Resource)?;
-                let mut graph = DirectGraph::compile(&self.backend, &frame)?;
+                let mut graph = DirectGraph::compile(&self.backend, &mut frame)?;
                 validate_allocated_budget(&frame, &contract, Some(&graph))?;
                 graph
                     .bind(&frame)
@@ -1790,7 +1847,7 @@ impl GpuRuntime {
                     };
                     // Trial inputs and artifact destinations are not production
                     // data, so device status words (integer control, preimage
-                    // retries, dynamic exports) are data-dependent and belong to
+                    // retries) are data-dependent and belong to
                     // execute; a trial only measures the joined Graph.
                     if trial_index >= self.options.measurement_warmups {
                         measured_seconds += region_seconds
@@ -1805,24 +1862,47 @@ impl GpuRuntime {
                         unsafe { slot.reset_after_completion() }
                             .map_err(|error| GpuPlanError::Measurement(error.to_string()))?;
                     }
-                    // SAFETY: the trial Graph has completed and no artifact
-                    // observer was started for this plan-time measurement.
-                    unsafe { reset_dynamic_exports_after_completion(&frame) }
-                        .map_err(GpuPlanError::Measurement)?;
                 }
                 Ok(measured_seconds / self.options.measurement_iterations.get() as f64)
             })();
+            // The candidate's owners and Graphs are gone; complete their
+            // frees and return the pools' retained memory so the next
+            // candidate, and the selected plan, are admitted on their own.
+            for device in contract_devices(&contract)? {
+                crate::poly::dcrt::gpu::gpu_release_cached_memory(device)
+                    .map_err(GpuPlanError::Resource)?;
+                tracing::debug!(
+                    device,
+                    free = crate::poly::dcrt::gpu::gpu_memory_info(device)
+                        .map_err(GpuPlanError::Resource)?
+                        .free,
+                    graph_reserved = crate::poly::dcrt::gpu::gpu_graph_memory_reserved(device)
+                        .map_err(GpuPlanError::Resource)?,
+                    pool = ?crate::poly::dcrt::gpu::gpu_default_mempool_usage(device)
+                        .map_err(GpuPlanError::Resource)?,
+                    "released GPU plan candidate memory"
+                );
+            }
             match trial {
                 Ok(seconds) if seconds.is_finite() => {
+                    tracing::debug!(
+                        candidate_w,
+                        candidate_c,
+                        seconds,
+                        "measured GPU plan candidate"
+                    );
                     measured.insert(candidate_w, candidate_c, seconds);
-                    if best.is_none_or(|(_, _, current)| seconds < current) {
+                    if best.as_ref().is_none_or(|(_, _, current)| seconds < *current) {
                         best = Some((candidate_w, candidate_c, seconds));
                     }
                 }
                 Ok(_) => {
                     rejected.push(format!("W={candidate_w}, C={candidate_c}: non-finite time"))
                 }
-                Err(error) => rejected.push(format!("W={candidate_w}, C={candidate_c}: {error}")),
+                Err(error) => {
+                    tracing::debug!(candidate_w, candidate_c, %error, "rejected GPU plan candidate");
+                    rejected.push(format!("W={candidate_w}, C={candidate_c}: {error}"))
+                }
             }
         }
         let (selected_w, selected_c, selected_seconds) = best.ok_or_else(|| {
@@ -1831,10 +1911,11 @@ impl GpuRuntime {
                 rejected.join("; ")
             ))
         })?;
+        tracing::debug!(selected_w, selected_c, "selected GPU plan candidate");
         let logical =
             single_root_physical_plan(&validated, contract.clone(), selected_c, selected_w)
                 .map_err(GpuPlanError::InvalidInput)?;
-        let frame = plan_physical_graph(
+        let mut frame = plan_physical_graph(
             &self.backend,
             &validated,
             &logical,
@@ -1844,7 +1925,7 @@ impl GpuRuntime {
         )
         .map_err(GpuPlanError::Resource)?;
         validate_allocated_budget(&frame, &contract, None)?;
-        let graph = DirectGraph::compile(&self.backend, &frame)?;
+        let graph = DirectGraph::compile(&self.backend, &mut frame)?;
         validate_allocated_budget(&frame, &contract, Some(&graph))?;
         let report = GpuWarmupReport {
             predicted_seconds: selected_seconds,
@@ -1949,12 +2030,6 @@ impl GpuRuntime {
                 // observer before returning.
                 unsafe { slot.reset_after_completion() }?;
             }
-            // SAFETY: a successful prior execute joined both its Graph and
-            // all mapped-slot I/O readers before incrementing completed_runs.
-            if let Err(error) = unsafe { reset_dynamic_exports_after_completion(&plan.frame) } {
-                plan.poisoned = true;
-                return Err(GpuRuntimeError::Execution(error));
-            }
         }
         for control in &plan.frame.control_resets {
             control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
@@ -2001,7 +2076,6 @@ impl GpuRuntime {
                 control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
             }
             check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
-            check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
             plan.completed_runs += 1;
             return Ok(GpuExecutionPayload {
                 outputs: returned_values(&plan.frame).map_err(GpuRuntimeError::Execution)?,
@@ -2287,11 +2361,7 @@ impl GpuRuntime {
             upload_sample_seeds(&plan.frame, execution_nonce, &logical_path)
                 .map_err(GpuRuntimeError::Execution)?;
             let wave = &plan.frame.waves[wave_index];
-            for (owner, occurrence) in
-                wave.export_occurrences.iter().chain(parent_occurrence.into_iter().flat_map(
-                    |actual| wave.invocation_export_occurrences.get(&actual).into_iter().flatten(),
-                ))
-            {
+            for (owner, occurrence) in &wave.export_occurrences {
                 owner
                     .upload_u64(&[*occurrence])
                     .and_then(|()| owner.wait_until_ready())
@@ -2316,8 +2386,6 @@ impl GpuRuntime {
                 control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
             }
             check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
-            check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
-            check_wave_export_slots(&plan.frame, wave_index).map_err(GpuRuntimeError::Execution)?;
         }
         Ok(())
     }
@@ -2359,7 +2427,6 @@ impl GpuRuntime {
             control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
         }
         check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
-        check_dynamic_exports(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
         if pump.is_none() {
             plan.completed_runs += 1;
         }
@@ -2557,7 +2624,6 @@ impl GpuRuntime {
                 .iter()
                 .try_for_each(|control| control.check_completed())
                 .and_then(|()| check_preimage_replays(&plan.frame))
-                .and_then(|()| check_dynamic_exports(&plan.frame))
                 .map_err(GpuRuntimeError::DeviceStatus)
         } else {
             Ok(())

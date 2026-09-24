@@ -285,17 +285,6 @@ struct MxxRawSmallMatrixView
     uint32_t crt_depth;
     uint32_t reserved;
 };
-struct MxxDynamicExportEntry
-{
-    uint64_t header_address;
-    uint64_t payload_address;
-    uint64_t payload_capacity;
-    uint64_t occurrence;
-    uint64_t artifact_offset;
-    uint64_t payload_bytes;
-    uint32_t site;
-    uint32_t flags;
-};
 int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     int inverse, uint32_t source_binding_base, uint32_t destination_binding_base);
@@ -442,10 +431,10 @@ int gpu_raw_matrix_decompose_coeff(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     uint32_t base_bits, size_t dropped_moduli,
     uint32_t source_binding_base, uint32_t destination_binding_base);
-int gpu_raw_matrix_decompose_small_balanced(GpuContext *ctx, void *stream,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    uint32_t base_bits, uint32_t source_binding_base,
-    uint32_t destination_binding_base);
+int gpu_raw_matrix_decompose_compact(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *source, const MxxRawSmallMatrixView *destination,
+    uint32_t base_bits, size_t dropped_moduli, int full_basis_small,
+    uint32_t source_binding_base, uint32_t destination_binding);
 int gpu_raw_modulus_conversion_prepare(
     GpuContext *ctx, int physical_device, void *stream,
     const uint64_t *source_moduli, size_t source_count,
@@ -484,11 +473,6 @@ int gpu_raw_compact_pack_emit(
     const MxxRawSmallMatrixView *destination, uint32_t *status,
     uint32_t source_binding_base, uint32_t destination_binding,
     uint32_t status_binding);
-int gpu_raw_compact_pack_per_crt_limb(
-    GpuContext *ctx, void *stream, const MxxRawMatrixView *source,
-    const MxxRawSmallMatrixView *destination, uint32_t *status,
-    uint64_t bound, uint32_t source_binding_base,
-    uint32_t destination_binding, uint32_t status_binding);
 int gpu_raw_matrix_dynamic_slice(
     GpuContext *ctx, void *stream, const MxxRawMatrixView *source,
     const MxxRawMatrixView *destination,
@@ -521,6 +505,15 @@ int gpu_raw_polynomial_from_values(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *destination, uint32_t *status,
     uint32_t source_binding, uint32_t destination_binding_base,
     uint32_t status_binding);
+int gpu_raw_matrix_mul_scalar(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *matrix, const MxxRawMatrixView *scalar,
+    const MxxRawMatrixView *destination, uint32_t matrix_binding_base,
+    uint32_t scalar_binding_base, uint32_t destination_binding_base);
+int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *left, const MxxRawSmallMatrixView *right,
+    const MxxRawMatrixView *workspace, const MxxRawMatrixView *destination,
+    uint32_t left_binding_base, uint32_t right_binding,
+    uint32_t workspace_binding_base, uint32_t destination_binding_base);
 int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream,
     const MxxRawSmallMatrixView *source,
     const MxxRawMatrixView *destination,
@@ -530,6 +523,15 @@ int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream,
 // returned by finish_operation; each operation's internal nodes are ordered.
 int mxx_gpu_graph_builder_create(GpuContext *ctx, int physical_device,
     void *stream, MxxGpuGraphBuilder **out_builder);
+int gpu_device_release_cached_memory(int device);
+int gpu_device_graph_memory_reserved(int device, size_t *out_reserved_bytes);
+int gpu_graph_allocation_free_async(uint64_t address, void *stream);
+int mxx_gpu_graph_builder_add_memory_alloc(MxxGpuGraphBuilder *builder, int device,
+    size_t bytes, uint32_t *out_token, uint64_t *out_address);
+int mxx_gpu_graph_builder_add_memory_free(MxxGpuGraphBuilder *builder, uint64_t address,
+    const uint32_t *operations, size_t operation_count);
+int mxx_gpu_graph_builder_set_pending_memory_dependencies(MxxGpuGraphBuilder *builder,
+    const uint32_t *tokens, size_t count);
 int mxx_gpu_graph_builder_begin_operation(MxxGpuGraphBuilder *builder,
     uint32_t operation_index, const uint32_t *predecessors, size_t predecessor_count);
 int mxx_gpu_graph_builder_finish_operation(MxxGpuGraphBuilder *builder,
@@ -551,14 +553,6 @@ int mxx_gpu_graph_builder_add_export_publish(MxxGpuGraphBuilder *builder,
     void *device_header, uint64_t occurrence, uint64_t artifact_offset,
     uint64_t payload_bytes, uint32_t site, uint32_t flags,
     uint32_t header_binding);
-int mxx_gpu_graph_builder_add_dynamic_export(
-    MxxGpuGraphBuilder *builder, const MxxDynamicExportEntry *device_table,
-    uint32_t *device_claims, uint32_t *device_claim_result,
-    const uint64_t *device_occurrence, const void *source,
-    uint32_t *device_status, size_t entry_count, size_t maximum_payload_bytes,
-    uint32_t table_binding, uint32_t claims_binding,
-    uint32_t claim_result_binding, uint32_t occurrence_binding,
-    uint32_t source_binding, uint32_t status_binding);
 
 int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder,
     const uint64_t *predicate, uint32_t predicate_binding);

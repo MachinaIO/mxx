@@ -68,6 +68,10 @@ extern "C"
     int gpu_matrix_binding_limb_count(const GpuMatrix *mat, size_t *out_count);
     int gpu_matrix_binding_limb(const GpuMatrix *mat,
         size_t crt_limb_index, GpuMatrixBindingLimb *out);
+    int gpu_matrix_binding_layout(
+        const GpuContext *ctx, int level, size_t rows, size_t cols,
+        GpuMatrixBindingLimb *out_limbs, size_t capacity,
+        size_t *out_limb_count, size_t *out_data_bytes);
 
     int gpu_matrix_create(
         GpuContext *ctx,

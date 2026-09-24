@@ -42,64 +42,6 @@ __global__ void mxx_export_slot_publish_kernel(MxxExportSlotHeader *header,
     atomicExch_system(reinterpret_cast<unsigned long long *>(&header->ready), 1ULL);
 }
 
-__global__ void mxx_dynamic_export_claim_kernel(
-    const MxxDynamicExportEntry *table, uint32_t *claims,
-    uint32_t *claim_result, const uint64_t *occurrence,
-    uint32_t *status, size_t count)
-{
-    if (threadIdx.x || blockIdx.x) return;
-    *claim_result = 0;
-    if (*status != 0U) return;
-    const uint64_t index = *occurrence;
-    if (index >= count)
-    {
-        atomicCAS(status, 0U, 1U);
-        return;
-    }
-    const auto entry = table[index];
-    if (!entry.header_address || !entry.payload_address ||
-        entry.payload_bytes > entry.payload_capacity || entry.occurrence != index)
-    {
-        atomicCAS(status, 0U, 3U);
-        return;
-    }
-    if (atomicCAS(&claims[index], 0U, 1U) != 0U)
-    {
-        atomicCAS(status, 0U, 2U);
-        return;
-    }
-    *claim_result = 1;
-}
-
-__global__ void mxx_dynamic_export_copy_kernel(
-    const MxxDynamicExportEntry *table, const uint32_t *claim_result,
-    const uint64_t *occurrence, const uint8_t *source,
-    size_t byte_offset)
-{
-    if (*claim_result != 1U) return;
-    const auto entry = table[*occurrence];
-    const size_t index = byte_offset +
-        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < entry.payload_bytes)
-        reinterpret_cast<uint8_t *>(entry.payload_address)[index] = source[index];
-}
-
-__global__ void mxx_dynamic_export_publish_kernel(
-    const MxxDynamicExportEntry *table, const uint32_t *claim_result,
-    const uint64_t *occurrence)
-{
-    if (threadIdx.x || blockIdx.x || *claim_result != 1U) return;
-    const auto entry = table[*occurrence];
-    auto *header = reinterpret_cast<MxxExportSlotHeader *>(entry.header_address);
-    header->occurrence = entry.occurrence;
-    header->artifact_offset = entry.artifact_offset;
-    header->payload_bytes = entry.payload_bytes;
-    header->site = entry.site;
-    header->flags = entry.flags;
-    __threadfence_system();
-    atomicExch_system(reinterpret_cast<unsigned long long *>(&header->ready), 1ULL);
-}
-
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
 
 __global__ void mxx_if_gate_kernel(const uint64_t *predicate,
@@ -1447,6 +1389,66 @@ extern "C"
         return 0;
     }
 
+    // Free a Graph-owned allocation of an earlier Graph after the work already
+    // enqueued on `stream`.
+    int gpu_graph_allocation_free_async(uint64_t address, void *stream)
+    {
+        if (address == 0 || !stream) return set_error("invalid graph allocation free");
+        const cudaError_t err = cudaFreeAsync(
+            reinterpret_cast<void *>(address), reinterpret_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess) return set_error(err);
+        return 0;
+    }
+
+    // Graph-reserved physical memory currently mapped on `device`.
+    int gpu_device_graph_memory_reserved(int device, size_t *out_reserved_bytes)
+    {
+        if (device < 0 || !out_reserved_bytes)
+            return set_error("invalid gpu_device_graph_memory_reserved arguments");
+        uint64_t reserved = 0;
+        const cudaError_t err = cudaDeviceGetGraphMemAttribute(
+            mxx_physical_device(device), cudaGraphMemAttrReservedMemCurrent, &reserved);
+        if (err != cudaSuccess) return set_error(err);
+        *out_reserved_bytes = static_cast<size_t>(reserved);
+        return 0;
+    }
+
+    // Complete every pending free on `device`, then return the physical
+    // memory the Graph pool, the default pool, and the driver's cache of
+    // destroyed Graph executables retain, so either pool can satisfy the next
+    // allocation. Planning only: this synchronizes the whole device.
+    int gpu_device_release_cached_memory(int device)
+    {
+        if (device < 0) return set_error("invalid gpu_device_release_cached_memory device");
+        const int physical = mxx_physical_device(device);
+        cudaError_t err = mxx_set_device(device);
+        if (err == cudaSuccess) err = cudaDeviceSynchronize();
+        if (err == cudaSuccess) err = cudaDeviceGraphMemTrim(physical);
+        cudaMemPool_t pool = nullptr;
+        if (err == cudaSuccess) err = cudaDeviceGetDefaultMemPool(&pool, physical);
+        if (err == cudaSuccess) err = cudaMemPoolTrimTo(pool, 0);
+        if (err != cudaSuccess) return set_error(err);
+        // The driver caches the device memory of destroyed Graph executables
+        // (several KiB per kernel node) and returns it only to cudaMalloc,
+        // not to pool or Graph allocations. A request for the whole device
+        // cannot succeed, but makes the driver release that cache first.
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        err = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (err != cudaSuccess) return set_error(err);
+        void *probe = nullptr;
+        if (cudaMalloc(&probe, total_bytes) == cudaSuccess)
+        {
+            err = cudaFree(probe);
+            if (err != cudaSuccess) return set_error(err);
+        }
+        else
+        {
+            cudaGetLastError();
+        }
+        return 0;
+    }
+
     int gpu_default_mempool_get_usage(
         int device,
         size_t *out_used_current_bytes,
@@ -2137,6 +2139,14 @@ extern "C"
         struct ResidentAddress { uint64_t address; size_t bytes; uint32_t binding; };
         std::vector<ResidentAddress> resident_addresses;
         std::vector<MxxGraphBindingMapEntry> binding_map;
+        // Graph-owned scratch allocations. Every allocation and free node is
+        // appended to one chain in operation order, so a free precedes every
+        // later allocation and CUDA may place the later one in its memory.
+        // Only allocation tokens are handed out; frees are never referenced.
+        std::vector<cudaGraphNode_t> memory_nodes;
+        cudaGraphNode_t memory_chain_tail = nullptr;
+        // Allocation nodes the next top-level operation must follow.
+        std::vector<cudaGraphNode_t> pending_memory_dependencies;
         ~MxxGpuGraphBuilder() { if (root_graph) cudaGraphDestroy(root_graph); }
     };
 
@@ -2295,6 +2305,13 @@ extern "C"
                 auto node = available_terminals[token];
                 if (std::find(builder->frontier.begin(), builder->frontier.end(), node) ==
                     builder->frontier.end()) builder->frontier.push_back(node);
+            }
+            if (!builder->generic_body_mode)
+            {
+                for (auto node : builder->pending_memory_dependencies)
+                    if (std::find(builder->frontier.begin(), builder->frontier.end(), node) ==
+                        builder->frontier.end()) builder->frontier.push_back(node);
+                builder->pending_memory_dependencies.clear();
             }
             builder->operation_index = operation_index;
             builder->operation_active = true;
@@ -2542,70 +2559,6 @@ extern "C"
             1, 1, 1, 1, 1, 1, 0, arguments, sizes, 6, &patch, 1);
     }
 
-    int mxx_gpu_graph_builder_add_dynamic_export(
-        MxxGpuGraphBuilder *builder, const MxxDynamicExportEntry *table,
-        uint32_t *claims, uint32_t *claim_result,
-        const uint64_t *occurrence, const void *source,
-        uint32_t *status, size_t count, size_t maximum_payload_bytes,
-        uint32_t table_binding, uint32_t claims_binding,
-        uint32_t claim_result_binding, uint32_t occurrence_binding,
-        uint32_t source_binding, uint32_t status_binding)
-    {
-        if (!builder || !builder->operation_active || !table || !claims ||
-            !claim_result || !occurrence || !source || !status ||
-            !count || !maximum_payload_bytes)
-            return set_error("invalid dynamic export graph arguments");
-        auto pointer_patch = [](uint32_t argument, uint32_t binding) {
-            return MxxGraphPatch{nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,
-                argument, 0, sizeof(void *), binding, 0};
-        };
-        const void *claim_arguments[] = {
-            &table, &claims, &claim_result, &occurrence, &status, &count};
-        const size_t claim_sizes[] = {
-            sizeof(table), sizeof(claims), sizeof(claim_result),
-            sizeof(occurrence), sizeof(status), sizeof(count)};
-        const MxxGraphPatch claim_patches[] = {
-            pointer_patch(0, table_binding), pointer_patch(1, claims_binding),
-            pointer_patch(2, claim_result_binding),
-            pointer_patch(3, occurrence_binding), pointer_patch(4, status_binding)};
-        int result = mxx_gpu_graph_builder_add_kernel(builder,
-            reinterpret_cast<const void *>(mxx_dynamic_export_claim_kernel),
-            1, 1, 1, 1, 1, 1, 0, claim_arguments, claim_sizes, 6,
-            claim_patches, std::size(claim_patches));
-        if (result != 0) return result;
-        const auto *source_bytes = static_cast<const uint8_t *>(source);
-        const MxxGraphPatch copy_patches[] = {
-            pointer_patch(0, table_binding), pointer_patch(1, claim_result_binding),
-            pointer_patch(2, occurrence_binding), pointer_patch(3, source_binding)};
-        constexpr size_t max_copy_chunk = 65535ULL * 256ULL;
-        for (size_t offset = 0; offset < maximum_payload_bytes; offset += max_copy_chunk)
-        {
-            const size_t chunk = std::min(max_copy_chunk, maximum_payload_bytes - offset);
-            const void *copy_arguments[] = {
-                &table, &claim_result, &occurrence, &source_bytes, &offset};
-            const size_t copy_sizes[] = {
-                sizeof(table), sizeof(claim_result), sizeof(occurrence),
-                sizeof(source_bytes), sizeof(offset)};
-            result = mxx_gpu_graph_builder_add_kernel(builder,
-                reinterpret_cast<const void *>(mxx_dynamic_export_copy_kernel),
-                static_cast<uint32_t>((chunk + 255) / 256), 1, 1, 256, 1, 1,
-                0, copy_arguments, copy_sizes, 5,
-                copy_patches, std::size(copy_patches));
-            if (result != 0) return result;
-        }
-        const void *publish_arguments[] = {&table, &claim_result, &occurrence};
-        const size_t publish_sizes[] = {
-            sizeof(table), sizeof(claim_result), sizeof(occurrence)};
-        const MxxGraphPatch publish_patches[] = {
-            pointer_patch(0, table_binding), pointer_patch(1, claim_result_binding),
-            pointer_patch(2, occurrence_binding)};
-        return mxx_gpu_graph_builder_add_kernel(builder,
-            reinterpret_cast<const void *>(mxx_dynamic_export_publish_kernel),
-            1, 1, 1, 1, 1, 1, 0,
-            publish_arguments, publish_sizes, 3,
-            publish_patches, std::size(publish_patches));
-    }
-
     static MxxGraphPatch mxx_direct_pointer_patch(uint32_t argument_index,
         uint32_t binding)
     {
@@ -2810,6 +2763,81 @@ extern "C"
         (void)builder;
         return GPU_STATUS_CONDITIONAL_UNSUPPORTED;
 #endif
+    }
+
+    // Allocate one graph-owned device buffer ordered after the previous
+    // memory node. The address is fixed for the graph's lifetime.
+    int mxx_gpu_graph_builder_add_memory_alloc(MxxGpuGraphBuilder *builder, int device,
+        size_t bytes, uint32_t *out_token, uint64_t *out_address)
+    {
+        if (!builder || !out_token || !out_address || bytes == 0 ||
+            builder->operation_active || builder->conditional_body_active ||
+            builder->generic_body_mode || builder->graph != builder->root_graph)
+            return set_error("invalid graph memory allocation");
+        if (builder->memory_nodes.size() >= UINT32_MAX)
+            return set_error("graph memory node token overflow");
+        cudaMemAllocNodeParams params{};
+        params.poolProps.allocType = cudaMemAllocationTypePinned;
+        params.poolProps.location.type = cudaMemLocationTypeDevice;
+        params.poolProps.location.id = mxx_physical_device(device);
+        params.bytesize = bytes;
+        cudaGraphNode_t node = nullptr;
+        const cudaError_t error = cudaGraphAddMemAllocNode(&node, builder->root_graph,
+            builder->memory_chain_tail ? &builder->memory_chain_tail : nullptr,
+            builder->memory_chain_tail ? 1 : 0, &params);
+        if (error != cudaSuccess) return set_error(error);
+        builder->memory_chain_tail = node;
+        builder->memory_nodes.push_back(node);
+        *out_token = static_cast<uint32_t>(builder->memory_nodes.size() - 1);
+        *out_address = reinterpret_cast<uint64_t>(params.dptr);
+        return 0;
+    }
+
+    // Free one graph allocation after the previous memory node and after the
+    // emitted top-level operations that use it. CUDA checks memset and memcpy
+    // nodes against the allocation's lifetime, so a free is created only once
+    // every operation using the allocation exists.
+    int mxx_gpu_graph_builder_add_memory_free(MxxGpuGraphBuilder *builder, uint64_t address,
+        const uint32_t *operations, size_t operation_count)
+    {
+        if (!builder || address == 0 || (operation_count && !operations) ||
+            builder->operation_active || builder->conditional_body_active ||
+            builder->generic_body_mode || builder->graph != builder->root_graph)
+            return set_error("invalid graph memory free");
+        std::vector<cudaGraphNode_t> dependencies;
+        if (builder->memory_chain_tail) dependencies.push_back(builder->memory_chain_tail);
+        for (size_t index = 0; index < operation_count; ++index)
+        {
+            if (operations[index] >= builder->terminals.size())
+                return set_error("graph memory free operation is unknown");
+            const cudaGraphNode_t terminal = builder->terminals[operations[index]];
+            if (std::find(dependencies.begin(), dependencies.end(), terminal) ==
+                dependencies.end()) dependencies.push_back(terminal);
+        }
+        cudaGraphNode_t node = nullptr;
+        const cudaError_t error = cudaGraphAddMemFreeNode(&node, builder->root_graph,
+            dependencies.data(), dependencies.size(), reinterpret_cast<void *>(address));
+        if (error != cudaSuccess) return set_error(error);
+        builder->memory_chain_tail = node;
+        builder->memory_nodes.push_back(node);
+        return 0;
+    }
+
+    // The next top-level operation starts after these allocation nodes.
+    int mxx_gpu_graph_builder_set_pending_memory_dependencies(MxxGpuGraphBuilder *builder,
+        const uint32_t *tokens, size_t count)
+    {
+        if (!builder || (count && !tokens) || builder->operation_active ||
+            builder->generic_body_mode)
+            return set_error("invalid pending graph memory dependencies");
+        builder->pending_memory_dependencies.clear();
+        for (size_t index = 0; index < count; ++index)
+        {
+            if (tokens[index] >= builder->memory_nodes.size())
+                return set_error("graph memory dependency token is unknown");
+            builder->pending_memory_dependencies.push_back(builder->memory_nodes[tokens[index]]);
+        }
+        return 0;
     }
 
     int mxx_gpu_graph_builder_finish(MxxGpuGraphBuilder *builder, MxxGpuGraphExec **out_exec)

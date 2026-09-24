@@ -22,6 +22,8 @@ pub mod backend;
 pub mod executor;
 pub mod gpu_execution_plan;
 #[cfg(feature = "gpu")]
+pub(crate) mod gpu_graph_memory;
+#[cfg(feature = "gpu")]
 pub(crate) mod gpu_io_worker;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_physical_control;

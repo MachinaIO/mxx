@@ -60,6 +60,34 @@ pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
     positive_usize("MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS", 64)
 }
 
+/// `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS`: columns of a bounded right operand that
+/// one GPU small-RHS product transforms at a time. Each chunk is decoded and
+/// transformed into one reused workspace of `rhs rows x chunk` polynomials, so
+/// the whole right operand is never expanded; larger chunks trade workspace
+/// memory for fewer kernel launches. Default: 16. Zero or malformed values are
+/// errors.
+pub fn gpu_small_rhs_chunk_columns() -> Result<usize, String> {
+    positive_usize("MXX_GPU_SMALL_RHS_CHUNK_COLUMNS", 16)
+}
+
+/// `MXX_GPU_MEMORY_FRACTION`: fraction of each GPU's physical memory one plan's
+/// persistent allocations may use. Graph-owned scratch is admitted separately,
+/// against the memory free at its Graph's first launch. Default: 0.8. Values
+/// outside `(0, 1]` are errors.
+pub fn gpu_memory_fraction() -> Result<f64, String> {
+    let name = "MXX_GPU_MEMORY_FRACTION";
+    match std::env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|fraction| *fraction > 0.0 && *fraction <= 1.0)
+            .ok_or_else(|| format!("{name} must be in (0, 1], got {value:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(0.8),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
     // Small unit-test defaults; overrides permit the same production path to

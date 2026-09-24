@@ -9,17 +9,17 @@ use crate::{
     artifact::ArtifactKey,
     backend::{
         BoundStorage, GpuResidentValue,
-        poly_gpu::{GpuDcrtBackend, PhysicalExport, physical_raw_matrix_view},
+        poly_gpu::{GpuDcrtBackend, physical_raw_matrix_view},
     },
     gpu_execution_plan::{
         ColumnRange, CompiledGpuOp, FrozenGpuPlan, GpuBindingSource, GpuImplementation,
-        GpuLoopSiteKey, GpuPreparedWorkspaceKind, KernelArg, PhysicalEncoding, PhysicalPart,
-        PhysicalValue, PhysicalValueId, PhysicalView, StorageRef,
+        GpuLoopSiteKey, KernelArg, PhysicalEncoding, PhysicalPart, PhysicalValue, PhysicalValueId,
+        PhysicalView, StorageRef,
     },
     gpu_physical_lowering::{
-        ExportTemplate, ImportDestination, ImportTemplate, IndexedMatrixTableReplay,
-        PhysicalLoweringContext, all_predecessors, allocate_compact_value, allocate_scratch_matrix,
-        emit_matrix_operation, full_eval_value, hash_tag_resource, lower_centered_rebase_node,
+        ImportDestination, ImportTemplate, IndexedMatrixTableReplay, PhysicalLoweringContext,
+        all_predecessors, allocate_compact_value, allocate_scratch_matrix, emit_matrix_operation,
+        full_coeff_value, full_eval_value, hash_tag_resource, lower_centered_rebase_node,
         lower_crt_recompose_node, lower_gadget_trapdoor_node, lower_hash_sample_node,
         lower_matrix_node, lower_preimage_sample_node, lower_rns_conversion_node,
         lower_sample_matrix_node, lower_static_matrix_node, lower_trapdoor_sample_node,
@@ -31,8 +31,7 @@ use crate::{
         PolyParams,
         dcrt::{
             gpu::{
-                GpuDynamicExportEntry, GpuDynamicExportTable, GpuExportSlot, GpuExportStatus,
-                GpuIndexedMatrixTable, GpuIntegerOperation, GpuSignedValues,
+                GpuExportStatus, GpuIndexedMatrixTable, GpuIntegerOperation, GpuSignedValues,
                 GpuSignedValuesEncoding,
             },
             gpu_real::{GpuDeviceReal, GpuRealOperation},
@@ -41,7 +40,7 @@ use crate::{
 };
 use mxx_ir_core::{
     IntExpr, ParamEnv, RealExpr,
-    artifact::{ArtifactAvailability, ArtifactType, ManifestArtifact, ProductionId},
+    artifact::{ArtifactType, ManifestArtifact, ProductionId},
     concretize_wire_type,
     graph::{FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
     node::{ConcatAxis, LoopInputMode, NodeKind},
@@ -74,8 +73,7 @@ pub(super) enum ControlReset {
 
 /// One bounded replay of the same W-lane Graph. Each member returned by a
 /// wave has a distinct owner, even when the Graph reuses its physical value
-/// identifier in a later wave. Export template indices likewise identify
-/// occurrence-specific slots allocated during planning.
+/// identifier in a later wave.
 pub(crate) struct PhysicalWave {
     /// Frozen physical loop template, reused across actual logical instances.
     pub loop_site: GpuLoopSiteKey,
@@ -98,12 +96,10 @@ pub(crate) struct PhysicalWave {
     pub active_lanes: usize,
     /// Upload these plan-owned device occurrence scalars at each wave boundary.
     pub export_occurrences: Vec<(Arc<GpuSignedValues>, u64)>,
-    pub export_template_indices: Vec<usize>,
     pub import_template_indices: Vec<usize>,
     /// Reached-only selected templates when a child template is reused for
     /// several actual parent occurrences. No payloads are read during plan.
     pub invocation_imports: BTreeMap<usize, Vec<usize>>,
-    pub invocation_export_occurrences: BTreeMap<usize, Vec<(Arc<GpuSignedValues>, u64)>>,
     pub family_members: BTreeMap<String, Vec<(usize, PhysicalValueId)>>,
 }
 
@@ -176,252 +172,6 @@ fn allocate_wave_occurrence(
     ctx.values.push(physical);
     ctx.owners.insert(id, Arc::new(owner));
     Ok((id, native))
-}
-
-fn prepared_export_binding(
-    ctx: &mut PhysicalLoweringContext<'_>,
-    resource_id: u32,
-    component: u32,
-) -> Result<u32, String> {
-    let binding = u32::try_from(ctx.bindings.len())
-        .map_err(|_| "too many GPU dynamic export bindings".to_owned())?;
-    ctx.bindings.push(GpuBindingSource::PreparedWorkspace {
-        kind: GpuPreparedWorkspaceKind::DynamicExport,
-        resource_id,
-        component,
-    });
-    Ok(binding)
-}
-
-/// Export every real member of one W-wave matrix family through one shared
-/// device occurrence table per raw fragment. The Graph has W source nodes per
-/// fragment and is rebound only at wave boundaries. Padded lanes publish to
-/// distinct dummy slots that the artifact observer never sees.
-pub(super) fn lower_wave_family_artifact_export(
-    ctx: &mut PhysicalLoweringContext<'_>,
-    name: &str,
-    family: PhysicalValueId,
-    availability: ArtifactAvailability,
-    slots: &mut Vec<Arc<GpuExportSlot>>,
-    templates: &mut Vec<ExportTemplate>,
-) -> Result<(), String> {
-    let family_physical = ctx
-        .values
-        .get(family.0 as usize)
-        .ok_or_else(|| "GPU family export has no physical value".to_owned())?;
-    let ConcreteWireType::IndexedFamily { element, count } = &family_physical.ty else {
-        return Err("GPU family export source is not indexed".into());
-    };
-    let ConcreteWireType::Matrix(matrix) = element.as_ref() else {
-        return Err("GPU wave export needs matrix family members".into());
-    };
-    if *count == 0 || family_physical.encodings.as_ref() != [PhysicalEncoding::FullEval] {
-        return Err("GPU wave export needs a nonempty full-Eval family".into());
-    }
-    let count = *count;
-    let matrix = matrix.clone();
-    let artifact_type = ArtifactType::from_wire_type(element.as_ref())
-        .ok_or_else(|| "GPU family element has no artifact type".to_owned())?;
-    let wave_indices = ctx
-        .waves
-        .iter()
-        .enumerate()
-        .filter_map(|(index, wave)| wave.family_members.contains_key(name).then_some(index))
-        .collect::<Vec<_>>();
-    let Some(&first_wave_index) = wave_indices.first() else {
-        return Err("GPU family artifact output has no W-wave producer".into());
-    };
-    let first_members = ctx.waves[first_wave_index]
-        .family_members
-        .get(name)
-        .ok_or_else(|| "GPU first wave has no family members".to_owned())?
-        .clone();
-    let width = first_members.len();
-    if width == 0 || first_members.iter().enumerate().any(|(lane, (index, _))| *index != lane) {
-        return Err("GPU family first wave has invalid member order".into());
-    }
-    let padded_count = count
-        .div_ceil(width)
-        .checked_mul(width)
-        .ok_or_else(|| "GPU family padded occurrence count overflows".to_owned())?;
-    let max_occurrence = u64::try_from(padded_count - 1)
-        .map_err(|_| "GPU family occurrence exceeds u64".to_owned())?;
-    let mut seen = std::collections::BTreeSet::new();
-    for &wave_index in &wave_indices {
-        let wave = &ctx.waves[wave_index];
-        let members = wave
-            .family_members
-            .get(name)
-            .ok_or_else(|| "GPU wave has no selected family members".to_owned())?;
-        if wave.start_index >= count ||
-            wave.active_lanes != members.len() ||
-            wave.active_lanes > width ||
-            members.iter().enumerate().any(|(lane, (index, _))| {
-                *index != wave.start_index + lane || !seen.insert(*index)
-            })
-        {
-            return Err("GPU family wave occurrence layout is invalid".into());
-        }
-    }
-    if seen.len() != count || seen.iter().copied().ne(0..count) {
-        return Err("GPU family waves omit or duplicate a member".into());
-    }
-
-    let mut lane_coefficients = Vec::with_capacity(width);
-    let mut lane_occurrences = Vec::with_capacity(width);
-    for (lane, (_, source)) in first_members.iter().copied().enumerate() {
-        let source_value = ctx
-            .values
-            .get(source.0 as usize)
-            .ok_or_else(|| "GPU family lane source is missing".to_owned())?;
-        if source_value.ty != ConcreteWireType::Matrix(matrix.clone()) ||
-            source_value.encodings.as_ref() != [PhysicalEncoding::FullEval]
-        {
-            return Err("GPU family lane differs from its declared matrix type".into());
-        }
-        let coefficient = allocate_scratch_matrix(ctx, &matrix, PhysicalEncoding::FullCoeff)?;
-        emit_matrix_operation(ctx, GpuImplementation::ntt(true), &[source], coefficient)?;
-        lane_coefficients.push(coefficient);
-        let initial =
-            u64::try_from(lane).map_err(|_| "GPU export lane index exceeds u64".to_owned())?;
-        lane_occurrences.push(allocate_wave_occurrence(ctx, initial, max_occurrence)?);
-    }
-    for &wave_index in &wave_indices {
-        let wave = &mut ctx.waves[wave_index];
-        for (lane, (_, owner)) in lane_occurrences.iter().enumerate() {
-            let occurrence = wave
-                .start_index
-                .checked_add(lane)
-                .ok_or_else(|| "GPU wave occurrence overflows".to_owned())?;
-            wave.export_occurrences.push((
-                Arc::clone(owner),
-                u64::try_from(occurrence)
-                    .map_err(|_| "GPU wave occurrence exceeds u64".to_owned())?,
-            ));
-        }
-    }
-
-    let first_coeff = lane_coefficients[0];
-    let physical = Arc::new(ctx.values[first_coeff.0 as usize].clone());
-    let selected_parts = (0..physical.parts.len()).collect::<Vec<_>>();
-    let export = Arc::new(PhysicalExport::from_parts(physical, &selected_parts)?);
-    let params = ctx.backend.physical_matrix_parameters(&matrix, ctx.device)?;
-    for (fragment_index, fragment) in export.fragments.iter().enumerate() {
-        let resource_id = u32::try_from(ctx.dynamic_export_resources.len())
-            .map_err(|_| "too many GPU dynamic export resources".to_owned())?;
-        let site = u32::try_from(templates.len())
-            .map_err(|_| "too many GPU artifact export sites".to_owned())?;
-        let payload_bytes = usize::try_from(fragment.raw_bytes)
-            .map_err(|_| "GPU family fragment exceeds host address space".to_owned())?;
-        let final_chunk = fragment_index + 1 == export.fragments.len();
-        let mut entries = Vec::with_capacity(padded_count);
-        for occurrence in 0..padded_count {
-            let slot = slots.len();
-            let owner = Arc::new(
-                GpuExportSlot::new(ctx.device, payload_bytes).map_err(|error| error.to_string())?,
-            );
-            slots.push(Arc::clone(&owner));
-            entries.push(GpuDynamicExportEntry {
-                slot: owner,
-                occurrence: u64::try_from(occurrence)
-                    .map_err(|_| "GPU export occurrence exceeds u64".to_owned())?,
-                artifact_offset: fragment.raw_offset,
-                payload_bytes,
-                site,
-                final_chunk,
-            });
-            if occurrence < count {
-                let template_index = templates.len();
-                templates.push(ExportTemplate {
-                    name: name.to_owned(),
-                    site,
-                    slot,
-                    fragment_index,
-                    final_chunk,
-                    artifact_type: artifact_type.clone(),
-                    availability,
-                    export: Arc::clone(&export),
-                    index: Some(occurrence),
-                    occurrence: occurrence as u64,
-                });
-                let wave_index = *wave_indices
-                    .get(occurrence / width)
-                    .ok_or_else(|| "GPU export occurrence has no wave".to_owned())?;
-                ctx.waves[wave_index].export_template_indices.push(template_index);
-            }
-        }
-        let table = Arc::new(
-            GpuDynamicExportTable::new(&params, ctx.device, entries)
-                .map_err(|error| error.to_string())?,
-        );
-        let status =
-            Arc::new(GpuExportStatus::new(&params, ctx.device).map_err(|error| error.to_string())?);
-        ctx.dynamic_export_resources.insert(resource_id, (table, status));
-        let workspace_bindings = [0, 1, 2, 3]
-            .into_iter()
-            .map(|component| prepared_export_binding(ctx, resource_id, component))
-            .collect::<Result<Vec<_>, _>>()?;
-        let implementation = ctx
-            .implementations
-            .register(GpuImplementation::export_dynamic())
-            .map_err(str::to_owned)?;
-        // The table has one claim-result word shared by its lane operations.
-        // Order only exports of this fragment; independent producer kernels
-        // and other fragment tables retain their own dependency chains.
-        let mut previous_export = None;
-        for (lane, &coefficient) in lane_coefficients.iter().enumerate() {
-            let (occurrence, _) = &lane_occurrences[lane];
-            let source_binding_base = register_bindings(ctx.bindings, ctx.values, coefficient)?;
-            let source_binding = source_binding_base
-                .checked_add(
-                    u32::try_from(fragment_index)
-                        .map_err(|_| "GPU artifact fragment binding exceeds u32".to_owned())?,
-                )
-                .ok_or_else(|| "GPU artifact fragment binding overflows".to_owned())?;
-            let occurrence_binding = scalar_binding(ctx, *occurrence)?;
-            let operation_index = u32::try_from(ctx.operations.len())
-                .map_err(|_| "too many GPU family export operations".to_owned())?;
-            let mut predecessors = all_predecessors(ctx.producer, coefficient).into_vec();
-            if let Some(previous) = previous_export {
-                predecessors.push(previous);
-            }
-            predecessors.sort_unstable();
-            predecessors.dedup();
-            ctx.operations.push(CompiledGpuOp {
-                implementation,
-                arguments: Box::new([
-                    KernelArg::U32(resource_id),
-                    KernelArg::Value(coefficient),
-                    KernelArg::U32(
-                        u32::try_from(fragment_index)
-                            .map_err(|_| "GPU artifact fragment index exceeds u32".to_owned())?,
-                    ),
-                    KernelArg::Value(*occurrence),
-                    KernelArg::U32(0),
-                    KernelArg::U32(workspace_bindings[0]),
-                    KernelArg::U32(workspace_bindings[1]),
-                    KernelArg::U32(workspace_bindings[2]),
-                    KernelArg::U32(occurrence_binding),
-                    KernelArg::U32(source_binding),
-                    KernelArg::U32(workspace_bindings[3]),
-                ]),
-                outputs: Box::new([]),
-                device: ctx.device,
-                grid: [0; 3],
-                block: [0; 3],
-                shared_bytes: 0,
-                predecessors: predecessors.into_boxed_slice(),
-                body: None,
-            });
-            previous_export = Some(operation_index);
-        }
-    }
-    let body_end = u32::try_from(ctx.operations.len())
-        .map_err(|_| "too many GPU family export operations".to_owned())?;
-    for &wave_index in &wave_indices {
-        ctx.waves[wave_index].body_end = body_end;
-    }
-    Ok(())
 }
 
 struct ArtifactZipLane {
@@ -1274,6 +1024,8 @@ pub(super) fn lower_control_node(
                     let id = *ctx.wire_ids.get(wire).ok_or_else(|| {
                         "GPU eager matrix Select candidate has no physical value".to_owned()
                     })?;
+                    // Candidates share one family layout in the evaluation domain.
+                    let id = full_eval_value(ctx, id)?;
                     let owner = ctx.owners.get(&id).ok_or_else(|| {
                         "GPU eager matrix Select candidate has no resident owner".to_owned()
                     })?;
@@ -1738,6 +1490,8 @@ pub(super) fn lower_control_node(
                     .wire_ids
                     .get(argument)
                     .ok_or_else(|| "GPU family pack member has no physical value".to_owned())?;
+                // Matrix family members share the evaluation-domain layout.
+                let source_id = full_eval_value(ctx, source_id)?;
                 let owner = ctx
                     .owners
                     .get(&source_id)
@@ -2434,7 +2188,6 @@ fn lower_lazy_int_expr_select(
                 sample_seeds: ctx.sample_seeds,
                 real_owners: ctx.real_owners,
                 indexed_tables: ctx.indexed_tables,
-                dynamic_export_resources: ctx.dynamic_export_resources,
                 device_loop_indices: ctx.device_loop_indices.clone(),
                 lanes: ctx.lanes,
                 active_parallel_template: ctx.active_parallel_template,
@@ -2492,7 +2245,6 @@ fn lower_lazy_int_expr_select(
                 sample_seeds: ctx.sample_seeds,
                 real_owners: ctx.real_owners,
                 indexed_tables: ctx.indexed_tables,
-                dynamic_export_resources: ctx.dynamic_export_resources,
                 device_loop_indices: ctx.device_loop_indices.clone(),
                 lanes: ctx.lanes,
                 active_parallel_template: ctx.active_parallel_template,
@@ -3539,37 +3291,57 @@ fn lower_matrix_mul_small_rhs(
     {
         return Err("GPU small-RHS output differs from validated matrix type".into());
     }
-    let coefficient = allocate_scratch_matrix(ctx, &right_ty, PhysicalEncoding::FullCoeff)?;
+    // The bounded right operand stays compact. One fused operation decodes
+    // and transforms it one column chunk at a time into a reused workspace of
+    // `rhs rows x chunk` polynomials and multiplies each chunk into its output
+    // columns, so no full copy of the right operand is ever resident.
+    let chunk = crate::env::gpu_small_rhs_chunk_columns()?.min(right_ty.columns);
+    let workspace_ty = ConcreteMatrixType { columns: chunk, ..right_ty.clone() };
+    let workspace = allocate_scratch_matrix(ctx, &workspace_ty, PhysicalEncoding::FullEval)?;
+    let output = allocate_scratch_matrix(ctx, &expected, PhysicalEncoding::FullEval)?;
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::matrix_mul_small_rhs())
+        .map_err(str::to_owned)?;
+    let left_binding = register_bindings(ctx.bindings, ctx.values, left)?;
     let right_binding = scalar_binding(ctx, right)?;
-    let coefficient_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
-    let implementation =
-        ctx.implementations.register(GpuImplementation::expand_compact()).map_err(str::to_owned)?;
+    let workspace_binding = register_bindings(ctx.bindings, ctx.values, workspace)?;
+    let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
+    let predecessors = all_predecessors(ctx.producer, left)
+        .iter()
+        .chain(all_predecessors(ctx.producer, right).iter())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let index = u32::try_from(ctx.operations.len())
-        .map_err(|_| "too many GPU compact expansion operations".to_owned())?;
+        .map_err(|_| "too many GPU small-RHS product operations".to_owned())?;
     ctx.operations.push(CompiledGpuOp {
         implementation,
         arguments: Box::new([
+            KernelArg::Value(left),
+            KernelArg::U32(0),
             KernelArg::Value(right),
             KernelArg::U32(0),
-            KernelArg::Value(coefficient),
+            KernelArg::Value(workspace),
             KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::U32(left_binding),
             KernelArg::U32(right_binding),
-            KernelArg::U32(coefficient_binding),
+            KernelArg::U32(workspace_binding),
+            KernelArg::U32(output_binding),
         ]),
-        outputs: Box::new([coefficient]),
+        outputs: Box::new([output, workspace]),
         device: ctx.device,
         grid: [1; 3],
         block: [1; 3],
         shared_bytes: 0,
-        predecessors: all_predecessors(ctx.producer, right),
+        predecessors,
         body: None,
     });
-    ctx.producer
-        .insert(coefficient, vec![(ColumnRange { start: 0, end: right_ty.columns }, index)]);
-    let right_eval = allocate_scratch_matrix(ctx, &right_ty, PhysicalEncoding::FullEval)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[coefficient], right_eval)?;
-    let output = allocate_scratch_matrix(ctx, &expected, PhysicalEncoding::FullEval)?;
-    emit_matrix_operation(ctx, GpuImplementation::matrix_mul(false), &[left, right_eval], output)?;
+    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: expected.columns }, index)]);
     ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
     Ok(())
 }
@@ -3770,13 +3542,13 @@ fn lower_gadget_decompose(
         return Err("GPU gadget decomposition needs one input".into());
     };
     let source = *ctx.wire_ids.get(source_wire).ok_or("GPU gadget source is missing")?;
-    let source = full_eval_value(ctx, source)?;
-    let physical = &ctx.values[source.0 as usize];
+    let source_coefficient = full_coeff_value(ctx, source)?;
+    let physical = &ctx.values[source_coefficient.0 as usize];
     let ConcreteWireType::Matrix(source_ty) = &physical.ty else {
         return Err("GPU gadget source is not a matrix".into());
     };
-    if physical.encodings.as_ref() != [PhysicalEncoding::FullEval] {
-        return Err("GPU gadget source must have an exact full-Eval basis".into());
+    if physical.encodings.as_ref() != [PhysicalEncoding::FullCoeff] {
+        return Err("GPU gadget source must have an exact full-coefficient basis".into());
     }
     let source_ty = source_ty.clone();
     let output_ty = resolved_node_output_type(scope_id, node_id, node, env)?;
@@ -3803,6 +3575,11 @@ fn lower_gadget_decompose(
     let params = ctx.backend.parameters_on_physical_device(ctx.device, &source_ty)?;
     let backend_base = BigInt::from(1u8) << params.base_bits();
     let expected_rows = source_ty.rows.checked_mul(digits).ok_or("GPU gadget rows overflow")?;
+    // Balanced digits satisfy |d| <= base / 2; the compact output needs no
+    // runtime bound check when the declared bound admits every digit.
+    if max_coefficient_bound < &base / 2u8 {
+        return Err("GPU gadget digits exceed the declared preimage bound".into());
+    }
     if base != backend_base ||
         digits == 0 ||
         output_matrix.rows != expected_rows ||
@@ -3823,48 +3600,34 @@ fn lower_gadget_decompose(
                 .ok_or("GPU balanced gadget digits do not match backend CRT layout")?,
         )
     };
-    let source_coefficient = allocate_scratch_matrix(ctx, &source_ty, PhysicalEncoding::FullCoeff)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(true), &[source], source_coefficient)?;
-    let decomposed = allocate_scratch_matrix(ctx, &output_matrix, PhysicalEncoding::FullCoeff)?;
+    // The signed digits are written directly into the compact bounded
+    // output; no full coefficient-domain digit matrix is materialized.
+    let (output, _) = crate::gpu_physical_lowering::allocate_compact_value(ctx, output_ty, true)?;
     let source_binding = register_bindings(ctx.bindings, ctx.values, source_coefficient)?;
-    let destination_binding = register_bindings(ctx.bindings, ctx.values, decomposed)?;
+    let destination_binding = scalar_binding(ctx, output)?;
     let implementation = ctx
         .implementations
-        .register(if small {
-            GpuImplementation::gadget_decompose_small_balanced()
-        } else {
-            GpuImplementation::gadget_decompose_coeff()
-        })
+        .register(GpuImplementation::gadget_decompose_compact())
         .map_err(str::to_owned)?;
     let index = u32::try_from(ctx.operations.len())
         .map_err(|_| "too many GPU gadget decomposition operations".to_owned())?;
     ctx.operations.push(CompiledGpuOp {
         implementation,
-        arguments: if let Some(dropped) = dropped {
-            Box::new([
-                KernelArg::Value(source_coefficient),
-                KernelArg::U32(0),
-                KernelArg::Value(decomposed),
-                KernelArg::U32(0),
-                KernelArg::U32(params.base_bits()),
-                KernelArg::U32(
-                    u32::try_from(dropped).map_err(|_| "GPU dropped CRT count exceeds u32")?,
-                ),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(destination_binding),
-            ])
-        } else {
-            Box::new([
-                KernelArg::Value(source_coefficient),
-                KernelArg::U32(0),
-                KernelArg::Value(decomposed),
-                KernelArg::U32(0),
-                KernelArg::U32(params.base_bits()),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(destination_binding),
-            ])
-        },
-        outputs: Box::new([decomposed]),
+        arguments: Box::new([
+            KernelArg::Value(source_coefficient),
+            KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::U32(params.base_bits()),
+            KernelArg::U32(
+                u32::try_from(dropped.unwrap_or(0))
+                    .map_err(|_| "GPU dropped CRT count exceeds u32")?,
+            ),
+            KernelArg::U32(u32::from(small)),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(destination_binding),
+        ]),
+        outputs: Box::new([output]),
         device: ctx.device,
         grid: [1; 3],
         block: [1; 3],
@@ -3873,70 +3636,7 @@ fn lower_gadget_decompose(
         body: None,
     });
     ctx.producer
-        .insert(decomposed, vec![(ColumnRange { start: 0, end: output_matrix.columns }, index)]);
-    let (output, _) = crate::gpu_physical_lowering::allocate_compact_value(ctx, output_ty, true)?;
-    let status = allocate_integer_status(ctx)?;
-    let mut bound_words = max_coefficient_bound
-        .to_biguint()
-        .ok_or("GPU gadget output bound is negative")?
-        .to_u64_digits();
-    if bound_words.is_empty() {
-        bound_words.push(0);
-    }
-    let input_binding = register_bindings(ctx.bindings, ctx.values, decomposed)?;
-    let output_binding = scalar_binding(ctx, output)?;
-    let status_binding = scalar_binding(ctx, status)?;
-    let implementation = ctx
-        .implementations
-        .register(if small {
-            GpuImplementation::compact_pack_per_crt_limb()
-        } else {
-            GpuImplementation::compact_pack()
-        })
-        .map_err(str::to_owned)?;
-    let pack = u32::try_from(ctx.operations.len())
-        .map_err(|_| "too many GPU gadget packing operations".to_owned())?;
-    ctx.operations.push(CompiledGpuOp {
-        implementation,
-        arguments: if small {
-            Box::new([
-                KernelArg::Value(decomposed),
-                KernelArg::U32(0),
-                KernelArg::Value(output),
-                KernelArg::U32(0),
-                KernelArg::Value(status),
-                KernelArg::U32(0),
-                KernelArg::U64(
-                    max_coefficient_bound.to_u64().ok_or("GPU per-limb bound exceeds u64")?,
-                ),
-                KernelArg::U32(input_binding),
-                KernelArg::U32(output_binding),
-                KernelArg::U32(status_binding),
-            ])
-        } else {
-            Box::new([
-                KernelArg::U32(output.0),
-                KernelArg::Value(decomposed),
-                KernelArg::U32(0),
-                KernelArg::Value(output),
-                KernelArg::U32(0),
-                KernelArg::Value(status),
-                KernelArg::U32(0),
-                KernelArg::U64List(bound_words.into_boxed_slice()),
-                KernelArg::U32(input_binding),
-                KernelArg::U32(output_binding),
-                KernelArg::U32(status_binding),
-            ])
-        },
-        outputs: Box::new([output]),
-        device: ctx.device,
-        grid: [1; 3],
-        block: [1; 3],
-        shared_bytes: 0,
-        predecessors: Box::new([index]),
-        body: None,
-    });
-    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: output_matrix.columns }, pack)]);
+        .insert(output, vec![(ColumnRange { start: 0, end: output_matrix.columns }, index)]);
     ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
     Ok(())
 }
@@ -3955,21 +3655,22 @@ fn lower_ring_automorphism(
         return Err("GPU automorphism needs one matrix".into());
     };
     let source = *ctx.wire_ids.get(source_wire).ok_or("GPU automorphism source is missing")?;
-    let source = full_eval_value(ctx, source)?;
-    let source_value = &ctx.values[source.0 as usize];
+    // The automorphism permutes coefficients: its input and output are
+    // coefficient-domain matrices, and any domain change is inserted by the
+    // generic encoding conversion.
+    let coefficient = full_coeff_value(ctx, source)?;
+    let source_value = &ctx.values[coefficient.0 as usize];
     let ConcreteWireType::Matrix(ty) = &source_value.ty else {
         return Err("GPU automorphism source is not a matrix".into());
     };
-    if source_value.encodings.as_ref() != [PhysicalEncoding::FullEval] ||
+    if source_value.encodings.as_ref() != [PhysicalEncoding::FullCoeff] ||
         resolved_node_output_type(scope_id, node_id, node, env)? != source_value.ty
     {
-        return Err("GPU automorphism needs exact full-Eval matrix type".into());
+        return Err("GPU automorphism needs exact full-Coeff matrix type".into());
     }
     let ty = ty.clone();
     let index_value = lower_device_int_expr(ctx, index_expr, env)?;
     integer_range(ctx, index_value)?;
-    let coefficient = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(true), &[source], coefficient)?;
     let transformed = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
     let status = allocate_integer_status(ctx)?;
     let source_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
@@ -4014,9 +3715,7 @@ fn lower_ring_automorphism(
         body: None,
     });
     ctx.producer.insert(transformed, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
-    let result = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[transformed], result)?;
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, result);
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, transformed);
     Ok(())
 }
 
@@ -4228,9 +3927,7 @@ fn lower_lift_integer_constant(
         body: None,
     });
     ctx.producer.insert(coefficient, vec![(ColumnRange { start: 0, end: 1 }, operation)]);
-    let result = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[coefficient], result)?;
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, result);
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
     Ok(())
 }
 
@@ -4241,21 +3938,16 @@ fn polynomial_source_in_domain(
     evaluation: bool,
 ) -> Result<PhysicalValueId, String> {
     let physical = &ctx.values[source.0 as usize];
-    let wanted = if evaluation { PhysicalEncoding::FullEval } else { PhysicalEncoding::FullCoeff };
     if physical.ty != ConcreteWireType::Matrix(ty.clone()) {
         return Err("GPU polynomial source has the wrong concrete matrix type".into());
     }
-    if physical.encodings.as_ref() == [wanted.clone()] {
-        return Ok(source);
+    if !matches!(
+        physical.encodings.as_ref(),
+        [PhysicalEncoding::FullEval] | [PhysicalEncoding::FullCoeff]
+    ) {
+        return Err("GPU polynomial source has no full CRT encoding".into());
     }
-    let inverse = match (evaluation, physical.encodings.as_ref()) {
-        (false, [PhysicalEncoding::FullEval]) => true,
-        (true, [PhysicalEncoding::FullCoeff]) => false,
-        _ => return Err("GPU polynomial source has no full CRT encoding".into()),
-    };
-    let transformed = allocate_scratch_matrix(ctx, ty, wanted)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(inverse), &[source], transformed)?;
-    Ok(transformed)
+    if evaluation { full_eval_value(ctx, source) } else { full_coeff_value(ctx, source) }
 }
 
 fn lower_polynomial_values(
@@ -4508,9 +4200,7 @@ fn lower_pack_polynomial_coefficients(
         body: None,
     });
     ctx.producer.insert(coefficient, vec![(ColumnRange { start: 0, end: 1 }, operation)]);
-    let output = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[coefficient], output)?;
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, coefficient);
     Ok(())
 }
 
@@ -4951,25 +4641,25 @@ fn lower_centered_round_divide(
         .wire_ids
         .get(source_wire)
         .ok_or_else(|| "GPU centered division input has no physical value".to_owned())?;
-    let source = full_eval_value(ctx, source)?;
+    // Rounded division acts on centered coefficients: input and output are
+    // coefficient-domain matrices.
+    let source_coeff = full_coeff_value(ctx, source)?;
     let physical = ctx
         .values
-        .get(source.0 as usize)
+        .get(source_coeff.0 as usize)
         .ok_or_else(|| "GPU centered division input metadata is missing".to_owned())?;
     let ConcreteWireType::Matrix(ty) = &physical.ty else {
         return Err("GPU centered division input is not a matrix".into());
     };
-    if physical.encodings.as_ref() != [PhysicalEncoding::FullEval] ||
+    if physical.encodings.as_ref() != [PhysicalEncoding::FullCoeff] ||
         resolved_node_output_type(scope_id, node_id, node, env)? != physical.ty
     {
-        return Err("GPU centered division needs exact full-Eval matrix type".into());
+        return Err("GPU centered division needs exact full-Coeff matrix type".into());
     }
     let ty = ty.clone();
     if divisor.contains_loop_index() {
         let device_divisor = lower_device_int_expr(ctx, divisor, env)?;
         integer_range(ctx, device_divisor)?;
-        let source_coeff = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
-        emit_matrix_operation(ctx, GpuImplementation::ntt(true), &[source], source_coeff)?;
         let result_coeff = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
         let status = allocate_integer_status(ctx)?;
         let source_binding = register_bindings(ctx.bindings, ctx.values, source_coeff)?;
@@ -5018,9 +4708,7 @@ fn lower_centered_round_divide(
         });
         ctx.producer
             .insert(result_coeff, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
-        let output = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
-        emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[result_coeff], output)?;
-        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, result_coeff);
         return Ok(());
     }
     let divisor = divisor
@@ -5036,8 +4724,6 @@ fn lower_centered_round_divide(
     while words.len() > 1 && words.last() == Some(&0) {
         words.pop();
     }
-    let source_coeff = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(true), &[source], source_coeff)?;
     let result_coeff = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullCoeff)?;
     let source_binding = register_bindings(ctx.bindings, ctx.values, source_coeff)?;
     let result_binding = register_bindings(ctx.bindings, ctx.values, result_coeff)?;
@@ -5067,9 +4753,7 @@ fn lower_centered_round_divide(
         body: None,
     });
     ctx.producer.insert(result_coeff, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
-    let output = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[result_coeff], output)?;
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, result_coeff);
     Ok(())
 }
 
@@ -5213,13 +4897,16 @@ fn lower_matrix_slice(
     let window_id = value_id(ctx.values.len())?;
     ctx.values.push(window);
     ctx.owners.insert(window_id, Arc::new(window_owner));
-    let native =
-        ctx.backend.allocate_physical_matrix(&output_ty, ctx.device, PhysicalEncoding::FullEval)?;
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU matrix storages".to_owned())?,
     );
-    let (physical, owner) =
-        physical_matrix(&output_ty, PhysicalEncoding::FullEval, storage, native)?;
+    let (physical, owner) = crate::gpu_graph_memory::deferred_scratch_matrix(
+        ctx.backend,
+        ctx.device,
+        &output_ty,
+        PhysicalEncoding::FullEval,
+        storage,
+    )?;
     let output = value_id(ctx.values.len())?;
     ctx.values.push(physical);
     ctx.owners.insert(output, owner);
@@ -5516,17 +5203,19 @@ fn lower_modulus_conversion(
         .wire_ids
         .get(source_wire)
         .ok_or_else(|| "GPU modulus reduction input has no physical value".to_owned())?;
-    let source = full_eval_value(ctx, source)?;
+    // Modulus conversion acts on coefficients: input and output are
+    // coefficient-domain matrices.
+    let source_coeff = full_coeff_value(ctx, source)?;
     let source_value = ctx
         .values
-        .get(source.0 as usize)
+        .get(source_coeff.0 as usize)
         .ok_or_else(|| "GPU modulus reduction input metadata is missing".to_owned())?;
     let ConcreteWireType::Matrix(source_ty) = &source_value.ty else {
         return Err("GPU modulus reduction input is not a matrix".into());
     };
     let source_ty = source_ty.clone();
-    if source_value.encodings.as_ref() != [PhysicalEncoding::FullEval] {
-        return Err("GPU modulus reduction input must be full Eval CRT".into());
+    if source_value.encodings.as_ref() != [PhysicalEncoding::FullCoeff] {
+        return Err("GPU modulus reduction input must be full Coeff CRT".into());
     }
     let ConcreteWireType::Matrix(destination_ty) =
         resolved_node_output_type(scope_id, node_id, node, env)?
@@ -5545,8 +5234,6 @@ fn lower_modulus_conversion(
     {
         return Err("GPU modulus reduction destination is not an exact ordered CRT subset".into());
     }
-    let source_coeff = allocate_scratch_matrix(ctx, &source_ty, PhysicalEncoding::FullCoeff)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(true), &[source], source_coeff)?;
     let destination_coeff =
         allocate_scratch_matrix(ctx, &destination_ty, PhysicalEncoding::FullCoeff)?;
     let source_binding = register_bindings(ctx.bindings, ctx.values, source_coeff)?;
@@ -5578,9 +5265,7 @@ fn lower_modulus_conversion(
         destination_coeff,
         vec![(ColumnRange { start: 0, end: destination_ty.columns }, index)],
     );
-    let destination = allocate_scratch_matrix(ctx, &destination_ty, PhysicalEncoding::FullEval)?;
-    emit_matrix_operation(ctx, GpuImplementation::ntt(false), &[destination_coeff], destination)?;
-    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, destination);
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, destination_coeff);
     Ok(())
 }
 
@@ -5663,13 +5348,16 @@ fn lower_concat(
         return Err("GPU concat dimensions disagree with its declared output".into());
     }
 
-    let native =
-        ctx.backend.allocate_physical_matrix(&output_ty, ctx.device, PhysicalEncoding::FullEval)?;
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU scratch storages".to_owned())?,
     );
-    let (physical, resident) =
-        physical_matrix(&output_ty, PhysicalEncoding::FullEval, storage, native)?;
+    let (physical, resident) = crate::gpu_graph_memory::deferred_scratch_matrix(
+        ctx.backend,
+        ctx.device,
+        &output_ty,
+        PhysicalEncoding::FullEval,
+        storage,
+    )?;
     let output_id = value_id(ctx.values.len())?;
     ctx.values.push(physical);
     ctx.owners.insert(output_id, resident);
@@ -6052,6 +5740,9 @@ fn allocate_sequential_carry(
         }
         return allocate_integer_value(ctx, target.clone(), range, None);
     }
+    // Loop carries are evaluation-domain matrices; a coefficient-domain
+    // producer is converted by the generic encoding conversion.
+    let source = full_eval_value(ctx, source)?;
     let planned = ctx.values[source.0 as usize].clone();
     if planned.ty != *target &&
         !matches!(
@@ -6140,6 +5831,7 @@ fn copy_carry_to(
     destination: PhysicalValueId,
     barrier: &[u32],
 ) -> Result<Vec<u32>, String> {
+    let source = full_eval_value(ctx, source)?;
     let source_value = &ctx.values[source.0 as usize];
     let destination_value = &ctx.values[destination.0 as usize];
     if (source_value.ty != destination_value.ty &&
@@ -6371,10 +6063,7 @@ fn lower_sequential_loop(
             ctx.external_io_loops.len(),
             *ctx.crt_resource_next,
         );
-        let resource_keys = (
-            ctx.hash_resources.keys().copied().collect::<BTreeSet<_>>(),
-            ctx.dynamic_export_resources.keys().copied().collect::<BTreeSet<_>>(),
-        );
+        let resource_keys = ctx.hash_resources.keys().copied().collect::<BTreeSet<_>>();
         let mut input_ids = Vec::with_capacity(arguments.len());
         let mut outer_dependencies = std::collections::BTreeSet::new();
         for (position, wire) in arguments.iter().enumerate() {
@@ -6485,7 +6174,6 @@ fn lower_sequential_loop(
                 sample_seeds: ctx.sample_seeds,
                 real_owners: ctx.real_owners,
                 indexed_tables: ctx.indexed_tables,
-                dynamic_export_resources: ctx.dynamic_export_resources,
                 device_loop_indices: ctx.device_loop_indices.clone(),
                 lanes: ctx.lanes,
                 active_parallel_template: ctx.active_parallel_template,
@@ -6594,9 +6282,8 @@ fn lower_sequential_loop(
         ctx.import_templates.truncate(mark.9);
         ctx.external_io_loops.truncate(mark.10);
         *ctx.crt_resource_next = mark.11;
-        ctx.hash_resources.retain(|id, _| resource_keys.0.contains(id));
+        ctx.hash_resources.retain(|id, _| resource_keys.contains(id));
         ctx.integer_status.retain(|_, id| (id.0 as usize) < first_new);
-        ctx.dynamic_export_resources.retain(|id, _| resource_keys.1.contains(id));
         carry_ranges = widened;
         widenings += 1;
     };
@@ -7358,7 +7045,7 @@ fn lower_parallel_loop(
                 let template = if ctx.device_body {
                     selected
                 } else {
-                    Arc::new(selected.deep_copy(ctx.backend)?)
+                    Arc::new(selected.private_placeholder(ctx.backend)?)
                 };
                 ctx.owners.insert(id, template);
                 input_ids.push(if lane_device == home {
@@ -7445,10 +7132,8 @@ fn lower_parallel_loop(
             start_index: wave_start,
             active_lanes,
             export_occurrences: Vec::new(),
-            export_template_indices: Vec::new(),
             import_template_indices: Vec::new(),
             invocation_imports: BTreeMap::new(),
-            invocation_export_occurrences: BTreeMap::new(),
             family_members: BTreeMap::new(),
         };
         for (lane, (_, owner)) in index_lanes.iter().enumerate() {
@@ -7965,16 +7650,18 @@ fn lower_inlined_child(
                 )?;
             }
         }
-        child
-            .outputs()
-            .iter()
-            .map(|wire| {
-                ctx.wire_ids
-                    .get(wire)
-                    .copied()
-                    .ok_or_else(|| "GPU subgraph output has no physical value".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()
+        // Child boundaries hand matrices to their parent (families, carries,
+        // and call results) in the evaluation domain.
+        let mut outputs = Vec::with_capacity(child.outputs().len());
+        for wire in child.outputs() {
+            let id = ctx
+                .wire_ids
+                .get(wire)
+                .copied()
+                .ok_or_else(|| "GPU subgraph output has no physical value".to_owned())?;
+            outputs.push(full_eval_value(ctx, id)?);
+        }
+        Ok(outputs)
     })();
     *ctx.wire_ids = outer;
     ctx.device_loop_indices = outer_device_indices;

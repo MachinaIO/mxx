@@ -530,6 +530,66 @@ extern "C" int gpu_matrix_binding_limb(
     return 0;
 }
 
+// Describe the limb layout gpu_matrix_create would allocate for one
+// single-partition matrix without allocating it. `data` of each limb holds its
+// byte offset from the allocation base; `out_data_bytes` is the coefficient
+// storage every limb addresses (the auxiliary tables are not included).
+extern "C" int gpu_matrix_binding_layout(
+    const GpuContext *ctx, int level, size_t rows, size_t cols,
+    GpuMatrixBindingLimb *out_limbs, size_t capacity,
+    size_t *out_limb_count, size_t *out_data_bytes)
+{
+    if (!ctx || !out_limb_count || !out_data_bytes || level < 0 ||
+        (capacity && !out_limbs))
+        return set_error("invalid gpu_matrix_binding_layout arguments");
+    MatrixAllocationPlan plan{};
+    const int status = build_matrix_allocation_plan(ctx, level, rows, cols, &plan);
+    if (status != 0) return status;
+    const size_t limb_count = static_cast<size_t>(level) + 1;
+    if (plan.count == 0 || limb_count > capacity ||
+        limb_count > ctx->limb_gpu_ids.size() || limb_count > ctx->moduli.size())
+        return set_error("matrix binding layout needs a nonempty matrix and limb capacity");
+    const MatrixPartitionAllocationPlan *single = nullptr;
+    for (const auto &partition : plan.partitions)
+    {
+        if (partition.local_limb_count == 0) continue;
+        if (single) return set_error("matrix binding layout needs one partition");
+        single = &partition;
+    }
+    if (!single || single->bytes_per_poly == 0 || single->bytes_per_poly % 2 != 0 ||
+        cols > SIZE_MAX / single->bytes_per_poly)
+        return set_error("matrix binding layout partition is invalid");
+    const size_t n = static_cast<size_t>(ctx->N);
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 id = ctx->limb_gpu_ids[limb];
+        if (id.x != single->partition || id.y >= single->local_limb_count)
+            return set_error("matrix binding layout limb is outside its partition");
+        const size_t width = single->limb_coeff_bytes[id.y];
+        const size_t offset = single->limb_offsets_bytes[id.y];
+        const size_t coefficient_half = single->bytes_per_poly / 2;
+        if ((width != 4 && width != 8) || offset > coefficient_half ||
+            width > (coefficient_half - offset) / n)
+            return set_error("matrix binding layout limb width/offset is invalid");
+        out_limbs[limb] = GpuMatrixBindingLimb{
+            ctx->gpu_ids[single->partition],
+            limb,
+            static_cast<size_t>(id.x),
+            static_cast<size_t>(id.y),
+            offset,
+            width,
+            single->bytes_per_poly,
+            cols * single->bytes_per_poly,
+            coefficient_half,
+            single->data_bytes,
+            ctx->moduli[limb],
+            reinterpret_cast<void *>(offset)};
+    }
+    *out_limb_count = limb_count;
+    *out_data_bytes = single->data_bytes;
+    return 0;
+}
+
 extern "C" int gpu_matrix_create(
     GpuContext *ctx,
     int level,

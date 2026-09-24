@@ -620,3 +620,68 @@ fn download_trapdoor_leaf(
         .expect("trapdoor leaf matrix owner");
     runtime.download_matrix(&RuntimeValue::Resident(owner.clone())).unwrap()
 }
+
+/// Run a parallel-loop family consumed by a later sequential loop; with
+/// `publish`, the family is also a transferred artifact.
+fn run_family_consumed_by_later_loop(publish: bool) {
+    let cpu_params = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let gpu_params = GpuDCRTPolyParams::new(
+        cpu_params.ring_dimension(),
+        cpu_params.moduli().to_vec(),
+        cpu_params.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        cpu_params.moduli().iter().copied().map(Into::into).collect(),
+        cpu_params.ring_dimension(),
+    );
+    let member_ring = ring.clone();
+    // Members are runtime values of the loop index, not static constants.
+    let members = parallel(4, move |index| {
+        Ok(index.add(3).lift_to_constant_polynomial(member_ring.matrix_type((1, 1))))
+    })
+    .unwrap();
+    let consumed = members.clone();
+    let sum =
+        mxx_dsl::iterate(4, ring.zero((1, 1)), move |index, sum| Ok(sum + consumed.at(index)))
+            .unwrap();
+    let context = DslContext::new("family-consumed-by-later-loop");
+    let context =
+        if publish { context.transferred_output("members", members).unwrap() } else { context };
+    let graph = context
+        .output("sum", sum)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .unwrap();
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+    let mut plan = runtime.plan(graph, &BTreeMap::new()).unwrap();
+    let mut store = MemoryArtifactStore::default();
+    let result =
+        runtime.execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x71; 32]).unwrap();
+    let sum = runtime.download_matrix_output(&result.output("sum").expect("sum output")).unwrap();
+    assert_eq!(sum.entry(0, 0).coeffs_biguints()[0], num_bigint::BigUint::from(18u8));
+    if publish {
+        let production = result.production_id.clone().expect("producer identity");
+        drop(result);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        assert_eq!(manifest.artifacts.len(), 1);
+    }
+}
+
+/// Every member of a published family is committed even though a later loop
+/// also consumes it, and the consumer reads every member.
+#[test]
+#[serial_test::serial]
+fn exported_family_consumed_by_later_loop_commits_every_member() {
+    run_family_consumed_by_later_loop(true);
+}
+
+/// A value live across the family's replayed region is freed by the host
+/// after its last region, which also holds the consumer's device loop.
+#[test]
+#[serial_test::serial]
+fn family_consumed_by_later_loop_reads_every_member() {
+    run_family_consumed_by_later_loop(false);
+}

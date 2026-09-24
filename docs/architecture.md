@@ -778,7 +778,10 @@ context and device, default 32), `MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS` (GPU preim
 bound per column tile, default 64; zero or malformed values are errors), and
 `MXX_GPU_LOGICAL_DEVICES` (`gpu_logical_devices`: one physical CUDA device id per logical device,
 for example `0,0`; unset or empty means one logical device per detected GPU, and an invalid value
-panics; see section 6.4).
+panics; see section 6.4), `MXX_GPU_MEMORY_FRACTION` (`gpu_memory_fraction`: the fraction of each
+device's memory that one plan's persistent allocations may use, default 0.8, values outside
+`(0, 1]` are errors), and `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` (`gpu_small_rhs_chunk_columns`: the
+right-operand columns the fused small-RHS multiplication transforms per chunk, default 16).
 
 Errors: planning returns `GpuPlanError` (`InvalidInput`, `Resource`, `Measurement`,
 `GraphCompile`, `InvalidCompiledSchedule`). Execution returns `GpuRuntimeError`: `StalePlan`,
@@ -807,8 +810,20 @@ Planning (`GpuRuntime::plan_with_payload_sizes` in `gpu_runtime_direct.rs`) choo
 Both use a geometric grid (`geometric_candidates`): W in `1, 2, 4, ...` plus the maximum itself,
 and C in `ceil(columns / t)` for `t = 1, 2, 4, ...` plus `t = columns`, so both extremes are always
 tried. For every `(W, C)` pair the planner lowers the graph (`single_root_physical_plan`,
-`plan_physical_graph`), actually allocates the physical frame, checks the device budget, compiles
-the CUDA Graph regions, and runs `measurement_warmups + measurement_iterations` trials. Each
+`plan_physical_graph`), actually allocates the physical frame, checks its persistent allocations
+against the device budget, compiles the CUDA Graph regions, and runs
+`measurement_warmups + measurement_iterations` trials. A candidate whose allocation, compilation,
+or trial fails is rejected and the search continues with the next candidate; no VRAM requirement
+is predicted. Graph-owned scratch (section 6.3) is the one exception, because CUDA keeps the
+reservation of a Graph launch that runs out of memory and the process can then no longer
+allocate: before a compiled Graph's first launch, `admit_graph_scratch` compares its scheduled
+scratch peak (the sum of simultaneously live allocations, plus 1/32 for CUDA's rounding) with the
+memory currently free, and refuses the launch if it does not fit. After each candidate,
+`gpu_release_cached_memory` synchronizes the device, trims the Graph and default pools, and makes
+one whole-device `cudaMalloc` request that cannot succeed: the driver caches the device memory of
+destroyed Graph executables (several KiB per kernel node) and releases it only to `cudaMalloc`,
+not to pool or Graph allocations. This device-wide synchronization happens only while planning;
+`execute` waits on streams and events. Each
 region's measured time is weighted by how often production replays it (waves times active parent
 occurrences). The feasible candidate with the smallest measured time is re-lowered and frozen;
 if no candidate is feasible, planning fails with the collected rejection reasons. Trials measure
@@ -913,15 +928,24 @@ templates, control resets, and wave descriptors needed to run it.
   candidate, and checks its cutoff, repeating until acceptance or until the frozen
   `preimage_max_attempts` bound (`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`) is reached. Exhaustion is
   a `DeviceStatus` error after the join.
-- **NTT insertion only when encodings differ.** `full_eval_value` returns an operand unchanged if
-  it is already `FullEval`; a `FullCoeff` matrix gets exactly one forward NTT into a scratch
-  value, which is cached and shared by all later consumers. Coefficient-domain kernels
-  (conversions, decompositions) emit the inverse and forward NTTs they need explicitly.
-- **Scratch sharing.** `share_scratch_allocations` lets full-matrix scratch values with disjoint
-  lifetimes share one allocation. An allocation is reused only when every operation that
-  referenced its previous occupant is already an ancestor of every writer of the new occupant,
-  so sharing adds no dependency and preserves the measured concurrency. Inputs, outputs,
-  wave-bound members, imports, and values read before any write keep their own allocations.
+- **Conversions only when encodings differ.** `full_eval_value` and `full_coeff_value` return an
+  operand unchanged if it already has the requested encoding; otherwise the value gets exactly one
+  forward or inverse NTT, cached in `converted` and shared by all later consumers. When the
+  source has no later reader, the conversion writes in place. Coefficient-domain operations
+  (automorphisms, modulus and RNS conversions, rounding, CRT recomposition, gadget
+  decomposition, samplers, packs, imports, and exports) consume and produce `FullCoeff` directly.
+- **Graph-owned scratch.** Lowering creates scratch values as deferred owners
+  (`GpuDeferredScratch` in `crates/backends/src/gpu_graph_memory.rs`) that carry only a layout.
+  `DirectGraph::compile` calls `plan_graph_scratch`, which makes a scratch value Graph-owned when
+  it is written before it is read, lives on one device, and stays within one region (or spans
+  regions whose endpoints are not replayed). Each region's operations are emitted in order: a
+  CUDA memory-allocation node precedes the first writer and a free node follows the last reader,
+  so CUDA reuses freed memory inside the Graph, as a caching allocator would. Memory nodes are not
+  allowed in conditional bodies, so scratch used inside a loop body is allocated before the loop
+  and freed after it. An allocation freed by a later region is recorded on the `DirectGraph`,
+  freed on the launch stream after that region's launch (or when the `DirectGraph` is dropped).
+  Every other scratch value, together with inputs, outputs, wave-bound members, and imports, is
+  materialized as a persistent allocation.
 
 ### 6.4 Multiple GPUs
 

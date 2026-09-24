@@ -419,12 +419,14 @@ pub(crate) enum GpuNativePrimitive {
     ForwardNtt,
     InverseNtt,
     GadgetDecomposeCoeff,
-    GadgetDecomposeSmallBalanced,
+    GadgetDecomposeCompact,
     MatrixAdd,
     MatrixSub,
     MatrixMul,
     MatrixMulAccumulate,
+    MatrixMulScalar,
     ExpandCompact,
+    MatrixMulSmallRhs,
     MatrixCopyView,
     MatrixTranspose,
     MatrixTensor,
@@ -451,7 +453,6 @@ pub(crate) enum GpuNativePrimitive {
     BlockModSwitch,
     CrtRecomposeLevel,
     CompactPack,
-    CompactPackPerCrtLimb,
     HashSample,
     SampleUniform,
     SampleInterval,
@@ -470,7 +471,6 @@ pub(crate) enum GpuNativePrimitive {
     PreimageDeriveAttemptSeed,
     ExportCopy,
     ExportPublish,
-    ExportDynamic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -540,6 +540,17 @@ impl GpuImplementation {
         }
     }
 
+    /// Every polynomial of a matrix times one 1x1 scalar matrix; arguments are
+    /// (matrix, part, scalar, part, destination, part, bindings...).
+    pub(crate) fn matrix_mul_scalar() -> Self {
+        use GpuArgumentKind::{U32, Value};
+        Self {
+            primitive: GpuNativePrimitive::MatrixMulScalar,
+            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U32, U32, U32]),
+            output_count: 1,
+        }
+    }
+
     pub(crate) fn matrix_mul(accumulate: bool) -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
@@ -562,11 +573,12 @@ impl GpuImplementation {
         }
     }
 
-    pub(crate) fn gadget_decompose_small_balanced() -> Self {
+    /// Signed gadget digits written directly into a compact bounded matrix.
+    pub(crate) fn gadget_decompose_compact() -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
-            primitive: GpuNativePrimitive::GadgetDecomposeSmallBalanced,
-            argument_kinds: Box::new([Value, U32, Value, U32, U32, U32, U32]),
+            primitive: GpuNativePrimitive::GadgetDecomposeCompact,
+            argument_kinds: Box::new([Value, U32, Value, U32, U32, U32, U32, U32, U32]),
             output_count: 1,
         }
     }
@@ -654,15 +666,6 @@ impl GpuImplementation {
             argument_kinds: Box::new([
                 U32, Value, U32, Value, U32, Value, U32, U64List, U32, U32, U32,
             ]),
-            output_count: 1,
-        }
-    }
-
-    pub(crate) fn compact_pack_per_crt_limb() -> Self {
-        use GpuArgumentKind::{U32, U64, Value};
-        Self {
-            primitive: GpuNativePrimitive::CompactPackPerCrtLimb,
-            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U64, U32, U32, U32]),
             output_count: 1,
         }
     }
@@ -936,6 +939,18 @@ impl GpuImplementation {
 
     /// Expand one compact sign/magnitude fragment into a preallocated
     /// coefficient-form matrix. Its NTT and multiplication are separate ops.
+    pub(crate) fn matrix_mul_small_rhs() -> Self {
+        use GpuArgumentKind::{U32, Value};
+        Self {
+            primitive: GpuNativePrimitive::MatrixMulSmallRhs,
+            argument_kinds: Box::new([
+                Value, U32, Value, U32, Value, U32, Value, U32, U32, U32, U32, U32,
+            ]),
+            // The product and the workspace it transforms each chunk into.
+            output_count: 2,
+        }
+    }
+
     pub(crate) fn expand_compact() -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
@@ -1054,15 +1069,6 @@ impl GpuImplementation {
             output_count: 0,
         }
     }
-
-    pub(crate) fn export_dynamic() -> Self {
-        use GpuArgumentKind::{U32, Value};
-        Self {
-            primitive: GpuNativePrimitive::ExportDynamic,
-            argument_kinds: Box::new([U32, Value, U32, Value, U32, U32, U32, U32, U32, U32, U32]),
-            output_count: 0,
-        }
-    }
 }
 
 /// A process-local table used by both candidate selection and native lowering.
@@ -1168,7 +1174,6 @@ impl CompiledGpuOp {
                 GpuNativePrimitive::Zero |
                 GpuNativePrimitive::ExportCopy |
                 GpuNativePrimitive::ExportPublish |
-                GpuNativePrimitive::ExportDynamic |
                 GpuNativePrimitive::BranchIf |
                 GpuNativePrimitive::LoopWhile
         );
@@ -1238,7 +1243,6 @@ pub(crate) enum GpuPreparedWorkspaceKind {
     P1,
     Gq,
     Cutoff,
-    DynamicExport,
 }
 
 #[cfg(feature = "gpu")]
@@ -1305,47 +1309,6 @@ impl CompiledGpuProgram {
                         return Err("GPU export publication is unordered or duplicated");
                     }
                 }
-                (
-                    GpuNativePrimitive::ExportDynamic,
-                    [
-                        KernelArg::U32(resource_id),
-                        KernelArg::Value(source),
-                        KernelArg::U32(source_part),
-                        KernelArg::Value(occurrence),
-                        KernelArg::U32(occurrence_part),
-                        KernelArg::U32(table_binding),
-                        KernelArg::U32(claims_binding),
-                        KernelArg::U32(claim_result_binding),
-                        KernelArg::U32(occurrence_binding),
-                        KernelArg::U32(source_binding),
-                        KernelArg::U32(status_binding),
-                    ],
-                ) => {
-                    let prepared = |component| GpuBindingSource::PreparedWorkspace {
-                        kind: GpuPreparedWorkspaceKind::DynamicExport,
-                        resource_id: *resource_id,
-                        component,
-                    };
-                    if binding(*table_binding)? != prepared(0) ||
-                        binding(*claims_binding)? != prepared(1) ||
-                        binding(*claim_result_binding)? != prepared(2) ||
-                        binding(*status_binding)? != prepared(3) ||
-                        binding(*occurrence_binding)? !=
-                            (GpuBindingSource::PhysicalPart {
-                                value: *occurrence,
-                                part: *occurrence_part,
-                                limb: 0,
-                            }) ||
-                        binding(*source_binding)? !=
-                            (GpuBindingSource::PhysicalPart {
-                                value: *source,
-                                part: *source_part,
-                                limb: 0,
-                            })
-                    {
-                        return Err("GPU dynamic export bindings disagree with its operands");
-                    }
-                }
                 _ => {}
             }
         }
@@ -1356,17 +1319,13 @@ impl CompiledGpuProgram {
         // device copy has completed. No disk completion edge is required.
         for (copy_index, copy_op) in self.operations.iter().enumerate() {
             let kind = self.implementations.resolve(copy_op.implementation)?.primitive;
-            if !matches!(kind, GpuNativePrimitive::ExportCopy | GpuNativePrimitive::ExportDynamic) {
+            if kind != GpuNativePrimitive::ExportCopy {
                 continue;
             }
             let (source, part) = match (kind, copy_op.arguments.as_ref()) {
                 (
                     GpuNativePrimitive::ExportCopy,
                     [KernelArg::Value(source), KernelArg::U32(part), ..],
-                ) => (source, part),
-                (
-                    GpuNativePrimitive::ExportDynamic,
-                    [KernelArg::U32(_), KernelArg::Value(source), KernelArg::U32(part), ..],
                 ) => (source, part),
                 _ => return Err("GPU export copy has no physical source"),
             };
@@ -1424,7 +1383,6 @@ impl CompiledGpuProgram {
                     GpuPreparedWorkspaceKind::Gq | GpuPreparedWorkspaceKind::Cutoff => {
                         component == 0
                     }
-                    GpuPreparedWorkspaceKind::DynamicExport => component < 4,
                 };
                 if !valid {
                     return Err("GPU prepared workspace binding has an invalid component");

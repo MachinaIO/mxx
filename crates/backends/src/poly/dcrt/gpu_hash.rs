@@ -238,7 +238,8 @@ impl GpuHashSamplePlan {
         stream: &GpuNativeLaunchStream,
         operands: &[GpuRawIntegerView],
     ) -> Result<(), GpuNativeGraphError> {
-        // Any context's stream on the plan's device orders the refresh.
+        // The region's stream may belong to another ring's context on the
+        // same device; the plan uploads through its own context on it.
         if stream.physical_device != self.physical_device ||
             operands.len() != self.operand_encodings.len() ||
             operands.iter().zip(self.operand_encodings.iter()).any(|(view, encoding)| {
@@ -296,8 +297,9 @@ impl GpuHashSamplePlan {
         key_binding: u32,
         destination_binding_base: u32,
     ) -> Result<(), GpuNativeGraphError> {
-        if !Arc::ptr_eq(&self.context, &stream._context) ||
-            stream.physical_device != self.physical_device ||
+        // The Graph's stream may belong to another ring's context on the same
+        // device; the plan launches through its own context on that stream.
+        if stream.physical_device != self.physical_device ||
             destination.physical_device != self.physical_device ||
             destination.limbs.len() != self.moduli.len() ||
             destination.limbs.iter().zip(self.moduli.iter()).enumerate().any(

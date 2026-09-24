@@ -4,7 +4,7 @@ use num_traits::One;
 #[cfg(test)]
 use serial_test::serial as sequential;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ffi::CStr,
     fmt::Debug,
     hash::Hash,
@@ -535,6 +535,16 @@ unsafe extern "C" {
         crt_limb_index: usize,
         out: *mut GpuMatrixBindingLimbRaw,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_binding_layout(
+        ctx: *const GpuContextOpaque,
+        level: c_int,
+        rows: usize,
+        cols: usize,
+        out_limbs: *mut GpuMatrixBindingLimbRaw,
+        capacity: usize,
+        out_limb_count: *mut usize,
+        out_data_bytes: *mut usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
     pub(crate) fn gpu_matrix_wait(mat: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_wait_compiled_inputs(
@@ -589,17 +599,6 @@ unsafe extern "C" {
         bits_binding: u32,
         coefficient_bits_binding: u32,
         destination_binding_base: u32,
-        status_binding: u32,
-    ) -> c_int;
-    fn gpu_raw_compact_pack_per_crt_limb(
-        ctx: *mut GpuContextOpaque,
-        stream: *mut c_void,
-        source: *const GpuRawMatrixViewAbi,
-        destination: *const GpuRawSmallMatrixViewAbi,
-        status: *mut u32,
-        bound: u64,
-        source_binding_base: u32,
-        destination_binding: u32,
         status_binding: u32,
     ) -> c_int;
     fn gpu_raw_matrix_dynamic_slice(
@@ -770,6 +769,16 @@ unsafe extern "C" {
         accumulate: c_int,
         left_binding_base: u32,
         right_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> c_int;
+    fn gpu_raw_matrix_mul_scalar(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        matrix: *const GpuRawMatrixViewAbi,
+        scalar: *const GpuRawMatrixViewAbi,
+        destination: *const GpuRawMatrixViewAbi,
+        matrix_binding_base: u32,
+        scalar_binding_base: u32,
         destination_binding_base: u32,
     ) -> c_int;
     fn gpu_raw_matrix_mul_transpose_rhs(
@@ -1099,15 +1108,6 @@ unsafe extern "C" {
         source_binding_base: u32,
         destination_binding_base: u32,
     ) -> c_int;
-    fn gpu_raw_matrix_decompose_small_balanced(
-        ctx: *mut GpuContextOpaque,
-        stream: *mut c_void,
-        source: *const GpuRawMatrixViewAbi,
-        destination: *const GpuRawMatrixViewAbi,
-        base_bits: u32,
-        source_binding_base: u32,
-        destination_binding_base: u32,
-    ) -> c_int;
     fn gpu_raw_modulus_conversion_prepare(
         ctx: *mut GpuContextOpaque,
         physical_device: c_int,
@@ -1236,6 +1236,29 @@ unsafe extern "C" {
         destination_binding_base: u32,
         status_binding: u32,
     ) -> c_int;
+    fn gpu_raw_matrix_decompose_compact(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        source: *const GpuRawMatrixViewAbi,
+        destination: *const GpuRawSmallMatrixViewAbi,
+        base_bits: u32,
+        dropped_moduli: usize,
+        full_basis_small: c_int,
+        source_binding_base: u32,
+        destination_binding: u32,
+    ) -> c_int;
+    fn gpu_raw_matrix_mul_small_rhs(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        left: *const GpuRawMatrixViewAbi,
+        right: *const GpuRawSmallMatrixViewAbi,
+        workspace: *const GpuRawMatrixViewAbi,
+        destination: *const GpuRawMatrixViewAbi,
+        left_binding_base: u32,
+        right_binding: u32,
+        workspace_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> c_int;
     fn gpu_raw_small_rhs_expand(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
@@ -1280,6 +1303,27 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_builder: *mut *mut MxxGpuGraphBuilderOpaque,
     ) -> c_int;
+    fn gpu_device_release_cached_memory(device: c_int) -> c_int;
+    fn gpu_device_graph_memory_reserved(device: c_int, out_reserved_bytes: *mut usize) -> c_int;
+    fn gpu_graph_allocation_free_async(address: u64, stream: *mut c_void) -> c_int;
+    fn mxx_gpu_graph_builder_add_memory_alloc(
+        builder: *mut MxxGpuGraphBuilderOpaque,
+        device: c_int,
+        bytes: usize,
+        out_token: *mut u32,
+        out_address: *mut u64,
+    ) -> c_int;
+    fn mxx_gpu_graph_builder_add_memory_free(
+        builder: *mut MxxGpuGraphBuilderOpaque,
+        address: u64,
+        operations: *const u32,
+        operation_count: usize,
+    ) -> c_int;
+    fn mxx_gpu_graph_builder_set_pending_memory_dependencies(
+        builder: *mut MxxGpuGraphBuilderOpaque,
+        tokens: *const u32,
+        count: usize,
+    ) -> c_int;
     fn mxx_gpu_graph_builder_begin_operation(
         builder: *mut MxxGpuGraphBuilderOpaque,
         operation_index: u32,
@@ -1322,23 +1366,6 @@ unsafe extern "C" {
         site: u32,
         flags: u32,
         header_binding: u32,
-    ) -> c_int;
-    fn mxx_gpu_graph_builder_add_dynamic_export(
-        builder: *mut MxxGpuGraphBuilderOpaque,
-        device_table: *const GpuDynamicExportEntryRaw,
-        device_claims: *mut u32,
-        device_claim_result: *mut u32,
-        device_occurrence: *const u64,
-        source: *const c_void,
-        device_status: *mut u32,
-        entry_count: usize,
-        maximum_payload_bytes: usize,
-        table_binding: u32,
-        claims_binding: u32,
-        claim_result_binding: u32,
-        occurrence_binding: u32,
-        source_binding: u32,
-        status_binding: u32,
     ) -> c_int;
     fn mxx_gpu_graph_builder_begin_if(
         builder: *mut MxxGpuGraphBuilderOpaque,
@@ -1574,6 +1601,24 @@ pub fn gpu_device_memory_usage(device: i32) -> Result<GpuDeviceMemoryUsage, Stri
     Ok(GpuDeviceMemoryUsage { total: physical.total, resident, live_contexts, context_generation })
 }
 
+/// Graph-reserved physical memory currently mapped on `device`.
+pub fn gpu_graph_memory_reserved(device: i32) -> Result<usize, String> {
+    let mut reserved = 0;
+    if unsafe { gpu_device_graph_memory_reserved(device, &mut reserved) } != 0 {
+        return Err(last_error_string());
+    }
+    Ok(reserved)
+}
+
+/// Wait for `device`, then release the physical memory its Graph pool and
+/// default pool retain without using it.
+pub fn gpu_release_cached_memory(device: i32) -> Result<(), String> {
+    if unsafe { gpu_device_release_cached_memory(device) } != 0 {
+        return Err(last_error_string());
+    }
+    Ok(())
+}
+
 /// Install the logical device table before any device is queried or used.
 fn ensure_logical_devices() {
     static CONFIGURED: OnceLock<()> = OnceLock::new();
@@ -1797,49 +1842,6 @@ pub struct GpuRawP1Bindings {
     pub update: u32,
     pub sampled: u32,
     pub sample_workspace: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GpuDynamicExportEntryRaw {
-    header_address: u64,
-    payload_address: u64,
-    payload_capacity: u64,
-    occurrence: u64,
-    artifact_offset: u64,
-    payload_bytes: u64,
-    site: u32,
-    flags: u32,
-}
-
-pub struct GpuDynamicExportEntry {
-    pub slot: Arc<GpuExportSlot>,
-    pub occurrence: u64,
-    pub artifact_offset: u64,
-    pub payload_bytes: usize,
-    pub site: u32,
-    pub final_chunk: bool,
-}
-
-/// Plan-sized mapping from a device loop index to export slots. Reset claim
-/// state only after the preceding execution and its I/O readers have joined.
-pub struct GpuDynamicExportTable {
-    table: GpuDeviceBuffer,
-    claims: GpuDeviceBuffer,
-    claim_result: GpuDeviceBuffer,
-    slots: Vec<Arc<GpuExportSlot>>,
-    physical_device: i32,
-    maximum_payload_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GpuDynamicExportBindings {
-    pub table: u32,
-    pub claims: u32,
-    pub claim_result: u32,
-    pub occurrence: u32,
-    pub source: u32,
-    pub status: u32,
 }
 
 impl GpuRawP1Workspace {
@@ -2087,111 +2089,6 @@ impl GpuRawPreimageCutoffPlan {
 impl Drop for GpuRawPreimageCutoffPlan {
     fn drop(&mut self) {
         unsafe { gpu_raw_preimage_cutoff_destroy(self.raw.as_ptr()) };
-    }
-}
-
-impl GpuDynamicExportTable {
-    pub fn new(
-        params: &GpuDCRTPolyParams,
-        physical_device: i32,
-        entries: Vec<GpuDynamicExportEntry>,
-    ) -> Result<Self, GpuNativeGraphError> {
-        if entries.is_empty() || entries.len() > u32::MAX as usize {
-            return Err(GpuNativeGraphError::Native("invalid dynamic export entry count".into()));
-        }
-        let mut raw_entries = Vec::with_capacity(entries.len());
-        let mut slots = Vec::with_capacity(entries.len());
-        let mut slot_addresses = HashSet::with_capacity(entries.len());
-        let mut maximum_payload_bytes = 0;
-        for (index, entry) in entries.into_iter().enumerate() {
-            if entry.occurrence != index as u64 ||
-                entry.slot.physical_device != physical_device ||
-                entry.payload_bytes == 0 ||
-                entry.payload_bytes > entry.slot.payload_capacity() ||
-                !slot_addresses.insert(entry.slot.device_header_address())
-            {
-                return Err(GpuNativeGraphError::Native(
-                    "invalid or duplicate dynamic export slot".into(),
-                ));
-            }
-            maximum_payload_bytes = maximum_payload_bytes.max(entry.payload_bytes);
-            raw_entries.push(GpuDynamicExportEntryRaw {
-                header_address: entry.slot.device_header_address(),
-                payload_address: entry.slot.device_payload_address(),
-                payload_capacity: entry.slot.payload_capacity() as u64,
-                occurrence: entry.occurrence,
-                artifact_offset: entry.artifact_offset,
-                payload_bytes: entry.payload_bytes as u64,
-                site: entry.site,
-                flags: u32::from(entry.final_chunk),
-            });
-            slots.push(entry.slot);
-        }
-        let stream = params.native_launch_stream(physical_device)?;
-        let table_bytes = raw_entries.len() * mem::size_of::<GpuDynamicExportEntryRaw>();
-        let table = GpuDeviceBuffer::allocate(&stream, table_bytes)?;
-        let table_slice =
-            unsafe { slice::from_raw_parts(raw_entries.as_ptr().cast::<u8>(), table_bytes) };
-        table.upload(0, table_slice)?;
-        let claim_bytes = slots.len() * mem::size_of::<u32>();
-        let claims = GpuDeviceBuffer::allocate(&stream, claim_bytes)?;
-        claims.upload(0, &vec![0u8; claim_bytes])?;
-        let claim_result = GpuDeviceBuffer::allocate(&stream, mem::size_of::<u32>())?;
-        claim_result.upload(0, &[0u8; 4])?;
-        Ok(Self { table, claims, claim_result, slots, physical_device, maximum_payload_bytes })
-    }
-
-    pub fn physical_device(&self) -> i32 {
-        self.physical_device
-    }
-    pub fn entry_count(&self) -> usize {
-        self.slots.len()
-    }
-    pub fn maximum_payload_bytes(&self) -> usize {
-        self.maximum_payload_bytes
-    }
-    pub fn table_address(&self) -> u64 {
-        self.table.as_ptr() as u64
-    }
-    pub fn claims_address(&self) -> u64 {
-        self.claims.as_ptr() as u64
-    }
-    pub fn claim_result_address(&self) -> u64 {
-        self.claim_result.as_ptr() as u64
-    }
-    pub fn binding_ranges(&self) -> [(u64, usize); 3] {
-        [
-            (self.table_address(), self.slots.len() * mem::size_of::<GpuDynamicExportEntryRaw>()),
-            (self.claims_address(), self.slots.len() * mem::size_of::<u32>()),
-            (self.claim_result_address(), mem::size_of::<u32>()),
-        ]
-    }
-
-    /// Clear all device-side slot claims for the next sequential plan replay.
-    ///
-    /// # Safety
-    /// The preceding GPU execution and all consumers of its export slots must
-    /// have completed before this method is called.
-    pub unsafe fn reset_after_completion(&self) -> Result<(), GpuNativeGraphError> {
-        let claim_bytes = self
-            .slots
-            .len()
-            .checked_mul(mem::size_of::<u32>())
-            .ok_or_else(|| GpuNativeGraphError::Native("export claim count overflow".into()))?;
-        self.claims.upload(0, &vec![0u8; claim_bytes])?;
-        self.claim_result.upload(0, &[0u8; 4])
-    }
-
-    pub fn prepare_graph_launch(
-        &self,
-        stream: &GpuNativeLaunchStream,
-    ) -> Result<(), GpuNativeGraphError> {
-        if stream.physical_device != self.physical_device {
-            return Err(GpuNativeGraphError::Native("export table belongs to another GPU".into()));
-        }
-        self.table.wait_compiled_inputs(self.physical_device, stream, true)?;
-        self.claims.wait_compiled_inputs(self.physical_device, stream, false)?;
-        self.claim_result.wait_compiled_inputs(self.physical_device, stream, false)
     }
 }
 
@@ -3016,6 +2913,44 @@ impl GpuDCRTPolyParams {
                 c_int::from(accumulate),
                 left_binding_base,
                 right_binding_base,
+                destination_binding_base,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Multiply every polynomial of `matrix` by the one polynomial of the 1x1
+    /// `scalar` in the evaluation domain.
+    pub fn emit_raw_matrix_mul_scalar(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        matrix: &GpuRawMatrixView,
+        scalar: &GpuRawMatrixView,
+        destination: &GpuRawMatrixView,
+        matrix_binding_base: u32,
+        scalar_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if [matrix, scalar, destination].iter().any(|view| {
+            view.physical_device != stream.physical_device || view.degree != self.ring_dimension
+        }) {
+            return Err(GpuNativeGraphError::Native(
+                "raw scalar product view/context mismatch".into(),
+            ));
+        }
+        let (matrix, scalar, destination) = (matrix.abi(), scalar.abi(), destination.abi());
+        if unsafe {
+            gpu_raw_matrix_mul_scalar(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &matrix,
+                &scalar,
+                &destination,
+                matrix_binding_base,
+                scalar_binding_base,
                 destination_binding_base,
             )
         } != 0
@@ -3942,45 +3877,6 @@ impl GpuDCRTPolyParams {
         Ok(())
     }
 
-    /// Emit one balanced digit per CRT tower into each shared small-gadget
-    /// row. Every ordered source limb remains present in the destination.
-    pub fn emit_raw_gadget_decompose_small_balanced(
-        &self,
-        stream: &GpuNativeLaunchStream,
-        source: &GpuRawMatrixView,
-        destination: &GpuRawMatrixView,
-        base_bits: u32,
-        source_binding_base: u32,
-        destination_binding_base: u32,
-    ) -> Result<(), GpuNativeGraphError> {
-        if source.physical_device != stream.physical_device ||
-            destination.physical_device != stream.physical_device ||
-            source.degree != self.ring_dimension ||
-            destination.degree != self.ring_dimension
-        {
-            return Err(GpuNativeGraphError::Native(
-                "raw small balanced decomposition view/context mismatch".into(),
-            ));
-        }
-        let source = source.abi();
-        let destination = destination.abi();
-        if unsafe {
-            gpu_raw_matrix_decompose_small_balanced(
-                self.ctx.raw_ptr(),
-                stream.raw_ptr(),
-                &source,
-                &destination,
-                base_bits,
-                source_binding_base,
-                destination_binding_base,
-            )
-        } != 0
-        {
-            return Err(GpuNativeGraphError::Native(last_error_string()));
-        }
-        Ok(())
-    }
-
     /// Prepare ordered CRT subset conversion once for a compiled graph plan.
     pub fn prepare_raw_modulus_conversion(
         &self,
@@ -4604,45 +4500,43 @@ impl GpuDCRTPolyParams {
         Ok(())
     }
 
-    /// Pack each ordered CRT residue as its own bounded signed compact cell.
-    /// The destination view is the owner-derived PerCrtLimb layout.
-    pub fn emit_raw_compact_pack_per_crt_limb(
+    /// Write the signed gadget digits of a coefficient-domain matrix directly
+    /// into a preallocated compact sign/magnitude destination. `small`
+    /// selects the per-CRT-limb balanced gadget; otherwise the digit rows of
+    /// the retained source limbs are concatenated under a global bound.
+    pub fn emit_raw_matrix_decompose_compact(
         &self,
         stream: &GpuNativeLaunchStream,
         source: &GpuRawMatrixView,
         destination: &GpuRawSmallMatrixView,
-        status: GpuRawControlStatusView,
-        bound: u64,
+        base_bits: u32,
+        dropped_moduli: usize,
+        small: bool,
         source_binding_base: u32,
         destination_binding: u32,
     ) -> Result<(), GpuNativeGraphError> {
         if source.physical_device != stream.physical_device ||
             destination.physical_device != stream.physical_device ||
             source.degree != self.ring_dimension ||
-            source.degree != destination.degree ||
-            source.rows != destination.rows ||
-            source.columns != destination.columns ||
-            source.limbs.len() != self.moduli().len() ||
-            destination.bound_domain != 1 ||
-            destination.crt_depth as usize != source.limbs.len() ||
-            destination.payload_address == 0 ||
-            status.address == 0
+            destination.degree != self.ring_dimension
         {
             return Err(GpuNativeGraphError::Native(
-                "invalid per-CRT-limb compact pack physical view".into(),
+                "raw compact decomposition view/context mismatch".into(),
             ));
         }
+        let source = source.abi();
+        let destination = destination.abi();
         if unsafe {
-            gpu_raw_compact_pack_per_crt_limb(
+            gpu_raw_matrix_decompose_compact(
                 self.ctx.raw_ptr(),
                 stream.raw_ptr(),
-                &source.abi(),
-                &destination.abi(),
-                status.address as *mut u32,
-                bound,
+                &source,
+                &destination,
+                base_bits,
+                dropped_moduli,
+                c_int::from(small),
                 source_binding_base,
                 destination_binding,
-                status.binding,
             )
         } != 0
         {
@@ -4677,6 +4571,56 @@ impl GpuDCRTPolyParams {
                 &source,
                 &destination,
                 source_binding,
+                destination_binding_base,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Multiply an evaluation-domain `left` by the compact bounded `right`
+    /// into `destination`, transforming `right` one `workspace`-wide column
+    /// chunk at a time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_raw_matrix_mul_small_rhs(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        left: &GpuRawMatrixView,
+        right: &GpuRawSmallMatrixView,
+        workspace: &GpuRawMatrixView,
+        destination: &GpuRawMatrixView,
+        left_binding_base: u32,
+        right_binding: u32,
+        workspace_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if [left.physical_device, right.physical_device, workspace.physical_device]
+            .into_iter()
+            .chain([destination.physical_device])
+            .any(|device| device != stream.physical_device) ||
+            [left.degree, right.degree, workspace.degree, destination.degree]
+                .into_iter()
+                .any(|degree| degree != self.ring_dimension)
+        {
+            return Err(GpuNativeGraphError::Native(
+                "raw small-RHS product view/context mismatch".into(),
+            ));
+        }
+        let (left, right) = (left.abi(), right.abi());
+        let (workspace, destination) = (workspace.abi(), destination.abi());
+        if unsafe {
+            gpu_raw_matrix_mul_small_rhs(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &left,
+                &right,
+                &workspace,
+                &destination,
+                left_binding_base,
+                right_binding,
+                workspace_binding_base,
                 destination_binding_base,
             )
         } != 0
@@ -5162,6 +5106,15 @@ impl Drop for GpuContext {
 }
 
 impl GpuNativeLaunchStream {
+    /// Free a Graph-owned allocation of an earlier Graph once the work already
+    /// enqueued on this stream completes.
+    pub fn free_graph_allocation(&self, address: u64) -> Result<(), GpuNativeGraphError> {
+        if unsafe { gpu_graph_allocation_free_async(address, self.raw) } != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
     pub fn begin_graph(&self) -> Result<GpuNativeGraphBuilder, GpuNativeGraphError> {
         let mut raw = ptr::null_mut();
         let status = unsafe {
@@ -5903,6 +5856,68 @@ impl GpuNativeGraphBuilder {
         std::mem::replace(&mut self.stream, stream)
     }
 
+    /// Allocate one graph-owned buffer on `device`, ordered after every
+    /// earlier graph memory node, and return its token and fixed address.
+    pub fn add_memory_alloc(
+        &mut self,
+        device: i32,
+        bytes: usize,
+    ) -> Result<(u32, u64), GpuNativeGraphError> {
+        let (mut token, mut address) = (0, 0);
+        if unsafe {
+            mxx_gpu_graph_builder_add_memory_alloc(
+                self.raw,
+                device,
+                bytes,
+                &mut token,
+                &mut address,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok((token, address))
+    }
+
+    /// Free one graph allocation after every earlier graph memory node and
+    /// after the emitted top-level `operations` that use it.
+    pub fn add_memory_free(
+        &mut self,
+        address: u64,
+        operations: &[u32],
+    ) -> Result<(), GpuNativeGraphError> {
+        if unsafe {
+            mxx_gpu_graph_builder_add_memory_free(
+                self.raw,
+                address,
+                operations.as_ptr(),
+                operations.len(),
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Make the next top-level operation start after these allocations.
+    pub fn set_pending_memory_dependencies(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(), GpuNativeGraphError> {
+        if unsafe {
+            mxx_gpu_graph_builder_set_pending_memory_dependencies(
+                self.raw,
+                tokens.as_ptr(),
+                tokens.len(),
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
     pub fn begin_operation(
         &mut self,
         operation_index: u32,
@@ -6069,70 +6084,6 @@ impl GpuNativeGraphBuilder {
             )
         };
         if status != 0 {
-            return Err(GpuNativeGraphError::Native(last_error_string()));
-        }
-        Ok(())
-    }
-
-    /// Append claim, device-indexed payload copy, and system-scope release
-    /// publication nodes inside the current operation or conditional body.
-    pub fn add_dynamic_export(
-        &mut self,
-        table: &GpuDynamicExportTable,
-        source_address: u64,
-        device_occurrence_address: u64,
-        status: &GpuExportStatus,
-        bindings: GpuDynamicExportBindings,
-    ) -> Result<(), GpuNativeGraphError> {
-        if table.physical_device != self.stream.physical_device ||
-            status.physical_device != self.stream.physical_device ||
-            source_address == 0 ||
-            device_occurrence_address == 0
-        {
-            return Err(GpuNativeGraphError::Native(
-                "dynamic export device/address mismatch".into(),
-            ));
-        }
-        self.bind_resident_address(
-            table.table_address(),
-            table.table.bytes,
-            self.global_binding(bindings.table),
-        )?;
-        self.bind_resident_address(
-            table.claims_address(),
-            table.claims.bytes,
-            self.global_binding(bindings.claims),
-        )?;
-        self.bind_resident_address(
-            table.claim_result_address(),
-            4,
-            self.global_binding(bindings.claim_result),
-        )?;
-        self.bind_resident_address(
-            status.device_address(),
-            4,
-            self.global_binding(bindings.status),
-        )?;
-        if unsafe {
-            mxx_gpu_graph_builder_add_dynamic_export(
-                self.raw,
-                table.table_address() as *const GpuDynamicExportEntryRaw,
-                table.claims_address() as *mut u32,
-                table.claim_result_address() as *mut u32,
-                device_occurrence_address as *const u64,
-                source_address as *const c_void,
-                status.device_address() as *mut u32,
-                table.entry_count(),
-                table.maximum_payload_bytes(),
-                bindings.table,
-                bindings.claims,
-                bindings.claim_result,
-                bindings.occurrence,
-                bindings.source,
-                bindings.status,
-            )
-        } != 0
-        {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
         Ok(())

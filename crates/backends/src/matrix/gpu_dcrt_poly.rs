@@ -8,12 +8,12 @@ use crate::{
             GpuNativeGraphError, GpuNativeLaunchStream, GpuSmallMatrixBindingDescriptorRaw,
             GpuSmallMatrixOpaque, check_status, gpu_event_set_destroy, gpu_event_set_wait,
             gpu_matrix_binding_component, gpu_matrix_binding_component_count,
-            gpu_matrix_binding_limb, gpu_matrix_binding_limb_count, gpu_matrix_create,
-            gpu_matrix_destroy, gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch,
-            gpu_matrix_record_compiled_write, gpu_matrix_wait, gpu_matrix_wait_compiled_inputs,
-            gpu_small_matrix_binding_descriptor, gpu_small_matrix_create, gpu_small_matrix_destroy,
-            gpu_small_matrix_load_coefficients, gpu_small_matrix_query_allocation_bytes,
-            gpu_small_matrix_wait,
+            gpu_matrix_binding_layout, gpu_matrix_binding_limb, gpu_matrix_binding_limb_count,
+            gpu_matrix_create, gpu_matrix_destroy, gpu_matrix_load_compact_bytes,
+            gpu_matrix_load_rns_batch, gpu_matrix_record_compiled_write, gpu_matrix_wait,
+            gpu_matrix_wait_compiled_inputs, gpu_small_matrix_binding_descriptor,
+            gpu_small_matrix_create, gpu_small_matrix_destroy, gpu_small_matrix_load_coefficients,
+            gpu_small_matrix_query_allocation_bytes, gpu_small_matrix_wait,
         },
     },
 };
@@ -641,7 +641,64 @@ impl GpuDCRTPolyMatrix {
         Ok(())
     }
 
-    fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
+    /// Describe the limb layout of a `rows x columns` allocation for
+    /// `params` without allocating it. Each limb's `data_address` is its byte
+    /// offset from the allocation base; the returned byte count is the
+    /// coefficient storage every limb addresses.
+    pub fn binding_layout(
+        params: &GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+    ) -> Result<(Box<[GpuMatrixBindingLimb]>, usize), GpuNativeGraphError> {
+        let depth = params.crt_depth();
+        let level = depth.checked_sub(1).ok_or_else(|| {
+            GpuNativeGraphError::Native("cannot lay out a matrix with empty CRT basis".into())
+        })?;
+        let mut raw = vec![GpuMatrixBindingLimbRaw::default(); depth];
+        let (mut count, mut data_bytes) = (0usize, 0usize);
+        if unsafe {
+            gpu_matrix_binding_layout(
+                params.ctx_raw(),
+                level as i32,
+                rows,
+                columns,
+                raw.as_mut_ptr(),
+                raw.len(),
+                &mut count,
+                &mut data_bytes,
+            )
+        } != 0 ||
+            count != depth
+        {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        let limbs = raw
+            .into_iter()
+            .map(|raw| GpuMatrixBindingLimb {
+                physical_device: raw.physical_device,
+                crt_limb_index: raw.crt_limb_index,
+                component_index: raw.component_index,
+                local_limb_index: raw.local_limb_index,
+                byte_offset: raw.byte_offset,
+                coefficient_bytes: raw.coefficient_bytes,
+                poly_stride_bytes: raw.poly_stride_bytes,
+                row_stride_bytes: raw.row_stride_bytes,
+                scratch_offset_bytes: raw.scratch_offset_bytes,
+                data_bytes: raw.data_bytes,
+                modulus: raw.modulus,
+                data_address: raw.data as usize as u64,
+            })
+            .collect();
+        Ok((limbs, data_bytes))
+    }
+
+    /// Create the native allocation, returning the failing status and its
+    /// context so callers choose between an error and the typed OOM panic.
+    fn create(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+    ) -> Result<Self, (std::ffi::c_int, String)> {
         let level = params.crt_depth().saturating_sub(1);
         let mut raw: *mut GpuMatrixOpaque = ptr::null_mut();
         let status = unsafe {
@@ -655,18 +712,27 @@ impl GpuDCRTPolyMatrix {
             )
         };
         if status != 0 {
-            let context = format!(
-                "gpu_matrix_create(nrow={}, ncol={}, level={}, ring_dim={}, crt_depth={})",
-                nrow,
-                ncol,
-                level,
-                params.ring_dimension(),
-                params.crt_depth(),
-            );
-            check_status(status, &context);
+            return Err((
+                status,
+                format!(
+                    "gpu_matrix_create(nrow={}, ncol={}, level={}, ring_dim={}, crt_depth={})",
+                    nrow,
+                    ncol,
+                    level,
+                    params.ring_dimension(),
+                    params.crt_depth(),
+                ),
+            ));
         }
         let owner = Arc::new(GpuMatrixOwner { raw, _params: params.clone() });
-        Self { _owner: owner, params: params.clone(), nrow, ncol, level, raw }
+        Ok(Self { _owner: owner, params: params.clone(), nrow, ncol, level, raw })
+    }
+
+    fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
+        Self::create(params, nrow, ncol).unwrap_or_else(|(status, context)| {
+            check_status(status, &context);
+            unreachable!("check_status panics on a failing status")
+        })
     }
 
     /// Allocate a zero-filled physical matrix. Its encoding is owned by the
@@ -684,7 +750,14 @@ impl GpuDCRTPolyMatrix {
         params
             .matrix_allocation_bytes(level, rows, columns)
             .map_err(GpuNativeGraphError::Native)?;
-        let mut out = Self::new_empty(params, rows, columns);
+        // An allocation failure is returned so plan candidates can be
+        // rejected instead of aborting the planner.
+        let mut out = Self::create(params, rows, columns).map_err(|(_, context)| {
+            GpuNativeGraphError::Native(format!(
+                "{context} failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            ))
+        })?;
         let bytes_per_poly = rns_bytes_len(params);
         if rows != 0 && columns != 0 && bytes_per_poly != 0 {
             out.load_rns_bytes(&vec![0u8; rows * columns * bytes_per_poly], bytes_per_poly);

@@ -441,15 +441,12 @@ extern "C" int gpu_small_matrix_load_coefficients(
 
 namespace
 {
-    __global__ void raw_small_rhs_expand_kernel(
-        MxxRawSmallMatrixView source, MxxRawMatrixLimb destination,
-        size_t compact_limb, size_t coefficient_count, size_t coefficient_offset)
+    // The signed compact coefficient of polynomial `poly` of the view as a
+    // residue of `modulus`; a per-CRT-limb view stores limb `compact_limb`.
+    __device__ __forceinline__ uint64_t compact_residue(
+        const MxxRawSmallMatrixView &source, size_t poly, size_t coefficient,
+        size_t compact_limb, uint64_t modulus)
     {
-        const size_t index = coefficient_offset +
-            static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (index >= coefficient_count) return;
-        const size_t coefficient = index % source.degree;
-        const size_t poly = index / source.degree;
         const size_t row = poly / source.columns;
         const size_t column = poly - row * source.columns;
         const size_t width = 1 + source.magnitude_bytes;
@@ -459,12 +456,138 @@ namespace
         const auto *encoded = reinterpret_cast<const uint8_t *>(source.payload_address) +
             ((source_poly * source.degree + coefficient) * depth +
                 (source.bound_domain == 1 ? compact_limb : 0)) * width;
-        uint64_t residue = compact_mod_magnitude(
-            encoded + 1, source.magnitude_bytes, destination.modulus);
-        if (encoded[0] == 2 && residue != 0)
-            residue = destination.modulus - residue;
-        raw_matrix_store(destination, poly, coefficient, source.columns, residue);
+        uint64_t residue = compact_mod_magnitude(encoded + 1, source.magnitude_bytes, modulus);
+        if (encoded[0] == 2 && residue != 0) residue = modulus - residue;
+        return residue;
     }
+
+    __global__ void raw_small_rhs_expand_kernel(
+        MxxRawSmallMatrixView source, MxxRawMatrixLimb destination,
+        size_t compact_limb, size_t coefficient_count, size_t coefficient_offset)
+    {
+        const size_t index = coefficient_offset +
+            static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index >= coefficient_count) return;
+        const size_t coefficient = index % source.degree;
+        const size_t poly = index / source.degree;
+        raw_matrix_store(destination, poly, coefficient, source.columns,
+            compact_residue(source, poly, coefficient, compact_limb, destination.modulus));
+    }
+}
+
+static bool valid_compact_rhs_view(const MxxRawSmallMatrixView *source, size_t limb_count)
+{
+    return source && source->payload_address &&
+        source->column_offset <= source->storage_columns &&
+        source->columns <= source->storage_columns - source->column_offset &&
+        source->magnitude_bytes != 0 && source->magnitude_bytes <= 64 &&
+        source->bound_domain <= 1 && source->crt_depth != 0 &&
+        (source->bound_domain == 1 || source->crt_depth == 1) &&
+        (source->bound_domain == 0 || source->crt_depth == limb_count);
+}
+
+// left (L x K, evaluation domain) times the compact bounded right operand
+// (K x C) into destination (L x C, evaluation domain). The right operand is
+// transformed one workspace-wide column chunk at a time: the compact chunk is
+// decoded into the workspace, the shared NTT transforms it in place, and the
+// shared product kernel writes the chunk's output columns. The right operand
+// is never expanded in full.
+extern "C" int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *left, const MxxRawSmallMatrixView *right,
+    const MxxRawMatrixView *workspace, const MxxRawMatrixView *destination,
+    uint32_t left_binding_base, uint32_t right_binding,
+    uint32_t workspace_binding_base, uint32_t destination_binding_base)
+{
+    if (validate_raw_view(ctx, left, stream_raw) != 0 ||
+        validate_raw_view(ctx, workspace, stream_raw) != 0 ||
+        validate_raw_view(ctx, destination, stream_raw) != 0 ||
+        !valid_compact_rhs_view(right, left->limb_count) ||
+        left->physical_device != right->physical_device ||
+        left->physical_device != workspace->physical_device ||
+        left->physical_device != destination->physical_device ||
+        left->degree != right->degree || left->degree != workspace->degree ||
+        left->degree != destination->degree ||
+        left->limb_count != workspace->limb_count ||
+        left->limb_count != destination->limb_count ||
+        left->columns != right->rows || workspace->rows != right->rows ||
+        workspace->columns == 0 || left->rows != destination->rows ||
+        right->columns != destination->columns ||
+        left_binding_base > UINT32_MAX - left->limb_count ||
+        workspace_binding_base > UINT32_MAX - workspace->limb_count ||
+        destination_binding_base > UINT32_MAX - destination->limb_count)
+        return set_error("invalid raw small-RHS product views");
+    for (size_t limb = 0; limb < left->limb_count; ++limb)
+        if (left->limbs[limb].crt_limb_index != workspace->limbs[limb].crt_limb_index ||
+            left->limbs[limb].crt_limb_index != destination->limbs[limb].crt_limb_index ||
+            left->limbs[limb].modulus != workspace->limbs[limb].modulus ||
+            left->limbs[limb].modulus != destination->limbs[limb].modulus ||
+            workspace->limbs[limb].address == left->limbs[limb].address ||
+            workspace->limbs[limb].address == destination->limbs[limb].address)
+            return set_error("raw small-RHS product limb mismatch or alias");
+    if (mxx_set_device(left->physical_device) != cudaSuccess)
+        return set_error(cudaGetLastError());
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    const uint32_t degree = left->degree;
+    for (size_t start = 0; start < right->columns; start += workspace->columns)
+    {
+        const size_t width = std::min<size_t>(workspace->columns, right->columns - start);
+        MxxRawSmallMatrixView chunk = *right;
+        chunk.columns = width;
+        chunk.column_offset += start;
+        const size_t chunk_coefficients = right->rows * width * degree;
+        constexpr size_t maximum_decode = 65535ULL * 256ULL;
+        for (size_t limb = 0; limb < left->limb_count; ++limb)
+        {
+            const MxxGraphPatch decode_patches[] = {
+                {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
+                    offsetof(MxxRawSmallMatrixView, payload_address), sizeof(void *),
+                    right_binding, 0},
+                {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
+                    static_cast<uint32_t>(workspace_binding_base + limb), 0},
+            };
+            for (size_t offset = 0; offset < chunk_coefficients; offset += maximum_decode)
+            {
+                const size_t count = std::min(maximum_decode, chunk_coefficients - offset);
+                const int status = mxx_gpu_launch_kernel(ctx, stream,
+                    raw_small_rhs_expand_kernel, dim3(static_cast<uint32_t>((count + 255) / 256)),
+                    dim3(256), 0, decode_patches, 2, chunk, workspace->limbs[limb], limb,
+                    chunk_coefficients, offset);
+                if (status != 0) return status;
+            }
+        }
+        // The chunk occupies the first `width` workspace columns.
+        MxxRawMatrixView transformed = *workspace;
+        transformed.columns = width;
+        if (gpu_raw_matrix_ntt(ctx, stream_raw, &transformed, &transformed, 0,
+                workspace_binding_base, workspace_binding_base) != 0)
+            return 1;
+        // The shared product kernel writes the chunk's output columns, which
+        // start `start` columns into the destination.
+        const size_t output_polys = destination->rows * width;
+        for (size_t first = 0; first < left->limb_count; first += kRawNttLimbs)
+        {
+            const size_t limbs = std::min(kRawNttLimbs, left->limb_count - first);
+            RawLimbSet lefts{}, rights{}, outputs{};
+            std::vector<MxxGraphPatch> patches;
+            raw_limb_set(left, first, limbs, 0, left_binding_base, lefts, patches);
+            raw_limb_set(&transformed, first, limbs, 1, workspace_binding_base, rights, patches);
+            raw_limb_set(destination, first, limbs, 2, destination_binding_base, outputs, patches,
+                start);
+            for (size_t offset = 0; offset < output_polys; offset += kMaxGridY)
+            {
+                const size_t polys = std::min(kMaxGridY, output_polys - offset);
+                const dim3 grid((degree + kMulCoefficients - 1) / kMulCoefficients,
+                    static_cast<uint32_t>(polys), static_cast<uint32_t>(limbs));
+                const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_mul_kernel,
+                    grid, dim3(kMulCoefficients, kMulSlices), 0, patches.data(), patches.size(),
+                    lefts, rights, outputs, static_cast<size_t>(left->columns), width, width,
+                    static_cast<size_t>(destination->rows), static_cast<size_t>(degree), offset,
+                    false, false);
+                if (status != 0) return status;
+            }
+        }
+    }
+    return 0;
 }
 
 extern "C" int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream_raw,
@@ -472,18 +595,12 @@ extern "C" int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *destination,
     uint32_t source_binding, uint32_t destination_binding_base)
 {
-    if (!source || !source->payload_address ||
-        validate_raw_view(ctx, destination, stream_raw) != 0 ||
+    if (validate_raw_view(ctx, destination, stream_raw) != 0 ||
+        !valid_compact_rhs_view(source, destination->limb_count) ||
         source->physical_device != destination->physical_device ||
         source->degree != destination->degree ||
         source->rows != destination->rows ||
         source->columns != destination->columns ||
-        source->column_offset > source->storage_columns ||
-        source->columns > source->storage_columns - source->column_offset ||
-        source->magnitude_bytes == 0 || source->magnitude_bytes > 64 ||
-        source->bound_domain > 1 || source->crt_depth == 0 ||
-        (source->bound_domain == 0 && source->crt_depth != 1) ||
-        (source->bound_domain == 1 && source->crt_depth != destination->limb_count) ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw compact RHS expansion views");
     if (mxx_set_device(source->physical_device) != cudaSuccess)

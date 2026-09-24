@@ -535,6 +535,27 @@ impl GpuResidentValue {
             .map_err(str::to_owned)
     }
 
+    /// Allocate new device storage with the same physical descriptor without
+    /// copying: a template whose storage is rebound before every use needs
+    /// only a distinct allocation, and its source may not be allocated yet.
+    pub(crate) fn private_placeholder(
+        &self,
+        backend: &crate::backend::poly_gpu::GpuDcrtBackend,
+    ) -> Result<Self, String> {
+        let mut storage = BTreeMap::new();
+        for (&slot, bound) in &self.storage {
+            let parameters = backend.control_parameters_on_device(bound.device)?;
+            let bytes = usize::try_from(bound.bytes)
+                .map_err(|_| "GPU resident placeholder exceeds host address space".to_owned())?;
+            let allocation = Arc::new(
+                crate::poly::dcrt::gpu::GpuDeviceBytes::new(&parameters, bound.device, bytes)
+                    .map_err(|error| error.to_string())?,
+            );
+            storage.insert(slot, BoundStorage::from_device_bytes(allocation)?);
+        }
+        Self::new(Arc::clone(&self.physical), storage, Box::new([])).map_err(str::to_owned)
+    }
+
     pub(crate) fn new(
         physical: Arc<crate::gpu_execution_plan::PhysicalValue>,
         storage: BTreeMap<crate::gpu_execution_plan::StorageRef, BoundStorage>,

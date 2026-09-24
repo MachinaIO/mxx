@@ -7,7 +7,8 @@ members = [
     "crates/backends",
     "crates/gadgets",
     "crates/func-enc",
-    "crates/we",
+    # Diamond WE is excluded until its ring-parameterized protocol family is redesigned.
+    # "crates/we",
     "crates/io",
     "crates/fhe",
 ]
@@ -21,7 +22,7 @@ license = "MIT OR Apache-2.0"
 mxx-backends = { path = "crates/backends" }
 mxx-gadgets = { path = "crates/gadgets" }
 mxx-func-enc = { path = "crates/func-enc" }
-mxx-we = { path = "crates/we" }
+# mxx-we = { path = "crates/we" }
 mxx-io = { path = "crates/io" }
 mxx-ir-core = { path = "crates/ir-core" }
 mxx-dsl = { path = "crates/dsl" }

@@ -14,7 +14,7 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
 | `mxx-fhe` | DSL-based TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and ciphertext noise tracking. |
-| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. |
+| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Currently excluded from the workspace (commented out in `Cargo.toml`). |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
 
 The retired symbolic IR and probabilistic noise simulator are not part of the workspace.

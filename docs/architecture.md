@@ -85,7 +85,7 @@ abstraction.
 | `crates/gadgets` | `mxx-gadgets` | Reusable, BGG-independent circuits and circuit gadgets (nested RNS arithmetic, NTT, FHE gadgets, noise refresh, input injector). |
 | `crates/bgg` | `mxx-bgg` | BGG+ public keys, encodings, circuit lowering, lookups, slot transfer, Tall encodings, WEE25 commitments. |
 | `crates/fhe` | `mxx-fhe` | TFHE (integer LWE with NAND bootstrapping) and leveled BGV graph builders. |
-| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. |
+| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. Currently excluded from the workspace (commented out in `Cargo.toml`). |
 | `crates/func-enc` | `mxx-func-enc` | Functional-encryption interface trait only (`FuncEnc`). |
 | `crates/io` | `mxx-io` | Indistinguishability-obfuscation interface trait only (`Obfuscation`). |
 
@@ -1277,6 +1277,10 @@ backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactSt
 `docs/plans/fhe.md` records the formulas and design, and `README.md` summarizes the FHE API.
 
 ### 7.4 `mxx-we`: Diamond witness encryption
+
+`mxx-we` is currently excluded from the workspace: its protocol family is bound to one ring, so
+it is not parameter-independent across rings, and it is commented out in `Cargo.toml` until that
+is redesigned. The description below is kept for that work.
 
 `crates/we/src/` defines implementation-independent WE interfaces and the Diamond construction:
 

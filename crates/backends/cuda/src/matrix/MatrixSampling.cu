@@ -237,8 +237,15 @@ __device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t
 
 namespace
 {
+    // Threads per sampling block. Small blocks spread the rejection samplers,
+    // whose cost dominates, over more multiprocessors.
+    constexpr uint32_t kSampleThreads = 64;
+
+    // A uniform draw has its own stream per CRT limb, and blockIdx.y picks the
+    // limb. A non-uniform draw is one signed integer per coefficient that every
+    // limb reduces, so each thread samples once and writes all `limbs`.
     __global__ void raw_matrix_sample_kernel(
-        MxxRawMatrixLimb destination, const GpuRngSeed *device_seed,
+        RawLimbSet destinations, uint32_t limbs, const GpuRngSeed *device_seed,
         uint64_t rows, uint64_t columns, uint64_t row_origin,
         uint64_t column_origin, uint64_t full_columns,
         uint32_t degree, int distribution, double sigma,
@@ -259,6 +266,9 @@ namespace
         const uint64_t column = poly - row * columns;
         const uint64_t global_poly =
             (row_origin + row) * full_columns + column_origin + column;
+        const bool uniform = distribution == GPU_MATRIX_DIST_UNIFORM;
+        const MxxRawMatrixLimb &destination = destinations.limb[uniform ? blockIdx.y : 0];
+        const uint32_t written = uniform ? 1 : limbs;
         const uint64_t domain = distribution == GPU_MATRIX_DIST_UNIFORM ?
             0x6f70656e66686531ULL :
             (distribution == GPU_MATRIX_DIST_GAUSS ? 0x6f70656e66686532ULL :
@@ -279,28 +289,32 @@ namespace
         {
             const uint64_t coefficient = coefficient_start + lane;
             if (coefficient >= degree) break;
-            uint64_t sample = 0;
-            if (distribution == GPU_MATRIX_DIST_UNIFORM)
-                sample = sample_uniform_mod(rng, modulus, rejection_threshold);
-            else if (distribution == GPU_MATRIX_DIST_GAUSS)
+            if (uniform)
             {
-                int64_t signed_sample;
+                raw_matrix_store(destination, poly, coefficient, columns,
+                    sample_uniform_mod(rng, modulus, rejection_threshold));
+                continue;
+            }
+            int64_t signed_sample;
+            if (distribution == GPU_MATRIX_DIST_GAUSS)
+            {
                 do
                 {
                     signed_sample = sample_integer_karney(rng, 0.0, sigma);
                 } while (centered_sample_abs_i64(signed_sample, coefficient_modulus) >
                     max_coefficient_bound);
-                sample = signed_mod_i64(signed_sample, modulus);
             }
             else
             {
                 // interval_span == 0 encodes the full 2^64 span of [i64::MIN, i64::MAX].
                 const uint64_t offset = interval_span == 0 ? rng_next_u64(rng) :
                     sample_uniform_mod(rng, interval_span, rejection_threshold);
-                sample = signed_mod_i64(static_cast<int64_t>(
-                    static_cast<uint64_t>(interval_minimum) + offset), modulus);
+                signed_sample =
+                    static_cast<int64_t>(static_cast<uint64_t>(interval_minimum) + offset);
             }
-            raw_matrix_store(destination, poly, coefficient, columns, sample);
+            for (uint32_t limb = 0; limb < written; ++limb)
+                raw_matrix_store(destinations.limb[limb], poly, coefficient, columns,
+                    signed_mod_i64(signed_sample, destinations.limb[limb].modulus));
         }
     }
 }
@@ -334,22 +348,26 @@ extern "C" int gpu_raw_matrix_sample(GpuContext *ctx, void *stream_raw,
         destination->rows * destination->columns > UINT64_MAX / chunks_per_poly)
         return set_error("raw sampler chunk count overflow");
     const uint64_t chunks = destination->rows * destination->columns * chunks_per_poly;
-    constexpr uint64_t max_chunks = 65535ULL * 256ULL;
-    for (size_t limb = 0; limb < destination->limb_count; ++limb)
+    constexpr uint64_t max_chunks = 65535ULL * kSampleThreads;
+    const bool uniform = distribution == GPU_MATRIX_DIST_UNIFORM;
+    for (size_t first = 0; first < destination->limb_count; first += kRawNttLimbs)
     {
-        const MxxGraphPatch patches[] = {
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(void *),
-                static_cast<uint32_t>(destination_binding_base + limb), 0},
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
-                seed_binding, 0},
-        };
+        const size_t limbs = std::min(kRawNttLimbs, destination->limb_count - first);
+        RawLimbSet destinations{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(destination, first, limbs, 0, destination_binding_base, destinations,
+            patches);
+        patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 2, 0,
+            sizeof(void *), seed_binding, 0});
         for (uint64_t offset = 0; offset < chunks; offset += max_chunks)
         {
             const uint64_t count = std::min(max_chunks, chunks - offset);
-            const dim3 grid(static_cast<uint32_t>((count + 255) / 256));
+            const dim3 grid(static_cast<uint32_t>((count + kSampleThreads - 1) / kSampleThreads),
+                uniform ? static_cast<uint32_t>(limbs) : 1);
             const int status = mxx_gpu_launch_kernel(ctx, stream,
-                raw_matrix_sample_kernel, grid, dim3(256), 0, patches, 2,
-                destination->limbs[limb], static_cast<const GpuRngSeed *>(device_seed),
+                raw_matrix_sample_kernel, grid, dim3(kSampleThreads), 0, patches.data(),
+                patches.size(), destinations, static_cast<uint32_t>(limbs),
+                static_cast<const GpuRngSeed *>(device_seed),
                 destination->rows, destination->columns,
                 destination->row_origin, destination->column_origin,
                 full_columns, destination->degree, distribution, sigma,

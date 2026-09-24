@@ -5775,13 +5775,14 @@ fn lower_concat(
             // Every view of the piece moves into the window: the same view
             // over the output allocation, displaced by the window offset, so
             // the writers (and their registered bindings) target the output.
+            let piece = ctx.values[source.0 as usize].clone();
             for alias in aliases {
                 let mut moved = ctx.values[alias.0 as usize].clone();
-                for (part, window_part) in moved.parts.iter_mut().zip(window.parts.iter()) {
+                for ((part, window_part), piece_part) in
+                    moved.parts.iter_mut().zip(window.parts.iter()).zip(piece.parts.iter())
+                {
                     part.storage = window_part.storage;
-                    part.view.byte_offset = part
-                        .view
-                        .byte_offset
+                    part.view.byte_offset = (part.view.byte_offset - piece_part.view.byte_offset)
                         .checked_add(window_part.view.byte_offset)
                         .ok_or_else(|| "GPU concat piece offset overflows".to_owned())?;
                 }
@@ -5887,10 +5888,8 @@ fn concat_piece_writers(
     let value = ctx.values.get(source.0 as usize)?;
     let owner = ctx.owners.get(&source)?;
     let storages = owner.storages().collect::<Vec<_>>();
-    if value.parts.iter().any(|part| part.view.byte_offset != 0) ||
-        storages.len() != value.parts.len() ||
-        storages.iter().any(|(storage, _)| !matches!(storage, StorageRef::Scratch(_)))
-    {
+    // The piece's CRT limbs may share one scratch allocation.
+    if storages.iter().any(|(storage, _)| !matches!(storage, StorageRef::Scratch(_))) {
         return None;
     }
     let allocations = storages
@@ -5922,6 +5921,7 @@ fn concat_piece_writers(
             alias.parts.iter().zip(value.parts.iter()).any(|(alias, own)| {
                 alias.storage != own.storage ||
                     alias.view.byte_strides != own.view.byte_strides ||
+                    alias.view.byte_offset < own.view.byte_offset ||
                     end(alias).is_none() ||
                     end(alias) > end(own)
             })

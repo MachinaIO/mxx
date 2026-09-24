@@ -6919,11 +6919,9 @@ pub(crate) fn plan_physical_graph(
             continue;
         }
         let owner = owners.get(&source).ok_or("GPU return source has no owner")?;
+        // Its parts may share one allocation (the CRT limbs of one matrix).
         if !input_ids.values().any(|id| *id == source) &&
-            source_value.parts.iter().all(|part| {
-                part.view.byte_offset == 0 && matches!(part.storage, StorageRef::Scratch(_))
-            }) &&
-            owner.storages().count() == source_value.parts.len()
+            source_value.parts.iter().all(|part| matches!(part.storage, StorageRef::Scratch(_)))
         {
             let mut physical = source_value.clone();
             let relabel = |storage: StorageRef| match storage {
@@ -7536,10 +7534,11 @@ mod tests {
     fn direct_concat_pieces_and_returns_are_written_in_place() {
         use crate::gpu_execution_plan::GpuNativePrimitive;
         let device = detected_gpu_device_ids()[0];
-        let cpu = DCRTPolyParams::new(32, 1, 28, 8, None, None);
-        let modulus = cpu.to_crt().0[0];
-        let parameters = GpuDCRTPolyParams::new(32, vec![modulus], 8, None);
-        let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
+        // Two CRT limbs share each matrix allocation at limb offsets.
+        let cpu = DCRTPolyParams::new(32, 2, 28, 8, None, None);
+        let moduli = cpu.to_crt().0;
+        let parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
         let x = ring.uniform_residue((1, 1));
         let y = ring.uniform_residue((1, 1));
         let joined = mxx_dsl::Mat::concat(

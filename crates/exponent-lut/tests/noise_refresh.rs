@@ -1,9 +1,15 @@
 #![cfg(feature = "gpu")]
 
-use mxx_bench_estimator::{
-    estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
+use mxx_backends::{
+    GpuRuntime,
+    artifact::FileArtifactStore,
+    backend::poly_gpu::gpu_backend_on,
+    poly::{
+        Poly, PolyParams,
+        dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
+    },
 };
-use mxx_dsl::{GraphValue, GraphValueSchema, Ring};
+use mxx_dsl::{GraphValue, GraphValueSchema};
 use mxx_exponent_lut::{
     CompiledNandCircuit, ExpLayout, NandCircuit, api,
     noise_refresh::{
@@ -26,13 +32,6 @@ use mxx_exponent_lut::{
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv};
-use mxx_primitives::poly::{
-    Poly, PolyParams,
-    dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
-};
-use mxx_runtime::{
-    ExecutionConfig, artifact::FileArtifactStore, backend::poly::gpu::gpu_backend_on,
-};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::One;
 use serial_test::serial as sequential;
@@ -74,6 +73,11 @@ fn select_rns_candidate() -> SelectedCandidate {
     assert!(max_crt_depth >= 2, "MXX_EXPONENT_LUT_NOISE_REFRESH_MAX_CRT_DEPTH must be at least 2");
     let operations_per_drop = env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_OPERATIONS_PER_DROP", 1)
         .expect("valid operations-per-drop setting");
+    // Each drop removes up to this many CRT primes; the drop quotient is the
+    // message scale that the level noise must stay below half of.
+    let max_primes_per_drop = env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_MAX_PRIMES_PER_DROP", 4)
+        .expect("valid maximum primes-per-drop setting");
+    assert!(max_primes_per_drop > 0);
     assert!(!NOISE_REFRESH_PREFIX.is_empty());
     assert!(operations_per_drop > 0);
     let average =
@@ -93,7 +97,10 @@ fn select_rns_candidate() -> SelectedCandidate {
             Ok(source) => source,
             Err(_) => continue,
         };
-        for crt_depth in 2..=max_crt_depth {
+        let depth_candidates = (2..=max_crt_depth).flat_map(|depth| {
+            (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
+        });
+        for (crt_depth, primes_per_drop) in depth_candidates {
             let request = RnsBggPlanRequest {
                 ring_dimension,
                 encoding_error_sigma: encoding_error_sigma.clone(),
@@ -102,6 +109,7 @@ fn select_rns_candidate() -> SelectedCandidate {
                 max_crt_depth: crt_depth,
                 terminal_value_bound: BigUint::one(),
                 operations_per_drop,
+                primes_per_drop,
             };
             let source_program = source.program();
             let source_bindings = RnsBggNoiseBindings::from_inputs(
@@ -127,6 +135,7 @@ fn select_rns_candidate() -> SelectedCandidate {
                 &source_bindings,
                 &vec![BigUint::one(); source_program.outputs().len()],
                 average.as_ref(),
+                2,
             ) else {
                 continue;
             };
@@ -207,10 +216,7 @@ fn build_candidate(
     }
     let target_columns =
         parameters.component_columns(target_level).map_err(|error| error.to_string())?;
-    let target_ring = Ring::new(
-        BigInt::from_biguint(Sign::Plus, target_modulus),
-        poly_parameters.ring_dimension() as usize,
-    );
+    let target_ring = parameters.ring(target_level).map_err(|error| error.to_string())?;
     let target_matrix = (
         (
             target_ring.input("refresh-candidate-00", (1, target_columns)),
@@ -488,7 +494,7 @@ fn noise_refresh_end_to_end() {
     // This scenario is intentionally serialized because the DCRT runtime and
     // CUDA context are shared by the refresh channels.  Keep the device gate
     // before allocating any stage state so CPU-only environments exit cleanly.
-    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+    let devices = mxx_backends::poly::dcrt::gpu::detected_gpu_device_ids();
     if devices.is_empty() {
         eprintln!("skipping RNS refresh round trip: no CUDA device detected");
         return;
@@ -547,53 +553,30 @@ fn noise_refresh_end_to_end() {
         prf.selection_families()[0].selector,
         InputBinding::Family(selector_values),
     )]);
-    let payload = RnsEncryptBuild::<mxx_runtime::backend::poly::gpu::GpuDcrtBackend>::new(
-        &parameters,
-        [0x51; 32],
-    )
-    .sample_payload_secret()
-    .expect("payload secret");
-    let mask = RnsEncryptBuild::<mxx_runtime::backend::poly::gpu::GpuDcrtBackend>::new(
-        &parameters,
-        [0x51; 32],
-    )
-    .sample_mask_secret()
-    .expect("mask secret");
+    // Only after simulation succeeds do we allocate the CUDA runtime. Each
+    // of the three production stages is planned on it (measuring its W/C
+    // candidates, which is logged as the benchmark estimate) before it runs.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let gpu_levels = parameters.distinct_levels().into_iter().map(|level| {
+        GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
+    });
+    let mut runtime = GpuRuntime::new(gpu_backend_on(gpu_levels, devices)).expect("GPU runtime");
+    let directory = tempfile::tempdir().expect("artifact directory");
+    let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
+    // The secrets are sampled on the stage runtime and stay resident there.
+    let payload = RnsEncryptBuild::new(&parameters, [0x51; 32])
+        .sample_payload_secret(&mut runtime, &mut store)
+        .expect("payload secret");
+    let mask = RnsEncryptBuild::new(&parameters, [0x51; 32])
+        .sample_mask_secret(&mut runtime, &mut store)
+        .expect("mask secret");
     // The PRF schedule has a source-q carrier distinct from the outer
     // schedule's level zero.  Import the already sampled outer secrets into
     // that ring; never create an unrelated child secret relation.
     let prf_payload = payload.at_level(&prf_parameters, 0).expect("PRF payload import");
     let prf_mask = mask.at_level(&prf_parameters, 0).expect("PRF mask import");
-
-    // Only after simulation succeeds do we allocate CUDA backends and the
-    // measurement harness used by each of the three production stages.
-    let gpu_levels = parameters.levels().iter().map(|level| {
-        GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
-    });
-    let measurement_backends = devices
-        .iter()
-        .copied()
-        .map(|device| {
-            let levels = parameters.levels().iter().map(|level| {
-                GpuDCRTPolyParams::new(
-                    level.ring_dimension(),
-                    level.to_crt().0,
-                    level.base_bits(),
-                    None,
-                )
-            });
-            (gpu_backend_on(levels, [device]), device)
-        })
-        .collect();
-    let mut estimator = GpuNodeMeasurementBackend::new(
-        measurement_backends,
-        MeasurementHarnessConfig {
-            warm_up_iterations: 1,
-            measured_iterations: 1,
-            ..MeasurementHarnessConfig::default()
-        },
-    );
-    let mut backend = gpu_backend_on(gpu_levels, devices);
     let source_lhs_rhs = source
         .plaintext_inputs::<DCRTPoly>(&poly_parameters, &[false, false])
         .expect("source plaintext bindings");
@@ -611,9 +594,6 @@ fn noise_refresh_end_to_end() {
         preprocess_children.insert(slot, child);
     }
 
-    let directory = tempfile::tempdir().expect("artifact directory");
-    let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
-    let config = ExecutionConfig::default();
     let preprocess_declaration = declaration.clone();
     // Preprocess executes once and publishes two typed stage records from the
     // same named session: one for encryption and one for online evaluation.
@@ -624,9 +604,8 @@ fn noise_refresh_end_to_end() {
         &payload,
         &hash_key,
         RnsPreprocessBuild::new(&parameters, [0x51; 32]),
-        &mut backend,
+        &mut runtime,
         &mut store,
-        config.clone(),
         move |build, outputs| {
             build
                 .bind_refresh_declaration(&preprocess_declaration)
@@ -643,15 +622,7 @@ fn noise_refresh_end_to_end() {
                 .expect("source preprocess refresh");
             Ok(outputs)
         },
-        |validated| {
-            // Estimate the validated graph before execution, collect one GPU
-            // measurement, then estimate again using the measured node costs.
-            estimate(validated, &mut estimator).expect("estimate preprocess graph");
-            estimator.measure_collected().expect("measure preprocess graph");
-            let report = estimate(validated, &mut estimator).expect("preprocess estimate");
-            assert!(report.total_work_seconds > 0.0);
-            Ok(())
-        },
+        |_| Ok(()),
     )
     .expect("source preprocess");
 
@@ -687,9 +658,8 @@ fn noise_refresh_end_to_end() {
         &mask,
         &hash_key,
         RnsEncryptBuild::new(&parameters, [0x51; 32]),
-        &mut backend,
+        &mut runtime,
         &mut store,
-        config.clone(),
         move |build| {
             build
                 .bind_refresh_declaration(&encrypt_declaration)
@@ -699,15 +669,7 @@ fn noise_refresh_end_to_end() {
                 .expect("source encryption refresh children");
             Ok(())
         },
-        |validated| {
-            // Keep encryption's estimate independent from preprocess and
-            // online estimates while reusing the same measurement harness.
-            estimate(validated, &mut estimator).expect("estimate encrypt graph");
-            estimator.measure_collected().expect("measure encrypt graph");
-            let report = estimate(validated, &mut estimator).expect("encrypt estimate");
-            assert!(report.total_work_seconds > 0.0);
-            Ok(())
-        },
+        |_| Ok(()),
     )
     .expect("source encryption");
 
@@ -724,30 +686,22 @@ fn noise_refresh_end_to_end() {
         online_children.insert(slot, child);
     }
     let online_declaration = declaration.clone();
-    let mut online_result = api::online_eval(
+    let online_result = api::online_eval(
         source_program,
         &ParamEnv::default(),
         &online,
         &encrypted,
         &hash_key,
         RnsOnlineBuild::new(&parameters, [0x51; 32]),
-        &mut backend,
+        &mut runtime,
         &mut store,
-        config.clone(),
         move |build, outputs| {
             build
                 .apply_refresh(0, &online_declaration, online_children)
                 .expect("source online refresh");
             Ok(outputs)
         },
-        |validated| {
-            // Measure online lowering separately from the two setup stages.
-            estimate(validated, &mut estimator).expect("estimate online graph");
-            estimator.measure_collected().expect("measure online graph");
-            let report = estimate(validated, &mut estimator).expect("online estimate");
-            assert!(report.total_work_seconds > 0.0);
-            Ok(())
-        },
+        |_| Ok(()),
     )
     .expect("source online evaluation");
     // Verify the independently expected NAND output against the refreshed
@@ -756,15 +710,14 @@ fn noise_refresh_end_to_end() {
     verify_refreshed_output(
         source_program,
         &declaration,
-        &mut online_result,
+        &online_result,
         0,
         &expected,
         &parameters,
         &payload,
         &mask,
-        &mut backend,
+        &mut runtime,
         &mut store,
-        config,
     )
     .expect("RNS-BGG refresh application verification");
     assert!(!online_result.outputs.is_empty(), "refresh online evaluation has no outputs");
@@ -777,15 +730,14 @@ fn noise_refresh_end_to_end() {
     let checkpointed = checkpoint_refreshed_output(
         source_program,
         &declaration,
-        &mut online_result,
+        &online_result,
         0,
         &online,
         &encrypted,
         &parameters,
         &hash_key,
-        &mut backend,
+        &mut runtime,
         &mut store,
-        ExecutionConfig::default(),
     )
     .expect("checkpoint refreshed output");
     let resumed_parameters = RnsBggParameters::new(
@@ -798,9 +750,8 @@ fn noise_refresh_end_to_end() {
         &declaration,
         &checkpointed,
         &resumed_parameters,
-        &mut backend,
+        &mut runtime,
         &mut store,
-        ExecutionConfig::default(),
     )
     .expect("resume refreshed output");
     assert!(

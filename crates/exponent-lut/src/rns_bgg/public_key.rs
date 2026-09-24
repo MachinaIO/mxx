@@ -17,6 +17,7 @@ use crate::{
         ProgramLoweringContext, RhsId, RhsRef, WireId, lower_program,
     },
 };
+use mxx_backends::{RuntimeValue, poly::Poly};
 use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
@@ -24,8 +25,6 @@ use mxx_ir_core::{
     node::ConstantMatrix,
     types::WireType,
 };
-use mxx_primitives::poly::Poly;
-use mxx_runtime::{Backend, RuntimeValue};
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
@@ -94,9 +93,9 @@ fn matrix_entries(matrix: &RnsBggMatrix) -> [Mat; 4] {
     [matrix.0.0.clone(), matrix.0.1.clone(), matrix.1.0.clone(), matrix.1.1.clone()]
 }
 
-fn public_lut_branch(
+fn public_lut_branch<D: super::RightAction>(
     public_data: RnsBggMatrix,
-    switched_key_decomposition: RnsBggDecomposition,
+    switched_key_decomposition: ((D, D), (D, D)),
 ) -> RnsBggMatrix {
     multiply_public_action(public_data, switched_key_decomposition)
 }
@@ -107,17 +106,35 @@ fn matrix_from_hash(
     tag: impl Into<mxx_dsl::HashTag>,
     columns: usize,
 ) -> RnsBggMatrix {
+    // Each component has its own tag, so the four components are independent.
     let tag = tag.into();
-    (
-        (
-            ring.hash_matrix(key.clone(), tag.clone(), (1, columns)),
-            ring.hash_matrix(key.clone(), tag.clone(), (1, columns)),
-        ),
-        (
-            ring.hash_matrix(key.clone(), tag.clone(), (1, columns)),
-            ring.hash_matrix(key, tag, (1, columns)),
-        ),
-    )
+    let component = |index: u64| {
+        let mut tag = tag.clone();
+        tag.push("component");
+        tag.push(mxx_ir_core::IntExpr::constant(index));
+        ring.hash_matrix(key.clone(), tag, (1, columns))
+    };
+    ((component(0), component(1)), (component(2), component(3)))
+}
+
+/// The deterministic public `A_sigma` of evaluation level `level`. Every
+/// stage that uses it samples it from the shared hash key, so preprocess,
+/// encryption, and online evaluation derive the same matrix without
+/// publishing it.
+/// `sigma` is always a runtime integer tag component, so a constant sigma and
+/// one selected by a loop index derive the same tag.
+pub(super) fn lut_public_matrix(
+    parameters: &RnsBggParameters,
+    key: Bytes,
+    level: usize,
+    sigma: Int,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let ring = parameters.ring(level)?;
+    let columns = parameters.component_columns(level)?;
+    let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/lut-a".to_vec());
+    tag.push(mxx_ir_core::IntExpr::constant(level));
+    tag.push(sigma);
+    Ok(matrix_from_hash(&ring, key, tag, columns))
 }
 
 fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::HashTag {
@@ -133,7 +150,7 @@ fn decompose_matrix(
     parameters: &RnsBggParameters,
     level: usize,
     matrix: RnsBggMatrix,
-) -> Result<RnsBggDecomposition, RnsBggError> {
+) -> Result<RnsBggDigits, RnsBggError> {
     let p = parameters.level(level)?;
     let base = 1u64
         .checked_shl(p.base_bits())
@@ -149,16 +166,6 @@ fn decompose_matrix(
             matrix.1.1.decompose(base, decomposition_count),
         ),
     ))
-}
-
-fn centered_rebase_decomposition(
-    value: RnsBggDecomposition,
-    modulus: BigInt,
-) -> RnsBggDecomposition {
-    (
-        (value.0.0.centered_rebase(modulus.clone()), value.0.1.centered_rebase(modulus.clone())),
-        (value.1.0.centered_rebase(modulus.clone()), value.1.1.centered_rebase(modulus)),
-    )
 }
 
 fn decompose_refresh_matrix(
@@ -182,9 +189,8 @@ fn decompose_refresh_matrix(
             matrix.1.1.decompose(base, decomposition_count),
         ),
     );
-    let evaluation_modulus =
-        BigInt::from(parameters.level(evaluation_level)?.modulus().as_ref().clone());
-    Ok(centered_rebase_decomposition(value, evaluation_modulus))
+    let evaluation_ring = parameters.ring(evaluation_level)?;
+    Ok(super::centered_rebase_compact(value, &evaluation_ring))
 }
 
 fn refresh_payload_action(
@@ -196,10 +202,9 @@ fn refresh_payload_action(
     tag: impl Into<mxx_dsl::HashTag>,
     target_columns: usize,
 ) -> Result<RnsBggMatrix, RnsBggError> {
-    let p_modulus = BigInt::from(parameters.level(decomposition_level)?.modulus().as_ref().clone());
     let p_ring = parameters.ring(decomposition_level)?;
     let top_matrix = matrix_from_hash(&p_ring, hash_key, tag, target_columns);
-    let r0 = checked_modulus_convert(payload.row.0.clone(), p_modulus.clone())?;
+    let r0 = checked_modulus_convert(payload.row.0.clone(), &p_ring)?;
     let eta =
         crate::rns_bgg::encoding::fresh_error(parameters, decomposition_level, target_columns)?;
     let bottom = (
@@ -209,9 +214,9 @@ fn refresh_payload_action(
     Ok(((top_matrix.0.0, top_matrix.0.1), bottom))
 }
 
-fn lift_output_target_to_p(value: RnsBggRow, p_modulus: BigInt, h_p: Mat) -> RnsBggRow {
-    let h_p = h_p.centered_rebase(p_modulus.clone());
-    super::map_row(value, |entry| h_p.clone() * entry.centered_rebase(p_modulus.clone()))
+fn lift_output_target_to_p(value: RnsBggRow, p_ring: &Ring, h_p: Mat) -> RnsBggRow {
+    let h_p = h_p.centered_rebase(p_ring);
+    super::map_row(value, |entry| h_p.clone() * entry.centered_rebase(p_ring))
 }
 
 fn lut_payload_target(scale: Mat, coefficient: Mat, payload: RnsBggRow, gadget: Mat) -> RnsBggRow {
@@ -325,9 +330,6 @@ pub struct PublicKeyLowering<'a> {
     /// identity.  The family member is the concrete automorphism branch.
     pub(crate) lut_material:
         BTreeMap<(usize, usize, crate::program::LutId, ExpLayout), Family<RnsBggMatrix>>,
-    /// Deterministic public `A_sigma` matrices, shared by level and
-    /// automorphism independently of LUT, layout, wire, or scope.
-    pub(crate) lut_public_data: BTreeMap<(usize, usize), RnsBggMatrix>,
     /// Refresh targets and compact actions, keyed by declaration commitment
     /// and CRT slot.  Keeping the commitment in the key prevents material
     /// from one refresh declaration being reused by another invocation.
@@ -356,7 +358,6 @@ impl<'a> PublicKeyLowering<'a> {
             rhs: BTreeMap::new(),
             rhs_material: BTreeMap::new(),
             lut_material: BTreeMap::new(),
-            lut_public_data: BTreeMap::new(),
             refresh_sums: BTreeMap::new(),
             refresh_stars: BTreeMap::new(),
             refresh_targets: BTreeMap::new(),
@@ -404,8 +405,6 @@ impl<'a> PublicKeyLowering<'a> {
         let level = self.workload.rhs_level(rhs.id)?;
         let next_level =
             level.checked_add(1).ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
-        let next_modulus =
-            BigInt::from(self.parameters.level(next_level)?.modulus().as_ref().clone());
         let next_ring = self.parameters.ring(next_level)?;
         let target_columns = self.parameters.component_columns(next_level)?;
         // Bind the sampled RHS to the caller's plaintext through the same
@@ -424,11 +423,11 @@ impl<'a> PublicKeyLowering<'a> {
         // the RHS consumer's logical level: the setup-fixed ciphertext is
         // intentionally sampled at q_(level + 1), and this conversion is the
         // boundary where the plaintext is represented in that ring.
-        let nu = checked_modulus_convert(plaintext, next_modulus.clone())?;
-        let payload = checked_modulus_convert_row(self.payload_secret.row.clone(), next_modulus)?;
+        let nu = checked_modulus_convert(plaintext, &next_ring)?;
+        let payload = checked_modulus_convert_row(self.payload_secret.row.clone(), &next_ring)?;
         let gadget = self.parameters.state_gadget(next_level)?;
         let scale =
-            self.parameters.scalar(next_level, self.parameters.scale(next_level)?.clone())?;
+            self.parameters.scalar(next_level, self.parameters.message_scale(next_level)?)?;
         let target = (payload.0.clone() * gadget.clone(), payload.1.clone() * gadget);
         let desired = (target.0 * scale.clone() * nu.clone(), target.1 * scale * nu);
         let tag = mxx_dsl::HashTag::from(
@@ -443,56 +442,6 @@ impl<'a> PublicKeyLowering<'a> {
         );
         Ok(((top_matrix.0.0, top_matrix.0.1), bottom))
     }
-    /// Eagerly materialize the deterministic public `A_sigma` superset for
-    /// the complete input/LUT projection.  No Program body or workload is
-    /// consulted here, so encryption can derive exactly the same key set.
-    pub(crate) fn prepare_lut_public_data_projection(
-        &mut self,
-        inputs: &crate::program::EncryptionInputs,
-    ) -> Result<(), RnsBggError> {
-        for (level, sigma) in canonical_lut_helper_keys(self.parameters, inputs)? {
-            if self.lut_public_data.contains_key(&(level, sigma)) {
-                continue;
-            }
-            let ring = self.parameters.ring(level)?;
-            let columns = self.parameters.component_columns(level)?;
-            let data = matrix_from_hash(
-                &ring,
-                self.hash_key.clone(),
-                mxx_dsl::HashTag::from(format!("rns-bgg/lut-a/{level}/sigma/{sigma}").into_bytes()),
-                columns,
-            );
-            self.lut_public_data.insert((level, sigma), data);
-        }
-        Ok(())
-    }
-
-    /// Resolve `A_sigma` for one LUT layout from the eagerly prepared store.
-    /// A missing key is an invalid preprocessing projection, never a reason
-    /// for body lowering to synthesize a new public matrix.
-    fn lut_public_data_for(
-        &self,
-        level: usize,
-        table: &LutTable,
-    ) -> Result<Family<RnsBggMatrix>, RnsBggError> {
-        let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
-        let layout = table.input_layout();
-        layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-        let sigmas = layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-        Family::pack(
-            sigmas
-                .iter()
-                .map(|sigma| {
-                    self.lut_public_data
-                        .get(&(level, *sigma))
-                        .cloned()
-                        .ok_or(RnsBggError::Binding("missing eagerly prepared LUT A matrix"))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-        .map_err(graph)
-    }
-
     /// Materialize setup-fixed compact `B_sigma` switching ciphertexts for a
     /// complete LUT/layout identity.  Gadget decomposition is deferred until
     /// the branch is consumed.
@@ -505,8 +454,7 @@ impl<'a> PublicKeyLowering<'a> {
         let level = self.workload.level(input.wire)?;
         let next_level =
             level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
-        let target_modulus =
-            BigInt::from(self.parameters.level(next_level)?.modulus().as_ref().clone());
+        let target_ring = self.parameters.ring(next_level)?;
         let layout = table.input_layout();
         layout
             .validate(self.parameters.level(level)?.ring_dimension() as usize)
@@ -537,17 +485,15 @@ impl<'a> PublicKeyLowering<'a> {
             // payload secret. Its signed switching decomposition has
             // each compact digit centered-rebased to the source ring; the
             // full B matrix is never rebased as a dense matrix.
-            let payload = checked_modulus_convert_row(
-                self.payload_secret.row.clone(),
-                target_modulus.clone(),
-            )
-            .map_err(|_| DslError::Schema)?;
+            let payload =
+                checked_modulus_convert_row(self.payload_secret.row.clone(), &target_ring)
+                    .map_err(|_| DslError::Schema)?;
             let gadget = self.parameters.state_gadget(next_level).map_err(|_| DslError::Schema)?;
             let scale = self
                 .parameters
                 .scalar(
                     next_level,
-                    self.parameters.scale(next_level).map_err(|_| DslError::Schema)?.clone(),
+                    self.parameters.message_scale(next_level).map_err(|_| DslError::Schema)?,
                 )
                 .map_err(|_| DslError::Schema)?;
             let target = lut_payload_target(scale, coefficient, payload.clone(), gadget);
@@ -597,11 +543,10 @@ impl<'a> PublicKeyLowering<'a> {
                     let target = level
                         .checked_add(1)
                         .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
-                    let q = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
-                    let source_moduli = self.parameters.level(level)?.to_crt().0;
+                    let q_ring = self.parameters.ring(target)?;
                     Ok(RnsBggPublicKey::new(
                         output.wire,
-                        super::mod_down_public(output.matrix, q, &source_moduli),
+                        super::mod_down_public(output.matrix, &q_ring),
                     ))
                 } else {
                     Ok(output)
@@ -712,26 +657,21 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         let decomposition_level = evaluation_level
             .checked_add(1)
             .ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
-        let target_modulus =
-            BigInt::from(self.parameters.level(decomposition_level)?.modulus().as_ref().clone());
-        let compact = checked_modulus_convert_matrix(compact, target_modulus)?;
+        let target_ring = self.parameters.ring(decomposition_level)?;
+        let compact = checked_modulus_convert_matrix(compact, &target_ring)?;
         let compact = decompose_matrix(self.parameters, decomposition_level, compact)?;
-        let evaluation_modulus =
-            BigInt::from(self.parameters.level(evaluation_level)?.modulus().as_ref().clone());
+        let evaluation_ring = self.parameters.ring(evaluation_level)?;
         // Only the bounded decomposition digits cross back into the
         // evaluation ring; the compact RHS artifact itself remains at its
         // native next-level schema.
-        let action = centered_rebase_decomposition(compact, evaluation_modulus);
+        let action = super::centered_rebase_compact(compact, &evaluation_ring);
         let target_level = self.workload.level(self.output()?)?;
-        let target_modulus =
-            BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
-        let source_moduli = self.parameters.level(evaluation_level)?.to_crt().0;
+        let target_ring = self.parameters.ring(target_level)?;
         Ok(RnsBggPublicKey::new(
             self.output()?,
             super::mod_down_public(
                 super::multiply_public_action(input.matrix.clone(), action),
-                target_modulus,
-                &source_moduli,
+                &target_ring,
             ),
         ))
     }
@@ -746,69 +686,72 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         }
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let source_level = self.workload.level(input.wire)?;
-        let data = self.lut_public_data_for(source_level, table)?;
         let switching_ciphertexts = self.prepare_lut_switching_ciphertexts(input, lut_id, table)?;
         let next_level =
             source_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
-        let source_modulus =
-            BigInt::from(self.parameters.level(source_level)?.modulus().as_ref().clone());
-        let target_modulus =
-            BigInt::from(self.parameters.level(next_level)?.modulus().as_ref().clone());
-        let source_moduli = self.parameters.level(source_level)?.to_crt().0;
+        let source_ring = self.parameters.ring(source_level)?;
+        let target_ring = self.parameters.ring(next_level)?;
         let layout = table.input_layout();
         let sigmas = layout
             .automorphism_indices(self.parameters.level(source_level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
-        let branch_decompositions =
-            mxx_dsl::parallel(IntExpr::constant(table.values().len()), |index| {
+        // Accumulate the branches sequentially: modular addition is exact and
+        // associative, so the sum and its noise bound equal the balanced tree,
+        // while only one branch is resident instead of the whole branch family
+        // and every tree level.
+        let columns = self.parameters.component_columns(next_level)?;
+        let zero = source_ring.zero((1, columns));
+        let initial = ((zero.clone(), zero.clone()), (zero.clone(), zero));
+        let result =
+            mxx_dsl::iterate(IntExpr::constant(table.values().len()), initial, |index, sum| {
                 let sigma = IntExpr::Select {
                     selector: Box::new(index.expression()?),
                     branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
                 };
-                let switching_decomposition = centered_rebase_decomposition(
+                let switching_decomposition = super::centered_rebase_compact(
                     decompose_matrix(
                         self.parameters,
                         next_level,
                         switching_ciphertexts.at(index.clone()),
                     )
                     .map_err(|_| DslError::Schema)?,
-                    source_modulus.clone(),
+                    &source_ring,
                 );
                 let routed = super::map_matrix(input.matrix.clone(), |entry| {
                     entry.ring_automorphism(sigma.clone())
                 });
                 let switched_public_key = super::mod_down_public(
                     super::multiply_public_action(routed, switching_decomposition),
-                    target_modulus.clone(),
-                    &source_moduli,
+                    &target_ring,
                 );
-                let switched_key_decomposition = centered_rebase_decomposition(
+                let switched_key_decomposition = super::centered_rebase_compact(
                     decompose_matrix(self.parameters, next_level, switched_public_key)
                         .map_err(|_| DslError::Schema)?,
-                    source_modulus.clone(),
+                    &source_ring,
                 );
-                Ok(public_lut_branch(data.at(index), switched_key_decomposition))
+                // A_sigma is sampled in its own branch, so one is resident.
+                let data = lut_public_matrix(
+                    self.parameters,
+                    self.hash_key.clone(),
+                    source_level,
+                    Int::from(sigma),
+                )
+                .map_err(|_| DslError::Schema)?;
+                Ok(super::add_public_matrices(
+                    sum,
+                    public_lut_branch(data, switched_key_decomposition),
+                ))
             })
             .map_err(graph)?;
         let output = self.output()?;
-        let result =
-            crate::utils::balanced_sum_family(branch_decompositions, super::add_public_matrices)
-                .map_err(graph)?;
         if !self
             .program
             .wire_is_coefficient_output(output)
             .map_err(|_| RnsBggError::Binding("coefficient output metadata"))?
         {
             let target = self.workload.level(output)?;
-            let modulus = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
-            return Ok(RnsBggPublicKey::new(
-                output,
-                super::mod_down_public(
-                    result,
-                    modulus,
-                    &self.parameters.level(source_level)?.to_crt().0,
-                ),
-            ));
+            let ring = self.parameters.ring(target)?;
+            return Ok(RnsBggPublicKey::new(output, super::mod_down_public(result, &ring)));
         }
         Ok(RnsBggPublicKey::new(output, result))
     }
@@ -873,15 +816,10 @@ fn scale_public_matrix(matrix: RnsBggMatrix, scalar: &BigInt) -> RnsBggMatrix {
 #[cfg(test)]
 fn mod_down_lift_public(
     matrix: RnsBggMatrix,
-    channel_modulus: BigInt,
-    target_modulus: BigInt,
-    source_moduli: &[u64],
+    channel_ring: &Ring,
+    target_ring: &Ring,
 ) -> RnsBggMatrix {
-    map_matrix(matrix, |entry| {
-        entry
-            .block_mod_switch(channel_modulus.clone(), source_moduli.to_vec(), 1)
-            .centered_rebase(target_modulus.clone())
-    })
+    map_matrix(matrix, |entry| entry.block_mod_switch(channel_ring, 1).centered_rebase(target_ring))
 }
 
 /// Project one refresh anchor into its plaintext channel and then preserve
@@ -893,11 +831,11 @@ fn mod_down_lift_public(
 /// `A_sum - H*A_star` by the encoding stage.
 fn reduce_lift_public_anchor(
     matrix: RnsBggMatrix,
-    channel_modulus: BigInt,
-    target_modulus: BigInt,
+    channel_ring: &Ring,
+    target_ring: &Ring,
 ) -> Result<RnsBggMatrix, RnsBggError> {
-    let reduced = checked_modulus_convert_matrix(matrix, channel_modulus)?;
-    Ok(map_matrix(reduced, |entry| entry.centered_rebase(target_modulus.clone())))
+    let reduced = checked_modulus_convert_matrix(matrix, channel_ring)?;
+    Ok(map_matrix(reduced, |entry| entry.centered_rebase(target_ring)))
 }
 
 fn matrix_schema_matches(lhs: &RnsBggMatrix, rhs: &RnsBggMatrix) -> bool {
@@ -1117,7 +1055,7 @@ fn refresh_crt_weight(
         .and_then(|entry| entry.q_t.to_biguint())
         .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
     let base = &total / &qt;
-    let inverse = mxx_primitives::utils::mod_inverse_biguints(&(&base % &qt), &qt)
+    let inverse = mxx_backends::utils::mod_inverse_biguints(&(&base % &qt), &qt)
         .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
     Ok(BigInt::from(base * inverse))
 }
@@ -1245,9 +1183,9 @@ impl PublicKeyLowering<'_> {
                     .q
                     .to_biguint()
                     .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-                let expected_modulus = IntExpr::constant(BigInt::from(modulus));
-                if ain.matrix.0.0.matrix_type().modulus != expected_modulus ||
-                    value.matrix.0.0.matrix_type().modulus != expected_modulus
+                let expected_modulus = BigInt::from(modulus);
+                if super::concrete_ring(&ain.matrix.0.0)?.modulus() != expected_modulus ||
+                    super::concrete_ring(&value.matrix.0.0)?.modulus() != expected_modulus
                 {
                     return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
                 }
@@ -1264,13 +1202,11 @@ impl PublicKeyLowering<'_> {
                     label,
                     h.clone(),
                 )?;
-                let p_modulus = BigInt::from(
-                    self.parameters.level(decomposition_level)?.modulus().as_ref().clone(),
-                );
+                let p_ring = self.parameters.ring(decomposition_level)?;
                 // Encoding carries the private payload with a minus sign.
                 // The preprocessing action therefore stores -W_label so
                 // that applying it to the PRF value contributes +z*W_label.
-                let target_p = checked_modulus_convert_matrix(target_q, p_modulus.clone())
+                let target_p = checked_modulus_convert_matrix(target_q, &p_ring)
                     .map(|target| map_matrix(target, |entry| -entry))?;
                 let label_action = refresh_payload_action(
                     self.parameters,
@@ -1323,24 +1259,20 @@ impl PublicKeyLowering<'_> {
             let decomposition_level = decomposition_levels[slot];
             let target_level = declaration.target_level();
             let target_columns = self.parameters.component_columns(target_level)?;
-            let p_modulus = BigInt::from(
-                self.parameters.level(decomposition_level)?.modulus().as_ref().clone(),
-            );
             let p_ring = self.parameters.ring(decomposition_level)?;
             let h_p = p_ring.polynomial([IntExpr::constant(h.clone())]);
-            let output_modulus =
-                BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
+            let output_ring = self.parameters.ring(target_level)?;
             let output_gadget = self.parameters.state_gadget(target_level)?;
             let output_scale = self
                 .parameters
-                .scalar(target_level, self.parameters.scale(target_level)?.clone())?;
+                .scalar(target_level, self.parameters.message_scale(target_level)?)?;
             let output_payload =
-                checked_modulus_convert_row(self.payload_secret.row.clone(), output_modulus)?;
+                checked_modulus_convert_row(self.payload_secret.row.clone(), &output_ring)?;
             let desired_output = (
                 output_scale.clone() * output_payload.0 * output_gadget.clone(),
                 output_scale * output_payload.1 * output_gadget,
             );
-            let desired_data = lift_output_target_to_p(desired_output, p_modulus.clone(), h_p);
+            let desired_data = lift_output_target_to_p(desired_output, &p_ring, h_p);
             let action = refresh_payload_action(
                 self.parameters,
                 decomposition_level,
@@ -1368,27 +1300,18 @@ impl PublicKeyLowering<'_> {
             // modulo q_t without scaling, then centered-extend into Q* before
             // CRT recomposition.  Decoder targets remain A_sum-H*A_star and
             // are assembled by the encoding stage from the raw artifacts.
-            let aout_p = checked_modulus_convert_matrix(aout.matrix.clone(), p_modulus.clone())?;
+            let aout_p = checked_modulus_convert_matrix(aout.matrix.clone(), &p_ring)?;
             let target_at_output = reduce_lift_public_anchor(
                 aout_p.clone(),
-                BigInt::from(
-                    declaration.slots()[slot]
-                        .q_t
-                        .to_biguint()
-                        .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?,
-                ),
-                BigInt::from(target_modulus.clone()),
+                &self.parameters.ring_for_modulus(&declaration.slots()[slot].q_t)?,
+                &output_ring,
             )?;
             if values.first().is_some_and(|first| !matrix_schema_matches(first, &target_at_output))
             {
                 return Err(RnsBggError::Binding("refresh CRT channel schemas differ"));
             }
             let a_sum = add_public_matrices(a_sum, data_public);
-            let a_sum = mod_down_public(
-                a_sum,
-                p_modulus.clone(),
-                &self.parameters.level(evaluation_level)?.to_crt().0,
-            );
+            let a_sum = mod_down_public(a_sum, &p_ring);
             self.refresh_sums.insert((*declaration.commitment(), slot), a_sum);
             self.refresh_stars.insert((*declaration.commitment(), slot), aout_p);
             self.refresh_targets.insert((*declaration.commitment(), slot), action);
@@ -1410,7 +1333,7 @@ impl PublicKeyLowering<'_> {
 }
 
 /// Preprocessing stage adapter using the common stage lifecycle.
-pub struct RnsPreprocessBuild<'a, B: Backend> {
+pub struct RnsPreprocessBuild<'a> {
     parameters: &'a RnsBggParameters,
     context: [u8; 32],
     hash_key_commitment: [u8; 32],
@@ -1418,13 +1341,13 @@ pub struct RnsPreprocessBuild<'a, B: Backend> {
     families: GraphFamilyExecution,
     environment:
         Environment<RnsBggPublicKey, RhsRef<Int>, Family<RnsBggPublicKey>, Family<RhsRef<Int>>>,
-    runtime: BTreeMap<String, RuntimeValue<B>>,
+    runtime: BTreeMap<String, RuntimeValue>,
     refresh_declaration: Option<crate::noise_refresh::refresh::RefreshDeclaration>,
     pending_refresh: Option<(usize, RnsBggPublicKey)>,
     refresh_prf_binding: Option<([u8; 32], usize, ExponentLutProgramId, [u8; 32])>,
     refresh_prf_children: BTreeMap<usize, PublicKeyLowering<'a>>,
 }
-impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
+impl<'a> RnsPreprocessBuild<'a> {
     /// Create an unbound preprocessing adapter.
     pub fn new(parameters: &'a RnsBggParameters, context: [u8; 32]) -> Self {
         Self {
@@ -1452,9 +1375,7 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
         payload: &RnsBggPayloadSecret,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        <Self as PreprocessBuild<B, P>>::bind_inputs(
-            self, program, parameters, rhs, payload, hash_key,
-        )
+        <Self as PreprocessBuild<P>>::bind_inputs(self, program, parameters, rhs, payload, hash_key)
     }
 
     /// Bind the common refresh declaration before the preprocessing graph is
@@ -1594,7 +1515,7 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
         output_index: usize,
         declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
         inputs: BTreeMap<usize, RnsBggPublicKey>,
-        mut channels: BTreeMap<usize, RnsPreprocessBuild<'a, B>>,
+        mut channels: BTreeMap<usize, RnsPreprocessBuild<'a>>,
     ) -> Result<(), RnsBggError> {
         if self.pending_refresh.is_some() || output_index >= declaration.output_schema().len() {
             return Err(RnsBggError::Binding(
@@ -1701,9 +1622,9 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
     }
 }
 
-fn merge_runtime<B: Backend>(
-    destination: &mut BTreeMap<String, RuntimeValue<B>>,
-    source: BTreeMap<String, RuntimeValue<B>>,
+fn merge_runtime(
+    destination: &mut BTreeMap<String, RuntimeValue>,
+    source: BTreeMap<String, RuntimeValue>,
 ) -> Result<(), RnsBggError> {
     for (name, value) in source {
         match destination.get(&name) {
@@ -1714,6 +1635,8 @@ fn merge_runtime<B: Backend>(
                 }
                 _ => return Err(RnsBggError::Binding("refresh child runtime input schema")),
             },
+            // A secret input name is unique to one sampled secret.
+            Some(RuntimeValue::Matrix(_)) if matches!(value, RuntimeValue::Matrix(_)) => {}
             Some(_) => return Err(RnsBggError::Binding("refresh child runtime input schema")),
             None => {
                 destination.insert(name, value);
@@ -1723,13 +1646,13 @@ fn merge_runtime<B: Backend>(
     Ok(())
 }
 
-impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B> {
+impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
     type Evaluator = PublicKeyLowering<'a>;
     type Families = GraphFamilyExecution;
     type PayloadSecret = RnsBggPayloadSecret;
     type EncryptDescriptor = RnsBggPreprocessEncryptDescriptor;
     type OnlineDescriptor = RnsBggPreprocessOnlineDescriptor;
-    type Encrypt = RnsEncryptBuild<'a, B>;
+    type Encrypt = RnsEncryptBuild<'a>;
     type Online = RnsOnlineBuild<'a>;
     fn lowering_state(
         &mut self,
@@ -1766,7 +1689,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
             return Err(ApiError::input("RHS bindings do not exactly match Program inputs"));
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let bytes = ring.bytes_input("rns-bgg/hash-key", hash_key.len());
+        let bytes = ring.bytes_input(HASH_KEY_INPUT, hash_key.len());
         let program = Arc::new(program.clone());
         let workload =
             Arc::new(RnsBggDerivedWorkload::from_program(&program).map_err(ApiError::scheme)?);
@@ -1777,13 +1700,6 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
             payload.clone(),
             bytes,
         );
-        // A_sigma is setup-fixed and projection-owned.  Prepare the complete
-        // superset before walking the body so unused LUTs and LUTs in later
-        // logical levels are still available to the independent encrypt
-        // stage.  B_sigma remains body/site material and is added by `lut`.
-        evaluator
-            .prepare_lut_public_data_projection(&program.encryption_inputs())
-            .map_err(ApiError::scheme)?;
         for (wire, declaration) in program.inputs() {
             let binding = match declaration.shape() {
                 InputBinding::Scalar(()) => InputBinding::Scalar(
@@ -1867,7 +1783,10 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         // Plaintext RHS graph handles are needed only while preparing compact
         // setup-fixed ciphertexts.  Never retain them for online lowering.
         evaluator.rhs.clear();
-        self.runtime.insert("rns-bgg/hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()));
+        self.runtime.insert(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.into()));
+        if let Some(binding) = &payload.binding {
+            binding.bind(&mut self.runtime);
+        }
         self.hash_key_commitment = hash_key_commitment(hash_key);
         self.evaluator = Some(evaluator);
         Ok(())
@@ -1899,7 +1818,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
     fn build_graph(
         mut self,
         outputs: Vec<RnsBggPublicKey>,
-    ) -> Result<(StageGraph<B>, (Self::EncryptDescriptor, Self::OnlineDescriptor)), ApiError> {
+    ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineDescriptor)), ApiError> {
         let mut evaluator =
             self.evaluator.ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
         let mut outputs = outputs;
@@ -2036,20 +1955,6 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                         )
                         .map_err(ApiError::scheme)?;
                 }
-                for ((evaluation_level, sigma), matrix) in &child.lut_public_data {
-                    for (port, entry) in matrix_entries(matrix).into_iter().enumerate() {
-                        graph = graph
-                            .cached_output(
-                                refresh_prf_artifact_name(
-                                    commitment,
-                                    *slot,
-                                    &format!("lut-public/{evaluation_level}/{sigma}.{port}"),
-                                ),
-                                entry,
-                            )
-                            .map_err(ApiError::scheme)?;
-                    }
-                }
             }
         }
         for (rhs, prepared) in &evaluator.rhs_material {
@@ -2077,18 +1982,6 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                     material.clone(),
                 )
                 .map_err(ApiError::scheme)?;
-        }
-        // A_sigma is deterministic public mask-alignment data.  Publish one
-        // matrix per (evaluation level, sigma), independently of LUT,
-        // layout, wire, and family site.  Encryption and online evaluation
-        // resolve these canonical keys instead of receiving a synthetic
-        // helper-origin family.
-        for ((evaluation_level, sigma), matrix) in &evaluator.lut_public_data {
-            for (port, entry) in matrix_entries(matrix).into_iter().enumerate() {
-                graph = graph
-                    .cached_output(format!("lut-public/{evaluation_level}/{sigma}.{port}"), entry)
-                    .map_err(ApiError::scheme)?;
-            }
         }
         for ((commitment, slot), sum) in &evaluator.refresh_sums {
             for (index, entry) in matrix_entries(sum).into_iter().enumerate() {
@@ -2140,8 +2033,9 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         }
         let encrypt_binding = RnsBggPreprocessEncryptDescriptor::from_binding(binding.clone());
         let online_binding = RnsBggPreprocessOnlineDescriptor::from_binding(binding);
+        let runtime = super::encoding::declared_runtime_inputs(&graph, self.runtime);
         Ok((
-            StageGraph::new(graph, self.runtime, BTreeMap::<ProductionId, Manifest>::new()),
+            StageGraph::new(graph, runtime, BTreeMap::<ProductionId, Manifest>::new()),
             (encrypt_binding, online_binding),
         ))
     }
@@ -2166,9 +2060,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, PublicKeyLowering<'_>> {
 mod test {
     use super::*;
     use crate::{api::execute_graph, program::ProgramValidationError};
-    use mxx_runtime::{
-        ExecutionConfig, MemoryArtifactStore, RuntimeValue, backend::poly::cpu_backend,
-    };
+    use mxx_backends::{MemoryArtifactStore, backend::poly::cpu_backend};
 
     #[test]
     fn cloned_program_lowers_equal_lut_registrations_by_instruction_identity() {
@@ -2205,10 +2097,9 @@ mod test {
             &parameters,
             owned_program.clone(),
             workload.clone(),
-            RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)) },
+            RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None },
             ring.bytes_input("equal-luts-hash-key", 32),
         );
-        public.prepare_lut_public_data_projection(&program.encryption_inputs()).unwrap();
         let input_key = public.sample_input_public_key(input).unwrap();
         let mut public_environment = Environment::new();
         public_environment.bind_wire(input, InputBinding::Scalar(input_key.clone())).unwrap();
@@ -2235,6 +2126,7 @@ mod test {
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: None,
+            hash_key: ring.bytes_input("equal-luts-hash-key", 32),
         };
         let row = ring.input("equal-luts-input", (1, parameters.component_columns(0).unwrap()));
         let mut online_environment = Environment::new();
@@ -2271,7 +2163,7 @@ mod test {
 
     #[test]
     fn public_key_carrier_is_wire_and_matrix() {
-        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let ring = crate::test_support::explicit_ring(&[17], 4);
         let key = RnsBggPublicKey::<Mat>::new(
             WireId(3),
             ring.polynomial([IntExpr::constant(BigInt::from(0u8))]),
@@ -2295,7 +2187,10 @@ mod test {
             &parameters,
             program,
             workload,
-            RnsBggPayloadSecret { row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)) },
+            RnsBggPayloadSecret {
+                row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)),
+                binding: None,
+            },
             ring.bytes_input("sampled-key-schema", 32),
         );
         let private_key = lowering.sample_input_public_key(private).unwrap();
@@ -2414,7 +2309,7 @@ mod test {
 
     #[test]
     fn repeated_program_outputs_keep_the_first_public_key_carrier() {
-        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let ring = crate::test_support::explicit_ring(&[17], 4);
         let matrix = || {
             let one = ring.identity(1);
             ((one.clone(), one.clone()), (one.clone(), one))
@@ -2475,6 +2370,7 @@ mod test {
             workload,
             RnsBggPayloadSecret {
                 row: (high_ring.uniform_interval((1, 1), -1, 1), high_ring.identity(1)),
+                binding: None,
             },
             high_ring.bytes_input("mul-public-private-level", 32),
         );
@@ -2563,7 +2459,7 @@ mod test {
             &parameters,
             program,
             workload,
-            RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)) },
+            RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None },
             ring.bytes_input("mul-public-numeric-key", 32),
         );
         lowering.current_site =
@@ -2590,7 +2486,7 @@ mod test {
                 (matrix.1.0.decompose(base, columns), matrix.1.1.decompose(base, columns)),
             )
         };
-        let direct_action = |lhs: RnsBggMatrix, rhs: RnsBggDecomposition| {
+        let direct_action = |lhs: RnsBggMatrix, rhs: RnsBggDigits| {
             (
                 (
                     rhs.0.0.clone().mul_small_rhs(lhs.0.0.clone()) +
@@ -2633,42 +2529,25 @@ mod test {
         }
         graph = graph.output("wrong-key", actual_private.matrix.0.0 - wrong_key.0.0).unwrap();
         let graph = graph.build().unwrap();
-        let mut backend = cpu_backend([level]);
+        let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend([level]));
         let mut store = MemoryArtifactStore::default();
-        let mut result = execute_graph(
+        let result = execute_graph(
             StageGraph::new(graph, BTreeMap::new(), BTreeMap::<ProductionId, Manifest>::new()),
             &ParamEnv::default(),
-            &mut backend,
+            &mut execution,
             &mut store,
-            ExecutionConfig::default(),
             |_| Ok(()),
         )
         .unwrap();
         for index in 0..4 {
-            let RuntimeValue::Matrix(matrix) = result
-                .materialize_output(
-                    &format!("private-difference-{index}"),
-                    &mut backend,
-                    &mut store,
-                )
-                .unwrap()
-            else {
-                panic!("private MulPublic difference is not a matrix");
-            };
+            let matrix =
+                crate::test_support::full(&result.outputs[&format!("private-difference-{index}")]);
             assert!(matrix.entry(0, 0).coeffs_biguints().iter().all(|value| value.is_zero()));
-            let RuntimeValue::Matrix(matrix) = result
-                .materialize_output(&format!("public-difference-{index}"), &mut backend, &mut store)
-                .unwrap()
-            else {
-                panic!("public MulPublic difference is not a matrix");
-            };
+            let matrix =
+                crate::test_support::full(&result.outputs[&format!("public-difference-{index}")]);
             assert!(matrix.entry(0, 0).coeffs_biguints().iter().all(|value| value.is_zero()));
         }
-        let RuntimeValue::Matrix(wrong) =
-            result.materialize_output("wrong-key", &mut backend, &mut store).unwrap()
-        else {
-            panic!("wrong key difference is not a matrix");
-        };
+        let wrong = crate::test_support::full(&result.outputs["wrong-key"]);
         assert!(wrong.entry(0, 0).coeffs_biguints().iter().any(|value| !value.is_zero()));
     }
 
@@ -2795,14 +2674,16 @@ mod test {
 
     #[test]
     fn refresh_two_prime_channels_mod_down_then_lift_to_combined_ring() {
-        let source = mxx_dsl::Ring::new(BigInt::from(105u8), 4);
+        use crate::test_support::{explicit_ring, modulus_of, primes};
+        let primes = primes(4, 3, 17);
+        let source = explicit_ring(&primes, 4);
+        let combined = explicit_ring(&primes[..2], 4);
         let value = source.input("refresh-source", (1, 1));
         let matrix = ((value.clone(), value.clone()), (value.clone(), value));
-        let lifted =
-            mod_down_lift_public(matrix, BigInt::from(3u8), BigInt::from(15u8), &[3, 5, 7]);
+        let lifted = mod_down_lift_public(matrix, &explicit_ring(&primes[..1], 4), &combined);
         for row in [lifted.0, lifted.1] {
             for entry in [row.0, row.1] {
-                assert_eq!(entry.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
+                assert_eq!(modulus_of(entry.matrix_type()), BigInt::from(primes[0]) * primes[1]);
             }
         }
         assert_eq!(
@@ -2830,7 +2711,10 @@ mod test {
 
     #[test]
     fn refresh_anchor_reduction_is_not_moddown_and_decoder_target_is_distinct() {
-        let source = mxx_dsl::Ring::new(BigInt::from(105u8), 4);
+        use crate::test_support::{explicit_ring, modulus_of, primes};
+        let primes = primes(4, 3, 17);
+        let source = explicit_ring(&primes, 4);
+        let combined = explicit_ring(&primes[..2], 4);
         let anchor_entry = source.input("refresh-anchor", (1, 1));
         let anchor = (
             (anchor_entry.clone(), anchor_entry.clone()),
@@ -2844,34 +2728,25 @@ mod test {
         // carrier uses plaintext reduction for each q_t, while the old
         // ModDown path divides by q_t and therefore produces a different
         // graph even when the final ring is the same Q* ring.
-        for channel_modulus in [BigInt::from(3u8), BigInt::from(5u8)] {
-            let reduced = reduce_lift_public_anchor(
-                anchor.clone(),
-                channel_modulus.clone(),
-                BigInt::from(15u8),
-            )
-            .unwrap();
-            let divided = mod_down_lift_public(
-                anchor.clone(),
-                channel_modulus,
-                BigInt::from(15u8),
-                &[3, 5, 7],
-            );
+        for channel in [&primes[..1], &primes[1..2]] {
+            let channel = explicit_ring(channel, 4);
+            let reduced = reduce_lift_public_anchor(anchor.clone(), &channel, &combined).unwrap();
+            let divided = mod_down_lift_public(anchor.clone(), &channel, &combined);
             assert_ne!(reduced.flatten(), divided.flatten());
-            assert_eq!(reduced.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
+            assert_eq!(modulus_of(reduced.0.0.matrix_type()), BigInt::from(primes[0]) * primes[1]);
         }
 
-        // H is intentionally non-unit (p/q_t = 105/5 = 21).  The decoder
+        // H is intentionally non-unit (p/q_t = a*b*c/b = a*c).  The decoder
         // target includes the A_sum contribution and remains a separate
         // artifact from the public A_star carrier.
+        let channel = explicit_ring(&primes[1..2], 4);
+        let h = BigInt::from(primes[0]) * primes[2];
         let decoder_target = mod_down_lift_public(
-            add_public_matrices(a_sum, scale_public_matrix(anchor.clone(), &BigInt::from(-21i8))),
-            BigInt::from(5u8),
-            BigInt::from(15u8),
-            &[3, 5, 7],
+            add_public_matrices(a_sum, scale_public_matrix(anchor.clone(), &-h)),
+            &channel,
+            &combined,
         );
-        let public_anchor =
-            reduce_lift_public_anchor(anchor, BigInt::from(5u8), BigInt::from(15u8)).unwrap();
+        let public_anchor = reduce_lift_public_anchor(anchor, &channel, &combined).unwrap();
         assert_ne!(decoder_target.flatten(), public_anchor.flatten());
     }
 
@@ -2930,26 +2805,34 @@ mod test {
 
     #[test]
     fn refresh_output_target_lifts_qstar_into_containing_p() {
-        let qstar = mxx_dsl::Ring::new(BigInt::from(15u8), 4);
+        use crate::test_support::{explicit_ring, modulus_of, primes};
+        let primes = primes(4, 3, 17);
+        let qstar = explicit_ring(&primes[..2], 4);
+        let p_ring = explicit_ring(&primes, 4);
         let value = qstar.input("refresh-qstar-target", (1, 1));
         let row = (value.clone(), value);
         let lifted = lift_output_target_to_p(
             row.clone(),
-            BigInt::from(105u8),
+            &p_ring,
             qstar.polynomial([IntExpr::constant(BigInt::from(3u8))]),
         );
-        let reduced = checked_modulus_convert_row(row, BigInt::from(105u8)).unwrap();
+        let reduced = checked_modulus_convert_row(row, &p_ring).unwrap();
         let reduced = super::map_row(reduced, |entry| {
             qstar.polynomial([IntExpr::constant(BigInt::from(3u8))]) * entry
         });
-        assert_eq!(lifted.0.matrix_type().modulus, IntExpr::constant(BigInt::from(105u8)));
+        assert_eq!(
+            modulus_of(lifted.0.matrix_type()),
+            BigInt::from(primes[0]) * primes[1] * primes[2]
+        );
         assert_ne!(lifted.flatten(), reduced.flatten());
         let graph = DslContext::new("refresh-qstar-to-p")
             .transferred_output("lifted", lifted)
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
     }
 
     #[test]
@@ -2986,6 +2869,7 @@ mod test {
                 parameters.ring(evaluation_level).unwrap().uniform_interval((1, 1), -1, 1),
                 parameters.ring(evaluation_level).unwrap().identity(1),
             ),
+            binding: None,
         };
         let p_ring = parameters.ring(decomposition_level).unwrap();
         let desired = (p_ring.zero((1, target_columns)), p_ring.zero((1, target_columns)));
@@ -3000,10 +2884,8 @@ mod test {
         )
         .unwrap();
         assert_eq!(
-            action.0.0.matrix_type().modulus,
-            IntExpr::constant(BigInt::from(
-                parameters.level(decomposition_level).unwrap().modulus().as_ref().clone()
-            ))
+            crate::test_support::modulus_of(action.0.0.matrix_type()),
+            BigInt::from(parameters.level(decomposition_level).unwrap().modulus().as_ref().clone())
         );
         assert_eq!(action.0.0.matrix_type().columns, IntExpr::constant(target_columns));
 
@@ -3014,13 +2896,11 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
 
-        let a_star = checked_modulus_convert_matrix(
-            anchor.matrix,
-            BigInt::from(parameters.level(decomposition_level).unwrap().modulus().as_ref().clone()),
-        )
-        .unwrap();
+        let a_star = checked_modulus_convert_matrix(anchor.matrix, &p_ring).unwrap();
         assert_eq!(a_star.0.0.matrix_type(), &p_ring.matrix_type((1, target_columns)));
     }
 
@@ -3044,8 +2924,10 @@ mod test {
         assert_eq!(workload.rhs_level(rhs).unwrap(), 0);
 
         let ring = parameters.ring(0).unwrap();
-        let payload =
-            RnsBggPayloadSecret { row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)) };
+        let payload = RnsBggPayloadSecret {
+            row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)),
+            binding: None,
+        };
         let mut lowering = PublicKeyLowering::new(
             &parameters,
             program,
@@ -3068,9 +2950,9 @@ mod test {
                 "prepared RHS is stored as a compact next-level matrix"
             );
         }
-        let action = centered_rebase_decomposition(
+        let action = super::centered_rebase_compact(
             decompose_matrix(&parameters, 1, compact.clone()).unwrap(),
-            BigInt::from(parameters.level(0).unwrap().modulus().as_ref().clone()),
+            &ring,
         );
         let expected_columns = parameters.level(1).unwrap().modulus_digits();
         let expected_action_schema =
@@ -3087,13 +2969,14 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
     }
 
     #[test]
     fn bind_inputs_canonicalizes_later_rhs_levels_from_natural_input_ring() {
-        use mxx_primitives::poly::dcrt::poly::DCRTPoly;
-        use mxx_runtime::backend::poly::CpuDcrtBackend;
+        use mxx_backends::poly::dcrt::poly::DCRTPoly;
 
         let source = DCRTPolyParams::new(16, 3, 17, 4, None, None);
         let moduli = source.to_crt().0;
@@ -3130,8 +3013,10 @@ mod test {
         assert_eq!(expected_workload.rhs_level(second_rhs).unwrap(), 1);
 
         let ring = parameters.ring(0).unwrap();
-        let payload =
-            RnsBggPayloadSecret { row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)) };
+        let payload = RnsBggPayloadSecret {
+            row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)),
+            binding: None,
+        };
         let value = |constant| {
             DCRTPoly::from_u32s(&source, &vec![constant; source.ring_dimension() as usize])
         };
@@ -3139,11 +3024,8 @@ mod test {
         rhs.insert(first_rhs, InputBinding::Scalar(value(3)));
         rhs.insert(second_rhs, InputBinding::Scalar(value(5)));
 
-        let mut preprocess = RnsPreprocessBuild::<CpuDcrtBackend>::new(&parameters, [0x52; 32]);
-        <RnsPreprocessBuild<'_, CpuDcrtBackend> as PreprocessBuild<
-            CpuDcrtBackend,
-            DCRTPoly,
-        >>::bind_inputs(
+        let mut preprocess = RnsPreprocessBuild::new(&parameters, [0x52; 32]);
+        <RnsPreprocessBuild<'_> as PreprocessBuild<DCRTPoly>>::bind_inputs(
             &mut preprocess,
             &program,
             &ParamEnv::default(),
@@ -3217,8 +3099,10 @@ mod test {
             Arc::new(builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap());
         let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
         let ring = parameters.ring(0).unwrap();
-        let payload =
-            RnsBggPayloadSecret { row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)) };
+        let payload = RnsBggPayloadSecret {
+            row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)),
+            binding: None,
+        };
         let mut lowering = PublicKeyLowering::new(
             &parameters,
             program,
@@ -3273,7 +3157,7 @@ mod test {
 
     #[test]
     fn public_lut_branch_is_helper_action_only() {
-        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let ring = crate::test_support::explicit_ring(&[17], 4);
         let data = (
             (ring.input("lut-data-00", (1, 1)), ring.input("lut-data-01", (1, 1))),
             (ring.input("lut-data-10", (1, 1)), ring.input("lut-data-11", (1, 1))),
@@ -3296,12 +3180,14 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
     }
 
     #[test]
     fn lut_payload_target_uses_distinct_r0_and_r1_components() {
-        let ring = mxx_dsl::Ring::new(BigInt::from(257u16), 4);
+        let ring = crate::test_support::explicit_ring(&[257], 4);
         let r0 = ring.input("lut-r0", (1, 1));
         let r1 = ring.identity(1);
         let one = ring.identity(1);
@@ -3311,11 +3197,12 @@ mod test {
 
     #[test]
     fn switching_decomposition_is_centered_rebased_into_the_source_ring() {
-        let next = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        use crate::test_support::{explicit_ring, modulus_of};
+        let next = explicit_ring(&[17], 4);
         let compact = next.preimage_input("lut-switching-decomposition-next", (1, 1), 17);
         let decomposition = ((compact.clone(), compact.clone()), (compact.clone(), compact));
-        let rebased = centered_rebase_decomposition(decomposition, BigInt::from(257u16));
-        assert_eq!(rebased.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
-        assert_eq!(rebased.1.1.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
+        let rebased = super::centered_rebase_compact(decomposition, &explicit_ring(&[257], 4));
+        assert_eq!(modulus_of(rebased.0.0.matrix_type()), BigInt::from(257u16));
+        assert_eq!(modulus_of(rebased.1.1.matrix_type()), BigInt::from(257u16));
     }
 }

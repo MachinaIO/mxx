@@ -3,8 +3,18 @@
 //! The application-facing RNS Sparse-LWR PRF lifecycle.
 
 use bigdecimal::BigDecimal;
-use mxx_bench_estimator::{
-    estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
+use mxx_backends::{
+    GpuRuntime,
+    artifact::FileArtifactStore,
+    backend::poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+    poly::{
+        Poly, PolyParams,
+        dcrt::{
+            gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+            params::DCRTPolyParams,
+            poly::DCRTPoly,
+        },
+    },
 };
 use mxx_exponent_lut::{
     ExpLayout, api,
@@ -21,24 +31,11 @@ use mxx_exponent_lut::{
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv};
-use mxx_primitives::poly::{
-    Poly, PolyParams,
-    dcrt::{
-        gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
-        params::DCRTPolyParams,
-        poly::DCRTPoly,
-    },
-};
-use mxx_runtime::{
-    ExecutionConfig,
-    artifact::FileArtifactStore,
-    backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
-};
 use num_bigint::{BigInt, BigUint};
 use serial_test::serial as sequential;
-use std::{cell::RefCell, collections::BTreeMap, env, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, env};
 
-const HASH_KEY: &[u8] = b"lwr-prf-rns-hash-key";
+const HASH_KEY: &[u8; 32] = b"lwr-prf-rns-public-api-hash-key1";
 
 struct Fixture {
     parameters: RnsBggParameters,
@@ -175,6 +172,14 @@ fn search_fixture(
     assert!(max_crt_depth > 0, "MXX_EXPONENT_LUT_LWR_PRF_MAX_CRT_DEPTH must be positive");
     let operations_per_drop = env_usize("MXX_EXPONENT_LUT_LWR_PRF_OPERATIONS_PER_DROP", 1)
         .expect("operations-per-drop configuration");
+    // Each drop removes up to this many CRT primes; the drop quotient is the
+    // message scale that the level noise must stay below half of.
+    let max_primes_per_drop = env_usize("MXX_EXPONENT_LUT_LWR_PRF_MAX_PRIMES_PER_DROP", 4)
+        .expect("maximum primes-per-drop configuration");
+    assert!(
+        max_primes_per_drop > 0,
+        "MXX_EXPONENT_LUT_LWR_PRF_MAX_PRIMES_PER_DROP must be positive"
+    );
     assert!(
         operations_per_drop > 0,
         "MXX_EXPONENT_LUT_LWR_PRF_OPERATIONS_PER_DROP must be positive"
@@ -192,7 +197,10 @@ fn search_fixture(
         let (profile, program) = profile_and_program(ring_dimension);
         let noise = noise_bindings(&program, sigma);
         let terminal_bounds = terminal_value_bounds(&profile, &program);
-        for crt_depth in 1..=max_crt_depth {
+        let depth_candidates = (1..=max_crt_depth).flat_map(|depth| {
+            (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
+        });
+        for (crt_depth, primes_per_drop) in depth_candidates {
             let request = RnsBggPlanRequest {
                 ring_dimension,
                 encoding_error_sigma: sigma.clone(),
@@ -205,6 +213,7 @@ fn search_fixture(
                     .cloned()
                     .expect("terminal bounds are nonempty"),
                 operations_per_drop,
+                primes_per_drop,
             };
             let (parameters, audit_trace) = match audit_program_at_crt_depth(
                 &request,
@@ -212,6 +221,7 @@ fn search_fixture(
                 &noise,
                 &terminal_bounds,
                 average.as_ref(),
+                0,
             ) {
                 Ok(candidate) => candidate,
                 Err(error) => {
@@ -289,12 +299,15 @@ fn fixture(
     profile: SparseLwrPrfProfile,
     program: SparseLwrPrfProgram,
     trace: RnsBggNoiseTrace,
+    runtime: &mut GpuRuntime,
+    store: &mut FileArtifactStore,
 ) -> Fixture {
-    let payload = RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [7; 32])
-        .sample_payload_secret()
+    // The secrets are sampled on the stage runtime and stay resident there.
+    let payload = RnsEncryptBuild::new(&parameters, [7; 32])
+        .sample_payload_secret(runtime, store)
         .expect("payload secret");
-    let mask = RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [7; 32])
-        .sample_mask_secret()
+    let mask = RnsEncryptBuild::new(&parameters, [7; 32])
+        .sample_mask_secret(runtime, store)
         .expect("mask secret");
     let zero = DCRTPoly::const_zero(&poly_parameters);
     let d_exponents = (0..profile.transform_column_count().expect("D width"))
@@ -348,8 +361,8 @@ fn fixture(
 }
 
 fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBackend {
-    let levels = parameters.levels().iter().map(|parameters| {
-        mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams::new(
+    let levels = parameters.distinct_levels().into_iter().map(|parameters| {
+        GpuDCRTPolyParams::new(
             parameters.ring_dimension(),
             parameters.to_crt().0,
             parameters.base_bits(),
@@ -390,34 +403,20 @@ fn lwr_prf_end_to_end() {
     }
     let sigma = error_sigma();
     let (parameters, poly_parameters, profile, program, trace) = search_fixture(&sigma);
-    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, d_exponents } =
-        fixture(parameters, poly_parameters, profile, program, trace);
-    assert!(!trace.wires.is_empty(), "noise simulation must visit the PRF gates");
-
-    let mut backend = gpu_backend(&parameters, devices.clone());
-    let estimate_levels = parameters.levels().iter().map(|level| {
-        GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
-    });
-    let estimate_backends = devices
-        .iter()
-        .copied()
-        .map(|device| (gpu_backend_on(estimate_levels.clone(), [device]), device))
-        .collect();
-    let estimator = Rc::new(RefCell::new(GpuNodeMeasurementBackend::new(
-        estimate_backends,
-        MeasurementHarnessConfig {
-            warm_up_iterations: 1,
-            measured_iterations: 1,
-            ..MeasurementHarnessConfig::default()
-        },
-    )));
-    let observed = Rc::new(RefCell::new(Vec::<&'static str>::new()));
-    let observe = |name: &'static str, graph: &mxx_ir_core::ValidatedGraph| {
-        estimate(graph, &mut *estimator.borrow_mut()).expect("stage estimate");
-        observed.borrow_mut().push(name);
-    };
+    // Stage plans report their measured W/C selection (the benchmark
+    // estimate) through tracing; show it with `RUST_LOG=info`.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let mut runtime =
+        GpuRuntime::new(gpu_backend(&parameters, devices.clone())).expect("GPU runtime");
     let directory = tempfile::tempdir().expect("artifact directory");
     let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
+    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, d_exponents } =
+        fixture(parameters, poly_parameters, profile, program, trace, &mut runtime, &mut store);
+    assert!(!trace.wires.is_empty(), "noise simulation must visit the PRF gates");
+    let observed = RefCell::new(Vec::<&'static str>::new());
+    let observe = |name: &'static str| observed.borrow_mut().push(name);
     // Preprocess receives the private payload secret and fixed RHS selectors,
     // while encrypt receives public D attributes, a fresh mask, and only the
     // preparation artifacts.  Online receives artifacts/configuration only;
@@ -429,12 +428,11 @@ fn lwr_prf_end_to_end() {
         &payload,
         HASH_KEY,
         RnsPreprocessBuild::new(&parameters, [7; 32]),
-        &mut backend,
+        &mut runtime,
         &mut store,
-        ExecutionConfig::default(),
         |_, outputs| Ok(outputs),
-        |graph| {
-            observe("preprocess", graph);
+        |_| {
+            observe("preprocess");
             Ok(())
         },
     )
@@ -448,37 +446,35 @@ fn lwr_prf_end_to_end() {
         &mask,
         HASH_KEY,
         RnsEncryptBuild::new(&parameters, [7; 32]),
-        &mut backend,
+        &mut runtime,
         &mut store,
-        ExecutionConfig::default(),
         |_| Ok(()),
-        |graph| {
-            observe("encrypt", graph);
+        |_| {
+            observe("encrypt");
             Ok(())
         },
     )
     .expect("RNS encryption");
-    let mut result = api::online_eval(
+    let result = api::online_eval(
         program.program(),
         &ParamEnv::default(),
         &online,
         &encrypted,
         HASH_KEY,
         RnsOnlineBuild::new(&parameters, [7; 32]),
-        &mut backend,
+        &mut runtime,
         &mut store,
-        ExecutionConfig::default(),
         |_, outputs| Ok(outputs),
-        |graph| {
-            observe("online_eval", graph);
+        |_| {
+            observe("online_eval");
             Ok(())
         },
     )
     .expect("RNS online evaluation");
-    // Estimation is attached to each of the three actual production graphs,
-    // so the measured workflow remains simulation -> preprocess -> encrypt ->
-    // online evaluation rather than a test-only reconstruction.
-    estimator.borrow_mut().measure_collected().expect("measure all three production graphs");
+    // Each of the three actual production graphs was planned (and its
+    // candidates measured) by the GPU runtime immediately before execution,
+    // so the workflow remains simulation -> preprocess -> encrypt -> online
+    // evaluation rather than a test-only reconstruction.
     assert_eq!(
         observed.borrow().as_slice(),
         ["preprocess", "encrypt", "online_eval"],
@@ -500,15 +496,14 @@ fn lwr_prf_end_to_end() {
     );
     verify_output(
         program.program(),
-        &mut result,
+        &result,
         0,
         &expected,
         &parameters,
         &payload,
         &mask,
-        &mut backend,
+        &mut runtime,
         &mut store,
-        ExecutionConfig::default(),
     )
     .expect("LWR application verification");
     assert!(!trace.outputs.is_empty(), "noise trace must finalize declared output");

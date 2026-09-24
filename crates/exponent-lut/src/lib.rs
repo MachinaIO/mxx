@@ -5,12 +5,17 @@
 //! backend evaluator.
 
 pub mod api;
+#[cfg(feature = "gpu")]
+mod gpu_execution;
 pub mod nand_circuit;
 pub mod noise_refresh;
 pub mod noise_utils;
 pub mod program;
 pub mod rns_bgg;
 pub mod utils;
+
+#[cfg(test)]
+mod test_support;
 
 pub use nand_circuit::{CompiledNandCircuit, NandCircuit, NandCircuitError};
 pub use noise_refresh::prf::SparseLwrPrfProfile;

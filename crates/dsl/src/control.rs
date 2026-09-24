@@ -174,7 +174,7 @@ mod tests {
             })
             .is_err()
         );
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let key = ring.bytes_input("key", 32);
         assert!(
             parallel(1, |_| {
@@ -189,12 +189,12 @@ mod tests {
     #[test]
     fn indexed_reads_keep_member_placement_without_retaining_index_arithmetic() {
         for offset in [0, 1] {
-            let ring = Ring::new(17, 8);
+            let ring = Ring::from_crt_moduli(vec![17.into()], 8);
             let source = ring.input_family("source", 3, (1, 1));
             let output = parallel(2, |i| Ok((source.at(&i + offset), source.at(i)))).unwrap();
             let built =
                 DslContext::new("indexed-reads").output("result", output).unwrap().build().unwrap();
-            built.validate(&ParamEnv::default()).unwrap();
+            built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
             let spec = built
                 .graph
                 .root_scope()
@@ -225,12 +225,12 @@ mod tests {
 
     #[test]
     fn ordinary_integer_offset_keeps_member_placement() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let source = ring.input_family("source", 4, (1, 1));
         let output = parallel(3, |i| Ok(source.at(i + 1))).unwrap();
         let built =
             DslContext::new("offset-members").output("result", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         let spec = built
             .graph
             .root_scope()
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn static_index_folding_preserves_runtime_euclidean_division() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let source = ring.input_family("source", 3, (1, 1));
         let quotient = Int::constant(7) / 3;
         let expected = mxx_ir_core::expr::euclidean_div_rem(&7.into(), &3.into()).unwrap().0;
@@ -262,7 +262,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert!((Int::constant(7) / -3).expression().is_err());
         assert!((Int::constant(7) % -3).expression().is_err());
     }

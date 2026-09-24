@@ -3,12 +3,14 @@ use crate::{
     diamond::DiamondWeCompiler,
     lean::numeric::{NumericCertificateInputs, render_numeric_certificate},
 };
+use mxx_backends::{
+    lean::{export_dcrt_layouts, render_backend_context},
+    poly::dcrt::params::DCRTPolyParams,
+};
 use mxx_ir_core::{
     artifact::{ProductionId, SpecHash, export_validated_manifest},
     validate,
 };
-use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
-use mxx_runtime::lean::{export_dcrt_layouts, render_backend_context};
 use num_bigint::{BigInt, BigUint};
 use std::{
     collections::BTreeMap,
@@ -106,8 +108,9 @@ pub fn export_diamond_certificate(
     }
     let layouts = export_dcrt_layouts([parameters])?;
     let layout = &layouts[0];
-    if layout.modulus != compiler.config.modulus ||
-        layout.ring_dimension as usize != compiler.config.ring_dimension ||
+    if layout.modulus != compiler.config.modulus() ||
+        layout.crt_moduli != compiler.config.crt_moduli ||
+        layout.ring_dimension != compiler.config.ring_dimension ||
         layout.regular_digit_count != compiler.config.digit_count ||
         (BigInt::from(1u32) << layout.base_bits) != compiler.config.gadget_base
     {
@@ -125,7 +128,11 @@ pub fn export_diamond_certificate(
         .iter()
         .find(|stage| stage.id.0 == "encrypt")
         .ok_or("encrypt stage missing")?;
-    let producer = validate(&encryption.graph, &bindings)?;
+    let producer = validate(
+        &encryption.graph,
+        &bindings,
+        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+    )?;
     let placeholder = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
     let manifests =
         BTreeMap::from([(placeholder.clone(), export_validated_manifest(placeholder, &producer)?)]);

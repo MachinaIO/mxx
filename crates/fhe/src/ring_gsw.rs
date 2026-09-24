@@ -1,14 +1,14 @@
 use crate::{
     FheCommonParams, FheError, FheScheme,
-    utils::{self, check_matrix, scalar},
+    utils::{check_matrix, scalar},
 };
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Int, Mat, MatType, parallel};
+use mxx_backends::poly::PolyParams;
+use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
     node::{ConcatAxis, IndexRange},
     types::WireType,
 };
-use mxx_primitives::poly::PolyParams;
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 
@@ -205,16 +205,8 @@ impl FheScheme for RingGswParams {
         for part in [secret, &ciphertext.a, &ciphertext.b] {
             check_matrix(p, part, 1, 1)?;
         }
-        // Center before rounding: a residue near q represents a small negative
-        // phase. Packing the decoded integers returns canonical R_q residues.
         let phase = &ciphertext.b - secret * &ciphertext.a;
-        let coefficients = utils::extract(p, &phase)?;
-        let delta = BigInt::from(self.scale.clone());
-        let decoded = parallel(p.ring_dimension(), |index| {
-            let value = utils::centered(coefficients.at(index), p.modulus().as_ref())?;
-            Ok(value.mul(2).add(Int::constant(delta.clone())).div(Int::constant(&delta * 2)))
-        })?;
-        utils::pack(p, &decoded)
+        Ok(phase.centered_round_divide(self.scale.clone()))
     }
     fn add(
         &self,
@@ -315,14 +307,17 @@ mod tests {
             .mul_small_rhs(common.ring().gadget(2, base, digits));
         ctx = ctx.output("original", column).unwrap().output("recomposed", recomposed).unwrap();
         let result = execute_graph(ctx.build().unwrap(), &common, inputs, &[]);
-        let mxx_runtime::RuntimeValue::Matrix(original) = &result.outputs["original"] else {
+        let mxx_backends::RuntimeValue::Matrix(original) = &result.outputs["original"] else {
             panic!("matrix")
         };
-        let mxx_runtime::RuntimeValue::Matrix(recomposed) = &result.outputs["recomposed"] else {
+        let mxx_backends::RuntimeValue::Matrix(recomposed) = &result.outputs["recomposed"] else {
             panic!("matrix")
         };
-        assert_eq!(original, recomposed);
-        use mxx_primitives::{
+        assert_eq!(
+            original.as_cpu_full().expect("CPU original"),
+            recomposed.as_cpu_full().expect("CPU recomposed")
+        );
+        use mxx_backends::{
             element::PolyElem,
             poly::{Poly, dcrt::poly::DCRTPoly},
         };
@@ -400,7 +395,7 @@ mod tests {
             scheme
                 .encrypt_gsw(
                     &ring.zero((1, 1)),
-                    &mxx_dsl::Ring::new(97, common.ring.ring_dimension()).zero((1, 1))
+                    &crate::utils::plaintext_ring(97, common.ring.ring_dimension()).zero((1, 1))
                 )
                 .is_err()
         );

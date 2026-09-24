@@ -6,15 +6,13 @@ use crate::{
     lean::{ExportOptions, export},
     node::{ConstantMatrix, NodeKind},
     types::{MatrixType, WireType},
-    validate,
 };
 use std::collections::BTreeMap;
 
 #[test]
 fn export_constant_fixture() {
     let matrix = MatrixType {
-        modulus: IntExpr::constant(17),
-        ring_dimension: IntExpr::constant(2),
+        ring: crate::ring::test_ring(17, 2),
         rows: IntExpr::constant(1),
         columns: IntExpr::constant(1),
     };
@@ -51,7 +49,7 @@ fn export_constant_fixture() {
     )
     .unwrap()
     .0;
-    let checked = validate(&graph, &ParamEnv::default()).unwrap();
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let artifact = export(&checked, &ExportOptions::default()).unwrap();
     let root = &artifact.root;
     let mut proof = String::new();

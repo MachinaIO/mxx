@@ -3,9 +3,9 @@ use super::{
     default_preimage_max_coefficient_bound,
 };
 use crate::lean::diamond::{VerifiedDiamondCertificate, verify_diamond_certificate};
+use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use mxx_gadgets::circuit::{BooleanCircuitError, BooleanCircuitShape};
 use mxx_ir_core::RealExpr;
-use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
 use std::{
     collections::BTreeMap,
@@ -254,8 +254,8 @@ impl DiamondParameterSearch {
         .map_err(|_| DiamondParameterSearchError::Expression)?;
         let compiler = DiamondWeCompiler::new(
             DiamondWeConfig {
-                modulus: BigInt::from(modulus.as_ref().clone()),
-                ring_dimension: ring_dimension as usize,
+                crt_moduli: parameters.to_crt().0,
+                ring_dimension,
                 input_count: self.input_count,
                 digit_base: self.digit_base,
                 batch_bits: self.batch_bits,
@@ -419,7 +419,7 @@ mod tests {
             include_str!("../../lean/Certificate.lean")
         );
         assert!(selected.certificate.numeric_bound() < selected.certificate.radius());
-        assert_eq!(selected.compiler.config.modulus, BigInt::from(selected.modulus.clone()));
+        assert_eq!(selected.compiler.config.modulus(), BigInt::from(selected.modulus.clone()));
         let reuse_error = crate::lean::diamond::export_diamond_certificate(
             &selected.parameters,
             &selected.compiler,

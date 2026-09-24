@@ -963,13 +963,23 @@ impl Eq for Graph {}
 
 impl Serialize for Graph {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.serialized().serialize(serializer)
+        let (graph, ring_table) = crate::ring::serialize_with_ring_table(&self.serialized())
+            .map_err(serde::ser::Error::custom)?;
+        serde_json::json!({"ring_table": ring_table, "graph": graph}).serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Graph {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let serialized = SerializedGraph::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct EncodedGraph {
+            ring_table: Vec<serde_json::Value>,
+            graph: serde_json::Value,
+        }
+        let encoded = EncodedGraph::deserialize(deserializer)?;
+        let serialized: SerializedGraph =
+            crate::ring::deserialize_with_ring_table(encoded.graph, encoded.ring_table)
+                .map_err(serde::de::Error::custom)?;
         serialized.into_graph().map_err(serde::de::Error::custom)
     }
 }
@@ -1365,14 +1375,12 @@ mod tests {
     use super::*;
     use crate::{
         IntExpr, encoding::spec_hash, expr::ParamEnv, node::MatrixBinaryOp, types::MatrixType,
-        validate::validate,
     };
     use num_bigint::BigInt;
 
     fn matrix_type() -> MatrixType {
         MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(8),
+            ring: crate::ring::test_ring(17, 8),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         }
@@ -1578,7 +1586,7 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        validate(&graph, &ParamEnv::default()).unwrap();
+        crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -1809,8 +1817,12 @@ mod tests {
         )
         .unwrap();
         let serialized = graph.serialized();
-        let decoded: Graph =
-            serde_json::from_slice(&serde_json::to_vec(&serialized).unwrap()).unwrap();
+        let encode = |serialized: &SerializedGraph| {
+            let (graph, ring_table) = crate::ring::serialize_with_ring_table(serialized).unwrap();
+            serde_json::to_vec(&serde_json::json!({"ring_table": ring_table, "graph": graph}))
+                .unwrap()
+        };
+        let decoded: Graph = serde_json::from_slice(&encode(&serialized)).unwrap();
         assert_eq!(decoded, graph);
 
         let mut swapped = serialized.clone();
@@ -1818,7 +1830,7 @@ mod tests {
         let b = swapped.outputs["b"].value;
         swapped.outputs.get_mut("a").unwrap().value = b;
         swapped.outputs.get_mut("b").unwrap().value = a;
-        assert!(serde_json::from_slice::<Graph>(&serde_json::to_vec(&swapped).unwrap()).is_err());
+        assert!(serde_json::from_slice::<Graph>(&encode(&swapped)).is_err());
 
         let missing_node = WireRef { node: NodeId(u64::MAX), port: Port(0) };
         let missing_port = WireRef { node: a.node, port: Port(u32::MAX) };
@@ -1843,12 +1855,44 @@ mod tests {
                     _ => unreachable!(),
                 }
                 assert!(
-                    serde_json::from_slice::<Graph>(&serde_json::to_vec(&malformed).unwrap())
-                        .is_err(),
+                    serde_json::from_slice::<Graph>(&encode(&malformed)).is_err(),
                     "accepted invalid {location} wire {wire:?}",
                 );
             }
         }
+    }
+
+    #[test]
+    fn graph_ring_table_deduplicates_equal_expressions() {
+        let ty = MatrixType {
+            ring: crate::ring::test_ring(17, 8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let value = NodeHandle::new(
+            NodeKind::Input {
+                name: "source".into(),
+                wire_type: WireType::Matrix(ty.clone()),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![WireType::Matrix(MatrixType { ring: crate::ring::test_ring(17, 8), ..ty })],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "ring-table",
+            Vec::new(),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let encoded = serde_json::to_value(&graph).unwrap();
+        assert_eq!(encoded["ring_table"].as_array().unwrap().len(), 1);
+        assert_eq!(serde_json::from_value::<Graph>(encoded).unwrap(), graph);
     }
 
     #[test]
@@ -1887,7 +1931,7 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        let mut validated = validate(&graph, &ParamEnv::default()).unwrap();
+        let mut validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
 
         assert!(graph.shares_storage_with(&validated.source));
         validated.bindings.integers.insert("independent".to_owned(), BigInt::from(1));

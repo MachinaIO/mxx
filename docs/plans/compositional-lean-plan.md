@@ -57,7 +57,7 @@ Several earlier requirements are reclassified:
 ## 3. Stage A: smallest viable semantic interface
 
 Owners: the exporter in `crates/ir-core/src/lean` and relation combinators in
-`crates/ir-core/lean`, with a tiny primitive domain in `crates/runtime/lean` or a test module.
+`crates/ir-core/lean`, with a tiny primitive domain in `crates/backends/lean` or a test module.
 
 Implement only enough direct extraction and primitive relations to exercise:
 
@@ -188,7 +188,7 @@ and `BggEncoding.lean`.
 
 | Prior files | Action |
 | --- | --- |
-| `crates/primitives/lean/MxxPrimitives/Negacyclic.lean`, `Matrix.lean`, `Reduction.lean` | Reuse quotient-ring and coefficient-view foundations after checking interfaces |
+| `crates/backends/lean/MxxPrimitives/Negacyclic.lean`, `Matrix.lean`, `Reduction.lean` | Reuse quotient-ring and coefficient-view foundations after checking interfaces |
 | `Bounds.lean` | Retain the one-output-coefficient `n` bound and constant-side improvements |
 | `Preimage.lean`, `Radix.lean` | Reuse local equations and reconstruction facts where they match current primitives |
 | `crates/bgg/lean/MxxBgg/Encoding.lean`, `Multiplication.lean`, `Boolean.lean` | Reuse full encoding and local gate algebra; remove dependencies on old runtime trace certificates |
@@ -218,7 +218,7 @@ the preferred family representation; they need not also become a new polynomial 
 
 ## 7. Stage E: primitive semantics for the Diamond inventory
 
-Owner: `crates/runtime/lean`, with lower-level facts in their mathematical crates.
+Owner: `crates/backends/lean`, with lower-level facts in their mathematical crates.
 
 Complete the semantic rules for exactly the operations reached by Diamond and its validity/circuit
 predicates. Maintain an inventory generated from those actual scopes. Each reached operation has a

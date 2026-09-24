@@ -22,8 +22,8 @@ use super::PbcEncodedPublicVector;
 use crate::noise_refresh::pbc::{
     PbcError, PbcGeneratedKeyLayout, PbcLayoutId, PbcLocation, PbcPrivateSchedule, PbcPublicLayout,
 };
+use mxx_backends::RuntimeValue;
 use mxx_dsl::{Family, Mat, Ring};
-use mxx_runtime::{Backend, RuntimeValue};
 
 /// Canonical names for one active bucket/slot selector package.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -368,13 +368,12 @@ fn matrix_type_matches(
     actual: &mxx_ir_core::types::MatrixType,
     expected: &ConcreteMatrixType,
 ) -> bool {
-    actual.modulus.evaluate(&ParamEnv::default()).ok().as_ref() == Some(&expected.modulus) &&
-        actual
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_usize()) ==
-            Some(expected.ring_dimension) &&
+    actual
+        .ring
+        .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .ok()
+        .as_ref() ==
+        Some(&expected.ring) &&
         actual.rows.evaluate(&ParamEnv::default()).ok().and_then(|value| value.to_usize()) ==
             Some(expected.rows) &&
         actual.columns.evaluate(&ParamEnv::default()).ok().and_then(|value| value.to_usize()) ==
@@ -612,10 +611,11 @@ impl PbcSelectorRuntimeBinding {
         Ok(self.bits.iter().map(|bit| if *bit == 0 { zero.clone() } else { one.clone() }).collect())
     }
 
-    pub fn materialize<B: Backend>(
+    /// Bind the selector family as host constant-polynomial members.
+    pub fn materialize(
         &self,
-        backend: &mut B,
-    ) -> Result<BTreeMap<String, RuntimeValue<B>>, B::Error> {
+        backend: &mut mxx_backends::backend::poly::CpuDcrtBackend,
+    ) -> Result<BTreeMap<String, RuntimeValue>, mxx_backends::backend::poly::PolyBackendError> {
         let env = ParamEnv::default();
         let matrix_type = self.matrix_type.clone();
         let members = self.materialize_members(|bit| {
@@ -629,7 +629,12 @@ impl PbcSelectorRuntimeBinding {
                 )
                 .map(RuntimeValue::matrix)
         })?;
-        Ok(BTreeMap::from([(self.input_name.clone(), RuntimeValue::IndexedFamily(members))]))
+        let element_type = mxx_ir_core::types::ConcreteWireType::Matrix(matrix_type);
+        Ok(BTreeMap::from([(
+            self.input_name.clone(),
+            RuntimeValue::indexed_family(element_type, members)
+                .expect("selector members match their declared matrix type"),
+        )]))
     }
 }
 
@@ -780,25 +785,19 @@ pub(crate) fn concrete_matrix_type(
 ) -> Result<mxx_ir_core::types::ConcreteMatrixType, PbcError> {
     let matrix = ring.matrix_type(shape);
     let env = mxx_ir_core::ParamEnv::default();
+    let dimension = |value: &mxx_ir_core::IntExpr| {
+        value
+            .evaluate(&env)
+            .map_err(|_| PbcError::ArtifactIdentityMismatch)?
+            .to_usize()
+            .ok_or(PbcError::ArtifactIdentityMismatch)
+    };
     Ok(mxx_ir_core::types::ConcreteMatrixType {
-        modulus: matrix.modulus.evaluate(&env).map_err(|_| PbcError::ArtifactIdentityMismatch)?,
-        ring_dimension: matrix
-            .ring_dimension
-            .evaluate(&env)
-            .map_err(|_| PbcError::ArtifactIdentityMismatch)?
-            .to_usize()
-            .ok_or(PbcError::ArtifactIdentityMismatch)?,
-        rows: matrix
-            .rows
-            .evaluate(&env)
-            .map_err(|_| PbcError::ArtifactIdentityMismatch)?
-            .to_usize()
-            .ok_or(PbcError::ArtifactIdentityMismatch)?,
-        columns: matrix
-            .columns
-            .evaluate(&env)
-            .map_err(|_| PbcError::ArtifactIdentityMismatch)?
-            .to_usize()
-            .ok_or(PbcError::ArtifactIdentityMismatch)?,
+        ring: matrix
+            .ring
+            .resolve(&env, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .map_err(|_| PbcError::ArtifactIdentityMismatch)?,
+        rows: dimension(&matrix.rows)?,
+        columns: dimension(&matrix.columns)?,
     })
 }

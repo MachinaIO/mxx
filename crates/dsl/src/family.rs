@@ -55,7 +55,7 @@ impl<T: GraphValue> Family<T> {
     pub fn at(&self, index: impl Into<Int>) -> T {
         let index = index.into();
         let expression =
-            index.compile_expression().filter(|expression| !integer::has_loop_index(expression));
+            index.compile_expression().filter(|expression| !expression.contains_loop_index());
 
         let values = self
             .values
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn composite_values_preserve_static_metadata_in_pack_select_and_state() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let revealed = TaggedMatrix { matrix: ring.input("a", (1, 1)), revealed: true };
         let hidden = TaggedMatrix { matrix: ring.input("b", (1, 1)), revealed: false };
         assert!(matches!(
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn field_projection_preserves_producer_and_rejects_computation() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let values =
             parallel(3, |_| Ok((ring.gaussian((1, 1), 1, 4), ring.uniform_residue((1, 1)))))
                 .unwrap();
@@ -320,7 +320,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(
             built
                 .graph
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn composite_input_index_and_output_use_one_shared_schema() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let context = DslContext::new("record-input");
         let schema = FamilyType {
             element: (MatType(ring.matrix_type((1, 1))), IntType, BoolType),
@@ -344,7 +344,7 @@ mod tests {
         let inputs: Family<(Mat, Int, Bool)> = context.input("records", schema).unwrap();
         let output = parallel(4, |i| Ok(inputs.at(i))).unwrap();
         let built = context.output("records", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(
             built.graph.outputs().keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["records.0", "records.1", "records.2"]

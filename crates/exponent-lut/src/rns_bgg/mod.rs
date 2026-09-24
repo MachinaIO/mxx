@@ -12,8 +12,9 @@ mod noise;
 mod public_key;
 
 use bigdecimal::BigDecimal;
-use mxx_dsl::{Family, Mat, Preimage, Ring};
-use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
+use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
+use mxx_dsl::{Family, Mat, Preimage, Ring, SmallMatrix};
+use mxx_ir_core::{IntExpr, ring::ConcreteRing};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
@@ -42,12 +43,27 @@ pub use noise::{
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
 
+/// Name of the graph input carrying the shared 32-byte hash key. A stage
+/// graph declares it only where it samples hash-derived public matrices.
+pub(crate) const HASH_KEY_INPUT: &str = "rns-bgg/hash-key";
+
+/// Whether `graph` declares a root input named `name`, so a stage binds an
+/// optional runtime input only when its graph consumes it.
+pub(crate) fn graph_declares_input(graph: &mxx_dsl::BuiltGraph, name: &str) -> bool {
+    graph.graph.root_scope().nodes().iter().any(|node| {
+        matches!(node.kind(), mxx_ir_core::node::NodeKind::Input { name: input, .. } if input == name)
+    })
+}
+
 /// A two-polynomial row block.
 pub type RnsBggRow = (Mat, Mat);
 /// A two-by-two polynomial block matrix.
 pub type RnsBggMatrix = ((Mat, Mat), (Mat, Mat));
 /// A two-by-two matrix of signed compact preimages.
-pub(crate) type RnsBggDecomposition = ((Preimage, Preimage), (Preimage, Preimage));
+/// Raw signed gadget digits of a right-action matrix in its decomposition ring.
+pub(crate) type RnsBggDigits = ((Preimage, Preimage), (Preimage, Preimage));
+/// Bounded digits of a right action, represented in the ring that consumes them.
+pub(crate) type RnsBggDecomposition = ((SmallMatrix, SmallMatrix), (SmallMatrix, SmallMatrix));
 fn refresh_commitment_hex(commitment: [u8; 32]) -> String {
     commitment.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -119,15 +135,19 @@ impl From<mxx_dsl::DslError> for RnsBggError {
 fn canonical_encoding_sigma(sigma: BigDecimal) -> Result<BigDecimal, RnsBggError> {
     let sigma = sigma.normalized();
     let (_, exponent) = sigma.as_bigint_and_exponent();
-    if sigma <= BigDecimal::zero() || exponent.unsigned_abs() > u64::from(u32::MAX) {
-        return Err(RnsBggError::Parameters("encoding_error_sigma must be positive"));
+    if sigma < BigDecimal::zero() || exponent.unsigned_abs() > u64::from(u32::MAX) {
+        return Err(RnsBggError::Parameters("encoding_error_sigma must be nonnegative"));
     }
     Ok(sigma)
 }
 
+/// A zero sigma selects noise-free encodings: no error is sampled or added.
 fn encoding_error_bound(sigma: &BigDecimal) -> Result<BigUint, RnsBggError> {
+    if sigma.is_zero() {
+        return Ok(BigUint::zero());
+    }
     let bound = std::panic::catch_unwind(|| {
-        mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(sigma)
+        mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound(sigma)
     })
     .map_err(|_| RnsBggError::Parameters("encoding_error_sigma is unrepresentable"))?;
     if bound.is_zero() {
@@ -236,12 +256,39 @@ impl RnsBggParameters {
         &self.levels
     }
 
+    /// Levels with distinct ordered CRT bases, in chain order. Adjacent
+    /// logical levels between drops share one physical ring; an execution
+    /// backend registers each physical ring once.
+    pub fn distinct_levels(&self) -> Vec<&DCRTPolyParams> {
+        let mut levels = Vec::<&DCRTPolyParams>::new();
+        for level in &self.levels {
+            if !levels.iter().any(|known| known.to_crt().0 == level.to_crt().0) {
+                levels.push(level);
+            }
+        }
+        levels
+    }
+
     pub fn level(&self, level: usize) -> Result<&DCRTPolyParams, RnsBggError> {
         self.levels.get(level).ok_or(RnsBggError::Parameters("level outside modulus chain"))
     }
 
     pub fn scale(&self, level: usize) -> Result<&BigUint, RnsBggError> {
         self.drops.get(level).ok_or(RnsBggError::Parameters("level outside modulus chain"))
+    }
+
+    /// Public scale of the message in a level-`level` payload relation.
+    /// Below the terminal level it is the level's drop `p_level`, which the
+    /// next ModDown removes. The terminal level has no further drop and an
+    /// identity state gadget, so its message carries the public scale
+    /// `floor(q / 2)`: distinct monomial plaintexts then differ by about
+    /// `q / 2` per coefficient and fail the `q / 4` residual decode.
+    pub fn message_scale(&self, level: usize) -> Result<BigUint, RnsBggError> {
+        if level + 1 == self.levels.len() {
+            Ok(self.level(level)?.modulus().as_ref() / 2u8)
+        } else {
+            self.scale(level).cloned()
+        }
     }
 
     pub fn component_columns(&self, level: usize) -> Result<usize, RnsBggError> {
@@ -357,9 +404,8 @@ impl RnsBggParameters {
             return Ok(None);
         }
         let source = self.level(source_level)?;
-        let source_modulus = BigInt::from(source.modulus().as_ref().clone());
         let target_gadget =
-            self.public_gadget(target_level)?.centered_rebase(source_modulus.clone());
+            self.public_gadget(target_level)?.centered_rebase(&self.ring(source_level)?);
         let alpha = self.scalar(source_level, BigInt::from(alignment.ratio().clone()))?;
         let scaled_target_gadget = alpha * target_gadget;
         let base = 1u64
@@ -652,9 +698,39 @@ impl RnsBggParameters {
 
     pub fn ring(&self, level: usize) -> Result<Ring, RnsBggError> {
         let parameters = self.level(level)?;
-        Ok(Ring::new(
-            BigInt::from(parameters.modulus().as_ref().clone()),
-            parameters.ring_dimension() as usize,
+        Ok(Ring::from_crt_moduli(
+            parameters.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            parameters.ring_dimension(),
+        ))
+    }
+
+    /// Ring whose ordered CRT basis has product `modulus`.
+    ///
+    /// A level with exactly this modulus keeps its own ordered basis. Other
+    /// moduli, such as per-slot refresh channels, are CRT sub-bases of the
+    /// parameter prime pool; their primes keep the pool's first-appearance
+    /// order so equal moduli always resolve to the same ring.
+    pub(crate) fn ring_for_modulus(&self, modulus: &BigInt) -> Result<Ring, RnsBggError> {
+        if let Some(level) = self
+            .levels
+            .iter()
+            .position(|level| &BigInt::from(level.modulus().as_ref().clone()) == modulus)
+        {
+            return self.ring(level);
+        }
+        let mut primes = Vec::<u64>::new();
+        for prime in self.levels.iter().flat_map(|level| level.to_crt().0) {
+            if !primes.contains(&prime) && (modulus % BigInt::from(prime)).is_zero() {
+                primes.push(prime);
+            }
+        }
+        let product = primes.iter().fold(BigInt::one(), |product, prime| product * prime);
+        if primes.is_empty() || &product != modulus {
+            return Err(RnsBggError::Parameters("modulus is not a CRT sub-basis of the parameters"));
+        }
+        Ok(Ring::from_crt_moduli(
+            primes.into_iter().map(IntExpr::from).collect(),
+            self.level(0)?.ring_dimension(),
         ))
     }
 
@@ -769,7 +845,7 @@ impl RnsBggParameters {
     }
 
     pub(crate) fn state_gadget(&self, level: usize) -> Result<Mat, RnsBggError> {
-        let high = self.level(level)?;
+        self.level(level)?;
         match self.levels.get(level + 1) {
             Some(low) => {
                 let base = 1u64
@@ -778,7 +854,7 @@ impl RnsBggParameters {
                 Ok(self
                     .ring(level + 1)?
                     .gadget(1, base, low.modulus_digits())
-                    .centered_rebase(BigInt::from(high.modulus().as_ref().clone())))
+                    .centered_rebase(&self.ring(level)?))
             }
             None => Ok(self.ring(level)?.identity(1)),
         }
@@ -841,14 +917,19 @@ fn compatible_level_parameters_except_basis(lhs: &DCRTPolyParams, rhs: &DCRTPoly
 pub(crate) fn planned_crt_depth(
     logical_level: usize,
     operations_per_drop: usize,
+    primes_per_drop: usize,
     max_crt_depth: usize,
     terminal_depth: usize,
 ) -> Result<usize, RnsBggError> {
-    if operations_per_drop == 0 || terminal_depth == 0 || max_crt_depth < terminal_depth {
+    if operations_per_drop == 0 ||
+        primes_per_drop == 0 ||
+        terminal_depth == 0 ||
+        max_crt_depth < terminal_depth
+    {
         return Err(RnsBggError::Parameters("invalid CRT drop cadence"));
     }
-    let physical_drop = logical_level / operations_per_drop;
-    Ok(max_crt_depth.saturating_sub(physical_drop).max(terminal_depth))
+    let dropped = (logical_level / operations_per_drop).saturating_mul(primes_per_drop);
+    Ok(max_crt_depth.saturating_sub(dropped).max(terminal_depth))
 }
 
 /// Return the reusable LUT mask-helper keys required by the encryption
@@ -1098,61 +1179,59 @@ fn map_matrix(matrix: RnsBggMatrix, mut operation: impl FnMut(Mat) -> Mat) -> Rn
     ((operation(matrix.0.0), operation(matrix.0.1)), (operation(matrix.1.0), operation(matrix.1.1)))
 }
 
+/// Resolve the concrete ordered CRT ring of a graph matrix.
+pub(crate) fn concrete_ring(value: &Mat) -> Result<ConcreteRing, RnsBggError> {
+    resolve_ring(&value.matrix_type().ring)
+}
+
+pub(crate) fn resolve_ring(ring: &mxx_ir_core::RingRef) -> Result<ConcreteRing, RnsBggError> {
+    ring.resolve(
+        &mxx_ir_core::ParamEnv::default(),
+        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+    )
+    .map_err(|_| RnsBggError::Parameters("matrix ring must be concrete"))
+}
+
 /// Convert a matrix between concrete CRT rings without constructing an
-/// invalid modulus-reduction node.  Reduction is only valid when the source
-/// ring is larger; extending is used for a larger destination and equal rings
-/// are preserved as-is.
-pub(crate) fn checked_modulus_convert(
-    value: Mat,
-    destination: impl Into<BigInt>,
-) -> Result<Mat, RnsBggError> {
-    let destination = destination.into();
-    if destination <= BigInt::zero() {
-        return Err(RnsBggError::Parameters("destination modulus must be positive"));
+/// invalid modulus-reduction node.  Reduction is only valid when the
+/// destination basis is a strict CRT subset of the source; a destination
+/// that contains the source modulus is reached by centered rebasing, and
+/// equal rings are preserved as-is.
+pub(crate) fn checked_modulus_convert(value: Mat, destination: &Ring) -> Result<Mat, RnsBggError> {
+    let source = concrete_ring(&value)?;
+    let target = resolve_ring(destination.as_ref())?;
+    if source == target {
+        return Ok(value);
     }
-    let source = value
-        .matrix_type()
-        .modulus
-        .evaluate(&mxx_ir_core::ParamEnv::default())
-        .map_err(|_| RnsBggError::Parameters("source modulus must be concrete"))?;
-    if source <= BigInt::zero() {
-        return Err(RnsBggError::Parameters("source modulus must be positive"));
+    if target.crt_moduli().iter().all(|prime| source.crt_moduli().contains(prime)) &&
+        target.crt_depth() < source.crt_depth()
+    {
+        return Ok(value.reduce_modulus(destination));
     }
-    match source.cmp(&destination) {
-        std::cmp::Ordering::Greater => {
-            if &source % &destination != BigInt::zero() {
-                return Err(RnsBggError::Parameters("destination modulus must divide source"));
-            }
-            Ok(value.reduce_modulus(destination))
-        }
-        std::cmp::Ordering::Equal => Ok(value),
-        std::cmp::Ordering::Less => Ok(value.centered_rebase(destination)),
+    if (target.modulus() % source.modulus()).is_zero() {
+        return Ok(value.centered_rebase(destination));
     }
+    Err(RnsBggError::Parameters("destination modulus must divide or contain the source"))
 }
 
 pub(crate) fn checked_modulus_convert_row(
     row: RnsBggRow,
-    destination: impl Into<BigInt> + Clone,
+    destination: &Ring,
 ) -> Result<RnsBggRow, RnsBggError> {
-    let destination = destination.into();
-    Ok((
-        checked_modulus_convert(row.0, destination.clone())?,
-        checked_modulus_convert(row.1, destination)?,
-    ))
+    Ok((checked_modulus_convert(row.0, destination)?, checked_modulus_convert(row.1, destination)?))
 }
 
 pub(crate) fn checked_modulus_convert_matrix(
     matrix: RnsBggMatrix,
-    destination: impl Into<BigInt> + Clone,
+    destination: &Ring,
 ) -> Result<RnsBggMatrix, RnsBggError> {
-    let destination = destination.into();
     Ok((
         (
-            checked_modulus_convert(matrix.0.0, destination.clone())?,
-            checked_modulus_convert(matrix.0.1, destination.clone())?,
+            checked_modulus_convert(matrix.0.0, destination)?,
+            checked_modulus_convert(matrix.0.1, destination)?,
         ),
         (
-            checked_modulus_convert(matrix.1.0, destination.clone())?,
+            checked_modulus_convert(matrix.1.0, destination)?,
             checked_modulus_convert(matrix.1.1, destination)?,
         ),
     ))
@@ -1175,28 +1254,18 @@ pub(crate) fn compact_decompose_matrix(
     decomposition_level: usize,
     matrix: RnsBggMatrix,
 ) -> Result<RnsBggDecomposition, RnsBggError> {
-    let evaluation_modulus = parameters.level(evaluation_level)?.modulus().as_ref().clone();
+    let evaluation_ring = parameters.ring(evaluation_level)?;
+    let evaluation = resolve_ring(evaluation_ring.as_ref())?;
     let decomposition = parameters.level(decomposition_level)?;
-    let decomposition_modulus = decomposition.modulus().as_ref().clone();
-    let expected_dimension = BigInt::from(decomposition.ring_dimension());
+    let decomposition_ring = resolve_ring(parameters.ring(decomposition_level)?.as_ref())?;
     for entry in [&matrix.0.0, &matrix.0.1, &matrix.1.0, &matrix.1.1] {
-        let matrix_type = entry.matrix_type();
-        let modulus = matrix_type
-            .modulus
-            .evaluate(&mxx_ir_core::ParamEnv::default())
-            .map_err(|_| RnsBggError::Parameters("decomposition modulus must be concrete"))?;
-        let dimension =
-            matrix_type.ring_dimension.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(
-                |_| RnsBggError::Parameters("decomposition ring dimension must be concrete"),
-            )?;
-        if modulus != BigInt::from(decomposition_modulus.clone()) || dimension != expected_dimension
-        {
+        if concrete_ring(entry)? != decomposition_ring {
             return Err(RnsBggError::Parameters(
                 "compact action matrix does not match its decomposition ring",
             ));
         }
     }
-    if evaluation_modulus < decomposition_modulus {
+    if evaluation.modulus() < decomposition_ring.modulus() {
         return Err(RnsBggError::Parameters(
             "evaluation modulus must contain the decomposition modulus",
         ));
@@ -1215,17 +1284,15 @@ pub(crate) fn compact_decompose_matrix(
             matrix.1.1.decompose(base, decomposition_count),
         ),
     );
-    if evaluation_modulus == decomposition_modulus {
-        Ok(value)
-    } else {
-        Ok(centered_rebase_compact(value, BigInt::from(evaluation_modulus)))
-    }
+    // Equal rings keep the digit values; the rebase only drops the preimage
+    // relation, which does not hold for a consuming right action.
+    Ok(centered_rebase_compact(value, &evaluation_ring))
 }
 
-fn centered_rebase_compact(value: RnsBggDecomposition, modulus: BigInt) -> RnsBggDecomposition {
+pub(crate) fn centered_rebase_compact(value: RnsBggDigits, ring: &Ring) -> RnsBggDecomposition {
     (
-        (value.0.0.centered_rebase(modulus.clone()), value.0.1.centered_rebase(modulus.clone())),
-        (value.1.0.centered_rebase(modulus.clone()), value.1.1.centered_rebase(modulus)),
+        (value.0.0.centered_rebase(ring), value.0.1.centered_rebase(ring)),
+        (value.1.0.centered_rebase(ring), value.1.1.centered_rebase(ring)),
     )
 }
 
@@ -1287,8 +1354,7 @@ pub(crate) fn apply_public_alignment_row(
         return Ok(row);
     };
     let aligned = (action.clone().mul_small_rhs(row.0), action.mul_small_rhs(row.1));
-    let target_modulus = BigInt::from(parameters.level(target_level)?.modulus().as_ref().clone());
-    checked_mod_down_encoding(aligned, target_modulus, &parameters.level(source_level)?.to_crt().0)
+    checked_mod_down_encoding(aligned, &parameters.ring(target_level)?)
 }
 
 /// Apply one shared public alignment action to every component of a public
@@ -1311,106 +1377,107 @@ pub(crate) fn apply_public_alignment_matrix(
         (action.clone().mul_small_rhs(matrix.0.0), action.clone().mul_small_rhs(matrix.0.1)),
         (action.clone().mul_small_rhs(matrix.1.0), action.mul_small_rhs(matrix.1.1)),
     );
-    let target_modulus = BigInt::from(parameters.level(target_level)?.modulus().as_ref().clone());
-    checked_mod_down_public(aligned, target_modulus, &parameters.level(source_level)?.to_crt().0)
+    checked_mod_down_public(aligned, &parameters.ring(target_level)?)
 }
 
-pub(crate) fn multiply_public_action(lhs: RnsBggMatrix, rhs: RnsBggDecomposition) -> RnsBggMatrix {
+/// A bounded right operand of a matrix product.
+///
+/// Raw gadget digits multiply as a preimage; digits rebased into another
+/// ring multiply as an ordinary bounded matrix.
+pub(crate) trait RightAction: Clone {
+    fn right_multiply(self, lhs: Mat) -> Mat;
+}
+
+impl RightAction for Preimage {
+    fn right_multiply(self, lhs: Mat) -> Mat {
+        self.mul_small_rhs(lhs)
+    }
+}
+
+impl RightAction for SmallMatrix {
+    fn right_multiply(self, lhs: Mat) -> Mat {
+        lhs.mul_small_rhs(self)
+    }
+}
+
+pub(crate) fn multiply_public_action<D: RightAction>(
+    lhs: RnsBggMatrix,
+    rhs: ((D, D), (D, D)),
+) -> RnsBggMatrix {
     let ((a, b), (c, d)) = lhs;
     let ((u, v), (w, x)) = rhs;
     (
         (
-            u.clone().mul_small_rhs(a.clone()) + w.clone().mul_small_rhs(b.clone()),
-            v.clone().mul_small_rhs(a.clone()) + x.clone().mul_small_rhs(b.clone()),
+            u.clone().right_multiply(a.clone()) + w.clone().right_multiply(b.clone()),
+            v.clone().right_multiply(a) + x.clone().right_multiply(b),
         ),
         (
-            u.mul_small_rhs(c.clone()) + w.mul_small_rhs(d.clone()),
-            v.mul_small_rhs(c) + x.mul_small_rhs(d),
+            u.right_multiply(c.clone()) + w.right_multiply(d.clone()),
+            v.right_multiply(c) + x.right_multiply(d),
         ),
     )
 }
 
-pub(crate) fn multiply_encoding_action(lhs: RnsBggRow, rhs: RnsBggDecomposition) -> RnsBggRow {
+pub(crate) fn multiply_encoding_action<D: RightAction>(
+    lhs: RnsBggRow,
+    rhs: ((D, D), (D, D)),
+) -> RnsBggRow {
     let (a, b) = lhs;
     let ((u, v), (w, x)) = rhs;
     (
-        u.mul_small_rhs(a.clone()) + w.mul_small_rhs(b.clone()),
-        v.mul_small_rhs(a) + x.mul_small_rhs(b),
+        u.right_multiply(a.clone()) + w.right_multiply(b.clone()),
+        v.right_multiply(a) + x.right_multiply(b),
     )
 }
 
-fn concrete_entry_modulus(entry: &Mat) -> Result<BigInt, RnsBggError> {
-    entry
-        .matrix_type()
-        .modulus
-        .evaluate(&mxx_ir_core::ParamEnv::default())
-        .map_err(|_| RnsBggError::Parameters("source modulus must be concrete"))
-}
-
-fn validate_mod_down_entry(entry: &Mat, modulus: &BigInt) -> Result<bool, RnsBggError> {
-    if modulus <= &BigInt::zero() {
-        return Err(RnsBggError::Parameters("destination modulus must be positive"));
+/// Whether a ModDown of `entry` into `destination` is the identity. Upward
+/// switches and destinations outside the source basis are rejected.
+fn validate_mod_down_entry(entry: &Mat, destination: &ConcreteRing) -> Result<bool, RnsBggError> {
+    let source = concrete_ring(entry)?;
+    if &source == destination {
+        return Ok(true);
     }
-    let source = concrete_entry_modulus(entry)?;
-    match source.cmp(modulus) {
-        std::cmp::Ordering::Less => {
-            Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
-        }
-        std::cmp::Ordering::Equal => Ok(true),
-        std::cmp::Ordering::Greater => {
-            if &source % modulus != BigInt::zero() {
-                return Err(RnsBggError::Parameters("destination modulus must divide source"));
-            }
-            Ok(false)
-        }
+    if destination.crt_depth() >= source.crt_depth() {
+        return Err(RnsBggError::Parameters("modulus switch cannot increase modulus"));
     }
+    if !destination.crt_moduli().iter().all(|prime| source.crt_moduli().contains(prime)) {
+        return Err(RnsBggError::Parameters("destination modulus must divide source"));
+    }
+    Ok(false)
 }
 
 fn checked_mod_down_matrix(
     value: RnsBggMatrix,
-    modulus: BigInt,
-    source_moduli: &[u64],
+    destination: &Ring,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let entries = [&value.0.0, &value.0.1, &value.1.0, &value.1.1];
-    let source = concrete_entry_modulus(entries[0])?;
+    let source = concrete_ring(entries[0])?;
     if entries[1..]
         .iter()
-        .map(|entry| concrete_entry_modulus(entry))
+        .map(|entry| concrete_ring(entry))
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .any(|entry| *entry != source)
     {
         return Err(RnsBggError::Parameters("matrix entries have incompatible source moduli"));
     }
-    let no_op = entries
-        .iter()
-        .map(|entry| validate_mod_down_entry(entry, &modulus))
-        .collect::<Result<Vec<_>, _>>()?;
-    if no_op.iter().all(|entry| *entry) {
+    let target = resolve_ring(destination.as_ref())?;
+    if validate_mod_down_entry(entries[0], &target)? {
         return Ok(value);
     }
-    Ok(map_matrix(value, |entry| {
-        entry.block_mod_switch(modulus.clone(), source_moduli.to_vec(), 1)
-    }))
+    Ok(map_matrix(value, |entry| entry.block_mod_switch(destination, 1)))
 }
 
-fn checked_mod_down_row(
-    value: RnsBggRow,
-    modulus: BigInt,
-    source_moduli: &[u64],
-) -> Result<RnsBggRow, RnsBggError> {
-    let source = concrete_entry_modulus(&value.0)?;
-    if concrete_entry_modulus(&value.1)? != source {
+fn checked_mod_down_row(value: RnsBggRow, destination: &Ring) -> Result<RnsBggRow, RnsBggError> {
+    let source = concrete_ring(&value.0)?;
+    if concrete_ring(&value.1)? != source {
         return Err(RnsBggError::Parameters("row entries have incompatible source moduli"));
     }
-    let no_op = [
-        validate_mod_down_entry(&value.0, &modulus)?,
-        validate_mod_down_entry(&value.1, &modulus)?,
-    ];
-    if no_op[0] {
+    let target = resolve_ring(destination.as_ref())?;
+    if validate_mod_down_entry(&value.0, &target)? {
         return Ok(value);
     }
-    Ok(map_row(value, |entry| entry.block_mod_switch(modulus.clone(), source_moduli.to_vec(), 1)))
+    Ok(map_row(value, |entry| entry.block_mod_switch(destination, 1)))
 }
 
 /// Checked public-role ModDown.  Equal physical moduli return the original
@@ -1418,40 +1485,30 @@ fn checked_mod_down_row(
 /// construction.
 pub(crate) fn checked_mod_down_public(
     value: RnsBggMatrix,
-    modulus: BigInt,
-    source_moduli: &[u64],
+    destination: &Ring,
 ) -> Result<RnsBggMatrix, RnsBggError> {
-    checked_mod_down_matrix(value, modulus, source_moduli)
+    checked_mod_down_matrix(value, destination)
 }
 
 /// Checked encoding-role ModDown with the same source/target policy as public
 /// matrices.
 pub(crate) fn checked_mod_down_encoding(
     value: RnsBggRow,
-    modulus: BigInt,
-    source_moduli: &[u64],
+    destination: &Ring,
 ) -> Result<RnsBggRow, RnsBggError> {
-    checked_mod_down_row(value, modulus, source_moduli)
+    checked_mod_down_row(value, destination)
 }
 
 /// Existing graph callers use this infallible boundary after their enclosing
 /// validation.  Keep the error visible as a panic rather than constructing an
 /// invalid upward or non-exact switch node.
-pub(crate) fn mod_down_public(
-    value: RnsBggMatrix,
-    modulus: BigInt,
-    source_moduli: &[u64],
-) -> RnsBggMatrix {
-    checked_mod_down_public(value, modulus, source_moduli)
+pub(crate) fn mod_down_public(value: RnsBggMatrix, destination: &Ring) -> RnsBggMatrix {
+    checked_mod_down_public(value, destination)
         .unwrap_or_else(|error| panic!("invalid public modulus switch: {error}"))
 }
 
-pub(crate) fn mod_down_encoding(
-    value: RnsBggRow,
-    modulus: BigInt,
-    source_moduli: &[u64],
-) -> RnsBggRow {
-    checked_mod_down_encoding(value, modulus, source_moduli)
+pub(crate) fn mod_down_encoding(value: RnsBggRow, destination: &Ring) -> RnsBggRow {
+    checked_mod_down_encoding(value, destination)
         .unwrap_or_else(|error| panic!("invalid encoding modulus switch: {error}"))
 }
 
@@ -1522,8 +1579,8 @@ mod tests {
         assert!(!direct.is_noop());
         let action = parameters.public_alignment_action(0, 2).unwrap().unwrap();
         assert_eq!(
-            action.matrix_type().modulus,
-            IntExpr::constant(BigInt::from(high.modulus().as_ref().clone()))
+            crate::test_support::modulus_of(action.matrix_type()),
+            BigInt::from(high.modulus().as_ref().clone())
         );
         assert_eq!(
             action.matrix_type().rows,
@@ -1579,47 +1636,26 @@ mod tests {
         let ring = parameters.ring(0).unwrap();
         let entry = ring.input("equal-modulus-entry", (1, 1));
         let matrix = ((entry.clone(), entry.clone()), (entry.clone(), entry.clone()));
-        let converted = checked_mod_down_public(
-            matrix.clone(),
-            BigInt::from(level.modulus().as_ref().clone()),
-            &level.to_crt().0,
-        )
-        .unwrap();
+        let converted = checked_mod_down_public(matrix.clone(), &ring).unwrap();
         assert_eq!(converted.0.0.flatten(), matrix.0.0.flatten());
         let row = (entry.clone(), entry.clone());
-        let converted_row = checked_mod_down_encoding(
-            row.clone(),
-            BigInt::from(level.modulus().as_ref().clone()),
-            &level.to_crt().0,
-        )
-        .unwrap();
+        let converted_row = checked_mod_down_encoding(row.clone(), &ring).unwrap();
         assert_eq!(converted_row.0.flatten(), row.0.flatten());
 
         let low = level.select_modulus(&BigUint::from(level.to_crt().0[0])).unwrap();
-        let low_ring = mxx_dsl::Ring::new(
-            BigInt::from(low.modulus().as_ref().clone()),
-            low.ring_dimension() as usize,
-        );
+        let low_ring = crate::test_support::ring_of(&low);
         let lower_entry = low_ring.input("upward-entry", (1, 1));
         let lower_matrix = (
             (lower_entry.clone(), lower_entry.clone()),
             (lower_entry.clone(), lower_entry.clone()),
         );
         assert!(matches!(
-            checked_mod_down_public(
-                lower_matrix,
-                BigInt::from(level.modulus().as_ref().clone()),
-                &low.to_crt().0,
-            ),
+            checked_mod_down_public(lower_matrix, &ring),
             Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
         ));
         let lower_row = (lower_entry.clone(), lower_entry);
         assert!(matches!(
-            checked_mod_down_encoding(
-                lower_row,
-                BigInt::from(level.modulus().as_ref().clone()),
-                &low.to_crt().0,
-            ),
+            checked_mod_down_encoding(lower_row, &ring),
             Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
         ));
     }
@@ -1656,9 +1692,9 @@ mod tests {
     #[test]
     fn planned_crt_depth_keeps_three_operation_windows() {
         let depths =
-            (0..=7).map(|level| planned_crt_depth(level, 3, 6, 2).unwrap()).collect::<Vec<_>>();
+            (0..=7).map(|level| planned_crt_depth(level, 3, 1, 6, 2).unwrap()).collect::<Vec<_>>();
         assert_eq!(depths, vec![6, 6, 6, 5, 5, 5, 4, 4]);
-        assert!(planned_crt_depth(0, 0, 6, 2).is_err());
+        assert!(planned_crt_depth(0, 0, 1, 6, 2).is_err());
     }
 
     #[test]
@@ -1671,8 +1707,8 @@ mod tests {
         let action = ((low_one.clone(), low_one.clone()), (low_one.clone(), low_one.clone()));
         let decomposition = compact_decompose_matrix(&parameters, 0, 1, action.clone()).unwrap();
         assert_eq!(
-            decomposition.0.0.matrix_type().modulus,
-            mxx_ir_core::IntExpr::constant(BigInt::from(high.modulus().as_ref().clone()))
+            crate::test_support::modulus_of(decomposition.0.0.matrix_type()),
+            BigInt::from(high.modulus().as_ref().clone())
         );
         let high_ring = parameters.ring(0).unwrap();
         let high_one = high_ring.polynomial([mxx_ir_core::IntExpr::constant(BigInt::from(1u8))]);
@@ -1696,10 +1732,7 @@ mod tests {
             parameters.ring(1).unwrap().polynomial([IntExpr::constant(BigInt::from(-1i8))]);
         let action = ((negative.clone(), negative.clone()), (negative.clone(), negative.clone()));
         let decomposition = compact_decompose_matrix(&parameters, 0, 1, action).unwrap();
-        assert_eq!(
-            decomposition.0.0.matrix_type().ring_dimension,
-            IntExpr::constant(BigInt::from(16u8))
-        );
+        assert_eq!(decomposition.0.0.matrix_type().ring.ring_dimension(), 16);
     }
 
     #[test]
@@ -1735,16 +1768,22 @@ mod tests {
 
     #[test]
     fn checked_modulus_conversion_handles_greater_equal_and_less() {
-        let source_ring = Ring::new(BigInt::from(105u8), 4);
+        use crate::test_support::{explicit_ring, modulus_of, primes};
+        let primes = primes(4, 3, 17);
+        let source_ring = explicit_ring(&primes, 4);
+        let small_ring = explicit_ring(&primes[..2], 4);
         let source = source_ring.input("checked-modulus-source", (1, 1));
-        let reduced = checked_modulus_convert(source.clone(), BigInt::from(15u8)).unwrap();
-        let equal = checked_modulus_convert(source.clone(), BigInt::from(105u8)).unwrap();
-        let less_source = Ring::new(BigInt::from(15u8), 4).input("checked-modulus-less", (1, 1));
-        let extended = checked_modulus_convert(less_source, BigInt::from(105u8)).unwrap();
+        let reduced = checked_modulus_convert(source.clone(), &small_ring).unwrap();
+        let equal = checked_modulus_convert(source.clone(), &source_ring).unwrap();
+        let less_source = small_ring.input("checked-modulus-less", (1, 1));
+        let extended = checked_modulus_convert(less_source, &source_ring).unwrap();
 
-        assert_eq!(reduced.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
+        assert_eq!(modulus_of(reduced.matrix_type()), BigInt::from(primes[0]) * primes[1]);
         assert_eq!(equal.flatten(), source.flatten());
-        assert_eq!(extended.matrix_type().modulus, IntExpr::constant(BigInt::from(105u8)));
+        assert_eq!(
+            modulus_of(extended.matrix_type()),
+            BigInt::from(primes[0]) * primes[1] * primes[2]
+        );
 
         let graph = mxx_dsl::DslContext::new("checked-modulus-conversion")
             .transferred_output("reduced", reduced)
@@ -1755,7 +1794,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        graph
+            .validate(
+                &mxx_ir_core::ParamEnv::default(),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .unwrap();
     }
 
     fn helper_test_parameters() -> RnsBggParameters {

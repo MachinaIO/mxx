@@ -7,14 +7,13 @@ description = "Private exponent-LUT programs over RNS-BGG encodings"
 
 [features]
 default = []
-gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
+gpu = ["mxx-backends/gpu"]
 test-utils = []
 
 [dependencies]
 mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
-mxx-primitives.workspace = true
-mxx-runtime.workspace = true
+mxx-backends.workspace = true
 bigdecimal.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
@@ -23,12 +22,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 rand.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rayon.workspace = true
 tempfile.workspace = true
-mxx-bench-estimator = { workspace = true, features = ["gpu"] }
-mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 serial_test.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -2,6 +2,13 @@
 
 ## Status and scope
 
+Status note (2026-09-23): this plan is not the implemented design. The current multi-GPU runtime
+(`docs/architecture.md`, section 6.4) shards matrix-product columns, preimage column tiles, and
+outermost parallel-loop lanes over logical devices inside one CUDA Graph per region, with widths
+chosen by the measured W/C trials. Per-device VRAM calibration, `MXX_GPU_VRAM_PERCENT`, and
+estimator calibration reuse described below are not implemented. The rule that every CRT limb of a
+shard stays on one device still holds. The text below is kept as a historical design record.
+
 This document is the normative design for executing and estimating GPU matrix
 operations across every configured GPU. It is self-contained: it defines the
 runtime representation, the estimator contract, dynamic per-device wave widths,
@@ -116,16 +123,16 @@ meanings and remain independent of this percentage.
 
 ## Ownership and crate boundary
 
-`mxx-runtime` owns the fleet matrix representation, fleet scheduler, calibration
-signature and profile types, and the reusable calibration registry.
-`mxx-bench-estimator` depends on `mxx-runtime`, invokes these production APIs,
-and returns or shares the resulting registry. This preserves the dependency
-direction in `docs/architecture.md`; runtime must not depend on the estimator.
+`mxx-backends` owns the fleet matrix representation, fleet scheduler, calibration
+signature and profile types, the reusable calibration registry, and the
+production-equivalent warmup that freezes an execution plan. The report returned
+by that warmup is the sole estimate for the planned run, preserving the dependency
+direction in `docs/architecture.md` without a separate estimator package.
 
 Native memory-pool high-water queries and reset operations belong to
-`mxx-primitives` and its CUDA implementation. CUDA headers expose only the
+`mxx-backends` and its CUDA implementation. CUDA headers expose only the
 cross-file or Rust-facing declarations; implementation bodies remain under
-`crates/primitives/cuda/src/`.
+`crates/backends/cuda/src/`.
 
 ## Fleet matrix representation
 
@@ -640,7 +647,7 @@ diagnostics.
 
 1. **Configuration and CUDA probes**
    - Replace the small-matrix percentage variable with
-     `MXX_GPU_VRAM_PERCENT` in `crates/primitives/src/env.rs`.
+     `MXX_GPU_VRAM_PERCENT` in `crates/backends/src/env.rs`.
    - Cache checked per-device total and budget bytes in GPU contexts.
    - Add context-local CUDA memory-pool current/high-water query and reset APIs.
    - Remove every column-width environment control and compatibility alias.
@@ -724,8 +731,8 @@ Required focused tests include:
 - event-safe early drops and repeated execution without implicit synchronization.
 
 After focused tests, run CPU and GPU workspace unit-test builds with no new
-warnings attributable to this change and the full allowed `mxx-primitives` and
-`mxx-runtime` unit suites. Run the built GPU
+warnings attributable to this change and the full allowed `mxx-backends` and
+`mxx-backends` unit suites. Run the built GPU
 test binaries repeatedly with identical multithreaded commands as required by
 `GPU.md`. Do not use synchronization to hide intermittent failures.
 

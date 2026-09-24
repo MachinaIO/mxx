@@ -40,6 +40,7 @@ pub fn export_claim(
     semantics: &ClaimSemantics<'_>,
     manifests: &BTreeMap<crate::artifact::ProductionId, crate::artifact::Manifest>,
     directory: &std::path::Path,
+    resolve_basis: crate::ResolveCrtBasis,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
         lean::{ExportOptions, export},
@@ -58,13 +59,13 @@ pub fn export_claim(
             .requirements
             .iter()
             .enumerate()
-            .map(|(index, requirement)| (format!("Requirement_{index}"), &requirement.graph)),
+            .map(|(index, requirement)| (format!("Requirement_{index}"), requirement.graph())),
     );
-    graphs.push(("Ideal".into(), &declaration.bundle.ideal.graph));
+    graphs.push(("Ideal".into(), declaration.bundle.ideal.graph()));
     declaration.validate()?;
     let mut generated = BTreeMap::new();
     for (name, graph) in graphs {
-        let validated = validate_with_manifests(graph, bindings, manifests)?;
+        let validated = validate_with_manifests(graph, bindings, manifests, resolve_basis)?;
         let artifact = export(
             &validated,
             &ExportOptions {
@@ -95,7 +96,7 @@ pub fn export_claim(
             .collect(),
         ideal: generated.remove("Ideal").expect("exported ideal"),
     };
-    let claim = assemble_claim(protocol, &roots, bindings, backend, semantics)?;
+    let claim = assemble_claim(protocol, &roots, bindings, backend, semantics, resolve_basis)?;
     fs::write(directory.join("Claim.lean"), claim)?;
     Ok(())
 }
@@ -181,6 +182,7 @@ pub fn assemble_claim(
     bindings: &ParamEnv,
     backend: &ClaimBackend<'_>,
     semantics: &ClaimSemantics<'_>,
+    resolve_basis: crate::ResolveCrtBasis,
 ) -> Result<String, ProtocolExportError> {
     declaration.validate().map_err(|error| ProtocolExportError::Invalid(error.to_string()))?;
     let bundle = &declaration.bundle;
@@ -210,14 +212,14 @@ pub fn assemble_claim(
         bundle.requirements.iter().zip(&roots.requirements).enumerate()
     {
         entries.push(ClaimRoot {
-            graph: &requirement.graph,
+            graph: requirement.graph(),
             artifact,
             field: format!("requirement_{index}"),
         });
     }
     let ideal_position = entries.len();
     entries.push(ClaimRoot {
-        graph: &bundle.ideal.graph,
+        graph: bundle.ideal.graph(),
         artifact: &roots.ideal,
         field: "ideal".into(),
     });
@@ -323,7 +325,7 @@ pub fn assemble_claim(
             },
         },
     };
-    claim::assemble_claim(&claim, bindings, backend, semantics)
+    claim::assemble_claim(&claim, bindings, backend, semantics, resolve_basis)
         .map_err(ProtocolExportError::Invalid)
 }
 
@@ -371,8 +373,7 @@ mod tests {
 
         let unsupported = InputValueContract::MatrixLarge {
             matrix_type: MatrixType {
-                modulus: 17.into(),
-                ring_dimension: 8.into(),
+                ring: crate::ring::test_ring(17, 8),
                 rows: 1.into(),
                 columns: 1.into(),
             },

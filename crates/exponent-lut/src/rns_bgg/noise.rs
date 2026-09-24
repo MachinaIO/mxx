@@ -26,8 +26,8 @@ use crate::{
     },
 };
 use bigdecimal::BigDecimal;
+use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use mxx_ir_core::{IntExpr, ParamEnv, types::WireType};
-use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,7 @@ fn refresh_crt_weight(plaintext_moduli: &[BigUint], slot: usize) -> Result<BigUi
     let total = plaintext_moduli.iter().product::<BigUint>();
     let qt = plaintext_moduli.get(slot).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
     let base = &total / qt;
-    let inverse = mxx_primitives::utils::mod_inverse_biguints(&(&base % qt), qt)
+    let inverse = mxx_backends::utils::mod_inverse_biguints(&(&base % qt), qt)
         .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
     Ok(base * inverse)
 }
@@ -262,9 +262,36 @@ impl RnsBggParameters {
         Ok(modulus.as_ref() > &(&noise.bound.error * 4u8))
     }
 
-    /// Preserve the established LUT recurrence while taking level ownership
-    /// from the derived workload.
+    /// Flat-LUT noise after its single scale-and-round by `p = q_l/q_(l+1)`
+    /// (spec §8.2): the branch sum of [`Self::lut_noise_bound_before_mod_down`]
+    /// converted once by [`Self::lut_mod_down_bound`].
     pub fn lut_noise_bound(
+        &self,
+        level: usize,
+        input: &RnsBggNoiseBound,
+        branches: usize,
+        fresh_error_gain: &BigUint,
+        output_payload_l1: BigUint,
+    ) -> Result<RnsBggNoiseBound, RnsBggError> {
+        let before = self.lut_noise_bound_before_mod_down(
+            level,
+            input,
+            branches,
+            fresh_error_gain,
+            output_payload_l1,
+        )?;
+        Ok(RnsBggNoiseBound {
+            error: self.lut_mod_down_bound(level, &before.error)?,
+            payload_l1: before.payload_l1,
+        })
+    }
+
+    /// Flat-LUT noise of the summed branches before the scale-and-round, in
+    /// level-`level` units: `J K (e + e_h) + J p ||x||_1 e_C` plus the `J`
+    /// mask-rounding remainders `s_sigma rho`, each at most `(n+1)(p-1)/2`.
+    /// The RHS fresh error is multiplied by `p`, so the one later division
+    /// leaves it undivided.
+    pub fn lut_noise_bound_before_mod_down(
         &self,
         level: usize,
         input: &RnsBggNoiseBound,
@@ -280,7 +307,6 @@ impl RnsBggParameters {
         let p = self.scale(level)?;
         let n = BigUint::from(source.ring_dimension());
         let j = BigUint::from(branches);
-        let twice_p = p * 2u8;
         let inherited = &j *
             &n *
             (BigUint::one() << next.base_bits()) *
@@ -288,12 +314,26 @@ impl RnsBggParameters {
             (&input.error + self.encoding_error_bound()) *
             2u8;
         let fresh =
-            &j * &input.payload_l1 * fresh_error_gain * self.encoding_error_bound() * &twice_p;
-        let rounding = ((&j + 1u8) * (&n + 1u8) + 1u8) * (p - 1u8);
+            &j * &input.payload_l1 * fresh_error_gain * self.encoding_error_bound() * p * 2u8;
+        let rounding = &j * (&n + 1u8) * (p - 1u8);
         Ok(RnsBggNoiseBound {
-            error: (inherited + fresh + rounding + &twice_p - 1u8) / twice_p,
+            error: (inherited + fresh + rounding + 1u8) / 2u8,
             payload_l1: output_payload_l1,
         })
+    }
+
+    /// Scale-and-round a level-`level` LUT noise bound once by `p`, adding the
+    /// public-key rounding under the mask secret and the encoding rounding,
+    /// `(n+1)/2 + 1/2`: `ceil((2 e + (n+2)(p-1)) / 2p)`.
+    pub fn lut_mod_down_bound(
+        &self,
+        level: usize,
+        error: &BigUint,
+    ) -> Result<BigUint, RnsBggError> {
+        let p = self.scale(level)?;
+        let n = BigUint::from(self.level(level)?.ring_dimension());
+        let twice_p = p * 2u8;
+        Ok((error * 2u8 + (&n + 2u8) * (p - 1u8) + &twice_p - 1u8) / twice_p)
     }
 
     /// Check the deterministic q/4 correctness threshold and q/2 message
@@ -572,6 +612,44 @@ impl RnsBggParameters {
         payload_gain: &RightActionNoiseGain,
         fresh_error_gain: &RightActionNoiseGain,
     ) -> Result<NonnegativeRational, RnsBggError> {
+        let before = self.lut_noise_variance_before_mod_down(
+            level,
+            input_variance,
+            branches,
+            payload_gain,
+            fresh_error_gain,
+        )?;
+        let p = self.scale(level)?;
+        Ok(before
+            .scaled_ratio(&BigUint::one(), &(p * p))
+            .add(&self.lut_public_rounding_variance(level)?)
+            .add(&NonnegativeRational::new(p * p - 1u8, 12u8 * p * p).expect("positive scale")))
+    }
+
+    /// Variance of the public-key rounding under the mask secret after the
+    /// scale-and-round: `E||[s_bar,1]||_2^2 (p^2-1)/(12 p^2)` with
+    /// `E||[s_bar,1]||_2^2 = (2N+3)/3`.
+    pub fn lut_public_rounding_variance(
+        &self,
+        level: usize,
+    ) -> Result<NonnegativeRational, RnsBggError> {
+        let p = self.scale(level)?;
+        let n = BigUint::from(self.level(level)?.ring_dimension());
+        let p_squared = p * p;
+        Ok(NonnegativeRational::new((n * 2u8 + 3u8) * (&p_squared - 1u8), 36u8 * p_squared)
+            .expect("positive scale"))
+    }
+
+    /// Flat-LUT variance of the summed branches before the scale-and-round,
+    /// in level-`level` units, with the `J` internal mask remainders.
+    pub fn lut_noise_variance_before_mod_down(
+        &self,
+        level: usize,
+        input_variance: &NonnegativeRational,
+        branches: usize,
+        payload_gain: &RightActionNoiseGain,
+        fresh_error_gain: &RightActionNoiseGain,
+    ) -> Result<NonnegativeRational, RnsBggError> {
         let p = self.scale(level)?;
         let next = self.level(level + 1)?;
         let n = BigUint::from(next.ring_dimension());
@@ -587,22 +665,22 @@ impl RnsBggParameters {
                 &n *
                 (BigUint::one() << (2 * next.base_bits())) *
                 next.modulus_digits(),
-            &input_and_helper.denominator * 2u8 * &p_squared,
+            &input_and_helper.denominator * 2u8,
         )
-        .expect("positive scale and variance denominator");
+        .expect("positive variance denominator");
         // Automorphisms preserve both norms. Combine deterministic actions on
         // each F_k before estimating convolution, just as for the direct gate.
         let fresh_gain = (payload_gain.l1.pow(2) * &fresh_error_gain.l2_squared)
             .min(&payload_gain.l2_squared * fresh_error_gain.l1.pow(2));
-        let fresh = gaussian.scaled(&(&j * fresh_gain));
-        // J internal public remainders, one outer public remainder, and one
-        // outer encoding remainder. E||[s_bar,1]||_2^2 = (2N+3)/3.
-        // The two outer terms occur once, after the branch sum.
+        let fresh = gaussian.scaled(&(&j * fresh_gain * &p_squared));
+        // The J internal public remainders; the outer public and encoding
+        // remainders occur once, in the scale-and-round after the branch sum.
+        // E||[s_bar,1]||_2^2 = (2N+3)/3.
         let rounding = NonnegativeRational::new(
-            ((&j + 1u8) * (&n * 2u8 + 3u8) + 3u8) * (&p_squared - 1u8),
-            36u8 * &p_squared,
+            &j * (&n * 2u8 + 3u8) * (&p_squared - 1u8),
+            BigUint::from(36u8),
         )
-        .expect("positive scale");
+        .expect("positive denominator");
         Ok(inherited_and_helper.add(&fresh).add(&rounding))
     }
 
@@ -2415,32 +2493,43 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 }
                 let level = self.level(wire)?;
                 let ratio = self.parameters.scale(level)?.clone();
-                value.bound.error += self.parameters.encoding_error_bound();
-                value.bound.error = refresh_channel_mod_down_bound(&value.bound.error, &ratio)?;
-                if let Some(moments) = value.moments.take() {
-                    let with_encoding = moments.add_with_covariance(
-                        &NoiseMoments {
-                            mean_numerator: BigInt::zero(),
-                            mean_denominator: BigUint::one(),
-                            mean_radius: NonnegativeRational::zero(),
-                            variance: self.parameters.encoding_error_variance(),
-                        },
-                        NoiseCorrelation::Unknown,
-                    );
-                    let switched = with_encoding.linear_image(
-                        &NonnegativeRational::new(BigUint::one(), ratio.clone())
-                            .expect("positive coefficient modulus ratio"),
-                        with_encoding.variance.scaled_ratio(&BigUint::one(), &ratio.pow(2u32)),
-                    );
-                    value.moments = Some(if ratio == BigUint::one() {
-                        switched
-                    } else {
-                        switched.add_with_covariance(
-                            &NoiseMoments::discrete_rounding_residue(&ratio)
-                                .map_err(|error| RnsBggError::Graph(error.to_string()))?,
-                            NoiseCorrelation::Independent,
-                        )
-                    });
+                if ratio == BigUint::one() {
+                    // The terminal level has no scale-and-round.
+                    value.bound.error += self.parameters.encoding_error_bound();
+                    if let Some(moments) = value.moments.take() {
+                        value.moments = Some(moments.add_with_covariance(
+                            &NoiseMoments {
+                                mean_numerator: BigInt::zero(),
+                                mean_denominator: BigUint::one(),
+                                mean_radius: NonnegativeRational::zero(),
+                                variance: self.parameters.encoding_error_variance(),
+                            },
+                            NoiseCorrelation::Unknown,
+                        ));
+                    }
+                } else {
+                    // The aggregated noise is still before the flat LUT's one
+                    // scale-and-round (spec §8.2); convert it exactly once,
+                    // with the public-key and encoding roundings.
+                    value.bound.error =
+                        self.parameters.lut_mod_down_bound(level, &value.bound.error)?;
+                    if let Some(moments) = value.moments.take() {
+                        let switched = moments.linear_image(
+                            &NonnegativeRational::new(BigUint::one(), ratio.clone())
+                                .expect("positive coefficient modulus ratio"),
+                            moments
+                                .variance
+                                .scaled_ratio(&BigUint::one(), &ratio.pow(2u32))
+                                .add(&self.parameters.lut_public_rounding_variance(level)?),
+                        );
+                        value.moments = Some(
+                            switched.add_with_covariance(
+                                &NoiseMoments::discrete_rounding_residue(&ratio)
+                                    .map_err(|error| RnsBggError::Graph(error.to_string()))?,
+                                NoiseCorrelation::Independent,
+                            ),
+                        );
+                    }
                 }
                 if ratio != BigUint::one() {
                     let source = stable_source_id(&(
@@ -2752,11 +2841,21 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         );
         let terminal_coefficient =
             coefficient_output && level + 1 >= self.parameters.levels().len();
+        // A coefficient output keeps its noise before the scale-and-round
+        // through its aggregation; `finish_outputs` converts it exactly once.
         let bound = if terminal_coefficient {
             RnsBggNoiseBound {
                 error: input.1.bound.error.clone(),
                 payload_l1: output_payload_l1.clone(),
             }
+        } else if coefficient_output {
+            self.parameters.lut_noise_bound_before_mod_down(
+                level,
+                &input.1.bound,
+                table.values().len(),
+                &fresh_error_gain.l1,
+                output_payload_l1,
+            )?
         } else {
             self.parameters.lut_noise_bound(
                 level,
@@ -2771,18 +2870,34 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             .moments
             .as_ref()
             .map(|m| {
+                let payload_gain = RightActionNoiseGain {
+                    l1: input.1.bound.payload_l1.clone(),
+                    l2_squared: input.1.payload_l2_squared.clone(),
+                };
                 if terminal_coefficient {
                     Ok(m.clone())
+                } else if coefficient_output {
+                    // Level-`level` units: the mean is scaled by `p` here and
+                    // divided by it once in `finish_outputs`.
+                    let p = self.parameters.scale(level)?.clone();
+                    self.parameters
+                        .lut_noise_variance_before_mod_down(
+                            level,
+                            &m.variance,
+                            table.values().len(),
+                            &payload_gain,
+                            &fresh_error_gain,
+                        )
+                        .map(|v| {
+                            m.linear_image(&NonnegativeRational::new(p, BigUint::one()).unwrap(), v)
+                        })
                 } else {
                     self.parameters
                         .lut_noise_variance(
                             level,
                             &m.variance,
                             table.values().len(),
-                            &RightActionNoiseGain {
-                                l1: input.1.bound.payload_l1.clone(),
-                                l2_squared: input.1.payload_l2_squared.clone(),
-                            },
+                            &payload_gain,
                             &fresh_error_gain,
                         )
                         .map(|v| {
@@ -2953,6 +3068,10 @@ pub struct RnsBggPlanRequest {
     pub terminal_value_bound: BigUint,
     /// Logical operations per physical drop.
     pub operations_per_drop: usize,
+    /// CRT primes removed by each physical drop. The drop quotient is the
+    /// message scale that a level's noise must stay below half of, so its
+    /// width, not only the drop cadence, decides whether a level fits.
+    pub primes_per_drop: usize,
 }
 
 /// Serialized parameter-search evidence.
@@ -3050,6 +3169,7 @@ impl RnsBggParameters {
         program: &ExponentLutProgram,
     ) -> Result<Self, RnsBggError> {
         if request.operations_per_drop == 0 ||
+            request.primes_per_drop == 0 ||
             request.terminal_depth == 0 ||
             request.max_crt_depth < request.terminal_depth
         {
@@ -3072,6 +3192,7 @@ impl RnsBggParameters {
             let depth = super::planned_crt_depth(
                 index,
                 request.operations_per_drop,
+                request.primes_per_drop,
                 request.max_crt_depth,
                 request.terminal_depth,
             )?;
@@ -4171,7 +4292,7 @@ mod test {
     #[test]
     fn cadence_maps_logical_levels_to_equal_modulus_windows() {
         let depths = (0..=8)
-            .map(|level| crate::rns_bgg::planned_crt_depth(level, 3, 6, 2).unwrap())
+            .map(|level| crate::rns_bgg::planned_crt_depth(level, 3, 1, 6, 2).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(depths, vec![6, 6, 6, 5, 5, 5, 4, 4, 4]);
     }
@@ -4482,9 +4603,8 @@ mod test {
         let mut evaluator = RnsBggNoiseEvaluator::new(&parameters, &program, &workload, &bindings);
         let outputs =
             evaluator.finish_outputs(vec![(output, value(&[1])), (output, value(&[1]))]).unwrap();
-        let ratio = parameters.scale(0).unwrap();
-        let expected =
-            refresh_channel_mod_down_bound(parameters.encoding_error_bound(), ratio).unwrap();
+        // The aggregated pre-rounding noise is scaled and rounded once.
+        let expected = parameters.lut_mod_down_bound(0, &value(&[1]).bound.error).unwrap();
 
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].bound.error, expected);

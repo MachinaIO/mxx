@@ -5,19 +5,14 @@ use crate::{
     graph::CompileParameter,
     lean::{BackendLayout, ExportOptions, export},
     node::NodeKind,
-    types::MatrixType,
-    validate,
+    types::{CoefficientBoundDomain, MatrixType},
 };
 use std::collections::BTreeMap;
 
 #[test]
 fn export_gadget_fixture() {
-    let matrix = MatrixType {
-        modulus: 17.into(),
-        ring_dimension: 2.into(),
-        rows: 1.into(),
-        columns: 1.into(),
-    };
+    let matrix =
+        MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
     let input = NodeHandle::new(
         NodeKind::Input {
             name: "target".into(),
@@ -35,6 +30,7 @@ fn export_gadget_fixture() {
         vec![WireType::Preimage {
             matrix: MatrixType { rows: 5.into(), ..matrix },
             max_coefficient_bound: 1.into(),
+            bound_domain: CoefficientBoundDomain::Global,
         }],
     )
     .output(0)
@@ -52,7 +48,7 @@ fn export_gadget_fixture() {
     )
     .unwrap()
     .0;
-    let checked = validate(&graph, &ParamEnv::default()).unwrap();
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let artifact = export(
         &checked,
         &ExportOptions {
@@ -78,4 +74,60 @@ theorem generated_gadget_relation
   exact sampleRuns
 "#;
     super::write_fixture("gadget", format!("{}\n{}", artifact.source, proof));
+}
+
+#[test]
+fn export_small_gadget_uses_per_tower_relation() {
+    let matrix =
+        MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
+    let input = NodeHandle::new(
+        NodeKind::Input {
+            name: "target".into(),
+            wire_type: WireType::Matrix(matrix.clone()),
+            artifact: None,
+        },
+        vec![],
+        vec![WireType::Matrix(matrix.clone())],
+    )
+    .output(0)
+    .unwrap();
+    let decomposition = NodeHandle::new(
+        NodeKind::GadgetDecompose { base: 2.into(), small: true, digit_count: 5.into() },
+        vec![input],
+        vec![WireType::Preimage {
+            matrix: MatrixType { rows: 5.into(), ..matrix },
+            max_coefficient_bound: 1.into(),
+            bound_domain: CoefficientBoundDomain::PerCrtLimb,
+        }],
+    )
+    .output(0)
+    .unwrap();
+    let graph = Graph::freeze(
+        "small-gadget",
+        Vec::<CompileParameter>::new(),
+        BTreeMap::from([(
+            "decomposition".into(),
+            GraphOutput { value: decomposition, availability: None },
+        )]),
+        vec![],
+        vec![],
+        BTreeMap::new(),
+    )
+    .unwrap()
+    .0;
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+    let artifact = export(
+        &checked,
+        &ExportOptions {
+            backend_layouts: vec![BackendLayout {
+                modulus: 17.into(),
+                ring_dimension: 2,
+                base: 2.into(),
+                regular_digits: 5,
+            }],
+            ..ExportOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(artifact.source.contains("MxxRuntime.smallGadgetDecomposeRuns backend 2 5"));
 }

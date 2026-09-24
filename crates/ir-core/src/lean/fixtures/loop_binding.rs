@@ -4,7 +4,6 @@ use crate::{
     graph::{SubgraphHandle, with_new_construction_scope},
     lean::{ExportOptions, export},
     node::{NodeKind, ParallelLoop, SequentialLoop},
-    validate,
 };
 use std::collections::BTreeMap;
 
@@ -88,7 +87,7 @@ fn export_loop_binding_fixture() {
     )
     .unwrap()
     .0;
-    let validated = validate(&graph, &ParamEnv::default()).unwrap();
+    let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let artifact = export(&validated, &ExportOptions::default()).unwrap();
     assert!(artifact.source.contains("∀ i : Fin 3, 1 ≠ 0"));
     assert!(artifact.source.contains("(current next : Int) => 1 ≠ 0"));

@@ -134,6 +134,36 @@ fn start(command: &mut Command, module: String, log: PathBuf) -> Result<Running,
     Ok(Running { module, child, log })
 }
 
+fn start_with_separate_stdout(
+    command: &mut Command,
+    module: String,
+    log: PathBuf,
+    stdout_log: &Path,
+) -> Result<Running, CheckError> {
+    let stderr_log = File::create(&log).map_err(io_error("create Lean log"))?;
+    let stdout = File::create(stdout_log).map_err(io_error("create Lean stdout log"))?;
+    let program = command.get_program().to_string_lossy().into_owned();
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr_log))
+        .spawn()
+        .map_err(|source| CheckError::Spawn { program, source })?;
+    Ok(Running { module, child, log })
+}
+
+fn lake_environment_lines(stdout: &str) -> Result<(&str, &str), CheckError> {
+    let mut lines = stdout.lines();
+    let library_line =
+        lines.next().ok_or_else(|| CheckError::Environment("missing LEAN_PATH".into()))?;
+    let executable_line =
+        lines.next().ok_or_else(|| CheckError::Environment("missing PATH".into()))?;
+    if lines.next().is_some() {
+        return Err(CheckError::Environment("unexpected Lake output".into()));
+    }
+    Ok((library_line, executable_line))
+}
+
 fn poll(running: &mut Running, deadline: Instant) -> Result<bool, CheckError> {
     if let Some(status) = running.child.try_wait().map_err(io_error("poll Lean process"))? {
         if !status.success() {
@@ -180,23 +210,26 @@ pub fn check_generated_modules(directory: &Path, timeout: Duration) -> Result<()
         "LEAN_PATH",
         "PATH",
     ]);
-    let mut setup =
-        start(&mut environment, "environment".into(), directory.join("lean-environment.log"))?;
+    let environment_log = directory.join("lean-environment.log");
+    let environment_stdout = directory.join("lean-environment.stdout");
+    let mut setup = start_with_separate_stdout(
+        &mut environment,
+        "environment".into(),
+        environment_log.clone(),
+        &environment_stdout,
+    )?;
     while !poll(&mut setup, deadline)? {
         thread::sleep(Duration::from_millis(10));
     }
-    let text = fs::read_to_string(&setup.log).map_err(io_error("read Lean environment"))?;
-    let mut lines = text.lines();
-    let library_line =
-        lines.next().ok_or_else(|| CheckError::Environment("missing LEAN_PATH".into()))?;
-    let executable_line =
-        lines.next().ok_or_else(|| CheckError::Environment("missing PATH".into()))?;
-    if lines.next().is_some() {
-        return Err(CheckError::Environment(format!(
-            "unexpected Lake output; see {}",
-            setup.log.display()
-        )));
-    }
+    let text =
+        fs::read_to_string(&environment_stdout).map_err(io_error("read Lean environment"))?;
+    let (library_line, executable_line) = lake_environment_lines(&text).map_err(|error| {
+        CheckError::Environment(format!(
+            "{error}; stdout: {}, stderr: {}",
+            environment_stdout.display(),
+            environment_log.display()
+        ))
+    })?;
     let libraries: Vec<_> = std::env::split_paths(library_line).collect();
     validate_dependencies(&modules, &libraries)?;
     let lean = std::env::split_paths(executable_line)
@@ -286,6 +319,24 @@ mod tests {
         assert!(matches!(
             validate_dependencies(&local_imports(directory.path()).unwrap(), &[]),
             Err(CheckError::MissingDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn lake_environment_ignores_informational_stderr_when_parsing_stdout() {
+        let lake_stderr = "info: downloading pinned package\ninfo: building package\n";
+        let lake_stdout = "/pinned/.lake/build/lib/lean:/local/lib\n/usr/bin:/bin\n";
+        assert!(lake_stderr.contains("info:"));
+        let (library_path, executable_path) = lake_environment_lines(lake_stdout).unwrap();
+        assert_eq!(library_path, "/pinned/.lake/build/lib/lean:/local/lib");
+        assert_eq!(executable_path, "/usr/bin:/bin");
+    }
+
+    #[test]
+    fn lake_environment_rejects_extra_stdout_lines() {
+        assert!(matches!(
+            lake_environment_lines("/lib\n/bin\nunexpected\n"),
+            Err(CheckError::Environment(message)) if message == "unexpected Lake output"
         ));
     }
 

@@ -3,8 +3,14 @@
 //! Public RNS-BGG NAND application workflow.
 
 use bigdecimal::BigDecimal;
-use mxx_bench_estimator::{
-    estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
+use mxx_backends::{
+    GpuRuntime,
+    artifact::MemoryArtifactStore,
+    backend::poly_gpu::gpu_backend_on,
+    poly::{
+        Poly, PolyParams,
+        dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
+    },
 };
 use mxx_exponent_lut::{
     ExpLayout, NandCircuit, api,
@@ -21,22 +27,14 @@ use mxx_exponent_lut::{
     },
 };
 use mxx_ir_core::ParamEnv;
-use mxx_primitives::poly::{
-    Poly, PolyParams,
-    dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
-};
-use mxx_runtime::{
-    artifact::MemoryArtifactStore,
-    backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
-};
 use num_bigint::{BigInt, BigUint};
 use serial_test::serial as sequential;
 use std::env;
 
-const HASH_KEY: &[u8] = b"nand-rns-public-api-v1";
+const HASH_KEY: &[u8; 32] = b"nand-rns-public-api-hash-key-v01";
 const NAND_DEPTH_ENV: &str = "MXX_EXPONENT_LUT_NAND_DEPTH";
 
-fn nand_fixture() -> (NandCircuit, usize, Vec<Vec<bool>>) {
+fn nand_fixture() -> (NandCircuit, usize, Vec<bool>) {
     let depth = env::var(NAND_DEPTH_ENV)
         .unwrap_or_else(|_| "1".to_owned())
         .parse::<u32>()
@@ -78,17 +76,17 @@ fn nand_fixture() -> (NandCircuit, usize, Vec<Vec<bool>>) {
     assert_eq!(circuit.input_count(), leaves);
     assert_eq!(circuit.gates().len(), gate_count);
 
-    let mut assignments = vec![vec![false; leaves], vec![true; leaves]];
-    if leaves > 1 {
-        assignments.push((0..leaves).map(|index| index % 2 == 1).collect());
-    }
-    (circuit, max_lut_rounds, assignments)
+    // One round trip takes minutes at production parameters, so each run
+    // checks a single assignment whose every input is drawn at random.
+    let assignment = (0..leaves).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+    eprintln!("NAND input assignment: {assignment:?}");
+    (circuit, max_lut_rounds, assignment)
 }
 
 fn gpu_parameters(parameters: &RnsBggParameters) -> Vec<GpuDCRTPolyParams> {
     parameters
-        .levels()
-        .iter()
+        .distinct_levels()
+        .into_iter()
         .map(|level| {
             GpuDCRTPolyParams::new(
                 level.ring_dimension(),
@@ -125,15 +123,23 @@ fn select_candidate(
         .unwrap_or_else(|_| "4".to_owned())
         .parse::<BigDecimal>()
         .unwrap_or_else(|error| {
-            panic!("MXX_EXPONENT_LUT_NAND_ERROR_SIGMA must be a positive decimal: {error}")
+            panic!("MXX_EXPONENT_LUT_NAND_ERROR_SIGMA must be a nonnegative decimal: {error}")
         });
-    assert!(sigma > BigDecimal::from(0u8), "MXX_EXPONENT_LUT_NAND_ERROR_SIGMA must be positive");
+    assert!(
+        sigma >= BigDecimal::from(0u8),
+        "MXX_EXPONENT_LUT_NAND_ERROR_SIGMA must be nonnegative"
+    );
     let crt_bits = env_usize("MXX_EXPONENT_LUT_NAND_CRT_BITS", 40)
         .unwrap_or_else(|error| panic!("invalid NAND CRT bits: {error}"));
     let max_crt_depth = env_usize("MXX_EXPONENT_LUT_NAND_MAX_CRT_DEPTH", 32)
         .unwrap_or_else(|error| panic!("invalid NAND maximum CRT depth: {error}"));
     let operations_per_drop = env_usize("MXX_EXPONENT_LUT_NAND_OPERATIONS_PER_DROP", 2)
         .unwrap_or_else(|error| panic!("invalid NAND operations-per-drop: {error}"));
+    // Each drop removes up to this many CRT primes; the drop quotient is the
+    // message scale that the level noise must stay below half of.
+    let max_primes_per_drop = env_usize("MXX_EXPONENT_LUT_NAND_MAX_PRIMES_PER_DROP", 4)
+        .unwrap_or_else(|error| panic!("invalid NAND maximum primes-per-drop: {error}"));
+    assert!(max_primes_per_drop > 0, "MXX_EXPONENT_LUT_NAND_MAX_PRIMES_PER_DROP must be positive");
     let security_target = env_usize("MXX_EXPONENT_LUT_NAND_SECURITY_BITS", 1)
         .unwrap_or_else(|error| panic!("invalid NAND security target: {error}"));
     assert!(security_target > 0, "MXX_EXPONENT_LUT_NAND_SECURITY_BITS must be positive");
@@ -169,7 +175,10 @@ fn select_candidate(
             );
         let bindings = noise_bindings(&compiled, &sigma);
         let terminal_bounds = vec![BigUint::from(1u8); compiled.program().outputs().len()];
-        for crt_depth in 1..=max_crt_depth {
+        let depth_candidates = (1..=max_crt_depth).flat_map(|depth| {
+            (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
+        });
+        for (crt_depth, primes_per_drop) in depth_candidates {
             let request = RnsBggPlanRequest {
                 ring_dimension,
                 encoding_error_sigma: sigma.clone(),
@@ -178,6 +187,7 @@ fn select_candidate(
                 max_crt_depth: crt_depth,
                 terminal_value_bound: BigUint::from(1u8),
                 operations_per_drop,
+                primes_per_drop,
             };
             let Ok((parameters, audit_trace)) = audit_program_at_crt_depth(
                 &request,
@@ -185,6 +195,7 @@ fn select_candidate(
                 &bindings,
                 &terminal_bounds,
                 average.as_ref(),
+                0,
             ) else {
                 continue;
             };
@@ -231,14 +242,21 @@ fn select_candidate(
                 }
             }
             let source = parameters.level(0).expect("selected source level");
-            let achieved = lattice_security_bits(source, &sigma).unwrap_or_else(|error| {
-                panic!("NAND security estimation failed for n={ring_dimension}, CRT depth {crt_depth}: {error}")
-            });
+            // A zero sigma is a noise-free correctness diagnostic: without
+            // error there is no lattice security to estimate.
+            let achieved = if sigma == BigDecimal::from(0u8) {
+                eprintln!("noise-free NAND diagnostic: the lattice security gate is skipped");
+                security_target
+            } else {
+                lattice_security_bits(source, &sigma).unwrap_or_else(|error| {
+                    panic!("NAND security estimation failed for n={ring_dimension}, CRT depth {crt_depth}: {error}")
+                })
+            };
             if achieved < security_target {
                 continue;
             }
             eprintln!(
-                "selected NAND parameters: n={ring_dimension}, crt_depth={crt_depth}, security_bits={achieved}, required_security_bits={security_target}"
+                "selected NAND parameters: n={ring_dimension}, crt_depth={crt_depth}, primes_per_drop={primes_per_drop}, security_bits={achieved}, required_security_bits={security_target}"
             );
             return (
                 source.clone(),
@@ -256,10 +274,15 @@ fn select_candidate(
 #[test]
 #[sequential(dcrt_runtime)]
 fn nand_circuit_end_to_end() {
+    // Stage plans report their measured W/C selection (the benchmark
+    // estimate) through tracing; show it with `RUST_LOG=info`.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     // This is a GPU-only application fixture.  Returning here records that
     // the workflow is unverified when the required execution environment is
     // unavailable; it does not silently fall back to a CPU protocol.
-    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+    let devices = mxx_backends::poly::dcrt::gpu::detected_gpu_device_ids();
     if devices.is_empty() {
         eprintln!("skipping NAND round trip: no CUDA device detected");
         return;
@@ -267,138 +290,116 @@ fn nand_circuit_end_to_end() {
     // Select a complete binary tree from the fixture environment and compile
     // it once. `NandCircuit::evaluate` below is the independent Boolean oracle;
     // it does not inspect encoded outputs or reuse the production lowering.
-    let (circuit, max_lut_rounds, assignments) = nand_fixture();
+    let (circuit, max_lut_rounds, assignment) = nand_fixture();
     let layout = ExpLayout { stride_log2: 0, width_log2: 4 };
     let (poly_parameters, parameters, compiled, output_bound) =
         select_candidate(&circuit, layout, max_lut_rounds);
-    let payload: RnsBggPayloadSecret =
-        RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32])
-            .sample_payload_secret()
-            .expect("payload secret");
-    for assignment in assignments {
-        // Convert natural Boolean inputs into the declared LHS and fixed-RHS
-        // plaintext maps.  The RHS plaintexts remain preprocessing inputs and
-        // are never supplied to online evaluation.
-        let (lhs, rhs) = compiled
-            .plaintext_inputs::<mxx_primitives::poly::dcrt::poly::DCRTPoly>(
-                &poly_parameters,
-                &assignment,
-            )
-            .expect("NAND plaintext bindings");
-        // Encryption owns a fresh caller-supplied mask for each invocation;
-        // the mask is retained locally for the final public verification only.
-        let mask = RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, rand::random())
-            .sample_mask_secret()
-            .expect("fresh mask secret");
-        // The estimator observes each production graph before execution; its
-        // measurements are separate from correctness-oracle computation.
-        let measurement_backends = devices
-            .iter()
-            .copied()
-            .map(|device| (gpu_backend_on(gpu_parameters(&parameters), [device]), device))
-            .collect();
-        let mut estimator = GpuNodeMeasurementBackend::new(
-            measurement_backends,
-            MeasurementHarnessConfig {
-                warm_up_iterations: 1,
-                measured_iterations: 1,
-                ..MeasurementHarnessConfig::default()
-            },
-        );
-        let mut backend = gpu_backend_on(gpu_parameters(&parameters), devices.clone());
-        let mut store = MemoryArtifactStore::default();
-        let config = mxx_runtime::ExecutionConfig::default();
-        // Preprocess receives the private RHS plaintexts and caller payload,
-        // then returns two typed named-session artifacts consumed by later
-        // stages.
-        let (preprocess, online) = api::preprocess(
-            compiled.program(),
-            &ParamEnv::default(),
-            &rhs,
-            &payload,
-            HASH_KEY,
-            RnsPreprocessBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32]),
-            &mut backend,
-            &mut store,
-            config.clone(),
-            |_, outputs| Ok(outputs),
-            |validated| {
-                estimate(validated, &mut estimator).expect("estimate preprocess graph");
-                estimator.measure_collected().expect("measure preprocess graph");
-                let report = estimate(validated, &mut estimator).expect("preprocess estimate");
-                assert!(report.total_work_seconds > 0.0);
-                Ok(())
-            },
-        )
-        .expect("public preprocessing");
-        // Encrypt receives public LHS plaintexts, the fresh private mask, and
-        // the preprocess artifact.  Its estimate and execution share one
-        // graph construction path.
-        let encrypted = api::encrypt(
-            &compiled.program().encryption_inputs(),
-            &ParamEnv::default(),
-            &lhs,
-            &preprocess,
-            &payload,
-            &mask,
-            HASH_KEY,
-            RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32]),
-            &mut backend,
-            &mut store,
-            config.clone(),
-            |_| Ok(()),
-            |validated| {
-                estimate(validated, &mut estimator).expect("estimate encrypt graph");
-                estimator.measure_collected().expect("measure encrypt graph");
-                let report = estimate(validated, &mut estimator).expect("encrypt estimate");
-                assert!(report.total_work_seconds > 0.0);
-                Ok(())
-            },
-        )
-        .expect("public encryption");
-        // Online evaluation receives only preparation artifacts and public
-        // configuration; preprocessing RHS plaintexts and the mask stay out
-        // of this stage.
-        let mut result = api::online_eval(
-            compiled.program(),
-            &ParamEnv::default(),
-            &online,
-            &encrypted,
-            HASH_KEY,
-            RnsOnlineBuild::new(&parameters, [0x4e; 32]),
-            &mut backend,
-            &mut store,
-            config.clone(),
-            |_, outputs| Ok(outputs),
-            |validated| {
-                estimate(validated, &mut estimator).expect("estimate online graph");
-                estimator.measure_collected().expect("measure online graph");
-                let report = estimate(validated, &mut estimator).expect("online estimate");
-                assert!(report.total_work_seconds > 0.0);
-                Ok(())
-            },
-        )
-        .expect("public online evaluation");
+    // Every stage is planned on this GPU runtime before it executes; the
+    // planner measures its W/C candidates on the real production graph and
+    // logs the selected estimate. The secrets are sampled on it and stay
+    // resident there for every stage that binds them.
+    let mut runtime = GpuRuntime::new(gpu_backend_on(gpu_parameters(&parameters), devices.clone()))
+        .expect("GPU runtime");
+    let payload: RnsBggPayloadSecret = RnsEncryptBuild::new(&parameters, [0x4e; 32])
+        .sample_payload_secret(&mut runtime, &mut MemoryArtifactStore::default())
+        .expect("payload secret");
+    let mut store = MemoryArtifactStore::default();
+    // Convert natural Boolean inputs into the declared LHS and fixed-RHS
+    // plaintext maps.  The RHS plaintexts remain preprocessing inputs and
+    // are never supplied to online evaluation.
+    let (lhs, rhs) = compiled
+        .plaintext_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(&poly_parameters, &assignment)
+        .expect("NAND plaintext bindings");
+    // Encryption owns a fresh caller-supplied mask for each invocation;
+    // the mask is retained locally for the final public verification only.
+    let mask = RnsEncryptBuild::new(&parameters, rand::random())
+        .sample_mask_secret(&mut runtime, &mut store)
+        .expect("fresh mask secret");
+    // Preprocess receives the private RHS plaintexts and caller payload,
+    // then returns two typed named-session artifacts consumed by later
+    // stages.
+    let (preprocess, online) = api::preprocess(
+        compiled.program(),
+        &ParamEnv::default(),
+        &rhs,
+        &payload,
+        HASH_KEY,
+        RnsPreprocessBuild::new(&parameters, [0x4e; 32]),
+        &mut runtime,
+        &mut store,
+        |_, outputs| Ok(outputs),
+        |_| Ok(()),
+    )
+    .expect("public preprocessing");
+    // Encrypt receives public LHS plaintexts, the fresh private mask, and
+    // the preprocess artifact.  Its estimate and execution share one
+    // graph construction path.
+    let encrypted = api::encrypt(
+        &compiled.program().encryption_inputs(),
+        &ParamEnv::default(),
+        &lhs,
+        &preprocess,
+        &payload,
+        &mask,
+        HASH_KEY,
+        RnsEncryptBuild::new(&parameters, [0x4e; 32]),
+        &mut runtime,
+        &mut store,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .expect("public encryption");
+    // Online evaluation receives only preparation artifacts and public
+    // configuration; preprocessing RHS plaintexts and the mask stay out
+    // of this stage.
+    let result = api::online_eval(
+        compiled.program(),
+        &ParamEnv::default(),
+        &online,
+        &encrypted,
+        HASH_KEY,
+        RnsOnlineBuild::new(&parameters, [0x4e; 32]),
+        &mut runtime,
+        &mut store,
+        |_, outputs| Ok(outputs),
+        |_| Ok(()),
+    )
+    .expect("public online evaluation");
 
-        // Compute the expected bit from the ordinary Boolean circuit, then
-        // verify the returned encoding through the application-facing API
-        // using the caller-retained payload and mask.
-        let expected_bit = circuit.evaluate(&assignment).expect("NAND Boolean evaluation");
-        assert!(!result.outputs.is_empty(), "online evaluation must produce output");
-        let expected = DCRTPoly::const_rotate_poly(&poly_parameters, usize::from(expected_bit));
+    // Compute the expected bit from the ordinary Boolean circuit, then
+    // verify the returned encoding through the application-facing API
+    // using the caller-retained payload and mask.
+    let expected_bit = circuit.evaluate(&assignment).expect("NAND Boolean evaluation");
+    assert!(!result.outputs.is_empty(), "online evaluation must produce output");
+    let expected = DCRTPoly::const_rotate_poly(&poly_parameters, usize::from(expected_bit));
+    verify_output(
+        compiled.program(),
+        &result,
+        0,
+        &expected,
+        &parameters,
+        &payload,
+        &mask,
+        &mut runtime,
+        &mut store,
+    )
+    .expect("NAND application verification");
+    // The same output must not verify as the other bit.
+    let wrong = DCRTPoly::const_rotate_poly(&poly_parameters, usize::from(!expected_bit));
+    assert!(
         verify_output(
             compiled.program(),
-            &mut result,
+            &result,
             0,
-            &expected,
+            &wrong,
             &parameters,
             &payload,
             &mask,
-            &mut backend,
+            &mut runtime,
             &mut store,
-            config,
         )
-        .expect("NAND application verification");
-        assert!(output_bound > 0u8.into());
-    }
+        .is_err(),
+        "NAND output must not verify as the wrong bit"
+    );
+    assert!(output_bound > 0u8.into());
 }

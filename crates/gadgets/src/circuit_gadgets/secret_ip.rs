@@ -29,19 +29,20 @@ mod tests {
         ArithmeticCircuitLowering, CircuitLoweringTypes, GateInstance, PolyGateKind,
         PublicLookupLowering, SlotOperationLowering, lower_circuit,
     };
-    use mxx_dsl::{DslContext, Mat, Ring};
-    use mxx_ir_core::{IntExpr, ParamEnv};
-    use mxx_primitives::{
+    use mxx_backends::{
+        ExecutionConfig, RuntimeValue,
+        artifact::MemoryArtifactStore,
+        backend::poly::cpu_backend,
+        execute,
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
-            Poly as ConcretePoly, PolyParams,
+            Poly as ConcretePoly,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
-    };
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
     };
+    use mxx_dsl::{DslContext, Mat, Ring};
+    use mxx_ir_core::{IntExpr, ParamEnv};
     use num_bigint::{BigInt, BigUint};
     use std::{collections::BTreeMap, convert::Infallible};
 
@@ -136,10 +137,7 @@ mod tests {
     #[test]
     fn runtime_result_matches_the_primitive_inner_product() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
-        let ring = Ring::new(
-            BigInt::from(parameters.modulus().as_ref().clone()),
-            parameters.ring_dimension() as usize,
-        );
+        let ring = crate::ring_from_params(&parameters);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let inputs = circuit.input(4).to_vec();
         let output = secret_inner_product(&mut circuit, &inputs[..2], &inputs[2..]);
@@ -158,7 +156,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default())
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
         let values = [2usize, 3, 5, 7].map(|value| {
             DCRTPolyMatrix::from_poly_vec_row(
@@ -178,13 +176,14 @@ mod tests {
                 .collect::<BTreeMap<_, _>>(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("runtime execution");
         let RuntimeValue::Matrix(actual) = &result.outputs["output"] else {
             panic!("inner-product output must be a matrix")
         };
         assert_eq!(
-            actual.as_ref(),
+            actual.as_cpu_full().expect("CPU inner-product matrix"),
             &(values[0].clone() * values[2].entry(0, 0) +
                 values[1].clone() * values[3].entry(0, 0))
         );

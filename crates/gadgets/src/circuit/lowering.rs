@@ -54,7 +54,7 @@ impl<'a> GateInstance<'a> {
 /// The circuit layer owns traversal, parameter binding, and recursive
 /// sub-circuit expansion. Scheme crates implement only the operation-specific
 /// wire formulas. This keeps `mxx-gadgets` independent of BGG value types and
-/// keeps concrete execution in `mxx-runtime`.
+/// keeps concrete execution in `mxx-backends`.
 pub trait CircuitLoweringTypes {
     type Wire: Clone;
     type Error: Error + Send + Sync + 'static;

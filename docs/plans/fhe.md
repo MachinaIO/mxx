@@ -14,12 +14,12 @@ ciphertext coefficients as BigIntegers, including inside runtime primitives.
 
 All cryptographic algorithms are graph builders written with `mxx-dsl`, including
 key generation, sampling, encoding, encryption, evaluation, key switching, and
-decryption. The graph is validated by `mxx-ir-core` and executed by `mxx-runtime`.
+decryption. The graph is validated by `mxx-ir-core` and executed by `mxx-backends`.
 Do not first implement a separate native FHE evaluator and wrap it with a DSL
 node. Native polynomial operations remain the existing runtime backend's job.
 
 Add `mxx-fhe` at `crates/fhe`. Normal dependencies are `mxx-dsl`, `mxx-ir-core`,
-`mxx-primitives`
+`mxx-backends`
 (for the existing parameter type), and ordinary utility libraries. Runtime is
 initially a unit-test dependency. Use its existing execution and artifact APIs;
 no new public executor wrapper is planned. No application crate or circuit-gadget
@@ -52,15 +52,15 @@ share the in-memory store and its manifests.
 - `crates/dsl/src/lib.rs:617`, `:623`, and `:638` provide uniform residue,
   small interval, and bounded Gaussian sampling nodes.
 - `crates/dsl/src/lib.rs:1014` exposes `Mat::ring_automorphism`;
-  `crates/runtime/src/backend/poly.rs:951` executes it on native polynomials.
+  `crates/backends/src/backend/poly.rs:951` executes it on native polynomials.
 - `crates/dsl/src/lib.rs:1081` provides regular gadget decomposition and `:562`
   constructs its gadget. `Preimage::mul_small_rhs` at `:1322` multiplies an
   ordinary matrix by the bounded decomposition without expanding it first.
 - `crates/dsl/src/lib.rs:1122` extracts coefficients; `:596` packs canonical
   coefficient bits. `crates/dsl/src/integer.rs:49` and `:55` provide division
-  and nonnegative remainder. `crates/runtime/src/executor.rs:1431` confirms
+  and nonnegative remainder. `crates/backends/src/executor.rs:1431` confirms
   Euclidean division/remainder, including negative inputs.
-- `crates/primitives/src/matrix/dcrt_poly.rs:200` currently implements
+- `crates/backends/src/matrix/dcrt_poly.rs:200` currently implements
   `reduce_modulus` by exporting full coefficients. Although its mathematical
   result is correct, it violates the requested RNS-only modswitch path. Replace
   this implementation with direct copying/selecting of existing CRT towers;
@@ -70,9 +70,9 @@ share the in-memory store and its manifests.
   schema. Do not carry a changing-modulus ciphertext through one such loop.
 - `crates/bgg/src/test_utils.rs:38` already demonstrates graph validation and
   execution with `cpu_backend`, `MemoryArtifactStore`, and `SamplingMode::Fresh`.
-- `crates/primitives/native/ExactBasis.cc:221` constructs cyclotomic order `2*N`.
+- `crates/backends/native/ExactBasis.cc:221` constructs cyclotomic order `2*N`.
   Use `R_Q = Z_Q[X]/(X^N+1)`, power-of-two `N >= 2`. Correct the conflicting
-  `X^N-1` documentation in `crates/primitives/src/poly/mod.rs` when implementing.
+  `X^N-1` documentation in `crates/backends/src/poly/mod.rs` when implementing.
 - The old Ring-GSW circuit code is not a DSL-native FHE interface. Its helper in
   `crates/gadgets/src/circuit_gadgets/fhe/ring_gsw_nested_rns.rs:243` uses the
   opposite sign. The user permits sign adjustments: use `phi_s(a,b)=b-s*a`
@@ -93,8 +93,8 @@ x = sum_{i,j} g[i,j] * D[i,j](x) mod Q_l
 
 Each digit is a small signed integer polynomial lifted consistently to all CRT
 limbs. The implementation and column order are in
-`crates/primitives/native/ExactBasis.cc:260` and
-`crates/primitives/src/matrix/dcrt_poly.rs:559`. Derive widths from the registered
+`crates/backends/native/ExactBasis.cc:260` and
+`crates/backends/src/matrix/dcrt_poly.rs:559`. Derive widths from the registered
 backend layout and validate them. Use `Mat::decompose`, not `small_decompose`:
 the latter has different limb semantics. All GSW and key-switch formulas below
 use these same gadget weights, denoted `g_j` with one flattened index.
@@ -210,7 +210,7 @@ builders; there is no additional RingGsw or Bgv wrapper.
 Validate distinct compatible primes, ordered prefix bases, N, coprimality with t,
 exact gadget dimensions, ciphertext shapes, and correction factors. Match the
 runtime's registered CRT order explicitly: Q alone does not identify tower order.
-The common parameters need a normal dependency on `mxx-primitives`, but all
+The common parameters need a normal dependency on `mxx-backends`, but all
 cryptographic execution still occurs through DSL and runtime, not these params.
 Do not import BGG-specific sampler layout types merely to reuse a few fields.
 
@@ -368,7 +368,7 @@ an interval ending at 0 describes a wraparound interval, not an ordered integer
 range. A bound d=q/t can describe a particular message/noise range but is not
 the centering threshold p/2 for this dropped-limb correction.
 
-`crates/primitives/src/modulus.rs:26` already has centered `modulus_raise`
+`crates/backends/src/modulus.rs:26` already has centered `modulus_raise`
 semantics, but requires a larger target and reconstructs full coefficients.
 It cannot be used unchanged here, especially at the final drop where q_i may
 be smaller than p. Reuse its mathematical convention; implement the single-limb
@@ -378,8 +378,8 @@ representative conversion, independent of the final method name.
 
 Add the single new centered-rebase operation to `mxx-ir-core` node/type/parameter validation,
 serialization and exhaustive graph consumers, `mxx-dsl` builders, and
-`mxx-runtime` backend dispatch. Native Rust/C++ implementations belong in
-`mxx-primitives`. Extend execution-relation/Lean export support as required by
+`mxx-backends` backend dispatch. Native Rust/C++ implementations belong in
+`mxx-backends`. Extend execution-relation/Lean export support as required by
 the existing core architecture; do not silently emit an uninterpreted FHE call.
 Process the two ciphertext components as one (2,1) matrix and process all
 remaining limbs in one native batch. Reuse existing stream/format conventions
@@ -632,7 +632,7 @@ For each test:
    Runtime message inputs use `DslContext::int_family_input`; do not bake input
    messages into graph constants or host-produced ciphertexts.
 3. Call `DslContext::build`, `BuiltGraph::validate(&ParamEnv)`, then
-   `mxx_runtime::execute` with `MemoryArtifactStore` and `SamplingMode::Fresh`.
+   `mxx_backends::execute` with `MemoryArtifactStore` and `SamplingMode::Fresh`.
 4. Read final `RuntimeValue::IndexedFamily`/`Int` leaves and assert exact equality
    modulo t. Expected slotwise add/multiply and index permutations are elementary
    arithmetic, not a second cryptosystem. Coefficient polynomial expectations

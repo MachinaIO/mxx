@@ -6,7 +6,7 @@
 //! checks the parameter-to-device ring contract without duplicating a runner.
 
 use super::RnsBggParameters;
-use mxx_primitives::poly::{
+use mxx_backends::poly::{
     PolyParams,
     dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
 };
@@ -54,11 +54,11 @@ fn test_gpu_rns_bgg_operations_per_drop_three_at_boundaries() {
     assert_eq!(parameters.operations_per_drop(), 3);
     // Logical levels 0..=2 share the first physical CRT depth.  The drop is
     // selected at the first operation in each subsequent cadence window.
-    assert_eq!(super::planned_crt_depth(0, 3, 4, 1).unwrap(), 4);
-    assert_eq!(super::planned_crt_depth(2, 3, 4, 1).unwrap(), 4);
-    assert_eq!(super::planned_crt_depth(3, 3, 4, 1).unwrap(), 3);
-    assert_eq!(super::planned_crt_depth(5, 3, 4, 1).unwrap(), 3);
-    assert_eq!(super::planned_crt_depth(6, 3, 4, 1).unwrap(), 2);
-    assert_eq!(super::planned_crt_depth(9, 3, 4, 1).unwrap(), 1);
-    assert!(super::planned_crt_depth(0, 0, 4, 1).is_err());
+    assert_eq!(super::planned_crt_depth(0, 3, 1, 4, 1).unwrap(), 4);
+    assert_eq!(super::planned_crt_depth(2, 3, 1, 4, 1).unwrap(), 4);
+    assert_eq!(super::planned_crt_depth(3, 3, 1, 4, 1).unwrap(), 3);
+    assert_eq!(super::planned_crt_depth(5, 3, 1, 4, 1).unwrap(), 3);
+    assert_eq!(super::planned_crt_depth(6, 3, 1, 4, 1).unwrap(), 2);
+    assert_eq!(super::planned_crt_depth(9, 3, 1, 4, 1).unwrap(), 1);
+    assert!(super::planned_crt_depth(0, 0, 1, 4, 1).is_err());
 }

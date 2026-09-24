@@ -942,6 +942,13 @@ mod tests {
         BggSlotTransferPublicKeyLowering, LweLookupArtifacts, LweLookupCompiler, LweLookupIdentity,
         LweLookupInvocation, LweLookupPublicKeyLowering, LweLookupTable,
     };
+    use mxx_backends::{
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+        sampler::bounds::default_preimage_cutoff,
+    };
     use mxx_dsl::{DslContext, Ring};
     use mxx_gadgets::circuit::{LutExpr, PublicLutProgram};
     use mxx_ir_core::{
@@ -950,28 +957,21 @@ mod tests {
         node::NodeKind,
         types::MatrixType,
     };
-    use mxx_primitives::{
-        poly::{
-            PolyParams,
-            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-        },
-        sampler::bounds::default_preimage_cutoff,
-    };
     use num_bigint::{BigInt, BigUint};
 
     #[test]
     fn circuit_multiplication_consumes_only_supplied_decompositions() {
         use crate::test_utils::{execute_graph, matrix_output};
-        use mxx_primitives::{
+        use mxx_backends::{
+            RuntimeValue,
             matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
             sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
         };
-        use mxx_runtime::RuntimeValue;
         use std::collections::{BTreeMap, VecDeque};
         for dropped in [None, Some(1)] {
             let parameters = DCRTPolyParams::new(8, 3, 17, 4, None, dropped);
             let columns = parameters.modulus_digits();
-            let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 8);
+            let ring = crate::ring_from_params(&parameters);
             let compiler = PolyCircuitCompiler {
                 public_key: BggPublicKeyCompiler {
                     ring: ring.clone(),
@@ -1047,14 +1047,8 @@ mod tests {
                 BTreeMap::from([
                     ("lhs".into(), RuntimeValue::matrix(lhs)),
                     ("rhs".into(), RuntimeValue::matrix(rhs)),
-                    (
-                        "rhs-decomposition".into(),
-                        RuntimeValue::Preimage(std::sync::Arc::new(rhs_decomposition)),
-                    ),
-                    (
-                        "scalar-decomposition".into(),
-                        RuntimeValue::Preimage(std::sync::Arc::new(scalar_decomposition)),
-                    ),
+                    ("rhs-decomposition".into(), RuntimeValue::preimage(rhs_decomposition)),
+                    ("scalar-decomposition".into(), RuntimeValue::preimage(scalar_decomposition)),
                 ]),
             );
             assert_eq!(matrix_output(&result, "vector"), &expected);
@@ -1093,8 +1087,7 @@ mod tests {
 
     fn matrix_type(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> MatrixType {
         MatrixType {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(parameters).as_ref().clone(),
             rows: IntExpr::constant(rows),
             columns: IntExpr::constant(columns),
         }
@@ -1107,7 +1100,7 @@ mod tests {
         let transferred = circuit.slot_transfer_gate(input_gate, &[(1, None), (0, Some(3))]);
         circuit.output([transferred]);
 
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let compiler = PolyCircuitCompiler {
             public_key: BggPublicKeyCompiler {
                 ring: ring.clone(),
@@ -1131,13 +1124,15 @@ mod tests {
             .expect("output")
             .build()
             .expect("build");
-        built.validate(&ParamEnv::default()).expect("validation");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("validation");
     }
 
     #[test]
     fn configured_lowering_forwards_audited_lut_ranges_for_normal_and_parallel_calls() {
         let context = DslContext::new("audited-lut-range-forwarding");
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let public_key =
             BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
         let arithmetic =
@@ -1189,7 +1184,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(calls, vec![&bounds, &bounds, &bounds]);
-        graph.validate(&ParamEnv::default()).expect("validation");
+        graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("validation");
     }
 
     #[test]
@@ -1216,7 +1213,7 @@ mod tests {
         );
         parent.output(output);
 
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let public_key =
             BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
         let tall = |name: &str| BggTallEncodingWire {
@@ -1298,10 +1295,7 @@ mod tests {
             &circuit,
         )
         .expect("lookup invocation");
-        let ring = Ring::new(
-            lookup.public_key_type.modulus.clone(),
-            lookup.public_key_type.ring_dimension.clone(),
-        );
+        let ring = Ring::from_ref(lookup.public_key_type.ring.clone());
         let public_key_compiler = BggPublicKeyCompiler {
             ring: ring.clone(),
             base: lookup.gadget_base.clone(),

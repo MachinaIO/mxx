@@ -638,7 +638,7 @@ mod tests {
         let parameters = PbcParameters::custom(5, 1, 2, 3, 1, None);
         let generated = generate_key_layout(&parameters, seed(15), &[0]).unwrap();
         let layout = &generated.public_layout;
-        let ring = Ring::new(257, 4);
+        let ring = crate::test_support::explicit_ring(&[257], (4) as u32);
         let active = PbcActiveCellIndex::build(layout).unwrap();
         let expected_active = layout
             .cells
@@ -725,19 +725,17 @@ mod tests {
 
     #[test]
     fn trusted_selector_bits_bind_through_the_runtime_family_input() {
-        use mxx_dsl::DslContext;
-        use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-        use mxx_runtime::{
-            Backend, MemoryArtifactStore, RuntimeValue, backend::poly::cpu_backend, execute,
-            transcript::SamplingMode,
+        use crate::test_support::{full, ring_of};
+        use mxx_backends::{
+            ExecutionConfig, MemoryArtifactStore, RuntimeValue, backend::poly::cpu_backend,
+            execute, poly::dcrt::params::DCRTPolyParams, transcript::SamplingMode,
         };
-        use num_bigint::{BigInt, Sign};
+        use mxx_dsl::DslContext;
 
         let parameters = PbcParameters::custom(5, 1, 2, 3, 1, None);
         let generated = generate_key_layout(&parameters, seed(18), &[0]).unwrap();
         let poly_parameters = DCRTPolyParams::new(4, 1, 20, 2, None, None);
-        let modulus = BigInt::from_biguint(Sign::Plus, poly_parameters.modulus().as_ref().clone());
-        let ring = mxx_dsl::Ring::new(modulus, 4);
+        let ring = ring_of(&poly_parameters);
         let trusted = PbcTrustedSelectorBits::from_schedule(&generated, &ring, [9; 32]).unwrap();
         let runtime_binding = trusted.runtime_binding(&ring).unwrap();
         let materialization_count = std::cell::Cell::new(0usize);
@@ -754,7 +752,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&Default::default())
+            .validate(&Default::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
         let mut backend = cpu_backend([poly_parameters]);
         let inputs = runtime_binding.materialize(&mut backend).unwrap();
@@ -764,17 +762,16 @@ mod tests {
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
-        let RuntimeValue::IndexedFamily(actual) = &result.outputs["bits"] else {
+        let RuntimeValue::IndexedFamily { values: actual, .. } = &result.outputs["bits"] else {
             panic!("selector output must remain a runtime family")
         };
         assert_eq!(actual.len(), trusted.runtime_bits().len());
         let scalar_type = artifacts::concrete_matrix_type(&ring, (1, 1)).unwrap();
         for (actual, bit) in actual.iter().zip(trusted.runtime_bits()) {
-            let RuntimeValue::Matrix(actual) = actual else {
-                panic!("selector member must be a matrix")
-            };
+            let actual = full(actual);
             let expected = backend
                 .constant_matrix(
                     &scalar_type,
@@ -784,7 +781,7 @@ mod tests {
                     &Default::default(),
                 )
                 .unwrap();
-            assert_eq!(actual.as_ref(), &expected);
+            assert_eq!(actual, &expected);
         }
     }
 }
@@ -2486,7 +2483,7 @@ pub(crate) mod routing_tests {
             .expect("route toy vector");
         let binding =
             PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
-        let ring = Ring::new(257, 8);
+        let ring = crate::test_support::explicit_ring(&[257], (8) as u32);
         let family: Family<Mat> = binding.input_family(&ring, "pbc-values");
         let active_count = PbcActiveCellIndex::build(&layout).unwrap().len();
         assert_eq!(binding.family_count, active_count);
@@ -2503,7 +2500,7 @@ pub(crate) mod routing_tests {
             .expect("route toy vector");
         let binding =
             PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
-        let ring = Ring::new(257, 8);
+        let ring = crate::test_support::explicit_ring(&[257], (8) as u32);
         let production = ProductionId { spec_hash: SpecHash([31; 32]), execution_nonce: [32; 32] };
         let scalar = ring.artifact_input(
             production.clone(),
@@ -2548,6 +2545,7 @@ pub(crate) mod routing_tests {
             .validate_with_manifests(
                 &mxx_ir_core::ParamEnv::default(),
                 &BTreeMap::from([(production, manifest)]),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
             )
             .expect("neutral artifact inputs validate against typed manifest");
     }

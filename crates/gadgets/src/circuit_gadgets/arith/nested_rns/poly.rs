@@ -2305,7 +2305,7 @@ mod tests {
         test_utils::{diagonal_matrix, execute_circuit_with_shape},
         utils::{ceil_biguint_nth_root, gen_biguint_for_modulus, pow_biguint_usize},
     };
-    use mxx_primitives::{
+    use mxx_backends::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly as ConcretePoly, PolyParams,

@@ -12,16 +12,15 @@ use crate::{
         ProgramLowerError, RhsId, WireId, lower_program,
     },
 };
+use mxx_backends::{
+    ExecutionConfig, ExecutionError, RuntimeValue, SessionAliasDescriptor, SessionStore,
+    authority::CpuExecution, execute_in_session, matrix::dcrt_poly::DCRTPolyMatrix, poly::Poly,
+};
 use mxx_dsl::BuiltGraph;
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
     artifact::{Manifest, ProductionId},
     encoding::spec_hash,
-};
-use mxx_primitives::poly::Poly;
-use mxx_runtime::{
-    Backend, ExecutionConfig, ExecutionError, ExecutionResult, RuntimeValue,
-    SessionAliasDescriptor, SessionStore, execute_in_session_with_config,
 };
 use std::{collections::BTreeMap, error::Error};
 use thiserror::Error as ThisError;
@@ -47,19 +46,115 @@ pub type PlaintextInputs<I, P> = BTreeMap<I, crate::program::InputBinding<P, Vec
 /// `BuiltGraph` is deliberately unvalidated here. Stage orchestration
 /// validates it against the invocation's actual parameter environment and the
 /// application-owned manifest map before execution.
-pub struct StageGraph<B: Backend> {
+pub struct StageGraph {
     pub(crate) graph: BuiltGraph,
-    pub(crate) runtime_inputs: BTreeMap<String, RuntimeValue<B>>,
+    pub(crate) runtime_inputs: BTreeMap<String, RuntimeValue>,
     pub(crate) manifests: BTreeMap<ProductionId, Manifest>,
 }
 
-impl<B: Backend> StageGraph<B> {
+impl StageGraph {
     pub fn new(
         graph: BuiltGraph,
-        runtime_inputs: BTreeMap<String, RuntimeValue<B>>,
+        runtime_inputs: BTreeMap<String, RuntimeValue>,
         manifests: BTreeMap<ProductionId, Manifest>,
     ) -> Self {
         Self { graph, runtime_inputs, manifests }
+    }
+}
+
+/// Owned outputs of one non-producing stage execution.
+///
+/// Outputs are copied out of executor-owned storage, so they remain valid
+/// after the executor runs another graph and can be bound as inputs of a
+/// later graph on the same executor.
+pub struct StageOutputs {
+    pub outputs: BTreeMap<String, RuntimeValue>,
+}
+
+/// The executor boundary used by every Exponent-LUT stage.
+///
+/// CPU execution and compiled GPU execution return differently owned
+/// results; this trait keeps the stage contract local to Exponent-LUT:
+/// producing stages report their finalized production, evaluating stages
+/// return owned outputs, and verification downloads single matrices.
+pub trait StageExecution<S: SessionStore> {
+    /// Execute an artifact-producing graph in the session selected by
+    /// `execution_nonce` and return its production identity.
+    fn produce(
+        &mut self,
+        validated: ValidatedGraph,
+        inputs: BTreeMap<String, RuntimeValue>,
+        store: &mut S,
+        execution_nonce: [u8; 32],
+    ) -> Result<ProductionId, ApiError>;
+
+    /// Execute a graph and return owned copies of all of its outputs.
+    fn evaluate(
+        &mut self,
+        validated: ValidatedGraph,
+        inputs: BTreeMap<String, RuntimeValue>,
+        store: &mut S,
+        execution_nonce: [u8; 32],
+    ) -> Result<StageOutputs, ApiError>;
+
+    /// Download one matrix output to host memory.
+    fn download_matrix(&self, value: &RuntimeValue) -> Result<DCRTPolyMatrix, ApiError>;
+}
+
+impl<S: SessionStore> StageExecution<S> for CpuExecution {
+    fn produce(
+        &mut self,
+        validated: ValidatedGraph,
+        inputs: BTreeMap<String, RuntimeValue>,
+        store: &mut S,
+        execution_nonce: [u8; 32],
+    ) -> Result<ProductionId, ApiError> {
+        let result = execute_in_session(
+            &validated,
+            self.backend_mut(),
+            inputs,
+            store,
+            execution_nonce,
+            ExecutionConfig::default(),
+        )?;
+        result.production_id.ok_or_else(|| {
+            ApiError::input("artifact execution did not produce a production identity")
+        })
+    }
+
+    fn evaluate(
+        &mut self,
+        validated: ValidatedGraph,
+        inputs: BTreeMap<String, RuntimeValue>,
+        store: &mut S,
+        execution_nonce: [u8; 32],
+    ) -> Result<StageOutputs, ApiError> {
+        let mut result = execute_in_session(
+            &validated,
+            self.backend_mut(),
+            inputs,
+            store,
+            execution_nonce,
+            ExecutionConfig::default(),
+        )?;
+        let names = result.outputs.keys().cloned().collect::<Vec<_>>();
+        let mut outputs = BTreeMap::new();
+        for name in names {
+            let value = result.materialize_output(&name, self.backend(), store)?.clone();
+            outputs.insert(name, value);
+        }
+        result.cleanup_staged(store)?;
+        Ok(StageOutputs { outputs })
+    }
+
+    fn download_matrix(&self, value: &RuntimeValue) -> Result<DCRTPolyMatrix, ApiError> {
+        let RuntimeValue::Matrix(matrix) = value else {
+            return Err(ApiError::input("stage output is not a matrix"));
+        };
+        matrix
+            .cpu_full_arc()
+            .map(|matrix| matrix.as_ref().clone())
+            .ok_or_else(|| ApiError::input("CPU stage output is not a full host matrix"))
     }
 }
 
@@ -154,22 +249,20 @@ impl ApiError {
 }
 
 /// Builder contract for setup/preprocess graph construction.
-pub trait PreprocessBuild<B: Backend, P: Poly> {
+pub trait PreprocessBuild<P: Poly> {
     type Evaluator: ExponentLUTProgramLowering + crate::program::ProgramLoweringContext;
     type Families: FamilyExecution<Self::Evaluator>;
     type PayloadSecret;
     type EncryptDescriptor;
     type OnlineDescriptor;
     type Encrypt: EncryptBuild<
-            B,
             P,
             PayloadSecret = Self::PayloadSecret,
             PreprocessDescriptor = Self::EncryptDescriptor,
         >;
     type Online: OnlineBuild<
-            B,
             PreprocessDescriptor = Self::OnlineDescriptor,
-            EncryptDescriptor = <Self::Encrypt as EncryptBuild<B, P>>::Descriptor,
+            EncryptDescriptor = <Self::Encrypt as EncryptBuild<P>>::Descriptor,
         >;
 
     fn lowering_state(
@@ -210,11 +303,11 @@ pub trait PreprocessBuild<B: Backend, P: Poly> {
     fn build_graph(
         self,
         outputs: Vec<<Self::Evaluator as ExponentLUTProgramLowering>::Wire>,
-    ) -> Result<(StageGraph<B>, (Self::EncryptDescriptor, Self::OnlineDescriptor)), ApiError>;
+    ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineDescriptor)), ApiError>;
 }
 
 /// Builder contract for the input-only encryption graph.
-pub trait EncryptBuild<B: Backend, P: Poly> {
+pub trait EncryptBuild<P: Poly> {
     type PayloadSecret;
     type MaskSecret;
     type PreprocessDescriptor;
@@ -237,12 +330,12 @@ pub trait EncryptBuild<B: Backend, P: Poly> {
 
     fn artifact_identity(&self) -> [u8; 32];
 
-    fn build_graph(self) -> Result<(StageGraph<B>, Self::Descriptor), ApiError>;
+    fn build_graph(self) -> Result<(StageGraph, Self::Descriptor), ApiError>;
 }
 
 /// Builder contract for online Program lowering and scheme refresh graph
 /// construction.
-pub trait OnlineBuild<B: Backend> {
+pub trait OnlineBuild {
     type Evaluator: ExponentLUTProgramLowering + crate::program::ProgramLoweringContext;
     type Families: FamilyExecution<Self::Evaluator>;
     type PreprocessDescriptor;
@@ -276,7 +369,7 @@ pub trait OnlineBuild<B: Backend> {
     fn build_graph(
         self,
         outputs: Vec<<Self::Evaluator as ExponentLUTProgramLowering>::Wire>,
-    ) -> Result<StageGraph<B>, ApiError>;
+    ) -> Result<StageGraph, ApiError>;
 }
 
 /// Builder contract for Program-based noise simulation.
@@ -312,48 +405,53 @@ pub trait NoiseBuild {
 ///
 /// This is the common persistence boundary used when a refreshed graph must
 /// resume through the normal `StageArtifacts` lifecycle. It does not create a
-/// second executor or bypass graph validation, observers, or execution
-/// configuration.
-pub(crate) fn execute_artifacts<B, S, D>(
-    graph: StageGraph<B>,
+/// second executor or bypass graph validation or observers.
+pub(crate) fn execute_artifacts<E, S, D>(
+    graph: StageGraph,
     parameters: &ParamEnv,
     descriptor: D,
     identity: [u8; 32],
-    backend: &mut B,
+    execution: &mut E,
     store: &mut S,
-    config: ExecutionConfig,
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
 ) -> Result<StageArtifacts<D>, ApiError>
 where
-    B: Backend,
+    E: StageExecution<S>,
     S: SessionStore,
 {
-    let validated = graph
-        .graph
-        .validate_with_manifests(parameters, &graph.manifests)
-        .map_err(ApiError::graph)?;
+    let validated = validate_stage(&graph, parameters)?;
     before_execute(&validated)?;
     let (execution_nonce, session) = fresh_execution_session(&validated, store, identity)?;
-    let result = execute_in_session_with_config(
-        &validated,
-        backend,
-        graph.runtime_inputs,
-        store,
-        execution_nonce,
-        config,
-    )?;
-    let production = result.production_id.ok_or_else(|| {
-        ApiError::input("artifact execution did not produce a production identity")
-    })?;
+    let production = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    let manifest = finalized_manifest(store, &session, &production)?;
+    Ok(StageArtifacts::new(production, manifest, descriptor, session))
+}
+
+fn validate_stage(graph: &StageGraph, parameters: &ParamEnv) -> Result<ValidatedGraph, ApiError> {
+    graph
+        .graph
+        .validate_with_manifests(
+            parameters,
+            &graph.manifests,
+            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+        )
+        .map_err(ApiError::graph)
+}
+
+fn finalized_manifest<S: SessionStore>(
+    store: &mut S,
+    session: &SessionAliasDescriptor,
+    production: &ProductionId,
+) -> Result<Manifest, ApiError> {
     let manifest = store
-        .load_finalized_named_manifest(&session)
+        .load_finalized_named_manifest(session)
         .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))?;
-    if manifest.production_id != production {
+    if &manifest.production_id != production {
         return Err(ApiError::compatibility(
             "finalized named session returned a different production identity",
         ));
     }
-    Ok(StageArtifacts::new(production, manifest, descriptor, session))
+    Ok(manifest)
 }
 
 /// Reload a finalized stage from its named session after an application
@@ -391,36 +489,24 @@ where
 
 /// Execute one caller-owned graph without publishing application artifacts.
 ///
-/// The graph is validated against its manifest map, the observer runs before
-/// execution, and the supplied execution configuration is preserved. The
-/// returned runtime result retains the leases needed by callers that
-/// materialize verification residuals or other outputs.
-pub(crate) fn execute_graph<B, S>(
-    graph: StageGraph<B>,
+/// The graph is validated against its manifest map and the observer runs
+/// before execution. The returned outputs are owned copies, so callers can
+/// download verification residuals or bind them into a later graph.
+pub(crate) fn execute_graph<E, S>(
+    graph: StageGraph,
     parameters: &ParamEnv,
-    backend: &mut B,
+    execution: &mut E,
     store: &mut S,
-    config: ExecutionConfig,
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
-) -> Result<ExecutionResult<B>, ApiError>
+) -> Result<StageOutputs, ApiError>
 where
-    B: Backend,
+    E: StageExecution<S>,
     S: SessionStore,
 {
-    let validated = graph
-        .graph
-        .validate_with_manifests(parameters, &graph.manifests)
-        .map_err(ApiError::graph)?;
+    let validated = validate_stage(&graph, parameters)?;
     before_execute(&validated)?;
     let (execution_nonce, _) = fresh_execution_session(&validated, store, rand::random())?;
-    Ok(execute_in_session_with_config(
-        &validated,
-        backend,
-        graph.runtime_inputs,
-        store,
-        execution_nonce,
-        config,
-    )?)
+    execution.evaluate(validated, graph.runtime_inputs, store, execution_nonce)
 }
 
 /// Dispatch one refresh PRF evaluation and finish the concrete stage.
@@ -463,6 +549,16 @@ pub(crate) fn domain_identity(base: [u8; 32], domain: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// Hash sampling keys are exactly 32 bytes; reject other keys before any
+/// graph is built.
+fn validate_hash_key(hash_key: &[u8]) -> Result<(), ApiError> {
+    if hash_key.len() == 32 {
+        Ok(())
+    } else {
+        Err(ApiError::input(format!("hash key must be 32 bytes, got {}", hash_key.len())))
+    }
+}
+
 fn fresh_execution_session<S: SessionStore>(
     validated: &ValidatedGraph,
     store: &mut S,
@@ -486,16 +582,15 @@ fn fresh_execution_session<S: SessionStore>(
 /// Build and execute preprocessing once, then publish two typed stage records
 /// over that same finalized production: encryption preparation first and
 /// online preparation second.
-pub fn preprocess<B, S, P, T>(
+pub fn preprocess<E, S, P, T>(
     program: &ExponentLutProgram,
     parameters: &ParamEnv,
     rhs: &PlaintextInputs<RhsId, P>,
     payload: &T::PayloadSecret,
     hash_key: &[u8],
     mut build: T,
-    backend: &mut B,
+    execution: &mut E,
     store: &mut S,
-    config: ExecutionConfig,
     compose: impl FnOnce(
         &mut T,
         Vec<<T::Evaluator as ExponentLUTProgramLowering>::Wire>,
@@ -504,11 +599,12 @@ pub fn preprocess<B, S, P, T>(
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
 ) -> Result<(StageArtifacts<T::EncryptDescriptor>, StageArtifacts<T::OnlineDescriptor>), ApiError>
 where
-    B: Backend,
+    E: StageExecution<S>,
     S: SessionStore,
     P: Poly,
-    T: PreprocessBuild<B, P>,
+    T: PreprocessBuild<P>,
 {
+    validate_hash_key(hash_key)?;
     build.bind_inputs(program, parameters, rhs, payload, hash_key)?;
     let (encryption_identity, _) = build.artifact_identities();
     let outputs = {
@@ -520,41 +616,17 @@ where
 
     // Validate and execute once. Both stage records share the same finalized
     // production and manifest.
-    let validated = graph
-        .graph
-        .validate_with_manifests(parameters, &graph.manifests)
-        .map_err(ApiError::graph)?;
+    let validated = validate_stage(&graph, parameters)?;
     before_execute(&validated)?;
     let (execution_nonce, session) = fresh_execution_session(
         &validated,
         store,
         domain_identity(encryption_identity, b"preprocess"),
     )?;
-    let result = execute_in_session_with_config(
-        &validated,
-        backend,
-        graph.runtime_inputs,
-        store,
-        execution_nonce,
-        config,
-    )?;
-    let (encrypt_descriptor, online_descriptor) = T::finalize_descriptors(
-        result.production_id.as_ref().ok_or_else(|| {
-            ApiError::input("preprocess execution did not produce an artifact identity")
-        })?,
-        (encrypt_descriptor, online_descriptor),
-    )?;
-    let production = result.production_id.ok_or_else(|| {
-        ApiError::input("preprocess execution did not produce an artifact identity")
-    })?;
-    let manifest = store
-        .load_finalized_named_manifest(&session)
-        .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))?;
-    if manifest.production_id != production {
-        return Err(ApiError::compatibility(
-            "finalized named session returned a different production identity",
-        ));
-    }
+    let production = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    let (encrypt_descriptor, online_descriptor) =
+        T::finalize_descriptors(&production, (encrypt_descriptor, online_descriptor))?;
+    let manifest = finalized_manifest(store, &session, &production)?;
     let encrypt_stage = StageArtifacts::new(
         production.clone(),
         manifest.clone(),
@@ -566,7 +638,7 @@ where
 }
 
 /// Build and execute the input-only encryption graph.
-pub fn encrypt<B, S, P, T>(
+pub fn encrypt<E, S, P, T>(
     inputs: &crate::program::EncryptionInputs,
     parameters: &ParamEnv,
     lhs: &PlaintextInputs<WireId, P>,
@@ -575,59 +647,50 @@ pub fn encrypt<B, S, P, T>(
     mask: &T::MaskSecret,
     hash_key: &[u8],
     mut build: T,
-    backend: &mut B,
+    execution: &mut E,
     store: &mut S,
-    config: ExecutionConfig,
     compose: impl FnOnce(&mut T) -> Result<(), ApiError>,
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
 ) -> Result<StageArtifacts<T::Descriptor>, ApiError>
 where
-    B: Backend,
+    E: StageExecution<S>,
     S: SessionStore,
     P: Poly,
-    T: EncryptBuild<B, P>,
+    T: EncryptBuild<P>,
 {
+    validate_hash_key(hash_key)?;
     build.bind_inputs(inputs, parameters, lhs, payload, mask, hash_key)?;
     build.bind_artifacts(preprocess)?;
     compose(&mut build)?;
     let identity = build.artifact_identity();
     let (graph, descriptor) = build.build_graph()?;
-    execute_artifacts(
-        graph,
-        parameters,
-        descriptor,
-        identity,
-        backend,
-        store,
-        config,
-        before_execute,
-    )
+    execute_artifacts(graph, parameters, descriptor, identity, execution, store, before_execute)
 }
 
 /// Lower the Program, append scheme-owned refresh operations, and execute the
-/// resulting online graph. The returned runtime result retains all leases.
-pub fn online_eval<B, S, T>(
+/// resulting online graph. The returned outputs are owned copies.
+pub fn online_eval<E, S, T>(
     program: &ExponentLutProgram,
     parameters: &ParamEnv,
     preprocess: &StageArtifacts<T::PreprocessDescriptor>,
     encryption: &StageArtifacts<T::EncryptDescriptor>,
     hash_key: &[u8],
     mut build: T,
-    backend: &mut B,
+    execution: &mut E,
     store: &mut S,
-    config: ExecutionConfig,
     compose: impl FnOnce(
         &mut T,
         Vec<<T::Evaluator as ExponentLUTProgramLowering>::Wire>,
     )
         -> Result<Vec<<T::Evaluator as ExponentLUTProgramLowering>::Wire>, ApiError>,
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
-) -> Result<ExecutionResult<B>, ApiError>
+) -> Result<StageOutputs, ApiError>
 where
-    B: Backend,
+    E: StageExecution<S>,
     S: SessionStore,
-    T: OnlineBuild<B>,
+    T: OnlineBuild,
 {
+    validate_hash_key(hash_key)?;
     build.bind_artifacts(program, parameters, preprocess, encryption, hash_key)?;
     let outputs = {
         let (evaluator, families, environment) = build.lowering_state()?;
@@ -635,7 +698,7 @@ where
     };
     let outputs = compose(&mut build, outputs)?;
     let graph = build.build_graph(outputs)?;
-    execute_graph(graph, parameters, backend, store, config, before_execute)
+    execute_graph(graph, parameters, execution, store, before_execute)
 }
 
 /// Lower the Program once through the noise evaluator and produce its report.
@@ -662,8 +725,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mxx_backends::{MemoryArtifactStore, backend::poly::cpu_backend};
     use mxx_dsl::{DslContext, Int};
-    use mxx_runtime::{MemoryArtifactStore, backend::poly::cpu_backend};
+
+    fn execution() -> CpuExecution {
+        CpuExecution::new(cpu_backend([]))
+    }
     use std::{
         collections::BTreeMap,
         sync::{
@@ -672,7 +739,7 @@ mod tests {
         },
     };
 
-    fn observer_test_graph() -> StageGraph<mxx_runtime::backend::poly::CpuDcrtBackend> {
+    fn observer_test_graph() -> StageGraph {
         let graph = DslContext::new("api-observer")
             .transferred_output("value", Int::constant(1))
             .expect("artifact output")
@@ -700,16 +767,15 @@ mod tests {
 
     #[test]
     fn online_observer_runs_once_before_execution() {
-        let mut backend = cpu_backend([]);
+        let mut execution = execution();
         let mut store = MemoryArtifactStore::default();
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = Arc::clone(&calls);
         execute_graph(
             observer_test_graph(),
             &ParamEnv::default(),
-            &mut backend,
+            &mut execution,
             &mut store,
-            ExecutionConfig::default(),
             move |_| {
                 observed_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -721,14 +787,13 @@ mod tests {
 
     #[test]
     fn online_observer_error_prevents_execution() {
-        let mut backend = cpu_backend([]);
+        let mut execution = execution();
         let mut store = MemoryArtifactStore::default();
         let result = execute_graph(
             observer_test_graph(),
             &ParamEnv::default(),
-            &mut backend,
+            &mut execution,
             &mut store,
-            ExecutionConfig::default(),
             |_| Err(ApiError::input("observer rejected graph")),
         );
         let error = match result {
@@ -742,16 +807,15 @@ mod tests {
 
     #[test]
     fn encrypt_observer_error_prevents_artifact_publication() {
-        let mut backend = cpu_backend([]);
+        let mut execution = execution();
         let mut store = MemoryArtifactStore::default();
         let result = execute_artifacts(
             observer_test_graph(),
             &ParamEnv::default(),
             "descriptor".to_owned(),
             [7; 32],
-            &mut backend,
+            &mut execution,
             &mut store,
-            ExecutionConfig::default(),
             |_| Err(ApiError::input("observer rejected artifact")),
         );
         let error = match result {
@@ -765,16 +829,15 @@ mod tests {
 
     #[test]
     fn finalized_named_stage_can_be_reloaded_with_a_reconstructed_descriptor() {
-        let mut backend = cpu_backend([]);
+        let mut execution = execution();
         let mut store = MemoryArtifactStore::default();
         let stage = execute_artifacts(
             observer_test_graph(),
             &ParamEnv::default(),
             "descriptor".to_owned(),
             [11; 32],
-            &mut backend,
+            &mut execution,
             &mut store,
-            ExecutionConfig::default(),
             |_| Ok(()),
         )
         .expect("artifact graph executes");

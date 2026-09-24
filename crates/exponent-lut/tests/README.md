@@ -3,7 +3,11 @@
 The integration suite contains exactly three GPU-gated targets. Each target
 contains exactly one sequential test and runs the complete production flow:
 noise simulation, benchmark estimation, then an artifact-backed preprocess,
-encrypt, and online round trip.
+encrypt, and online round trip. Benchmark estimation is the GPU runtime's
+planning step: every stage graph is planned with `GpuRuntime` immediately
+before it executes, the planner measures its wave-width and column-tile
+candidates on that exact graph, and the selected `GpuWarmupReport` is logged
+at `info` level (run with `RUST_LOG=info` to see it).
 
 | File | Test | Application |
 | --- | --- | --- |
@@ -19,7 +23,8 @@ production noise report, and retain only a candidate that reaches its
 configured positive lattice-security target through `lattice-estimator-cli`.
 The refresh target likewise checks its production noise/transcript contracts
 before verifying the refreshed output. The estimator is required for these
-security gates; there is no successful skip-Sage mode.
+security gates; the only mode that skips it is the NAND noiseless diagnostic
+described below, which makes no security claim.
 
 Parameter controls are namespaced per target rather than shared globally:
 `MXX_EXPONENT_LUT_NAND_*` controls the NAND workflow and
@@ -57,13 +62,41 @@ cargo test -r -p mxx-exponent-lut --features gpu \
 
 The NAND target builds a complete binary NAND tree whose depth is controlled
 by `MXX_EXPONENT_LUT_NAND_DEPTH`; its LUT-round budget is checked before
-compilation. It compares every selected assignment with an independent
-Boolean NAND oracle. The PRF target uses a fixed canonical label and
-independently computes the sequential `D*T` exponent and readout before
-verifying the caller-owned output. The refresh target independently computes
+compilation. Because one round trip takes minutes at production parameters,
+each run evaluates a single assignment whose every input bit is drawn at
+random (it is printed as `NAND input assignment`). The output is compared
+with an independent Boolean NAND oracle, and the same output must be rejected
+as the opposite bit. `MXX_EXPONENT_LUT_NAND_ERROR_SIGMA`
+sets the encoding-error width (default 4); `0` is a noiseless diagnostic
+mode that samples and adds no encoding error and skips the lattice-estimator
+gate, so it checks correctness only.
+
+The 128-bit, depth-1 NAND round trip was verified on one 16 GiB GPU with the
+following command, which selected `n=16384`, CRT depth 8, and two primes per
+drop. With three fixed assignments it took about 30 minutes, most of it spent
+planning the preprocess graph once per assignment:
+
+```sh
+MXX_GPU_MEASUREMENT_WARMUPS=0 MXX_GPU_MEASUREMENT_ITERATIONS=1 \
+MXX_EXPONENT_LUT_NAND_MIN_LOG_RING_DIMENSION=14 \
+MXX_EXPONENT_LUT_NAND_MAX_LOG_RING_DIMENSION=14 \
+MXX_EXPONENT_LUT_NAND_DEPTH=1 MXX_EXPONENT_LUT_NAND_SECURITY_BITS=128 \
+MXX_EXPONENT_LUT_NAND_CRT_BITS=40 \
+cargo test -r -p mxx-exponent-lut --features gpu \
+  --test nand_circuit nand_circuit_end_to_end -- --nocapture
+```
+
+GPU memory controls that affect these targets are `MXX_GPU_MEMORY_FRACTION`
+(share of device memory for a plan's persistent allocations, default 0.8) and
+`MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` (small-RHS multiplication chunk width,
+default 16); see `docs/architecture.md` section 6.1.
+
+The PRF target uses a fixed canonical label and independently computes the
+sequential `D*T` exponent and readout before verifying the caller-owned
+output. The refresh target independently computes
 the clear PRF state/readout, checks the three production graphs in order, and
 verifies the refreshed output with caller-owned secrets. Correctness-oracle
-calculations remain outside the graphs passed to the estimator.
+calculations remain outside the production graphs.
 
 There is no alternate scheme selector or stage-skip switch. Internal
 structural regressions belong to the crate's unit tests; these external

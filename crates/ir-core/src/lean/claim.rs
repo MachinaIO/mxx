@@ -112,9 +112,10 @@ fn input_contract_predicate(
     bindings: &crate::ParamEnv,
     value: &str,
     depth: usize,
+    resolve_basis: crate::ResolveCrtBasis,
 ) -> Result<String, String> {
     let evaluate = |expression: &crate::IntExpr| {
-        expression.evaluate(bindings).map_err(|error| error.to_string())
+        expression.evaluate_with_rings(bindings, resolve_basis).map_err(|error| error.to_string())
     };
     match (contract, ty) {
         (InputContract::IntegerRange { lower, upper }, ConcreteWireType::Int) => {
@@ -127,23 +128,24 @@ fn input_contract_predicate(
         }
         (InputContract::Boolean, ConcreteWireType::Bool) => Ok("True".into()),
         (InputContract::BooleanPolynomial, ConcreteWireType::Matrix(matrix)) => {
-            if !matrix.is_scalar() || matrix.ring_dimension == 0 {
+            if !matrix.is_scalar() || matrix.ring.ring_dimension() as usize == 0 {
                 return Err("Boolean polynomial contract requires a nonempty scalar matrix".into());
             }
             Ok(format!("(({value}) 0 0 = 0 ∨ ({value}) 0 0 = 1)"))
         }
         (InputContract::SignedMonomial { exponent_stride }, ConcreteWireType::Matrix(matrix)) => {
-            if !matrix.is_scalar() || matrix.ring_dimension == 0 {
+            if !matrix.is_scalar() || matrix.ring.ring_dimension() as usize == 0 {
                 return Err("signed monomial contract requires a nonempty scalar matrix".into());
             }
-            let n = matrix.ring_dimension;
-            if *exponent_stride == 0 || matrix.ring_dimension % exponent_stride != 0 {
+            let n = matrix.ring.ring_dimension() as usize;
+            if *exponent_stride == 0 || matrix.ring.ring_dimension() as usize % exponent_stride != 0
+            {
                 return Err(
                     "monomial exponent stride must be positive and divide the ring dimension"
                         .into(),
                 );
             }
-            let q = &matrix.modulus;
+            let q = matrix.ring.modulus();
             Ok(format!(
                 "(∃ exponent : Fin (2 * ({n} / {exponent_stride})), ({value}) 0 0 = AdjoinRoot.root (Mxx.Primitives.negacyclicModulus {n} (ZMod {q})) ^ ({exponent_stride} * exponent.val))"
             ))
@@ -165,6 +167,7 @@ fn input_contract_predicate(
                 bindings,
                 &format!("({value} i)"),
                 depth + 1,
+                resolve_basis,
             )?;
             let mut conditions = vec![format!("(∀ i : Fin {count}, {element_predicate})")];
             let mut offset = 0;
@@ -200,6 +203,7 @@ fn input_contract_predicate(
                 bindings,
                 &format!("({value} {index})"),
                 depth + 1,
+                resolve_basis,
             )?;
             Ok(format!("(∀ {index} : Fin {expected}, {body})"))
         }
@@ -211,6 +215,7 @@ fn check_root(
     root: &ClaimRoot<'_>,
     bindings: &ParamEnv,
     backend: &ClaimBackend<'_>,
+    resolve_basis: crate::ResolveCrtBasis,
 ) -> Result<(), String> {
     let artifact = root.artifact;
     if artifact.backend_layouts.iter().any(|layout| !backend.layouts.contains(layout)) {
@@ -264,6 +269,7 @@ fn check_root(
                 bindings,
                 &crate::FrozenGraphScopeId::Root,
                 value.wire.node,
+                resolve_basis,
             )
             .map_err(|e| e.to_string())? !=
                 value.wire_type
@@ -293,13 +299,14 @@ pub fn assemble_claim(
     bindings: &ParamEnv,
     backend: &ClaimBackend<'_>,
     semantics: &ClaimSemantics<'_>,
+    resolve_basis: crate::ResolveCrtBasis,
 ) -> Result<String, String> {
     let mut fields = BTreeSet::new();
     for root in &claim.roots {
         if super::valid_identifier(&root.field).is_err() || !fields.insert(&root.field) {
             return Err("invalid or duplicate execution field".into());
         }
-        check_root(root, bindings, backend)?;
+        check_root(root, bindings, backend, resolve_basis)?;
     }
     let entries =
         claim.roots.iter().map(|root| (root.artifact, root.field.clone())).collect::<Vec<_>>();
@@ -338,6 +345,7 @@ pub fn assemble_claim(
             bindings,
             &format!("external.{field}"),
             0,
+            resolve_basis,
         )?);
         external_fields.push((field, lean_type.expect("typed destination")));
     }
@@ -452,7 +460,7 @@ pub fn assemble_claim(
         if actual.wire_type != ideal.wire_type || actual.lean_type != ideal.lean_type {
             return Err("approximation endpoint type mismatch".into());
         }
-        if matrix.ring_dimension == 0 || matrix.rows == 0 || matrix.columns == 0 {
+        if matrix.ring.ring_dimension() as usize == 0 || matrix.rows == 0 || matrix.columns == 0 {
             return Err("approximation endpoint must be nonempty".into());
         }
         let actual_value =
@@ -475,10 +483,10 @@ pub fn assemble_claim(
     let ConcreteWireType::Matrix(matrix) = &residual.wire_type else {
         return Err("residual must be a matrix".into());
     };
-    if !matrix.is_scalar() || matrix.ring_dimension == 0 {
+    if !matrix.is_scalar() || matrix.ring.ring_dimension() as usize == 0 {
         return Err("residual must be a scalar polynomial".into());
     }
-    let q = &matrix.modulus;
+    let q = matrix.ring.modulus();
     let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
     let actual_value = project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
     let residual_value =
@@ -530,12 +538,8 @@ mod tests {
         )
         .output(0)
         .unwrap();
-        let matrix = MatrixType {
-            modulus: 17.into(),
-            ring_dimension: 2.into(),
-            rows: 1.into(),
-            columns: 1.into(),
-        };
+        let matrix =
+            MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
         let residual = NodeHandle::new(
             NodeKind::ConstantMatrix { matrix_type: matrix.clone(), value: ConstantMatrix::Zero },
             vec![],
@@ -556,7 +560,7 @@ mod tests {
         )
         .unwrap()
         .0;
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact =
             super::super::export(&validated, &super::super::ExportOptions::default()).unwrap();
         (graph, artifact)
@@ -597,6 +601,7 @@ mod tests {
                 message_center: "OtherApplication.messageCenter",
                 decoder_radius: "OtherApplication.decoderRadius",
             },
+            crate::ring::test_resolve_basis,
         )
     }
 
@@ -649,9 +654,15 @@ mod tests {
         let (_, artifact) = exported_graph();
         let ty = &artifact.root.outputs["residual"].wire_type;
         let env = ParamEnv::default();
-        let boolean =
-            input_contract_predicate(&InputContract::BooleanPolynomial, ty, &env, "input", 0)
-                .unwrap();
+        let boolean = input_contract_predicate(
+            &InputContract::BooleanPolynomial,
+            ty,
+            &env,
+            "input",
+            0,
+            crate::ring::test_resolve_basis,
+        )
+        .unwrap();
         assert_eq!(boolean, "((input) 0 0 = 0 ∨ (input) 0 0 = 1)");
         let monomial = input_contract_predicate(
             &InputContract::SignedMonomial { exponent_stride: 1 },
@@ -659,6 +670,7 @@ mod tests {
             &env,
             "input",
             0,
+            crate::ring::test_resolve_basis,
         )
         .unwrap();
         assert!(monomial.contains("Fin (2 * (2 / 1))"));
@@ -669,6 +681,7 @@ mod tests {
             &env,
             "input",
             0,
+            crate::ring::test_resolve_basis,
         )
         .unwrap();
         assert!(strided.contains("^ (2 * exponent.val)"));
@@ -679,7 +692,8 @@ mod tests {
                     ty,
                     &env,
                     "input",
-                    0
+                    0,
+                    crate::ring::test_resolve_basis
                 )
                 .is_err()
             );
@@ -690,8 +704,15 @@ mod tests {
             [InputContract::BooleanPolynomial, InputContract::SignedMonomial { exponent_stride: 1 }]
         {
             assert!(
-                input_contract_predicate(&contract, &ConcreteWireType::Bool, &env, "input", 0)
-                    .is_err()
+                input_contract_predicate(
+                    &contract,
+                    &ConcreteWireType::Bool,
+                    &env,
+                    "input",
+                    0,
+                    crate::ring::test_resolve_basis
+                )
+                .is_err()
             );
             assert!(
                 input_contract_predicate(
@@ -699,7 +720,8 @@ mod tests {
                     &ConcreteWireType::Matrix(nonscalar.clone()),
                     &env,
                     "input",
-                    0
+                    0,
+                    crate::ring::test_resolve_basis
                 )
                 .is_err()
             );
@@ -733,6 +755,7 @@ mod tests {
                 message_center: "MxxWe.messageCenter",
                 decoder_radius: "MxxWe.decoderRadius",
             },
+            crate::ring::test_resolve_basis,
         )
         .unwrap();
         assert!(source.contains("  «match» :"));
@@ -820,9 +843,15 @@ mod tests {
             count: 1_000_000,
             element: Box::new(ConcreteWireType::Int),
         };
-        let predicate =
-            input_contract_predicate(&contract, &ty, &ParamEnv::default(), "external.bits", 0)
-                .unwrap();
+        let predicate = input_contract_predicate(
+            &contract,
+            &ty,
+            &ParamEnv::default(),
+            "external.bits",
+            0,
+            crate::ring::test_resolve_basis,
+        )
+        .unwrap();
         assert_eq!(predicate.matches("∀").count(), 1);
         assert!(predicate.contains("Fin 1000000"));
         assert!(predicate.contains("(0 : Int) ≤ (external.bits contract_i_0)"));
@@ -834,7 +863,15 @@ mod tests {
     fn input_contract_types_and_sizes_are_checked() {
         let env = ParamEnv::default();
         assert!(
-            input_contract_predicate(&bit_range(), &ConcreteWireType::Bool, &env, "x", 0).is_err()
+            input_contract_predicate(
+                &bit_range(),
+                &ConcreteWireType::Bool,
+                &env,
+                "x",
+                0,
+                crate::ring::test_resolve_basis
+            )
+            .is_err()
         );
         assert_eq!(
             input_contract_predicate(
@@ -842,20 +879,35 @@ mod tests {
                 &ConcreteWireType::Bool,
                 &env,
                 "x",
-                0
+                0,
+                crate::ring::test_resolve_basis
             )
             .unwrap(),
             "True"
         );
         let bytes = InputContract::Bytes { length: IntExpr::constant(32) };
         assert_eq!(
-            input_contract_predicate(&bytes, &ConcreteWireType::Bytes { length: 32 }, &env, "x", 0)
-                .unwrap(),
+            input_contract_predicate(
+                &bytes,
+                &ConcreteWireType::Bytes { length: 32 },
+                &env,
+                "x",
+                0,
+                crate::ring::test_resolve_basis
+            )
+            .unwrap(),
             "(x).size = 32"
         );
         assert!(
-            input_contract_predicate(&bytes, &ConcreteWireType::Bytes { length: 31 }, &env, "x", 0)
-                .is_err()
+            input_contract_predicate(
+                &bytes,
+                &ConcreteWireType::Bytes { length: 31 },
+                &env,
+                "x",
+                0,
+                crate::ring::test_resolve_basis
+            )
+            .is_err()
         );
         for count in [-1, 2] {
             let family = InputContract::Family {
@@ -866,7 +918,17 @@ mod tests {
                 count: 1,
                 element: Box::new(ConcreteWireType::Int),
             };
-            assert!(input_contract_predicate(&family, &ty, &env, "x", 0).is_err());
+            assert!(
+                input_contract_predicate(
+                    &family,
+                    &ty,
+                    &env,
+                    "x",
+                    0,
+                    crate::ring::test_resolve_basis
+                )
+                .is_err()
+            );
         }
     }
 }

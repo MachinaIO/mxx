@@ -11,9 +11,9 @@ use crate::{
     },
 };
 use bigdecimal::{BigDecimal, Zero};
+use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use mxx_dsl::{Family, GraphValue, Int};
 use mxx_ir_core::{ParamEnv, Rational, RealExpr};
-use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 use std::{env, error::Error, fmt, process::Command};
@@ -151,14 +151,21 @@ pub fn lattice_security_bits(
 /// as the public search API.  Keeping the requested terminal depth unchanged
 /// lets callers try deeper source CRT chains without silently changing the
 /// configured drop cadence.
+///
+/// The chain ends at the program's last output level, after coefficient
+/// finalization, so a decrypted output carries the terminal relation. A
+/// program whose outputs continue, such as a refresh source, requests
+/// `successor_levels` further levels past its last LUT level.
 pub fn audit_program_at_crt_depth(
     request: &RnsBggPlanRequest,
     program: &ExponentLutProgram,
     bindings: &RnsBggNoiseBindings,
     terminal_value_bounds: &[BigUint],
     average: Option<&AverageCaseConfig>,
+    successor_levels: usize,
 ) -> Result<(RnsBggParameters, RnsBggNoiseTrace), String> {
     if request.operations_per_drop == 0 ||
+        request.primes_per_drop == 0 ||
         request.terminal_depth == 0 ||
         request.max_crt_depth < request.terminal_depth
     {
@@ -166,18 +173,22 @@ pub fn audit_program_at_crt_depth(
     }
     let workload =
         RnsBggDerivedWorkload::from_program(program).map_err(|error| error.to_string())?;
-    let logical_count = program
+    let output_levels = program
         .outputs()
         .iter()
         .map(|output| match output {
             Operand::Scalar(wire) | Operand::Member { family: wire, .. } => *wire,
         })
-        .map(|wire| workload.level(wire))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+        .map(|wire| {
+            let level = workload.level(wire).map_err(|error| error.to_string())?;
+            let coefficient = program
+                .wire_is_coefficient_output(wire)
+                .map_err(|_| "output metadata is invalid".to_owned())?;
+            Ok((level, level + usize::from(coefficient)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let logical_count = output_levels.iter().map(|(level, _)| *level).max().unwrap_or(0);
+    let output_last = output_levels.iter().map(|(_, level)| *level).max().unwrap_or(0);
     let base_bits = request.crt_bits.div_ceil(2);
     let pool = DCRTPolyParams::try_new(
         request.ring_dimension,
@@ -189,16 +200,24 @@ pub fn audit_program_at_crt_depth(
     )
     .map_err(|_| "unsupported prime pool".to_owned())?;
     let primes = pool.to_crt().0;
-    // Keep two successors beyond the program's last output level.  Refresh
-    // uses them as `p` and the target q_t product, respectively; without
-    // both levels a source whose final LUT lands at the last logical level
-    // cannot follow the production q -> p -> q_t chain.
-    let chain_last =
-        logical_count.checked_add(2).ok_or_else(|| "logical level chain overflows".to_owned())?;
+    // A refresh source keeps two successors beyond its last LUT level, used
+    // as `p` and the target q_t product; without both a source whose final
+    // LUT lands at the last logical level cannot follow the production
+    // q -> p -> q_t chain.
+    let chain_last = logical_count
+        .checked_add(successor_levels)
+        .ok_or_else(|| "logical level chain overflows".to_owned())?
+        .max(output_last);
     let mut levels = Vec::with_capacity(chain_last + 1);
     for logical_level in 0..=chain_last {
-        let physical_drop = logical_level / request.operations_per_drop;
-        let depth = request.max_crt_depth.saturating_sub(physical_drop).max(request.terminal_depth);
+        let depth = crate::rns_bgg::planned_crt_depth(
+            logical_level,
+            request.operations_per_drop,
+            request.primes_per_drop,
+            request.max_crt_depth,
+            request.terminal_depth,
+        )
+        .map_err(|error| error.to_string())?;
         let modulus = primes
             .get(..depth)
             .ok_or_else(|| "CRT-depth candidate exceeds the prime pool".to_owned())?
@@ -383,18 +402,15 @@ pub(crate) fn reduce_generated_segments<T: GraphValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Ring};
+    use crate::test_support::{execute_cpu, explicit_ring, full, primes, ring_of, validate};
+    use mxx_backends::poly::dcrt::params::DCRTPolyParams;
+    use mxx_dsl::DslContext;
     use mxx_ir_core::IntExpr;
-    use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
-    };
     use std::collections::BTreeMap;
     #[test]
     fn odd_width_segmented_reduction_matches_scalar_addition() {
         let parameters = DCRTPolyParams::new(4, 1, 20, 4, None, None);
-        let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 4);
+        let ring = ring_of(&parameters);
         let mut context = DslContext::new("odd-width-segmented-reduction");
         for width in [1usize, 3, 5, 257] {
             let values = (0..2 * width)
@@ -426,36 +442,21 @@ mod tests {
                     .unwrap();
             }
         }
-        let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        let result = execute(
-            &graph,
-            &mut cpu_backend([parameters]),
-            BTreeMap::new(),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
+        let graph = validate(&context.build().unwrap());
+        let result = execute_cpu(&graph, [parameters], BTreeMap::new());
         for width in [1usize, 3, 5, 257] {
             for segment in 0..2 {
-                let RuntimeValue::Matrix(expected) =
-                    &result.outputs[&format!("expected-{width}-{segment}")]
-                else {
-                    panic!("expected matrix")
-                };
+                let expected = full(&result.outputs[&format!("expected-{width}-{segment}")]);
                 for prefix in ["actual", "scalar"] {
-                    let RuntimeValue::Matrix(actual) =
-                        &result.outputs[&format!("{prefix}-{width}-{segment}")]
-                    else {
-                        panic!("reduced matrix")
-                    };
-                    assert_eq!(actual.as_ref(), expected.as_ref());
+                    let actual = full(&result.outputs[&format!("{prefix}-{width}-{segment}")]);
+                    assert_eq!(actual, expected);
                 }
             }
         }
     }
     #[test]
     fn public_refresh_segments_preserve_slot_axis_without_implicit_family_capture() {
-        let ring = mxx_dsl::Ring::new(97, 4);
+        let ring = explicit_ring(&primes(4, 1, 17), 4);
         let routed = ring.input_family("routed-public-prf", 15, (2, 4));
         let reduced = reduce_family_segments(routed, 3, 5, |left, right| left + right).unwrap();
         assert_eq!(reduced.count(), &IntExpr::constant(3));
@@ -465,6 +466,6 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        validate(&graph);
     }
 }

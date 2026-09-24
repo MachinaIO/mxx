@@ -1199,7 +1199,8 @@ mod tests {
             &[PrfLabel::from_components(&[b"toy-label"]).unwrap()],
         )
         .unwrap();
-        let ring = mxx_dsl::Ring::new(257, profile.ring_dimension().unwrap());
+        let ring =
+            crate::test_support::explicit_ring(&[257], profile.ring_dimension().unwrap() as u32);
         let selector = crate::noise_refresh::pbc::PbcTrustedSelectorBits::from_schedule(
             &generated, &ring, [9; 32],
         )

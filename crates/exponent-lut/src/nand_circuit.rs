@@ -13,7 +13,7 @@ use crate::{
         LutOutputRepresentation, Operand, ProgramValidationError, RhsId, WireId,
     },
 };
-use mxx_primitives::poly::Poly;
+use mxx_backends::poly::Poly;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -383,11 +383,11 @@ mod tests {
             LutOutputRepresentation, ProgramLowerError, ProgramLoweringContext, lower_program,
         },
     };
-    use mxx_ir_core::IntExpr;
-    use mxx_primitives::poly::{
+    use mxx_backends::poly::{
         Poly,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };
+    use mxx_ir_core::IntExpr;
 
     #[derive(Debug)]
     struct LogicalError;

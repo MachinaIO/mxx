@@ -20,18 +20,18 @@ from repo_validation import (
 class RepoValidationTests(unittest.TestCase):
     def test_gpu_validation_trigger_paths_split_repeat_and_single_run_modes(self) -> None:
         paths = [
-            "crates/primitives/cuda/src/kernel.cu",
-            "crates/primitives/src/matrix/gpu_mul.rs",
-            "crates/primitives/src/poly/subdir/gpu_fft.rs",
+            "crates/backends/cuda/src/kernel.cu",
+            "crates/backends/src/matrix/gpu_mul.rs",
+            "crates/backends/src/poly/subdir/gpu_fft.rs",
             "crates/gadgets/src/lookup/ggh15/poly_encoding_gpu.rs",
             "crates/gadgets/tests/test_gpu_case.rs",
-            "crates/primitives/src/matrix/mul.rs",
+            "crates/backends/src/matrix/mul.rs",
             "README.md",
         ]
 
         self.assertEqual(
             gpu_repeat_validation_trigger_paths(paths),
-            ["crates/primitives/cuda/src/kernel.cu", "crates/primitives/src/matrix/gpu_mul.rs", "crates/primitives/src/poly/subdir/gpu_fft.rs"],
+            ["crates/backends/cuda/src/kernel.cu", "crates/backends/src/matrix/gpu_mul.rs", "crates/backends/src/poly/subdir/gpu_fft.rs"],
         )
         self.assertEqual(
             gpu_single_run_validation_trigger_paths(paths),
@@ -101,7 +101,7 @@ class RepoValidationTests(unittest.TestCase):
     def test_edited_paths_from_git_combines_unstaged_staged_and_untracked(self) -> None:
         outputs = iter(
             [
-                subprocess.CompletedProcess(args=("git",), returncode=0, stdout="crates/gadgets/src/lib.rs\ncrates/primitives/cuda/src/kernel.cu\n", stderr=""),
+                subprocess.CompletedProcess(args=("git",), returncode=0, stdout="crates/gadgets/src/lib.rs\ncrates/backends/cuda/src/kernel.cu\n", stderr=""),
                 subprocess.CompletedProcess(args=("git",), returncode=0, stdout="crates/gadgets/src/lib.rs\n", stderr=""),
                 subprocess.CompletedProcess(args=("git",), returncode=0, stdout="crates/gadgets/tests/test_gpu_case.rs\n", stderr=""),
             ]
@@ -112,7 +112,7 @@ class RepoValidationTests(unittest.TestCase):
 
         self.assertEqual(
             edited_paths_from_git(Path("/tmp/repo"), runner=runner),
-            ["crates/gadgets/src/lib.rs", "crates/primitives/cuda/src/kernel.cu", "crates/gadgets/tests/test_gpu_case.rs"],
+            ["crates/gadgets/src/lib.rs", "crates/backends/cuda/src/kernel.cu", "crates/gadgets/tests/test_gpu_case.rs"],
         )
 
     def test_edited_paths_from_git_includes_deleted_gpu_related_files(self) -> None:
@@ -121,7 +121,7 @@ class RepoValidationTests(unittest.TestCase):
                 subprocess.CompletedProcess(
                     args=("git",),
                     returncode=0,
-                    stdout="crates/primitives/cuda/src/removed_kernel.cu\n",
+                    stdout="crates/backends/cuda/src/removed_kernel.cu\n",
                     stderr="",
                 ),
                 subprocess.CompletedProcess(
@@ -141,11 +141,11 @@ class RepoValidationTests(unittest.TestCase):
 
         self.assertEqual(
             paths,
-            ["crates/primitives/cuda/src/removed_kernel.cu", "crates/gadgets/tests/test_gpu_removed.rs"],
+            ["crates/backends/cuda/src/removed_kernel.cu", "crates/gadgets/tests/test_gpu_removed.rs"],
         )
         self.assertEqual(
             gpu_repeat_validation_trigger_paths(paths),
-            ["crates/primitives/cuda/src/removed_kernel.cu"],
+            ["crates/backends/cuda/src/removed_kernel.cu"],
         )
         self.assertEqual(
             gpu_single_run_validation_trigger_paths(paths),
@@ -158,7 +158,7 @@ class RepoValidationTests(unittest.TestCase):
         executed: list[Path] = []
 
         with (
-            patch("repo_validation.edited_paths_from_git", return_value=["crates/primitives/src/matrix/gpu_mul.rs"]),
+            patch("repo_validation.edited_paths_from_git", return_value=["crates/backends/src/matrix/gpu_mul.rs"]),
             patch("repo_validation.compile_gpu_test_binaries", return_value=[binary]),
             patch(
                 "repo_validation.run_gpu_binary",

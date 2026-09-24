@@ -21,7 +21,7 @@ pub fn protocol() -> ProtocolDecl {
 fn protocol_with_consumer_availability(
     consumer_availability: ArtifactAvailability,
 ) -> Result<ProtocolDecl, mxx_ir_core::protocol::ProtocolError> {
-    let ring = Ring::new(256, 1);
+    let ring = Ring::from_crt_moduli(vec![257.into()], 1);
     let message = ring.bool_input("message");
     let selector = message.clone().to_int();
     let zero = ring.zero((1, 1));
@@ -175,7 +175,8 @@ mod tests {
             ..ParamEnv::default()
         };
         let production = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-        let producer = validate(&declaration.stages()[0].graph, &bindings).unwrap();
+        let producer =
+            validate(&declaration.stages()[0].graph, &bindings, crate::test_resolve_basis).unwrap();
         let manifest = export_validated_manifest(production.clone(), &producer).unwrap();
         let manifests = BTreeMap::from([(production, manifest)]);
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -204,6 +205,7 @@ mod tests {
             &semantics,
             &manifests,
             &directory,
+            crate::test_resolve_basis,
         )
         .expect("generic export accepts the validated threshold decoder");
 
@@ -214,12 +216,12 @@ mod tests {
         assert!(premises.contains("Ideal.generatedRoot"));
         assert_eq!(premises.matches("(external.input_0)").count(), 2);
         assert!(!premises.contains(".natAbs <"));
-        assert!(premises.contains("ThresholdFixture.zeroCenter 256"));
+        assert!(premises.contains("ThresholdFixture.zeroCenter 257"));
         assert!(!source.contains("MxxWe"));
         assert!(conclusion.contains("Runs hashModel external execution →"));
         assert!(
             conclusion.contains(
-                "(observedResidual execution).natAbs < ThresholdFixture.decoderRadius 256"
+                "(observedResidual execution).natAbs < ThresholdFixture.decoderRadius 257"
             )
         );
         assert!(conclusion.contains("execution.«stage_1» = execution.«ideal»"));
@@ -263,7 +265,7 @@ mod tests {
     fn sampled_artifacts_are_transferred_but_public_deterministic_cache_is_cached() {
         use mxx_ir_core::node::NodeKind;
 
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let sampled = ring.sample_trapdoor(1, 1, 2, 3, 4);
         let sampled_public = sampled.public_matrix();
         let sampled_preimage = sampled.sample_preimage(ring.zero((1, 1)), (5, 1));
@@ -331,7 +333,7 @@ mod tests {
             lean::{ExportOptions, export},
         };
         use std::{collections::BTreeMap, fs, path::Path};
-        let ring = Ring::new(256, 2);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 2);
         let input = ring.input("ciphertext", (1, 1));
         let modulus = IntExpr::Var("plaintext_modulus".into());
         let integers = input.clone().threshold_decode_ints(modulus.clone(), 2);
@@ -348,7 +350,7 @@ mod tests {
             integers: BTreeMap::from([("plaintext_modulus".into(), 3.into())]),
             ..ParamEnv::default()
         };
-        let validated = graph.validate(&bindings).unwrap();
+        let validated = graph.validate(&bindings, crate::test_resolve_basis).unwrap();
         let artifact = export(
             &validated,
             &ExportOptions {

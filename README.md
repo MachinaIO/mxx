@@ -8,11 +8,9 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 
 | Crate | Responsibility |
 | --- | --- |
-| `mxx-primitives` | Polynomial/matrix operations, CPU/GPU kernels, and concrete samplers. |
+| `mxx-backends` | Polynomial/matrix operations, CPU/GPU kernels and execution, concrete samplers, transcripts, sessions, and artifacts. |
 | `mxx-ir-core` | Executable DAG, protocol declarations, structural validation, artifact manifests, and Lean claim generation. |
 | `mxx-dsl` | Typed graph construction and sampler-free ideal/predicate builders. |
-| `mxx-runtime` | CPU/GPU graph execution, transcripts, sessions, and in-memory artifacts. |
-| `mxx-bench-estimator` | Validated-graph cost and memory composition. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
 | `mxx-fhe` | DSL-based Ring Regev/Ring-GSW and leveled BGV, SIMD, rotations, and ciphertext noise tracking. |
@@ -20,19 +18,19 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
 
 The retired symbolic IR and probabilistic noise simulator are not part of the workspace.
-Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU
-samplers implement the current runtime-correspondence contract; GPU cutoff enforcement is tracked
-as a follow-up. Lattice-security estimation intentionally continues to model the corresponding
+Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU and
+GPU samplers enforce the same cutoffs: Gaussian draws are resampled until they meet the bound, and
+preimage sampling retries whole candidates that exceed it. Lattice-security estimation intentionally continues to model the corresponding
 ordinary untruncated distributions separately.
 
-See `docs/architecture.md`, `docs/dsl.md`, `docs/ir-core.md`, `docs/runtime.md`, and
-`docs/correctness/operational-protocol-inventory.md`.
+See `docs/architecture.md` (the design entry point, covering the IR, DSL, CPU executor, and GPU
+runtime) and `docs/correctness/operational-protocol-inventory.md`.
 
 ## FHE graphs
 
 `mxx-fhe` constructs cryptographic graphs; its methods do not encrypt eagerly.
 Key generation, sampling, polynomial arithmetic, and decryption execute when
-`mxx-runtime` runs the validated graph. CPU and GPU backends use the same FHE DSL.
+`mxx-backends` runs the validated graph. CPU and GPU backends use the same FHE DSL.
 Bootstrapping is not implemented.
 
 | API | Representation and behavior |

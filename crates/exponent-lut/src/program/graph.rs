@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn strided_monomial_wraps_at_the_full_negacyclic_modulus() {
         let layout = ExpLayout { stride_log2: 1, width_log2: 3 };
-        let ring = mxx_dsl::Ring::new(257, 16);
+        let ring = crate::test_support::explicit_ring(&[257], (16) as u32);
         let modulus = layout.effective_modulus(16);
         let zero = layout.mono(&ring, &BigInt::from(0)).unwrap();
         let half = layout.mono(&ring, &BigInt::from(modulus / 2)).unwrap();
@@ -367,7 +367,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        graph
+            .validate(
+                &mxx_ir_core::ParamEnv::default(),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -397,6 +402,11 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        graph
+            .validate(
+                &mxx_ir_core::ParamEnv::default(),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .unwrap();
     }
 }

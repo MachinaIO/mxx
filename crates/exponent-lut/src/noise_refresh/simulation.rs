@@ -1027,11 +1027,11 @@ fn artifact_storage_purpose(artifact: &ManifestArtifact) -> ArtifactStoragePurpo
 }
 
 fn matrix_coefficient_bytes(matrix: &ConcreteMatrixType) -> u64 {
-    let modulus_bytes = matrix.modulus.bits().div_ceil(8).max(1);
+    let modulus_bytes = matrix.ring.modulus().bits().div_ceil(8).max(1);
     u64::try_from(matrix.rows)
         .unwrap_or(u64::MAX)
         .saturating_mul(u64::try_from(matrix.columns).unwrap_or(u64::MAX))
-        .saturating_mul(u64::try_from(matrix.ring_dimension).unwrap_or(u64::MAX))
+        .saturating_mul(u64::from(matrix.ring.ring_dimension()))
         .saturating_mul(modulus_bytes)
 }
 
@@ -1041,15 +1041,15 @@ fn compact_coefficient_bytes(matrix: &ConcreteMatrixType, bound: &BigInt) -> u64
     u64::try_from(matrix.rows)
         .unwrap_or(u64::MAX)
         .saturating_mul(u64::try_from(matrix.columns).unwrap_or(u64::MAX))
-        .saturating_mul(u64::try_from(matrix.ring_dimension).unwrap_or(u64::MAX))
+        .saturating_mul(u64::from(matrix.ring.ring_dimension()))
         .saturating_mul(1u64.saturating_add(magnitude_bytes))
 }
 
 fn artifact_member_bytes(artifact: &ManifestArtifact) -> u64 {
     match &artifact.artifact_type {
         ArtifactType::Matrix(matrix) => matrix_coefficient_bytes(matrix),
-        ArtifactType::SmallMatrix { matrix, max_coefficient_bound } |
-        ArtifactType::Preimage { matrix, max_coefficient_bound } => {
+        ArtifactType::SmallMatrix { matrix, max_coefficient_bound, .. } |
+        ArtifactType::Preimage { matrix, max_coefficient_bound, .. } => {
             let bound_bytes = max_coefficient_bound
                 .to_biguint()
                 .map(|value| value.to_bytes_le().len().max(1))
@@ -1088,8 +1088,7 @@ mod storage_report_tests {
             execution_nonce: [22; 32],
         };
         let matrix = ConcreteMatrixType {
-            modulus: BigInt::from(257),
-            ring_dimension: 8,
+            ring: crate::test_support::concrete_ring(&[257], 8),
             rows: 2,
             columns: 3,
         };
@@ -1097,6 +1096,7 @@ mod storage_report_tests {
             artifact_type: ArtifactType::Preimage {
                 matrix: matrix.clone(),
                 max_coefficient_bound: BigInt::from(7),
+                bound_domain: mxx_ir_core::types::CoefficientBoundDomain::Global,
             },
             family_count,
             availability: ArtifactAvailability::Transferred,
@@ -1142,8 +1142,9 @@ mod storage_report_tests {
         };
         let artifact = ManifestArtifact {
             artifact_type: ArtifactType::Preimage {
-                matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
+                matrix: ConcreteMatrixType::scalar(crate::test_support::concrete_ring(&[257], 8)),
                 max_coefficient_bound: BigInt::from(7),
+                bound_domain: mxx_ir_core::types::CoefficientBoundDomain::Global,
             },
             family_count: Some(usize::MAX),
             availability: ArtifactAvailability::Transferred,

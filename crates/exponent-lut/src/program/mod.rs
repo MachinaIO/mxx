@@ -121,13 +121,7 @@ impl ExpLayout {
         exponent: &BigInt,
     ) -> Result<mxx_dsl::Mat, LayoutError> {
         use mxx_ir_core::node::ConstantMatrix;
-        let dimension = ring
-            .matrix_type((1, 1))
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .map_err(|_| LayoutError::NonConcreteRingDimension)?
-            .to_usize()
-            .ok_or(LayoutError::NonConcreteRingDimension)?;
+        let dimension = ring.ring_dimension() as usize;
         self.validate(dimension)?;
         let doubled =
             dimension.checked_mul(2).ok_or(LayoutError::ExponentModulusOverflow(dimension))?;
@@ -1041,11 +1035,17 @@ impl IntInterval {
 }
 
 fn interval_of(expression: &IntExpr, loop_bounds: &BTreeMap<u32, IntInterval>) -> IntInterval {
-    if let Ok(value) = expression.evaluate(&ParamEnv::default()) {
+    if let Ok(value) = expression.evaluate_with_rings(
+        &ParamEnv::default(),
+        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+    ) {
         return IntInterval::exact(value);
     }
     match expression {
         IntExpr::Const(value) => IntInterval::exact(value.clone()),
+        IntExpr::RingModulus(_) | IntExpr::RingCrtDepth(_) | IntExpr::RingCrtModulus { .. } => {
+            IntInterval::unknown()
+        }
         IntExpr::Var(_) => IntInterval::unknown(),
         IntExpr::LoopIndex(slot) => loop_bounds.get(slot).cloned().unwrap_or_default(),
         IntExpr::Add(lhs, rhs) => {

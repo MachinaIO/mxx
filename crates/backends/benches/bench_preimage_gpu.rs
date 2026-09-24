@@ -83,9 +83,14 @@ fn bench_gpu_preimage() {
     info!("GPU trapdoor+preimage plan: {:?}", start.elapsed());
     let mut store = MemoryArtifactStore::default();
     // The first execute binds the plan; the timed one measures steady-state replay.
-    drop(runtime.execute(&mut plan, inputs.clone(), &mut store, rand::random()).unwrap());
+    drop(
+        runtime
+            .execute_with_artifacts(&mut plan, inputs.clone(), &mut store, rand::random())
+            .unwrap(),
+    );
     let start = Instant::now();
-    let result = runtime.execute(&mut plan, inputs, &mut store, rand::random()).unwrap();
+    let result =
+        runtime.execute_with_artifacts(&mut plan, inputs, &mut store, rand::random()).unwrap();
     let elapsed = start.elapsed();
     black_box(result.output("preimage").unwrap());
 

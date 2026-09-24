@@ -196,6 +196,9 @@ fn physical_input_shape(value: &RuntimeValue) -> String {
                 descriptor.artifact_type, descriptor.family_count, descriptor.layout
             )
         }
+        RuntimeValue::Composite(leaves) => {
+            format!("composite:{:?}", leaves.iter().map(physical_input_shape).collect::<Vec<_>>())
+        }
         RuntimeValue::Int(_) => "int".to_owned(),
         RuntimeValue::Real(_) => "real".to_owned(),
         RuntimeValue::Bool(_) => "bool".to_owned(),

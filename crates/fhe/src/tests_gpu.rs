@@ -1,10 +1,7 @@
 //! GPU execution of the production FHE graphs; all artifacts stay in memory.
 use crate::{
-    BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme, RingGswParams,
-    utils::{
-        common,
-        gpu::{copy_outputs, integers},
-    },
+    BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme,
+    utils::{common, gpu::integers},
 };
 use mxx_backends::{
     GpuRuntime, MemoryArtifactStore, RuntimeValue,
@@ -49,7 +46,7 @@ fn test_gpu_integer_family_permutation_across_waves() {
     let inputs = BTreeMap::from([("values".into(), input(&input_values))]);
     let mut plan = runtime.plan(graph, &inputs).unwrap();
     let mut store = MemoryArtifactStore::default();
-    let result = runtime.execute(&mut plan, inputs, &mut store, [0; 32]).unwrap();
+    let result = runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0; 32]).unwrap();
     assert_eq!(
         runtime.download_integer_family_output(&result.output("result").unwrap()).unwrap(),
         input_values.iter().rev().map(|value| BigInt::from(*value)).collect::<Vec<_>>()
@@ -72,8 +69,7 @@ fn backend(common: &FheCommonParams, bgv: Option<&BgvParams>) -> GpuDcrtBackend 
     gpu_backend(gpu_parameters(common, bgv))
 }
 
-/// Execute once and copy every output out of the plan, as a caller must
-/// before the plan's storage can be reused.
+/// Execute once and return every output with the production id.
 fn prepare_and_run(
     graph: mxx_ir_core::ValidatedGraph,
     runtime: &mut GpuRuntime,
@@ -82,10 +78,11 @@ fn prepare_and_run(
 ) -> (BTreeMap<String, RuntimeValue>, Option<mxx_ir_core::artifact::ProductionId>) {
     let mut plan = runtime.plan(graph, &inputs).expect("prepare FHE GPU graph");
     let launches_before = plan.compiled_launch_count();
-    let result = runtime.execute(&mut plan, inputs, store, [0; 32]).expect("execute FHE GPU graph");
-    let outputs = copy_outputs(runtime, &result);
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, store, [0; 32])
+        .expect("execute FHE GPU graph");
     let production_id = result.production_id.clone();
-    drop(result);
+    let outputs = result.into_outputs();
     assert!(
         plan.compiled_launch_count() > launches_before,
         "FHE GPU execution must submit the compiled production path"
@@ -139,7 +136,8 @@ fn test_gpu_compiled_matrix_product_rebinds_sources() {
         coefficients[0] = coefficient;
         let inputs = BTreeMap::from([("values".into(), input(&coefficients))]);
         let launches = plan.compiled_launch_count();
-        let result = runtime.execute(&mut plan, inputs, &mut store, [0; 32]).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0; 32]).unwrap();
         let modulus = BigInt::from(common.ring.modulus().as_ref().clone());
         let mut expected = vec![BigInt::from(0); n];
         expected[0] = BigInt::from(coefficient).mod_floor(&modulus);
@@ -154,80 +152,6 @@ fn test_gpu_compiled_matrix_product_rebinds_sources() {
         drop(result);
         assert!(plan.compiled_launch_count() > launches);
     }
-}
-
-#[test]
-fn test_gpu_fhe_ring_gsw_runtime() {
-    let common = common();
-    let n = common.ring.ring_dimension() as usize;
-    let scheme =
-        RingGswParams::new(common.clone(), BigUint::from(1u64 << 22), BigUint::from(2u8)).unwrap();
-    let context = DslContext::new("gpu-ring-gsw");
-    let message = context.int_family_input("message", n);
-    let multiplier = context.int_family_input("multiplier", n);
-    let (secret, key) = scheme.keygen().unwrap();
-    let ct = scheme.encrypt(&key, &common.ring().from_coefficients(&message)).unwrap();
-    let gsw = scheme.encrypt_gsw(&secret, &common.ring().from_coefficients(&multiplier)).unwrap();
-    let product = scheme.mul(&ct, &gsw, &()).unwrap();
-    let sum = scheme.add(&ct, &ct).unwrap();
-    let graph = context
-        .transferred_output("roundtrip", scheme.decrypt(&secret, &ct).unwrap().coefficients())
-        .unwrap()
-        .transferred_output("sum", scheme.decrypt(&secret, &sum).unwrap().coefficients())
-        .unwrap()
-        .transferred_output("product", scheme.decrypt(&secret, &product).unwrap().coefficients())
-        .unwrap()
-        .build()
-        .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .unwrap();
-    let message = (0..n).map(|i| i as i64 % 5 - 2).collect::<Vec<_>>();
-    let mut multiplier = vec![0; n];
-    multiplier[1] = 1;
-    let backend = backend(&common, None);
-    let mut store = MemoryArtifactStore::default();
-    let mut runtime = GpuRuntime::new(backend).expect("construct FHE GPU runtime");
-    let ranges = &mut runtime.options_mut().integer_input_ranges;
-    ranges.insert("message".into(), BigInt::from(-2)..=BigInt::from(2));
-    ranges.insert("multiplier".into(), BigInt::from(0)..=BigInt::from(1));
-    let (result, _) = prepare_and_run(
-        graph,
-        &mut runtime,
-        BTreeMap::from([
-            ("message".into(), input(&message)),
-            ("multiplier".into(), input(&multiplier)),
-        ]),
-        &mut store,
-    );
-    assert_eq!(
-        integers(&runtime, &result, "roundtrip"),
-        message
-            .iter()
-            .map(|v| BigInt::from(*v)
-                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        integers(&runtime, &result, "sum"),
-        message
-            .iter()
-            .map(|v| BigInt::from(2 * v)
-                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
-            .collect::<Vec<_>>()
-    );
-    // Multiplication by X shifts coefficients, with a negated wrapped term
-    // because this is R_q = Z_q[X]/(X^N + 1), not a cyclic polynomial ring.
-    let mut expected = message;
-    expected.rotate_right(1);
-    expected[0] = -expected[0];
-    assert_eq!(
-        integers(&runtime, &result, "product"),
-        expected
-            .into_iter()
-            .map(|v| BigInt::from(v)
-                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
-            .collect::<Vec<_>>()
-    );
 }
 
 #[test]

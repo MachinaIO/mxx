@@ -209,6 +209,22 @@ __global__ void integer_operation_kernel(
             bool nonzero = false;
             for (size_t word = 0; word < integer_words(re); ++word) nonzero |= integer_word(right, re, word) != 0;
             if (!nonzero) { control_error(status, MXX_GPU_CONTROL_DIVISION_BY_ZERO); continue; }
+            if (words <= 2 && integer_words(le) <= 2 && integer_words(re) <= 2) {
+                // Two-word magnitudes divide natively in registers.
+                const unsigned __int128 numerator =
+                    (static_cast<unsigned __int128>(integer_word(left, le, 1)) << 64) | integer_word(left, le, 0);
+                const unsigned __int128 divisor =
+                    (static_cast<unsigned __int128>(integer_word(right, re, 1)) << 64) | integer_word(right, re, 0);
+                const unsigned __int128 quotient = numerator / divisor;
+                const unsigned __int128 rest = numerator - quotient * divisor;
+                if (words == 1 && (quotient >> 64) != 0) control_error(status, MXX_GPU_CONTROL_OVERFLOW);
+                result[1] = static_cast<uint64_t>(quotient);
+                remainder[1] = static_cast<uint64_t>(rest);
+                if (words == 2) {
+                    result[2] = static_cast<uint64_t>(quotient >> 64);
+                    remainder[2] = static_cast<uint64_t>(rest >> 64);
+                }
+            } else
             for (size_t bit = integer_words(le) * 64; bit != 0;) {
                 --bit;
                 uint64_t carry = (integer_word(left, le, bit / 64) >> (bit % 64)) & 1;
@@ -257,6 +273,100 @@ __global__ void integer_operation_kernel(
 }
 }
 
+namespace {
+// One-word integer element `index` as a signed 64-bit value. The lowering
+// proves every member and every partial product sum fits in int64.
+__device__ __forceinline__ int64_t integer_i64(const uint64_t *values, int encoding, size_t index) {
+    if (encoding <= 2) return static_cast<int64_t>(values[index]);
+    const uint64_t *element = values + index * 2;
+    return element[0] ? -static_cast<int64_t>(element[1]) : static_cast<int64_t>(element[1]);
+}
+__device__ __forceinline__ void integer_store_i64(uint64_t *element, int64_t value) {
+    element[0] = value < 0;
+    element[1] = value < 0 ? uint64_t(0) - static_cast<uint64_t>(value) : static_cast<uint64_t>(value);
+}
+constexpr unsigned MATVEC_THREADS = 256;
+constexpr size_t MATVEC_ROWS = 64;
+// `out = M v` for a row-major `rows x columns` matrix: one warp per row,
+// reading the row coalesced and reducing with shuffles.
+__global__ void integer_matrix_vector_kernel(
+    uint64_t *out, const uint64_t *matrix, const uint64_t *vector,
+    size_t rows, size_t columns, int me, int ve)
+{
+    const size_t warps = static_cast<size_t>(gridDim.x) * (blockDim.x / 32);
+    const unsigned lane = threadIdx.x % 32;
+    for (size_t row = static_cast<size_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32; row < rows; row += warps) {
+        int64_t sum = 0;
+        for (size_t column = lane; column < columns; column += 32)
+            sum += integer_i64(matrix, me, row * columns + column) * integer_i64(vector, ve, column);
+        for (unsigned offset = 16; offset; offset >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        if (lane == 0) integer_store_i64(out + row * 2, sum);
+    }
+}
+// `out = v^T M`: thread `j` of a block accumulates column `j` over one chunk
+// of `MATVEC_ROWS` rows into the two's-complement magnitude word; a finish
+// pass converts the sums to sign-magnitude.
+__global__ void integer_vector_matrix_kernel(
+    uint64_t *out, const uint64_t *matrix, const uint64_t *vector,
+    size_t rows, size_t columns, int me, int ve)
+{
+    const size_t column = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (column >= columns) return;
+    const size_t start = static_cast<size_t>(blockIdx.y) * MATVEC_ROWS;
+    const size_t end = min(rows, start + MATVEC_ROWS);
+    int64_t sum = 0;
+    for (size_t row = start; row < end; ++row)
+        sum += integer_i64(vector, ve, row) * integer_i64(matrix, me, row * columns + column);
+    atomicAdd(reinterpret_cast<unsigned long long *>(out + column * 2 + 1), static_cast<unsigned long long>(sum));
+}
+__global__ void integer_vector_matrix_clear_kernel(uint64_t *out, size_t columns) {
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < columns * 2; index += static_cast<size_t>(gridDim.x) * blockDim.x)
+        out[index] = 0;
+}
+__global__ void integer_vector_matrix_finish_kernel(uint64_t *out, size_t columns) {
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < columns; index += static_cast<size_t>(gridDim.x) * blockDim.x)
+        integer_store_i64(out + index * 2, static_cast<int64_t>(out[index * 2 + 1]));
+}
+
+// Operation 19: the product of the row-major matrix `lhs` with the vector
+// `rhs`; `argument` selects `v^T M` (1) or `M v` (0). The output is one-word
+// SignedWords and every operand has one magnitude word.
+int integer_matrix_vector_product(
+    GpuContext *ctx, cudaStream_t stream, uint64_t *out, const uint64_t *matrix,
+    const uint64_t *vector, size_t count, size_t matrix_count, size_t vector_count,
+    int oe, int me, int ve, uint64_t transpose, uint32_t out_binding,
+    uint32_t matrix_binding, uint32_t vector_binding)
+{
+    if (oe != 3 || me > 3 || ve > 3 || !vector || transpose > 1 ||
+        matrix_count != count * vector_count)
+        return gpu_set_last_error_cuda(cudaErrorInvalidValue);
+    const MxxGraphPatch patches[] = {
+        control_kernel_patch(0, out_binding),
+        control_kernel_patch(1, matrix_binding),
+        control_kernel_patch(2, vector_binding),
+    };
+    if (!transpose) {
+        const size_t warps = MATVEC_THREADS / 32;
+        return mxx_gpu_launch_kernel(ctx, stream, integer_matrix_vector_kernel,
+            dim3(static_cast<unsigned>(std::min<size_t>(65535, (count + warps - 1) / warps))),
+            dim3(MATVEC_THREADS), 0, patches, 3, out, matrix, vector, count,
+            vector_count, me, ve);
+    }
+    int result = mxx_gpu_launch_kernel(ctx, stream, integer_vector_matrix_clear_kernel,
+        dim3(control_blocks(count * 2)), dim3(CONTROL_THREADS), 0, patches, 1, out, count);
+    if (result != 0) return result;
+    const size_t chunks = (vector_count + MATVEC_ROWS - 1) / MATVEC_ROWS;
+    if (chunks > 65535) return gpu_set_last_error_cuda(cudaErrorInvalidValue);
+    result = mxx_gpu_launch_kernel(ctx, stream, integer_vector_matrix_kernel,
+        dim3(static_cast<unsigned>((count + MATVEC_THREADS - 1) / MATVEC_THREADS),
+            static_cast<unsigned>(chunks)),
+        dim3(MATVEC_THREADS), 0, patches, 3, out, matrix, vector, vector_count, count, me, ve);
+    if (result != 0) return result;
+    return mxx_gpu_launch_kernel(ctx, stream, integer_vector_matrix_finish_kernel,
+        dim3(control_blocks(count)), dim3(CONTROL_THREADS), 0, patches, 1, out, count);
+}
+}
+
 extern "C" int gpu_control_integer_operation_direct(
     GpuContext *ctx, void *out, const void *lhs, const void *rhs,
     void *aux, uint32_t *status, size_t count, size_t lhs_count,
@@ -265,6 +375,14 @@ extern "C" int gpu_control_integer_operation_direct(
     void *stream_raw, uint32_t out_binding, uint32_t lhs_binding,
     uint32_t rhs_binding, uint32_t aux_binding, uint32_t status_binding)
 {
+    if (operation == 19)
+        return ctx && stream_raw && out && lhs && status && !aux ?
+            integer_matrix_vector_product(ctx, reinterpret_cast<cudaStream_t>(stream_raw),
+                static_cast<uint64_t *>(out), static_cast<const uint64_t *>(lhs),
+                static_cast<const uint64_t *>(rhs), count, lhs_count, rhs_count,
+                output_encoding, lhs_encoding, rhs_encoding, argument, out_binding,
+                lhs_binding, rhs_binding) :
+            gpu_set_last_error_cuda(cudaErrorInvalidValue);
     if (!ctx || !stream_raw || !out || !lhs || !status || !count || !lhs_count ||
         operation > 18 || (rhs && !rhs_count) ||
         (operation <= 6 && !rhs) ||

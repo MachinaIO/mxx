@@ -311,9 +311,9 @@ int gpu_raw_matrix_tensor(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *destination,
     uint32_t left_binding_base, uint32_t right_binding_base,
     uint32_t destination_binding_base);
-int gpu_raw_matrix_copy(GpuContext *ctx, void *stream,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    uint32_t source_binding_base, uint32_t destination_binding_base);
+int gpu_raw_matrix_copy(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *sources, const MxxRawMatrixView *destinations, size_t count,
+    const uint32_t *source_binding_bases, const uint32_t *destination_binding_bases);
 int gpu_raw_matrix_scale(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     const uint64_t *scalar_residues, size_t residue_count,
@@ -527,9 +527,11 @@ int gpu_device_release_cached_memory(int device);
 int gpu_device_graph_memory_reserved(int device, size_t *out_reserved_bytes);
 int gpu_graph_allocation_free_async(uint64_t address, void *stream);
 int mxx_gpu_graph_builder_add_memory_alloc(MxxGpuGraphBuilder *builder, int device,
-    size_t bytes, uint32_t *out_token, uint64_t *out_address);
+    size_t bytes, const uint32_t *after, size_t after_count, uint32_t *out_token,
+    uint64_t *out_address);
 int mxx_gpu_graph_builder_add_memory_free(MxxGpuGraphBuilder *builder, uint64_t address,
-    const uint32_t *operations, size_t operation_count);
+    const uint32_t *operations, size_t operation_count, const uint32_t *after,
+    size_t after_count, uint32_t *out_token);
 int mxx_gpu_graph_builder_set_pending_memory_dependencies(MxxGpuGraphBuilder *builder,
     const uint32_t *tokens, size_t count);
 int mxx_gpu_graph_builder_begin_operation(MxxGpuGraphBuilder *builder,

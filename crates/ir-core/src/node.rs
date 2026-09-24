@@ -15,7 +15,7 @@ pub enum HashTagComponent {
     Integer(IntExpr),
     Decimal(IntExpr),
     U64Le(IntExpr),
-    /// Index into HashSample arguments, including the key at index zero.
+    /// Index into hash sampler arguments, including the key at index zero.
     Operand(usize),
 }
 
@@ -72,6 +72,9 @@ pub enum NodeKind {
     RingAutomorphism {
         index: IntExpr,
     },
+    /// Multiplies every entry by `X^k` in the negacyclic ring, for the
+    /// runtime integer `k` of argument 1 (any sign, taken modulo `2n`).
+    MultiplyMonomial,
     /// Coefficientwise exact nearest scaling into a divisor ring.
     ModulusSwitch {
         destination: RingRef,
@@ -142,6 +145,16 @@ pub enum NodeKind {
         #[serde(default)]
         digit_count: Option<IntExpr>,
     },
+    /// `count` integers uniform on `[0, modulus)` for a power-of-two
+    /// `modulus`, keyed like `HashSample`: integer `i` is the first
+    /// `log2(modulus)` bits of the digest stream of coefficient `i` of entry
+    /// `(0, 0)`, so no candidate is ever rejected.
+    HashIntFamily {
+        count: IntExpr,
+        modulus: IntExpr,
+        tag_prefix: Vec<u8>,
+        tag_components: Vec<HashTagComponent>,
+    },
     TrapdoorSample {
         matrix_type: crate::types::MatrixType,
         sigma: RealExpr,
@@ -193,6 +206,13 @@ pub enum NodeKind {
     /// Exports a scalar polynomial as canonical coefficients or native evaluation slots.
     PolynomialValues {
         evaluation: bool,
+    },
+    /// The integer product of a row-major matrix family (argument 0) with
+    /// a vector family (argument 1). The vector length fixes the inner
+    /// dimension: `M v` with `out[i] = sum_j M[i, j] v[j]`, or with
+    /// `transpose` `v^T M` with `out[j] = sum_i v[i] M[i, j]`.
+    IntMatrixVectorProduct {
+        transpose: bool,
     },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),

@@ -1311,6 +1311,19 @@ impl Mat {
         Self { value: node.output(0).expect("small RHS multiplication"), matrix_type: output_type }
     }
 
+    /// Multiplies every entry by `X^k` in the negacyclic ring for a runtime
+    /// integer `k`, taken modulo twice the ring dimension.
+    #[track_caller]
+    pub fn multiply_monomial(self, exponent: impl Into<Int>) -> Self {
+        let ty = self.matrix_type.clone();
+        let node = NodeHandle::new(
+            NodeKind::MultiplyMonomial,
+            vec![self.value, exponent.into().value],
+            vec![WireType::Matrix(ty.clone())],
+        );
+        Self { value: node.output(0).expect("monomial product"), matrix_type: ty }
+    }
+
     /// Applies the raw negacyclic automorphism `sigma_k: X -> X^k` entrywise.
     #[track_caller]
     pub fn ring_automorphism(self, index: impl Into<IntExpr>) -> Self {
@@ -1922,6 +1935,44 @@ impl DslContext {
         Int { value: expression }.add(Int::constant(0))
     }
 
+    /// `count` integers uniform on `[0, modulus)` for a power-of-two `modulus`,
+    /// derived from the 32-byte key, the tag, and each element's index. The
+    /// tag is prefixed with a fixed integer-family domain, so the stream never
+    /// coincides with a `hash_matrix` stream under the same key and tag.
+    #[track_caller]
+    pub fn hash_int_family(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        modulus: impl Into<IntExpr>,
+    ) -> Family<Int> {
+        let count = count.into();
+        let tag = tag.into();
+        let mut tag_prefix = b"mxx/hash-int-family/v1\0".to_vec();
+        tag_prefix.extend(tag.prefix);
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
+        let node = NodeHandle::new(
+            NodeKind::HashIntFamily {
+                count: count.clone(),
+                modulus: modulus.into(),
+                tag_prefix,
+                tag_components: tag.components,
+            },
+            arguments,
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("hash integer family")],
+            element_schema: IntType,
+            count,
+        }
+    }
+
     #[track_caller]
     pub fn int_family_input(
         &self,
@@ -2047,6 +2098,12 @@ pub struct BuiltGraph {
 }
 
 impl BuiltGraph {
+    /// How many times each primitive operation runs under the default
+    /// parameter bindings, loop iterations and subgraph calls included.
+    pub fn operation_counts(&self) -> Result<BTreeMap<String, u128>, mxx_ir_core::expr::ExprError> {
+        self.graph.operation_counts(&ParamEnv::default())
+    }
+
     pub fn validate(
         &self,
         bindings: &ParamEnv,
@@ -2062,6 +2119,16 @@ impl BuiltGraph {
         resolve_basis: mxx_ir_core::ResolveCrtBasis,
     ) -> Result<mxx_ir_core::validate::ValidatedGraph, ValidationBuildError> {
         Ok(mxx_ir_core::validate_with_manifests(&self.graph, bindings, manifests, resolve_basis)?)
+    }
+}
+
+impl mxx_ir_core::IntoValidatedGraph for BuiltGraph {
+    /// Validates with default parameter bindings.
+    fn into_validated_graph(
+        self,
+        resolve_basis: mxx_ir_core::ResolveCrtBasis,
+    ) -> Result<mxx_ir_core::validate::ValidatedGraph, String> {
+        self.validate(&ParamEnv::default(), resolve_basis).map_err(|error| error.to_string())
     }
 }
 

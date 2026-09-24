@@ -473,23 +473,6 @@ namespace
         raw_matrix_store(destination, poly, coefficient, source.columns,
             compact_residue(source, poly, coefficient, compact_limb, destination.modulus));
     }
-
-    // Decode compact coefficients straight into the negacyclic twist that
-    // opens the forward NTT, so no coefficient-domain copy is written.
-    __global__ void raw_small_rhs_twist_kernel(
-        MxxRawSmallMatrixView source, MxxRawMatrixLimb destination,
-        const uint64_t *twiddles, const uint64_t *shoup, size_t compact_limb,
-        size_t degree, size_t poly_offset)
-    {
-        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
-        const size_t poly = poly_offset + blockIdx.y;
-        const uint64_t residue =
-            compact_residue(source, poly, coefficient, compact_limb, destination.modulus);
-        raw_matrix_store(destination, poly, coefficient, source.columns,
-            mul_mod_shoup_u64(residue, twiddles[coefficient], shoup[coefficient],
-                destination.modulus));
-    }
 }
 
 static bool valid_compact_rhs_view(const MxxRawSmallMatrixView *source, size_t limb_count)
@@ -505,10 +488,10 @@ static bool valid_compact_rhs_view(const MxxRawSmallMatrixView *source, size_t l
 
 // left (L x K, evaluation domain) times the compact bounded right operand
 // (K x C) into destination (L x C, evaluation domain). The right operand is
-// transformed one workspace-wide column chunk at a time: compact decoding is
-// fused into the NTT's twist pass, the shared butterfly passes finish the
-// transform in the workspace, and the shared product kernel writes the
-// chunk's output columns. The right operand is never expanded in full.
+// transformed one workspace-wide column chunk at a time: the compact chunk is
+// decoded into the workspace, the shared NTT transforms it in place, and the
+// shared product kernel writes the chunk's output columns. The right operand
+// is never expanded in full.
 extern "C" int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *left, const MxxRawSmallMatrixView *right,
     const MxxRawMatrixView *workspace, const MxxRawMatrixView *destination,
@@ -545,68 +528,61 @@ extern "C" int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream_raw,
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const uint32_t degree = left->degree;
-    const dim3 coefficient_block(kTransformThreads);
-    const uint32_t coefficient_blocks = (degree + kTransformThreads - 1) / kTransformThreads;
     for (size_t start = 0; start < right->columns; start += workspace->columns)
     {
         const size_t width = std::min<size_t>(workspace->columns, right->columns - start);
         MxxRawSmallMatrixView chunk = *right;
         chunk.columns = width;
         chunk.column_offset += start;
-        const size_t chunk_polys = right->rows * width;
+        const size_t chunk_coefficients = right->rows * width * degree;
+        constexpr size_t maximum_decode = 65535ULL * 256ULL;
         for (size_t limb = 0; limb < left->limb_count; ++limb)
         {
-            const MxxRawMatrixLimb &transformed = workspace->limbs[limb];
-            const uint64_t *twiddles = nullptr;
-            const uint64_t *shoup = nullptr;
-            size_t local_limb = 0;
-            if (raw_ntt_limb_tables(ctx, transformed, left->physical_device, degree, false,
-                    &twiddles, &shoup, &local_limb) != 0)
-                return 1;
-            const MxxGraphPatch twist_patches[] = {
+            const MxxGraphPatch decode_patches[] = {
                 {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
                     offsetof(MxxRawSmallMatrixView, payload_address), sizeof(void *),
                     right_binding, 0},
                 {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
                     static_cast<uint32_t>(workspace_binding_base + limb), 0},
             };
-            const MxxGraphPatch stage_patch{nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                0, sizeof(void *), static_cast<uint32_t>(workspace_binding_base + limb), 0};
-            for (size_t offset = 0; offset < chunk_polys; offset += kMaxGridY)
+            for (size_t offset = 0; offset < chunk_coefficients; offset += maximum_decode)
             {
-                const size_t polys = std::min(kMaxGridY, chunk_polys - offset);
-                int status = mxx_gpu_launch_kernel(ctx, stream, raw_small_rhs_twist_kernel,
-                    dim3(coefficient_blocks, static_cast<uint32_t>(polys)), coefficient_block,
-                    0, twist_patches, 2, chunk, transformed, twiddles, shoup, limb,
-                    static_cast<size_t>(degree), offset);
-                if (status != 0) return status;
-                status = raw_ntt_forward_stages(ctx, stream, transformed, stage_patch,
-                    twiddles, shoup, width, degree, offset, polys);
+                const size_t count = std::min(maximum_decode, chunk_coefficients - offset);
+                const int status = mxx_gpu_launch_kernel(ctx, stream,
+                    raw_small_rhs_expand_kernel, dim3(static_cast<uint32_t>((count + 255) / 256)),
+                    dim3(256), 0, decode_patches, 2, chunk, workspace->limbs[limb], limb,
+                    chunk_coefficients, offset);
                 if (status != 0) return status;
             }
         }
+        // The chunk occupies the first `width` workspace columns.
+        MxxRawMatrixView transformed = *workspace;
+        transformed.columns = width;
+        if (gpu_raw_matrix_ntt(ctx, stream_raw, &transformed, &transformed, 0,
+                workspace_binding_base, workspace_binding_base) != 0)
+            return 1;
+        // The shared product kernel writes the chunk's output columns, which
+        // start `start` columns into the destination.
         const size_t output_polys = destination->rows * width;
-        for (size_t limb = 0; limb < left->limb_count; ++limb)
+        for (size_t first = 0; first < left->limb_count; first += kRawNttLimbs)
         {
-            MxxRawMatrixLimb output = destination->limbs[limb];
-            output.address += start * output.column_stride_bytes;
-            const MxxGraphPatch patches[] = {
-                {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(void *),
-                    static_cast<uint32_t>(left_binding_base + limb), 0},
-                {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
-                    static_cast<uint32_t>(workspace_binding_base + limb), 0},
-                {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 2, 0, sizeof(void *),
-                    static_cast<uint32_t>(destination_binding_base + limb), 0},
-            };
+            const size_t limbs = std::min(kRawNttLimbs, left->limb_count - first);
+            RawLimbSet lefts{}, rights{}, outputs{};
+            std::vector<MxxGraphPatch> patches;
+            raw_limb_set(left, first, limbs, 0, left_binding_base, lefts, patches);
+            raw_limb_set(&transformed, first, limbs, 1, workspace_binding_base, rights, patches);
+            raw_limb_set(destination, first, limbs, 2, destination_binding_base, outputs, patches,
+                start);
             for (size_t offset = 0; offset < output_polys; offset += kMaxGridY)
             {
                 const size_t polys = std::min(kMaxGridY, output_polys - offset);
+                const dim3 grid((degree + kMulCoefficients - 1) / kMulCoefficients,
+                    static_cast<uint32_t>(polys), static_cast<uint32_t>(limbs));
                 const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_mul_kernel,
-                    dim3(coefficient_blocks, static_cast<uint32_t>(polys)), coefficient_block,
-                    0, patches, 3, left->limbs[limb], workspace->limbs[limb], output,
-                    static_cast<size_t>(left->columns), width, width,
-                    static_cast<size_t>(destination->rows), static_cast<size_t>(degree),
-                    offset, false, false);
+                    grid, dim3(kMulCoefficients, kMulSlices), 0, patches.data(), patches.size(),
+                    lefts, rights, outputs, static_cast<size_t>(left->columns), width, width,
+                    static_cast<size_t>(destination->rows), static_cast<size_t>(degree), offset,
+                    false, false);
                 if (status != 0) return status;
             }
         }

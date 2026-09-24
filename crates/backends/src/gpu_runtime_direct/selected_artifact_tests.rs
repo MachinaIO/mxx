@@ -103,8 +103,9 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
 
     for (replay, index) in [2, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
-        let result =
-            runtime.execute(&mut plan, bind(index), &mut store, [0x61 + replay as u8; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, bind(index), &mut store, [0x61 + replay as u8; 32])
+            .unwrap();
         let matrix = runtime
             .download_matrix_output(&result.output("selected").expect("selected output"))
             .unwrap();
@@ -115,7 +116,11 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
         for member in 0..3 {
             assert_eq!(after[member] - before[member], usize::from(member == index));
         }
+        // A consumer that only imports opens no producer session.
+        assert!(result.production_id.is_none());
     }
+    // Reusing a nonce is valid for a consumer, since it records no session.
+    runtime.execute_with_artifacts(&mut plan, bind(0), &mut store, [0x61; 32]).unwrap();
 }
 
 #[test]
@@ -250,8 +255,9 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
-        let result =
-            runtime.execute(&mut plan, bind(index), &mut store, [0x81 + replay as u8; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, bind(index), &mut store, [0x81 + replay as u8; 32])
+            .unwrap();
         assert_eq!(
             runtime
                 .download_bytes_output(&result.output("selected").expect("selected output"))
@@ -387,8 +393,9 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
-        let result =
-            runtime.execute(&mut plan, bind(index), &mut store, [0xa1 + replay as u8; 32]).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, bind(index), &mut store, [0xa1 + replay as u8; 32])
+            .unwrap();
         assert_eq!(
             runtime
                 .download_integer_family_output(
@@ -510,8 +517,9 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     for (replay, index) in [1, 0].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
         {
-            let result =
-                runtime.execute(&mut plan, bind(index), &mut store, rand::random()).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, bind(index), &mut store, rand::random())
+                .unwrap();
             assert!(result.output("selected").is_some(), "selected trapdoor output");
         }
         let frame = plan.physical_frame_for_test();
@@ -654,14 +662,27 @@ fn run_family_consumed_by_later_loop(publish: bool) {
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
     let mut plan = runtime.plan(graph, &BTreeMap::new()).unwrap();
     let mut store = MemoryArtifactStore::default();
-    let result = runtime.execute(&mut plan, BTreeMap::new(), &mut store, [0x71; 32]).unwrap();
+    let result =
+        runtime.execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x71; 32]).unwrap();
     let sum = runtime.download_matrix_output(&result.output("sum").expect("sum output")).unwrap();
     assert_eq!(sum.entry(0, 0).coeffs_biguints()[0], num_bigint::BigUint::from(18u8));
     if publish {
         let production = result.production_id.clone().expect("producer identity");
+        let handles = result.artifact_handles.clone();
         drop(result);
         let manifest = store.load_finalized_manifest(&production).unwrap();
         assert_eq!(manifest.artifacts.len(), 1);
+        // The same nonce replays the finalized production: the outputs are
+        // recomputed and the committed artifacts are returned, not rewritten.
+        let replay = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x71; 32])
+            .unwrap();
+        assert_eq!(replay.production_id.as_ref(), Some(&production));
+        assert_eq!(replay.artifact_handles, handles);
+        let sum =
+            runtime.download_matrix_output(&replay.output("sum").expect("sum output")).unwrap();
+        assert_eq!(sum.entry(0, 0).coeffs_biguints()[0], num_bigint::BigUint::from(18u8));
+        assert_eq!(store.load_finalized_manifest(&production).unwrap(), manifest);
     }
 }
 

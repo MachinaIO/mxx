@@ -15,12 +15,13 @@ use crate::{
     },
     poly::dcrt::gpu::GpuExportSlot,
     session::{
-        ArtifactHandle, ProducerSession, ProducerSessionError, SessionDescriptor, SessionStore,
+        ArtifactHandle, ProducerSession, ProducerSessionError, SessionDescriptor, SessionStatus,
+        SessionStore,
     },
 };
 #[cfg(test)]
 use mxx_ir_core::artifact::ProductionId;
-use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType, ManifestArtifact};
+use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact};
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
@@ -405,29 +406,60 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> Drop for ProducerIoPu
     }
 }
 
-/// Check the producer input digest before launching the worker.
+/// Check the producer input digest before launching the worker. `run`
+/// receives the finalized manifest of a production that already finished;
+/// such a replay must not write artifacts again.
 pub fn with_checked_producer_io_pump<S, R>(
     store: &mut S,
     descriptor: SessionDescriptor,
     expected_input_digest: [u8; 32],
     window: NonZeroUsize,
-    run: impl for<'scope> FnOnce(&mut ProducerIoPump<'scope, ProducerSessionError<S::Error>>) -> R,
+    run: impl for<'scope> FnOnce(
+        &mut ProducerIoPump<'scope, ProducerSessionError<S::Error>>,
+        Option<Manifest>,
+    ) -> R,
 ) -> Result<R, CheckedProducerIoError<S::Error>>
 where
     S: SessionStore + Send,
 {
     let mut session = ProducerSession::open_checked(store, descriptor, expected_input_digest)
         .map_err(CheckedProducerIoError::Session)?;
+    let finalized = match session.status() {
+        SessionStatus::Finalized => {
+            Some(session.finalized_manifest().map_err(CheckedProducerIoError::Session)?)
+        }
+        _ => None,
+    };
     let result =
         crate::gpu_io_worker::with_scoped_producer_io_worker(&mut session, window, |client| {
             let mut pump = ProducerIoPump::new(client, window);
-            let result = run(&mut pump);
+            let result = run(&mut pump, finalized);
             pump.finish_export_observer(false)?;
             pump.drain().map(|()| result)
         });
     result
         .map_err(CheckedProducerIoError::Worker)
         .and_then(|nested| nested.map_err(CheckedProducerIoError::Pump))
+}
+
+/// Run a worker over `store` without a session, for a graph that imports
+/// artifacts but exports none. Its caller only imports, so nothing is staged,
+/// committed, or finalized, and no input digest or nonce is recorded.
+pub fn with_transient_io_pump<S, R>(
+    store: &mut S,
+    window: NonZeroUsize,
+    run: impl for<'scope> FnOnce(&mut ProducerIoPump<'scope, S::Error>) -> R,
+) -> Result<R, IoPumpError<S::Error>>
+where
+    S: SessionStore + Send,
+{
+    crate::gpu_io_worker::with_scoped_producer_io_worker(store, window, |client| {
+        let mut pump = ProducerIoPump::new(client, window);
+        let result = run(&mut pump);
+        pump.drain().map(|()| result)
+    })
+    .map_err(IoPumpError::Worker)
+    .and_then(|nested| nested)
 }
 
 #[derive(Debug, Error)]
@@ -462,7 +494,7 @@ mod tests {
             descriptor(),
             [4; 32],
             NonZeroUsize::new(1).unwrap(),
-            |_pump| (),
+            |_pump, _finalized| (),
         );
         assert!(matches!(
             result,

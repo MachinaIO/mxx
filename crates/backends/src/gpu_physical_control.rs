@@ -19,11 +19,12 @@ use crate::{
     gpu_physical_lowering::{
         ImportDestination, ImportTemplate, IndexedMatrixTableReplay, PhysicalLoweringContext,
         all_predecessors, allocate_compact_value, allocate_scratch_matrix, emit_matrix_operation,
-        full_coeff_value, full_eval_value, lower_centered_rebase_node, lower_crt_recompose_node,
-        lower_gadget_trapdoor_node, lower_hash_sample_node, lower_matrix_node,
-        lower_preimage_sample_node, lower_rns_conversion_node, lower_sample_matrix_node,
-        lower_static_matrix_node, lower_trapdoor_sample_node, pack_trapdoor_leaves,
-        physical_matrix, register_bindings, root_matrix_operation_identity, trapdoor_leaf_types,
+        full_coeff_value, full_eval_value, hash_tag_resource, lower_centered_rebase_node,
+        lower_crt_recompose_node, lower_gadget_trapdoor_node, lower_hash_sample_node,
+        lower_matrix_node, lower_preimage_sample_node, lower_rns_conversion_node,
+        lower_sample_matrix_node, lower_static_matrix_node, lower_trapdoor_sample_node,
+        pack_trapdoor_leaves, physical_matrix, push_hash_sample, register_bindings,
+        register_preimage_control_binding, root_matrix_operation_identity, trapdoor_leaf_types,
         value_id,
     },
     poly::{
@@ -901,6 +902,22 @@ pub(super) fn lower_control_node(
                 .ok_or_else(|| "GPU integer rhs has no physical value".to_owned())?;
             let a = integer_range(ctx, lhs)?;
             let b = integer_range(ctx, rhs)?;
+            // Operands with one possible value fold into a constant written
+            // when the plan is built, so no operation or binding remains.
+            let folded = match operation {
+                _ if a.start() != a.end() || b.start() != b.end() => None,
+                mxx_ir_core::node::IntBinaryOp::Add => Some(a.start() + b.start()),
+                mxx_ir_core::node::IntBinaryOp::Subtract => Some(a.start() - b.start()),
+                mxx_ir_core::node::IntBinaryOp::Multiply => Some(a.start() * b.start()),
+                _ => None,
+            };
+            if let Some(value) = folded {
+                let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+                let id =
+                    allocate_integer_value(ctx, ty, value.clone()..=value.clone(), Some(&value))?;
+                ctx.wire_ids.insert(output, id);
+                return Ok(());
+            }
             let range = integer_binary_output_range(*operation, &a, &b)?;
             let opcode = match operation {
                 mxx_ir_core::node::IntBinaryOp::Add => GpuIntegerOperation::Add,
@@ -1450,6 +1467,29 @@ pub(super) fn lower_control_node(
                 let range = lower
                     .ok_or_else(|| "GPU integer family has no lower bound".to_owned())?..=
                     upper.ok_or_else(|| "GPU integer family has no upper bound".to_owned())?;
+                // Members with one possible value each form a constant family,
+                // written once when the plan is built, with no per-member
+                // operation or binding.
+                let constants = ids
+                    .iter()
+                    .map(|id| {
+                        integer_range(ctx, *id).map(|range| {
+                            (range.start() == range.end()).then(|| range.start().clone())
+                        })
+                    })
+                    .collect::<Result<Option<Vec<_>>, _>>()?;
+                if let Some(constants) = constants {
+                    let id = allocate_integer_family_value_with_storage(
+                        ctx,
+                        expected,
+                        range,
+                        false,
+                        false,
+                        Some(&constants),
+                    )?;
+                    ctx.wire_ids.insert(output, id);
+                    return Ok(());
+                }
                 let id = allocate_integer_family_value(ctx, expected, range)?;
                 for (index, member) in ids.into_iter().enumerate() {
                     emit_integer_operation(
@@ -1561,6 +1601,15 @@ pub(super) fn lower_control_node(
             )?;
             Ok(())
         }
+        NodeKind::HashIntFamily { .. } => {
+            lower_hash_int_family(ctx, scope, scope_id, node_id, node, env)
+        }
+        NodeKind::MultiplyMonomial => {
+            lower_multiply_monomial(ctx, scope, scope_id, node_id, node, env)
+        }
+        NodeKind::IntMatrixVectorProduct { transpose } => {
+            lower_int_matrix_vector_product(ctx, scope, scope_id, node_id, node, env, *transpose)
+        }
         NodeKind::ParallelLoop(loop_node) => {
             lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env)
         }
@@ -1587,6 +1636,58 @@ pub(super) fn lower_control_node(
     }
 }
 
+/// A hash-sampled integer family: one native sample of the tag stream into
+/// a resident family with the range `[0, modulus)`.
+fn lower_hash_int_family(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    node: &NodeHandle,
+    env: &ParamEnv,
+) -> Result<(), String> {
+    let NodeKind::HashIntFamily { modulus, tag_prefix, tag_components, .. } = node.kind() else {
+        return Err("GPU hash family lowerer received another node".into());
+    };
+    let arguments = scope.arguments(node).ok_or("GPU hash family arguments are missing")?;
+    let key = *arguments
+        .first()
+        .and_then(|wire| ctx.wire_ids.get(wire))
+        .ok_or("GPU hash family key has no physical value")?;
+    let key_physical = &ctx.values[key.0 as usize];
+    if key_physical.ty != (ConcreteWireType::Bytes { length: 32 }) ||
+        key_physical.encodings.as_ref() != [PhysicalEncoding::Bytes] ||
+        key_physical.parts.len() != 1
+    {
+        return Err("GPU hash key must be resident Bytes32".into());
+    }
+    let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+    let output = WireRef { node: node_id, port: Port(0) };
+    if matches!(ty, ConcreteWireType::IndexedFamily { count: 0, .. }) {
+        let family = pack_resident_family(ty, &[], ctx.device)?;
+        let id = value_id(ctx.values.len())?;
+        ctx.values.push(family.physical().as_ref().clone());
+        ctx.owners.insert(id, family);
+        ctx.wire_ids.insert(output, id);
+        return Ok(());
+    }
+    let modulus = modulus
+        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+        .map_err(|error| error.to_string())?;
+    let (resource_id, operands) =
+        hash_tag_resource(ctx, &arguments, tag_prefix, tag_components, env)?;
+    // A family below 2^64 is stored compactly, one word per member.
+    let range = BigInt::from(0u8)..=modulus - 1u8;
+    let canonical = range.end().bits() <= 64;
+    let family =
+        allocate_integer_family_value_with_storage(ctx, ty, range, false, canonical, None)?;
+    let binding = register_preimage_control_binding(ctx, family)?;
+    let sample = push_hash_sample(ctx, resource_id, key, family, binding, &operands)?;
+    ctx.producer.insert(family, vec![(ColumnRange { start: 0, end: 1 }, sample)]);
+    ctx.wire_ids.insert(output, family);
+    Ok(())
+}
+
 /// Conservative finite transfer shared by direct integer dispatch and loop
 /// carry reservation. Division and remainder include all signed operands; the
 /// native status reports an actual zero divisor at execution.
@@ -1607,6 +1708,13 @@ fn integer_binary_output_range(
                 a.end() * b.end(),
             ];
             products.iter().min().unwrap().clone()..=products.iter().max().unwrap().clone()
+        }
+        // A Euclidean remainder by a positive divisor lies in `[0, divisor)`.
+        IntBinaryOp::Remainder if b.start().is_positive() => {
+            let largest = b.end() - 1u8;
+            let largest =
+                if a.start().is_negative() { largest } else { largest.min(a.end().clone()) };
+            BigInt::from(0u8)..=largest
         }
         IntBinaryOp::Divide | IntBinaryOp::Remainder => {
             let magnitude = [a.start(), a.end(), b.start(), b.end()]
@@ -2131,6 +2239,7 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                parallel_lanes: ctx.parallel_lanes,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -2188,6 +2297,7 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                parallel_lanes: ctx.parallel_lanes,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -2394,22 +2504,31 @@ fn allocate_integer_family_value(
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
 ) -> Result<PhysicalValueId, String> {
-    allocate_integer_family_value_with_storage(ctx, ty, range, false)
+    allocate_integer_family_value_with_storage(ctx, ty, range, false, false, None)
 }
 
+/// A returned family is stored as `CanonicalU64` when `canonical` (its range
+/// lies in `[0, 2^64)`) and as SignedWords otherwise.
 pub(super) fn allocate_return_integer_family_value(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
+    canonical: bool,
 ) -> Result<PhysicalValueId, String> {
-    allocate_integer_family_value_with_storage(ctx, ty, range, true)
+    allocate_integer_family_value_with_storage(ctx, ty, range, true, canonical, None)
 }
 
+/// `canonical` stores one `u64` word per member instead of a sign word and
+/// magnitude words; the range must then lie in `[0, 2^64)`. Only producers
+/// and consumers that read any one-word encoding may request it. `constants`
+/// holds every member's value, written once when the plan is built.
 fn allocate_integer_family_value_with_storage(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
     returned: bool,
+    canonical: bool,
+    constants: Option<&[BigInt]>,
 ) -> Result<PhysicalValueId, String> {
     let ConcreteWireType::IndexedFamily { element, count } = &ty else {
         return Err("GPU integer family allocation needs an indexed family".into());
@@ -2417,22 +2536,34 @@ fn allocate_integer_family_value_with_storage(
     if element.as_ref() != &ConcreteWireType::Int || *count == 0 || range.start() > range.end() {
         return Err("GPU integer family has invalid type, count, or range".into());
     }
+    if canonical && (range.start().is_negative() || range.end().bits() > 64) {
+        return Err("GPU canonical integer family range is outside u64".into());
+    }
     let count = *count;
     let params = ctx.backend.control_parameters_on_device(ctx.device)?;
     let words = usize::try_from(range.start().bits().max(range.end().bits()).div_ceil(64))
         .map_err(|_| "GPU family integer width exceeds usize".to_owned())?
         .max(1);
+    let encoding = if canonical {
+        GpuSignedValuesEncoding::CanonicalU64
+    } else {
+        GpuSignedValuesEncoding::SignedWords(words)
+    };
     let owner = Arc::new(
-        GpuSignedValues::allocate(
-            &params,
-            ctx.device,
-            count,
-            GpuSignedValuesEncoding::SignedWords(words),
-        )
+        match constants {
+            Some(values) if !canonical && values.len() == count => {
+                GpuSignedValues::from_bigints_with_words(&params, ctx.device, values, words)
+            }
+            Some(_) => return Err("GPU constant family differs from its layout".into()),
+            None => GpuSignedValues::allocate(&params, ctx.device, count, encoding),
+        }
         .map_err(|error| error.to_string())?,
     );
+    let element_words = encoding.words_per_value();
     let stride = u64::try_from(
-        (words + 1).checked_mul(8).ok_or_else(|| "GPU family word stride overflows".to_owned())?,
+        element_words
+            .checked_mul(8)
+            .ok_or_else(|| "GPU family word stride overflows".to_owned())?,
     )
     .map_err(|_| "GPU family word stride exceeds u64".to_owned())?;
     let slot =
@@ -2440,9 +2571,7 @@ fn allocate_integer_family_value_with_storage(
     let storage = if returned { StorageRef::Output(slot) } else { StorageRef::Scratch(slot) };
     let physical = PhysicalValue {
         ty,
-        encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedWords(
-            words,
-        ))]),
+        encodings: Box::new([PhysicalEncoding::Signed(encoding)]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
@@ -2450,7 +2579,7 @@ fn allocate_integer_family_value_with_storage(
             view: PhysicalView {
                 byte_offset: 0,
                 origin: Box::new([0, 0, 0]),
-                extent: Box::new([count as u64, 1, (words + 1) as u64]),
+                extent: Box::new([count as u64, 1, element_words as u64]),
                 byte_strides: Box::new([stride, stride, 8]),
                 element_bytes: 8,
             },
@@ -3640,6 +3769,160 @@ fn lower_ring_automorphism(
     Ok(())
 }
 
+/// Multiply a full-Eval matrix by `X^k` for a resident integer `k`: one
+/// pointwise scaling of every evaluation slot, with no NTT.
+fn lower_multiply_monomial(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    node: &NodeHandle,
+    env: &ParamEnv,
+) -> Result<(), String> {
+    let arguments = scope.arguments(node).ok_or("GPU monomial argument is out of scope")?;
+    let [source_wire, exponent_wire] = arguments.as_slice() else {
+        return Err("GPU monomial multiplication needs a matrix and an exponent".into());
+    };
+    let source = *ctx.wire_ids.get(source_wire).ok_or("GPU monomial source is missing")?;
+    let source = full_eval_value(ctx, source)?;
+    let exponent = *ctx.wire_ids.get(exponent_wire).ok_or("GPU monomial exponent is missing")?;
+    integer_range(ctx, exponent)?;
+    let source_value = &ctx.values[source.0 as usize];
+    let ConcreteWireType::Matrix(ty) = &source_value.ty else {
+        return Err("GPU monomial source is not a matrix".into());
+    };
+    if source_value.encodings.as_ref() != [PhysicalEncoding::FullEval] ||
+        resolved_node_output_type(scope_id, node_id, node, env)? != source_value.ty
+    {
+        return Err("GPU monomial multiplication needs an exact full-Eval matrix type".into());
+    }
+    let ty = ty.clone();
+    let output = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
+    let status = allocate_integer_status(ctx)?;
+    let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
+    let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
+    let exponent_binding = scalar_binding(ctx, exponent)?;
+    let status_binding = scalar_binding(ctx, status)?;
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::multiply_monomial())
+        .map_err(str::to_owned)?;
+    let predecessors = all_predecessors(ctx.producer, source)
+        .into_iter()
+        .chain(all_predecessors(ctx.producer, exponent))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let operation = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU monomial operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: Box::new([
+            KernelArg::Value(source),
+            KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::Value(exponent),
+            KernelArg::U32(0),
+            KernelArg::Value(status),
+            KernelArg::U32(0),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(output_binding),
+            KernelArg::U32(exponent_binding),
+            KernelArg::U32(status_binding),
+        ]),
+        outputs: Box::new([output]),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors,
+        body: None,
+    });
+    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    Ok(())
+}
+
+/// One native product of a resident integer matrix family with a vector
+/// family. Every member has one magnitude word and the proven output range
+/// fits in `i64`, so the kernel accumulates exactly without widening.
+fn lower_int_matrix_vector_product(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    node: &NodeHandle,
+    env: &ParamEnv,
+    transpose: bool,
+) -> Result<(), String> {
+    if ctx.lanes > 1 {
+        return Err("GPU integer matrix-vector product is not supported in a vectorized body".into());
+    }
+    let arguments = scope.arguments(node).ok_or("GPU matrix-vector arguments are out of scope")?;
+    let [matrix_wire, vector_wire] = arguments.as_slice() else {
+        return Err("GPU integer matrix-vector product needs a matrix and a vector".into());
+    };
+    let family_range = |ctx: &PhysicalLoweringContext<'_>, wire| {
+        let id = *ctx.wire_ids.get(wire).ok_or("GPU matrix-vector operand is missing")?;
+        let value = &ctx.values[id.0 as usize];
+        let ConcreteWireType::IndexedFamily { element, count } = &value.ty else {
+            return Err("GPU matrix-vector operand is not a family".to_owned());
+        };
+        if element.as_ref() != &ConcreteWireType::Int ||
+            value.parts.len() != 1 ||
+            !matches!(
+                value.encodings.as_ref(),
+                [PhysicalEncoding::Signed(
+                    GpuSignedValuesEncoding::SignedI64 |
+                        GpuSignedValuesEncoding::CanonicalU64 |
+                        GpuSignedValuesEncoding::SignedWords(1)
+                )]
+            )
+        {
+            return Err("GPU matrix-vector operand is not a one-word integer family".into());
+        }
+        let range = value
+            .integer_ranges
+            .get(&0)
+            .cloned()
+            .ok_or("GPU matrix-vector operand has no proven range")?;
+        Ok((id, *count, range))
+    };
+    let (matrix, _, matrix_range) = family_range(ctx, matrix_wire)?;
+    let (vector, inner, vector_range) = family_range(ctx, vector_wire)?;
+    let products = [
+        matrix_range.start() * vector_range.start(),
+        matrix_range.start() * vector_range.end(),
+        matrix_range.end() * vector_range.start(),
+        matrix_range.end() * vector_range.end(),
+    ];
+    let terms = BigInt::from(inner);
+    let range = products.iter().min().unwrap() * &terms..=products.iter().max().unwrap() * &terms;
+    let limit = BigInt::from(i64::MAX);
+    if [matrix_range.start(), matrix_range.end(), vector_range.start(), vector_range.end()]
+        .into_iter()
+        .chain([range.start(), range.end()])
+        .any(|bound| bound.abs() > limit)
+    {
+        return Err("GPU integer matrix-vector product may exceed int64".into());
+    }
+    let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+    let output = allocate_integer_family_value(ctx, ty, range)?;
+    emit_integer_operation(
+        ctx,
+        GpuIntegerOperation::MatrixVectorProduct,
+        output,
+        matrix,
+        Some(vector),
+        None,
+        u64::from(transpose),
+    )?;
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    Ok(())
+}
+
 fn lower_lift_integer_constant(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &GraphScope,
@@ -4628,6 +4911,37 @@ fn lower_matrix_slice(
         part.view.extent[0] = output_ty.rows as u64;
         part.view.extent[1] = output_ty.columns as u64;
     }
+    let output_wire = WireRef { node: node_id, port: Port(0) };
+    let returned = matches!(scope_id, FrozenGraphScopeId::Root) &&
+        ctx.validated.source.outputs().values().any(|output| output.value == output_wire);
+    if !returned {
+        // The slice is the window itself: a matrix of the output shape in its
+        // own coordinates, whose byte offset already addresses the source.
+        window.ty = ConcreteWireType::Matrix(output_ty.clone());
+        for part in window.parts.iter_mut() {
+            part.view.origin[0] = 0;
+            part.view.origin[1] = 0;
+        }
+        let window_owner =
+            source_owner.with_physical_view(Arc::new(window.clone())).map_err(str::to_owned)?;
+        let window_id = value_id(ctx.values.len())?;
+        ctx.values.push(window);
+        ctx.owners.insert(window_id, Arc::new(window_owner));
+        let writers = crate::gpu_physical_lowering::predecessors_for(
+            ctx.producer,
+            source,
+            ColumnRange { start: column_start, end: column_end },
+        );
+        ctx.producer.insert(
+            window_id,
+            writers
+                .iter()
+                .map(|&writer| (ColumnRange { start: 0, end: output_ty.columns }, writer))
+                .collect(),
+        );
+        ctx.wire_ids.insert(output_wire, window_id);
+        return Ok(());
+    }
     let window_owner =
         source_owner.with_physical_view(Arc::new(window.clone())).map_err(str::to_owned)?;
     let window_id = value_id(ctx.values.len())?;
@@ -4813,10 +5127,24 @@ fn lower_polynomial_from_values(
     let [family_wire] = arguments.as_slice() else {
         return Err("GPU polynomial import needs one integer family".into());
     };
-    let source = *ctx
+    let mut source = *ctx
         .wire_ids
         .get(family_wire)
         .ok_or_else(|| "GPU polynomial import family has no physical value".to_owned())?;
+    // The import kernel reads SignedWords; a canonical family is widened.
+    if let [PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)] =
+        ctx.values[source.0 as usize].encodings.as_ref()
+    {
+        let ty = ctx.values[source.0 as usize].ty.clone();
+        let range = ctx.values[source.0 as usize]
+            .integer_ranges
+            .get(&0)
+            .cloned()
+            .ok_or("GPU polynomial import family has no proven range")?;
+        let widened = allocate_integer_family_value(ctx, ty, range)?;
+        emit_integer_operation(ctx, GpuIntegerOperation::Copy, widened, source, None, None, 0)?;
+        source = widened;
+    }
     let physical = ctx
         .values
         .get(source.0 as usize)
@@ -5021,7 +5349,7 @@ fn lower_concat(
     let mut total_rows = 0usize;
     let mut total_columns = 0usize;
     let mut first_shape = None;
-    for wire in arguments {
+    for &wire in &arguments {
         let id = *ctx
             .wire_ids
             .get(&wire)
@@ -5057,7 +5385,7 @@ fn lower_concat(
         total_columns = total_columns
             .checked_add(ty.columns)
             .ok_or_else(|| "GPU concat column count overflows".to_owned())?;
-        inputs.push((id, ty.rows, ty.columns));
+        inputs.push((wire, id, ty.rows, ty.columns));
     }
     let (first_rows, first_columns) =
         first_shape.ok_or_else(|| "GPU concat has no input shape".to_owned())?;
@@ -5115,21 +5443,27 @@ fn lower_concat(
     } else {
         None
     };
-    let implementation = ctx
-        .implementations
-        .register(GpuImplementation::matrix_copy_view())
-        .map_err(str::to_owned)?;
+    // A piece whose writers are elementwise or product operations, and which
+    // nothing else reads, is written straight into its window; every other
+    // piece is copied into its window by one operation.
+    let index = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU concat operations".to_owned())?;
+    let mut copy_arguments = Vec::with_capacity(6 * inputs.len());
+    let mut outputs = Vec::with_capacity(inputs.len());
+    let mut predecessors = zero.into_iter().collect::<std::collections::BTreeSet<_>>();
     let mut row_start = 0usize;
     let mut column_start = 0usize;
     let mut written = Vec::with_capacity(inputs.len() + usize::from(zero.is_some()));
     if let Some(index) = zero {
         written.push((ColumnRange { start: 0, end: output_ty.columns }, index));
     }
-    for (source, rows, columns) in inputs {
-        let owner = ctx
-            .owners
-            .get(&output_id)
-            .ok_or_else(|| "GPU concat output owner is missing".to_owned())?;
+    for (wire, source, rows, columns) in inputs {
+        let writers = concat_piece_writers(ctx, scope, scope_id, &arguments, wire, source);
+        let owner = Arc::clone(
+            ctx.owners
+                .get(&output_id)
+                .ok_or_else(|| "GPU concat output owner is missing".to_owned())?,
+        );
         let mut window = ctx.values[output_id.0 as usize].clone();
         let (row, column) = match axis {
             ConcatAxis::Rows => (row_start, 0),
@@ -5161,6 +5495,56 @@ fn lower_concat(
             part.view.origin[1] = column;
             part.view.extent[1] = columns_u64;
         }
+        let range = if matches!(axis, ConcatAxis::Rows) {
+            ColumnRange { start: 0, end: output_ty.columns }
+        } else {
+            ColumnRange { start: column_start, end: column_start + columns }
+        };
+        if let Some((aliases, writers)) = writers.filter(|_| {
+            // Moving the piece into the window keeps its layout only when the
+            // output window has the piece's strides.
+            let piece = &ctx.values[source.0 as usize];
+            piece.parts.len() == window.parts.len() &&
+                piece.parts.iter().zip(window.parts.iter()).all(|(piece, window)| {
+                    piece.view.byte_strides == window.view.byte_strides &&
+                        piece.view.element_bytes == window.view.element_bytes
+                })
+        }) {
+            // Every view of the piece moves into the window: the same view
+            // over the output allocation, displaced by the window offset, so
+            // the writers (and their registered bindings) target the output.
+            let piece = ctx.values[source.0 as usize].clone();
+            for alias in aliases {
+                let mut moved = ctx.values[alias.0 as usize].clone();
+                for ((part, window_part), piece_part) in
+                    moved.parts.iter_mut().zip(window.parts.iter()).zip(piece.parts.iter())
+                {
+                    part.storage = window_part.storage;
+                    part.view.byte_offset = (part.view.byte_offset - piece_part.view.byte_offset)
+                        .checked_add(window_part.view.byte_offset)
+                        .ok_or_else(|| "GPU concat piece offset overflows".to_owned())?;
+                }
+                let moved_owner =
+                    owner.with_physical_view(Arc::new(moved.clone())).map_err(str::to_owned)?;
+                ctx.values[alias.0 as usize] = moved;
+                ctx.owners.insert(alias, Arc::new(moved_owner));
+            }
+            for (range, writer) in writers {
+                let range = if matches!(axis, ConcatAxis::Rows) {
+                    range
+                } else {
+                    ColumnRange { start: column_start + range.start, end: column_start + range.end }
+                };
+                written.push((range, writer));
+            }
+            row_start = row_start
+                .checked_add(rows)
+                .ok_or_else(|| "GPU concat row offset overflows".to_owned())?;
+            column_start = column_start
+                .checked_add(columns)
+                .ok_or_else(|| "GPU concat column offset overflows".to_owned())?;
+            continue;
+        }
         let window_owner =
             owner.with_physical_view(Arc::new(window.clone())).map_err(str::to_owned)?;
         let window_id = value_id(ctx.values.len())?;
@@ -5168,38 +5552,16 @@ fn lower_concat(
         ctx.owners.insert(window_id, Arc::new(window_owner));
         let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
         let destination_binding = register_bindings(ctx.bindings, ctx.values, window_id)?;
-        let index = u32::try_from(ctx.operations.len())
-            .map_err(|_| "too many GPU concat operations".to_owned())?;
-        let predecessors = all_predecessors(ctx.producer, source)
-            .into_iter()
-            .chain(zero)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        ctx.operations.push(CompiledGpuOp {
-            implementation,
-            arguments: Box::new([
-                KernelArg::Value(source),
-                KernelArg::U32(0),
-                KernelArg::Value(window_id),
-                KernelArg::U32(0),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(destination_binding),
-            ]),
-            outputs: Box::new([window_id]),
-            device: ctx.device,
-            grid: [1; 3],
-            block: [1; 3],
-            shared_bytes: 0,
-            predecessors,
-            body: None,
-        });
-        let range = if matches!(axis, ConcatAxis::Rows) {
-            ColumnRange { start: 0, end: output_ty.columns }
-        } else {
-            ColumnRange { start: column_start, end: column_start + columns }
-        };
+        predecessors.extend(all_predecessors(ctx.producer, source).iter().copied());
+        copy_arguments.extend([
+            KernelArg::Value(source),
+            KernelArg::U32(0),
+            KernelArg::Value(window_id),
+            KernelArg::U32(0),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(destination_binding),
+        ]);
+        outputs.push(window_id);
         written.push((range, index));
         row_start = row_start
             .checked_add(rows)
@@ -5208,9 +5570,123 @@ fn lower_concat(
             .checked_add(columns)
             .ok_or_else(|| "GPU concat column offset overflows".to_owned())?;
     }
+    if !outputs.is_empty() {
+        let implementation = ctx
+            .implementations
+            .register(GpuImplementation::matrix_copy_views(outputs.len()))
+            .map_err(str::to_owned)?;
+        ctx.operations.push(CompiledGpuOp {
+            implementation,
+            arguments: copy_arguments.into_boxed_slice(),
+            outputs: outputs.into_boxed_slice(),
+            device: ctx.device,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_bytes: 0,
+            predecessors: predecessors.into_iter().collect(),
+            body: None,
+        });
+    }
     ctx.producer.insert(output_id, written);
     ctx.wire_ids.insert(output_wire, output_id);
     Ok(())
+}
+
+/// The writers of concat piece `source` (the value of `wire`) when the
+/// piece can be written straight into its output window: elementwise or
+/// product operations of this scope that write only views of the piece's own
+/// unshared scratch allocations, which nothing but this concat reads.
+/// Returns every value viewing the piece's allocations with the writers.
+fn concat_piece_writers(
+    ctx: &PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    concat_arguments: &[WireRef],
+    wire: WireRef,
+    source: PhysicalValueId,
+) -> Option<(Vec<PhysicalValueId>, Vec<(ColumnRange, u32)>)> {
+    use crate::gpu_execution_plan::GpuNativePrimitive as P;
+    if ctx.wire_ids.get(&wire) != Some(&source) ||
+        concat_arguments.iter().filter(|argument| **argument == wire).count() != 1 ||
+        matches!(scope_id, FrozenGraphScopeId::Root) &&
+            ctx.validated.source.outputs().values().any(|output| output.value == wire)
+    {
+        return None;
+    }
+    let readers = scope
+        .nodes()
+        .iter()
+        .filter_map(|node| scope.arguments(node))
+        .flatten()
+        .filter(|argument| *argument == wire)
+        .count();
+    if readers != 1 {
+        return None;
+    }
+    let value = ctx.values.get(source.0 as usize)?;
+    let owner = ctx.owners.get(&source)?;
+    let storages = owner.storages().collect::<Vec<_>>();
+    // The piece's CRT limbs may share one scratch allocation.
+    if storages.iter().any(|(storage, _)| !matches!(storage, StorageRef::Scratch(_))) {
+        return None;
+    }
+    let allocations = storages
+        .iter()
+        .map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>())
+        .collect::<Vec<_>>();
+    let aliases = ctx
+        .owners
+        .iter()
+        .filter(|(_, other)| {
+            other
+                .storages()
+                .any(|(_, bound)| allocations.contains(&Arc::as_ptr(&bound.owner).cast::<()>()))
+        })
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    // Every aliasing value is a view within the piece with its strides; a
+    // piece that is itself a view into a larger value (one row of a product)
+    // does not move.
+    let end = |part: &crate::gpu_execution_plan::PhysicalPart| {
+        part.view.extent.iter().zip(part.view.byte_strides.iter()).try_fold(
+            part.view.byte_offset + u64::from(part.view.element_bytes),
+            |end, (&extent, &stride)| extent.checked_sub(1)?.checked_mul(stride)?.checked_add(end),
+        )
+    };
+    if aliases.iter().any(|id| {
+        let alias = &ctx.values[id.0 as usize];
+        alias.parts.len() != value.parts.len() ||
+            alias.parts.iter().zip(value.parts.iter()).any(|(alias, own)| {
+                alias.storage != own.storage ||
+                    alias.view.byte_strides != own.view.byte_strides ||
+                    alias.view.byte_offset < own.view.byte_offset ||
+                    end(alias).is_none() ||
+                    end(alias) > end(own)
+            })
+    }) {
+        return None;
+    }
+    let writers = ctx.producer.get(&source)?.clone();
+    for (_, writer) in &writers {
+        let op = ctx.operations.get(*writer as usize)?;
+        let primitive = ctx.implementations.resolve(op.implementation).ok()?.primitive;
+        if op.body.is_some() ||
+            op.outputs.iter().any(|output| !aliases.contains(output)) ||
+            !matches!(
+                primitive,
+                P::MatrixAdd |
+                    P::MatrixSub |
+                    P::MatrixMul |
+                    P::MatrixTensor |
+                    P::MatrixScale |
+                    P::MultiplyMonomial |
+                    P::RingAutomorphism
+            )
+        {
+            return None;
+        }
+    }
+    Some((aliases, writers))
 }
 
 /// Copy one exact full-Eval matrix without borrowing its source allocation as
@@ -5273,6 +5749,33 @@ fn copy_matrix_to(
     Ok(vec![index])
 }
 
+/// An Int carry, scalar or a family of Ints, sized by its range over every
+/// iteration.
+fn is_integer_carry(ty: &ConcreteWireType) -> bool {
+    match ty {
+        ConcreteWireType::Int => true,
+        ConcreteWireType::IndexedFamily { element, count } => {
+            *count > 0 && element.as_ref() == &ConcreteWireType::Int
+        }
+        _ => false,
+    }
+}
+
+/// The range shared by every member of an Int carry.
+fn carry_range(
+    ctx: &PhysicalLoweringContext<'_>,
+    id: PhysicalValueId,
+) -> Result<RangeInclusive<BigInt>, String> {
+    if matches!(ctx.values[id.0 as usize].ty, ConcreteWireType::IndexedFamily { .. }) {
+        return ctx.values[id.0 as usize]
+            .integer_ranges
+            .get(&0)
+            .cloned()
+            .ok_or_else(|| "GPU integer family carry has no proven range".to_owned());
+    }
+    integer_range(ctx, id)
+}
+
 /// `range` is the closed interval of an Int carry over every iteration; the
 /// carry storage is sized for it rather than for the initial value.
 fn allocate_sequential_carry(
@@ -5282,6 +5785,9 @@ fn allocate_sequential_carry(
     range: Option<RangeInclusive<BigInt>>,
 ) -> Result<PhysicalValueId, String> {
     if let Some(range) = range {
+        if matches!(target, ConcreteWireType::IndexedFamily { .. }) {
+            return allocate_integer_family_value(ctx, target.clone(), range);
+        }
         return allocate_integer_value(ctx, target.clone(), range, None);
     }
     // Loop carries are evaluation-domain matrices; a coefficient-domain
@@ -5398,15 +5904,17 @@ fn copy_carry_to(
     if ty.matrix_type().is_some() {
         return copy_matrix_to(ctx, source, destination, barrier);
     }
-    if matches!(
-        ty,
-        ConcreteWireType::Int |
-            ConcreteWireType::Bool |
-            ConcreteWireType::ConstantInt |
-            ConcreteWireType::ConstantBool |
-            ConcreteWireType::Real |
-            ConcreteWireType::ConstantReal
-    ) {
+    if is_integer_carry(&ty) ||
+        matches!(
+            ty,
+            ConcreteWireType::Int |
+                ConcreteWireType::Bool |
+                ConcreteWireType::ConstantInt |
+                ConcreteWireType::ConstantBool |
+                ConcreteWireType::Real |
+                ConcreteWireType::ConstantReal
+        )
+    {
         let operation = u32::try_from(ctx.operations.len())
             .map_err(|_| "too many GPU scalar carry operations".to_owned())?;
         if matches!(ty, ConcreteWireType::Real | ConcreteWireType::ConstantReal) {
@@ -5572,8 +6080,10 @@ fn lower_sequential_loop(
                 .wire_ids
                 .get(&arguments[position])
                 .ok_or_else(|| "GPU sequential input has no physical value".to_owned())?;
-            Ok(matches!(first_types.get(&child.inputs()[position]), Some(ConcreteWireType::Int))
-                .then(|| integer_range(ctx, source))
+            Ok(first_types
+                .get(&child.inputs()[position])
+                .is_some_and(is_integer_carry)
+                .then(|| carry_range(ctx, source))
                 .transpose()?)
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -5725,6 +6235,7 @@ fn lower_sequential_loop(
                 import_templates: &mut body_static_imports,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: &mut body_imports,
+                parallel_lanes: ctx.parallel_lanes,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -5787,7 +6298,7 @@ fn lower_sequential_loop(
         let mut widened = carry_ranges.clone();
         for (position, range) in widened.iter_mut().enumerate() {
             if let Some(range) = range {
-                let output = integer_range(ctx, outputs[position])?;
+                let output = carry_range(ctx, outputs[position])?;
                 *range = range.start().min(output.start()).clone()..=
                     range.end().max(output.end()).clone();
             }
@@ -6460,7 +6971,10 @@ fn lower_parallel_loop(
     let mut result_ids = Vec::<Vec<PhysicalValueId>>::with_capacity(width);
     let mut index_lanes = Vec::with_capacity(width);
     let template_values_start = ctx.values.len();
+    let mut lane_operations = Vec::with_capacity(width);
     for lane in 0..width {
+        let lane_start = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU parallel body operations".to_owned())?;
         let lane_device = lane_devices[lane % lane_devices.len()];
         ctx.device = lane_device;
         let outer_indices = ctx.device_loop_indices.clone();
@@ -6642,9 +7156,18 @@ fn lower_parallel_loop(
             }
         }
         result_ids.push(outputs);
+        lane_operations.push(
+            lane_start..
+                u32::try_from(ctx.operations.len())
+                    .map_err(|_| "too many GPU parallel body operations".to_owned())?,
+        );
     }
     let body_end = u32::try_from(ctx.operations.len())
         .map_err(|_| "too many GPU parallel body operations".to_owned())?;
+    // A device body is one top-level operation; its lanes share no memory node.
+    if !ctx.device_body && width > 1 {
+        ctx.parallel_lanes.push(lane_operations);
+    }
     let template_values = template_values_start..ctx.values.len();
     if ctx.device_body {
         // Every occurrence is its own lane; the device body replays them all.
@@ -6807,7 +7330,7 @@ fn bind_template_aliases(
     wave: &mut PhysicalWave,
     template_values: std::ops::Range<usize>,
 ) -> Result<(), String> {
-    let mut replaced = Vec::new();
+    let mut replaced = std::collections::HashMap::new();
     let mut ready = Vec::new();
     for (id, occurrence) in &wave.owner_bindings {
         // The first occurrence binds its template owners too: a replay after
@@ -6820,7 +7343,7 @@ fn bind_template_aliases(
             let rebound = occurrence
                 .storage(*slot)
                 .ok_or_else(|| "GPU wave occurrence lost a template storage slot".to_owned())?;
-            replaced.push((Arc::as_ptr(&bound.owner).cast::<()>(), rebound.clone()));
+            replaced.insert(Arc::as_ptr(&bound.owner).cast::<()>(), rebound.clone());
         }
         ready.extend(occurrence.ready_events().iter().cloned());
     }
@@ -6833,10 +7356,9 @@ fn bind_template_aliases(
             continue;
         }
         if let Some(owner) = ctx.owners.get(&id) {
-            let only_replaced = owner.storages().all(|(_, bound)| {
-                let allocation = Arc::as_ptr(&bound.owner).cast::<()>();
-                replaced.iter().any(|(old, _)| *old == allocation)
-            });
+            let only_replaced = owner
+                .storages()
+                .all(|(_, bound)| replaced.contains_key(&Arc::as_ptr(&bound.owner).cast::<()>()));
             if !only_replaced {
                 continue;
             }
@@ -7432,8 +7954,9 @@ mod tests {
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
         for _ in 0..2 {
-            let result =
-                runtime.execute(&mut plan, BTreeMap::new(), &mut store, [0x29; 32]).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x29; 32])
+                .unwrap();
             assert_eq!(
                 runtime.download_integer_family_output(&result.output("sum").unwrap()).unwrap(),
                 vec![BigInt::from(5)],
@@ -7468,8 +7991,9 @@ mod tests {
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
         let mut store = MemoryArtifactStore::default();
         for _ in 0..2 {
-            let result =
-                runtime.execute(&mut plan, BTreeMap::new(), &mut store, rand::random()).unwrap();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
             assert_eq!(
                 runtime.download_integer_family_output(&result.output("power").unwrap()).unwrap(),
                 vec![step.pow(3)],
@@ -7540,7 +8064,8 @@ mod tests {
         ranges.insert("v".into(), BigInt::from(0)..=BigInt::from(16));
         let mut plan = runtime.plan(validated, &inputs).unwrap();
         let mut store = MemoryArtifactStore::default();
-        let result = runtime.execute(&mut plan, inputs, &mut store, rand::random()).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, rand::random()).unwrap();
         for name in ["gathered", "eval_coeff", "eval_eval", "coeff_eval", "coeff_coeff"] {
             let RuntimeValue::IndexedFamily { values: expected, .. } =
                 cpu.materialize_output(name, &cpu_backend, &mut cpu_store).unwrap()
@@ -7722,7 +8247,7 @@ mod tests {
         for (replay, offset) in [0usize, 20].into_iter().enumerate() {
             let mut store = MemoryArtifactStore::default();
             let result = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut plan,
                     BTreeMap::from([("source".into(), resident(offset))]),
                     &mut store,
@@ -7800,7 +8325,8 @@ mod tests {
         assert!((1..=2).contains(&stage.wave_instances));
         assert!(stage.columns_per_job.iter().all(|width| *width > 0));
         let mut store = MemoryArtifactStore::default();
-        let result = runtime.execute(&mut plan, inputs, &mut store, rand::random()).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, rand::random()).unwrap();
         let family = result.output("sum").unwrap();
         for index in 0..3 {
             let actual = runtime.download_matrix_member_output(&family, index).unwrap();
@@ -7896,7 +8422,7 @@ mod tests {
         let expected = (left.clone() * &right) + &(left * &right);
         for replay in 0..2u8 {
             let result = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut plan,
                     inputs.clone(),
                     &mut MemoryArtifactStore::default(),
@@ -7968,7 +8494,8 @@ mod tests {
         let mut plan = runtime.plan(validated, &inputs).unwrap();
         assert!((1..=2).contains(&plan.report().stages[0].wave_instances));
         let mut store = MemoryArtifactStore::default();
-        let result = runtime.execute(&mut plan, inputs, &mut store, [0x73; 32]).unwrap();
+        let result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0x73; 32]).unwrap();
         let production = result.production_id.expect("family production identity");
         assert_eq!(result.artifact_handles["sum"].len(), 3);
         let manifest = store.load_finalized_manifest(&production).unwrap();
@@ -8098,7 +8625,7 @@ mod tests {
         for replay in 0..2 {
             let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
             let consumed = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut consumer_plan,
                     BTreeMap::from([("initial".into(), initial_value.clone())]),
                     &mut store,
@@ -8156,7 +8683,7 @@ mod tests {
             .unwrap();
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
         let error = runtime
-            .execute(
+            .execute_with_artifacts(
                 &mut bad_plan,
                 BTreeMap::from([("initial".into(), initial_value)]),
                 &mut store,

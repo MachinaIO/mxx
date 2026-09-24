@@ -50,6 +50,45 @@ where
     }
 }
 
+/// `count` integers uniform on `[0, modulus)` for a power-of-two `modulus`.
+/// Integer `i` is coefficient `i` of entry `(0, 0)` in the matrix transcript
+/// (`key || tag || row || column`), truncated to `log2(modulus)` bits, so no
+/// candidate is ever rejected.
+pub fn sample_hash_integers<H>(
+    hash_key: [u8; 32],
+    tag: &[u8],
+    count: usize,
+    modulus: &BigUint,
+) -> Vec<BigUint>
+where
+    H: digest::Digest + Clone + Send + Sync,
+{
+    let bits = modulus.bits().saturating_sub(1) as usize;
+    assert!(
+        bits > 0 && modulus == &(BigUint::from(1u8) << bits),
+        "hash integers need a power-of-two modulus above one"
+    );
+    let bytes_per_coeff = bits.div_ceil(8);
+    let high_mask = if bits.is_multiple_of(8) { u8::MAX } else { ((1u16 << (bits % 8)) - 1) as u8 };
+    let mut hasher = H::new();
+    hasher.update(hash_key);
+    hasher.update(tag);
+    hasher.update(0usize.to_le_bytes());
+    hasher.update(0usize.to_le_bytes());
+    parallel_iter!(0..count)
+        .map(|index| {
+            sample_uniform_coeff_from_hash(
+                &hasher,
+                index,
+                modulus,
+                bits,
+                bytes_per_coeff,
+                high_mask,
+            )
+        })
+        .collect()
+}
+
 pub struct DCRTPolyHashSampler<H: OutputSizeUser + digest::Digest> {
     _h: PhantomData<H>,
 }

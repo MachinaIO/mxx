@@ -684,6 +684,64 @@ impl<S: SessionStore> Executor<'_, S> {
         Ok(())
     }
 
+    /// The key and the tag bytes of a hash sampler node: the static prefix,
+    /// then each length-framed typed component.
+    fn hash_key_and_tag(
+        &mut self,
+        values: &mut BTreeMap<WireRef, RuntimeValue>,
+        node: &ExecutableNode<'_>,
+        env: &ParamEnv,
+        tag_prefix: &[u8],
+        tag_components: &[mxx_ir_core::node::HashTagComponent],
+    ) -> Result<([u8; 32], Vec<u8>), ExecutionError> {
+        let key = self.bytes(values, node.args[0])?;
+        let key: [u8; 32] = key.try_into().map_err(|_| ExecutionError::ValueKind(node.args[0]))?;
+        let mut tag = tag_prefix.to_vec();
+        for component in tag_components {
+            use mxx_ir_core::node::HashTagComponent;
+            match component {
+                HashTagComponent::Bytes(bytes) => {
+                    tag.push(0);
+                    tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                    tag.extend_from_slice(bytes);
+                }
+                HashTagComponent::Integer(expression) => {
+                    let value = expression
+                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .map_err(|error| self.expression_error(node.id, error))?;
+                    tag.push(1);
+                    append_tag_integer(&mut tag, &value);
+                }
+                HashTagComponent::Decimal(expression) => {
+                    let value = expression
+                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .map_err(|error| self.expression_error(node.id, error))?;
+                    let decimal = value.to_string();
+                    tag.push(2);
+                    tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                    tag.extend_from_slice(decimal.as_bytes());
+                }
+                HashTagComponent::U64Le(expression) => {
+                    let value = expression
+                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .map_err(|error| self.expression_error(node.id, error))?
+                        .to_u64()
+                        .ok_or_else(|| ExecutionError::Expression {
+                            node: node.id,
+                            message: "little-endian hash tag component must fit in u64".to_owned(),
+                        })?;
+                    tag.push(3);
+                    tag.extend_from_slice(&value.to_le_bytes());
+                }
+                HashTagComponent::Operand(index) => {
+                    tag.push(1);
+                    append_tag_integer(&mut tag, &self.int(values, node.args[*index])?);
+                }
+            }
+        }
+        Ok((key, tag))
+    }
+
     fn execute_node(
         &mut self,
         scope_id: &FrozenGraphScopeId,
@@ -1093,65 +1151,33 @@ impl<S: SessionStore> Executor<'_, S> {
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
+            NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } => {
+                let (key, tag) =
+                    self.hash_key_and_tag(values, node, env, tag_prefix, tag_components)?;
+                let count = self.eval_usize(node.id, count, env)?;
+                let modulus = modulus
+                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .map_err(|error| self.expression_error(node.id, error))?
+                    .to_biguint()
+                    .ok_or_else(|| ExecutionError::Expression {
+                        node: node.id,
+                        message: "hash integer family modulus is negative".to_owned(),
+                    })?;
+                let sampled = crate::sampler::hash::sample_hash_integers::<keccak_asm::Keccak256>(
+                    key, &tag, count, &modulus,
+                );
+                self.put(
+                    values,
+                    node.id,
+                    0,
+                    RuntimeValue::integer_values(sampled.into_iter().map(BigInt::from).collect()),
+                );
+            }
             NodeKind::HashSample {
                 variant, tag_prefix, tag_components, base, digit_count, ..
             } => {
-                let key = self.bytes(values, node.args[0])?;
-                let key: [u8; 32] =
-                    key.try_into().map_err(|_| ExecutionError::ValueKind(node.args[0]))?;
-                let mut tag = tag_prefix.clone();
-                for component in tag_components {
-                    use mxx_ir_core::node::HashTagComponent;
-                    match component {
-                        HashTagComponent::Bytes(bytes) => {
-                            tag.push(0);
-                            tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-                            tag.extend_from_slice(bytes);
-                        }
-                        HashTagComponent::Integer(expression) => {
-                            let value = expression
-                                .evaluate_with_rings(
-                                    env,
-                                    crate::openfhe_guard::gen_modulus_and_warmup,
-                                )
-                                .map_err(|error| self.expression_error(node.id, error))?;
-                            tag.push(1);
-                            append_tag_integer(&mut tag, &value);
-                        }
-                        HashTagComponent::Decimal(expression) => {
-                            let value = expression
-                                .evaluate_with_rings(
-                                    env,
-                                    crate::openfhe_guard::gen_modulus_and_warmup,
-                                )
-                                .map_err(|error| self.expression_error(node.id, error))?;
-                            let decimal = value.to_string();
-                            tag.push(2);
-                            tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
-                            tag.extend_from_slice(decimal.as_bytes());
-                        }
-                        HashTagComponent::U64Le(expression) => {
-                            let value = expression
-                                .evaluate_with_rings(
-                                    env,
-                                    crate::openfhe_guard::gen_modulus_and_warmup,
-                                )
-                                .map_err(|error| self.expression_error(node.id, error))?
-                                .to_u64()
-                                .ok_or_else(|| ExecutionError::Expression {
-                                    node: node.id,
-                                    message: "little-endian hash tag component must fit in u64"
-                                        .to_owned(),
-                                })?;
-                            tag.push(3);
-                            tag.extend_from_slice(&value.to_le_bytes());
-                        }
-                        HashTagComponent::Operand(index) => {
-                            tag.push(1);
-                            append_tag_integer(&mut tag, &self.int(values, node.args[*index])?);
-                        }
-                    }
-                }
+                let (key, tag) =
+                    self.hash_key_and_tag(values, node, env, tag_prefix, tag_components)?;
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, env, wire)?;
                 let gadget_base = base
@@ -1501,6 +1527,55 @@ impl<S: SessionStore> Executor<'_, S> {
                 let index = self.eval_usize(node.id, index, env)?;
                 let output =
                     self.backend.ring_automorphism(&input, index).map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::IntMatrixVectorProduct { transpose } => {
+                use rayon::prelude::*;
+                let members = |executor: &mut Self, wire| {
+                    let count = executor.family_count(values, wire)?;
+                    (0..count)
+                        .map(|index| {
+                            match executor.family_member(values, wire, index, node.id)? {
+                                RuntimeValue::Int(value) => Ok(value),
+                                _ => Err(ExecutionError::ValueKind(wire)),
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let matrix = members(self, node.args[0])?;
+                let vector = members(self, node.args[1])?;
+                let inner = vector.len();
+                let outer = matrix.len() / inner;
+                let output = (0..outer)
+                    .into_par_iter()
+                    .map(|position| {
+                        (0..inner)
+                            .map(|term| {
+                                let entry = if *transpose {
+                                    term * outer + position
+                                } else {
+                                    position * inner + term
+                                };
+                                &matrix[entry] * &vector[term]
+                            })
+                            .sum::<BigInt>()
+                    })
+                    .collect();
+                self.put(values, node.id, 0, RuntimeValue::integer_values(output));
+            }
+            NodeKind::MultiplyMonomial => {
+                let input = self.matrix(values, node.args[0])?;
+                let exponent = self.int(values, node.args[1])?;
+                let period = BigInt::from(2 * input.params().ring_dimension() as u64);
+                let exponent = mxx_ir_core::expr::euclidean_div_rem(&exponent, &period)
+                    .map_err(|error| self.expression_error(node.id, error))?
+                    .1
+                    .to_usize()
+                    .expect("residue below 2n fits usize");
+                let output = self
+                    .backend
+                    .multiply_monomial(&input, exponent)
+                    .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::ExtractCoefficient { position, .. } => {

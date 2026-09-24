@@ -1062,6 +1062,14 @@ impl CpuDcrtBackend {
         Ok(value.ring_automorphism_out_of_place(index))
     }
 
+    pub fn multiply_monomial(
+        &mut self,
+        value: &DCRTPolyMatrix,
+        exponent: usize,
+    ) -> Result<DCRTPolyMatrix, PolyBackendError> {
+        Ok(value.multiply_monomial_out_of_place(exponent))
+    }
+
     pub fn modulus_switch(
         &mut self,
         value: &DCRTPolyMatrix,

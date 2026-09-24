@@ -30,6 +30,6 @@ pub use graph::{
 pub use ring::{ConcreteRing, ResolveCrtBasis, RingExpr, RingRef};
 pub use types::{NodeId, Port, WireRef, WireType};
 pub use validate::{
-    LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError, concretize_wire_type,
-    validate, validate_structure, validate_with_manifests,
+    IntoValidatedGraph, LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError,
+    concretize_wire_type, validate, validate_structure, validate_with_manifests,
 };

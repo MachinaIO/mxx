@@ -42,8 +42,9 @@ fn prepare_and_run(
     let mut runtime = GpuRuntime::new(backend).expect("construct GPU gadget runtime");
     let mut plan = runtime.plan(graph, &inputs).expect("prepare GPU gadget graph");
     let launches_before = plan.compiled_launch_count();
-    let result =
-        runtime.execute(&mut plan, inputs, store, [0; 32]).expect("execute GPU gadget graph");
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, store, [0; 32])
+        .expect("execute GPU gadget graph");
     let outputs = result
         .output_names()
         .map(|name| {

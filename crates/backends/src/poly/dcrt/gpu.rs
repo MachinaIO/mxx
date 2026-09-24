@@ -422,6 +422,9 @@ unsafe impl Sync for GpuNativeLaunchStream {}
 #[doc(hidden)]
 pub struct GpuNativeEvent {
     raw: *mut MxxGpuNativeEventOpaque,
+    /// Set once a host wait has observed completion; an event is recorded
+    /// exactly once, so later waits return immediately.
+    completed: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for GpuNativeEvent {}
@@ -809,10 +812,11 @@ unsafe extern "C" {
     fn gpu_raw_matrix_copy(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
-        source: *const GpuRawMatrixViewAbi,
-        destination: *const GpuRawMatrixViewAbi,
-        source_binding_base: u32,
-        destination_binding_base: u32,
+        sources: *const GpuRawMatrixViewAbi,
+        destinations: *const GpuRawMatrixViewAbi,
+        count: usize,
+        source_binding_bases: *const u32,
+        destination_binding_bases: *const u32,
     ) -> c_int;
     fn gpu_raw_matrix_scale(
         ctx: *mut GpuContextOpaque,
@@ -848,6 +852,19 @@ unsafe extern "C" {
         source_binding_base: u32,
         destination_binding_base: u32,
         index_binding: u32,
+        status_binding: u32,
+    ) -> c_int;
+    fn gpu_raw_monomial_multiply(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        source: *const GpuRawMatrixViewAbi,
+        destination: *const GpuRawMatrixViewAbi,
+        exponent: *const c_void,
+        exponent_encoding: c_int,
+        status: *mut u32,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+        exponent_binding: u32,
         status_binding: u32,
     ) -> c_int;
     fn gpu_raw_lift_integer_constant(
@@ -1293,6 +1310,8 @@ unsafe extern "C" {
         builder: *mut MxxGpuGraphBuilderOpaque,
         device: c_int,
         bytes: usize,
+        after: *const u32,
+        after_count: usize,
         out_token: *mut u32,
         out_address: *mut u64,
     ) -> c_int;
@@ -1301,6 +1320,9 @@ unsafe extern "C" {
         address: u64,
         operations: *const u32,
         operation_count: usize,
+        after: *const u32,
+        after_count: usize,
+        out_token: *mut u32,
     ) -> c_int;
     fn mxx_gpu_graph_builder_set_pending_memory_dependencies(
         builder: *mut MxxGpuGraphBuilderOpaque,
@@ -2331,7 +2353,7 @@ impl GpuDeviceBytes {
         if status != 0 || event.is_null() {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
-        Ok(GpuNativeEvent { raw: event })
+        Ok(GpuNativeEvent { raw: event, completed: Default::default() })
     }
 
     pub(crate) fn launch_stream(&self) -> &GpuNativeLaunchStream {
@@ -2563,7 +2585,7 @@ impl PolyParams for GpuDCRTPolyParams {
             return None;
         }
         let crt_bits = moduli.iter().map(|prime| bits_in_u64(*prime)).max()?;
-        if self.base_bits as usize > crt_bits / 2 {
+        if self.base_bits as usize > crt_bits.div_ceil(2) {
             return None;
         }
         Some(Self::new_with_gpu(
@@ -2697,8 +2719,8 @@ impl GpuDCRTPolyParams {
         let dropped_moduli = dropped_moduli.unwrap_or(0);
         assert!(dropped_moduli < crt_depth, "dropped_moduli must be less than crt_depth");
         assert!(
-            base_bits > 0 && base_bits as usize <= crt_bits / 2,
-            "base_bits must be positive and <= crt_bits / 2"
+            base_bits > 0 && base_bits as usize <= crt_bits.div_ceil(2),
+            "base_bits must be positive and <= ceil(crt_bits / 2)"
         );
         let modulus = moduli.iter().fold(BigUint::one(), |acc, m| acc * m);
         let dnum =
@@ -3052,31 +3074,36 @@ impl GpuDCRTPolyParams {
 
     /// Copy equal-sized physical matrix rectangles, allowing the source and
     /// destination to occupy different global row or column origins.
+    /// Copy every `(source, destination, source binding base, destination
+    /// binding base)` pair of equal-shape views in one launch per limb batch.
     pub fn emit_raw_matrix_copy(
         &self,
         stream: &GpuNativeLaunchStream,
-        source: &GpuRawMatrixView,
-        destination: &GpuRawMatrixView,
-        source_binding_base: u32,
-        destination_binding_base: u32,
+        pairs: &[(&GpuRawMatrixView, &GpuRawMatrixView, u32, u32)],
     ) -> Result<(), GpuNativeGraphError> {
-        if source.physical_device != stream.physical_device ||
-            destination.physical_device != stream.physical_device ||
-            source.degree != self.ring_dimension ||
-            destination.degree != self.ring_dimension
+        if pairs.is_empty() ||
+            pairs.iter().any(|(source, destination, _, _)| {
+                source.physical_device != stream.physical_device ||
+                    destination.physical_device != stream.physical_device ||
+                    source.degree != self.ring_dimension ||
+                    destination.degree != self.ring_dimension
+            })
         {
             return Err(GpuNativeGraphError::Native("raw copy view/context mismatch".into()));
         }
-        let source = source.abi();
-        let destination = destination.abi();
+        let sources = pairs.iter().map(|pair| pair.0.abi()).collect::<Vec<_>>();
+        let destinations = pairs.iter().map(|pair| pair.1.abi()).collect::<Vec<_>>();
+        let source_bindings = pairs.iter().map(|pair| pair.2).collect::<Vec<_>>();
+        let destination_bindings = pairs.iter().map(|pair| pair.3).collect::<Vec<_>>();
         if unsafe {
             gpu_raw_matrix_copy(
                 self.ctx.raw_ptr(),
                 stream.raw_ptr(),
-                &source,
-                &destination,
-                source_binding_base,
-                destination_binding_base,
+                sources.as_ptr(),
+                destinations.as_ptr(),
+                pairs.len(),
+                source_bindings.as_ptr(),
+                destination_bindings.as_ptr(),
             )
         } != 0
         {
@@ -3203,6 +3230,53 @@ impl GpuDCRTPolyParams {
                 source_binding_base,
                 destination_binding_base,
                 index.binding,
+                status.binding,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Multiply one evaluation-domain physical matrix by `X^exponent`; the
+    /// device reduces the resident integer exponent modulo 2*degree.
+    pub fn emit_raw_monomial_multiply(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        source: &GpuRawMatrixView,
+        destination: &GpuRawMatrixView,
+        exponent: GpuRawIntegerView,
+        status: GpuRawControlStatusView,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if source.physical_device != stream.physical_device ||
+            destination.physical_device != stream.physical_device ||
+            source.degree != self.ring_dimension ||
+            destination.degree != self.ring_dimension ||
+            exponent.address == 0 ||
+            exponent.count != 1 ||
+            status.address == 0
+        {
+            return Err(GpuNativeGraphError::Native(
+                "invalid raw monomial multiplication view".into(),
+            ));
+        }
+        let source = source.abi();
+        let destination = destination.abi();
+        if unsafe {
+            gpu_raw_monomial_multiply(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &source,
+                &destination,
+                exponent.address as *const c_void,
+                exponent.encoding.native_code(),
+                status.address as *mut u32,
+                source_binding_base,
+                destination_binding_base,
+                exponent.binding,
                 status.binding,
             )
         } != 0
@@ -5089,7 +5163,7 @@ impl GpuNativeLaunchStream {
         {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
-        Ok(GpuNativeEvent { raw })
+        Ok(GpuNativeEvent { raw, completed: Default::default() })
     }
 }
 
@@ -5135,6 +5209,9 @@ pub enum GpuIntegerOperation {
     Log2Ceil,
     ReportError,
     GatherRingCrtModulus,
+    /// `lhs` is a row-major matrix family and `rhs` a vector family;
+    /// `argument` 1 gives `rhs^T lhs` and 0 gives `lhs rhs`.
+    MatrixVectorProduct,
 }
 
 /// Borrowed physical integer slice for one direct CUDA Graph control node.
@@ -5383,6 +5460,21 @@ impl GpuDCRTPolyParams {
         {
             return Err(GpuNativeGraphError::Native(
                 "raw ring CRT lookup requires a signed-word modulus family and scalar index".into(),
+            ));
+        }
+        if operation == GpuIntegerOperation::MatrixVectorProduct &&
+            (argument > 1 ||
+                output.encoding != GpuSignedValuesEncoding::SignedWords(1) ||
+                aux.is_some() ||
+                rhs.is_none_or(|vector| {
+                    Some(lhs.count) != output.count.checked_mul(vector.count) ||
+                        matches!(vector.encoding, GpuSignedValuesEncoding::SignedWords(words) if words != 1)
+                }) ||
+                matches!(lhs.encoding, GpuSignedValuesEncoding::SignedWords(words) if words != 1))
+        {
+            return Err(GpuNativeGraphError::Native(
+                "raw integer matrix-vector product needs one-word operands of matching shape"
+                    .into(),
             ));
         }
         let result = unsafe {
@@ -5769,12 +5861,13 @@ impl GpuNativeGraphBuilder {
         std::mem::replace(&mut self.stream, stream)
     }
 
-    /// Allocate one graph-owned buffer on `device`, ordered after every
-    /// earlier graph memory node, and return its token and fixed address.
+    /// Allocate one graph-owned buffer on `device`, ordered after the memory
+    /// nodes `after`, and return its token and fixed address.
     pub fn add_memory_alloc(
         &mut self,
         device: i32,
         bytes: usize,
+        after: &[u32],
     ) -> Result<(u32, u64), GpuNativeGraphError> {
         let (mut token, mut address) = (0, 0);
         if unsafe {
@@ -5782,6 +5875,8 @@ impl GpuNativeGraphBuilder {
                 self.raw,
                 device,
                 bytes,
+                after.as_ptr(),
+                after.len(),
                 &mut token,
                 &mut address,
             )
@@ -5792,25 +5887,30 @@ impl GpuNativeGraphBuilder {
         Ok((token, address))
     }
 
-    /// Free one graph allocation after every earlier graph memory node and
-    /// after the emitted top-level `operations` that use it.
+    /// Free one graph allocation after the memory nodes `after` and after the
+    /// emitted top-level `operations` that use it, and return its token.
     pub fn add_memory_free(
         &mut self,
         address: u64,
         operations: &[u32],
-    ) -> Result<(), GpuNativeGraphError> {
+        after: &[u32],
+    ) -> Result<u32, GpuNativeGraphError> {
+        let mut token = 0;
         if unsafe {
             mxx_gpu_graph_builder_add_memory_free(
                 self.raw,
                 address,
                 operations.as_ptr(),
                 operations.len(),
+                after.as_ptr(),
+                after.len(),
+                &mut token,
             )
         } != 0
         {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
-        Ok(())
+        Ok(token)
     }
 
     /// Make the next top-level operation start after these allocations.
@@ -6168,7 +6268,7 @@ impl GpuNativeGraphExec {
                 last_error_string()
             )));
         }
-        Ok(GpuNativeEvent { raw: raw_event })
+        Ok(GpuNativeEvent { raw: raw_event, completed: Default::default() })
     }
 }
 
@@ -6205,6 +6305,10 @@ impl GpuNativeEvent {
     /// asynchronous; this is only for an intentional host-observation point.
     #[doc(hidden)]
     pub fn wait(&self) -> Result<(), GpuNativeGraphError> {
+        use std::sync::atomic::Ordering;
+        if self.completed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let status = unsafe { mxx_gpu_native_event_wait(self.raw) };
         if status != 0 {
             return Err(GpuNativeGraphError::Native(format!(
@@ -6212,6 +6316,7 @@ impl GpuNativeEvent {
                 last_error_string()
             )));
         }
+        self.completed.store(true, Ordering::Release);
         Ok(())
     }
 

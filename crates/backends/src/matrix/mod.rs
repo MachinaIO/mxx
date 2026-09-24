@@ -300,6 +300,41 @@ pub trait PolyMatrix:
         Self::from_poly_vec(self.params(), entries)
     }
 
+    /// Multiplies every entry by `X^exponent` in `Z_q[X]/(X^n + 1)`, for
+    /// `exponent` in `[0, 2n)`.
+    fn multiply_monomial_out_of_place(&self, exponent: usize) -> Self {
+        let n = self.params().ring_dimension() as usize;
+        assert!(exponent < 2 * n, "monomial exponent must lie in [0, 2n)");
+        let (rows, columns) = self.size();
+        let entries = (0..rows)
+            .into_par_iter()
+            .map(|row| {
+                (0..columns)
+                    .map(|column| {
+                        let mut output = vec![
+                            <<Self as PolyMatrix>::P as Poly>::Elem::zero(
+                                &self.params().modulus(),
+                            );
+                            n
+                        ];
+                        for (source, coefficient) in
+                            self.entry(row, column).coeffs().into_iter().enumerate()
+                        {
+                            let target = (source + exponent) % (2 * n);
+                            if target < n {
+                                output[target] = coefficient;
+                            } else {
+                                output[target - n] = -coefficient;
+                            }
+                        }
+                        Self::P::from_coeffs(self.params(), &output)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::from_poly_vec(self.params(), entries)
+    }
+
     fn ring_automorphism_batch_out_of_place(inputs: Vec<(Arc<Self>, usize)>) -> Vec<Self> {
         inputs
             .into_par_iter()

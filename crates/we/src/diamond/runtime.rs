@@ -36,7 +36,7 @@ impl<E> DiamondBooleanOutput<E> for ExecutionResult {
 }
 
 #[cfg(feature = "gpu")]
-impl DiamondBooleanOutput<GpuRuntime> for GpuExecutionResult<'_> {
+impl DiamondBooleanOutput<GpuRuntime> for GpuExecutionResult {
     fn boolean_output(&self, execution: &GpuRuntime, name: &str) -> Result<Option<bool>, String> {
         self.output(name)
             .map(|output| {

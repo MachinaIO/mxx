@@ -2012,6 +2012,10 @@ extern "C"
         {
             return set_error("GPU context has no compute stream for physical device");
         }
+        // Callers allocate on the stream or add Graph nodes that do not select
+        // a device themselves, so the stream's device becomes current.
+        if (mxx_set_device(physical_device) != cudaSuccess)
+            return set_error(cudaGetLastError());
         const size_t index = ctx->execution->next_compute_stream.fetch_add(
             1, std::memory_order_relaxed) %
             ctx->execution->compute_streams_by_partition[partition].size();
@@ -2032,6 +2036,9 @@ extern "C"
         std::vector<std::vector<uint8_t>> arguments;
         std::vector<void *> argument_pointers;
         std::vector<GraphPatchRecord> patches;
+        // The executable node holds `arguments` (from creation on); a bind
+        // that leaves every patched byte unchanged skips the node update.
+        bool bound = false;
     };
 
     struct GraphMemcpyUpdateRecord
@@ -2042,6 +2049,9 @@ extern "C"
         size_t bytes = 0;
         cudaMemcpyKind kind = cudaMemcpyDefault;
         std::vector<GraphPatchRecord> patches;
+        void *bound_source = nullptr;
+        void *bound_destination = nullptr;
+        bool bound = false;
     };
 
     struct GraphMemsetUpdateRecord
@@ -2049,7 +2059,13 @@ extern "C"
         cudaGraphNode_t node = nullptr;
         cudaMemsetParams params{};
         GraphPatchRecord patch{};
+        bool bound = false;
     };
+
+    // Writes every patch of `record` into its argument bytes and reports
+    // whether any byte changed. Returns nonzero on an invalid patch.
+    int patch_kernel_record(GraphKernelUpdateRecord &record,
+        const MxxGraphBindingValue *values, size_t count, bool &changed);
 
     struct MxxGpuGraphExec
     {
@@ -2127,12 +2143,10 @@ extern "C"
         struct ResidentAddress { uint64_t address; size_t bytes; uint32_t binding; };
         std::vector<ResidentAddress> resident_addresses;
         std::vector<MxxGraphBindingMapEntry> binding_map;
-        // Graph-owned scratch allocations. Every allocation and free node is
-        // appended to one chain in operation order, so a free precedes every
-        // later allocation and CUDA may place the later one in its memory.
-        // Only allocation tokens are handed out; frees are never referenced.
+        // Graph-owned scratch allocation and free nodes, addressed by token.
+        // The caller orders each one after earlier memory nodes; CUDA may
+        // place an allocation in the memory of any free ordered before it.
         std::vector<cudaGraphNode_t> memory_nodes;
-        cudaGraphNode_t memory_chain_tail = nullptr;
         // Allocation nodes the next top-level operation must follow.
         std::vector<cudaGraphNode_t> pending_memory_dependencies;
         ~MxxGpuGraphBuilder() { if (root_graph) cudaGraphDestroy(root_graph); }
@@ -2191,6 +2205,28 @@ extern "C"
             address += patch.address_addend;
             memcpy(destination, &address, sizeof(address));
         }
+        return 0;
+    }
+
+    int patch_kernel_record(GraphKernelUpdateRecord &record,
+        const MxxGraphBindingValue *values, size_t count, bool &changed)
+    {
+        changed = false;
+        for (const GraphPatchRecord &patch_record : record.patches)
+        {
+            const MxxGraphPatch &patch = patch_record.patch;
+            if (patch.byte_offset > record.arguments[patch.argument_index].size() ||
+                patch.byte_count > record.arguments[patch.argument_index].size() - patch.byte_offset)
+                return 1;
+            uint8_t *field = record.arguments[patch.argument_index].data() + patch.byte_offset;
+            uint8_t previous[sizeof(MxxGraphBindingValue::bytes)];
+            memcpy(previous, field, patch.byte_count);
+            if (validate_patch_value(patch, values, count, field) != 0) return 1;
+            changed = changed || memcmp(previous, field, patch.byte_count) != 0;
+        }
+        for (size_t index = 0; index < record.arguments.size(); ++index)
+            record.argument_pointers[index] = record.arguments[index].data();
+        record.launch.kernelParams = record.argument_pointers.data();
         return 0;
     }
 
@@ -2422,6 +2458,8 @@ extern "C"
             const cudaError_t error = cudaGraphAddKernelNode(&record.node, builder->graph,
                 builder->frontier.data(), builder->frontier.size(), &record.launch);
             if (error != cudaSuccess) return set_error(error);
+            // The node, and the executable instantiated from it, hold these bytes.
+            record.bound = true;
             builder->frontier.assign(1, record.node);
             builder->operation_nodes.push_back(record.node);
             if (builder->conditional_body_active)
@@ -2460,6 +2498,9 @@ extern "C"
             builder->frontier.data(), builder->frontier.size(), destination, source,
             bytes, record.kind);
         if (error != cudaSuccess) return set_error(error);
+        record.bound_source = record.source;
+        record.bound_destination = record.destination;
+        record.bound = true;
         builder->frontier.assign(1, record.node);
         builder->operation_nodes.push_back(record.node);
         if (builder->conditional_body_active)
@@ -2490,6 +2531,7 @@ extern "C"
         const cudaError_t error = cudaGraphAddMemsetNode(&record.node, builder->graph,
             builder->frontier.data(), builder->frontier.size(), &record.params);
         if (error != cudaSuccess) return set_error(error);
+        record.bound = true;
         builder->frontier.assign(1, record.node);
         builder->operation_nodes.push_back(record.node);
         if (patch)
@@ -2725,10 +2767,27 @@ extern "C"
 #endif
     }
 
-    // Allocate one graph-owned device buffer ordered after the previous
-    // memory node. The address is fixed for the graph's lifetime.
+    // The memory nodes named by `tokens`, appended to `dependencies`.
+    int append_memory_dependencies(const MxxGpuGraphBuilder *builder, const uint32_t *tokens,
+        size_t count, std::vector<cudaGraphNode_t> &dependencies)
+    {
+        if (count && !tokens) return set_error("graph memory dependencies are missing");
+        for (size_t index = 0; index < count; ++index)
+        {
+            if (tokens[index] >= builder->memory_nodes.size())
+                return set_error("graph memory dependency token is unknown");
+            const cudaGraphNode_t node = builder->memory_nodes[tokens[index]];
+            if (std::find(dependencies.begin(), dependencies.end(), node) == dependencies.end())
+                dependencies.push_back(node);
+        }
+        return 0;
+    }
+
+    // Allocate one graph-owned device buffer ordered after the memory nodes
+    // `after`. The address is fixed for the graph's lifetime.
     int mxx_gpu_graph_builder_add_memory_alloc(MxxGpuGraphBuilder *builder, int device,
-        size_t bytes, uint32_t *out_token, uint64_t *out_address)
+        size_t bytes, const uint32_t *after, size_t after_count, uint32_t *out_token,
+        uint64_t *out_address)
     {
         if (!builder || !out_token || !out_address || bytes == 0 ||
             builder->operation_active || builder->conditional_body_active ||
@@ -2741,31 +2800,34 @@ extern "C"
         params.poolProps.location.type = cudaMemLocationTypeDevice;
         params.poolProps.location.id = mxx_physical_device(device);
         params.bytesize = bytes;
+        std::vector<cudaGraphNode_t> dependencies;
+        if (append_memory_dependencies(builder, after, after_count, dependencies) != 0) return 1;
         cudaGraphNode_t node = nullptr;
         const cudaError_t error = cudaGraphAddMemAllocNode(&node, builder->root_graph,
-            builder->memory_chain_tail ? &builder->memory_chain_tail : nullptr,
-            builder->memory_chain_tail ? 1 : 0, &params);
+            dependencies.data(), dependencies.size(), &params);
         if (error != cudaSuccess) return set_error(error);
-        builder->memory_chain_tail = node;
         builder->memory_nodes.push_back(node);
         *out_token = static_cast<uint32_t>(builder->memory_nodes.size() - 1);
         *out_address = reinterpret_cast<uint64_t>(params.dptr);
         return 0;
     }
 
-    // Free one graph allocation after the previous memory node and after the
+    // Free one graph allocation after the memory nodes `after` and after the
     // emitted top-level operations that use it. CUDA checks memset and memcpy
     // nodes against the allocation's lifetime, so a free is created only once
     // every operation using the allocation exists.
     int mxx_gpu_graph_builder_add_memory_free(MxxGpuGraphBuilder *builder, uint64_t address,
-        const uint32_t *operations, size_t operation_count)
+        const uint32_t *operations, size_t operation_count, const uint32_t *after,
+        size_t after_count, uint32_t *out_token)
     {
-        if (!builder || address == 0 || (operation_count && !operations) ||
+        if (!builder || !out_token || address == 0 || (operation_count && !operations) ||
             builder->operation_active || builder->conditional_body_active ||
             builder->generic_body_mode || builder->graph != builder->root_graph)
             return set_error("invalid graph memory free");
+        if (builder->memory_nodes.size() >= UINT32_MAX)
+            return set_error("graph memory node token overflow");
         std::vector<cudaGraphNode_t> dependencies;
-        if (builder->memory_chain_tail) dependencies.push_back(builder->memory_chain_tail);
+        if (append_memory_dependencies(builder, after, after_count, dependencies) != 0) return 1;
         for (size_t index = 0; index < operation_count; ++index)
         {
             if (operations[index] >= builder->terminals.size())
@@ -2778,8 +2840,8 @@ extern "C"
         const cudaError_t error = cudaGraphAddMemFreeNode(&node, builder->root_graph,
             dependencies.data(), dependencies.size(), reinterpret_cast<void *>(address));
         if (error != cudaSuccess) return set_error(error);
-        builder->memory_chain_tail = node;
         builder->memory_nodes.push_back(node);
+        *out_token = static_cast<uint32_t>(builder->memory_nodes.size() - 1);
         return 0;
     }
 
@@ -2917,25 +2979,18 @@ extern "C"
         // otherwise conditional retry replay would dereference stale
         // plan-time pointers. CUDA accepts these updates on the retained
         // child graph before its parent executable is launched.
+        // A node whose patched bytes are unchanged since its last update keeps
+        // its parameters; replays with the same inputs update nothing.
+        bool body_changed = false;
         for (auto &record : exec->body_kernels)
         {
-            for (const GraphPatchRecord &patch_record : record.patches)
-            {
-                const MxxGraphPatch &patch = patch_record.patch;
-                if (patch.byte_offset > record.arguments[patch.argument_index].size() ||
-                    patch.byte_count > record.arguments[patch.argument_index].size() - patch.byte_offset ||
-                    validate_patch_value(
-                        patch,
-                        values,
-                        count,
-                        record.arguments[patch.argument_index].data() + patch.byte_offset) != 0)
-                    return 1;
-            }
-            for (size_t index = 0; index < record.arguments.size(); ++index)
-                record.argument_pointers[index] = record.arguments[index].data();
-            record.launch.kernelParams = record.argument_pointers.data();
+            bool changed = false;
+            if (patch_kernel_record(record, values, count, changed) != 0) return 1;
+            if (record.bound && !changed) continue;
             error = cudaGraphKernelNodeSetParams(record.node, &record.launch);
             if (error != cudaSuccess) return set_error(error);
+            record.bound = true;
+            body_changed = true;
         }
         for (auto &record : exec->body_memcpys)
         {
@@ -2952,9 +3007,16 @@ extern "C"
                 else
                     destination = reinterpret_cast<void *>(address);
             }
+            if (record.bound && source == record.bound_source &&
+                destination == record.bound_destination)
+                continue;
             error = cudaGraphMemcpyNodeSetParams1D(
                 record.node, destination, source, record.bytes, record.kind);
             if (error != cudaSuccess) return set_error(error);
+            record.bound_source = source;
+            record.bound_destination = destination;
+            record.bound = true;
+            body_changed = true;
         }
         for (auto &record : exec->body_memsets)
         {
@@ -2962,12 +3024,17 @@ extern "C"
             if (validate_patch_value(record.patch.patch, values, count,
                                      reinterpret_cast<uint8_t *>(&address)) != 0)
                 return 1;
+            if (record.bound && record.params.dst == reinterpret_cast<void *>(address)) continue;
             record.params.dst = reinterpret_cast<void *>(address);
             error = cudaGraphMemsetNodeSetParams(record.node, &record.params);
             if (error != cudaSuccess) return set_error(error);
+            record.bound = true;
+            body_changed = true;
         }
-        if (!exec->body_kernels.empty() || !exec->body_memcpys.empty() ||
-            !exec->body_memsets.empty())
+        // Reconciling the executable with the child graph also resets every
+        // top-level node to its graph parameters, so they are all reapplied.
+        const bool reapply_top_level = body_changed;
+        if (body_changed)
         {
             // Body records refer to the retained child graph nodes rather than
             // executable top-level nodes.  Force CUDA to reconcile the
@@ -2988,27 +3055,15 @@ extern "C"
         }
         for (auto &record : exec->kernels)
         {
-            for (const GraphPatchRecord &patch_record : record.patches)
-            {
-                const MxxGraphPatch &patch = patch_record.patch;
-                if (patch.byte_offset > record.arguments[patch.argument_index].size() ||
-                    patch.byte_count > record.arguments[patch.argument_index].size() - patch.byte_offset ||
-                    validate_patch_value(patch, values, count,
-                        record.arguments[patch.argument_index].data() + patch.byte_offset) != 0)
-                {
-                    return 1;
-                }
-            }
-            for (size_t index = 0; index < record.arguments.size(); ++index)
-            {
-                record.argument_pointers[index] = record.arguments[index].data();
-            }
-            record.launch.kernelParams = record.argument_pointers.data();
+            bool changed = false;
+            if (patch_kernel_record(record, values, count, changed) != 0) return 1;
+            if (record.bound && !changed && !reapply_top_level) continue;
             error = cudaGraphExecKernelNodeSetParams(exec->exec, record.node, &record.launch);
             if (error != cudaSuccess)
             {
                 return set_error(error);
             }
+            record.bound = true;
         }
         for (auto &record : exec->memcpys)
         {
@@ -3027,12 +3082,18 @@ extern "C"
                 else
                     destination = reinterpret_cast<void *>(address);
             }
+            if (record.bound && !reapply_top_level && source == record.bound_source &&
+                destination == record.bound_destination)
+                continue;
             error = cudaGraphExecMemcpyNodeSetParams1D(
                 exec->exec, record.node, destination, source, record.bytes, record.kind);
             if (error != cudaSuccess)
             {
                 return set_error(error);
             }
+            record.bound_source = source;
+            record.bound_destination = destination;
+            record.bound = true;
         }
         for (auto &record : exec->memsets)
         {
@@ -3042,12 +3103,16 @@ extern "C"
             {
                 return 1;
             }
+            if (record.bound && !reapply_top_level &&
+                record.params.dst == reinterpret_cast<void *>(address))
+                continue;
             record.params.dst = reinterpret_cast<void *>(address);
             error = cudaGraphExecMemsetNodeSetParams(exec->exec, record.node, &record.params);
             if (error != cudaSuccess)
             {
                 return set_error(error);
             }
+            record.bound = true;
         }
         return 0;
     }

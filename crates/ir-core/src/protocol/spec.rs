@@ -30,6 +30,7 @@ fn require_sampler_free(graph: &Graph) -> Result<(), SpecificationError> {
                     NodeKind::UniformIntervalSample { .. } |
                     NodeKind::GaussianSample { .. } |
                     NodeKind::HashSample { .. } |
+                    NodeKind::HashIntFamily { .. } |
                     NodeKind::TrapdoorSample { .. } |
                     NodeKind::PreimageSample { .. }
             )

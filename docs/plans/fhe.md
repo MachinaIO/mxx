@@ -3,6 +3,11 @@
 Status: implemented and validated on CPU and GPU.
 Baseline: main commit `daf4421ab5b742730b77eef59b24b909a6bde171`.
 
+Update: Ring Regev/Ring-GSW (`ring_gsw.rs`, `RingGswParams`) was later removed and replaced by
+TFHE with NAND bootstrapping in `crates/fhe/src/tfhe.rs` (GPU test `crates/fhe/tests/gpu_tfhe.rs`).
+The Ring-GSW sections and the out-of-scope bootstrapping statement below are historical; BGV
+remains as described. See `docs/architecture.md`, section 7.3, for the current crate.
+
 ## Scope and architecture
 
 Implement common FHE traits, Ring Regev encryption, Ring-GSW encryption and

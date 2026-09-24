@@ -161,10 +161,11 @@ pub struct DiamondWeCompiler {
     pub shape: BooleanCircuitShape,
 }
 
-/// The parameter-independent Diamond WE protocol family.
+/// The Diamond WE protocol family over one ring.
 ///
-/// All circuit dimensions and cryptographic values are declared as symbolic Graph IR parameters.
-/// The tag is the sole fixed domain-separation value committed to by this declaration.
+/// Circuit dimensions and the remaining cryptographic values are symbolic Graph IR parameters.
+/// The ring's CRT basis and dimension are fixed, because a Graph IR ring has a concrete
+/// dimension and CRT length; with the tag, they are the fixed values this declaration commits to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiamondWeProtocolFamily {
     bgg_tag: Vec<u8>,

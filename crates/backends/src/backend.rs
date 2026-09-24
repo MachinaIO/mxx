@@ -458,11 +458,24 @@ impl GpuResidentValue {
         &self.ready
     }
 
+    /// The same allocations under another descriptor, bound only to the
+    /// storages its parts use, so a member view of a large family does not
+    /// carry (and rebind) every allocation of the family.
     pub(crate) fn with_physical_view(
         &self,
         physical: Arc<crate::gpu_execution_plan::PhysicalValue>,
     ) -> Result<Self, &'static str> {
-        Self::new(physical, self.storage.clone(), self.ready.clone())
+        let storage = physical
+            .parts
+            .iter()
+            .map(|part| {
+                self.storage
+                    .get(&part.storage)
+                    .map(|bound| (part.storage, bound.clone()))
+                    .ok_or("GPU resident view references an unbound storage")
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Self::new(physical, storage, self.ready.clone())
     }
 
     pub(crate) fn storages(
@@ -476,13 +489,11 @@ impl GpuResidentValue {
     /// becomes the replacements' producers. `None` if nothing aliases them.
     pub(crate) fn rebound(
         &self,
-        replaced: &[(*const (), BoundStorage)],
+        replaced: &std::collections::HashMap<*const (), BoundStorage>,
         ready: &[Arc<crate::poly::dcrt::gpu::GpuNativeEvent>],
     ) -> Result<Option<Self>, &'static str> {
-        let replacement = |bound: &BoundStorage| {
-            let owner = Arc::as_ptr(&bound.owner).cast::<()>();
-            replaced.iter().find(|(old, _)| *old == owner).map(|(_, new)| new)
-        };
+        let replacement =
+            |bound: &BoundStorage| replaced.get(&Arc::as_ptr(&bound.owner).cast::<()>());
         if self.storage.values().all(|bound| replacement(bound).is_none()) {
             return Ok(None);
         }
@@ -614,6 +625,75 @@ pub enum RuntimeValue {
         name: String,
         descriptor: mxx_ir_core::artifact::ManifestArtifact,
     },
+    /// The leaves of one composite DSL value (a ciphertext, a key), in
+    /// flattening order. A graph declares them as the inputs or outputs
+    /// `name.0`, `name.1`, ...; runtimes accept and return them as one value.
+    Composite(Arc<[RuntimeValue]>),
+}
+
+/// Expand every composite value into the leaf names its graph declares:
+/// `name` for a single leaf, `name.0`, `name.1`, ... otherwise.
+pub fn expand_composite_values(
+    values: std::collections::BTreeMap<String, RuntimeValue>,
+) -> std::collections::BTreeMap<String, RuntimeValue> {
+    if !values.values().any(|value| matches!(value, RuntimeValue::Composite(_))) {
+        return values;
+    }
+    let mut expanded = std::collections::BTreeMap::new();
+    for (name, value) in values {
+        match value {
+            RuntimeValue::Composite(leaves) if leaves.len() == 1 => {
+                expanded.insert(name, leaves[0].clone());
+            }
+            RuntimeValue::Composite(leaves) => {
+                for (index, leaf) in leaves.iter().enumerate() {
+                    expanded.insert(format!("{name}.{index}"), leaf.clone());
+                }
+            }
+            value => {
+                expanded.insert(name, value);
+            }
+        }
+    }
+    expanded
+}
+
+/// Group the leaves `name.0`, ..., `name.{k-1}` (`k >= 2`) of one composite
+/// output back into a single `Composite` value named `name`.
+pub fn group_composite_values(
+    values: std::collections::BTreeMap<String, RuntimeValue>,
+) -> std::collections::BTreeMap<String, RuntimeValue> {
+    use std::collections::BTreeMap;
+    if !values.keys().any(|name| name.contains('.')) {
+        return values;
+    }
+    let mut leaves = BTreeMap::<String, BTreeMap<usize, RuntimeValue>>::new();
+    let mut grouped = BTreeMap::new();
+    for (name, value) in values {
+        match name.rsplit_once('.').and_then(|(base, index)| {
+            index.parse::<usize>().ok().map(|index| (base.to_owned(), index))
+        }) {
+            Some((base, index)) => {
+                leaves.entry(base).or_default().insert(index, value);
+            }
+            None => {
+                grouped.insert(name, value);
+            }
+        }
+    }
+    for (base, members) in leaves {
+        let contiguous = members.len() >= 2 &&
+            members.keys().copied().eq(0..members.len()) &&
+            !grouped.contains_key(&base);
+        if contiguous {
+            grouped.insert(base, RuntimeValue::Composite(members.into_values().collect()));
+        } else {
+            for (index, value) in members {
+                grouped.insert(format!("{base}.{index}"), value);
+            }
+        }
+    }
+    grouped
 }
 
 impl RuntimeValue {

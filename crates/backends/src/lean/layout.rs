@@ -219,7 +219,7 @@ impl LeanRingLayout {
         if self.crt_bits == 0 {
             return Err(LayoutError::InvalidCrtBits);
         }
-        if self.base_bits == 0 || self.base_bits as usize > self.crt_bits / 2 {
+        if self.base_bits == 0 || self.base_bits as usize > self.crt_bits.div_ceil(2) {
             return Err(LayoutError::InvalidBaseBits);
         }
         if self.ring_dimension == 0 {

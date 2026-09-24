@@ -22,7 +22,7 @@ Contents:
 `mxx` is a Rust and CUDA workspace for lattice-cryptography research. It provides polynomial and
 matrix arithmetic over RNS (CRT) rings `Z_q[X]/(X^N + 1)`, bounded samplers (uniform, Gaussian,
 hash-derived, lattice trapdoors and preimages), and constructions built from them: BGG+ encodings,
-circuit gadgets, leveled BGV and Ring-GSW, and Diamond witness encryption.
+circuit gadgets, TFHE NAND bootstrapping and leveled BGV, and Diamond witness encryption.
 
 Cryptographic algorithms are not written as eager function calls. They are written once as a
 typed dataflow graph and then interpreted by several consumers. The life of a computation is:
@@ -38,8 +38,8 @@ typed dataflow graph and then interpreted by several consumers. The life of a co
         |
         +--> CPU executor:  mxx_backends::execute(..., &mut CpuDcrtBackend, ...)
         |
-        +--> GPU runtime:   GpuRuntime::plan(validated, inputs) -> GpuExecutionPlan
-        |                   GpuRuntime::execute(&mut plan, inputs, store, nonce)
+        +--> GPU runtime:   GpuRuntime::plan(graph, inputs) -> GpuExecutionPlan
+        |                   GpuRuntime::execute(&mut plan, inputs)
         |
         +--> Lean exporter: mxx_ir_core::lean (execution relations, linked correctness claims)
         v
@@ -84,8 +84,8 @@ abstraction.
 | `crates/backends` | `mxx-backends` | Polynomial/matrix primitives (OpenFHE via cxx), samplers, runtime values, CPU executor, GPU runtime and native CUDA, artifacts, sessions, transcripts. |
 | `crates/gadgets` | `mxx-gadgets` | Reusable, BGG-independent circuits and circuit gadgets (nested RNS arithmetic, NTT, FHE gadgets, noise refresh, input injector). |
 | `crates/bgg` | `mxx-bgg` | BGG+ public keys, encodings, circuit lowering, lookups, slot transfer, Tall encodings, WEE25 commitments. |
-| `crates/fhe` | `mxx-fhe` | Ring Regev/Ring-GSW and leveled BGV graph builders. |
-| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. |
+| `crates/fhe` | `mxx-fhe` | TFHE (integer LWE with NAND bootstrapping) and leveled BGV graph builders. |
+| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. Currently excluded from the workspace (commented out in `Cargo.toml`). |
 | `crates/func-enc` | `mxx-func-enc` | Functional-encryption interface trait only (`FuncEnc`). |
 | `crates/io` | `mxx-io` | Indistinguishability-obfuscation interface trait only (`Obfuscation`). |
 
@@ -194,11 +194,11 @@ of provenance.
 | --- | --- |
 | Inputs and constants | `Input { name, wire_type, artifact }`, `ConstantInt`, `EvaluateInt(IntExpr)`, `ConstantReal`, `ConstantBool`, `ConstantMatrix { matrix_type, value }` |
 | Trapdoor structure | `GadgetTrapdoor { matrix_type, base }`, `TrapdoorPublic` |
-| Scalar arithmetic | `IntBinary(Add/Subtract/Multiply/Divide/Remainder)`, `IntCompare(Equal/Less/LessEqual)`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt` |
-| Matrix arithmetic | `MatrixBinary(Add/Subtract/Multiply)`, `MatrixMulAccumulate { coefficients, has_bias }`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism { index }` |
+| Scalar arithmetic | `IntBinary(Add/Subtract/Multiply/Divide/Remainder)`, `IntCompare(Equal/Less/LessEqual)`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt`, `IntMatrixVectorProduct { transpose }` |
+| Matrix arithmetic | `MatrixBinary(Add/Subtract/Multiply)`, `MatrixMulAccumulate { coefficients, has_bias }`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism { index }`, `MultiplyMonomial` |
 | Ring and modulus conversion | `ModulusSwitch`, `ModulusReduce`, `CenteredRebase` (each with a destination `RingRef`), `CenteredRoundDivide { divisor }`, `RnsModUp { destination, digit_size, normalize }`, `RnsModDown { destination, plaintext_modulus }`, `BlockModSwitch { destination, plaintext_modulus }` |
 | Shape | `Transpose`, `Slice { rows, columns }`, `Tensor`, `Concat { axis: Rows/Columns/Diagonal }` |
-| Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample { sigma, max_coefficient_bound }`, `HashSample { variant: Plain/Decomposed/SmallDecomposed, tag_prefix, tag_components, base, digit_count }`, `TrapdoorSample`, `PreimageSample { max_coefficient_bound }` |
+| Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample { sigma, max_coefficient_bound }`, `HashSample { variant: Plain/Decomposed/SmallDecomposed, tag_prefix, tag_components, base, digit_count }`, `HashIntFamily { count, modulus, tag_prefix, tag_components }`, `TrapdoorSample`, `PreimageSample { max_coefficient_bound }` |
 | Decomposition and coefficients | `GadgetDecompose { base, small, digit_count }`, `ExtractCoefficient`, `LiftIntegerToConstantPolynomial`, `PackPolynomialCoefficients`, `PolynomialFromValues { evaluation }`, `PolynomialValues { evaluation }` |
 | Decoding and CRT | `ThresholdDecode { plaintext_modulus, length, output_bool }`, `CrtRecompose` |
 | Control | `SubgraphCall`, `ParallelLoop`, `SequentialLoop`, `Select { count }` |
@@ -208,6 +208,20 @@ of provenance.
 `PowerOfBase`, `Rotation`, and `Polynomial`. Hash-tag components are typed
 (`HashTagComponent::{Bytes, Integer, Decimal, U64Le, Operand}`) so different framings cannot
 collide.
+
+`HashIntFamily` returns a `Family<Int>` of `count` integers uniform on `[0, modulus)`, where
+`modulus` is a power of two above one. It reuses the `HashSample` transcript: integer `i` is
+coefficient `i` of entry `(0, 0)`, truncated to `log2(modulus)` bits, so no candidate is
+rejected. Both hash samplers share key and tag validation (`validate_hash_key_and_tag` in
+`validate.rs`: a 32-byte key and integer tag operands). Like the other samplers, `HashIntFamily`
+is rejected in sampler-free protocol specifications and has no Lean sampler relation.
+
+`MultiplyMonomial` multiplies every matrix entry by `X^k` in the negacyclic ring, where `k` is a
+runtime integer (argument 1) of any sign taken modulo `2n`. `IntMatrixVectorProduct { transpose }`
+is the integer product of a row-major matrix family (argument 0) with a vector family (argument
+1); the vector length fixes the inner dimension, so the matrix count must be a nonzero multiple of
+it. It computes `M v` (`out[i] = sum_j M[i, j] v[j]`), or `v^T M` with `transpose`. Neither node
+has a Lean relation; the Lean emitter reports both as unsupported.
 
 The ring-conversion nodes are fused CRT operations with explicit destination rings. They are
 not a generic, implicit modulus-changing mechanism: nested-RNS level switching, for example,
@@ -383,10 +397,13 @@ types), and execution or analysis (a backend or the Lean exporter consumes the
 
 - `DslContext` (`crates/dsl/src/lib.rs`): `new(name)`, `int_parameter(name)`,
   `real_parameter(name)`, `input::<V>(name, schema)`, `evaluate_int(expr)`,
-  `int_family_input(name, count)`, `output(name, value)`, `transferred_output`, `cached_output`,
+  `int_family_input(name, count)`, `hash_int_family(key, tag, count, modulus)`,
+  `output(name, value)`, `transferred_output`, `cached_output`,
   `transferred_trapdoor_output`, `transferred_trapdoor_family_output`, and `build()`. Output
   methods consume and return the context. Composite outputs are flattened as `x.0`, `x.1`, ...;
-  names must be unique after flattening.
+  names must be unique after flattening. `hash_int_family` builds a `HashIntFamily` node and
+  prefixes the tag with the domain `mxx/hash-int-family/v1\0`, so its stream never coincides
+  with a `hash_matrix` stream under the same key and tag.
 - `BuiltGraph { graph }` has `validate(bindings, resolve_basis)` and
   `validate_with_manifests(bindings, manifests, resolve_basis)`.
 - `Ring` wraps a `RingRef`: `Ring::new(crt_bits, crt_depth, ring_dimension)` (generated basis),
@@ -412,7 +429,8 @@ types), and execution or analysis (a backend or the Lean exporter consumes the
 
 - `Mat` supports `+`, `-`, `*`, unary `-` for owned and borrowed operands; a `1 x 1` matrix
   multiplies as a scalar, and `mat * scalar` scales by a constant polynomial. Other operations
-  include `Mat::multi_row_gemm_accumulate`, `mul_small_rhs`, `ring_automorphism`, `transpose`,
+  include `Mat::multi_row_gemm_accumulate`, `mul_small_rhs`, `ring_automorphism`,
+  `multiply_monomial` (by `X^k` for a runtime `Int` `k`), `transpose`,
   `slice`, `tensor`, `decompose`/`small_decompose` (returning `Preimage`), `extract_coefficient`,
   `canonical_coefficient_bits`, `threshold_decode_ints`/`threshold_decode_bools`, `concat` (with
   the `concat_rows!`, `concat_cols!`, `concat_diag!` macros), `crt_recompose`, `coefficients`,
@@ -441,6 +459,9 @@ types), and execution or analysis (a backend or the Lean exporter consumes the
   otherwise. `Family::pack`, `count`, and `field` (structural projection of existing fields) are
   also available. Nested families (families of families) are not supported, but an `iterate`
   state, `select` candidate, or subgraph argument may be a whole family.
+- `Family<Int>::matrix_vector_product(&v)` (`M v`) and `vector_matrix_product(&v)` (`v^T M`)
+  treat the family as a row-major matrix whose inner dimension is the length of `v`, and build
+  one `IntMatrixVectorProduct` node.
 - `parallel(count, |i| body)` builds a `ParallelLoop` whose instances are independent and
   returns a `Family<T>` in index order. The closure runs once, inside a new construction scope,
   with `i` bound to a loop-index slot. The body is sealed with lexical captures: outer values
@@ -518,7 +539,7 @@ store)`; staged family members are removed with `ExecutionResult::cleanup_staged
   polynomial traits. `DCRTPolyParams` (`crates/backends/src/poly/dcrt/params.rs`) holds the ring
   dimension, CRT depth and bit width, the exact ordered basis `moduli`, gadget base bits, and
   dropped moduli. `try_new` validates capability limits (power-of-two dimension, CRT width at
-  most 60 bits, `base_bits <= crt_bits / 2`) and generates or checks the basis through
+  most 60 bits, `base_bits <= ceil(crt_bits / 2)`) and generates or checks the basis through
   `openfhe_guard::gen_modulus_and_warmup`.
 - `DCRTPoly` (`crates/backends/src/poly/dcrt/poly.rs`) wraps an OpenFHE `DCRTPoly`. The OpenFHE
   Rust bindings come from the `openfhe` crate; repository-owned C++ adapters in
@@ -545,6 +566,9 @@ store)`; staged family members are removed with `ExecutionResult::cleanup_staged
   magnitude exceeds the cutoff; it never clips.
 - `DCRTPolyHashSampler<H>` (`hash.rs`) derives matrices from `H(key || tag)` with per-entry and
   per-column framing, so column windows are consistent with whole-matrix sampling.
+  `sample_hash_integers` (same file) samples a `HashIntFamily` from the entry `(0, 0)`
+  coefficient streams of that transcript (`key || tag || row || column || coefficient ||
+  attempt || block`).
 - `DCRTPolyTrapdoorSampler` (`trapdoor/sampler.rs`) samples gadget trapdoors (`DCRTTrapdoor`) and
   preimages. CPU preimage sampling rejects and redraws a whole candidate that exceeds its cutoff,
   so the preimage equation always holds.
@@ -555,7 +579,8 @@ store)`; staged family members are removed with `ExecutionResult::cleanup_staged
 Correctness uses these enforced integer cutoffs and deterministic worst-case bounds. Lattice-
 security estimation separately models the ordinary untruncated distributions.
 
-The executor encodes `HashSample` tags as the fixed prefix followed by typed, length-framed
+The executor encodes `HashSample` and `HashIntFamily` tags (`hash_key_and_tag` in
+`crates/backends/src/executor/cpu.rs`) as the fixed prefix followed by typed, length-framed
 components, so tags such as `(1, 23)` and `(12, 3)` differ. Changing the tag encoding changes
 every hash-derived value: rebuild serialized graphs and hash-derived artifacts together.
 
@@ -601,7 +626,8 @@ release_fence_interval }` controls execution. The executor (`crates/backends/src
    concatenation/slice aliases), cached per thread in `executor/plan_cache.rs`. Fusions never
    change the graph, its identity, or its outputs, and are disabled in trace mode.
 
-Parallelism lives in the primitives: matrix operations, samplers, and bound checks use Rayon.
+Parallelism lives in the primitives: matrix operations (including `MultiplyMonomial`), integer
+matrix-vector products, samplers, and bound checks use Rayon.
 The executor itself orders nodes deterministically.
 
 `ExecutionError` reports missing inputs or wires, value-kind mismatches, runtime integer errors
@@ -639,9 +665,10 @@ These contracts apply to both CPU and GPU execution:
   Execution does not copy resident matrices to the host or scan their contents to re-validate
   them; producers enforce these properties.
 - GPU execution checks only what addressing needs: the exact input set, the physical layout of
-  each resident input, and the declared range of each host integer while encoding it. Integer
-  inputs to GPU plans need a range, either the resident value's producer-proven range or
-  `GpuRuntimeOptions::integer_input_ranges`; ranges are never inferred from sample values.
+  each resident input, and the frozen range of each host integer while encoding it. A resident
+  integer input carries its producer-proven range. A host integer input uses its entry in
+  `GpuRuntimeOptions::integer_input_ranges`, or else the full signed range of the fewest 64-bit
+  words (at least one) that hold its planning values.
 - A session nonce binds an immutable, complete input map. A failed execution can leave a durable
   session descriptor; changing inputs requires a new nonce (and a new alias). Retrying with the
   original nonce resumes the original inputs.
@@ -684,27 +711,50 @@ Two principles define the design:
 ```rust
 let backend = mxx_backends::backend::poly_gpu::gpu_backend(gpu_params); // or gpu_backend_on(params, devices)
 let mut runtime = GpuRuntime::new(backend)?;          // reads GpuRuntimeOptions::from_env()
-let mut plan = runtime.plan(validated, &inputs)?;     // or plan_with_store(validated, &inputs, &mut store)
-let result = runtime.execute(&mut plan, inputs, &mut store, nonce)?;
-let out = result.output("result").unwrap();
-let matrix = runtime.download_matrix_output(&out)?;   // or runtime.copy_output(&out)
+let mut plan = runtime.plan(graph, &inputs)?;         // a BuiltGraph or a ValidatedGraph
+let result = runtime.execute(&mut plan, inputs)?;     // or execute_with_artifacts(.., store, nonce)
+let next_inputs = BTreeMap::from([("ct".into(), result["ct"].clone())]);
+let matrix = runtime.download_matrix(&result["result"])?;
 ```
 
-- `GpuRuntime::plan(validated, &inputs)` lowers the graph, allocates it, compiles it to CUDA
+- `GpuRuntime::plan(graph, &inputs)` takes a `ValidatedGraph` or a DSL `BuiltGraph` (validated
+  with default parameters through `IntoValidatedGraph`), lowers the graph, allocates it, compiles it to CUDA
   Graph regions, measures candidates, and returns a `GpuExecutionPlan`. `plan_with_store` also
   queries the store for artifact payload sizes (never payload bytes) so that integer and
   typed-blob imports get fixed, pointer-stable destinations.
-- `GpuRuntime::execute(&mut plan, inputs, store, nonce)` rebinds new inputs and replays the frozen
+- Inputs and outputs are keyed by their DSL names. A composite DSL value (a ciphertext, a key)
+  flattens into the graph leaves `name.0`, `name.1`, ...; the runtime accepts and returns it as one
+  `RuntimeValue::Composite` (`expand_composite_values` and `group_composite_values` in
+  `crates/backends/src/backend.rs`). Two inputs that plan on one resident allocation (the same
+  example value for both operands) are planned on a device copy of the repeat, since input
+  rebinding redirects views by allocation.
+- `GpuRuntime::execute(&mut plan, inputs)` draws fresh sampling randomness and needs no artifact
+  store; a plan with artifact inputs or outputs runs through
+  `execute_with_artifacts(&mut plan, inputs, store, nonce)`. Both rebind new inputs and replay the frozen
   program. It does not plan, measure, or re-validate. A plan executes only on the backend
-  instance that planned it (`GpuRuntimeError::StalePlan` otherwise).
-- The result, `GpuExecutionResult<'plan>`, borrows the plan mutably. Its outputs live in
-  plan-owned storage and may be overwritten by the next execution, so Rust prevents executing the
-  plan again while the result is alive. `result.output(name)` returns a non-cloneable
-  `GpuOutputRef`. Callers either download it (`download_matrix_output`,
-  `download_matrix_member_output`, `download_integer_family_output`, `download_bool_output`,
-  `download_real_output`, `download_bytes_output`) or call `GpuRuntime::copy_output`, which copies
-  a device output on the device into storage owned by the returned `RuntimeValue`. A copied
-  output survives the next execution and can be bound as an input of another plan.
+  instance that planned it (`GpuRuntimeError::StalePlan` otherwise). A resident input produced by
+  another plan is moved into this plan's storage slots when it is rebound
+  (`with_planned_storage` in `gpu_physical_lowering.rs`), so outputs of one plan can feed
+  another plan regardless of which plan produced them. `PhysicalFrame::rebind_inputs` collects
+  the replaced allocations in a hash map keyed by owner pointer; only inputs whose storage
+  actually changed contribute (binding the same input again leaves every view untouched), and
+  only plan values aliasing a replaced allocation are re-derived (`GpuResidentValue::rebound` in
+  `crates/backends/src/backend.rs`). A member or view of a family
+  (`GpuResidentValue::with_physical_view`) binds only the storages its parts use, so it does not
+  carry or rebind every allocation of the family. Input ready events are waited once per event,
+  and a `GpuNativeEvent` caches completion after a successful host wait. Binding a compiled
+  graph (`mxx_gpu_graph_bind` in `crates/backends/cuda/src/Runtime.cu`) updates only nodes whose
+  patched argument bytes changed; nodes start bound to their build-time arguments, and an update
+  of a conditional body, which reconciles the whole executable, reapplies every top-level node.
+- The result, `GpuExecutionResult`, owns its outputs: `result[name]` (or `into_outputs`) gives
+  values that can be kept, downloaded, or bound as inputs of any plan, including the same plan.
+  Each output has one caller handle (`PhysicalFrame::output_handles`), reused while its plan
+  owner is unchanged; the next execute writes an output whose handle still has another reference
+  into fresh storage, together with every plan value viewing its old allocation, before inputs
+  rebind. An output the caller released is written in place with no allocation. Planning uploads
+  each compiled executable, so the first production launch pays no device-side graph setup. `result.output(name)` returns a `GpuOutputRef` for the typed downloads
+  (`download_matrix_output`, `download_matrix_member_output`, `download_integer_family_output`,
+  `download_bool_output`, `download_real_output`, `download_bytes_output`).
 - `GpuExecutionPlan::report()` returns the `GpuWarmupReport` selected during planning; reading it
   performs no measurement. `compiled_region_count` and `compiled_launch_count` expose compiled
   structure.
@@ -735,7 +785,9 @@ right-operand columns the fused small-RHS multiplication transforms per chunk, d
 
 Errors: planning returns `GpuPlanError` (`InvalidInput`, `Resource`, `Measurement`,
 `GraphCompile`, `InvalidCompiledSchedule`). Execution returns `GpuRuntimeError`: `StalePlan`,
-`Execution`, `LaunchUncertain`, `DeviceStatus`, `Artifact`, `Session`. A data-dependent failure
+`Execution`, `LaunchUncertain`, `DeviceStatus`, `Artifact`, `Session`. `StalePlan` means only
+that the plan came from another backend instance; an input that does not match the planned
+layout fails as `Execution("input rebinding failed: ...")`. A data-dependent failure
 reported by a device status word after its launch joined (for example integer division by zero,
 an invalid selected index, or exhausted preimage retries) is `DeviceStatus`: outputs are
 suppressed and the plan remains reusable. An uncertain launch drains the device and poisons the
@@ -763,10 +815,14 @@ against the device budget, compiles the CUDA Graph regions, and runs
 `measurement_warmups + measurement_iterations` trials. A candidate whose allocation, compilation,
 or trial fails is rejected and the search continues with the next candidate; no VRAM requirement
 is predicted. Graph-owned scratch (section 6.3) is the one exception, because CUDA keeps the
-reservation of a Graph launch that runs out of memory and the process can then no longer
-allocate: before a compiled Graph's first launch, `admit_graph_scratch` compares its scheduled
-scratch peak (the sum of simultaneously live allocations, plus 1/32 for CUDA's rounding) with the
-memory currently free, and refuses the launch if it does not fit. After each candidate,
+reservation of a Graph upload or launch that runs out of memory and the process can then no
+longer allocate: `DirectGraph::compile` (`crates/backends/src/gpu_runtime_direct.rs`), after
+building all regions and before `executable.upload(...)` of any of them, calls
+`admit_graph_scratch`, which compares the scheduled scratch peak (the bytes of allocations whose
+memory cannot yet be reused, plus 1/32 for CUDA's rounding) with the memory currently free and
+fails compilation with `GpuPlanError::Resource` if it does not fit, so the candidate is rejected
+and the search continues. Uploading every region while planning means the first production launch
+does not pay the device-side Graph setup. After each candidate,
 `gpu_release_cached_memory` synchronizes the device, trims the Graph and default pools, and makes
 one whole-device `cudaMalloc` request that cannot succeed: the driver caches the device memory of
 destroyed Graph executables (several KiB per kernel node) and releases it only to `cudaMalloc`,
@@ -798,11 +854,22 @@ templates, control resets, and wave descriptors needed to run it.
   `PhysicalEncoding` covers `FullCoeff` and `FullEval` matrices, compact bounded coefficients
   (`CompactCoeff`, `CompactCoeffPerCrtLimb`), signed integers (`Signed`), `BoolI64`, `RealF64`,
   `Bytes`, `TypedBlobLengthPrefixed`, and the public-only gadget trapdoor `PublicGadgetEval`.
+- **Integer family storage.** An integer family is stored as `SignedWords(words)` (one sign word
+  and `words` magnitude words per member) or as `CanonicalU64` (one word per member, range in
+  `[0, 2^64)`). Hash integer families with modulus at most `2^64` are `CanonicalU64`. A returned
+  (graph output) integer family is `CanonicalU64` exactly when its proven range lies in
+  `[0, 2^64)` and SignedWords otherwise (`plan_physical_graph`), so its layout depends on its
+  range, not its producer, and outputs of different graphs rebind into one another's plans.
+  Polynomial import (`PolynomialFromValues`) reads SignedWords, so it widens a canonical family
+  with an integer `Copy` first.
 - **Compiled operations.** `CompiledGpuOp { implementation, arguments, outputs, device, grid,
   block, shared_bytes, predecessors, body }` is one native launch with explicit dependency edges.
   `body` holds the nested operations of a CUDA conditional node (`GpuNativePrimitive::BranchIf`
   or `LoopWhile`). `GpuNativePrimitive` enumerates the native operations (NTTs, arithmetic,
-  RNS conversions, samplers, preimage stages, copies, exports, control, ...).
+  RNS conversions, samplers, preimage stages, copies, exports, control, ...). A
+  `GpuImplementation` is a primitive with its argument schema, and `GpuImplementationRegistry`
+  is keyed by the full implementation, so one primitive may have several schemas (for example
+  `GpuImplementation::matrix_copy_views(count)`, one six-argument group per copied window).
 - **Explicit CUDA Graph regions.** `DirectGraph::compile` splits the operation list into
   `GraphRegion`s at wave-body boundaries, import points, and external-I/O loop bodies, and builds
   each region with `GpuNativeGraphBuilder` (`crates/backends/src/poly/dcrt/gpu.rs`). One region is
@@ -824,6 +891,42 @@ templates, control resets, and wave descriptors needed to run it.
   replay resets a status word once, and status words are checked only after the launch joins,
   instead of one host reset and readback per operation. Each device has its own status word
   (`PhysicalLoweringContext::integer_status` is a per-device map).
+- **Sequential-loop carries.** A sequential loop may carry matrices, scalars, and `Int` families
+  (`is_integer_carry` in `gpu_physical_control.rs`). An `Int` carry, scalar or family, is sized
+  by a range closed over every iteration (`carry_range`), not by its initial value. The integer
+  range analysis gives a Euclidean remainder by a positive divisor the exact range
+  `[0, divisor)` (capped by a nonnegative dividend's upper bound), so a carry reduced modulo a
+  constant each iteration keeps a finite range.
+- **Hash samplers.** `HashSample` and `HashIntFamily` share the `HashSample` native primitive:
+  `hash_tag_resource` registers the tag and `push_hash_sample` emits the sample
+  (`gpu_physical_lowering.rs`), and `lower_hash_int_family` (`gpu_physical_control.rs`) lowers
+  the integer family. An integer family uses a `GpuHashSamplePlan` without CRT moduli, and
+  `GpuHashSamplePlan::emit_raw_hash_integers` (`crates/backends/src/poly/dcrt/gpu_hash.rs`)
+  launches `raw_hash_integer_kernel` through `gpu_raw_hash_integers_emit`
+  (`crates/backends/cuda/src/matrix/MatrixHash.cu`); its `sign_words` argument (0 or 1) writes
+  either a `CanonicalU64` or a SignedWords family. The output matches the CPU transcript.
+- **Monomial products.** `MultiplyMonomial` (`lower_multiply_monomial` in
+  `gpu_physical_control.rs`) takes its operand as `FullEval` and adds no NTT of its own:
+  `raw_monomial_multiply_kernel` (`crates/backends/cuda/src/matrix/MatrixRawRemaining.cu`)
+  reduces the resident exponent modulo `2n` and multiplies each evaluation slot by the matching
+  twiddle or its negation.
+- **Integer matrix-vector products.** `lower_int_matrix_vector_product`
+  (`gpu_physical_control.rs`) emits integer operation 19 (`GpuIntegerOperation::MatrixVectorProduct`,
+  `crates/backends/cuda/src/Control.cu`). `M v` uses one warp per row with shuffle reduction;
+  `v^T M` clears the output, accumulates 64-row chunks per column with atomics, then converts the
+  sums to sign-magnitude. Operands must be one-word integer families, the body must not be
+  vectorized, and the operand ranges and the proven output range must fit in `int64`, so the
+  kernel accumulates exactly without widening.
+- **Slices and concatenation.** A matrix `Slice` that is not a root graph output is a view: the
+  window retyped to the output shape over the source allocation, with no copy. A `Concat` piece
+  whose writers are elementwise or product operations (add, subtract, multiply, tensor, scale,
+  monomial, automorphism), and which nothing else reads, is written straight into its window:
+  every view of the piece's scratch allocation moves into the output at the window offset when
+  the strides agree (`concat_piece_writers` in `gpu_physical_control.rs`). The remaining pieces
+  are copied into their windows by one `MatrixCopyView` operation.
+- **Returned matrices.** A root output that is a whole plan-owned scratch matrix is returned in
+  place: its storage is relabeled as return storage, which scratch sharing never reuses, instead
+  of being copied into a separate return allocation.
 - **Preimage retry loop.** Each preimage column tile is a device `LoopWhile` body that derives a
   per-attempt seed (`crates/backends/cuda/src/matrix/MatrixPreimageSeed.cu`), samples a
   candidate, and checks its cutoff, repeating until acceptance or until the frozen
@@ -841,12 +944,29 @@ templates, control resets, and wave descriptors needed to run it.
   it is written before it is read, lives on one device, and stays within one region (or spans
   regions whose endpoints are not replayed). Each region's operations are emitted in order: a
   CUDA memory-allocation node precedes the first writer and a free node follows the last reader,
-  so CUDA reuses freed memory inside the Graph, as a caching allocator would. Memory nodes are not
-  allowed in conditional bodies, so scratch used inside a loop body is allocated before the loop
-  and freed after it. An allocation freed by a later region is recorded on the `DirectGraph`,
-  freed on the launch stream after that region's launch (or when the `DirectGraph` is dropped).
-  Every other scratch value, together with inputs, outputs, wave-bound members, and imports, is
-  materialized as a persistent allocation.
+  so CUDA reuses freed memory inside the Graph, as a caching allocator would. The builder keeps no
+  implicit chain: `mxx_gpu_graph_builder_add_memory_alloc` and `_free`
+  (`crates/backends/cuda/src/Runtime.cu`) take explicit `after` tokens, and `GraphScratchPlan`
+  (`enter_operation`, `push_memory_node`) supplies them. Outside parallel loops the memory nodes
+  form one chain in operation order, each following the previous one, which serializes them and
+  keeps the peak low; the column-parallel jobs of one operation write column views of one output
+  allocation with no memory nodes between them, so the chain does not serialize them. Lowering
+  records the top-level operation range of every lane of each parallel loop in
+  `PhysicalFrame::parallel_lanes` (`lower_parallel_loop` in
+  `crates/backends/src/gpu_physical_control.rs`; lanes lowered inside a device body are not
+  recorded, because the body is one top-level operation). Inside the outermost parallel loop every
+  memory node follows only the chain at the loop's start and no memory is reused: a free node joins
+  all readers of its allocation, and making later work depend on such joins made CUDA run the W
+  lanes one after another (a 64-lane keygen region went from about 4.4 ms to 62 ms). When the loop
+  ends, the chain joins every memory node created inside it, so memory freed by the W lanes is
+  reused by the next W-wave replay and by later operations, and the loop's scratch peak grows with
+  W. `peak_bytes` counts each allocation from its first use until its memory can be reused: after
+  its last use, or after the end of the outermost parallel loop containing its last use. Memory
+  nodes are not allowed in conditional bodies, so scratch used inside a loop body is allocated
+  before the loop and freed after it. An allocation freed by a later region is recorded on the
+  `DirectGraph`, freed on the launch stream after that region's launch (or when the `DirectGraph`
+  is dropped). Every other scratch value, together with inputs, outputs, wave-bound members, and
+  imports, is materialized as a persistent allocation.
 
 ### 6.4 Multiple GPUs
 
@@ -962,7 +1082,7 @@ Rust-facing functions; bodies live in `src/`.
 | File | Role |
 | --- | --- |
 | `src/Runtime.cu`, `include/Runtime.cuh` | C ABI for contexts, execution owners, streams, memory, export slots, the explicit Graph builder (including conditional `if`/`while` nodes), binding, launch, and events. |
-| `src/Control.cu`, `include/Control.cuh` | Device integer control operations and status codes. |
+| `src/Control.cu`, `include/Control.cuh` | Device integer control operations (`integer_operation_kernel`, the integer matrix-vector product kernels of operation 19) and status codes. |
 | `src/Primitive.cu`, `include/Primitive.cuh` | Scalar-polynomial primitives (polynomial values, coefficient extraction, packing, threshold decoding). |
 | `src/Real.cu`, `include/Real.cuh` | Device `f64` operations with their own status word. |
 | `src/ChaCha.cu`, `include/ChaCha.cuh` | Device ChaCha RNG (included by the matrix unity build). |
@@ -975,6 +1095,31 @@ Rust-facing functions; bodies live in `src/`.
 sources as `MXX_NATIVE_KERNEL_BUILD_REVISION`. The matrix sources included by `Matrix.cu` are not
 compiled on their own. GPU-specific Rust code lives in files whose names contain `gpu`, as
 required by `GPU.md`.
+
+Raw matrix kernels:
+
+- **Limb batching.** One launch covers up to 8 CRT limbs (`RawLimbSet`, `RawNttBatch`,
+  `RawCopyBatch`, `RawDecomposeBatch`); `blockIdx.z` selects the limb (or the window-limb or
+  source-output limb pair), and graph patches target the nested address fields of these argument
+  structs by byte offset. Addition and subtraction, multiplication, tensor products, NTTs, copies
+  (all windows of one `MatrixCopyView`), and decompositions are batched this way.
+- **Fused NTT** (`src/matrix/MatrixNTT.cu`). `raw_ntt_fused_local_kernel` runs up to ten
+  butterfly stages of a 1024-coefficient tile in shared memory, with the stage twiddles staged in
+  shared memory, and applies the twist or scaling when the tile is the whole transform.
+  `raw_ntt_fused_top_kernel` runs the stages above one tile with warp XOR shuffles
+  (`Width = n / 1024` lanes per group). A forward transform runs the top kernel and then the local
+  kernel in place; an inverse runs them in the opposite order. Ring dimensions up to 32768 are
+  supported. Shoup multiplication uses a 32-bit path for moduli below `2^31`.
+- **Matrix product.** The product kernel splits the inner dimension over 4 thread rows and sums
+  products in 128 bits, with one modular reduction per batch that cannot overflow.
+- **Decomposition** (`src/matrix/MatrixDecompose.cu`) peels every balanced digit of a coefficient
+  in one pass.
+- **Compact pack** (`gpu_raw_compact_pack_emit` in `src/matrix/MatrixCrt.cu`) uses a single-limb
+  kernel when the bound is below half of every source modulus, because the centered residue of
+  one limb is then the value (under the trusted-input contract of section 5.6); otherwise it runs
+  the full CRT recombination kernel.
+- **Integer division** in `integer_operation_kernel` (`src/Control.cu`) uses native 128-bit
+  register division when the magnitudes have at most two words.
 
 ### 6.8 Current limitations
 
@@ -1001,10 +1146,14 @@ These restrictions are explicit errors in the current code:
 - **External I/O and waves** cannot be combined: external-I/O loops and selected artifact imports
   cannot be nested in a wave schedule (`DirectGraph::compile`).
 - **Artifacts.** Integer and typed-blob artifact inputs need `plan_with_store` for payload sizes;
-  host `Int` inputs need an entry in `integer_input_ranges` ("has no declared range"); matrix
+  host `Int` inputs without an `integer_input_ranges` entry get a signed word range; matrix
   exports need a `FullEval` source; raw transcoding does not support every wire type ("raw
   artifact transcode does not support this wire type yet" in `fleet.rs`).
 - **Trapdoors and preimages** require the exact regular gadget layout, sigma, and shapes.
+- **Integer matrix-vector products** need one-word operand families and operand and output ranges
+  within `int64`, and cannot run in a vectorized body ("GPU integer matrix-vector product may
+  exceed int64").
+- **NTTs** support ring dimensions up to 32768.
 
 The GPU planner is under active development (support for more loop structures is being added),
 so check the current error messages in `gpu_physical_lowering.rs`, `gpu_physical_control.rs`,
@@ -1070,18 +1219,41 @@ All application-level crates build graphs through `mxx-dsl` and execute them thr
 - `wee25_commitment.rs`, `wee25_opening.rs`, `wee25_public_parameters.rs`: WEE25 commitments and
   public parameters. The commitment-backed lookup evaluator is intentionally absent.
 
-### 7.3 `mxx-fhe`: BGV and Ring-GSW
+### 7.3 `mxx-fhe`: TFHE and BGV
 
-`crates/fhe/src/` builds FHE graphs; bootstrapping is not implemented. Graph handles are not
+`crates/fhe/src/` builds FHE graphs: TFHE with NAND bootstrapping and leveled BGV (BGV has no
+bootstrapping). Graph handles are not
 authenticated cryptographic objects, and key/ciphertext compatibility beyond ring and shape is the
 caller's responsibility.
 
 - `FheCommonParams { ring: DCRTPolyParams, secret_range, error_sigma, error_cutoff }`
   (`params.rs`). Level zero keeps the first CRT prime and higher levels keep longer prefixes.
-  `FheScheme` (`lib.rs`) is the shared `keygen`/`encrypt`/`decrypt`/`add`/`mul` interface.
-- **Ring Regev / Ring-GSW** (`ring_gsw.rs`): `RingGswParams::new(common, scale, plaintext_bound)`;
-  `RingCiphertext` (aliases `RingRegevCiphertext`, `RingGswCiphertext`) with phase
-  `b - s*a = scale*m + e`; `encrypt_gsw`, `external_product`, and `can_decrypt`.
+  `FheScheme` (`lib.rs`) is the shared matrix-plaintext `keygen`/`encrypt`/`decrypt`/`add`/`mul`
+  interface, implemented by BGV; TFHE has its own integer LWE API.
+- **TFHE** (`tfhe.rs`): `TfheParams::new(common, lwe_dimension, lwe_modulus, lwe_error_sigma,
+  lwe_error_cutoff)` pairs integer LWE over a power-of-two modulus `q` with the CRT ring `R_Q`;
+  secrets are binary and both Gaussian cutoffs must be at least 16 sigma.
+  `LweCiphertext { a, b, .. }` has phase `b - <a, s>` modulo `q` and encodes a bit as
+  `+floor(q/8)` (true) or `-floor(q/8)` (false). `RingCiphertext` holds ring-LWE `(1,1)` values and ring-GSW `(1,2L)` key entries.
+  `keygen(hash_key)` returns `TfheKeys { lwe_secret, ring_secret, bootstrapping_key,
+  key_switch_key }`: a `BootstrappingKey` of GSW encryptions of each LWE secret coordinate and a
+  flat `KeySwitchKey` (base `2^b` with `d` digits, both set in `TfheParams::new`; digit `j`
+  encrypts the coefficient times `2^(log2 q - b d + b j)`, and `key_switch` rounds each
+  coefficient to its leading `b d` bits before decomposing). `encrypt`, `decrypt`, and
+  `can_decrypt` work on single bits. Bootstrapping is four public stages, `pre_blind_rotation`, `blind_rotation`
+  (external products), `sample_extract` (with rounded `Q -> q` modulus switching), and
+  `key_switch`; `bootstrap` chains them and `nand` applies them to `nand_input` (`floor(q/8) -
+  ct1 - ct2`) with the `nand_accumulator` sign LUT. LWE `a` vectors come from
+  `DslContext::hash_int_family` keyed by a fresh caller-supplied 32-byte key per ciphertext (and
+  per `keygen` for the KSK); secrets and errors are independent samples. KSK errors are sampled
+  as whole Gaussian polynomials outside the key loop and read by coefficient
+  (`lwe_error_sources`, `lwe_error_at`). The KSK `b` dot products `<a_k, s>` are one
+  `matrix_vector_product` of the row-major `a` family with the LWE secret, and `key_switch`
+  computes both of its sums as `vector_matrix_product`s of the flat key arrays with the digits of
+  the extracted coefficients. `blind_rotation` carries the accumulator as one `(a; b)` column, so
+  each step multiplies it by `X^k` (`Mat::multiply_monomial`), subtracts, and takes the external
+  product on both components in single operations; `pre_blind_rotation` also uses
+  `multiply_monomial` for the initial rotation.
 - **BGV** (`bgv.rs`): `BgvParams::new(common, plaintext_modulus, hybrid: Option<BgvHybridParams>)`
   and `BgvCiphertext { components, correction_factor, noise_bound }`. Messages are SIMD slots
   (`Family<Int>`, 1 to N values modulo a prime `t = 1 mod 2N`); encoding lifts the inverse NTT
@@ -1100,11 +1272,15 @@ caller's responsibility.
   cutoffs come from `mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound`.
 
 Execution follows the general pattern: build with `DslContext`, validate with the backend CRT
-resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV) with the
+resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV and TFHE) with the
 backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactStore`.
 `docs/plans/fhe.md` records the formulas and design, and `README.md` summarizes the FHE API.
 
 ### 7.4 `mxx-we`: Diamond witness encryption
+
+`mxx-we` is currently excluded from the workspace: its protocol family is bound to one ring, so
+it is not parameter-independent across rings, and it is commented out in `Cargo.toml` until that
+is redesigned. The description below is kept for that work.
 
 `crates/we/src/` defines implementation-independent WE interfaces and the Diamond construction:
 
@@ -1159,7 +1335,8 @@ backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactSt
   | --- | --- |
   | `crates/backends/tests/gpu_control_resident.rs` | `#![cfg(feature = "gpu")]` |
   | `crates/backends/tests/gpu_direct_node_semantics.rs` | `#![cfg(feature = "gpu")]`; compares direct GPU nodes with the CPU backend |
-  | `crates/fhe/tests/gpu_bgv.rs`, `crates/fhe/tests/gpu_ring_gsw.rs` | `required-features = ["gpu"]` in `crates/fhe/Cargo.toml` |
+  | `crates/fhe/tests/gpu_bgv.rs` | `required-features = ["gpu"]` in `crates/fhe/Cargo.toml` |
+  | `crates/fhe/tests/gpu_tfhe.rs` | `required-features = ["gpu"]`; the TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (LWE `n = 630`, `q = 2^32`, sigma `2^17`; ring `N = 1024`, double-CRT `Q = 65537 * 79873`, sigma 156, about `2^-25` of `Q`; gadget base `2^9`, two digits per limb; KSK base `2^2` with 8 digits). `test_gpu_tfhe_round_trip` mirrors the BGV round trip: key generation, encryption, one bootstrapped NAND program per gate, and decryption, each planned once with keys kept resident; checks the NAND truth table and four chained gates that feed each output back as the next left input (profile in `utils::tfhe_params`, overridable through `FHE_TEST_TFHE_*`) |
   | `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs` | `#![cfg(feature = "gpu")]`; long modes are `#[ignore]` |
   | `crates/we/tests/test_gpu_diamond_we.rs` | `#![cfg(feature = "gpu")]` and `#[ignore]`; Lean-checked parameter search plus a GPU round trip |
 

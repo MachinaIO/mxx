@@ -2,7 +2,7 @@
 //! RNS modulus switching must not call the coefficient-boundary helpers.
 use crate::FheError;
 #[cfg(feature = "gpu")]
-use crate::{BgvHybridParams, BgvParams, FheCommonParams, RingGswParams};
+use crate::{BgvHybridParams, BgvParams, FheCommonParams, TfheParams};
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 #[cfg(test)]
 use mxx_dsl::{DslError, select};
@@ -14,6 +14,8 @@ use num_bigint::BigInt;
 #[cfg(any(test, feature = "gpu"))]
 use num_bigint::BigUint;
 
+#[cfg(feature = "gpu")]
+use num_traits::One;
 #[cfg(feature = "gpu")]
 use std::env;
 
@@ -213,18 +215,73 @@ pub fn bgv_params() -> BgvParams {
     .expect("valid BGV parameters")
 }
 
+/// The TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (the original TFHE
+/// library set): n = 630, N = 1024, k = 1, LWE noise 2^-15 and ring noise
+/// 2^-25 of their moduli, and a base 2^2, 8-digit key switch of the leading
+/// 16 bits of q = 2^32. The ring torus 2^32 is replaced by the double-CRT
+/// modulus Q = 65537 * 79873 (about 2^32.3) with the same relative noise; its
+/// exact per-limb gadget uses two base 2^9 digits per 17-bit limb in place of
+/// the profile's three approximate base 2^7 torus digits. `FHE_TEST_TFHE_*`
+/// variables override each value.
 #[cfg(feature = "gpu")]
-pub fn ring_gsw_params() -> RingGswParams {
-    let n = integer("FHE_TEST_RING_DIMENSION", 2048);
-    let bits = integer("FHE_TEST_CRT_BITS", 60);
-    let depth = integer("FHE_TEST_CRT_DEPTH", 1);
-    let base = integer("FHE_TEST_BASE_BITS", 8);
-    let q = DCRTPolyParams::new(n as u32, depth, bits, base as u32, None, None).to_crt().0;
-    let common = common_params(n, primes("FHE_TEST_Q_PRIMES", q), base, "339.0", true);
-    let scale = env::var("FHE_TEST_SCALE")
-        .map(|value| value.parse().expect("integer scale"))
-        .unwrap_or_else(|_| common.ring.modulus().as_ref() / BigUint::from(4 * n));
-    RingGswParams::new(common, scale, BigUint::from(1u8)).expect("valid Ring-GSW parameters")
+pub fn tfhe_params() -> TfheParams {
+    let n = integer("FHE_TEST_TFHE_RING_DIMENSION", 1024);
+    let base = integer("FHE_TEST_TFHE_BASE_BITS", 9);
+    let q = primes("FHE_TEST_TFHE_Q_PRIMES", vec![65_537, 79_873]);
+    let ring_sigma = env::var("FHE_TEST_TFHE_RING_SIGMA").unwrap_or_else(|_| "156".into());
+    let mut common = common_params(n, q, base, &ring_sigma, true);
+    common.error_cutoff = common.error_cutoff.max(ceil_sigma_multiple(&ring_sigma, 16));
+    let lwe_sigma = env::var("FHE_TEST_TFHE_LWE_SIGMA").unwrap_or_else(|_| "131072".into());
+    let lwe_error_sigma: f64 = lwe_sigma.parse().expect("finite positive LWE sigma");
+    assert!(lwe_error_sigma.is_finite() && lwe_error_sigma > 0.0);
+    let lwe_error_cutoff = env::var("FHE_TEST_TFHE_LWE_ERROR_CUTOFF")
+        .map(|value| value.parse().expect("integer LWE error cutoff"))
+        .unwrap_or_else(|_| ceil_sigma_multiple(&lwe_sigma, 16));
+    let lwe_dimension = integer("FHE_TEST_TFHE_LWE_DIMENSION", 630);
+    let lwe_modulus = env::var("FHE_TEST_TFHE_LWE_MODULUS")
+        .map(|value| value.parse().expect("power-of-two LWE modulus"))
+        .unwrap_or_else(|_| BigUint::one() << 32usize);
+    let key_switch_base_bits = integer("FHE_TEST_TFHE_KS_BASE_BITS", 2);
+    let key_switch_digits = integer("FHE_TEST_TFHE_KS_DIGITS", 8);
+    TfheParams::new(
+        common,
+        lwe_dimension,
+        lwe_modulus,
+        lwe_error_sigma,
+        lwe_error_cutoff,
+        key_switch_base_bits,
+        key_switch_digits,
+    )
+    .expect("valid TFHE parameters")
+}
+
+#[cfg(feature = "gpu")]
+fn ceil_sigma_multiple(sigma: &str, multiple: u64) -> BigUint {
+    let (mantissa, exponent) = sigma
+        .find(['e', 'E'])
+        .map(|index| {
+            let (mantissa, exponent) = sigma.split_at(index);
+            (mantissa, exponent[1..].parse::<i64>().expect("decimal sigma exponent"))
+        })
+        .unwrap_or((sigma, 0));
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    assert!(!mantissa.starts_with('-'), "sigma must be nonnegative");
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    assert!(whole.bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(fraction.bytes().all(|byte| byte.is_ascii_digit()));
+    let digits = format!("{whole}{fraction}");
+    let mut numerator = digits.parse::<BigUint>().expect("decimal sigma digits");
+    numerator *= multiple;
+    let scale = i64::try_from(fraction.len()).expect("sigma precision fits i64") - exponent;
+    if scale <= 0 {
+        let power = u32::try_from(-scale).expect("sigma exponent fits u32");
+        numerator * BigUint::from(10u8).pow(power)
+    } else {
+        let power = u32::try_from(scale).expect("sigma precision fits u32");
+        let denominator = BigUint::from(10u8).pow(power);
+        let quotient = &numerator / &denominator;
+        if &quotient * denominator < numerator { quotient + BigUint::one() } else { quotient }
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -242,13 +299,15 @@ pub fn modswitch_steps() -> usize {
 pub mod gpu {
     use super::*;
     use crate::BgvParams;
-    use mxx_backends::{
-        GpuExecutionResult, GpuRuntime, RuntimeValue, poly::dcrt::gpu::GpuDCRTPolyParams,
-    };
+    use mxx_backends::{GpuRuntime, RuntimeValue, poly::dcrt::gpu::GpuDCRTPolyParams};
     use std::collections::BTreeMap;
 
     pub fn bgv_gpu_parameters(bgv: &BgvParams) -> Vec<GpuDCRTPolyParams> {
         related_gpu_parameters(bgv.runtime_parameters().expect("BGV runtime parameters"))
+    }
+
+    pub fn tfhe_gpu_parameters(tfhe: &TfheParams) -> Vec<GpuDCRTPolyParams> {
+        related_gpu_parameters(tfhe.runtime_parameters())
     }
 
     /// One GPU context per distinct ordered ring, all sharing the first ring's
@@ -291,24 +350,6 @@ pub mod gpu {
 
     pub fn input(values: &[i64]) -> RuntimeValue {
         RuntimeValue::integer_values(values.iter().map(|v| BigInt::from(*v)).collect())
-    }
-
-    /// Copy every output out of its plan so it survives the plan's next
-    /// execute and can be bound as another plan's input.
-    pub fn copy_outputs(
-        runtime: &GpuRuntime,
-        result: &GpuExecutionResult<'_>,
-    ) -> BTreeMap<String, RuntimeValue> {
-        result
-            .output_names()
-            .map(|name| {
-                let output = result.output(name).expect("listed GPU output");
-                let copied = runtime
-                    .copy_output(&output)
-                    .unwrap_or_else(|error| panic!("copy GPU output {name}: {error}"));
-                (name.to_owned(), copied)
-            })
-            .collect()
     }
 
     pub fn integers(

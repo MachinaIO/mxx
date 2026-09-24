@@ -398,11 +398,8 @@ __device__ __forceinline__ uint64_t mul_mod_u64(uint64_t a, uint64_t b, uint64_t
 
 __device__ __forceinline__ uint64_t add_mod_u64(uint64_t a, uint64_t b, uint64_t mod)
 {
-    unsigned __int128 sum = static_cast<unsigned __int128>(a) + static_cast<unsigned __int128>(b);
-    if (sum >= mod)
-    {
-        sum -= mod;
-    }
-    return static_cast<uint64_t>(sum);
+    // For a, b < mod, a wrapped sum still exceeds mod, and s - mod wraps back.
+    const uint64_t sum = a + b;
+    return sum < a || sum >= mod ? sum - mod : sum;
 }
 

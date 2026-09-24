@@ -23,6 +23,10 @@ struct GpuModulusConversionPlan
     bool raw_block = false;
     bool raw_recompose = false;
     bool raw_compact_pack = false;
+    // Nonzero when every packed magnitude is below half of every source
+    // modulus, so one limb's centered residue is the value itself.
+    uint64_t compact_single_limb_bound = 0;
+    bool compact_single_limb = false;
     GpuMatrix::SharedLimbBuffer::DeviceDescriptor *raw_source_descriptors = nullptr;
     GpuMatrix::SharedLimbBuffer::DeviceDescriptor *raw_target_descriptors = nullptr;
     cudaEvent_t raw_ready = nullptr;
@@ -1524,6 +1528,44 @@ namespace
     }
 }
 
+namespace
+{
+    // The single-limb form of `raw_compact_pack_kernel`: with the bound below
+    // half of the limb modulus, the centered residue is the packed value.
+    __global__ void raw_compact_pack_single_limb_kernel(
+        MxxRawMatrixLimb source, MxxRawSmallMatrixView destination,
+        uint32_t *status, uint64_t bound, size_t coefficient_count)
+    {
+        const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+        for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             index < coefficient_count; index += stride)
+        {
+            const size_t poly = index / destination.degree;
+            const size_t coefficient = index - poly * destination.degree;
+            const uint64_t residue = raw_matrix_load(
+                source, poly, coefficient, destination.columns);
+            const bool negative = residue > source.modulus / 2;
+            const uint64_t magnitude = negative ? source.modulus - residue : residue;
+            if (magnitude > bound)
+            {
+                atomicCAS(status, 0U, 2U);
+                continue;
+            }
+            const size_t row = poly / destination.columns;
+            const size_t column = poly - row * destination.columns;
+            const size_t packed_poly = row * destination.storage_columns +
+                destination.column_offset + column;
+            const size_t width = static_cast<size_t>(destination.magnitude_bytes) + 1;
+            auto *encoded = reinterpret_cast<uint8_t *>(destination.payload_address) +
+                (packed_poly * destination.degree + coefficient) * width;
+            encoded[0] = magnitude == 0 ? 0 : (negative ? 2 : 1);
+            for (size_t byte = 0; byte < destination.magnitude_bytes; ++byte)
+                encoded[1 + byte] = byte < sizeof(uint64_t) ?
+                    static_cast<uint8_t>(magnitude >> (8 * byte)) : 0;
+        }
+    }
+}
+
 extern "C" int gpu_raw_compact_pack_prepare(
     GpuContext *ctx, int32_t device, void *stream_raw,
     const uint64_t *source_moduli, size_t source_count,
@@ -1589,6 +1631,15 @@ extern "C" int gpu_raw_compact_pack_prepare(
     plan->ring_dimension = static_cast<size_t>(ctx->N);
     plan->source_count = source_count;
     plan->raw_compact_pack = true;
+    {
+        bool single = !bound_exceeds_source_width;
+        for (size_t word = 1; word < bound_count; ++word)
+            single = single && bound_words[word] == 0;
+        for (size_t index = 0; index < source_count; ++index)
+            single = single && bound_words[0] < source_moduli[index] / 2;
+        plan->compact_single_limb = single;
+        plan->compact_single_limb_bound = bound_words[0];
+    }
     plan->metadata_bytes = sizeof(metadata) + source_count *
         sizeof(GpuMatrix::SharedLimbBuffer::DeviceDescriptor);
     error = cudaMallocAsync(&plan->device_metadata, plan->metadata_bytes, plan->stream);
@@ -1648,6 +1699,23 @@ extern "C" int gpu_raw_compact_pack_emit(
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     cudaError_t error = mxx_set_device(plan->device);
     if (error != cudaSuccess) return set_error(error);
+    if (plan->compact_single_limb)
+    {
+        const MxxGraphPatch patches[] = {
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
+                static_cast<uint32_t>(offsetof(MxxRawMatrixLimb, address)),
+                sizeof(void *), source_binding_base, 0},
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1,
+                static_cast<uint32_t>(offsetof(MxxRawSmallMatrixView, payload_address)),
+                sizeof(void *), destination_binding, 0},
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 2, 0,
+                sizeof(void *), status_binding, 0},
+        };
+        return mxx_gpu_launch_kernel(ctx, stream, raw_compact_pack_single_limb_kernel,
+            dim3(static_cast<unsigned>(std::min<size_t>(65535, (count + 255) / 256))),
+            dim3(256), 0, patches, 3, source->limbs[0], *destination, status_address,
+            plan->compact_single_limb_bound, count);
+    }
     for (size_t index = 0; index < source->limb_count; ++index)
     {
         const MxxGraphPatch patch{nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,

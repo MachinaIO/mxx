@@ -163,7 +163,7 @@ fn matrix_partial_slice_concat_replays_with_fresh_owners() {
         let source = make(scalar);
         let expected = make_cpu(2 * scalar).slice(0, 2, 0, 4);
         let result = runtime
-            .execute(
+            .execute_with_artifacts(
                 &mut plan,
                 BTreeMap::from([("matrix".into(), gpu_matrix_value(&parameters, source))]),
                 &mut MemoryArtifactStore::default(),
@@ -236,17 +236,16 @@ fn typed_real_boundary_and_trapdoor_public_output_execute() {
     let mut plan = runtime.plan(graph, &BTreeMap::new()).unwrap();
     for seed in [1, 2] {
         let result = runtime
-            .execute(&mut plan, BTreeMap::new(), &mut MemoryArtifactStore::default(), [seed; 32])
+            .execute_with_artifacts(
+                &mut plan,
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                [seed; 32],
+            )
             .unwrap();
         assert_eq!(runtime.download_real_output(&result.output("real").unwrap()).unwrap(), 10.0);
-        assert!(matches!(
-            runtime.copy_output(&result.output("public").unwrap()).unwrap(),
-            RuntimeValue::Matrix(_)
-        ));
-        assert!(matches!(
-            runtime.copy_output(&result.output("trapdoor").unwrap()).unwrap(),
-            RuntimeValue::Resident(_)
-        ));
+        assert!(matches!(result["public"].clone(), RuntimeValue::Matrix(_)));
+        assert!(matches!(result["trapdoor"].clone(), RuntimeValue::Resident(_)));
     }
 }
 
@@ -304,7 +303,7 @@ fn resident_pack_invalid_bit_and_out_of_range_suppress_publication() {
         )
         .unwrap();
     runtime
-        .execute(
+        .execute_with_artifacts(
             &mut plan,
             BTreeMap::from([("bits".into(), gpu_boolean_family(&gpu_parameters, &valid))]),
             &mut MemoryArtifactStore::default(),
@@ -323,7 +322,7 @@ fn resident_pack_invalid_bit_and_out_of_range_suppress_publication() {
             }
         }
         let error = runtime
-            .execute(
+            .execute_with_artifacts(
                 &mut plan,
                 BTreeMap::from([("bits".into(), gpu_boolean_family(&gpu_parameters, &bits))]),
                 &mut MemoryArtifactStore::default(),
@@ -413,7 +412,7 @@ fn resident_multiword_polynomial_primitives_rebind_and_decode() {
     for shift in [1, 3] {
         let values = make_values(shift);
         let result = runtime
-            .execute(
+            .execute_with_artifacts(
                 &mut plan,
                 BTreeMap::from([(
                     "values".into(),
@@ -595,7 +594,12 @@ fn resident_control_parallel_tail_replays_bounded_wave() {
     let input_values = [1, 2, 3, 4, 5, 6];
     let inputs = gpu_control_inputs(&gpu_parameters, &anchor, &input_values);
     let mut plan = runtime.plan(graph, &inputs).expect("plan tail resident graph");
-    let result = runtime.execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [4; 32]);
+    let result = runtime.execute_with_artifacts(
+        &mut plan,
+        inputs,
+        &mut MemoryArtifactStore::default(),
+        [4; 32],
+    );
     unsafe { std::env::remove_var("MXX_GPU_MAX_PARALLEL_INSTANCES") };
     let result = result.expect("execute bounded resident tail");
     assert_eq!(resident_output(&mut runtime, result), expected_values(&input_values[..5]));
@@ -618,12 +622,14 @@ fn resident_control_sequential_carried_counts_publish_final_state() {
         let inputs = BTreeMap::from([("anchor".to_owned(), anchor.clone())]);
         let mut plan = runtime.plan(graph, &inputs).expect("plan sequential resident graph");
         let result = runtime
-            .execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [10 + nonce as u8; 32])
+            .execute_with_artifacts(
+                &mut plan,
+                inputs,
+                &mut MemoryArtifactStore::default(),
+                [10 + nonce as u8; 32],
+            )
             .expect("execute sequential resident graph");
-        assert!(matches!(
-            runtime.copy_output(&result.output("result").unwrap()).unwrap(),
-            RuntimeValue::Resident(_)
-        ));
+        assert!(matches!(result["result"].clone(), RuntimeValue::Resident(_)));
         let actual = runtime
             .download_integer_family_output(&result.output("result").unwrap())
             .expect("read sequential result");
@@ -680,24 +686,31 @@ fn resident_control_replay_uses_new_family_values_and_signed_semantics() {
     let first_values = [1, 2, 3, 4, 5, 6];
     let first_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &first_values);
     let first = runtime
-        .execute(&mut plan, first_inputs, &mut MemoryArtifactStore::default(), [0; 32])
+        .execute_with_artifacts(
+            &mut plan,
+            first_inputs,
+            &mut MemoryArtifactStore::default(),
+            [0; 32],
+        )
         .expect("execute first resident control replay");
     assert_eq!(resident_output(&mut runtime, first), expected_values(&first_values[..4]));
 
     let second_values = [-9, 8, -7, 6, -5, 4];
     let second_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &second_values);
     let second = runtime
-        .execute(&mut plan, second_inputs, &mut MemoryArtifactStore::default(), [1; 32])
+        .execute_with_artifacts(
+            &mut plan,
+            second_inputs,
+            &mut MemoryArtifactStore::default(),
+            [1; 32],
+        )
         .expect("execute second resident control replay");
     assert_eq!(resident_output(&mut runtime, second), expected_values(&second_values[..4]));
     assert!(plan.compiled_launch_count() >= 2, "both control replays must launch GPU work");
 }
 
 fn resident_output(runtime: &GpuRuntime, result: GpuExecutionResult) -> Vec<BigInt> {
-    assert!(matches!(
-        runtime.copy_output(&result.output("result").unwrap()).unwrap(),
-        RuntimeValue::Resident(_)
-    ));
+    assert!(matches!(result["result"].clone(), RuntimeValue::Resident(_)));
     runtime
         .download_integer_family_output(&result.output("result").unwrap())
         .expect("gather resident control result")
@@ -730,8 +743,12 @@ fn test_gpu_resident_invalid_index_suppresses_outputs() {
     let planning_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &[0, 1, 0, 1, 0, 0]);
     let mut plan = runtime.plan(graph, &planning_inputs).unwrap();
     let invalid_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &[0, 2, 0, 1, 0, 0]);
-    let result =
-        runtime.execute(&mut plan, invalid_inputs, &mut MemoryArtifactStore::default(), [2; 32]);
+    let result = runtime.execute_with_artifacts(
+        &mut plan,
+        invalid_inputs,
+        &mut MemoryArtifactStore::default(),
+        [2; 32],
+    );
     let error = match result {
         Ok(_) => panic!("invalid device index published an ExecutionResult"),
         Err(error) => error.to_string(),
@@ -739,7 +756,12 @@ fn test_gpu_resident_invalid_index_suppresses_outputs() {
     assert!(error.contains("index"), "unexpected execution error: {error}");
     let valid_inputs = gpu_control_inputs(&gpu_parameters, &anchor, &[1, 0, 1, 0, 0, 0]);
     let recovered = runtime
-        .execute(&mut plan, valid_inputs, &mut MemoryArtifactStore::default(), [3; 32])
+        .execute_with_artifacts(
+            &mut plan,
+            valid_inputs,
+            &mut MemoryArtifactStore::default(),
+            [3; 32],
+        )
         .unwrap();
     assert_eq!(resident_output(&mut runtime, recovered), [20, 10, 20, 10].map(BigInt::from));
 }
@@ -768,7 +790,7 @@ fn matrix_family_constants(
     let runs = (0..3u8)
         .map(|nonce| {
             let result = runtime
-                .execute(
+                .execute_with_artifacts(
                     &mut plan,
                     inputs.clone(),
                     &mut MemoryArtifactStore::default(),

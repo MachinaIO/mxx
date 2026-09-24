@@ -107,6 +107,14 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         label: format!("{prefix}: uniform range must be nonempty"),
                     })
                 }
+                NodeKind::HashIntFamily { count, modulus, .. } => {
+                    nonnegative(&mut constraints, count, format!("{prefix}: hash family count"));
+                    constraints.push(ParamConstraint::IntGreaterThan {
+                        left: modulus.clone(),
+                        right: IntExpr::constant(1),
+                        label: format!("{prefix}: hash family modulus must exceed one"),
+                    });
+                }
                 NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                     nonnegative_real(&mut constraints, sigma, format!("{prefix}: Gaussian sigma"));
                     nonnegative(
@@ -223,6 +231,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
                 NodeKind::RingAutomorphism { .. } |
+                NodeKind::MultiplyMonomial |
+                NodeKind::IntMatrixVectorProduct { .. } |
                 NodeKind::ModulusSwitch { .. } |
                 NodeKind::ModulusReduce { .. } |
                 NodeKind::CenteredRebase { .. } |

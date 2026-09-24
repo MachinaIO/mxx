@@ -29,7 +29,9 @@ use crate::{
         stage_canonical_resident_input,
     },
     gpu_runtime_import::load_import_template,
-    gpu_runtime_io::{PlannedExportSlot, ProducerIoPump, with_checked_producer_io_pump},
+    gpu_runtime_io::{
+        PlannedExportSlot, ProducerIoPump, with_checked_producer_io_pump, with_transient_io_pump,
+    },
     gpu_warmup::{GpuMeasuredCostCache, GpuWarmupReport},
     matrix::dcrt_poly::DCRTPolyMatrix,
     poly::dcrt::gpu::{
@@ -104,22 +106,21 @@ struct GpuExecutionPayload {
     artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
 }
 
-/// Outputs borrow the executed plan. A further execution may overwrite every
-/// resident output; explicitly download or copy the needed data first.
-pub struct GpuExecutionResult<'plan> {
+/// The outputs of one execute, keyed by their graph names; a composite
+/// output is one `RuntimeValue::Composite`. Outputs are owned: a later execute
+/// of the same plan writes into fresh storage while a caller keeps them.
+pub struct GpuExecutionResult {
     outputs: BTreeMap<String, RuntimeValue>,
     pub production_id: Option<ProductionId>,
     pub artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
-    _plan: std::marker::PhantomData<&'plan mut GpuExecutionPlan>,
 }
 
-/// A non-cloneable view of one output. The resident owner cannot escape the
-/// plan borrow through this public API.
+/// A view of one output for downloads and type inspection.
 pub struct GpuOutputRef<'a> {
     value: &'a RuntimeValue,
 }
 
-impl<'plan> GpuExecutionResult<'plan> {
+impl GpuExecutionResult {
     #[cfg(test)]
     pub(crate) fn output_value_for_test(&self, name: &str) -> Option<&RuntimeValue> {
         self.outputs.get(name)
@@ -131,6 +132,18 @@ impl<'plan> GpuExecutionResult<'plan> {
 
     pub fn output_names(&self) -> impl Iterator<Item = &str> {
         self.outputs.keys().map(String::as_str)
+    }
+
+    pub fn into_outputs(self) -> BTreeMap<String, RuntimeValue> {
+        self.outputs
+    }
+}
+
+impl std::ops::Index<&str> for GpuExecutionResult {
+    type Output = RuntimeValue;
+
+    fn index(&self, name: &str) -> &RuntimeValue {
+        self.outputs.get(name).unwrap_or_else(|| panic!("no GPU output named {name}"))
     }
 }
 
@@ -180,10 +193,8 @@ impl Drop for DirectGraph {
 
 struct DirectGraph {
     regions: Vec<GraphRegion>,
-    /// Peak Graph-owned scratch bytes per device of the compiled schedule.
-    graph_memory_peaks: BTreeMap<i32, u64>,
-    /// Whether a launch has already backed `graph_memory_peaks`.
-    graph_memory_admitted: bool,
+    /// When the current execute first launched a region.
+    first_launch: Option<Instant>,
     /// Allocations a launched region made that no later launch has freed
     /// yet, for example after a failed launch; dropping the Graph frees them.
     live_allocations: BTreeSet<u64>,
@@ -428,8 +439,7 @@ impl DirectGraph {
             }
             return Ok(Self {
                 regions: Vec::new(),
-                graph_memory_peaks: BTreeMap::new(),
-                graph_memory_admitted: true,
+                first_launch: None,
                 live_allocations: BTreeSet::new(),
             });
         }
@@ -645,12 +655,19 @@ impl DirectGraph {
                 outliving,
             });
         }
-        let graph = Self {
-            regions,
-            graph_memory_peaks: scratch.peak_bytes(),
-            graph_memory_admitted: false,
-            live_allocations: BTreeSet::new(),
-        };
+        // Upload maps the Graph-owned scratch, and CUDA keeps the reservation
+        // of an upload that runs out of memory, so admit the scheduled peak
+        // first. Upload now, so the first production launch does not pay the
+        // device-side graph setup.
+        admit_graph_scratch(&scratch.peak_bytes()).map_err(GpuPlanError::Resource)?;
+        for region in &mut regions {
+            let launch_stream = region.executable.launch_stream().clone();
+            region
+                .executable
+                .upload(&launch_stream)
+                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
+        }
+        let graph = Self { regions, first_launch: None, live_allocations: BTreeSet::new() };
         wave_groups(frame, &graph).map_err(GpuPlanError::GraphCompile)?;
         Ok(graph)
     }
@@ -750,10 +767,7 @@ impl DirectGraph {
         frame: &PhysicalFrame,
         index: usize,
     ) -> Result<GpuNativeEvent, GpuRuntimeError> {
-        if !self.graph_memory_admitted {
-            admit_graph_scratch(&self.graph_memory_peaks)?;
-            self.graph_memory_admitted = true;
-        }
+        self.first_launch.get_or_insert_with(Instant::now);
         let region = self.regions.get_mut(index).ok_or_else(|| {
             GpuRuntimeError::Execution("Graph region index is out of range".into())
         })?;
@@ -894,20 +908,18 @@ fn contract_devices(
         .collect()
 }
 
-/// Refuse the first launch of a Graph whose scheduled scratch peak, with a
-/// small margin for CUDA's rounding, exceeds the memory now free. CUDA keeps
-/// the reservation of a Graph launch that runs out of memory, which leaves
-/// the process unable to allocate, so an unfit launch is never attempted.
-fn admit_graph_scratch(peaks: &BTreeMap<i32, u64>) -> Result<(), GpuRuntimeError> {
+/// Refuse a Graph whose scheduled scratch peak, with a small margin for
+/// CUDA's rounding, exceeds the memory now free. CUDA keeps the reservation
+/// of a Graph upload or launch that runs out of memory, which leaves the
+/// process unable to allocate, so an unfit Graph is never uploaded.
+fn admit_graph_scratch(peaks: &BTreeMap<i32, u64>) -> Result<(), String> {
     for (&device, &peak) in peaks {
-        let free = crate::poly::dcrt::gpu::gpu_memory_info(device)
-            .map_err(GpuRuntimeError::Execution)?
-            .free as u64;
+        let free = crate::poly::dcrt::gpu::gpu_memory_info(device)?.free as u64;
         let required = peak.saturating_add(peak / 32);
         if required > free {
-            return Err(GpuRuntimeError::Execution(format!(
+            return Err(format!(
                 "Graph scratch needs {required} bytes on GPU {device}, {free} bytes are free"
-            )));
+            ));
         }
     }
     Ok(())
@@ -932,7 +944,7 @@ fn validate_allocated_budget(
             let storage = owner
                 .storage(part.storage)
                 .ok_or_else(|| GpuPlanError::Resource("allocated storage is missing".into()))?;
-            // Graph-owned scratch is admitted at its first launch.
+            // Graph-owned scratch is admitted when the Graph is compiled.
             if crate::gpu_graph_memory::is_graph_managed(storage) {
                 continue;
             }
@@ -984,10 +996,14 @@ fn validate_allocated_budget(
 }
 
 fn wait_for_bound_inputs(frame: &PhysicalFrame) -> Result<(), String> {
+    // Members of one input family commonly share a producer event.
+    let mut waited = std::collections::HashSet::new();
     for id in frame.input_ids.values() {
         let owner = frame.owners.get(id).ok_or("bound GPU input is missing")?;
         for event in owner.ready_events() {
-            event.wait().map_err(|error| error.to_string())?;
+            if waited.insert(Arc::as_ptr(event)) {
+                event.wait().map_err(|error| error.to_string())?;
+            }
         }
     }
     Ok(())
@@ -1241,26 +1257,6 @@ impl GpuRuntime {
     }
     pub fn measured_costs(&self) -> &GpuMeasuredCostCache {
         &self.measured_costs
-    }
-
-    /// Copy an output into storage owned by the returned value, so it stays
-    /// valid after the next execute of its plan and can be bound as another
-    /// plan's input. Device outputs are copied on the device.
-    pub fn copy_output(&self, output: &GpuOutputRef<'_>) -> Result<RuntimeValue, GpuRuntimeError> {
-        let copy = |resident: &Arc<crate::backend::GpuResidentValue>| {
-            resident.deep_copy(&self.backend).map(Arc::new).map_err(GpuRuntimeError::Execution)
-        };
-        Ok(match output.value {
-            RuntimeValue::Resident(resident) => RuntimeValue::Resident(copy(resident)?),
-            RuntimeValue::Matrix(matrix) => match matrix.as_gpu() {
-                Some(resident) => RuntimeValue::Matrix(
-                    crate::backend::PolyMatrix::gpu(matrix.wire_type().clone(), copy(resident)?)
-                        .map_err(|error| GpuRuntimeError::Execution(error.to_owned()))?,
-                ),
-                None => output.value.clone(),
-            },
-            host => host.clone(),
-        })
     }
 
     pub fn download_integer_family_output(
@@ -1529,12 +1525,62 @@ impl GpuRuntime {
         })?;
         Ok(bytes)
     }
+    /// Freeze a plan for `graph` (a validated graph, or a built DSL graph
+    /// validated here) against example `inputs`. A composite input value
+    /// binds every leaf its graph declares.
     pub fn plan(
         &mut self,
-        validated: ValidatedGraph,
+        graph: impl mxx_ir_core::IntoValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue>,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
-        self.plan_with_payload_sizes(validated, inputs, &BTreeMap::new(), None)
+        let validated = graph
+            .into_validated_graph(crate::openfhe_guard::gen_modulus_and_warmup)
+            .map_err(GpuPlanError::InvalidInput)?;
+        let inputs = crate::backend::expand_composite_values(inputs.clone());
+        let inputs = self.distinct_planning_inputs(inputs).map_err(GpuPlanError::InvalidInput)?;
+        self.plan_with_payload_sizes(validated, &inputs, &BTreeMap::new(), None)
+    }
+
+    /// Input rebinding redirects every plan value viewing an input's planning
+    /// allocation, so two inputs must not plan on one allocation (e.g. the same
+    /// example ciphertext for both operands). A repeated resident allocation is
+    /// planned on a device copy.
+    fn distinct_planning_inputs(
+        &self,
+        inputs: BTreeMap<String, RuntimeValue>,
+    ) -> Result<BTreeMap<String, RuntimeValue>, String> {
+        let mut seen = std::collections::HashSet::new();
+        inputs
+            .into_iter()
+            .map(|(name, value)| {
+                let resident = match &value {
+                    RuntimeValue::Resident(resident) => Some(Arc::clone(resident)),
+                    RuntimeValue::Matrix(matrix) => matrix.as_gpu().cloned(),
+                    _ => None,
+                };
+                let Some(resident) = resident else {
+                    return Ok((name, value));
+                };
+                let shared = resident
+                    .storages()
+                    .map(|(_, bound)| Arc::as_ptr(&bound.owner).cast::<()>())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .fold(false, |shared, pointer| !seen.insert(pointer) || shared);
+                if !shared {
+                    return Ok((name, value));
+                }
+                let copy = Arc::new(resident.deep_copy(&self.backend)?);
+                let value = match value {
+                    RuntimeValue::Matrix(matrix) => RuntimeValue::Matrix(
+                        crate::backend::PolyMatrix::gpu(matrix.wire_type().clone(), copy)
+                            .map_err(str::to_owned)?,
+                    ),
+                    _ => RuntimeValue::Resident(copy),
+                };
+                Ok((name, value))
+            })
+            .collect()
     }
 
     /// Exercise a particular physical tile width through the production
@@ -1921,20 +1967,58 @@ impl GpuRuntime {
     /// Execute into plan-owned reusable storage. The returned borrow prevents
     /// another execute until the caller has downloaded or copied the outputs.
     /// Scratch may be reused only after the prior GPU and artifact I/O join.
-    pub fn execute<'plan, S: SessionStore + Send>(
+    /// Execute `plan` on `inputs` with fresh sampling randomness. A composite
+    /// input binds every leaf its graph declares. Plans that import or export
+    /// artifacts use `execute_with_artifacts`.
+    pub fn execute(
         &mut self,
-        plan: &'plan mut GpuExecutionPlan,
+        plan: &mut GpuExecutionPlan,
+        inputs: BTreeMap<String, RuntimeValue>,
+    ) -> Result<GpuExecutionResult, GpuRuntimeError> {
+        let frame = &plan.frame;
+        if !frame.import_templates.is_empty() ||
+            !frame.export_templates.is_empty() ||
+            !frame.external_io_imports.is_empty() ||
+            !frame.external_io_loops.is_empty()
+        {
+            return Err(GpuRuntimeError::Execution(
+                "a plan with artifact inputs or outputs runs through execute_with_artifacts".into(),
+            ));
+        }
+        let mut store = crate::MemoryArtifactStore::default();
+        self.execute_with_artifacts(plan, inputs, &mut store, rand::random())
+    }
+
+    /// Execute `plan` with an artifact `store` for its artifact inputs and
+    /// outputs and an explicit `execution_nonce` for its sampling randomness.
+    pub fn execute_with_artifacts<S: SessionStore + Send>(
+        &mut self,
+        plan: &mut GpuExecutionPlan,
         inputs: BTreeMap<String, RuntimeValue>,
         store: &mut S,
         execution_nonce: [u8; 32],
-    ) -> Result<GpuExecutionResult<'plan>, GpuRuntimeError> {
+    ) -> Result<GpuExecutionResult, GpuRuntimeError> {
+        let started = Instant::now();
+        plan.graph.first_launch = None;
+        let inputs = crate::backend::expand_composite_values(inputs);
         let payload = self.execute_inner(plan, inputs, store, execution_nonce)?;
-        Ok(GpuExecutionResult {
-            outputs: payload.outputs,
+        let result = GpuExecutionResult {
+            outputs: crate::backend::group_composite_values(payload.outputs),
             production_id: payload.production_id,
             artifact_handles: payload.artifact_handles,
-            _plan: std::marker::PhantomData,
-        })
+        };
+        // Preparation ends where the first Graph region launches; the run
+        // covers the launches, the GPU work, and collecting the outputs.
+        let finished = Instant::now();
+        let launched = plan.graph.first_launch.unwrap_or(finished);
+        tracing::debug!(
+            target: "mxx_backends::gpu_execute",
+            graph = plan.validated.source.name(),
+            prepare_us = %format_args!("{:.1}", (launched - started).as_secs_f64() * 1e6),
+            run_us = %format_args!("{:.1}", (finished - launched).as_secs_f64() * 1e6),
+            "GPU execute"
+        );
+        Ok(result)
     }
 
     fn execute_inner<S: SessionStore + Send>(
@@ -1953,10 +2037,14 @@ impl GpuRuntime {
         if self.backend.execution_identity() != plan.backend_execution_identity {
             return Err(GpuRuntimeError::StalePlan);
         }
-        plan.frame.rebind_inputs(&inputs).map_err(|_| GpuRuntimeError::StalePlan)?;
+        // Held outputs move to fresh storage before inputs rebind, so an input
+        // that is a previous output of this plan keeps its own storage.
+        plan.frame.bind_return_outputs(&self.backend).map_err(GpuRuntimeError::Execution)?;
+        plan.frame.rebind_inputs(&inputs).map_err(|error| {
+            GpuRuntimeError::Execution(format!("input rebinding failed: {error}"))
+        })?;
         upload_bytes_inputs(&plan.frame, &inputs).map_err(GpuRuntimeError::Execution)?;
         wait_for_bound_inputs(&plan.frame).map_err(GpuRuntimeError::Execution)?;
-        plan.frame.bind_return_outputs(&self.backend).map_err(GpuRuntimeError::Execution)?;
 
         if plan.completed_runs > 0 {
             for slot in &plan.frame.slots {
@@ -2018,15 +2106,6 @@ impl GpuRuntime {
                 artifact_handles: BTreeMap::new(),
             });
         }
-        let digest = runtime_inputs_digest(&plan.validated, &self.backend, &inputs)
-            .map_err(GpuRuntimeError::Session)?;
-        let specification_hash =
-            mxx_ir_core::encoding::spec_hash(&plan.validated.source, &plan.validated.bindings)
-                .map_err(|error| GpuRuntimeError::Session(error.to_string()))?;
-        let production = mxx_ir_core::artifact::production_id(specification_hash, execution_nonce);
-        let manifest =
-            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &plan.validated)
-                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
         let requests =
             plan.frame
                 .slots
@@ -2043,56 +2122,105 @@ impl GpuRuntime {
                 })?;
         let window = NonZeroUsize::new(requests.max(1))
             .ok_or_else(|| GpuRuntimeError::Artifact("producer I/O window is zero".into()))?;
+        // Only a graph that exports artifacts is a producer with a durable
+        // session; a consumer that only imports reads the store directly.
+        if plan.frame.export_templates.is_empty() {
+            return with_transient_io_pump(store, window, |pump| {
+                self.execute_io(plan, &inputs, execution_nonce, pump, None)
+            })
+            .map_err(|error| GpuRuntimeError::Session(error.to_string()))?;
+        }
+        let digest = runtime_inputs_digest(&plan.validated, &self.backend, &inputs)
+            .map_err(GpuRuntimeError::Session)?;
+        let specification_hash =
+            mxx_ir_core::encoding::spec_hash(&plan.validated.source, &plan.validated.bindings)
+                .map_err(|error| GpuRuntimeError::Session(error.to_string()))?;
+        let production = mxx_ir_core::artifact::production_id(specification_hash, execution_nonce);
+        let manifest =
+            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &plan.validated)
+                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
         let descriptor = SessionDescriptor::new(
             production.clone(),
             plan.validated.source.name().to_owned(),
             digest,
         );
-        with_checked_producer_io_pump(store, descriptor, digest, window, |pump| {
-            if !plan.frame.waves.is_empty() {
-                let frame = FrameGeneration::new(0, plan.completed_runs);
-                let planned = planned_export_slots(&plan.frame, &manifest, &production, frame)?;
-                let handles = finalized_export_handles(&plan.frame, &manifest, &production)?;
-                let has_exports = !planned.is_empty();
-                if has_exports {
-                    pump.start_export_observer(planned)
-                        .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
-                }
-                let run = self.execute_waves(plan, &inputs, execution_nonce, Some(pump));
-                if has_exports {
-                    if let Err(error) = pump.finish_export_observer(run.is_ok()) {
-                        plan.poisoned = true;
-                        return Err(GpuRuntimeError::Artifact(error.to_string()));
-                    }
-                }
-                let mut result = run?;
-                let completion = match pump
-                    .finalize(frame, manifest)
-                    .map_err(|error| GpuRuntimeError::Session(error.to_string()))
-                    .and_then(|request| {
-                        request.wait().map_err(|error| GpuRuntimeError::Session(error.to_string()))
-                    }) {
-                    Ok(completion) => completion,
-                    Err(error) => {
-                        plan.poisoned = true;
-                        return Err(error);
-                    }
-                };
-                if !matches!(completion, IoCompletion::SessionFinalized { .. }) {
-                    plan.poisoned = true;
-                    return Err(GpuRuntimeError::Session(
-                        "wave import session finalized with wrong completion".into(),
-                    ));
-                }
-                plan.completed_runs += 1;
-                result.production_id = Some(production);
-                result.artifact_handles = handles;
-                Ok(result)
-            } else {
-                self.execute_producer(plan, pump, production, manifest)
-            }
+        with_checked_producer_io_pump(store, descriptor, digest, window, |pump, finalized| {
+            // A finalized production is replayed: the GPU recomputes the
+            // outputs, and its artifacts are the ones already committed.
+            let handles = finalized_export_handles(
+                &plan.frame,
+                finalized.as_ref().unwrap_or(&manifest),
+                &production,
+            )?;
+            let persist = finalized.is_none().then(|| (production.clone(), manifest));
+            let mut result = self.execute_io(plan, &inputs, execution_nonce, pump, persist)?;
+            result.production_id = Some(production);
+            result.artifact_handles = handles;
+            Ok(result)
         })
         .map_err(|error| GpuRuntimeError::Session(error.to_string()))?
+    }
+
+    /// Run a plan whose artifacts go through `pump`. `persist` names the
+    /// production and manifest whose exports are written and finalized;
+    /// without it nothing is written, as for a consumer or a finalized replay.
+    fn execute_io<E: std::error::Error + Send + Sync + 'static>(
+        &mut self,
+        plan: &mut GpuExecutionPlan,
+        inputs: &BTreeMap<String, RuntimeValue>,
+        execution_nonce: [u8; 32],
+        pump: &mut ProducerIoPump<'_, E>,
+        persist: Option<(ProductionId, Manifest)>,
+    ) -> Result<GpuExecutionPayload, GpuRuntimeError> {
+        let frame = FrameGeneration::new(0, plan.completed_runs);
+        let planned = match &persist {
+            Some((production, manifest)) => {
+                planned_export_slots(&plan.frame, manifest, production, frame)?
+            }
+            None => Vec::new(),
+        };
+        let has_exports = !planned.is_empty();
+        if has_exports {
+            pump.start_export_observer(planned)
+                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
+        }
+        let run = if plan.frame.waves.is_empty() {
+            self.execute_producer(plan, pump, frame)
+        } else {
+            self.execute_waves(plan, inputs, execution_nonce, Some(pump))
+        };
+        if has_exports {
+            let observed = pump
+                .finish_export_observer(run.is_ok())
+                .map_err(|error| GpuRuntimeError::Artifact(error.to_string()));
+            if let Err(error) = observed {
+                plan.poisoned = true;
+                return Err(error);
+            }
+        }
+        let result = run?;
+        if let Some((_, manifest)) = persist {
+            let completion = match pump
+                .finalize(frame, manifest)
+                .map_err(|error| GpuRuntimeError::Session(error.to_string()))
+                .and_then(|request| {
+                    request.wait().map_err(|error| GpuRuntimeError::Session(error.to_string()))
+                }) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    plan.poisoned = true;
+                    return Err(error);
+                }
+            };
+            if !matches!(completion, IoCompletion::SessionFinalized { .. }) {
+                plan.poisoned = true;
+                return Err(GpuRuntimeError::Session(
+                    "producer finalize returned wrong completion".into(),
+                ));
+            }
+        }
+        plan.completed_runs += 1;
+        Ok(result)
     }
 
     fn run_wave_region_range<E: std::error::Error + Send + Sync + 'static>(
@@ -2532,78 +2660,38 @@ impl GpuRuntime {
         Ok(())
     }
 
+    /// Launch the Graph regions of a plan with imports and exports and check
+    /// its device status; a failed launch drains the device before the export
+    /// observer stops.
     fn execute_producer<E: std::error::Error + Send + Sync + 'static>(
         &mut self,
         plan: &mut GpuExecutionPlan,
         pump: &mut ProducerIoPump<'_, E>,
-        production: ProductionId,
-        manifest: Manifest,
+        frame: FrameGeneration,
     ) -> Result<GpuExecutionPayload, GpuRuntimeError> {
-        let frame = FrameGeneration::new(0, plan.completed_runs);
-        let planned = planned_export_slots(&plan.frame, &manifest, &production, frame)?;
-        let handles = finalized_export_handles(&plan.frame, &manifest, &production)?;
-        pump.start_export_observer(planned)
-            .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
-        let gpu_result = self.execute_producer_regions(plan, pump, frame);
-        if gpu_result.is_err() {
+        if let Err(error) = self.execute_producer_regions(plan, pump, frame) {
             plan.poisoned = true;
             self.backend.drain_uncertain_launches().map_err(|drain| {
                 GpuRuntimeError::LaunchUncertain(format!(
                     "failed GPU producer could not be drained before observer stop: {drain}"
                 ))
             })?;
-        }
-        let status_result = if gpu_result.is_ok() {
-            plan.frame
-                .control_resets
-                .iter()
-                .try_for_each(|control| control.check_completed())
-                .and_then(|()| check_preimage_replays(&plan.frame))
-                .map_err(GpuRuntimeError::DeviceStatus)
-        } else {
-            Ok(())
-        };
-        if status_result.is_err() {
-            plan.poisoned = true;
-        }
-        let observer_result = pump
-            .finish_export_observer(gpu_result.is_ok() && status_result.is_ok())
-            .map_err(|error| GpuRuntimeError::Artifact(error.to_string()));
-        if let Err(error) = gpu_result {
-            observer_result?;
             return Err(error);
         }
-        if let Err(error) = status_result {
-            observer_result?;
-            return Err(error);
-        }
-        if let Err(error) = observer_result {
+        if let Err(error) = plan
+            .frame
+            .control_resets
+            .iter()
+            .try_for_each(|control| control.check_completed())
+            .and_then(|()| check_preimage_replays(&plan.frame))
+        {
             plan.poisoned = true;
-            return Err(error);
+            return Err(GpuRuntimeError::DeviceStatus(error));
         }
-        let completion = match pump
-            .finalize(frame, manifest)
-            .map_err(|error| GpuRuntimeError::Session(error.to_string()))
-            .and_then(|request| {
-                request.wait().map_err(|error| GpuRuntimeError::Session(error.to_string()))
-            }) {
-            Ok(completion) => completion,
-            Err(error) => {
-                plan.poisoned = true;
-                return Err(error);
-            }
-        };
-        if !matches!(completion, IoCompletion::SessionFinalized { .. }) {
-            plan.poisoned = true;
-            return Err(GpuRuntimeError::Session(
-                "producer finalize returned wrong completion".into(),
-            ));
-        }
-        plan.completed_runs += 1;
         Ok(GpuExecutionPayload {
             outputs: returned_values(&plan.frame).map_err(GpuRuntimeError::Execution)?,
-            production_id: Some(production),
-            artifact_handles: handles,
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
         })
     }
 }

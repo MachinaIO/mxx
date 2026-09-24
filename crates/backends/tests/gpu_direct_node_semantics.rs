@@ -63,6 +63,17 @@ fn run_shape_case(
     expected: impl FnOnce(&DCRTPolyMatrix) -> DCRTPolyMatrix,
 ) -> usize {
     let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let input = cpu_input(&parameters);
+    run_shape_case_on(label, &parameters, input, expression, expected)
+}
+
+fn run_shape_case_on(
+    label: &str,
+    parameters: &DCRTPolyParams,
+    input: DCRTPolyMatrix,
+    expression: impl FnOnce(Mat) -> Mat,
+    expected: impl FnOnce(&DCRTPolyMatrix) -> DCRTPolyMatrix,
+) -> usize {
     let gpu_parameters = GpuDCRTPolyParams::new(
         parameters.ring_dimension(),
         parameters.moduli().to_vec(),
@@ -80,7 +91,6 @@ fn run_shape_case(
         .unwrap()
         .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .unwrap();
-    let input = cpu_input(&parameters);
     let input_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: parameters.ring_dimension(),
@@ -102,8 +112,9 @@ fn run_shape_case(
         .map(|node| node.columns_per_job.iter().filter(|width| **width > 0).count())
         .max()
         .unwrap_or(0);
-    let result =
-        runtime.execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [7; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, bindings, &mut MemoryArtifactStore::default(), [7; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input));
     devices
@@ -192,8 +203,9 @@ fn run_crt_case_with_prime(
     let bindings = BTreeMap::from([("source".to_owned(), value)]);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_full, gpu_single])).unwrap();
     let mut plan = runtime.plan(graph, &bindings).unwrap();
-    let result =
-        runtime.execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [9; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, bindings, &mut MemoryArtifactStore::default(), [9; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input, destination));
 }
@@ -261,7 +273,7 @@ fn run_manual_matrix_case(
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
     let mut plan = runtime.plan(graph, &bindings).unwrap();
     let result = runtime
-        .execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [11; 32])
+        .execute_with_artifacts(&mut plan, bindings, &mut MemoryArtifactStore::default(), [11; 32])
         .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input));
@@ -285,6 +297,33 @@ fn matrix_slice_matches_cpu() {
     let range =
         |start: usize, end: usize| Some(IndexRange { start: start.into(), end: end.into() });
     run_shape_case("direct-slice", |a| a.slice(range(0, 2), range(1, 2)), |a| a.slice(0, 2, 1, 2));
+}
+
+/// Slices consumed inside the graph are views of their source: add, product
+/// and concat read them in place.
+#[test]
+#[serial_test::serial]
+fn matrix_slice_views_feed_operations() {
+    let range =
+        |start: usize, end: usize| Some(IndexRange { start: start.into(), end: end.into() });
+    run_shape_case(
+        "direct-slice-views",
+        |a| {
+            let top = a.clone().slice(range(0, 1), None);
+            let bottom = a.clone().slice(range(1, 2), None);
+            let column = a.clone().slice(None, range(1, 2));
+            let sum = top + bottom;
+            let rows = Mat::concat(ConcatAxis::Rows, vec![sum.clone() * a.clone(), sum]);
+            let columns = Mat::concat(ConcatAxis::Columns, vec![a * column.clone(), column]);
+            rows + columns
+        },
+        |a| {
+            let sum = a.slice(0, 1, 0, 2) + &a.slice(1, 2, 0, 2);
+            let column = a.slice(0, 2, 1, 2);
+            (sum.clone() * a).concat_rows(&[&sum]) +
+                &(a.clone() * &column).concat_columns(&[&column])
+        },
+    );
 }
 
 #[test]
@@ -370,6 +409,40 @@ fn gadget_decompose_and_small_rhs_multiply_reconstruct_input() {
     );
 }
 
+/// A base of `ceil(crt_bits / 2)` bits leaves two digits per limb; residues
+/// across the whole limb range still reconstruct exactly.
+#[test]
+#[serial_test::serial]
+fn two_digit_gadget_decompose_reconstructs_full_range_input() {
+    let parameters = DCRTPolyParams::new(8, 2, 17, 9, None, None);
+    let digit_count = parameters.modulus_digits();
+    assert_eq!(digit_count, 4);
+    let modulus = parameters.modulus().as_ref().clone();
+    let entry = |offset: u64| {
+        let coefficients = (0..parameters.ring_dimension() as u64)
+            .map(|index| {
+                let value = (&modulus / 2u8 + BigUint::from(index * 7919 + offset)) % &modulus;
+                if index % 2 == 0 { value } else { &modulus - 1u8 - value }
+            })
+            .collect::<Vec<_>>();
+        DCRTPoly::from_biguints(&parameters, &coefficients)
+    };
+    let input = DCRTPolyMatrix::from_poly_vec(
+        &parameters,
+        vec![vec![entry(0), entry(1)], vec![entry(12_345), entry(99_999)]],
+    );
+    run_shape_case_on(
+        "direct-two-digit-gadget-decompose",
+        &parameters,
+        input,
+        move |source| {
+            let ring = Ring::from_ref(source.matrix_type().ring.clone());
+            source.decompose(512, digit_count).mul_small_rhs(ring.gadget(2, 512, digit_count))
+        },
+        |source| source.clone(),
+    );
+}
+
 #[test]
 #[serial_test::serial]
 fn balanced_small_gadget_decompose_reconstructs_full_crt_input() {
@@ -396,6 +469,70 @@ fn ring_automorphism_matches_cpu() {
         |a| a.ring_automorphism(3),
         |a| a.ring_automorphism_out_of_place(3),
     );
+}
+
+/// One plan multiplies by `X^k` for every rebound runtime `k`, including
+/// negative, wrapping and multiword-sized exponents, matching the CPU ring.
+#[test]
+#[serial_test::serial]
+fn multiply_monomial_matches_cpu_for_runtime_exponents() {
+    let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let gpu_parameters = GpuDCRTPolyParams::new(
+        parameters.ring_dimension(),
+        parameters.moduli().to_vec(),
+        parameters.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        parameters.moduli().iter().copied().map(Into::into).collect(),
+        parameters.ring_dimension(),
+    );
+    let context = DslContext::new("direct-multiply-monomial");
+    let source = ring.input("source", (2, 2));
+    let exponent: mxx_dsl::Int = context.input("k", mxx_dsl::IntType).unwrap();
+    let graph = context
+        .output("result", source.multiply_monomial(exponent))
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .unwrap();
+    let input = cpu_input(&parameters);
+    let input_ring = RingRef::new(RingExpr::Explicit {
+        crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
+        ring_dimension: parameters.ring_dimension(),
+    })
+    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .unwrap();
+    let matrix = RuntimeValue::gpu_matrix(
+        ConcreteWireType::Matrix(ConcreteMatrixType { ring: input_ring, rows: 2, columns: 2 }),
+        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &input)),
+    )
+    .unwrap();
+    let bind = |k: i64| {
+        BTreeMap::from([
+            ("source".to_owned(), matrix.clone()),
+            ("k".to_owned(), RuntimeValue::Int(BigInt::from(k))),
+        ])
+    };
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
+    let limit = BigInt::from(1u64 << 40);
+    runtime.options_mut().integer_input_ranges.insert("k".to_owned(), -&limit..=limit);
+    let mut plan = runtime.plan(graph, &bind(1)).unwrap();
+    let period = 2 * parameters.ring_dimension() as i64;
+    for k in [0, 1, 3, 7, 8, 9, 15, -1, -9, 1 << 35, -(1 << 35) - 5] {
+        let result = runtime
+            .execute_with_artifacts(
+                &mut plan,
+                bind(k),
+                &mut MemoryArtifactStore::default(),
+                [5; 32],
+            )
+            .unwrap();
+        let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
+        let expected = input.multiply_monomial_out_of_place(k.rem_euclid(period) as usize);
+        assert_same_matrix_values(&format!("X^{k}"), &actual, &expected);
+    }
 }
 
 #[test]
@@ -678,7 +815,7 @@ fn run_loop_index_matrix_scale_case_impl(
     let mut plan = runtime.plan(graph, &bind(&first)).unwrap();
     let replays = if expected_scalar.is_none() { vec![first] } else { vec![first, second] };
     for (replay, matrix) in replays.into_iter().enumerate() {
-        let result = runtime.execute(
+        let result = runtime.execute_with_artifacts(
             &mut plan,
             bind(&matrix),
             &mut MemoryArtifactStore::default(),
@@ -924,8 +1061,9 @@ fn crt_recompose_matches_independent_cpu_formula() {
     ]);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_full, gpu_left, gpu_right])).unwrap();
     let mut plan = runtime.plan(graph, &inputs).unwrap();
-    let result =
-        runtime.execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [13; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), [13; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values("CRT recompose", &actual, &expected);
 }
@@ -967,8 +1105,9 @@ fn hash_sample_matches_cpu_for_fixed_key_and_tag() {
     let inputs = BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from(key)))]);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
     let mut plan = runtime.plan(graph, &inputs).unwrap();
-    let result =
-        runtime.execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [17; 32]).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, &mut MemoryArtifactStore::default(), [17; 32])
+        .unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values("hash sample", &actual, &expected);
 }

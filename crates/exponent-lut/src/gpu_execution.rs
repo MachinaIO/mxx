@@ -47,7 +47,9 @@ impl<S: SessionStore + Send> StageExecution<S> for GpuRuntime {
         execution_nonce: [u8; 32],
     ) -> Result<ProductionId, ApiError> {
         let mut plan = plan(self, validated, &inputs, store)?;
-        let result = self.execute(&mut plan, inputs, store, execution_nonce).map_err(gpu_error)?;
+        let result = self
+            .execute_with_artifacts(&mut plan, inputs, store, execution_nonce)
+            .map_err(gpu_error)?;
         result.production_id.clone().ok_or_else(|| {
             ApiError::input("artifact execution did not produce a production identity")
         })
@@ -61,15 +63,14 @@ impl<S: SessionStore + Send> StageExecution<S> for GpuRuntime {
         execution_nonce: [u8; 32],
     ) -> Result<StageOutputs, ApiError> {
         let mut plan = plan(self, validated, &inputs, store)?;
-        let result = self.execute(&mut plan, inputs, store, execution_nonce).map_err(gpu_error)?;
-        let mut outputs = BTreeMap::new();
-        for name in result.output_names() {
-            let output = result
-                .output(name)
-                .ok_or_else(|| ApiError::input("GPU stage output disappeared"))?;
-            outputs.insert(name.to_owned(), self.copy_output(&output).map_err(gpu_error)?);
-        }
-        Ok(StageOutputs { outputs })
+        let result = self
+            .execute_with_artifacts(&mut plan, inputs, store, execution_nonce)
+            .map_err(gpu_error)?;
+        // The result owns its outputs, grouped per composite value; stage
+        // outputs are addressed by their leaf names (`name.i`).
+        Ok(StageOutputs {
+            outputs: mxx_backends::backend::expand_composite_values(result.into_outputs()),
+        })
     }
 
     fn download_matrix(&self, value: &RuntimeValue) -> Result<DCRTPolyMatrix, ApiError> {

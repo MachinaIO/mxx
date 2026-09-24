@@ -4,7 +4,6 @@ namespace
 {
     constexpr uint32_t kDecomposeThreads = 256;
     constexpr size_t kDecomposeMaxGridY = 65535;
-    constexpr size_t kDecomposeMaxGridZ = 65535;
 
     MxxGraphPatch decompose_pointer_patch(
         uint32_t argument_index,
@@ -75,37 +74,46 @@ __device__ __forceinline__ uint64_t signed_digit_to_residue(int64_t digit, uint6
 
 namespace
 {
+    // One launch covers up to this many (source limb, output limb) pairs;
+    // blockIdx.z picks the pair.
+    constexpr size_t kDecomposePairs = 8;
+
+    struct RawDecomposeBatch
+    {
+        MxxRawMatrixLimb source[kDecomposePairs];
+        MxxRawMatrixLimb destination[kDecomposePairs];
+        uint64_t source_digit_offset[kDecomposePairs];
+    };
+
+    // Each thread peels every balanced digit of one coefficient in order and
+    // stores digit `d` to output row `source_row * digits_per_row + offset + d`.
     __global__ void raw_matrix_decompose_coeff_kernel(
-        MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
-        size_t source_columns, size_t destination_columns,
-        size_t degree, size_t output_digits_per_row,
-        size_t source_digit_offset, uint32_t base_bits,
-        uint32_t digits_per_tower, size_t poly_offset,
-        size_t digit_offset)
+        RawDecomposeBatch batch, size_t source_columns, size_t destination_columns,
+        size_t degree, size_t output_digits_per_row, uint32_t base_bits,
+        uint32_t digits_per_tower, size_t poly_offset)
     {
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (coefficient >= degree) return;
+        const MxxRawMatrixLimb &source = batch.source[blockIdx.z];
+        const MxxRawMatrixLimb &destination = batch.destination[blockIdx.z];
         const size_t poly = poly_offset + blockIdx.y;
-        const uint32_t digit_index = static_cast<uint32_t>(digit_offset + blockIdx.z);
-        if (digit_index >= digits_per_tower) return;
         const uint64_t residue = raw_matrix_load(source, poly, coefficient, source_columns);
         int64_t value = centered_lift_u64(residue, source.modulus);
-        int64_t signed_digit = 0;
         const int64_t base = int64_t{1} << base_bits;
-        for (uint32_t index = 0; index <= digit_index; ++index)
-        {
-            int64_t next = 0;
-            const int64_t current = balanced_digit_step(value, base, &next);
-            if (index == digit_index) signed_digit = current;
-            value = next;
-        }
-        const uint64_t digit = signed_digit_to_residue(signed_digit, destination.modulus);
         const size_t source_row = poly / source_columns;
         const size_t source_column = poly - source_row * source_columns;
-        const size_t output_row = source_row * output_digits_per_row +
-            source_digit_offset + digit_index;
-        raw_matrix_store(destination, output_row * destination_columns + source_column,
-            coefficient, destination_columns, digit);
+        const size_t first_row = source_row * output_digits_per_row +
+            batch.source_digit_offset[blockIdx.z];
+        for (uint32_t digit_index = 0; digit_index < digits_per_tower; ++digit_index)
+        {
+            int64_t next = 0;
+            const int64_t signed_digit = balanced_digit_step(value, base, &next);
+            value = next;
+            raw_matrix_store(destination,
+                (first_row + digit_index) * destination_columns + source_column,
+                coefficient, destination_columns,
+                signed_digit_to_residue(signed_digit, destination.modulus));
+        }
     }
 }
 
@@ -148,38 +156,43 @@ static int raw_matrix_decompose_coeff_impl(GpuContext *ctx, void *stream_raw,
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = source->rows * source->columns;
+    struct Pair { size_t source_limb, output_limb, digit_offset; };
+    std::vector<Pair> pairs;
     for (size_t input_limb = 0; input_limb < retained; ++input_limb)
-    {
         for (size_t output_limb = 0; output_limb < destination->limb_count; ++output_limb)
+            pairs.push_back({input_limb, output_limb, input_limb * digits});
+    for (size_t first = 0; first < pairs.size(); first += kDecomposePairs)
+    {
+        const size_t count = std::min(kDecomposePairs, pairs.size() - first);
+        RawDecomposeBatch batch{};
+        std::vector<MxxGraphPatch> patches;
+        for (size_t local = 0; local < count; ++local)
         {
-            const MxxGraphPatch patches[] = {
-                decompose_pointer_patch(0, 0,
-                    static_cast<uint32_t>(source_binding_base + input_limb)),
-                decompose_pointer_patch(1, 0,
-                    static_cast<uint32_t>(destination_binding_base + output_limb)),
-            };
-            for (size_t poly_offset = 0; poly_offset < poly_count;
-                 poly_offset += kDecomposeMaxGridY)
-            {
-                const size_t poly_chunk = std::min(kDecomposeMaxGridY, poly_count - poly_offset);
-                for (size_t digit_offset = 0; digit_offset < digits;
-                     digit_offset += kDecomposeMaxGridZ)
-                {
-                    const size_t digit_chunk = std::min(kDecomposeMaxGridZ, digits - digit_offset);
-                    const dim3 grid(
-                        static_cast<uint32_t>((source->degree + kDecomposeThreads - 1) /
-                            kDecomposeThreads),
-                        static_cast<uint32_t>(poly_chunk), static_cast<uint32_t>(digit_chunk));
-                    const int status = mxx_gpu_launch_kernel(ctx, stream,
-                        raw_matrix_decompose_coeff_kernel, grid, dim3(kDecomposeThreads), 0,
-                        patches, 2, source->limbs[input_limb], destination->limbs[output_limb],
-                        source->columns, destination->columns,
-                        static_cast<size_t>(source->degree), digits * retained,
-                        input_limb * digits, base_bits,
-                        static_cast<uint32_t>(digits), poly_offset, digit_offset);
-                    if (status != 0) return status;
-                }
-            }
+            const Pair &pair = pairs[first + local];
+            batch.source[local] = source->limbs[pair.source_limb];
+            batch.destination[local] = destination->limbs[pair.output_limb];
+            batch.source_digit_offset[local] = pair.digit_offset;
+            patches.push_back(decompose_pointer_patch(0,
+                offsetof(RawDecomposeBatch, source) + local * sizeof(MxxRawMatrixLimb) +
+                    offsetof(MxxRawMatrixLimb, address),
+                static_cast<uint32_t>(source_binding_base + pair.source_limb)));
+            patches.push_back(decompose_pointer_patch(0,
+                offsetof(RawDecomposeBatch, destination) + local * sizeof(MxxRawMatrixLimb) +
+                    offsetof(MxxRawMatrixLimb, address),
+                static_cast<uint32_t>(destination_binding_base + pair.output_limb)));
+        }
+        for (size_t poly_offset = 0; poly_offset < poly_count; poly_offset += kDecomposeMaxGridY)
+        {
+            const size_t poly_chunk = std::min(kDecomposeMaxGridY, poly_count - poly_offset);
+            const dim3 grid(
+                static_cast<uint32_t>((source->degree + kDecomposeThreads - 1) / kDecomposeThreads),
+                static_cast<uint32_t>(poly_chunk), static_cast<uint32_t>(count));
+            const int status = mxx_gpu_launch_kernel(ctx, stream,
+                raw_matrix_decompose_coeff_kernel, grid, dim3(kDecomposeThreads), 0,
+                patches.data(), patches.size(), batch, source->columns, destination->columns,
+                static_cast<size_t>(source->degree), digits * retained, base_bits,
+                static_cast<uint32_t>(digits), poly_offset);
+            if (status != 0) return status;
         }
     }
     return 0;
@@ -204,41 +217,38 @@ namespace
         MxxRawMatrixLimb source, MxxRawSmallMatrixView destination,
         size_t source_columns, size_t degree, size_t output_digits_per_row,
         size_t source_digit_offset, uint32_t base_bits, uint32_t digits_per_tower,
-        size_t destination_limb, size_t poly_offset, size_t digit_offset)
+        size_t destination_limb, size_t poly_offset)
     {
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (coefficient >= degree) return;
         const size_t poly = poly_offset + blockIdx.y;
-        const uint32_t digit_index = static_cast<uint32_t>(digit_offset + blockIdx.z);
-        if (digit_index >= digits_per_tower) return;
         const uint64_t residue = raw_matrix_load(source, poly, coefficient, source_columns);
         int64_t value = centered_lift_u64(residue, source.modulus);
-        int64_t signed_digit = 0;
         const int64_t base = int64_t{1} << base_bits;
-        for (uint32_t index = 0; index <= digit_index; ++index)
-        {
-            int64_t next = 0;
-            const int64_t current = balanced_digit_step(value, base, &next);
-            if (index == digit_index) signed_digit = current;
-            value = next;
-        }
         const size_t source_row = poly / source_columns;
         const size_t source_column = poly - source_row * source_columns;
-        const size_t output_row = source_row * output_digits_per_row +
-            source_digit_offset + digit_index;
-        const size_t packed_poly = output_row * destination.storage_columns +
-            destination.column_offset + source_column;
         const size_t width = static_cast<size_t>(destination.magnitude_bytes) + 1;
         const size_t depth = destination.bound_domain == 1 ? destination.crt_depth : 1;
-        auto *encoded = reinterpret_cast<uint8_t *>(destination.payload_address) +
-            ((packed_poly * destination.degree + coefficient) * depth + destination_limb) * width;
-        const uint64_t magnitude = signed_digit < 0
-            ? static_cast<uint64_t>(-(signed_digit + 1)) + 1
-            : static_cast<uint64_t>(signed_digit);
-        encoded[0] = signed_digit == 0 ? 0 : (signed_digit < 0 ? 2 : 1);
-        for (size_t byte = 0; byte < destination.magnitude_bytes; ++byte)
-            encoded[1 + byte] = byte < sizeof(uint64_t) ?
-                static_cast<uint8_t>(magnitude >> (8 * byte)) : 0;
+        for (uint32_t digit_index = 0; digit_index < digits_per_tower; ++digit_index)
+        {
+            int64_t next = 0;
+            const int64_t signed_digit = balanced_digit_step(value, base, &next);
+            value = next;
+            const size_t output_row = source_row * output_digits_per_row +
+                source_digit_offset + digit_index;
+            const size_t packed_poly = output_row * destination.storage_columns +
+                destination.column_offset + source_column;
+            auto *encoded = reinterpret_cast<uint8_t *>(destination.payload_address) +
+                ((packed_poly * destination.degree + coefficient) * depth + destination_limb) *
+                    width;
+            const uint64_t magnitude = signed_digit < 0
+                ? static_cast<uint64_t>(-(signed_digit + 1)) + 1
+                : static_cast<uint64_t>(signed_digit);
+            encoded[0] = signed_digit == 0 ? 0 : (signed_digit < 0 ? 2 : 1);
+            for (size_t byte = 0; byte < destination.magnitude_bytes; ++byte)
+                encoded[1 + byte] = byte < sizeof(uint64_t) ?
+                    static_cast<uint8_t>(magnitude >> (8 * byte)) : 0;
+        }
     }
 }
 
@@ -301,23 +311,16 @@ extern "C" int gpu_raw_matrix_decompose_compact(GpuContext *ctx, void *stream_ra
              poly_offset += kDecomposeMaxGridY)
         {
             const size_t poly_chunk = std::min(kDecomposeMaxGridY, poly_count - poly_offset);
-            for (size_t digit_offset = 0; digit_offset < digits;
-                 digit_offset += kDecomposeMaxGridZ)
-            {
-                const size_t digit_chunk = std::min(kDecomposeMaxGridZ, digits - digit_offset);
-                const dim3 grid(
-                    static_cast<uint32_t>((source->degree + kDecomposeThreads - 1) /
-                        kDecomposeThreads),
-                    static_cast<uint32_t>(poly_chunk), static_cast<uint32_t>(digit_chunk));
-                const int status = mxx_gpu_launch_kernel(ctx, stream,
-                    raw_matrix_decompose_compact_kernel, grid, dim3(kDecomposeThreads), 0,
-                    patches, 2, source->limbs[pass], *destination, source->columns,
-                    static_cast<size_t>(source->degree), digits * retained,
-                    full_basis_small ? 0 : pass * digits, base_bits,
-                    static_cast<uint32_t>(digits), full_basis_small ? pass : 0,
-                    poly_offset, digit_offset);
-                if (status != 0) return status;
-            }
+            const dim3 grid(
+                static_cast<uint32_t>((source->degree + kDecomposeThreads - 1) / kDecomposeThreads),
+                static_cast<uint32_t>(poly_chunk));
+            const int status = mxx_gpu_launch_kernel(ctx, stream,
+                raw_matrix_decompose_compact_kernel, grid, dim3(kDecomposeThreads), 0,
+                patches, 2, source->limbs[pass], *destination, source->columns,
+                static_cast<size_t>(source->degree), digits * retained,
+                full_basis_small ? 0 : pass * digits, base_bits,
+                static_cast<uint32_t>(digits), full_basis_small ? pass : 0, poly_offset);
+            if (status != 0) return status;
         }
     }
     return 0;

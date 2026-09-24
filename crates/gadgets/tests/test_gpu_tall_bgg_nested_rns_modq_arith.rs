@@ -1270,7 +1270,7 @@ fn prepare_gpu_graph(
 }
 
 fn matrix_family_output(
-    result: &GpuExecutionResult<'_>,
+    result: &GpuExecutionResult,
     name: &str,
     runtime: &GpuRuntime,
 ) -> Result<Vec<DCRTPolyMatrix>, String> {

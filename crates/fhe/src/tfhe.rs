@@ -5,7 +5,7 @@ use crate::{
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use mxx_dsl::{
     Bytes, DslContext, DslError, Family, FamilyType, GraphValue, GraphValueSchema, HashTag, Int,
-    IntType, Mat, MatType, Ring, iterate, parallel, select,
+    IntType, Mat, MatType, iterate, parallel, select,
 };
 use mxx_ir_core::{IntExpr, RealExpr, ValueHandle, node::ConcatAxis, types::WireType};
 use num_bigint::{BigInt, BigUint};
@@ -563,7 +563,10 @@ impl TfheParams {
         let context = DslContext::new("tfhe-keygen");
         let ring = self.common.ring();
         let lwe_secret_source = ring.uniform_interval((1, 1), 0, 1).coefficients();
-        let lwe_secret = parallel(self.lwe_dimension, |index| Ok(lwe_secret_source.at(index)))?;
+        // The reduction is the identity on the binary coefficients; it only
+        // gives the secret its proven range `[0, 1]` for the key products.
+        let lwe_secret =
+            parallel(self.lwe_dimension, |index| Ok(lwe_secret_source.at(index).rem(2)))?;
         let ring_secret = ring.uniform_interval((1, 1), 0, 1);
         let lwe_secret_dimension = self.lwe_dimension;
         let bootstrapping_entries = parallel(lwe_secret_dimension, |index| {
@@ -593,18 +596,9 @@ impl TfheParams {
         // Independent Gaussian errors, sampled as whole polynomials outside the
         // loop so its body reads only scalars.
         let error_sources = self.lwe_error_sources(key_count);
-        // Accumulate every key's dot product one LWE coordinate at a time, so
-        // the working set is one value per key rather than one per term.
-        let zeros = parallel(key_count, |_| Ok(Int::constant(0)))?;
-        let dots = iterate(self.lwe_dimension, zeros, |coordinate, sums| {
-            parallel(key_count, |flat_index| {
-                let index = flat_index.clone().mul(self.lwe_dimension).add(coordinate.clone());
-                Ok(sums
-                    .at(flat_index)
-                    .add(a_values.at(index).mul(lwe_secret.at(coordinate.clone())))
-                    .rem(Int::constant(BigInt::from(self.lwe_modulus.clone()))))
-            })
-        })?;
+        // Every key's dot product `<a_k, s>` as one matrix-vector product
+        // of the row-major `a` family with the LWE secret.
+        let dots = a_values.matrix_vector_product(&lwe_secret);
         let b_values = parallel(key_count, |flat_index| {
             let coefficient_index = flat_index.clone().div(self.key_switch_digits);
             let digit_index = flat_index.clone().rem(self.key_switch_digits);
@@ -736,12 +730,7 @@ impl TfheParams {
         let ring = self.common.ring();
         Ok(RingCiphertext {
             a: ring.zero((1, 1)),
-            b: rotate(
-                accumulator,
-                negative_exponent,
-                &ring,
-                self.common.ring.ring_dimension() as usize,
-            )?,
+            b: accumulator.clone().multiply_monomial(negative_exponent),
             noise_bound: BigUint::zero(),
             // Any canonical accumulator coefficient is at most Q/2 in
             // centered form. Built-in NAND coefficients use only Q/8.
@@ -771,30 +760,24 @@ impl TfheParams {
         check_matrix(&self.common.ring, &first_entry.b, 1, 2 * self.common.ring.modulus_digits())?;
 
         let ring_dimension = self.common.ring.ring_dimension() as usize;
-        let ring = self.common.ring();
-        let (a, b) = iterate(
+        // The accumulator travels as one (a; b) column, so each step rotates,
+        // differences and multiplies both components in single operations.
+        let column = iterate(
             self.lwe_dimension,
-            (initial.a.clone(), initial.b.clone()),
-            |index, (current_a, current_b)| {
+            Mat::concat(ConcatAxis::Rows, vec![initial.a.clone(), initial.b.clone()]),
+            |index, current| {
                 let exponent = scale_to_ring_exponent(
                     ciphertext.a.at(index.clone()),
                     &self.lwe_modulus,
                     ring_dimension,
                 );
-                let rotated_a = rotate(&current_a, exponent.clone(), &ring, ring_dimension)?;
-                let rotated_b = rotate(&current_b, exponent, &ring, ring_dimension)?;
-                let difference_a = rotated_a - current_a.clone();
-                let difference_b = rotated_b - current_b.clone();
+                let difference = current.clone().multiply_monomial(exponent) - current.clone();
                 let encrypted_bit = bootstrapping_key.entries.at(index);
-                let (product_a, product_b) = self.external_product_matrices(
-                    &encrypted_bit.a,
-                    &encrypted_bit.b,
-                    &difference_a,
-                    &difference_b,
-                );
-                Ok((current_a + product_a, current_b + product_b))
+                Ok(current + self.external_product(&encrypted_bit.a, &encrypted_bit.b, &difference))
             },
         )?;
+        let a = row_of(&column, 0);
+        let b = row_of(&column, 1);
 
         // Propagate static bounds on the host while the ciphertext matrices
         // travel through a single sequential-loop node in the graph.
@@ -873,44 +856,19 @@ impl TfheParams {
         }
         let base = BigUint::from(1u8) << self.key_switch_base_bits;
         let q = Int::constant(BigInt::from(self.lwe_modulus.clone()));
-        let initial_a = parallel(self.lwe_dimension, |_| Ok(Int::constant(0)))?;
-        let (a_sum, b_sum) = iterate(
-            ring_dimension,
-            (initial_a, Int::constant(0)),
-            |coefficient_index, (a_sum, b_sum)| {
-                // The KSK uses base 2. Fold all digit terms for this ring
-                // coefficient in parallel with the output coordinates, so
-                // the runtime loop has only N sequential iterations.
-                let coefficient = extracted.a.at(coefficient_index.clone());
-                let digits = (0..self.key_switch_digits)
-                    .map(|digit| {
-                        coefficient
-                            .clone()
-                            .div(Int::constant(BigInt::from(base.pow(digit as u32))))
-                            .rem(base.clone())
-                    })
-                    .collect::<Vec<_>>();
-                let mut b_contribution = Int::constant(0);
-                for (digit_index, digit) in digits.iter().enumerate() {
-                    let entry =
-                        coefficient_index.clone().mul(self.key_switch_digits).add(digit_index);
-                    b_contribution = b_contribution.add(digit.clone().mul(key.b_values.at(entry)));
-                }
-                let next_a = parallel(self.lwe_dimension, |coordinate| {
-                    let mut contribution = Int::constant(0);
-                    for (digit_index, digit) in digits.iter().enumerate() {
-                        let entry =
-                            coefficient_index.clone().mul(self.key_switch_digits).add(digit_index);
-                        let flat_index = entry.mul(self.lwe_dimension).add(coordinate.clone());
-                        contribution =
-                            contribution.add(digit.clone().mul(key.a_values.at(flat_index)));
-                    }
-                    Ok(a_sum.at(coordinate).add(contribution))
-                })?;
-                let next_b = b_sum.add(b_contribution);
-                Ok((next_a, next_b))
-            },
-        )?;
+        let powers = (0..self.key_switch_digits)
+            .map(|digit| Int::constant(BigInt::from(base.pow(digit as u32))))
+            .collect::<Vec<_>>();
+        // The base digits of every extracted coefficient, in key order
+        // `coefficient * digits + digit`, then both sums as one product each
+        // with the flat key arrays.
+        let digits = parallel(ring_dimension * self.key_switch_digits, |entry| {
+            let coefficient = extracted.a.at(entry.clone().div(self.key_switch_digits));
+            let power = select(entry.rem(self.key_switch_digits), powers.clone())?;
+            Ok(coefficient.div(power).rem(base.clone()))
+        })?;
+        let a_sum = key.a_values.vector_matrix_product(&digits);
+        let b_sum = key.b_values.vector_matrix_product(&digits).at(0);
         let b = extracted.b.clone().sub(b_sum).rem(q.clone());
         let a = parallel(self.lwe_dimension, |coordinate| {
             Ok(Int::constant(0).sub(a_sum.at(coordinate)).rem(q.clone()))
@@ -1051,31 +1009,17 @@ impl TfheParams {
         }
     }
 
-    fn external_product_matrices(
-        &self,
-        multiplier_a: &Mat,
-        multiplier_b: &Mat,
-        input_a: &Mat,
-        input_b: &Mat,
-    ) -> (Mat, Mat) {
+    /// The GSW external product of the (a; b) row pair with a (2 x 1)
+    /// ring-LWE column, returned as a column.
+    fn external_product(&self, multiplier_a: &Mat, multiplier_b: &Mat, column: &Mat) -> Mat {
         let parameters = &self.common.ring;
         let digits = parameters.modulus_digits();
         let matrix =
             Mat::concat(ConcatAxis::Rows, vec![multiplier_a.clone(), multiplier_b.clone()]);
-        let column = Mat::concat(ConcatAxis::Rows, vec![input_a.clone(), input_b.clone()]);
-        let decomposition = column
-            .decompose(IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())), digits);
-        let output = decomposition.mul_small_rhs(matrix);
-        (
-            output.clone().slice(
-                Some(mxx_ir_core::node::IndexRange { start: 0.into(), end: 1.into() }),
-                None,
-            ),
-            output.slice(
-                Some(mxx_ir_core::node::IndexRange { start: 1.into(), end: 2.into() }),
-                None,
-            ),
-        )
+        column
+            .clone()
+            .decompose(IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())), digits)
+            .mul_small_rhs(matrix)
     }
 }
 
@@ -1140,16 +1084,11 @@ fn minimum_sixteen_sigma_cutoff(sigma: f64) -> Result<BigUint, FheError> {
     Ok(BigUint::from(cutoff as u64))
 }
 
-fn rotate(value: &Mat, exponent: Int, ring: &Ring, ring_dimension: usize) -> Result<Mat, DslError> {
-    let n = Int::constant(ring_dimension);
-    let normalized = exponent.rem(Int::constant(2 * ring_dimension));
-    let index = normalized.clone().rem(n.clone());
-    let negacyclic_sign = Int::constant(1).sub(normalized.div(n).mul(2));
-    let coefficients = parallel(ring_dimension, |coefficient| {
-        Ok(index.clone().equal(coefficient).to_int().mul(negacyclic_sign.clone()))
-    })?;
-    let monomial = ring.from_coefficients(&coefficients);
-    Ok(&monomial * value)
+fn row_of(column: &Mat, row: usize) -> Mat {
+    column.clone().slice(
+        Some(mxx_ir_core::node::IndexRange { start: row.into(), end: (row + 1).into() }),
+        None,
+    )
 }
 
 #[cfg(test)]

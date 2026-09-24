@@ -72,6 +72,9 @@ pub enum NodeKind {
     RingAutomorphism {
         index: IntExpr,
     },
+    /// Multiplies every entry by `X^k` in the negacyclic ring, for the
+    /// runtime integer `k` of argument 1 (any sign, taken modulo `2n`).
+    MultiplyMonomial,
     /// Coefficientwise exact nearest scaling into a divisor ring.
     ModulusSwitch {
         destination: RingRef,
@@ -203,6 +206,13 @@ pub enum NodeKind {
     /// Exports a scalar polynomial as canonical coefficients or native evaluation slots.
     PolynomialValues {
         evaluation: bool,
+    },
+    /// The integer product of a row-major matrix family (argument 0) with
+    /// a vector family (argument 1). The vector length fixes the inner
+    /// dimension: `M v` with `out[i] = sum_j M[i, j] v[j]`, or with
+    /// `transpose` `v^T M` with `out[j] = sum_i v[i] M[i, j]`.
+    IntMatrixVectorProduct {
+        transpose: bool,
     },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),

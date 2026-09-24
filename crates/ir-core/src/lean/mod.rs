@@ -1595,6 +1595,22 @@ impl<'a> Emitter<'a> {
                     &[sigma, bound],
                 );
             }
+            NodeKind::MultiplyMonomial => {
+                return self.unsupported(
+                    scope_id,
+                    node_id,
+                    kind,
+                    "runtime monomial multiplication has no Lean ring relation",
+                );
+            }
+            NodeKind::IntMatrixVectorProduct { .. } => {
+                return self.unsupported(
+                    scope_id,
+                    node_id,
+                    kind,
+                    "integer matrix-vector products have no Lean relation",
+                );
+            }
             NodeKind::HashIntFamily { .. } => {
                 return self.unsupported(
                     scope_id,

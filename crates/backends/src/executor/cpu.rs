@@ -1529,6 +1529,55 @@ impl<S: SessionStore> Executor<'_, S> {
                     self.backend.ring_automorphism(&input, index).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
+            NodeKind::IntMatrixVectorProduct { transpose } => {
+                use rayon::prelude::*;
+                let members = |executor: &mut Self, wire| {
+                    let count = executor.family_count(values, wire)?;
+                    (0..count)
+                        .map(|index| {
+                            match executor.family_member(values, wire, index, node.id)? {
+                                RuntimeValue::Int(value) => Ok(value),
+                                _ => Err(ExecutionError::ValueKind(wire)),
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let matrix = members(self, node.args[0])?;
+                let vector = members(self, node.args[1])?;
+                let inner = vector.len();
+                let outer = matrix.len() / inner;
+                let output = (0..outer)
+                    .into_par_iter()
+                    .map(|position| {
+                        (0..inner)
+                            .map(|term| {
+                                let entry = if *transpose {
+                                    term * outer + position
+                                } else {
+                                    position * inner + term
+                                };
+                                &matrix[entry] * &vector[term]
+                            })
+                            .sum::<BigInt>()
+                    })
+                    .collect();
+                self.put(values, node.id, 0, RuntimeValue::integer_values(output));
+            }
+            NodeKind::MultiplyMonomial => {
+                let input = self.matrix(values, node.args[0])?;
+                let exponent = self.int(values, node.args[1])?;
+                let period = BigInt::from(2 * input.params().ring_dimension() as u64);
+                let exponent = mxx_ir_core::expr::euclidean_div_rem(&exponent, &period)
+                    .map_err(|error| self.expression_error(node.id, error))?
+                    .1
+                    .to_usize()
+                    .expect("residue below 2n fits usize");
+                let output = self
+                    .backend
+                    .multiply_monomial(&input, exponent)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
             NodeKind::ExtractCoefficient { position, .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let position = self.eval_usize(node.id, position, env)?;

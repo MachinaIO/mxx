@@ -865,10 +865,14 @@ fn validate_allocated_budget(
 }
 
 fn wait_for_bound_inputs(frame: &PhysicalFrame) -> Result<(), String> {
+    // Members of one input family commonly share a producer event.
+    let mut waited = std::collections::HashSet::new();
     for id in frame.input_ids.values() {
         let owner = frame.owners.get(id).ok_or("bound GPU input is missing")?;
         for event in owner.ready_events() {
-            event.wait().map_err(|error| error.to_string())?;
+            if waited.insert(Arc::as_ptr(event)) {
+                event.wait().map_err(|error| error.to_string())?;
+            }
         }
     }
     Ok(())

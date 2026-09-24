@@ -1311,6 +1311,19 @@ impl Mat {
         Self { value: node.output(0).expect("small RHS multiplication"), matrix_type: output_type }
     }
 
+    /// Multiplies every entry by `X^k` in the negacyclic ring for a runtime
+    /// integer `k`, taken modulo twice the ring dimension.
+    #[track_caller]
+    pub fn multiply_monomial(self, exponent: impl Into<Int>) -> Self {
+        let ty = self.matrix_type.clone();
+        let node = NodeHandle::new(
+            NodeKind::MultiplyMonomial,
+            vec![self.value, exponent.into().value],
+            vec![WireType::Matrix(ty.clone())],
+        );
+        Self { value: node.output(0).expect("monomial product"), matrix_type: ty }
+    }
+
     /// Applies the raw negacyclic automorphism `sigma_k: X -> X^k` entrywise.
     #[track_caller]
     pub fn ring_automorphism(self, index: impl Into<IntExpr>) -> Self {

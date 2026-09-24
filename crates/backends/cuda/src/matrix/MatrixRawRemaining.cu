@@ -160,6 +160,42 @@ namespace
         }
     }
 
+    // Multiplying by X^k in the evaluation domain scales slot s by X^k's
+    // value there. The forward NTT twists by psi^i and leaves slot s in
+    // bit-reversed order, so X evaluates to psi^(2 rev(s) + 1) and X^k to
+    // psi^(k (2 rev(s) + 1) mod 2n), where psi^(n + t) = -psi^t.
+    __global__ void raw_monomial_multiply_kernel(
+        MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
+        const uint64_t *twiddles, const uint64_t *shoup,
+        const uint64_t *exponent_value, int exponent_encoding, uint32_t *status,
+        size_t columns, size_t degree, uint32_t log_degree, size_t polynomial_count)
+    {
+        __shared__ uint64_t exponent;
+        __shared__ bool valid;
+        if (threadIdx.x == 0)
+        {
+            valid = raw_integer_modulus_residue(exponent_value, exponent_encoding,
+                2ULL * degree, &exponent);
+            if (!valid) atomicCAS(status, 0U, kRawScalarInvalid);
+        }
+        __syncthreads();
+        if (!valid) return;
+        const size_t step = static_cast<size_t>(gridDim.x) * blockDim.x;
+        for (size_t item = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             item < polynomial_count * degree; item += step)
+        {
+            const size_t poly = item / degree;
+            const uint32_t slot = static_cast<uint32_t>(item % degree);
+            const uint64_t reversed = log_degree ? __brev(slot) >> (32 - log_degree) : 0;
+            const uint64_t power = (exponent * (2 * reversed + 1)) % (2ULL * degree);
+            const size_t index = power < degree ? power : power - degree;
+            uint64_t value = mul_mod_shoup_u64(raw_matrix_load(source, poly, slot, columns),
+                twiddles[index], shoup[index], destination.modulus);
+            if (power >= degree && value != 0) value = destination.modulus - value;
+            raw_matrix_store(destination, poly, slot, columns, value);
+        }
+    }
+
     __global__ void raw_lift_integer_kernel(const uint64_t *value, int encoding,
         MxxRawMatrixLimb destination, uint32_t *status, uint32_t degree)
     {
@@ -234,6 +270,69 @@ extern "C" int gpu_raw_ring_automorphism(GpuContext *ctx, void *stream_raw,
             destination->limbs[limb], index_value, index_encoding, status,
             static_cast<size_t>(source->columns),
             static_cast<size_t>(source->degree),
+            static_cast<size_t>(source->rows * source->columns));
+        if (result != 0) return result;
+    }
+    return 0;
+}
+
+extern "C" int gpu_raw_monomial_multiply(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+    const void *exponent_value, int exponent_encoding, uint32_t *status,
+    uint32_t source_binding_base, uint32_t destination_binding_base,
+    uint32_t exponent_binding, uint32_t status_binding)
+{
+    if (validate_raw_view(ctx, source, stream_raw) != 0 ||
+        validate_raw_view(ctx, destination, stream_raw) != 0 ||
+        !exponent_value || !status || exponent_encoding < 0 || exponent_encoding == 2 ||
+        source->physical_device != destination->physical_device ||
+        source->degree != destination->degree ||
+        source->rows != destination->rows ||
+        source->columns != destination->columns ||
+        source->limb_count != destination->limb_count ||
+        (source->degree & (source->degree - 1)) != 0 ||
+        source->rows > SIZE_MAX / source->columns ||
+        source->rows * source->columns > SIZE_MAX / source->degree ||
+        source_binding_base > UINT32_MAX - source->limb_count ||
+        destination_binding_base > UINT32_MAX - destination->limb_count)
+        return set_error("invalid raw monomial multiplication views");
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
+        return set_error(cudaGetLastError());
+    const size_t degree = source->degree;
+    const uint32_t log_degree = static_cast<uint32_t>(__builtin_ctzll(degree));
+    const size_t count = source->rows * source->columns * degree;
+    const uint32_t grid = static_cast<uint32_t>(std::min<size_t>((count + 255) / 256, 65535));
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    for (size_t limb = 0; limb < source->limb_count; ++limb)
+    {
+        const auto &source_limb = source->limbs[limb];
+        const auto &destination_limb = destination->limbs[limb];
+        if (source_limb.crt_limb_index != destination_limb.crt_limb_index ||
+            source_limb.modulus != destination_limb.modulus)
+            return set_error("raw monomial multiplication requires matching CRT views");
+        const dim3 partition = ctx->limb_gpu_ids[source_limb.crt_limb_index];
+        if (partition.x >= ctx->ntt_device_constants.size())
+            return set_error("missing raw monomial NTT constants");
+        const auto &constants = ctx->ntt_device_constants[partition.x];
+        if (constants.device != source->physical_device || partition.y >= constants.limb_count ||
+            constants.ring_dimension != degree || !constants.twiddle_forward ||
+            !constants.twiddle_shoup_forward)
+            return set_error("invalid raw monomial NTT constants");
+        const size_t table = static_cast<size_t>(partition.y) * degree;
+        const MxxGraphPatch patches[] = {
+            raw_remaining_patch(0, offsetof(MxxRawMatrixLimb, address),
+                source_binding_base + limb),
+            raw_remaining_patch(1, offsetof(MxxRawMatrixLimb, address),
+                destination_binding_base + limb),
+            raw_remaining_patch(4, 0, exponent_binding),
+            raw_remaining_patch(6, 0, status_binding),
+        };
+        const int result = mxx_gpu_launch_kernel(ctx, stream,
+            raw_monomial_multiply_kernel, dim3(grid), dim3(256), 0,
+            patches, std::size(patches), source_limb, destination_limb,
+            constants.twiddle_forward + table, constants.twiddle_shoup_forward + table,
+            exponent_value, exponent_encoding, status,
+            static_cast<size_t>(source->columns), degree, log_degree,
             static_cast<size_t>(source->rows * source->columns));
         if (result != 0) return result;
     }

@@ -433,6 +433,7 @@ pub(crate) enum GpuNativePrimitive {
     MatrixIndexedCopy,
     MatrixSliceDynamic,
     RingAutomorphism,
+    MultiplyMonomial,
     LiftIntegerConstant,
     MatrixMulTransposeRhs,
     IdentityFill,
@@ -745,6 +746,10 @@ impl GpuImplementation {
         }
     }
 
+    pub(crate) fn multiply_monomial() -> Self {
+        Self { primitive: GpuNativePrimitive::MultiplyMonomial, ..Self::ring_automorphism() }
+    }
+
     pub(crate) fn lift_integer_constant() -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
@@ -941,11 +946,18 @@ impl GpuImplementation {
     }
 
     pub(crate) fn matrix_copy_view() -> Self {
+        Self::matrix_copy_views(1)
+    }
+
+    /// `count` independent view copies in one operation: each copy is a
+    /// (source, part, destination, part, source binding, destination binding)
+    /// argument group with its destination as the matching output.
+    pub(crate) fn matrix_copy_views(count: usize) -> Self {
         use GpuArgumentKind::{U32, Value};
         Self {
             primitive: GpuNativePrimitive::MatrixCopyView,
-            argument_kinds: Box::new([Value, U32, Value, U32, U32, U32]),
-            output_count: 1,
+            argument_kinds: [Value, U32, Value, U32, U32, U32].repeat(count).into_boxed_slice(),
+            output_count: count,
         }
     }
 
@@ -1060,7 +1072,6 @@ impl GpuImplementation {
 #[cfg(feature = "gpu")]
 pub(crate) struct GpuImplementationRegistry {
     entries: Vec<GpuImplementation>,
-    by_kind: BTreeMap<GpuNativePrimitive, GpuImplId>,
 }
 
 #[cfg(feature = "gpu")]
@@ -1069,16 +1080,14 @@ impl GpuImplementationRegistry {
         &mut self,
         implementation: GpuImplementation,
     ) -> Result<GpuImplId, &'static str> {
-        if let Some(&id) = self.by_kind.get(&implementation.primitive) {
-            if self.entries[id.0 as usize] != implementation {
-                return Err("GPU primitive registered with conflicting argument schema");
-            }
-            return Ok(id);
+        // One primitive may have several argument schemas, e.g. a view copy
+        // of any number of windows; each distinct schema is one entry.
+        if let Some(index) = self.entries.iter().position(|entry| *entry == implementation) {
+            return Ok(GpuImplId(index as u32));
         }
         let id = GpuImplId(
             u32::try_from(self.entries.len()).map_err(|_| "too many GPU native implementations")?,
         );
-        self.by_kind.insert(implementation.primitive, id);
         self.entries.push(implementation);
         Ok(id)
     }

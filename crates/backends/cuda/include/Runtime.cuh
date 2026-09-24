@@ -322,9 +322,9 @@ int gpu_raw_matrix_tensor(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *destination,
     uint32_t left_binding_base, uint32_t right_binding_base,
     uint32_t destination_binding_base);
-int gpu_raw_matrix_copy(GpuContext *ctx, void *stream,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    uint32_t source_binding_base, uint32_t destination_binding_base);
+int gpu_raw_matrix_copy(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *sources, const MxxRawMatrixView *destinations, size_t count,
+    const uint32_t *source_binding_bases, const uint32_t *destination_binding_bases);
 int gpu_raw_matrix_scale(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     const uint64_t *scalar_residues, size_t residue_count,

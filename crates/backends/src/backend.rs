@@ -458,11 +458,24 @@ impl GpuResidentValue {
         &self.ready
     }
 
+    /// The same allocations under another descriptor, bound only to the
+    /// storages its parts use, so a member view of a large family does not
+    /// carry (and rebind) every allocation of the family.
     pub(crate) fn with_physical_view(
         &self,
         physical: Arc<crate::gpu_execution_plan::PhysicalValue>,
     ) -> Result<Self, &'static str> {
-        Self::new(physical, self.storage.clone(), self.ready.clone())
+        let storage = physical
+            .parts
+            .iter()
+            .map(|part| {
+                self.storage
+                    .get(&part.storage)
+                    .map(|bound| (part.storage, bound.clone()))
+                    .ok_or("GPU resident view references an unbound storage")
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Self::new(physical, storage, self.ready.clone())
     }
 
     pub(crate) fn storages(
@@ -476,13 +489,11 @@ impl GpuResidentValue {
     /// becomes the replacements' producers. `None` if nothing aliases them.
     pub(crate) fn rebound(
         &self,
-        replaced: &[(*const (), BoundStorage)],
+        replaced: &std::collections::HashMap<*const (), BoundStorage>,
         ready: &[Arc<crate::poly::dcrt::gpu::GpuNativeEvent>],
     ) -> Result<Option<Self>, &'static str> {
-        let replacement = |bound: &BoundStorage| {
-            let owner = Arc::as_ptr(&bound.owner).cast::<()>();
-            replaced.iter().find(|(old, _)| *old == owner).map(|(_, new)| new)
-        };
+        let replacement =
+            |bound: &BoundStorage| replaced.get(&Arc::as_ptr(&bound.owner).cast::<()>());
         if self.storage.values().all(|bound| replacement(bound).is_none()) {
             return Ok(None);
         }

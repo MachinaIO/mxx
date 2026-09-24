@@ -2652,42 +2652,59 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(right_owner));
             builder.retain_owner(Arc::clone(destination_owner));
         }
+        // Each (source, destination window) argument group is one copy; all
+        // groups of the operation share one launch per limb batch.
         GpuNativePrimitive::MatrixCopyView => {
-            let [
-                KernelArg::Value(source_id),
-                KernelArg::U32(source_part),
-                KernelArg::Value(destination_id),
-                KernelArg::U32(destination_part),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(destination_binding),
-            ] = op.arguments.as_ref()
-            else {
-                return Err(invalid("compiled matrix view copy has the wrong arguments"));
-            };
-            if op.outputs.as_ref() != [*destination_id] {
-                return Err(invalid("compiled matrix view copy output disagrees with destination"));
-            }
-            let source_owner = owners
-                .get(source_id)
-                .ok_or_else(|| invalid("compiled matrix view copy source is missing"))?;
-            let destination_owner = owners
-                .get(destination_id)
-                .ok_or_else(|| invalid("compiled matrix view copy destination is missing"))?;
-            let source_encoding = source_owner
-                .physical()
-                .parts
-                .get(*source_part as usize)
-                .and_then(|part| source_owner.physical().encodings.get(part.leaf as usize))
-                .cloned()
-                .ok_or_else(|| invalid("matrix view copy source encoding is missing"))?;
-            if !matches!(source_encoding, PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval)
+            if op.arguments.is_empty() ||
+                !op.arguments.len().is_multiple_of(6) ||
+                op.outputs.len() != op.arguments.len() / 6
             {
-                return Err(invalid("matrix view copy requires full CRT encoding"));
+                return Err(invalid("compiled matrix view copy has the wrong arguments"));
             }
-            let (source_ty, source, source_bindings) =
-                compiled_raw_matrix_part(source_owner, *source_part, source_encoding.clone())?;
-            let (destination_ty, destination, destination_bindings) =
-                if destination_owner.physical().encodings.as_ref() ==
+            let mut views = Vec::with_capacity(op.outputs.len());
+            let mut ring = None;
+            for (group, output) in op.arguments.chunks(6).zip(op.outputs.iter()) {
+                let [
+                    KernelArg::Value(source_id),
+                    KernelArg::U32(source_part),
+                    KernelArg::Value(destination_id),
+                    KernelArg::U32(destination_part),
+                    KernelArg::U32(source_binding),
+                    KernelArg::U32(destination_binding),
+                ] = group
+                else {
+                    return Err(invalid("compiled matrix view copy has the wrong arguments"));
+                };
+                if output != destination_id {
+                    return Err(invalid(
+                        "compiled matrix view copy output disagrees with destination",
+                    ));
+                }
+                let source_owner = owners
+                    .get(source_id)
+                    .ok_or_else(|| invalid("compiled matrix view copy source is missing"))?;
+                let destination_owner = owners
+                    .get(destination_id)
+                    .ok_or_else(|| invalid("compiled matrix view copy destination is missing"))?;
+                let source_encoding = source_owner
+                    .physical()
+                    .parts
+                    .get(*source_part as usize)
+                    .and_then(|part| source_owner.physical().encodings.get(part.leaf as usize))
+                    .cloned()
+                    .ok_or_else(|| invalid("matrix view copy source encoding is missing"))?;
+                if !matches!(
+                    source_encoding,
+                    PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval
+                ) {
+                    return Err(invalid("matrix view copy requires full CRT encoding"));
+                }
+                let (source_ty, source, source_bindings) =
+                    compiled_raw_matrix_part(source_owner, *source_part, source_encoding.clone())?;
+                let (destination_ty, destination, destination_bindings) = if destination_owner
+                    .physical()
+                    .encodings
+                    .as_ref() ==
                     [PhysicalEncoding::PublicGadgetEval] &&
                     source_encoding == PhysicalEncoding::FullEval
                 {
@@ -2695,28 +2712,34 @@ pub(crate) fn emit_compiled_gpu_op(
                 } else {
                     compiled_raw_matrix_part(destination_owner, *destination_part, source_encoding)?
                 };
-            if source_ty.ring != destination_ty.ring ||
-                !same_raw_limbs(&source, &destination) ||
-                source.physical_device != op.device ||
-                source.rows != destination.rows ||
-                source.columns != destination.columns
-            {
-                return Err(invalid("matrix view copy layouts disagree"));
+                if source_ty.ring != destination_ty.ring ||
+                    ring.as_ref()
+                        .is_some_and(|ring: &ConcreteMatrixType| ring.ring != source_ty.ring) ||
+                    !same_raw_limbs(&source, &destination) ||
+                    source.physical_device != op.device ||
+                    source.rows != destination.rows ||
+                    source.columns != destination.columns
+                {
+                    return Err(invalid("matrix view copy layouts disagree"));
+                }
+                bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
+                bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+                builder.retain_owner(Arc::clone(source_owner));
+                builder.retain_owner(Arc::clone(destination_owner));
+                ring.get_or_insert(source_ty);
+                views.push((source, destination, *source_binding, *destination_binding));
             }
-            bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
-            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+            let ring = ring.ok_or_else(|| invalid("matrix view copy has no operands"))?;
             let parameters = backend
-                .parameters_on_physical_device(op.device, &source_ty)
+                .parameters_on_physical_device(op.device, &ring)
                 .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
-            parameters.emit_raw_matrix_copy(
-                builder.launch_stream(),
-                &source,
-                &destination,
-                *source_binding,
-                *destination_binding,
-            )?;
-            builder.retain_owner(Arc::clone(source_owner));
-            builder.retain_owner(Arc::clone(destination_owner));
+            let pairs = views
+                .iter()
+                .map(|(source, destination, source_binding, destination_binding)| {
+                    (source, destination, *source_binding, *destination_binding)
+                })
+                .collect::<Vec<_>>();
+            parameters.emit_raw_matrix_copy(builder.launch_stream(), &pairs)?;
         }
         GpuNativePrimitive::MatrixMulTransposeRhs => {
             let [
@@ -2947,6 +2970,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 16 => GpuIntegerOperation::Log2Ceil,
                 17 => GpuIntegerOperation::ReportError,
                 18 => GpuIntegerOperation::GatherRingCrtModulus,
+                19 => GpuIntegerOperation::MatrixVectorProduct,
                 _ => return Err(invalid("compiled integer operation has an unknown opcode")),
             };
             let output_owner = owners
@@ -3154,7 +3178,12 @@ pub(crate) fn emit_compiled_gpu_op(
                 builder.retain_owner(Arc::clone(owner));
             }
         }
-        GpuNativePrimitive::RingAutomorphism => {
+        // An automorphism permutes coefficients; a monomial product scales
+        // evaluation slots. Both take a matrix and one resident integer.
+        GpuNativePrimitive::RingAutomorphism | GpuNativePrimitive::MultiplyMonomial => {
+            let monomial = implementation.primitive == GpuNativePrimitive::MultiplyMonomial;
+            let encoding =
+                if monomial { PhysicalEncoding::FullEval } else { PhysicalEncoding::FullCoeff };
             let [
                 KernelArg::Value(source_id),
                 KernelArg::U32(source_part),
@@ -3185,12 +3214,9 @@ pub(crate) fn emit_compiled_gpu_op(
             let status_owner =
                 owners.get(status_id).ok_or_else(|| invalid("automorphism status is absent"))?;
             let (source_ty, source, source_bindings) =
-                compiled_raw_matrix_part(source_owner, *source_part, PhysicalEncoding::FullCoeff)?;
-            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
-                destination_owner,
-                *destination_part,
-                PhysicalEncoding::FullCoeff,
-            )?;
+                compiled_raw_matrix_part(source_owner, *source_part, encoding.clone())?;
+            let (destination_ty, destination, destination_bindings) =
+                compiled_raw_matrix_part(destination_owner, *destination_part, encoding)?;
             if source_ty != destination_ty ||
                 !same_raw_window(&source, &destination) ||
                 source.physical_device != op.device
@@ -3222,15 +3248,27 @@ pub(crate) fn emit_compiled_gpu_op(
             let params = backend
                 .parameters_on_physical_device(op.device, &source_ty)
                 .map_err(GpuNativeGraphError::Native)?;
-            params.emit_raw_ring_automorphism(
-                builder.launch_stream(),
-                &source,
-                &destination,
-                index,
-                status,
-                *source_binding,
-                *destination_binding,
-            )?;
+            if monomial {
+                params.emit_raw_monomial_multiply(
+                    builder.launch_stream(),
+                    &source,
+                    &destination,
+                    index,
+                    status,
+                    *source_binding,
+                    *destination_binding,
+                )?;
+            } else {
+                params.emit_raw_ring_automorphism(
+                    builder.launch_stream(),
+                    &source,
+                    &destination,
+                    index,
+                    status,
+                    *source_binding,
+                    *destination_binding,
+                )?;
+            }
             for owner in [source_owner, destination_owner, index_owner, status_owner] {
                 builder.retain_owner(Arc::clone(owner));
             }

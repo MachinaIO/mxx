@@ -1811,6 +1811,12 @@ pub(super) fn lower_control_node(
         NodeKind::HashIntFamily { .. } => {
             lower_hash_int_family(ctx, scope, scope_id, node_id, node, env)
         }
+        NodeKind::MultiplyMonomial => {
+            lower_multiply_monomial(ctx, scope, scope_id, node_id, node, env)
+        }
+        NodeKind::IntMatrixVectorProduct { transpose } => {
+            lower_int_matrix_vector_product(ctx, scope, scope_id, node_id, node, env, *transpose)
+        }
         NodeKind::ParallelLoop(loop_node) => {
             lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env)
         }
@@ -1877,7 +1883,10 @@ fn lower_hash_int_family(
         .map_err(|error| error.to_string())?;
     let (resource_id, operands) =
         hash_tag_resource(ctx, &arguments, tag_prefix, tag_components, env)?;
-    let family = allocate_integer_family_value(ctx, ty, BigInt::from(0u8)..=modulus - 1u8)?;
+    // A family below 2^64 is stored compactly, one word per member.
+    let range = BigInt::from(0u8)..=modulus - 1u8;
+    let canonical = range.end().bits() <= 64;
+    let family = allocate_integer_family_value_with_storage(ctx, ty, range, false, canonical)?;
     let binding = register_preimage_control_binding(ctx, family)?;
     let sample = push_hash_sample(ctx, resource_id, key, family, binding, &operands)?;
     ctx.producer.insert(family, vec![(ColumnRange { start: 0, end: 1 }, sample)]);
@@ -2701,22 +2710,29 @@ fn allocate_integer_family_value(
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
 ) -> Result<PhysicalValueId, String> {
-    allocate_integer_family_value_with_storage(ctx, ty, range, false)
+    allocate_integer_family_value_with_storage(ctx, ty, range, false, false)
 }
 
+/// A returned family is stored as `CanonicalU64` when `canonical` (its range
+/// lies in `[0, 2^64)`) and as SignedWords otherwise.
 pub(super) fn allocate_return_integer_family_value(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
+    canonical: bool,
 ) -> Result<PhysicalValueId, String> {
-    allocate_integer_family_value_with_storage(ctx, ty, range, true)
+    allocate_integer_family_value_with_storage(ctx, ty, range, true, canonical)
 }
 
+/// `canonical` stores one `u64` word per member instead of a sign word and
+/// magnitude words; the range must then lie in `[0, 2^64)`. Only producers
+/// and consumers that read any one-word encoding may request it.
 fn allocate_integer_family_value_with_storage(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,
     range: RangeInclusive<BigInt>,
     returned: bool,
+    canonical: bool,
 ) -> Result<PhysicalValueId, String> {
     let ConcreteWireType::IndexedFamily { element, count } = &ty else {
         return Err("GPU integer family allocation needs an indexed family".into());
@@ -2724,22 +2740,28 @@ fn allocate_integer_family_value_with_storage(
     if element.as_ref() != &ConcreteWireType::Int || *count == 0 || range.start() > range.end() {
         return Err("GPU integer family has invalid type, count, or range".into());
     }
+    if canonical && (range.start().is_negative() || range.end().bits() > 64) {
+        return Err("GPU canonical integer family range is outside u64".into());
+    }
     let count = *count;
     let params = ctx.backend.control_parameters_on_device(ctx.device)?;
     let words = usize::try_from(range.start().bits().max(range.end().bits()).div_ceil(64))
         .map_err(|_| "GPU family integer width exceeds usize".to_owned())?
         .max(1);
+    let encoding = if canonical {
+        GpuSignedValuesEncoding::CanonicalU64
+    } else {
+        GpuSignedValuesEncoding::SignedWords(words)
+    };
     let owner = Arc::new(
-        GpuSignedValues::allocate(
-            &params,
-            ctx.device,
-            count,
-            GpuSignedValuesEncoding::SignedWords(words),
-        )
-        .map_err(|error| error.to_string())?,
+        GpuSignedValues::allocate(&params, ctx.device, count, encoding)
+            .map_err(|error| error.to_string())?,
     );
+    let element_words = encoding.words_per_value();
     let stride = u64::try_from(
-        (words + 1).checked_mul(8).ok_or_else(|| "GPU family word stride overflows".to_owned())?,
+        element_words
+            .checked_mul(8)
+            .ok_or_else(|| "GPU family word stride overflows".to_owned())?,
     )
     .map_err(|_| "GPU family word stride exceeds u64".to_owned())?;
     let slot =
@@ -2747,9 +2769,7 @@ fn allocate_integer_family_value_with_storage(
     let storage = if returned { StorageRef::Output(slot) } else { StorageRef::Scratch(slot) };
     let physical = PhysicalValue {
         ty,
-        encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedWords(
-            words,
-        ))]),
+        encodings: Box::new([PhysicalEncoding::Signed(encoding)]),
         parts: Box::new([PhysicalPart {
             leaf: 0,
             storage,
@@ -2757,7 +2777,7 @@ fn allocate_integer_family_value_with_storage(
             view: PhysicalView {
                 byte_offset: 0,
                 origin: Box::new([0, 0, 0]),
-                extent: Box::new([count as u64, 1, (words + 1) as u64]),
+                extent: Box::new([count as u64, 1, element_words as u64]),
                 byte_strides: Box::new([stride, stride, 8]),
                 element_bytes: 8,
             },
@@ -4000,6 +4020,160 @@ fn lower_ring_automorphism(
     Ok(())
 }
 
+/// Multiply a full-Eval matrix by `X^k` for a resident integer `k`: one
+/// pointwise scaling of every evaluation slot, with no NTT.
+fn lower_multiply_monomial(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    node: &NodeHandle,
+    env: &ParamEnv,
+) -> Result<(), String> {
+    let arguments = scope.arguments(node).ok_or("GPU monomial argument is out of scope")?;
+    let [source_wire, exponent_wire] = arguments.as_slice() else {
+        return Err("GPU monomial multiplication needs a matrix and an exponent".into());
+    };
+    let source = *ctx.wire_ids.get(source_wire).ok_or("GPU monomial source is missing")?;
+    let source = full_eval_value(ctx, source)?;
+    let exponent = *ctx.wire_ids.get(exponent_wire).ok_or("GPU monomial exponent is missing")?;
+    integer_range(ctx, exponent)?;
+    let source_value = &ctx.values[source.0 as usize];
+    let ConcreteWireType::Matrix(ty) = &source_value.ty else {
+        return Err("GPU monomial source is not a matrix".into());
+    };
+    if source_value.encodings.as_ref() != [PhysicalEncoding::FullEval] ||
+        resolved_node_output_type(scope_id, node_id, node, env)? != source_value.ty
+    {
+        return Err("GPU monomial multiplication needs an exact full-Eval matrix type".into());
+    }
+    let ty = ty.clone();
+    let output = allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)?;
+    let status = allocate_integer_status(ctx)?;
+    let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
+    let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
+    let exponent_binding = scalar_binding(ctx, exponent)?;
+    let status_binding = scalar_binding(ctx, status)?;
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::multiply_monomial())
+        .map_err(str::to_owned)?;
+    let predecessors = all_predecessors(ctx.producer, source)
+        .into_iter()
+        .chain(all_predecessors(ctx.producer, exponent))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let operation = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU monomial operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: Box::new([
+            KernelArg::Value(source),
+            KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::Value(exponent),
+            KernelArg::U32(0),
+            KernelArg::Value(status),
+            KernelArg::U32(0),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(output_binding),
+            KernelArg::U32(exponent_binding),
+            KernelArg::U32(status_binding),
+        ]),
+        outputs: Box::new([output]),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors,
+        body: None,
+    });
+    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    Ok(())
+}
+
+/// One native product of a resident integer matrix family with a vector
+/// family. Every member has one magnitude word and the proven output range
+/// fits in `i64`, so the kernel accumulates exactly without widening.
+fn lower_int_matrix_vector_product(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    node: &NodeHandle,
+    env: &ParamEnv,
+    transpose: bool,
+) -> Result<(), String> {
+    if ctx.lanes > 1 {
+        return Err("GPU integer matrix-vector product is not supported in a vectorized body".into());
+    }
+    let arguments = scope.arguments(node).ok_or("GPU matrix-vector arguments are out of scope")?;
+    let [matrix_wire, vector_wire] = arguments.as_slice() else {
+        return Err("GPU integer matrix-vector product needs a matrix and a vector".into());
+    };
+    let family_range = |ctx: &PhysicalLoweringContext<'_>, wire| {
+        let id = *ctx.wire_ids.get(wire).ok_or("GPU matrix-vector operand is missing")?;
+        let value = &ctx.values[id.0 as usize];
+        let ConcreteWireType::IndexedFamily { element, count } = &value.ty else {
+            return Err("GPU matrix-vector operand is not a family".to_owned());
+        };
+        if element.as_ref() != &ConcreteWireType::Int ||
+            value.parts.len() != 1 ||
+            !matches!(
+                value.encodings.as_ref(),
+                [PhysicalEncoding::Signed(
+                    GpuSignedValuesEncoding::SignedI64 |
+                        GpuSignedValuesEncoding::CanonicalU64 |
+                        GpuSignedValuesEncoding::SignedWords(1)
+                )]
+            )
+        {
+            return Err("GPU matrix-vector operand is not a one-word integer family".into());
+        }
+        let range = value
+            .integer_ranges
+            .get(&0)
+            .cloned()
+            .ok_or("GPU matrix-vector operand has no proven range")?;
+        Ok((id, *count, range))
+    };
+    let (matrix, _, matrix_range) = family_range(ctx, matrix_wire)?;
+    let (vector, inner, vector_range) = family_range(ctx, vector_wire)?;
+    let products = [
+        matrix_range.start() * vector_range.start(),
+        matrix_range.start() * vector_range.end(),
+        matrix_range.end() * vector_range.start(),
+        matrix_range.end() * vector_range.end(),
+    ];
+    let terms = BigInt::from(inner);
+    let range = products.iter().min().unwrap() * &terms..=products.iter().max().unwrap() * &terms;
+    let limit = BigInt::from(i64::MAX);
+    if [matrix_range.start(), matrix_range.end(), vector_range.start(), vector_range.end()]
+        .into_iter()
+        .chain([range.start(), range.end()])
+        .any(|bound| bound.abs() > limit)
+    {
+        return Err("GPU integer matrix-vector product may exceed int64".into());
+    }
+    let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+    let output = allocate_integer_family_value(ctx, ty, range)?;
+    emit_integer_operation(
+        ctx,
+        GpuIntegerOperation::MatrixVectorProduct,
+        output,
+        matrix,
+        Some(vector),
+        None,
+        u64::from(transpose),
+    )?;
+    ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
+    Ok(())
+}
+
 fn lower_lift_integer_constant(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &GraphScope,
@@ -5003,6 +5177,37 @@ fn lower_matrix_slice(
         part.view.extent[0] = output_ty.rows as u64;
         part.view.extent[1] = output_ty.columns as u64;
     }
+    let output_wire = WireRef { node: node_id, port: Port(0) };
+    let returned = matches!(scope_id, FrozenGraphScopeId::Root) &&
+        ctx.validated.source.outputs().values().any(|output| output.value == output_wire);
+    if !returned {
+        // The slice is the window itself: a matrix of the output shape in its
+        // own coordinates, whose byte offset already addresses the source.
+        window.ty = ConcreteWireType::Matrix(output_ty.clone());
+        for part in window.parts.iter_mut() {
+            part.view.origin[0] = 0;
+            part.view.origin[1] = 0;
+        }
+        let window_owner =
+            source_owner.with_physical_view(Arc::new(window.clone())).map_err(str::to_owned)?;
+        let window_id = value_id(ctx.values.len())?;
+        ctx.values.push(window);
+        ctx.owners.insert(window_id, Arc::new(window_owner));
+        let writers = crate::gpu_physical_lowering::predecessors_for(
+            ctx.producer,
+            source,
+            ColumnRange { start: column_start, end: column_end },
+        );
+        ctx.producer.insert(
+            window_id,
+            writers
+                .iter()
+                .map(|&writer| (ColumnRange { start: 0, end: output_ty.columns }, writer))
+                .collect(),
+        );
+        ctx.wire_ids.insert(output_wire, window_id);
+        return Ok(());
+    }
     let window_owner =
         source_owner.with_physical_view(Arc::new(window.clone())).map_err(str::to_owned)?;
     let window_id = value_id(ctx.values.len())?;
@@ -5185,10 +5390,24 @@ fn lower_polynomial_from_values(
     let [family_wire] = arguments.as_slice() else {
         return Err("GPU polynomial import needs one integer family".into());
     };
-    let source = *ctx
+    let mut source = *ctx
         .wire_ids
         .get(family_wire)
         .ok_or_else(|| "GPU polynomial import family has no physical value".to_owned())?;
+    // The import kernel reads SignedWords; a canonical family is widened.
+    if let [PhysicalEncoding::Signed(GpuSignedValuesEncoding::CanonicalU64)] =
+        ctx.values[source.0 as usize].encodings.as_ref()
+    {
+        let ty = ctx.values[source.0 as usize].ty.clone();
+        let range = ctx.values[source.0 as usize]
+            .integer_ranges
+            .get(&0)
+            .cloned()
+            .ok_or("GPU polynomial import family has no proven range")?;
+        let widened = allocate_integer_family_value(ctx, ty, range)?;
+        emit_integer_operation(ctx, GpuIntegerOperation::Copy, widened, source, None, None, 0)?;
+        source = widened;
+    }
     let physical = ctx
         .values
         .get(source.0 as usize)
@@ -5486,10 +5705,16 @@ fn lower_concat(
     } else {
         None
     };
+    // Every piece copies into its window of the output in one operation.
     let implementation = ctx
         .implementations
-        .register(GpuImplementation::matrix_copy_view())
+        .register(GpuImplementation::matrix_copy_views(inputs.len()))
         .map_err(str::to_owned)?;
+    let index = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU concat operations".to_owned())?;
+    let mut arguments = Vec::with_capacity(6 * inputs.len());
+    let mut outputs = Vec::with_capacity(inputs.len());
+    let mut predecessors = zero.into_iter().collect::<std::collections::BTreeSet<_>>();
     let mut row_start = 0usize;
     let mut column_start = 0usize;
     let mut written = Vec::with_capacity(inputs.len() + usize::from(zero.is_some()));
@@ -5539,33 +5764,16 @@ fn lower_concat(
         ctx.owners.insert(window_id, Arc::new(window_owner));
         let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
         let destination_binding = register_bindings(ctx.bindings, ctx.values, window_id)?;
-        let index = u32::try_from(ctx.operations.len())
-            .map_err(|_| "too many GPU concat operations".to_owned())?;
-        let predecessors = all_predecessors(ctx.producer, source)
-            .into_iter()
-            .chain(zero)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        ctx.operations.push(CompiledGpuOp {
-            implementation,
-            arguments: Box::new([
-                KernelArg::Value(source),
-                KernelArg::U32(0),
-                KernelArg::Value(window_id),
-                KernelArg::U32(0),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(destination_binding),
-            ]),
-            outputs: Box::new([window_id]),
-            device: ctx.device,
-            grid: [1; 3],
-            block: [1; 3],
-            shared_bytes: 0,
-            predecessors,
-            body: None,
-        });
+        predecessors.extend(all_predecessors(ctx.producer, source).iter().copied());
+        arguments.extend([
+            KernelArg::Value(source),
+            KernelArg::U32(0),
+            KernelArg::Value(window_id),
+            KernelArg::U32(0),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(destination_binding),
+        ]);
+        outputs.push(window_id);
         let range = if matches!(axis, ConcatAxis::Rows) {
             ColumnRange { start: 0, end: output_ty.columns }
         } else {
@@ -5579,6 +5787,17 @@ fn lower_concat(
             .checked_add(columns)
             .ok_or_else(|| "GPU concat column offset overflows".to_owned())?;
     }
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: arguments.into_boxed_slice(),
+        outputs: outputs.into_boxed_slice(),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors: predecessors.into_iter().collect(),
+        body: None,
+    });
     ctx.producer.insert(output_id, written);
     ctx.wire_ids.insert(output_wire, output_id);
     Ok(())
@@ -7215,7 +7434,7 @@ fn bind_template_aliases(
     wave: &mut PhysicalWave,
     template_values: std::ops::Range<usize>,
 ) -> Result<(), String> {
-    let mut replaced = Vec::new();
+    let mut replaced = std::collections::HashMap::new();
     let mut ready = Vec::new();
     for (id, occurrence) in &wave.owner_bindings {
         // The first occurrence binds its template owners too: a replay after
@@ -7228,7 +7447,7 @@ fn bind_template_aliases(
             let rebound = occurrence
                 .storage(*slot)
                 .ok_or_else(|| "GPU wave occurrence lost a template storage slot".to_owned())?;
-            replaced.push((Arc::as_ptr(&bound.owner).cast::<()>(), rebound.clone()));
+            replaced.insert(Arc::as_ptr(&bound.owner).cast::<()>(), rebound.clone());
         }
         ready.extend(occurrence.ready_events().iter().cloned());
     }
@@ -7241,10 +7460,9 @@ fn bind_template_aliases(
             continue;
         }
         if let Some(owner) = ctx.owners.get(&id) {
-            let only_replaced = owner.storages().all(|(_, bound)| {
-                let allocation = Arc::as_ptr(&bound.owner).cast::<()>();
-                replaced.iter().any(|(old, _)| *old == allocation)
-            });
+            let only_replaced = owner
+                .storages()
+                .all(|(_, bound)| replaced.contains_key(&Arc::as_ptr(&bound.owner).cast::<()>()));
             if !only_replaced {
                 continue;
             }

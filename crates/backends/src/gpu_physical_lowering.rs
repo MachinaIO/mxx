@@ -560,6 +560,8 @@ fn append_fixed_child_candidates(
             NodeKind::MatrixMulSmallRhs |
             NodeKind::MatrixScale { .. } |
             NodeKind::RingAutomorphism { .. } |
+            NodeKind::MultiplyMonomial |
+            NodeKind::IntMatrixVectorProduct { .. } |
             NodeKind::ModulusSwitch { .. } |
             NodeKind::GadgetDecompose { .. } |
             NodeKind::ExtractCoefficient { .. } |
@@ -825,7 +827,7 @@ impl PhysicalFrame {
         }
         // Plan values viewing a previous input (slices, members, lane views)
         // share its allocations; they are re-derived over the new input.
-        let mut replaced = Vec::new();
+        let mut replaced = std::collections::HashMap::new();
         let mut ready = Vec::new();
         for (name, id) in &self.input_ids {
             let value = inputs.get(name).ok_or_else(|| format!("missing GPU input {name}"))?;
@@ -877,13 +879,22 @@ impl PhysicalFrame {
                 return Err(format!("GPU input {name} changed its physical layout"));
             }
             if let Some(previous) = self.owners.insert(*id, Arc::clone(&resident)) {
+                // Only allocations that actually change are redirected; the
+                // same input bound again leaves every view untouched.
+                let mut changed = false;
                 for (slot, bound) in previous.storages() {
                     let replacement = resident
                         .storage(*slot)
                         .ok_or_else(|| format!("GPU input {name} lost a storage slot"))?;
-                    replaced.push((Arc::as_ptr(&bound.owner).cast::<()>(), replacement.clone()));
+                    if !Arc::ptr_eq(&bound.owner, &replacement.owner) {
+                        replaced
+                            .insert(Arc::as_ptr(&bound.owner).cast::<()>(), replacement.clone());
+                        changed = true;
+                    }
                 }
-                ready.extend(resident.ready_events().iter().cloned());
+                if changed {
+                    ready.extend(resident.ready_events().iter().cloned());
+                }
             }
         }
         if !replaced.is_empty() {
@@ -5576,7 +5587,7 @@ fn share_scratch_allocations(
         }
     }
     for (pointer, shared) in replacements {
-        let replacement = [(pointer, bound_of[&shared].clone())];
+        let replacement = std::collections::HashMap::from([(pointer, bound_of[&shared].clone())]);
         for id in &groups[&pointer].members {
             let owner = owners.get_mut(id).ok_or("GPU shared scratch owner is missing")?;
             if let Some(rebound) =
@@ -6421,9 +6432,13 @@ pub(crate) fn plan_physical_graph(
                         .cloned()
                         .ok_or_else(|| format!("GPU integer output {name} has no proven range"))?
                 };
+            // A returned family's layout follows its range, not its producer,
+            // so outputs of different graphs rebind to one another's plans.
+            let canonical =
+                range.start().sign() != num_bigint::Sign::Minus && range.end().bits() <= 64;
             let mut ctx = root_context!();
             let returned = if integer_family {
-                allocate_return_integer_family_value(&mut ctx, scalar_type, range)?
+                allocate_return_integer_family_value(&mut ctx, scalar_type, range, canonical)?
             } else {
                 allocate_return_integer_value(&mut ctx, scalar_type, range)?
             };
@@ -7572,6 +7587,77 @@ mod tests {
                     runtime.download_integer_family_output(&result.output(name).unwrap()).unwrap();
                 assert_eq!(actual, expected, "{name}");
             }
+        }
+    }
+
+    /// Both integer matrix-vector product orientations match the CPU for a
+    /// canonical hash matrix and a signed vector, across several row chunks.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_int_matrix_vector_products_match_cpu() {
+        let cpu = DCRTPolyParams::new(32, 1, 28, 8, None, None);
+        let modulus = cpu.to_crt().0[0];
+        let gpu = GpuDCRTPolyParams::new(32, vec![modulus], 8, None);
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
+        let context = DslContext::new("direct-int-matrix-vector");
+        let key = ring.bytes_input("key", 32);
+        let (rows, columns) = (130usize, 37usize);
+        let matrix = context.hash_int_family(
+            key.clone(),
+            HashTag::from(b"matrix".as_slice()),
+            rows * columns,
+            BigInt::from(1u64 << 32),
+        );
+        let raw = context.hash_int_family(
+            key,
+            HashTag::from(b"vector".as_slice()),
+            rows,
+            BigInt::from(1u64 << 8),
+        );
+        let vector =
+            mxx_dsl::parallel(rows, |index| Ok(raw.at(index).sub(Int::constant(128)))).unwrap();
+        let validated = context
+            .output("transposed", matrix.vector_matrix_product(&vector))
+            .unwrap()
+            .output("direct", matrix.matrix_vector_product(&vector))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let inputs =
+            BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from([0x5cu8; 32])))]);
+        let expected = execute_in_session(
+            &validated,
+            &mut cpu_backend([cpu]),
+            inputs.clone(),
+            &mut MemoryArtifactStore::default(),
+            [0x25; 32],
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+        let mut plan = runtime.plan(validated, &inputs).unwrap();
+        let result = runtime
+            .execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [0x41; 32])
+            .unwrap();
+        for name in ["transposed", "direct"] {
+            let RuntimeValue::IndexedFamily { values, .. } = &expected.outputs[name] else {
+                panic!("CPU product is an integer family");
+            };
+            let expected = values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::Int(value) => value.clone(),
+                    _ => panic!("CPU product member is an integer"),
+                })
+                .collect::<Vec<_>>();
+            assert!(expected.iter().any(|value| value.sign() == num_bigint::Sign::Minus), "{name}");
+            let actual =
+                runtime.download_integer_family_output(&result.output(name).unwrap()).unwrap();
+            assert_eq!(actual, expected, "{name}");
         }
     }
 

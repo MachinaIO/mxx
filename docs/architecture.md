@@ -194,8 +194,8 @@ of provenance.
 | --- | --- |
 | Inputs and constants | `Input { name, wire_type, artifact }`, `ConstantInt`, `EvaluateInt(IntExpr)`, `ConstantReal`, `ConstantBool`, `ConstantMatrix { matrix_type, value }` |
 | Trapdoor structure | `GadgetTrapdoor { matrix_type, base }`, `TrapdoorPublic` |
-| Scalar arithmetic | `IntBinary(Add/Subtract/Multiply/Divide/Remainder)`, `IntCompare(Equal/Less/LessEqual)`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt` |
-| Matrix arithmetic | `MatrixBinary(Add/Subtract/Multiply)`, `MatrixMulAccumulate { coefficients, has_bias }`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism { index }` |
+| Scalar arithmetic | `IntBinary(Add/Subtract/Multiply/Divide/Remainder)`, `IntCompare(Equal/Less/LessEqual)`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt`, `IntMatrixVectorProduct { transpose }` |
+| Matrix arithmetic | `MatrixBinary(Add/Subtract/Multiply)`, `MatrixMulAccumulate { coefficients, has_bias }`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism { index }`, `MultiplyMonomial` |
 | Ring and modulus conversion | `ModulusSwitch`, `ModulusReduce`, `CenteredRebase` (each with a destination `RingRef`), `CenteredRoundDivide { divisor }`, `RnsModUp { destination, digit_size, normalize }`, `RnsModDown { destination, plaintext_modulus }`, `BlockModSwitch { destination, plaintext_modulus }` |
 | Shape | `Transpose`, `Slice { rows, columns }`, `Tensor`, `Concat { axis: Rows/Columns/Diagonal }` |
 | Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample { sigma, max_coefficient_bound }`, `HashSample { variant: Plain/Decomposed/SmallDecomposed, tag_prefix, tag_components, base, digit_count }`, `HashIntFamily { count, modulus, tag_prefix, tag_components }`, `TrapdoorSample`, `PreimageSample { max_coefficient_bound }` |
@@ -215,6 +215,13 @@ coefficient `i` of entry `(0, 0)`, truncated to `log2(modulus)` bits, so no cand
 rejected. Both hash samplers share key and tag validation (`validate_hash_key_and_tag` in
 `validate.rs`: a 32-byte key and integer tag operands). Like the other samplers, `HashIntFamily`
 is rejected in sampler-free protocol specifications and has no Lean sampler relation.
+
+`MultiplyMonomial` multiplies every matrix entry by `X^k` in the negacyclic ring, where `k` is a
+runtime integer (argument 1) of any sign taken modulo `2n`. `IntMatrixVectorProduct { transpose }`
+is the integer product of a row-major matrix family (argument 0) with a vector family (argument
+1); the vector length fixes the inner dimension, so the matrix count must be a nonzero multiple of
+it. It computes `M v` (`out[i] = sum_j M[i, j] v[j]`), or `v^T M` with `transpose`. Neither node
+has a Lean relation; the Lean emitter reports both as unsupported.
 
 The ring-conversion nodes are fused CRT operations with explicit destination rings. They are
 not a generic, implicit modulus-changing mechanism: nested-RNS level switching, for example,
@@ -422,7 +429,8 @@ types), and execution or analysis (a backend or the Lean exporter consumes the
 
 - `Mat` supports `+`, `-`, `*`, unary `-` for owned and borrowed operands; a `1 x 1` matrix
   multiplies as a scalar, and `mat * scalar` scales by a constant polynomial. Other operations
-  include `Mat::multi_row_gemm_accumulate`, `mul_small_rhs`, `ring_automorphism`, `transpose`,
+  include `Mat::multi_row_gemm_accumulate`, `mul_small_rhs`, `ring_automorphism`,
+  `multiply_monomial` (by `X^k` for a runtime `Int` `k`), `transpose`,
   `slice`, `tensor`, `decompose`/`small_decompose` (returning `Preimage`), `extract_coefficient`,
   `canonical_coefficient_bits`, `threshold_decode_ints`/`threshold_decode_bools`, `concat` (with
   the `concat_rows!`, `concat_cols!`, `concat_diag!` macros), `crt_recompose`, `coefficients`,
@@ -451,6 +459,9 @@ types), and execution or analysis (a backend or the Lean exporter consumes the
   otherwise. `Family::pack`, `count`, and `field` (structural projection of existing fields) are
   also available. Nested families (families of families) are not supported, but an `iterate`
   state, `select` candidate, or subgraph argument may be a whole family.
+- `Family<Int>::matrix_vector_product(&v)` (`M v`) and `vector_matrix_product(&v)` (`v^T M`)
+  treat the family as a row-major matrix whose inner dimension is the length of `v`, and build
+  one `IntMatrixVectorProduct` node.
 - `parallel(count, |i| body)` builds a `ParallelLoop` whose instances are independent and
   returns a `Family<T>` in index order. The closure runs once, inside a new construction scope,
   with `i` bound to a loop-index slot. The body is sealed with lexical captures: outer values
@@ -615,7 +626,8 @@ release_fence_interval }` controls execution. The executor (`crates/backends/src
    concatenation/slice aliases), cached per thread in `executor/plan_cache.rs`. Fusions never
    change the graph, its identity, or its outputs, and are disabled in trace mode.
 
-Parallelism lives in the primitives: matrix operations, samplers, and bound checks use Rayon.
+Parallelism lives in the primitives: matrix operations (including `MultiplyMonomial`), integer
+matrix-vector products, samplers, and bound checks use Rayon.
 The executor itself orders nodes deterministically.
 
 `ExecutionError` reports missing inputs or wires, value-kind mismatches, runtime integer errors
@@ -713,7 +725,14 @@ let matrix = runtime.download_matrix_output(&out)?;   // or runtime.copy_output(
   instance that planned it (`GpuRuntimeError::StalePlan` otherwise). A resident input produced by
   another plan is moved into this plan's storage slots when it is rebound
   (`with_planned_storage` in `gpu_physical_lowering.rs`), so outputs of one plan can feed
-  another plan regardless of which plan produced them.
+  another plan regardless of which plan produced them. `PhysicalFrame::rebind_inputs` collects
+  the replaced allocations in a hash map keyed by owner pointer; only inputs whose storage
+  actually changed contribute (binding the same input again leaves every view untouched), and
+  only plan values aliasing a replaced allocation are re-derived (`GpuResidentValue::rebound` in
+  `crates/backends/src/backend.rs`). A member or view of a family
+  (`GpuResidentValue::with_physical_view`) binds only the storages its parts use, so it does not
+  carry or rebind every allocation of the family. Input ready events are waited once per event,
+  and a `GpuNativeEvent` caches completion after a successful host wait.
 - The result, `GpuExecutionResult<'plan>`, borrows the plan mutably. Its outputs live in
   plan-owned storage and may be overwritten by the next execution, so Rust prevents executing the
   plan again while the result is alive. `result.output(name)` returns a non-cloneable
@@ -802,11 +821,22 @@ templates, control resets, and wave descriptors needed to run it.
   `PhysicalEncoding` covers `FullCoeff` and `FullEval` matrices, compact bounded coefficients
   (`CompactCoeff`, `CompactCoeffPerCrtLimb`), signed integers (`Signed`), `BoolI64`, `RealF64`,
   `Bytes`, `TypedBlobLengthPrefixed`, and the public-only gadget trapdoor `PublicGadgetEval`.
+- **Integer family storage.** An integer family is stored as `SignedWords(words)` (one sign word
+  and `words` magnitude words per member) or as `CanonicalU64` (one word per member, range in
+  `[0, 2^64)`). Hash integer families with modulus at most `2^64` are `CanonicalU64`. A returned
+  (graph output) integer family is `CanonicalU64` exactly when its proven range lies in
+  `[0, 2^64)` and SignedWords otherwise (`plan_physical_graph`), so its layout depends on its
+  range, not its producer, and outputs of different graphs rebind into one another's plans.
+  Polynomial import (`PolynomialFromValues`) reads SignedWords, so it widens a canonical family
+  with an integer `Copy` first.
 - **Compiled operations.** `CompiledGpuOp { implementation, arguments, outputs, device, grid,
   block, shared_bytes, predecessors, body }` is one native launch with explicit dependency edges.
   `body` holds the nested operations of a CUDA conditional node (`GpuNativePrimitive::BranchIf`
   or `LoopWhile`). `GpuNativePrimitive` enumerates the native operations (NTTs, arithmetic,
-  RNS conversions, samplers, preimage stages, copies, exports, control, ...).
+  RNS conversions, samplers, preimage stages, copies, exports, control, ...). A
+  `GpuImplementation` is a primitive with its argument schema, and `GpuImplementationRegistry`
+  is keyed by the full implementation, so one primitive may have several schemas (for example
+  `GpuImplementation::matrix_copy_views(count)`, one six-argument group per copied window).
 - **Explicit CUDA Graph regions.** `DirectGraph::compile` splits the operation list into
   `GraphRegion`s at wave-body boundaries, import points, and external-I/O loop bodies, and builds
   each region with `GpuNativeGraphBuilder` (`crates/backends/src/poly/dcrt/gpu.rs`). One region is
@@ -840,7 +870,23 @@ templates, control resets, and wave descriptors needed to run it.
   the integer family. An integer family uses a `GpuHashSamplePlan` without CRT moduli, and
   `GpuHashSamplePlan::emit_raw_hash_integers` (`crates/backends/src/poly/dcrt/gpu_hash.rs`)
   launches `raw_hash_integer_kernel` through `gpu_raw_hash_integers_emit`
-  (`crates/backends/cuda/src/matrix/MatrixHash.cu`). The output matches the CPU transcript.
+  (`crates/backends/cuda/src/matrix/MatrixHash.cu`); its `sign_words` argument (0 or 1) writes
+  either a `CanonicalU64` or a SignedWords family. The output matches the CPU transcript.
+- **Monomial products.** `MultiplyMonomial` (`lower_multiply_monomial` in
+  `gpu_physical_control.rs`) takes its operand as `FullEval` and adds no NTT of its own:
+  `raw_monomial_multiply_kernel` (`crates/backends/cuda/src/matrix/MatrixRawRemaining.cu`)
+  reduces the resident exponent modulo `2n` and multiplies each evaluation slot by the matching
+  twiddle or its negation.
+- **Integer matrix-vector products.** `lower_int_matrix_vector_product`
+  (`gpu_physical_control.rs`) emits integer operation 19 (`GpuIntegerOperation::MatrixVectorProduct`,
+  `crates/backends/cuda/src/Control.cu`). `M v` uses one warp per row with shuffle reduction;
+  `v^T M` clears the output, accumulates 64-row chunks per column with atomics, then converts the
+  sums to sign-magnitude. Operands must be one-word integer families, the body must not be
+  vectorized, and the operand ranges and the proven output range must fit in `int64`, so the
+  kernel accumulates exactly without widening.
+- **Slices and concatenation.** A matrix `Slice` that is not a root graph output is a view: the
+  window retyped to the output shape over the source allocation, with no copy. `Concat` lowers to
+  one `MatrixCopyView` operation that copies every piece into its window of the output.
 - **Preimage retry loop.** Each preimage column tile is a device `LoopWhile` body that derives a
   per-attempt seed (`crates/backends/cuda/src/matrix/MatrixPreimageSeed.cu`), samples a
   candidate, and checks its cutoff, repeating until acceptance or until the frozen
@@ -970,7 +1016,7 @@ Rust-facing functions; bodies live in `src/`.
 | File | Role |
 | --- | --- |
 | `src/Runtime.cu`, `include/Runtime.cuh` | C ABI for contexts, execution owners, streams, memory, export slots, the explicit Graph builder (including conditional `if`/`while` nodes), binding, launch, and events. |
-| `src/Control.cu`, `include/Control.cuh` | Device integer control operations and status codes. |
+| `src/Control.cu`, `include/Control.cuh` | Device integer control operations (`integer_operation_kernel`, the integer matrix-vector product kernels of operation 19) and status codes. |
 | `src/Primitive.cu`, `include/Primitive.cuh` | Scalar-polynomial primitives (polynomial values, coefficient extraction, packing, threshold decoding). |
 | `src/Real.cu`, `include/Real.cuh` | Device `f64` operations with their own status word. |
 | `src/ChaCha.cu`, `include/ChaCha.cuh` | Device ChaCha RNG (included by the matrix unity build). |
@@ -983,6 +1029,31 @@ Rust-facing functions; bodies live in `src/`.
 sources as `MXX_NATIVE_KERNEL_BUILD_REVISION`. The matrix sources included by `Matrix.cu` are not
 compiled on their own. GPU-specific Rust code lives in files whose names contain `gpu`, as
 required by `GPU.md`.
+
+Raw matrix kernels:
+
+- **Limb batching.** One launch covers up to 8 CRT limbs (`RawLimbSet`, `RawNttBatch`,
+  `RawCopyBatch`, `RawDecomposeBatch`); `blockIdx.z` selects the limb (or the window-limb or
+  source-output limb pair), and graph patches target the nested address fields of these argument
+  structs by byte offset. Addition and subtraction, multiplication, tensor products, NTTs, copies
+  (all windows of one `MatrixCopyView`), and decompositions are batched this way.
+- **Fused NTT** (`src/matrix/MatrixNTT.cu`). `raw_ntt_fused_local_kernel` runs up to ten
+  butterfly stages of a 1024-coefficient tile in shared memory, with the stage twiddles staged in
+  shared memory, and applies the twist or scaling when the tile is the whole transform.
+  `raw_ntt_fused_top_kernel` runs the stages above one tile with warp XOR shuffles
+  (`Width = n / 1024` lanes per group). A forward transform runs the top kernel and then the local
+  kernel in place; an inverse runs them in the opposite order. Ring dimensions up to 32768 are
+  supported. Shoup multiplication uses a 32-bit path for moduli below `2^31`.
+- **Matrix product.** The product kernel splits the inner dimension over 4 thread rows and sums
+  products in 128 bits, with one modular reduction per batch that cannot overflow.
+- **Decomposition** (`src/matrix/MatrixDecompose.cu`) peels every balanced digit of a coefficient
+  in one pass.
+- **Compact pack** (`gpu_raw_compact_pack_emit` in `src/matrix/MatrixCrt.cu`) uses a single-limb
+  kernel when the bound is below half of every source modulus, because the centered residue of
+  one limb is then the value (under the trusted-input contract of section 5.6); otherwise it runs
+  the full CRT recombination kernel.
+- **Integer division** in `integer_operation_kernel` (`src/Control.cu`) uses native 128-bit
+  register division when the magnitudes have at most two words.
 
 ### 6.8 Current limitations
 
@@ -1013,6 +1084,10 @@ These restrictions are explicit errors in the current code:
   exports need a `FullEval` source; raw transcoding does not support every wire type ("raw
   artifact transcode does not support this wire type yet" in `fleet.rs`).
 - **Trapdoors and preimages** require the exact regular gadget layout, sigma, and shapes.
+- **Integer matrix-vector products** need one-word operand families and operand and output ranges
+  within `int64`, and cannot run in a vectorized body ("GPU integer matrix-vector product may
+  exceed int64").
+- **NTTs** support ring dimensions up to 32768.
 
 The GPU planner is under active development (support for more loop structures is being added),
 so check the current error messages in `gpu_physical_lowering.rs`, `gpu_physical_control.rs`,
@@ -1104,8 +1179,13 @@ caller's responsibility.
   `DslContext::hash_int_family` keyed by a fresh caller-supplied 32-byte key per ciphertext (and
   per `keygen` for the KSK); secrets and errors are independent samples. KSK errors are sampled
   as whole Gaussian polynomials outside the key loop and read by coefficient
-  (`lwe_error_sources`, `lwe_error_at`), and each KSK dot product accumulates one LWE coordinate
-  per `iterate` step, reduced modulo `q`, which bounds VRAM and lets the GPU carry range close.
+  (`lwe_error_sources`, `lwe_error_at`). The KSK `b` dot products `<a_k, s>` are one
+  `matrix_vector_product` of the row-major `a` family with the LWE secret, and `key_switch`
+  computes both of its sums as `vector_matrix_product`s of the flat key arrays with the digits of
+  the extracted coefficients. `blind_rotation` carries the accumulator as one `(a; b)` column, so
+  each step multiplies it by `X^k` (`Mat::multiply_monomial`), subtracts, and takes the external
+  product on both components in single operations; `pre_blind_rotation` also uses
+  `multiply_monomial` for the initial rotation.
 - **BGV** (`bgv.rs`): `BgvParams::new(common, plaintext_modulus, hybrid: Option<BgvHybridParams>)`
   and `BgvCiphertext { components, correction_factor, noise_bound }`. Messages are SIMD slots
   (`Family<Int>`, 1 to N values modulo a prime `t = 1 mod 2N`); encoding lifts the inverse NTT

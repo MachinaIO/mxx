@@ -59,6 +59,7 @@ unsafe extern "C" {
         destination: *mut u64,
         count: u64,
         words: usize,
+        sign_words: usize,
         bits: usize,
         status: *mut u32,
         key_binding: u32,
@@ -333,8 +334,8 @@ impl GpuHashSamplePlan {
 
 impl GpuHashSamplePlan {
     /// Emit tag construction and the `bits`-bit integers of a signed-word
-    /// family (one sign word, then `words` magnitude words per element)
-    /// into the active explicit CUDA Graph.
+    /// family (one sign word, then `words` magnitude words per element) or
+    /// a canonical one-word family into the active explicit CUDA Graph.
     pub fn emit_raw_hash_integers(
         &self,
         stream: &GpuNativeLaunchStream,
@@ -344,10 +345,14 @@ impl GpuHashSamplePlan {
         status: GpuRawControlStatusView,
         key_binding: u32,
     ) -> Result<(), GpuNativeGraphError> {
-        let GpuSignedValuesEncoding::SignedWords(words) = destination.encoding else {
-            return Err(GpuNativeGraphError::Native(
-                "raw hash integers need a signed-word family".into(),
-            ));
+        let (words, sign_words) = match destination.encoding {
+            GpuSignedValuesEncoding::SignedWords(words) => (words, 1),
+            GpuSignedValuesEncoding::CanonicalU64 => (1, 0),
+            GpuSignedValuesEncoding::SignedI64 => {
+                return Err(GpuNativeGraphError::Native(
+                    "raw hash integers need a signed-word or canonical family".into(),
+                ));
+            }
         };
         // An integer family has no ring, so the graph's stream may belong to
         // another context of the same device.
@@ -370,6 +375,7 @@ impl GpuHashSamplePlan {
                 destination.address as *mut u64,
                 destination.count as u64,
                 words,
+                sign_words,
                 bits,
                 status.address as *mut u32,
                 key_binding,

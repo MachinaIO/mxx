@@ -287,6 +287,33 @@ fn matrix_slice_matches_cpu() {
     run_shape_case("direct-slice", |a| a.slice(range(0, 2), range(1, 2)), |a| a.slice(0, 2, 1, 2));
 }
 
+/// Slices consumed inside the graph are views of their source: add, product
+/// and concat read them in place.
+#[test]
+#[serial_test::serial]
+fn matrix_slice_views_feed_operations() {
+    let range =
+        |start: usize, end: usize| Some(IndexRange { start: start.into(), end: end.into() });
+    run_shape_case(
+        "direct-slice-views",
+        |a| {
+            let top = a.clone().slice(range(0, 1), None);
+            let bottom = a.clone().slice(range(1, 2), None);
+            let column = a.clone().slice(None, range(1, 2));
+            let sum = top + bottom;
+            let rows = Mat::concat(ConcatAxis::Rows, vec![sum.clone() * a.clone(), sum]);
+            let columns = Mat::concat(ConcatAxis::Columns, vec![a * column.clone(), column]);
+            rows + columns
+        },
+        |a| {
+            let sum = a.slice(0, 1, 0, 2) + &a.slice(1, 2, 0, 2);
+            let column = a.slice(0, 2, 1, 2);
+            (sum.clone() * a).concat_rows(&[&sum]) +
+                &(a.clone() * &column).concat_columns(&[&column])
+        },
+    );
+}
+
 #[test]
 #[serial_test::serial]
 fn matrix_tensor_matches_cpu() {
@@ -396,6 +423,65 @@ fn ring_automorphism_matches_cpu() {
         |a| a.ring_automorphism(3),
         |a| a.ring_automorphism_out_of_place(3),
     );
+}
+
+/// One plan multiplies by `X^k` for every rebound runtime `k`, including
+/// negative, wrapping and multiword-sized exponents, matching the CPU ring.
+#[test]
+#[serial_test::serial]
+fn multiply_monomial_matches_cpu_for_runtime_exponents() {
+    let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let gpu_parameters = GpuDCRTPolyParams::new(
+        parameters.ring_dimension(),
+        parameters.moduli().to_vec(),
+        parameters.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        parameters.moduli().iter().copied().map(Into::into).collect(),
+        parameters.ring_dimension(),
+    );
+    let context = DslContext::new("direct-multiply-monomial");
+    let source = ring.input("source", (2, 2));
+    let exponent: mxx_dsl::Int = context.input("k", mxx_dsl::IntType).unwrap();
+    let graph = context
+        .output("result", source.multiply_monomial(exponent))
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .unwrap();
+    let input = cpu_input(&parameters);
+    let input_ring = RingRef::new(RingExpr::Explicit {
+        crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
+        ring_dimension: parameters.ring_dimension(),
+    })
+    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .unwrap();
+    let matrix = RuntimeValue::gpu_matrix(
+        ConcreteWireType::Matrix(ConcreteMatrixType { ring: input_ring, rows: 2, columns: 2 }),
+        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &input)),
+    )
+    .unwrap();
+    let bind = |k: i64| {
+        BTreeMap::from([
+            ("source".to_owned(), matrix.clone()),
+            ("k".to_owned(), RuntimeValue::Int(BigInt::from(k))),
+        ])
+    };
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
+    let limit = BigInt::from(1u64 << 40);
+    runtime.options_mut().integer_input_ranges.insert("k".to_owned(), -&limit..=limit);
+    let mut plan = runtime.plan(graph, &bind(1)).unwrap();
+    let period = 2 * parameters.ring_dimension() as i64;
+    for k in [0, 1, 3, 7, 8, 9, 15, -1, -9, 1 << 35, -(1 << 35) - 5] {
+        let result = runtime
+            .execute(&mut plan, bind(k), &mut MemoryArtifactStore::default(), [5; 32])
+            .unwrap();
+        let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
+        let expected = input.multiply_monomial_out_of_place(k.rem_euclid(period) as usize);
+        assert_same_matrix_values(&format!("X^{k}"), &actual, &expected);
+    }
 }
 
 #[test]

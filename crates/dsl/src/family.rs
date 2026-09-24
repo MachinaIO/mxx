@@ -133,6 +133,41 @@ impl<T: GraphValue> Family<T> {
     }
 }
 
+impl Family<Int> {
+    /// `M v` for this row-major matrix family `M` whose row length is the
+    /// length of `vector`: `out[i] = sum_j M[i, j] vector[j]`.
+    #[track_caller]
+    pub fn matrix_vector_product(&self, vector: &Family<Int>) -> Family<Int> {
+        self.int_matrix_vector_product(vector, false)
+    }
+
+    /// `v^T M` for this row-major matrix family `M` whose row count is the
+    /// length of `vector`: `out[j] = sum_i vector[i] M[i, j]`.
+    #[track_caller]
+    pub fn vector_matrix_product(&self, vector: &Family<Int>) -> Family<Int> {
+        self.int_matrix_vector_product(vector, true)
+    }
+
+    #[track_caller]
+    fn int_matrix_vector_product(&self, vector: &Family<Int>, transpose: bool) -> Family<Int> {
+        let count = IntExpr::Div(Box::new(self.count.clone()), Box::new(vector.count.clone()))
+            .canonicalize();
+        let node = NodeHandle::new(
+            NodeKind::IntMatrixVectorProduct { transpose },
+            vec![self.value_handle().clone(), vector.value_handle().clone()],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("integer matrix-vector product")],
+            element_schema: IntType,
+            count,
+        }
+    }
+}
+
 impl Family<Mat> {
     pub fn element_type(&self) -> &MatrixType {
         &self.element_schema.0

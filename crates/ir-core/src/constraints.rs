@@ -231,6 +231,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
                 NodeKind::RingAutomorphism { .. } |
+                NodeKind::MultiplyMonomial |
+                NodeKind::IntMatrixVectorProduct { .. } |
                 NodeKind::ModulusSwitch { .. } |
                 NodeKind::ModulusReduce { .. } |
                 NodeKind::CenteredRebase { .. } |

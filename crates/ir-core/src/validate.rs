@@ -986,6 +986,12 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(input)]
         }
+        NodeKind::MultiplyMonomial => {
+            require_arity(scope, node, 2)?;
+            let input = matrix_argument(scope, values, node, 0)?;
+            require_scalar(scope, values, node, 1, is_integer, "integer")?;
+            vec![ConcreteWireType::Matrix(input)]
+        }
         NodeKind::Transpose => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
@@ -1393,6 +1399,33 @@ fn validate_node(
                 }
             }
             vec![ConcreteWireType::Matrix(ring)]
+        }
+        NodeKind::IntMatrixVectorProduct { .. } => {
+            require_arity(scope, node, 2)?;
+            let count = |index| match argument(scope, values, node, index) {
+                Ok(ConcreteWireType::IndexedFamily { element, count }) if is_integer(element) => {
+                    Some(*count)
+                }
+                _ => None,
+            };
+            let (Some(matrix), Some(vector)) = (count(0), count(1)) else {
+                return node_error(
+                    scope,
+                    node.id,
+                    "integer matrix-vector product requires two integer families",
+                );
+            };
+            if vector == 0 || matrix % vector != 0 {
+                return node_error(
+                    scope,
+                    node.id,
+                    "integer matrix family is not a whole number of vector-length rows",
+                );
+            }
+            vec![ConcreteWireType::IndexedFamily {
+                element: Box::new(ConcreteWireType::Int),
+                count: matrix / vector,
+            }]
         }
         NodeKind::PolynomialValues { .. } => {
             require_arity(scope, node, 1)?;

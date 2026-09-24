@@ -329,12 +329,13 @@ namespace
     }
 
     // Integer i of a hash family is coefficient i of entry (0, 0) of the
-    // matrix transcript, truncated to `bits` bits. Each element is one sign
-    // word (always zero) followed by `words` little-endian magnitude words.
+    // matrix transcript, truncated to `bits` bits. Each element is
+    // `sign_words` (0 or 1) zero sign words followed by `words`
+    // little-endian magnitude words.
     __global__ void raw_hash_integer_kernel(
         const uint8_t *key, const uint64_t *tag_length, const uint8_t *tag,
         size_t tag_capacity, uint64_t *destination, uint64_t count, size_t words,
-        size_t bits, uint32_t *status)
+        size_t sign_words, size_t bits, uint32_t *status)
     {
         if (*status != 0 || *tag_length > tag_capacity) return;
         const size_t bytes = (bits + 7) / 8;
@@ -342,8 +343,8 @@ namespace
         for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
              index < count; index += stride)
         {
-            uint64_t *element = destination + index * (words + 1);
-            for (size_t word = 0; word <= words; ++word) element[word] = 0;
+            uint64_t *element = destination + index * (words + sign_words);
+            for (size_t word = 0; word < words + sign_words; ++word) element[word] = 0;
             for (size_t block = 0; block < (bytes + 31) / 32; ++block)
             {
                 uint8_t digest[32];
@@ -354,7 +355,7 @@ namespace
                     uint8_t value = digest[byte];
                     if (output + 1 == bytes && (bits & 7))
                         value &= static_cast<uint8_t>((1U << (bits & 7)) - 1);
-                    element[1 + output / 8] |= uint64_t(value) << (8 * (output % 8));
+                    element[sign_words + output / 8] |= uint64_t(value) << (8 * (output % 8));
                 }
             }
         }
@@ -652,12 +653,12 @@ extern "C" int gpu_raw_hash_sample_emit(
 extern "C" int gpu_raw_hash_integers_emit(
     GpuRawHashPlan *plan, GpuContext *ctx, void *stream_raw,
     const uint8_t *key, uint64_t *destination, uint64_t count, size_t words,
-    size_t bits, uint32_t *status, uint32_t key_binding,
+    size_t sign_words, size_t bits, uint32_t *status, uint32_t key_binding,
     uint32_t destination_binding, uint32_t status_binding)
 {
     if (!plan || plan->context != ctx || !plan->moduli.empty() || !stream_raw || !key ||
         !destination || !status || !count || !words || !bits || bits > words * 64 ||
-        count > UINT64_MAX / (words + 1) ||
+        sign_words > 1 || count > UINT64_MAX / (words + sign_words) ||
         !mxx_gpu_graph_builder_for_stream(ctx, stream_raw))
         return set_error("invalid raw hash integer family view");
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
@@ -680,11 +681,11 @@ extern "C" int gpu_raw_hash_integers_emit(
             sizeof(void *), key_binding, 0},
         {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 4, 0,
             sizeof(void *), destination_binding, 0},
-        {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 8, 0,
+        {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 9, 0,
             sizeof(void *), status_binding, 0},
     };
     return mxx_gpu_launch_kernel(ctx, stream,
         raw_hash_integer_kernel, dim3(blocks), dim3(128), 0,
         sample_patches, 3, key, plan->device_tag_length, plan->device_tag,
-        plan->max_tag_bytes, destination, count, words, bits, status);
+        plan->max_tag_bytes, destination, count, words, sign_words, bits, status);
 }

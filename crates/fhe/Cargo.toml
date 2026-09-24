@@ -29,6 +29,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 bigdecimal.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 sha2.workspace = true
 rand.workspace = true
 serde_json.workspace = true

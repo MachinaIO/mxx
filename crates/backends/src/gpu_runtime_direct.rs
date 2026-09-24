@@ -191,6 +191,8 @@ impl Drop for DirectGraph {
 
 struct DirectGraph {
     regions: Vec<GraphRegion>,
+    /// When the current execute first launched a region.
+    first_launch: Option<Instant>,
     /// Allocations a launched region made that no later launch has freed
     /// yet, for example after a failed launch; dropping the Graph frees them.
     live_allocations: BTreeSet<u64>,
@@ -433,7 +435,11 @@ impl DirectGraph {
                     "empty physical Graph has scheduled work".into(),
                 ));
             }
-            return Ok(Self { regions: Vec::new(), live_allocations: BTreeSet::new() });
+            return Ok(Self {
+                regions: Vec::new(),
+                first_launch: None,
+                live_allocations: BTreeSet::new(),
+            });
         }
         if !frame.external_io_loops.is_empty() && !frame.waves.is_empty() {
             return Err(GpuPlanError::GraphCompile(
@@ -659,7 +665,7 @@ impl DirectGraph {
                 .upload(&launch_stream)
                 .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
         }
-        let graph = Self { regions, live_allocations: BTreeSet::new() };
+        let graph = Self { regions, first_launch: None, live_allocations: BTreeSet::new() };
         wave_groups(frame, &graph).map_err(GpuPlanError::GraphCompile)?;
         Ok(graph)
     }
@@ -759,6 +765,7 @@ impl DirectGraph {
         frame: &PhysicalFrame,
         index: usize,
     ) -> Result<GpuNativeEvent, GpuRuntimeError> {
+        self.first_launch.get_or_insert_with(Instant::now);
         let region = self.regions.get_mut(index).ok_or_else(|| {
             GpuRuntimeError::Execution("Graph region index is out of range".into())
         })?;
@@ -1989,13 +1996,27 @@ impl GpuRuntime {
         store: &mut S,
         execution_nonce: [u8; 32],
     ) -> Result<GpuExecutionResult, GpuRuntimeError> {
+        let started = Instant::now();
+        plan.graph.first_launch = None;
         let inputs = crate::backend::expand_composite_values(inputs);
         let payload = self.execute_inner(plan, inputs, store, execution_nonce)?;
-        Ok(GpuExecutionResult {
+        let result = GpuExecutionResult {
             outputs: crate::backend::group_composite_values(payload.outputs),
             production_id: payload.production_id,
             artifact_handles: payload.artifact_handles,
-        })
+        };
+        // Preparation ends where the first Graph region launches; the run
+        // covers the launches, the GPU work, and collecting the outputs.
+        let finished = Instant::now();
+        let launched = plan.graph.first_launch.unwrap_or(finished);
+        tracing::debug!(
+            target: "mxx_backends::gpu_execute",
+            graph = plan.validated.source.name(),
+            prepare_us = %format_args!("{:.1}", (launched - started).as_secs_f64() * 1e6),
+            run_us = %format_args!("{:.1}", (finished - launched).as_secs_f64() * 1e6),
+            "GPU execute"
+        );
+        Ok(result)
     }
 
     fn execute_inner<S: SessionStore + Send>(

@@ -2098,6 +2098,12 @@ pub struct BuiltGraph {
 }
 
 impl BuiltGraph {
+    /// How many times each primitive operation runs under the default
+    /// parameter bindings, loop iterations and subgraph calls included.
+    pub fn operation_counts(&self) -> Result<BTreeMap<String, u128>, mxx_ir_core::expr::ExprError> {
+        self.graph.operation_counts(&ParamEnv::default())
+    }
+
     pub fn validate(
         &self,
         bindings: &ParamEnv,

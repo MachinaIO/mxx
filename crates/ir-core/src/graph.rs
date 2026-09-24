@@ -891,6 +891,87 @@ impl Graph {
         self.scope(&FrozenGraphScopeId::Root).expect("a frozen graph always has a root")
     }
 
+    /// How many times each primitive operation runs when the graph executes
+    /// under `env`: a loop body counts once per iteration and a subgraph once
+    /// per call, each evaluated in its own environment. A kind whose payload
+    /// is a plain operator is keyed with it, as in `MatrixBinary(Multiply)`.
+    pub fn operation_counts(
+        &self,
+        env: &crate::ParamEnv,
+    ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
+        let mut memo = BTreeMap::new();
+        self.scope_operation_counts(&FrozenGraphScopeId::Root, env, &mut memo)
+    }
+
+    fn scope_operation_counts(
+        &self,
+        scope_id: &FrozenGraphScopeId,
+        env: &crate::ParamEnv,
+        memo: &mut BTreeMap<(FrozenGraphScopeId, crate::ParamEnv), BTreeMap<String, u128>>,
+    ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
+        let key = (scope_id.clone(), env.clone());
+        if let Some(counts) = memo.get(&key) {
+            return Ok(counts.clone());
+        }
+        let bound = |parent: &crate::ParamEnv, bindings: &[(String, crate::IntExpr)]| {
+            let mut child = parent.clone();
+            for (name, expression) in bindings {
+                child.integers.insert(name.clone(), expression.evaluate(parent)?);
+            }
+            Ok::<_, crate::expr::ExprError>(child)
+        };
+        let mut counts = BTreeMap::<String, u128>::new();
+        let add = |counts: &mut BTreeMap<String, u128>, inner: BTreeMap<String, u128>| {
+            for (name, count) in inner {
+                *counts.entry(name).or_insert(0) += count;
+            }
+        };
+        let scope = self.scope(scope_id).expect("a child scope id names a frozen scope");
+        for (position, node) in scope.nodes.iter().enumerate() {
+            let kind = serde_json::to_value(node.kind()).unwrap_or_default();
+            let tag = kind["tag"].as_str().unwrap_or("Unknown");
+            let name = match kind["value"].as_str() {
+                Some(operator) if operator.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                    format!("{tag}({operator})")
+                }
+                _ => tag.to_owned(),
+            };
+            *counts.entry(name).or_insert(0) += 1;
+            let child = || {
+                self.child_scope_id(scope_id, NodeId(position as u64))
+                    .expect("a structural node has a child scope")
+            };
+            match node.kind() {
+                NodeKind::SubgraphCall(call) => {
+                    let inner =
+                        self.scope_operation_counts(&child(), &bound(env, &call.bindings)?, memo)?;
+                    add(&mut counts, inner);
+                }
+                NodeKind::ParallelLoop(ParallelLoop { count, index_slot, bindings, .. }) |
+                NodeKind::SequentialLoop(SequentialLoop {
+                    count, index_slot, bindings, ..
+                }) => {
+                    let (child, iterations) = (child(), count.evaluate(env)?);
+                    let mut index = num_bigint::BigInt::from(0u8);
+                    while index < iterations {
+                        let mut loop_env = env.clone();
+                        loop_env.loop_indices.insert(*index_slot, index.clone());
+                        let inner = self.scope_operation_counts(
+                            &child,
+                            &bound(&loop_env, bindings)?,
+                            memo,
+                        )?;
+                        add(&mut counts, inner);
+                        index += 1u8;
+                    }
+                }
+                _ => {}
+            }
+        }
+        memo.insert(key, counts.clone());
+        Ok(counts)
+    }
+
     pub fn real_constants(&self) -> &BTreeMap<String, RealExpr> {
         &self.inner.real_constants
     }

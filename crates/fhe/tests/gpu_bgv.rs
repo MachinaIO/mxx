@@ -26,6 +26,16 @@ fn record_timing(stage: &str, started: Instant, timings: &mut Vec<(String, f64)>
 
 #[test]
 fn test_gpu_bgv_round_trip() {
+    // Log how many times each primitive operation of every graph runs, and
+    // each execute's preparation and run times; `RUST_LOG` overrides this
+    // filter.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,gpu_bgv=info,mxx_backends::gpu_execute=debug".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let mut timings = Vec::new();
     let bgv = utils::bgv_params();
     let common = &bgv.common;
@@ -62,6 +72,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "keygen", operations = ?keygen_graph.operation_counts().unwrap());
     let mut keygen_plan = runtime.plan(keygen_graph, &BTreeMap::new()).unwrap();
     let started = Instant::now();
     let keys = runtime.execute(&mut keygen_plan, BTreeMap::new()).unwrap();
@@ -81,6 +92,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "encryption_x", operations = ?encryption_graph_x.operation_counts().unwrap());
     let lhs_inputs = BTreeMap::from([("pk".into(), keys["pk"].clone()), ("x".into(), input(&x))]);
     let mut lhs_plan = runtime.plan(encryption_graph_x, &lhs_inputs).unwrap();
     let started = Instant::now();
@@ -98,6 +110,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "encryption_y", operations = ?encryption_graph_y.operation_counts().unwrap());
     let rhs_inputs = BTreeMap::from([("pk".into(), keys["pk"].clone()), ("y".into(), input(&y))]);
     let mut rhs_plan = runtime.plan(encryption_graph_y, &rhs_inputs).unwrap();
     let started = Instant::now();
@@ -119,6 +132,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "multiply", operations = ?multiply_graph.operation_counts().unwrap());
     let multiply_inputs = BTreeMap::from([
         ("lhs".into(), encrypted_lhs["lhs"].clone()),
         ("rhs".into(), encrypted_rhs["rhs"].clone()),
@@ -139,6 +153,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "relinearize", operations = ?relinearize_graph.operation_counts().unwrap());
     let relinearize_inputs = BTreeMap::from([
         ("quadratic".into(), multiplied["quadratic"].clone()),
         ("rk".into(), keys["rk"].clone()),
@@ -159,6 +174,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "modswitch", operations = ?modswitch_graph.operation_counts().unwrap());
     let modswitch_inputs =
         BTreeMap::from([("relinearized".into(), relinearized_outputs["relinearized"].clone())]);
     let mut modswitch_plan = runtime.plan(modswitch_graph, &modswitch_inputs).unwrap();
@@ -184,6 +200,7 @@ fn test_gpu_bgv_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "decryption", operations = ?decryption_graph.operation_counts().unwrap());
     let decryption_inputs =
         BTreeMap::from([("ct".into(), evaluated["ct"].clone()), ("sk".into(), keys["sk"].clone())]);
     let mut decryption_plan = runtime.plan(decryption_graph, &decryption_inputs).unwrap();

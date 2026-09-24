@@ -19,6 +19,16 @@ fn record_timing(stage: &str, started: Instant, timings: &mut Vec<(String, f64)>
 
 #[test]
 fn test_gpu_tfhe_round_trip() {
+    // Log how many times each primitive operation of every graph runs, and
+    // each execute's preparation and run times; `RUST_LOG` overrides this
+    // filter.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,gpu_tfhe=info,mxx_backends::gpu_execute=debug".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let mut timings = Vec::new();
     let tfhe = utils::tfhe_params();
     let ring = Ring::from_crt_moduli(
@@ -46,6 +56,7 @@ fn test_gpu_tfhe_round_trip() {
         .unwrap()
         .build()
         .unwrap();
+    tracing::info!(graph = "keygen", operations = ?keygen_graph.operation_counts().unwrap());
     let keygen_inputs = BTreeMap::from([("keygen_hash_key".into(), fresh_hash_key())]);
     let mut keygen_plan = runtime.plan(keygen_graph, &keygen_inputs).unwrap();
     let started = Instant::now();
@@ -64,6 +75,7 @@ fn test_gpu_tfhe_round_trip() {
         .unwrap();
     let ciphertext_schema = ciphertext.schema();
     let encryption_graph = encryption.output("ct", ciphertext).unwrap().build().unwrap();
+    tracing::info!(graph = "encryption", operations = ?encryption_graph.operation_counts().unwrap());
     let encryption_inputs = |bit: bool| {
         BTreeMap::from([
             ("lwe_sk".into(), key_outputs["lwe_sk"].clone()),
@@ -93,6 +105,7 @@ fn test_gpu_tfhe_round_trip() {
         )
         .unwrap();
     let nand_graph = gate.output("ct", nand).unwrap().build().unwrap();
+    tracing::info!(graph = "nand", operations = ?nand_graph.operation_counts().unwrap());
     let gate_inputs = |left: RuntimeValue, right: RuntimeValue| {
         BTreeMap::from([
             ("left".into(), left),
@@ -115,6 +128,7 @@ fn test_gpu_tfhe_round_trip() {
         )
         .unwrap();
     let decryption_graph = decryption.output("bit", bit).unwrap().build().unwrap();
+    tracing::info!(graph = "decryption", operations = ?decryption_graph.operation_counts().unwrap());
     let decryption_inputs = |ciphertext: RuntimeValue| {
         BTreeMap::from([
             ("lwe_sk".into(), key_outputs["lwe_sk"].clone()),

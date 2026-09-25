@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 
-use super::noise_breakdown::{NoiseBreakdown, ReductionCounts};
+use crate::noise_utils::{NoiseBreakdown, ReductionCounts};
 
 mod bigdecimal_string {
     use bigdecimal::BigDecimal;
@@ -521,7 +521,7 @@ impl RnsBggParameters {
                 heuristics.insert(NoiseHeuristicId::ExactDistribution);
             }
             NoiseMomentPolicy::Continuous => {
-                heuristics.insert(NoiseHeuristicId::H2DigitUniform);
+                heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
             }
         }
         Ok(RnsBggNoiseValue {
@@ -2045,14 +2045,17 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 let mean_gain = NonnegativeRational::new(action.l1.clone(), alpha.clone())
                     .expect("positive alignment ratio");
                 let alpha_squared = alpha.pow(2u32);
+                // Energy only for a coefficient-uncorrelated contribution.
+                let l1_squared = action.l1.pow(2u32);
                 Some(
                     terms
                         .transform(|term| {
                             (
                                 mean_gain.clone(),
-                                term.moments
-                                    .variance
-                                    .scaled_ratio(&action.l2_squared, &alpha_squared),
+                                term.moments.variance.scaled_ratio(
+                                    if term.white { &action.l2_squared } else { &l1_squared },
+                                    &alpha_squared,
+                                ),
                                 false,
                             )
                         })
@@ -2063,7 +2066,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             None => None,
         };
         let mut aligned = aligned;
-        aligned.heuristics.insert(NoiseHeuristicId::H2DigitUniform);
+        aligned.heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
         Ok(aligned.with_breakdown(breakdown))
     }
 
@@ -2339,7 +2342,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 reduced.heuristics.insert(NoiseHeuristicId::ExactDistribution);
             }
             NoiseMomentPolicy::Continuous => {
-                reduced.heuristics.insert(NoiseHeuristicId::H2DigitUniform);
+                reduced.heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
             }
         }
         Ok(reduced)
@@ -2798,7 +2801,6 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     fn lut_contributions(
         &self,
         level: usize,
-        wire: WireId,
         lut: LutId,
         table: &LutTable,
         input: &RnsBggNoiseValue,
@@ -2837,12 +2839,12 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             if coefficient_output { BigUint::one() } else { terms.scale.clone() },
         )
         .expect("positive scale");
+        // Energy only for a coefficient-uncorrelated contribution (H1/H4);
+        // otherwise the squared L1 action of the coherent branch sum.
+        let l1_squared = terms.input_mean_gain.pow(2);
         let inherited = input_terms.transform(|term| {
-            (
-                mean_gain.clone(),
-                units(&term.moments.variance.scaled(&terms.input_variance_gain)),
-                false,
-            )
+            let action = if term.white { &terms.input_variance_gain } else { &l1_squared };
+            (mean_gain.clone(), units(&term.moments.variance.scaled(action)), false)
         });
         let helper = NoiseBreakdown::sampled(
             stable_source_id(&(b"rns-bgg/lut/helper".as_slice(), level)),
@@ -2856,18 +2858,29 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             zero_mean_moments(units(&terms.fresh.scaled(&branch_squares))),
             false,
         );
-        let gate = (self.program.id(), wire, level);
-        let mut contributions =
-            inherited.merge(&helper).merge(&fresh).merge(&NoiseBreakdown::rounding(
-                stable_source_id(&(b"rns-bgg/lut/rounding".as_slice(), gate)),
-                "lut-rounding",
-                zero_mean_moments(units(&terms.internal_rounding)),
-            ));
+        // The remainders are determined by the LUT and its input: every
+        // invocation of the same LUT on the same value shares them.
+        let operand = input_terms.identity();
+        let residual =
+            |tag: &'static [u8], origin: &'static str, variance: NonnegativeRational| match operand
+            {
+                Some(operand) => NoiseBreakdown::rounding(
+                    stable_source_id(&(tag, operand, lut, level)),
+                    origin,
+                    zero_mean_moments(variance),
+                ),
+                None => NoiseBreakdown::opaque(origin, zero_mean_moments(variance)),
+            };
+        let mut contributions = inherited.merge(&helper).merge(&fresh).merge(&residual(
+            b"rns-bgg/lut/rounding",
+            "lut-rounding",
+            units(&terms.internal_rounding),
+        ));
         if !coefficient_output {
-            contributions = contributions.merge(&NoiseBreakdown::rounding(
-                stable_source_id(&(b"rns-bgg/lut/outer-rounding".as_slice(), gate)),
+            contributions = contributions.merge(&residual(
+                b"rns-bgg/lut/outer-rounding",
                 "lut-outer-rounding",
-                zero_mean_moments(terms.outer_rounding),
+                terms.outer_rounding,
             ));
         }
         Ok(contributions)
@@ -2919,6 +2932,23 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                     let mean_gain = NonnegativeRational::new(BigUint::one(), ratio.clone())
                         .expect("positive coefficient modulus ratio");
                     let breakdown = value.contributions("coefficient-output").map(|terms| {
+                        // The final rounding is determined by the value it
+                        // rounds.
+                        let rounding = match terms.identity() {
+                            Some(operand) => NoiseBreakdown::rounding(
+                                stable_source_id(&(
+                                    b"rns-bgg/coefficient-final-rounding".as_slice(),
+                                    operand,
+                                    level,
+                                )),
+                                "coefficient-final-rounding",
+                                rounding.clone(),
+                            ),
+                            None => NoiseBreakdown::opaque(
+                                "coefficient-final-rounding",
+                                rounding.clone(),
+                            ),
+                        };
                         terms
                             .transform(|term| {
                                 (
@@ -2929,16 +2959,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                                     false,
                                 )
                             })
-                            .merge(&NoiseBreakdown::rounding(
-                                stable_source_id(&(
-                                    b"rns-bgg/coefficient-final-rounding".as_slice(),
-                                    self.program.id(),
-                                    wire,
-                                    level,
-                                )),
-                                "coefficient-final-rounding",
-                                rounding.clone(),
-                            ))
+                            .merge(&rounding)
                     });
                     value = value.with_breakdown(breakdown);
                 }
@@ -3249,12 +3270,17 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         // shares it, and distinct members of an RHS family are distinct
         // preparations. The remainders are this gate's residual.
         let breakdown = input.1.contributions("mul-private-input").map(|input_terms| {
+            // The energy gain needs coefficient-uncorrelated input (H1) under
+            // the fixed prepared action (H4); any other contribution keeps
+            // the squared L1 action.
+            let l1 = &terms.inherited_mean_gain;
             let inherited = input_terms.transform(|term| {
-                (
-                    terms.inherited_mean_gain.clone(),
-                    terms.inherited_variance(&term.moments.variance),
-                    false,
-                )
+                let variance = if term.white {
+                    terms.inherited_variance(&term.moments.variance)
+                } else {
+                    term.moments.variance.scaled_ratio(&l1.numerator.pow(2), &l1.denominator.pow(2))
+                };
+                (l1.clone(), variance, false)
             });
             let rhs_source = stable_source_id(&(b"rns-bgg/rhs-error".as_slice(), rhs.id, level));
             let rhs_moments = zero_mean_moments(terms.rhs_error.clone());
@@ -3272,19 +3298,28 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             };
             // Under H2 both remainders are centered uniforms independent per
             // coefficient and of the independent secret, so their images
-            // are coefficient-uncorrelated.
-            let rounding = NoiseBreakdown::object_residual(
-                stable_source_id(&(
-                    b"rns-bgg/private-mul/rounding".as_slice(),
-                    self.program.id(),
-                    wire,
-                    level,
-                )),
-                "private-mul-rounding",
-                Vec::new(),
-                zero_mean_moments(terms.rounding.clone()),
-                true,
-            );
+            // are coefficient-uncorrelated. The remainders are determined by
+            // the operation and its operands: every gate that multiplies the
+            // same input by the same RHS member at this level shares them.
+            let rounding = match input_terms.identity() {
+                Some(operand) => NoiseBreakdown::object_residual(
+                    stable_source_id(&(
+                        b"rns-bgg/private-mul/rounding".as_slice(),
+                        operand,
+                        rhs.id,
+                        format!("{:?}", rhs.index),
+                        level,
+                    )),
+                    "private-mul-rounding",
+                    Vec::new(),
+                    zero_mean_moments(terms.rounding.clone()),
+                    true,
+                ),
+                None => NoiseBreakdown::opaque(
+                    "private-mul-rounding",
+                    zero_mean_moments(terms.rounding.clone()),
+                ),
+            };
             inherited.merge(&rhs_error).merge(&rounding)
         });
         tracing::trace!(
@@ -3299,7 +3334,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         );
         let mut heuristics = input.1.heuristics.clone();
         heuristics.insert(NoiseHeuristicId::H1StateUncorrelated);
-        heuristics.insert(NoiseHeuristicId::H2DigitUniform);
+        heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
         heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
         let value = self.carry_provenance(
             RnsBggNoiseValue {
@@ -3392,15 +3427,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 if terminal_coefficient {
                     return Ok(input_terms);
                 }
-                self.lut_contributions(
-                    level,
-                    wire,
-                    lut,
-                    table,
-                    &input.1,
-                    input_terms,
-                    coefficient_output,
-                )
+                self.lut_contributions(level, lut, table, &input.1, input_terms, coefficient_output)
             })
             .transpose()?;
         let material = self.lut_material_provenance(level, lut, table)?;
@@ -4750,6 +4777,78 @@ mod test {
             .add(&terms.rhs_error.scaled(&4u8.into()))
             .add(&terms.rounding.scaled(&16u8.into()));
         assert_eq!(variance, expected);
+    }
+
+    #[test]
+    fn repeated_private_products_share_their_residuals_and_opaque_input_keeps_l1() {
+        fn program(repeat: bool) -> (ExponentLutProgram, WireId, RhsId) {
+            let mut builder = crate::program::ExponentLutProgramBuilder::new();
+            let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+            let rhs = builder.rhs_input().unwrap();
+            let product = |builder: &mut crate::program::ExponentLutProgramBuilder| {
+                builder
+                    .mul_private(
+                        crate::program::Operand::Scalar(input),
+                        crate::program::Operand::Scalar(rhs),
+                    )
+                    .unwrap()
+            };
+            let first = product(&mut builder);
+            let output = if repeat {
+                let second = product(&mut builder);
+                builder
+                    .add(
+                        crate::program::Operand::Scalar(first),
+                        crate::program::Operand::Scalar(second),
+                    )
+                    .unwrap()
+            } else {
+                first
+            };
+            let program = builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+            (program, input, rhs)
+        }
+        let parameters = nested_alignment_parameters();
+        let run = |repeat: bool, value: RnsBggNoiseValue| {
+            let (program, input, rhs) = program(repeat);
+            output_variance(
+                &program,
+                &parameters,
+                BTreeMap::from([(input, InputBinding::Scalar(value))]),
+                BTreeMap::from([(rhs, InputBinding::Scalar(unit_rhs()))]),
+            )
+        };
+        let encoding = RnsBggNoiseValue::sampled_encoding(&parameters, b"state", &[BigInt::one()]);
+        // Two gates perform the same deterministic product: all of its
+        // contributions, including the ModDown remainders, repeat.
+        let single = run(false, encoding.clone());
+        assert_eq!(run(true, encoding.clone()), single.scaled(&4u8.into()));
+
+        // An envelope without a breakdown is not coefficient-uncorrelated:
+        // the inherited error keeps the squared L1 action.
+        let mut opaque = encoding;
+        opaque.breakdown = None;
+        let terms = parameters
+            .private_mul_noise_terms(
+                0,
+                &RightActionNoiseGain::unit(),
+                &RightActionNoiseGain::unit(),
+            )
+            .unwrap();
+        let l1 = &terms.inherited_mean_gain;
+        let inherited = parameters
+            .encoding_error_variance()
+            .scaled_ratio(&l1.numerator.pow(2), &l1.denominator.pow(2));
+        let fallback = run(false, opaque);
+        let below = |left: &NonnegativeRational, right: &NonnegativeRational| {
+            &left.numerator * &right.denominator < &right.numerator * &left.denominator
+        };
+        assert!(below(
+            &terms.inherited_variance(&parameters.encoding_error_variance()),
+            &inherited
+        ));
+        assert!(!below(&fallback, &inherited.add(&terms.rhs_error).add(&terms.rounding)));
+        assert!(below(&single, &fallback));
     }
 
     #[test]

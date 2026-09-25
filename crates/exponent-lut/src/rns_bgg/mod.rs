@@ -9,7 +9,6 @@ mod encoding;
 #[cfg(all(test, feature = "gpu"))]
 pub(crate) mod gpu;
 mod noise;
-mod noise_breakdown;
 mod public_key;
 
 use bigdecimal::BigDecimal;

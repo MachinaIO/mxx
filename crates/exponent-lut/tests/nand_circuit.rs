@@ -160,24 +160,50 @@ fn select_candidate(
         Some(_) => NoiseModelKind::AverageCase,
         None => NoiseModelKind::WorstCase,
     };
+    // `n,crt_depth,primes_per_drop` of a candidate already selected by a
+    // full search. It replaces the search, and its lattice security estimate
+    // is not repeated; the noise audit still builds its parameter chain.
+    let selected = env::var("MXX_EXPONENT_LUT_NAND_SELECTED_PARAMETERS").ok().map(|value| {
+        let fields = value
+            .split(',')
+            .map(|field| field.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| {
+                panic!("MXX_EXPONENT_LUT_NAND_SELECTED_PARAMETERS must be n,crt_depth,primes_per_drop: {error}")
+            });
+        let [ring_dimension, crt_depth, primes_per_drop] = fields[..] else {
+            panic!("MXX_EXPONENT_LUT_NAND_SELECTED_PARAMETERS must be n,crt_depth,primes_per_drop");
+        };
+        let ring_dimension = u32::try_from(ring_dimension)
+            .unwrap_or_else(|_| panic!("selected NAND ring dimension does not fit u32"));
+        (ring_dimension, crt_depth, primes_per_drop)
+    });
+    let ring_dimensions = match selected {
+        Some((ring_dimension, _, _)) => vec![ring_dimension],
+        None => ring_dimension_candidates(
+            "MXX_EXPONENT_LUT_NAND_MIN_LOG_RING_DIMENSION",
+            "MXX_EXPONENT_LUT_NAND_MAX_LOG_RING_DIMENSION",
+            5,
+            16,
+        )
+        .unwrap_or_else(|error| panic!("invalid NAND ring-dimension range: {error}")),
+    };
 
-    for ring_dimension in ring_dimension_candidates(
-        "MXX_EXPONENT_LUT_NAND_MIN_LOG_RING_DIMENSION",
-        "MXX_EXPONENT_LUT_NAND_MAX_LOG_RING_DIMENSION",
-        5,
-        16,
-    )
-    .unwrap_or_else(|error| panic!("invalid NAND ring-dimension range: {error}"))
-    {
+    for ring_dimension in ring_dimensions {
         let compiled =
             circuit.compile(layout, ring_dimension as usize, max_lut_rounds).unwrap_or_else(
                 |error| panic!("NAND compilation failed for n={ring_dimension}: {error}"),
             );
         let bindings = noise_bindings(&compiled, &sigma);
         let terminal_bounds = vec![BigUint::from(1u8); compiled.program().outputs().len()];
-        let depth_candidates = (1..=max_crt_depth).flat_map(|depth| {
-            (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
-        });
+        let depth_candidates: Vec<(usize, usize)> = match selected {
+            Some((_, crt_depth, primes_per_drop)) => vec![(crt_depth, primes_per_drop)],
+            None => (1..=max_crt_depth)
+                .flat_map(|depth| {
+                    (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
+                })
+                .collect(),
+        };
         for (crt_depth, primes_per_drop) in depth_candidates {
             let request = RnsBggPlanRequest {
                 ring_dimension,
@@ -247,6 +273,11 @@ fn select_candidate(
             // error there is no lattice security to estimate.
             let achieved = if sigma == BigDecimal::from(0u8) {
                 eprintln!("noise-free NAND diagnostic: the lattice security gate is skipped");
+                security_target
+            } else if selected.is_some() {
+                eprintln!(
+                    "selected NAND parameters were supplied: the lattice security estimate is not repeated"
+                );
                 security_target
             } else {
                 lattice_security_bits(source, &sigma).unwrap_or_else(|error| {

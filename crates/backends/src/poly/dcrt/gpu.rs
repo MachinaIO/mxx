@@ -450,6 +450,8 @@ pub struct GpuNativeGraphBuilder {
     stream: GpuNativeLaunchStream,
     binding_map: Vec<(u32, u32)>,
     retained_owners: Vec<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Physical devices of the enclosing conditional bodies, innermost last.
+    body_devices: Vec<i32>,
 }
 
 unsafe extern "C" {
@@ -5139,6 +5141,7 @@ impl GpuNativeLaunchStream {
             stream: self.clone(),
             binding_map: Vec::new(),
             retained_owners: Vec::new(),
+            body_devices: Vec::new(),
         })
     }
 
@@ -5840,6 +5843,13 @@ impl GpuNativeGraphBuilder {
         self.retained_owners.push(owner);
     }
 
+    /// The physical device of the innermost conditional body being emitted.
+    /// CUDA requires every kernel of a conditional body, at any nesting
+    /// depth, to belong to the conditional node's context.
+    pub fn body_device(&self) -> Option<i32> {
+        self.body_devices.last().copied()
+    }
+
     pub fn launch_stream(&self) -> &GpuNativeLaunchStream {
         &self.stream
     }
@@ -6131,7 +6141,10 @@ impl GpuNativeGraphBuilder {
         if status != 0 {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
-        enqueue(self)?;
+        self.body_devices.push(self.stream.physical_device);
+        let enqueued = enqueue(self);
+        self.body_devices.pop();
+        enqueued?;
         self.select_device()?;
         if unsafe { mxx_gpu_graph_builder_finish_generic_body(self.raw) } != 0 {
             return Err(GpuNativeGraphError::Native(last_error_string()));
@@ -6179,7 +6192,10 @@ impl GpuNativeGraphBuilder {
         if status != 0 {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
-        enqueue(self)?;
+        self.body_devices.push(self.stream.physical_device);
+        let enqueued = enqueue(self);
+        self.body_devices.pop();
+        enqueued?;
         self.select_device()?;
         if unsafe { mxx_gpu_graph_builder_finish_generic_body(self.raw) } != 0 {
             return Err(GpuNativeGraphError::Native(last_error_string()));

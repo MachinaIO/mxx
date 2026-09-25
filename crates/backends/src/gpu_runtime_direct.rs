@@ -1102,6 +1102,22 @@ fn emit_direct_operation(
     let implementation =
         frame.program.implementations.resolve(operation.implementation).map_err(invalid)?;
     let index = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
+    // A conditional body runs in the context of its conditional node, and
+    // CUDA requires every kernel of the body to belong to it. An operation of
+    // another physical device cannot join the body, so this plan is
+    // rejected rather than instantiated into an invalid graph.
+    if let Some(body) = builder.body_device() {
+        let physical = if operation.device == builder.launch_stream().physical_device() {
+            body
+        } else {
+            device_launch_stream(backend, operation.device)?.physical_device()
+        };
+        if physical != body {
+            return Err(invalid(&format!(
+                "operation {index} runs on GPU {physical} inside a conditional body of GPU {body}"
+            )));
+        }
+    }
     // An operation on another device adds its nodes to this graph through
     // that device's stream.
     let home = (operation.device != builder.launch_stream().physical_device())

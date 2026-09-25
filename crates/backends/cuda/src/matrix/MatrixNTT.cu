@@ -146,89 +146,6 @@ namespace
     };
     static_assert(sizeof(RawNttBatch) < 4096, "bounded raw NTT kernel arguments");
 
-    // Up to ten butterfly stages of one 1024-coefficient tile in shared
-    // memory. A tile holding the whole transform also applies the twist
-    // (forward) or the scaling and untwist (inverse). Every stage twiddle of
-    // a tile is one of `tile_size / 2` table entries, staged in shared memory
-    // once so the stages never wait on global loads.
-    template <bool Forward>
-    __global__ void raw_ntt_fused_local_kernel(RawNttBatch batch, size_t columns,
-        uint32_t n, uint32_t tile_size, size_t poly_offset)
-    {
-        extern __shared__ uint64_t values[];
-        const uint32_t limb = blockIdx.z;
-        const MxxRawMatrixLimb &source = batch.source[limb];
-        const MxxRawMatrixLimb &destination = batch.destination[limb];
-        const uint64_t *twiddles = batch.twiddles[limb];
-        const uint64_t *shoup = batch.shoup[limb];
-        const uint64_t modulus = destination.modulus;
-        const size_t poly = poly_offset + blockIdx.y;
-        const uint32_t first = blockIdx.x * tile_size;
-        uint64_t *stage_twiddles = values + tile_size;
-        uint64_t *stage_shoup = stage_twiddles + tile_size / 2;
-        const uint32_t step = 2U * (n / tile_size);
-        for (uint32_t index = threadIdx.x; index < tile_size / 2; index += blockDim.x)
-        {
-            stage_twiddles[index] = twiddles[index * step];
-            stage_shoup[index] = shoup[index * step];
-        }
-        for (uint32_t index = threadIdx.x; index < tile_size; index += blockDim.x)
-        {
-            uint64_t value = raw_matrix_load(source, poly, first + index, columns);
-            if constexpr (Forward)
-            {
-                if (tile_size == n)
-                    value = mul_mod_shoup_u64(value, twiddles[index], shoup[index], modulus);
-            }
-            values[index] = value;
-        }
-        __syncthreads();
-        uint32_t length = Forward ? tile_size : 2;
-        while (length >= 2 && length <= tile_size)
-        {
-            const uint32_t half = length / 2;
-            for (uint32_t butterfly = threadIdx.x; butterfly < tile_size / 2;
-                 butterfly += blockDim.x)
-            {
-                const uint32_t j = butterfly % half;
-                const uint32_t index = (butterfly / half) * length + j;
-                // Table entry 2 (n / length) j is staged entry j tile / length.
-                const uint32_t twiddle = j * (tile_size / length);
-                const uint64_t lower = values[index];
-                const uint64_t upper = values[index + half];
-                if constexpr (Forward)
-                {
-                    values[index] = add_mod_u64(lower, upper, modulus);
-                    values[index + half] = mul_mod_shoup_u64(sub_mod_u64(lower, upper, modulus),
-                        stage_twiddles[twiddle], stage_shoup[twiddle], modulus);
-                }
-                else
-                {
-                    const uint64_t product = mul_mod_shoup_u64(
-                        upper, stage_twiddles[twiddle], stage_shoup[twiddle], modulus);
-                    values[index] = add_mod_u64(lower, product, modulus);
-                    values[index + half] = sub_mod_u64(lower, product, modulus);
-                }
-            }
-            __syncthreads();
-            length = Forward ? length >> 1 : length << 1;
-        }
-        for (uint32_t index = threadIdx.x; index < tile_size; index += blockDim.x)
-        {
-            uint64_t value = values[index];
-            if constexpr (!Forward)
-            {
-                if (tile_size == n)
-                {
-                    value = mul_mod_shoup_u64(value, *batch.n_inv[limb],
-                        *batch.n_inv_shoup[limb], modulus);
-                    value = mul_mod_shoup_u64(value, twiddles[index], shoup[index], modulus);
-                }
-            }
-            raw_matrix_store(destination, poly, first + index, columns, value);
-        }
-    }
-
     // The stages above one tile: the Width lanes of a group hold coefficients
     // one tile apart, and XOR shuffles realize those butterflies, including
     // the transform boundary twist (forward) or scaling and untwist (inverse).
@@ -306,6 +223,315 @@ namespace
 #undef MXX_RAW_NTT_TOP
         }
         return set_error("raw fused NTT has no top-stage width for this ring");
+    }
+
+    // The register-blocked NTT: every thread holds R coefficients of one
+    // tile and runs log2(R) butterfly stages in registers, so values cross
+    // threads only between passes. A tile is the whole polynomial when it
+    // fits one block; a larger ring splits into 1024-coefficient tiles whose
+    // stages above a tile run in raw_ntt_fused_top_kernel.
+    constexpr uint32_t kMaxNttRadix = 32;
+    constexpr uint32_t kDefaultNttRadix = 4;
+    constexpr uint32_t kBlockedNttMaxCoefficients = 4096;
+    constexpr uint32_t kBlockedNttMaxThreads = 1024;
+
+    __host__ __device__ constexpr uint32_t raw_ntt_log2(uint32_t value)
+    {
+        return value <= 1 ? 0 : 1 + raw_ntt_log2(value / 2);
+    }
+
+    // `warp_local` says every warp reads only what it wrote itself; one warp
+    // also owns the whole tile when the block has at most 32 threads.
+    __device__ __forceinline__ void raw_ntt_blocked_sync(bool warp_local)
+    {
+        if (warp_local || blockDim.x <= 32) __syncwarp();
+        else __syncthreads();
+    }
+
+    // Blocked-NTT arithmetic on one Word per coefficient. The 32-bit word
+    // serves moduli below 2^31, where sums stay below 2^32 and the Shoup
+    // constant of w is the high word floor(w 2^32 / q) of its 64-bit one.
+    __device__ __forceinline__ uint32_t raw_ntt_add(uint32_t a, uint32_t b, uint32_t modulus)
+    {
+        const uint32_t sum = a + b;
+        return sum >= modulus ? sum - modulus : sum;
+    }
+
+    __device__ __forceinline__ uint64_t raw_ntt_add(uint64_t a, uint64_t b, uint64_t modulus)
+    {
+        return add_mod_u64(a, b, modulus);
+    }
+
+    __device__ __forceinline__ uint32_t raw_ntt_sub(uint32_t a, uint32_t b, uint32_t modulus)
+    {
+        return a >= b ? a - b : a + modulus - b;
+    }
+
+    __device__ __forceinline__ uint64_t raw_ntt_sub(uint64_t a, uint64_t b, uint64_t modulus)
+    {
+        return sub_mod_u64(a, b, modulus);
+    }
+
+    __device__ __forceinline__ uint32_t raw_ntt_mul(
+        uint32_t value, uint32_t multiplier, uint32_t multiplier_shoup, uint32_t modulus)
+    {
+        const uint32_t reduced =
+            value * multiplier - __umulhi(value, multiplier_shoup) * modulus;
+        return reduced >= modulus ? reduced - modulus : reduced;
+    }
+
+    __device__ __forceinline__ uint64_t raw_ntt_mul(
+        uint64_t value, uint64_t multiplier, uint64_t multiplier_shoup, uint64_t modulus)
+    {
+        return mul_mod_shoup_u64(value, multiplier, multiplier_shoup, modulus);
+    }
+
+    template <typename Word>
+    __device__ __forceinline__ Word raw_ntt_shoup(uint64_t shoup)
+    {
+        return static_cast<Word>(sizeof(Word) == 4 ? shoup >> 32 : shoup);
+    }
+
+    // One pass of RP-point groups. A forward pass runs the
+    // decimation-in-frequency stages of lengths L, L/2, ..., 2L/RP for
+    // span L = 2^log_span; an inverse pass runs the decimation-in-time stages
+    // of lengths 2l, 4l, ..., RP l for span l = 2^log_span. A group holds the
+    // positions base + k stride, which pair with each other at every stage
+    // of the pass. Stage length `len` uses twiddle 2 j (n / len) for the
+    // butterfly at offset j of its block; a tile starts at a multiple of
+    // every stage length, so offsets within the tile give the same j. Every
+    // extent is a power of two, so the index math is shifts and masks. The
+    // twiddles 2 j (n / len) of every stage in the tile are the multiples of
+    // 2 n / tile; `stage_twiddles[k]` and `stage_shoup[k]` hold the k-th.
+    template <bool Forward, uint32_t RP, typename Word>
+    __device__ __forceinline__ void raw_ntt_blocked_pass(Word *values, uint32_t tile,
+        uint32_t log_tile, uint32_t log_span, const Word *stage_twiddles,
+        const Word *stage_shoup, Word modulus)
+    {
+        constexpr uint32_t log_rp = raw_ntt_log2(RP);
+        const uint32_t log_stride = Forward ? log_span - log_rp : log_span;
+        const uint32_t stride = 1U << log_stride;
+        for (uint32_t group = threadIdx.x; group < tile / RP; group += blockDim.x)
+        {
+            const uint32_t base = ((group >> log_stride) << (log_stride + log_rp)) |
+                (group & (stride - 1));
+            Word x[RP];
+#pragma unroll
+            for (uint32_t k = 0; k < RP; ++k) x[k] = values[base + k * stride];
+#pragma unroll
+            for (uint32_t level = 0; level < log_rp; ++level)
+            {
+                const uint32_t log_half = Forward ? log_rp - level - 1 : level;
+                const uint32_t half = 1U << log_half;
+                const uint32_t log_length = log_half + 1 + log_stride;
+#pragma unroll
+                for (uint32_t k = 0; k < RP; ++k)
+                {
+                    if (k & half) continue;
+                    const uint32_t offset = (base + k * stride) & ((1U << log_length) - 1);
+                    const uint32_t twiddle = offset << (log_tile - log_length);
+                    const Word lower = x[k];
+                    const Word upper = x[k + half];
+                    if constexpr (Forward)
+                    {
+                        x[k] = raw_ntt_add(lower, upper, modulus);
+                        x[k + half] = raw_ntt_mul(raw_ntt_sub(lower, upper, modulus),
+                            stage_twiddles[twiddle], stage_shoup[twiddle], modulus);
+                    }
+                    else
+                    {
+                        const Word product = raw_ntt_mul(upper, stage_twiddles[twiddle],
+                            stage_shoup[twiddle], modulus);
+                        x[k] = raw_ntt_add(lower, product, modulus);
+                        x[k + half] = raw_ntt_sub(lower, product, modulus);
+                    }
+                }
+            }
+#pragma unroll
+            for (uint32_t k = 0; k < RP; ++k) values[base + k * stride] = x[k];
+        }
+    }
+
+    // The stages within one tile per block of tile / R threads, in passes
+    // of log2(R) stages. A tile holding the whole transform also applies the
+    // twist (forward) or the scaling and untwist (inverse). blockIdx.x picks
+    // the tile, blockIdx.y the polynomial, and blockIdx.z the batch limb.
+    // Shared memory holds the tile, then its tile / 2 stage twiddles and
+    // their Shoup constants, staged with the tile so no stage waits on a
+    // global twiddle load. Word is uint32_t when every limb modulus is
+    // below 2^31 and uint64_t otherwise. `source` reads the input
+    // coefficients; the default reads the batch source views, and another
+    // source (a compact operand) decodes them while loading the tile.
+    struct RawNttMatrixSource
+    {
+        // The view limb of the launch's first batch limb.
+        uint64_t first_limb;
+
+        __device__ __forceinline__ uint64_t load(const RawNttBatch &batch, uint32_t limb,
+            size_t poly, size_t coefficient, size_t columns) const
+        {
+            return raw_matrix_load(batch.source[limb], poly, coefficient, columns);
+        }
+    };
+
+    template <bool Forward, uint32_t R, typename Word, typename Source>
+    __global__ void raw_ntt_blocked_kernel(RawNttBatch batch, size_t columns, uint32_t n,
+        uint32_t tile, size_t poly_offset, Source source)
+    {
+        extern __shared__ uint64_t shared_words[];
+        Word *values = reinterpret_cast<Word *>(shared_words);
+        const uint32_t limb = blockIdx.z;
+        const MxxRawMatrixLimb &destination = batch.destination[limb];
+        const uint64_t *twiddles = batch.twiddles[limb];
+        const uint64_t *shoup = batch.shoup[limb];
+        const Word modulus = static_cast<Word>(destination.modulus);
+        const size_t poly = poly_offset + blockIdx.y;
+        const uint32_t first = blockIdx.x * tile;
+        const uint32_t log_n = static_cast<uint32_t>(__ffs(n) - 1);
+        uint32_t remaining = static_cast<uint32_t>(__ffs(tile) - 1);
+        const uint32_t log_tile = remaining;
+        Word *stage_twiddles = values + tile;
+        Word *stage_shoup = stage_twiddles + tile / 2;
+        // The block has tile / R threads, so every thread stages R / 2
+        // twiddles and loads and stores R coefficients; the unrolled loops
+        // keep all of a thread's global reads in flight at once.
+#pragma unroll
+        for (uint32_t k = 0; k < (R + 1) / 2; ++k)
+        {
+            const uint32_t index = threadIdx.x + k * blockDim.x;
+            if (index >= tile / 2) break;
+            const uint32_t twiddle = index << (log_n - log_tile + 1);
+            stage_twiddles[index] = static_cast<Word>(twiddles[twiddle]);
+            stage_shoup[index] = raw_ntt_shoup<Word>(shoup[twiddle]);
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < R; ++k)
+        {
+            const uint32_t index = threadIdx.x + k * blockDim.x;
+            Word value =
+                static_cast<Word>(source.load(batch, limb, poly, first + index, columns));
+            if constexpr (Forward)
+            {
+                if (tile == n)
+                    value = raw_ntt_mul(value, static_cast<Word>(twiddles[index]),
+                        raw_ntt_shoup<Word>(shoup[index]), modulus);
+            }
+            values[index] = value;
+        }
+        uint32_t log_span = Forward ? remaining : 0;
+        // A full-radix pass whose stride is at most 32 gives warp w the
+        // groups 32w..32w+31, which cover positions [32 R w, 32 R (w + 1)).
+        // Consecutive such passes stay inside one warp and need no block
+        // barrier, so a shorter pass runs first in the forward transform
+        // (largest stride) and last in the inverse one.
+        constexpr uint32_t log_r = raw_ntt_log2(R);
+        bool previous_local = false;
+        while (remaining != 0)
+        {
+            const uint32_t bits = Forward && remaining % log_r != 0 ? remaining % log_r :
+                (remaining < log_r ? remaining : log_r);
+            const uint32_t log_stride = Forward ? log_span - bits : log_span;
+            const bool local = bits == log_r && log_stride <= 5;
+            raw_ntt_blocked_sync(previous_local && local);
+            previous_local = local;
+            switch (bits)
+            {
+            case 1: raw_ntt_blocked_pass<Forward, 2, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus); break;
+            case 2:
+                if constexpr (R >= 4)
+                    raw_ntt_blocked_pass<Forward, 4, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus);
+                break;
+            case 3:
+                if constexpr (R >= 8)
+                    raw_ntt_blocked_pass<Forward, 8, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus);
+                break;
+            case 4:
+                if constexpr (R >= 16)
+                    raw_ntt_blocked_pass<Forward, 16, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus);
+                break;
+            default:
+                if constexpr (R >= 32)
+                    raw_ntt_blocked_pass<Forward, 32, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus);
+                break;
+            }
+            log_span = Forward ? log_span - bits : log_span + bits;
+            remaining -= bits;
+        }
+        raw_ntt_blocked_sync(false);
+#pragma unroll
+        for (uint32_t k = 0; k < R; ++k)
+        {
+            const uint32_t index = threadIdx.x + k * blockDim.x;
+            Word value = values[index];
+            if constexpr (!Forward)
+            {
+                if (tile == n)
+                {
+                    value = raw_ntt_mul(value, static_cast<Word>(*batch.n_inv[limb]),
+                        raw_ntt_shoup<Word>(*batch.n_inv_shoup[limb]), modulus);
+                    value = raw_ntt_mul(value, static_cast<Word>(twiddles[index]),
+                        raw_ntt_shoup<Word>(shoup[index]), modulus);
+                }
+            }
+            raw_matrix_store(destination, poly, first + index, columns,
+                static_cast<uint64_t>(value));
+        }
+    }
+
+    // The blocked NTT radix, read from MXX_GPU_NTT_RADIX once per process:
+    // a power of two from 2 to 32, 4 when unset, and 0 when invalid.
+    uint32_t configured_ntt_radix()
+    {
+        static const uint32_t radix = [] {
+            const char *text = std::getenv("MXX_GPU_NTT_RADIX");
+            if (!text || !*text) return kDefaultNttRadix;
+            char *end = nullptr;
+            const unsigned long value = std::strtoul(text, &end, 10);
+            const bool valid = *end == '\0' && value >= 2 && value <= kMaxNttRadix &&
+                (value & (value - 1)) == 0;
+            return valid ? static_cast<uint32_t>(value) : 0U;
+        }();
+        return radix;
+    }
+
+    template <bool Forward, typename Source>
+    int launch_raw_ntt_blocked(GpuContext *ctx, cudaStream_t stream, const RawNttBatch &batch,
+        const MxxGraphPatch *patches, size_t patch_count, uint32_t radix, uint32_t n,
+        uint32_t tile, size_t columns, size_t poly_offset, size_t poly_chunk, size_t limbs,
+        const Source &source)
+    {
+        const dim3 grid(n / tile, static_cast<uint32_t>(poly_chunk), static_cast<uint32_t>(limbs));
+        bool narrow = true;
+        for (size_t limb = 0; limb < limbs; ++limb)
+            narrow = narrow && batch.destination[limb].modulus < (uint64_t(1) << 31);
+        const size_t shared =
+            static_cast<size_t>(tile) * 2 * (narrow ? sizeof(uint32_t) : sizeof(uint64_t));
+        // A whole 4096-coefficient ring of 64-bit words takes 64 KiB, above
+        // the default dynamic shared-memory limit of the current device.
+        const auto launch = [&](auto kernel, uint32_t r) {
+            if (shared > 48 * 1024)
+            {
+                const cudaError_t error = cudaFuncSetAttribute(kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared));
+                if (error != cudaSuccess) return set_error(error);
+            }
+            return mxx_gpu_launch_kernel(ctx, stream, kernel, grid, dim3(tile / r), shared,
+                patches, patch_count, batch, columns, n, tile, poly_offset, source);
+        };
+        switch (radix)
+        {
+#define MXX_RAW_NTT_BLOCKED(r) \
+        case r: \
+            return narrow ? launch(raw_ntt_blocked_kernel<Forward, r, uint32_t, Source>, r) : \
+                launch(raw_ntt_blocked_kernel<Forward, r, uint64_t, Source>, r)
+            MXX_RAW_NTT_BLOCKED(2);
+            MXX_RAW_NTT_BLOCKED(4);
+            MXX_RAW_NTT_BLOCKED(8);
+            MXX_RAW_NTT_BLOCKED(16);
+            MXX_RAW_NTT_BLOCKED(32);
+#undef MXX_RAW_NTT_BLOCKED
+        }
+        return set_error("raw blocked NTT has no kernel for this radix");
     }
 
     // Copies of several equal-shape (source, destination) windows, one
@@ -416,9 +642,22 @@ namespace
     // Each block covers `kMulCoefficients` coefficients of one output poly;
     // its `kMulSlices` thread rows split the inner dimension. Products are
     // summed in 128 bits and reduced once per batch that cannot overflow.
+    // A 128-bit value modulo `modulus`, with a 64-bit division when the high
+    // word is zero (small moduli keep a whole dot product in one word).
+    __device__ __forceinline__ unsigned __int128 raw_wide_mod(
+        unsigned __int128 value, uint64_t modulus)
+    {
+        const uint64_t low = static_cast<uint64_t>(value);
+        if (static_cast<uint64_t>(value >> 64) == 0)
+            return low < modulus ? low : low % modulus;
+        return value % modulus;
+    }
+
+    // With `accumulate`, the product is added to `addends` (the destination
+    // itself for an in-place accumulation) before the store.
     __global__ void raw_matrix_mul_kernel(
         RawLimbSet lefts, RawLimbSet rights,
-        RawLimbSet destinations, size_t left_columns,
+        RawLimbSet destinations, RawLimbSet addends, size_t left_columns,
         size_t right_columns, size_t output_columns, size_t output_rows,
         size_t degree, size_t poly_offset, bool accumulate,
         bool transpose_rhs)
@@ -457,11 +696,11 @@ namespace
                 wide += static_cast<unsigned __int128>(lhs) * rhs;
                 if (++pending == batch)
                 {
-                    wide %= modulus;
+                    wide = raw_wide_mod(wide, modulus);
                     pending = 0;
                 }
             }
-            if (batch) sum = static_cast<uint64_t>(wide % modulus);
+            if (batch) sum = static_cast<uint64_t>(raw_wide_mod(wide, modulus));
         }
         partial[threadIdx.y][threadIdx.x] = sum;
         __syncthreads();
@@ -470,7 +709,7 @@ namespace
             sum = add_mod_u64(sum, partial[slice][threadIdx.x], modulus);
         if (accumulate)
             sum = add_mod_u64(sum, raw_matrix_load(
-                destination, output_poly, coefficient, output_columns), modulus);
+                addends.limb[blockIdx.z], output_poly, coefficient, output_columns), modulus);
         raw_matrix_store(destination, output_poly, coefficient, output_columns, sum);
     }
 
@@ -598,9 +837,29 @@ static void raw_limb_set(const MxxRawMatrixView *view, size_t first, size_t limb
     }
 }
 
-extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
+// Whether a ring of dimension n is transformed by one block per polynomial,
+// with no separate launch for the stages above a tile.
+static uint32_t raw_ntt_tile(uint32_t n, uint32_t radix)
+{
+    return n <= kBlockedNttMaxCoefficients && n / std::min(radix, n) <= kBlockedNttMaxThreads ?
+        n : kFusedNttCoefficients;
+}
+
+static bool raw_ntt_whole_ring(uint32_t n)
+{
+    const uint32_t radix = configured_ntt_radix();
+    return radix != 0 && raw_ntt_tile(n, radix) == n;
+}
+
+// The raw NTT of `source` into `destination`. `loader` reads the input
+// coefficients (RawNttMatrixSource reads the source views); a loader other
+// than the default is accepted only for a whole-ring tile, where the input is
+// read once, and `loader_patches` patch its kernel argument.
+template <typename Source>
+static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    int inverse, uint32_t source_binding_base, uint32_t destination_binding_base)
+    int inverse, uint32_t source_binding_base, uint32_t destination_binding_base,
+    const Source &loader, const std::vector<MxxGraphPatch> &loader_patches)
 {
     if (validate_raw_view(ctx, source, stream_raw) != 0 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
@@ -615,7 +874,17 @@ extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
     const size_t poly_count = source->rows * source->columns;
     if (n > kFusedNttCoefficients * 32 || n % kTransformThreads != 0 && n > kFusedNttCoefficients)
         return set_error("raw fused NTT supports ring dimensions up to 32768");
-    const uint32_t tile_size = std::min(n, kFusedNttCoefficients);
+    const uint32_t radix = configured_ntt_radix();
+    if (radix == 0)
+        return set_error("MXX_GPU_NTT_RADIX must be a power of two from 2 to 32");
+    if (n < 2 || (n & (n - 1)) != 0)
+        return set_error("raw NTT ring dimension is not a power of two");
+    // A ring that fits one block is one tile and one launch; a larger ring
+    // runs its stages above a 1024-coefficient tile in the top kernel.
+    const uint32_t tile = raw_ntt_tile(n, radix);
+    if (!std::is_same_v<Source, RawNttMatrixSource> && tile != n)
+        return set_error("a raw NTT operand loader needs a whole-ring tile");
+    const uint32_t tile_radix = std::min(radix, tile);
     // Every transform is one or two launches over all limbs of a batch: a
     // ring above one tile runs its top stages and its local stages, reading
     // the source in the first launch and updating the destination in place.
@@ -668,43 +937,41 @@ extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
             destination_patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
                 destination_offset, sizeof(void *), destination_binding, 0});
         }
+        source_patches.insert(source_patches.end(), loader_patches.begin(), loader_patches.end());
+        Source group_loader = loader;
+        group_loader.first_limb = first;
+        const RawNttMatrixSource matrix_loader{first};
         RawNttBatch in_place = batch;
         for (size_t local = 0; local < limbs; ++local) in_place.source[local] = batch.destination[local];
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
-            const dim3 local_grid(n / tile_size, static_cast<uint32_t>(chunk),
-                static_cast<uint32_t>(limbs));
-            const size_t shared = 2 * tile_size * sizeof(uint64_t);
+            const auto tiles = [&](bool forward, const RawNttBatch &views,
+                                   const std::vector<MxxGraphPatch> &patches,
+                                   const auto &input) {
+                return forward ?
+                    launch_raw_ntt_blocked<true>(ctx, stream, views, patches.data(),
+                        patches.size(), tile_radix, n, tile, source->columns, offset, chunk,
+                        limbs, input) :
+                    launch_raw_ntt_blocked<false>(ctx, stream, views, patches.data(),
+                        patches.size(), tile_radix, n, tile, source->columns, offset, chunk,
+                        limbs, input);
+            };
             int status = 0;
-            if (n <= kFusedNttCoefficients)
+            if (tile == n)
             {
-                status = inverse ?
-                    mxx_gpu_launch_kernel(ctx, stream, raw_ntt_fused_local_kernel<false>,
-                        local_grid, dim3(kTransformThreads), shared, source_patches.data(),
-                        source_patches.size(), batch, static_cast<size_t>(source->columns), n,
-                        tile_size, offset) :
-                    mxx_gpu_launch_kernel(ctx, stream, raw_ntt_fused_local_kernel<true>,
-                        local_grid, dim3(kTransformThreads), shared, source_patches.data(),
-                        source_patches.size(), batch, static_cast<size_t>(source->columns), n,
-                        tile_size, offset);
+                status = tiles(!inverse, batch, source_patches, group_loader);
             }
             else if (!inverse)
             {
                 status = launch_raw_ntt_top<true>(ctx, stream, batch, source_patches.data(),
                     source_patches.size(), limbs, n, source->columns, offset, chunk);
                 if (status == 0)
-                    status = mxx_gpu_launch_kernel(ctx, stream, raw_ntt_fused_local_kernel<true>,
-                        local_grid, dim3(kTransformThreads), shared, destination_patches.data(),
-                        destination_patches.size(), in_place,
-                        static_cast<size_t>(source->columns), n, tile_size, offset);
+                    status = tiles(true, in_place, destination_patches, matrix_loader);
             }
             else
             {
-                status = mxx_gpu_launch_kernel(ctx, stream, raw_ntt_fused_local_kernel<false>,
-                    local_grid, dim3(kTransformThreads), shared, source_patches.data(),
-                    source_patches.size(), batch, static_cast<size_t>(source->columns), n,
-                    tile_size, offset);
+                status = tiles(false, batch, source_patches, matrix_loader);
                 if (status == 0)
                     status = launch_raw_ntt_top<false>(ctx, stream, in_place,
                         destination_patches.data(), destination_patches.size(), limbs, n,
@@ -714,6 +981,41 @@ extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
         }
     }
     return 0;
+}
+
+extern "C" int gpu_context_ntt_tables(GpuContext *ctx, const MxxRawMatrixView *view,
+    MxxNttTables *out_tables)
+{
+    if (!ctx || !view || !out_tables || (view->limb_count && !view->limbs))
+        return set_error("invalid NTT table query");
+    for (size_t limb = 0; limb < view->limb_count; ++limb)
+    {
+        const uint32_t crt = view->limbs[limb].crt_limb_index;
+        if (crt >= ctx->limb_gpu_ids.size()) return set_error("NTT table limb is out of range");
+        const dim3 partition = ctx->limb_gpu_ids[crt];
+        if (partition.x >= ctx->ntt_device_constants.size())
+            return set_error("missing NTT device constants");
+        const auto &constants = ctx->ntt_device_constants[partition.x];
+        if (constants.device != view->physical_device || partition.y >= constants.limb_count ||
+            constants.ring_dimension != view->degree || !constants.twiddle_forward ||
+            !constants.twiddle_inverse || !constants.twiddle_shoup_forward ||
+            !constants.twiddle_shoup_inverse || !constants.n_inv || !constants.n_inv_shoup)
+            return set_error("invalid NTT device constants");
+        const size_t table = static_cast<size_t>(partition.y) * view->degree;
+        out_tables[limb] = MxxNttTables{constants.twiddle_forward + table,
+            constants.twiddle_shoup_forward + table, constants.twiddle_inverse + table,
+            constants.twiddle_shoup_inverse + table, constants.n_inv + partition.y,
+            constants.n_inv_shoup + partition.y};
+    }
+    return 0;
+}
+
+extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
+    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+    int inverse, uint32_t source_binding_base, uint32_t destination_binding_base)
+{
+    return raw_matrix_ntt(ctx, stream_raw, source, destination, inverse, source_binding_base,
+        destination_binding_base, RawNttMatrixSource{0}, {});
 }
 
 extern "C" int gpu_raw_matrix_add_sub(GpuContext *ctx, void *stream_raw,
@@ -890,11 +1192,12 @@ static int raw_matrix_mul_impl(GpuContext *ctx, void *stream_raw,
     for (size_t first = 0; first < left->limb_count; first += kRawNttLimbs)
     {
         const size_t limbs = std::min(kRawNttLimbs, left->limb_count - first);
-        RawLimbSet lefts{}, rights{}, destinations{};
+        RawLimbSet lefts{}, rights{}, destinations{}, addends{};
         std::vector<MxxGraphPatch> patches;
         raw_limb_set(left, first, limbs, 0, left_binding_base, lefts, patches);
         raw_limb_set(right, first, limbs, 1, right_binding_base, rights, patches);
         raw_limb_set(destination, first, limbs, 2, destination_binding_base, destinations, patches);
+        raw_limb_set(destination, first, limbs, 3, destination_binding_base, addends, patches);
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
@@ -903,7 +1206,7 @@ static int raw_matrix_mul_impl(GpuContext *ctx, void *stream_raw,
                 static_cast<uint32_t>(chunk), static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_mul_kernel,
                 grid, dim3(kMulCoefficients, kMulSlices), 0, patches.data(), patches.size(),
-                lefts, rights, destinations,
+                lefts, rights, destinations, addends,
                 left->columns, right->columns, destination->columns,
                 destination->rows,
                 static_cast<size_t>(destination->degree), offset,

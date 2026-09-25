@@ -2924,15 +2924,22 @@ extern "C"
         const void *function, uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
         uint32_t block_x, uint32_t block_y, uint32_t block_z, size_t shared_bytes,
         void **arguments, const size_t *argument_sizes, size_t argument_count,
-        const MxxGraphPatch *patches, size_t patch_count)
+        const MxxGraphPatch *patches, size_t patch_count, int cooperative)
     {
-        if (!ctx || !stream || !function) return set_error("invalid kernel dispatch");
+        if (!ctx || !stream || !function || (cooperative != 0 && cooperative != 1))
+            return set_error("invalid kernel dispatch");
         if (auto *builder = mxx_gpu_graph_builder_for_stream(ctx, stream))
         {
-            return mxx_gpu_graph_builder_add_kernel(builder, function, grid_x, grid_y,
-                grid_z, block_x, block_y, block_z, shared_bytes,
+            const int status = mxx_gpu_graph_builder_add_kernel(builder, function, grid_x,
+                grid_y, grid_z, block_x, block_y, block_z, shared_bytes,
                 const_cast<const void *const *>(arguments), argument_sizes,
                 argument_count, patches, patch_count);
+            if (status != 0 || !cooperative) return status;
+            cudaLaunchAttributeValue value{};
+            value.cooperative = 1;
+            const cudaError_t error = cudaGraphKernelNodeSetAttribute(
+                builder->operation_nodes.back(), cudaLaunchAttributeCooperative, &value);
+            return error == cudaSuccess ? 0 : set_error(error);
         }
         {
             auto &owner = *ctx->execution;
@@ -2940,9 +2947,13 @@ extern "C"
             if (owner.explicit_builder)
                 return set_error("kernel dispatch escaped the active explicit graph operation");
         }
-        const cudaError_t error = cudaLaunchKernel(function,
-            dim3(grid_x, grid_y, grid_z), dim3(block_x, block_y, block_z),
-            arguments, shared_bytes, reinterpret_cast<cudaStream_t>(stream));
+        const cudaError_t error = cooperative ?
+            cudaLaunchCooperativeKernel(function, dim3(grid_x, grid_y, grid_z),
+                dim3(block_x, block_y, block_z), arguments, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)) :
+            cudaLaunchKernel(function, dim3(grid_x, grid_y, grid_z),
+                dim3(block_x, block_y, block_z), arguments, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream));
         return error == cudaSuccess ? 0 : set_error(error);
     }
 

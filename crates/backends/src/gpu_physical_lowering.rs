@@ -24,6 +24,7 @@ use crate::{
         lower_control_node, pack_resident_family, static_family_member,
     },
     gpu_schedule::GpuColumnInterval,
+    gpu_subgraph_kernel::GpuSubgraphKernel,
     matrix::gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix, GpuSmallMatrixOutputDescriptor},
     poly::{
         PolyParams,
@@ -1411,6 +1412,8 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// Errors are first-wins and each replay resets it once, instead of one
     /// host reset and readback per operation.
     pub integer_status: &'a mut BTreeMap<i32, PhysicalValueId>,
+    /// Kernels that execute registered subgraphs; a call names one by index.
+    pub subgraph_kernels: &'a [GpuSubgraphKernel],
 }
 
 /// Reserve one reusable lane input for a selected artifact member. The caller
@@ -4927,6 +4930,7 @@ pub(super) fn lower_preimage_sample_node(
                 crt_resource_next: &mut *ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                subgraph_kernels: ctx.subgraph_kernels,
             };
             let p2_seed = derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 0)?;
             let (p2_coeff, p2_eval) = emit_fresh_matrix_sample_parts(
@@ -5443,6 +5447,7 @@ pub(crate) fn plan_physical_graph(
     inputs: &BTreeMap<String, RuntimeValue>,
     integer_input_ranges: &BTreeMap<String, RangeInclusive<BigInt>>,
     artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
+    subgraph_kernels: &[GpuSubgraphKernel],
 ) -> Result<PhysicalFrame, String> {
     let device = i32::try_from(
         *logical
@@ -5918,6 +5923,7 @@ pub(crate) fn plan_physical_graph(
                 crt_resource_next: &mut crt_resource_next,
                 converted: &mut converted,
                 integer_status: &mut integer_status,
+                subgraph_kernels,
             }
         };
     }
@@ -6734,6 +6740,7 @@ pub(crate) fn plan_physical_graph(
         operations: operations.into_boxed_slice(),
         bindings: bindings.into_boxed_slice(),
         export_slots: reserve_gpu_export_slots(slot_ranges).map_err(str::to_owned)?,
+        subgraph_kernels: subgraph_kernels.to_vec().into_boxed_slice(),
     };
     program.validate().map_err(str::to_owned)?;
     Ok(PhysicalFrame {
@@ -6847,6 +6854,9 @@ mod tests {
                 (*magnitude_bytes + 1) as u64,
             ]
         );
+        for event in owner.ready_events() {
+            event.wait().unwrap();
+        }
         let mut bytes = vec![0u8; storage.bytes as usize];
         parameters.download_device_bytes(device, storage.address, &mut bytes).unwrap();
         assert_eq!(view.element_bytes, 1);
@@ -7051,6 +7061,9 @@ mod tests {
                 panic!("compact output has multiple parts")
             };
             let storage = owner.storage(part.storage).unwrap();
+            for event in owner.ready_events() {
+                event.wait().unwrap();
+            }
             let mut actual = vec![0u8; storage.bytes as usize];
             destination_gpu.download_device_bytes(device, storage.address, &mut actual).unwrap();
             assert_eq!(actual, expected);
@@ -7623,6 +7636,9 @@ mod tests {
                 panic!("GPU bounded hash has more than one compact part");
             };
             let storage = owner.storage(part.storage).expect("compact payload storage");
+            for event in owner.ready_events() {
+                event.wait().unwrap();
+            }
             let mut actual = vec![0u8; storage.bytes as usize];
             gpu.download_device_bytes(device, storage.address, &mut actual).unwrap();
             actual

@@ -509,6 +509,7 @@ name = "mxx-fhe"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "cc",
  "mxx-backends",
  "mxx-dsl",
  "mxx-ir-core",

@@ -24,8 +24,9 @@ use crate::{
 mod fleet;
 pub use fleet::GpuDcrtBackend;
 pub(crate) use fleet::{
-    GpuPreparedNativeResources, PhysicalExport, emit_compiled_gpu_op, physical_raw_matrix_view,
-    prepare_compiled_gpu_program, transcode_raw_artifact,
+    GpuPreparedNativeResources, PhysicalExport, emit_compiled_gpu_op,
+    emit_compiled_monomial_difference, emit_compiled_small_rhs_sum, emit_compiled_subgraph_kernel,
+    physical_raw_matrix_view, prepare_compiled_gpu_program, transcode_raw_artifact,
 };
 
 impl GpuDcrtBackend {

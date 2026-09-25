@@ -27,6 +27,7 @@ use crate::{
         register_preimage_control_binding, root_matrix_operation_identity, trapdoor_leaf_types,
         value_id,
     },
+    gpu_subgraph_kernel::GpuKernelOperandKind,
     poly::{
         PolyParams,
         dcrt::{
@@ -1591,6 +1592,11 @@ pub(super) fn lower_control_node(
             Ok(())
         }
         NodeKind::SubgraphCall(call) => {
+            if let Some(kernel) =
+                ctx.subgraph_kernels.iter().position(|kernel| kernel.name == call.definition)
+            {
+                return lower_subgraph_kernel(ctx, scope, scope_id, node_id, node, env, kernel);
+            }
             let child_id = graph
                 .child_scope_id(scope_id, node_id)
                 .ok_or_else(|| "GPU subgraph call has no child scope".to_owned())?;
@@ -2243,6 +2249,7 @@ fn lower_lazy_int_expr_select(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
             let value = lower_device_int_expr_mode(&mut body_ctx, branch, env, true)?;
@@ -2301,6 +2308,7 @@ fn lower_lazy_int_expr_select(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
             emit_integer_operation(
@@ -2752,6 +2760,217 @@ fn emit_indexed_matrix_choice(
     });
     ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: ty.columns }, operation)]);
     Ok(output)
+}
+
+/// A subgraph call executed by its registered kernel `kernel_index`: one
+/// operation over the call's arguments (captures last) whose results are
+/// evaluation-domain matrices; the subgraph body is not lowered. A matrix
+/// family argument is passed as an indexed member table refreshed before
+/// each launch, like a dynamic member read.
+fn lower_subgraph_kernel(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    node: &NodeHandle,
+    env: &ParamEnv,
+    kernel_index: usize,
+) -> Result<(), String> {
+    let kernel = ctx.subgraph_kernels[kernel_index].clone();
+    let name = &kernel.name;
+    let arguments = scope.arguments(node).ok_or("GPU subgraph kernel argument is out of scope")?;
+    let output_types = node
+        .output_types()
+        .iter()
+        .map(|ty| {
+            concretize_wire_type(
+                ty,
+                env,
+                scope_id,
+                node_id,
+                crate::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if arguments.len() != kernel.inputs.len() || output_types.len() != kernel.outputs.len() {
+        return Err(format!(
+            "subgraph kernel {name} takes {} operands and {} results; the call has {} and {}",
+            kernel.inputs.len(),
+            kernel.outputs.len(),
+            arguments.len(),
+            output_types.len()
+        ));
+    }
+    let mut predecessors = std::collections::BTreeSet::new();
+    // (kind, value, part or table resource, binding) per operand.
+    let mut operands = Vec::with_capacity(arguments.len() + output_types.len());
+    for (position, (wire, kind)) in arguments.iter().zip(&kernel.inputs).enumerate() {
+        let id = *ctx
+            .wire_ids
+            .get(wire)
+            .ok_or_else(|| format!("subgraph kernel {name} operand {position} is missing"))?;
+        let ty = ctx.values[id.0 as usize].ty.clone();
+        let mismatch = || format!("subgraph kernel {name} operand {position} is not a {kind:?}");
+        match (kind, &ty) {
+            (GpuKernelOperandKind::Matrix, ConcreteWireType::Matrix(_)) => {
+                let id = full_eval_value(ctx, id)?;
+                predecessors.extend(all_predecessors(ctx.producer, id));
+                let binding = register_bindings(ctx.bindings, ctx.values, id)?;
+                operands.push((0, id, 0, binding));
+            }
+            (
+                GpuKernelOperandKind::Integer,
+                ConcreteWireType::Int | ConcreteWireType::ConstantInt,
+            ) |
+            (GpuKernelOperandKind::IntegerFamily, ConcreteWireType::IndexedFamily { .. }) => {
+                let value = &ctx.values[id.0 as usize];
+                let integer_family = matches!(
+                    &ty,
+                    ConcreteWireType::IndexedFamily { element, .. }
+                        if matches!(element.as_ref(), ConcreteWireType::Int)
+                );
+                if (*kind == GpuKernelOperandKind::IntegerFamily && !integer_family) ||
+                    value.parts.len() != 1 ||
+                    !matches!(value.encodings.as_ref(), [PhysicalEncoding::Signed(_)])
+                {
+                    return Err(mismatch());
+                }
+                predecessors.extend(all_predecessors(ctx.producer, id));
+                let binding = scalar_binding(ctx, id)?;
+                let code = if *kind == GpuKernelOperandKind::Integer { 2 } else { 3 };
+                operands.push((code, id, 0, binding));
+            }
+            (
+                GpuKernelOperandKind::MatrixFamily,
+                ConcreteWireType::IndexedFamily { element, count },
+            ) if matches!(element.as_ref(), ConcreteWireType::Matrix(_)) => {
+                let source = Arc::clone(
+                    ctx.owners
+                        .get(&id)
+                        .ok_or_else(|| format!("subgraph kernel {name} family has no owner"))?,
+                );
+                if *count == 0 ||
+                    source.physical().encodings.as_ref() != [PhysicalEncoding::FullEval]
+                {
+                    return Err(format!(
+                        "subgraph kernel {name} operand {position} needs evaluation-domain members"
+                    ));
+                }
+                let mut members = Vec::with_capacity(*count);
+                for member_index in 0..*count {
+                    let selected = static_family_member(&source, member_index)?;
+                    let member = value_id(ctx.values.len())?;
+                    ctx.values.push(selected.physical().as_ref().clone());
+                    ctx.owners.insert(member, selected);
+                    let writers = ctx
+                        .family_member_producers
+                        .get(&(id, member_index))
+                        .cloned()
+                        .unwrap_or_else(|| ctx.producer.get(&id).cloned().unwrap_or_default());
+                    predecessors.extend(writers.iter().map(|(_, operation)| *operation));
+                    ctx.producer.insert(member, writers);
+                    members.push(member);
+                }
+                let layout = physical_raw_matrix_view(
+                    &ctx.owners[&members[0]],
+                    0,
+                    PhysicalEncoding::FullEval,
+                )
+                .map_err(|error| error.to_string())?;
+                let ConcreteWireType::Matrix(member_ty) = element.as_ref() else {
+                    return Err(mismatch());
+                };
+                let params = ctx.backend.physical_matrix_parameters(member_ty, ctx.device)?;
+                let stream =
+                    params.native_launch_stream(ctx.device).map_err(|error| error.to_string())?;
+                let table = Arc::new(
+                    GpuIndexedMatrixTable::new(&params, &stream, members.len(), &layout)
+                        .map_err(|error| error.to_string())?,
+                );
+                let resource_id = u32::try_from(ctx.indexed_tables.len())
+                    .map_err(|_| "too many GPU indexed matrix tables".to_owned())?;
+                ctx.indexed_tables.push(IndexedMatrixTableReplay {
+                    resource_id,
+                    candidates: members.iter().copied().map(|member| (member, 0)).collect(),
+                    encoding: PhysicalEncoding::FullEval,
+                    table,
+                });
+                operands.push((1, id, resource_id, 0));
+            }
+            _ => return Err(mismatch()),
+        }
+    }
+    let mut outputs = Vec::with_capacity(output_types.len());
+    for (position, (ty, kind)) in output_types.iter().zip(&kernel.outputs).enumerate() {
+        let (GpuKernelOperandKind::Matrix, ConcreteWireType::Matrix(ty)) = (kind, ty) else {
+            return Err(format!("subgraph kernel {name} result {position} is not a matrix"));
+        };
+        let output = allocate_scratch_matrix(ctx, ty, PhysicalEncoding::FullEval)?;
+        let binding = register_bindings(ctx.bindings, ctx.values, output)?;
+        operands.push((0, output, 0, binding));
+        outputs.push((output, ty.columns));
+    }
+    let status = allocate_integer_status(ctx)?;
+    let status_binding = scalar_binding(ctx, status)?;
+    // The scratch buffer is the first limb of a one-column matrix on the
+    // results' ring, tall enough for the registered size.
+    let (scratch, scratch_binding) = if kernel.scratch_bytes == 0 {
+        (status, status_binding)
+    } else {
+        let ConcreteWireType::Matrix(ty) = &output_types[0] else {
+            return Err(format!("subgraph kernel {name} has no matrix result"));
+        };
+        let row_bytes = u64::from(ty.ring.ring_dimension()) * 4;
+        let rows = usize::try_from(kernel.scratch_bytes.div_ceil(row_bytes))
+            .map_err(|_| format!("subgraph kernel {name} scratch is too large"))?;
+        let scratch_ty = ConcreteMatrixType { ring: ty.ring.clone(), rows, columns: 1 };
+        let scratch = allocate_scratch_matrix(ctx, &scratch_ty, PhysicalEncoding::FullEval)?;
+        (scratch, register_bindings(ctx.bindings, ctx.values, scratch)?)
+    };
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::subgraph_kernel(operands.len(), outputs.len()))
+        .map_err(str::to_owned)?;
+    let mut kernel_arguments = vec![
+        KernelArg::U32(
+            u32::try_from(kernel_index).map_err(|_| "too many subgraph kernels".to_owned())?,
+        ),
+        KernelArg::U32(
+            u32::try_from(arguments.len()).map_err(|_| "too many subgraph operands".to_owned())?,
+        ),
+        KernelArg::Value(scratch),
+        KernelArg::U32(scratch_binding),
+        KernelArg::Value(status),
+        KernelArg::U32(status_binding),
+    ];
+    for (code, id, part, binding) in &operands {
+        kernel_arguments.extend([
+            KernelArg::U32(*code),
+            KernelArg::Value(*id),
+            KernelArg::U32(*part),
+            KernelArg::U32(*binding),
+        ]);
+    }
+    let operation = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU subgraph kernel operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: kernel_arguments.into_boxed_slice(),
+        outputs: outputs.iter().map(|(output, _)| *output).collect(),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors: predecessors.into_iter().collect(),
+        body: None,
+    });
+    for (port, (output, columns)) in outputs.into_iter().enumerate() {
+        ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: columns }, operation)]);
+        let port = Port(u32::try_from(port).map_err(|_| "too many subgraph results".to_owned())?);
+        ctx.wire_ids.insert(WireRef { node: node_id, port }, output);
+    }
+    Ok(())
 }
 
 fn trapdoor_member_leaf(
@@ -5749,6 +5968,109 @@ fn copy_matrix_to(
     Ok(vec![index])
 }
 
+/// Let the one operation that writes a matrix carry's new value write it
+/// straight into the carried storage, so no copy follows the loop body. This
+/// holds when that operation alone writes the new value's allocation, every
+/// other body operation reading the carried value precedes it, and it reads
+/// the carried value only at the positions it writes (an elementwise addition
+/// or subtraction).
+fn write_carry_in_place(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    output: PhysicalValueId,
+    carried: PhysicalValueId,
+) -> Result<bool, String> {
+    let (output_value, carried_value) =
+        (&ctx.values[output.0 as usize], &ctx.values[carried.0 as usize]);
+    let Some(matrix) = output_value.ty.matrix_type() else { return Ok(false) };
+    if output_value.ty != carried_value.ty ||
+        output_value.encodings.as_ref() != [PhysicalEncoding::FullEval] ||
+        carried_value.encodings != output_value.encodings ||
+        output_value.parts.len() != carried_value.parts.len() ||
+        output_value
+            .parts
+            .iter()
+            .zip(carried_value.parts.iter())
+            .any(|(new, old)| new.view != old.view || new.device != old.device)
+    {
+        return Ok(false);
+    }
+    let Some([(range, writer)]) = ctx.producer.get(&output).map(Vec::as_slice) else {
+        return Ok(false);
+    };
+    if range.start != 0 || range.end != matrix.columns {
+        return Ok(false);
+    }
+    let writer = *writer as usize;
+    let storage = |id: PhysicalValueId| {
+        ctx.owners.get(&id).and_then(|owner| {
+            let mut storages = owner.storages();
+            let (_, bound) = storages.next()?;
+            storages.next().is_none().then(|| bound.clone())
+        })
+    };
+    let (Some(new), Some(old)) = (storage(output), storage(carried)) else { return Ok(false) };
+    if new.bytes != old.bytes || new.device != old.device {
+        return Ok(false);
+    }
+    // Every value viewing one allocation.
+    let viewing = |bound: &BoundStorage| {
+        ctx.owners
+            .iter()
+            .filter(|(_, owner)| {
+                owner.storages().any(|(_, other)| Arc::ptr_eq(&other.owner, &bound.owner))
+            })
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>()
+    };
+    let (output_views, carried_views) = (viewing(&new), viewing(&old));
+    fn reads(op: &CompiledGpuOp, values: &BTreeSet<PhysicalValueId>) -> bool {
+        op.arguments.iter().any(|argument| {
+            matches!(argument, KernelArg::Value(id) | KernelArg::OptionalValue(Some(id))
+                if values.contains(id))
+        }) || op.body.iter().flatten().any(|inner| reads(inner, values))
+    }
+    fn writes(op: &CompiledGpuOp, values: &BTreeSet<PhysicalValueId>) -> bool {
+        op.outputs.iter().any(|id| values.contains(id)) ||
+            op.body.iter().flatten().any(|inner| writes(inner, values))
+    }
+    let mut ancestors = BTreeSet::new();
+    let mut pending = ctx.operations[writer].predecessors.to_vec();
+    while let Some(index) = pending.pop() {
+        if ancestors.insert(index) {
+            pending.extend_from_slice(&ctx.operations[index as usize].predecessors);
+        }
+    }
+    for (index, op) in ctx.operations.iter().enumerate() {
+        if index == writer {
+            continue;
+        }
+        if writes(op, &output_views) ||
+            (!ancestors.contains(&(index as u32)) && reads(op, &carried_views))
+        {
+            return Ok(false);
+        }
+    }
+    let writer_op = &ctx.operations[writer];
+    if reads(writer_op, &carried_views) &&
+        !matches!(
+            ctx.implementations.resolve(writer_op.implementation).map(|kind| &kind.primitive),
+            Ok(crate::gpu_execution_plan::GpuNativePrimitive::MatrixAdd |
+                crate::gpu_execution_plan::GpuNativePrimitive::MatrixSub)
+        )
+    {
+        return Ok(false);
+    }
+    // Every view of the new value's allocation now binds the carried one.
+    let replaced = std::collections::HashMap::from([(Arc::as_ptr(&new.owner).cast::<()>(), old)]);
+    for id in output_views {
+        let owner = &ctx.owners[&id];
+        if let Some(rebound) = owner.rebound(&replaced, owner.ready_events())? {
+            ctx.owners.insert(id, Arc::new(rebound));
+        }
+    }
+    Ok(true)
+}
+
 /// An Int carry, scalar or a family of Ints, sized by its range over every
 /// iteration.
 fn is_integer_carry(ty: &ConcreteWireType) -> bool {
@@ -6239,6 +6561,7 @@ fn lower_sequential_loop(
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
+                subgraph_kernels: ctx.subgraph_kernels,
                 hash_resources: ctx.hash_resources,
             };
             let outputs = lower_inlined_child(
@@ -6285,6 +6608,13 @@ fn lower_sequential_loop(
                 }
             } else {
                 for (position, output) in outputs.iter().copied().enumerate() {
+                    // An external-I/O body keeps its carried-state copy tail,
+                    // which the host relaunches around each selected import.
+                    if body_ctx.external_io_imports.is_empty() &&
+                        write_carry_in_place(&mut body_ctx, output, input_ids[position])?
+                    {
+                        continue;
+                    }
                     carry_copy_ops.extend(copy_carry_to(
                         &mut body_ctx,
                         output,
@@ -7931,6 +8261,47 @@ mod tests {
             assert!(family.ready_events().is_empty());
             assert!(static_family_member(&family, 0).is_err());
         }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_subgraph_kernel_with_other_operands_is_a_planning_error() {
+        use crate::gpu_subgraph_kernel::{GpuKernelOperandKind, GpuSubgraphKernel};
+        use mxx_dsl::{Int, IntType, Subgraph};
+
+        unsafe extern "C" fn unused_entry(_launch: *const std::ffi::c_void) -> std::ffi::c_int {
+            1
+        }
+        let device = detected_gpu_device_ids()[0];
+        let params = DCRTPolyParams::new(32, 2, 50, 8, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(32, params.to_crt().0, 8, None);
+        let increment = Subgraph::<Int, Int>::define("test.increment", IntType, |value| {
+            Ok(value.add(Int::constant(1)))
+        })
+        .unwrap();
+        let context = DslContext::new("subgraph-kernel-mismatch");
+        let value = context.input("value", IntType).unwrap();
+        let validated = context
+            .output("sum", increment.call(value).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device])).unwrap();
+        // A kernel registered under the subgraph's name for matrix operands.
+        runtime.options_mut().subgraph_kernels.push(GpuSubgraphKernel {
+            name: "test.increment".into(),
+            inputs: vec![GpuKernelOperandKind::Matrix],
+            outputs: vec![GpuKernelOperandKind::Matrix],
+            parameters: Vec::new(),
+            scratch_bytes: 0,
+            entry: unused_entry,
+        });
+        let inputs = BTreeMap::from([("value".to_owned(), RuntimeValue::Int(BigInt::from(2)))]);
+        let error = runtime.plan(validated, &inputs).err().expect("mismatched kernel");
+        assert!(error.to_string().contains("subgraph kernel test.increment"), "{error}");
     }
 
     #[test]

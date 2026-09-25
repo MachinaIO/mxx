@@ -163,13 +163,19 @@ namespace
     // Multiplying by X^k in the evaluation domain scales slot s by X^k's
     // value there. The forward NTT twists by psi^i and leaves slot s in
     // bit-reversed order, so X evaluates to psi^(2 rev(s) + 1) and X^k to
-    // psi^(k (2 rev(s) + 1) mod 2n), where psi^(n + t) = -psi^t.
-    __global__ void raw_monomial_multiply_kernel(
-        MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
-        const uint64_t *twiddles, const uint64_t *shoup,
+    // psi^(k (2 rev(s) + 1) mod 2n), where psi^(n + t) = -psi^t. One launch
+    // covers up to kRawNttLimbs CRT limbs; blockIdx.y picks the limb. With
+    // `subtract_source` it writes X^k a - a, the CMUX difference, in the
+    // same pass.
+    __global__ void raw_monomial_multiply_kernel(RawNttBatch batch,
         const uint64_t *exponent_value, int exponent_encoding, uint32_t *status,
-        size_t columns, size_t degree, uint32_t log_degree, size_t polynomial_count)
+        size_t columns, size_t degree, uint32_t log_degree, size_t polynomial_count,
+        bool subtract_source)
     {
+        const MxxRawMatrixLimb &source = batch.source[blockIdx.y];
+        const MxxRawMatrixLimb &destination = batch.destination[blockIdx.y];
+        const uint64_t *twiddles = batch.twiddles[blockIdx.y];
+        const uint64_t *shoup = batch.shoup[blockIdx.y];
         __shared__ uint64_t exponent;
         __shared__ bool valid;
         if (threadIdx.x == 0)
@@ -187,11 +193,14 @@ namespace
             const size_t poly = item / degree;
             const uint32_t slot = static_cast<uint32_t>(item % degree);
             const uint64_t reversed = log_degree ? __brev(slot) >> (32 - log_degree) : 0;
-            const uint64_t power = (exponent * (2 * reversed + 1)) % (2ULL * degree);
+            // The degree is a power of two, so the reduction mod 2n is a mask.
+            const uint64_t power = (exponent * (2 * reversed + 1)) & (2ULL * degree - 1);
             const size_t index = power < degree ? power : power - degree;
-            uint64_t value = mul_mod_shoup_u64(raw_matrix_load(source, poly, slot, columns),
-                twiddles[index], shoup[index], destination.modulus);
+            const uint64_t input = raw_matrix_load(source, poly, slot, columns);
+            uint64_t value =
+                mul_mod_shoup_u64(input, twiddles[index], shoup[index], destination.modulus);
             if (power >= degree && value != 0) value = destination.modulus - value;
+            if (subtract_source) value = sub_mod_u64(value, input, destination.modulus);
             raw_matrix_store(destination, poly, slot, columns, value);
         }
     }
@@ -279,12 +288,13 @@ extern "C" int gpu_raw_ring_automorphism(GpuContext *ctx, void *stream_raw,
 extern "C" int gpu_raw_monomial_multiply(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     const void *exponent_value, int exponent_encoding, uint32_t *status,
-    uint32_t source_binding_base, uint32_t destination_binding_base,
+    int subtract_source, uint32_t source_binding_base, uint32_t destination_binding_base,
     uint32_t exponent_binding, uint32_t status_binding)
 {
     if (validate_raw_view(ctx, source, stream_raw) != 0 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
         !exponent_value || !status || exponent_encoding < 0 || exponent_encoding == 2 ||
+        (subtract_source != 0 && subtract_source != 1) ||
         source->physical_device != destination->physical_device ||
         source->degree != destination->degree ||
         source->rows != destination->rows ||
@@ -303,37 +313,48 @@ extern "C" int gpu_raw_monomial_multiply(GpuContext *ctx, void *stream_raw,
     const size_t count = source->rows * source->columns * degree;
     const uint32_t grid = static_cast<uint32_t>(std::min<size_t>((count + 255) / 256, 65535));
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
-    for (size_t limb = 0; limb < source->limb_count; ++limb)
+    for (size_t first = 0; first < source->limb_count; first += kRawNttLimbs)
     {
-        const auto &source_limb = source->limbs[limb];
-        const auto &destination_limb = destination->limbs[limb];
-        if (source_limb.crt_limb_index != destination_limb.crt_limb_index ||
-            source_limb.modulus != destination_limb.modulus)
-            return set_error("raw monomial multiplication requires matching CRT views");
-        const dim3 partition = ctx->limb_gpu_ids[source_limb.crt_limb_index];
-        if (partition.x >= ctx->ntt_device_constants.size())
-            return set_error("missing raw monomial NTT constants");
-        const auto &constants = ctx->ntt_device_constants[partition.x];
-        if (constants.device != source->physical_device || partition.y >= constants.limb_count ||
-            constants.ring_dimension != degree || !constants.twiddle_forward ||
-            !constants.twiddle_shoup_forward)
-            return set_error("invalid raw monomial NTT constants");
-        const size_t table = static_cast<size_t>(partition.y) * degree;
-        const MxxGraphPatch patches[] = {
-            raw_remaining_patch(0, offsetof(MxxRawMatrixLimb, address),
-                source_binding_base + limb),
-            raw_remaining_patch(1, offsetof(MxxRawMatrixLimb, address),
-                destination_binding_base + limb),
-            raw_remaining_patch(4, 0, exponent_binding),
-            raw_remaining_patch(6, 0, status_binding),
-        };
+        const size_t limbs = std::min(kRawNttLimbs, source->limb_count - first);
+        RawNttBatch batch{};
+        std::vector<MxxGraphPatch> patches;
+        for (size_t local = 0; local < limbs; ++local)
+        {
+            const size_t limb = first + local;
+            const auto &source_limb = source->limbs[limb];
+            const auto &destination_limb = destination->limbs[limb];
+            if (source_limb.crt_limb_index != destination_limb.crt_limb_index ||
+                source_limb.modulus != destination_limb.modulus)
+                return set_error("raw monomial multiplication requires matching CRT views");
+            const dim3 partition = ctx->limb_gpu_ids[source_limb.crt_limb_index];
+            if (partition.x >= ctx->ntt_device_constants.size())
+                return set_error("missing raw monomial NTT constants");
+            const auto &constants = ctx->ntt_device_constants[partition.x];
+            if (constants.device != source->physical_device ||
+                partition.y >= constants.limb_count || constants.ring_dimension != degree ||
+                !constants.twiddle_forward || !constants.twiddle_shoup_forward)
+                return set_error("invalid raw monomial NTT constants");
+            const size_t table = static_cast<size_t>(partition.y) * degree;
+            batch.source[local] = source_limb;
+            batch.destination[local] = destination_limb;
+            batch.twiddles[local] = constants.twiddle_forward + table;
+            batch.shoup[local] = constants.twiddle_shoup_forward + table;
+            patches.push_back(raw_remaining_patch(0,
+                static_cast<uint32_t>(offsetof(RawNttBatch, source) +
+                    local * sizeof(MxxRawMatrixLimb) + offsetof(MxxRawMatrixLimb, address)),
+                static_cast<uint32_t>(source_binding_base + limb)));
+            patches.push_back(raw_remaining_patch(0,
+                static_cast<uint32_t>(offsetof(RawNttBatch, destination) +
+                    local * sizeof(MxxRawMatrixLimb) + offsetof(MxxRawMatrixLimb, address)),
+                static_cast<uint32_t>(destination_binding_base + limb)));
+        }
+        patches.push_back(raw_remaining_patch(1, 0, exponent_binding));
+        patches.push_back(raw_remaining_patch(3, 0, status_binding));
         const int result = mxx_gpu_launch_kernel(ctx, stream,
-            raw_monomial_multiply_kernel, dim3(grid), dim3(256), 0,
-            patches, std::size(patches), source_limb, destination_limb,
-            constants.twiddle_forward + table, constants.twiddle_shoup_forward + table,
-            exponent_value, exponent_encoding, status,
+            raw_monomial_multiply_kernel, dim3(grid, static_cast<uint32_t>(limbs)), dim3(256), 0,
+            patches.data(), patches.size(), batch, exponent_value, exponent_encoding, status,
             static_cast<size_t>(source->columns), degree, log_degree,
-            static_cast<size_t>(source->rows * source->columns));
+            static_cast<size_t>(source->rows * source->columns), subtract_source != 0);
         if (result != 0) return result;
     }
     return 0;

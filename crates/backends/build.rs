@@ -57,6 +57,10 @@ fn main() {
     println!("cargo::rustc-link-lib=dylib=gomp");
 
     if env::var("CARGO_FEATURE_GPU").is_ok() {
+        // Crates implementing subgraph kernels compile against
+        // cuda/include/SubgraphKernel.cuh.
+        let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
+        println!("cargo::metadata=cuda_include={}", manifest.join("cuda/include").display());
         println!("cargo::rerun-if-env-changed=CUDA_ARCH");
         println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
         println!("cargo::rerun-if-changed=cuda/src/Primitive.cu");

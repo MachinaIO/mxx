@@ -12,7 +12,8 @@ use crate::{
         RuntimeValue,
         poly_gpu::{
             GpuDcrtBackend, GpuPreparedNativeResources, emit_compiled_gpu_op,
-            physical_raw_matrix_view, prepare_compiled_gpu_program,
+            emit_compiled_monomial_difference, emit_compiled_small_rhs_sum,
+            emit_compiled_subgraph_kernel, physical_raw_matrix_view, prepare_compiled_gpu_program,
         },
     },
     gpu_execution_plan::{
@@ -1082,10 +1083,199 @@ fn emit_direct_operations(
     resources: &GpuPreparedNativeResources,
     operations: &[CompiledGpuOp],
 ) -> Result<(), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let fusions = fused_operations(frame, operations, builder.launch_stream().physical_device())?;
+    let products = fusions.values().map(|fusion| fusion.product).collect::<BTreeSet<_>>();
     for (index, operation) in operations.iter().enumerate() {
-        emit_direct_operation(backend, builder, frame, resources, index, operation)?;
+        let token = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
+        if products.contains(&index) {
+            // The product runs inside its consumer; its operation is an
+            // empty node that passes its predecessors on.
+            builder
+                .begin_operation(token, &operation.predecessors)
+                .and_then(|()| builder.finish_operation().map(|_| ()))
+                .map_err(|error| {
+                    GpuNativeGraphError::Native(format!(
+                        "operation {index} (fused product): {error}"
+                    ))
+                })?;
+        } else if let Some(fusion) = fusions.get(&index) {
+            let product = fusion.product;
+            let product_operation = &operations[product];
+            let mut predecessors = operation
+                .predecessors
+                .iter()
+                .copied()
+                .filter(|predecessor| *predecessor as usize != product)
+                .chain(product_operation.predecessors.iter().copied())
+                .collect::<Vec<_>>();
+            predecessors.sort_unstable();
+            predecessors.dedup();
+            match fusion.addend_is_left {
+                None => emit_compiled_monomial_difference(
+                    backend,
+                    builder,
+                    token,
+                    &predecessors,
+                    product_operation,
+                    operation,
+                    &frame.owners,
+                ),
+                Some(addend_is_left) => emit_compiled_small_rhs_sum(
+                    backend,
+                    builder,
+                    token,
+                    &predecessors,
+                    product_operation,
+                    operation,
+                    addend_is_left,
+                    &frame.owners,
+                ),
+            }
+            .map_err(|error| {
+                GpuNativeGraphError::Native(format!(
+                    "operation {index} fused with product {product}: {error}"
+                ))
+            })?;
+        } else {
+            emit_direct_operation(backend, builder, frame, resources, index, operation)?;
+        }
     }
     Ok(())
+}
+
+/// A product operation emitted inside its only consumer.
+struct FusedOperation {
+    /// Index of the product whose launch the consumer performs.
+    product: usize,
+    /// `None` for a monomial difference `X^k a - a`; for a small-RHS sum,
+    /// whether the addend is the addition's left operand.
+    addend_is_left: Option<bool>,
+}
+
+/// The fusions of `operations`, keyed by the consumer's index:
+/// - a monomial product followed by the subtraction of its source, the CMUX difference `X^k a - a`,
+///   emitted as one monomial launch;
+/// - a compact small-RHS product followed by its addition to an addend, emitted as one accumulating
+///   product pass.
+///
+/// A pair fuses when the consumer reads the product's output, the output's
+/// allocation is used by no other operation of the program, only the
+/// consumer depends on the product, and both run on `device`. Operands are
+/// compared by allocation and view, since views of one allocation are
+/// distinct values.
+fn fused_operations(
+    frame: &PhysicalFrame,
+    operations: &[CompiledGpuOp],
+    device: i32,
+) -> Result<BTreeMap<usize, FusedOperation>, GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    // The allocation and view of part `part` of `value`.
+    let region = |value: &KernelArg, part: &KernelArg| {
+        let (KernelArg::Value(value), KernelArg::U32(part)) = (value, part) else {
+            return None;
+        };
+        let owner = frame.owners.get(value)?;
+        let part = owner.physical().parts.get(*part as usize)?;
+        let storage = owner.storage(part.storage)?;
+        Some((Arc::as_ptr(&storage.owner).cast::<()>(), storage.address, part.view.clone()))
+    };
+    fn count_uses(
+        frame: &PhysicalFrame,
+        operations: &[CompiledGpuOp],
+        uses: &mut BTreeMap<*const (), usize>,
+    ) {
+        for operation in operations {
+            let mut allocations = BTreeSet::new();
+            for argument in operation.arguments.iter() {
+                if let KernelArg::Value(value) = argument &&
+                    let Some(owner) = frame.owners.get(value)
+                {
+                    for part in owner.physical().parts.iter() {
+                        if let Some(storage) = owner.storage(part.storage) {
+                            allocations.insert(Arc::as_ptr(&storage.owner).cast::<()>());
+                        }
+                    }
+                }
+            }
+            for allocation in allocations {
+                *uses.entry(allocation).or_default() += 1;
+            }
+            if let Some(body) = &operation.body {
+                count_uses(frame, body, uses);
+            }
+        }
+    }
+    let primitive = |operation: &CompiledGpuOp| {
+        frame
+            .program
+            .implementations
+            .resolve(operation.implementation)
+            .map(|implementation| implementation.primitive)
+            .map_err(invalid)
+    };
+    let mut uses = BTreeMap::new();
+    count_uses(frame, &frame.program.operations, &mut uses);
+    let mut fusions = BTreeMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        let consumer = primitive(operation)?;
+        if !matches!(consumer, GpuNativePrimitive::MatrixSub | GpuNativePrimitive::MatrixAdd) ||
+            operation.device != device
+        {
+            continue;
+        }
+        let [left, left_part, right, right_part, ..] = operation.arguments.as_ref() else {
+            continue;
+        };
+        let (Some(left), Some(right)) = (region(left, left_part), region(right, right_part)) else {
+            continue;
+        };
+        for &product in operation.predecessors.iter() {
+            let product = product as usize;
+            let Some(product_operation) = operations.get(product) else {
+                continue;
+            };
+            if product_operation.device != device ||
+                !operations.iter().enumerate().all(|(other, candidate)| {
+                    other == index || !candidate.predecessors.contains(&(product as u32))
+                })
+            {
+                continue;
+            }
+            let arguments = product_operation.arguments.as_ref();
+            let output = |value: usize, part: usize| {
+                arguments.get(value).zip(arguments.get(part)).and_then(|(v, p)| region(v, p))
+            };
+            let only_consumer = |output: &(*const (), u64, _)| uses.get(&output.0) == Some(&2);
+            let addend_is_left = match (consumer, primitive(product_operation)?) {
+                (GpuNativePrimitive::MatrixSub, GpuNativePrimitive::MultiplyMonomial)
+                    if output(2, 3).as_ref() == Some(&left) &&
+                        output(0, 1).as_ref() == Some(&right) &&
+                        only_consumer(&left) =>
+                {
+                    None
+                }
+                (GpuNativePrimitive::MatrixAdd, GpuNativePrimitive::MatrixMulSmallRhs) => {
+                    let Some(destination) = output(6, 7) else { continue };
+                    let addend_is_left = if destination == right {
+                        true
+                    } else if destination == left {
+                        false
+                    } else {
+                        continue;
+                    };
+                    if !only_consumer(&destination) {
+                        continue;
+                    }
+                    Some(addend_is_left)
+                }
+                _ => continue,
+            };
+            fusions.insert(index, FusedOperation { product, addend_is_left });
+            break;
+        }
+    }
+    Ok(fusions)
 }
 
 /// Emit operation `index` of the operation list being built, including its
@@ -1166,6 +1356,18 @@ fn emit_direct_operation(
                 )
                 .and_then(|()| builder.finish_operation().map(|_| ()))
         }
+        GpuNativePrimitive::SubgraphKernel => emit_compiled_subgraph_kernel(
+            backend,
+            builder,
+            index,
+            operation,
+            &frame.program.subgraph_kernels,
+            resources,
+            &frame.owners,
+        )
+        .map_err(|error| {
+            GpuNativeGraphError::Native(format!("operation {index} subgraph kernel: {error}"))
+        }),
         _ => emit_compiled_gpu_op(
             backend,
             builder,
@@ -1817,6 +2019,7 @@ impl GpuRuntime {
                     inputs,
                     &self.options.integer_input_ranges,
                     artifact_payload_sizes,
+                    &self.options.subgraph_kernels,
                 )
                 .map_err(GpuPlanError::Resource)?;
                 validate_allocated_budget(&frame, &contract, None)?;
@@ -1931,6 +2134,7 @@ impl GpuRuntime {
             inputs,
             &self.options.integer_input_ranges,
             artifact_payload_sizes,
+            &self.options.subgraph_kernels,
         )
         .map_err(GpuPlanError::Resource)?;
         validate_allocated_budget(&frame, &contract, None)?;

@@ -38,6 +38,11 @@ fn test_gpu_tfhe_round_trip() {
 
     let mut runtime = GpuRuntime::new(gpu_backend(gpu::tfhe_gpu_parameters(&tfhe)))
         .expect("construct TFHE GPU runtime");
+    // Blind rotations run as one native kernel when it covers the
+    // parameters, unless FHE_TEST_TFHE_SUBGRAPH_KERNEL=0 runs their body.
+    if std::env::var("FHE_TEST_TFHE_SUBGRAPH_KERNEL").as_deref() != Ok("0") {
+        runtime.options_mut().subgraph_kernels.extend(tfhe.gpu_blind_rotation_kernel());
+    }
 
     // Key generation and encryption expand pseudorandom values from a public
     // 32-byte hash key, which the caller draws fresh from an OS CSPRNG.
@@ -95,17 +100,19 @@ fn test_gpu_tfhe_round_trip() {
     // rotates the NAND accumulator by it with the bootstrapping key, extracts
     // the constant coefficient, and key switches back to the LWE secret, so
     // its output is a fresh ciphertext that can feed the next gate.
-    let gate = DslContext::new("tfhe-round-trip-nand");
-    let nand = tfhe
-        .nand(
-            &gate.input("left", ciphertext_schema.clone()).unwrap(),
-            &gate.input("right", ciphertext_schema.clone()).unwrap(),
-            &gate.input("bsk", keys.bootstrapping_key.schema()).unwrap(),
-            &gate.input("ksk", keys.key_switch_key.schema()).unwrap(),
-        )
-        .unwrap();
-    let nand_graph = gate.output("ct", nand).unwrap().build().unwrap();
-    tracing::info!(graph = "nand", operations = ?nand_graph.operation_counts().unwrap());
+    let nand_graph = || {
+        let gate = DslContext::new("tfhe-round-trip-nand");
+        let nand = tfhe
+            .nand(
+                &gate.input("left", ciphertext_schema.clone()).unwrap(),
+                &gate.input("right", ciphertext_schema.clone()).unwrap(),
+                &gate.input("bsk", keys.bootstrapping_key.schema()).unwrap(),
+                &gate.input("ksk", keys.key_switch_key.schema()).unwrap(),
+            )
+            .unwrap();
+        gate.output("ct", nand).unwrap().build().unwrap()
+    };
+    tracing::info!(graph = "nand", operations = ?nand_graph().operation_counts().unwrap());
     let gate_inputs = |left: RuntimeValue, right: RuntimeValue| {
         BTreeMap::from([
             ("left".into(), left),
@@ -116,7 +123,21 @@ fn test_gpu_tfhe_round_trip() {
     };
     let example = encrypt(&mut runtime, false, &mut timings);
     let mut nand_plan =
-        runtime.plan(nand_graph, &gate_inputs(example.clone(), example.clone())).unwrap();
+        runtime.plan(nand_graph(), &gate_inputs(example.clone(), example.clone())).unwrap();
+    // With the blind rotation kernel registered, the same gate planned from
+    // the subgraph body must produce the identical ciphertext.
+    let kernels = std::mem::take(&mut runtime.options_mut().subgraph_kernels);
+    let mut reference_plan = (!kernels.is_empty()).then(|| {
+        runtime.plan(nand_graph(), &gate_inputs(example.clone(), example.clone())).unwrap()
+    });
+    runtime.options_mut().subgraph_kernels = kernels;
+    let ciphertext_words = |runtime: &GpuRuntime, value: &RuntimeValue| match value {
+        RuntimeValue::Composite(leaves) => leaves
+            .iter()
+            .map(|leaf| runtime.download_integer_family(leaf).unwrap())
+            .collect::<Vec<_>>(),
+        other => vec![runtime.download_integer_family(other).unwrap()],
+    };
 
     // Decryption is another DSL program: bind a ciphertext and the LWE
     // secret, execute it, and read the decoded bit.
@@ -152,8 +173,18 @@ fn test_gpu_tfhe_round_trip() {
         let right = encrypt(&mut runtime, right_bit, &mut timings);
 
         let started = Instant::now();
-        let output = runtime.execute(&mut nand_plan, gate_inputs(left, right)).unwrap();
+        let output =
+            runtime.execute(&mut nand_plan, gate_inputs(left.clone(), right.clone())).unwrap();
         record_timing("nand", started, &mut timings);
+        if let Some(reference_plan) = reference_plan.as_mut().filter(|_| index < truth_table.len())
+        {
+            let reference = runtime.execute(reference_plan, gate_inputs(left, right)).unwrap();
+            assert_eq!(
+                ciphertext_words(&runtime, &output["ct"]),
+                ciphertext_words(&runtime, &reference["ct"]),
+                "gate {index}: the blind rotation kernel differs from its subgraph"
+            );
+        }
 
         let started = Instant::now();
         let decrypted =

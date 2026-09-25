@@ -2002,80 +2002,7 @@ pub(crate) fn emit_compiled_gpu_op(
             }
         }
         GpuNativePrimitive::MatrixMulSmallRhs => {
-            let [
-                KernelArg::Value(left_id),
-                KernelArg::U32(left_part),
-                KernelArg::Value(right_id),
-                KernelArg::U32(right_part),
-                KernelArg::Value(workspace_id),
-                KernelArg::U32(workspace_part),
-                KernelArg::Value(destination_id),
-                KernelArg::U32(destination_part),
-                KernelArg::U32(left_binding),
-                KernelArg::U32(right_binding),
-                KernelArg::U32(workspace_binding),
-                KernelArg::U32(destination_binding),
-            ] = op.arguments.as_ref()
-            else {
-                return Err(invalid("compiled small-RHS product has the wrong arguments"));
-            };
-            if op.outputs.as_ref() != [*destination_id, *workspace_id] {
-                return Err(invalid("compiled small-RHS product outputs do not match"));
-            }
-            let owner = |id: &PhysicalValueId| {
-                owners.get(id).ok_or_else(|| invalid("compiled small-RHS product owner is missing"))
-            };
-            let (left_owner, right_owner) = (owner(left_id)?, owner(right_id)?);
-            let (workspace_owner, destination_owner) =
-                (owner(workspace_id)?, owner(destination_id)?);
-            let (left_ty, left, left_bindings) =
-                compiled_raw_matrix_part(left_owner, *left_part, PhysicalEncoding::FullEval)?;
-            let (right_ty, right, right_bytes) =
-                compiled_raw_small_matrix_part(right_owner, *right_part)?;
-            let (workspace_ty, workspace, workspace_bindings) = compiled_raw_matrix_part(
-                workspace_owner,
-                *workspace_part,
-                PhysicalEncoding::FullEval,
-            )?;
-            let (destination_ty, destination, destination_bindings) = compiled_raw_matrix_part(
-                destination_owner,
-                *destination_part,
-                PhysicalEncoding::FullEval,
-            )?;
-            if left_ty.ring != right_ty.ring ||
-                left_ty.ring != workspace_ty.ring ||
-                left_ty.ring != destination_ty.ring ||
-                !same_raw_limbs(&left, &workspace) ||
-                !same_raw_limbs(&left, &destination) ||
-                left.physical_device != op.device ||
-                left.columns != right.rows ||
-                workspace.rows != right.rows ||
-                destination.rows != left.rows ||
-                destination.columns != right.columns
-            {
-                return Err(invalid("compiled small-RHS product layouts disagree"));
-            }
-            bind_raw_matrix_part(builder, *left_binding, &left_bindings)?;
-            builder.bind_resident_address(right.payload_address, right_bytes, *right_binding)?;
-            bind_raw_matrix_part(builder, *workspace_binding, &workspace_bindings)?;
-            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
-            let parameters = backend
-                .parameters_on_physical_device(op.device, &left_ty)
-                .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
-            parameters.emit_raw_matrix_mul_small_rhs(
-                builder.launch_stream(),
-                &left,
-                &right,
-                &workspace,
-                &destination,
-                *left_binding,
-                *right_binding,
-                *workspace_binding,
-                *destination_binding,
-            )?;
-            for retained in [left_owner, right_owner, workspace_owner, destination_owner] {
-                builder.retain_owner(Arc::clone(retained));
-            }
+            emit_small_rhs_product(backend, builder, op, None, owners)?;
         }
         GpuNativePrimitive::MatrixSliceDynamic => {
             let [
@@ -3297,97 +3224,14 @@ pub(crate) fn emit_compiled_gpu_op(
         // An automorphism permutes coefficients; a monomial product scales
         // evaluation slots. Both take a matrix and one resident integer.
         GpuNativePrimitive::RingAutomorphism | GpuNativePrimitive::MultiplyMonomial => {
-            let monomial = implementation.primitive == GpuNativePrimitive::MultiplyMonomial;
-            let encoding =
-                if monomial { PhysicalEncoding::FullEval } else { PhysicalEncoding::FullCoeff };
-            let [
-                KernelArg::Value(source_id),
-                KernelArg::U32(source_part),
-                KernelArg::Value(destination_id),
-                KernelArg::U32(destination_part),
-                KernelArg::Value(index_id),
-                KernelArg::U32(index_part),
-                KernelArg::Value(status_id),
-                KernelArg::U32(status_part),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(destination_binding),
-                KernelArg::U32(index_binding),
-                KernelArg::U32(status_binding),
-            ] = op.arguments.as_ref()
-            else {
-                return Err(invalid("compiled ring automorphism has wrong arguments"));
-            };
-            if op.outputs.as_ref() != [*destination_id] {
-                return Err(invalid("compiled ring automorphism has wrong output"));
-            }
-            let source_owner =
-                owners.get(source_id).ok_or_else(|| invalid("automorphism source is absent"))?;
-            let destination_owner = owners
-                .get(destination_id)
-                .ok_or_else(|| invalid("automorphism destination is absent"))?;
-            let index_owner =
-                owners.get(index_id).ok_or_else(|| invalid("automorphism index is absent"))?;
-            let status_owner =
-                owners.get(status_id).ok_or_else(|| invalid("automorphism status is absent"))?;
-            let (source_ty, source, source_bindings) =
-                compiled_raw_matrix_part(source_owner, *source_part, encoding.clone())?;
-            let (destination_ty, destination, destination_bindings) =
-                compiled_raw_matrix_part(destination_owner, *destination_part, encoding)?;
-            if source_ty != destination_ty ||
-                !same_raw_window(&source, &destination) ||
-                source.physical_device != op.device
-            {
-                return Err(invalid("automorphism source and destination layouts disagree"));
-            }
-            let (index, index_bytes) =
-                compiled_raw_integer_part(index_owner, *index_part, *index_binding, op.device)?;
-            if index.count != 1 ||
-                !matches!(
-                    index.encoding,
-                    GpuSignedValuesEncoding::SignedI64 |
-                        GpuSignedValuesEncoding::CanonicalU64 |
-                        GpuSignedValuesEncoding::SignedWords(_)
-                )
-            {
-                return Err(invalid("automorphism index is not one resident integer"));
-            }
-            let status = compiled_raw_control_status(
-                status_owner,
-                *status_part,
-                *status_binding,
-                op.device,
+            emit_ring_rotation(
+                backend,
+                builder,
+                op,
+                implementation.primitive == GpuNativePrimitive::MultiplyMonomial,
+                None,
+                owners,
             )?;
-            bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
-            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
-            builder.bind_resident_address(index.address, index_bytes, *index_binding)?;
-            builder.bind_resident_address(status.address, 4, *status_binding)?;
-            let params = backend
-                .parameters_on_physical_device(op.device, &source_ty)
-                .map_err(GpuNativeGraphError::Native)?;
-            if monomial {
-                params.emit_raw_monomial_multiply(
-                    builder.launch_stream(),
-                    &source,
-                    &destination,
-                    index,
-                    status,
-                    *source_binding,
-                    *destination_binding,
-                )?;
-            } else {
-                params.emit_raw_ring_automorphism(
-                    builder.launch_stream(),
-                    &source,
-                    &destination,
-                    index,
-                    status,
-                    *source_binding,
-                    *destination_binding,
-                )?;
-            }
-            for owner in [source_owner, destination_owner, index_owner, status_owner] {
-                builder.retain_owner(Arc::clone(owner));
-            }
         }
         GpuNativePrimitive::LiftIntegerConstant => {
             let [
@@ -5328,10 +5172,428 @@ pub(crate) fn emit_compiled_gpu_op(
             )?;
             builder.retain_owner(Arc::clone(slot));
         }
-        GpuNativePrimitive::BranchIf | GpuNativePrimitive::LoopWhile => {
-            unreachable!("control primitives are emitted by the direct runtime")
+        GpuNativePrimitive::BranchIf |
+        GpuNativePrimitive::LoopWhile |
+        GpuNativePrimitive::SubgraphKernel => {
+            unreachable!(
+                "control primitives and subgraph kernels are emitted by the direct runtime"
+            )
         }
     }
+    builder.finish_operation()?;
+    Ok(())
+}
+
+/// A ring automorphism or monomial product of `op`. With `difference`, a
+/// subtraction `X^k a - a` whose left operand is the product and whose right
+/// operand is the product's source, the one launch writes the difference.
+fn emit_ring_rotation(
+    backend: &GpuDcrtBackend,
+    builder: &mut GpuNativeGraphBuilder,
+    op: &CompiledGpuOp,
+    monomial: bool,
+    difference: Option<&CompiledGpuOp>,
+    owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+) -> Result<(), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let encoding = if monomial { PhysicalEncoding::FullEval } else { PhysicalEncoding::FullCoeff };
+    let [
+        KernelArg::Value(source_id),
+        KernelArg::U32(source_part),
+        KernelArg::Value(destination_id),
+        KernelArg::U32(destination_part),
+        KernelArg::Value(index_id),
+        KernelArg::U32(index_part),
+        KernelArg::Value(status_id),
+        KernelArg::U32(status_part),
+        KernelArg::U32(source_binding),
+        KernelArg::U32(destination_binding),
+        KernelArg::U32(index_binding),
+        KernelArg::U32(status_binding),
+    ] = op.arguments.as_ref()
+    else {
+        return Err(invalid("compiled ring automorphism has wrong arguments"));
+    };
+    if op.outputs.as_ref() != [*destination_id] {
+        return Err(invalid("compiled ring automorphism has wrong output"));
+    }
+    let source_owner =
+        owners.get(source_id).ok_or_else(|| invalid("automorphism source is absent"))?;
+    // A fused difference writes `X^k a - a` to the subtraction's
+    // destination; the product's own destination is left unwritten.
+    let (destination_id, destination_part, destination_binding) = match difference {
+        None => (destination_id, destination_part, destination_binding),
+        Some(difference) => {
+            // The caller matched the subtraction's operands to the product's
+            // output and source by allocation and view.
+            let [
+                KernelArg::Value(_),
+                KernelArg::U32(_),
+                KernelArg::Value(_),
+                KernelArg::U32(_),
+                KernelArg::Value(difference_id),
+                KernelArg::U32(difference_part),
+                KernelArg::U32(_),
+                KernelArg::U32(_),
+                KernelArg::U32(difference_binding),
+            ] = difference.arguments.as_ref()
+            else {
+                return Err(invalid("fused monomial difference has wrong arguments"));
+            };
+            if !monomial || difference.outputs.as_ref() != [*difference_id] {
+                return Err(invalid("fused monomial difference operands disagree"));
+            }
+            (difference_id, difference_part, difference_binding)
+        }
+    };
+    let destination_owner =
+        owners.get(destination_id).ok_or_else(|| invalid("automorphism destination is absent"))?;
+    let index_owner =
+        owners.get(index_id).ok_or_else(|| invalid("automorphism index is absent"))?;
+    let status_owner =
+        owners.get(status_id).ok_or_else(|| invalid("automorphism status is absent"))?;
+    let (source_ty, source, source_bindings) =
+        compiled_raw_matrix_part(source_owner, *source_part, encoding.clone())?;
+    let (destination_ty, destination, destination_bindings) =
+        compiled_raw_matrix_part(destination_owner, *destination_part, encoding)?;
+    if source_ty != destination_ty ||
+        !same_raw_window(&source, &destination) ||
+        source.physical_device != op.device
+    {
+        return Err(invalid("automorphism source and destination layouts disagree"));
+    }
+    let (index, index_bytes) =
+        compiled_raw_integer_part(index_owner, *index_part, *index_binding, op.device)?;
+    if index.count != 1 ||
+        !matches!(
+            index.encoding,
+            GpuSignedValuesEncoding::SignedI64 |
+                GpuSignedValuesEncoding::CanonicalU64 |
+                GpuSignedValuesEncoding::SignedWords(_)
+        )
+    {
+        return Err(invalid("automorphism index is not one resident integer"));
+    }
+    let status =
+        compiled_raw_control_status(status_owner, *status_part, *status_binding, op.device)?;
+    bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
+    bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+    builder.bind_resident_address(index.address, index_bytes, *index_binding)?;
+    builder.bind_resident_address(status.address, 4, *status_binding)?;
+    let params = backend
+        .parameters_on_physical_device(op.device, &source_ty)
+        .map_err(GpuNativeGraphError::Native)?;
+    if monomial {
+        params.emit_raw_monomial_multiply(
+            builder.launch_stream(),
+            &source,
+            &destination,
+            index,
+            status,
+            difference.is_some(),
+            *source_binding,
+            *destination_binding,
+        )?;
+    } else {
+        params.emit_raw_ring_automorphism(
+            builder.launch_stream(),
+            &source,
+            &destination,
+            index,
+            status,
+            *source_binding,
+            *destination_binding,
+        )?;
+    }
+    for owner in [source_owner, destination_owner, index_owner, status_owner] {
+        builder.retain_owner(Arc::clone(owner));
+    }
+    Ok(())
+}
+
+/// The compact small-RHS product of `op`. With `sum`, an addition of the
+/// product and an addend (the left operand when the flag is set), the one
+/// product pass writes the sum to the addition's destination.
+fn emit_small_rhs_product(
+    backend: &GpuDcrtBackend,
+    builder: &mut GpuNativeGraphBuilder,
+    op: &CompiledGpuOp,
+    sum: Option<(&CompiledGpuOp, bool)>,
+    owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+) -> Result<(), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let [
+        KernelArg::Value(left_id),
+        KernelArg::U32(left_part),
+        KernelArg::Value(right_id),
+        KernelArg::U32(right_part),
+        KernelArg::Value(workspace_id),
+        KernelArg::U32(workspace_part),
+        KernelArg::Value(destination_id),
+        KernelArg::U32(destination_part),
+        KernelArg::U32(left_binding),
+        KernelArg::U32(right_binding),
+        KernelArg::U32(workspace_binding),
+        KernelArg::U32(destination_binding),
+    ] = op.arguments.as_ref()
+    else {
+        return Err(invalid("compiled small-RHS product has the wrong arguments"));
+    };
+    if op.outputs.as_ref() != [*destination_id, *workspace_id] {
+        return Err(invalid("compiled small-RHS product outputs do not match"));
+    }
+    // A fused sum writes `addend + left * right` to the addition's
+    // destination; the product's own destination is left unwritten.
+    let (destination_id, destination_part, destination_binding, addend) = match sum {
+        None => (destination_id, destination_part, destination_binding, None),
+        Some((sum, addend_is_left)) => {
+            let [
+                KernelArg::Value(left_id),
+                KernelArg::U32(left_part),
+                KernelArg::Value(right_id),
+                KernelArg::U32(right_part),
+                KernelArg::Value(sum_id),
+                KernelArg::U32(sum_part),
+                KernelArg::U32(left_binding),
+                KernelArg::U32(right_binding),
+                KernelArg::U32(sum_binding),
+            ] = sum.arguments.as_ref()
+            else {
+                return Err(invalid("fused small-RHS sum has wrong arguments"));
+            };
+            if sum.outputs.as_ref() != [*sum_id] {
+                return Err(invalid("fused small-RHS sum has wrong output"));
+            }
+            let addend = if addend_is_left {
+                (left_id, left_part, left_binding)
+            } else {
+                (right_id, right_part, right_binding)
+            };
+            (sum_id, sum_part, sum_binding, Some(addend))
+        }
+    };
+    let owner = |id: &PhysicalValueId| {
+        owners.get(id).ok_or_else(|| invalid("compiled small-RHS product owner is missing"))
+    };
+    let (left_owner, right_owner) = (owner(left_id)?, owner(right_id)?);
+    let (workspace_owner, destination_owner) = (owner(workspace_id)?, owner(destination_id)?);
+    let (left_ty, left, left_bindings) =
+        compiled_raw_matrix_part(left_owner, *left_part, PhysicalEncoding::FullEval)?;
+    let (right_ty, right, right_bytes) = compiled_raw_small_matrix_part(right_owner, *right_part)?;
+    let (workspace_ty, workspace, workspace_bindings) =
+        compiled_raw_matrix_part(workspace_owner, *workspace_part, PhysicalEncoding::FullEval)?;
+    let (destination_ty, destination, destination_bindings) =
+        compiled_raw_matrix_part(destination_owner, *destination_part, PhysicalEncoding::FullEval)?;
+    if left_ty.ring != right_ty.ring ||
+        left_ty.ring != workspace_ty.ring ||
+        left_ty.ring != destination_ty.ring ||
+        !same_raw_limbs(&left, &workspace) ||
+        !same_raw_limbs(&left, &destination) ||
+        left.physical_device != op.device ||
+        left.columns != right.rows ||
+        workspace.rows != right.rows ||
+        destination.rows != left.rows ||
+        destination.columns != right.columns
+    {
+        return Err(invalid("compiled small-RHS product layouts disagree"));
+    }
+    let addend = addend
+        .map(|(addend_id, addend_part, addend_binding)| {
+            let addend_owner = owner(addend_id)?;
+            let (addend_ty, addend, addend_bindings) =
+                compiled_raw_matrix_part(addend_owner, *addend_part, PhysicalEncoding::FullEval)?;
+            if addend_ty != destination_ty || !same_raw_window(&addend, &destination) {
+                return Err(invalid("fused small-RHS sum addend layout disagrees"));
+            }
+            bind_raw_matrix_part(builder, *addend_binding, &addend_bindings)?;
+            builder.retain_owner(Arc::clone(addend_owner));
+            Ok((addend, *addend_binding))
+        })
+        .transpose()?;
+    bind_raw_matrix_part(builder, *left_binding, &left_bindings)?;
+    builder.bind_resident_address(right.payload_address, right_bytes, *right_binding)?;
+    bind_raw_matrix_part(builder, *workspace_binding, &workspace_bindings)?;
+    bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+    let parameters = backend
+        .parameters_on_physical_device(op.device, &left_ty)
+        .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
+    parameters.emit_raw_matrix_mul_small_rhs(
+        builder.launch_stream(),
+        &left,
+        &right,
+        &workspace,
+        &destination,
+        addend.as_ref().map(|(addend, binding)| (addend, *binding)),
+        *left_binding,
+        *right_binding,
+        *workspace_binding,
+        *destination_binding,
+    )?;
+    for retained in [left_owner, right_owner, workspace_owner, destination_owner] {
+        builder.retain_owner(Arc::clone(retained));
+    }
+    Ok(())
+}
+
+/// Emit operation `index`, a `SubgraphKernel` call of one of `kernels`: bind
+/// every operand's addresses and call the kernel's entry, which adds its
+/// kernels to this operation.
+pub(crate) fn emit_compiled_subgraph_kernel(
+    backend: &GpuDcrtBackend,
+    builder: &mut GpuNativeGraphBuilder,
+    index: u32,
+    op: &CompiledGpuOp,
+    kernels: &[crate::gpu_subgraph_kernel::GpuSubgraphKernel],
+    resources: &GpuPreparedNativeResources,
+    owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+) -> Result<(), GpuNativeGraphError> {
+    use crate::poly::dcrt::gpu::GpuSubgraphOperandView;
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let [
+        KernelArg::U32(kernel_index),
+        KernelArg::U32(input_count),
+        KernelArg::Value(scratch_id),
+        KernelArg::U32(scratch_binding),
+        KernelArg::Value(status_id),
+        KernelArg::U32(status_binding),
+        operand_arguments @ ..,
+    ] = op.arguments.as_ref()
+    else {
+        return Err(invalid("compiled subgraph kernel has wrong arguments"));
+    };
+    let kernel = kernels
+        .get(*kernel_index as usize)
+        .ok_or_else(|| invalid("compiled subgraph kernel is not registered"))?;
+    let owner = |id: &PhysicalValueId| {
+        owners.get(id).ok_or_else(|| invalid("compiled subgraph kernel operand owner is missing"))
+    };
+    builder.begin_operation(index, &op.predecessors)?;
+    let mut operands = Vec::with_capacity(operand_arguments.len() / 4);
+    let mut basis = None;
+    for arguments in operand_arguments.chunks_exact(4) {
+        let [
+            KernelArg::U32(kind),
+            KernelArg::Value(id),
+            KernelArg::U32(part),
+            KernelArg::U32(binding),
+        ] = arguments
+        else {
+            return Err(invalid("compiled subgraph kernel operand has wrong arguments"));
+        };
+        let operand_owner = owner(id)?;
+        match kind {
+            0 => {
+                let (ty, view, bindings) =
+                    compiled_raw_matrix_part(operand_owner, *part, PhysicalEncoding::FullEval)?;
+                bind_raw_matrix_part(builder, *binding, &bindings)?;
+                basis.get_or_insert(ty);
+                operands.push(GpuSubgraphOperandView::Matrix { view, binding: *binding });
+            }
+            1 => {
+                let table = resources
+                    .indexed_matrices
+                    .get(part)
+                    .ok_or_else(|| invalid("subgraph kernel family table is missing"))?;
+                let ConcreteWireType::IndexedFamily { count, .. } = operand_owner.wire_type()
+                else {
+                    return Err(invalid("subgraph kernel family operand is not a family"));
+                };
+                let member = crate::gpu_physical_control::static_family_member(operand_owner, 0)
+                    .map_err(|error| invalid(&error))?;
+                let (ty, layout, _) =
+                    compiled_raw_matrix_part(&member, 0, PhysicalEncoding::FullEval)?;
+                if table.physical_device() != op.device {
+                    return Err(invalid("subgraph kernel family table is on another device"));
+                }
+                basis.get_or_insert(ty);
+                operands.push(GpuSubgraphOperandView::MatrixFamily {
+                    layout,
+                    table: table.device_address(),
+                    count: *count as u64,
+                });
+            }
+            2 | 3 => {
+                let (view, bytes) =
+                    compiled_raw_integer_part(operand_owner, *part, *binding, op.device)?;
+                builder.bind_resident_address(view.address, bytes, *binding)?;
+                operands.push(if *kind == 2 {
+                    GpuSubgraphOperandView::Integer(view)
+                } else {
+                    GpuSubgraphOperandView::IntegerFamily(view)
+                });
+            }
+            _ => return Err(invalid("compiled subgraph kernel operand has an unknown kind")),
+        }
+        builder.retain_owner(Arc::clone(operand_owner));
+    }
+    let scratch = if kernel.scratch_bytes == 0 {
+        (0, *scratch_binding)
+    } else {
+        let scratch_owner = owner(scratch_id)?;
+        let (_, view, bindings) =
+            compiled_raw_matrix_part(scratch_owner, 0, PhysicalEncoding::FullEval)?;
+        let first =
+            view.limbs.first().ok_or_else(|| invalid("subgraph kernel scratch is empty"))?;
+        if bindings.first().is_none_or(|&(_, bytes)| (bytes as u64) < kernel.scratch_bytes) {
+            return Err(invalid("subgraph kernel scratch is smaller than registered"));
+        }
+        bind_raw_matrix_part(builder, *scratch_binding, &bindings[..1])?;
+        builder.retain_owner(Arc::clone(scratch_owner));
+        (first.address, *scratch_binding)
+    };
+    let status_owner = owner(status_id)?;
+    let status = compiled_raw_control_status(status_owner, 0, *status_binding, op.device)?;
+    builder.bind_resident_address(status.address, 4, *status_binding)?;
+    builder.retain_owner(Arc::clone(status_owner));
+    let basis = basis.ok_or_else(|| invalid("subgraph kernel has no matrix operand"))?;
+    let params = backend
+        .parameters_on_physical_device(op.device, &basis)
+        .map_err(GpuNativeGraphError::Native)?;
+    params.emit_subgraph_kernel(
+        builder.launch_stream(),
+        kernel,
+        *input_count as usize,
+        &operands,
+        scratch,
+        status,
+    )?;
+    builder.finish_operation()?;
+    Ok(())
+}
+
+/// Emit operation `index`, the small-RHS product `product` fused with the
+/// addition `sum` of the product and an addend (see
+/// `emit_small_rhs_product`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_compiled_small_rhs_sum(
+    backend: &GpuDcrtBackend,
+    builder: &mut GpuNativeGraphBuilder,
+    index: u32,
+    predecessors: &[u32],
+    product: &CompiledGpuOp,
+    sum: &CompiledGpuOp,
+    addend_is_left: bool,
+    owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+) -> Result<(), GpuNativeGraphError> {
+    builder.begin_operation(index, predecessors)?;
+    emit_small_rhs_product(backend, builder, product, Some((sum, addend_is_left)), owners)?;
+    builder.finish_operation()?;
+    Ok(())
+}
+
+/// Emit operation `index`, the monomial product `monomial` fused with the
+/// subtraction `difference` of its source (see `emit_ring_rotation`).
+pub(crate) fn emit_compiled_monomial_difference(
+    backend: &GpuDcrtBackend,
+    builder: &mut GpuNativeGraphBuilder,
+    index: u32,
+    predecessors: &[u32],
+    monomial: &CompiledGpuOp,
+    difference: &CompiledGpuOp,
+    owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+) -> Result<(), GpuNativeGraphError> {
+    builder.begin_operation(index, predecessors)?;
+    emit_ring_rotation(backend, builder, monomial, true, Some(difference), owners)?;
     builder.finish_operation()?;
     Ok(())
 }

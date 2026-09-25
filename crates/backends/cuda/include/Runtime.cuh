@@ -5,6 +5,8 @@
 
 #include <cuda_runtime.h>
 
+#include "SubgraphKernel.cuh"
+
 #ifdef __cplusplus
 #include <atomic>
 #include <memory>
@@ -248,29 +250,6 @@ int gpu_context_download_address(
     GpuContext *ctx, int physical_device, const void *address,
     void *destination, size_t bytes);
 
-// A borrowed, plan-validated physical matrix rectangle. Each limb address
-// points at coefficient zero of the first row/column in this view.
-struct MxxRawMatrixLimb
-{
-    uint64_t address;
-    uint64_t row_stride_bytes;
-    uint64_t column_stride_bytes;
-    uint64_t coefficient_stride_bytes;
-    uint32_t word_bytes;
-    uint32_t crt_limb_index;
-    uint64_t modulus;
-};
-struct MxxRawMatrixView
-{
-    int32_t physical_device;
-    uint32_t degree;
-    uint64_t row_origin;
-    uint64_t column_origin;
-    uint64_t rows;
-    uint64_t columns;
-    const MxxRawMatrixLimb *limbs;
-    size_t limb_count;
-};
 struct MxxRawSmallMatrixView
 {
     uint64_t payload_address;
@@ -285,6 +264,9 @@ struct MxxRawSmallMatrixView
     uint32_t crt_depth;
     uint32_t reserved;
 };
+// The NTT tables of each limb of `view`, which must be on `physical_device`.
+int gpu_context_ntt_tables(GpuContext *ctx, const MxxRawMatrixView *view,
+    MxxNttTables *out_tables);
 int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     int inverse, uint32_t source_binding_base, uint32_t destination_binding_base);
@@ -512,8 +494,10 @@ int gpu_raw_matrix_mul_scalar(GpuContext *ctx, void *stream,
 int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *left, const MxxRawSmallMatrixView *right,
     const MxxRawMatrixView *workspace, const MxxRawMatrixView *destination,
+    const MxxRawMatrixView *addend,
     uint32_t left_binding_base, uint32_t right_binding,
-    uint32_t workspace_binding_base, uint32_t destination_binding_base);
+    uint32_t workspace_binding_base, uint32_t destination_binding_base,
+    uint32_t addend_binding_base);
 int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream,
     const MxxRawSmallMatrixView *source,
     const MxxRawMatrixView *destination,
@@ -567,11 +551,6 @@ int mxx_gpu_graph_builder_finish(MxxGpuGraphBuilder *builder, MxxGpuGraphExec **
 void mxx_gpu_graph_builder_destroy(MxxGpuGraphBuilder *builder);
 MxxGpuGraphBuilder *mxx_gpu_graph_builder_for_stream(GpuContext *ctx, void *stream);
 
-int mxx_gpu_graph_dispatch_kernel(GpuContext *ctx, void *stream,
-    const void *function, uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
-    uint32_t block_x, uint32_t block_y, uint32_t block_z, size_t shared_bytes,
-    void **arguments, const size_t *argument_sizes, size_t argument_count,
-    const MxxGraphPatch *patches, size_t patch_count);
 int mxx_gpu_graph_upload(MxxGpuGraphExec *exec, void *launch_stream);
 int mxx_gpu_graph_bind(
     MxxGpuGraphExec *exec,
@@ -606,27 +585,6 @@ int gpu_device_buffer_copy_from_address(
     size_t bytes,
     void *stream,
     MxxGpuNativeEvent **out_event);
-
-// Explicit graph node patches bind addresses at replay.
-enum MxxGraphPatchTarget
-{
-    MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD = 0,
-    MXX_GRAPH_PATCH_MEMCPY_1D_SRC = 1,
-    MXX_GRAPH_PATCH_MEMCPY_1D_DST = 2,
-    MXX_GRAPH_PATCH_MEMSET_1D_DST = 3,
-    MXX_GRAPH_PATCH_INTEGER_ENCODING = 4,
-};
-
-struct MxxGraphPatch
-{
-    void *node;
-    uint32_t target;
-    uint32_t argument_index;
-    uint32_t byte_offset;
-    uint32_t byte_count;
-    uint32_t binding_index;
-    uint64_t address_addend;
-};
 
 #ifdef __cplusplus
 }
@@ -715,16 +673,4 @@ struct GpuEventSet
 
 extern "C" int gpu_set_last_error(const char *msg);
 
-template <typename Kernel, typename... Args>
-int mxx_gpu_launch_kernel(GpuContext *ctx, cudaStream_t stream, Kernel kernel,
-    dim3 grid, dim3 block, size_t shared_bytes,
-    const MxxGraphPatch *patches, size_t patch_count, Args... values)
-{
-    void *arguments[] = {static_cast<void *>(&values)...};
-    const size_t sizes[] = {sizeof(Args)...};
-    return mxx_gpu_graph_dispatch_kernel(ctx, reinterpret_cast<void *>(stream),
-        reinterpret_cast<const void *>(kernel), grid.x, grid.y, grid.z,
-        block.x, block.y, block.z, shared_bytes, arguments, sizes,
-        sizeof...(Args), patches, patch_count);
-}
 #endif

@@ -120,7 +120,11 @@ Rules that follow from this layout:
   `mxx-fhe`, and `mxx-we` forward their `gpu` feature to it (`mxx-we` also forwards to
   `mxx-gadgets`). The `gpu` features of `mxx-func-enc` and `mxx-io` are empty.
 - Native CUDA sources, GPU wrappers, and the GPU runtime are owned by `mxx-backends` under
-  `crates/backends/cuda/` and `crates/backends/src/`; higher crates use its public API.
+  `crates/backends/cuda/` and `crates/backends/src/`; higher crates use its public API. The one
+  exception is a subgraph kernel (section "Subgraph kernels"): a higher crate may implement the
+  native kernel of one of its named subgraphs, compiled by its own build script against
+  `crates/backends/cuda/include/SubgraphKernel.cuh` only. `mxx-backends` publishes that
+  directory as `DEP_MXX_BACKENDS_CUDA_INCLUDE` (its `links = "mxx_backends"` key).
 
 Diamond iO and AKY24 iO, and the AKY24 functional-encryption implementation, were removed from
 this branch during the DSL migration; `README.md` links the `main`-branch implementations.
@@ -781,7 +785,38 @@ for example `0,0`; unset or empty means one logical device per detected GPU, and
 panics; see section 6.4), `MXX_GPU_MEMORY_FRACTION` (`gpu_memory_fraction`: the fraction of each
 device's memory that one plan's persistent allocations may use, default 0.8, values outside
 `(0, 1]` are errors), and `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` (`gpu_small_rhs_chunk_columns`: the
-right-operand columns the fused small-RHS multiplication transforms per chunk, default 16).
+right-operand columns the fused small-RHS multiplication transforms per chunk, default 16). The CUDA
+library reads `MXX_GPU_NTT_RADIX` once per process in
+`crates/backends/cuda/src/matrix/MatrixNTT.cu`: the butterfly radix of the register-blocked
+NTT, a power of two from 2 to 32 (default 4). Each thread holds that many coefficients and runs
+`log2(radix)` stages in registers between shared-memory exchanges, so a larger radix needs fewer
+barriers but gives each thread a longer serial chain; small batches such as TFHE blind rotation
+are latency-bound and run fastest at 2 or 4. An invalid value makes every NTT launch fail.
+
+### Subgraph kernels
+
+A named subgraph (`mxx_dsl::Subgraph`, an IR `SubgraphCall`) may have a native GPU kernel that
+executes the whole call. The IR is unchanged: validation, liveness, the CPU executor, and Lean
+export read the subgraph body as usual. Only GPU planning consults
+`GpuRuntimeOptions::subgraph_kernels` (`crates/backends/src/gpu_subgraph_kernel.rs`):
+
+- A call whose definition name equals a registered `GpuSubgraphKernel::name` lowers to one
+  `SubgraphKernel` operation instead of its body. Its arguments (explicit inputs, then captures)
+  and results must have the registered `GpuKernelOperandKind`s; otherwise planning fails.
+- Matrix operands are passed in the evaluation domain, integer operands with their signed
+  encoding, and matrix families as a per-member limb table refreshed before every launch (as for
+  a dynamic member read). The runtime allocates the results, a scratch buffer of
+  `scratch_bytes`, and a status word.
+- While the CUDA graph is built, the runtime calls `entry` once with an `MxxSubgraphLaunch`
+  (`crates/backends/cuda/include/SubgraphKernel.cuh`). The entry adds its kernels with
+  `mxx_gpu_launch_kernel` or `mxx_gpu_launch_cooperative_kernel`, declaring every resident
+  address as a patch of its operand's binding so replays rebind it.
+- An empty list runs every subgraph from its body.
+
+`mxx-fhe` registers the blind rotation (`tfhe.blind_rotation`,
+`TfheParams::gpu_blind_rotation_kernel`, `crates/fhe/cuda/tfhe_blind_rotation.cu`): the whole
+CMUX loop runs as one cooperative launch. `crates/fhe/tests/gpu_tfhe.rs` checks that its
+ciphertexts equal those of the subgraph body bit for bit.
 
 Errors: planning returns `GpuPlanError` (`InvalidInput`, `Resource`, `Measurement`,
 `GraphCompile`, `InvalidCompiledSchedule`). Execution returns `GpuRuntimeError`: `StalePlan`,

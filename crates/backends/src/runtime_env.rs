@@ -12,6 +12,9 @@ pub struct GpuRuntimeOptions {
     /// Caller-guaranteed closed ranges for named Int inputs, including every
     /// member of an Int family. The plan rejects unknown or noninteger names.
     pub integer_input_ranges: BTreeMap<String, RangeInclusive<BigInt>>,
+    /// Subgraphs the planner executes with their registered native kernel
+    /// instead of their body; empty runs every subgraph from its body.
+    pub subgraph_kernels: Vec<crate::gpu_subgraph_kernel::GpuSubgraphKernel>,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -76,6 +79,7 @@ impl GpuRuntimeOptions {
             measurement_iterations,
             release_fence_interval,
             integer_input_ranges: BTreeMap::new(),
+            subgraph_kernels: Vec::new(),
         })
     }
 }

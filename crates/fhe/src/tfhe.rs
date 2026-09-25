@@ -5,11 +5,12 @@ use crate::{
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use mxx_dsl::{
     Bytes, DslContext, DslError, Family, FamilyType, GraphValue, GraphValueSchema, HashTag, Int,
-    IntType, Mat, MatType, iterate, parallel, select,
+    IntType, Mat, MatType, Subgraph, iterate, parallel, select,
 };
 use mxx_ir_core::{IntExpr, RealExpr, ValueHandle, node::ConcatAxis, types::WireType};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
+use std::sync::{Arc, Mutex};
 
 /// Polynomial `a`/`b` matrices used for ring-LWE `(1,1)` values and ring-GSW
 /// `(1,2L)` evaluation-key entries. Ring-LWE phase is `b - secret * a`.
@@ -458,6 +459,28 @@ pub struct TfheParams {
     pub lwe_error_cutoff: BigUint,
     key_switch_base_bits: usize,
     key_switch_digits: usize,
+    blind_rotation: Arc<BlindRotationCache>,
+}
+
+/// The name of the blind rotation subgraph, under which a GPU runtime may
+/// register a native kernel for it (see `TfheParams::gpu_blind_rotation_kernel`).
+pub const BLIND_ROTATION_SUBGRAPH: &str = "tfhe.blind_rotation";
+
+/// Blind rotation arguments: the initial accumulator `a` and `b`, the LWE
+/// mask, and the `a` and `b` rows of every bootstrapping-key entry.
+type BlindRotationInputs = (Mat, Mat, Family<Int>, Family<Mat>, Family<Mat>);
+type BlindRotationSubgraph = Subgraph<BlindRotationInputs, (Mat, Mat)>;
+
+/// The blind rotation subgraph of one parameter set, defined on first use
+/// and shared by every graph built from these parameters, so a graph with
+/// several bootstraps calls one definition.
+#[derive(Default)]
+struct BlindRotationCache(Mutex<Option<BlindRotationSubgraph>>);
+
+impl std::fmt::Debug for BlindRotationCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BlindRotationCache")
+    }
 }
 
 impl TfheParams {
@@ -531,6 +554,7 @@ impl TfheParams {
             lwe_error_cutoff,
             key_switch_base_bits,
             key_switch_digits,
+            blind_rotation: Arc::default(),
         })
     }
 
@@ -789,24 +813,14 @@ impl TfheParams {
         check_matrix(&self.common.ring, &first_entry.b, 1, 2 * self.common.ring.modulus_digits())?;
 
         let ring_dimension = self.common.ring.ring_dimension() as usize;
-        // The accumulator travels as one (a; b) column, so each step rotates,
-        // differences and multiplies both components in single operations.
-        let column = iterate(
-            self.lwe_dimension,
-            Mat::concat(ConcatAxis::Rows, vec![initial.a.clone(), initial.b.clone()]),
-            |index, current| {
-                let exponent = scale_to_ring_exponent(
-                    ciphertext.a.at(index.clone()),
-                    &self.lwe_modulus,
-                    ring_dimension,
-                );
-                let difference = current.clone().multiply_monomial(exponent) - current.clone();
-                let encrypted_bit = bootstrapping_key.entries.at(index);
-                Ok(current + self.external_product(&encrypted_bit.a, &encrypted_bit.b, &difference))
-            },
-        )?;
-        let a = row_of(&column, 0);
-        let b = row_of(&column, 1);
+        let inputs = (
+            initial.a.clone(),
+            initial.b.clone(),
+            ciphertext.a.clone(),
+            bootstrapping_key.entries.field(|entry| entry.a)?,
+            bootstrapping_key.entries.field(|entry| entry.b)?,
+        );
+        let (a, b) = self.blind_rotation_subgraph(&inputs)?.call(inputs)?;
 
         // Propagate static bounds on the host while the ciphertext matrices
         // travel through a single sequential-loop node in the graph.
@@ -1053,6 +1067,104 @@ impl TfheParams {
 
     /// The GSW external product of the (a; b) row pair with a (2 x 1)
     /// ring-LWE column, returned as a column.
+    /// The blind rotation subgraph for arguments shaped like `inputs`. Its
+    /// body rotates the `(a; b)` accumulator column once per LWE mask
+    /// coordinate: `acc += key_i ⊡ (X^{e_i} acc - acc)`, with `e_i` the mask
+    /// coordinate scaled to the ring exponent modulus `2N`.
+    fn blind_rotation_subgraph(
+        &self,
+        inputs: &BlindRotationInputs,
+    ) -> Result<BlindRotationSubgraph, FheError> {
+        let mut cache = self.blind_rotation.0.lock().expect("blind rotation cache lock");
+        if let Some(subgraph) = cache.as_ref() {
+            return Ok(subgraph.clone());
+        }
+        let ring_dimension = self.common.ring.ring_dimension() as usize;
+        let subgraph = Subgraph::define(
+            BLIND_ROTATION_SUBGRAPH,
+            inputs.schema(),
+            |(initial_a, initial_b, mask, key_a, key_b): BlindRotationInputs| {
+                // The rotation exponents depend only on the LWE mask, not on
+                // the accumulator, so all of them are computed before the loop.
+                let exponents = parallel(self.lwe_dimension, |index| {
+                    Ok(scale_to_ring_exponent(mask.at(index), &self.lwe_modulus, ring_dimension))
+                })?;
+                // The accumulator travels as one (a; b) column, so each step
+                // rotates, differences and multiplies both components in
+                // single operations.
+                let column = iterate(
+                    self.lwe_dimension,
+                    Mat::concat(ConcatAxis::Rows, vec![initial_a, initial_b]),
+                    |index, current| {
+                        let exponent = exponents.at(index.clone());
+                        let difference =
+                            current.clone().multiply_monomial(exponent) - current.clone();
+                        let product = self.external_product(
+                            &key_a.at(index.clone()),
+                            &key_b.at(index),
+                            &difference,
+                        );
+                        Ok(current + product)
+                    },
+                )?;
+                Ok((row_of(&column, 0), row_of(&column, 1)))
+            },
+        )?;
+        *cache = Some(subgraph.clone());
+        Ok(subgraph)
+    }
+
+    /// The GPU kernel that executes the blind rotation subgraph of these
+    /// parameters in one cooperative launch
+    /// (`crates/fhe/cuda/tfhe_blind_rotation.cu`), for registration in
+    /// `GpuRuntimeOptions::subgraph_kernels`. `None` when the kernel does not
+    /// cover the parameters: it needs a ring dimension of 16 to 2048, at most
+    /// four CRT limbs below 2^31, and a base of at most 30 bits.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_blind_rotation_kernel(
+        &self,
+    ) -> Option<mxx_backends::gpu_subgraph_kernel::GpuSubgraphKernel> {
+        use mxx_backends::gpu_subgraph_kernel::{GpuKernelOperandKind, GpuSubgraphKernel};
+        unsafe extern "C" {
+            fn mxx_fhe_tfhe_blind_rotation(launch: *const std::ffi::c_void) -> std::ffi::c_int;
+        }
+        let ring = &self.common.ring;
+        let (moduli, crt_bits, limbs) = ring.to_crt();
+        let ring_dimension = ring.ring_dimension() as u64;
+        if !(16..=2048).contains(&ring_dimension) ||
+            limbs > 4 ||
+            moduli.iter().any(|&modulus| modulus >= 1 << 31) ||
+            ring.base_bits() > 30
+        {
+            return None;
+        }
+        let digits_per_tower = crt_bits.div_ceil(ring.base_bits() as usize);
+        Some(GpuSubgraphKernel {
+            name: BLIND_ROTATION_SUBGRAPH.into(),
+            inputs: vec![
+                GpuKernelOperandKind::Matrix,
+                GpuKernelOperandKind::Matrix,
+                GpuKernelOperandKind::IntegerFamily,
+                GpuKernelOperandKind::MatrixFamily,
+                GpuKernelOperandKind::MatrixFamily,
+            ],
+            outputs: vec![GpuKernelOperandKind::Matrix, GpuKernelOperandKind::Matrix],
+            parameters: vec![
+                self.lwe_dimension as u64,
+                self.lwe_modulus.bits() - 1,
+                u64::from(ring.base_bits()),
+                digits_per_tower as u64,
+                (ring.modulus_digits() / digits_per_tower) as u64,
+            ],
+            // The difference coefficients of every (limb, row) as 32-bit
+            // words (padded to 8 bytes), then a 64-bit product accumulator
+            // of every (row, limb).
+            scratch_bytes: (2 * limbs as u64 * ring_dimension).div_ceil(2) * 8 +
+                2 * limbs as u64 * ring_dimension * 8,
+            entry: mxx_fhe_tfhe_blind_rotation,
+        })
+    }
+
     fn external_product(&self, multiplier_a: &Mat, multiplier_b: &Mat, column: &Mat) -> Mat {
         let parameters = &self.common.ring;
         let digits = parameters.modulus_digits();

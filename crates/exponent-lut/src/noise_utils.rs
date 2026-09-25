@@ -785,8 +785,9 @@ pub struct NoiseDependencyGraph {
 //   keeps all of its contributions in one coherent group: overlapping sums of the same members are
 //   not independent.
 // * A rounding residual is identified by its operation and operands, so repeating an operation
-//   repeats its residual. Residuals of distinct operations are uncorrelated with each other and
-//   with sampled errors (H2).
+//   repeats its residual. Residuals of provably distinct operations are uncorrelated with each
+//   other and with sampled errors (H2); a family sum still keeps one operation's residuals coherent
+//   across lanes.
 // * An opaque contribution (a boundary that only has a total envelope) is coherent with everything.
 
 /// Coordinate of a sampled member.
@@ -799,6 +800,9 @@ pub(crate) enum SampleCoordinate {
     Reduced { depth: usize },
     /// A member related to other reads in an unknown way.
     Unknown,
+    /// The one sample of a source that has no members. It is the same object
+    /// in every read, so it never proves two reads different.
+    Fixed,
 }
 
 /// What produced a contribution. Independence also depends on the sampling
@@ -832,7 +836,9 @@ pub(crate) struct NoiseContribution {
 
 impl NoiseContribution {
     fn summarized(&self) -> bool {
-        self.sample.iter().any(|coordinate| !matches!(coordinate, SampleCoordinate::Index { .. }))
+        self.sample.iter().any(|coordinate| {
+            !matches!(coordinate, SampleCoordinate::Index { .. } | SampleCoordinate::Fixed)
+        })
     }
 }
 
@@ -908,22 +914,6 @@ impl NoiseBreakdown {
                 kind: ContributionKind::SampledError,
                 per_member: false,
                 white,
-                moments,
-            }],
-        }
-    }
-
-    /// One rounding residual of a gate.
-    pub(crate) fn rounding(source: [u8; 32], origin: &'static str, moments: NoiseMoments) -> Self {
-        Self {
-            lane_depth: None,
-            terms: vec![NoiseContribution {
-                source,
-                origin,
-                sample: Vec::new(),
-                kind: ContributionKind::RoundingResidual,
-                per_member: false,
-                white: false,
                 moments,
             }],
         }
@@ -1123,10 +1113,13 @@ impl NoiseBreakdown {
                         *coordinate = SampleCoordinate::Reduced { depth };
                     }
                 }
-                // Only a contribution carrying member coordinates can be a
-                // distinct object per lane; a gate residual has none.
-                let independent =
-                    term.kind != ContributionKind::Opaque && lane_dependent && at_depth.len() == 1;
+                // Only sampled errors of distinct members are independent
+                // across lanes. Lane-wise decorrelation of rounding residuals
+                // is not established, so they stay coherent even when their
+                // operands carry member coordinates.
+                let independent = term.kind == ContributionKind::SampledError &&
+                    lane_dependent &&
+                    at_depth.len() == 1;
                 let multiplicity = match (independent, at_depth.first()) {
                     (true, Some(SampleCoordinate::Index { index, .. })) => {
                         lane_multiplicity(index, &lane, count)
@@ -1143,7 +1136,7 @@ impl NoiseBreakdown {
                         reduced.moments = independent_sum(&term.moments, count, &squares);
                     }
                     None => {
-                        if lane_dependent && term.kind != ContributionKind::Opaque {
+                        if lane_dependent && term.kind == ContributionKind::SampledError {
                             counts.unknown_index += 1;
                             for coordinate in &mut reduced.sample {
                                 if matches!(coordinate, SampleCoordinate::Reduced { depth: d } if *d == depth) {
@@ -1227,28 +1220,41 @@ impl NoiseBreakdown {
         }
     }
 
-    /// A digest of the contributions' identities, naming the value that an
-    /// operation consumes: a deterministic operation on equal identities
-    /// produces the same residual. `None` when an opaque contribution hides
-    /// the value's identity.
-    pub(crate) fn identity(&self) -> Option<[u8; 32]> {
+    /// The identity of the value that an operation consumes, split into a
+    /// digest of its sources and its member coordinates: one coordinate per
+    /// source, in source order. A deterministic operation on the same value
+    /// produces the same residual, so a residual takes the digest into its
+    /// source and the coordinates as its sample; reads through different
+    /// expressions then stay coherent unless the coordinates provably
+    /// differ. A source read at several members, or at a non-single
+    /// coordinate, gets an unknown coordinate. `None` when an opaque
+    /// contribution hides the value's identity.
+    pub(crate) fn operand(&self) -> Option<([u8; 32], Vec<SampleCoordinate>)> {
         use sha2::{Digest, Sha256};
         if self.terms.iter().any(|term| term.kind == ContributionKind::Opaque) {
             return None;
         }
-        let mut keys = self
-            .terms
-            .iter()
-            .map(|term| format!("{:?}/{:?}/{:?}", term.kind, term.source, term.sample))
-            .collect::<Vec<_>>();
-        keys.sort_unstable();
-        keys.dedup();
-        let mut hasher = Sha256::new();
-        for key in keys {
-            hasher.update((key.len() as u64).to_le_bytes());
-            hasher.update(key.as_bytes());
+        let mut sources = BTreeMap::<(ContributionKind, [u8; 32]), Vec<&[SampleCoordinate]>>::new();
+        for term in &self.terms {
+            sources.entry((term.kind, term.source)).or_default().push(&term.sample);
         }
-        Some(hasher.finalize().into())
+        let mut hasher = Sha256::new();
+        let mut sample = Vec::with_capacity(sources.len());
+        for ((kind, source), reads) in sources {
+            hasher.update([kind as u8]);
+            hasher.update(source);
+            let first = reads[0];
+            sample.push(if reads.iter().any(|read| *read != first) {
+                SampleCoordinate::Unknown
+            } else {
+                match first {
+                    [] => SampleCoordinate::Fixed,
+                    [coordinate] => coordinate.clone(),
+                    _ => SampleCoordinate::Unknown,
+                }
+            });
+        }
+        Some((hasher.finalize().into(), sample))
     }
 
     /// Variance by contribution kind, for diagnostics.
@@ -1496,13 +1502,28 @@ mod breakdown_tests {
     }
 
     #[test]
-    fn identity_names_equal_operands_and_hides_opaque_ones() {
-        let a = NoiseBreakdown::sampled([1; 32], "a", moments(1), true);
-        let renamed = NoiseBreakdown::sampled([1; 32], "b", moments(9), true);
+    fn operand_identity_keeps_member_coordinates_out_of_the_source() {
+        let lane = IntExpr::LoopIndex(0);
+        let read = |index: IntExpr| {
+            NoiseBreakdown::sampled_member([1; 32], "a", 1, index, moments(1), true)
+        };
+        let aliased = IntExpr::Select {
+            selector: Box::new(lane.clone()),
+            branches: vec![IntExpr::constant(0), IntExpr::constant(0)],
+        };
+        let (first, first_sample) = read(IntExpr::constant(0)).operand().unwrap();
+        let (second, second_sample) = read(aliased).operand().unwrap();
+        assert_eq!(first, second, "reads of one source share the residual source");
+        // Their residuals alias in lane zero, so they stay coherent.
+        let residual =
+            |sample| NoiseBreakdown::object_residual([7; 32], "test", sample, moments(1), true);
+        assert_eq!(variance(&residual(first_sample).merge(&residual(second_sample))), rational(4));
+        let (_, other_sample) = read(IntExpr::constant(1)).operand().unwrap();
+        let (_, zero_sample) = read(IntExpr::constant(0)).operand().unwrap();
+        assert_eq!(variance(&residual(zero_sample).merge(&residual(other_sample))), rational(2));
         let b = NoiseBreakdown::sampled([2; 32], "a", moments(1), true);
-        assert_eq!(a.identity(), renamed.identity());
-        assert_ne!(a.identity(), b.identity());
-        assert_eq!(a.merge(&NoiseBreakdown::opaque("test", moments(1))).identity(), None);
+        assert_ne!(b.operand().unwrap().0, first);
+        assert_eq!(b.merge(&NoiseBreakdown::opaque("test", moments(1))).operand(), None);
     }
 
     #[test]
@@ -1525,7 +1546,8 @@ mod breakdown_tests {
     #[test]
     fn rounding_residuals_are_coherent_across_lanes_and_opaque_terms_with_everything() {
         let lane = IntExpr::LoopIndex(0);
-        let rounding = NoiseBreakdown::rounding([7; 32], "test", moments(1));
+        let rounding =
+            NoiseBreakdown::object_residual([7; 32], "test", Vec::new(), moments(1), false);
         let mut counts = ReductionCounts::default();
         assert_eq!(
             variance(&rounding.reduce(1, &lane, &BigUint::from(3u8), &mut counts)),

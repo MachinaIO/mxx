@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::noise_utils::{NoiseBreakdown, ReductionCounts};
+use crate::noise_utils::{NoiseBreakdown, ReductionCounts, SampleCoordinate};
 
 mod bigdecimal_string {
     use bigdecimal::BigDecimal;
@@ -2860,17 +2860,19 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         );
         // The remainders are determined by the LUT and its input: every
         // invocation of the same LUT on the same value shares them.
-        let operand = input_terms.identity();
-        let residual =
-            |tag: &'static [u8], origin: &'static str, variance: NonnegativeRational| match operand
-            {
-                Some(operand) => NoiseBreakdown::rounding(
+        let operand = input_terms.operand();
+        let residual = |tag: &'static [u8], origin: &'static str, variance: NonnegativeRational| {
+            match &operand {
+                Some((operand, sample)) => NoiseBreakdown::object_residual(
                     stable_source_id(&(tag, operand, lut, level)),
                     origin,
+                    sample.clone(),
                     zero_mean_moments(variance),
+                    false,
                 ),
                 None => NoiseBreakdown::opaque(origin, zero_mean_moments(variance)),
-            };
+            }
+        };
         let mut contributions = inherited.merge(&helper).merge(&fresh).merge(&residual(
             b"rns-bgg/lut/rounding",
             "lut-rounding",
@@ -2934,15 +2936,17 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                     let breakdown = value.contributions("coefficient-output").map(|terms| {
                         // The final rounding is determined by the value it
                         // rounds.
-                        let rounding = match terms.identity() {
-                            Some(operand) => NoiseBreakdown::rounding(
+                        let rounding = match terms.operand() {
+                            Some((operand, sample)) => NoiseBreakdown::object_residual(
                                 stable_source_id(&(
                                     b"rns-bgg/coefficient-final-rounding".as_slice(),
                                     operand,
                                     level,
                                 )),
                                 "coefficient-final-rounding",
+                                sample,
                                 rounding.clone(),
+                                false,
                             ),
                             None => NoiseBreakdown::opaque(
                                 "coefficient-final-rounding",
@@ -3301,17 +3305,26 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             // are coefficient-uncorrelated. The remainders are determined by
             // the operation and its operands: every gate that multiplies the
             // same input by the same RHS member at this level shares them.
-            let rounding = match input_terms.identity() {
-                Some(operand) => NoiseBreakdown::object_residual(
+            // The RHS member and the input's members are coordinates, not
+            // part of the source, so aliasing reads stay coherent.
+            let rounding = match input_terms.operand() {
+                Some((operand, input_sample)) => NoiseBreakdown::object_residual(
                     stable_source_id(&(
                         b"rns-bgg/private-mul/rounding".as_slice(),
                         operand,
                         rhs.id,
-                        format!("{:?}", rhs.index),
                         level,
                     )),
                     "private-mul-rounding",
-                    Vec::new(),
+                    rhs.index
+                        .as_ref()
+                        .map(|index| SampleCoordinate::Index {
+                            depth: self.lane_indices.len(),
+                            index: Arc::new(index.clone()),
+                        })
+                        .into_iter()
+                        .chain(input_sample)
+                        .collect(),
                     zero_mean_moments(terms.rounding.clone()),
                     true,
                 ),
@@ -4849,6 +4862,67 @@ mod test {
         ));
         assert!(!below(&fallback, &inherited.add(&terms.rhs_error).add(&terms.rounding)));
         assert!(below(&single, &fallback));
+    }
+
+    #[test]
+    fn aliasing_rhs_reads_share_their_residuals() {
+        // `rhs[0]` and `rhs[Select(i, [0, 0])]` read the same RHS member in
+        // every lane, so both products are the same deterministic product.
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let wires = std::cell::Cell::new(None);
+        let family = builder
+            .parallel(FamilyRange::full(IntExpr::constant(2)).unwrap(), |builder, lane| {
+                let product = |builder: &mut crate::program::ExponentLutProgramBuilder,
+                               index: IntExpr| {
+                    builder.mul_private(
+                        crate::program::Operand::Scalar(input),
+                        crate::program::Operand::Member { family: rhs, index },
+                    )
+                };
+                let direct = product(builder, IntExpr::constant(0))?;
+                let aliased = product(
+                    builder,
+                    IntExpr::Select {
+                        selector: Box::new(lane),
+                        branches: vec![IntExpr::constant(0), IntExpr::constant(0)],
+                    },
+                )?;
+                let sum = builder.add(
+                    crate::program::Operand::Scalar(direct),
+                    crate::program::Operand::Scalar(aliased),
+                )?;
+                wires.set(Some((direct, sum)));
+                Ok(crate::program::Operand::Scalar(sum))
+            })
+            .unwrap();
+        let output = builder.sum(family).unwrap();
+        let program = builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+        let parameters = nested_alignment_parameters();
+        let bindings = RnsBggNoiseBindings::new(
+            BTreeMap::from([(
+                input,
+                InputBinding::Scalar(RnsBggNoiseValue::sampled_encoding(
+                    &parameters,
+                    b"state",
+                    &[BigInt::one()],
+                )),
+            )]),
+            BTreeMap::from([(
+                rhs,
+                InputBinding::Family(RnsBggNoiseFamily {
+                    element: unit_rhs(),
+                    range: FamilyRange::full(IntExpr::constant(2)).unwrap(),
+                    max_nonzero_payloads: BigUint::one(),
+                }),
+            )]),
+        )
+        .unwrap();
+        let trace = trace_program(&parameters, &program, &bindings).unwrap();
+        let (direct, sum) = wires.get().unwrap();
+        let variance = |wire| trace.wires[&wire].moments.as_ref().unwrap().variance.clone();
+        assert_eq!(variance(sum), variance(direct).scaled(&4u8.into()));
     }
 
     #[test]

@@ -541,9 +541,10 @@ impl RnsBggParameters {
     /// decomposition base and modulus digits. An output column has `2D`
     /// digit polynomials of `N` coefficients bounded by `B / 2`, so the L1
     /// bound is `N * D * B` and the energy `sum u_i^2` is at most
-    /// `2 D N (B/2)^2 = N D B^2 / 2`. The energy is the variance gain of a
-    /// white (coefficient-uncorrelated) error under the fixed-action model
-    /// (H1/H4); callers use the squared L1 bound for any other error. Keeping
+    /// `2 D N (B/2)^2 = N D B^2 / 2`. The energy is the variance gain of an
+    /// error whose covariance is bounded by its variance times the identity,
+    /// under the fixed-action model (H1/H4); callers use the squared L1 bound
+    /// for any other error. Keeping
     /// this derivation here makes the noise recurrence use the same
     /// decomposition contract as the public-key evaluator.
     fn mul_public_action_gain(&self, level: usize) -> Result<RightActionNoiseGain, RnsBggError> {
@@ -2053,7 +2054,11 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                             (
                                 mean_gain.clone(),
                                 term.moments.variance.scaled_ratio(
-                                    if term.white { &action.l2_squared } else { &l1_squared },
+                                    if term.covariance_bounded {
+                                        &action.l2_squared
+                                    } else {
+                                        &l1_squared
+                                    },
                                     &alpha_squared,
                                 ),
                                 false,
@@ -2843,7 +2848,8 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         // otherwise the squared L1 action of the coherent branch sum.
         let l1_squared = terms.input_mean_gain.pow(2);
         let inherited = input_terms.transform(|term| {
-            let action = if term.white { &terms.input_variance_gain } else { &l1_squared };
+            let action =
+                if term.covariance_bounded { &terms.input_variance_gain } else { &l1_squared };
             (mean_gain.clone(), units(&term.moments.variance.scaled(action)), false)
         });
         let helper = NoiseBreakdown::sampled(
@@ -2852,14 +2858,27 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             zero_mean_moments(units(&terms.helper.scaled(&branch_squares))),
             false,
         );
+        // Each branch's B-key error is a fresh Gaussian sample weighted by
+        // the automorphed input plaintext and the scalar `p`: under a signed
+        // monomial plaintext its image keeps the sample's covariance bound,
+        // as the RHS error of a direct product does, and the branch sum
+        // keeps it whatever the branch correlation.
+        let monomial = payload_gain.l1.pow(2) == payload_gain.l2_squared;
         let fresh = NoiseBreakdown::sampled(
             stable_source_id(&(b"rns-bgg/lut/B".as_slice(), level, lut)),
             "lut-fresh",
             zero_mean_moments(units(&terms.fresh.scaled(&branch_squares))),
-            false,
+            monomial,
         );
         // The remainders are determined by the LUT and its input: every
-        // invocation of the same LUT on the same value shares them.
+        // invocation of the same LUT on the same value shares them. Under H2
+        // each branch's internal remainder sigma_k(s) * rho_k, averaged over
+        // the ternary secret and a centered uncorrelated residue, has
+        // covariance at most V I. Their branch correlation is not assumed:
+        // the coherent J^2 V sum keeps the (sum sqrt V)^2 I = J^2 V I bound,
+        // so a later fixed action may use its energy. The outer public and
+        // encoding remainders of the one scale-and-round are bounded the
+        // same way, and H2 makes them uncorrelated with each other.
         let operand = input_terms.operand();
         let residual = |tag: &'static [u8], origin: &'static str, variance: NonnegativeRational| {
             match &operand {
@@ -2868,7 +2887,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                     origin,
                     sample.clone(),
                     zero_mean_moments(variance),
-                    false,
+                    true,
                 ),
                 None => NoiseBreakdown::opaque(origin, zero_mean_moments(variance)),
             }
@@ -2946,7 +2965,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                                 "coefficient-final-rounding",
                                 sample,
                                 rounding.clone(),
-                                false,
+                                true,
                             ),
                             None => NoiseBreakdown::opaque(
                                 "coefficient-final-rounding",
@@ -3165,9 +3184,9 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         let plaintext_gain = lhs_value.bound.payload_l1.clone();
         // E_out = E_left * decomposition(A_right) + mu_left * E_right. Each
         // side is a fixed public action on its own contributions; the energy
-        // cap applies only to a white left contribution (H1/H4), any other
-        // keeps the squared L1 bound. A signed monomial left plaintext keeps
-        // the right contributions white.
+        // cap applies only to a covariance-bounded left contribution (H1/H4),
+        // any other keeps the squared L1 bound. A signed monomial left
+        // plaintext keeps the right contributions' covariance bound.
         let mut energy_cap_used = false;
         let breakdown = match (
             lhs_value.contributions("mul-public-lhs"),
@@ -3178,8 +3197,9 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                     .expect("positive decomposition gain");
                 let l1_squared = gain.l1.pow(2);
                 let lhs_terms = lhs_terms.transform(|term| {
-                    energy_cap_used |= term.white;
-                    let action = if term.white { &gain.l2_squared } else { &l1_squared };
+                    energy_cap_used |= term.covariance_bounded;
+                    let action =
+                        if term.covariance_bounded { &gain.l2_squared } else { &l1_squared };
                     (decomposition_l1.clone(), term.moments.variance.scaled(action), false)
                 });
                 let monomial = plaintext_gain.pow(2) == lhs_value.payload_l2_squared;
@@ -3189,7 +3209,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                     (
                         plaintext_l1.clone(),
                         term.moments.variance.scaled(&plaintext_gain.pow(2)),
-                        term.white && monomial,
+                        term.covariance_bounded && monomial,
                     )
                 });
                 Some(lhs_terms.merge(&rhs_terms))
@@ -3279,7 +3299,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             // the squared L1 action.
             let l1 = &terms.inherited_mean_gain;
             let inherited = input_terms.transform(|term| {
-                let variance = if term.white {
+                let variance = if term.covariance_bounded {
                     terms.inherited_variance(&term.moments.variance)
                 } else {
                     term.moments.variance.scaled_ratio(&l1.numerator.pow(2), &l1.denominator.pow(2))
@@ -3288,7 +3308,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             });
             let rhs_source = stable_source_id(&(b"rns-bgg/rhs-error".as_slice(), rhs.id, level));
             let rhs_moments = zero_mean_moments(terms.rhs_error.clone());
-            let rhs_white = payload_gain.l1.pow(2) == payload_gain.l2_squared;
+            let rhs_bounded = payload_gain.l1.pow(2) == payload_gain.l2_squared;
             let rhs_error = match rhs.index.as_ref() {
                 Some(index) => NoiseBreakdown::sampled_member(
                     rhs_source,
@@ -3296,9 +3316,9 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                     self.lane_indices.len(),
                     index.clone(),
                     rhs_moments,
-                    rhs_white,
+                    rhs_bounded,
                 ),
-                None => NoiseBreakdown::sampled(rhs_source, "rhs-error", rhs_moments, rhs_white),
+                None => NoiseBreakdown::sampled(rhs_source, "rhs-error", rhs_moments, rhs_bounded),
             };
             // Under H2 both remainders are centered uniforms independent per
             // coefficient and of the independent secret, so their images
@@ -3444,13 +3464,17 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             })
             .transpose()?;
         let material = self.lut_material_provenance(level, lut, table)?;
+        let mut heuristics = input.1.heuristics.clone();
+        if !terminal_coefficient {
+            heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
+        }
         let value = self.carry_provenance(
             RnsBggNoiseValue {
                 bound,
                 payload_l2_squared: output_payload_l2_squared,
                 moments: None,
                 provenance: BTreeMap::new(),
-                heuristics: input.1.heuristics.clone(),
+                heuristics,
                 breakdown: None,
             }
             .with_breakdown(breakdown),

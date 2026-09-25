@@ -827,10 +827,18 @@ pub(crate) struct NoiseContribution {
     /// Every member of the enclosing input family has its own sample, so a
     /// member read appends its index to `sample`.
     pub per_member: bool,
-    /// The coefficients are uncorrelated with a common variance (a fresh
-    /// sample, or its image under signed monomials), so a fixed action may
-    /// use its coefficient energy instead of its squared L1 norm (H1/H4).
-    pub white: bool,
+    /// The covariance over every coordinate a later action reads, all
+    /// coefficients of all columns, is bounded by `moments.variance` times
+    /// the identity: `Cov(E) <= V I`. A later fixed action may then use its
+    /// coefficient energy instead of its squared L1 norm (H1/H4). A per-
+    /// coefficient variance bound alone does not give this.
+    ///
+    /// It holds for a fresh sample, its image under signed monomials, and an
+    /// H2 remainder `s * rho` averaged over the ternary secret and the
+    /// centered uncorrelated residue. It survives every sum: Cauchy gives
+    /// `(sum sqrt V_k)^2 I` for unknown correlation, and uncorrelated terms
+    /// give `(sum V_k) I`. A general action's image does not keep it.
+    pub covariance_bounded: bool,
     pub moments: NoiseMoments,
 }
 
@@ -880,7 +888,7 @@ impl NoiseBreakdown {
         source: [u8; 32],
         origin: &'static str,
         moments: NoiseMoments,
-        white: bool,
+        covariance_bounded: bool,
     ) -> Self {
         Self {
             lane_depth: None,
@@ -890,7 +898,7 @@ impl NoiseBreakdown {
                 sample: Vec::new(),
                 kind: ContributionKind::SampledError,
                 per_member: false,
-                white,
+                covariance_bounded,
                 moments,
             }],
         }
@@ -903,7 +911,7 @@ impl NoiseBreakdown {
         depth: usize,
         index: IntExpr,
         moments: NoiseMoments,
-        white: bool,
+        covariance_bounded: bool,
     ) -> Self {
         Self {
             lane_depth: None,
@@ -913,7 +921,7 @@ impl NoiseBreakdown {
                 sample: vec![SampleCoordinate::Index { depth, index: Arc::new(index) }],
                 kind: ContributionKind::SampledError,
                 per_member: false,
-                white,
+                covariance_bounded,
                 moments,
             }],
         }
@@ -928,7 +936,7 @@ impl NoiseBreakdown {
         origin: &'static str,
         sample: Vec<SampleCoordinate>,
         moments: NoiseMoments,
-        white: bool,
+        covariance_bounded: bool,
     ) -> Self {
         Self {
             lane_depth: None,
@@ -938,7 +946,7 @@ impl NoiseBreakdown {
                 sample,
                 kind: ContributionKind::RoundingResidual,
                 per_member: false,
-                white,
+                covariance_bounded,
                 moments,
             }],
         }
@@ -964,7 +972,7 @@ impl NoiseBreakdown {
                 sample: Vec::new(),
                 kind: ContributionKind::Opaque,
                 per_member: false,
-                white: false,
+                covariance_bounded: false,
                 moments,
             }],
         }
@@ -1025,8 +1033,8 @@ impl NoiseBreakdown {
     }
 
     /// Apply a fixed linear action to every contribution. `action` returns
-    /// the mean gain, the variance of the image, and whether the image stays
-    /// white, from the contribution before the action.
+    /// the mean gain, the variance of the image, and whether the image keeps
+    /// its covariance bound, from the contribution before the action.
     pub(crate) fn transform(
         &self,
         mut action: impl FnMut(&NoiseContribution) -> (NonnegativeRational, NonnegativeRational, bool),
@@ -1035,10 +1043,10 @@ impl NoiseBreakdown {
             .terms
             .iter()
             .map(|term| {
-                let (mean_gain, variance, white) = action(term);
+                let (mean_gain, variance, covariance_bounded) = action(term);
                 NoiseContribution {
                     moments: term.moments.linear_image(&mean_gain, variance).rounded_up(PRECISION),
-                    white,
+                    covariance_bounded,
                     ..term.clone()
                 }
             })
@@ -1069,7 +1077,8 @@ impl NoiseBreakdown {
                         .moments
                         .add_with_covariance(&term.moments, NoiseCorrelation::SharedSource)
                         .rounded_up(PRECISION);
-                    existing.white &= term.white;
+                    // The Cauchy sum keeps a covariance bound of both.
+                    existing.covariance_bounded &= term.covariance_bounded;
                     existing.per_member &= term.per_member;
                 }
                 None => {
@@ -1149,7 +1158,9 @@ impl NoiseBreakdown {
                         reduced.moments = term.moments.scaled(count);
                     }
                 }
-                reduced.white = false;
+                // Every rule above is a sum of the members' images: coherent
+                // (r^2 V), uncorrelated (r V), or grouped (sum m^2 V), and
+                // each keeps the members' covariance bound.
                 reduced
             })
             .collect::<Vec<_>>();
@@ -1524,6 +1535,31 @@ mod breakdown_tests {
         let b = NoiseBreakdown::sampled([2; 32], "a", moments(1), true);
         assert_ne!(b.operand().unwrap().0, first);
         assert_eq!(b.merge(&NoiseBreakdown::opaque("test", moments(1))).operand(), None);
+    }
+
+    #[test]
+    fn sums_keep_the_covariance_bound_and_general_actions_drop_it() {
+        let lane = IntExpr::LoopIndex(0);
+        let bounded =
+            |breakdown: &NoiseBreakdown| breakdown.terms.iter().all(|term| term.covariance_bounded);
+        let member =
+            NoiseBreakdown::sampled_member([1; 32], "test", 1, lane.clone(), moments(1), true);
+        let residual =
+            NoiseBreakdown::object_residual([7; 32], "test", Vec::new(), moments(1), true);
+        let mut counts = ReductionCounts::default();
+        // Coherent, uncorrelated, and residual sums over lanes keep it.
+        let reduced = member.merge(&residual).reduce(1, &lane, &BigUint::from(4u8), &mut counts);
+        assert!(bounded(&reduced));
+        assert!(bounded(&residual.merge(&residual)));
+        // Merging with an image that lost the bound loses it.
+        let image = residual.transform(|term| {
+            (
+                NonnegativeRational::new(1u8.into(), 1u8.into()).unwrap(),
+                term.moments.variance.clone(),
+                false,
+            )
+        });
+        assert!(!bounded(&residual.merge(&image)));
     }
 
     #[test]

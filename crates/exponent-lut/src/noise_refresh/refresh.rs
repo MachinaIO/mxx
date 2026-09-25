@@ -689,19 +689,17 @@ mod tests {
         let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
-            64,
+            3,
         )
         .unwrap();
-        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new_structural(
+        let prf_labels = prf_labels.to_vec();
+        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new(
             profile,
-            generated.public_layout.bucket_width,
-            generated.public_layout.parameters.bucket_count,
-            b"refresh-test",
-            &prf_labels,
+            vec![generated.public_layout.clone(); prf_labels.len()],
+            prf_labels,
         )
         .unwrap();
-        let prepared =
-            PreparedSparseLwrPrf::new(sparse, &generated.public_layout, [9; 32]).unwrap();
+        let prepared = PreparedSparseLwrPrf::new(sparse, [9; 32]).unwrap();
         let (source, source_output) = source_program();
         let declaration = RefreshDeclaration::new(
             &source,
@@ -800,19 +798,17 @@ mod tests {
         let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
-            64,
+            3,
         )
         .unwrap();
-        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new_structural(
+        let prf_labels = labels.prf_labels().unwrap().to_vec();
+        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new(
             profile,
-            generated.public_layout.bucket_width,
-            generated.public_layout.parameters.bucket_count,
-            b"refresh-test",
-            &labels.prf_labels().unwrap(),
+            vec![generated.public_layout.clone(); prf_labels.len()],
+            prf_labels,
         )
         .unwrap();
-        let prepared =
-            PreparedSparseLwrPrf::new(sparse, &generated.public_layout, [9; 32]).unwrap();
+        let prepared = PreparedSparseLwrPrf::new(sparse, [9; 32]).unwrap();
         assert_eq!(
             RefreshDeclaration::new(
                 &source,
@@ -857,19 +853,17 @@ mod tests {
         let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
-            64,
+            3,
         )
         .unwrap();
-        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new_structural(
+        let prf_labels = [PrfLabel::from_components(&[b"foreign"]).unwrap()].to_vec();
+        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new(
             profile,
-            generated.public_layout.bucket_width,
-            generated.public_layout.parameters.bucket_count,
-            b"refresh-test",
-            &[PrfLabel::from_components(&[b"foreign"]).unwrap()],
+            vec![generated.public_layout.clone(); prf_labels.len()],
+            prf_labels,
         )
         .unwrap();
-        let prepared =
-            PreparedSparseLwrPrf::new(sparse, &generated.public_layout, [9; 32]).unwrap();
+        let prepared = PreparedSparseLwrPrf::new(sparse, [9; 32]).unwrap();
         let (source, source_output) = source_program();
         assert!(
             RefreshDeclaration::new(

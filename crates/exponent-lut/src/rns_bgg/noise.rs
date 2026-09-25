@@ -594,6 +594,17 @@ impl RnsBggParameters {
         // Adding the online remainder gives (2N/3+2)*(p^2-1)/(12*p^2).
         let rounding = NonnegativeRational::new((&n + 3u8) * (&p_squared - 1u8), 18u8 * &p_squared)
             .expect("positive scale");
+        tracing::trace!(
+            level,
+            input_log2 = variance_log2(input_variance),
+            inherited_log2 = variance_log2(&inherited),
+            fresh_log2 = variance_log2(&fresh),
+            fresh_gain_bits = fresh_gain.bits(),
+            payload_l1_bits = payload_gain.l1.bits(),
+            payload_l2_squared_bits = payload_gain.l2_squared.bits(),
+            rounding_log2 = variance_log2(&rounding),
+            "private multiplication variance terms"
+        );
         Ok(inherited.add(&fresh).add(&rounding))
     }
 
@@ -1233,6 +1244,31 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
     }
 }
 
+/// Approximate `log2` of a nonnegative rational variance.
+fn variance_log2(variance: &NonnegativeRational) -> i64 {
+    variance.numerator.bits() as i64 - variance.denominator.bits() as i64
+}
+
+/// Trace one noise operation's output, for diagnosing budget failures.
+fn trace_noise_value(
+    wire: WireId,
+    level: Option<usize>,
+    node: &crate::noise_utils::NoiseDependencyNode,
+    value: &RnsBggNoiseValue,
+) {
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let kind = format!("{node:?}");
+        tracing::trace!(
+            wire = wire.0,
+            level,
+            operation = kind.split(|c: char| !c.is_alphanumeric()).next().unwrap_or(""),
+            variance_log2 = value.moments.as_ref().map(|m| variance_log2(&m.variance)),
+            error_bits = value.bound.error.bits(),
+            "noise operation"
+        );
+    }
+}
+
 /// Hash a serializable sampling-domain label into a stable source identity.
 ///
 /// Callers must include every value that distinguishes independent sampling
@@ -1497,6 +1533,36 @@ pub struct RnsBggNoiseEvaluator<'a> {
     event_multiplier: BigUint,
     finalized_coefficient_wires: BTreeMap<WireId, RnsBggNoiseValue>,
     refresh_parameters: Option<RefreshNoiseParameters>,
+    /// Lane index of each enclosing parallel family, innermost last.
+    lane_indices: Vec<IntExpr>,
+    /// Wires whose payload is nonzero in at most `count` lanes of the family
+    /// at `depth` (the number of enclosing parallel families), because they
+    /// are weighted by distinct members of a sparse RHS family.
+    payload_support: BTreeMap<WireId, PayloadSupport>,
+}
+
+#[derive(Clone, Debug)]
+struct PayloadSupport {
+    depth: usize,
+    count: BigUint,
+}
+
+/// Whether distinct lanes of a family read distinct members through
+/// `index`: the lane index itself (up to a constant offset), or a selection
+/// by the lane among pairwise distinct constants.
+fn lane_injective(index: &IntExpr, lane: &IntExpr) -> bool {
+    let lane = lane.clone().canonicalize();
+    if let IntExpr::Select { selector, branches } = index {
+        let mut seen = std::collections::BTreeSet::new();
+        return selector.clone().canonicalize() == lane &&
+            branches.iter().all(|branch| {
+                branch.evaluate(&ParamEnv::default()).is_ok_and(|value| seen.insert(value))
+            });
+    }
+    IntExpr::Sub(Box::new(index.clone()), Box::new(lane))
+        .canonicalize()
+        .evaluate(&ParamEnv::default())
+        .is_ok()
 }
 
 impl<'a> RnsBggNoiseEvaluator<'a> {
@@ -1516,7 +1582,21 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             event_multiplier: BigUint::one(),
             finalized_coefficient_wires: BTreeMap::new(),
             refresh_parameters: None,
+            lane_indices: Vec::new(),
+            payload_support: BTreeMap::new(),
         }
+    }
+
+    /// Sparse payload support of `wire` in the innermost enclosing family.
+    fn lane_support(&self, wire: WireId) -> Option<&BigUint> {
+        self.payload_support
+            .get(&wire)
+            .filter(|support| support.depth == self.lane_indices.len())
+            .map(|support| &support.count)
+    }
+
+    fn set_lane_support(&mut self, wire: WireId, count: BigUint) {
+        self.payload_support.insert(wire, PayloadSupport { depth: self.lane_indices.len(), count });
     }
 
     /// Attach the checked refresh noise contract to this existing builder.
@@ -1796,6 +1876,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         multiplier: BigUint,
     ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
         let coordinates = self.event_coordinates(wire)?;
+        trace_noise_value(wire, self.level(wire).ok(), &node, &value);
         self.trace.wires.insert(wire, value.clone());
         let node_id = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
         self.trace.dependencies.nodes.push(node);
@@ -1900,6 +1981,12 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             provenance: family.element.provenance.clone(),
             heuristics: family.element.heuristics.clone(),
         };
+        tracing::trace!(
+            wire = wire.0,
+            members = %n,
+            variance_log2 = value.moments.as_ref().map(|m| variance_log2(&m.variance)),
+            "noise family sum"
+        );
         self.trace.wires.insert(wire, value.clone());
         let input_node = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
         self.trace.dependencies.nodes.push(crate::noise_utils::NoiseDependencyNode::Binding(
@@ -2608,26 +2695,24 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
             })?;
         let previous_multiplier = evaluator.event_multiplier.clone();
         evaluator.event_multiplier *= &count;
+        evaluator.lane_indices.push(index.clone());
         let result = body(self, evaluator, index);
+        let (wire, element) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                evaluator.lane_indices.pop();
+                evaluator.event_multiplier = previous_multiplier;
+                return Err(error);
+            }
+        };
+        // Members weighted by distinct members of a sparse RHS family have
+        // nonzero payloads in at most that family's sparse count of lanes.
+        let max_nonzero_payloads = evaluator
+            .lane_support(wire)
+            .map_or(count.clone(), |support| support.min(&count).clone());
+        evaluator.lane_indices.pop();
         evaluator.event_multiplier = previous_multiplier;
-        let (wire, element) = result?;
-        Ok((
-            wire,
-            RnsBggNoiseFamily {
-                element,
-                range: range.clone(),
-                max_nonzero_payloads: range
-                    .count()
-                    .evaluate(&ParamEnv::default())
-                    .ok()
-                    .and_then(|v| v.to_biguint())
-                    .ok_or_else(|| {
-                        ProgramLowerError::Backend(RnsBggError::Binding(
-                            "family count is not concrete",
-                        ))
-                    })?,
-            },
-        ))
+        Ok((wire, RnsBggNoiseFamily { element, range: range.clone(), max_nonzero_payloads }))
     }
     fn sum(
         &mut self,
@@ -2666,6 +2751,13 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             lhs: self.node_for_wire(lhs.0)?,
             rhs: self.node_for_wire(rhs.0)?,
         };
+        // A lane's sum is nonzero only where one of its summands is.
+        if let (Some(lhs_support), Some(rhs_support)) =
+            (self.lane_support(lhs.0), self.lane_support(rhs.0))
+        {
+            let count = lhs_support + rhs_support;
+            self.set_lane_support(wire, count);
+        }
         self.operation_node(wire, value, node)
     }
     fn mul_public(
@@ -2732,6 +2824,10 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             lhs: self.node_for_wire(lhs.0)?,
             rhs: self.node_for_wire(rhs.0)?,
         };
+        // A public factor keeps the zero payloads of the right operand.
+        if let Some(count) = self.lane_support(rhs.0).cloned() {
+            self.set_lane_support(wire, count);
+        }
         self.operation_node(wire, value, node)
     }
     fn mul_private(
@@ -2749,14 +2845,16 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         }
         let logical_level = self.level(input.0)?;
         let level = logical_level;
-        let contract = match self
+        let (contract, sparse_count) = match self
             .bindings
             .rhs
             .get(&rhs.id)
             .ok_or(RnsBggError::Binding("missing RHS noise contract"))?
         {
-            InputBinding::Scalar(value) => value.clone(),
-            InputBinding::Family(family) => family.element.clone(),
+            InputBinding::Scalar(value) => (value.clone(), None),
+            InputBinding::Family(family) => {
+                (family.element.clone(), Some(family.max_nonzero_payloads.clone()))
+            }
         };
         let fresh_error_gain = self.fresh_gain(level)?;
         let wire = self.site()?.output;
@@ -2806,6 +2904,13 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             rhs: self.rhs_node(rhs),
             helper: None,
         };
+        if let (Some(count), Some(index), Some(lane)) =
+            (sparse_count, rhs.index.as_ref(), self.lane_indices.last())
+        {
+            if lane_injective(index, lane) {
+                self.set_lane_support(wire, count);
+            }
+        }
         self.operation_node(wire, value, node)
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
@@ -3272,7 +3377,14 @@ impl RnsBggParameters {
                     4u8.into(),
                 )
                 .map_err(|_| RnsBggError::Parameters("invalid average-case rational budget"))?;
-                let scale_fits = level + 1 == self.levels.len() ||
+                // A coefficient LUT output keeps its noise at the scale
+                // before its one scale-and-round; the finalized output is
+                // checked against the terminal modulus below.
+                let coefficient_output = program
+                    .wire_is_coefficient_output(*wire)
+                    .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?;
+                let scale_fits = coefficient_output ||
+                    level + 1 == self.levels.len() ||
                     self.scale(level)? == &BigUint::one() ||
                     moments.fits(
                         &NonnegativeRational::new(self.scale(level)?.clone(), 2u8.into()).map_err(

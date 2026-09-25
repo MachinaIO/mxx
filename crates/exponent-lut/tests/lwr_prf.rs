@@ -19,7 +19,10 @@ use mxx_backends::{
 use mxx_exponent_lut::{
     ExpLayout, api,
     noise_refresh::{
-        pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
+        pbc::{
+            PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, clear_pbc_inner_product,
+            generate_key_layout,
+        },
         prf::{PrfLabel, SparseLwrPrfProfile, SparseLwrPrfProgram},
     },
     program::{AttributeKnowledge, FamilyRange, InputBinding, WireId},
@@ -50,7 +53,8 @@ struct Fixture {
     rhs: BTreeMap<mxx_exponent_lut::program::RhsId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
     lhs: BTreeMap<WireId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
     trace: RnsBggNoiseTrace,
-    d_exponents: Vec<usize>,
+    keys: Vec<PbcGeneratedKeyLayout>,
+    a_exponents: Vec<u64>,
 }
 
 fn error_sigma() -> BigDecimal {
@@ -62,19 +66,9 @@ fn error_sigma() -> BigDecimal {
     sigma
 }
 
-/// Optional positive integer setting; `None` when unset.
-fn optional_usize(name: &str) -> Option<usize> {
-    env::var(name).ok().map(|value| {
-        let value = value
-            .trim()
-            .parse::<usize>()
-            .unwrap_or_else(|error| panic!("{name} must be a positive integer: {error}"));
-        assert!(value > 0, "{name} must be positive");
-        value
-    })
-}
-
-fn profile_and_program(ring_dimension: u32) -> (SparseLwrPrfProfile, SparseLwrPrfProgram) {
+fn profile_and_program(
+    ring_dimension: u32,
+) -> (SparseLwrPrfProfile, SparseLwrPrfProgram, Vec<PbcGeneratedKeyLayout>) {
     // The LWR input modulus Q fixes the exponent layout inside the ring:
     // X^(2n / Q * z) adds exponents modulo Q natively, so width_log2 =
     // log2(Q) - 1 and stride_log2 = log2(n) - width_log2. The output modulus
@@ -97,39 +91,51 @@ fn profile_and_program(ring_dimension: u32) -> (SparseLwrPrfProfile, SparseLwrPr
             "LWR input modulus {input_modulus} exceeds twice the ring dimension {ring_dimension}"
         )
     });
-    let lwr_dimension =
-        optional_usize("MXX_EXPONENT_LUT_LWR_PRF_LWR_DIMENSION").unwrap_or(ring_dimension as usize);
+    let lwr_dimension = env_usize("MXX_EXPONENT_LUT_LWR_PRF_LWR_DIMENSION", 16)
+        .expect("LWR dimension configuration");
+    let support_weight = env_usize("MXX_EXPONENT_LUT_LWR_PRF_SUPPORT_WEIGHT", 2)
+        .expect("sparse key weight configuration");
+    let output_count =
+        env_usize("MXX_EXPONENT_LUT_LWR_PRF_OUTPUTS", 1).expect("PRF output count configuration");
+    assert!(
+        lwr_dimension > 0 && support_weight > 0 && support_weight <= lwr_dimension,
+        "the sparse key weight must be positive and at most the LWR dimension"
+    );
+    assert!(output_count > 0, "MXX_EXPONENT_LUT_LWR_PRF_OUTPUTS must be positive");
     let profile = SparseLwrPrfProfile::new(
         ExpLayout { stride_log2, width_log2 },
         output_modulus / 2,
         lwr_dimension,
     )
     .expect("valid sparse-LWR profile");
-    // With a sparse support weight h, the PBC layout over the nu coordinates
-    // fixes the number of blocks (h' = h + 3) and the common block width;
-    // otherwise two blocks of width two give the minimal structural program.
-    let (bucket_width, block_count) =
-        match optional_usize("MXX_EXPONENT_LUT_LWR_PRF_SUPPORT_WEIGHT") {
-            Some(support_weight) => {
-                let parameters = PbcParameters::paper_evaluation(lwr_dimension, support_weight);
-                let support =
-                    rand::seq::index::sample(&mut rand::rng(), lwr_dimension, support_weight)
-                        .into_vec();
-                let generated =
-                    generate_key_layout(&parameters, PbcRootSeed(rand::random()), &support)
-                        .expect("PBC layout for the sparse LWR key");
-                (generated.public_layout.bucket_width, parameters.bucket_count)
-            }
-            None => (2, 2),
-        };
-    let labels = [PrfLabel::from_components(&[b"lwr-rns-label"]).expect("canonical label")];
-    let program =
-        SparseLwrPrfProgram::new_structural(profile, bucket_width, block_count, HASH_KEY, &labels)
-            .expect("structural sparse-LWR program");
+    // Every output evaluates the same public vector `a` under its own sparse
+    // key of weight h, placed by its own PBC layout with h' = h + 3 blocks.
+    let parameters = PbcParameters::paper_evaluation(lwr_dimension, support_weight);
+    let keys = (0..output_count)
+        .map(|_| {
+            let support = rand::seq::index::sample(&mut rand::rng(), lwr_dimension, support_weight)
+                .into_vec();
+            generate_key_layout(&parameters, PbcRootSeed(rand::random()), &support)
+                .expect("PBC layout for the sparse LWR key")
+        })
+        .collect::<Vec<_>>();
+    let labels = (0..output_count as u64)
+        .map(|index| {
+            PrfLabel::from_components(&[b"lwr-rns-output".as_slice(), &index.to_le_bytes()])
+                .expect("canonical label")
+        })
+        .collect();
+    let program = SparseLwrPrfProgram::new(
+        profile,
+        keys.iter().map(|key| key.public_layout.clone()).collect(),
+        labels,
+    )
+    .expect("sparse-LWR PRF program");
     eprintln!(
-        "LWR PRF program: n={ring_dimension} Q={input_modulus} P={output_modulus} nu={lwr_dimension} blocks={block_count} block_width={bucket_width}"
+        "LWR PRF program: n={ring_dimension} Q={input_modulus} P={output_modulus} nu={lwr_dimension} h={support_weight} outputs={output_count} blocks={} block_width={}",
+        parameters.bucket_count, keys[0].public_layout.bucket_width
     );
-    (profile, program)
+    (profile, program, keys)
 }
 
 fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNoiseBindings {
@@ -207,10 +213,16 @@ fn terminal_value_bounds(
     vec![bound; program.program().outputs().len()]
 }
 
-fn search_fixture(
-    sigma: &BigDecimal,
-) -> (RnsBggParameters, DCRTPolyParams, SparseLwrPrfProfile, SparseLwrPrfProgram, RnsBggNoiseTrace)
-{
+type SearchedFixture = (
+    RnsBggParameters,
+    DCRTPolyParams,
+    SparseLwrPrfProfile,
+    SparseLwrPrfProgram,
+    Vec<PbcGeneratedKeyLayout>,
+    RnsBggNoiseTrace,
+);
+
+fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
     let required_security = env_usize("MXX_EXPONENT_LUT_LWR_PRF_SECURITY_BITS", 1)
         .expect("security bits configuration");
     assert!(required_security > 0, "MXX_EXPONENT_LUT_LWR_PRF_SECURITY_BITS must be positive");
@@ -251,7 +263,7 @@ fn search_fixture(
     .expect("ring-dimension configuration");
     let mut failures = Vec::new();
     for ring_dimension in candidates {
-        let (profile, program) = profile_and_program(ring_dimension);
+        let (profile, program, keys) = profile_and_program(ring_dimension);
         let noise = noise_bindings(&program, sigma);
         let terminal_bounds = terminal_value_bounds(&profile, &program);
         let depth_candidates = (1..=max_crt_depth)
@@ -337,7 +349,7 @@ fn search_fixture(
         });
         failures.extend(rejected.into_inner().expect("rejection list"));
         if let Some((parameters, source, audit_trace)) = accepted {
-            return (parameters, source, profile, program, audit_trace);
+            return (parameters, source, profile, program, keys, audit_trace);
         }
     }
     panic!(
@@ -352,6 +364,7 @@ fn fixture(
     poly_parameters: DCRTPolyParams,
     profile: SparseLwrPrfProfile,
     program: SparseLwrPrfProgram,
+    keys: Vec<PbcGeneratedKeyLayout>,
     trace: RnsBggNoiseTrace,
     runtime: &mut GpuRuntime,
     store: &mut FileArtifactStore,
@@ -364,57 +377,59 @@ fn fixture(
         .sample_mask_secret(runtime, store)
         .expect("mask secret");
     let zero = DCRTPoly::const_zero(&poly_parameters);
-    let d_exponents = (0..profile.transform_column_count().expect("D width"))
-        .map(|index| index % profile.q().expect("Q exponent"))
+    let one = DCRTPoly::const_rotate_poly(&poly_parameters, 0);
+    let q = profile.q().expect("Q exponent") as u64;
+    let a_exponents = (0..profile.lwr_dimension as u64)
+        .map(|coordinate| (7 * coordinate + 3) % q)
         .collect::<Vec<_>>();
-    // D is a public LHS family supplied at encrypt time.  Convert each
+    // `a` is a public LHS family supplied at encrypt time. Convert each
     // exponent to its stride-aware signed monomial, including the
     // X^n = -1 negacyclic sign when the rotation crosses the boundary.
-    let d_values = d_exponents
+    let a_values = a_exponents
         .iter()
         .map(|exponent| {
             let dimension = poly_parameters.ring_dimension() as usize;
-            let rotation = (exponent * profile.layout.stride()) % (2 * dimension);
+            let rotation = (*exponent as usize * profile.layout.stride()) % (2 * dimension);
             let monomial = DCRTPoly::const_rotate_poly(&poly_parameters, rotation % dimension);
             if rotation >= dimension { -monomial } else { monomial }
         })
+        .chain(std::iter::once(one.clone()))
         .collect::<Vec<_>>();
 
+    // The accumulator starts at mono(0) = 1 and the family is `a` followed by
+    // the encoding of zero read by dummy and padding cells. No private
+    // plaintext is copied into the online call.
     let mut lhs = BTreeMap::new();
-    let input_projection = program.program().encryption_inputs();
-    for (wire, declaration) in input_projection.inputs() {
-        // The initial state is private; public scalar/family inputs are
-        // supplied as encrypt-time attributes.  No private plaintext is
-        // copied into the online call.
+    for (wire, declaration) in program.program().encryption_inputs().inputs() {
         let value = match (declaration.knowledge(), declaration.shape()) {
             (AttributeKnowledge::PrivatePayload, InputBinding::Scalar(())) => {
-                InputBinding::Scalar(zero.clone())
-            }
-            (AttributeKnowledge::PublicPayload, InputBinding::Scalar(())) => {
-                InputBinding::Scalar(zero.clone())
+                InputBinding::Scalar(one.clone())
             }
             (AttributeKnowledge::PublicPayload, InputBinding::Family(_)) => {
-                InputBinding::Family(d_values.clone())
+                InputBinding::Family(a_values.clone())
             }
             (knowledge, shape) => panic!("unexpected input declaration: {knowledge:?} {shape:?}"),
         };
         lhs.insert(*wire, value);
     }
 
-    // Selectors are fixed private RHS plaintexts.  They are prepared during
-    // preprocessing and later consumed only through compact RHS artifacts.
-    // Every bucket selects its first slot.
+    // Selectors are fixed private RHS plaintexts: each output's key selects
+    // one cell per block of its layout.
     let rhs = program
         .selection_families()
         .iter()
         .map(|family| {
-            let mut selector_values = vec![zero.clone(); program.bucket_width()];
-            selector_values[0] = DCRTPoly::const_rotate_poly(&poly_parameters, 0);
-            (family.selector, InputBinding::Family(selector_values))
+            let bits =
+                program.selector_bits(family.output, &keys[family.output]).expect("key bits");
+            let values = bits[family.bucket]
+                .iter()
+                .map(|bit| if *bit == 1 { one.clone() } else { zero.clone() })
+                .collect();
+            (family.selector, InputBinding::Family(values))
         })
         .collect::<BTreeMap<_, _>>();
 
-    Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, d_exponents }
+    Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, keys, a_exponents }
 }
 
 fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBackend {
@@ -429,23 +444,20 @@ fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBacke
     gpu_backend_on(levels, devices)
 }
 
-fn sequential_dt_oracle(program: &SparseLwrPrfProgram, d_exponents: &[usize]) -> usize {
-    // This is an independent cleartext oracle for the sequential bucket
-    // recurrence.  It reads only the immutable transform bits and fixture D
-    // exponents, never the production key, row, artifact, or online result.
-    let q = program.profile().q().expect("Q exponent");
-    (0..program.block_count())
-        .map(|bucket| {
-            let transform = &program.label_transforms()[bucket * program.bucket_width()];
-            transform
-                .bits()
-                .iter()
-                .enumerate()
-                .filter_map(|(column, bit)| (*bit == 1).then_some(d_exponents[column]))
-                .sum::<usize>()
-        })
-        .sum::<usize>() %
-        q
+/// Independent cleartext oracle for output `output`: `z = <a, k> mod Q`
+/// from the key's PBC schedule, then the signed readout `(-1)^b * tau_r` for
+/// `z = r + b * Q/2`. It never reads the production program graph.
+fn lwr_oracle(
+    profile: &SparseLwrPrfProfile,
+    key: &PbcGeneratedKeyLayout,
+    a: &[u64],
+) -> (bool, usize) {
+    let q = profile.q().expect("Q exponent") as u64;
+    let z = clear_pbc_inner_product(&key.public_layout, key.private_schedule(), a, q)
+        .expect("clear PBC inner product") as usize;
+    let half = q as usize / 2;
+    let readout = profile.canonical_readout().expect("canonical readout");
+    if z < half { (false, readout[z]) } else { (true, readout[z - half]) }
 }
 
 #[test]
@@ -472,13 +484,22 @@ fn lwr_prf_end_to_end() {
         eprintln!("skipping Sparse-LWR round trip: no CUDA device detected");
         return;
     }
-    let (parameters, poly_parameters, profile, program, trace) = search_fixture(&sigma);
+    let (parameters, poly_parameters, profile, program, keys, trace) = search_fixture(&sigma);
     let mut runtime =
         GpuRuntime::new(gpu_backend(&parameters, devices.clone())).expect("GPU runtime");
     let directory = tempfile::tempdir().expect("artifact directory");
     let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
-    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, d_exponents } =
-        fixture(parameters, poly_parameters, profile, program, trace, &mut runtime, &mut store);
+    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, keys, a_exponents } =
+        fixture(
+            parameters,
+            poly_parameters,
+            profile,
+            program,
+            keys,
+            trace,
+            &mut runtime,
+            &mut store,
+        );
     assert!(!trace.wires.is_empty(), "noise simulation must visit the PRF gates");
     let observed = RefCell::new(Vec::<&'static str>::new());
     let observe = |name: &'static str| observed.borrow_mut().push(name);
@@ -545,32 +566,32 @@ fn lwr_prf_end_to_end() {
         ["preprocess", "encrypt", "online_eval"],
         "observers must see the exact three production graphs"
     );
-    // Compute the expected exponent/readout independently from D and the
-    // structural transform.  The coefficient polynomial is then built in
-    // the source ring with the exact canonical readout in every coefficient;
-    // it is not decoded from the returned carrier.
-    let expected_exponent = sequential_dt_oracle(&program, &d_exponents);
-    let expected_readout =
-        profile.canonical_readout().expect("canonical readout")[expected_exponent];
+    // Compute every output's expected readout independently from `a` and
+    // its key. The coefficient polynomial is built in the source ring with
+    // the exact signed readout in every coefficient; it is not decoded from
+    // the returned carrier.
     let source_parameters = parameters.level(0).expect("LWR source parameters").clone();
-    let expected_readout =
-        u32::try_from(expected_readout).expect("canonical readout fits DCRT coefficient");
-    let expected = DCRTPoly::from_u32s(
-        &source_parameters,
-        &vec![expected_readout; source_parameters.ring_dimension() as usize],
-    );
-    verify_output(
-        program.program(),
-        &result,
-        0,
-        &expected,
-        &parameters,
-        &payload,
-        &mask,
-        &mut runtime,
-        &mut store,
-    )
-    .expect("LWR application verification");
+    for (output, key) in keys.iter().enumerate() {
+        let (negative, readout) = lwr_oracle(&profile, key, &a_exponents);
+        let readout = u32::try_from(readout).expect("canonical readout fits DCRT coefficient");
+        let expected = DCRTPoly::from_u32s(
+            &source_parameters,
+            &vec![readout; source_parameters.ring_dimension() as usize],
+        );
+        let expected = if negative { -expected } else { expected };
+        verify_output(
+            program.program(),
+            &result,
+            output,
+            &expected,
+            &parameters,
+            &payload,
+            &mask,
+            &mut runtime,
+            &mut store,
+        )
+        .expect("LWR application verification");
+    }
     assert!(!trace.outputs.is_empty(), "noise trace must finalize declared output");
     assert!(!result.outputs.is_empty(), "online evaluation must produce output");
 }

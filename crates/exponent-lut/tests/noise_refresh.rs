@@ -13,7 +13,7 @@ use mxx_dsl::{GraphValue, GraphValueSchema};
 use mxx_exponent_lut::{
     CompiledNandCircuit, ExpLayout, NandCircuit, api,
     noise_refresh::{
-        pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
+        pbc::{PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, generate_key_layout},
         prf::{PreparedSparseLwrPrf, SparseLwrPrfProgram},
         refresh::{RefreshDeclaration, RefreshDigitPlan, RefreshPrfLabelIndex, RefreshSlot},
         simulation::RefreshTranscriptTopology,
@@ -46,6 +46,8 @@ struct SelectedCandidate {
     source: CompiledNandCircuit,
     declaration: RefreshDeclaration,
     prf: SparseLwrPrfProgram,
+    /// The generated sparse key of each PRF output, in output order.
+    prf_keys: Vec<PbcGeneratedKeyLayout>,
     refreshed_bound: BigUint,
 }
 
@@ -237,10 +239,20 @@ fn build_candidate(
     .map_err(|error| error.to_string())?;
     let labels =
         RefreshPrfLabelIndex::new([0x72; 32], &topology).map_err(|error| error.to_string())?;
-    let pbc_parameters = PbcParameters::custom(4, 1, 2, 2, poly_parameters.ring_dimension(), None);
-    let generated = (0..32u8)
-        .find_map(|seed| generate_key_layout(&pbc_parameters, PbcRootSeed([seed; 32]), &[0]).ok())
-        .ok_or_else(|| "PBC layout generation failed".to_owned())?;
+    // Every PRF output evaluates the same public vector `a` in Z_Q^4 under
+    // its own weight-one key, placed by its own PBC layout.
+    let lwr_dimension = 4;
+    let pbc_parameters =
+        PbcParameters::custom(lwr_dimension, 1, 2, 2, poly_parameters.ring_dimension(), None);
+    let prf_labels = labels.prf_labels().map_err(|error| error.to_string())?;
+    let keys = (0..prf_labels.len())
+        .map(|output| {
+            let mut seed = [0x5a; 32];
+            seed[..8].copy_from_slice(&(output as u64).to_le_bytes());
+            generate_key_layout(&pbc_parameters, PbcRootSeed(seed), &[output % lwr_dimension])
+                .map_err(|error| format!("PBC layout generation failed: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let profile = mxx_exponent_lut::noise_refresh::prf::SparseLwrPrfProfile::new(
         ExpLayout {
             stride_log2: ring_dimension_stride_log2(poly_parameters.ring_dimension(), 4)
@@ -248,20 +260,17 @@ fn build_candidate(
             width_log2: 4,
         },
         2,
-        poly_parameters.ring_dimension() as usize,
+        lwr_dimension,
     )
     .map_err(|error| error.to_string())?;
-    let prf_labels = labels.prf_labels().map_err(|error| error.to_string())?;
-    let prf = SparseLwrPrfProgram::new_structural(
+    let prf = SparseLwrPrfProgram::new(
         profile,
-        generated.public_layout.bucket_width,
-        generated.public_layout.parameters.bucket_count,
-        b"noise-refresh-prf",
-        &prf_labels,
+        keys.iter().map(|key| key.public_layout.clone()).collect(),
+        prf_labels,
     )
     .map_err(|error| error.to_string())?;
-    let prepared = PreparedSparseLwrPrf::new(prf.clone(), &generated.public_layout, [0x73; 32])
-        .map_err(|error| error.to_string())?;
+    let prepared =
+        PreparedSparseLwrPrf::new(prf.clone(), [0x73; 32]).map_err(|error| error.to_string())?;
     let source_q = parameters.level(source_level).map_err(|error| error.to_string())?;
     let prf_terminal = parameters.level(p_level).map_err(|error| error.to_string())?.clone();
     let prf_parameters = RnsBggParameters::new(
@@ -348,7 +357,7 @@ fn build_candidate(
         };
         prf_noise_inputs.insert(*wire, binding);
     }
-    // One one-hot selector family per PRF bucket.
+    // One one-hot selector family per PRF output and block.
     let prf_noise_rhs = prf
         .selection_families()
         .iter()
@@ -360,7 +369,7 @@ fn build_candidate(
                         payload_l1: 1u8.into(),
                         payload_l2_squared: 1u8.into(),
                     },
-                    range: FamilyRange::full(IntExpr::constant(prf.bucket_width()))
+                    range: FamilyRange::full(IntExpr::constant(family.capacity))
                         .map_err(|error| error.to_string())?,
                     max_nonzero_payloads: 1u8.into(),
                 }),
@@ -459,6 +468,7 @@ fn build_candidate(
         source,
         declaration,
         prf,
+        prf_keys: keys,
         refreshed_bound: refreshed_output.bound.error.clone(),
     })
 }
@@ -519,6 +529,7 @@ fn noise_refresh_end_to_end() {
         source,
         declaration,
         prf,
+        prf_keys: keys,
         refreshed_bound,
     } = select_rns_candidate();
     let source_program = source.program();
@@ -529,38 +540,40 @@ fn noise_refresh_end_to_end() {
     // encryption stage as required by MulPublic.
     let hash_key = [0x43; 32];
     let prf_program = prf.program();
-    let d_width = prf.profile().transform_column_count().expect("D width");
     let prf_poly_parameters = prf_parameters.level(0).expect("PRF level zero").clone();
     let zero = DCRTPoly::const_zero(&prf_poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
-    let d_values = (0..d_width)
-        .map(|index| {
-            DCRTPoly::const_rotate_poly(
-                &prf_poly_parameters,
-                index % prf.profile().q().expect("Q exponent"),
-            )
+    // The shared public vector `a`, as stride-aware signed monomials,
+    // followed by the encoding of zero read by dummy and padding cells.
+    let a_values = (0..prf.profile().lwr_dimension)
+        .map(|coordinate| {
+            let dimension = prf_poly_parameters.ring_dimension() as usize;
+            let exponent = (7 * coordinate + 3) % prf.profile().q().expect("Q exponent");
+            let rotation = (exponent * prf.profile().layout.stride()) % (2 * dimension);
+            let monomial = DCRTPoly::const_rotate_poly(&prf_poly_parameters, rotation % dimension);
+            if rotation >= dimension { -monomial } else { monomial }
         })
+        .chain(std::iter::once(one.clone()))
         .collect::<Vec<_>>();
     let mut prf_lhs = BTreeMap::new();
     for (&wire, declaration) in prf_program.encryption_inputs().inputs() {
-        let value = if wire == prf.d0_input() {
-            InputBinding::Family(d_values.clone())
-        } else {
-            match declaration.shape() {
-                InputBinding::Scalar(_) => InputBinding::Scalar(one.clone()),
-                InputBinding::Family(_) => InputBinding::Family(d_values.clone()),
-            }
+        let value = match declaration.shape() {
+            InputBinding::Scalar(_) => InputBinding::Scalar(one.clone()),
+            InputBinding::Family(_) => InputBinding::Family(a_values.clone()),
         };
         prf_lhs.insert(wire, value);
     }
-    // Every bucket selects its first slot.
+    // Each output's key selects one cell per block of its layout.
     let prf_rhs = prf
         .selection_families()
         .iter()
         .map(|family| {
-            let mut selector_values = vec![zero.clone(); prf.bucket_width()];
-            selector_values[0] = DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
-            (family.selector, InputBinding::Family(selector_values))
+            let bits = prf.selector_bits(family.output, &keys[family.output]).expect("key bits");
+            let values = bits[family.bucket]
+                .iter()
+                .map(|bit| if *bit == 1 { one.clone() } else { zero.clone() })
+                .collect();
+            (family.selector, InputBinding::Family(values))
         })
         .collect::<BTreeMap<_, _>>();
     // Only after simulation succeeds do we allocate the CUDA runtime. Each

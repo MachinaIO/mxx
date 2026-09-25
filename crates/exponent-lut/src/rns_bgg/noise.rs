@@ -3220,13 +3220,23 @@ impl RnsBggParameters {
         if terminal_value_bounds.len() != program.outputs().len() {
             return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
         }
+        let started = std::time::Instant::now();
         let mut trace = trace_program(self, program, bindings).map_err(|error| match error {
             ProgramLowerError::Backend(error) => error,
             ProgramLowerError::Program(error) => RnsBggError::Graph(error.to_string()),
             ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
             ProgramLowerError::UnsupportedStructure { reason } => RnsBggError::Graph(reason),
         })?;
+        tracing::info!(
+            wires = trace.wires.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "noise trace finished"
+        );
         let workload = RnsBggDerivedWorkload::from_program_with_parameters(self, program)?;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "noise audit workload derived"
+        );
         let average = average.filter(|config| config.allow_average_acceptance);
         let z_squared = average
             .map(|config| {
@@ -3270,7 +3280,20 @@ impl RnsBggParameters {
                         )?,
                         z_squared,
                     );
-                if !moments.fits(&modulus_limit, z_squared) || !scale_fits {
+                let modulus_fits = moments.fits(&modulus_limit, z_squared);
+                if !modulus_fits || !scale_fits {
+                    tracing::info!(
+                        wire = wire.0,
+                        level,
+                        levels = self.levels.len(),
+                        variance_log2 = moments.variance.numerator.bits() as i64 -
+                            moments.variance.denominator.bits() as i64,
+                        modulus_bits = self.level(level)?.modulus().bits(),
+                        scale_bits = self.scale(level)?.bits(),
+                        modulus_fits,
+                        scale_fits,
+                        "average-case evaluation noise exceeds the level budget"
+                    );
                     return Err(RnsBggError::Budget("evaluation noise"));
                 }
             }

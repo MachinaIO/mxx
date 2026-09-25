@@ -1,5 +1,28 @@
 use super::*;
-use std::error::Error;
+use std::{error::Error, time::Instant};
+
+/// Lowering progress, reported through `tracing`: long lowerings (a large
+/// noise simulation, for instance) show how many steps they have visited.
+struct LoweringProgress {
+    steps: u64,
+    started: Instant,
+}
+
+impl LoweringProgress {
+    const REPORT_INTERVAL: u64 = 10_000;
+
+    fn step(&mut self, depth: usize) {
+        self.steps += 1;
+        if self.steps.is_multiple_of(Self::REPORT_INTERVAL) {
+            tracing::debug!(
+                steps = self.steps,
+                depth,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "program lowering progress"
+            );
+        }
+    }
+}
 
 pub trait ExponentLUTProgramLowering {
     type Wire: Clone;
@@ -159,6 +182,8 @@ where
     }
     let mut indices = Vec::new();
     let mut ranges = Vec::new();
+    let mut progress = LoweringProgress { steps: 0, started: Instant::now() };
+    tracing::debug!(steps = program.body.steps.len(), "program lowering started");
     let values = lower_body(
         program,
         &program.body,
@@ -167,7 +192,13 @@ where
         environment,
         &mut indices,
         &mut ranges,
+        &mut progress,
     )?;
+    tracing::debug!(
+        steps = progress.steps,
+        elapsed_ms = progress.started.elapsed().as_millis() as u64,
+        "program lowering finished"
+    );
     Ok(values)
 }
 
@@ -179,6 +210,7 @@ fn lower_body<E, F>(
     environment: &mut Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily>,
     indices: &mut Vec<IntExpr>,
     ranges: &mut Vec<FamilyRange>,
+    progress: &mut LoweringProgress,
 ) -> Result<Vec<E::Wire>, ProgramLowerError<E::Error>>
 where
     E: ExponentLUTProgramLowering + ProgramLoweringContext,
@@ -186,7 +218,8 @@ where
 {
     let mut direct = Vec::new();
     let result = (|| -> Result<Vec<E::Wire>, ProgramLowerError<E::Error>> {
-        for step in &body.steps {
+        for (position, step) in body.steps.iter().enumerate() {
+            progress.step(indices.len());
             let output = step_output(step);
             let site = LoweringSite { output, indices: indices.clone(), ranges: ranges.clone() };
             let value = match step {
@@ -227,6 +260,12 @@ where
                         substitute_indices(range.count(), indices)?,
                         substitute_indices(range.capacity(), indices)?,
                     )?;
+                    tracing::debug!(
+                        depth = indices.len(),
+                        body_steps = body.steps.len(),
+                        count = ?range.count(),
+                        "lowering parallel family body once"
+                    );
                     let family =
                         families.parallel(evaluator, &range, |families, evaluator, local| {
                             indices.push(local);
@@ -239,6 +278,7 @@ where
                                 environment,
                                 indices,
                                 ranges,
+                                progress,
                             );
                             ranges.pop();
                             indices.pop();
@@ -273,6 +313,15 @@ where
             };
             environment.wires.insert(output, scalar);
             direct.push(output);
+            if indices.is_empty() {
+                tracing::info!(
+                    step = position + 1,
+                    of = body.steps.len(),
+                    visited_steps = progress.steps,
+                    elapsed_ms = progress.started.elapsed().as_millis() as u64,
+                    "program lowering top-level step finished"
+                );
+            }
         }
         let outputs = body
             .outputs

@@ -580,16 +580,16 @@ impl ExponentLutProgram {
             .ok_or(ProgramValidationError::UndefinedWire(wire))
     }
 
-    fn metadata(&self) -> Result<BTreeMap<WireId, WireMetadata>, ProgramValidationError> {
-        validate_program_structure(self)?;
+    /// Wire metadata of the immutable program. The structure is validated
+    /// once, when the metadata is first derived; later lookups read the cache
+    /// without walking the program again.
+    fn metadata(&self) -> Result<&BTreeMap<WireId, WireMetadata>, ProgramValidationError> {
         if let Some(metadata) = self.metadata_cache.get() {
-            return Ok(metadata.clone());
+            return Ok(metadata);
         }
+        validate_program_structure(self)?;
         let metadata = derive_wire_metadata(self)?;
-        match self.metadata_cache.set(metadata) {
-            Ok(()) => Ok(self.metadata_cache.get().expect("metadata was just initialized").clone()),
-            Err(metadata) => Ok(self.metadata_cache.get().cloned().unwrap_or(metadata)),
-        }
+        Ok(self.metadata_cache.get_or_init(|| metadata))
     }
 }
 

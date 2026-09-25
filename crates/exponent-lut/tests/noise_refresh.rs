@@ -248,6 +248,7 @@ fn build_candidate(
             width_log2: 4,
         },
         2,
+        poly_parameters.ring_dimension() as usize,
     )
     .map_err(|error| error.to_string())?;
     let prf_labels = labels.prf_labels().map_err(|error| error.to_string())?;
@@ -347,16 +348,25 @@ fn build_candidate(
         };
         prf_noise_inputs.insert(*wire, binding);
     }
-    let selector_width = prf.block_count() * prf.bucket_width();
-    let prf_noise_rhs = BTreeMap::from([(
-        prf.selection_families()[0].selector,
-        InputBinding::Family(RnsBggNoiseFamily {
-            element: RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() },
-            range: FamilyRange::full(IntExpr::constant(selector_width))
-                .map_err(|error| error.to_string())?,
-            max_nonzero_payloads: 1u8.into(),
-        }),
-    )]);
+    // One one-hot selector family per PRF bucket.
+    let prf_noise_rhs = prf
+        .selection_families()
+        .iter()
+        .map(|family| {
+            Ok((
+                family.selector,
+                InputBinding::Family(RnsBggNoiseFamily {
+                    element: RnsBggNoiseRhs {
+                        payload_l1: 1u8.into(),
+                        payload_l2_squared: 1u8.into(),
+                    },
+                    range: FamilyRange::full(IntExpr::constant(prf.bucket_width()))
+                        .map_err(|error| error.to_string())?,
+                    max_nonzero_payloads: 1u8.into(),
+                }),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
     let prf_noise_bindings = RnsBggNoiseBindings::new(prf_noise_inputs, prf_noise_rhs)
         .map_err(|error| error.to_string())?;
     let prf_terminal_bound = prf
@@ -520,7 +530,6 @@ fn noise_refresh_end_to_end() {
     let hash_key = [0x43; 32];
     let prf_program = prf.program();
     let d_width = prf.profile().transform_column_count().expect("D width");
-    let selector_width = prf.block_count() * prf.bucket_width();
     let prf_poly_parameters = prf_parameters.level(0).expect("PRF level zero").clone();
     let zero = DCRTPoly::const_zero(&prf_poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
@@ -544,15 +553,16 @@ fn noise_refresh_end_to_end() {
         };
         prf_lhs.insert(wire, value);
     }
-    let mut selector_values = vec![zero; selector_width];
-    for bucket in 0..prf.block_count() {
-        selector_values[bucket * prf.bucket_width()] =
-            DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
-    }
-    let prf_rhs = BTreeMap::from([(
-        prf.selection_families()[0].selector,
-        InputBinding::Family(selector_values),
-    )]);
+    // Every bucket selects its first slot.
+    let prf_rhs = prf
+        .selection_families()
+        .iter()
+        .map(|family| {
+            let mut selector_values = vec![zero.clone(); prf.bucket_width()];
+            selector_values[0] = DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
+            (family.selector, InputBinding::Family(selector_values))
+        })
+        .collect::<BTreeMap<_, _>>();
     // Only after simulation succeeds do we allocate the CUDA runtime. Each
     // of the three production stages is planned on it (measuring its W/C
     // candidates, which is logged as the benchmark estimate) before it runs.

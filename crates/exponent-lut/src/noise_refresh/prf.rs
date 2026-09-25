@@ -178,13 +178,16 @@ impl<'de> Deserialize<'de> for PrfLabel {
 
 /// Native sparse-LWR profile.
 ///
-/// The ring dimension is derived from the native layout as
-/// `n = 2^(m + width_log2)`. Consequently the exponent modulus is
-/// `Q = 2^(width_log2 + 1)` and the balanced digit base is `P = 2*p_prime`.
+/// The exponent layout fixes the encoding ring dimension the layout lives in,
+/// `n = 2^(stride_log2 + width_log2)`, the exponent modulus
+/// `Q = 2^(width_log2 + 1) = 2n / 2^stride_log2`, and the balanced digit base
+/// `P = 2*p_prime`. The LWR dimension `lwr_dimension` (the length of the
+/// public input `a` in `Z_Q^nu`) is independent of the ring dimension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct SparseLwrPrfProfile {
     pub layout: ExpLayout,
     pub p_prime: usize,
+    pub lwr_dimension: usize,
 }
 
 impl SparseLwrPrfProfile {
@@ -192,7 +195,7 @@ impl SparseLwrPrfProfile {
     /// Public fields are intentional for declarative manifests, therefore all
     /// consuming boundaries must call this check instead of trusting them.
     pub fn validate(&self) -> Result<(), PrfError> {
-        if self.p_prime == 0 {
+        if self.p_prime == 0 || self.lwr_dimension == 0 {
             return Err(PrfError::InvalidSparseLwrBlock);
         }
         let ring_log2 = self
@@ -213,9 +216,9 @@ impl SparseLwrPrfProfile {
         Ok(())
     }
 
-    /// Validates a native profile and derives its ring from the full layout.
-    pub fn new(layout: ExpLayout, p_prime: usize) -> Result<Self, PrfError> {
-        let profile = Self { layout, p_prime };
+    /// Validates a native profile; its ring is derived from the full layout.
+    pub fn new(layout: ExpLayout, p_prime: usize, lwr_dimension: usize) -> Result<Self, PrfError> {
+        let profile = Self { layout, p_prime, lwr_dimension };
         profile.validate()?;
         Ok(profile)
     }
@@ -238,10 +241,9 @@ impl SparseLwrPrfProfile {
         self.p_prime.checked_mul(2).ok_or(PrfError::InvalidSparseLwrBlock)
     }
 
-    /// Number of columns in the public matrix `D`: `v * log2(Q_exp)`.
-    /// Keeping this derivation next to the profile prevents callers from
-    /// accidentally treating the exponent modulus as the coefficient
-    /// modulus or introducing a configurable output-column count.
+    /// Number of columns in the public matrix `D`: `nu * log2(Q_exp)`, where
+    /// `nu` is the LWR dimension. It depends on neither the ring dimension nor
+    /// the encoding modulus.
     pub fn transform_column_count(&self) -> Result<usize, PrfError> {
         self.validate()?;
         let exponent_bits = self
@@ -250,7 +252,7 @@ impl SparseLwrPrfProfile {
             .checked_add(1)
             .and_then(|bits| usize::try_from(bits).ok())
             .ok_or(PrfError::InvalidSparseLwrBlock)?;
-        self.ring_dimension()?.checked_mul(exponent_bits).ok_or(PrfError::InvalidSparseLwrBlock)
+        self.lwr_dimension.checked_mul(exponent_bits).ok_or(PrfError::InvalidSparseLwrBlock)
     }
 
     /// Derives the fixed single-column binary transform `T_label` used by a
@@ -297,9 +299,11 @@ impl<'de> Deserialize<'de> for SparseLwrPrfProfile {
         struct RawProfile {
             layout: ExpLayout,
             p_prime: usize,
+            lwr_dimension: usize,
         }
         let raw = RawProfile::deserialize(deserializer)?;
-        let profile = Self { layout: raw.layout, p_prime: raw.p_prime };
+        let profile =
+            Self { layout: raw.layout, p_prime: raw.p_prime, lwr_dimension: raw.lwr_dimension };
         profile.validate().map_err(serde::de::Error::custom)?;
         Ok(profile)
     }
@@ -543,7 +547,12 @@ impl SparseLwrPrfProgram {
         let initial_input = builder.input(AttributeKnowledge::PrivatePayload)?;
         let d0 = builder
             .input_family(IntExpr::constant(d_columns), AttributeKnowledge::PublicPayload)?;
-        let selector = builder.rhs_family(IntExpr::constant(branch_count))?;
+        // One one-hot selector family per bucket: bucket `b` is consumed by
+        // the level-`b` private multiplication, and every RHS input is
+        // prepared for exactly one consuming level. All labels share them.
+        let selectors = (0..block_count)
+            .map(|_| builder.rhs_family(IntExpr::constant(bucket_width)))
+            .collect::<Result<Vec<_>, _>>()?;
         let identity = builder.input(AttributeKnowledge::PublicPayload)?;
 
         // The bucket chain stays in exponent representation. This terminal LUT
@@ -590,11 +599,11 @@ impl SparseLwrPrfProgram {
                     let range = FamilyRange::full(IntExpr::constant(branches.len()))?;
                     let family = builder.parallel(range, |builder, branch_index| {
                         // `branch_index` is local to this equal-width group.
-                        // Translate it back to the flattened branch index used
-                        // by the shared selector family.
+                        // Translate it back to the branch's slot in this
+                        // bucket's selector family.
                         let branch_indices = branches
                             .iter()
-                            .map(|(branch, _)| IntExpr::constant(*branch))
+                            .map(|(branch, _)| IntExpr::constant(*branch - bucket_start))
                             .collect::<Vec<_>>();
                         let selector_index = IntExpr::Select {
                             selector: Box::new(branch_index.clone()),
@@ -613,17 +622,26 @@ impl SparseLwrPrfProgram {
                                 // belonging to the current group-local branch.
                                 // This preserves one common family body while
                                 // allowing each branch to use different columns.
-                                let indices = branches
+                                // Branches sharing this column need no
+                                // per-branch selection.
+                                let first = first_selected[column];
+                                let index = if branches
                                     .iter()
-                                    .map(|(_, selected)| IntExpr::constant(selected[column]))
-                                    .collect::<Vec<_>>();
-                                leaves.push(Operand::Member {
-                                    family: d0,
-                                    index: IntExpr::Select {
+                                    .all(|(_, selected)| selected[column] == first)
+                                {
+                                    IntExpr::constant(first)
+                                } else {
+                                    IntExpr::Select {
                                         selector: Box::new(branch_index.clone()),
-                                        branches: indices,
-                                    },
-                                });
+                                        branches: branches
+                                            .iter()
+                                            .map(|(_, selected)| {
+                                                IntExpr::constant(selected[column])
+                                            })
+                                            .collect(),
+                                    }
+                                };
+                                leaves.push(Operand::Member { family: d0, index });
                             }
                         }
 
@@ -638,7 +656,7 @@ impl SparseLwrPrfProgram {
                         // bucket without revealing which branch was selected.
                         let weighted = builder.mul_private(
                             Operand::Scalar(multiplied),
-                            Operand::Member { family: selector, index: selector_index },
+                            Operand::Member { family: selectors[bucket], index: selector_index },
                         )?;
                         Ok(Operand::Scalar(weighted))
                     })?;
@@ -663,7 +681,7 @@ impl SparseLwrPrfProgram {
                     // Record bucket-facing metadata only once rather than
                     // duplicating identical declarations for every label.
                     selection_families.push(PrfSelectionFamily {
-                        selector,
+                        selector: selectors[bucket],
                         d0,
                         capacity: bucket_width,
                     });
@@ -983,27 +1001,29 @@ mod tests {
     #[test]
     fn profile_derives_q_and_p_for_nonbinary_digit_bases() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8, 64).unwrap();
         assert_eq!(profile.native_width(), 32);
         assert_eq!(profile.q().unwrap(), 64);
         assert_eq!(profile.p().unwrap(), 16);
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 6 }, 16).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 6 }, 16, 128).unwrap();
         assert_eq!(profile.q().unwrap(), 128);
         assert_eq!(profile.p().unwrap(), 32);
     }
 
     #[test]
     fn profile_rejects_nondividing_digit_base() {
-        assert!(SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 12).is_err());
+        assert!(
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 12, 64).is_err()
+        );
     }
 
     #[test]
     fn profile_preserves_zero_and_nonzero_stride_input_layouts() {
         let zero_stride =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 0, width_log2: 4 }, 2).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 0, width_log2: 4 }, 2, 16).unwrap();
         let nonzero_stride =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2, 16).unwrap();
 
         assert_eq!(zero_stride.ring_dimension(), nonzero_stride.ring_dimension());
         assert_ne!(
@@ -1023,7 +1043,7 @@ mod tests {
     #[test]
     fn canonical_labels_and_transforms_are_stable_and_single_column() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8, 64).unwrap();
         let first_slot = 7_u64.to_le_bytes();
         let second_slot = 8_u64.to_le_bytes();
         let first =
@@ -1051,8 +1071,12 @@ mod tests {
             let width_log2 = ring_dimension_log2 - stride_log2;
             let n_prime = 1usize << width_log2;
             let p_prime = n_prime / 2;
-            let profile =
-                SparseLwrPrfProfile::new(ExpLayout { stride_log2, width_log2 }, p_prime).unwrap();
+            let profile = SparseLwrPrfProfile::new(
+                ExpLayout { stride_log2, width_log2 },
+                p_prime,
+                1 << ring_dimension_log2,
+            )
+            .unwrap();
             let readout = profile.canonical_readout().unwrap();
             let expected = (0..n_prime).map(|k| p_prime * k / n_prime + 1).collect::<Vec<_>>();
             assert_eq!(readout, expected);
@@ -1105,7 +1129,7 @@ mod tests {
     #[test]
     fn structural_program_uses_one_shared_d_family_and_sequential_buckets() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8, 64).unwrap();
         let program = SparseLwrPrfProgram::new_structural(
             profile,
             4,
@@ -1118,7 +1142,7 @@ mod tests {
         assert_eq!(program.selection_families().len(), 3);
         assert_eq!(program.d0_input(), program.selection_families()[0].d0);
         assert!(program.selection_families().windows(2).all(|families| {
-            families[0].selector == families[1].selector && families[0].d0 == families[1].d0
+            families[0].selector != families[1].selector && families[0].d0 == families[1].d0
         }));
         assert!(program.has_terminal_coefficient_lut());
         assert!(!program.has_only_native_accumulation());
@@ -1146,7 +1170,7 @@ mod tests {
     #[test]
     fn fixed_transform_shapes_are_checked_before_ast_construction() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2, 16).unwrap();
         let columns = profile.transform_column_count().unwrap();
         let transform = BinaryTransformMatrix::new(1, columns, vec![1; columns]).unwrap();
         let label = PrfLabel::from_components(&[b"test-label"]).unwrap();
@@ -1178,7 +1202,7 @@ mod tests {
     #[test]
     fn setup_identity_is_shared_across_encryptor_d0_values() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8, 64).unwrap();
         let parameters = crate::noise_refresh::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
         let generated = (0..32_u8)
             .find_map(|seed| {
@@ -1251,7 +1275,7 @@ mod tests {
     #[test]
     fn prepared_descriptor_requires_an_external_trusted_identity() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8, 64).unwrap();
         let parameters = crate::noise_refresh::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
         let generated = (0..32_u8)
             .find_map(|seed| {
@@ -1284,7 +1308,7 @@ mod tests {
     #[test]
     fn profile_program_mismatch_is_rejected() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8, 64).unwrap();
         let program = SparseLwrPrfProgram::new_structural(
             profile,
             2,
@@ -1294,7 +1318,7 @@ mod tests {
         )
         .unwrap();
         let other =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 4).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 4, 32).unwrap();
         assert!(validate_profile_program(other, &program).is_err());
 
         let mut noncanonical = program.clone();
@@ -1304,7 +1328,7 @@ mod tests {
 
     #[test]
     fn tiny_native_reference_oracle_covers_every_z_mod_q() {
-        let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 2)
+        let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 2, 32)
             .expect("n=32, Q=32, p'=2 profile");
         assert_eq!(profile.ring_dimension().unwrap(), 32);
         assert_eq!(profile.q().unwrap(), 32);

@@ -233,9 +233,32 @@ pub fn audit_program_at_crt_depth(
         request.operations_per_drop,
     )
     .map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    tracing::info!(
+        ring_dimension = request.ring_dimension,
+        max_crt_depth = request.max_crt_depth,
+        primes_per_drop = request.primes_per_drop,
+        levels = parameters.levels().len(),
+        "auditing parameter candidate"
+    );
     let trace = parameters
         .audit_program(program, bindings, terminal_value_bounds, average)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            tracing::info!(
+                max_crt_depth = request.max_crt_depth,
+                primes_per_drop = request.primes_per_drop,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                %error,
+                "parameter candidate rejected by the noise audit"
+            );
+            error.to_string()
+        })?;
+    tracing::info!(
+        max_crt_depth = request.max_crt_depth,
+        primes_per_drop = request.primes_per_drop,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "parameter candidate passed the noise audit"
+    );
     Ok((parameters, trace))
 }
 

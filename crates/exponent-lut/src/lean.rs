@@ -609,6 +609,7 @@ mod tests {
                 width_log2: parameters.ring_dimension().ilog2() - 1,
             },
             2,
+            parameters.ring_dimension() as usize,
         )
         .unwrap();
         setup.lut_width = profile.layout.width();
@@ -831,6 +832,7 @@ mod tests {
         let profile = SparseLwrPrfProfile::new(
             crate::ExpLayout { stride_log2: 1, width_log2: n.ilog2() - 1 },
             2,
+            n as usize,
         )
         .unwrap();
         let generated = generate_key_layout(

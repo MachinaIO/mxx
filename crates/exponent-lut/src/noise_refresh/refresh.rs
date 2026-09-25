@@ -689,6 +689,7 @@ mod tests {
         let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
+            64,
         )
         .unwrap();
         let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new_structural(
@@ -799,6 +800,7 @@ mod tests {
         let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
+            64,
         )
         .unwrap();
         let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new_structural(
@@ -855,6 +857,7 @@ mod tests {
         let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
+            64,
         )
         .unwrap();
         let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new_structural(

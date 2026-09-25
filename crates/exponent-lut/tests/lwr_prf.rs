@@ -18,7 +18,10 @@ use mxx_backends::{
 };
 use mxx_exponent_lut::{
     ExpLayout, api,
-    noise_refresh::prf::{PrfLabel, SparseLwrPrfProfile, SparseLwrPrfProgram},
+    noise_refresh::{
+        pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
+        prf::{PrfLabel, SparseLwrPrfProfile, SparseLwrPrfProgram},
+    },
     program::{AttributeKnowledge, FamilyRange, InputBinding, WireId},
     rns_bgg::{
         RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
@@ -32,6 +35,7 @@ use mxx_exponent_lut::{
 };
 use mxx_ir_core::{IntExpr, ParamEnv};
 use num_bigint::{BigInt, BigUint};
+use rayon::prelude::*;
 use serial_test::serial as sequential;
 use std::{cell::RefCell, collections::BTreeMap, env};
 
@@ -58,18 +62,73 @@ fn error_sigma() -> BigDecimal {
     sigma
 }
 
+/// Optional positive integer setting; `None` when unset.
+fn optional_usize(name: &str) -> Option<usize> {
+    env::var(name).ok().map(|value| {
+        let value = value
+            .trim()
+            .parse::<usize>()
+            .unwrap_or_else(|error| panic!("{name} must be a positive integer: {error}"));
+        assert!(value > 0, "{name} must be positive");
+        value
+    })
+}
+
 fn profile_and_program(ring_dimension: u32) -> (SparseLwrPrfProfile, SparseLwrPrfProgram) {
-    let log_ring_dimension = ring_dimension.ilog2();
-    let stride_log2 =
-        log_ring_dimension.checked_sub(4).expect("LWR ring dimension must be at least 2^4");
-    // Rebuild the profile for every candidate dimension.  The exponent
-    // layout keeps width four while stride expands with the ring, so D's
-    // monomials remain valid in every searched negacyclic ring.
-    let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2, width_log2: 4 }, 2)
-        .expect("valid sparse-LWR profile");
+    // The LWR input modulus Q fixes the exponent layout inside the ring:
+    // X^(2n / Q * z) adds exponents modulo Q natively, so width_log2 =
+    // log2(Q) - 1 and stride_log2 = log2(n) - width_log2. The output modulus
+    // P = 2 * p_prime and the LWR dimension nu are independent of n.
+    let input_modulus = env_usize("MXX_EXPONENT_LUT_LWR_PRF_INPUT_MODULUS", 32)
+        .expect("LWR input modulus configuration");
+    assert!(
+        input_modulus >= 4 && input_modulus.is_power_of_two(),
+        "MXX_EXPONENT_LUT_LWR_PRF_INPUT_MODULUS must be a power of two at least 4"
+    );
+    let output_modulus = env_usize("MXX_EXPONENT_LUT_LWR_PRF_OUTPUT_MODULUS", 4)
+        .expect("LWR output modulus configuration");
+    assert!(
+        output_modulus >= 2 && output_modulus % 2 == 0 && input_modulus % output_modulus == 0,
+        "MXX_EXPONENT_LUT_LWR_PRF_OUTPUT_MODULUS must be even and divide the input modulus"
+    );
+    let width_log2 = input_modulus.ilog2() - 1;
+    let stride_log2 = ring_dimension.ilog2().checked_sub(width_log2).unwrap_or_else(|| {
+        panic!(
+            "LWR input modulus {input_modulus} exceeds twice the ring dimension {ring_dimension}"
+        )
+    });
+    let lwr_dimension =
+        optional_usize("MXX_EXPONENT_LUT_LWR_PRF_LWR_DIMENSION").unwrap_or(ring_dimension as usize);
+    let profile = SparseLwrPrfProfile::new(
+        ExpLayout { stride_log2, width_log2 },
+        output_modulus / 2,
+        lwr_dimension,
+    )
+    .expect("valid sparse-LWR profile");
+    // With a sparse support weight h, the PBC layout over the nu coordinates
+    // fixes the number of blocks (h' = h + 3) and the common block width;
+    // otherwise two blocks of width two give the minimal structural program.
+    let (bucket_width, block_count) =
+        match optional_usize("MXX_EXPONENT_LUT_LWR_PRF_SUPPORT_WEIGHT") {
+            Some(support_weight) => {
+                let parameters = PbcParameters::paper_evaluation(lwr_dimension, support_weight);
+                let support =
+                    rand::seq::index::sample(&mut rand::rng(), lwr_dimension, support_weight)
+                        .into_vec();
+                let generated =
+                    generate_key_layout(&parameters, PbcRootSeed(rand::random()), &support)
+                        .expect("PBC layout for the sparse LWR key");
+                (generated.public_layout.bucket_width, parameters.bucket_count)
+            }
+            None => (2, 2),
+        };
     let labels = [PrfLabel::from_components(&[b"lwr-rns-label"]).expect("canonical label")];
-    let program = SparseLwrPrfProgram::new_structural(profile, 2, 2, HASH_KEY, &labels)
-        .expect("structural sparse-LWR program");
+    let program =
+        SparseLwrPrfProgram::new_structural(profile, bucket_width, block_count, HASH_KEY, &labels)
+            .expect("structural sparse-LWR program");
+    eprintln!(
+        "LWR PRF program: n={ring_dimension} Q={input_modulus} P={output_modulus} nu={lwr_dimension} blocks={block_count} block_width={bucket_width}"
+    );
     (profile, program)
 }
 
@@ -97,16 +156,6 @@ fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNo
             .expect("valid LWR encoding sigma")
         })
         .collect::<Vec<_>>();
-    let noise_rhs = program
-        .selection_families()
-        .first()
-        .is_some()
-        .then_some(RnsBggNoiseRhs {
-            payload_l1: BigUint::from(1u8),
-            payload_l2_squared: BigUint::from(1u8),
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
     let mut input_bindings = BTreeMap::new();
     for ((wire, declaration), value) in
         program.program().encryption_inputs().inputs().iter().zip(noise_inputs)
@@ -121,18 +170,26 @@ fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNo
         };
         input_bindings.insert(*wire, binding);
     }
-    let rhs_binding = program.selection_families().first().map(|family| {
-        (
-            family.selector,
-            InputBinding::Family(RnsBggNoiseFamily {
-                element: noise_rhs[0].clone(),
-                range: FamilyRange::full(IntExpr::constant(family.capacity))
-                    .expect("valid selector family range"),
-                max_nonzero_payloads: 1u8.into(),
-            }),
-        )
-    });
-    RnsBggNoiseBindings::new(input_bindings, rhs_binding.into_iter().collect())
+    // Each bucket's one-hot selector family has exactly one nonzero member.
+    let rhs_bindings = program
+        .selection_families()
+        .iter()
+        .map(|family| {
+            (
+                family.selector,
+                InputBinding::Family(RnsBggNoiseFamily {
+                    element: RnsBggNoiseRhs {
+                        payload_l1: BigUint::from(1u8),
+                        payload_l2_squared: BigUint::from(1u8),
+                    },
+                    range: FamilyRange::full(IntExpr::constant(family.capacity))
+                        .expect("valid selector family range"),
+                    max_nonzero_payloads: 1u8.into(),
+                }),
+            )
+        })
+        .collect();
+    RnsBggNoiseBindings::new(input_bindings, rhs_bindings)
         .expect("declaration-order noise bindings")
 }
 
@@ -197,10 +254,21 @@ fn search_fixture(
         let (profile, program) = profile_and_program(ring_dimension);
         let noise = noise_bindings(&program, sigma);
         let terminal_bounds = terminal_value_bounds(&profile, &program);
-        let depth_candidates = (1..=max_crt_depth).flat_map(|depth| {
-            (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
-        });
-        for (crt_depth, primes_per_drop) in depth_candidates {
+        let depth_candidates = (1..=max_crt_depth)
+            .flat_map(|depth| {
+                (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
+            })
+            .collect::<Vec<_>>();
+        // Candidates are independent, so they are audited in parallel; the
+        // first accepted one in (CRT depth, primes per drop) order wins.
+        let rejected = std::sync::Mutex::new(Vec::new());
+        let accepted = depth_candidates.par_iter().find_map_first(|&(crt_depth, primes_per_drop)| {
+            let reject = |reason: String| {
+                rejected.lock().expect("rejection list").push(format!(
+                    "ring dimension {ring_dimension}, CRT depth {crt_depth}, primes per drop {primes_per_drop}: {reason}"
+                ));
+                None
+            };
             let request = RnsBggPlanRequest {
                 ring_dimension,
                 encoding_error_sigma: sigma.clone(),
@@ -224,12 +292,7 @@ fn search_fixture(
                 0,
             ) {
                 Ok(candidate) => candidate,
-                Err(error) => {
-                    failures.push(format!(
-                        "ring dimension {ring_dimension}, CRT depth {crt_depth}: {error}"
-                    ));
-                    continue;
-                }
+                Err(error) => return reject(error),
             };
             for (index, level) in parameters.levels().iter().enumerate() {
                 assert_eq!(
@@ -243,12 +306,7 @@ fn search_fixture(
                 program.program(),
             ) {
                 Ok(workload) => workload,
-                Err(error) => {
-                    failures.push(format!(
-                        "ring dimension {ring_dimension}, CRT depth {crt_depth}: workload validation failed: {error}"
-                    ));
-                    continue;
-                }
+                Err(error) => return reject(format!("workload validation failed: {error}")),
             };
             let trace = match api::noise_simulate(
                 program.program(),
@@ -257,33 +315,29 @@ fn search_fixture(
                 |_, outputs| Ok(outputs),
             ) {
                 Ok(trace) => trace,
-                Err(error) => {
-                    failures.push(format!(
-                        "ring dimension {ring_dimension}, CRT depth {crt_depth}: noise simulation failed: {error}"
-                    ));
-                    continue;
-                }
+                Err(error) => return reject(format!("noise simulation failed: {error}")),
             };
             if trace.outputs.len() != program.program().outputs().len() {
-                failures.push(format!(
-                    "ring dimension {ring_dimension}, CRT depth {crt_depth}: noise simulation finalized {} outputs, expected {}",
+                return reject(format!(
+                    "noise simulation finalized {} outputs, expected {}",
                     trace.outputs.len(),
                     program.program().outputs().len()
                 ));
-                continue;
             }
             let source = parameters.level(0).expect("source level").clone();
             let achieved = lattice_security_bits(&source, sigma)
                 .expect("lattice security estimator must be available");
-            if achieved >= required_security {
-                eprintln!(
-                    "LWR parameters accepted: ring_dimension={ring_dimension} crt_depth={crt_depth} security_bits={achieved} required_security_bits={required_security}"
-                );
-                return (parameters, source, profile, program, audit_trace);
+            if achieved < required_security {
+                return reject(format!("security {achieved} < {required_security}"));
             }
-            failures.push(format!(
-                "ring dimension {ring_dimension}, CRT depth {crt_depth}: security {achieved} < {required_security}"
-            ));
+            eprintln!(
+                "LWR parameters accepted: ring_dimension={ring_dimension} crt_depth={crt_depth} primes_per_drop={primes_per_drop} security_bits={achieved} required_security_bits={required_security}"
+            );
+            Some((parameters, source, audit_trace))
+        });
+        failures.extend(rejected.into_inner().expect("rejection list"));
+        if let Some((parameters, source, audit_trace)) = accepted {
+            return (parameters, source, profile, program, audit_trace);
         }
     }
     panic!(
@@ -349,13 +403,16 @@ fn fixture(
 
     // Selectors are fixed private RHS plaintexts.  They are prepared during
     // preprocessing and later consumed only through compact RHS artifacts.
-    let selector = program.selection_families()[0].selector;
-    let mut selector_values = vec![zero; program.block_count() * program.bucket_width()];
-    for bucket in 0..program.block_count() {
-        selector_values[bucket * program.bucket_width()] =
-            DCRTPoly::const_rotate_poly(&poly_parameters, 0);
-    }
-    let rhs = BTreeMap::from([(selector, InputBinding::Family(selector_values))]);
+    // Every bucket selects its first slot.
+    let rhs = program
+        .selection_families()
+        .iter()
+        .map(|family| {
+            let mut selector_values = vec![zero.clone(); program.bucket_width()];
+            selector_values[0] = DCRTPoly::const_rotate_poly(&poly_parameters, 0);
+            (family.selector, InputBinding::Family(selector_values))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, d_exponents }
 }
@@ -394,6 +451,20 @@ fn sequential_dt_oracle(program: &SparseLwrPrfProgram, d_exponents: &[usize]) ->
 #[test]
 #[sequential(dcrt_runtime)]
 fn lwr_prf_end_to_end() {
+    // Progress of the parameter search and the stage plans is reported
+    // through tracing; `RUST_LOG` overrides the default `info` filter.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+    let sigma = error_sigma();
+    if env::var("MXX_EXPONENT_LUT_LWR_PRF_SIMULATION_ONLY").is_ok_and(|value| value == "1") {
+        // Parameter search, noise simulation, and the security gate only.
+        search_fixture(&sigma);
+        return;
+    }
     let devices = detected_gpu_device_ids();
     if devices.is_empty() {
         // This target is GPU-only; the sequential runtime lock is applied by
@@ -401,13 +472,7 @@ fn lwr_prf_end_to_end() {
         eprintln!("skipping Sparse-LWR round trip: no CUDA device detected");
         return;
     }
-    let sigma = error_sigma();
     let (parameters, poly_parameters, profile, program, trace) = search_fixture(&sigma);
-    // Stage plans report their measured W/C selection (the benchmark
-    // estimate) through tracing; show it with `RUST_LOG=info`.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
     let mut runtime =
         GpuRuntime::new(gpu_backend(&parameters, devices.clone())).expect("GPU runtime");
     let directory = tempfile::tempdir().expect("artifact directory");

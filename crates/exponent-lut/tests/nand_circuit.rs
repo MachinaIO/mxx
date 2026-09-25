@@ -183,6 +183,7 @@ fn select_candidate(
                 ring_dimension,
                 encoding_error_sigma: sigma.clone(),
                 crt_bits,
+                base_bits: expected_base_bits,
                 terminal_depth: 1,
                 max_crt_depth: crt_depth,
                 terminal_value_bound: BigUint::from(1u8),

@@ -49,6 +49,20 @@ impl NonnegativeRational {
             .expect("positive variance denominator")
     }
 
+    /// The least multiple of `2^-fraction_bits` not below this value, when
+    /// the denominator is longer than `fraction_bits`; otherwise unchanged.
+    /// An outward bound that keeps propagated denominators short.
+    pub fn rounded_up(&self, fraction_bits: u32) -> Self {
+        if self.denominator.bits() <= u64::from(fraction_bits) {
+            return self.clone();
+        }
+        let scaled = &self.numerator << fraction_bits;
+        let quotient = &scaled / &self.denominator;
+        let numerator =
+            if &quotient * &self.denominator == scaled { quotient } else { quotient + 1u8 };
+        Self::new(numerator, BigUint::one() << fraction_bits).expect("positive power of two")
+    }
+
     /// Scale this exact rational by a (possibly fractional) nonnegative
     /// rational. Modulus-alignment transfers use this for the `1/alpha`
     /// action; no floating-point approximation is involved.
@@ -292,6 +306,44 @@ pub struct NoiseMoments {
 }
 
 impl NoiseMoments {
+    /// Outward bound with denominators of at most `fraction_bits` bits: a
+    /// long mean center joins the mean radius, and the radius and variance
+    /// round up. Short exact moments are unchanged.
+    pub fn rounded_up(&self, fraction_bits: u32) -> Self {
+        let limit = u64::from(fraction_bits);
+        if self.mean_denominator.bits() <= limit &&
+            self.mean_radius.denominator.bits() <= limit &&
+            self.variance.denominator.bits() <= limit
+        {
+            return self.clone();
+        }
+        let (mean_numerator, mean_denominator, mean_radius) =
+            if self.mean_denominator.bits() <= limit {
+                (
+                    self.mean_numerator.clone(),
+                    self.mean_denominator.clone(),
+                    self.mean_radius.rounded_up(fraction_bits),
+                )
+            } else {
+                let center = NonnegativeRational::new(
+                    self.mean_numerator.magnitude().clone(),
+                    self.mean_denominator.clone(),
+                )
+                .expect("positive mean denominator");
+                (
+                    BigInt::zero(),
+                    BigUint::one(),
+                    center.add(&self.mean_radius).rounded_up(fraction_bits),
+                )
+            };
+        Self {
+            mean_numerator,
+            mean_denominator,
+            mean_radius,
+            variance: self.variance.rounded_up(fraction_bits),
+        }
+    }
+
     /// Exact moments of the centered nearest-rounding residue for an integer
     /// modulus ratio. The support is `-floor(alpha/2)..ceil(alpha/2)-1`, and
     /// the residue is divided by `alpha`. Even ratios retain their real tie

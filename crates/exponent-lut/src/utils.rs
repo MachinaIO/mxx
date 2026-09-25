@@ -189,12 +189,14 @@ pub fn audit_program_at_crt_depth(
         .collect::<Result<Vec<_>, String>>()?;
     let logical_count = output_levels.iter().map(|(level, _)| *level).max().unwrap_or(0);
     let output_last = output_levels.iter().map(|(_, level)| *level).max().unwrap_or(0);
-    let base_bits = request.crt_bits.div_ceil(2);
+    if request.base_bits == 0 || request.base_bits > 31 {
+        return Err("decomposition base bits must be in 1..=31".to_owned());
+    }
     let pool = DCRTPolyParams::try_new(
         request.ring_dimension,
         request.max_crt_depth,
         request.crt_bits,
-        base_bits.min(31) as u32,
+        request.base_bits,
         None,
         None,
     )

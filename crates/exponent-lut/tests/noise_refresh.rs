@@ -107,6 +107,7 @@ fn select_rns_candidate() -> SelectedCandidate {
                 ring_dimension,
                 encoding_error_sigma: encoding_error_sigma.clone(),
                 crt_bits,
+                base_bits: expected_base_bits as u32,
                 terminal_depth: 2,
                 max_crt_depth: crt_depth,
                 terminal_value_bound: BigUint::one(),
@@ -349,8 +350,9 @@ fn build_candidate(
         let value = noise_value(&prf_parameters, format!("prf-input-{index}").as_bytes());
         let binding = match declaration.shape() {
             InputBinding::Scalar(()) => InputBinding::Scalar(value),
+            // Every member of an input family is a separate encryption.
             InputBinding::Family(count) => InputBinding::Family(RnsBggNoiseFamily {
-                element: value,
+                element: value.independent_family_members(),
                 range: FamilyRange::full(count.clone()).map_err(|error| error.to_string())?,
                 max_nonzero_payloads: 1u8.into(),
             }),

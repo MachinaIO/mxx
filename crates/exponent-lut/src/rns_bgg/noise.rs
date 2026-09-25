@@ -32,7 +32,9 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
+
+use super::noise_breakdown::{NoiseBreakdown, ReductionCounts};
 
 mod bigdecimal_string {
     use bigdecimal::BigDecimal;
@@ -51,6 +53,15 @@ mod bigdecimal_string {
     {
         let value = String::deserialize(deserializer)?;
         BigDecimal::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn zero_mean_moments(variance: NonnegativeRational) -> NoiseMoments {
+    NoiseMoments {
+        mean_numerator: BigInt::zero(),
+        mean_denominator: BigUint::one(),
+        mean_radius: NonnegativeRational::zero(),
+        variance,
     }
 }
 
@@ -382,6 +393,7 @@ impl RnsBggParameters {
             moments: None,
             provenance: source.provenance.clone(),
             heuristics: source.heuristics.clone(),
+            breakdown: None,
         })
     }
 
@@ -518,26 +530,30 @@ impl RnsBggParameters {
             moments,
             provenance,
             heuristics,
+            breakdown: None,
         })
     }
 
-    /// Conservative L1/L2 action gain of the decomposition used by
-    /// the parameter-bound signed decomposition used for a level-preserving
-    /// `MulPublic`.
+    /// L1 bound and coefficient-energy cap of the signed decomposition used
+    /// for a level-preserving `MulPublic`.
     ///
     /// The current-level key decomposition uses the current ring's CRT
-    /// decomposition base and modulus digits. Each
-    /// coefficient of a balanced digit is bounded by `B / 2`; summing the
-    /// digit columns and the ring convolution gives `N * D * B` as an L1
-    /// bound.  Keeping this derivation here makes the noise recurrence use
-    /// the same decomposition contract as the public-key evaluator.
+    /// decomposition base and modulus digits. An output column has `2D`
+    /// digit polynomials of `N` coefficients bounded by `B / 2`, so the L1
+    /// bound is `N * D * B` and the energy `sum u_i^2` is at most
+    /// `2 D N (B/2)^2 = N D B^2 / 2`. The energy is the variance gain of a
+    /// white (coefficient-uncorrelated) error under the fixed-action model
+    /// (H1/H4); callers use the squared L1 bound for any other error. Keeping
+    /// this derivation here makes the noise recurrence use the same
+    /// decomposition contract as the public-key evaluator.
     fn mul_public_action_gain(&self, level: usize) -> Result<RightActionNoiseGain, RnsBggError> {
         let current = self.level(level)?;
         let ring_dimension = BigUint::from(current.ring_dimension());
         let decomposition_columns = BigUint::from(current.modulus_digits());
         let base = BigUint::one() << current.base_bits();
-        let l1 = ring_dimension * decomposition_columns * base;
-        Ok(RightActionNoiseGain { l2_squared: l1.pow(2), l1 })
+        let l1 = &ring_dimension * &decomposition_columns * &base;
+        let l2_squared = ring_dimension * decomposition_columns * base.pow(2) / 2u8;
+        Ok(RightActionNoiseGain { l2_squared, l1 })
     }
 
     /// Return the physical-coordinate variance of one encoding error.
@@ -549,24 +565,22 @@ impl RnsBggParameters {
         encoding_variance_from_sigma(&self.encoding_error_sigma)
     }
 
-    /// Physical-coordinate variance transfer for the direct product's four
-    /// error terms. Conditional model: deviations from the coefficient means
-    /// are uncorrelated with a common variance bound, fixed RHS errors are the
-    /// encoding Gaussian with variance sigma²
-    /// and independent, and both ModDown remainders are independent centered
-    /// uniforms, independent of inherited/fresh errors and the ternary secret.
-    /// The prepared right action is fixed under H4's conditional model; its
-    /// action on a nonzero input mean is accounted for separately as bias.
-    /// These are average-case heuristics, not deterministic independence claims.
-    /// Reused error sources must have their linear actions combined first.
-    /// `payload_gain` bounds the actual reduced input plaintext norms.
-    pub fn private_mul_noise_variance(
+    /// Separately identified components of the direct product
+    /// `e*U/p - mu*F + s*rho(A*U)/p - rho(c*U)/p`, in output-level units.
+    ///
+    /// Conditional model: the prepared right action is fixed (H4) and the
+    /// input error deviations are uncorrelated with a common variance bound
+    /// (H1); the RHS error is the encoding Gaussian; both ModDown remainders
+    /// are independent centered uniforms, independent of inherited/fresh
+    /// errors and the ternary secret (H2). These are average-case
+    /// heuristics, not deterministic independence claims. `payload_gain`
+    /// bounds the actual reduced input plaintext norms.
+    pub(crate) fn private_mul_noise_terms(
         &self,
         level: usize,
-        input_variance: &NonnegativeRational,
         payload_gain: &RightActionNoiseGain,
         fresh_error_gain: &RightActionNoiseGain,
-    ) -> Result<NonnegativeRational, RnsBggError> {
+    ) -> Result<PrivateMulNoiseTerms, RnsBggError> {
         let p = self.scale(level)?;
         let next = self.level(level + 1)?;
         let n = BigUint::from(next.ring_dimension());
@@ -574,14 +588,16 @@ impl RnsBggParameters {
         // e*U/p: 2D bounded digit polynomials per output column, each with
         // N coefficients bounded by b/2. H4 conditions on the prepared U;
         // this is an energy cap, not a uniform-digit independence assumption.
-        let inherited = NonnegativeRational::new(
-            &input_variance.numerator *
-                &n *
-                next.modulus_digits() *
-                (BigUint::one() << (2 * next.base_bits())),
-            &input_variance.denominator * 2u8 * &p_squared,
+        let inherited_variance_gain = NonnegativeRational::new(
+            &n * next.modulus_digits() * (BigUint::one() << (2 * next.base_bits())),
+            &p_squared * 2u8,
         )
-        .expect("positive scale and variance denominator");
+        .expect("positive scale");
+        let inherited_mean_gain = NonnegativeRational::new(
+            &n * next.modulus_digits() * (BigUint::one() << next.base_bits()),
+            p.clone(),
+        )
+        .expect("positive scale");
         // -mu*sum(a_j*F_j): combine both deterministic actions on each F_j.
         // Weighted F coefficients are correlated, so multiplying squared l2
         // norms is not valid. Young's two convolution bounds give a cap using
@@ -589,52 +605,84 @@ impl RnsBggParameters {
         // square of their sum. Monomial payloads preserve the exact fresh gain.
         let fresh_gain = (payload_gain.l1.pow(2) * &fresh_error_gain.l2_squared)
             .min(&payload_gain.l2_squared * fresh_error_gain.l1.pow(2));
-        let fresh = self.encoding_error_variance().scaled(&fresh_gain);
+        let rhs_error = self.encoding_error_variance().scaled(&fresh_gain);
         // s*rho(A*C)/p - rho(c*C)/p: E||[s_bar,1]||_2^2 = 2N/3+1.
         // Adding the online remainder gives (2N/3+2)*(p^2-1)/(12*p^2).
         let rounding = NonnegativeRational::new((&n + 3u8) * (&p_squared - 1u8), 18u8 * &p_squared)
             .expect("positive scale");
-        tracing::trace!(
-            level,
-            input_log2 = variance_log2(input_variance),
-            inherited_log2 = variance_log2(&inherited),
-            fresh_log2 = variance_log2(&fresh),
-            fresh_gain_bits = fresh_gain.bits(),
-            payload_l1_bits = payload_gain.l1.bits(),
-            payload_l2_squared_bits = payload_gain.l2_squared.bits(),
-            rounding_log2 = variance_log2(&rounding),
-            "private multiplication variance terms"
-        );
-        Ok(inherited.add(&fresh).add(&rounding))
+        Ok(PrivateMulNoiseTerms {
+            inherited_variance_gain,
+            inherited_mean_gain,
+            rhs_error,
+            rounding,
+        })
     }
 
-    /// Physical variance of the explicit LUT equation (6.6). In addition to
-    /// the direct-product coefficient/fresh/remainder model above, this uses
-    /// the flat-branch decorrelation heuristic (H3). It does not apply to an
-    /// explicit Add, a repeated invocation sharing helpers, or a raw terminal
-    /// reduction: those must retain their shared sources and outer rounding.
-    /// Each mask helper is sampled with the encoding Gaussian at the input level. Branch
-    /// fresh gains describe ciphertext weighting, not fresh plaintext targets.
-    pub fn lut_noise_variance(
+    /// Total variance of the direct product when the input error, the RHS
+    /// error, and the remainders are pairwise uncorrelated; the sum of the
+    /// components of [`Self::private_mul_noise_terms`].
+    pub fn private_mul_noise_variance(
         &self,
         level: usize,
         input_variance: &NonnegativeRational,
-        branches: usize,
         payload_gain: &RightActionNoiseGain,
         fresh_error_gain: &RightActionNoiseGain,
     ) -> Result<NonnegativeRational, RnsBggError> {
-        let before = self.lut_noise_variance_before_mod_down(
-            level,
-            input_variance,
-            branches,
-            payload_gain,
-            fresh_error_gain,
-        )?;
-        let p = self.scale(level)?;
-        Ok(before
-            .scaled_ratio(&BigUint::one(), &(p * p))
-            .add(&self.lut_public_rounding_variance(level)?)
-            .add(&NonnegativeRational::new(p * p - 1u8, 12u8 * p * p).expect("positive scale")))
+        let terms = self.private_mul_noise_terms(level, payload_gain, fresh_error_gain)?;
+        Ok(terms.inherited_variance(input_variance).add(&terms.rhs_error).add(&terms.rounding))
+    }
+
+    /// Separately identified components of the explicit LUT equation (6.6)
+    /// with `branches = J`, before the scale-and-round, in level-`level`
+    /// units (a factor `p` above the output units).
+    ///
+    /// The input error enters every branch through a different automorphism
+    /// and decomposition. The flat-branch decorrelation heuristic (H3) is not
+    /// assumed: the input action is the coherent envelope of the `J` branch
+    /// actions. Helper and B-key errors are sampled per automorphism, so
+    /// their branch images are distinct samples. Branch fresh gains describe
+    /// ciphertext weighting, not fresh plaintext targets.
+    pub(crate) fn lut_noise_terms(
+        &self,
+        level: usize,
+        branches: usize,
+        payload_gain: &RightActionNoiseGain,
+        fresh_error_gain: &RightActionNoiseGain,
+    ) -> Result<LutNoiseTerms, RnsBggError> {
+        let p = self.scale(level)?.clone();
+        let next = self.level(level + 1)?;
+        let n = BigUint::from(next.ring_dimension());
+        let j = BigUint::from(branches);
+        let p_squared = &p * &p;
+        let gaussian = self.encoding_error_variance();
+        // sigma_k(e)*U_k and ed_k*V_k: both low-ring decompositions have 2D
+        // entries per column with coefficients <= b/2. Automorphisms preserve
+        // both norms.
+        let branch_energy =
+            &n * (BigUint::one() << (2 * next.base_bits())) * next.modulus_digits() / 2u8;
+        let branch_l1 = &n * (BigUint::one() << next.base_bits()) * next.modulus_digits();
+        // Combine deterministic actions on each F_k before estimating
+        // convolution, just as for the direct gate.
+        let fresh_gain = (payload_gain.l1.pow(2) * &fresh_error_gain.l2_squared)
+            .min(&payload_gain.l2_squared * fresh_error_gain.l1.pow(2));
+        // The J internal public remainders; the outer public and encoding
+        // remainders occur once, in the scale-and-round after the branch sum.
+        // E||[s_bar,1]||_2^2 = (2N+3)/3.
+        let branch_rounding =
+            NonnegativeRational::new((&n * 2u8 + 3u8) * (&p_squared - 1u8), BigUint::from(36u8))
+                .expect("positive denominator");
+        let outer_rounding = self.lut_public_rounding_variance(level)?.add(
+            &NonnegativeRational::new(&p_squared - 1u8, 12u8 * &p_squared).expect("positive scale"),
+        );
+        Ok(LutNoiseTerms {
+            input_variance_gain: (&j * &j) * &branch_energy,
+            input_mean_gain: &j * &branch_l1,
+            helper: gaussian.scaled(&branch_energy),
+            fresh: gaussian.scaled(&(fresh_gain * &p_squared)),
+            internal_rounding: branch_rounding.scaled(&(&j * &j)),
+            scale: p,
+            outer_rounding,
+        })
     }
 
     /// Variance of the public-key rounding under the mask secret after the
@@ -649,50 +697,6 @@ impl RnsBggParameters {
         let p_squared = p * p;
         Ok(NonnegativeRational::new((n * 2u8 + 3u8) * (&p_squared - 1u8), 36u8 * p_squared)
             .expect("positive scale"))
-    }
-
-    /// Flat-LUT variance of the summed branches before the scale-and-round,
-    /// in level-`level` units, with the `J` internal mask remainders.
-    pub fn lut_noise_variance_before_mod_down(
-        &self,
-        level: usize,
-        input_variance: &NonnegativeRational,
-        branches: usize,
-        payload_gain: &RightActionNoiseGain,
-        fresh_error_gain: &RightActionNoiseGain,
-    ) -> Result<NonnegativeRational, RnsBggError> {
-        let p = self.scale(level)?;
-        let next = self.level(level + 1)?;
-        let n = BigUint::from(next.ring_dimension());
-        let j = BigUint::from(branches);
-        let p_squared = p * p;
-        let gaussian = self.encoding_error_variance();
-        // sum_k (sigma_k(e)*U_k + ed_k*V_k)/p. Both low-ring
-        // decompositions have 2D entries per column with coefficients <= b/2.
-        let input_and_helper = input_variance.add(&gaussian);
-        let inherited_and_helper = NonnegativeRational::new(
-            &input_and_helper.numerator *
-                &j *
-                &n *
-                (BigUint::one() << (2 * next.base_bits())) *
-                next.modulus_digits(),
-            &input_and_helper.denominator * 2u8,
-        )
-        .expect("positive variance denominator");
-        // Automorphisms preserve both norms. Combine deterministic actions on
-        // each F_k before estimating convolution, just as for the direct gate.
-        let fresh_gain = (payload_gain.l1.pow(2) * &fresh_error_gain.l2_squared)
-            .min(&payload_gain.l2_squared * fresh_error_gain.l1.pow(2));
-        let fresh = gaussian.scaled(&(&j * fresh_gain * &p_squared));
-        // The J internal public remainders; the outer public and encoding
-        // remainders occur once, in the scale-and-round after the branch sum.
-        // E||[s_bar,1]||_2^2 = (2N+3)/3.
-        let rounding = NonnegativeRational::new(
-            &j * (&n * 2u8 + 3u8) * (&p_squared - 1u8),
-            BigUint::from(36u8),
-        )
-        .expect("positive denominator");
-        Ok(inherited_and_helper.add(&fresh).add(&rounding))
     }
 
     /// Direct product: e*U/p - mu*F + s*rho(A*U)/p - rho(c*U)/p.
@@ -754,6 +758,47 @@ impl RnsBggNoiseBound {
     }
 }
 
+/// Components of one private product's error; see
+/// [`RnsBggParameters::private_mul_noise_terms`].
+pub(crate) struct PrivateMulNoiseTerms {
+    /// Variance gain of the inherited input error, `N D B^2 / (2 p^2)`.
+    pub inherited_variance_gain: NonnegativeRational,
+    /// Mean gain of the inherited input error, `l1(U) / p`.
+    pub inherited_mean_gain: NonnegativeRational,
+    /// Variance of the RHS error term `-mu * F`.
+    pub rhs_error: NonnegativeRational,
+    /// Variance of both ModDown remainders.
+    pub rounding: NonnegativeRational,
+}
+
+impl PrivateMulNoiseTerms {
+    fn inherited_variance(&self, input: &NonnegativeRational) -> NonnegativeRational {
+        input.scaled_ratio(
+            &self.inherited_variance_gain.numerator,
+            &self.inherited_variance_gain.denominator,
+        )
+    }
+}
+
+/// Components of one flat LUT's error before its scale-and-round; see
+/// [`RnsBggParameters::lut_noise_terms`].
+pub(crate) struct LutNoiseTerms {
+    /// Coherent variance gain of the input error over all branches.
+    pub input_variance_gain: BigUint,
+    /// Mean gain of the input error over all branches.
+    pub input_mean_gain: BigUint,
+    /// Variance of one branch's helper-error image.
+    pub helper: NonnegativeRational,
+    /// Variance of one branch's B-key error image.
+    pub fresh: NonnegativeRational,
+    /// Coherent variance of the branches' internal public remainders.
+    pub internal_rounding: NonnegativeRational,
+    /// The scale `p` of the scale-and-round.
+    pub scale: BigUint,
+    /// Variance of the outer public and encoding remainders, output units.
+    pub outer_rounding: NonnegativeRational,
+}
+
 /// A symbolic wire value used by deterministic and average-case noise audits.
 /// Knowledge and logical level are paired by the Program/workload owners.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -779,6 +824,11 @@ pub struct RnsBggNoiseValue {
     pub provenance: BTreeMap<[u8; 32], NoiseSourceProvenance>,
     /// Conservative assumptions used while composing moments.
     pub heuristics: NoiseHeuristicLedger,
+    /// Source-aware contributions whose total is `moments`. `None` means
+    /// only the total envelope is known; it is then treated as one opaque
+    /// contribution, coherent with every other.
+    #[serde(skip)]
+    pub(crate) breakdown: Option<Arc<NoiseBreakdown>>,
 }
 
 impl RnsBggNoiseValue {
@@ -801,13 +851,10 @@ impl RnsBggNoiseValue {
     /// coefficients are the chosen integer lift, with negacyclic terms reduced
     /// and combined before constructing this value.
     pub fn public(error_bound: BigUint, coefficients: &[BigInt]) -> Self {
+        let moments = error_bound.is_zero().then(|| zero_mean_moments(NonnegativeRational::zero()));
         Self {
-            moments: error_bound.is_zero().then(|| NoiseMoments {
-                mean_numerator: BigInt::zero(),
-                mean_denominator: BigUint::one(),
-                mean_radius: NonnegativeRational::zero(),
-                variance: NonnegativeRational::zero(),
-            }),
+            breakdown: moments.as_ref().map(|_| Arc::new(NoiseBreakdown::empty())),
+            moments,
             payload_l2_squared: coefficients.iter().map(|c| c.magnitude().pow(2)).sum(),
             bound: RnsBggNoiseBound {
                 error: error_bound,
@@ -831,24 +878,79 @@ impl RnsBggNoiseValue {
     ) -> Result<Self, RnsBggError> {
         let sigma = super::canonical_encoding_sigma(sigma.clone())?;
         let source = stable_source_id(&(b"rns-bgg/encoding", source));
+        let moments = zero_mean_moments(encoding_variance_from_sigma(&sigma));
         Ok(Self {
             bound: RnsBggNoiseBound {
                 error: super::encoding_error_bound(&sigma)?,
                 payload_l1: coefficients.iter().map(|c| c.magnitude()).sum(),
             },
             payload_l2_squared: coefficients.iter().map(|c| c.magnitude().pow(2)).sum(),
-            moments: Some(NoiseMoments {
-                mean_numerator: BigInt::zero(),
-                mean_denominator: BigUint::one(),
-                mean_radius: NonnegativeRational::zero(),
-                variance: encoding_variance_from_sigma(&sigma),
-            }),
+            breakdown: Some(Arc::new(NoiseBreakdown::sampled(
+                source,
+                "encoding",
+                moments.clone(),
+                true,
+            ))),
+            moments: Some(moments),
             provenance: BTreeMap::from([(
                 source,
                 NoiseSourceProvenance { source, route: Vec::new() },
             )]),
             heuristics: NoiseHeuristicLedger::new(),
         })
+    }
+
+    /// Declare that the members of a family bound with this element are
+    /// encrypted independently, each with its own error sample. Without this
+    /// binding contract every member read is treated as the same sample.
+    pub fn independent_family_members(mut self) -> Self {
+        self.breakdown = self
+            .breakdown
+            .map(|breakdown| Arc::new(breakdown.as_ref().clone().independent_members()));
+        self
+    }
+
+    /// Replace the moments by the total of `breakdown`, when one exists.
+    fn with_breakdown(mut self, breakdown: Option<NoiseBreakdown>) -> Self {
+        if let Some(breakdown) = breakdown {
+            self.moments = Some(breakdown.total());
+            self.breakdown = Some(Arc::new(breakdown));
+        }
+        self
+    }
+
+    /// The source-aware contributions of this value. A value that only has
+    /// total moments is one opaque contribution, coherent with every other.
+    fn contributions(&self, origin: &'static str) -> Option<NoiseBreakdown> {
+        match (&self.breakdown, &self.moments) {
+            (Some(breakdown), Some(_)) => Some(breakdown.as_ref().clone()),
+            (None, Some(moments)) => Some(NoiseBreakdown::opaque(origin, moments.clone())),
+            (_, None) => None,
+        }
+    }
+
+    /// Diagnostic summary of the largest contribution and the variance by
+    /// contribution kind.
+    fn describe_contributions(&self) -> String {
+        let Some(breakdown) = self.breakdown.as_ref() else {
+            return "no breakdown".into();
+        };
+        let dominant = breakdown.dominant().map_or("none".into(), |term| {
+            format!(
+                "{} {:?} {:?} log2 {}",
+                term.origin,
+                term.kind,
+                term.sample,
+                variance_log2(&term.moments.variance)
+            )
+        });
+        let by_kind = breakdown
+            .variance_by_kind()
+            .iter()
+            .map(|(kind, variance)| format!("{kind:?}: log2 {}", variance_log2(variance)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("dominant {dominant}; {by_kind}")
     }
 
     /// Construct a fresh encoding-error carrier with a parameter set's
@@ -967,6 +1069,7 @@ impl RnsBggNoiseValue {
             moments,
             provenance,
             heuristics,
+            breakdown: None,
         }
     }
 }
@@ -1055,7 +1158,7 @@ impl RnsBggDerivedWorkload {
             }
             .map_err(|_| RnsBggError::Binding("invalid workload RHS binding"))?;
         }
-        let mut families = RnsBggNoiseFamilies;
+        let mut families = RnsBggNoiseFamilies::default();
         crate::program::lower_program(program, &mut collector, &mut families, &mut environment)
             .map_err(|error| match error {
                 ProgramLowerError::Backend(error) => error,
@@ -1520,7 +1623,11 @@ impl<T> RnsBggNoiseFamily<T> {
 }
 
 /// Stateless family adapter shared by workload and noise lowerings.
-pub struct RnsBggNoiseFamilies;
+#[derive(Default)]
+pub struct RnsBggNoiseFamilies {
+    /// Number of enclosing parallel families of the member being lowered.
+    depth: usize,
+}
 
 /// Evaluator-owned symbolic noise state.
 pub struct RnsBggNoiseEvaluator<'a> {
@@ -1539,12 +1646,19 @@ pub struct RnsBggNoiseEvaluator<'a> {
     /// at `depth` (the number of enclosing parallel families), because they
     /// are weighted by distinct members of a sparse RHS family.
     payload_support: BTreeMap<WireId, PayloadSupport>,
+    /// How the family sums of this Program combined their contributions.
+    reduction_counts: ReductionCounts,
 }
 
 #[derive(Clone, Debug)]
 struct PayloadSupport {
     depth: usize,
     count: BigUint,
+}
+
+/// The canonical lane index of a family over `range`.
+fn family_lane(range: &FamilyRange) -> IntExpr {
+    IntExpr::Add(Box::new(range.start().clone()), Box::new(IntExpr::LoopIndex(0))).canonicalize()
 }
 
 /// Whether distinct lanes of a family read distinct members through
@@ -1584,6 +1698,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             refresh_parameters: None,
             lane_indices: Vec::new(),
             payload_support: BTreeMap::new(),
+            reduction_counts: ReductionCounts::default(),
         }
     }
 
@@ -1750,6 +1865,13 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     /// Bound the fixed public action used to align one source ring with the
     /// target ring.  The action is setup material, so this is a deterministic
     /// norm envelope rather than a newly sampled noise source.
+    ///
+    /// `H = Dec_(G_source)(alpha * G_target)` decomposes scalar multiples of
+    /// the gadget, so its entries are constant polynomials: an output
+    /// coefficient of `e * H` combines the same coefficient of the `D_s`
+    /// source columns, without a ring convolution. Each output column has at
+    /// most `D_s` digits bounded by `B / 2`; counting `2 D_s` of them keeps a
+    /// factor-two margin, giving `l1 = D_s B` and energy `D_s B^2 / 2`.
     fn public_alignment_action_gain(
         &self,
         source_level: usize,
@@ -1760,13 +1882,10 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             return Ok(RightActionNoiseGain::unit());
         }
         let source = self.parameters.level(source_level)?;
-        let target = self.parameters.level(target_level)?;
         let base = BigUint::one() << source.base_bits();
-        let l1 = BigUint::from(source.ring_dimension()) *
-            BigUint::from(source.modulus_digits()) *
-            BigUint::from(target.modulus_digits()) *
-            base;
-        Ok(RightActionNoiseGain { l2_squared: l1.pow(2u32), l1 })
+        let digits = BigUint::from(source.modulus_digits());
+        let l1 = &digits * &base;
+        Ok(RightActionNoiseGain { l2_squared: digits * base.pow(2u32) / 2u8, l1 })
     }
 
     /// Construct one shared rounding carrier for a source/key/target route.
@@ -1807,6 +1926,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 },
             )]),
             heuristics,
+            breakdown: None,
         })
     }
 
@@ -1841,24 +1961,110 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         )?;
         let ring_dimension = BigUint::from(self.parameters.level(target_level)?.ring_dimension());
         // The public alignment error contains `s * rho_A`, where `s` is the
-        // two-component mask row.  Account for both components explicitly;
+        // two-component mask row `(s_bar, 1)` with uniform ternary `s_bar`
+        // (`sample_secret_row`). Account for both components explicitly;
         // omitting the second row underestimates both hard bounds and moments.
+        // The hard bound uses `||s_bar||_1 <= N`, the moments the exact
+        // second moment `E||s_bar||_2^2 = 2N/3`; the constant `1` is exact.
         let mask_secret = [
-            RnsBggMaskSecretComponent::deterministic(
-                ring_dimension.clone(),
-                ring_dimension.clone(),
-            ),
-            RnsBggMaskSecretComponent::deterministic(ring_dimension.clone(), ring_dimension),
+            RnsBggMaskSecretComponent {
+                coefficient_l1: ring_dimension.clone(),
+                coefficient_l2_squared: NonnegativeRational::new(
+                    ring_dimension * 2u8,
+                    BigUint::from(3u8),
+                )
+                .expect("positive ternary second-moment denominator"),
+            },
+            RnsBggMaskSecretComponent::deterministic(BigUint::one(), BigUint::one()),
         ];
-        value.align_public(
+        let policy = NoiseMomentPolicy::Discrete { alpha: alpha.clone() };
+        let aligned = value.align_public(
             self.parameters,
             &action,
             &alpha,
             &ciphertext_rounding,
             &public_key_rounding,
             &mask_secret,
-            &NoiseMomentPolicy::Discrete { alpha: alpha.clone() },
-        )
+            &policy,
+        )?;
+        // The source contributions keep their identities through the fixed
+        // action h/alpha. Under H2 the rounding residue of the aligned
+        // ciphertext is a centered uniform per coefficient, independent of
+        // the error it rounds: the residue of one freshly sampled ciphertext
+        // is its own object, with that ciphertext's member coordinates, and
+        // any other ciphertext's residue keeps the route's shared identity.
+        // The mask term s * rho_A convolves the key residue with the
+        // independent secret; its coefficients are uncorrelated, and every
+        // ciphertext aligned along this route shares it.
+        let breakdown = match value.contributions("alignment-source") {
+            Some(terms) => {
+                let policy_rounding = policy
+                    .rounding_moments()
+                    .map_err(|_| RnsBggError::Parameters("invalid alignment moment policy"))?;
+                let zero = zero_mean_moments(NonnegativeRational::zero());
+                let mask = self.parameters.public_alignment_noise_moments(
+                    &zero,
+                    &action,
+                    &alpha,
+                    &zero,
+                    public_key_rounding.moments.as_ref().unwrap_or(&policy_rounding),
+                    &mask_secret,
+                )?;
+                let residue = ciphertext_rounding.moments.clone().unwrap_or(policy_rounding);
+                let route = (source_level, target_level);
+                let ciphertext_residual = match terms.single_sample() {
+                    Some((sample_source, sample)) => NoiseBreakdown::object_residual(
+                        stable_source_id(&(
+                            b"rns-bgg/public-alignment/ciphertext-residue".as_slice(),
+                            sample_source,
+                            route,
+                        )),
+                        "alignment-ciphertext-residue",
+                        sample.to_vec(),
+                        residue,
+                        true,
+                    ),
+                    None => NoiseBreakdown::object_residual(
+                        stable_source_id(&(
+                            b"rns-bgg/public-alignment/ciphertext-residue".as_slice(),
+                            route,
+                        )),
+                        "alignment-ciphertext-residue",
+                        Vec::new(),
+                        residue,
+                        true,
+                    ),
+                };
+                let mask = NoiseBreakdown::object_residual(
+                    stable_source_id(&(b"rns-bgg/public-alignment/mask".as_slice(), route)),
+                    "alignment-mask",
+                    Vec::new(),
+                    mask,
+                    true,
+                );
+                let mean_gain = NonnegativeRational::new(action.l1.clone(), alpha.clone())
+                    .expect("positive alignment ratio");
+                let alpha_squared = alpha.pow(2u32);
+                Some(
+                    terms
+                        .transform(|term| {
+                            (
+                                mean_gain.clone(),
+                                term.moments
+                                    .variance
+                                    .scaled_ratio(&action.l2_squared, &alpha_squared),
+                                false,
+                            )
+                        })
+                        .merge(&ciphertext_residual)
+                        .merge(&mask),
+                )
+            }
+            None => None,
+        };
+        let mut aligned = aligned;
+        aligned.heuristics.insert(NoiseHeuristicId::H2DigitUniform);
+        Ok(aligned.with_breakdown(breakdown))
     }
 
     fn event_coordinates(&self, wire: WireId) -> Result<BigUint, RnsBggError> {
@@ -1971,22 +2177,44 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
         let n = family.validate_support()?;
         let k = family.max_nonzero_payloads.clone().min(n.clone());
+        // The payload support only bounds the plaintext; every lane's
+        // sampled errors and residuals are summed.
+        let mut counts = ReductionCounts::default();
+        let breakdown = family.element.contributions("family-element").map(|breakdown| {
+            breakdown.reduce(
+                self.lane_indices.len() + 1,
+                &family_lane(&family.range),
+                &n,
+                &mut counts,
+            )
+        });
         let value = RnsBggNoiseValue {
             bound: RnsBggNoiseBound {
                 error: &family.element.bound.error * &n,
                 payload_l1: &family.element.bound.payload_l1 * &k,
             },
             payload_l2_squared: &family.element.payload_l2_squared * k.pow(2),
-            moments: family.element.moments.as_ref().map(|m| m.scaled(&n)),
+            moments: family.element.moments.clone(),
             provenance: family.element.provenance.clone(),
             heuristics: family.element.heuristics.clone(),
-        };
-        tracing::trace!(
+            breakdown: None,
+        }
+        .with_breakdown(breakdown);
+        tracing::debug!(
             wire = wire.0,
             members = %n,
+            coherent = counts.coherent,
+            independent = counts.independent,
+            histogram = counts.histogram,
+            unknown_index = counts.unknown_index,
             variance_log2 = value.moments.as_ref().map(|m| variance_log2(&m.variance)),
+            contributions = %value.describe_contributions(),
             "noise family sum"
         );
+        self.reduction_counts.coherent += counts.coherent;
+        self.reduction_counts.independent += counts.independent;
+        self.reduction_counts.histogram += counts.histogram;
+        self.reduction_counts.unknown_index += counts.unknown_index;
         self.trace.wires.insert(wire, value.clone());
         let input_node = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
         self.trace.dependencies.nodes.push(crate::noise_utils::NoiseDependencyNode::Binding(
@@ -2052,6 +2280,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             }),
             provenance: BTreeMap::new(),
             heuristics: NoiseHeuristicLedger::new(),
+            breakdown: None,
         }
     }
 
@@ -2477,6 +2706,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 }),
                 provenance: decoder_provenance,
                 heuristics: NoiseHeuristicLedger::new(),
+                breakdown: None,
             };
             let decoder_target = self.mod_down_channel(
                 decoder_target,
@@ -2515,6 +2745,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                     NoiseSourceProvenance { source: decoder_source, route: vec![slot_index] },
                 )]),
                 heuristics: NoiseHeuristicLedger::new(),
+                breakdown: None,
             };
             let decoder = self.combine_route(decoder_target, decoder_error);
             refresh_nodes.push(self.refresh_binding_node(slot_input.0));
@@ -2560,6 +2791,88 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         self.trace.refreshed_moment_policy = Some(declaration.moment_policy().clone());
         Ok(refreshed)
     }
+    /// Contributions of a non-terminal flat LUT. A coefficient output stays
+    /// in the units before its one scale-and-round, which `finish_outputs`
+    /// applies; any other output is converted here.
+    #[allow(clippy::too_many_arguments)]
+    fn lut_contributions(
+        &self,
+        level: usize,
+        wire: WireId,
+        lut: LutId,
+        table: &LutTable,
+        input: &RnsBggNoiseValue,
+        input_terms: NoiseBreakdown,
+        coefficient_output: bool,
+    ) -> Result<NoiseBreakdown, RnsBggError> {
+        let branches = table.values().len();
+        let payload_gain = RightActionNoiseGain {
+            l1: input.bound.payload_l1.clone(),
+            l2_squared: input.payload_l2_squared.clone(),
+        };
+        let terms = self.parameters.lut_noise_terms(
+            level,
+            branches,
+            &payload_gain,
+            &self.fresh_gain(level)?,
+        )?;
+        // Helper and B-key errors are sampled per automorphism; a repeated
+        // automorphism reuses its sample, so only distinct ones add linearly.
+        let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
+        let automorphisms = table
+            .input_layout()
+            .automorphism_indices(ring_dimension)
+            .map_err(|_| RnsBggError::Lut)?
+            .len();
+        let branch_squares = if automorphisms == branches {
+            BigUint::from(branches)
+        } else {
+            BigUint::from(branches).pow(2)
+        };
+        let divisor = if coefficient_output { BigUint::one() } else { terms.scale.pow(2) };
+        let units =
+            |variance: &NonnegativeRational| variance.scaled_ratio(&BigUint::one(), &divisor);
+        let mean_gain = NonnegativeRational::new(
+            terms.input_mean_gain.clone(),
+            if coefficient_output { BigUint::one() } else { terms.scale.clone() },
+        )
+        .expect("positive scale");
+        let inherited = input_terms.transform(|term| {
+            (
+                mean_gain.clone(),
+                units(&term.moments.variance.scaled(&terms.input_variance_gain)),
+                false,
+            )
+        });
+        let helper = NoiseBreakdown::sampled(
+            stable_source_id(&(b"rns-bgg/lut/helper".as_slice(), level)),
+            "lut-helper",
+            zero_mean_moments(units(&terms.helper.scaled(&branch_squares))),
+            false,
+        );
+        let fresh = NoiseBreakdown::sampled(
+            stable_source_id(&(b"rns-bgg/lut/B".as_slice(), level, lut)),
+            "lut-fresh",
+            zero_mean_moments(units(&terms.fresh.scaled(&branch_squares))),
+            false,
+        );
+        let gate = (self.program.id(), wire, level);
+        let mut contributions =
+            inherited.merge(&helper).merge(&fresh).merge(&NoiseBreakdown::rounding(
+                stable_source_id(&(b"rns-bgg/lut/rounding".as_slice(), gate)),
+                "lut-rounding",
+                zero_mean_moments(units(&terms.internal_rounding)),
+            ));
+        if !coefficient_output {
+            contributions = contributions.merge(&NoiseBreakdown::rounding(
+                stable_source_id(&(b"rns-bgg/lut/outer-rounding".as_slice(), gate)),
+                "lut-outer-rounding",
+                zero_mean_moments(terms.outer_rounding),
+            ));
+        }
+        Ok(contributions)
+    }
+
     fn finish_outputs(
         &mut self,
         outputs: Vec<(WireId, RnsBggNoiseValue)>,
@@ -2583,40 +2896,51 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 if ratio == BigUint::one() {
                     // The terminal level has no scale-and-round.
                     value.bound.error += self.parameters.encoding_error_bound();
-                    if let Some(moments) = value.moments.take() {
-                        value.moments = Some(moments.add_with_covariance(
-                            &NoiseMoments {
-                                mean_numerator: BigInt::zero(),
-                                mean_denominator: BigUint::one(),
-                                mean_radius: NonnegativeRational::zero(),
-                                variance: self.parameters.encoding_error_variance(),
-                            },
-                            NoiseCorrelation::Unknown,
-                        ));
-                    }
+                    let breakdown = value.contributions("coefficient-output").map(|terms| {
+                        terms.merge(&NoiseBreakdown::opaque(
+                            "terminal-encoding",
+                            zero_mean_moments(self.parameters.encoding_error_variance()),
+                        ))
+                    });
+                    value = value.with_breakdown(breakdown);
                 } else {
                     // The aggregated noise is still before the flat LUT's one
                     // scale-and-round (spec §8.2); convert it exactly once,
                     // with the public-key and encoding roundings.
                     value.bound.error =
                         self.parameters.lut_mod_down_bound(level, &value.bound.error)?;
-                    if let Some(moments) = value.moments.take() {
-                        let switched = moments.linear_image(
-                            &NonnegativeRational::new(BigUint::one(), ratio.clone())
-                                .expect("positive coefficient modulus ratio"),
-                            moments
-                                .variance
-                                .scaled_ratio(&BigUint::one(), &ratio.pow(2u32))
-                                .add(&self.parameters.lut_public_rounding_variance(level)?),
-                        );
-                        value.moments = Some(
-                            switched.add_with_covariance(
+                    let rounding =
+                        zero_mean_moments(self.parameters.lut_public_rounding_variance(level)?)
+                            .add_with_covariance(
                                 &NoiseMoments::discrete_rounding_residue(&ratio)
                                     .map_err(|error| RnsBggError::Graph(error.to_string()))?,
                                 NoiseCorrelation::Independent,
-                            ),
-                        );
-                    }
+                            );
+                    let mean_gain = NonnegativeRational::new(BigUint::one(), ratio.clone())
+                        .expect("positive coefficient modulus ratio");
+                    let breakdown = value.contributions("coefficient-output").map(|terms| {
+                        terms
+                            .transform(|term| {
+                                (
+                                    mean_gain.clone(),
+                                    term.moments
+                                        .variance
+                                        .scaled_ratio(&BigUint::one(), &ratio.pow(2u32)),
+                                    false,
+                                )
+                            })
+                            .merge(&NoiseBreakdown::rounding(
+                                stable_source_id(&(
+                                    b"rns-bgg/coefficient-final-rounding".as_slice(),
+                                    self.program.id(),
+                                    wire,
+                                    level,
+                                )),
+                                "coefficient-final-rounding",
+                                rounding.clone(),
+                            ))
+                    });
+                    value = value.with_breakdown(breakdown);
                 }
                 if ratio != BigUint::one() {
                     let source = stable_source_id(&(
@@ -2638,6 +2962,17 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             }
             finalized.push(value);
         }
+        let counts = &self.reduction_counts;
+        tracing::info!(
+            coherent = counts.coherent,
+            independent = counts.independent,
+            histogram = counts.histogram,
+            unknown_index = counts.unknown_index,
+            "noise family reductions"
+        );
+        for value in &finalized {
+            tracing::debug!(contributions = %value.describe_contributions(), "noise output");
+        }
         Ok(finalized)
     }
 }
@@ -2657,7 +2992,12 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
                 ),
             ));
         }
-        Ok((family.0, family.1.element.clone()))
+        let element = &family.1.element;
+        let member = element.breakdown.as_ref().map(|breakdown| {
+            let identity = *index == family_lane(&family.1.range);
+            breakdown.member(self.depth, index, identity)
+        });
+        Ok((family.0, element.clone().with_breakdown(member)))
     }
     fn rhs_at(
         &mut self,
@@ -2683,8 +3023,7 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
             IntExpr,
         ) -> Result<(WireId, RnsBggNoiseValue), ProgramLowerError<RnsBggError>>,
     ) -> Result<Self::WireFamily, ProgramLowerError<RnsBggError>> {
-        let index = IntExpr::Add(Box::new(range.start().clone()), Box::new(IntExpr::LoopIndex(0)))
-            .canonicalize();
+        let index = family_lane(range);
         let count = range
             .count()
             .evaluate(&ParamEnv::default())
@@ -2696,8 +3035,11 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
         let previous_multiplier = evaluator.event_multiplier.clone();
         evaluator.event_multiplier *= &count;
         evaluator.lane_indices.push(index.clone());
+        self.depth += 1;
         let result = body(self, evaluator, index);
-        let (wire, element) = match result {
+        let body_depth = self.depth;
+        self.depth -= 1;
+        let (wire, mut element) = match result {
             Ok(value) => value,
             Err(error) => {
                 evaluator.lane_indices.pop();
@@ -2705,6 +3047,9 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
                 return Err(error);
             }
         };
+        element.breakdown = element
+            .breakdown
+            .map(|breakdown| Arc::new(breakdown.as_ref().clone().with_lane_depth(body_depth)));
         // Members weighted by distinct members of a sparse RHS family have
         // nonzero payloads in at most that family's sparse count of lanes.
         let max_nonzero_payloads = evaluator
@@ -2742,7 +3087,11 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             } else {
                 NoiseCorrelation::Unknown
             };
-        let mut value = lhs.1.combine(&rhs.1, correlation);
+        let breakdown = match (lhs.1.contributions("add-lhs"), rhs.1.contributions("add-rhs")) {
+            (Some(lhs), Some(rhs)) => Some(lhs.merge(&rhs)),
+            _ => None,
+        };
+        let mut value = lhs.1.combine(&rhs.1, correlation).with_breakdown(breakdown);
         value.bound = lhs.1.bound.add(&rhs.1.bound);
         value.payload_l2_squared =
             RnsBggNoiseValue::l2_add_bound(&lhs.1.payload_l2_squared, &rhs.1.payload_l2_squared);
@@ -2789,22 +3138,44 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         let gain = self.parameters.mul_public_action_gain(target_level)?;
         let wire = self.site()?.output;
         let plaintext_gain = lhs_value.bound.payload_l1.clone();
-        let moments = match (lhs_value.moments.as_ref(), rhs_value.moments.as_ref()) {
-            (Some(lhs_moments), Some(rhs_moments)) => {
-                let rhs_term = rhs_moments.linear_image(
-                    &NonnegativeRational::new(plaintext_gain.clone(), BigUint::one())
-                        .expect("positive plaintext gain"),
-                    rhs_moments.variance.scaled(&plaintext_gain.pow(2)),
-                );
-                let lhs_term = lhs_moments.linear_image(
-                    &NonnegativeRational::new(gain.l1.clone(), BigUint::one())
-                        .expect("positive decomposition gain"),
-                    lhs_moments.variance.scaled(&gain.l2_squared),
-                );
-                Some(rhs_term.add_with_covariance(&lhs_term, NoiseCorrelation::Unknown))
+        // E_out = E_left * decomposition(A_right) + mu_left * E_right. Each
+        // side is a fixed public action on its own contributions; the energy
+        // cap applies only to a white left contribution (H1/H4), any other
+        // keeps the squared L1 bound. A signed monomial left plaintext keeps
+        // the right contributions white.
+        let mut energy_cap_used = false;
+        let breakdown = match (
+            lhs_value.contributions("mul-public-lhs"),
+            rhs_value.contributions("mul-public-rhs"),
+        ) {
+            (Some(lhs_terms), Some(rhs_terms)) => {
+                let decomposition_l1 = NonnegativeRational::new(gain.l1.clone(), BigUint::one())
+                    .expect("positive decomposition gain");
+                let l1_squared = gain.l1.pow(2);
+                let lhs_terms = lhs_terms.transform(|term| {
+                    energy_cap_used |= term.white;
+                    let action = if term.white { &gain.l2_squared } else { &l1_squared };
+                    (decomposition_l1.clone(), term.moments.variance.scaled(action), false)
+                });
+                let monomial = plaintext_gain.pow(2) == lhs_value.payload_l2_squared;
+                let plaintext_l1 = NonnegativeRational::new(plaintext_gain.clone(), BigUint::one())
+                    .expect("positive plaintext gain");
+                let rhs_terms = rhs_terms.transform(|term| {
+                    (
+                        plaintext_l1.clone(),
+                        term.moments.variance.scaled(&plaintext_gain.pow(2)),
+                        term.white && monomial,
+                    )
+                });
+                Some(lhs_terms.merge(&rhs_terms))
             }
             _ => None,
         };
+        let mut heuristics = lhs_value.heuristics.clone();
+        if energy_cap_used {
+            heuristics.insert(NoiseHeuristicId::H1StateUncorrelated);
+            heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
+        }
         let value = self.carry_provenance(
             RnsBggNoiseValue {
                 bound: rhs_value.bound.mul_public_with_action(
@@ -2813,10 +3184,12 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                     &gain,
                 ),
                 payload_l2_squared: &lhs_value.payload_l2_squared * &rhs_value.payload_l2_squared,
-                moments,
+                moments: None,
                 provenance: BTreeMap::new(),
-                heuristics: lhs_value.heuristics.clone(),
-            },
+                heuristics,
+                breakdown: None,
+            }
+            .with_breakdown(breakdown),
             [lhs_value.provenance.clone(), rhs_value.provenance.clone()],
         );
         let node = crate::noise_utils::NoiseDependencyNode::MulPublic {
@@ -2865,37 +3238,79 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             &fresh_error_gain.l1,
             output_l1.clone(),
         )?;
-        let moments = input
-            .1
-            .moments
-            .as_ref()
-            .map(|m| {
-                self.parameters
-                    .private_mul_noise_variance(
-                        level,
-                        &m.variance,
-                        &RightActionNoiseGain {
-                            l1: input.1.bound.payload_l1.clone(),
-                            l2_squared: input.1.payload_l2_squared.clone(),
-                        },
-                        &fresh_error_gain,
-                    )
-                    .map(|v| {
-                        m.linear_image(
-                            &NonnegativeRational::new(BigUint::one(), BigUint::one()).unwrap(),
-                            v,
-                        )
-                    })
-            })
-            .transpose()?;
+        let payload_gain = RightActionNoiseGain {
+            l1: input.1.bound.payload_l1.clone(),
+            l2_squared: input.1.payload_l2_squared.clone(),
+        };
+        let terms =
+            self.parameters.private_mul_noise_terms(level, &payload_gain, &fresh_error_gain)?;
+        // e*U/p keeps each input contribution's identity. -mu*F is the RHS
+        // artifact's own sample: every gate reading the same RHS member
+        // shares it, and distinct members of an RHS family are distinct
+        // preparations. The remainders are this gate's residual.
+        let breakdown = input.1.contributions("mul-private-input").map(|input_terms| {
+            let inherited = input_terms.transform(|term| {
+                (
+                    terms.inherited_mean_gain.clone(),
+                    terms.inherited_variance(&term.moments.variance),
+                    false,
+                )
+            });
+            let rhs_source = stable_source_id(&(b"rns-bgg/rhs-error".as_slice(), rhs.id, level));
+            let rhs_moments = zero_mean_moments(terms.rhs_error.clone());
+            let rhs_white = payload_gain.l1.pow(2) == payload_gain.l2_squared;
+            let rhs_error = match rhs.index.as_ref() {
+                Some(index) => NoiseBreakdown::sampled_member(
+                    rhs_source,
+                    "rhs-error",
+                    self.lane_indices.len(),
+                    index.clone(),
+                    rhs_moments,
+                    rhs_white,
+                ),
+                None => NoiseBreakdown::sampled(rhs_source, "rhs-error", rhs_moments, rhs_white),
+            };
+            // Under H2 both remainders are centered uniforms independent per
+            // coefficient and of the independent secret, so their images
+            // are coefficient-uncorrelated.
+            let rounding = NoiseBreakdown::object_residual(
+                stable_source_id(&(
+                    b"rns-bgg/private-mul/rounding".as_slice(),
+                    self.program.id(),
+                    wire,
+                    level,
+                )),
+                "private-mul-rounding",
+                Vec::new(),
+                zero_mean_moments(terms.rounding.clone()),
+                true,
+            );
+            inherited.merge(&rhs_error).merge(&rounding)
+        });
+        tracing::trace!(
+            wire = wire.0,
+            level,
+            inherited_gain_log2 = variance_log2(&terms.inherited_variance_gain),
+            rhs_error_log2 = variance_log2(&terms.rhs_error),
+            payload_l1_bits = payload_gain.l1.bits(),
+            payload_l2_squared_bits = payload_gain.l2_squared.bits(),
+            rounding_log2 = variance_log2(&terms.rounding),
+            "private multiplication variance terms"
+        );
+        let mut heuristics = input.1.heuristics.clone();
+        heuristics.insert(NoiseHeuristicId::H1StateUncorrelated);
+        heuristics.insert(NoiseHeuristicId::H2DigitUniform);
+        heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
         let value = self.carry_provenance(
             RnsBggNoiseValue {
                 bound,
                 payload_l2_squared: &input.1.payload_l2_squared * &contract.payload_l2_squared,
-                moments,
+                moments: None,
                 provenance: BTreeMap::new(),
-                heuristics: input.1.heuristics.clone(),
-            },
+                heuristics,
+                breakdown: None,
+            }
+            .with_breakdown(breakdown),
             [input.1.provenance.clone()],
         );
         let node = crate::noise_utils::NoiseDependencyNode::MulPrivate {
@@ -2970,48 +3385,22 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 output_payload_l1,
             )?
         };
-        let moments = input
+        let breakdown = input
             .1
-            .moments
-            .as_ref()
-            .map(|m| {
-                let payload_gain = RightActionNoiseGain {
-                    l1: input.1.bound.payload_l1.clone(),
-                    l2_squared: input.1.payload_l2_squared.clone(),
-                };
+            .contributions("lut-input")
+            .map(|input_terms| {
                 if terminal_coefficient {
-                    Ok(m.clone())
-                } else if coefficient_output {
-                    // Level-`level` units: the mean is scaled by `p` here and
-                    // divided by it once in `finish_outputs`.
-                    let p = self.parameters.scale(level)?.clone();
-                    self.parameters
-                        .lut_noise_variance_before_mod_down(
-                            level,
-                            &m.variance,
-                            table.values().len(),
-                            &payload_gain,
-                            &fresh_error_gain,
-                        )
-                        .map(|v| {
-                            m.linear_image(&NonnegativeRational::new(p, BigUint::one()).unwrap(), v)
-                        })
-                } else {
-                    self.parameters
-                        .lut_noise_variance(
-                            level,
-                            &m.variance,
-                            table.values().len(),
-                            &payload_gain,
-                            &fresh_error_gain,
-                        )
-                        .map(|v| {
-                            m.linear_image(
-                                &NonnegativeRational::new(BigUint::one(), BigUint::one()).unwrap(),
-                                v,
-                            )
-                        })
+                    return Ok(input_terms);
                 }
+                self.lut_contributions(
+                    level,
+                    wire,
+                    lut,
+                    table,
+                    &input.1,
+                    input_terms,
+                    coefficient_output,
+                )
             })
             .transpose()?;
         let material = self.lut_material_provenance(level, lut, table)?;
@@ -3019,10 +3408,12 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             RnsBggNoiseValue {
                 bound,
                 payload_l2_squared: output_payload_l2_squared,
-                moments,
+                moments: None,
                 provenance: BTreeMap::new(),
                 heuristics: input.1.heuristics.clone(),
-            },
+                breakdown: None,
+            }
+            .with_breakdown(breakdown),
             [input.1.provenance.clone(), material],
         );
         let node = crate::noise_utils::NoiseDependencyNode::Lut {
@@ -3147,7 +3538,7 @@ pub fn trace_program(
         let coordinates = evaluator.event_coordinates(*wire).map_err(ProgramLowerError::Backend)?;
         evaluator.trace.node_event_counts.insert(node.0, multiplicity * coordinates);
     }
-    let mut families = RnsBggNoiseFamilies;
+    let mut families = RnsBggNoiseFamilies::default();
     let outputs =
         crate::program::lower_program(program, &mut evaluator, &mut families, &mut environment)?;
     evaluator.trace.outputs =
@@ -3165,6 +3556,8 @@ pub struct RnsBggPlanRequest {
     pub encoding_error_sigma: bigdecimal::BigDecimal,
     /// Target CRT prime bits.
     pub crt_bits: usize,
+    /// Gadget decomposition base bits, at most 31.
+    pub base_bits: u32,
     /// Terminal CRT depth.
     pub terminal_depth: usize,
     /// Maximum candidate CRT depth.
@@ -3286,7 +3679,7 @@ impl RnsBggParameters {
             request.ring_dimension,
             request.max_crt_depth,
             request.crt_bits,
-            request.crt_bits.div_ceil(2).min(31) as u32,
+            request.base_bits,
             None,
             None,
         )
@@ -3404,6 +3797,10 @@ impl RnsBggParameters {
                         scale_bits = self.scale(level)?.bits(),
                         modulus_fits,
                         scale_fits,
+                        z_squared_log2 = variance_log2(z_squared),
+                        top_modulus_bits = self.levels[0].modulus().bits(),
+                        first_scale_bits = self.scale(0)?.bits(),
+                        contributions = %value.describe_contributions(),
                         "average-case evaluation noise exceeds the level budget"
                     );
                     return Err(RnsBggError::Budget("evaluation noise"));
@@ -3447,6 +3844,14 @@ impl RnsBggParameters {
                 let modulus_limit = NonnegativeRational::new(modulus.as_ref().clone(), 4u8.into())
                     .map_err(|_| RnsBggError::Parameters("invalid average-case rational budget"))?;
                 if !moments.fits(&modulus_limit, z_squared) {
+                    tracing::info!(
+                        wire = wire.0,
+                        level,
+                        variance_log2 = variance_log2(&moments.variance),
+                        modulus_bits = modulus.bits(),
+                        contributions = %value.describe_contributions(),
+                        "average-case terminal noise exceeds the output budget"
+                    );
                     return Err(RnsBggError::Budget("terminal range"));
                 }
             } else {
@@ -3600,7 +4005,7 @@ impl RnsBggParameterManifest {
             self.request.ring_dimension,
             self.request.max_crt_depth,
             self.request.crt_bits,
-            self.request.crt_bits.div_ceil(2).min(31) as u32,
+            self.request.base_bits,
             None,
             None,
         )
@@ -3738,7 +4143,7 @@ impl<'a> RnsNoiseBuild<'a> {
         }
         Ok(Self {
             evaluator: Some(evaluator),
-            families: RnsBggNoiseFamilies,
+            families: RnsBggNoiseFamilies::default(),
             environment,
             refresh_prf: None,
             pending_refresh: None,
@@ -3804,7 +4209,7 @@ impl<'a> RnsNoiseBuild<'a> {
             .ordered_outputs()
             .map(|(label, wire)| (label.clone(), wire))
             .collect::<Vec<_>>();
-        let mut families = RnsBggNoiseFamilies;
+        let mut families = RnsBggNoiseFamilies::default();
         let outputs = crate::program::lower_program(
             evaluator.program,
             evaluator,
@@ -4035,6 +4440,7 @@ mod test {
                 },
             )]),
             heuristics: NoiseHeuristicLedger::new().with([NoiseHeuristicId::ExactDistribution]),
+            breakdown: None,
         }
     }
 
@@ -4279,6 +4685,173 @@ mod test {
         assert_eq!(exponent.outputs[0].payload_l2_squared, BigUint::one());
         assert_eq!(coefficient.outputs[0].bound.payload_l1, BigUint::from(2u8));
         assert_eq!(coefficient.outputs[0].payload_l2_squared, BigUint::from(4u8));
+    }
+
+    fn output_variance(
+        program: &ExponentLutProgram,
+        parameters: &RnsBggParameters,
+        inputs: BTreeMap<WireId, InputBinding<RnsBggNoiseValue, RnsBggNoiseFamily>>,
+        rhs: BTreeMap<RhsId, InputBinding<RnsBggNoiseRhs, RnsBggNoiseFamily<RnsBggNoiseRhs>>>,
+    ) -> NonnegativeRational {
+        let bindings = RnsBggNoiseBindings::new(inputs, rhs).unwrap();
+        let trace = trace_program(parameters, program, &bindings).unwrap();
+        trace.outputs[0].moments.as_ref().unwrap().variance.clone()
+    }
+
+    fn unit_rhs() -> RnsBggNoiseRhs {
+        RnsBggNoiseRhs { payload_l1: BigUint::one(), payload_l2_squared: BigUint::one() }
+    }
+
+    #[test]
+    fn family_sum_keeps_rhs_errors_independent_and_the_shared_input_coherent() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(4)).unwrap();
+        let products = builder
+            .parallel(FamilyRange::full(IntExpr::constant(4)).unwrap(), |builder, index| {
+                builder
+                    .mul_private(
+                        crate::program::Operand::Scalar(input),
+                        crate::program::Operand::Member { family: rhs, index },
+                    )
+                    .map(crate::program::Operand::Scalar)
+            })
+            .unwrap();
+        let output = builder.sum(products).unwrap();
+        let program = builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+        let parameters = nested_alignment_parameters();
+        let encoding = RnsBggNoiseValue::sampled_encoding(&parameters, b"state", &[BigInt::one()]);
+        let variance = output_variance(
+            &program,
+            &parameters,
+            BTreeMap::from([(input, InputBinding::Scalar(encoding))]),
+            BTreeMap::from([(
+                rhs,
+                InputBinding::Family(RnsBggNoiseFamily {
+                    element: unit_rhs(),
+                    range: FamilyRange::full(IntExpr::constant(4)).unwrap(),
+                    // One-hot payloads do not remove the other members' errors.
+                    max_nonzero_payloads: BigUint::one(),
+                }),
+            )]),
+        );
+        let terms = parameters
+            .private_mul_noise_terms(
+                0,
+                &RightActionNoiseGain::unit(),
+                &RightActionNoiseGain::unit(),
+            )
+            .unwrap();
+        let inherited = terms.inherited_variance(&parameters.encoding_error_variance());
+        // 4² for the shared input and the gate's residual, 4 for the RHS
+        // family's distinct samples.
+        let expected = inherited
+            .scaled(&16u8.into())
+            .add(&terms.rhs_error.scaled(&4u8.into()))
+            .add(&terms.rounding.scaled(&16u8.into()));
+        assert_eq!(variance, expected);
+    }
+
+    #[test]
+    fn mul_public_energy_cap_applies_to_white_errors_and_independent_members() {
+        fn program(family: bool) -> (ExponentLutProgram, WireId, WireId) {
+            let mut builder = crate::program::ExponentLutProgramBuilder::new();
+            let state = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+            let public = if family {
+                builder
+                    .input_family(
+                        IntExpr::constant(4),
+                        crate::program::AttributeKnowledge::PublicPayload,
+                    )
+                    .unwrap()
+            } else {
+                builder.input(crate::program::AttributeKnowledge::PublicPayload).unwrap()
+            };
+            let output = if family {
+                let products = builder
+                    .parallel(FamilyRange::full(IntExpr::constant(4)).unwrap(), |builder, index| {
+                        builder
+                            .mul_public(
+                                crate::program::Operand::Member { family: public, index },
+                                crate::program::Operand::Scalar(state),
+                            )
+                            .map(crate::program::Operand::Scalar)
+                    })
+                    .unwrap();
+                builder.sum(products).unwrap()
+            } else {
+                builder
+                    .mul_public(
+                        crate::program::Operand::Scalar(public),
+                        crate::program::Operand::Scalar(state),
+                    )
+                    .unwrap()
+            };
+            let program = builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+            (program, state, public)
+        }
+        let parameters = nested_alignment_parameters();
+        let encoding =
+            |label: &[u8]| RnsBggNoiseValue::sampled_encoding(&parameters, label, &[BigInt::one()]);
+        let v = parameters.encoding_error_variance();
+        let gain = parameters.mul_public_action_gain(0).unwrap();
+        assert!(gain.l2_squared < gain.l1.pow(2));
+
+        let (scalar, state, public) = program(false);
+        let white = output_variance(
+            &scalar,
+            &parameters,
+            BTreeMap::from([
+                (state, InputBinding::Scalar(encoding(b"state"))),
+                (public, InputBinding::Scalar(encoding(b"a"))),
+            ]),
+            BTreeMap::new(),
+        );
+        assert_eq!(white, v.scaled(&gain.l2_squared).add(&v));
+        // An envelope without a source-aware breakdown is not white; it keeps
+        // the squared L1 action and its unknown covariance with the rest.
+        let mut opaque = encoding(b"a");
+        opaque.breakdown = None;
+        let fallback = output_variance(
+            &scalar,
+            &parameters,
+            BTreeMap::from([
+                (state, InputBinding::Scalar(encoding(b"state"))),
+                (public, InputBinding::Scalar(opaque)),
+            ]),
+            BTreeMap::new(),
+        );
+        assert_eq!(fallback, v.scaled(&gain.l1.pow(2)).sum_variance_bound(&v));
+
+        let (summed, state, public) = program(true);
+        let family = |element: RnsBggNoiseValue| {
+            InputBinding::Family(RnsBggNoiseFamily {
+                element,
+                range: FamilyRange::full(IntExpr::constant(4)).unwrap(),
+                max_nonzero_payloads: 4u8.into(),
+            })
+        };
+        let independent = output_variance(
+            &summed,
+            &parameters,
+            BTreeMap::from([
+                (state, InputBinding::Scalar(encoding(b"state"))),
+                (public, family(encoding(b"a").independent_family_members())),
+            ]),
+            BTreeMap::new(),
+        );
+        assert_eq!(independent, v.scaled(&(&gain.l2_squared * 4u8)).add(&v.scaled(&16u8.into())));
+        // Without the binding contract every member is the same sample.
+        let shared = output_variance(
+            &summed,
+            &parameters,
+            BTreeMap::from([
+                (state, InputBinding::Scalar(encoding(b"state"))),
+                (public, family(encoding(b"a"))),
+            ]),
+            BTreeMap::new(),
+        );
+        assert_eq!(shared, v.scaled(&(&gain.l2_squared * 16u8)).add(&v.scaled(&16u8.into())));
     }
 
     #[test]

@@ -168,8 +168,9 @@ fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNo
     {
         let binding = match declaration.shape() {
             InputBinding::Scalar(()) => InputBinding::Scalar(value),
+            // Every member of an input family is a separate encryption.
             InputBinding::Family(count) => InputBinding::Family(RnsBggNoiseFamily {
-                element: value,
+                element: value.independent_family_members(),
                 range: FamilyRange::full(count.clone()).expect("valid input family range"),
                 max_nonzero_payloads: 1u8.into(),
             }),
@@ -231,10 +232,11 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
     let crt_bits =
         env_usize("MXX_EXPONENT_LUT_LWR_PRF_CRT_BITS", 40).expect("CRT bits configuration");
     assert!(crt_bits > 0, "MXX_EXPONENT_LUT_LWR_PRF_CRT_BITS must be positive");
-    let expected_base_bits = crt_bits.div_ceil(2);
+    let expected_base_bits = env_usize("MXX_EXPONENT_LUT_LWR_PRF_BASE_BITS", crt_bits.div_ceil(2))
+        .expect("decomposition base bits configuration");
     assert!(
-        expected_base_bits <= 31,
-        "MXX_EXPONENT_LUT_LWR_PRF_CRT_BITS is unsupported above 62 bits"
+        (1..=31).contains(&expected_base_bits),
+        "MXX_EXPONENT_LUT_LWR_PRF_BASE_BITS must be in 1..=31"
     );
     let max_crt_depth = env_usize("MXX_EXPONENT_LUT_LWR_PRF_MAX_CRT_DEPTH", 32)
         .expect("maximum CRT depth configuration");
@@ -285,6 +287,7 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
                 ring_dimension,
                 encoding_error_sigma: sigma.clone(),
                 crt_bits,
+                base_bits: expected_base_bits as u32,
                 terminal_depth: 1,
                 max_crt_depth: crt_depth,
                 terminal_value_bound: terminal_bounds
@@ -310,7 +313,7 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
                 assert_eq!(
                     level.base_bits(),
                     expected_base_bits as u32,
-                    "selected LWR level {index} must use ceil(CRT_BITS/2) base bits"
+                    "selected LWR level {index} must use the configured base bits"
                 );
             }
             let workload = match RnsBggDerivedWorkload::from_program_with_parameters(

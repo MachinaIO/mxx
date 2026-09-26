@@ -43,7 +43,9 @@ use mxx_ir_core::{
     artifact::{ArtifactAvailability, ArtifactType, ManifestArtifact},
     concretize_wire_type,
     graph::FrozenGraphScopeId,
-    node::{ConstantMatrix, HashTagComponent, HashVariant, MatrixBinaryOp, NodeKind},
+    node::{
+        ConstantMatrix, HashTagComponent, HashVariant, LoopInputMode, MatrixBinaryOp, NodeKind,
+    },
     types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, Port, WireRef},
 };
 use num_bigint::BigInt;
@@ -6009,6 +6011,22 @@ pub(crate) fn plan_physical_graph(
                     }
                 }
                 arguments[..spec.carried_count].to_vec()
+            } else if let NodeKind::ParallelLoop(spec) = node.kind() {
+                // A broadcast input is read by every lane, so the artifact is
+                // loaded once before the loop. A zipped family artifact would
+                // need per-lane selection, which is not planned here.
+                if spec.input_modes.len() != arguments.len() {
+                    return Err("GPU parallel loop input modes disagree with its arguments".into());
+                }
+                if arguments.iter().zip(&spec.input_modes).any(|(wire, mode)| {
+                    pending_imports.contains_key(wire) && *mode != LoopInputMode::Broadcast
+                }) {
+                    return Err(
+                        "GPU parallel loop zips an artifact input without a planned import boundary"
+                            .into(),
+                    );
+                }
+                arguments.to_vec()
             } else if matches!(
                 node.kind(),
                 NodeKind::SubgraphCall(_) |
@@ -6041,10 +6059,11 @@ pub(crate) fn plan_physical_graph(
             ) {
                 arguments.to_vec()
             } else {
-                return Err(
-                    "GPU artifact first consumer needs a planned conditional import boundary"
-                        .into(),
-                );
+                return Err(format!(
+                    "GPU artifact first consumer needs a planned conditional import boundary: \
+                     node {node_id:?} is {:.120}",
+                    format!("{:?}", node.kind())
+                ));
             };
             for wire in active_arguments {
                 activate_import(wire, &mut pending_imports, &operations, &mut import_templates)?;

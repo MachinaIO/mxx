@@ -444,11 +444,6 @@ impl DirectGraph {
                 live_allocations: BTreeSet::new(),
             });
         }
-        if !frame.external_io_loops.is_empty() && !frame.waves.is_empty() {
-            return Err(GpuPlanError::GraphCompile(
-                "external-I/O loop cannot be nested in a wave schedule".into(),
-            ));
-        }
         let mut starts = vec![0usize];
         for wave in &frame.waves {
             let start = wave.body_start as usize;
@@ -477,11 +472,6 @@ impl DirectGraph {
                 ));
             }
             starts.push(boundary);
-        }
-        if !frame.external_io_imports.is_empty() && !frame.waves.is_empty() {
-            return Err(GpuPlanError::GraphCompile(
-                "selected artifact import cannot be nested in a wave schedule".into(),
-            ));
         }
         for import in &frame.external_io_imports {
             if import.descriptor.artifact_type != import.expected_type {
@@ -2461,11 +2451,7 @@ impl GpuRuntime {
                 .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
         }
         let observer_started = Instant::now();
-        let run = if plan.frame.waves.is_empty() {
-            self.execute_producer(plan, pump, frame)
-        } else {
-            self.execute_waves(plan, inputs, execution_nonce, Some(pump))
-        };
+        let run = self.execute_waves(plan, inputs, execution_nonce, Some(pump));
         let run_finished = Instant::now();
         if has_exports {
             let observed = pump
@@ -2515,7 +2501,19 @@ impl GpuRuntime {
         Ok(result)
     }
 
-    fn run_wave_region_range<E: std::error::Error + Send + Sync + 'static>(
+    /// Run the Graph regions of operations `start..end`. At each region
+    /// boundary the host replays a nested wave, iterates a host-driven loop
+    /// whose body starts there, loads the imports planned there, and reads
+    /// the selected artifact member of each selected import there, whose
+    /// selector the preceding regions computed. A wave replays this range for
+    /// its body, and a host-driven loop for its body in each iteration, so
+    /// each of these nests in the other.
+    ///
+    /// `host_loop` is the host-driven loop whose body this range is, not
+    /// entered again at its own start. `static_imports` is false after its
+    /// first iteration: a loop's fixed imports are read once.
+    #[allow(clippy::too_many_arguments)]
+    fn run_region_range<E: std::error::Error + Send + Sync + 'static>(
         &mut self,
         plan: &mut GpuExecutionPlan,
         groups: &[WaveGroup],
@@ -2526,6 +2524,8 @@ impl GpuRuntime {
         active_wave: Option<&ActiveWave>,
         active_imports: Option<&[usize]>,
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
+        host_loop: Option<usize>,
+        static_imports: bool,
     ) -> Result<(), GpuRuntimeError> {
         let interval = plan.graph.region_interval(start, end)?;
         let active_site = active_wave.map(|wave| plan.frame.waves[wave.wave_index].loop_site);
@@ -2613,9 +2613,52 @@ impl GpuRuntime {
                     "wave region has no reached parent invocation".into(),
                 ));
             }
-            let templates = active_imports
-                .map(|indices| indices.to_vec())
-                .unwrap_or_else(|| (0..plan.frame.import_templates.len()).collect());
+            let frame = FrameGeneration::new(0, plan.completed_runs);
+            if let Some(loop_index) = plan
+                .frame
+                .external_io_loops
+                .iter()
+                .position(|loop_body| loop_body.body_start == operation) &&
+                host_loop != Some(loop_index)
+            {
+                let loop_body = &plan.frame.external_io_loops[loop_index];
+                if loop_body.body_end > end {
+                    return Err(GpuRuntimeError::Execution(
+                        "host-driven loop body crosses its enclosing Graph range".into(),
+                    ));
+                }
+                let (body_start, body_end, count) =
+                    (loop_body.body_start, loop_body.body_end, loop_body.count);
+                let index_owner = Arc::clone(&loop_body.index_owner);
+                for iteration in 0..count {
+                    index_owner
+                        .upload_u64(&[iteration])
+                        .and_then(|()| index_owner.wait_until_ready())
+                        .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
+                    self.run_region_range(
+                        plan,
+                        groups,
+                        inputs,
+                        execution_nonce,
+                        body_start,
+                        body_end,
+                        active_wave,
+                        active_imports,
+                        pump,
+                        Some(loop_index),
+                        static_imports && iteration == 0,
+                    )?;
+                }
+                region = plan.graph.region_interval(body_start, body_end)?.end;
+                continue;
+            }
+            let templates = if static_imports {
+                active_imports
+                    .map(|indices| indices.to_vec())
+                    .unwrap_or_else(|| (0..plan.frame.import_templates.len()).collect())
+            } else {
+                Vec::new()
+            };
             for index in templates {
                 let template = plan.frame.import_templates.get(index).ok_or_else(|| {
                     GpuRuntimeError::Artifact("scheduled import template is absent".into())
@@ -2640,11 +2683,45 @@ impl GpuRuntime {
                 }
                 .map_err(GpuRuntimeError::Artifact)?;
             }
-            if active_wave.is_none() {
-                upload_sample_seeds(&plan.frame, execution_nonce, &[0])
-                    .map_err(GpuRuntimeError::Execution)?;
+            // Every selected import planned at this boundary: at the root, in a
+            // host-driven loop body, or in one lane of a wave body.
+            let selected = plan
+                .frame
+                .external_io_imports
+                .iter()
+                .enumerate()
+                .filter(|(_, import)| import.before_operation == operation)
+                .map(|(index, _)| (None, index))
+                .chain(plan.frame.external_io_loops.iter().enumerate().flat_map(
+                    |(loop_index, loop_body)| {
+                        loop_body
+                            .imports
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, import)| import.before_operation == operation)
+                            .map(move |(index, _)| (Some(loop_index), index))
+                    },
+                ))
+                .collect::<Vec<_>>();
+            for (loop_index, index) in selected {
+                let pump = pump.as_deref_mut().ok_or_else(|| {
+                    GpuRuntimeError::Artifact("selected import has no I/O pump".into())
+                })?;
+                let import = match loop_index {
+                    None => &plan.frame.external_io_imports[index],
+                    Some(loop_index) => &plan.frame.external_io_loops[loop_index].imports[index],
+                };
+                self.load_selected_import(plan, pump, frame, operation, import)?;
             }
-            plan.graph.bind(&plan.frame)?;
+            // A plan without waves bound its owners and uploaded its seeds
+            // once; a wave rebinds its lanes' owners before each launch.
+            if !plan.frame.waves.is_empty() {
+                if active_wave.is_none() {
+                    upload_sample_seeds(&plan.frame, execution_nonce, &[0])
+                        .map_err(GpuRuntimeError::Execution)?;
+                }
+                plan.graph.bind(&plan.frame)?;
+            }
             let completion = plan.graph.launch_region(&plan.frame, region)?;
             plan.launches.fetch_add(1, Ordering::AcqRel);
             completion.wait().map_err(GpuRuntimeError::from)?;
@@ -2727,7 +2804,7 @@ impl GpuRuntime {
             if let Some(actual) = parent_occurrence {
                 imports.extend(wave.invocation_imports.get(&actual).into_iter().flatten().copied());
             }
-            self.run_wave_region_range(
+            self.run_region_range(
                 plan,
                 groups,
                 inputs,
@@ -2737,6 +2814,8 @@ impl GpuRuntime {
                 Some(&ActiveWave { wave_index, logical_path }),
                 Some(&imports),
                 pump,
+                None,
+                true,
             )?;
             for control in &plan.frame.control_resets {
                 control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
@@ -2756,7 +2835,7 @@ impl GpuRuntime {
         let groups = wave_groups(&plan.frame, &plan.graph).map_err(GpuRuntimeError::Execution)?;
         let end = u32::try_from(plan.frame.program.operations.len())
             .map_err(|_| GpuRuntimeError::Execution("GPU operation count exceeds u32".into()))?;
-        let run = self.run_wave_region_range(
+        let run = self.run_region_range(
             plan,
             &groups,
             inputs,
@@ -2766,6 +2845,8 @@ impl GpuRuntime {
             None,
             None,
             &mut pump,
+            None,
+            true,
         );
         if let Err(error) = run {
             // A device status is read only after its region joined.
@@ -2853,158 +2934,6 @@ impl GpuRuntime {
             )
         }
         .map_err(GpuRuntimeError::Artifact)
-    }
-
-    fn execute_producer_regions<E: std::error::Error + Send + Sync + 'static>(
-        &mut self,
-        plan: &mut GpuExecutionPlan,
-        pump: &mut ProducerIoPump<'_, E>,
-        frame: FrameGeneration,
-    ) -> Result<(), GpuRuntimeError> {
-        let mut region = 0usize;
-        let mut next_loop = 0usize;
-        while region < plan.graph.regions.len() {
-            let start = plan.graph.regions[region].start_operation;
-            if let Some(loop_body) = plan.frame.external_io_loops.get(next_loop) {
-                if start == loop_body.body_start {
-                    let end = plan
-                        .graph
-                        .regions
-                        .iter()
-                        .position(|candidate| candidate.start_operation == loop_body.body_end)
-                        .unwrap_or(plan.graph.regions.len());
-                    if end <= region ||
-                        (end == plan.graph.regions.len() &&
-                            loop_body.body_end as usize !=
-                                plan.frame.program.operations.len())
-                    {
-                        return Err(GpuRuntimeError::Execution(
-                            "external-I/O loop has no matching Graph body end".into(),
-                        ));
-                    }
-                    for iteration in 0..loop_body.count {
-                        loop_body
-                            .index_owner
-                            .upload_u64(&[iteration])
-                            .and_then(|()| loop_body.index_owner.wait_until_ready())
-                            .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
-                        for body_region in region..end {
-                            let operation = plan.graph.regions[body_region].start_operation;
-                            if iteration == 0 {
-                                for import in plan
-                                    .frame
-                                    .import_templates
-                                    .iter()
-                                    .filter(|import| import.before_operation == operation)
-                                {
-                                    // SAFETY: the previous Graph region and
-                                    // execution have joined before this upload.
-                                    unsafe {
-                                        load_import_template(
-                                            &self.backend,
-                                            pump,
-                                            frame,
-                                            operation,
-                                            import,
-                                            &plan.frame.owners,
-                                        )
-                                    }
-                                    .map_err(GpuRuntimeError::Artifact)?;
-                                }
-                            }
-                            for import in loop_body
-                                .imports
-                                .iter()
-                                .filter(|import| import.before_operation == operation)
-                            {
-                                self.load_selected_import(plan, pump, frame, operation, import)?;
-                            }
-                            let completion = plan.graph.launch_region(&plan.frame, body_region)?;
-                            plan.launches.fetch_add(1, Ordering::AcqRel);
-                            completion.wait().map_err(GpuRuntimeError::from)?;
-                        }
-                    }
-                    region = end;
-                    next_loop += 1;
-                    continue;
-                }
-                if start > loop_body.body_start {
-                    return Err(GpuRuntimeError::Execution(
-                        "external-I/O loop body was skipped".into(),
-                    ));
-                }
-            }
-            for import in
-                plan.frame.import_templates.iter().filter(|import| import.before_operation == start)
-            {
-                // SAFETY: execute owns this plan exclusively; every earlier
-                // Graph region and the previous execution have joined.
-                unsafe {
-                    load_import_template(
-                        &self.backend,
-                        pump,
-                        frame,
-                        start,
-                        import,
-                        &plan.frame.owners,
-                    )
-                }
-                .map_err(GpuRuntimeError::Artifact)?;
-            }
-            for import in plan
-                .frame
-                .external_io_imports
-                .iter()
-                .filter(|import| import.before_operation == start)
-            {
-                self.load_selected_import(plan, pump, frame, start, import)?;
-            }
-            let completion = plan.graph.launch_region(&plan.frame, region)?;
-            plan.launches.fetch_add(1, Ordering::AcqRel);
-            completion.wait().map_err(GpuRuntimeError::from)?;
-            region += 1;
-        }
-        if next_loop != plan.frame.external_io_loops.len() {
-            return Err(GpuRuntimeError::Execution(
-                "external-I/O loop did not reach its Graph region".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Launch the Graph regions of a plan with imports and exports and check
-    /// its device status; a failed launch drains the device before the export
-    /// observer stops.
-    fn execute_producer<E: std::error::Error + Send + Sync + 'static>(
-        &mut self,
-        plan: &mut GpuExecutionPlan,
-        pump: &mut ProducerIoPump<'_, E>,
-        frame: FrameGeneration,
-    ) -> Result<GpuExecutionPayload, GpuRuntimeError> {
-        if let Err(error) = self.execute_producer_regions(plan, pump, frame) {
-            plan.poisoned = true;
-            self.backend.drain_uncertain_launches().map_err(|drain| {
-                GpuRuntimeError::LaunchUncertain(format!(
-                    "failed GPU producer could not be drained before observer stop: {drain}"
-                ))
-            })?;
-            return Err(error);
-        }
-        if let Err(error) = plan
-            .frame
-            .control_resets
-            .iter()
-            .try_for_each(|control| control.check_completed())
-            .and_then(|()| check_preimage_replays(&plan.frame))
-        {
-            plan.poisoned = true;
-            return Err(GpuRuntimeError::DeviceStatus(error));
-        }
-        Ok(GpuExecutionPayload {
-            outputs: returned_values(&plan.frame).map_err(GpuRuntimeError::Execution)?,
-            production_id: None,
-            artifact_handles: BTreeMap::new(),
-        })
     }
 }
 

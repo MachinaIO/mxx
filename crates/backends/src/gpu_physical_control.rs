@@ -7312,6 +7312,8 @@ fn lower_parallel_loop(
     let mut result_ids = Vec::<Vec<PhysicalValueId>>::with_capacity(width);
     let mut index_lanes = Vec::with_capacity(width);
     let template_values_start = ctx.values.len();
+    let body_imports_start = ctx.import_templates.len();
+    let body_waves_start = ctx.waves.len();
     let mut lane_operations = Vec::with_capacity(width);
     for lane in 0..width {
         let lane_start = u32::try_from(ctx.operations.len())
@@ -7338,6 +7340,23 @@ fn lower_parallel_loop(
         {
             let offset = match mode {
                 LoopInputMode::Broadcast => {
+                    // A root artifact family is never loaded whole: the body's
+                    // family reads import the members they reach, so this
+                    // position only keeps the arguments aligned.
+                    let unloaded_family = source.is_none() &&
+                        is_root &&
+                        matches!(
+                            parent.node(wire.node).map(NodeHandle::kind),
+                            Some(NodeKind::Input { artifact: Some(_), .. })
+                        ) &&
+                        matches!(
+                            ctx.validated.root_scope().wire_types.get(wire),
+                            Some(ConcreteWireType::IndexedFamily { .. })
+                        );
+                    if unloaded_family {
+                        input_ids.push(PhysicalValueId(u32::MAX));
+                        continue;
+                    }
                     let source = source
                         .ok_or_else(|| "GPU broadcast argument has no physical value".to_owned())?;
                     input_ids.push(
@@ -7484,6 +7503,13 @@ fn lower_parallel_loop(
                 *id = crate::gpu_physical_lowering::replicate_to_device(ctx, *id, home)?;
             }
         }
+        // A body that returns one of its inputs unchanged still produces its
+        // output: copy the input into a value of this lane.
+        for id in &mut outputs {
+            if !ctx.producer.contains_key(id) && input_ids.contains(id) {
+                *id = crate::gpu_physical_lowering::replicate_to_device(ctx, *id, lane_device)?;
+            }
+        }
         ctx.device = home;
         for (port, id) in outputs.iter().copied().enumerate() {
             let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
@@ -7493,7 +7519,12 @@ fn lower_parallel_loop(
                 return Err("GPU parallel child output has the wrong family element type".into());
             }
             if !ctx.producer.contains_key(&id) {
-                return Err("GPU parallel child output must be produced inside its body".into());
+                return Err(format!(
+                    "GPU parallel child output must be produced inside its body: output {port} \
+                     of node {node_id:?} is {:?}{}",
+                    ctx.values[id.0 as usize].ty,
+                    if input_ids.contains(&id) { ", a body input" } else { "" }
+                ));
             }
         }
         result_ids.push(outputs);
@@ -7522,6 +7553,23 @@ fn lower_parallel_loop(
             }
         }
     }
+    // Imports that the body itself reads, the same for every lane, are loaded
+    // with each wave; those of a nested wave are loaded by that wave.
+    let nested_imports = ctx.waves[body_waves_start..]
+        .iter()
+        .flat_map(|wave| {
+            wave.import_template_indices
+                .iter()
+                .chain(wave.invocation_imports.values().flatten())
+                .copied()
+        })
+        .collect::<BTreeSet<_>>();
+    let body_imports = (body_imports_start..ctx.import_templates.len())
+        .filter(|index| !nested_imports.contains(index))
+        .collect::<Vec<_>>();
+    if ctx.device_body && !body_imports.is_empty() {
+        return Err("GPU device body artifact import needs an on-demand region boundary".into());
+    }
     for wave_start in (0..count).step_by(width).filter(|_| !ctx.device_body) {
         let active_lanes = (count - wave_start).min(width);
         let mut wave = PhysicalWave {
@@ -7536,7 +7584,7 @@ fn lower_parallel_loop(
             start_index: wave_start,
             active_lanes,
             export_occurrences: Vec::new(),
-            import_template_indices: Vec::new(),
+            import_template_indices: body_imports.clone(),
             invocation_imports: BTreeMap::new(),
             family_members: BTreeMap::new(),
         };
@@ -7776,11 +7824,38 @@ fn contains_scoped_artifact_input(
     visit(graph, scope_id, &mut std::collections::BTreeSet::new())
 }
 
+/// Whether a parallel body, or a scope nested in it, imports an artifact on
+/// demand. A captured artifact is a parameter of its scope whose value the
+/// loop receives as an argument, so it is not an import of the body.
+fn contains_on_demand_artifact_input(
+    graph: &Graph,
+    scope_id: &FrozenGraphScopeId,
+) -> Result<bool, String> {
+    let scope =
+        graph.scope(scope_id).ok_or_else(|| "GPU device body scope is missing".to_owned())?;
+    for (index, node) in scope.nodes().iter().enumerate() {
+        let node_id = NodeId(
+            u64::try_from(index).map_err(|_| "GPU device body has too many nodes".to_owned())?,
+        );
+        if matches!(node.kind(), NodeKind::Input { artifact: Some(_), .. }) &&
+            !scope.inputs().iter().any(|input| input.node == node_id)
+        {
+            return Ok(true);
+        }
+        if let Some(child) = graph.child_scope_id(scope_id, node_id) &&
+            contains_on_demand_artifact_input(graph, &child)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn reject_scoped_artifacts_in_device_body(
     graph: &Graph,
     scope_id: &FrozenGraphScopeId,
 ) -> Result<(), String> {
-    if contains_scoped_artifact_input(graph, scope_id)? {
+    if contains_on_demand_artifact_input(graph, scope_id)? {
         return Err("GPU device body artifact import needs an on-demand region boundary".into());
     }
     Ok(())
@@ -7841,6 +7916,12 @@ fn lower_inlined_child(
                     NodeKind::SequentialLoop(spec) if position < spec.carried_count => {
                         input_overrides.and_then(|ids| ids.get(position)).copied()
                     }
+                    // A parallel loop imports a broadcast artifact once,
+                    // before its body; an unloaded family has no value here.
+                    NodeKind::ParallelLoop(_) => input_overrides
+                        .and_then(|ids| ids.get(position))
+                        .copied()
+                        .filter(|id| id.0 != u32::MAX),
                     _ => None,
                 };
                 if let Some(id) = already_imported {

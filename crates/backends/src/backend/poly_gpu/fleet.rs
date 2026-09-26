@@ -2437,8 +2437,15 @@ pub(crate) fn emit_compiled_gpu_op(
             let status_owner = owners
                 .get(status_id)
                 .ok_or_else(|| invalid("indexed matrix status owner is missing"))?;
-            if !matches!(index_owner.wire_type(), ConcreteWireType::Int) {
-                return Err(invalid("indexed matrix index must be an integer scalar"));
+            // A constant index is lowered to the same device integer.
+            if !matches!(
+                index_owner.wire_type(),
+                ConcreteWireType::Int | ConcreteWireType::ConstantInt
+            ) {
+                return Err(invalid(&format!(
+                    "indexed matrix index must be an integer scalar, not {:?}",
+                    index_owner.wire_type()
+                )));
             }
             let (index, index_bytes) =
                 compiled_raw_integer_part(index_owner, *index_part, *index_binding, op.device)?;

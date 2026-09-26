@@ -12,7 +12,8 @@ use crate::{
         RuntimeValue,
         poly_gpu::{
             GpuDcrtBackend, GpuPreparedNativeResources, emit_compiled_gpu_op,
-            physical_raw_matrix_view, prepare_compiled_gpu_program,
+            emit_compiled_monomial_difference, emit_compiled_small_rhs_sum,
+            emit_compiled_subgraph_kernel, physical_raw_matrix_view, prepare_compiled_gpu_program,
         },
     },
     gpu_execution_plan::{
@@ -550,6 +551,7 @@ impl DirectGraph {
         starts.dedup();
         let mut scratch = crate::gpu_graph_memory::plan_graph_scratch(backend, frame, &starts)
             .map_err(GpuPlanError::Resource)?;
+        let uses = AllocationUses::count(frame);
         let mut regions = Vec::with_capacity(starts.len());
         let indexed_tables = frame
             .indexed_tables
@@ -623,6 +625,7 @@ impl DirectGraph {
                             backend,
                             &mut builder,
                             frame,
+                            &uses,
                             &resources,
                             offset,
                             operation,
@@ -1079,13 +1082,245 @@ fn emit_direct_operations(
     backend: &GpuDcrtBackend,
     builder: &mut GpuNativeGraphBuilder,
     frame: &PhysicalFrame,
+    uses: &AllocationUses,
     resources: &GpuPreparedNativeResources,
     operations: &[CompiledGpuOp],
 ) -> Result<(), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let fusions =
+        fused_operations(frame, uses, operations, builder.launch_stream().physical_device())?;
+    let products = fusions.values().map(|fusion| fusion.product).collect::<BTreeSet<_>>();
     for (index, operation) in operations.iter().enumerate() {
-        emit_direct_operation(backend, builder, frame, resources, index, operation)?;
+        let token = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
+        builder.select_device()?;
+        if products.contains(&index) {
+            // The product runs inside its consumer; its operation is an
+            // empty node that passes its predecessors on.
+            builder
+                .begin_operation(token, &operation.predecessors)
+                .and_then(|()| builder.finish_operation().map(|_| ()))
+                .map_err(|error| {
+                    GpuNativeGraphError::Native(format!(
+                        "operation {index} (fused product): {error}"
+                    ))
+                })?;
+        } else if let Some(fusion) = fusions.get(&index) {
+            let product = fusion.product;
+            let product_operation = &operations[product];
+            let mut predecessors = operation
+                .predecessors
+                .iter()
+                .copied()
+                .filter(|predecessor| *predecessor as usize != product)
+                .chain(product_operation.predecessors.iter().copied())
+                .collect::<Vec<_>>();
+            predecessors.sort_unstable();
+            predecessors.dedup();
+            match fusion.addend_is_left {
+                None => emit_compiled_monomial_difference(
+                    backend,
+                    builder,
+                    token,
+                    &predecessors,
+                    product_operation,
+                    operation,
+                    &frame.owners,
+                ),
+                Some(addend_is_left) => emit_compiled_small_rhs_sum(
+                    backend,
+                    builder,
+                    token,
+                    &predecessors,
+                    product_operation,
+                    operation,
+                    addend_is_left,
+                    &frame.owners,
+                ),
+            }
+            .map_err(|error| {
+                GpuNativeGraphError::Native(format!(
+                    "operation {index} fused with product {product}: {error}"
+                ))
+            })?;
+        } else {
+            emit_direct_operation(backend, builder, frame, uses, resources, index, operation)?;
+        }
     }
     Ok(())
+}
+
+/// How many operations of the whole program use each allocation, by the
+/// (value, part) whose storage it is. It is counted once per compile: binding
+/// Graph scratch during emission gives all members of an allocation one new
+/// owner, so the counts stay valid by value while owner identities change.
+struct AllocationUses(BTreeMap<(PhysicalValueId, u32), usize>);
+
+impl AllocationUses {
+    fn count(frame: &PhysicalFrame) -> Self {
+        fn count_operations(
+            frame: &PhysicalFrame,
+            operations: &[CompiledGpuOp],
+            uses: &mut BTreeMap<*const (), usize>,
+        ) {
+            for operation in operations {
+                let mut allocations = BTreeSet::new();
+                for argument in operation.arguments.iter() {
+                    if let KernelArg::Value(value) = argument &&
+                        let Some(owner) = frame.owners.get(value)
+                    {
+                        for part in owner.physical().parts.iter() {
+                            if let Some(storage) = owner.storage(part.storage) {
+                                allocations.insert(Arc::as_ptr(&storage.owner).cast::<()>());
+                            }
+                        }
+                    }
+                }
+                for allocation in allocations {
+                    *uses.entry(allocation).or_default() += 1;
+                }
+                if let Some(body) = &operation.body {
+                    count_operations(frame, body, uses);
+                }
+            }
+        }
+        let mut uses = BTreeMap::new();
+        count_operations(frame, &frame.program.operations, &mut uses);
+        let mut by_part = BTreeMap::new();
+        for (&value, owner) in &frame.owners {
+            for (index, part) in owner.physical().parts.iter().enumerate() {
+                if let Some(storage) = owner.storage(part.storage) &&
+                    let Some(&count) = uses.get(&Arc::as_ptr(&storage.owner).cast::<()>())
+                {
+                    by_part.insert((value, index as u32), count);
+                }
+            }
+        }
+        Self(by_part)
+    }
+
+    fn of(&self, value: &KernelArg, part: &KernelArg) -> Option<usize> {
+        let (KernelArg::Value(value), KernelArg::U32(part)) = (value, part) else {
+            return None;
+        };
+        self.0.get(&(*value, *part)).copied()
+    }
+}
+
+/// A product operation emitted inside its only consumer.
+struct FusedOperation {
+    /// Index of the product whose launch the consumer performs.
+    product: usize,
+    /// `None` for a monomial difference `X^k a - a`; for a small-RHS sum,
+    /// whether the addend is the addition's left operand.
+    addend_is_left: Option<bool>,
+}
+
+/// The fusions of `operations`, keyed by the consumer's index:
+/// - a monomial product followed by the subtraction of its source, the CMUX difference `X^k a - a`,
+///   emitted as one monomial launch;
+/// - a compact small-RHS product followed by its addition to an addend, emitted as one accumulating
+///   product pass.
+///
+/// A pair fuses when the consumer reads the product's output, the output's
+/// allocation is used by no other operation of the program, only the
+/// consumer depends on the product, and both run on `device`. Operands are
+/// compared by allocation and view, since views of one allocation are
+/// distinct values.
+fn fused_operations(
+    frame: &PhysicalFrame,
+    uses: &AllocationUses,
+    operations: &[CompiledGpuOp],
+    device: i32,
+) -> Result<BTreeMap<usize, FusedOperation>, GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    // The allocation and view of part `part` of `value`.
+    let region = |value: &KernelArg, part: &KernelArg| {
+        let (KernelArg::Value(value), KernelArg::U32(part)) = (value, part) else {
+            return None;
+        };
+        let owner = frame.owners.get(value)?;
+        let part = owner.physical().parts.get(*part as usize)?;
+        let storage = owner.storage(part.storage)?;
+        Some((Arc::as_ptr(&storage.owner).cast::<()>(), storage.address, part.view.clone()))
+    };
+    let primitive = |operation: &CompiledGpuOp| {
+        frame
+            .program
+            .implementations
+            .resolve(operation.implementation)
+            .map(|implementation| implementation.primitive)
+            .map_err(invalid)
+    };
+    // How many operations of the list follow each one.
+    let mut consumers = vec![0usize; operations.len()];
+    for operation in operations {
+        for &predecessor in operation.predecessors.iter() {
+            if let Some(count) = consumers.get_mut(predecessor as usize) {
+                *count += 1;
+            }
+        }
+    }
+    let mut fusions = BTreeMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        let consumer = primitive(operation)?;
+        if !matches!(consumer, GpuNativePrimitive::MatrixSub | GpuNativePrimitive::MatrixAdd) ||
+            operation.device != device
+        {
+            continue;
+        }
+        let [left, left_part, right, right_part, ..] = operation.arguments.as_ref() else {
+            continue;
+        };
+        let (Some(left), Some(right)) = (region(left, left_part), region(right, right_part)) else {
+            continue;
+        };
+        for &product in operation.predecessors.iter() {
+            let product = product as usize;
+            let Some(product_operation) = operations.get(product) else {
+                continue;
+            };
+            // The consumer must be the product's only follower.
+            if product_operation.device != device || consumers[product] != 1 {
+                continue;
+            }
+            let arguments = product_operation.arguments.as_ref();
+            let output = |value: usize, part: usize| {
+                arguments.get(value).zip(arguments.get(part)).and_then(|(v, p)| region(v, p))
+            };
+            // Its output allocation is used by the product and the consumer only.
+            let only_consumer = |value: usize, part: usize| {
+                arguments.get(value).zip(arguments.get(part)).and_then(|(v, p)| uses.of(v, p)) ==
+                    Some(2)
+            };
+            let addend_is_left = match (consumer, primitive(product_operation)?) {
+                (GpuNativePrimitive::MatrixSub, GpuNativePrimitive::MultiplyMonomial)
+                    if output(2, 3).as_ref() == Some(&left) &&
+                        output(0, 1).as_ref() == Some(&right) &&
+                        only_consumer(2, 3) =>
+                {
+                    None
+                }
+                (GpuNativePrimitive::MatrixAdd, GpuNativePrimitive::MatrixMulSmallRhs) => {
+                    let Some(destination) = output(6, 7) else { continue };
+                    let addend_is_left = if destination == right {
+                        true
+                    } else if destination == left {
+                        false
+                    } else {
+                        continue;
+                    };
+                    if !only_consumer(6, 7) {
+                        continue;
+                    }
+                    Some(addend_is_left)
+                }
+                _ => continue,
+            };
+            fusions.insert(index, FusedOperation { product, addend_is_left });
+            break;
+        }
+    }
+    Ok(fusions)
 }
 
 /// Emit operation `index` of the operation list being built, including its
@@ -1094,6 +1329,7 @@ fn emit_direct_operation(
     backend: &GpuDcrtBackend,
     builder: &mut GpuNativeGraphBuilder,
     frame: &PhysicalFrame,
+    uses: &AllocationUses,
     resources: &GpuPreparedNativeResources,
     index: usize,
     operation: &CompiledGpuOp,
@@ -1126,6 +1362,8 @@ fn emit_direct_operation(
                 .map(|stream| builder.replace_launch_stream(stream))
         })
         .transpose()?;
+    // An earlier operation may have left another device current.
+    builder.select_device()?;
     let emitted = match implementation.primitive {
         GpuNativePrimitive::BranchIf => {
             let [KernelArg::Value(predicate), KernelArg::U32(part), KernelArg::U32(binding)] =
@@ -1139,7 +1377,7 @@ fn emit_direct_operation(
             builder.bind_resident_address(address, 8, *binding)?;
             builder
                 .add_if_with_body(address, *binding, |body_builder| {
-                    emit_direct_operations(backend, body_builder, frame, resources, body)
+                    emit_direct_operations(backend, body_builder, frame, uses, resources, body)
                 })
                 .and_then(|()| builder.finish_operation().map(|_| ()))
         }
@@ -1177,11 +1415,23 @@ fn emit_direct_operation(
                     *limit_binding,
                     *status_binding,
                     |body_builder| {
-                        emit_direct_operations(backend, body_builder, frame, resources, body)
+                        emit_direct_operations(backend, body_builder, frame, uses, resources, body)
                     },
                 )
                 .and_then(|()| builder.finish_operation().map(|_| ()))
         }
+        GpuNativePrimitive::SubgraphKernel => emit_compiled_subgraph_kernel(
+            backend,
+            builder,
+            index,
+            operation,
+            &frame.program.subgraph_kernels,
+            resources,
+            &frame.owners,
+        )
+        .map_err(|error| {
+            GpuNativeGraphError::Native(format!("operation {index} subgraph kernel: {error}"))
+        }),
         _ => emit_compiled_gpu_op(
             backend,
             builder,
@@ -1836,6 +2086,7 @@ impl GpuRuntime {
                     inputs,
                     &self.options.integer_input_ranges,
                     artifact_payload_sizes,
+                    &self.options.subgraph_kernels,
                     device_artifact_exports,
                 )
                 .map_err(GpuPlanError::Resource)?;
@@ -1898,7 +2149,9 @@ impl GpuRuntime {
             // frees and return the pools' retained memory so the next
             // candidate, and the selected plan, are admitted on their own.
             for device in contract_devices(&contract)? {
-                crate::poly::dcrt::gpu::gpu_release_cached_memory(device)
+                self.backend
+                    .control_parameters_on_device(device)
+                    .and_then(|params| params.release_cached_memory(device))
                     .map_err(GpuPlanError::Resource)?;
                 tracing::debug!(
                     device,
@@ -1951,6 +2204,7 @@ impl GpuRuntime {
             inputs,
             &self.options.integer_input_ranges,
             artifact_payload_sizes,
+            &self.options.subgraph_kernels,
             device_artifact_exports,
         )
         .map_err(GpuPlanError::Resource)?;

@@ -4,8 +4,7 @@
 
 This is a replacement design proposal, not an implemented verification system. It is based on
 `codex/new-IR` at `d84669f79ad2cd4c72c88970da92043187043244`, pulled on 2026-09-05.
-The design branch is `codex/compositional-lean-design`. The companion implementation plan is
-[compositional-lean-plan.md](../plans/compositional-lean-plan.md).
+The design branch is `codex/compositional-lean-design`.
 
 The retained requirement is:
 

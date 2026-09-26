@@ -85,7 +85,7 @@ abstraction.
 | `crates/gadgets` | `mxx-gadgets` | Reusable, BGG-independent circuits and circuit gadgets (nested RNS arithmetic, NTT, FHE gadgets, noise refresh, input injector). |
 | `crates/bgg` | `mxx-bgg` | BGG+ public keys, encodings, circuit lowering, lookups, slot transfer, Tall encodings, WEE25 commitments. |
 | `crates/fhe` | `mxx-fhe` | TFHE (integer LWE with NAND bootstrapping) and leveled BGV graph builders. |
-| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. Currently excluded from the workspace (commented out in `Cargo.toml`). |
+| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. Excluded from the workspace (`exclude` in `Cargo.toml`); its manifest is standalone. |
 | `crates/func-enc` | `mxx-func-enc` | Functional-encryption interface trait only (`FuncEnc`). |
 | `crates/io` | `mxx-io` | Indistinguishability-obfuscation interface trait only (`Obfuscation`). |
 
@@ -120,7 +120,11 @@ Rules that follow from this layout:
   `mxx-fhe`, and `mxx-we` forward their `gpu` feature to it (`mxx-we` also forwards to
   `mxx-gadgets`). The `gpu` features of `mxx-func-enc` and `mxx-io` are empty.
 - Native CUDA sources, GPU wrappers, and the GPU runtime are owned by `mxx-backends` under
-  `crates/backends/cuda/` and `crates/backends/src/`; higher crates use its public API.
+  `crates/backends/cuda/` and `crates/backends/src/`; higher crates use its public API. The one
+  exception is a subgraph kernel (section "Subgraph kernels"): a higher crate may implement the
+  native kernel of one of its named subgraphs, compiled by its own build script against
+  `crates/backends/cuda/include/SubgraphKernel.cuh` only. `mxx-backends` publishes that
+  directory as `DEP_MXX_BACKENDS_CUDA_INCLUDE` (its `links = "mxx_backends"` key).
 
 Diamond iO and AKY24 iO, and the AKY24 functional-encryption implementation, were removed from
 this branch during the DSL migration; `README.md` links the `main`-branch implementations.
@@ -782,6 +786,43 @@ panics; see section 6.4), `MXX_GPU_MEMORY_FRACTION` (`gpu_memory_fraction`: the 
 device's memory that one plan's persistent allocations may use, default 0.8, values outside
 `(0, 1]` are errors), and `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` (`gpu_small_rhs_chunk_columns`: the
 right-operand columns the fused small-RHS multiplication transforms per chunk, default 16).
+A copy between two physical GPUs without peer access is staged through a pinned host buffer
+(a device-to-host and a host-to-device graph node). The staged copies between one GPU pair in
+one graph take turns on two buffers, so pinned memory is bounded by the GPU pairs and the largest
+copy rather than the number of copies; `MXX_GPU_HOST_STAGED_COPIES=1` stages every
+copy between distinct logical devices, which lets `MXX_GPU_LOGICAL_DEVICES=0,0` test that path
+on one GPU. The CUDA
+library reads `MXX_GPU_NTT_RADIX` once per process in
+`crates/backends/cuda/src/matrix/MatrixNTT.cu`: the butterfly radix of the register-blocked
+NTT, a power of two from 2 to 32 (default 4). Each thread holds that many coefficients and runs
+`log2(radix)` stages in registers between shared-memory exchanges, so a larger radix needs fewer
+barriers but gives each thread a longer serial chain; small batches such as TFHE blind rotation
+are latency-bound and run fastest at 2 or 4. An invalid value makes every NTT launch fail.
+
+### Subgraph kernels
+
+A named subgraph (`mxx_dsl::Subgraph`, an IR `SubgraphCall`) may have a native GPU kernel that
+executes the whole call. The IR is unchanged: validation, liveness, the CPU executor, and Lean
+export read the subgraph body as usual. Only GPU planning consults
+`GpuRuntimeOptions::subgraph_kernels` (`crates/backends/src/gpu_subgraph_kernel.rs`):
+
+- A call whose definition name equals a registered `GpuSubgraphKernel::name` lowers to one
+  `SubgraphKernel` operation instead of its body. Its arguments (explicit inputs, then captures)
+  and results must have the registered `GpuKernelOperandKind`s; otherwise planning fails.
+- Matrix operands are passed in the evaluation domain, integer operands with their signed
+  encoding, and matrix families as a per-member limb table refreshed before every launch (as for
+  a dynamic member read). The runtime allocates the results, a scratch buffer of
+  `scratch_bytes`, and a status word.
+- While the CUDA graph is built, the runtime calls `entry` once with an `MxxSubgraphLaunch`
+  (`crates/backends/cuda/include/SubgraphKernel.cuh`). The entry adds its kernels with
+  `mxx_gpu_launch_kernel` or `mxx_gpu_launch_cooperative_kernel`, declaring every resident
+  address as a patch of its operand's binding so replays rebind it.
+- An empty list runs every subgraph from its body.
+
+`mxx-fhe` registers the blind rotation (`tfhe.blind_rotation`,
+`TfheParams::gpu_blind_rotation_kernel`, `crates/fhe/cuda/tfhe_blind_rotation.cu`): the whole
+CMUX loop runs as one cooperative launch. `crates/fhe/tests/gpu_tfhe.rs` checks that its
+ciphertexts equal those of the subgraph body bit for bit.
 
 Errors: planning returns `GpuPlanError` (`InvalidInput`, `Resource`, `Measurement`,
 `GraphCompile`, `InvalidCompiledSchedule`). Execution returns `GpuRuntimeError`: `StalePlan`,
@@ -1274,13 +1315,15 @@ caller's responsibility.
 Execution follows the general pattern: build with `DslContext`, validate with the backend CRT
 resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV and TFHE) with the
 backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactStore`.
-`docs/plans/fhe.md` records the formulas and design, and `README.md` summarizes the FHE API.
+`README.md` summarizes the FHE API.
 
 ### 7.4 `mxx-we`: Diamond witness encryption
 
 `mxx-we` is currently excluded from the workspace: its protocol family is bound to one ring, so
-it is not parameter-independent across rings, and it is commented out in `Cargo.toml` until that
-is redesigned. The description below is kept for that work.
+it is not parameter-independent across rings. Until that is redesigned, the root `Cargo.toml`
+lists it under `exclude`, so no workspace command (`--workspace` included) builds it, and its
+standalone manifest is built only by naming it: `cargo test --manifest-path crates/we/Cargo.toml`.
+The description below is kept for that work.
 
 `crates/we/src/` defines implementation-independent WE interfaces and the Diamond construction:
 
@@ -1364,6 +1407,6 @@ is redesigned. The description below is kept for that work.
 | `GPU.md` | GPU dataflow, synchronization, memory complexity, and GPU validation requirements. |
 | `README.md` | Project overview, FHE API summary, and requirements (OpenFHE, OpenMP, CUDA). |
 | `docs/correctness/` | Correctness specifications, for example `docs/correctness/operational-protocol-inventory.md`. |
-| `docs/plans/` | Design plans and progress records, for example `docs/plans/fhe.md`. Plans are historical context and may be ahead of or behind the code. |
+| `docs/plans/` | Local design plans and progress records; ignored by git and not part of the repository. |
 | `crates/ir-core/lean/README.md`, `crates/we/lean/README.md` | Lean packages and fixture workflows. |
 | `references/` | Read-only specifications and papers. |

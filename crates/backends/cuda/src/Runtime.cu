@@ -1,7 +1,5 @@
 #include "Runtime.cuh"
 
-#include <cuda.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <condition_variable>
@@ -18,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -121,7 +120,9 @@ __global__ void mxx_export_slot_publish_kernel(MxxExportSlotHeader *header,
     header->site = site;
     header->flags = flags;
     __threadfence_system();
-    atomicExch_system(reinterpret_cast<unsigned long long *>(&header->ready), 1ULL);
+    // A fenced aligned store: GPUs on PCIe have no native atomics on host
+    // memory, and the host reads `ready` with an acquire load.
+    *reinterpret_cast<volatile unsigned long long *>(&header->ready) = 1ULL;
 }
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
@@ -821,7 +822,9 @@ namespace
 
     // Cross-device graph copies go peer to peer where the hardware allows it:
     // each context's GPU gets access to every other physical GPU and to its
-    // stream-ordered pool. Logical devices sharing one GPU need nothing.
+    // stream-ordered pool. Logical devices sharing one GPU need nothing, and
+    // copies between GPUs without peer access are staged through host memory
+    // (mxx_gpu_graph_builder_add_device_copy).
     void enable_peer_access(const std::vector<int> &gpu_list)
     {
         static std::mutex mutex;
@@ -1495,16 +1498,36 @@ extern "C"
         return 0;
     }
 
-    // Complete every pending free on `device`, then return the physical
-    // memory the Graph pool, the default pool, and the driver's cache of
-    // destroyed Graph executables retain, so either pool can satisfy the next
-    // allocation. Planning only: this synchronizes the whole device.
-    int gpu_device_release_cached_memory(int device)
+    // Complete the work and pending frees of `ctx` on `device`, then return
+    // the physical memory the Graph pool, the default pool, and the driver's
+    // cache of destroyed Graph executables retain, so either pool can satisfy
+    // the next allocation. Planning only: the host waits for this context's
+    // streams on the device, not for other work on the GPU.
+    int gpu_device_release_cached_memory(const GpuContext *ctx, int device)
     {
-        if (device < 0) return set_error("invalid gpu_device_release_cached_memory device");
+        if (!ctx || !ctx->execution || device < 0)
+            return set_error("invalid gpu_device_release_cached_memory arguments");
+        const GpuExecutionOwner &owner = *ctx->execution;
+        const auto found = std::find(owner.gpu_ids.begin(), owner.gpu_ids.end(), device);
+        if (found == owner.gpu_ids.end())
+            return set_error("device is not owned by the GPU context");
+        const size_t partition = static_cast<size_t>(found - owner.gpu_ids.begin());
+        std::vector<cudaStream_t> streams;
+        if (partition < owner.compute_streams_by_partition.size())
+            streams = owner.compute_streams_by_partition[partition];
+        if (partition < owner.release_streams_by_partition.size() &&
+            owner.release_streams_by_partition[partition])
+            streams.push_back(owner.release_streams_by_partition[partition]);
         const int physical = mxx_physical_device(device);
         cudaError_t err = mxx_set_device(device);
-        if (err == cudaSuccess) err = cudaDeviceSynchronize();
+        for (cudaStream_t stream : streams)
+        {
+            cudaEvent_t done = nullptr;
+            if (err == cudaSuccess) err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+            if (err == cudaSuccess) err = cudaEventRecord(done, stream);
+            if (err == cudaSuccess) err = cudaEventSynchronize(done);
+            if (done) cudaEventDestroy(done);
+        }
         if (err == cudaSuccess) err = cudaDeviceGraphMemTrim(physical);
         cudaMemPool_t pool = nullptr;
         if (err == cudaSuccess) err = cudaDeviceGetDefaultMemPool(&pool, physical);
@@ -2089,12 +2112,12 @@ extern "C"
     {
         if (!buffer || !source || offset > buffer->bytes || bytes > buffer->bytes - offset)
             return set_error("invalid gpu_device_buffer_upload arguments");
-        cudaError_t status = cudaMemcpyAsync(
-            buffer->address + offset,
-            source,
-            bytes,
-            cudaMemcpyHostToDevice,
-            buffer->allocation_stream);
+        // The buffer is pool memory of its own device, which only that
+        // device may name as a copy operand.
+        cudaError_t status = mxx_set_device(buffer->device);
+        if (status == cudaSuccess)
+            status = cudaMemcpyAsync(buffer->address + offset, source, bytes,
+                cudaMemcpyHostToDevice, buffer->allocation_stream);
         if (status == cudaSuccess)
             status = cudaEventRecord(buffer->producer, buffer->allocation_stream);
         if (status != cudaSuccess)
@@ -2224,66 +2247,13 @@ extern "C"
         std::vector<std::vector<uint8_t>> arguments;
         std::vector<void *> argument_pointers;
         std::vector<GraphPatchRecord> patches;
-        // The physical device current when the node was added. CUDA resolves
-        // `launch.func` in the current context, so an update must run there:
-        // a multi-device graph holds nodes of several devices.
-        int device = -1;
         // The executable node holds `arguments` (from creation on); a bind
         // that leaves every patched byte unchanged skips the node update.
         bool bound = false;
+        // The (logical) device current at creation: a node's kernel function
+        // resolves on that GPU, so every update selects it again.
+        int device = -1;
     };
-
-    // Make the kernel node's device current before updating it.
-    cudaError_t enter_kernel_record_device(const GraphKernelUpdateRecord &record)
-    {
-        int current = -1;
-        const cudaError_t error = cudaGetDevice(&current);
-        if (error != cudaSuccess) return error;
-        return record.device < 0 || record.device == current ? cudaSuccess :
-            cudaSetDevice(record.device);
-    }
-
-    // Update a kernel node of `exec` that belongs to another device's context.
-    // The runtime resolves a kernel symbol in the current context, which is
-    // the executable's while it is updated; the driver call takes the node's
-    // own CUfunction instead, resolved on the node's device.
-    cudaError_t exec_kernel_set_params_on_device(cudaGraphExec_t exec, int exec_device,
-        const GraphKernelUpdateRecord &record)
-    {
-        using SetParams = CUresult (*)(CUgraphExec, CUgraphNode, const CUDA_KERNEL_NODE_PARAMS_v2 *);
-        static SetParams set_params = nullptr;
-        static cudaError_t load_error = cudaSuccess;
-        static std::once_flag loaded;
-        std::call_once(loaded, [] {
-            void *entry = nullptr;
-            cudaDriverEntryPointQueryResult query = cudaDriverEntryPointSymbolNotFound;
-            load_error = cudaGetDriverEntryPointByVersion("cuGraphExecKernelNodeSetParams",
-                &entry, 12000, cudaEnableDefault, &query);
-            if (load_error == cudaSuccess && (query != cudaDriverEntryPointSuccess || !entry))
-                load_error = cudaErrorNotSupported;
-            set_params = reinterpret_cast<SetParams>(entry);
-        });
-        if (load_error != cudaSuccess) return load_error;
-        cudaFunction_t function = nullptr;
-        cudaError_t error = cudaSetDevice(record.device);
-        if (error == cudaSuccess) error = cudaGetFuncBySymbol(&function, record.launch.func);
-        const cudaError_t restore = mxx_set_device(exec_device);
-        if (error != cudaSuccess) return error;
-        if (restore != cudaSuccess) return restore;
-        CUDA_KERNEL_NODE_PARAMS_v2 parameters{};
-        parameters.func = reinterpret_cast<CUfunction>(function);
-        parameters.gridDimX = record.launch.gridDim.x;
-        parameters.gridDimY = record.launch.gridDim.y;
-        parameters.gridDimZ = record.launch.gridDim.z;
-        parameters.blockDimX = record.launch.blockDim.x;
-        parameters.blockDimY = record.launch.blockDim.y;
-        parameters.blockDimZ = record.launch.blockDim.z;
-        parameters.sharedMemBytes = record.launch.sharedMemBytes;
-        parameters.kernelParams = record.launch.kernelParams;
-        const CUresult result = set_params(reinterpret_cast<CUgraphExec>(exec),
-            reinterpret_cast<CUgraphNode>(record.node), &parameters);
-        return result == CUDA_SUCCESS ? cudaSuccess : static_cast<cudaError_t>(result);
-    }
 
     struct GraphMemcpyUpdateRecord
     {
@@ -2296,6 +2266,10 @@ extern "C"
         void *bound_source = nullptr;
         void *bound_destination = nullptr;
         bool bound = false;
+        // The (logical) device made current to create and update the node,
+        // for memory (a stream-ordered pool or graph allocation) only that
+        // GPU may name; -1 uses the graph's device.
+        int device = -1;
     };
 
     struct GraphMemsetUpdateRecord
@@ -2304,6 +2278,8 @@ extern "C"
         cudaMemsetParams params{};
         GraphPatchRecord patch{};
         bool bound = false;
+        // The (logical) device current at creation, selected for updates.
+        int device = -1;
     };
 
     // Writes every patch of `record` into its argument bytes and reports
@@ -2325,6 +2301,8 @@ extern "C"
         std::vector<GraphKernelUpdateRecord> body_kernels;
         std::vector<GraphMemcpyUpdateRecord> body_memcpys;
         std::vector<GraphMemsetUpdateRecord> body_memsets;
+        // Pinned host buffers staging copies between GPUs without peer access.
+        std::vector<void *> host_staging;
     };
 
     // A graph-owned buffer, mapped only on its owning GPU.
@@ -2407,7 +2385,29 @@ extern "C"
         std::vector<cudaGraphNode_t> memory_nodes;
         // Allocation nodes the next top-level operation must follow.
         std::vector<cudaGraphNode_t> pending_memory_dependencies;
-        ~MxxGpuGraphBuilder() { if (root_graph) cudaGraphDestroy(root_graph); }
+        // Pinned buffers of staged device copies, moved to the executable.
+        std::vector<void *> host_staging;
+        // Staged copies between one pair of physical GPUs in one graph take
+        // turns on two buffers: a copy reuses the buffer of the copy two
+        // before it, after that copy's host-to-device node. Pinned memory is
+        // then bounded by the GPU pairs, not by the number of copies.
+        struct HostStagingSlot
+        {
+            void *buffer = nullptr;
+            size_t bytes = 0;
+            cudaGraphNode_t last_reader = nullptr;
+        };
+        struct HostStagingRing
+        {
+            HostStagingSlot slots[2];
+            size_t next = 0;
+        };
+        std::map<std::tuple<int, int, cudaGraph_t>, HostStagingRing> staging_rings;
+        ~MxxGpuGraphBuilder()
+        {
+            if (root_graph) cudaGraphDestroy(root_graph);
+            for (void *buffer : host_staging) cudaFreeHost(buffer);
+        }
     };
 
     struct MxxGpuNativeEvent
@@ -2693,10 +2693,6 @@ extern "C"
             record.launch.blockDim = dim3(block_x, block_y, block_z);
             record.launch.sharedMemBytes = static_cast<unsigned int>(shared_bytes);
             record.launch.kernelParams = record.argument_pointers.data();
-            {
-                const cudaError_t device_error = cudaGetDevice(&record.device);
-                if (device_error != cudaSuccess) return set_error(device_error);
-            }
             for (size_t index = 0; index < patch_count; ++index)
             {
                 const auto &patch = patches[index];
@@ -2717,8 +2713,10 @@ extern "C"
                 if (normalize_builder_patch(builder, &normalized, captured_address) != 0) return 1;
                 record.patches.push_back(GraphPatchRecord{normalized});
             }
-            const cudaError_t error = cudaGraphAddKernelNode(&record.node, builder->graph,
-                builder->frontier.data(), builder->frontier.size(), &record.launch);
+            cudaError_t error = mxx_get_device(&record.device);
+            if (error == cudaSuccess)
+                error = cudaGraphAddKernelNode(&record.node, builder->graph,
+                    builder->frontier.data(), builder->frontier.size(), &record.launch);
             if (error != cudaSuccess) return set_error(error);
             // The node, and the executable instantiated from it, hold these bytes.
             record.bound = true;
@@ -2906,6 +2904,98 @@ extern "C"
         return 0;
     }
 
+    static bool host_staged_copies_forced()
+    {
+        static const bool forced = [] {
+            const char *value = std::getenv("MXX_GPU_HOST_STAGED_COPIES");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        return forced;
+    }
+
+    int mxx_gpu_graph_builder_add_device_copy(MxxGpuGraphBuilder *builder,
+        void *destination, int destination_device, const void *source, int source_device,
+        size_t bytes, const MxxGraphPatch *patches, size_t patch_count)
+    {
+        if (!builder || !destination || !source || !bytes || (patch_count && !patches))
+            return set_error("invalid explicit device copy");
+        const int from = mxx_physical_device(source_device);
+        const int to = mxx_physical_device(destination_device);
+        bool direct = from == to;
+        if (!direct)
+        {
+            int accessible = 0;
+            direct = cudaDeviceCanAccessPeer(&accessible, to, from) == cudaSuccess && accessible;
+            cudaGetLastError();
+        }
+        if (source_device != destination_device && host_staged_copies_forced()) direct = false;
+        // A stream-ordered pool or graph allocation is a valid copy operand
+        // only with its own GPU current, so every node is created (and later
+        // updated) with the GPU of the memory it touches current: the shared
+        // GPU, the destination GPU of a peer copy (which may access the
+        // source's pool), or each side of a copy staged through host memory.
+        int current = -1;
+        if (cudaGetDevice(&current) != cudaSuccess) return set_error(cudaGetLastError());
+        auto &records = builder->conditional_body_active ? builder->body_memcpys : builder->memcpys;
+        const auto add_on = [&](int device, void *to_address, const void *from_address,
+                                cudaMemcpyKind kind, const MxxGraphPatch *node_patches,
+                                size_t node_patch_count) {
+            if (mxx_set_device(device) != cudaSuccess) return set_error(cudaGetLastError());
+            const size_t before = records.size();
+            const int status = mxx_gpu_graph_builder_add_memcpy(builder, to_address,
+                from_address, bytes, kind, node_patches, node_patch_count);
+            if (status == 0 && records.size() == before + 1) records.back().device = device;
+            return status;
+        };
+        int status = 0;
+        if (direct)
+        {
+            status = add_on(from == to ? source_device : destination_device, destination, source,
+                from == to ? cudaMemcpyDeviceToDevice : cudaMemcpyDefault, patches, patch_count);
+        }
+        else
+        {
+            // Without peer access neither GPU may touch the other's memory, so
+            // the copy passes through a pinned host buffer the executable owns.
+            std::vector<MxxGraphPatch> source_patches, destination_patches;
+            for (size_t index = 0; index < patch_count; ++index)
+                (patches[index].target == MXX_GRAPH_PATCH_MEMCPY_1D_SRC ? source_patches :
+                    destination_patches).push_back(patches[index]);
+            auto &ring = builder->staging_rings[{from, to, builder->graph}];
+            auto &slot = ring.slots[ring.next];
+            ring.next ^= 1;
+            if (slot.bytes < bytes)
+            {
+                // Earlier nodes keep reading the smaller buffer it replaces.
+                void *staging = nullptr;
+                const cudaError_t error = cudaMallocHost(&staging, bytes);
+                if (error != cudaSuccess) return set_error(error);
+                try { builder->host_staging.push_back(staging); }
+                catch (const std::exception &exception)
+                {
+                    cudaFreeHost(staging);
+                    return set_error(exception);
+                }
+                slot = {staging, bytes, nullptr};
+            }
+            // Nodes are added in dependency order, so the edge from an earlier
+            // node cannot close a cycle.
+            if (slot.last_reader &&
+                std::find(builder->frontier.begin(), builder->frontier.end(), slot.last_reader) ==
+                    builder->frontier.end())
+                builder->frontier.push_back(slot.last_reader);
+            status = add_on(source_device, slot.buffer, source, cudaMemcpyDeviceToHost,
+                source_patches.data(), source_patches.size());
+            if (status == 0)
+                status = add_on(destination_device, destination, slot.buffer,
+                    cudaMemcpyHostToDevice, destination_patches.data(), destination_patches.size());
+            if (status == 0) slot.last_reader = records.back().node;
+        }
+        if (cudaSetDevice(current) != cudaSuccess && status == 0)
+            return set_error(cudaGetLastError());
+        return status;
+    }
+
     int mxx_gpu_graph_builder_add_memset(MxxGpuGraphBuilder *builder,
         void *destination, int value, size_t bytes, const MxxGraphPatch *patch)
     {
@@ -2925,8 +3015,10 @@ extern "C"
             if (normalize_builder_patch(builder, &record.patch.patch,
                 reinterpret_cast<uint64_t>(destination)) != 0) return 1;
         }
-        const cudaError_t error = cudaGraphAddMemsetNode(&record.node, builder->graph,
-            builder->frontier.data(), builder->frontier.size(), &record.params);
+        cudaError_t error = mxx_get_device(&record.device);
+        if (error == cudaSuccess)
+            error = cudaGraphAddMemsetNode(&record.node, builder->graph,
+                builder->frontier.data(), builder->frontier.size(), &record.params);
         if (error != cudaSuccess) return set_error(error);
         record.bound = true;
         builder->frontier.assign(1, record.node);
@@ -3292,6 +3384,8 @@ extern "C"
         result->body_kernels = std::move(builder->body_kernels);
         result->body_memcpys = std::move(builder->body_memcpys);
         result->body_memsets = std::move(builder->body_memsets);
+        result->host_staging = std::move(builder->host_staging);
+        builder->host_staging.clear();
         *out_exec = result;
         delete builder;
         return 0;
@@ -3332,9 +3426,10 @@ extern "C"
         const void *function, uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
         uint32_t block_x, uint32_t block_y, uint32_t block_z, size_t shared_bytes,
         void **arguments, const size_t *argument_sizes, size_t argument_count,
-        const MxxGraphPatch *patches, size_t patch_count)
+        const MxxGraphPatch *patches, size_t patch_count, int cooperative)
     {
-        if (!ctx || !stream || !function) return set_error("invalid kernel dispatch");
+        if (!ctx || !stream || !function || (cooperative != 0 && cooperative != 1))
+            return set_error("invalid kernel dispatch");
         if (auto *builder = mxx_gpu_graph_builder_for_stream(ctx, stream))
         {
             // A kernel node belongs to the context current when it is added,
@@ -3358,10 +3453,15 @@ extern "C"
                 argument_count, patches, patch_count);
             if (target != current)
             {
-                error = cudaSetDevice(current);
-                if (error != cudaSuccess && status == 0) return set_error(error);
+                const cudaError_t restore = cudaSetDevice(current);
+                if (restore != cudaSuccess && status == 0) return set_error(restore);
             }
-            return status;
+            if (status != 0 || !cooperative) return status;
+            cudaLaunchAttributeValue value{};
+            value.cooperative = 1;
+            const cudaError_t attribute = cudaGraphKernelNodeSetAttribute(
+                builder->operation_nodes.back(), cudaLaunchAttributeCooperative, &value);
+            return attribute == cudaSuccess ? 0 : set_error(attribute);
         }
         {
             auto &owner = *ctx->execution;
@@ -3369,9 +3469,13 @@ extern "C"
             if (owner.explicit_builder)
                 return set_error("kernel dispatch escaped the active explicit graph operation");
         }
-        const cudaError_t error = cudaLaunchKernel(function,
-            dim3(grid_x, grid_y, grid_z), dim3(block_x, block_y, block_z),
-            arguments, shared_bytes, reinterpret_cast<cudaStream_t>(stream));
+        const cudaError_t error = cooperative ?
+            cudaLaunchCooperativeKernel(function, dim3(grid_x, grid_y, grid_z),
+                dim3(block_x, block_y, block_z), arguments, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)) :
+            cudaLaunchKernel(function, dim3(grid_x, grid_y, grid_z),
+                dim3(block_x, block_y, block_z), arguments, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream));
         return error == cudaSuccess ? 0 : set_error(error);
     }
 
@@ -3387,6 +3491,27 @@ extern "C"
             error = cudaGraphUpload(exec->exec, reinterpret_cast<cudaStream_t>(launch_stream));
         }
         return error == cudaSuccess ? 0 : set_error(error);
+    }
+
+    // Run a node update with the node's creation device current, then make
+    // `home` current again. A kernel resolves, and pool or graph memory is
+    // valid, only on its own GPU.
+    extern "C++" template <typename Update>
+    cudaError_t update_on_device(int device, int home, Update update)
+    {
+        const bool select = device >= 0 && device != home;
+        if (select)
+        {
+            const cudaError_t error = mxx_set_device(device);
+            if (error != cudaSuccess) return error;
+        }
+        cudaError_t error = update();
+        if (select)
+        {
+            const cudaError_t restore = mxx_set_device(home);
+            if (error == cudaSuccess) error = restore;
+        }
+        return error;
     }
 
     // Describe a failed memcpy rebind: CUDA accepts new operands only on the
@@ -3439,10 +3564,9 @@ extern "C"
             bool changed = false;
             if (patch_kernel_record(record, values, count, changed) != 0) return 1;
             if (record.bound && !changed) continue;
-            error = enter_kernel_record_device(record);
-            if (error == cudaSuccess)
-                error = cudaGraphKernelNodeSetParams(record.node, &record.launch);
-            if (error != cudaSuccess) return set_error((std::string("body kernel rebind: ") + cudaGetErrorString(error)).c_str());
+            error = update_on_device(record.device, exec->device,
+                [&] { return cudaGraphKernelNodeSetParams(record.node, &record.launch); });
+            if (error != cudaSuccess) return set_error(error);
             record.bound = true;
             body_changed = true;
         }
@@ -3468,11 +3592,11 @@ extern "C"
             if (record.bound && source == record.bound_source &&
                 destination == record.bound_destination)
                 continue;
-            error = cudaGraphMemcpyNodeSetParams1D(
-                record.node, destination, source, record.bytes, record.kind);
-            if (error != cudaSuccess)
-                return set_error(memcpy_rebind_error(error, record.bound_source,
-                    record.bound_destination, source, destination, record.bytes, record.kind).c_str());
+            error = update_on_device(record.device, exec->device, [&] {
+                return cudaGraphMemcpyNodeSetParams1D(
+                    record.node, destination, source, record.bytes, record.kind);
+            });
+            if (error != cudaSuccess) return set_error(error);
             record.bound_source = source;
             record.bound_destination = destination;
             record.bound = true;
@@ -3486,8 +3610,9 @@ extern "C"
                 return 1;
             if (record.bound && record.params.dst == reinterpret_cast<void *>(address)) continue;
             record.params.dst = reinterpret_cast<void *>(address);
-            error = cudaGraphMemsetNodeSetParams(record.node, &record.params);
-            if (error != cudaSuccess) return set_error((std::string("body memset rebind: ") + cudaGetErrorString(error)).c_str());
+            error = update_on_device(record.device, exec->device,
+                [&] { return cudaGraphMemsetNodeSetParams(record.node, &record.params); });
+            if (error != cudaSuccess) return set_error(error);
             record.bound = true;
             body_changed = true;
         }
@@ -3524,9 +3649,9 @@ extern "C"
             bool changed = false;
             if (patch_kernel_record(record, values, count, changed) != 0) return 1;
             if (record.bound && !changed && !reapply_top_level) continue;
-            error = record.device >= 0 && record.device != mxx_physical_device(exec->device) ?
-                exec_kernel_set_params_on_device(exec->exec, exec->device, record) :
-                cudaGraphExecKernelNodeSetParams(exec->exec, record.node, &record.launch);
+            error = update_on_device(record.device, exec->device, [&] {
+                return cudaGraphExecKernelNodeSetParams(exec->exec, record.node, &record.launch);
+            });
             if (error != cudaSuccess)
             {
                 return set_error((std::string("kernel rebind: ") + cudaGetErrorString(error)).c_str());
@@ -3557,8 +3682,10 @@ extern "C"
             if (record.bound && !reapply_top_level && source == record.bound_source &&
                 destination == record.bound_destination)
                 continue;
-            error = cudaGraphExecMemcpyNodeSetParams1D(
-                exec->exec, record.node, destination, source, record.bytes, record.kind);
+            error = update_on_device(record.device, exec->device, [&] {
+                return cudaGraphExecMemcpyNodeSetParams1D(
+                    exec->exec, record.node, destination, source, record.bytes, record.kind);
+            });
             if (error != cudaSuccess)
             {
                 return set_error(memcpy_rebind_error(error, record.bound_source,
@@ -3580,7 +3707,9 @@ extern "C"
                 record.params.dst == reinterpret_cast<void *>(address))
                 continue;
             record.params.dst = reinterpret_cast<void *>(address);
-            error = cudaGraphExecMemsetNodeSetParams(exec->exec, record.node, &record.params);
+            error = update_on_device(record.device, exec->device, [&] {
+                return cudaGraphExecMemsetNodeSetParams(exec->exec, record.node, &record.params);
+            });
             if (error != cudaSuccess)
             {
                 return set_error((std::string("memset rebind: ") + cudaGetErrorString(error)).c_str());
@@ -3670,6 +3799,7 @@ extern "C"
             if (error != cudaSuccess) set_error(error);
             exec->graph = nullptr;
         }
+        for (void *buffer : exec->host_staging) cudaFreeHost(buffer);
         delete exec;
     }
 

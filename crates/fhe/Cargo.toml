@@ -27,6 +27,9 @@ num-integer.workspace = true
 num-traits.workspace = true
 thiserror.workspace = true
 
+[build-dependencies]
+cc.workspace = true
+
 [dev-dependencies]
 bigdecimal.workspace = true
 tracing.workspace = true

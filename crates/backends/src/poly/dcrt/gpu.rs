@@ -110,6 +110,70 @@ pub struct GpuRawMatrixView {
     pub limbs: Vec<GpuRawMatrixLimb>,
 }
 
+/// One operand a subgraph kernel entry receives (`MxxSubgraphOperand`).
+#[derive(Clone, Debug)]
+pub(crate) enum GpuSubgraphOperandView {
+    /// An evaluation-domain matrix whose limb `t` is patched by `binding + t`.
+    Matrix {
+        view: GpuRawMatrixView,
+        binding: u32,
+    },
+    /// A family of matrices of the `layout` shape, whose member limbs are
+    /// in the device table at `table` (member major).
+    MatrixFamily {
+        layout: GpuRawMatrixView,
+        table: u64,
+        count: u64,
+    },
+    Integer(GpuRawIntegerView),
+    IntegerFamily(GpuRawIntegerView),
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpuNttTablesAbi {
+    forward: *const u64,
+    forward_shoup: *const u64,
+    inverse: *const u64,
+    inverse_shoup: *const u64,
+    degree_inverse: *const u64,
+    degree_inverse_shoup: *const u64,
+}
+
+#[repr(C)]
+struct GpuSubgraphOperandAbi {
+    kind: u32,
+    binding: u32,
+    matrix: GpuRawMatrixViewAbi,
+    family_table: *const GpuRawMatrixLimb,
+    family_count: u64,
+    integers: *const c_void,
+    integer_encoding: i32,
+    reserved: u32,
+    integer_count: u64,
+}
+
+#[repr(C)]
+struct GpuSubgraphLaunchAbi {
+    context: *mut GpuContextOpaque,
+    stream: *mut c_void,
+    physical_device: i32,
+    degree: u32,
+    limb_count: u32,
+    input_count: u32,
+    output_count: u32,
+    reserved: u32,
+    ntt: *const GpuNttTablesAbi,
+    operands: *const GpuSubgraphOperandAbi,
+    scratch: *mut c_void,
+    scratch_bytes: u64,
+    scratch_binding: u32,
+    status_binding: u32,
+    status: *mut u32,
+    parameters: *const u64,
+    parameter_count: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuRawSmallMatrixView {
     pub payload_address: u64,
@@ -167,6 +231,12 @@ struct GpuRawMatrixViewAbi {
     columns: u64,
     limbs: *const GpuRawMatrixLimb,
     limb_count: usize,
+}
+
+impl GpuRawMatrixViewAbi {
+    fn clone_abi(&self) -> Self {
+        Self { limbs: self.limbs, ..*self }
+    }
 }
 
 impl GpuRawMatrixView {
@@ -358,7 +428,6 @@ struct MxxGraphPatchRaw {
 const GRAPH_PATCH_MEMCPY_1D_SRC: u32 = 1;
 const GRAPH_PATCH_MEMCPY_1D_DST: u32 = 2;
 const GRAPH_PATCH_MEMSET_1D_DST: u32 = 3;
-pub(crate) const CUDA_MEMCPY_DEFAULT: i32 = 4;
 
 /// A native graph patch declaration. The node handle is resolved by native
 /// launch-site introspection; callers describe only the exact field layout
@@ -909,6 +978,11 @@ unsafe extern "C" {
         index_binding: u32,
         status_binding: u32,
     ) -> c_int;
+    fn gpu_context_ntt_tables(
+        ctx: *mut GpuContextOpaque,
+        view: *const GpuRawMatrixViewAbi,
+        out_tables: *mut GpuNttTablesAbi,
+    ) -> c_int;
     fn gpu_raw_monomial_multiply(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
@@ -917,6 +991,7 @@ unsafe extern "C" {
         exponent: *const c_void,
         exponent_encoding: c_int,
         status: *mut u32,
+        subtract_source: c_int,
         source_binding_base: u32,
         destination_binding_base: u32,
         exponent_binding: u32,
@@ -1309,10 +1384,12 @@ unsafe extern "C" {
         right: *const GpuRawSmallMatrixViewAbi,
         workspace: *const GpuRawMatrixViewAbi,
         destination: *const GpuRawMatrixViewAbi,
+        addend: *const GpuRawMatrixViewAbi,
         left_binding_base: u32,
         right_binding: u32,
         workspace_binding_base: u32,
         destination_binding_base: u32,
+        addend_binding_base: u32,
     ) -> c_int;
     fn gpu_raw_small_rhs_expand(
         ctx: *mut GpuContextOpaque,
@@ -1358,7 +1435,7 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_builder: *mut *mut MxxGpuGraphBuilderOpaque,
     ) -> c_int;
-    fn gpu_device_release_cached_memory(device: c_int) -> c_int;
+    fn gpu_device_release_cached_memory(ctx: *const GpuContextOpaque, device: c_int) -> c_int;
     fn gpu_device_graph_memory_reserved(device: c_int, out_reserved_bytes: *mut usize) -> c_int;
     fn gpu_graph_allocation_free_async(address: u64, stream: *mut c_void) -> c_int;
     fn mxx_gpu_graph_builder_add_memory_alloc(
@@ -1401,6 +1478,16 @@ unsafe extern "C" {
         binding: u32,
     ) -> c_int;
     fn mxx_set_device(logical: c_int) -> c_int;
+    fn mxx_gpu_graph_builder_add_device_copy(
+        builder: *mut MxxGpuGraphBuilderOpaque,
+        destination: *mut c_void,
+        destination_device: c_int,
+        source: *const c_void,
+        source_device: c_int,
+        bytes: usize,
+        patches: *const MxxGraphPatchRaw,
+        patch_count: usize,
+    ) -> c_int;
     fn mxx_gpu_graph_builder_add_strided_copy(
         builder: *mut MxxGpuGraphBuilderOpaque,
         destination: *mut c_void,
@@ -1682,15 +1769,6 @@ pub fn gpu_graph_memory_reserved(device: i32) -> Result<usize, String> {
         return Err(last_error_string());
     }
     Ok(reserved)
-}
-
-/// Wait for `device`, then release the physical memory its Graph pool and
-/// default pool retain without using it.
-pub fn gpu_release_cached_memory(device: i32) -> Result<(), String> {
-    if unsafe { gpu_device_release_cached_memory(device) } != 0 {
-        return Err(last_error_string());
-    }
-    Ok(())
 }
 
 /// Install the logical device table before any device is queried or used.
@@ -2355,7 +2433,7 @@ impl GpuPreimageAttempt {
     ) -> Result<Self, GpuNativeGraphError> {
         let stream = params.native_launch_stream(physical_device)?;
         let buffer = GpuDeviceBuffer::allocate(&stream, mem::size_of::<u64>())?;
-        buffer.upload(0, &[0u8; 8])?;
+        buffer.upload_initial(0, &[0u8; 8])?;
         Ok(Self { buffer, physical_device })
     }
 
@@ -2397,7 +2475,7 @@ impl GpuPreimageStatus {
     ) -> Result<Self, GpuNativeGraphError> {
         let stream = params.native_launch_stream(physical_device)?;
         let buffer = GpuDeviceBuffer::allocate(&stream, mem::size_of::<PreimageStatus>())?;
-        buffer.upload(0, &[0u8; 16])?;
+        buffer.upload_initial(0, &[0u8; 16])?;
         Ok(Self { buffer, physical_device })
     }
 
@@ -2446,11 +2524,14 @@ impl GpuExportStatus {
     ) -> Result<Self, GpuNativeGraphError> {
         let stream = params.native_launch_stream(physical_device)?;
         let buffer = GpuDeviceBuffer::allocate(&stream, 4)?;
-        buffer.upload(0, &[0u8; 4])?;
+        buffer.upload_initial(0, &[0u8; 4])?;
         Ok(Self { buffer, physical_device })
     }
     pub fn reset(&self) -> Result<(), GpuNativeGraphError> {
         self.buffer.upload(0, &[0u8; 4])
+    }
+    pub fn wait_until_ready(&self) -> Result<(), GpuNativeGraphError> {
+        self.buffer.wait_until_ready()
     }
     pub fn read(&self) -> Result<u32, GpuNativeGraphError> {
         let mut bytes = [0u8; 4];
@@ -3046,6 +3127,15 @@ impl GpuDCRTPolyParams {
         self.ctx.raw_ptr()
     }
 
+    /// Wait for this context's work on `device`, then release the physical
+    /// memory the device's Graph pool and default pool retain without using it.
+    pub fn release_cached_memory(&self, device: i32) -> Result<(), String> {
+        if unsafe { gpu_device_release_cached_memory(self.ctx_raw(), device) } != 0 {
+            return Err(last_error_string());
+        }
+        Ok(())
+    }
+
     pub fn begin_graph(
         &self,
         physical_device: i32,
@@ -3513,8 +3603,149 @@ impl GpuDCRTPolyParams {
         Ok(())
     }
 
+    /// Call the entry of `kernel` for one subgraph call: `operands` are its
+    /// `input_count` inputs then its outputs, every matrix on this context's
+    /// basis and `stream`'s device. The entry adds its kernels to the graph
+    /// being built on `stream`.
+    pub(crate) fn emit_subgraph_kernel(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        kernel: &crate::gpu_subgraph_kernel::GpuSubgraphKernel,
+        input_count: usize,
+        operands: &[GpuSubgraphOperandView],
+        scratch: (u64, u32),
+        status: GpuRawControlStatusView,
+    ) -> Result<(), GpuNativeGraphError> {
+        let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+        let basis = operands
+            .iter()
+            .find_map(|operand| match operand {
+                GpuSubgraphOperandView::Matrix { view, .. } |
+                GpuSubgraphOperandView::MatrixFamily { layout: view, .. } => Some(view),
+                _ => None,
+            })
+            .ok_or_else(|| invalid("subgraph kernel has no matrix operand"))?;
+        let crt = |view: &GpuRawMatrixView| {
+            view.limbs.iter().map(|limb| (limb.crt_limb_index, limb.modulus)).collect::<Vec<_>>()
+        };
+        if basis.physical_device != stream.physical_device ||
+            basis.degree != self.ring_dimension ||
+            input_count > operands.len() ||
+            operands.iter().any(|operand| match operand {
+                GpuSubgraphOperandView::Matrix { view, .. } |
+                GpuSubgraphOperandView::MatrixFamily { layout: view, .. } => {
+                    view.physical_device != basis.physical_device ||
+                        view.degree != basis.degree ||
+                        crt(view) != crt(basis)
+                }
+                _ => false,
+            })
+        {
+            return Err(invalid("subgraph kernel operands disagree with their context"));
+        }
+        let basis_abi = basis.abi();
+        let null_tables = GpuNttTablesAbi {
+            forward: ptr::null(),
+            forward_shoup: ptr::null(),
+            inverse: ptr::null(),
+            inverse_shoup: ptr::null(),
+            degree_inverse: ptr::null(),
+            degree_inverse_shoup: ptr::null(),
+        };
+        let mut tables = vec![null_tables; basis.limbs.len()];
+        if unsafe { gpu_context_ntt_tables(self.ctx.raw_ptr(), &basis_abi, tables.as_mut_ptr()) } !=
+            0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        let empty = GpuRawMatrixViewAbi {
+            physical_device: basis.physical_device,
+            degree: basis.degree,
+            row_origin: 0,
+            column_origin: 0,
+            rows: 0,
+            columns: 0,
+            limbs: ptr::null(),
+            limb_count: 0,
+        };
+        let operand_abis = operands
+            .iter()
+            .map(|operand| {
+                let mut abi = GpuSubgraphOperandAbi {
+                    kind: 0,
+                    binding: 0,
+                    matrix: empty.clone_abi(),
+                    family_table: ptr::null(),
+                    family_count: 0,
+                    integers: ptr::null(),
+                    integer_encoding: 0,
+                    reserved: 0,
+                    integer_count: 0,
+                };
+                match operand {
+                    GpuSubgraphOperandView::Matrix { view, binding } => {
+                        abi.binding = *binding;
+                        abi.matrix = view.abi();
+                    }
+                    GpuSubgraphOperandView::MatrixFamily { layout, table, count } => {
+                        abi.kind = 1;
+                        abi.matrix = layout.abi();
+                        abi.family_table = *table as *const GpuRawMatrixLimb;
+                        abi.family_count = *count;
+                    }
+                    GpuSubgraphOperandView::Integer(view) |
+                    GpuSubgraphOperandView::IntegerFamily(view) => {
+                        abi.kind = if matches!(operand, GpuSubgraphOperandView::Integer(_)) {
+                            2
+                        } else {
+                            3
+                        };
+                        abi.binding = view.binding;
+                        abi.integers = view.address as *const c_void;
+                        abi.integer_encoding = view.encoding.native_code();
+                        abi.integer_count = view.count as u64;
+                    }
+                }
+                abi
+            })
+            .collect::<Vec<_>>();
+        let launch = GpuSubgraphLaunchAbi {
+            context: self.ctx.raw_ptr(),
+            stream: stream.raw_ptr(),
+            physical_device: basis.physical_device,
+            degree: basis.degree,
+            limb_count: u32::try_from(basis.limbs.len())
+                .map_err(|_| invalid("subgraph kernel basis is too large"))?,
+            input_count: u32::try_from(input_count)
+                .map_err(|_| invalid("subgraph kernel has too many operands"))?,
+            output_count: u32::try_from(operands.len() - input_count)
+                .map_err(|_| invalid("subgraph kernel has too many operands"))?,
+            reserved: 0,
+            ntt: tables.as_ptr(),
+            operands: operand_abis.as_ptr(),
+            scratch: scratch.0 as *mut c_void,
+            scratch_bytes: kernel.scratch_bytes,
+            scratch_binding: scratch.1,
+            status_binding: status.binding,
+            status: status.address as *mut u32,
+            parameters: kernel.parameters.as_ptr(),
+            parameter_count: kernel.parameters.len() as u64,
+        };
+        // SAFETY: the launch and everything it points to live across the
+        // call; the registered entry reads them only during the call.
+        if unsafe { (kernel.entry)((&launch as *const GpuSubgraphLaunchAbi).cast()) } != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "subgraph kernel {}: {}",
+                kernel.name,
+                last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
     /// Multiply one evaluation-domain physical matrix by `X^exponent`; the
-    /// device reduces the resident integer exponent modulo 2*degree.
+    /// device reduces the resident integer exponent modulo 2*degree. With
+    /// `subtract_source` the destination receives `X^exponent a - a`.
     pub fn emit_raw_monomial_multiply(
         &self,
         stream: &GpuNativeLaunchStream,
@@ -3522,6 +3753,7 @@ impl GpuDCRTPolyParams {
         destination: &GpuRawMatrixView,
         exponent: GpuRawIntegerView,
         status: GpuRawControlStatusView,
+        subtract_source: bool,
         source_binding_base: u32,
         destination_binding_base: u32,
     ) -> Result<(), GpuNativeGraphError> {
@@ -3548,6 +3780,7 @@ impl GpuDCRTPolyParams {
                 exponent.address as *const c_void,
                 exponent.encoding.native_code(),
                 status.address as *mut u32,
+                c_int::from(subtract_source),
                 source_binding_base,
                 destination_binding_base,
                 exponent.binding,
@@ -4861,7 +5094,8 @@ impl GpuDCRTPolyParams {
 
     /// Multiply an evaluation-domain `left` by the compact bounded `right`
     /// into `destination`, transforming `right` one `workspace`-wide column
-    /// chunk at a time.
+    /// chunk at a time. With `addend` (a view and its binding base), the
+    /// destination receives `addend + left * right`.
     #[allow(clippy::too_many_arguments)]
     pub fn emit_raw_matrix_mul_small_rhs(
         &self,
@@ -4870,6 +5104,7 @@ impl GpuDCRTPolyParams {
         right: &GpuRawSmallMatrixView,
         workspace: &GpuRawMatrixView,
         destination: &GpuRawMatrixView,
+        addend: Option<(&GpuRawMatrixView, u32)>,
         left_binding_base: u32,
         right_binding: u32,
         workspace_binding_base: u32,
@@ -4878,6 +5113,7 @@ impl GpuDCRTPolyParams {
         if [left.physical_device, right.physical_device, workspace.physical_device]
             .into_iter()
             .chain([destination.physical_device])
+            .chain(addend.map(|(addend, _)| addend.physical_device))
             .any(|device| device != stream.physical_device) ||
             [left.degree, right.degree, workspace.degree, destination.degree]
                 .into_iter()
@@ -4889,6 +5125,7 @@ impl GpuDCRTPolyParams {
         }
         let (left, right) = (left.abi(), right.abi());
         let (workspace, destination) = (workspace.abi(), destination.abi());
+        let addend_abi = addend.map(|(addend, _)| addend.abi());
         if unsafe {
             gpu_raw_matrix_mul_small_rhs(
                 self.ctx.raw_ptr(),
@@ -4897,10 +5134,12 @@ impl GpuDCRTPolyParams {
                 &right,
                 &workspace,
                 &destination,
+                addend_abi.as_ref().map_or(std::ptr::null(), |addend| addend as *const _),
                 left_binding_base,
                 right_binding,
                 workspace_binding_base,
                 destination_binding_base,
+                addend.map_or(0, |(_, binding)| binding),
             )
         } != 0
         {
@@ -5863,6 +6102,7 @@ impl GpuSignedValues {
             GpuSignedValuesEncoding::CanonicalU64,
         )?;
         out.upload_u64(values)?;
+        out.buffer.wait_until_ready()?;
         Ok(out)
     }
 
@@ -5893,6 +6133,7 @@ impl GpuSignedValues {
             GpuSignedValuesEncoding::SignedWords(words),
         )?;
         output.upload_bigints(values)?;
+        output.buffer.wait_until_ready()?;
         Ok(output)
     }
 
@@ -5993,11 +6234,26 @@ impl GpuDeviceBuffer {
                 last_error_string()
             )));
         }
-        Ok(Self {
+        let buffer = Self {
             owner: NonNull::new(raw).expect("device allocation returned null"),
             bytes,
             stream: stream.clone(),
-        })
+        };
+        // Graphs read the buffer from other streams without waiting for this
+        // stream-ordered allocation, so it completes before it is returned.
+        buffer.wait_until_ready()?;
+        Ok(buffer)
+    }
+
+    /// Write the buffer's first contents, complete before any Graph on
+    /// another stream reads them.
+    pub(crate) fn upload_initial(
+        &self,
+        offset: usize,
+        source: &[u8],
+    ) -> Result<(), GpuNativeGraphError> {
+        self.upload(offset, source)?;
+        self.wait_until_ready()
     }
 
     pub(crate) fn as_ptr(&self) -> *mut c_void {
@@ -6126,7 +6382,9 @@ impl GpuNativeGraphBuilder {
         &self.stream
     }
 
-    fn select_device(&self) -> Result<(), GpuNativeGraphError> {
+    /// Make the device of the launch stream current: kernel and memory
+    /// nodes run on the device that is current when they are added.
+    pub(crate) fn select_device(&self) -> Result<(), GpuNativeGraphError> {
         if unsafe { mxx_set_device(self.stream.physical_device) } != 0 {
             return Err(GpuNativeGraphError::Native("cannot select the graph device".into()));
         }
@@ -6277,6 +6535,38 @@ impl GpuNativeGraphBuilder {
                 source as *const c_void,
                 bytes,
                 copy_kind,
+                patches.as_ptr(),
+                patches.len(),
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Copy `bytes` between resident allocations on `source_device` and
+    /// `destination_device` (logical devices). Between GPUs without peer
+    /// access the copy is staged through pinned host memory
+    /// (`mxx_gpu_graph_builder_add_device_copy`).
+    pub fn add_device_copy(
+        &mut self,
+        destination: u64,
+        destination_device: i32,
+        source: u64,
+        source_device: i32,
+        bytes: usize,
+        patches: &[GpuGraphPatch],
+    ) -> Result<(), GpuNativeGraphError> {
+        let patches = patches.iter().copied().map(GpuGraphPatch::raw).collect::<Vec<_>>();
+        let status = unsafe {
+            mxx_gpu_graph_builder_add_device_copy(
+                self.raw,
+                destination as *mut c_void,
+                destination_device,
+                source as *const c_void,
+                source_device,
+                bytes,
                 patches.as_ptr(),
                 patches.len(),
             )

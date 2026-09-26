@@ -113,6 +113,13 @@ __device__ __forceinline__ uint64_t compact_mod_magnitude(
     uint64_t modulus)
 {
     uint64_t value = 0;
+    if (width <= 7)
+    {
+        // A magnitude of at most 56 bits is one word, usually already
+        // reduced (a gadget digit is far below the modulus).
+        for (size_t i = 0; i < width; ++i) value |= static_cast<uint64_t>(magnitude[i]) << (8 * i);
+        return value < modulus ? value : value % modulus;
+    }
     for (size_t i = width; i-- > 0;)
     {
         value = static_cast<uint64_t>(
@@ -461,18 +468,40 @@ namespace
         return residue;
     }
 
+    // One launch covers up to kRawNttLimbs destination limbs; blockIdx.y
+    // picks the limb `first_limb + blockIdx.y`.
     __global__ void raw_small_rhs_expand_kernel(
-        MxxRawSmallMatrixView source, MxxRawMatrixLimb destination,
-        size_t compact_limb, size_t coefficient_count, size_t coefficient_offset)
+        MxxRawSmallMatrixView source, RawLimbSet destinations,
+        size_t first_limb, size_t coefficient_count, size_t coefficient_offset)
     {
         const size_t index = coefficient_offset +
             static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (index >= coefficient_count) return;
+        const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.y];
+        const size_t compact_limb = first_limb + blockIdx.y;
         const size_t coefficient = index % source.degree;
         const size_t poly = index / source.degree;
         raw_matrix_store(destination, poly, coefficient, source.columns,
             compact_residue(source, poly, coefficient, compact_limb, destination.modulus));
     }
+}
+
+namespace
+{
+    // Reads the compact right operand as residues while the NTT loads its
+    // tile, so the operand is transformed without a decoded workspace pass.
+    struct RawNttCompactSource
+    {
+        MxxRawSmallMatrixView view;
+        uint64_t first_limb;
+
+        __device__ __forceinline__ uint64_t load(const RawNttBatch &batch, uint32_t limb,
+            size_t poly, size_t coefficient, size_t) const
+        {
+            return compact_residue(view, poly, coefficient, first_limb + limb,
+                batch.destination[limb].modulus);
+        }
+    };
 }
 
 static bool valid_compact_rhs_view(const MxxRawSmallMatrixView *source, size_t limb_count)
@@ -491,13 +520,20 @@ static bool valid_compact_rhs_view(const MxxRawSmallMatrixView *source, size_t l
 // transformed one workspace-wide column chunk at a time: the compact chunk is
 // decoded into the workspace, the shared NTT transforms it in place, and the
 // shared product kernel writes the chunk's output columns. The right operand
-// is never expanded in full.
+// is never expanded in full. A non-null `addend` (L x C, evaluation domain,
+// possibly the destination itself) is added to the product in the same pass.
 extern "C" int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream_raw,
     const MxxRawMatrixView *left, const MxxRawSmallMatrixView *right,
     const MxxRawMatrixView *workspace, const MxxRawMatrixView *destination,
+    const MxxRawMatrixView *addend,
     uint32_t left_binding_base, uint32_t right_binding,
-    uint32_t workspace_binding_base, uint32_t destination_binding_base)
+    uint32_t workspace_binding_base, uint32_t destination_binding_base,
+    uint32_t addend_binding_base)
 {
+    if (addend &&
+        (validate_raw_view(ctx, addend, stream_raw) != 0 || !same_raw_extent(addend, destination) ||
+            addend_binding_base > UINT32_MAX - addend->limb_count))
+        return set_error("invalid raw small-RHS product addend");
     if (validate_raw_view(ctx, left, stream_raw) != 0 ||
         validate_raw_view(ctx, workspace, stream_raw) != 0 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
@@ -534,31 +570,48 @@ extern "C" int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream_raw,
         MxxRawSmallMatrixView chunk = *right;
         chunk.columns = width;
         chunk.column_offset += start;
+        // The chunk occupies the first `width` workspace columns.
+        MxxRawMatrixView transformed = *workspace;
+        transformed.columns = width;
         const size_t chunk_coefficients = right->rows * width * degree;
         constexpr size_t maximum_decode = 65535ULL * 256ULL;
-        for (size_t limb = 0; limb < left->limb_count; ++limb)
+        // A whole-ring tile decodes the compact chunk while the NTT loads it.
+        const bool decode_in_ntt = raw_ntt_whole_ring(degree);
+        if (decode_in_ntt)
         {
-            const MxxGraphPatch decode_patches[] = {
+            const std::vector<MxxGraphPatch> loader_patches{
+                {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 5,
+                    static_cast<uint32_t>(offsetof(RawNttCompactSource, view) +
+                        offsetof(MxxRawSmallMatrixView, payload_address)),
+                    sizeof(void *), right_binding, 0}};
+            if (raw_matrix_ntt(ctx, stream_raw, &transformed, &transformed, 0,
+                    workspace_binding_base, workspace_binding_base,
+                    RawNttCompactSource{chunk, 0}, loader_patches) != 0)
+                return 1;
+        }
+        for (size_t first = 0; !decode_in_ntt && first < left->limb_count; first += kRawNttLimbs)
+        {
+            const size_t limbs = std::min(kRawNttLimbs, left->limb_count - first);
+            RawLimbSet destinations{};
+            std::vector<MxxGraphPatch> decode_patches{
                 {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
                     offsetof(MxxRawSmallMatrixView, payload_address), sizeof(void *),
-                    right_binding, 0},
-                {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
-                    static_cast<uint32_t>(workspace_binding_base + limb), 0},
-            };
+                    right_binding, 0}};
+            raw_limb_set(workspace, first, limbs, 1, workspace_binding_base, destinations,
+                decode_patches);
             for (size_t offset = 0; offset < chunk_coefficients; offset += maximum_decode)
             {
                 const size_t count = std::min(maximum_decode, chunk_coefficients - offset);
                 const int status = mxx_gpu_launch_kernel(ctx, stream,
-                    raw_small_rhs_expand_kernel, dim3(static_cast<uint32_t>((count + 255) / 256)),
-                    dim3(256), 0, decode_patches, 2, chunk, workspace->limbs[limb], limb,
-                    chunk_coefficients, offset);
+                    raw_small_rhs_expand_kernel,
+                    dim3(static_cast<uint32_t>((count + 255) / 256), static_cast<uint32_t>(limbs)),
+                    dim3(256), 0, decode_patches.data(), decode_patches.size(), chunk,
+                    destinations, first, chunk_coefficients, offset);
                 if (status != 0) return status;
             }
         }
-        // The chunk occupies the first `width` workspace columns.
-        MxxRawMatrixView transformed = *workspace;
-        transformed.columns = width;
-        if (gpu_raw_matrix_ntt(ctx, stream_raw, &transformed, &transformed, 0,
+        if (!decode_in_ntt &&
+            gpu_raw_matrix_ntt(ctx, stream_raw, &transformed, &transformed, 0,
                 workspace_binding_base, workspace_binding_base) != 0)
             return 1;
         // The shared product kernel writes the chunk's output columns, which
@@ -567,12 +620,14 @@ extern "C" int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream_raw,
         for (size_t first = 0; first < left->limb_count; first += kRawNttLimbs)
         {
             const size_t limbs = std::min(kRawNttLimbs, left->limb_count - first);
-            RawLimbSet lefts{}, rights{}, outputs{};
+            RawLimbSet lefts{}, rights{}, outputs{}, addends{};
             std::vector<MxxGraphPatch> patches;
             raw_limb_set(left, first, limbs, 0, left_binding_base, lefts, patches);
             raw_limb_set(&transformed, first, limbs, 1, workspace_binding_base, rights, patches);
             raw_limb_set(destination, first, limbs, 2, destination_binding_base, outputs, patches,
                 start);
+            if (addend)
+                raw_limb_set(addend, first, limbs, 3, addend_binding_base, addends, patches, start);
             for (size_t offset = 0; offset < output_polys; offset += kMaxGridY)
             {
                 const size_t polys = std::min(kMaxGridY, output_polys - offset);
@@ -580,9 +635,9 @@ extern "C" int gpu_raw_matrix_mul_small_rhs(GpuContext *ctx, void *stream_raw,
                     static_cast<uint32_t>(polys), static_cast<uint32_t>(limbs));
                 const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_mul_kernel,
                     grid, dim3(kMulCoefficients, kMulSlices), 0, patches.data(), patches.size(),
-                    lefts, rights, outputs, static_cast<size_t>(left->columns), width, width,
-                    static_cast<size_t>(destination->rows), static_cast<size_t>(degree), offset,
-                    false, false);
+                    lefts, rights, outputs, addends, static_cast<size_t>(left->columns), width,
+                    width, static_cast<size_t>(destination->rows), static_cast<size_t>(degree),
+                    offset, addend != nullptr, false);
                 if (status != 0) return status;
             }
         }
@@ -611,22 +666,24 @@ extern "C" int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream_raw,
         return set_error("raw compact RHS coefficient count overflow");
     const size_t count = source->rows * source->columns * source->degree;
     constexpr size_t maximum_chunk = 65535ULL * 256ULL;
-    for (size_t limb = 0; limb < destination->limb_count; ++limb)
+    for (size_t first = 0; first < destination->limb_count; first += kRawNttLimbs)
     {
-        const MxxGraphPatch patches[] = {
+        const size_t limbs = std::min(kRawNttLimbs, destination->limb_count - first);
+        RawLimbSet destinations{};
+        std::vector<MxxGraphPatch> patches{
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
                 offsetof(MxxRawSmallMatrixView, payload_address), sizeof(void *),
-                source_binding, 0},
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0,
-                sizeof(void *), static_cast<uint32_t>(destination_binding_base + limb), 0},
-        };
+                source_binding, 0}};
+        raw_limb_set(destination, first, limbs, 1, destination_binding_base, destinations,
+            patches);
         for (size_t offset = 0; offset < count; offset += maximum_chunk)
         {
             const size_t chunk = std::min(maximum_chunk, count - offset);
-            const dim3 grid(static_cast<uint32_t>((chunk + 255) / 256));
+            const dim3 grid(static_cast<uint32_t>((chunk + 255) / 256),
+                static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream,
                 raw_small_rhs_expand_kernel, grid, dim3(256), 0,
-                patches, 2, *source, destination->limbs[limb], limb, count, offset);
+                patches.data(), patches.size(), *source, destinations, first, count, offset);
             if (status != 0) return status;
         }
     }

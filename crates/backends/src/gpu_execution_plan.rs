@@ -471,6 +471,8 @@ pub(crate) enum GpuNativePrimitive {
     PreimageDeriveAttemptSeed,
     ExportCopy,
     ExportPublish,
+    /// A subgraph call executed by its registered native kernel.
+    SubgraphKernel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -746,6 +748,24 @@ impl GpuImplementation {
                 Value, U32, Value, U32, Value, U32, Value, U32, U32, U32, U32, U32,
             ]),
             output_count: 1,
+        }
+    }
+
+    /// A subgraph kernel call with `operands` inputs and outputs and
+    /// `outputs` of them results. Arguments: the kernel index in the
+    /// program, the input count, the scratch value and binding, the status
+    /// value and binding, then per operand its kind, value, part (or indexed
+    /// table resource), and binding.
+    pub(crate) fn subgraph_kernel(operands: usize, outputs: usize) -> Self {
+        use GpuArgumentKind::{U32, Value};
+        let mut argument_kinds = vec![U32, U32, Value, U32, Value, U32];
+        for _ in 0..operands {
+            argument_kinds.extend([U32, Value, U32, U32]);
+        }
+        Self {
+            primitive: GpuNativePrimitive::SubgraphKernel,
+            argument_kinds: argument_kinds.into_boxed_slice(),
+            output_count: outputs,
         }
     }
 
@@ -1213,6 +1233,8 @@ pub(crate) struct CompiledGpuProgram {
     /// Dense, plan-global binding indices used by native patch records.
     pub bindings: Box<[GpuBindingSource]>,
     pub export_slots: Box<[GpuExportSlotRange]>,
+    /// The registered kernels `SubgraphKernel` operations name by index.
+    pub subgraph_kernels: Box<[crate::gpu_subgraph_kernel::GpuSubgraphKernel]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1563,6 +1585,7 @@ mod gpu_export_slot_tests {
                 GpuBindingSource::ExportSlotHeader { slot: 0 },
             ]),
             export_slots: reserve_gpu_export_slots([(7, 1, 1)]).unwrap(),
+            subgraph_kernels: Box::new([]),
         };
         assert!(program.validate().is_ok());
         let mut unordered = program.clone();

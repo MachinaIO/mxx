@@ -42,21 +42,24 @@ namespace
         return *selected < family_count;
     }
 
+    // One launch covers up to kRawNttLimbs destination limbs; blockIdx.y
+    // picks the limb `first_limb + blockIdx.y`.
     __global__ void indexed_matrix_copy_kernel(const void *index_address,
         int index_encoding, const MxxRawMatrixLimb *table,
-        size_t family_count, size_t limb_count, size_t limb_index,
-        MxxRawMatrixLimb destination, uint64_t rows, uint64_t columns,
+        size_t family_count, size_t limb_count, size_t first_limb,
+        RawLimbSet destinations, uint64_t rows, uint64_t columns,
         uint32_t degree, uint32_t *status)
     {
         uint64_t selected = 0;
         if (!indexed_matrix_index(index_address, index_encoding,
             family_count, &selected))
         {
-            if (blockIdx.x == 0 && threadIdx.x == 0)
+            if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
                 atomicCAS(status, 0U, 2U);
             return;
         }
-        const MxxRawMatrixLimb source = table[selected * limb_count + limb_index];
+        const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.y];
+        const MxxRawMatrixLimb source = table[selected * limb_count + first_limb + blockIdx.y];
         const uint64_t total = rows * columns * degree;
         for (uint64_t flat = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
              flat < total; flat += static_cast<uint64_t>(gridDim.x) * blockDim.x)
@@ -163,22 +166,22 @@ extern "C" int gpu_raw_matrix_indexed_copy(GpuContext *ctx, void *stream_raw,
     const uint64_t total = destination->rows * destination->columns * destination->degree;
     const uint32_t grid = static_cast<uint32_t>(std::min<uint64_t>((total + 255) / 256, 65535));
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
-    for (size_t limb = 0; limb < destination->limb_count; ++limb)
+    for (size_t first = 0; first < destination->limb_count; first += kRawNttLimbs)
     {
-        const MxxGraphPatch patches[] = {
+        const size_t limbs = std::min(kRawNttLimbs, destination->limb_count - first);
+        RawLimbSet destinations{};
+        std::vector<MxxGraphPatch> patches{
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0,
                 sizeof(void *), index_binding, 0},
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 6,
-                static_cast<uint32_t>(offsetof(MxxRawMatrixLimb, address)),
-                sizeof(void *), destination_binding_base + static_cast<uint32_t>(limb), 0},
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 10, 0,
-                sizeof(void *), status_binding, 0},
-        };
+                sizeof(void *), status_binding, 0}};
+        raw_limb_set(destination, first, limbs, 6, destination_binding_base, destinations,
+            patches);
         const int result = mxx_gpu_launch_kernel(ctx, stream,
-            indexed_matrix_copy_kernel, dim3(grid), dim3(256), 0,
-            patches, std::size(patches), index_address, index_encoding,
+            indexed_matrix_copy_kernel, dim3(grid, static_cast<uint32_t>(limbs)), dim3(256), 0,
+            patches.data(), patches.size(), index_address, index_encoding,
             table->device_limbs, table->family_count, table->limb_count,
-            limb, destination->limbs[limb], destination->rows,
+            first, destinations, destination->rows,
             destination->columns, destination->degree, status);
         if (result != 0) return result;
     }

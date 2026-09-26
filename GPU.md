@@ -2,7 +2,7 @@
 
 Apply these requirements to GPU implementation and review. Passing tests does not establish the required ownership, asynchronous execution, or memory complexity; check the production path as well.
 
-Native CUDA sources, GPU wrappers, and the concrete GPU runtime are owned by `mxx-backends` under `crates/backends/cuda/` and `crates/backends/src/`. Higher-level application graphs use its public APIs.
+Native CUDA sources, GPU wrappers, and the concrete GPU runtime are owned by `mxx-backends` under `crates/backends/cuda/` and `crates/backends/src/`. Higher-level application graphs use its public APIs. A higher crate may own the native kernel of one of its named subgraphs (a subgraph kernel, `docs/architecture.md`), built against `crates/backends/cuda/include/SubgraphKernel.cuh` only; the rules below apply to that code too.
 
 1. Minimize memory transfers (and transfer frequency) between the device and the host.
 2. Minimize synchronization. Do not use `cudaDeviceSynchronize`. Use per-stream events and avoid `cudaStreamSynchronize` in asynchronous wrappers. Use `cudaMallocAsync`, `cudaFreeAsync`, and `cudaMemcpyAsync` rather than `cudaMalloc`, `cudaFree`, and `cudaMemcpy`.

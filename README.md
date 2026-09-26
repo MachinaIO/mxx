@@ -14,7 +14,7 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
 | `mxx-fhe` | DSL-based TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and ciphertext noise tracking. |
-| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Currently excluded from the workspace (commented out in `Cargo.toml`). |
+| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Excluded from the workspace; build it with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
 
 The retired symbolic IR and probabilistic noise simulator are not part of the workspace.
@@ -137,8 +137,7 @@ secret key. The integration test `crates/fhe/tests/gpu_tfhe.rs` is a TFHE round 
 GPU with the standard TFHE Boolean profile (`utils::tfhe_params`): it
 generates keys, encrypts bits, evaluates the NAND truth table and chained
 bootstrapped gates, and decrypts every result, with keys kept resident
-between plans. The BGV design and
-formulas are documented in `docs/plans/fhe.md`.
+between plans.
 
 ```sh
 cargo test -r -p mxx-fhe --lib

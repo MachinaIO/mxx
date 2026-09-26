@@ -33,15 +33,14 @@ __device__ __forceinline__ int64_t centered_lift_u64(uint64_t residue, uint64_t 
     return static_cast<int64_t>(value);
 }
 
-__device__ __forceinline__ int64_t balanced_digit_step(int64_t value, int64_t base, int64_t *next)
+__device__ __forceinline__ int64_t balanced_digit_step(
+    int64_t value, uint32_t base_bits, int64_t *next)
 {
-    int64_t quotient = value / base;
-    int64_t remainder = value % base;
-    if (remainder < 0)
-    {
-        remainder += base;
-        quotient -= 1;
-    }
+    // The base is 2^base_bits: an arithmetic shift is the floor quotient and
+    // the mask its non-negative remainder.
+    const int64_t base = int64_t{1} << base_bits;
+    const int64_t quotient = value >> base_bits;
+    const int64_t remainder = value & (base - 1);
     const int64_t half = base / 2;
     if (remainder < half)
     {
@@ -66,9 +65,11 @@ __device__ __forceinline__ uint64_t signed_digit_to_residue(int64_t digit, uint6
 {
     if (digit >= 0)
     {
-        return static_cast<uint64_t>(digit) % modulus;
+        const uint64_t value = static_cast<uint64_t>(digit);
+        return value < modulus ? value : value % modulus;
     }
-    const uint64_t magnitude = static_cast<uint64_t>(-digit) % modulus;
+    uint64_t magnitude = static_cast<uint64_t>(-digit);
+    if (magnitude >= modulus) magnitude %= modulus;
     return magnitude == 0 ? 0 : modulus - magnitude;
 }
 
@@ -99,7 +100,6 @@ namespace
         const size_t poly = poly_offset + blockIdx.y;
         const uint64_t residue = raw_matrix_load(source, poly, coefficient, source_columns);
         int64_t value = centered_lift_u64(residue, source.modulus);
-        const int64_t base = int64_t{1} << base_bits;
         const size_t source_row = poly / source_columns;
         const size_t source_column = poly - source_row * source_columns;
         const size_t first_row = source_row * output_digits_per_row +
@@ -107,7 +107,7 @@ namespace
         for (uint32_t digit_index = 0; digit_index < digits_per_tower; ++digit_index)
         {
             int64_t next = 0;
-            const int64_t signed_digit = balanced_digit_step(value, base, &next);
+            const int64_t signed_digit = balanced_digit_step(value, base_bits, &next);
             value = next;
             raw_matrix_store(destination,
                 (first_row + digit_index) * destination_columns + source_column,
@@ -213,18 +213,26 @@ namespace
     // Signed balanced digits are modulus independent, so they are stored once
     // per coefficient (global bound) or once per CRT limb (small gadget) in
     // the compact sign-and-magnitude layout consumed by compact expansion.
+    //
+    // One launch covers up to kRawNttLimbs passes; blockIdx.z picks the pass
+    // `first_pass + blockIdx.z`, whose source is that CRT limb. The ordinary
+    // gadget writes the pass's digit rows after the earlier passes' rows; the
+    // small gadget writes the pass's own CRT slot.
     __global__ void raw_matrix_decompose_compact_kernel(
-        MxxRawMatrixLimb source, MxxRawSmallMatrixView destination,
+        RawLimbSet sources, MxxRawSmallMatrixView destination,
         size_t source_columns, size_t degree, size_t output_digits_per_row,
-        size_t source_digit_offset, uint32_t base_bits, uint32_t digits_per_tower,
-        size_t destination_limb, size_t poly_offset)
+        uint32_t base_bits, uint32_t digits_per_tower, bool full_basis_small,
+        size_t first_pass, size_t poly_offset)
     {
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (coefficient >= degree) return;
+        const MxxRawMatrixLimb &source = sources.limb[blockIdx.z];
+        const size_t pass = first_pass + blockIdx.z;
+        const size_t source_digit_offset = full_basis_small ? 0 : pass * digits_per_tower;
+        const size_t destination_limb = full_basis_small ? pass : 0;
         const size_t poly = poly_offset + blockIdx.y;
         const uint64_t residue = raw_matrix_load(source, poly, coefficient, source_columns);
         int64_t value = centered_lift_u64(residue, source.modulus);
-        const int64_t base = int64_t{1} << base_bits;
         const size_t source_row = poly / source_columns;
         const size_t source_column = poly - source_row * source_columns;
         const size_t width = static_cast<size_t>(destination.magnitude_bytes) + 1;
@@ -232,7 +240,7 @@ namespace
         for (uint32_t digit_index = 0; digit_index < digits_per_tower; ++digit_index)
         {
             int64_t next = 0;
-            const int64_t signed_digit = balanced_digit_step(value, base, &next);
+            const int64_t signed_digit = balanced_digit_step(value, base_bits, &next);
             value = next;
             const size_t output_row = source_row * output_digits_per_row +
                 source_digit_offset + digit_index;
@@ -300,26 +308,26 @@ extern "C" int gpu_raw_matrix_decompose_compact(GpuContext *ctx, void *stream_ra
     // The ordinary gadget concatenates the digit rows of the retained source
     // limbs; the small gadget stores each limb's own digits in its CRT slot.
     const size_t passes = full_basis_small ? source->limb_count : retained;
-    for (size_t pass = 0; pass < passes; ++pass)
+    for (size_t first = 0; first < passes; first += kRawNttLimbs)
     {
-        const MxxGraphPatch patches[] = {
-            decompose_pointer_patch(0, 0, static_cast<uint32_t>(source_binding_base + pass)),
-            decompose_pointer_patch(1, offsetof(MxxRawSmallMatrixView, payload_address),
-                destination_binding),
-        };
+        const size_t limbs = std::min(kRawNttLimbs, passes - first);
+        RawLimbSet sources{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(source, first, limbs, 0, source_binding_base, sources, patches);
+        patches.push_back(decompose_pointer_patch(1,
+            offsetof(MxxRawSmallMatrixView, payload_address), destination_binding));
         for (size_t poly_offset = 0; poly_offset < poly_count;
              poly_offset += kDecomposeMaxGridY)
         {
             const size_t poly_chunk = std::min(kDecomposeMaxGridY, poly_count - poly_offset);
             const dim3 grid(
                 static_cast<uint32_t>((source->degree + kDecomposeThreads - 1) / kDecomposeThreads),
-                static_cast<uint32_t>(poly_chunk));
+                static_cast<uint32_t>(poly_chunk), static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream,
                 raw_matrix_decompose_compact_kernel, grid, dim3(kDecomposeThreads), 0,
-                patches, 2, source->limbs[pass], *destination, source->columns,
-                static_cast<size_t>(source->degree), digits * retained,
-                full_basis_small ? 0 : pass * digits, base_bits,
-                static_cast<uint32_t>(digits), full_basis_small ? pass : 0, poly_offset);
+                patches.data(), patches.size(), sources, *destination, source->columns,
+                static_cast<size_t>(source->degree), digits * retained, base_bits,
+                static_cast<uint32_t>(digits), full_basis_small != 0, first, poly_offset);
             if (status != 0) return status;
         }
     }

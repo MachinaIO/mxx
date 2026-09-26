@@ -19,7 +19,7 @@ use crate::{
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
         ExponentLutProgramBuilder, GraphFamilyExecution, GraphParallelLowering, InputBinding,
-        LoweringSite, LutTable, Operand, ProgramLoweringContext, RhsRef, WireId,
+        LoweringSite, LutTable, Operand, ProgramLoweringContext, RhsId, WireId, family_of_fields,
     },
 };
 use mxx_backends::{
@@ -388,6 +388,89 @@ where
         }
     }
     Ok(())
+}
+
+/// The family of input encodings whose fields are the imported families:
+/// four public-key parts, two row parts, and an optional payload.
+fn encoding_family(
+    wire: WireId,
+    key_parts: &[Family<Mat>],
+    rows: &[Family<Mat>],
+    payload: Option<&Family<Mat>>,
+    count: IntExpr,
+) -> Result<Family<RnsBggEncoding>, ApiError> {
+    let ([k0, k1, k2, k3], [r0, r1]) = (key_parts, rows) else {
+        return Err(ApiError::input("an input encoding family has the wrong field count"));
+    };
+    let first = |family: &Family<Mat>| family.at(Int::constant(0));
+    let element = RnsBggEncoding::new(
+        RnsBggPublicKey::new(wire, ((first(k0), first(k1)), (first(k2), first(k3)))),
+        (first(r0), first(r1)),
+        payload.map(first),
+    );
+    let fields = key_parts
+        .iter()
+        .chain(rows)
+        .chain(payload)
+        .map(|family| family.value_handle().clone())
+        .collect::<Vec<_>>();
+    family_of_fields(&element, count, &fields).map_err(ApiError::scheme)
+}
+
+/// Import every RHS of `program` from `preprocess`, for binding before the
+/// Program is lowered. Preprocessing publishes each compact RHS at the level
+/// after its consumer's, so it is imported once at that level; a family RHS
+/// is one family per matrix port. `name` maps a role to its artifact name.
+fn import_rhs_bindings(
+    parameters: &RnsBggParameters,
+    program: &ExponentLutProgram,
+    workload: &RnsBggDerivedWorkload,
+    preprocess: &ProductionId,
+    name: impl Fn(String) -> String,
+) -> Result<Vec<(RhsId, InputBinding<RnsBggMatrix, Family<RnsBggMatrix>>)>, ApiError> {
+    let mut bindings = Vec::with_capacity(program.rhs_inputs().len());
+    for (rhs, shape) in program.rhs_inputs() {
+        let level = workload.rhs_level(*rhs).map_err(ApiError::scheme)?.checked_add(1).ok_or_else(
+            || ApiError::scheme(RnsBggError::Parameters("RHS target level overflow")),
+        )?;
+        let ring = parameters.ring(level).map_err(ApiError::scheme)?;
+        let columns = parameters.component_columns(level).map_err(ApiError::scheme)?;
+        let binding = match shape {
+            InputBinding::Scalar(()) => {
+                let port = |port: usize| {
+                    ring.artifact_input(
+                        preprocess.clone(),
+                        name(format!("rhs/{rhs:?}.{port}")),
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    )
+                };
+                InputBinding::Scalar(((port(0), port(1)), (port(2), port(3))))
+            }
+            InputBinding::Family(count) => {
+                let ports = (0..4)
+                    .map(|port| {
+                        ring.family_artifact_input(
+                            preprocess.clone(),
+                            name(format!("rhs/{rhs:?}/family.{port}")),
+                            count.clone(),
+                            (1, columns),
+                            ArtifactAvailability::Transferred,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let first = |port: usize| ports[port].at(Int::constant(0));
+                let element: RnsBggMatrix = ((first(0), first(1)), (first(2), first(3)));
+                let fields =
+                    ports.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
+                InputBinding::Family(
+                    family_of_fields(&element, count.clone(), &fields).map_err(ApiError::scheme)?,
+                )
+            }
+        };
+        bindings.push((*rhs, binding));
+    }
+    Ok(bindings)
 }
 
 impl<R: GraphValue, A: GraphValue, K: GraphValue> GraphValue for RnsBggEncoding<R, A, K> {
@@ -834,88 +917,23 @@ impl EncodingLowering<'_> {
         super::public_key::lut_public_matrix(self.parameters, self.hash_key.clone(), level, sigma)
     }
 
-    fn rhs_compact_matrix_at(
+    fn rhs_decomposition(
         &self,
-        rhs: &RhsRef<Int>,
-        evaluation_level: usize,
-    ) -> Result<RnsBggMatrix, RnsBggError> {
-        let decomposition_level = evaluation_level
-            .checked_add(1)
-            .ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
-        // Preprocess publishes the compact RHS directly at the consumer's
-        // next modulus-chain level.  Online imports that compact C at q_(l+1)
-        // and decomposes it there; only the bounded digits are centered-
-        // extended to the evaluation ring q_l.  Never reduce or extend the
-        // dense compact matrix in the online path.
-        let columns = self.parameters.component_columns(decomposition_level)?;
-        if let Some(index) = rhs.index.clone() {
-            let count = match self.program.rhs_inputs().get(&rhs.id) {
-                Some(InputBinding::Family(count)) => count.clone(),
-                _ => return Err(RnsBggError::Binding("family RHS index")),
-            };
-            let ring = self.parameters.ring(decomposition_level)?;
-            let family = |port: usize| {
-                ring.family_artifact_input(
-                    self.preprocess.clone(),
-                    self.preprocess_artifact_name(format!("rhs/{:?}/family.{port}", rhs.id)),
-                    count.clone(),
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                )
-            };
-            let matrix = (
-                (family(0).at(index.clone()), family(1).at(index.clone())),
-                (family(2).at(index.clone()), family(3).at(index)),
-            );
-            return Ok(matrix);
-        }
-        let ring = self.parameters.ring(decomposition_level)?;
-        let matrix = (
-            (
-                ring.artifact_input(
-                    self.preprocess.clone(),
-                    self.preprocess_artifact_name(format!("rhs/{:?}.0", rhs.id)),
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                ),
-                ring.artifact_input(
-                    self.preprocess.clone(),
-                    self.preprocess_artifact_name(format!("rhs/{:?}.1", rhs.id)),
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                ),
-            ),
-            (
-                ring.artifact_input(
-                    self.preprocess.clone(),
-                    self.preprocess_artifact_name(format!("rhs/{:?}.2", rhs.id)),
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                ),
-                ring.artifact_input(
-                    self.preprocess.clone(),
-                    self.preprocess_artifact_name(format!("rhs/{:?}.3", rhs.id)),
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                ),
-            ),
-        );
-        Ok(matrix)
-    }
-
-    fn rhs_decomposition_at(
-        &self,
-        rhs: &RhsRef<Int>,
+        rhs: &RnsBggMatrix,
         evaluation_level: usize,
     ) -> Result<RnsBggDecomposition, RnsBggError> {
         // Decompose immediately before the RHS action consumes the compact
         // artifact.  The resulting bounded digits are transported to the
         // evaluation ring, but never persisted at the stage boundary.
-        let matrix = self.rhs_compact_matrix_at(rhs, evaluation_level)?;
         let decomposition_level = evaluation_level
             .checked_add(1)
             .ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
-        compact_decompose_matrix(self.parameters, evaluation_level, decomposition_level, matrix)
+        compact_decompose_matrix(
+            self.parameters,
+            evaluation_level,
+            decomposition_level,
+            rhs.clone(),
+        )
     }
 
     /// The imported compact `B_sigma` switching ciphertexts of one LUT, one
@@ -1227,7 +1245,7 @@ impl EncodingLowering<'_> {
 
 impl ExponentLUTProgramLowering for EncodingLowering<'_> {
     type Wire = RnsBggEncoding;
-    type Rhs = RhsRef<Int>;
+    type Rhs = RnsBggMatrix;
     type Error = RnsBggError;
     fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
         if self.workload.level(lhs.wire())? != self.workload.level(rhs.wire())? {
@@ -1345,7 +1363,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             return Err(RnsBggError::Binding("RNS-BGG MulPrivate requires a private input"));
         }
         let evaluation_level = self.workload.level(input.wire())?;
-        let action = self.rhs_decomposition_at(rhs, evaluation_level)?;
+        let action = self.rhs_decomposition(rhs, evaluation_level)?;
         let output = self.site()?.output;
         let target_level = self.workload.level(output)?;
         let target_ring = self.parameters.ring(target_level)?;
@@ -2465,7 +2483,7 @@ pub struct RnsOnlineBuild<'a> {
     evaluator: Option<EncodingLowering<'a>>,
     families: GraphFamilyExecution,
     environment:
-        Environment<RnsBggEncoding, RhsRef<Int>, Family<RnsBggEncoding>, Family<RhsRef<Int>>>,
+        Environment<RnsBggEncoding, RnsBggMatrix, Family<RnsBggEncoding>, Family<RnsBggMatrix>>,
     pending_refresh: Option<(usize, RefreshDeclaration, BTreeMap<usize, RnsOnlineBuild<'a>>)>,
     refreshed_input: Option<(RefreshDeclaration, RnsBggEncoding)>,
     refresh_prf: Option<(usize, crate::program::ExponentLutProgramId, [u8; 32])>,
@@ -2688,46 +2706,29 @@ impl<'a> RnsOnlineBuild<'a> {
                             ArtifactAvailability::Transferred,
                         )
                     });
-                    InputBinding::Family(
-                        mxx_dsl::parallel(count.clone(), |index| {
-                            Ok(RnsBggEncoding::new(
-                                RnsBggPublicKey::new(
-                                    *wire,
-                                    (
-                                        (
-                                            key_parts[0].at(index.clone()),
-                                            key_parts[1].at(index.clone()),
-                                        ),
-                                        (
-                                            key_parts[2].at(index.clone()),
-                                            key_parts[3].at(index.clone()),
-                                        ),
-                                    ),
-                                ),
-                                (rows[0].at(index.clone()), rows[1].at(index.clone())),
-                                payload.as_ref().map(|value| value.at(index)),
-                            ))
-                        })
-                        .map_err(ApiError::scheme)?,
-                    )
+                    InputBinding::Family(encoding_family(
+                        *wire,
+                        &key_parts,
+                        &rows,
+                        payload.as_ref(),
+                        count.clone(),
+                    )?)
                 }
             };
             self.environment
                 .bind_wire(*wire, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
-        for (rhs, input) in prepared.rhs_inputs() {
-            let binding = match input {
-                InputBinding::Scalar(()) => InputBinding::Scalar(RhsRef { id: *rhs, index: None }),
-                InputBinding::Family(count) => InputBinding::Family(
-                    mxx_dsl::parallel(count.clone(), |index| {
-                        Ok(RhsRef { id: *rhs, index: Some(index) })
-                    })
-                    .map_err(ApiError::scheme)?,
-                ),
-            };
+        let commitment = *declaration.commitment();
+        for (rhs, binding) in import_rhs_bindings(
+            self.parameters,
+            prepared,
+            &workload,
+            &preprocess_production,
+            |role| refresh_prf_artifact_name(commitment, slot, &role),
+        )? {
             self.environment
-                .bind_rhs(*rhs, binding)
+                .bind_rhs(rhs, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
         self.evaluator = Some(EncodingLowering {
@@ -3001,24 +3002,17 @@ impl<'a> RnsOnlineBuild<'a> {
                 )),
             )
             .map_err(|error| ApiError::input(error.to_string()))?;
-        for (rhs, rhs_declaration) in program.rhs_inputs() {
-            let binding = match rhs_declaration {
-                InputBinding::Scalar(()) => InputBinding::Scalar(RhsRef { id: *rhs, index: None }),
-                InputBinding::Family(count) => InputBinding::Family(
-                    mxx_dsl::parallel(count.clone(), |index| {
-                        Ok(RhsRef { id: *rhs, index: Some(index) })
-                    })
-                    .map_err(ApiError::scheme)?,
-                ),
-            };
-            environment
-                .bind_rhs(*rhs, binding)
-                .map_err(|error| ApiError::input(error.to_string()))?;
-        }
         let mut sources = descriptor.sources().to_vec();
         sources.sort();
         sources.dedup();
         let preprocess = sources.first().cloned().unwrap_or_else(|| production.clone());
+        for (rhs, binding) in
+            import_rhs_bindings(self.parameters, program, &workload, &preprocess, |role| role)?
+        {
+            environment
+                .bind_rhs(rhs, binding)
+                .map_err(|error| ApiError::input(error.to_string()))?;
+        }
         let encryption = sources.get(1).cloned().unwrap_or_else(|| preprocess.clone());
         let manifests = BTreeMap::from([(production.clone(), artifacts.manifest().clone())]);
         if !manifests.contains_key(&production) {
@@ -3298,9 +3292,9 @@ impl<'a> RnsOnlineBuild<'a> {
             &mut GraphFamilyExecution,
             &mut Environment<
                 RnsBggEncoding,
-                RhsRef<Int>,
+                RnsBggMatrix,
                 Family<RnsBggEncoding>,
-                Family<RhsRef<Int>>,
+                Family<RnsBggMatrix>,
             >,
         ),
         ApiError,
@@ -3607,9 +3601,9 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
             &mut Self::Families,
             &mut Environment<
                 RnsBggEncoding,
-                RhsRef<Int>,
+                RnsBggMatrix,
                 Family<RnsBggEncoding>,
-                Family<RhsRef<Int>>,
+                Family<RnsBggMatrix>,
             >,
         ),
         ApiError,
@@ -3776,49 +3770,29 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
                             ArtifactAvailability::Transferred,
                         )
                     });
-                    let family = mxx_dsl::parallel(count.clone(), |index| {
-                        Ok(RnsBggEncoding::new(
-                            RnsBggPublicKey::new(
-                                *wire,
-                                (
-                                    (
-                                        key_parts[0].at(index.clone()),
-                                        key_parts[1].at(index.clone()),
-                                    ),
-                                    (
-                                        key_parts[2].at(index.clone()),
-                                        key_parts[3].at(index.clone()),
-                                    ),
-                                ),
-                            ),
-                            (rows[0].at(index.clone()), rows[1].at(index.clone())),
-                            payload.as_ref().map(|payload| payload.at(index)),
-                        ))
-                    })
-                    .map_err(ApiError::scheme)?;
-                    InputBinding::Family(family)
+                    InputBinding::Family(encoding_family(
+                        *wire,
+                        &key_parts,
+                        &rows,
+                        payload.as_ref(),
+                        count.clone(),
+                    )?)
                 }
             };
             self.environment
                 .bind_wire(*wire, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
-        for (rhs, declaration) in program.rhs_inputs() {
-            match declaration {
-                InputBinding::Scalar(()) => self
-                    .environment
-                    .bind_rhs(*rhs, InputBinding::Scalar(RhsRef { id: *rhs, index: None }))
-                    .map_err(|error| ApiError::input(error.to_string()))?,
-                InputBinding::Family(count) => {
-                    let family = mxx_dsl::parallel(count.clone(), |index| {
-                        Ok(RhsRef { id: *rhs, index: Some(index) })
-                    })
-                    .map_err(ApiError::scheme)?;
-                    self.environment
-                        .bind_rhs(*rhs, InputBinding::Family(family))
-                        .map_err(|error| ApiError::input(error.to_string()))?;
-                }
-            }
+        for (rhs, binding) in import_rhs_bindings(
+            self.parameters,
+            program,
+            &workload,
+            &preprocess_production,
+            |role| role,
+        )? {
+            self.environment
+                .bind_rhs(rhs, binding)
+                .map_err(|error| ApiError::input(error.to_string()))?;
         }
         self.evaluator = Some(EncodingLowering {
             parameters: self.parameters,
@@ -4487,6 +4461,34 @@ mod test {
             spec_hash: mxx_ir_core::artifact::SpecHash([29; 32]),
             execution_nonce: [31; 32],
         };
+        let compact_type = parameters.ring(1).unwrap().matrix_type((1, compact_columns));
+        let decomposed_type = parameters
+            .ring(0)
+            .unwrap()
+            .matrix_type((parameters.level(1).unwrap().modulus_digits(), compact_columns));
+        let decomposed_bound = IntExpr::RoundDiv(
+            Box::new(IntExpr::constant(
+                BigInt::from(1u8) << parameters.level(1).unwrap().base_bits(),
+            )),
+            Box::new(IntExpr::constant(BigInt::from(2u8))),
+        )
+        .canonicalize();
+        let lowerer = |program: &Arc<ExponentLutProgram>, output| EncodingLowering {
+            parameters: &parameters,
+            hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
+            program: Arc::clone(program),
+            workload: Arc::new(RnsBggDerivedWorkload::from_program(program).unwrap()),
+            preprocess: production.clone(),
+            encryption: production.clone(),
+            manifests: BTreeMap::new(),
+            refresh_prf_namespace: None,
+            current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
+        };
+        let assert_compact = |matrix: &RnsBggMatrix| {
+            for entry in [&matrix.0.0, &matrix.0.1, &matrix.1.0, &matrix.1.1] {
+                assert_eq!(entry.matrix_type(), &compact_type);
+            }
+        };
 
         let mut scalar_builder = crate::program::ExponentLutProgramBuilder::new();
         let scalar_input = scalar_builder.input(AttributeKnowledge::PrivatePayload).unwrap();
@@ -4496,46 +4498,21 @@ mod test {
             .unwrap();
         let scalar_program =
             Arc::new(scalar_builder.finish(vec![Operand::Scalar(scalar_output)]).unwrap());
-        let scalar_workload =
-            Arc::new(RnsBggDerivedWorkload::from_program(&scalar_program).unwrap());
-        let scalar_lowerer = EncodingLowering {
-            parameters: &parameters,
-            hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
-            program: scalar_program,
-            workload: scalar_workload,
-            preprocess: production.clone(),
-            encryption: production.clone(),
-            manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
-            current_site: Some(LoweringSite {
-                output: scalar_output,
-                indices: Vec::new(),
-                ranges: Vec::new(),
-            }),
-        };
-        let compact_ring = parameters.ring(1).unwrap();
-        let compact_type = compact_ring.matrix_type((1, compact_columns));
-        let scalar_compact = scalar_lowerer
-            .rhs_compact_matrix_at(&RhsRef { id: scalar_rhs, index: None::<Int> }, 0)
-            .unwrap();
-        for entry in
-            [&scalar_compact.0.0, &scalar_compact.0.1, &scalar_compact.1.0, &scalar_compact.1.1]
-        {
-            assert_eq!(entry.matrix_type(), &compact_type);
-        }
-        let scalar_action = scalar_lowerer
-            .rhs_decomposition_at(&RhsRef { id: scalar_rhs, index: None::<Int> }, 0)
-            .unwrap();
-        let source_ring = parameters.ring(0).unwrap();
-        let decomposed_type = source_ring
-            .matrix_type((parameters.level(1).unwrap().modulus_digits(), compact_columns));
-        let decomposed_bound = IntExpr::RoundDiv(
-            Box::new(IntExpr::constant(
-                BigInt::from(1u8) << parameters.level(1).unwrap().base_bits(),
-            )),
-            Box::new(IntExpr::constant(BigInt::from(2u8))),
+        let scalar_lowerer = lowerer(&scalar_program, scalar_output);
+        let bindings = import_rhs_bindings(
+            &parameters,
+            &scalar_program,
+            &scalar_lowerer.workload,
+            &production,
+            |role| role,
         )
-        .canonicalize();
+        .unwrap();
+        let [(id, InputBinding::Scalar(scalar_compact))] = bindings.as_slice() else {
+            panic!("one scalar RHS binding expected");
+        };
+        assert_eq!(*id, scalar_rhs);
+        assert_compact(scalar_compact);
+        let scalar_action = scalar_lowerer.rhs_decomposition(scalar_compact, 0).unwrap();
         assert_eq!(scalar_action.0.0.matrix_type(), &decomposed_type);
         assert_eq!(scalar_action.0.0.max_coefficient_bound(), &decomposed_bound);
         let scalar_name = format!("rhs/{scalar_rhs:?}");
@@ -4565,42 +4542,32 @@ mod test {
         let family_output = family_builder.sum(family_products).unwrap();
         let family_program =
             Arc::new(family_builder.finish(vec![Operand::Scalar(family_output)]).unwrap());
-        let family_workload =
-            Arc::new(RnsBggDerivedWorkload::from_program(&family_program).unwrap());
-        let family_lowerer = EncodingLowering {
-            parameters: &parameters,
-            hash_key: parameters.ring(0).unwrap().bytes_input(super::HASH_KEY_INPUT, 32),
-            program: family_program,
-            workload: family_workload,
-            preprocess: production.clone(),
-            encryption: production.clone(),
-            manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
-            current_site: Some(LoweringSite {
-                output: family_output,
-                indices: vec![IntExpr::constant(1)],
-                ranges: vec![crate::program::FamilyRange::full(IntExpr::constant(2)).unwrap()],
-            }),
+        let family_lowerer = lowerer(&family_program, family_output);
+        let bindings = import_rhs_bindings(
+            &parameters,
+            &family_program,
+            &family_lowerer.workload,
+            &production,
+            |role| role,
+        )
+        .unwrap();
+        let [(id, InputBinding::Family(family))] = bindings.as_slice() else {
+            panic!("one family RHS binding expected");
         };
-        let family_compact = family_lowerer
-            .rhs_compact_matrix_at(&RhsRef { id: family_rhs, index: Some(Int::constant(1)) }, 0)
-            .unwrap();
-        for entry in
-            [&family_compact.0.0, &family_compact.0.1, &family_compact.1.0, &family_compact.1.1]
-        {
-            assert_eq!(entry.matrix_type(), &compact_type);
-        }
-        let family_action = family_lowerer
-            .rhs_decomposition_at(&RhsRef { id: family_rhs, index: Some(Int::constant(1)) }, 0)
-            .unwrap();
+        assert_eq!(*id, family_rhs);
+        // The family is the imported port families themselves: no loop reads them.
+        assert!(family.flatten().iter().all(|value| matches!(
+            value.node().kind(),
+            mxx_ir_core::node::NodeKind::Input { artifact: Some(_), .. }
+        )));
+        let member = family.at(Int::constant(1));
+        assert_compact(&member);
+        let family_action = family_lowerer.rhs_decomposition(&member, 0).unwrap();
         assert_eq!(family_action.0.0.matrix_type(), &decomposed_type);
         assert_eq!(family_action.0.0.max_coefficient_bound(), &decomposed_bound);
         let family_name = format!("rhs/{family_rhs:?}/family");
         let family_members = mxx_dsl::parallel(IntExpr::constant(2), |index| {
-            let member = family_lowerer
-                .rhs_decomposition_at(&RhsRef { id: family_rhs, index: Some(index) }, 0)
-                .map_err(|_| DslError::Schema)?;
-            Ok(member)
+            family_lowerer.rhs_decomposition(&family.at(index), 0).map_err(|_| DslError::Schema)
         })
         .unwrap();
         let family_graph = DslContext::new("rhs-family-consumer-schema")

@@ -52,6 +52,26 @@ impl<S: mxx_dsl::GraphValueSchema> mxx_dsl::GraphValueSchema for RhsRef<S> {
     }
 }
 
+/// A family of composite elements assembled directly from the family of
+/// each field. `fields` lists those families' values in the order in which
+/// [`mxx_dsl::GraphValue::flatten`] lists the fields of one element, and
+/// `element` is any element of the family's schema, used only for that
+/// schema (for example one built from each field family's first member).
+///
+/// Building an input family this way, instead of in a loop that reads each
+/// field family's member, keeps the field families at the scope where they
+/// were made: a stage binds its imported families before lowering, and a
+/// loop body that reads a member then captures the family instead of
+/// importing it.
+pub fn family_of_fields<T: mxx_dsl::GraphValue>(
+    element: &T,
+    count: IntExpr,
+    fields: &[ValueHandle],
+) -> Result<mxx_dsl::Family<T>, mxx_dsl::DslError> {
+    let schema = mxx_dsl::FamilyType { element: element.schema(), count };
+    <mxx_dsl::Family<T> as mxx_dsl::GraphValue>::from_values(&schema, fields)
+}
+
 /// Graph-valued execution adapter shared by all graph lowerers.
 /// Graph-valued family execution used by the built-in scheme adapters.
 pub struct GraphFamilyExecution;
@@ -147,13 +167,23 @@ where
                 reason: "cannot reduce an empty family".into(),
             });
         }
-        let initial = family.at(mxx_dsl::Int::constant(0));
+        let first = family.at(mxx_dsl::Int::constant(0));
+        if count.evaluate(&mxx_ir_core::ParamEnv::default()).is_ok_and(|count| count == 1.into()) {
+            return Ok(first);
+        }
+        // A sum is labelled with the reduction's output wire, which a family
+        // member is not. Add the first two members before the loop so that
+        // every loop state carries that label and the state schema is the
+        // same in each iteration.
+        let initial = evaluator
+            .add(&first, &family.at(mxx_dsl::Int::constant(1)))
+            .map_err(ProgramLowerError::Backend)?;
         let mut failure = None;
-        let result = mxx_dsl::iterate(count - 1usize, initial, |index, state| {
+        let result = mxx_dsl::iterate(count - 2usize, initial, |index, state| {
             if failure.is_some() {
                 return Err(mxx_dsl::DslError::Schema);
             }
-            let rhs = family.at(index.add(1usize));
+            let rhs = family.at(index.add(2usize));
             match evaluator.add(&state, &rhs) {
                 Ok(value) => Ok(value),
                 Err(error) => {

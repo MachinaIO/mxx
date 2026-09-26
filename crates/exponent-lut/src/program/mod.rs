@@ -25,7 +25,7 @@ use thiserror::Error;
 
 pub use builder::ExponentLutProgramBuilder;
 pub(crate) use graph::GraphParallelLowering;
-pub use graph::{GraphFamilyExecution, RhsRef};
+pub use graph::{GraphFamilyExecution, RhsRef, family_of_fields};
 pub(crate) use lowering::lower_program;
 pub use lowering::{
     Environment, FamilyExecution, LoweringSite, ProgramLowerError, ProgramLoweringContext,

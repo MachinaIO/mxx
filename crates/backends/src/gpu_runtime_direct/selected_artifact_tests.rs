@@ -27,6 +27,135 @@ use num_bigint::BigInt;
 use num_traits::Zero;
 use std::{collections::BTreeMap, sync::Arc};
 
+/// A parallel body input that lacks the artifact descriptor of the root
+/// family broadcast to it would need that family whole, which is never
+/// loaded: planning returns an error instead of reading a missing value.
+#[test]
+#[serial_test::serial]
+fn parallel_body_reading_an_unloaded_root_family_is_a_planning_error() {
+    use mxx_ir_core::{
+        graph::{SubgraphHandle, with_new_construction_scope},
+        node::{LoopInputMode, ParallelLoop},
+    };
+    let cpu_params = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let gpu_params = GpuDCRTPolyParams::new(
+        cpu_params.ring_dimension(),
+        cpu_params.moduli().to_vec(),
+        cpu_params.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        cpu_params.moduli().iter().copied().map(Into::into).collect(),
+        cpu_params.ring_dimension(),
+    );
+    let producer_ring = ring.clone();
+    let producer = DslContext::new("unloaded-root-family-producer")
+        .cached_output(
+            "members",
+            parallel(3, move |index| Ok(producer_ring.polynomial([index.expression()? + 11])))
+                .unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .unwrap();
+    let mut store = MemoryArtifactStore::default();
+    let production = execute_in_session(
+        &producer,
+        &mut cpu_backend([cpu_params]),
+        BTreeMap::new(),
+        &mut store,
+        [0x53; 32],
+        ExecutionConfig::default(),
+    )
+    .unwrap()
+    .production_id
+    .expect("producer identity");
+    let manifest = store.load_finalized_manifest(&production).unwrap();
+
+    let family = ring.family_artifact_input(
+        production.clone(),
+        "members",
+        3,
+        (1, 1),
+        ArtifactAvailability::Cached,
+    );
+    let [family] = <[_; 1]>::try_from(mxx_dsl::GraphValue::flatten(&family)).unwrap();
+    let family_type = family.wire_type().clone();
+    let WireType::IndexedFamily { element, .. } = &family_type else {
+        panic!("an artifact family input is an indexed family")
+    };
+    let member_type = element.as_ref().clone();
+    // The body reads the broadcast family through an input without the
+    // family's artifact descriptor.
+    let body = with_new_construction_scope(|scope| {
+        let input = NodeHandle::new(
+            NodeKind::Input {
+                name: "members".into(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![family_type.clone()],
+        )
+        .output(0)
+        .unwrap();
+        let member = NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: IntExpr::constant(0) },
+            vec![input.clone()],
+            vec![member_type.clone()],
+        )
+        .output(0)
+        .unwrap();
+        SubgraphHandle::new("unloaded-root-family-body", scope, vec![input], vec![member]).unwrap()
+    });
+    let lanes = NodeHandle::parallel_loop(
+        body,
+        vec![family],
+        vec![WireType::IndexedFamily {
+            element: Box::new(member_type),
+            count: IntExpr::constant(2),
+        }],
+        ParallelLoop {
+            count: IntExpr::constant(2),
+            minimum_count: 0,
+            index_slot: 0,
+            bindings: vec![],
+            input_modes: vec![LoopInputMode::Broadcast],
+        },
+    );
+    let graph = Graph::freeze(
+        "unloaded-root-family-consumer",
+        vec![],
+        BTreeMap::from([(
+            "lanes".into(),
+            GraphOutput { value: lanes.output(0).unwrap(), availability: None },
+        )]),
+        vec![],
+        vec![],
+        BTreeMap::new(),
+    )
+    .unwrap()
+    .0;
+    let consumer = mxx_ir_core::validate_with_manifests(
+        &graph,
+        &ParamEnv::default(),
+        &BTreeMap::from([(production, manifest)]),
+        crate::openfhe_guard::gen_modulus_and_warmup,
+    )
+    .unwrap();
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+    let error = match runtime.plan(consumer, &BTreeMap::new()) {
+        Ok(_) => panic!("reading an unloaded root family must not plan"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("uses a root artifact family other than by reading its members"),
+        "{error}"
+    );
+}
+
 #[test]
 #[serial_test::serial]
 fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {

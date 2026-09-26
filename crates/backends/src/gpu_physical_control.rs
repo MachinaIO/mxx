@@ -7107,6 +7107,11 @@ fn lower_vectorized_parallel_loop(
     Ok(())
 }
 
+/// The argument position of a root artifact family that a parallel loop
+/// broadcasts without loading it: the body's family reads import the members
+/// they reach. It never names a physical value.
+const UNLOADED_FAMILY: PhysicalValueId = PhysicalValueId(u32::MAX);
+
 fn lower_parallel_loop(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -7354,7 +7359,7 @@ fn lower_parallel_loop(
                             Some(ConcreteWireType::IndexedFamily { .. })
                         );
                     if unloaded_family {
-                        input_ids.push(PhysicalValueId(u32::MAX));
+                        input_ids.push(UNLOADED_FAMILY);
                         continue;
                     }
                     let source = source
@@ -7921,7 +7926,7 @@ fn lower_inlined_child(
                     NodeKind::ParallelLoop(_) => input_overrides
                         .and_then(|ids| ids.get(position))
                         .copied()
-                        .filter(|id| id.0 != u32::MAX),
+                        .filter(|id| *id != UNLOADED_FAMILY),
                     _ => None,
                 };
                 if let Some(id) = already_imported {
@@ -7981,6 +7986,13 @@ fn lower_inlined_child(
                     .get(argument)
                     .ok_or_else(|| "GPU subgraph argument has no physical value".to_owned())?,
             };
+            // Only a body input that carries the family's artifact descriptor
+            // reads its members; any other use would need the whole family.
+            if id == UNLOADED_FAMILY {
+                return Err("GPU parallel body uses a root artifact family other than by reading \
+                            its members"
+                    .into());
+            }
             // A broadcast family may have as many members as there are lanes.
             // An enclosing template's loop index is a device Int even where
             // the child, concretized for one lane, declares it constant.

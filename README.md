@@ -137,8 +137,7 @@ secret key. The integration test `crates/fhe/tests/gpu_tfhe.rs` is a TFHE round 
 GPU with the standard TFHE Boolean profile (`utils::tfhe_params`): it
 generates keys, encrypts bits, evaluates the NAND truth table and chained
 bootstrapped gates, and decrypts every result, with keys kept resident
-between plans. The BGV design and
-formulas are documented in `docs/plans/fhe.md`.
+between plans.
 
 ```sh
 cargo test -r -p mxx-fhe --lib

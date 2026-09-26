@@ -1315,7 +1315,7 @@ caller's responsibility.
 Execution follows the general pattern: build with `DslContext`, validate with the backend CRT
 resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV and TFHE) with the
 backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactStore`.
-`docs/plans/fhe.md` records the formulas and design, and `README.md` summarizes the FHE API.
+`README.md` summarizes the FHE API.
 
 ### 7.4 `mxx-we`: Diamond witness encryption
 
@@ -1407,6 +1407,6 @@ The description below is kept for that work.
 | `GPU.md` | GPU dataflow, synchronization, memory complexity, and GPU validation requirements. |
 | `README.md` | Project overview, FHE API summary, and requirements (OpenFHE, OpenMP, CUDA). |
 | `docs/correctness/` | Correctness specifications, for example `docs/correctness/operational-protocol-inventory.md`. |
-| `docs/plans/` | Design plans and progress records, for example `docs/plans/fhe.md`. Plans are historical context and may be ahead of or behind the code. |
+| `docs/plans/` | Local design plans and progress records; ignored by git and not part of the repository. |
 | `crates/ir-core/lean/README.md`, `crates/we/lean/README.md` | Lean packages and fixture workflows. |
 | `references/` | Read-only specifications and papers. |

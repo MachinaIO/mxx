@@ -5,7 +5,6 @@
 use bigdecimal::BigDecimal;
 use mxx_backends::{
     GpuRuntime,
-    artifact::FileArtifactStore,
     backend::poly_gpu::{GpuDcrtBackend, gpu_backend_on},
     poly::{
         Poly, PolyParams,
@@ -111,11 +110,20 @@ fn profile_and_program(
     // Every output evaluates the same public vector `a` under its own sparse
     // key of weight h, placed by its own PBC layout with h' = h + 3 blocks.
     let parameters = PbcParameters::paper_evaluation(lwr_dimension, support_weight);
+    // The keys are sampled from `MXX_EXPONENT_LUT_LWR_PRF_KEY_SEED`, or from a
+    // fresh seed that is reported, so that any run can be repeated.
+    let key_seed = match env::var("MXX_EXPONENT_LUT_LWR_PRF_KEY_SEED") {
+        Ok(value) => value.parse::<u64>().expect("MXX_EXPONENT_LUT_LWR_PRF_KEY_SEED must be a u64"),
+        Err(_) => rand::random(),
+    };
+    eprintln!("Sparse-LWR key seed: MXX_EXPONENT_LUT_LWR_PRF_KEY_SEED={key_seed}");
+    let mut key_rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(key_seed);
     let keys = (0..output_count)
         .map(|_| {
-            let support = rand::seq::index::sample(&mut rand::rng(), lwr_dimension, support_weight)
-                .into_vec();
-            generate_key_layout(&parameters, PbcRootSeed(rand::random()), &support)
+            let support =
+                rand::seq::index::sample(&mut key_rng, lwr_dimension, support_weight).into_vec();
+            let root = rand::Rng::random(&mut key_rng);
+            generate_key_layout(&parameters, PbcRootSeed(root), &support)
                 .expect("PBC layout for the sparse LWR key")
         })
         .collect::<Vec<_>>();
@@ -369,8 +377,8 @@ fn fixture(
     program: SparseLwrPrfProgram,
     keys: Vec<PbcGeneratedKeyLayout>,
     trace: RnsBggNoiseTrace,
-    runtime: &mut GpuRuntime,
-    store: &mut FileArtifactStore,
+    runtime: &mut impl api::StageExecution<api::StageStore>,
+    store: &mut api::StageStore,
 ) -> Fixture {
     // The secrets are sampled on the stage runtime and stay resident there.
     let payload = RnsEncryptBuild::new(&parameters, [7; 32])
@@ -463,6 +471,20 @@ fn lwr_oracle(
     if z < half { (false, readout[z]) } else { (true, readout[z - half]) }
 }
 
+/// Stage storage selected by `MXX_EXPONENT_LUT_LWR_PRF_STORAGE`: `device`,
+/// `host`, `file` (the default, in `directory`), or `file:<directory>`.
+fn lwr_prf_storage(directory: &std::path::Path) -> api::StageStorage {
+    match env::var("MXX_EXPONENT_LUT_LWR_PRF_STORAGE").as_deref() {
+        Err(_) | Ok("file") => api::StageStorage::File(directory.into()),
+        Ok("device") => api::StageStorage::Device,
+        Ok("host") => api::StageStorage::Host,
+        Ok(value) => match value.strip_prefix("file:") {
+            Some(directory) => api::StageStorage::File(directory.into()),
+            None => panic!("unknown Sparse-LWR stage storage {value}"),
+        },
+    }
+}
+
 #[test]
 #[sequential(dcrt_runtime)]
 fn lwr_prf_end_to_end() {
@@ -488,21 +510,46 @@ fn lwr_prf_end_to_end() {
         return;
     }
     let (parameters, poly_parameters, profile, program, keys, trace) = search_fixture(&sigma);
-    let mut runtime =
-        GpuRuntime::new(gpu_backend(&parameters, devices.clone())).expect("GPU runtime");
     let directory = tempfile::tempdir().expect("artifact directory");
-    let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
-    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, keys, a_exponents } =
-        fixture(
+    let store = lwr_prf_storage(directory.path()).open().expect("stage storage");
+    // `MXX_EXPONENT_LUT_LWR_PRF_EXECUTOR=cpu` runs the same stages on the CPU
+    // executor, a reference for isolating a GPU runtime fault.
+    if env::var("MXX_EXPONENT_LUT_LWR_PRF_EXECUTOR").is_ok_and(|value| value == "cpu") {
+        let mut execution = mxx_backends::authority::CpuExecution::new(
+            mxx_backends::backend::poly::cpu_backend(parameters.levels().iter().cloned()),
+        );
+        round_trip(
             parameters,
             poly_parameters,
             profile,
             program,
             keys,
             trace,
-            &mut runtime,
-            &mut store,
+            &mut execution,
+            store,
         );
+    } else {
+        let mut runtime =
+            GpuRuntime::new(gpu_backend(&parameters, devices.clone())).expect("GPU runtime");
+        round_trip(parameters, poly_parameters, profile, program, keys, trace, &mut runtime, store);
+    }
+}
+
+/// Preprocess, encrypt, and evaluate online on `runtime`, then verify every
+/// output against the clear PRF.
+#[allow(clippy::too_many_arguments)]
+fn round_trip(
+    parameters: RnsBggParameters,
+    poly_parameters: DCRTPolyParams,
+    profile: SparseLwrPrfProfile,
+    program: SparseLwrPrfProgram,
+    keys: Vec<PbcGeneratedKeyLayout>,
+    trace: RnsBggNoiseTrace,
+    runtime: &mut impl api::StageExecution<api::StageStore>,
+    mut store: api::StageStore,
+) {
+    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, keys, a_exponents } =
+        fixture(parameters, poly_parameters, profile, program, keys, trace, runtime, &mut store);
     assert!(!trace.wires.is_empty(), "noise simulation must visit the PRF gates");
     let observed = RefCell::new(Vec::<&'static str>::new());
     let observe = |name: &'static str| observed.borrow_mut().push(name);
@@ -517,7 +564,7 @@ fn lwr_prf_end_to_end() {
         &payload,
         HASH_KEY,
         RnsPreprocessBuild::new(&parameters, [7; 32]),
-        &mut runtime,
+        runtime,
         &mut store,
         |_, outputs| Ok(outputs),
         |_| {
@@ -535,7 +582,7 @@ fn lwr_prf_end_to_end() {
         &mask,
         HASH_KEY,
         RnsEncryptBuild::new(&parameters, [7; 32]),
-        &mut runtime,
+        runtime,
         &mut store,
         |_| Ok(()),
         |_| {
@@ -551,7 +598,7 @@ fn lwr_prf_end_to_end() {
         &encrypted,
         HASH_KEY,
         RnsOnlineBuild::new(&parameters, [7; 32]),
-        &mut runtime,
+        runtime,
         &mut store,
         |_, outputs| Ok(outputs),
         |_| {
@@ -570,17 +617,19 @@ fn lwr_prf_end_to_end() {
         "observers must see the exact three production graphs"
     );
     // Compute every output's expected readout independently from `a` and
-    // its key. The coefficient polynomial is built in the source ring with
-    // the exact signed readout in every coefficient; it is not decoded from
-    // the returned carrier.
+    // its key. The coefficient LUT returns the signed readout as the
+    // constant polynomial, so the expected plaintext is built in the source
+    // ring with the readout in coefficient 0 only; it is not decoded from the
+    // returned carrier. The terminal scale is floor(q / 2), so verification
+    // decides the readout modulo 2: only a key whose readout is odd tells a
+    // correct output from a zero one.
     let source_parameters = parameters.level(0).expect("LWR source parameters").clone();
     for (output, key) in keys.iter().enumerate() {
         let (negative, readout) = lwr_oracle(&profile, key, &a_exponents);
         let readout = u32::try_from(readout).expect("canonical readout fits DCRT coefficient");
-        let expected = DCRTPoly::from_u32s(
-            &source_parameters,
-            &vec![readout; source_parameters.ring_dimension() as usize],
-        );
+        let mut coefficients = vec![0; source_parameters.ring_dimension() as usize];
+        coefficients[0] = readout;
+        let expected = DCRTPoly::from_u32s(&source_parameters, &coefficients);
         let expected = if negative { -expected } else { expected };
         verify_output(
             program.program(),
@@ -590,7 +639,7 @@ fn lwr_prf_end_to_end() {
             &parameters,
             &payload,
             &mask,
-            &mut runtime,
+            runtime,
             &mut store,
         )
         .expect("LWR application verification");

@@ -203,4 +203,32 @@ fn test_gpu_tfhe_round_trip() {
     let mean_ms =
         gates.iter().map(|(_, milliseconds)| milliseconds).sum::<f64>() / gates.len() as f64;
     println!("TFHE_TIMING_SUMMARY stage=nand samples={} mean_ms={mean_ms:.3}", gates.len());
+
+    // Repeat one gate on the same plan, whose Graph has launched before, on
+    // fresh encryptions made outside the timer, and log its mean time. The
+    // first repetition is discarded as a warmup.
+    let repeats = 3;
+    let mut repeated = Vec::new();
+    for repetition in 0..=repeats {
+        if repetition == 1 {
+            repeated.clear();
+        }
+        let (left_bit, right_bit) = (rand::rng().random::<bool>(), rand::rng().random::<bool>());
+        let left = encrypt(&mut runtime, left_bit, &mut Vec::new());
+        let right = encrypt(&mut runtime, right_bit, &mut Vec::new());
+        let started = Instant::now();
+        let output = runtime.execute(&mut nand_plan, gate_inputs(left, right)).unwrap();
+        record_timing("repeat_nand", started, &mut repeated);
+        let decrypted =
+            runtime.execute(&mut decryption_plan, decryption_inputs(output["ct"].clone())).unwrap();
+        assert_eq!(
+            runtime.download_integer_family(&decrypted["bit"]).unwrap(),
+            vec![BigInt::from(u8::from(!(left_bit && right_bit)))],
+            "repeated NAND({left_bit}, {right_bit})"
+        );
+    }
+    let mean_ms = repeated.iter().map(|(_, ms)| ms).sum::<f64>() / repeats as f64;
+    println!(
+        "TFHE_TIMING_SUMMARY stage=eval warmups=1 repeats={repeats} nand_mean_ms={mean_ms:.3}"
+    );
 }

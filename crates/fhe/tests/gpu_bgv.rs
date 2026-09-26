@@ -215,4 +215,47 @@ fn test_gpu_bgv_round_trip() {
     assert_eq!(runtime.download_integer_family(&decrypted["slots"]).unwrap(), expected);
     let total_ms = timings.iter().map(|(_, milliseconds)| milliseconds).sum::<f64>();
     println!("BGV_TIMING_SUMMARY total_execute_ms={total_ms:.3} stages={}", timings.len());
+
+    // Repeat the evaluation on the same plans, whose Graphs have launched
+    // before, and log the mean time of each stage. The first repetition
+    // follows the decryption and download, so it is discarded as a warmup.
+    let repeats = 3;
+    let mut repeated = Vec::new();
+    for repetition in 0..=repeats {
+        if repetition == 1 {
+            repeated.clear();
+        }
+        let multiply_inputs = BTreeMap::from([
+            ("lhs".into(), encrypted_lhs["lhs"].clone()),
+            ("rhs".into(), encrypted_rhs["rhs"].clone()),
+        ]);
+        let started = Instant::now();
+        let multiplied = runtime.execute(&mut multiply_plan, multiply_inputs).unwrap();
+        record_timing("repeat_multiply", started, &mut repeated);
+        let relinearize_inputs = BTreeMap::from([
+            ("quadratic".into(), multiplied["quadratic"].clone()),
+            ("rk".into(), keys["rk"].clone()),
+        ]);
+        let started = Instant::now();
+        let relinearized_outputs =
+            runtime.execute(&mut relinearize_plan, relinearize_inputs).unwrap();
+        record_timing("repeat_relinearize", started, &mut repeated);
+        let modswitch_inputs =
+            BTreeMap::from([("relinearized".into(), relinearized_outputs["relinearized"].clone())]);
+        let started = Instant::now();
+        runtime.execute(&mut modswitch_plan, modswitch_inputs).unwrap();
+        record_timing("repeat_modswitch", started, &mut repeated);
+    }
+    let mean = |stage: &str| {
+        repeated.iter().filter(|(name, _)| name == stage).map(|(_, ms)| ms).sum::<f64>() /
+            repeats as f64
+    };
+    let (multiply, relinearize, modswitch) =
+        (mean("repeat_multiply"), mean("repeat_relinearize"), mean("repeat_modswitch"));
+    println!(
+        "BGV_TIMING_SUMMARY stage=eval warmups=1 repeats={repeats} multiply_mean_ms={multiply:.3} \
+         relinearize_mean_ms={relinearize:.3} modswitch_mean_ms={modswitch:.3} \
+         total_mean_ms={:.3}",
+        multiply + relinearize + modswitch
+    );
 }

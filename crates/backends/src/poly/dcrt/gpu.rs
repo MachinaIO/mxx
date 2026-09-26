@@ -1424,6 +1424,16 @@ unsafe extern "C" {
         binding: u32,
     ) -> c_int;
     fn mxx_set_device(logical: c_int) -> c_int;
+    fn mxx_gpu_graph_builder_add_device_copy(
+        builder: *mut MxxGpuGraphBuilderOpaque,
+        destination: *mut c_void,
+        destination_device: c_int,
+        source: *const c_void,
+        source_device: c_int,
+        bytes: usize,
+        patches: *const MxxGraphPatchRaw,
+        patch_count: usize,
+    ) -> c_int;
     fn mxx_gpu_graph_builder_add_memcpy(
         builder: *mut MxxGpuGraphBuilderOpaque,
         destination: *mut c_void,
@@ -2219,7 +2229,7 @@ impl GpuPreimageAttempt {
     ) -> Result<Self, GpuNativeGraphError> {
         let stream = params.native_launch_stream(physical_device)?;
         let buffer = GpuDeviceBuffer::allocate(&stream, mem::size_of::<u64>())?;
-        buffer.upload(0, &[0u8; 8])?;
+        buffer.upload_initial(0, &[0u8; 8])?;
         Ok(Self { buffer, physical_device })
     }
 
@@ -2261,7 +2271,7 @@ impl GpuPreimageStatus {
     ) -> Result<Self, GpuNativeGraphError> {
         let stream = params.native_launch_stream(physical_device)?;
         let buffer = GpuDeviceBuffer::allocate(&stream, mem::size_of::<PreimageStatus>())?;
-        buffer.upload(0, &[0u8; 16])?;
+        buffer.upload_initial(0, &[0u8; 16])?;
         Ok(Self { buffer, physical_device })
     }
 
@@ -2310,11 +2320,14 @@ impl GpuExportStatus {
     ) -> Result<Self, GpuNativeGraphError> {
         let stream = params.native_launch_stream(physical_device)?;
         let buffer = GpuDeviceBuffer::allocate(&stream, 4)?;
-        buffer.upload(0, &[0u8; 4])?;
+        buffer.upload_initial(0, &[0u8; 4])?;
         Ok(Self { buffer, physical_device })
     }
     pub fn reset(&self) -> Result<(), GpuNativeGraphError> {
         self.buffer.upload(0, &[0u8; 4])
+    }
+    pub fn wait_until_ready(&self) -> Result<(), GpuNativeGraphError> {
+        self.buffer.wait_until_ready()
     }
     pub fn read(&self) -> Result<u32, GpuNativeGraphError> {
         let mut bytes = [0u8; 4];
@@ -5815,6 +5828,7 @@ impl GpuSignedValues {
             GpuSignedValuesEncoding::CanonicalU64,
         )?;
         out.upload_u64(values)?;
+        out.buffer.wait_until_ready()?;
         Ok(out)
     }
 
@@ -5845,6 +5859,7 @@ impl GpuSignedValues {
             GpuSignedValuesEncoding::SignedWords(words),
         )?;
         output.upload_bigints(values)?;
+        output.buffer.wait_until_ready()?;
         Ok(output)
     }
 
@@ -5945,11 +5960,26 @@ impl GpuDeviceBuffer {
                 last_error_string()
             )));
         }
-        Ok(Self {
+        let buffer = Self {
             owner: NonNull::new(raw).expect("device allocation returned null"),
             bytes,
             stream: stream.clone(),
-        })
+        };
+        // Graphs read the buffer from other streams without waiting for this
+        // stream-ordered allocation, so it completes before it is returned.
+        buffer.wait_until_ready()?;
+        Ok(buffer)
+    }
+
+    /// Write the buffer's first contents, complete before any Graph on
+    /// another stream reads them.
+    pub(crate) fn upload_initial(
+        &self,
+        offset: usize,
+        source: &[u8],
+    ) -> Result<(), GpuNativeGraphError> {
+        self.upload(offset, source)?;
+        self.wait_until_ready()
     }
 
     pub(crate) fn as_ptr(&self) -> *mut c_void {
@@ -6071,7 +6101,9 @@ impl GpuNativeGraphBuilder {
         &self.stream
     }
 
-    fn select_device(&self) -> Result<(), GpuNativeGraphError> {
+    /// Make the device of the launch stream current: kernel and memory
+    /// nodes run on the device that is current when they are added.
+    pub(crate) fn select_device(&self) -> Result<(), GpuNativeGraphError> {
         if unsafe { mxx_set_device(self.stream.physical_device) } != 0 {
             return Err(GpuNativeGraphError::Native("cannot select the graph device".into()));
         }
@@ -6222,6 +6254,38 @@ impl GpuNativeGraphBuilder {
                 source as *const c_void,
                 bytes,
                 copy_kind,
+                patches.as_ptr(),
+                patches.len(),
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Copy `bytes` between resident allocations on `source_device` and
+    /// `destination_device` (logical devices). Between GPUs without peer
+    /// access the copy is staged through pinned host memory
+    /// (`mxx_gpu_graph_builder_add_device_copy`).
+    pub fn add_device_copy(
+        &mut self,
+        destination: u64,
+        destination_device: i32,
+        source: u64,
+        source_device: i32,
+        bytes: usize,
+        patches: &[GpuGraphPatch],
+    ) -> Result<(), GpuNativeGraphError> {
+        let patches = patches.iter().copied().map(GpuGraphPatch::raw).collect::<Vec<_>>();
+        let status = unsafe {
+            mxx_gpu_graph_builder_add_device_copy(
+                self.raw,
+                destination as *mut c_void,
+                destination_device,
+                source as *const c_void,
+                source_device,
+                bytes,
                 patches.as_ptr(),
                 patches.len(),
             )

@@ -530,6 +530,17 @@ int mxx_gpu_graph_builder_add_kernel(MxxGpuGraphBuilder *builder, const void *fu
     uint32_t block_x, uint32_t block_y, uint32_t block_z,
     size_t shared_bytes, const void *const *arguments, const size_t *argument_sizes,
     size_t argument_count, const MxxGraphPatch *patches, size_t patch_count);
+// Copy between resident allocations of two (logical) devices. The copy is
+// one node when both are on one physical GPU or the destination GPU can
+// access the source GPU's memory; otherwise it is staged through a pinned
+// host buffer the executable owns, as a device-to-host and a host-to-device
+// node. Each node is created and updated with the GPU of the memory it
+// touches current, which pool and graph allocations require.
+// MXX_GPU_HOST_STAGED_COPIES=1 stages every copy between distinct logical
+// devices (a diagnostic for GPUs without peer access).
+int mxx_gpu_graph_builder_add_device_copy(MxxGpuGraphBuilder *builder,
+    void *destination, int destination_device, const void *source, int source_device,
+    size_t bytes, const MxxGraphPatch *patches, size_t patch_count);
 int mxx_gpu_graph_builder_add_memcpy(MxxGpuGraphBuilder *builder,
     void *destination, const void *source, size_t bytes, int copy_kind,
     const MxxGraphPatch *patches, size_t patch_count);

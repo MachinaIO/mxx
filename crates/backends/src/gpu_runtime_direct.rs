@@ -1088,6 +1088,7 @@ fn emit_direct_operations(
     let products = fusions.values().map(|fusion| fusion.product).collect::<BTreeSet<_>>();
     for (index, operation) in operations.iter().enumerate() {
         let token = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
+        builder.select_device()?;
         if products.contains(&index) {
             // The product runs inside its consumer; its operation is an
             // empty node that passes its predecessors on.
@@ -1300,6 +1301,8 @@ fn emit_direct_operation(
                 .map(|stream| builder.replace_launch_stream(stream))
         })
         .transpose()?;
+    // An earlier operation may have left another device current.
+    builder.select_device()?;
     let emitted = match implementation.primitive {
         GpuNativePrimitive::BranchIf => {
             let [KernelArg::Value(predicate), KernelArg::U32(part), KernelArg::U32(binding)] =

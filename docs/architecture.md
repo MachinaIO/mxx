@@ -785,7 +785,11 @@ for example `0,0`; unset or empty means one logical device per detected GPU, and
 panics; see section 6.4), `MXX_GPU_MEMORY_FRACTION` (`gpu_memory_fraction`: the fraction of each
 device's memory that one plan's persistent allocations may use, default 0.8, values outside
 `(0, 1]` are errors), and `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` (`gpu_small_rhs_chunk_columns`: the
-right-operand columns the fused small-RHS multiplication transforms per chunk, default 16). The CUDA
+right-operand columns the fused small-RHS multiplication transforms per chunk, default 16).
+A copy between two physical GPUs without peer access is staged through a pinned host buffer
+(a device-to-host and a host-to-device graph node); `MXX_GPU_HOST_STAGED_COPIES=1` stages every
+copy between distinct logical devices, which lets `MXX_GPU_LOGICAL_DEVICES=0,0` test that path
+on one GPU. The CUDA
 library reads `MXX_GPU_NTT_RADIX` once per process in
 `crates/backends/cuda/src/matrix/MatrixNTT.cu`: the butterfly radix of the register-blocked
 NTT, a power of two from 2 to 32 (default 4). Each thread holds that many coefficients and runs

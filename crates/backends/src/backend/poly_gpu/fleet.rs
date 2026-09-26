@@ -10,15 +10,14 @@ use crate::{
         PolyParams,
         dcrt::{
             gpu::{
-                CUDA_MEMCPY_DEFAULT, GpuDCRTPolyParams, GpuExportSlot, GpuGraphPatch,
-                GpuHashSamplePlan, GpuIndexedMatrixTable, GpuIntegerOperation,
-                GpuModulusConversionPlan, GpuNativeEvent, GpuNativeGraphBuilder,
-                GpuNativeGraphError, GpuNativeLaunchStream, GpuRawControlStatusView,
-                GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb, GpuRawMatrixView,
-                GpuRawP1Bindings, GpuRawP1Workspace, GpuRawPreimageCutoffBindings,
-                GpuRawPreimageCutoffPlan, GpuRawSeedView, GpuRawSmallMatrixView,
-                GpuSignedValuesEncoding, gpu_device_identity, gpu_device_memory_usage,
-                gpu_device_sync,
+                GpuDCRTPolyParams, GpuExportSlot, GpuGraphPatch, GpuHashSamplePlan,
+                GpuIndexedMatrixTable, GpuIntegerOperation, GpuModulusConversionPlan,
+                GpuNativeEvent, GpuNativeGraphBuilder, GpuNativeGraphError, GpuNativeLaunchStream,
+                GpuRawControlStatusView, GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb,
+                GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
+                GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
+                GpuRawSmallMatrixView, GpuSignedValuesEncoding, gpu_device_identity,
+                gpu_device_memory_usage, gpu_device_sync,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
             params::DCRTPolyParams,
@@ -1798,11 +1797,12 @@ pub(crate) fn emit_compiled_gpu_op(
                 .map_err(|_| invalid("compiled copy length exceeds usize"))?;
             builder.bind_resident_address(source, bytes, *source_binding)?;
             builder.bind_resident_address(destination, bytes, *destination_binding)?;
-            builder.add_memcpy(
+            builder.add_device_copy(
                 destination,
+                destination_device,
                 source,
+                source_device,
                 bytes,
-                if source_device == destination_device { 3 } else { CUDA_MEMCPY_DEFAULT },
                 &[
                     GpuGraphPatch::memcpy_source(*source_binding),
                     GpuGraphPatch::memcpy_destination(*destination_binding),

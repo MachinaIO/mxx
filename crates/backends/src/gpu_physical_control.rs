@@ -218,14 +218,22 @@ fn selected_import_capacity(
 
 impl ControlReset {
     /// The caller must first join the previous GPU launch and its I/O writes.
+    /// Graphs read these words from other streams without waiting, so the
+    /// uploads complete before this returns.
     pub(super) fn reset_for_replay(&self) -> Result<(), String> {
         match self {
             Self::Loop { index, limit, status, count } => {
                 index.upload_u64(&[0]).map_err(|error| error.to_string())?;
                 limit.upload_u64(&[*count]).map_err(|error| error.to_string())?;
-                status.reset().map_err(|error| error.to_string())
+                status.reset().map_err(|error| error.to_string())?;
+                index.wait_until_ready().map_err(|error| error.to_string())?;
+                limit.wait_until_ready().map_err(|error| error.to_string())?;
+                status.wait_until_ready().map_err(|error| error.to_string())
             }
-            Self::IntegerStatus(status) => status.reset().map_err(|error| error.to_string()),
+            Self::IntegerStatus(status) => status
+                .reset()
+                .and_then(|()| status.wait_until_ready())
+                .map_err(|error| error.to_string()),
         }
     }
 

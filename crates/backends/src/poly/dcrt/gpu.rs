@@ -315,6 +315,34 @@ impl GpuGraphBindingValue {
     }
 }
 
+/// The elements of a four-dimensional view in two byte-strided layouts,
+/// matching the native `MxxStridedCopy`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuStridedCopy {
+    pub extent: [u64; 4],
+    pub source_stride: [u64; 4],
+    pub destination_stride: [u64; 4],
+    pub element_bytes: u32,
+}
+
+impl GpuStridedCopy {
+    fn span(extent: &[u64; 4], stride: &[u64; 4], element_bytes: u32) -> u64 {
+        extent.iter().zip(stride).map(|(extent, stride)| (extent - 1) * stride).sum::<u64>() +
+            u64::from(element_bytes)
+    }
+
+    /// Bytes from the first to the past-the-last source element.
+    pub fn source_span(&self) -> u64 {
+        Self::span(&self.extent, &self.source_stride, self.element_bytes)
+    }
+
+    /// Bytes from the first to the past-the-last destination element.
+    pub fn destination_span(&self) -> u64 {
+        Self::span(&self.extent, &self.destination_stride, self.element_bytes)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MxxGraphPatchRaw {
@@ -712,6 +740,31 @@ unsafe extern "C" {
         payload_capacity: usize,
         out_host: *mut *mut c_void,
         out_device: *mut *mut c_void,
+    ) -> c_int;
+    fn gpu_export_slot_alloc_device(
+        physical_device: c_int,
+        payload_capacity: usize,
+        out_host: *mut *mut c_void,
+        out_device_header: *mut *mut c_void,
+        out_device_payload: *mut *mut c_void,
+    ) -> c_int;
+    fn gpu_device_memory_alloc(
+        physical_device: c_int,
+        bytes: usize,
+        out: *mut *mut c_void,
+    ) -> c_int;
+    fn gpu_device_memory_free(physical_device: c_int, address: *mut c_void) -> c_int;
+    fn gpu_device_memory_copy(
+        destination_device: c_int,
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+    ) -> c_int;
+    fn gpu_device_memory_download(
+        physical_device: c_int,
+        source: *const c_void,
+        destination: *mut c_void,
+        bytes: usize,
     ) -> c_int;
     fn gpu_export_slot_ready(host_header: *const c_void, out_ready: *mut c_int) -> c_int;
     fn gpu_export_slot_reset(host_header: *mut c_void) -> c_int;
@@ -1348,6 +1401,20 @@ unsafe extern "C" {
         binding: u32,
     ) -> c_int;
     fn mxx_set_device(logical: c_int) -> c_int;
+    fn mxx_gpu_graph_builder_add_strided_copy(
+        builder: *mut MxxGpuGraphBuilderOpaque,
+        destination: *mut c_void,
+        source: *const c_void,
+        copy: GpuStridedCopy,
+        patches: *const MxxGraphPatchRaw,
+        patch_count: usize,
+    ) -> c_int;
+    fn gpu_device_strided_copy(
+        device: c_int,
+        destination: *mut c_void,
+        source: *const c_void,
+        copy: GpuStridedCopy,
+    ) -> c_int;
     fn mxx_gpu_graph_builder_add_memcpy(
         builder: *mut MxxGpuGraphBuilderOpaque,
         destination: *mut c_void,
@@ -1762,8 +1829,153 @@ const _: () = {
 pub struct GpuExportSlot {
     host: NonNull<u8>,
     device: NonNull<u8>,
+    /// The payload in device memory instead of after the mapped header.
+    device_payload: Option<NonNull<u8>>,
     physical_device: i32,
     payload_capacity: usize,
+}
+
+/// A persistent device allocation holding an artifact kept in GPU memory.
+pub struct GpuDeviceMemory {
+    address: NonNull<c_void>,
+    physical_device: i32,
+    bytes: usize,
+}
+
+unsafe impl Send for GpuDeviceMemory {}
+unsafe impl Sync for GpuDeviceMemory {}
+
+impl GpuDeviceMemory {
+    pub fn allocate(physical_device: i32, bytes: usize) -> Result<Self, GpuNativeGraphError> {
+        let mut raw = ptr::null_mut();
+        if unsafe { gpu_device_memory_alloc(physical_device, bytes.max(1), &mut raw) } != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        let address = NonNull::new(raw)
+            .ok_or_else(|| GpuNativeGraphError::Native("null device allocation".into()))?;
+        Ok(Self { address, physical_device, bytes })
+    }
+
+    pub fn physical_device(&self) -> i32 {
+        self.physical_device
+    }
+
+    pub fn address(&self) -> u64 {
+        self.address.as_ptr() as u64
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    fn checked_address(&self, offset: usize, bytes: usize) -> Result<u64, GpuNativeGraphError> {
+        if offset.checked_add(bytes).is_none_or(|end| end > self.bytes) {
+            return Err(GpuNativeGraphError::Native("device memory range is out of bounds".into()));
+        }
+        Ok(self.address.as_ptr() as u64 + offset as u64)
+    }
+
+    /// Copy `bytes` from the device address `source` into this allocation.
+    pub fn copy_from_device(
+        &self,
+        offset: usize,
+        source: u64,
+        bytes: usize,
+    ) -> Result<(), GpuNativeGraphError> {
+        let destination = self.checked_address(offset, bytes)?;
+        copy_device_memory(self.physical_device, destination, source, bytes)
+    }
+
+    /// Copy `bytes` of this allocation into the device address `destination`
+    /// on `destination_device`.
+    pub fn copy_to_device(
+        &self,
+        offset: usize,
+        destination_device: i32,
+        destination: u64,
+        bytes: usize,
+    ) -> Result<(), GpuNativeGraphError> {
+        let source = self.checked_address(offset, bytes)?;
+        copy_device_memory(destination_device, destination, source, bytes)
+    }
+
+    pub fn download(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> Result<(), GpuNativeGraphError> {
+        let source = self.checked_address(offset, destination.len())?;
+        download_device_memory(self.physical_device, source, destination)
+    }
+}
+
+impl Drop for GpuDeviceMemory {
+    fn drop(&mut self) {
+        unsafe { gpu_device_memory_free(self.physical_device, self.address.as_ptr()) };
+    }
+}
+
+/// Read `destination.len()` bytes at the device address `source`.
+pub fn download_device_memory(
+    physical_device: i32,
+    source: u64,
+    destination: &mut [u8],
+) -> Result<(), GpuNativeGraphError> {
+    let status = unsafe {
+        gpu_device_memory_download(
+            physical_device,
+            source as *const c_void,
+            destination.as_mut_ptr().cast(),
+            destination.len(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuNativeGraphError::Native(last_error_string()));
+    }
+    Ok(())
+}
+
+/// Copy the elements of a strided view between device addresses on `device`,
+/// returning after the copy completes.
+pub fn strided_copy_on_device(
+    device: i32,
+    destination: u64,
+    source: u64,
+    copy: GpuStridedCopy,
+) -> Result<(), GpuNativeGraphError> {
+    let status = unsafe {
+        gpu_device_strided_copy(device, destination as *mut c_void, source as *const c_void, copy)
+    };
+    if status != 0 {
+        return Err(GpuNativeGraphError::Native(last_error_string()));
+    }
+    Ok(())
+}
+
+/// Copy between device addresses, possibly on different GPUs, returning
+/// after the copy completes.
+pub fn copy_device_memory(
+    destination_device: i32,
+    destination: u64,
+    source: u64,
+    bytes: usize,
+) -> Result<(), GpuNativeGraphError> {
+    let status = unsafe {
+        gpu_device_memory_copy(
+            destination_device,
+            destination as *mut c_void,
+            source as *const c_void,
+            bytes,
+        )
+    };
+    if status != 0 {
+        return Err(GpuNativeGraphError::Native(last_error_string()));
+    }
+    Ok(())
 }
 
 /// Device-resident 32-byte RNG seed used by compiled sampler kernels.
@@ -2381,7 +2593,13 @@ unsafe impl Sync for GpuExportSlot {}
 
 pub struct GpuReadyExportSlot<'a> {
     pub header: GpuExportSlotHeader,
-    pub payload: &'a [u8],
+    pub payload: GpuExportPayload<'a>,
+}
+
+/// A published export payload: host-mapped bytes, or a device range.
+pub enum GpuExportPayload<'a> {
+    Host(&'a [u8]),
+    Device { physical_device: i32, address: u64, bytes: usize },
 }
 
 impl GpuExportSlot {
@@ -2400,15 +2618,59 @@ impl GpuExportSlot {
             unsafe { gpu_pinned_free(host.as_ptr()) };
             return Err(GpuNativeGraphError::Native("null export slot device mapping".into()));
         };
-        Ok(Self { host, device, physical_device, payload_capacity })
+        Ok(Self { host, device, device_payload: None, physical_device, payload_capacity })
+    }
+
+    /// A slot whose payload stays in device memory, for a store that keeps
+    /// artifacts on the GPU.
+    pub fn new_on_device(
+        physical_device: i32,
+        payload_capacity: usize,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let (mut host, mut device, mut payload) =
+            (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            gpu_export_slot_alloc_device(
+                physical_device,
+                payload_capacity,
+                &mut host,
+                &mut device,
+                &mut payload,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        let host = NonNull::new(host.cast::<u8>())
+            .ok_or_else(|| GpuNativeGraphError::Native("null export slot host mapping".into()))?;
+        let device_payload = NonNull::new(payload.cast::<u8>());
+        let (Some(device), true) =
+            (NonNull::new(device.cast::<u8>()), device_payload.is_some() || payload_capacity == 0)
+        else {
+            unsafe { gpu_pinned_free(host.as_ptr()) };
+            return Err(GpuNativeGraphError::Native("null device export slot mapping".into()));
+        };
+        Ok(Self { host, device, device_payload, physical_device, payload_capacity })
     }
 
     pub fn device_header_address(&self) -> u64 {
         self.device.as_ptr() as u64
     }
 
+    /// Bytes addressable from the header: the payload follows it only when
+    /// it is host-mapped.
+    pub fn header_span(&self) -> usize {
+        mem::size_of::<GpuExportSlotHeader>() +
+            if self.device_payload.is_some() { 0 } else { self.payload_capacity }
+    }
+
     pub fn device_payload_address(&self) -> u64 {
-        unsafe { self.device.as_ptr().add(mem::size_of::<GpuExportSlotHeader>()) as u64 }
+        match self.device_payload {
+            Some(payload) => payload.as_ptr() as u64,
+            None => unsafe {
+                self.device.as_ptr().add(mem::size_of::<GpuExportSlotHeader>()) as u64
+            },
+        }
     }
 
     pub fn payload_capacity(&self) -> usize {
@@ -2444,11 +2706,18 @@ impl GpuExportSlot {
                 "invalid published export slot metadata".into(),
             ));
         }
-        let payload = unsafe {
-            slice::from_raw_parts(
-                self.host.as_ptr().add(mem::size_of::<GpuExportSlotHeader>()),
-                payload_bytes,
-            )
+        let payload = match self.device_payload {
+            Some(payload) => GpuExportPayload::Device {
+                physical_device: self.physical_device,
+                address: payload.as_ptr() as u64,
+                bytes: payload_bytes,
+            },
+            None => GpuExportPayload::Host(unsafe {
+                slice::from_raw_parts(
+                    self.host.as_ptr().add(mem::size_of::<GpuExportSlotHeader>()),
+                    payload_bytes,
+                )
+            }),
         };
         Ok(Some(GpuReadyExportSlot { header, payload }))
     }
@@ -2457,6 +2726,9 @@ impl GpuExportSlot {
 impl Drop for GpuExportSlot {
     fn drop(&mut self) {
         unsafe { gpu_pinned_free(self.host.as_ptr()) };
+        if let Some(payload) = self.device_payload {
+            unsafe { gpu_device_memory_free(self.physical_device, payload.as_ptr().cast()) };
+        }
     }
 }
 
@@ -6021,10 +6293,14 @@ impl GpuNativeGraphBuilder {
         &mut self,
         slot: &GpuExportSlot,
         source_address: u64,
+        copy: GpuStridedCopy,
         bytes: usize,
         source_binding: u32,
         slot_binding: u32,
     ) -> Result<(), GpuNativeGraphError> {
+        if copy.destination_span() != bytes as u64 {
+            return Err(GpuNativeGraphError::Native("export copy is not dense".into()));
+        }
         if slot.physical_device != self.stream.physical_device {
             return Err(GpuNativeGraphError::Native("export slot belongs to another GPU".into()));
         }
@@ -6036,16 +6312,24 @@ impl GpuNativeGraphBuilder {
             slot.payload_capacity(),
             self.global_binding(slot_binding),
         )?;
-        self.add_memcpy(
-            slot.device_payload_address(),
-            source_address,
-            bytes,
-            CUDA_MEMCPY_DEFAULT,
-            &[
-                GpuGraphPatch::memcpy_source(source_binding),
-                GpuGraphPatch::memcpy_destination(slot_binding),
-            ],
-        )
+        let patches = [
+            GpuGraphPatch::memcpy_source(source_binding).raw(),
+            GpuGraphPatch::memcpy_destination(slot_binding).raw(),
+        ];
+        let status = unsafe {
+            mxx_gpu_graph_builder_add_strided_copy(
+                self.raw,
+                slot.device_payload_address() as *mut c_void,
+                source_address as *const c_void,
+                copy,
+                patches.as_ptr(),
+                patches.len(),
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
     }
 
     pub fn add_memset(
@@ -6091,7 +6375,7 @@ impl GpuNativeGraphBuilder {
         }
         self.bind_resident_address(
             slot.device_header_address(),
-            mem::size_of::<GpuExportSlotHeader>() + slot.payload_capacity(),
+            slot.header_span(),
             self.global_binding(header_binding),
         )?;
         let status = unsafe {

@@ -42,11 +42,12 @@ pub(crate) fn stage_canonical_resident_input(
     }
     let physical: Arc<PhysicalValue> = Arc::clone(resident.physical());
     let selected = (0..physical.parts.len()).collect::<Vec<_>>();
-    let export = PhysicalExport::from_parts(physical, &selected)?;
+    let export = PhysicalExport::from_parts_spans(physical, &selected)?;
     let mut raw = tempfile::tempfile().map_err(|error| error.to_string())?;
     raw.set_len(export.raw_total_bytes).map_err(|error| error.to_string())?;
     let mut buffer = vec![0u8; COPY_CHUNK_BYTES];
-    for (part, fragment) in resident.physical().parts.iter().zip(export.fragments.iter()) {
+    for fragment in export.fragments.iter() {
+        let part = &resident.physical().parts[fragment.part as usize];
         let storage = resident
             .storage(part.storage)
             .ok_or("resident input has no planned storage binding")?;

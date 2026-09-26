@@ -811,6 +811,50 @@ impl GpuDCRTPolyMatrix {
         Ok(())
     }
 
+    /// Overwrite this already allocated owner with residues laid out as
+    /// `[poly][limb][coefficient]`, preserving every physical address bound
+    /// into a compiled graph. The residues keep their representation.
+    ///
+    /// # Safety
+    /// The same contract as [`Self::load_compact_bytes_in_place_after_completion`].
+    pub unsafe fn load_rns_words_in_place_after_completion(
+        &self,
+        residues: &[u64],
+    ) -> Result<(), GpuNativeGraphError> {
+        let poly_words = (self.level + 1) * self.params.ring_dimension() as usize;
+        if residues.len() != self.nrow * self.ncol * poly_words {
+            return Err(GpuNativeGraphError::Native("RNS import length mismatch".into()));
+        }
+        if residues.is_empty() {
+            return Ok(());
+        }
+        if unsafe { gpu_matrix_wait(self.raw) } != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_load_rns_batch(
+                self.raw,
+                residues.as_ptr().cast(),
+                poly_words * std::mem::size_of::<u64>(),
+                &mut events as *mut *mut GpuEventSetOpaque,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        if !events.is_null() {
+            let wait_status = unsafe { gpu_event_set_wait(events) };
+            unsafe { gpu_event_set_destroy(events) };
+            if wait_status != 0 {
+                return Err(
+                    GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Upload row-major polynomials of `(level + 1) * n` little-endian `u64`
     /// residues each, exactly as they will be interpreted by the plan.
     pub(crate) fn load_rns_bytes(&mut self, bytes: &[u8], bytes_per_poly: usize) {

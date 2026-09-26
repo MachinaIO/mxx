@@ -2,16 +2,96 @@
 
 use crate::{
     artifact::ArtifactPayload,
-    backend::{poly::decode_small_matrix_artifact, poly_gpu::GpuDcrtBackend},
+    backend::{
+        GpuResidentValue,
+        poly::decode_small_matrix_artifact,
+        poly_gpu::{GpuDcrtBackend, PhysicalExport, strided_copy},
+    },
+    device_artifact::DeviceArtifact,
+    gpu_execution_plan::PhysicalValueId,
     gpu_io_worker::{FrameGeneration, IoCompletion},
     gpu_physical_lowering::{ImportDestination, ImportTemplate},
     gpu_runtime_io::{ProducerIoPump, RuntimeIoOperation},
-    poly::{PolyParams, dcrt::gpu::GpuSignedValuesEncoding},
+    poly::{
+        PolyParams,
+        dcrt::gpu::{GpuDeviceMemory, GpuSignedValuesEncoding, strided_copy_on_device},
+    },
 };
 use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use std::error::Error;
+use std::{collections::BTreeMap, error::Error, sync::Arc};
+
+/// Copy an artifact held in GPU memory into `destination` when both describe
+/// the same elements. The artifact holds each part densely; each part is
+/// scattered into the destination's strides. Returns false, copying nothing,
+/// when the two differ.
+fn copy_device_artifact(
+    artifact: &DeviceArtifact,
+    destination: &GpuResidentValue,
+) -> Result<bool, String> {
+    let physical = destination.physical();
+    let selected = (0..physical.parts.len()).collect::<Vec<_>>();
+    let layout = PhysicalExport::from_parts(Arc::clone(physical), &selected)?;
+    let source = &artifact.export;
+    if source.public.is_some() ||
+        source.physical.ty != physical.ty ||
+        source.physical.encodings != physical.encodings ||
+        source.fragments != layout.fragments
+    {
+        return Ok(false);
+    }
+    let mut staged = None;
+    for fragment in &layout.fragments {
+        let part = &physical.parts[fragment.part as usize];
+        let storage = destination
+            .storage(part.storage)
+            .ok_or("device artifact destination has no bound storage")?;
+        let copy = strided_copy(
+            &part.view.extent,
+            &part.view.byte_strides,
+            part.view.element_bytes,
+            Some(&part.view.byte_strides),
+        )
+        .map_err(|error| error.to_string())?;
+        if storage.device != part.device ||
+            part.view
+                .byte_offset
+                .checked_add(copy.destination_span())
+                .is_none_or(|end| end > storage.bytes)
+        {
+            return Err("device artifact fragment exceeds its destination".into());
+        }
+        // A kernel on the destination GPU reads the dense part; an artifact on
+        // another GPU is first copied there.
+        let source_address = if artifact.memory.physical_device() == storage.device {
+            artifact.memory.address() + fragment.raw_offset
+        } else {
+            let bytes = usize::try_from(fragment.raw_bytes)
+                .map_err(|_| "device artifact fragment exceeds usize")?;
+            let local = GpuDeviceMemory::allocate(storage.device, bytes)
+                .map_err(|error| error.to_string())?;
+            artifact
+                .memory
+                .copy_to_device(
+                    fragment.raw_offset as usize,
+                    storage.device,
+                    local.address(),
+                    bytes,
+                )
+                .map_err(|error| error.to_string())?;
+            staged.insert(local).address()
+        };
+        strided_copy_on_device(
+            storage.device,
+            storage.address + part.view.byte_offset,
+            source_address,
+            copy,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(true)
+}
 
 fn trapdoor_secret_parts(bytes: &[u8]) -> Result<[&[u8]; 6], String> {
     let mut parts = [&[][..]; 6];
@@ -76,7 +156,7 @@ unsafe fn upload_selected_payload(
         ) if expected == ty => {
             // SAFETY: the caller's joined-region and exclusive-plan contract
             // applies to this plan-owned matrix destination.
-            unsafe { backend.upload_physical_matrix_import_after_completion(owner, ty, &bytes) }?;
+            unsafe { backend.upload_eval_matrix_import_after_completion(owner, ty, &bytes) }?;
             owner.wait_until_ready();
             Ok(())
         }
@@ -186,7 +266,7 @@ unsafe fn upload_selected_payload(
             }
             // SAFETY: all seven matrices are plan-owned and prior uses have joined.
             unsafe {
-                backend.upload_physical_matrix_import_after_completion(
+                backend.upload_eval_matrix_import_after_completion(
                     &public.0,
                     &public.1,
                     &public_bytes,
@@ -220,6 +300,7 @@ pub(crate) unsafe fn load_import_template<E: Error + Send + Sync + 'static>(
     frame: FrameGeneration,
     operation: u32,
     template: &ImportTemplate,
+    owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
 ) -> Result<(), String> {
     if operation != template.before_operation {
         return Err("artifact import is not at its planned first consumer".into());
@@ -239,8 +320,33 @@ pub(crate) unsafe fn load_import_template<E: Error + Send + Sync + 'static>(
     )
     .map_err(|error| error.to_string())?;
     let reply = pump.done(frame, operation).map_err(|error| error.to_string())?;
-    let IoCompletion::Imported { frame: completed_frame, payload } = reply.completion else {
-        return Err("artifact import returned a different I/O completion".into());
+    let (completed_frame, payload) = match reply.completion {
+        IoCompletion::Imported { frame, payload } => (frame, payload.into_payload()),
+        IoCompletion::ImportedDevice { frame: completed_frame, artifact } => {
+            if completed_frame != frame {
+                return Err("artifact import returned a stale frame completion".into());
+            }
+            // A trapdoor import fills seven owners; only single-owner
+            // destinations take the device copy.
+            let destination = match template.upload_owner {
+                ImportDestination::Trapdoor { .. } => None,
+                _ => owners.get(&template.destination),
+            };
+            // SAFETY: as for the upload below, no GPU or I/O operation uses
+            // the destination while it is overwritten.
+            if let Some(destination) = destination &&
+                copy_device_artifact(&artifact, destination)?
+            {
+                return Ok(());
+            }
+            tracing::debug!(
+                target: "mxx_backends::gpu_execute",
+                artifact = %template.key.name,
+                "device artifact layout differs from its import; transcoding on the host"
+            );
+            (completed_frame, artifact.host_payload()?)
+        }
+        _ => return Err("artifact import returned a different I/O completion".into()),
     };
     if completed_frame != frame {
         return Err("artifact import returned a stale frame completion".into());
@@ -248,5 +354,5 @@ pub(crate) unsafe fn load_import_template<E: Error + Send + Sync + 'static>(
     // SAFETY: the runtime calls this function only after the previous Graph
     // region and every earlier I/O reader have completed. A plan executes at
     // most once at a time, so this owner has no concurrent GPU or I/O users.
-    unsafe { upload_selected_payload(backend, template, payload.into_payload()) }
+    unsafe { upload_selected_payload(backend, template, payload) }
 }

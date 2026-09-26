@@ -13,17 +13,222 @@ use crate::{
     },
 };
 use mxx_backends::{
-    ExecutionConfig, ExecutionError, RuntimeValue, SessionAliasDescriptor, SessionStore,
-    authority::CpuExecution, execute_in_session, matrix::dcrt_poly::DCRTPolyMatrix, poly::Poly,
+    ArtifactHandle, ArtifactKey, ArtifactPayload, ArtifactStore, ExecutionConfig, ExecutionError,
+    FileArtifactError, FileArtifactStore, MemoryArtifactStore, RuntimeValue,
+    SessionAliasDescriptor, SessionDescriptor, SessionStatus, SessionStore,
+    artifact::{MemoryArtifactError, ReadSeek},
+    authority::CpuExecution,
+    execute_in_session,
+    matrix::dcrt_poly::DCRTPolyMatrix,
+    poly::Poly,
+    transcript::{DrawSite, RecordedValue},
 };
 use mxx_dsl::BuiltGraph;
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
-    artifact::{Manifest, ProductionId},
+    artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId},
     encoding::spec_hash,
 };
-use std::{collections::BTreeMap, error::Error};
+use std::{collections::BTreeMap, error::Error, io::Write, path::PathBuf};
 use thiserror::Error as ThisError;
+
+/// Where stages keep the artifacts they hand to later stages.
+#[derive(Clone, Debug)]
+pub enum StageStorage {
+    /// GPU memory: a GPU stage exports matrix artifacts without leaving the
+    /// device and the next GPU stage imports them by a device copy. Other
+    /// artifacts, and host readers, use host memory.
+    #[cfg(feature = "gpu")]
+    Device,
+    /// Host memory.
+    Host,
+    /// Files under this directory.
+    File(PathBuf),
+}
+
+impl StageStorage {
+    pub fn open(&self) -> Result<StageStore, ApiError> {
+        Ok(match self {
+            #[cfg(feature = "gpu")]
+            Self::Device => StageStore::Memory(MemoryArtifactStore::on_device()),
+            Self::Host => StageStore::Memory(MemoryArtifactStore::default()),
+            Self::File(root) => {
+                StageStore::File(FileArtifactStore::new(root).map_err(|error| {
+                    ApiError::Runtime(ExecutionError::Artifact(error.to_string()))
+                })?)
+            }
+        })
+    }
+}
+
+/// The session store a [`StageStorage`] opens.
+pub enum StageStore {
+    Memory(MemoryArtifactStore),
+    File(FileArtifactStore),
+}
+
+#[derive(Debug, ThisError)]
+pub enum StageStoreError {
+    #[error(transparent)]
+    Memory(MemoryArtifactError),
+    #[error(transparent)]
+    File(FileArtifactError),
+}
+
+macro_rules! delegate_store {
+    ($self:ident, $store:ident => $call:expr) => {
+        match $self {
+            StageStore::Memory($store) => $call.map_err(StageStoreError::Memory),
+            StageStore::File($store) => $call.map_err(StageStoreError::File),
+        }
+    };
+}
+
+impl ArtifactStore for StageStore {
+    type Error = StageStoreError;
+
+    fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
+        delegate_store!(self, store => store.load_manifest(production))
+    }
+
+    fn load(
+        &mut self,
+        key: &ArtifactKey,
+        descriptor: &ManifestArtifact,
+    ) -> Result<ArtifactPayload, Self::Error> {
+        delegate_store!(self, store => store.load(key, descriptor))
+    }
+
+    fn load_payload_size(
+        &mut self,
+        key: &ArtifactKey,
+        descriptor: &ManifestArtifact,
+    ) -> Result<usize, Self::Error> {
+        delegate_store!(self, store => store.load_payload_size(key, descriptor))
+    }
+
+    fn store(
+        &mut self,
+        key: ArtifactKey,
+        artifact_type: &ArtifactType,
+        availability: ArtifactAvailability,
+        layout: Option<&str>,
+        payload: ArtifactPayload,
+    ) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.store(key, artifact_type, availability, layout, payload))
+    }
+
+    fn stage_raw_chunk(
+        &mut self,
+        key: ArtifactKey,
+        total_raw_bytes: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<bool, Self::Error> {
+        delegate_store!(self, store => store.stage_raw_chunk(key, total_raw_bytes, offset, bytes))
+    }
+
+    fn transcode_staged(
+        &mut self,
+        key: ArtifactKey,
+        artifact_type: &ArtifactType,
+        availability: ArtifactAvailability,
+        layout: Option<&str>,
+        payload_kind: u8,
+        encode: &mut dyn FnMut(&mut dyn ReadSeek, &mut dyn Write) -> Result<(), String>,
+    ) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.transcode_staged(
+            key,
+            artifact_type,
+            availability,
+            layout,
+            payload_kind,
+            encode,
+        ))
+    }
+
+    fn load_staged(
+        &mut self,
+        key: &ArtifactKey,
+        descriptor: &ManifestArtifact,
+    ) -> Result<ArtifactPayload, Self::Error> {
+        delegate_store!(self, store => store.load_staged(key, descriptor))
+    }
+
+    fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.remove_staged(key))
+    }
+
+    fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.store_manifest(manifest))
+    }
+
+    #[cfg(feature = "gpu")]
+    fn device_artifacts(&mut self) -> Option<&mut mxx_backends::device_artifact::DeviceArtifacts> {
+        match self {
+            StageStore::Memory(store) => store.device_artifacts(),
+            StageStore::File(store) => store.device_artifacts(),
+        }
+    }
+}
+
+impl SessionStore for StageStore {
+    fn resolve_session_nonce(
+        &mut self,
+        descriptor: &SessionAliasDescriptor,
+    ) -> Result<[u8; 32], Self::Error> {
+        delegate_store!(self, store => store.resolve_session_nonce(descriptor))
+    }
+
+    fn open_session(
+        &mut self,
+        descriptor: &SessionDescriptor,
+    ) -> Result<SessionStatus, Self::Error> {
+        delegate_store!(self, store => store.open_session(descriptor))
+    }
+
+    fn release_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.release_session(production))
+    }
+
+    fn transcript_entry(
+        &mut self,
+        production: &ProductionId,
+        site: &DrawSite,
+    ) -> Result<Option<RecordedValue>, Self::Error> {
+        delegate_store!(self, store => store.transcript_entry(production, site))
+    }
+
+    fn record_transcript_batch(
+        &mut self,
+        production: &ProductionId,
+        entries: &[(DrawSite, RecordedValue)],
+    ) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.record_transcript_batch(production, entries))
+    }
+
+    fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.commit_artifact(handle))
+    }
+
+    fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.finalize_session(manifest))
+    }
+
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error> {
+        delegate_store!(self, store => store.load_finalized_manifest(production))
+    }
+
+    fn load_finalized_named_manifest(
+        &mut self,
+        expected: &SessionAliasDescriptor,
+    ) -> Result<Manifest, Self::Error> {
+        delegate_store!(self, store => store.load_finalized_named_manifest(expected))
+    }
+}
 
 /// Errors raised while composing the common refresh declaration with a
 /// concrete stage refresh implementation.
@@ -419,11 +624,20 @@ where
     E: StageExecution<S>,
     S: SessionStore,
 {
+    let started = std::time::Instant::now();
     let validated = validate_stage(&graph, parameters)?;
     before_execute(&validated)?;
     let (execution_nonce, session) = fresh_execution_session(&validated, store, identity)?;
+    let validated_at = std::time::Instant::now();
     let production = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    let produced_at = std::time::Instant::now();
     let manifest = finalized_manifest(store, &session, &production)?;
+    tracing::info!(
+        validate_ms = (validated_at - started).as_millis() as u64,
+        produce_ms = (produced_at - validated_at).as_millis() as u64,
+        manifest_ms = produced_at.elapsed().as_millis() as u64,
+        "artifact stage timing"
+    );
     Ok(StageArtifacts::new(production, manifest, descriptor, session))
 }
 
@@ -604,15 +818,19 @@ where
     P: Poly,
     T: PreprocessBuild<P>,
 {
+    let started = std::time::Instant::now();
     validate_hash_key(hash_key)?;
     build.bind_inputs(program, parameters, rhs, payload, hash_key)?;
     let (encryption_identity, _) = build.artifact_identities();
+    let bound_at = std::time::Instant::now();
     let outputs = {
         let (evaluator, families, environment) = build.lowering_state()?;
         lower_program(program, evaluator, families, environment).map_err(ApiError::lowering)?
     };
     let outputs = compose(&mut build, outputs)?;
+    let lowered_at = std::time::Instant::now();
     let (graph, (encrypt_descriptor, online_descriptor)) = build.build_graph(outputs)?;
+    let built_at = std::time::Instant::now();
 
     // Validate and execute once. Both stage records share the same finalized
     // production and manifest.
@@ -623,10 +841,21 @@ where
         store,
         domain_identity(encryption_identity, b"preprocess"),
     )?;
+    let validated_at = std::time::Instant::now();
     let production = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    let produced_at = std::time::Instant::now();
     let (encrypt_descriptor, online_descriptor) =
         T::finalize_descriptors(&production, (encrypt_descriptor, online_descriptor))?;
     let manifest = finalized_manifest(store, &session, &production)?;
+    tracing::info!(
+        bind_ms = (bound_at - started).as_millis() as u64,
+        lower_ms = (lowered_at - bound_at).as_millis() as u64,
+        build_graph_ms = (built_at - lowered_at).as_millis() as u64,
+        validate_ms = (validated_at - built_at).as_millis() as u64,
+        produce_ms = (produced_at - validated_at).as_millis() as u64,
+        finalize_ms = produced_at.elapsed().as_millis() as u64,
+        "preprocess stage timing"
+    );
     let encrypt_stage = StageArtifacts::new(
         production.clone(),
         manifest.clone(),

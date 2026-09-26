@@ -2,7 +2,11 @@ use crate::{
     element::PolyElem,
     matrix::{
         CompactMatrixDecodeError, CpuSmallMatrix, MatrixElem, MatrixParams, PolyMatrix,
-        PolyMatrixSmallRhs, SmallMatrixError, cpp_matrix::CppMatrix,
+        PolyMatrixSmallRhs, SmallMatrixError,
+        cpp_matrix::CppMatrix,
+        eval_artifact::{
+            EvalMatrixError, EvalMatrixHeader, decode_eval_matrix, encode_eval_matrix,
+        },
     },
     parallel_iter,
     poly::{
@@ -713,6 +717,80 @@ impl PolyMatrixSmallRhs for DCRTPolyMatrix {
 }
 
 impl DCRTPolyMatrix {
+    /// Encode this matrix as an evaluation artifact: its CRT residues in the
+    /// native NTT slot order, with no inverse NTT and no data-dependent width.
+    pub fn to_eval_artifact(&self) -> Vec<u8> {
+        let (rows, columns) = self.size();
+        let (moduli, _, _) = self.params().to_crt();
+        let header = EvalMatrixHeader::new(
+            rows,
+            columns,
+            self.params().ring_dimension() as usize,
+            moduli.clone(),
+        )
+        .expect("a ring matrix has a valid evaluation artifact header");
+        let slots = (0..rows * columns)
+            .into_par_iter()
+            .map(|poly| self.entry(poly / columns, poly % columns).eval_slots())
+            .collect::<Vec<_>>();
+        let moduli = moduli.into_iter().map(BigUint::from).collect::<Vec<_>>();
+        encode_eval_matrix(&header, |poly, limb, out| {
+            for (residue, slot) in out.iter_mut().zip(&slots[poly]) {
+                *residue = (slot % &moduli[limb]).to_u64().expect("residue is below a u64 prime");
+            }
+        })
+    }
+
+    /// Decode an evaluation artifact of shape `(rows, columns)` over `params`.
+    pub fn try_from_eval_artifact(
+        params: &DCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        bytes: &[u8],
+    ) -> Result<Self, EvalMatrixError> {
+        let (header, residues) = decode_eval_matrix(bytes)?;
+        let (moduli, _, _) = params.to_crt();
+        let ring_dimension = params.ring_dimension() as usize;
+        if (header.rows, header.columns) != (rows, columns) ||
+            header.ring_dimension != ring_dimension ||
+            header.moduli != moduli
+        {
+            return Err(EvalMatrixError::InvalidHeader(
+                "shape or ring differs from the expected matrix type",
+            ));
+        }
+        let modulus = params.modulus();
+        let lifts = moduli
+            .iter()
+            .map(|&prime| {
+                let prime = BigUint::from(prime);
+                let cofactor = modulus.as_ref() / &prime;
+                let inverse = (&cofactor % &prime).modinv(&prime).expect("CRT primes are coprime");
+                cofactor * inverse
+            })
+            .collect::<Vec<_>>();
+        let mut polys = residues
+            .par_chunks(ring_dimension * moduli.len())
+            .map(|words| {
+                let slots = (0..ring_dimension)
+                    .map(|slot| {
+                        lifts
+                            .iter()
+                            .enumerate()
+                            .map(|(limb, lift)| lift * words[limb * ring_dimension + slot])
+                            .sum::<BigUint>() %
+                            modulus.as_ref()
+                    })
+                    .collect::<Vec<_>>();
+                DCRTPoly::from_biguints_eval(params, &slots)
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        let entries =
+            (0..rows).map(|_| polys.by_ref().take(columns).collect::<Vec<_>>()).collect::<Vec<_>>();
+        Ok(Self::from_poly_vec(params, entries))
+    }
+
     pub(crate) fn to_cpp_matrix_ptr(&self) -> CppMatrix {
         let nrow = self.nrow;
         let ncol = self.ncol;

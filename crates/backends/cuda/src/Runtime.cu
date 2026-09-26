@@ -50,6 +50,66 @@ __global__ void mxx_peer_copy_kernel(uint8_t *destination, const uint8_t *source
     for (uint64_t index = first; index < bytes; index += stride) destination[index] = source[index];
 }
 
+// Copy the elements of a four-dimensional view between two layouts, each
+// given by its byte strides. An artifact export gathers a strided physical
+// view densely; a device import scatters it back.
+__global__ void mxx_strided_copy_kernel(uint8_t *destination, const uint8_t *source,
+    MxxStridedCopy copy)
+{
+    // Copy each element in the widest units its alignment allows, so that
+    // writes into mapped host memory stay wide and coalesced.
+    uint64_t alignment = reinterpret_cast<uintptr_t>(destination) |
+        reinterpret_cast<uintptr_t>(source) | copy.element_bytes;
+    for (int axis = 0; axis < 4; ++axis)
+        alignment |= copy.source_stride[axis] | copy.destination_stride[axis];
+    const uint32_t unit = (alignment & 15U) == 0 ? 16 : (alignment & 7U) == 0 ? 8
+        : (alignment & 3U) == 0 ? 4 : 1;
+    const uint64_t units_per_element = copy.element_bytes / unit;
+    const uint64_t units = copy.extent[0] * copy.extent[1] * copy.extent[2] * copy.extent[3] *
+        units_per_element;
+    const uint64_t step = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < units; index += step)
+    {
+        uint64_t rest = index / units_per_element;
+        const uint64_t within = (index % units_per_element) * unit;
+        uint64_t from = within;
+        uint64_t to = within;
+        for (int axis = 3; axis >= 0; --axis)
+        {
+            const uint64_t coordinate = rest % copy.extent[axis];
+            rest /= copy.extent[axis];
+            from += coordinate * copy.source_stride[axis];
+            to += coordinate * copy.destination_stride[axis];
+        }
+        switch (unit)
+        {
+        case 16:
+            *reinterpret_cast<uint4 *>(destination + to) =
+                *reinterpret_cast<const uint4 *>(source + from);
+            break;
+        case 8:
+            *reinterpret_cast<uint64_t *>(destination + to) =
+                *reinterpret_cast<const uint64_t *>(source + from);
+            break;
+        case 4:
+            *reinterpret_cast<uint32_t *>(destination + to) =
+                *reinterpret_cast<const uint32_t *>(source + from);
+            break;
+        default:
+            destination[to] = source[from];
+        }
+    }
+}
+
+static uint32_t strided_copy_blocks(const MxxStridedCopy &copy, uint32_t threads)
+{
+    const uint64_t units = copy.extent[0] * copy.extent[1] * copy.extent[2] * copy.extent[3] *
+        ((copy.element_bytes + 15) / 16);
+    return static_cast<uint32_t>(
+        std::max<uint64_t>(1, std::min<uint64_t>((units + threads - 1) / threads, 65535)));
+}
+
 __global__ void mxx_export_slot_publish_kernel(MxxExportSlotHeader *header,
     uint64_t occurrence, uint64_t artifact_offset, uint64_t payload_bytes,
     uint32_t site, uint32_t flags)
@@ -1826,6 +1886,112 @@ extern "C"
         return 0;
     }
 
+    // An export slot whose payload lives in device memory: the Graph copy
+    // stays on the GPU and only the small header is host-mapped for the
+    // publication the I/O worker observes.
+    int gpu_export_slot_alloc_device(int physical_device, size_t payload_capacity,
+        void **out_host, void **out_device_header, void **out_device_payload)
+    {
+        if (!out_host || !out_device_header || !out_device_payload)
+            return set_error("invalid device export slot allocation arguments");
+        *out_host = nullptr;
+        *out_device_header = nullptr;
+        *out_device_payload = nullptr;
+        cudaError_t error = mxx_set_device(physical_device);
+        if (error != cudaSuccess) return set_error(error);
+        void *host = nullptr;
+        error = cudaHostAlloc(&host, sizeof(MxxExportSlotHeader), cudaHostAllocMapped);
+        if (error != cudaSuccess) return set_error(error);
+        void *device_header = nullptr;
+        error = cudaHostGetDevicePointer(&device_header, host, 0);
+        void *payload = nullptr;
+        if (error == cudaSuccess && payload_capacity != 0)
+            error = cudaMalloc(&payload, payload_capacity);
+        if (error != cudaSuccess)
+        {
+            cudaFreeHost(host);
+            return set_error(error);
+        }
+        memset(host, 0, sizeof(MxxExportSlotHeader));
+        *out_host = host;
+        *out_device_header = device_header;
+        *out_device_payload = payload;
+        return 0;
+    }
+
+    int gpu_device_memory_alloc(int physical_device, size_t bytes, void **out)
+    {
+        if (!out || bytes == 0) return set_error("invalid device memory allocation arguments");
+        *out = nullptr;
+        cudaError_t error = mxx_set_device(physical_device);
+        if (error == cudaSuccess) error = cudaMalloc(out, bytes);
+        return error == cudaSuccess ? 0 : set_error(error);
+    }
+
+    int gpu_device_memory_free(int physical_device, void *address)
+    {
+        if (!address) return 0;
+        cudaError_t error = mxx_set_device(physical_device);
+        if (error == cudaSuccess) error = cudaFree(address);
+        return error == cudaSuccess ? 0 : set_error(error);
+    }
+
+    // Copy between device allocations, possibly on different GPUs, and return
+    // only after the copy has completed.
+    int gpu_device_memory_copy(
+        int destination_device, void *destination, const void *source, size_t bytes)
+    {
+        if (bytes == 0) return 0;
+        if (!destination || !source) return set_error("invalid device memory copy arguments");
+        cudaError_t error = mxx_set_device(destination_device);
+        cudaStream_t stream = nullptr;
+        if (error == cudaSuccess) error = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (error != cudaSuccess) return set_error(error);
+        error = cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDefault, stream);
+        const cudaError_t synchronized = cudaStreamSynchronize(stream);
+        if (error == cudaSuccess) error = synchronized;
+        const cudaError_t destroyed = cudaStreamDestroy(stream);
+        if (error == cudaSuccess) error = destroyed;
+        return error == cudaSuccess ? 0 : set_error(error);
+    }
+
+    int gpu_device_strided_copy(
+        int device, void *destination, const void *source, MxxStridedCopy copy)
+    {
+        if (!destination || !source || copy.element_bytes == 0)
+            return set_error("invalid device strided copy arguments");
+        cudaError_t error = mxx_set_device(device);
+        cudaStream_t stream = nullptr;
+        if (error == cudaSuccess) error = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (error != cudaSuccess) return set_error(error);
+        constexpr uint32_t threads = 256;
+        mxx_strided_copy_kernel<<<strided_copy_blocks(copy, threads), threads, 0, stream>>>(
+            static_cast<uint8_t *>(destination), static_cast<const uint8_t *>(source), copy);
+        error = cudaGetLastError();
+        const cudaError_t synchronized = cudaStreamSynchronize(stream);
+        if (error == cudaSuccess) error = synchronized;
+        const cudaError_t destroyed = cudaStreamDestroy(stream);
+        if (error == cudaSuccess) error = destroyed;
+        return error == cudaSuccess ? 0 : set_error(error);
+    }
+
+    int gpu_device_memory_download(
+        int physical_device, const void *source, void *destination, size_t bytes)
+    {
+        if (bytes == 0) return 0;
+        if (!destination || !source) return set_error("invalid device memory download arguments");
+        cudaError_t error = mxx_set_device(physical_device);
+        cudaStream_t stream = nullptr;
+        if (error == cudaSuccess) error = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (error != cudaSuccess) return set_error(error);
+        error = cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToHost, stream);
+        const cudaError_t synchronized = cudaStreamSynchronize(stream);
+        if (error == cudaSuccess) error = synchronized;
+        const cudaError_t destroyed = cudaStreamDestroy(stream);
+        if (error == cudaSuccess) error = destroyed;
+        return error == cudaSuccess ? 0 : set_error(error);
+    }
+
     int gpu_export_slot_ready(const void *host_header, int *out_ready)
     {
         if (!host_header || !out_ready) return set_error("invalid export slot ready query");
@@ -2564,6 +2730,38 @@ extern "C"
             return 0;
         }
         catch (const std::exception &error) { return set_error(error); }
+    }
+
+    // A strided-copy kernel node. Patches name the destination and source
+    // like the one-dimensional memcpy patches.
+    int mxx_gpu_graph_builder_add_strided_copy(MxxGpuGraphBuilder *builder,
+        void *destination, const void *source, MxxStridedCopy copy,
+        const MxxGraphPatch *patches, size_t patch_count)
+    {
+        if (!builder || !builder->operation_active || !destination || !source ||
+            copy.element_bytes == 0 || (patch_count && !patches))
+            return set_error("invalid strided copy node");
+        std::vector<MxxGraphPatch> kernel_patches;
+        for (size_t index = 0; index < patch_count; ++index)
+        {
+            const auto &patch = patches[index];
+            if ((patch.target != MXX_GRAPH_PATCH_MEMCPY_1D_SRC &&
+                patch.target != MXX_GRAPH_PATCH_MEMCPY_1D_DST) ||
+                patch.byte_count != sizeof(uint64_t))
+                return set_error("invalid strided copy patch");
+            MxxGraphPatch kernel_patch = patch;
+            kernel_patch.target = MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD;
+            kernel_patch.argument_index = patch.target == MXX_GRAPH_PATCH_MEMCPY_1D_DST ? 0 : 1;
+            kernel_patch.byte_offset = 0;
+            kernel_patches.push_back(kernel_patch);
+        }
+        const void *arguments[] = {&destination, &source, &copy};
+        const size_t sizes[] = {sizeof(destination), sizeof(source), sizeof(copy)};
+        constexpr uint32_t threads = 256;
+        return mxx_gpu_graph_builder_add_kernel(builder,
+            reinterpret_cast<const void *>(mxx_strided_copy_kernel),
+            strided_copy_blocks(copy, threads), 1, 1, threads, 1, 1, 0, arguments, sizes, 3,
+            kernel_patches.data(), kernel_patches.size());
     }
 
     int mxx_gpu_graph_builder_add_memcpy(MxxGpuGraphBuilder *builder,

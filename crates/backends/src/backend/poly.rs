@@ -5,7 +5,7 @@ use super::{
 use crate::{
     matrix::{
         CpuSmallMatrix, PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError,
-        SmallPolyMatrix, dcrt_poly::DCRTPolyMatrix,
+        SmallPolyMatrix, dcrt_poly::DCRTPolyMatrix, eval_artifact::EvalMatrixError,
     },
     poly::{
         Poly, PolyParams,
@@ -318,6 +318,8 @@ pub enum PolyBackendError {
     InvalidSmallMatrixArtifact(&'static str),
     #[error("invalid compact matrix artifact: {0}")]
     InvalidCompactMatrix(&'static str),
+    #[error(transparent)]
+    EvalMatrix(#[from] EvalMatrixError),
     #[error(
         "unsupported compact matrix version {version}; supported versions are {supported_versions:?}"
     )]
@@ -1659,19 +1661,15 @@ impl CpuDcrtBackend {
         )
     }
 
+    /// Encode a full matrix artifact in the evaluation representation: each
+    /// CRT residue at the width of its prime, with no inverse NTT and no CRT
+    /// recomposition.
     pub fn matrix_to_bytes(&self, value: &DCRTPolyMatrix) -> Vec<u8> {
-        value.to_compact_bytes()
+        value.to_eval_artifact()
     }
 
     pub fn matrices_to_bytes(&self, values: &[&DCRTPolyMatrix]) -> Vec<Vec<u8>> {
-        #[cfg(feature = "gpu")]
-        {
-            DCRTPolyMatrix::compact_bytes_batch(values)
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            values.iter().map(|value| value.to_compact_bytes()).collect()
-        }
+        values.iter().map(|value| value.to_eval_artifact()).collect()
     }
 
     pub fn matrix_from_bytes(
@@ -1679,40 +1677,12 @@ impl CpuDcrtBackend {
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<DCRTPolyMatrix, PolyBackendError> {
-        let (rows, columns) =
-            DCRTPolyMatrix::compact_shape(bytes).map_err(|error| match error {
-                crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
-                    version,
-                    supported_versions,
-                } => PolyBackendError::UnsupportedCompactMatrixVersion {
-                    version,
-                    supported_versions,
-                },
-                crate::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
-                crate::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
-                    PolyBackendError::InvalidCompactMatrix(message)
-                }
-            })?;
-        if (rows, columns) != (ty.rows, ty.columns) {
-            return Err(PolyBackendError::InvalidCompactMatrix(
-                "serialized compact matrix shape does not match expected type",
-            ));
-        }
-        DCRTPolyMatrix::try_from_compact_bytes(self.parameters(ty)?, bytes).map_err(|error| {
-            match error {
-                crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
-                    version,
-                    supported_versions,
-                } => PolyBackendError::UnsupportedCompactMatrixVersion {
-                    version,
-                    supported_versions,
-                },
-                crate::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
-                crate::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
-                    PolyBackendError::InvalidCompactMatrix(message)
-                }
-            }
-        })
+        Ok(DCRTPolyMatrix::try_from_eval_artifact(
+            self.parameters(ty)?,
+            ty.rows,
+            ty.columns,
+            bytes,
+        )?)
     }
 
     pub fn small_matrix_to_bytes(
@@ -2361,10 +2331,24 @@ mod tests {
         assert_eq!(backend.matrix_from_bytes(&source_type, &bytes).unwrap().size(), (1, 1));
         assert!(matches!(
             backend.matrix_from_bytes(&wrong_type, &bytes),
-            Err(PolyBackendError::InvalidCompactMatrix(
-                "serialized compact matrix shape does not match expected type"
-            ))
+            Err(PolyBackendError::EvalMatrix(EvalMatrixError::InvalidHeader(
+                "shape or ring differs from the expected matrix type"
+            )))
         ));
+    }
+
+    #[test]
+    fn matrix_artifact_round_trips_in_evaluation_representation() {
+        let parameters = DCRTPolyParams::new(16, 3, 20, 8, None, None);
+        let ty = matrix_type(&parameters, 2, 3);
+        let backend = cpu_backend([parameters.clone()]);
+        let value =
+            DCRTPolyUniformSampler::new().sample_uniform(&parameters, 2, 3, DistType::FinRingDist);
+        let bytes = backend.matrix_to_bytes(&value);
+        let widths = parameters.moduli().iter().map(|q| 64 - (q - 1).leading_zeros() as usize);
+        let payload = 6 * 16 * widths.sum::<usize>() / 8;
+        assert_eq!(bytes.len(), 32 + 8 * 3 + payload);
+        assert_eq!(backend.matrix_from_bytes(&ty, &bytes).unwrap(), value);
     }
 }
 

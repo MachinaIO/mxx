@@ -17,6 +17,7 @@ use thiserror::Error;
 pub mod base;
 pub(crate) mod cpp_matrix;
 pub mod dcrt_poly;
+pub mod eval_artifact;
 #[cfg(feature = "gpu")]
 pub mod gpu_dcrt_poly;
 pub mod i64;

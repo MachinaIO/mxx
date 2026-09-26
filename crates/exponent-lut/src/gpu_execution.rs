@@ -46,10 +46,19 @@ impl<S: SessionStore + Send> StageExecution<S> for GpuRuntime {
         store: &mut S,
         execution_nonce: [u8; 32],
     ) -> Result<ProductionId, ApiError> {
+        let name = validated.source.name().to_owned();
+        let started = std::time::Instant::now();
         let mut plan = plan(self, validated, &inputs, store)?;
+        let planned = std::time::Instant::now();
         let result = self
             .execute_with_artifacts(&mut plan, inputs, store, execution_nonce)
             .map_err(gpu_error)?;
+        info!(
+            graph = name,
+            plan_ms = (planned - started).as_millis() as u64,
+            execute_ms = planned.elapsed().as_millis() as u64,
+            "Exponent-LUT GPU stage timing"
+        );
         result.production_id.clone().ok_or_else(|| {
             ApiError::input("artifact execution did not produce a production identity")
         })
@@ -62,10 +71,19 @@ impl<S: SessionStore + Send> StageExecution<S> for GpuRuntime {
         store: &mut S,
         execution_nonce: [u8; 32],
     ) -> Result<StageOutputs, ApiError> {
+        let name = validated.source.name().to_owned();
+        let started = std::time::Instant::now();
         let mut plan = plan(self, validated, &inputs, store)?;
+        let planned = std::time::Instant::now();
         let result = self
             .execute_with_artifacts(&mut plan, inputs, store, execution_nonce)
             .map_err(gpu_error)?;
+        info!(
+            graph = name,
+            plan_ms = (planned - started).as_millis() as u64,
+            execute_ms = planned.elapsed().as_millis() as u64,
+            "Exponent-LUT GPU stage timing"
+        );
         // The result owns its outputs, grouped per composite value; stage
         // outputs are addressed by their leaf names (`name.i`).
         Ok(StageOutputs {

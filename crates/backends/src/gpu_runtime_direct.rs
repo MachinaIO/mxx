@@ -1554,7 +1554,7 @@ impl GpuRuntime {
             .map_err(GpuPlanError::InvalidInput)?;
         let inputs = crate::backend::expand_composite_values(inputs.clone());
         let inputs = self.distinct_planning_inputs(inputs).map_err(GpuPlanError::InvalidInput)?;
-        self.plan_with_payload_sizes(validated, &inputs, &BTreeMap::new(), None)
+        self.plan_with_payload_sizes(validated, &inputs, &BTreeMap::new(), false, None)
     }
 
     /// Input rebinding redirects every plan value viewing an input's planning
@@ -1612,6 +1612,7 @@ impl GpuRuntime {
             validated,
             inputs,
             &BTreeMap::new(),
+            false,
             Some((columns_per_job, None)),
         )
     }
@@ -1626,7 +1627,7 @@ impl GpuRuntime {
         wave_instances: usize,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
         let fixed = Some((columns_per_job, Some(wave_instances)));
-        self.plan_with_payload_sizes(validated, inputs, &BTreeMap::new(), fixed)
+        self.plan_with_payload_sizes(validated, inputs, &BTreeMap::new(), false, fixed)
     }
 
     /// Query only artifact metadata before allocating a reusable frame.
@@ -1683,7 +1684,8 @@ impl GpuRuntime {
                 }
             }
         }
-        self.plan_with_payload_sizes(validated, inputs, &sizes, None)
+        let device_artifact_exports = store.device_artifacts().is_some();
+        self.plan_with_payload_sizes(validated, inputs, &sizes, device_artifact_exports, None)
     }
 
     fn plan_with_payload_sizes(
@@ -1691,6 +1693,7 @@ impl GpuRuntime {
         validated: ValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue>,
         artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
+        device_artifact_exports: bool,
         fixed_geometry: Option<(usize, Option<usize>)>,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
         for (name, range) in &self.options.integer_input_ranges {
@@ -1833,6 +1836,7 @@ impl GpuRuntime {
                     inputs,
                     &self.options.integer_input_ranges,
                     artifact_payload_sizes,
+                    device_artifact_exports,
                 )
                 .map_err(GpuPlanError::Resource)?;
                 validate_allocated_budget(&frame, &contract, None)?;
@@ -1947,6 +1951,7 @@ impl GpuRuntime {
             inputs,
             &self.options.integer_input_ranges,
             artifact_payload_sizes,
+            device_artifact_exports,
         )
         .map_err(GpuPlanError::Resource)?;
         validate_allocated_budget(&frame, &contract, None)?;
@@ -2196,15 +2201,18 @@ impl GpuRuntime {
             None => Vec::new(),
         };
         let has_exports = !planned.is_empty();
+        let io_started = Instant::now();
         if has_exports {
             pump.start_export_observer(planned)
                 .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
         }
+        let observer_started = Instant::now();
         let run = if plan.frame.waves.is_empty() {
             self.execute_producer(plan, pump, frame)
         } else {
             self.execute_waves(plan, inputs, execution_nonce, Some(pump))
         };
+        let run_finished = Instant::now();
         if has_exports {
             let observed = pump
                 .finish_export_observer(run.is_ok())
@@ -2214,7 +2222,9 @@ impl GpuRuntime {
                 return Err(error);
             }
         }
+        let exports_drained = Instant::now();
         let result = run?;
+        let persisted = persist.is_some();
         if let Some((_, manifest)) = persist {
             let completion = match pump
                 .finalize(frame, manifest)
@@ -2235,6 +2245,18 @@ impl GpuRuntime {
                 ));
             }
         }
+        tracing::debug!(
+            target: "mxx_backends::gpu_execute",
+            graph = plan.validated.source.name(),
+            waves = !plan.frame.waves.is_empty(),
+            exports = has_exports,
+            persisted,
+            observer_start_us = %format_args!("{:.1}", (observer_started - io_started).as_secs_f64() * 1e6),
+            run_us = %format_args!("{:.1}", (run_finished - observer_started).as_secs_f64() * 1e6),
+            export_drain_us = %format_args!("{:.1}", (exports_drained - run_finished).as_secs_f64() * 1e6),
+            finalize_us = %format_args!("{:.1}", exports_drained.elapsed().as_secs_f64() * 1e6),
+            "GPU execute I/O"
+        );
         plan.completed_runs += 1;
         Ok(result)
     }
@@ -2359,6 +2381,7 @@ impl GpuRuntime {
                         FrameGeneration::new(0, plan.completed_runs),
                         operation,
                         template,
+                        &plan.frame.owners,
                     )
                 }
                 .map_err(GpuRuntimeError::Artifact)?;
@@ -2565,8 +2588,17 @@ impl GpuRuntime {
         };
         // SAFETY: this plan executes exclusively, and both the selector's
         // producer region and the previous use of this destination have joined.
-        unsafe { load_import_template(&self.backend, pump, frame, operation, &selected) }
-            .map_err(GpuRuntimeError::Artifact)
+        unsafe {
+            load_import_template(
+                &self.backend,
+                pump,
+                frame,
+                operation,
+                &selected,
+                &plan.frame.owners,
+            )
+        }
+        .map_err(GpuRuntimeError::Artifact)
     }
 
     fn execute_producer_regions<E: std::error::Error + Send + Sync + 'static>(
@@ -2620,6 +2652,7 @@ impl GpuRuntime {
                                             frame,
                                             operation,
                                             import,
+                                            &plan.frame.owners,
                                         )
                                     }
                                     .map_err(GpuRuntimeError::Artifact)?;
@@ -2652,8 +2685,17 @@ impl GpuRuntime {
             {
                 // SAFETY: execute owns this plan exclusively; every earlier
                 // Graph region and the previous execution have joined.
-                unsafe { load_import_template(&self.backend, pump, frame, start, import) }
-                    .map_err(GpuRuntimeError::Artifact)?;
+                unsafe {
+                    load_import_template(
+                        &self.backend,
+                        pump,
+                        frame,
+                        start,
+                        import,
+                        &plan.frame.owners,
+                    )
+                }
+                .map_err(GpuRuntimeError::Artifact)?;
             }
             for import in plan
                 .frame

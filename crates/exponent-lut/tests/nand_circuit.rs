@@ -303,6 +303,19 @@ fn select_candidate(
     );
 }
 
+/// Stage storage selected by `MXX_EXPONENT_LUT_NAND_STORAGE`: `device`,
+/// `host` (the default), or `file:<directory>`.
+fn nand_storage() -> api::StageStorage {
+    match env::var("MXX_EXPONENT_LUT_NAND_STORAGE").as_deref() {
+        Err(_) | Ok("host") => api::StageStorage::Host,
+        Ok("device") => api::StageStorage::Device,
+        Ok(value) => match value.strip_prefix("file:") {
+            Some(directory) => api::StageStorage::File(directory.into()),
+            None => panic!("unknown NAND stage storage {value}"),
+        },
+    }
+}
+
 #[test]
 #[sequential(dcrt_runtime)]
 fn nand_circuit_end_to_end() {
@@ -335,7 +348,7 @@ fn nand_circuit_end_to_end() {
     let payload: RnsBggPayloadSecret = RnsEncryptBuild::new(&parameters, [0x4e; 32])
         .sample_payload_secret(&mut runtime, &mut MemoryArtifactStore::default())
         .expect("payload secret");
-    let mut store = MemoryArtifactStore::default();
+    let mut store = nand_storage().open().expect("stage storage");
     // Convert natural Boolean inputs into the declared LHS and fixed-RHS
     // plaintext maps.  The RHS plaintexts remain preprocessing inputs and
     // are never supplied to online evaluation.

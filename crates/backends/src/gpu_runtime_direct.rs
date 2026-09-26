@@ -2579,6 +2579,12 @@ impl GpuRuntime {
                     let active = parent_occurrence.is_none_or(|actual| {
                         group.active_parent_occurrences.binary_search(&actual).is_ok()
                     });
+                    // Imports of this scope whose first consumer is in the wave
+                    // body are planned at the body's first operation; the
+                    // wave itself loads only its own imports.
+                    if static_imports {
+                        self.load_boundary_imports(plan, pump, operation, active_imports)?;
+                    }
                     if active {
                         for control in &plan.frame.control_resets {
                             control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
@@ -2652,36 +2658,8 @@ impl GpuRuntime {
                 region = plan.graph.region_interval(body_start, body_end)?.end;
                 continue;
             }
-            let templates = if static_imports {
-                active_imports
-                    .map(|indices| indices.to_vec())
-                    .unwrap_or_else(|| (0..plan.frame.import_templates.len()).collect())
-            } else {
-                Vec::new()
-            };
-            for index in templates {
-                let template = plan.frame.import_templates.get(index).ok_or_else(|| {
-                    GpuRuntimeError::Artifact("scheduled import template is absent".into())
-                })?;
-                if template.before_operation != operation {
-                    continue;
-                }
-                let pump = pump.as_deref_mut().ok_or_else(|| {
-                    GpuRuntimeError::Artifact("scheduled import has no I/O pump".into())
-                })?;
-                // SAFETY: every preceding Graph region has joined and execute
-                // exclusively borrows this pointer-stable plan and I/O pump.
-                unsafe {
-                    load_import_template(
-                        &self.backend,
-                        pump,
-                        FrameGeneration::new(0, plan.completed_runs),
-                        operation,
-                        template,
-                        &plan.frame.owners,
-                    )
-                }
-                .map_err(GpuRuntimeError::Artifact)?;
+            if static_imports {
+                self.load_boundary_imports(plan, pump, operation, active_imports)?;
             }
             // Every selected import planned at this boundary: at the root, in a
             // host-driven loop body, or in one lane of a wave body.
@@ -2872,6 +2850,55 @@ impl GpuRuntime {
             production_id: None,
             artifact_handles: BTreeMap::new(),
         })
+    }
+
+    /// Load the import templates of the running scope planned before
+    /// `operation`: those of `active_imports` inside a wave, otherwise every
+    /// template that no wave owns.
+    fn load_boundary_imports<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        plan: &GpuExecutionPlan,
+        pump: &mut Option<&mut ProducerIoPump<'_, E>>,
+        operation: u32,
+        active_imports: Option<&[usize]>,
+    ) -> Result<(), GpuRuntimeError> {
+        let templates = match active_imports {
+            Some(indices) => indices.to_vec(),
+            None => (0..plan.frame.import_templates.len())
+                .filter(|index| {
+                    !plan
+                        .frame
+                        .waves
+                        .iter()
+                        .any(|wave| wave.import_template_indices.contains(index))
+                })
+                .collect(),
+        };
+        for index in templates {
+            let template = plan.frame.import_templates.get(index).ok_or_else(|| {
+                GpuRuntimeError::Artifact("scheduled import template is absent".into())
+            })?;
+            if template.before_operation != operation {
+                continue;
+            }
+            let pump = pump.as_deref_mut().ok_or_else(|| {
+                GpuRuntimeError::Artifact("scheduled import has no I/O pump".into())
+            })?;
+            // SAFETY: every preceding Graph region has joined and execute
+            // exclusively borrows this pointer-stable plan and I/O pump.
+            unsafe {
+                load_import_template(
+                    &self.backend,
+                    pump,
+                    FrameGeneration::new(0, plan.completed_runs),
+                    operation,
+                    template,
+                    &plan.frame.owners,
+                )
+            }
+            .map_err(GpuRuntimeError::Artifact)?;
+        }
+        Ok(())
     }
 
     fn load_selected_import<E: std::error::Error + Send + Sync + 'static>(

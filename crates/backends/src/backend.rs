@@ -487,6 +487,10 @@ impl GpuResidentValue {
     /// The same view over new allocations: every storage owned by one of the
     /// `replaced` allocations is swapped for its replacement, and `ready`
     /// becomes the replacements' producers. `None` if nothing aliases them.
+    ///
+    /// A replacement spans the whole replaced allocation. A storage that views
+    /// only its tail, such as a family member, ends where the allocation ends,
+    /// so it keeps its offset from the end.
     pub(crate) fn rebound(
         &self,
         replaced: &std::collections::HashMap<*const (), BoundStorage>,
@@ -500,8 +504,19 @@ impl GpuResidentValue {
         let storage = self
             .storage
             .iter()
-            .map(|(slot, bound)| (*slot, replacement(bound).unwrap_or(bound).clone()))
-            .collect();
+            .map(|(slot, bound)| {
+                let Some(new) = replacement(bound) else {
+                    return Ok((*slot, bound.clone()));
+                };
+                let offset = new
+                    .bytes
+                    .checked_sub(bound.bytes)
+                    .ok_or("GPU rebound view exceeds its replacement allocation")?;
+                let address =
+                    new.address.checked_add(offset).ok_or("GPU rebound view address overflows")?;
+                Ok((*slot, BoundStorage { address, bytes: bound.bytes, ..new.clone() }))
+            })
+            .collect::<Result<_, &'static str>>()?;
         Self::new(Arc::clone(&self.physical), storage, ready.into()).map(Some)
     }
 

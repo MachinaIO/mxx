@@ -899,8 +899,14 @@ impl PhysicalFrame {
                         .storage(*slot)
                         .ok_or_else(|| format!("GPU input {name} lost a storage slot"))?;
                     if !Arc::ptr_eq(&bound.owner, &replacement.owner) {
-                        replaced
-                            .insert(Arc::as_ptr(&bound.owner).cast::<()>(), replacement.clone());
+                        // `rebound` keeps each view's offset from the end of
+                        // the replaced storage. Giving the new input the old
+                        // extent keeps it from the input's start instead, so a
+                        // view stays right when the new storage is larger or
+                        // smaller than the planned one.
+                        let replacement =
+                            BoundStorage { bytes: bound.bytes, ..replacement.clone() };
+                        replaced.insert(Arc::as_ptr(&bound.owner).cast::<()>(), replacement);
                         changed = true;
                     }
                 }
@@ -946,6 +952,17 @@ impl PhysicalFrame {
         if held.is_empty() {
             return self.check_return_outputs();
         }
+        // Every view of an allocation ends where it ends, so the largest view
+        // spans the whole allocation.
+        let mut extents = std::collections::HashMap::<*const (), (i32, u64)>::new();
+        for owner in self.owners.values() {
+            for (_, bound) in owner.storages() {
+                let extent = extents
+                    .entry(Arc::as_ptr(&bound.owner).cast::<()>())
+                    .or_insert((bound.device, 0));
+                extent.1 = extent.1.max(bound.bytes);
+            }
+        }
         let mut replaced = std::collections::HashMap::new();
         for id in &held {
             let owner = self.owners.get(id).ok_or("GPU held output has no owner")?;
@@ -955,7 +972,7 @@ impl PhysicalFrame {
                     continue;
                 }
                 let parameters = backend.control_parameters_on_device(bound.device)?;
-                let bytes = usize::try_from(bound.bytes)
+                let bytes = usize::try_from(extents[&pointer].1)
                     .map_err(|_| "GPU output storage exceeds host address space".to_owned())?;
                 let fresh = Arc::new(
                     crate::poly::dcrt::gpu::GpuDeviceBytes::new(&parameters, bound.device, bytes)
@@ -8293,5 +8310,135 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn direct_add_imports_and_exports_cached_matrix() {
         run_direct_artifact_import_smoke(true);
+    }
+
+    /// Every entry of `matrix` is the zero polynomial.
+    fn is_zero_matrix(matrix: &DCRTPolyMatrix) -> bool {
+        let (rows, columns) = matrix.size();
+        (0..rows).all(|row| {
+            (0..columns).all(|column| {
+                matrix.entry(row, column).coeffs_biguints().iter().all(num_traits::Zero::is_zero)
+            })
+        })
+    }
+
+    /// A parallel loop that zips the family computed by an earlier parallel
+    /// loop reads each of its members. A wave-0 member views the tail of the
+    /// earlier loop's lane allocation, which is only chosen when the Graph is
+    /// compiled; the view keeps its offset when that allocation is bound.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn zip_of_a_computed_family_reads_each_member() {
+        let parameters = DCRTPolyParams::new(32, 3, 28, 8, None, None);
+        let moduli = parameters.to_crt().0;
+        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
+        let count = 3usize;
+        let first = mxx_dsl::parallel(count, |_| Ok(ring.uniform_residue((1, 2)))).unwrap();
+        let three = ring.polynomial([IntExpr::constant(3)]);
+        let second = mxx_dsl::parallel(count, |index| Ok(first.at(index) * three.clone())).unwrap();
+        let mut context = DslContext::new("zip-of-computed-family");
+        for member in 0..count {
+            let member_index = Int::constant(member);
+            context = context
+                .output(
+                    format!("difference-{member}"),
+                    second.at(member_index.clone()) - first.at(member_index) * three.clone(),
+                )
+                .unwrap();
+        }
+        let validated = context
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_parameters], detected_gpu_device_ids())).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let result = runtime
+            .execute_with_artifacts(
+                &mut plan,
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                [0x33; 32],
+            )
+            .unwrap();
+        for member in 0..count {
+            let name = format!("difference-{member}");
+            let difference =
+                runtime.download_matrix_output(&result.output(&name).unwrap()).unwrap();
+            assert!(is_zero_matrix(&difference), "{name}");
+        }
+    }
+
+    /// An artifact whose first consumer is inside a wave body is imported at
+    /// the body's first operation, before the wave group runs.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn artifact_first_read_in_a_wave_body_is_imported() {
+        let parameters = DCRTPolyParams::new(32, 3, 28, 8, None, None);
+        let moduli = parameters.to_crt().0;
+        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
+        let producer = DslContext::new("wave-import-producer")
+            .cached_output("stored", ring.uniform_residue((1, 2)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let production = execute_in_session(
+            &producer,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut store,
+            [0x34; 32],
+            ExecutionConfig::default(),
+        )
+        .unwrap()
+        .production_id
+        .expect("producer identity");
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let stored =
+            ring.artifact_input(production.clone(), "stored", (1, 2), ArtifactAvailability::Cached);
+        let two = ring.polynomial([IntExpr::constant(2)]);
+        let count = 3usize;
+        let lanes = mxx_dsl::parallel(count, |_| Ok(stored.clone() * two.clone())).unwrap();
+        let mut context = DslContext::new("wave-import-consumer");
+        for member in 0..count {
+            context = context
+                .output(
+                    format!("difference-{member}"),
+                    lanes.at(Int::constant(member)) - stored.clone() * two.clone(),
+                )
+                .unwrap();
+        }
+        context = context.output("stored", stored.clone() + ring.zero((1, 2))).unwrap();
+        let validated = context
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+                crate::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_parameters], detected_gpu_device_ids())).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x35; 32])
+            .unwrap();
+        let loaded = runtime.download_matrix_output(&result.output("stored").unwrap()).unwrap();
+        assert!(!is_zero_matrix(&loaded), "the stored artifact is loaded");
+        for member in 0..count {
+            let name = format!("difference-{member}");
+            let difference =
+                runtime.download_matrix_output(&result.output(&name).unwrap()).unwrap();
+            assert!(is_zero_matrix(&difference), "{name}");
+        }
     }
 }

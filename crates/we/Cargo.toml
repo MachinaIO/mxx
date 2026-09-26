@@ -1,8 +1,8 @@
 [package]
 name = "mxx-we"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "Witness encryption constructions for mxx"
 
 [features]
@@ -10,21 +10,25 @@ default = []
 gpu = ["mxx-backends/gpu", "mxx-gadgets/gpu"]
 
 [dependencies]
-mxx-backends.workspace = true
-mxx-gadgets.workspace = true
-mxx-bgg.workspace = true
-mxx-dsl.workspace = true
-mxx-ir-core.workspace = true
-num-bigint.workspace = true
-num-integer.workspace = true
-num-traits.workspace = true
-rand.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-keccak-asm.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
+mxx-backends = { path = "../backends" }
+mxx-gadgets = { path = "../gadgets" }
+mxx-bgg = { path = "../bgg" }
+mxx-dsl = { path = "../dsl" }
+mxx-ir-core = { path = "../ir-core" }
+num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
+num-integer = "0.1"
+num-traits = "0.2.19"
+rand = { version = "0.9.0", features = ["std_rng"] }
+thiserror = "1"
+tracing = "0.1"
+keccak-asm = "0.1.4"
+sha2 = "0.10"
+tempfile = "3.19.1"
 
 [dev-dependencies]
-serial_test.workspace = true
-tracing-subscriber.workspace = true
+serial_test = { version = "3.5.0", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Excluded from the mxx workspace (see the root `Cargo.toml`); this manifest
+# is its own workspace root.
+[workspace]

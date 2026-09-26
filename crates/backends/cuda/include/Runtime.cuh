@@ -507,7 +507,7 @@ int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream,
 // returned by finish_operation; each operation's internal nodes are ordered.
 int mxx_gpu_graph_builder_create(GpuContext *ctx, int physical_device,
     void *stream, MxxGpuGraphBuilder **out_builder);
-int gpu_device_release_cached_memory(int device);
+int gpu_device_release_cached_memory(const GpuContext *ctx, int device);
 int gpu_device_graph_memory_reserved(int device, size_t *out_reserved_bytes);
 int gpu_graph_allocation_free_async(uint64_t address, void *stream);
 int mxx_gpu_graph_builder_add_memory_alloc(MxxGpuGraphBuilder *builder, int device,
@@ -534,7 +534,10 @@ int mxx_gpu_graph_builder_add_kernel(MxxGpuGraphBuilder *builder, const void *fu
 // one node when both are on one physical GPU or the destination GPU can
 // access the source GPU's memory; otherwise it is staged through a pinned
 // host buffer the executable owns, as a device-to-host and a host-to-device
-// node. Each node is created and updated with the GPU of the memory it
+// node. Staged copies between one GPU pair in one graph alternate between two
+// buffers, each copy ordered after the host-to-device node of the copy that
+// used its buffer last, so pinned memory does not grow with the copy count.
+// Each node is created and updated with the GPU of the memory it
 // touches current, which pool and graph allocations require.
 // MXX_GPU_HOST_STAGED_COPIES=1 stages every copy between distinct logical
 // devices (a diagnostic for GPUs without peer access).

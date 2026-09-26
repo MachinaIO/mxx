@@ -85,7 +85,7 @@ abstraction.
 | `crates/gadgets` | `mxx-gadgets` | Reusable, BGG-independent circuits and circuit gadgets (nested RNS arithmetic, NTT, FHE gadgets, noise refresh, input injector). |
 | `crates/bgg` | `mxx-bgg` | BGG+ public keys, encodings, circuit lowering, lookups, slot transfer, Tall encodings, WEE25 commitments. |
 | `crates/fhe` | `mxx-fhe` | TFHE (integer LWE with NAND bootstrapping) and leveled BGV graph builders. |
-| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. Currently excluded from the workspace (commented out in `Cargo.toml`). |
+| `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. Excluded from the workspace (`exclude` in `Cargo.toml`); its manifest is standalone. |
 | `crates/func-enc` | `mxx-func-enc` | Functional-encryption interface trait only (`FuncEnc`). |
 | `crates/io` | `mxx-io` | Indistinguishability-obfuscation interface trait only (`Obfuscation`). |
 
@@ -787,7 +787,9 @@ device's memory that one plan's persistent allocations may use, default 0.8, val
 `(0, 1]` are errors), and `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` (`gpu_small_rhs_chunk_columns`: the
 right-operand columns the fused small-RHS multiplication transforms per chunk, default 16).
 A copy between two physical GPUs without peer access is staged through a pinned host buffer
-(a device-to-host and a host-to-device graph node); `MXX_GPU_HOST_STAGED_COPIES=1` stages every
+(a device-to-host and a host-to-device graph node). The staged copies between one GPU pair in
+one graph take turns on two buffers, so pinned memory is bounded by the GPU pairs and the largest
+copy rather than the number of copies; `MXX_GPU_HOST_STAGED_COPIES=1` stages every
 copy between distinct logical devices, which lets `MXX_GPU_LOGICAL_DEVICES=0,0` test that path
 on one GPU. The CUDA
 library reads `MXX_GPU_NTT_RADIX` once per process in
@@ -1318,8 +1320,10 @@ backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactSt
 ### 7.4 `mxx-we`: Diamond witness encryption
 
 `mxx-we` is currently excluded from the workspace: its protocol family is bound to one ring, so
-it is not parameter-independent across rings, and it is commented out in `Cargo.toml` until that
-is redesigned. The description below is kept for that work.
+it is not parameter-independent across rings. Until that is redesigned, the root `Cargo.toml`
+lists it under `exclude`, so no workspace command (`--workspace` included) builds it, and its
+standalone manifest is built only by naming it: `cargo test --manifest-path crates/we/Cargo.toml`.
+The description below is kept for that work.
 
 `crates/we/src/` defines implementation-independent WE interfaces and the Diamond construction:
 

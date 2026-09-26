@@ -1149,15 +1149,20 @@ impl SessionStore for FileArtifactStore {
             .filter(|key| &key.production == production)
             .cloned()
             .collect::<Vec<_>>();
+        // The session and its lock are released even when removing a staged
+        // file fails; the first removal error is returned afterwards.
+        let mut cleanup = Ok(());
         for key in incomplete_raw {
-            if let Some(stage) = self.raw_stages.remove(&key) {
-                fs::remove_file(&stage.temporary)
-                    .map_err(|source| FileArtifactError::Io { path: stage.temporary, source })?;
+            if let Some(stage) = self.raw_stages.remove(&key) &&
+                let Err(source) = fs::remove_file(&stage.temporary) &&
+                cleanup.is_ok()
+            {
+                cleanup = Err(FileArtifactError::Io { path: stage.temporary, source });
             }
         }
         self.locks.remove(production);
         self.active_sessions.remove(production);
-        Ok(())
+        cleanup
     }
 
     fn transcript_entry(
@@ -2603,6 +2608,27 @@ mod tests {
         store.release_session(&key.production).expect("release session");
         assert!(!temporary.exists());
         assert!(!store.artifact_path(&key).exists());
+    }
+
+    #[test]
+    fn test_session_is_released_when_raw_cleanup_fails() {
+        let directory = tempdir().expect("temp directory");
+        let mut store = FileArtifactStore::new(directory.path()).expect("file store");
+        let key = key();
+        let descriptor = SessionDescriptor::new(key.production.clone(), "raw-cleanup", [6; 32]);
+        store.open_session(&descriptor).expect("open session");
+        assert!(
+            !store.stage_raw_chunk(key.clone(), 4, 0, &[1, 2]).expect("stage incomplete fragment")
+        );
+        // Removing the staged file fails once it is already gone.
+        fs::remove_file(&store.raw_stages[&key].temporary).expect("remove staged file");
+        assert!(matches!(
+            store.release_session(&key.production),
+            Err(FileArtifactError::Io { .. })
+        ));
+        assert!(store.raw_stages.is_empty());
+        store.open_session(&descriptor).expect("reopen after failed cleanup");
+        store.release_session(&key.production).expect("release reopened session");
     }
 
     #[test]

@@ -17,3 +17,5 @@
 /tmp_*.sh
 /bench
 /docs/benchmarks/
+/crates/we/target
+/crates/we/Cargo.lock

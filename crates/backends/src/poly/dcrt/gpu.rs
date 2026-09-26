@@ -1381,7 +1381,7 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_builder: *mut *mut MxxGpuGraphBuilderOpaque,
     ) -> c_int;
-    fn gpu_device_release_cached_memory(device: c_int) -> c_int;
+    fn gpu_device_release_cached_memory(ctx: *const GpuContextOpaque, device: c_int) -> c_int;
     fn gpu_device_graph_memory_reserved(device: c_int, out_reserved_bytes: *mut usize) -> c_int;
     fn gpu_graph_allocation_free_async(address: u64, stream: *mut c_void) -> c_int;
     fn mxx_gpu_graph_builder_add_memory_alloc(
@@ -1701,15 +1701,6 @@ pub fn gpu_graph_memory_reserved(device: i32) -> Result<usize, String> {
         return Err(last_error_string());
     }
     Ok(reserved)
-}
-
-/// Wait for `device`, then release the physical memory its Graph pool and
-/// default pool retain without using it.
-pub fn gpu_release_cached_memory(device: i32) -> Result<(), String> {
-    if unsafe { gpu_device_release_cached_memory(device) } != 0 {
-        return Err(last_error_string());
-    }
-    Ok(())
 }
 
 /// Install the logical device table before any device is queried or used.
@@ -2861,6 +2852,15 @@ impl GpuDCRTPolyParams {
 
     pub(crate) fn ctx_raw(&self) -> *mut GpuContextOpaque {
         self.ctx.raw_ptr()
+    }
+
+    /// Wait for this context's work on `device`, then release the physical
+    /// memory the device's Graph pool and default pool retain without using it.
+    pub fn release_cached_memory(&self, device: i32) -> Result<(), String> {
+        if unsafe { gpu_device_release_cached_memory(self.ctx_raw(), device) } != 0 {
+            return Err(last_error_string());
+        }
+        Ok(())
     }
 
     pub fn begin_graph(

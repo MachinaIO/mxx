@@ -2084,7 +2084,9 @@ impl GpuRuntime {
             // frees and return the pools' retained memory so the next
             // candidate, and the selected plan, are admitted on their own.
             for device in contract_devices(&contract)? {
-                crate::poly::dcrt::gpu::gpu_release_cached_memory(device)
+                self.backend
+                    .control_parameters_on_device(device)
+                    .and_then(|params| params.release_cached_memory(device))
                     .map_err(GpuPlanError::Resource)?;
                 tracing::debug!(
                     device,

@@ -551,6 +551,7 @@ impl DirectGraph {
         starts.dedup();
         let mut scratch = crate::gpu_graph_memory::plan_graph_scratch(backend, frame, &starts)
             .map_err(GpuPlanError::Resource)?;
+        let uses = AllocationUses::count(frame);
         let mut regions = Vec::with_capacity(starts.len());
         let indexed_tables = frame
             .indexed_tables
@@ -624,6 +625,7 @@ impl DirectGraph {
                             backend,
                             &mut builder,
                             frame,
+                            &uses,
                             &resources,
                             offset,
                             operation,
@@ -1080,11 +1082,13 @@ fn emit_direct_operations(
     backend: &GpuDcrtBackend,
     builder: &mut GpuNativeGraphBuilder,
     frame: &PhysicalFrame,
+    uses: &AllocationUses,
     resources: &GpuPreparedNativeResources,
     operations: &[CompiledGpuOp],
 ) -> Result<(), GpuNativeGraphError> {
     let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
-    let fusions = fused_operations(frame, operations, builder.launch_stream().physical_device())?;
+    let fusions =
+        fused_operations(frame, uses, operations, builder.launch_stream().physical_device())?;
     let products = fusions.values().map(|fusion| fusion.product).collect::<BTreeSet<_>>();
     for (index, operation) in operations.iter().enumerate() {
         let token = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
@@ -1139,10 +1143,67 @@ fn emit_direct_operations(
                 ))
             })?;
         } else {
-            emit_direct_operation(backend, builder, frame, resources, index, operation)?;
+            emit_direct_operation(backend, builder, frame, uses, resources, index, operation)?;
         }
     }
     Ok(())
+}
+
+/// How many operations of the whole program use each allocation, by the
+/// (value, part) whose storage it is. It is counted once per compile: binding
+/// Graph scratch during emission gives all members of an allocation one new
+/// owner, so the counts stay valid by value while owner identities change.
+struct AllocationUses(BTreeMap<(PhysicalValueId, u32), usize>);
+
+impl AllocationUses {
+    fn count(frame: &PhysicalFrame) -> Self {
+        fn count_operations(
+            frame: &PhysicalFrame,
+            operations: &[CompiledGpuOp],
+            uses: &mut BTreeMap<*const (), usize>,
+        ) {
+            for operation in operations {
+                let mut allocations = BTreeSet::new();
+                for argument in operation.arguments.iter() {
+                    if let KernelArg::Value(value) = argument &&
+                        let Some(owner) = frame.owners.get(value)
+                    {
+                        for part in owner.physical().parts.iter() {
+                            if let Some(storage) = owner.storage(part.storage) {
+                                allocations.insert(Arc::as_ptr(&storage.owner).cast::<()>());
+                            }
+                        }
+                    }
+                }
+                for allocation in allocations {
+                    *uses.entry(allocation).or_default() += 1;
+                }
+                if let Some(body) = &operation.body {
+                    count_operations(frame, body, uses);
+                }
+            }
+        }
+        let mut uses = BTreeMap::new();
+        count_operations(frame, &frame.program.operations, &mut uses);
+        let mut by_part = BTreeMap::new();
+        for (&value, owner) in &frame.owners {
+            for (index, part) in owner.physical().parts.iter().enumerate() {
+                if let Some(storage) = owner.storage(part.storage) &&
+                    let Some(&count) = uses.get(&Arc::as_ptr(&storage.owner).cast::<()>())
+                {
+                    by_part.insert((value, index as u32), count);
+                }
+            }
+        }
+        Self(by_part)
+    }
+
+    fn of(&self, value: &KernelArg, part: &KernelArg) -> Option<usize> {
+        let (KernelArg::Value(value), KernelArg::U32(part)) = (value, part) else {
+            return None;
+        };
+        self.0.get(&(*value, *part)).copied()
+    }
 }
 
 /// A product operation emitted inside its only consumer.
@@ -1167,6 +1228,7 @@ struct FusedOperation {
 /// distinct values.
 fn fused_operations(
     frame: &PhysicalFrame,
+    uses: &AllocationUses,
     operations: &[CompiledGpuOp],
     device: i32,
 ) -> Result<BTreeMap<usize, FusedOperation>, GpuNativeGraphError> {
@@ -1181,32 +1243,6 @@ fn fused_operations(
         let storage = owner.storage(part.storage)?;
         Some((Arc::as_ptr(&storage.owner).cast::<()>(), storage.address, part.view.clone()))
     };
-    fn count_uses(
-        frame: &PhysicalFrame,
-        operations: &[CompiledGpuOp],
-        uses: &mut BTreeMap<*const (), usize>,
-    ) {
-        for operation in operations {
-            let mut allocations = BTreeSet::new();
-            for argument in operation.arguments.iter() {
-                if let KernelArg::Value(value) = argument &&
-                    let Some(owner) = frame.owners.get(value)
-                {
-                    for part in owner.physical().parts.iter() {
-                        if let Some(storage) = owner.storage(part.storage) {
-                            allocations.insert(Arc::as_ptr(&storage.owner).cast::<()>());
-                        }
-                    }
-                }
-            }
-            for allocation in allocations {
-                *uses.entry(allocation).or_default() += 1;
-            }
-            if let Some(body) = &operation.body {
-                count_uses(frame, body, uses);
-            }
-        }
-    }
     let primitive = |operation: &CompiledGpuOp| {
         frame
             .program
@@ -1215,8 +1251,15 @@ fn fused_operations(
             .map(|implementation| implementation.primitive)
             .map_err(invalid)
     };
-    let mut uses = BTreeMap::new();
-    count_uses(frame, &frame.program.operations, &mut uses);
+    // How many operations of the list follow each one.
+    let mut consumers = vec![0usize; operations.len()];
+    for operation in operations {
+        for &predecessor in operation.predecessors.iter() {
+            if let Some(count) = consumers.get_mut(predecessor as usize) {
+                *count += 1;
+            }
+        }
+    }
     let mut fusions = BTreeMap::new();
     for (index, operation) in operations.iter().enumerate() {
         let consumer = primitive(operation)?;
@@ -1236,23 +1279,24 @@ fn fused_operations(
             let Some(product_operation) = operations.get(product) else {
                 continue;
             };
-            if product_operation.device != device ||
-                !operations.iter().enumerate().all(|(other, candidate)| {
-                    other == index || !candidate.predecessors.contains(&(product as u32))
-                })
-            {
+            // The consumer must be the product's only follower.
+            if product_operation.device != device || consumers[product] != 1 {
                 continue;
             }
             let arguments = product_operation.arguments.as_ref();
             let output = |value: usize, part: usize| {
                 arguments.get(value).zip(arguments.get(part)).and_then(|(v, p)| region(v, p))
             };
-            let only_consumer = |output: &(*const (), u64, _)| uses.get(&output.0) == Some(&2);
+            // Its output allocation is used by the product and the consumer only.
+            let only_consumer = |value: usize, part: usize| {
+                arguments.get(value).zip(arguments.get(part)).and_then(|(v, p)| uses.of(v, p)) ==
+                    Some(2)
+            };
             let addend_is_left = match (consumer, primitive(product_operation)?) {
                 (GpuNativePrimitive::MatrixSub, GpuNativePrimitive::MultiplyMonomial)
                     if output(2, 3).as_ref() == Some(&left) &&
                         output(0, 1).as_ref() == Some(&right) &&
-                        only_consumer(&left) =>
+                        only_consumer(2, 3) =>
                 {
                     None
                 }
@@ -1265,7 +1309,7 @@ fn fused_operations(
                     } else {
                         continue;
                     };
-                    if !only_consumer(&destination) {
+                    if !only_consumer(6, 7) {
                         continue;
                     }
                     Some(addend_is_left)
@@ -1285,6 +1329,7 @@ fn emit_direct_operation(
     backend: &GpuDcrtBackend,
     builder: &mut GpuNativeGraphBuilder,
     frame: &PhysicalFrame,
+    uses: &AllocationUses,
     resources: &GpuPreparedNativeResources,
     index: usize,
     operation: &CompiledGpuOp,
@@ -1332,7 +1377,7 @@ fn emit_direct_operation(
             builder.bind_resident_address(address, 8, *binding)?;
             builder
                 .add_if_with_body(address, *binding, |body_builder| {
-                    emit_direct_operations(backend, body_builder, frame, resources, body)
+                    emit_direct_operations(backend, body_builder, frame, uses, resources, body)
                 })
                 .and_then(|()| builder.finish_operation().map(|_| ()))
         }
@@ -1370,7 +1415,7 @@ fn emit_direct_operation(
                     *limit_binding,
                     *status_binding,
                     |body_builder| {
-                        emit_direct_operations(backend, body_builder, frame, resources, body)
+                        emit_direct_operations(backend, body_builder, frame, uses, resources, body)
                     },
                 )
                 .and_then(|()| builder.finish_operation().map(|_| ()))

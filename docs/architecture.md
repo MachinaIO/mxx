@@ -1179,13 +1179,22 @@ These restrictions are explicit errors in the current code:
   artifact-reading sequential loop cannot run inside a device body"). Sibling conditional nodes
   inside one conditional body are ordered one after another, because concurrently executing
   nested conditionals did not complete on the device.
-- **Parallel-loop bodies** cannot import scoped artifacts ("GPU device body artifact import needs
-  an on-demand region boundary"); nested loop counts and types cannot depend on the enclosing
+- **Parallel-loop bodies** cannot create their own artifact inputs ("GPU device body artifact
+  import needs an on-demand region boundary"); an artifact the body captures from an enclosing
+  scope is imported once before the loop, and a family member it selects is read per lane (see
+  "External I/O and waves"). Nested loop counts and types cannot depend on the enclosing
   index; matrix-valued loop outputs must be homogeneous matrix families ("GPU loop can return only
   matrix members", "GPU parallel loop needs a homogeneous matrix family"); a vectorized scalar
   loop cannot be nested in another vectorized body.
-- **External I/O and waves** cannot be combined: external-I/O loops and selected artifact imports
-  cannot be nested in a wave schedule (`DirectGraph::compile`).
+- **External I/O and waves** run in one executor (`GpuRuntime::run_region_range` in
+  `gpu_runtime_direct.rs`). At each region boundary the host replays a nested wave, iterates an
+  external-I/O loop whose body starts there, loads the imports planned there, and reads each
+  selected artifact member whose selector the preceding regions computed. A wave replays its body
+  range, and an external-I/O loop its body range per iteration, through the same executor, so an
+  external-I/O loop or a selected import may lie inside a wave's lanes. A wave cannot lie inside an
+  external-I/O loop, whose body lowers as a device body. A selected import inside a wave body is
+  read for each lane of each wave: one host round trip per lane between that lane's selector and
+  its consumer.
 - **Artifacts.** Integer and typed-blob artifact inputs need `plan_with_store` for payload sizes;
   host `Int` inputs without an `integer_input_ranges` entry get a signed word range; matrix
   exports need a `FullEval` source; raw transcoding does not support every wire type ("raw

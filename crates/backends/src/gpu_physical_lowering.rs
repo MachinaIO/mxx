@@ -8,7 +8,7 @@ use crate::{
     artifact::ArtifactKey,
     backend::{
         BoundStorage, GpuResidentValue, PolyMatrix, RuntimeValue,
-        poly_gpu::{GpuDcrtBackend, PhysicalExport},
+        poly_gpu::{GpuDcrtBackend, PhysicalExport, RawExportLeaf},
     },
     gpu_execution_plan::{
         ColumnRange, CompiledGpuOp, CompiledGpuProgram, FrozenGpuPlan, GpuBindingSource,
@@ -1365,6 +1365,8 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub validated: &'a ValidatedGraph,
     pub integer_input_ranges: &'a BTreeMap<String, RangeInclusive<BigInt>>,
     pub artifact_payload_sizes: &'a BTreeMap<ArtifactKey, usize>,
+    /// Matrix exports stay in GPU memory for a store that keeps them there.
+    pub device_artifact_exports: bool,
     pub backend: &'a GpuDcrtBackend,
     pub logical: &'a FrozenGpuPlan,
     pub device: i32,
@@ -1418,27 +1420,28 @@ pub(super) struct PhysicalLoweringContext<'a> {
 
 /// Reserve one reusable lane input for a selected artifact member. The caller
 /// records an ImportTemplate for each wave occurrence, all referencing the
-/// same coefficient destination; no family-wide allocation or read occurs.
-/// The destination is the graph value: an evaluation-domain consumer converts
-/// it through [`full_eval_value`]. The returned index is the first operation
-/// emitted after the destination exists, before which the upload runs.
+/// same destination; no family-wide allocation or read occurs. The
+/// destination is the graph value in `encoding`: a matrix artifact arrives in
+/// evaluation representation and a trapdoor secret leaf in coefficients, and a
+/// consumer of the other encoding converts it once. The returned index is the
+/// first operation emitted after the destination exists, before which the
+/// upload runs.
 pub(super) fn allocate_matrix_import_destination(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: &ConcreteMatrixType,
+    encoding: PhysicalEncoding,
 ) -> Result<(PhysicalValueId, Arc<GpuDCRTPolyMatrix>, u32), String> {
-    let native =
-        ctx.backend.allocate_physical_matrix(ty, ctx.device, PhysicalEncoding::FullCoeff)?;
+    let native = ctx.backend.allocate_physical_matrix(ty, ctx.device, encoding.clone())?;
     let storage = StorageRef::Input(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU import storages".to_owned())?,
     );
-    let (physical, owner) =
-        physical_matrix(ty, PhysicalEncoding::FullCoeff, storage, Arc::clone(&native))?;
-    let coefficient = value_id(ctx.values.len())?;
+    let (physical, owner) = physical_matrix(ty, encoding, storage, Arc::clone(&native))?;
+    let destination = value_id(ctx.values.len())?;
     ctx.values.push(physical);
-    ctx.owners.insert(coefficient, owner);
+    ctx.owners.insert(destination, owner);
     let before_operation =
         u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
-    Ok((coefficient, native, before_operation))
+    Ok((destination, native, before_operation))
 }
 
 /// Allocate only the selected member's typed owner. Trapdoor imports insert
@@ -1453,7 +1456,7 @@ pub(super) fn allocate_typed_import_destination(
 ) -> Result<(PhysicalValueId, PhysicalValueId, ImportDestination, u32), String> {
     if let ConcreteWireType::Matrix(matrix) = ty {
         let (destination, owner, before_operation) =
-            allocate_matrix_import_destination(ctx, matrix)?;
+            allocate_matrix_import_destination(ctx, matrix, PhysicalEncoding::FullEval)?;
         return Ok((
             destination,
             destination,
@@ -1462,18 +1465,18 @@ pub(super) fn allocate_typed_import_destination(
         ));
     }
     if let ConcreteWireType::Trapdoor { matrix, .. } = ty {
-        let (public_coeff, public_owner, before_operation) =
-            allocate_matrix_import_destination(ctx, matrix)?;
+        let (public_eval, public_owner, before_operation) =
+            allocate_matrix_import_destination(ctx, matrix, PhysicalEncoding::FullEval)?;
         let leaf_types = trapdoor_leaf_types(ty)?;
         let mut coefficient_leaves = Vec::with_capacity(6);
         let mut secret_owners = Vec::with_capacity(6);
         for leaf_ty in leaf_types {
-            let (coefficient, owner, _) = allocate_matrix_import_destination(ctx, &leaf_ty)?;
+            let (coefficient, owner, _) =
+                allocate_matrix_import_destination(ctx, &leaf_ty, PhysicalEncoding::FullCoeff)?;
             coefficient_leaves.push(coefficient);
             secret_owners.push((owner, leaf_ty));
         }
         // Trapdoor leaves are consumed by evaluation-domain preimage kernels.
-        let public_eval = full_eval_value(ctx, public_coeff)?;
         let evaluation_leaves = coefficient_leaves
             .iter()
             .map(|&coefficient| full_eval_value(ctx, coefficient))
@@ -1486,7 +1489,7 @@ pub(super) fn allocate_typed_import_destination(
         let secret_owners: [(Arc<GpuDCRTPolyMatrix>, ConcreteMatrixType); 6] = secret_owners
             .try_into()
             .map_err(|_| "GPU trapdoor import has the wrong owner count")?;
-        let destination = coefficient_leaves.into_iter().next().unwrap_or(public_coeff);
+        let destination = coefficient_leaves.into_iter().next().unwrap_or(public_eval);
         return Ok((
             destination,
             secret,
@@ -2462,7 +2465,8 @@ fn plan_static_matrix(
         }
     }
     let canonical = encode_static_matrix(ty, value, env, regular_gadget_digits_per_tower)?;
-    let (coefficient, native, _) = allocate_matrix_import_destination(ctx, ty)?;
+    let (coefficient, native, _) =
+        allocate_matrix_import_destination(ctx, ty, PhysicalEncoding::FullCoeff)?;
     // The owner is new at plan time and has no prior GPU or I/O readers.
     unsafe {
         ctx.backend.upload_physical_matrix_import_after_completion(&native, ty, &canonical)?;
@@ -3802,7 +3806,7 @@ fn inverse_trapdoor_for_export(
     Ok(coefficient)
 }
 
-fn inverse_matrix_for_export(
+fn eval_matrix_for_export(
     ctx: &mut PhysicalLoweringContext<'_>,
     source: PhysicalValueId,
 ) -> Result<PhysicalValueId, String> {
@@ -3815,7 +3819,7 @@ fn inverse_matrix_for_export(
     {
         return Err("GPU matrix artifact source is not a full matrix".into());
     }
-    full_coeff_value(ctx, source)
+    full_eval_value(ctx, source)
 }
 
 fn trapdoor_leaf_view(
@@ -4899,6 +4903,7 @@ pub(super) fn lower_preimage_sample_node(
                 validated: ctx.validated,
                 integer_input_ranges: ctx.integer_input_ranges,
                 artifact_payload_sizes: ctx.artifact_payload_sizes,
+                device_artifact_exports: ctx.device_artifact_exports,
                 backend: ctx.backend,
                 logical: ctx.logical,
                 device: ctx.device,
@@ -5348,9 +5353,19 @@ fn emit_artifact_export(
             let slot = slots.len();
             let payload_bytes = usize::try_from(fragment.raw_bytes)
                 .map_err(|_| "GPU artifact fragment exceeds host address space".to_owned())?;
-            slots.push(Arc::new(
-                GpuExportSlot::new(ctx.device, payload_bytes).map_err(|error| error.to_string())?,
-            ));
+            let on_device = ctx.device_artifact_exports &&
+                matches!(
+                    artifact_type,
+                    ArtifactType::Matrix(_) |
+                        ArtifactType::SmallMatrix { .. } |
+                        ArtifactType::Preimage { .. }
+                );
+            let slot_owner = if on_device {
+                GpuExportSlot::new_on_device(ctx.device, payload_bytes)
+            } else {
+                GpuExportSlot::new(ctx.device, payload_bytes)
+            };
+            slots.push(Arc::new(slot_owner.map_err(|error| error.to_string())?));
             let payload_binding = u32::try_from(ctx.bindings.len())
                 .map_err(|_| "too many GPU graph bindings".to_owned())?;
             ctx.bindings.push(GpuBindingSource::ExportSlotPayload { slot });
@@ -5359,21 +5374,17 @@ fn emit_artifact_export(
             ctx.bindings.push(GpuBindingSource::ExportSlotHeader { slot });
             let copy_index = u32::try_from(ctx.operations.len())
                 .map_err(|_| "too many GPU operations".to_owned())?;
-            let source_parts = ctx.values[export_source.0 as usize].parts.len();
-            let (copy_source, part_index, binding_base) = match public_export_source {
-                Some(public) if fragment_index >= source_parts => (
+            let part_index = fragment.part;
+            let (copy_source, binding_base) = match (fragment.leaf, public_export_source) {
+                (RawExportLeaf::TrapdoorPublic, Some(public)) => (
                     public,
-                    u32::try_from(fragment_index - source_parts)
-                        .map_err(|_| "GPU public export part index exceeds u32".to_owned())?,
                     public_binding_base
                         .ok_or_else(|| "GPU trapdoor public binding is missing".to_owned())?,
                 ),
-                _ => (
-                    *export_source,
-                    u32::try_from(fragment_index)
-                        .map_err(|_| "GPU export fragment index exceeds u32".to_owned())?,
-                    *source_binding_base,
-                ),
+                (RawExportLeaf::TrapdoorPublic, None) => {
+                    return Err("GPU trapdoor public fragment has no public source".into());
+                }
+                (RawExportLeaf::Value(_), _) => (*export_source, *source_binding_base),
             };
             let source_binding = binding_base
                 .checked_add(part_index)
@@ -5448,6 +5459,7 @@ pub(crate) fn plan_physical_graph(
     integer_input_ranges: &BTreeMap<String, RangeInclusive<BigInt>>,
     artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
     subgraph_kernels: &[GpuSubgraphKernel],
+    device_artifact_exports: bool,
 ) -> Result<PhysicalFrame, String> {
     let device = i32::try_from(
         *logical
@@ -5717,18 +5729,19 @@ pub(crate) fn plan_physical_graph(
                 .and_then(ConcreteWireType::matrix_type)
                 .ok_or_else(|| "GPU artifact import currently needs one matrix".to_owned())?
                 .clone();
+            // A matrix artifact holds evaluation residues.
             let native =
-                backend.allocate_physical_matrix(&ty, device, PhysicalEncoding::FullCoeff)?;
+                backend.allocate_physical_matrix(&ty, device, PhysicalEncoding::FullEval)?;
             let storage = StorageRef::Input(
                 u32::try_from(values.len())
                     .map_err(|_| "too many GPU import storages".to_owned())?,
             );
             let (physical, owner) =
-                physical_matrix(&ty, PhysicalEncoding::FullCoeff, storage, Arc::clone(&native))?;
-            let coefficient = value_id(values.len())?;
+                physical_matrix(&ty, PhysicalEncoding::FullEval, storage, Arc::clone(&native))?;
+            let evaluation = value_id(values.len())?;
             values.push(physical);
-            owners.insert(coefficient, owner);
-            wire_ids.insert(wire, coefficient);
+            owners.insert(evaluation, owner);
+            wire_ids.insert(wire, evaluation);
             pending_imports.insert(
                 wire,
                 ImportTemplate {
@@ -5744,7 +5757,7 @@ pub(crate) fn plan_physical_graph(
                     )
                     .ok_or("GPU import has no artifact type")?,
                     staged: false,
-                    destination: coefficient,
+                    destination: evaluation,
                     upload_owner: ImportDestination::Matrix { owner: native, ty },
                 },
             );
@@ -5870,7 +5883,7 @@ pub(crate) fn plan_physical_graph(
         BTreeMap::<(PhysicalValueId, usize), Vec<(ColumnRange, u32)>>::new();
     let mut slots = Vec::<Arc<GpuExportSlot>>::new();
     let mut export_templates = Vec::<ExportTemplate>::new();
-    let mut coefficient_exports = BTreeMap::<PhysicalValueId, PhysicalValueId>::new();
+    let mut export_sources = BTreeMap::<PhysicalValueId, PhysicalValueId>::new();
     let mut control_resets = Vec::<ControlReset>::new();
     let mut sample_seeds = Vec::<SampleSeed>::new();
     let mut hash_resources = BTreeMap::<u32, GpuHashResourceSpec>::new();
@@ -5892,6 +5905,7 @@ pub(crate) fn plan_physical_graph(
                 validated,
                 integer_input_ranges,
                 artifact_payload_sizes,
+                device_artifact_exports,
                 backend,
                 logical,
                 device,
@@ -6274,7 +6288,7 @@ pub(crate) fn plan_physical_graph(
                     if let Some(writers) = writers {
                         ctx.producer.insert(id, writers);
                     }
-                    exported.push((Some(index), full_coeff_value(&mut ctx, id)?));
+                    exported.push((Some(index), full_eval_value(&mut ctx, id)?));
                 }
                 emit_artifact_export(
                     &mut ctx,
@@ -6509,40 +6523,34 @@ pub(crate) fn plan_physical_graph(
             continue;
         }
         if let Some(availability) = output_root.availability {
-            // Canonical artifact encoding reads coefficients. Keep the Eval
-            // producer alive for other readers and share one iNTT among
+            // A matrix artifact is written in evaluation representation and
+            // a trapdoor secret in coefficients. One conversion is shared among
             // multiple artifact names for the same physical output.
-            let export_source = if let Some(&coefficient) = coefficient_exports.get(&source) {
-                coefficient
+            let export_source = if let Some(&exported) = export_sources.get(&source) {
+                exported
             } else if matches!(values[source.0 as usize].ty, ConcreteWireType::Trapdoor { .. }) {
                 let mut ctx = root_context!();
                 let coefficient = inverse_trapdoor_for_export(&mut ctx, source)?;
-                coefficient_exports.insert(source, coefficient);
+                export_sources.insert(source, coefficient);
                 coefficient
             } else {
-                if !matches!(
-                    values[source.0 as usize].encodings.as_ref(),
-                    [PhysicalEncoding::FullEval] | [PhysicalEncoding::FullCoeff]
-                ) {
-                    return Err("GPU artifact export requires a full matrix source".into());
-                }
                 let mut ctx = root_context!();
-                let coefficient = full_coeff_value(&mut ctx, source)?;
-                coefficient_exports.insert(source, coefficient);
-                coefficient
+                let evaluation = eval_matrix_for_export(&mut ctx, source)?;
+                export_sources.insert(source, evaluation);
+                evaluation
             };
             let public_export_source =
                 if matches!(values[source.0 as usize].ty, ConcreteWireType::Trapdoor { .. }) {
                     let public = *trapdoor_public_ids.get(&source).ok_or_else(|| {
                         "GPU trapdoor artifact lacks paired public output".to_owned()
                     })?;
-                    if let Some(&coefficient) = coefficient_exports.get(&public) {
-                        Some(coefficient)
+                    if let Some(&evaluation) = export_sources.get(&public) {
+                        Some(evaluation)
                     } else {
                         let mut ctx = root_context!();
-                        let coefficient = inverse_matrix_for_export(&mut ctx, public)?;
-                        coefficient_exports.insert(public, coefficient);
-                        Some(coefficient)
+                        let evaluation = eval_matrix_for_export(&mut ctx, public)?;
+                        export_sources.insert(public, evaluation);
+                        Some(evaluation)
                     }
                 } else {
                     None
@@ -8091,6 +8099,163 @@ mod tests {
             assert!(result.production_id.is_some());
             assert_eq!(result.artifact_handles["sum"].len(), 1);
         }
+    }
+
+    /// A matrix artifact is stored in evaluation representation: the GPU
+    /// imports the CPU's bytes as residues and exports the unchanged value
+    /// as the same bytes, over a multi-limb ring whose limbs are interleaved
+    /// in one allocation.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_matrix_artifact_bytes_round_trip_between_cpu_and_gpu() {
+        let device = detected_gpu_device_ids()[0];
+        let parameters = DCRTPolyParams::new(32, 3, 28, 8, None, None);
+        let moduli = parameters.to_crt().0;
+        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
+        let producer = DslContext::new("eval-artifact-producer")
+            .cached_output("stored", ring.uniform_residue((2, 3)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let produced = execute_in_session(
+            &producer,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut store,
+            [0x61; 32],
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let production = produced.production_id.expect("producer identity");
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let imported =
+            ring.artifact_input(production.clone(), "stored", (2, 3), ArtifactAvailability::Cached);
+        let consumer = DslContext::new("eval-artifact-consumer")
+            .cached_output("sum", imported + ring.zero((2, 3)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest.clone())]),
+                crate::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_parameters], [device])).unwrap();
+        let mut plan = runtime.plan(consumer, &BTreeMap::new()).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x62; 32])
+            .unwrap();
+        let exported_production = result.production_id.clone().expect("consumer identity");
+        let exported_manifest = store.load_finalized_manifest(&exported_production).unwrap();
+        use crate::{ArtifactPayload, artifact::ArtifactStore};
+        use mxx_ir_core::artifact::{Manifest, ProductionId};
+        let load = |store: &mut MemoryArtifactStore,
+                    production: &ProductionId,
+                    manifest: &Manifest,
+                    name: &str| {
+            let key =
+                ArtifactKey { production: production.clone(), name: name.into(), index: None };
+            match store.load(&key, &manifest.artifacts[name]).unwrap() {
+                ArtifactPayload::Matrix(bytes) => bytes,
+                _ => panic!("matrix artifact expected"),
+            }
+        };
+        let stored = load(&mut store, &production, &manifest, "stored");
+        let exported = load(&mut store, &exported_production, &exported_manifest, "sum");
+        assert_eq!(&stored[..4], b"MXE1");
+        assert_eq!(exported, stored);
+    }
+
+    /// A store on the device keeps GPU matrix exports in GPU memory: the
+    /// next GPU stage imports them by a device copy without a host read, and
+    /// a host read still returns the canonical bytes.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn device_store_keeps_matrix_artifacts_in_gpu_memory() {
+        use crate::{ArtifactPayload, artifact::ArtifactStore};
+        use mxx_ir_core::artifact::{Manifest, ProductionId};
+        let device = detected_gpu_device_ids()[0];
+        let parameters = DCRTPolyParams::new(32, 3, 28, 8, None, None);
+        let moduli = parameters.to_crt().0;
+        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), 32);
+        let mut store = MemoryArtifactStore::on_device();
+        let producer = DslContext::new("device-store-producer")
+            .cached_output("stored", ring.uniform_residue((2, 3)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let production = execute_in_session(
+            &producer,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut store,
+            [0x71; 32],
+            ExecutionConfig::default(),
+        )
+        .unwrap()
+        .production_id
+        .expect("producer identity");
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_parameters], [device])).unwrap();
+        // Two GPU stages: each imports the previous artifact and exports it
+        // unchanged.
+        let mut stage = |store: &mut MemoryArtifactStore,
+                         source: &ProductionId,
+                         name: &str,
+                         nonce: u8|
+         -> ProductionId {
+            let manifest = store.load_finalized_manifest(source).unwrap();
+            let imported =
+                ring.artifact_input(source.clone(), name, (2, 3), ArtifactAvailability::Cached);
+            let consumer = DslContext::new(format!("device-store-stage-{nonce}"))
+                .cached_output("sum", imported + ring.zero((2, 3)))
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(source.clone(), manifest)]),
+                    crate::openfhe_guard::gen_modulus_and_warmup,
+                )
+                .unwrap();
+            let mut plan = runtime.plan_with_store(consumer, &BTreeMap::new(), store).unwrap();
+            runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), store, [nonce; 32])
+                .unwrap()
+                .production_id
+                .expect("stage identity")
+        };
+        let first = stage(&mut store, &production, "stored", 0x72);
+        assert!(store.device_resident_bytes() > 0, "GPU export stays in GPU memory");
+        let second = stage(&mut store, &first, "sum", 0x73);
+        let key = |production: &ProductionId, name: &str| ArtifactKey {
+            production: production.clone(),
+            name: name.into(),
+            index: None,
+        };
+        assert_eq!(
+            store.device_host_reads(&key(&first, "sum")),
+            Some(0),
+            "the GPU import used a device copy"
+        );
+        let load = |store: &mut MemoryArtifactStore, production: &ProductionId, name: &str| {
+            let manifest: Manifest = store.load_finalized_manifest(production).unwrap();
+            match store.load(&key(production, name), &manifest.artifacts[name]).unwrap() {
+                ArtifactPayload::Matrix(bytes) => bytes,
+                _ => panic!("matrix artifact expected"),
+            }
+        };
+        let stored = load(&mut store, &production, "stored");
+        assert_eq!(load(&mut store, &second, "sum"), stored);
     }
 
     /// The plan is store-free; the selected matrix is read at its first

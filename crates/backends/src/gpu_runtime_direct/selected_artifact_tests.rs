@@ -544,8 +544,13 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         else {
             panic!("selected CPU oracle artifact must be a trapdoor");
         };
-        let expected_public =
-            DCRTPolyMatrix::try_from_compact_bytes(&oracle_params, &public_bytes).unwrap();
+        let expected_public = DCRTPolyMatrix::try_from_eval_artifact(
+            &oracle_params,
+            public.size().0,
+            public.size().1,
+            &public_bytes,
+        )
+        .unwrap();
         let expected_secret =
             DCRTTrapdoor::try_from_compact_bytes(&oracle_params, &secret_bytes).unwrap();
         assert_eq!(public.to_compact_bytes(), expected_public.to_compact_bytes());

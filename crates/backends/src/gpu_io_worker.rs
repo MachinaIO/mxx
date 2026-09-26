@@ -18,13 +18,15 @@ use crate::transcript::{DrawSite, RecordedValue};
 use crate::{
     artifact::{ArtifactKey, ArtifactPayload},
     backend::poly_gpu::{PhysicalExport, transcode_raw_artifact},
-    poly::dcrt::gpu::GpuExportSlot,
+    device_artifact::DeviceArtifact,
+    poly::dcrt::gpu::{GpuExportPayload, GpuExportSlot, download_device_memory},
     session::SessionStore,
 };
 #[cfg(test)]
 use mxx_ir_core::artifact::ProductionId;
 use mxx_ir_core::artifact::{Manifest, ManifestArtifact};
 use std::{
+    collections::BTreeMap,
     marker::PhantomData,
     num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
@@ -78,6 +80,11 @@ pub enum IoCompletion {
         frame: FrameGeneration,
         payload: RuntimeOwnedPayload,
     },
+    /// The artifact is held in GPU memory by the store.
+    ImportedDevice {
+        frame: FrameGeneration,
+        artifact: Arc<DeviceArtifact>,
+    },
     Exported {
         frame: FrameGeneration,
     },
@@ -100,6 +107,7 @@ impl IoCompletion {
     pub fn frame(&self) -> FrameGeneration {
         match self {
             Self::Imported { frame, .. } |
+            Self::ImportedDevice { frame, .. } |
             Self::Exported { frame, .. } |
             Self::ArtifactCommitted { frame } |
             Self::Transcoded { frame } |
@@ -340,28 +348,120 @@ where
     })
 }
 
+struct TimingGuard<'a> {
+    started: std::time::Instant,
+    entry: &'a mut std::time::Duration,
+}
+
+impl Drop for TimingGuard<'_> {
+    fn drop(&mut self) {
+        *self.entry += self.started.elapsed();
+    }
+}
+
 fn worker_loop<S>(store: &mut S, receiver: Receiver<IoCommand<S::Error>>)
 where
     S: SessionStore + Send,
 {
     let mut failed = false;
+    // Per command kind: count, busy time, and payload bytes, reported when a
+    // session finalizes.
+    let mut busy: BTreeMap<&'static str, (u64, std::time::Duration, u64)> = BTreeMap::new();
+    // Stored artifact bytes and counts by availability: transferred artifacts
+    // must reach the consumer; cached ones can be regenerated from public
+    // context.
+    let mut stored = [(0u64, 0u64); 2];
+    let mut raw_by_key: BTreeMap<String, u64> = BTreeMap::new();
+    // Exports whose chunks the store holds in GPU memory, awaiting their
+    // transcode command, which finishes them without transcoding.
+    let mut device_staged = std::collections::BTreeSet::<ArtifactKey>::new();
     while let Ok(command) = receiver.recv() {
+        let started = std::time::Instant::now();
+        let (kind, bytes) = match &command {
+            IoCommand::Import { .. } => ("import", 0),
+            IoCommand::ExportSlot { raw_bytes, key, .. } => {
+                *raw_by_key
+                    .entry(format!(
+                        "{}{}",
+                        key.name,
+                        key.index.map(|index| format!("[{index}]")).unwrap_or_default()
+                    ))
+                    .or_default() += *raw_bytes;
+                ("export_slot", *raw_bytes)
+            }
+            IoCommand::Commit { .. } => ("commit", 0),
+            IoCommand::Transcode { export, .. } => (
+                match &export.physical.ty {
+                    mxx_ir_core::types::ConcreteWireType::Matrix(_) => "transcode:matrix",
+                    mxx_ir_core::types::ConcreteWireType::SmallMatrix { .. } => {
+                        "transcode:small_matrix"
+                    }
+                    mxx_ir_core::types::ConcreteWireType::Preimage { .. } => "transcode:preimage",
+                    mxx_ir_core::types::ConcreteWireType::Trapdoor { .. } => "transcode:trapdoor",
+                    _ => "transcode:other",
+                },
+                0,
+            ),
+            #[cfg(test)]
+            IoCommand::TranscriptRecord { .. } => ("transcript", 0),
+            IoCommand::Finalize { .. } => ("finalize", 0),
+        };
+        if kind == "finalize" {
+            for (kind, (count, time, bytes)) in &busy {
+                tracing::debug!(
+                    target: "mxx_backends::gpu_execute",
+                    kind,
+                    count,
+                    busy_ms = time.as_millis() as u64,
+                    bytes,
+                    "GPU I/O worker commands"
+                );
+            }
+            if matches!(command, IoCommand::Finalize { .. }) {
+                tracing::info!(
+                    target: "mxx_backends::gpu_execute",
+                    transferred_bytes = stored[0].0,
+                    transferred_artifacts = stored[0].1,
+                    cached_bytes = stored[1].0,
+                    cached_artifacts = stored[1].1,
+                    "stored artifact sizes"
+                );
+            }
+            busy.clear();
+            stored = [(0, 0); 2];
+            raw_by_key.clear();
+        }
+        let entry = busy.entry(kind).or_default();
+        entry.0 += 1;
+        entry.2 += bytes;
+        let _timing = TimingGuard { started, entry: &mut entry.1 };
         match command {
             IoCommand::Import { frame, key, descriptor, staged, reply } => {
                 if failed {
                     let _ = reply.send(Err(IoWorkerError::PriorFailure));
                     continue;
                 }
-                let result = if staged {
-                    store.load_staged(&key, &descriptor)
-                } else {
-                    store.load(&key, &descriptor)
-                }
-                .map(|payload| IoCompletion::Imported {
-                    frame,
-                    payload: RuntimeOwnedPayload::new(payload),
-                })
-                .map_err(IoWorkerError::Store);
+                let device = store
+                    .device_artifacts()
+                    .and_then(|device| device.get(&key).cloned())
+                    .filter(|artifact| {
+                        artifact.artifact_type == descriptor.artifact_type &&
+                            artifact.availability == descriptor.availability &&
+                            artifact.layout == descriptor.layout
+                    });
+                let result = match device {
+                    Some(artifact) => Ok(IoCompletion::ImportedDevice { frame, artifact }),
+                    None => if staged {
+                        store.load_staged(&key, &descriptor)
+                    } else {
+                        store.load(&key, &descriptor)
+                    }
+                    .map(|payload| IoCompletion::Imported {
+                        frame,
+                        payload: RuntimeOwnedPayload::new(payload),
+                    })
+                    .map_err(IoWorkerError::Store),
+                };
                 failed = result.is_err();
                 let _ = reply.send(result);
             }
@@ -405,15 +505,40 @@ where
                                 "slot metadata differs from planned export".into(),
                             ));
                         }
-                        store
-                            .stage_raw_chunk(
-                                key,
-                                total_raw_bytes,
-                                ready.header.artifact_offset,
-                                ready.payload,
-                            )
-                            .map(|_| IoCompletion::Exported { frame })
-                            .map_err(IoWorkerError::Store)
+                        let offset = ready.header.artifact_offset;
+                        match ready.payload {
+                            GpuExportPayload::Host(bytes) => store
+                                .stage_raw_chunk(key, total_raw_bytes, offset, bytes)
+                                .map(|_| IoCompletion::Exported { frame })
+                                .map_err(IoWorkerError::Store),
+                            GpuExportPayload::Device { physical_device, address, bytes } => {
+                                if let Some(device) = store.device_artifacts() {
+                                    device_staged.insert(key.clone());
+                                    return device
+                                        .stage_chunk(
+                                            key,
+                                            total_raw_bytes,
+                                            offset,
+                                            physical_device,
+                                            address,
+                                            bytes,
+                                        )
+                                        .map(|_| IoCompletion::Exported { frame })
+                                        .map_err(IoWorkerError::InvalidExport);
+                                }
+                                // A plan made for a device store executes with
+                                // a host store: bring the chunk to the host.
+                                let mut host = vec![0u8; bytes];
+                                download_device_memory(physical_device, address, &mut host)
+                                    .map_err(|error| {
+                                        IoWorkerError::InvalidExport(error.to_string())
+                                    })?;
+                                store
+                                    .stage_raw_chunk(key, total_raw_bytes, offset, &host)
+                                    .map(|_| IoCompletion::Exported { frame })
+                                    .map_err(IoWorkerError::Store)
+                            }
+                        }
                     });
                 failed = result.is_err();
                 let _ = reply.send(result);
@@ -435,9 +560,65 @@ where
                     let _ = reply.send(Err(IoWorkerError::PriorFailure));
                     continue;
                 }
+                let artifact_name = format!(
+                    "{}{}",
+                    handle.key.name,
+                    handle.key.index.map(|index| format!("[{index}]")).unwrap_or_default()
+                );
+                let class = match handle.availability {
+                    mxx_ir_core::artifact::ArtifactAvailability::Transferred => 0,
+                    mxx_ir_core::artifact::ArtifactAvailability::Cached => 1,
+                };
+                if device_staged.remove(&handle.key) {
+                    let raw_bytes = export.raw_total_bytes;
+                    tracing::debug!(
+                        target: "mxx_backends::gpu_execute",
+                        artifact = %artifact_name,
+                        raw_bytes,
+                        logical_bytes = export
+                            .fragments
+                            .iter()
+                            .flat_map(|fragment| fragment.views.iter())
+                            .map(|view| view.extent.iter().product::<u64>() * u64::from(view.element_bytes))
+                            .sum::<u64>(),
+                        fragments = export.fragments.len(),
+                        views = ?export.fragments.iter().map(|fragment| (&fragment.views[0].extent, &fragment.views[0].byte_strides)).collect::<Vec<_>>(),
+                        "device artifact"
+                    );
+                    let result = store
+                        .device_artifacts()
+                        .ok_or_else(|| {
+                            IoWorkerError::InvalidExport(
+                                "device export lost its device store".into(),
+                            )
+                        })
+                        .and_then(|device| {
+                            device
+                                .finish(
+                                    handle.key,
+                                    &handle.artifact_type,
+                                    handle.availability,
+                                    handle.layout.as_deref(),
+                                    payload_kind,
+                                    export,
+                                )
+                                .map_err(IoWorkerError::InvalidExport)
+                        })
+                        .map(|()| IoCompletion::Transcoded { frame });
+                    if result.is_ok() {
+                        stored[class].0 += raw_bytes;
+                        stored[class].1 += 1;
+                    }
+                    failed = result.is_err();
+                    let _ = reply.send(result);
+                    continue;
+                }
+                let mut written_bytes = 0u64;
                 let mut encode = |source: &mut dyn crate::artifact::ReadSeek,
                                   sink: &mut dyn std::io::Write| {
-                    transcode_raw_artifact(&export, source, sink).map(|_| ())
+                    transcode_raw_artifact(&export, source, sink).map(|written| {
+                        written_bytes = written;
+                    })
                 };
                 let result = store
                     .transcode_staged(
@@ -450,6 +631,18 @@ where
                     )
                     .map(|()| IoCompletion::Transcoded { frame })
                     .map_err(IoWorkerError::Store);
+                if result.is_ok() {
+                    stored[class].0 += written_bytes;
+                    stored[class].1 += 1;
+                    tracing::debug!(
+                        target: "mxx_backends::gpu_execute",
+                        artifact = %artifact_name,
+                        class,
+                        written_bytes,
+                        raw_bytes = raw_by_key.get(&artifact_name).copied().unwrap_or(0),
+                        "transcoded artifact"
+                    );
+                }
                 failed = result.is_err();
                 let _ = reply.send(result);
             }

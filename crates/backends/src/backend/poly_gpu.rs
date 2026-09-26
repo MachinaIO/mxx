@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+    matrix::{eval_artifact::decode_eval_matrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         PolyParams,
         dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
@@ -24,9 +24,9 @@ use crate::{
 mod fleet;
 pub use fleet::GpuDcrtBackend;
 pub(crate) use fleet::{
-    GpuPreparedNativeResources, PhysicalExport, emit_compiled_gpu_op,
+    GpuPreparedNativeResources, PhysicalExport, RawExportLeaf, emit_compiled_gpu_op,
     emit_compiled_monomial_difference, emit_compiled_small_rhs_sum, emit_compiled_subgraph_kernel,
-    physical_raw_matrix_view, prepare_compiled_gpu_program, transcode_raw_artifact,
+    physical_raw_matrix_view, prepare_compiled_gpu_program, strided_copy, transcode_raw_artifact,
 };
 
 impl GpuDcrtBackend {
@@ -161,6 +161,37 @@ impl GpuDcrtBackend {
             )
         }
         .map_err(|error| error.to_string())
+    }
+
+    /// Fill one already planned evaluation-domain import owner from an
+    /// evaluation matrix artifact: the residues are uploaded as they are, with
+    /// no CRT or NTT work on the host.
+    ///
+    /// # Safety
+    /// The same contract as [`Self::upload_physical_matrix_import_after_completion`].
+    pub(crate) unsafe fn upload_eval_matrix_import_after_completion(
+        &self,
+        owner: &Arc<GpuDCRTPolyMatrix>,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let components = owner.binding_components().map_err(|error| error.to_string())?;
+        let [component] = components.as_ref() else {
+            return Err("import destination requires one physical matrix component".into());
+        };
+        let (header, residues) = decode_eval_matrix(bytes).map_err(|error| error.to_string())?;
+        if owner.size() != (ty.rows, ty.columns) ||
+            owner.params().ring_dimension() != ty.ring.ring_dimension() ||
+            owner.params().moduli() != ty.ring.crt_moduli() ||
+            (header.rows, header.columns) != (ty.rows, ty.columns) ||
+            header.ring_dimension != ty.ring.ring_dimension() as usize ||
+            header.moduli != ty.ring.crt_moduli()
+        {
+            return Err("evaluation import differs from its concrete matrix type".into());
+        }
+        self.physical_matrix_parameters(ty, component.physical_device)?;
+        unsafe { owner.load_rns_words_in_place_after_completion(&residues) }
+            .map_err(|error| error.to_string())
     }
 }
 

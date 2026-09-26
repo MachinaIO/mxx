@@ -19,6 +19,8 @@ pub mod utils;
 pub mod artifact;
 pub mod authority;
 pub mod backend;
+#[cfg(feature = "gpu")]
+pub mod device_artifact;
 pub mod executor;
 pub mod gpu_execution_plan;
 #[cfg(feature = "gpu")]

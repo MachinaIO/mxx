@@ -213,7 +213,27 @@ struct alignas(8) MxxExportSlotHeader
 };
 int gpu_export_slot_alloc(int physical_device, size_t payload_capacity,
     void **out_host, void **out_device);
+int gpu_export_slot_alloc_device(int physical_device, size_t payload_capacity,
+    void **out_host, void **out_device_header, void **out_device_payload);
 int gpu_export_slot_ready(const void *host_header, int *out_ready);
+// Persistent device allocations for artifacts kept in GPU memory, and
+// synchronous copies out of them.
+int gpu_device_memory_alloc(int physical_device, size_t bytes, void **out);
+int gpu_device_memory_free(int physical_device, void *address);
+int gpu_device_memory_copy(
+    int destination_device, void *destination, const void *source, size_t bytes);
+int gpu_device_memory_download(
+    int physical_device, const void *source, void *destination, size_t bytes);
+// The elements of a four-dimensional view in two byte-strided layouts.
+struct MxxStridedCopy
+{
+    uint64_t extent[4];
+    uint64_t source_stride[4];
+    uint64_t destination_stride[4];
+    uint32_t element_bytes;
+};
+int gpu_device_strided_copy(
+    int device, void *destination, const void *source, MxxStridedCopy copy);
 int gpu_export_slot_reset(void *host_header);
 
 // Stream-ordered device buffer owners used by allocation-free graph bodies.
@@ -544,6 +564,9 @@ int mxx_gpu_graph_builder_add_kernel(MxxGpuGraphBuilder *builder, const void *fu
 int mxx_gpu_graph_builder_add_device_copy(MxxGpuGraphBuilder *builder,
     void *destination, int destination_device, const void *source, int source_device,
     size_t bytes, const MxxGraphPatch *patches, size_t patch_count);
+int mxx_gpu_graph_builder_add_strided_copy(MxxGpuGraphBuilder *builder,
+    void *destination, const void *source, MxxStridedCopy copy,
+    const MxxGraphPatch *patches, size_t patch_count);
 int mxx_gpu_graph_builder_add_memcpy(MxxGpuGraphBuilder *builder,
     void *destination, const void *source, size_t bytes, int copy_kind,
     const MxxGraphPatch *patches, size_t patch_count);

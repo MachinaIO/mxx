@@ -5,7 +5,10 @@ use crate::{
         GpuNativePrimitive, GpuPreparedWorkspaceKind, KernelArg, PhysicalEncoding, PhysicalPart,
         PhysicalValue, PhysicalValueId, PhysicalView, StorageRef,
     },
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+    matrix::{
+        dcrt_poly::DCRTPolyMatrix, eval_artifact::EvalMatrixHeader,
+        gpu_dcrt_poly::GpuDCRTPolyMatrix,
+    },
     poly::{
         PolyParams,
         dcrt::{
@@ -16,8 +19,8 @@ use crate::{
                 GpuRawControlStatusView, GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb,
                 GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
                 GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
-                GpuRawSmallMatrixView, GpuSignedValuesEncoding, gpu_device_identity,
-                gpu_device_memory_usage, gpu_device_sync,
+                GpuRawSmallMatrixView, GpuSignedValuesEncoding, GpuStridedCopy,
+                gpu_device_identity, gpu_device_memory_usage, gpu_device_sync,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
             params::DCRTPolyParams,
@@ -27,6 +30,7 @@ use crate::{
 use mxx_ir_core::types::{ConcreteMatrixType, ConcreteWireType};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -335,7 +339,7 @@ fn compiled_raw_export_span(
     part_index: u32,
     raw_bytes: u64,
     device: i32,
-) -> Result<u64, GpuNativeGraphError> {
+) -> Result<(u64, u64, PhysicalView), GpuNativeGraphError> {
     let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
     let part = owner
         .physical()
@@ -362,18 +366,24 @@ fn compiled_raw_export_span(
     let span = last
         .checked_add(u64::from(part.view.element_bytes))
         .ok_or_else(|| invalid("compiled export span overflows"))?;
-    if span != raw_bytes ||
-        part.view.byte_offset.checked_add(raw_bytes).is_none_or(|end| end > storage.bytes)
+    // The export copy gathers this part's elements densely.
+    let dense =
+        part.view.extent.iter().try_fold(u64::from(part.view.element_bytes), |bytes, &extent| {
+            bytes.checked_mul(extent)
+        });
+    if dense != Some(raw_bytes) ||
+        part.view.byte_offset.checked_add(span).is_none_or(|end| end > storage.bytes)
     {
-        return Err(invalid("compiled export length exceeds physical part"));
+        return Err(invalid("compiled export length differs from its physical part"));
     }
     part.view
         .validate_in_allocation(storage.bytes, u64::from(part.view.element_bytes))
         .map_err(invalid)?;
-    storage
+    let address = storage
         .address
         .checked_add(part.view.byte_offset)
-        .ok_or_else(|| invalid("compiled export source address overflows"))
+        .ok_or_else(|| invalid("compiled export source address overflows"))?;
+    Ok((address, span, part.view.clone()))
 }
 
 fn compiled_bytes_part(
@@ -5121,16 +5131,17 @@ pub(crate) fn emit_compiled_gpu_op(
             let slot = slots
                 .get(*slot_index as usize)
                 .ok_or_else(|| invalid("compiled export slot is missing"))?;
-            let address = compiled_raw_export_span(owner, *part_index, *raw_bytes, op.device)?;
+            let (address, span, view) =
+                compiled_raw_export_span(owner, *part_index, *raw_bytes, op.device)?;
             builder.bind_resident_address(
                 address,
-                usize::try_from(*raw_bytes)
-                    .map_err(|_| invalid("compiled export length exceeds usize"))?,
+                usize::try_from(span).map_err(|_| invalid("compiled export span exceeds usize"))?,
                 *source_binding,
             )?;
             builder.add_export_copy(
                 slot,
                 address,
+                strided_copy(&view.extent, &view.byte_strides, view.element_bytes, None)?,
                 usize::try_from(*raw_bytes)
                     .map_err(|_| invalid("compiled export length exceeds usize"))?,
                 *source_binding,
@@ -5619,10 +5630,44 @@ pub(crate) enum RawExportLeaf {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RawExportFragment {
     pub leaf: RawExportLeaf,
+    /// The physical part whose bound address starts this fragment's copy.
+    pub part: u32,
     pub raw_offset: u64,
     pub raw_bytes: u64,
-    /// A view relative to the beginning of this fragment's raw file range.
-    pub view: PhysicalView,
+    /// Views of every part the copy covers, relative to the beginning of this
+    /// fragment's raw file range.
+    pub views: Box<[PhysicalView]>,
+}
+
+impl RawExportFragment {
+    /// Byte offset of `coordinate` within this fragment and the element width
+    /// of the view that covers it.
+    fn locate(&self, coordinate: &[u64]) -> Result<Option<(u64, u32)>, String> {
+        'views: for view in &self.views {
+            if view.origin.len() != coordinate.len() {
+                continue;
+            }
+            let mut offset = view.byte_offset;
+            for (axis, &value) in coordinate.iter().enumerate() {
+                let origin = view.origin[axis];
+                if value < origin || value >= origin + view.extent[axis] {
+                    continue 'views;
+                }
+                offset = (value - origin)
+                    .checked_mul(view.byte_strides[axis])
+                    .and_then(|step| offset.checked_add(step))
+                    .ok_or("raw export address overflows")?;
+            }
+            if offset
+                .checked_add(u64::from(view.element_bytes))
+                .is_none_or(|end| end > self.raw_bytes)
+            {
+                return Err("raw export element is outside its fragment".into());
+            }
+            return Ok(Some((offset, view.element_bytes)));
+        }
+        Ok(None)
+    }
 }
 
 impl PhysicalExport {
@@ -5633,32 +5678,102 @@ impl PhysicalExport {
         physical: Arc<PhysicalValue>,
         selected_parts: &[usize],
     ) -> Result<Self, String> {
+        // Each selected part is gathered densely, so an artifact copies only
+        // its own elements whatever the strides of the allocation it views.
         let mut fragments = Vec::with_capacity(selected_parts.len());
         let mut raw_total_bytes = 0u64;
         for &index in selected_parts {
             let part =
                 physical.parts.get(index).ok_or("raw export selected an unknown physical part")?;
-            let mut last = 0u64;
-            for (&extent, &stride) in part.view.extent.iter().zip(&part.view.byte_strides) {
-                if extent == 0 {
-                    return Err("raw export selected an empty part".into());
-                }
-                last = last
-                    .checked_add(
-                        (extent - 1).checked_mul(stride).ok_or("raw export stride overflows")?,
-                    )
-                    .ok_or("raw export span overflows")?;
+            if part.view.extent.contains(&0) {
+                return Err("raw export selected an empty part".into());
             }
-            let raw_bytes = last
-                .checked_add(u64::from(part.view.element_bytes))
-                .ok_or("raw export span overflows")?;
-            let mut view = part.view.clone();
-            view.byte_offset = 0;
+            let view = dense_view(&part.view).ok_or("raw export part size overflows")?;
+            let raw_bytes = view
+                .extent
+                .iter()
+                .try_fold(u64::from(view.element_bytes), |bytes, &extent| bytes.checked_mul(extent))
+                .ok_or("raw export part size overflows")?;
             fragments.push(RawExportFragment {
                 leaf: RawExportLeaf::Value(part.leaf),
+                part: u32::try_from(index).map_err(|_| "raw export part index exceeds u32")?,
                 raw_offset: raw_total_bytes,
                 raw_bytes,
-                view,
+                views: Box::new([view]),
+            });
+            raw_total_bytes = raw_total_bytes
+                .checked_add(raw_bytes)
+                .ok_or("raw export total length overflows")?;
+        }
+        let export = Self {
+            physical,
+            public: None,
+            fragments: fragments.into_boxed_slice(),
+            raw_total_bytes,
+        };
+        export.validate()?;
+        Ok(export)
+    }
+
+    /// Reserve raw file ranges that copy each allocation's byte span as it
+    /// is, for host readers that download device ranges directly. Parts of
+    /// one leaf in one allocation share a single span.
+    pub(crate) fn from_parts_spans(
+        physical: Arc<PhysicalValue>,
+        selected_parts: &[usize],
+    ) -> Result<Self, String> {
+        // Parts of one leaf in one allocation (the CRT limbs of a matrix)
+        // share a single copy of the byte range they jointly span, instead of
+        // one copy per part that each spans the interleaved other limbs.
+        let mut groups = Vec::<((u32, StorageRef, i32), Vec<usize>)>::new();
+        for &index in selected_parts {
+            let part =
+                physical.parts.get(index).ok_or("raw export selected an unknown physical part")?;
+            let key = (part.leaf, part.storage, part.device);
+            match groups.iter_mut().find(|(group, _)| *group == key) {
+                Some((_, members)) => members.push(index),
+                None => groups.push((key, vec![index])),
+            }
+        }
+        let mut fragments = Vec::with_capacity(groups.len());
+        let mut raw_total_bytes = 0u64;
+        for ((leaf, _, _), members) in groups {
+            let mut spans = Vec::with_capacity(members.len());
+            for &index in &members {
+                let view = &physical.parts[index].view;
+                let mut last = view.byte_offset;
+                for (&extent, &stride) in view.extent.iter().zip(&view.byte_strides) {
+                    if extent == 0 {
+                        return Err("raw export selected an empty part".into());
+                    }
+                    last = (extent - 1)
+                        .checked_mul(stride)
+                        .and_then(|step| last.checked_add(step))
+                        .ok_or("raw export span overflows")?;
+                }
+                let end = last
+                    .checked_add(u64::from(view.element_bytes))
+                    .ok_or("raw export span overflows")?;
+                spans.push((index, view.byte_offset, end));
+            }
+            let &(first, start, _) =
+                spans.iter().min_by_key(|(_, start, _)| *start).expect("nonempty part group");
+            let end = spans.iter().map(|(_, _, end)| *end).max().expect("nonempty part group");
+            let views = members
+                .iter()
+                .map(|&index| {
+                    let mut view = physical.parts[index].view.clone();
+                    view.byte_offset -= start;
+                    view
+                })
+                .collect();
+            let raw_bytes = end - start;
+            fragments.push(RawExportFragment {
+                leaf: RawExportLeaf::Value(leaf),
+                part: u32::try_from(first).map_err(|_| "raw export part index exceeds u32")?,
+                raw_offset: raw_total_bytes,
+                raw_bytes,
+                views,
             });
             raw_total_bytes = raw_total_bytes
                 .checked_add(raw_bytes)
@@ -5718,7 +5833,12 @@ impl PhysicalExport {
                 }
                 _ => {}
             }
-            fragment.view.validate_in_allocation(fragment.raw_bytes, 1).map_err(str::to_owned)?;
+            if fragment.views.is_empty() {
+                return Err("raw export fragment covers no part".into());
+            }
+            for view in &fragment.views {
+                view.validate_in_allocation(fragment.raw_bytes, 1).map_err(str::to_owned)?;
+            }
             let end = fragment
                 .raw_offset
                 .checked_add(fragment.raw_bytes)
@@ -5740,6 +5860,87 @@ impl PhysicalExport {
     }
 }
 
+/// `view` over its own elements packed in axis order from offset zero.
+pub(crate) fn dense_view(view: &PhysicalView) -> Option<PhysicalView> {
+    let mut strides = vec![0u64; view.extent.len()];
+    let mut stride = u64::from(view.element_bytes);
+    for axis in (0..view.extent.len()).rev() {
+        strides[axis] = stride;
+        stride = stride.checked_mul(view.extent[axis])?;
+    }
+    Some(PhysicalView {
+        byte_offset: 0,
+        origin: view.origin.clone(),
+        extent: view.extent.clone(),
+        byte_strides: strides.into_boxed_slice(),
+        element_bytes: view.element_bytes,
+    })
+}
+
+/// A copy of the elements of a view with `extent` and `strides` into the dense
+/// layout, or from it into `destination_strides` when given.
+pub(crate) fn strided_copy(
+    extent: &[u64],
+    strides: &[u64],
+    element_bytes: u32,
+    destination_strides: Option<&[u64]>,
+) -> Result<GpuStridedCopy, GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    if extent.len() > 4 || extent.len() != strides.len() || element_bytes == 0 {
+        return Err(invalid("strided copy needs a view of at most four axes"));
+    }
+    let view = PhysicalView {
+        byte_offset: 0,
+        origin: vec![0; extent.len()].into_boxed_slice(),
+        extent: extent.into(),
+        byte_strides: strides.into(),
+        element_bytes,
+    };
+    let dense = dense_view(&view).ok_or_else(|| invalid("strided copy size overflows"))?;
+    let (source, destination) = match destination_strides {
+        None => (strides, dense.byte_strides.as_ref()),
+        Some(destination) if destination.len() == extent.len() => {
+            (dense.byte_strides.as_ref(), destination)
+        }
+        Some(_) => return Err(invalid("strided copy layouts have different ranks")),
+    };
+    let pad = 4 - extent.len();
+    let mut copy = GpuStridedCopy {
+        extent: [1; 4],
+        source_stride: [0; 4],
+        destination_stride: [0; 4],
+        element_bytes,
+    };
+    for axis in 0..extent.len() {
+        copy.extent[pad + axis] = extent[axis];
+        copy.source_stride[pad + axis] = source[axis];
+        copy.destination_stride[pad + axis] = destination[axis];
+    }
+    // Fold inner axes that are contiguous in both layouts into the element,
+    // so the kernel copies long runs instead of single residues.
+    loop {
+        let contiguous = copy.extent[3] == 1 ||
+            (copy.source_stride[3] == u64::from(copy.element_bytes) &&
+                copy.destination_stride[3] == u64::from(copy.element_bytes));
+        if !contiguous || copy.extent == [1; 4] {
+            break;
+        }
+        let Some(element_bytes) = u64::from(copy.element_bytes)
+            .checked_mul(copy.extent[3])
+            .and_then(|bytes| u32::try_from(bytes).ok())
+        else {
+            break;
+        };
+        copy.element_bytes = element_bytes;
+        copy.extent = [1, copy.extent[0], copy.extent[1], copy.extent[2]];
+        copy.source_stride =
+            [0, copy.source_stride[0], copy.source_stride[1], copy.source_stride[2]];
+        copy.destination_stride =
+            [0, copy.destination_stride[0], copy.destination_stride[1], copy.destination_stride[2]];
+    }
+    Ok(copy)
+}
+
 fn inverse_mod_u64(value: u64, modulus: u64) -> Result<u64, String> {
     let (mut old_r, mut r) = (modulus as i128, value as i128);
     let (mut old_t, mut t) = (0i128, 1i128);
@@ -5754,55 +5955,30 @@ fn inverse_mod_u64(value: u64, modulus: u64) -> Result<u64, String> {
     Ok(old_t.rem_euclid(modulus as i128) as u64)
 }
 
-fn raw_matrix_residue<R: Read + Seek + ?Sized>(
+/// Read the element at `coordinate` of `leaf` if some fragment view covers it
+/// with `element_bytes` of 1, 4, or 8.
+fn raw_export_element<R: Read + Seek + ?Sized>(
     layout: &PhysicalExport,
     source: &mut R,
     leaf: RawExportLeaf,
-    row: u64,
-    column: u64,
-    limb: u64,
-    coefficient: u64,
-) -> Result<u64, String> {
-    let coordinate = [row, column, limb, coefficient];
-    for fragment in &layout.fragments {
-        if fragment.leaf != leaf || fragment.view.origin.len() != 4 {
+    coordinate: &[u64],
+    accept: impl Fn(u32) -> bool,
+) -> Result<Option<u64>, String> {
+    for fragment in layout.fragments.iter().filter(|fragment| fragment.leaf == leaf) {
+        let Some((offset, width)) = fragment.locate(coordinate)? else {
             continue;
-        }
-        let mut offset = fragment.view.byte_offset;
-        let mut covered = true;
-        for (axis, &value) in coordinate.iter().enumerate() {
-            let origin = fragment.view.origin[axis];
-            let extent = fragment.view.extent[axis];
-            if value < origin || value >= origin + extent {
-                covered = false;
-                break;
-            }
-            offset = offset
-                .checked_add(
-                    (value - origin)
-                        .checked_mul(fragment.view.byte_strides[axis])
-                        .ok_or("raw matrix stride overflows")?,
-                )
-                .ok_or("raw matrix address overflows")?;
-        }
-        if !covered {
+        };
+        if !accept(width) {
             continue;
-        }
-        let width = usize::try_from(fragment.view.element_bytes)
-            .map_err(|_| "raw matrix residue width overflows")?;
-        if !matches!(width, 4 | 8) ||
-            offset.checked_add(width as u64).is_none_or(|end| end > fragment.raw_bytes)
-        {
-            return Err("raw matrix residue is outside its fragment".into());
         }
         source
             .seek(SeekFrom::Start(fragment.raw_offset + offset))
             .map_err(|error| error.to_string())?;
         let mut bytes = [0u8; 8];
-        source.read_exact(&mut bytes[..width]).map_err(|error| error.to_string())?;
-        return Ok(u64::from_le_bytes(bytes));
+        source.read_exact(&mut bytes[..width as usize]).map_err(|error| error.to_string())?;
+        return Ok(Some(u64::from_le_bytes(bytes)));
     }
-    Err("raw export has a missing matrix coefficient or CRT limb".into())
+    Ok(None)
 }
 
 fn raw_export_byte<R: Read + Seek + ?Sized>(
@@ -5811,43 +5987,9 @@ fn raw_export_byte<R: Read + Seek + ?Sized>(
     leaf: RawExportLeaf,
     coordinate: &[u64],
 ) -> Result<u8, String> {
-    for fragment in &layout.fragments {
-        if fragment.leaf != leaf ||
-            fragment.view.origin.len() != coordinate.len() ||
-            fragment.view.element_bytes != 1
-        {
-            continue;
-        }
-        let mut offset = fragment.view.byte_offset;
-        let mut covered = true;
-        for (axis, &value) in coordinate.iter().enumerate() {
-            let origin = fragment.view.origin[axis];
-            let extent = fragment.view.extent[axis];
-            if value < origin || value >= origin + extent {
-                covered = false;
-                break;
-            }
-            offset = offset
-                .checked_add(
-                    (value - origin)
-                        .checked_mul(fragment.view.byte_strides[axis])
-                        .ok_or("raw byte stride overflows")?,
-                )
-                .ok_or("raw byte address overflows")?;
-        }
-        if covered {
-            if offset >= fragment.raw_bytes {
-                return Err("raw byte exceeds its fragment".into());
-            }
-            source
-                .seek(SeekFrom::Start(fragment.raw_offset + offset))
-                .map_err(|error| error.to_string())?;
-            let mut byte = [0u8; 1];
-            source.read_exact(&mut byte).map_err(|error| error.to_string())?;
-            return Ok(byte[0]);
-        }
-    }
-    Err("raw export has a missing byte".into())
+    raw_export_element(layout, source, leaf, coordinate, |width| width == 1)?
+        .map(|byte| byte as u8)
+        .ok_or_else(|| "raw export has a missing byte".into())
 }
 
 fn raw_export_word<R: Read + Seek + ?Sized>(
@@ -5855,43 +5997,60 @@ fn raw_export_word<R: Read + Seek + ?Sized>(
     source: &mut R,
     coordinate: &[u64],
 ) -> Result<u64, String> {
-    for fragment in &layout.fragments {
-        if fragment.leaf != RawExportLeaf::Value(0) ||
-            fragment.view.origin.len() != coordinate.len() ||
-            fragment.view.element_bytes != 8
-        {
+    raw_export_element(layout, source, RawExportLeaf::Value(0), coordinate, |width| width == 8)?
+        .ok_or_else(|| "raw export has a missing integer word".into())
+}
+
+/// Read the `ring_dimension` residues of one CRT limb of one matrix entry.
+/// A limb whose coefficients are contiguous is read with one seek.
+fn raw_matrix_limb<R: Read + Seek + ?Sized>(
+    layout: &PhysicalExport,
+    source: &mut R,
+    leaf: RawExportLeaf,
+    [row, column, limb]: [u64; 3],
+    residues: &mut [u64],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    for fragment in layout.fragments.iter().filter(|fragment| fragment.leaf == leaf) {
+        let Some((offset, width)) = fragment.locate(&[row, column, limb, 0])? else {
             continue;
+        };
+        let view = fragment
+            .views
+            .iter()
+            .find(|view| {
+                view.origin.len() == 4 &&
+                    (0..3).all(|axis| {
+                        let value = [row, column, limb][axis];
+                        view.origin[axis] <= value && value < view.origin[axis] + view.extent[axis]
+                    })
+            })
+            .ok_or("raw matrix limb has no covering view")?;
+        let count = residues.len() as u64;
+        if !matches!(width, 4 | 8) || view.origin[3] != 0 || view.extent[3] != count {
+            return Err("raw matrix limb view does not cover its coefficients".into());
         }
-        let mut offset = fragment.view.byte_offset;
-        let mut covered = true;
-        for (axis, &value) in coordinate.iter().enumerate() {
-            let origin = fragment.view.origin[axis];
-            let extent = fragment.view.extent[axis];
-            if value < origin || value >= origin + extent {
-                covered = false;
-                break;
-            }
-            offset = offset
-                .checked_add(
-                    (value - origin)
-                        .checked_mul(fragment.view.byte_strides[axis])
-                        .ok_or("raw word stride overflows")?,
-                )
-                .ok_or("raw word address overflows")?;
-        }
-        if covered {
-            if offset.checked_add(8).is_none_or(|end| end > fragment.raw_bytes) {
-                return Err("raw word exceeds its fragment".into());
-            }
-            source
-                .seek(SeekFrom::Start(fragment.raw_offset + offset))
-                .map_err(|error| error.to_string())?;
+        let width = width as usize;
+        let stride = view.byte_strides[3];
+        let span = (count - 1)
+            .checked_mul(stride)
+            .and_then(|last| last.checked_add(width as u64))
+            .filter(|span| offset.checked_add(*span).is_some_and(|end| end <= fragment.raw_bytes))
+            .ok_or("raw matrix limb is outside its fragment")?;
+        scratch.resize(span as usize, 0);
+        source
+            .seek(SeekFrom::Start(fragment.raw_offset + offset))
+            .map_err(|error| error.to_string())?;
+        source.read_exact(scratch).map_err(|error| error.to_string())?;
+        for (index, residue) in residues.iter_mut().enumerate() {
+            let at = index * stride as usize;
             let mut bytes = [0u8; 8];
-            source.read_exact(&mut bytes).map_err(|error| error.to_string())?;
-            return Ok(u64::from_le_bytes(bytes));
+            bytes[..width].copy_from_slice(&scratch[at..at + width]);
+            *residue = u64::from_le_bytes(bytes);
         }
+        return Ok(());
     }
-    Err("raw export has a missing integer word".into())
+    Err("raw export has a missing matrix CRT limb".into())
 }
 
 fn transcode_raw_integer<R: Read + Seek + ?Sized, W: Write + ?Sized>(
@@ -6097,6 +6256,67 @@ fn write_bincode_length<W: Write + ?Sized>(sink: &mut W, length: usize) -> Resul
     Ok(bytes.len() as u64)
 }
 
+fn raw_leaf_encoding(layout: &PhysicalExport, leaf: RawExportLeaf) -> Option<&PhysicalEncoding> {
+    match leaf {
+        RawExportLeaf::Value(index) => layout.physical.encodings.get(index as usize),
+        RawExportLeaf::TrapdoorPublic => {
+            layout.public.as_ref().and_then(|public| public.encodings.first())
+        }
+    }
+}
+
+/// Stream an evaluation-domain matrix leaf into the evaluation artifact
+/// format: one read and one fixed-width pack per (entry, limb) block.
+fn transcode_raw_eval_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
+    layout: &PhysicalExport,
+    source: &mut R,
+    sink: &mut W,
+    matrix: &ConcreteMatrixType,
+    leaf: RawExportLeaf,
+) -> Result<u64, String> {
+    if raw_leaf_encoding(layout, leaf) != Some(&PhysicalEncoding::FullEval) {
+        return Err("raw matrix export must be in evaluation representation".into());
+    }
+    let header = EvalMatrixHeader::new(
+        matrix.rows,
+        matrix.columns,
+        matrix.ring.ring_dimension() as usize,
+        matrix.ring.crt_moduli().to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut sink = std::io::BufWriter::with_capacity(1 << 20, sink);
+    let encoded_header = header.encoded_header();
+    sink.write_all(&encoded_header).map_err(|error| error.to_string())?;
+    let mut residues = vec![0u64; header.ring_dimension];
+    let mut scratch = Vec::new();
+    let mut packed = Vec::new();
+    for row in 0..matrix.rows as u64 {
+        for column in 0..matrix.columns as u64 {
+            for limb in 0..header.moduli.len() {
+                raw_matrix_limb(
+                    layout,
+                    source,
+                    leaf,
+                    [row, column, limb as u64],
+                    &mut residues,
+                    &mut scratch,
+                )?;
+                packed.resize(header.limb_block_bytes(limb), 0);
+                header
+                    .pack_limb_block(limb, &residues, &mut packed)
+                    .map_err(|error| error.to_string())?;
+                sink.write_all(&packed).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    sink.flush().map_err(|error| error.to_string())?;
+    let payload = header.payload_len().ok_or("matrix payload length overflows")?;
+    u64::try_from(encoded_header.len() + payload)
+        .map_err(|_| "matrix artifact length overflows".into())
+}
+
+/// Stream a coefficient-domain matrix leaf into the compact coefficient
+/// format that trapdoor secrets keep.
 fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     layout: &PhysicalExport,
     source: &mut R,
@@ -6104,13 +6324,7 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     matrix: &ConcreteMatrixType,
     leaf: RawExportLeaf,
 ) -> Result<u64, String> {
-    let encoding = match leaf {
-        RawExportLeaf::Value(index) => layout.physical.encodings.get(index as usize),
-        RawExportLeaf::TrapdoorPublic => {
-            layout.public.as_ref().and_then(|public| public.encodings.first())
-        }
-    };
-    if encoding != Some(&PhysicalEncoding::FullCoeff) {
+    if raw_leaf_encoding(layout, leaf) != Some(&PhysicalEncoding::FullCoeff) {
         return Err("raw matrix export must be in coefficient representation".into());
     }
     let mut sink = std::io::BufWriter::with_capacity(64 * 1024, sink);
@@ -6126,31 +6340,43 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
             Ok(factor * inverse)
         })
         .collect::<Result<Vec<BigUint>, String>>()?;
-    let rows = u64::try_from(matrix.rows).map_err(|_| "row count overflows u64")?;
-    let columns = u64::try_from(matrix.columns).map_err(|_| "column count overflows u64")?;
-    let degree = u64::from(matrix.ring.ring_dimension());
-    let centered = |source: &mut R,
-                    row: u64,
-                    column: u64,
-                    coefficient: u64|
-     -> Result<(bool, BigUint), String> {
-        let mut value = BigUint::from(0u8);
-        for (limb, (&prime, weight)) in moduli.iter().zip(&weights).enumerate() {
-            let residue =
-                raw_matrix_residue(layout, source, leaf, row, column, limb as u64, coefficient)?;
-            if residue >= prime {
-                return Err("raw CRT residue exceeds its modulus".into());
+    let degree = matrix.ring.ring_dimension() as usize;
+    let mut limbs = vec![0u64; moduli.len() * degree];
+    let mut scratch = Vec::new();
+    let mut centered_entry =
+        |source: &mut R, row: u64, column: u64| -> Result<Vec<(bool, BigUint)>, String> {
+            for (limb, residues) in limbs.chunks_mut(degree).enumerate() {
+                raw_matrix_limb(
+                    layout,
+                    source,
+                    leaf,
+                    [row, column, limb as u64],
+                    residues,
+                    &mut scratch,
+                )?;
+                if residues.iter().any(|&residue| residue >= moduli[limb]) {
+                    return Err("raw CRT residue exceeds its modulus".into());
+                }
             }
-            value += weight * residue;
-        }
-        value %= &modulus;
-        if value > half { Ok((true, &modulus - value)) } else { Ok((false, value)) }
-    };
+            Ok((0..degree)
+                .into_par_iter()
+                .map(|coefficient| {
+                    let value = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(limb, weight)| weight * limbs[limb * degree + coefficient])
+                        .sum::<BigUint>() %
+                        &modulus;
+                    if value > half { (true, &modulus - value) } else { (false, value) }
+                })
+                .collect())
+        };
+    let rows = matrix.rows as u64;
+    let columns = matrix.columns as u64;
     let mut max_magnitude_bits = 0u64;
     for row in 0..rows {
         for column in 0..columns {
-            for coefficient in 0..degree {
-                let (_, magnitude) = centered(source, row, column, coefficient)?;
+            for (_, magnitude) in centered_entry(source, row, column)? {
                 max_magnitude_bits = max_magnitude_bits.max(magnitude.bits());
             }
         }
@@ -6166,7 +6392,7 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     let coefficient_count = matrix
         .rows
         .checked_mul(matrix.columns)
-        .and_then(|count| count.checked_mul(matrix.ring.ring_dimension() as usize))
+        .and_then(|count| count.checked_mul(degree))
         .ok_or("matrix coefficient count overflows")?;
     let payload_bits = coefficient_count
         .checked_mul(usize::from(max_coeff_bits))
@@ -6206,8 +6432,7 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
         if max_coeff_bits != 0 {
             for row in 0..rows {
                 for column in 0..columns {
-                    for coefficient in 0..degree {
-                        let (negative, magnitude) = centered(source, row, column, coefficient)?;
+                    for (negative, magnitude) in centered_entry(source, row, column)? {
                         let bytes = magnitude.to_bytes_le();
                         for bit in 0..usize::from(max_coeff_bits - 1) {
                             let set =
@@ -6252,7 +6477,7 @@ fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
         columns: secret_columns,
     };
     let mut public_file = tempfile::tempfile().map_err(|error| error.to_string())?;
-    let public_len = transcode_raw_full_matrix(
+    let public_len = transcode_raw_eval_matrix(
         layout,
         source,
         &mut public_file,
@@ -6318,7 +6543,7 @@ pub(crate) fn transcode_raw_artifact<R: Read + Seek + ?Sized, W: Write + ?Sized>
     layout.validate()?;
     match &layout.physical.ty {
         ConcreteWireType::Matrix(matrix) => {
-            transcode_raw_full_matrix(layout, source, sink, matrix, RawExportLeaf::Value(0))
+            transcode_raw_eval_matrix(layout, source, sink, matrix, RawExportLeaf::Value(0))
         }
         ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => {
             transcode_raw_small_matrix(
@@ -6450,12 +6675,13 @@ impl GpuDcrtBackend {
         parameters.download_device_bytes(physical, address, destination)
     }
 
-    fn coefficient_scratch(
+    fn matrix_scratch(
         &self,
         matrix: &ConcreteMatrixType,
         device: i32,
+        encoding: PhysicalEncoding,
     ) -> Result<(Arc<GpuDCRTPolyMatrix>, Arc<GpuResidentValue>), String> {
-        let native = self.allocate_physical_matrix(matrix, device, PhysicalEncoding::FullCoeff)?;
+        let native = self.allocate_physical_matrix(matrix, device, encoding.clone())?;
         let limbs = native.binding_limbs().map_err(|error| error.to_string())?;
         if limbs.len() != matrix.ring.crt_depth() {
             return Err("coefficient scratch does not cover the ordered CRT basis".into());
@@ -6509,7 +6735,7 @@ impl GpuDcrtBackend {
         }
         let physical = Arc::new(PhysicalValue {
             ty: ConcreteWireType::Matrix(matrix.clone()),
-            encodings: Box::new([PhysicalEncoding::FullCoeff]),
+            encodings: Box::new([encoding]),
             parts: parts.into_boxed_slice(),
             integer_ranges: BTreeMap::new(),
         });
@@ -6519,16 +6745,24 @@ impl GpuDcrtBackend {
         Ok((native, resident))
     }
 
-    fn inverse_transform_resident(
+    /// Transform a resident full matrix into a separate owner in the other
+    /// full encoding: an inverse NTT when `inverse`, a forward NTT otherwise.
+    fn transform_resident(
         &self,
         value: &GpuResidentValue,
         matrix: &ConcreteMatrixType,
+        inverse: bool,
     ) -> Result<Arc<GpuResidentValue>, String> {
+        let (source_encoding, destination_encoding) = if inverse {
+            (PhysicalEncoding::FullEval, PhysicalEncoding::FullCoeff)
+        } else {
+            (PhysicalEncoding::FullCoeff, PhysicalEncoding::FullEval)
+        };
         let source_part =
             value.physical().parts.first().ok_or("resident matrix has no physical CRT parts")?;
         let device = source_part.device;
         let (source_ty, source, source_bindings) =
-            compiled_raw_matrix_part(value, 0, PhysicalEncoding::FullEval)
+            compiled_raw_matrix_part(value, 0, source_encoding)
                 .map_err(|error| error.to_string())?;
         if &source_ty != matrix ||
             source.row_origin != 0 ||
@@ -6536,11 +6770,12 @@ impl GpuDcrtBackend {
             source.rows != matrix.rows as u64 ||
             source.columns != matrix.columns as u64
         {
-            return Err("resident iNTT requires the complete matrix view".into());
+            return Err("resident NTT requires the complete matrix view".into());
         }
-        let (scratch_owner, scratch) = self.coefficient_scratch(matrix, device)?;
+        let (scratch_owner, scratch) =
+            self.matrix_scratch(matrix, device, destination_encoding.clone())?;
         let (_, destination, destination_bindings) =
-            compiled_raw_matrix_part(&scratch, 0, PhysicalEncoding::FullCoeff)
+            compiled_raw_matrix_part(&scratch, 0, destination_encoding)
                 .map_err(|error| error.to_string())?;
         let destination_binding = u32::try_from(source_bindings.len())
             .map_err(|_| "resident iNTT CRT depth exceeds binding capacity")?;
@@ -6556,7 +6791,7 @@ impl GpuDcrtBackend {
                 builder.launch_stream(),
                 &source,
                 &destination,
-                true,
+                inverse,
                 0,
                 destination_binding,
             )
@@ -6577,8 +6812,9 @@ impl GpuDcrtBackend {
         Ok(scratch)
     }
 
-    /// Canonical host observation of a physical matrix. Evaluation values are
-    /// transformed into a separate coefficient owner by an explicit Graph.
+    /// Canonical host observation of a physical matrix: its evaluation
+    /// artifact. Coefficient values are transformed into a separate
+    /// evaluation owner by an explicit Graph.
     pub(crate) fn stage_canonical_resident_matrix(
         &self,
         value: &GpuResidentValue,
@@ -6587,8 +6823,8 @@ impl GpuDcrtBackend {
             return Err("canonical resident download requires a matrix value".into());
         };
         let resident = match value.physical().encodings.as_ref() {
-            [PhysicalEncoding::FullCoeff] => None,
-            [PhysicalEncoding::FullEval] => Some(self.inverse_transform_resident(value, matrix)?),
+            [PhysicalEncoding::FullEval] => None,
+            [PhysicalEncoding::FullCoeff] => Some(self.transform_resident(value, matrix, false)?),
             _ => return Err("canonical resident download requires a full matrix encoding".into()),
         };
         let observed = resident.as_deref().unwrap_or(value);
@@ -6596,11 +6832,12 @@ impl GpuDcrtBackend {
             event.wait().map_err(|error| error.to_string())?;
         }
         let selected = (0..observed.physical().parts.len()).collect::<Vec<_>>();
-        let export = PhysicalExport::from_parts(Arc::clone(observed.physical()), &selected)?;
+        let export = PhysicalExport::from_parts_spans(Arc::clone(observed.physical()), &selected)?;
         let mut raw = tempfile::tempfile().map_err(|error| error.to_string())?;
         raw.set_len(export.raw_total_bytes).map_err(|error| error.to_string())?;
         let mut chunk = vec![0u8; 64 * 1024];
-        for (part, fragment) in observed.physical().parts.iter().zip(export.fragments.iter()) {
+        for fragment in export.fragments.iter() {
+            let part = &observed.physical().parts[fragment.part as usize];
             let bound = observed
                 .storage(part.storage)
                 .ok_or("resident matrix part has no bound storage")?;
@@ -6663,7 +6900,8 @@ impl GpuDcrtBackend {
             None,
         )
         .map_err(|error| error.to_string())?;
-        DCRTPolyMatrix::try_from_compact_bytes(&params, &bytes).map_err(|error| error.to_string())
+        DCRTPolyMatrix::try_from_eval_artifact(&params, matrix.rows, matrix.columns, &bytes)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn drain_uncertain_launches(&mut self) -> Result<(), GpuNativeGraphError> {
@@ -6779,137 +7017,198 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_full_matrix_transcode_matches_cpu_compact_codec() {
-        use crate::{
-            matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-            poly::dcrt::params::DCRTPolyParams,
-        };
-        let ring = mxx_ir_core::RingRef::new(mxx_ir_core::RingExpr::Explicit {
-            crt_moduli: vec![mxx_ir_core::IntExpr::constant(97)],
+    fn explicit_ring(moduli: &[u64]) -> mxx_ir_core::ConcreteRing {
+        mxx_ir_core::RingRef::new(mxx_ir_core::RingExpr::Explicit {
+            crt_moduli: moduli.iter().map(|&prime| mxx_ir_core::IntExpr::constant(prime)).collect(),
             ring_dimension: 8,
         })
         .resolve(&ParamEnv::default(), |_, _, _, basis| {
             basis.ok_or_else(|| "explicit test ring has no CRT basis".into())
         })
-        .expect("valid explicit ring");
-        let ty = ConcreteWireType::Matrix(ConcreteMatrixType { ring, rows: 1, columns: 1 });
-        let layout = PhysicalExport {
-            physical: Arc::new(PhysicalValue {
-                ty,
-                encodings: vec![PhysicalEncoding::FullCoeff].into_boxed_slice(),
-                parts: Box::new([]),
-                integer_ranges: BTreeMap::new(),
-            }),
-            public: None,
-            fragments: vec![RawExportFragment {
-                leaf: RawExportLeaf::Value(0),
-                raw_offset: 0,
-                raw_bytes: 64,
-                view: PhysicalView {
-                    byte_offset: 0,
-                    origin: vec![0, 0, 0, 0].into_boxed_slice(),
-                    extent: vec![1, 1, 1, 8].into_boxed_slice(),
-                    byte_strides: vec![64, 64, 64, 8].into_boxed_slice(),
-                    element_bytes: 8,
-                },
-            }]
-            .into_boxed_slice(),
-            raw_total_bytes: 64,
-        };
-        let raw = [0u64, 1, 2, 47, 48, 95, 96, 12]
-            .into_iter()
-            .flat_map(u64::to_le_bytes)
-            .collect::<Vec<_>>();
-        let mut source = std::io::Cursor::new(raw);
-        let mut encoded = Vec::new();
-        let length = transcode_raw_artifact(&layout, &mut source, &mut encoded)
-            .expect("transcode full matrix");
-        assert_eq!(length as usize, encoded.len());
-        let params = DCRTPolyParams::new(8, 1, 7, 3, Some(vec![97]), None);
-        let decoded = DCRTPolyMatrix::try_from_compact_bytes(&params, &encoded)
-            .expect("CPU matrix artifact decoder accepts physical transcode");
-        assert_eq!(decoded.to_compact_bytes(), encoded);
+        .expect("valid explicit ring")
     }
 
-    #[test]
-    fn raw_mixed_limb_strided_matrix_matches_cpu_codec() {
+    /// The CPU evaluation artifact of a 1 x `slots.len()` matrix whose
+    /// entries have the given composed evaluation slots.
+    fn cpu_eval_artifact(moduli: &[u64], slots: &[Vec<u64>]) -> Vec<u8> {
         use crate::{
-            matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+            matrix::PolyMatrix,
             poly::{
                 Poly,
                 dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
             },
         };
-        let params = DCRTPolyParams::new(8, 2, 7, 3, Some(vec![97, 113]), None);
-        let modulus = num_bigint::BigUint::from(97u64 * 113);
-        let first = (0u64..8).map(num_bigint::BigUint::from).collect::<Vec<_>>();
-        let mut second = (8u64..16).map(num_bigint::BigUint::from).collect::<Vec<_>>();
-        second[7] = &modulus - 1u8;
-        let expected = DCRTPolyMatrix::from_poly_vec_row(
-            &params,
-            vec![
-                DCRTPoly::from_biguints(&params, &first),
-                DCRTPoly::from_biguints(&params, &second),
-            ],
-        )
-        .to_compact_bytes();
-        let ring = mxx_ir_core::RingRef::new(mxx_ir_core::RingExpr::Explicit {
-            crt_moduli: vec![97.into(), 113.into()],
-            ring_dimension: 8,
-        })
-        .resolve(&ParamEnv::default(), |_, _, _, basis| {
-            basis.ok_or_else(|| "explicit test ring has no CRT basis".into())
-        })
-        .expect("valid ordered CRT ring");
-        let matrix = ConcreteMatrixType { ring, rows: 1, columns: 2 };
+        let params = DCRTPolyParams::new(8, moduli.len(), 7, 3, Some(moduli.to_vec()), None);
+        let entries = slots
+            .iter()
+            .map(|entry| {
+                let entry = entry.iter().copied().map(BigUint::from).collect::<Vec<_>>();
+                DCRTPoly::from_biguints_eval(&params, &entry)
+            })
+            .collect();
+        DCRTPolyMatrix::from_poly_vec_row(&params, entries).to_eval_artifact()
+    }
+
+    fn eval_layout(
+        ty: ConcreteMatrixType,
+        fragments: Vec<RawExportFragment>,
+        raw_total_bytes: u64,
+    ) -> PhysicalExport {
+        PhysicalExport {
+            physical: Arc::new(PhysicalValue {
+                ty: ConcreteWireType::Matrix(ty),
+                encodings: Box::new([PhysicalEncoding::FullEval]),
+                parts: Box::new([]),
+                integer_ranges: BTreeMap::new(),
+            }),
+            public: None,
+            fragments: fragments.into_boxed_slice(),
+            raw_total_bytes,
+        }
+    }
+
+    #[test]
+    fn raw_eval_matrix_transcode_matches_cpu_eval_codec() {
+        let ty = ConcreteMatrixType { ring: explicit_ring(&[97]), rows: 1, columns: 1 };
+        let slots = [0u64, 1, 2, 47, 48, 95, 96, 12];
+        let layout = eval_layout(
+            ty,
+            vec![RawExportFragment {
+                leaf: RawExportLeaf::Value(0),
+                part: 0,
+                raw_offset: 0,
+                raw_bytes: 64,
+                views: Box::new([PhysicalView {
+                    byte_offset: 0,
+                    origin: Box::new([0, 0, 0, 0]),
+                    extent: Box::new([1, 1, 1, 8]),
+                    byte_strides: Box::new([64, 64, 64, 8]),
+                    element_bytes: 8,
+                }]),
+            }],
+            64,
+        );
+        let raw = slots.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        let length = transcode_raw_artifact(&layout, &mut std::io::Cursor::new(raw), &mut encoded)
+            .expect("transcode evaluation matrix");
+        assert_eq!(length as usize, encoded.len());
+        assert_eq!(encoded, cpu_eval_artifact(&[97], &[slots.to_vec()]));
+    }
+
+    #[test]
+    fn raw_mixed_limb_strided_eval_matrix_matches_cpu_codec() {
+        let moduli = [97u64, 113];
+        let modulus = 97 * 113;
+        let first = (0u64..8).collect::<Vec<_>>();
+        let mut second = (8u64..16).map(|value| value * 601).collect::<Vec<_>>();
+        second[7] = modulus - 1;
+        let ty = ConcreteMatrixType { ring: explicit_ring(&moduli), rows: 1, columns: 2 };
+        // Limb 0 holds 4-byte and limb 1 8-byte residues, interleaved per
+        // entry, so the two limbs are separate fragments.
         let poly_stride = 2 * (8 * 4 + 8 * 8);
         let fragments = [(4u64, 0u64), (8, 224)]
             .into_iter()
             .enumerate()
             .map(|(limb, (width, raw_offset))| RawExportFragment {
                 leaf: RawExportLeaf::Value(0),
+                part: limb as u32,
                 raw_offset,
                 raw_bytes: poly_stride + 8 * width,
-                view: PhysicalView {
+                views: Box::new([PhysicalView {
                     byte_offset: 0,
                     origin: Box::new([0, 0, limb as u64, 0]),
                     extent: Box::new([1, 2, 1, 8]),
                     byte_strides: Box::new([2 * poly_stride, poly_stride, 8 * width, width]),
                     element_bytes: width as u32,
-                },
+                }]),
             })
             .collect::<Vec<_>>();
         let total = fragments.iter().map(|fragment| fragment.raw_bytes).sum::<u64>() as usize;
         let mut raw = vec![0u8; total];
-        for (limb, prime) in [97u64, 113].into_iter().enumerate() {
+        for (limb, prime) in moduli.into_iter().enumerate() {
             let fragment = &fragments[limb];
-            let width = fragment.view.element_bytes as usize;
+            let width = fragment.views[0].element_bytes as usize;
             for (column, values) in [&first, &second].into_iter().enumerate() {
-                for (coefficient, value) in values.iter().enumerate() {
-                    let residue = (value % prime).to_u64().expect("small residue");
-                    let offset = fragment.raw_offset as usize +
-                        column * poly_stride as usize +
-                        coefficient * width;
-                    raw[offset..offset + width].copy_from_slice(&residue.to_le_bytes()[..width]);
+                for (slot, value) in values.iter().enumerate() {
+                    let offset =
+                        fragment.raw_offset as usize + column * poly_stride as usize + slot * width;
+                    raw[offset..offset + width]
+                        .copy_from_slice(&(value % prime).to_le_bytes()[..width]);
                 }
             }
         }
-        let layout = PhysicalExport {
-            physical: Arc::new(PhysicalValue {
-                ty: ConcreteWireType::Matrix(matrix),
-                encodings: Box::new([PhysicalEncoding::FullCoeff]),
-                parts: Box::new([]),
-                integer_ranges: BTreeMap::new(),
-            }),
-            public: None,
-            fragments: fragments.into_boxed_slice(),
-            raw_total_bytes: total as u64,
-        };
+        let layout = eval_layout(ty, fragments, total as u64);
         let mut encoded = Vec::new();
         let length = transcode_raw_artifact(&layout, &mut std::io::Cursor::new(raw), &mut encoded)
             .expect("transcode mixed-width strided matrix");
         assert_eq!(length as usize, encoded.len());
-        assert_eq!(encoded, expected);
+        assert_eq!(encoded, cpu_eval_artifact(&moduli, &[first, second]));
+    }
+
+    #[test]
+    fn interleaved_limbs_export_densely_and_as_one_span_for_host_readers() {
+        let moduli = [97u64, 113, 193];
+        let ty = ConcreteMatrixType { ring: explicit_ring(&moduli), rows: 2, columns: 3 };
+        // One allocation laid out as [row][column][limb][slot] with 8-byte
+        // residues: each limb part spans every other limb of the entries.
+        let limb_stride = 8 * 8;
+        let poly_stride = 3 * limb_stride;
+        let row_stride = 3 * poly_stride;
+        let parts = (0..3u64)
+            .map(|limb| PhysicalPart {
+                leaf: 0,
+                storage: StorageRef::Input(0),
+                device: 0,
+                view: PhysicalView {
+                    byte_offset: 16 + limb * limb_stride,
+                    origin: Box::new([0, 0, limb, 0]),
+                    extent: Box::new([2, 3, 1, 8]),
+                    byte_strides: Box::new([row_stride, poly_stride, 0, 8]),
+                    element_bytes: 8,
+                },
+            })
+            .collect::<Vec<_>>();
+        let physical = Arc::new(PhysicalValue {
+            ty: ConcreteWireType::Matrix(ty),
+            encodings: Box::new([PhysicalEncoding::FullEval]),
+            parts: parts.into_boxed_slice(),
+            integer_ranges: BTreeMap::new(),
+        });
+        let dense = PhysicalExport::from_parts(Arc::clone(&physical), &[0, 1, 2]).expect("dense");
+        assert_eq!(dense.fragments.len(), 3);
+        assert_eq!(dense.raw_total_bytes, 3 * 6 * 8 * 8, "each limb holds only its own residues");
+        let layout = PhysicalExport::from_parts_spans(physical, &[0, 1, 2]).expect("span layout");
+        assert_eq!(layout.fragments.len(), 1);
+        assert_eq!(layout.fragments[0].part, 0);
+        assert_eq!(layout.raw_total_bytes, 2 * row_stride);
+        let slot_value = |poly: u64, slot: u64| poly * 1000 + slot * 37;
+        let mut raw = vec![0u8; layout.raw_total_bytes as usize];
+        for poly in 0..6u64 {
+            for (limb, prime) in moduli.into_iter().enumerate() {
+                for slot in 0..8u64 {
+                    let offset =
+                        (poly * poly_stride + limb as u64 * limb_stride + slot * 8) as usize;
+                    raw[offset..offset + 8]
+                        .copy_from_slice(&(slot_value(poly, slot) % prime).to_le_bytes());
+                }
+            }
+        }
+        let mut encoded = Vec::new();
+        transcode_raw_artifact(&layout, &mut std::io::Cursor::new(raw), &mut encoded)
+            .expect("transcode merged fragment");
+        let slots = (0..6u64)
+            .map(|poly| (0..8u64).map(|slot| slot_value(poly, slot)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let (header, residues) =
+            crate::matrix::eval_artifact::decode_eval_matrix(&encoded).expect("decode");
+        assert_eq!((header.rows, header.columns), (2, 3));
+        for (poly, entry) in slots.iter().enumerate() {
+            for (limb, prime) in moduli.into_iter().enumerate() {
+                for (slot, value) in entry.iter().enumerate() {
+                    assert_eq!(residues[(poly * 3 + limb) * 8 + slot], value % prime);
+                }
+            }
+        }
     }
 }

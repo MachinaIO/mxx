@@ -101,6 +101,12 @@ pub trait ArtifactStore {
     /// Removes an internal runtime-staged payload. Missing entries are ignored.
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error>;
     fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error>;
+    /// The artifacts this store keeps in GPU memory, if it keeps any there.
+    /// GPU exports of such a store stay on the device.
+    #[cfg(feature = "gpu")]
+    fn device_artifacts(&mut self) -> Option<&mut crate::device_artifact::DeviceArtifacts> {
+        None
+    }
 }
 
 pub trait ReadSeek: Read + Seek {}
@@ -1364,7 +1370,7 @@ fn payload_storage_len(payload: &ArtifactPayload) -> Option<usize> {
     }
 }
 
-fn decode_stored_payload(kind: u8, bytes: &[u8]) -> Result<ArtifactPayload, String> {
+pub(crate) fn decode_stored_payload(kind: u8, bytes: &[u8]) -> Result<ArtifactPayload, String> {
     match kind {
         0 => Ok(ArtifactPayload::Matrix(bytes.to_vec())),
         1 => Ok(ArtifactPayload::SmallMatrix(bytes.to_vec())),
@@ -1566,6 +1572,9 @@ pub struct MemoryArtifactStore {
     /// finalized session can never accidentally authorize a write.
     read_sessions: BTreeSet<ProductionId>,
     raw_stages: BTreeMap<ArtifactKey, MemoryRawStage>,
+    /// Artifacts kept in GPU memory, when the store was created on the device.
+    #[cfg(feature = "gpu")]
+    device: Option<crate::device_artifact::DeviceArtifacts>,
 }
 
 #[derive(Clone, Debug)]
@@ -1650,9 +1659,72 @@ pub enum MemoryArtifactError {
     FamilyIndexMismatch(ArtifactKey),
     #[error("canonical payload size evidence is unavailable for artifact: {0:?}")]
     SizeEvidenceUnavailable(ArtifactKey),
+    #[error("artifact in GPU memory is unreadable: {0}")]
+    Device(String),
 }
 
 impl MemoryArtifactStore {
+    /// A store that keeps GPU exports of matrices in GPU memory instead of
+    /// host memory. Sessions, manifests, and every other artifact stay on the
+    /// host as in the default store.
+    #[cfg(feature = "gpu")]
+    pub fn on_device() -> Self {
+        Self { device: Some(Default::default()), ..Self::default() }
+    }
+
+    /// Bytes of artifacts held in GPU memory.
+    #[cfg(feature = "gpu")]
+    pub fn device_resident_bytes(&self) -> usize {
+        self.device.as_ref().map_or(0, crate::device_artifact::DeviceArtifacts::resident_bytes)
+    }
+
+    /// How many times an artifact held in GPU memory was downloaded for a
+    /// host reader, or `None` when it is not held there.
+    #[cfg(feature = "gpu")]
+    pub fn device_host_reads(&self, key: &ArtifactKey) -> Option<usize> {
+        self.device.as_ref()?.get(key).map(|artifact| artifact.host_reads())
+    }
+
+    /// Metadata of a stored artifact, wherever its payload lives.
+    fn stored_metadata(
+        &self,
+        key: &ArtifactKey,
+    ) -> Option<(&ArtifactType, ArtifactAvailability, &Option<String>)> {
+        if let Some((artifact_type, availability, layout, _)) = self.entries.get(key) {
+            return Some((artifact_type, *availability, layout));
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(artifact) = self.device.as_ref().and_then(|device| device.get(key)) {
+            return Some((&artifact.artifact_type, artifact.availability, &artifact.layout));
+        }
+        None
+    }
+
+    /// Metadata and payload of a stored artifact. An artifact in GPU memory
+    /// is downloaded and transcoded.
+    fn stored_entry(
+        &self,
+        key: &ArtifactKey,
+    ) -> Result<
+        (ArtifactType, ArtifactAvailability, Option<String>, ArtifactPayload),
+        MemoryArtifactError,
+    > {
+        if let Some((artifact_type, availability, layout, payload)) = self.entries.get(key) {
+            return Ok((artifact_type.clone(), *availability, layout.clone(), payload.clone()));
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(artifact) = self.device.as_ref().and_then(|device| device.get(key)) {
+            let payload = artifact.host_payload().map_err(MemoryArtifactError::Device)?;
+            return Ok((
+                artifact.artifact_type.clone(),
+                artifact.availability,
+                artifact.layout.clone(),
+                payload,
+            ));
+        }
+        Err(MemoryArtifactError::Missing(key.clone()))
+    }
+
     pub fn insert(
         &mut self,
         key: ArtifactKey,
@@ -1708,18 +1780,15 @@ impl MemoryArtifactStore {
                     name: name.clone(),
                     index,
                 };
-                let (artifact_type, availability, layout, payload) = self
-                    .entries
-                    .get(&key)
-                    .ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
-                if artifact_type != &descriptor.artifact_type ||
-                    availability != &descriptor.availability ||
-                    layout != &descriptor.layout ||
-                    !payload_matches(artifact_type, payload)
+                let (artifact_type, availability, layout, payload) = self.stored_entry(&key)?;
+                if artifact_type != descriptor.artifact_type ||
+                    availability != descriptor.availability ||
+                    layout != descriptor.layout ||
+                    !payload_matches(&artifact_type, &payload)
                 {
                     return Err(MemoryArtifactError::DescriptorMismatch(key));
                 }
-                payloads.push((key, payload.clone()));
+                payloads.push((key, payload));
             }
         }
         Ok(payloads)
@@ -2070,19 +2139,18 @@ impl ArtifactStore for MemoryArtifactStore {
             (Some(count), Some(index)) if index < count => {}
             _ => return Err(MemoryArtifactError::FamilyIndexMismatch(key.clone())),
         }
-        let (artifact_type, availability, layout, payload) =
-            self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
-        if artifact_type != &descriptor.artifact_type ||
-            availability != &descriptor.availability ||
-            layout != &descriptor.layout
+        let (artifact_type, availability, layout, payload) = self.stored_entry(key)?;
+        if artifact_type != descriptor.artifact_type ||
+            availability != descriptor.availability ||
+            layout != descriptor.layout
         {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
-        if !payload_matches(artifact_type, payload) {
+        if !payload_matches(&artifact_type, &payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
         }
         *self.loads.entry(key.clone()).or_default() += 1;
-        Ok(payload.clone())
+        Ok(payload)
     }
 
     fn load_payload_size(
@@ -2104,18 +2172,17 @@ impl ArtifactStore for MemoryArtifactStore {
             }
             _ => MemoryArtifactError::DescriptorMismatch(key.clone()),
         })?;
-        let (artifact_type, availability, layout, payload) =
-            self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
-        if artifact_type != &descriptor.artifact_type ||
-            *availability != descriptor.availability ||
-            layout != &descriptor.layout
+        let (artifact_type, availability, layout, payload) = self.stored_entry(key)?;
+        if artifact_type != descriptor.artifact_type ||
+            availability != descriptor.availability ||
+            layout != descriptor.layout
         {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
-        if !payload_matches(artifact_type, payload) {
+        if !payload_matches(&artifact_type, &payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
         }
-        payload_storage_len(payload)
+        payload_storage_len(&payload)
             .ok_or_else(|| MemoryArtifactError::SizeEvidenceUnavailable(key.clone()))
     }
 
@@ -2161,25 +2228,33 @@ impl ArtifactStore for MemoryArtifactStore {
         key: &ArtifactKey,
         descriptor: &ManifestArtifact,
     ) -> Result<ArtifactPayload, Self::Error> {
-        let (stored_type, stored_availability, stored_layout, payload) =
-            self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
-        if stored_type != &descriptor.artifact_type ||
-            *stored_availability != descriptor.availability ||
-            stored_layout != &descriptor.layout
+        let (stored_type, stored_availability, stored_layout, payload) = self.stored_entry(key)?;
+        if stored_type != descriptor.artifact_type ||
+            stored_availability != descriptor.availability ||
+            stored_layout != descriptor.layout
         {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
-        if !payload_matches(&descriptor.artifact_type, payload) {
+        if !payload_matches(&descriptor.artifact_type, &payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
         }
         *self.loads.entry(key.clone()).or_default() += 1;
-        Ok(payload.clone())
+        Ok(payload)
     }
 
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
         self.ensure_session_mutable(&key.production)?;
         self.entries.remove(key);
+        #[cfg(feature = "gpu")]
+        if let Some(device) = &mut self.device {
+            device.remove(key);
+        }
         Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    fn device_artifacts(&mut self) -> Option<&mut crate::device_artifact::DeviceArtifacts> {
+        self.device.as_mut()
     }
 
     fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
@@ -2311,12 +2386,11 @@ impl SessionStore for MemoryArtifactStore {
     fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
         self.ensure_session_mutable(&handle.key.production)?;
         let stored = self
-            .entries
-            .get(&handle.key)
+            .stored_metadata(&handle.key)
             .ok_or_else(|| MemoryArtifactError::UnstoredArtifact(handle.key.clone()))?;
-        if stored.0 != handle.artifact_type ||
+        if stored.0 != &handle.artifact_type ||
             stored.1 != handle.availability ||
-            stored.2 != handle.layout
+            stored.2 != &handle.layout
         {
             return Err(MemoryArtifactError::DescriptorMismatch(handle.key.clone()));
         }

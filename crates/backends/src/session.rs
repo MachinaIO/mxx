@@ -327,6 +327,11 @@ impl<'store, S: SessionStore + ?Sized> crate::artifact::ArtifactStore
             .map_err(ProducerSessionError::Store)
     }
 
+    #[cfg(feature = "gpu")]
+    fn device_artifacts(&mut self) -> Option<&mut crate::device_artifact::DeviceArtifacts> {
+        self.store.device_artifacts()
+    }
+
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
         self.store.load_manifest(production).map_err(ProducerSessionError::Store)
     }

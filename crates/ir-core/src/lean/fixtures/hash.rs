@@ -4,7 +4,6 @@ use crate::{
     lean::{ExportOptions, export},
     node::{HashTagComponent, HashVariant, NodeKind},
     types::MatrixType,
-    validate,
 };
 use std::collections::BTreeMap;
 
@@ -25,12 +24,8 @@ fn export_hash_fixture() {
     )
     .output(0)
     .unwrap();
-    let matrix = MatrixType {
-        modulus: 17.into(),
-        ring_dimension: 2.into(),
-        rows: 1.into(),
-        columns: 1.into(),
-    };
+    let matrix =
+        MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
     let hash = NodeHandle::new(
         NodeKind::HashSample {
             matrix_type: matrix.clone(),
@@ -61,8 +56,8 @@ fn export_hash_fixture() {
         "hash-fixture",
         vec![],
         BTreeMap::from([
-            ("hash".into(), GraphOutput { value: hash, confidentiality: None }),
-            ("coefficient".into(), GraphOutput { value: coefficient, confidentiality: None }),
+            ("hash".into(), GraphOutput { value: hash, availability: None }),
+            ("coefficient".into(), GraphOutput { value: coefficient, availability: None }),
         ]),
         vec![],
         vec![],
@@ -70,7 +65,7 @@ fn export_hash_fixture() {
     )
     .unwrap()
     .0;
-    let checked = validate(&graph, &ParamEnv::default()).unwrap();
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let artifact = export(&checked, &ExportOptions::default()).unwrap();
     let proof = r#"
 example : MxxRuntime.signedIntegerTag (-256) = [1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0] := by decide

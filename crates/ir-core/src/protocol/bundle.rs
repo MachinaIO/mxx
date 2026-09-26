@@ -489,9 +489,9 @@ impl ClosedProtocolBundle {
                     .requirements
                     .get(*requirement)
                     .ok_or(BundleValidationError::MissingInputDestination)?;
-                (&requirement.graph, input.as_str())
+                (requirement.graph(), input.as_str())
             }
-            ProtocolInputDestination::Ideal { input } => (&self.ideal.graph, input.as_str()),
+            ProtocolInputDestination::Ideal { input } => (self.ideal.graph(), input.as_str()),
         };
         root_input_type(graph, name)
     }
@@ -506,11 +506,11 @@ impl ClosedProtocolBundle {
             })
         });
         let requirements = self.requirements.iter().enumerate().flat_map(|(index, requirement)| {
-            root_inputs(&requirement.graph).map(move |(name, _, _)| {
+            root_inputs(requirement.graph()).map(move |(name, _, _)| {
                 ProtocolInputDestination::Requirement { requirement: index, input: name.to_owned() }
             })
         });
-        let ideal = root_inputs(&self.ideal.graph)
+        let ideal = root_inputs(self.ideal.graph())
             .map(|(name, _, _)| ProtocolInputDestination::Ideal { input: name.to_owned() });
         workflow.chain(requirements).chain(ideal).collect()
     }
@@ -539,7 +539,7 @@ impl ClosedProtocolBundle {
             let stage = stages
                 .get(&endpoint.workflow_output.stage)
                 .ok_or(BundleValidationError::MissingEndpointBinding)?;
-            if !self.ideal.graph.outputs().contains_key(&endpoint.ideal_output) ||
+            if !self.ideal.graph().outputs().contains_key(&endpoint.ideal_output) ||
                 !stage.graph.outputs().contains_key(&endpoint.workflow_output.output)
             {
                 return Err(BundleValidationError::MissingEndpointBinding);
@@ -580,7 +580,7 @@ impl ClosedProtocolBundle {
             }
             ComparatorSpec::EqualityAfterMap { program, endpoints } => {
                 let comparator_inputs =
-                    root_inputs(&program.graph).map(|(name, _, _)| name).collect::<BTreeSet<_>>();
+                    root_inputs(program.graph()).map(|(name, _, _)| name).collect::<BTreeSet<_>>();
                 for endpoint in endpoints {
                     if !comparator_inputs.contains(endpoint.actual_input.as_str()) ||
                         (!endpoint.ideal_input.is_empty() &&
@@ -589,11 +589,11 @@ impl ClosedProtocolBundle {
                         return Err(BundleValidationError::MissingComparatorConnection);
                     }
                     let output = program
-                        .graph
+                        .graph()
                         .outputs()
                         .get(&endpoint.result_output)
                         .ok_or(BundleValidationError::MissingComparatorConnection)?;
-                    let output_type = output_type(&program.graph, output.value)
+                    let output_type = output_type(program.graph(), output.value)
                         .ok_or(BundleValidationError::MissingComparatorConnection)?;
                     if !matches!(output_type, WireType::Bool | WireType::ConstantBool) {
                         return Err(BundleValidationError::ComparatorResultTypeMismatch);
@@ -684,7 +684,7 @@ impl ClosedProtocolBundle {
                             matches!(
                                 (decoder_input, output_type(&residual_stage.graph, residual.value)),
                                 (WireType::Matrix(decoder_type), _)
-                                    if decoder_type.modulus == residual_matrix_type.modulus
+                                    if decoder_type.ring == residual_matrix_type.ring
                             )
                         });
                     let residual_family_witness_matches = !matches!(
@@ -733,11 +733,11 @@ impl ClosedProtocolBundle {
             self.requirements.iter().zip(&self.precondition_spec.requirement_outputs)
         {
             let output = requirement
-                .graph
+                .graph()
                 .outputs()
                 .get(output_name)
                 .ok_or(BundleValidationError::InvalidPreconditionOutput)?;
-            let output_type = output_type(&requirement.graph, output.value)
+            let output_type = output_type(requirement.graph(), output.value)
                 .ok_or(BundleValidationError::InvalidPreconditionOutput)?;
             if !matches!(output_type, WireType::Bool | WireType::ConstantBool) {
                 return Err(BundleValidationError::InvalidPreconditionOutput);
@@ -819,7 +819,7 @@ fn boolean_interval_decoder_matches(
 
     let expected_quarter = IntExpr::RoundDiv(
         Box::new(IntExpr::Sub(
-            Box::new(residual_type.modulus.clone()),
+            Box::new(IntExpr::RingModulus(residual_type.ring.clone())),
             Box::new(IntExpr::constant(2)),
         )),
         Box::new(IntExpr::constant(4)),
@@ -1243,8 +1243,8 @@ mod tests {
                 "interval",
                 Vec::new(),
                 BTreeMap::from([
-                    ("residual".to_owned(), GraphOutput { value: residual, confidentiality: None }),
-                    ("decoded".to_owned(), GraphOutput { value: decoded, confidentiality: None }),
+                    ("residual".to_owned(), GraphOutput { value: residual, availability: None }),
+                    ("decoded".to_owned(), GraphOutput { value: decoded, availability: None }),
                 ]),
                 Vec::new(),
                 Vec::new(),
@@ -1253,7 +1253,7 @@ mod tests {
             .unwrap()
             .0
         }
-        let modulus = matrix_type(1, 1).modulus;
+        let modulus = IntExpr::RingModulus(matrix_type(1, 1).ring);
         let original = IntExpr::RoundDiv(
             Box::new(IntExpr::Sub(Box::new(modulus.clone()), Box::new(IntExpr::constant(2)))),
             Box::new(IntExpr::constant(4)),
@@ -1278,8 +1278,7 @@ mod tests {
 
     fn matrix_type(rows: i64, columns: i64) -> MatrixType {
         MatrixType {
-            modulus: 17.into(),
-            ring_dimension: 1.into(),
+            ring: crate::ring::test_ring(17, 1),
             rows: rows.into(),
             columns: columns.into(),
         }

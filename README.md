@@ -8,46 +8,53 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 
 | Crate | Responsibility |
 | --- | --- |
-| `mxx-primitives` | Polynomial/matrix operations, CPU/GPU kernels, and concrete samplers. |
+| `mxx-backends` | Polynomial/matrix operations, CPU/GPU kernels and execution, concrete samplers, transcripts, sessions, and artifacts. |
 | `mxx-ir-core` | Executable DAG, protocol declarations, structural validation, artifact manifests, and Lean claim generation. |
 | `mxx-dsl` | Typed graph construction and sampler-free ideal/predicate builders. |
-| `mxx-runtime` | CPU/GPU graph execution, transcripts, sessions, and in-memory artifacts. |
-| `mxx-bench-estimator` | Validated-graph cost and memory composition. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
-| `mxx-fhe` | DSL-based Ring Regev/Ring-GSW and leveled BGV, SIMD, rotations, and ciphertext noise tracking. |
-| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. |
+| `mxx-fhe` | DSL-based TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and ciphertext noise tracking. |
+| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Excluded from the workspace; build it with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
 
 The retired symbolic IR and probabilistic noise simulator are not part of the workspace.
-Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU
-samplers implement the current runtime-correspondence contract; GPU cutoff enforcement is tracked
-as a follow-up. Lattice-security estimation intentionally continues to model the corresponding
+Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU and
+GPU samplers enforce the same cutoffs: Gaussian draws are resampled until they meet the bound, and
+preimage sampling retries whole candidates that exceed it. Lattice-security estimation intentionally continues to model the corresponding
 ordinary untruncated distributions separately.
 
-See `docs/architecture.md`, `docs/dsl.md`, `docs/ir-core.md`, `docs/runtime.md`, and
-`docs/correctness/operational-protocol-inventory.md`.
+See `docs/architecture.md` (the design entry point, covering the IR, DSL, CPU executor, and GPU
+runtime) and `docs/correctness/operational-protocol-inventory.md`.
 
 ## FHE graphs
 
 `mxx-fhe` constructs cryptographic graphs; its methods do not encrypt eagerly.
 Key generation, sampling, polynomial arithmetic, and decryption execute when
-`mxx-runtime` runs the validated graph. CPU and GPU backends use the same FHE DSL.
-Bootstrapping is not implemented.
+`mxx-backends` runs the validated graph. CPU and GPU backends use the same FHE DSL.
+TFHE implements NAND bootstrapping; BGV is leveled and has no bootstrapping.
 
 | API | Representation and behavior |
 | --- | --- |
 | `FheCommonParams` | Existing `DCRTPolyParams`, binary/ternary secret interval, Gaussian sigma, and coefficient cutoff. Level zero keeps the first CRT prime; higher levels keep longer prefixes. |
-| `FheScheme` | Shared `keygen`, `encrypt`, `decrypt`, `add`, and `mul` graph builders, with scheme-specific plaintext, multiplication operand, and evaluation-key types. |
-| `RingGswParams` | `new(common, scale, plaintext_bound)`; scalar polynomial `Mat` plaintexts in the ciphertext ring R_q. Regev ciphertexts have separate a/b parts with phase `b - s*a = scale*m + e`. |
-| `RingCiphertext` | Shared storage for Regev and GSW aliases, with a/b parts and public noise/plaintext bounds. GSW encrypts an unscaled gadget diagonal; its external product multiplies a Regev plaintext by the GSW polynomial. |
+| `FheScheme` | Shared matrix-plaintext `keygen`, `encrypt`, `decrypt`, `add`, and `mul` graph builders, with scheme-specific plaintext, multiplication operand, and evaluation-key types. BGV implements it; TFHE has its own integer LWE API. |
+| `TfheParams` | `new(common, lwe_dimension, lwe_modulus, lwe_error_sigma, lwe_error_cutoff)`; integer LWE over a power-of-two modulus q with binary secrets, plus the CRT ring R_Q for blind rotation. Gaussian cutoffs must be at least 16 sigma. |
+| `LweCiphertext` | `Family<Int>` vector `a` and `Int` `b` with phase `b - <a, s>` mod q; a bit is encoded as `+floor(q/8)` (true) or `-floor(q/8)` (false). |
+| `TfheKeys` | Output of `keygen(hash_key)`: LWE and ring secrets, a `BootstrappingKey` (ring-GSW encryptions of each LWE secret coordinate, stored as `RingCiphertext`s), and a flat `KeySwitchKey` (base `2^b` with `d` digits of the rounded leading `b * d` bits of each coefficient, both set in `TfheParams::new`). |
 | `BgvParams` | `new(common, plaintext_modulus)`; messages are `Family<Int>` with 1 to N SIMD slots modulo t. Supports addition, multiplication with relinearization, CRT modulus switching, SIMD, and rotations. |
 | `BgvCiphertext` | Components are descending coefficients in `-s`: `(a,b)` for ordinary ciphertexts or three rows before relinearization. `correction_factor` tracks the plaintext multiplier modulo t, while `noise_bound` tracks coefficient noise. |
 
-Ring Regev's plaintext ring and ciphertext ring have the same modulus q.
-The scale and declared centered coefficient bound restrict which plaintexts can
-be recovered under noise; negative decoded coefficients are returned as canonical
-residues modulo q. BGV instead decrypts modulo its separate plaintext modulus t.
+TFHE `encrypt(secret, bit, hash_key)` and `decrypt(secret, ciphertext)` work on
+single bits. `nand(lhs, rhs, bootstrapping_key, key_switch_key)`
+forms `nand_input` (`floor(q/8) - ct1 - ct2`) and bootstraps it with the
+`nand_accumulator` sign LUT. `bootstrap` runs four public stages that can also
+be built as separate graphs: `pre_blind_rotation`, `blind_rotation` (one
+external product per LWE secret coordinate), `sample_extract` (with rounded
+Q-to-q modulus switching), and `key_switch`. LWE `a` vectors are hash-derived
+with `DslContext::hash_int_family`, so every ciphertext and every `keygen` call
+needs a fresh 32-byte key from a CSPRNG; secrets and errors are independent
+samples.
+
+BGV decrypts modulo its separate plaintext modulus t.
 For BGV multiplication, `mul` takes a relinearization key; alternatively,
 `mul_unrelinearized` and `relinearize` expose the two steps explicitly.
 
@@ -109,7 +116,8 @@ To execute a graph:
 2. Build and validate the graph with a `ParamEnv`. Register the exact ordered
    ciphertext CRT bases with the runtime backend. For BGV,
    `runtime_parameters()` supplies all ciphertext, hybrid, single-prime, and
-   plaintext rings in their exact tower order.
+   plaintext rings in their exact tower order; `TfheParams::runtime_parameters()`
+   supplies the CRT prefixes and single-prime rings TFHE uses.
 3. Call runtime `execute` with inputs, a backend, a `MemoryArtifactStore`, and a
    sampling mode. Materialize lazy family outputs before inspecting their values.
 
@@ -121,11 +129,15 @@ not contain correction factors or bounds: carry those alongside components when
 connecting separate protocol stages. Artifacts remain in memory or are passed as
 direct runtime inputs.
 
-Start with the runtime unit tests in `crates/fhe/src/ring_gsw.rs` and
-`crates/fhe/src/bgv.rs` for slot arithmetic, measured noise, and
-staged evaluation. `crates/fhe/src/tests_gpu.rs` executes the production graphs
-on GPU, including a public evaluator that receives no secret key. The design
-and formulas are documented in `docs/plans/fhe.md`.
+Start with the runtime unit tests in `crates/fhe/src/tfhe.rs` (NAND truth
+tables and LWE round trips) and `crates/fhe/src/bgv.rs` (slot arithmetic,
+measured noise, and staged evaluation). `crates/fhe/src/tests_gpu.rs` executes
+the BGV production graphs on GPU, including a public evaluator that receives no
+secret key. The integration test `crates/fhe/tests/gpu_tfhe.rs` is a TFHE round trip on
+GPU with the standard TFHE Boolean profile (`utils::tfhe_params`): it
+generates keys, encrypts bits, evaluates the NAND truth table and chained
+bootstrapped gates, and decrypts every result, with keys kept resident
+between plans.
 
 ```sh
 cargo test -r -p mxx-fhe --lib

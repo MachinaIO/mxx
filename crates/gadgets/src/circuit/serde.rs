@@ -528,7 +528,7 @@ impl SerializablePolyCircuit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+    use mxx_backends::poly::dcrt::poly::DCRTPoly;
 
     fn assert_json_roundtrip(circuit: PolyCircuit<DCRTPoly>) {
         let serialized = SerializablePolyCircuit::from_circuit(circuit.clone());

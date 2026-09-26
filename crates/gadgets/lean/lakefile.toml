@@ -8,11 +8,11 @@ pp.unicode.fun = true
 
 [[require]]
 name = "mathlib"
-path = "../../primitives/lean/.lake/packages/mathlib"
+path = "../../backends/lean/.lake/packages/mathlib"
 
 [[require]]
-name = "MxxPrimitives"
-path = "../../primitives/lean"
+name = "MxxBackends"
+path = "../../backends/lean"
 
 [[lean_lib]]
 name = "MxxGadgets"

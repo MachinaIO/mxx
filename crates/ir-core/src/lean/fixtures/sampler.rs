@@ -6,30 +6,17 @@ use crate::{
     lean::{BackendLayout, ExportOptions, export},
     node::NodeKind,
     types::MatrixType,
-    validate,
 };
 use std::collections::BTreeMap;
 
 #[test]
 fn export_sampler_fixture() {
-    let public_type = MatrixType {
-        modulus: 17.into(),
-        ring_dimension: 2.into(),
-        rows: 1.into(),
-        columns: 3.into(),
-    };
-    let target_type = MatrixType {
-        modulus: 17.into(),
-        ring_dimension: 2.into(),
-        rows: 1.into(),
-        columns: 1.into(),
-    };
-    let preimage_type = MatrixType {
-        modulus: 17.into(),
-        ring_dimension: 2.into(),
-        rows: 3.into(),
-        columns: 1.into(),
-    };
+    let public_type =
+        MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 3.into() };
+    let target_type =
+        MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
+    let preimage_type =
+        MatrixType { ring: crate::ring::test_ring(17, 2), rows: 3.into(), columns: 1.into() };
     let trapdoor = NodeHandle::new(
         NodeKind::TrapdoorSample {
             matrix_type: public_type.clone(),
@@ -69,7 +56,11 @@ fn export_sampler_fixture() {
             max_coefficient_bound: 4.into(),
         },
         vec![public.clone(), token.clone(), target.clone()],
-        vec![WireType::Preimage { matrix: preimage_type.clone(), max_coefficient_bound: 4.into() }],
+        vec![WireType::Preimage {
+            matrix: preimage_type.clone(),
+            max_coefficient_bound: 4.into(),
+            bound_domain: crate::types::CoefficientBoundDomain::Global,
+        }],
     )
     .output(0)
     .unwrap();
@@ -79,7 +70,11 @@ fn export_sampler_fixture() {
             max_coefficient_bound: 4.into(),
         },
         vec![public, token, target],
-        vec![WireType::Preimage { matrix: preimage_type, max_coefficient_bound: 4.into() }],
+        vec![WireType::Preimage {
+            matrix: preimage_type,
+            max_coefficient_bound: 4.into(),
+            bound_domain: crate::types::CoefficientBoundDomain::Global,
+        }],
     )
     .output(0)
     .unwrap();
@@ -87,8 +82,8 @@ fn export_sampler_fixture() {
         "stage-a-sampled-trapdoor",
         Vec::<CompileParameter>::new(),
         BTreeMap::from([
-            ("preimage".into(), GraphOutput { value: preimage, confidentiality: None }),
-            ("second".into(), GraphOutput { value: second, confidentiality: None }),
+            ("preimage".into(), GraphOutput { value: preimage, availability: None }),
+            ("second".into(), GraphOutput { value: second, availability: None }),
         ]),
         vec![],
         vec![],
@@ -96,7 +91,7 @@ fn export_sampler_fixture() {
     )
     .unwrap()
     .0;
-    let checked = validate(&graph, &ParamEnv::default()).unwrap();
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let artifact = export(
         &checked,
         &ExportOptions {

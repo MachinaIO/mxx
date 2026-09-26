@@ -1386,7 +1386,7 @@ mod graph_tests {
         },
         test_utils::{constant_matrix, execute_circuit, execute_circuit_with_shape},
     };
-    use mxx_primitives::{
+    use mxx_backends::{
         matrix::dcrt_poly::DCRTPolyMatrix,
         poly::{
             Poly,

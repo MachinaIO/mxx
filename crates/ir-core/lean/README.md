@@ -11,7 +11,7 @@ Fixture generators are ordinary unit tests, not example executables. From the re
 
 ```sh
 cargo test -p mxx-ir-core --lib lean::fixtures
-cargo test -p mxx-runtime --lib lean::fixtures
+cargo test -p mxx-backends --lib lean::fixtures
 ```
 
 IR fixtures are written to `test_data/lean_ir_fixtures/<fixture>/Generated.lean`. The runtime
@@ -25,11 +25,11 @@ IR and runtime packages:
 
 ```sh
 LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean \
-  lake +leanprover/lean4:v4.28.0 -d crates/runtime/lean env lean \
+  lake +leanprover/lean4:v4.28.0 -d crates/backends/lean env lean \
   test_data/lean_ir_fixtures/sampler/Generated.lean
 ```
 
-The explicit toolchain matches `crates/runtime/lean/lean-toolchain`: Lake's `-d` selects the
+The explicit toolchain matches `crates/backends/lean/lean-toolchain`: Lake's `-d` selects the
 package without changing the repository-root working directory or Elan's initial toolchain choice.
 
 The fixtures prove consequences of generated execution relations, not sampler termination or

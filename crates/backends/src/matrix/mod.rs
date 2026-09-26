@@ -1,0 +1,1332 @@
+use crate::{
+    element::PolyElem,
+    poly::{Poly, PolyParams},
+};
+use mxx_ir_core::types::CoefficientBoundDomain;
+use num_bigint::BigUint;
+use num_traits::Zero;
+use rayon::prelude::*;
+use std::{
+    fmt::Debug,
+    ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
+    path::Path,
+    sync::Arc,
+};
+use thiserror::Error;
+
+pub mod base;
+pub(crate) mod cpp_matrix;
+pub mod dcrt_poly;
+pub mod eval_artifact;
+#[cfg(feature = "gpu")]
+pub mod gpu_dcrt_poly;
+pub mod i64;
+
+pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {
+    fn entry_size(&self) -> usize;
+}
+
+/// Typed errors for compact matrix headers. The legacy matrix trait retains
+/// its infallible decoder, while backend boundaries can validate versioned
+/// headers before invoking it.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum CompactMatrixDecodeError {
+    #[error(
+        "unsupported compact matrix version {version}; supported versions are {supported_versions:?}"
+    )]
+    UnsupportedVersion { version: u8, supported_versions: &'static [u8] },
+    #[error("invalid compact matrix header: {0}")]
+    InvalidHeader(&'static str),
+    #[error("invalid compact matrix payload: {0}")]
+    InvalidPayload(&'static str),
+}
+
+/// A logical full matrix whose columns are materialized on demand.
+///
+/// Implementations may be backed by host staging bytes or persistent storage;
+/// callers must not assume that the complete expanded matrix is resident.
+pub trait PolyMatrixColumnSource<M>: Debug + Send + Sync {
+    fn row_size(&self) -> usize;
+    fn col_size(&self) -> usize;
+
+    /// Expanded storage already resident while a sampling tile is live.
+    /// Host-backed sources return `None`; resident sources expose their owner
+    /// so the sampler includes it in its peak-memory calculation.
+    fn resident_matrix(&self) -> Option<&M> {
+        None
+    }
+
+    /// Global offset of local column zero in the logical matrix.
+    ///
+    /// Column-partitioned backends include this offset when deriving tile
+    /// randomness. GPU sampling is reproducible for the same seed and tile
+    /// schedule; changing tile boundaries can change the sampled preimage.
+    fn global_column_start(&self) -> usize {
+        0
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> M;
+}
+
+/// Owns a resident matrix while presenting it as a logical column source.
+/// Sampling can therefore retain the full logical shape and load only the
+/// requested columns, without exposing an expanded preimage-returning API.
+#[derive(Clone, Debug)]
+pub struct ResidentPolyMatrixColumnSource<M: PolyMatrix> {
+    value: M,
+}
+
+impl<M: PolyMatrix> ResidentPolyMatrixColumnSource<M> {
+    pub fn new(value: M) -> Self {
+        Self { value }
+    }
+}
+
+impl<M: PolyMatrix> PolyMatrixColumnSource<M> for ResidentPolyMatrixColumnSource<M> {
+    fn resident_matrix(&self) -> Option<&M> {
+        Some(&self.value)
+    }
+
+    fn row_size(&self) -> usize {
+        self.value.row_size()
+    }
+
+    fn col_size(&self) -> usize {
+        self.value.col_size()
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> M {
+        self.value.slice_columns(start, end)
+    }
+}
+
+pub trait MatrixElem:
+    Sized
+    + Clone
+    + Debug
+    + PartialEq
+    + Eq
+    + Add<Output = Self>
+    + Sub<Output = Self>
+    + Mul<Output = Self>
+    + Neg<Output = Self>
+    + AddAssign
+    + SubAssign
+    + MulAssign
+    + for<'a> Add<&'a Self, Output = Self>
+    + for<'a> Sub<&'a Self, Output = Self>
+    + for<'a> Mul<&'a Self, Output = Self>
+    + Send
+    + Sync
+{
+    type Params: MatrixParams;
+    fn zero(params: &Self::Params) -> Self;
+    fn one(params: &Self::Params) -> Self;
+    fn from_bytes_to_elem(params: &Self::Params, bytes: &[u8]) -> Self;
+    fn as_elem_to_bytes(&self) -> Vec<u8>;
+}
+
+pub trait PolyMatrix:
+    Sized
+    + Clone
+    + Debug
+    + PartialEq
+    + Eq
+    + Add<Output = Self>
+    + Sub<Output = Self>
+    + Mul<Output = Self>
+    + Neg<Output = Self>
+    + for<'a> Add<&'a Self, Output = Self>
+    + for<'a> Sub<&'a Self, Output = Self>
+    + for<'a> Mul<&'a Self, Output = Self>
+    + Mul<Self::P, Output = Self>
+    + for<'a> Mul<&'a Self::P, Output = Self>
+    + Send
+    + Sync
+{
+    type P: Poly;
+
+    fn params(&self) -> &<Self::P as Poly>::Params;
+
+    /// Waits until writes submitted for this matrix have completed.
+    ///
+    /// CPU-backed matrices are ready immediately. GPU implementations override
+    /// this to wait only for this matrix's recorded write events.
+    fn wait_until_ready(&self) {}
+
+    fn add_out_of_place(&self, rhs: &Self) -> Self {
+        self.clone() + rhs
+    }
+    /// Sums selected source rows into each output row, allowing repeated indices.
+    /// Each group must be nonempty and every index must be in bounds.
+    fn sum_rows(&self, rows: &[Vec<usize>]) -> Self {
+        let (source_rows, cols) = self.size();
+        assert!(
+            rows.iter()
+                .all(|group| !group.is_empty() && group.iter().all(|&row| row < source_rows)),
+            "row sums require nonempty groups of valid row indices"
+        );
+        let mut sums = rows
+            .par_iter()
+            .map(|group| {
+                let mut sum = self.slice(group[0], group[0] + 1, 0, cols);
+                for &row in &group[1..] {
+                    sum = sum.add_out_of_place(&self.slice(row, row + 1, 0, cols));
+                }
+                sum
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        match sums.next() {
+            Some(first) => first.concat_rows_owned(sums.collect()),
+            None => self.slice(0, 0, 0, cols),
+        }
+    }
+
+    /// Adds vertically stacked blocks without requiring a concatenated input.
+    fn add_row_blocks_out_of_place(&self, blocks: &[&Self]) -> Self {
+        let (first, rest) = blocks.split_first().expect("nonempty row blocks");
+        first.concat_rows(rest).add_out_of_place(self)
+    }
+    fn add_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        inputs.into_par_iter().map(|(left, right)| left.add_out_of_place(&right)).collect()
+    }
+
+    fn sub_out_of_place(&self, rhs: &Self) -> Self {
+        self.clone() - rhs
+    }
+    fn sub_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        inputs.into_par_iter().map(|(left, right)| left.sub_out_of_place(&right)).collect()
+    }
+
+    fn multiply_out_of_place(&self, rhs: &Self) -> Self {
+        self.clone() * rhs
+    }
+    fn multiply_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
+        inputs
+            .into_par_iter()
+            .map(|(left, right)| {
+                if left.size() == (1, 1) {
+                    right.multiply_poly_out_of_place(&left.entry(0, 0))
+                } else if right.size() == (1, 1) {
+                    left.multiply_poly_out_of_place(&right.entry(0, 0))
+                } else {
+                    left.multiply_out_of_place(&right)
+                }
+            })
+            .collect()
+    }
+
+    /// Computes batches of `bias + sum(coefficient * left * right)`.
+    /// GPU implementations may fuse the products and accumulation; the
+    /// default preserves the exact ordinary-operation semantics.
+    fn multiply_accumulate_batch_out_of_place(
+        requests: Vec<(Vec<(Option<Self::P>, Arc<Self>, Arc<Self>)>, Option<Arc<Self>>)>,
+    ) -> Vec<Self> {
+        requests
+            .into_par_iter()
+            .map(|(products, bias)| {
+                let mut products = products.into_iter();
+                let (coefficient, left, right) =
+                    products.next().expect("multiply-accumulate request has a product");
+                let mut output = left.multiply_out_of_place(&right);
+                if let Some(coefficient) = coefficient {
+                    output = output.multiply_poly_out_of_place(&coefficient);
+                }
+                for (coefficient, left, right) in products {
+                    let mut product = left.multiply_out_of_place(&right);
+                    if let Some(coefficient) = coefficient {
+                        product = product.multiply_poly_out_of_place(&coefficient);
+                    }
+                    output.add_in_place(&product);
+                }
+                if let Some(bias) = bias {
+                    output.add_in_place(&bias);
+                }
+                output
+            })
+            .collect()
+    }
+
+    fn negate_out_of_place(&self) -> Self {
+        -self.clone()
+    }
+    fn negate_batch_out_of_place(inputs: Vec<Arc<Self>>) -> Vec<Self> {
+        inputs.into_par_iter().map(|value| value.negate_out_of_place()).collect()
+    }
+
+    fn multiply_poly_out_of_place(&self, scalar: &Self::P) -> Self {
+        self.clone() * scalar
+    }
+    fn multiply_polys_batch_out_of_place(inputs: Vec<(Arc<Self>, Self::P)>) -> Vec<Self> {
+        inputs
+            .into_par_iter()
+            .map(|(matrix, scalar)| matrix.multiply_poly_out_of_place(&scalar))
+            .collect()
+    }
+
+    /// Applies `sigma_k: X -> X^k` in `Z_q[X]/(X^n + 1)` entrywise.
+    fn ring_automorphism_out_of_place(&self, index: usize) -> Self {
+        let n = self.params().ring_dimension() as usize;
+        assert!(n.is_power_of_two(), "ring automorphism requires a power-of-two ring dimension");
+        assert!(index > 0 && index < 2 * n && index % 2 == 1, "invalid ring automorphism index");
+        let (rows, columns) = self.size();
+        let entries = (0..rows)
+            .into_par_iter()
+            .map(|row| {
+                (0..columns)
+                    .map(|column| {
+                        let mut output = vec![
+                            <<Self as PolyMatrix>::P as Poly>::Elem::zero(
+                                &self.params().modulus(),
+                            );
+                            n
+                        ];
+                        for (source, coefficient) in
+                            self.entry(row, column).coeffs().into_iter().enumerate()
+                        {
+                            let exponent =
+                                ((source as u128 * index as u128) % (2 * n) as u128) as usize;
+                            if exponent < n {
+                                output[exponent] = coefficient;
+                            } else {
+                                output[exponent - n] = -coefficient;
+                            }
+                        }
+                        Self::P::from_coeffs(self.params(), &output)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::from_poly_vec(self.params(), entries)
+    }
+
+    /// Multiplies every entry by `X^exponent` in `Z_q[X]/(X^n + 1)`, for
+    /// `exponent` in `[0, 2n)`.
+    fn multiply_monomial_out_of_place(&self, exponent: usize) -> Self {
+        let n = self.params().ring_dimension() as usize;
+        assert!(exponent < 2 * n, "monomial exponent must lie in [0, 2n)");
+        let (rows, columns) = self.size();
+        let entries = (0..rows)
+            .into_par_iter()
+            .map(|row| {
+                (0..columns)
+                    .map(|column| {
+                        let mut output = vec![
+                            <<Self as PolyMatrix>::P as Poly>::Elem::zero(
+                                &self.params().modulus(),
+                            );
+                            n
+                        ];
+                        for (source, coefficient) in
+                            self.entry(row, column).coeffs().into_iter().enumerate()
+                        {
+                            let target = (source + exponent) % (2 * n);
+                            if target < n {
+                                output[target] = coefficient;
+                            } else {
+                                output[target - n] = -coefficient;
+                            }
+                        }
+                        Self::P::from_coeffs(self.params(), &output)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::from_poly_vec(self.params(), entries)
+    }
+
+    fn ring_automorphism_batch_out_of_place(inputs: Vec<(Arc<Self>, usize)>) -> Vec<Self> {
+        inputs
+            .into_par_iter()
+            .map(|(matrix, index)| matrix.ring_automorphism_out_of_place(index))
+            .collect()
+    }
+
+    fn add_in_place(&mut self, rhs: &Self) {
+        *self = self.clone() + rhs;
+    }
+
+    fn sub_in_place(&mut self, rhs: &Self) {
+        *self = self.clone() - rhs;
+    }
+
+    fn copy_block_from(
+        &mut self,
+        src: &Self,
+        dst_row: usize,
+        dst_col: usize,
+        src_row: usize,
+        src_col: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        for r in 0..rows {
+            for c in 0..cols {
+                let elem = src.entry(src_row + r, src_col + c);
+                self.set_entry(dst_row + r, dst_col + c, elem);
+            }
+        }
+    }
+
+    fn into_compact_bytes(self) -> Vec<u8>;
+    fn to_compact_bytes(&self) -> Vec<u8> {
+        self.clone().into_compact_bytes()
+    }
+    fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
+    /// Checked compact decoder used at artifact/runtime boundaries.  The
+    /// historical infallible method remains available for already-validated
+    /// internal values, but untrusted bytes must enter through this method.
+    fn try_from_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        Self::validate_compact_bytes(bytes)?;
+        Ok(Self::from_compact_bytes(params, bytes))
+    }
+    fn validate_compact_bytes(bytes: &[u8]) -> Result<(), CompactMatrixDecodeError> {
+        let _ = bytes;
+        Ok(())
+    }
+    /// Extract the serialized logical shape without allocating a matrix.
+    /// Artifact/runtime boundaries use this before invoking the checked
+    /// decoder so a valid payload for a different wire shape cannot be
+    /// accepted under the requested type.
+    fn compact_shape(bytes: &[u8]) -> Result<(usize, usize), CompactMatrixDecodeError> {
+        let _ = bytes;
+        Err(CompactMatrixDecodeError::InvalidHeader("compact matrix shape is unavailable"))
+    }
+    fn compact_bytes_batch(values: &[&Self]) -> Vec<Vec<u8>> {
+        values.iter().map(|value| value.to_compact_bytes()).collect()
+    }
+    fn into_cpu_staging_bytes(self) -> Vec<u8> {
+        self.into_compact_bytes()
+    }
+    fn to_cpu_staging_bytes(&self) -> Vec<u8> {
+        self.clone().into_cpu_staging_bytes()
+    }
+    fn from_cpu_staging_columns(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Self {
+        Self::try_from_cpu_staging_columns(params, bytes, start, end)
+            .expect("validated CPU staging artifact")
+    }
+    fn try_from_cpu_staging_columns(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        let full = Self::try_from_cpu_staging_bytes(params, bytes)?;
+        if start > end || end > full.col_size() {
+            return Err(CompactMatrixDecodeError::InvalidHeader("invalid staging column interval"));
+        }
+        Ok(full.slice_columns(start, end))
+    }
+
+    fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
+        Self::from_compact_bytes(params, bytes)
+    }
+    /// Checked decoder for host/RNS staging artifacts.
+    fn try_from_cpu_staging_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        Self::try_from_compact_bytes(params, bytes)
+    }
+    fn copy_to_params_direct(&self, _params: &<Self::P as Poly>::Params) -> Option<Self> {
+        None
+    }
+    fn copy_to_params_fanout(&self, params: &[&<Self::P as Poly>::Params]) -> Vec<Self> {
+        let bytes = self.to_cpu_staging_bytes();
+        params
+            .par_iter()
+            .map(|parameters| Self::from_cpu_staging_bytes(parameters, &bytes))
+            .collect()
+    }
+    fn zero_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        nrow: usize,
+        ncol: usize,
+        level: usize,
+    ) -> Vec<u8>;
+    fn from_poly_vec(params: &<Self::P as Poly>::Params, vec: Vec<Vec<Self::P>>) -> Self;
+    /// Creates a row vector (1 x n matrix) from a vector of n DCRTPoly elements.
+    fn from_poly_vec_row(params: &<Self::P as Poly>::Params, vec: Vec<Self::P>) -> Self {
+        // Wrap the vector in another vector to create a single row
+        let wrapped_vec = vec![vec];
+        Self::from_poly_vec(params, wrapped_vec)
+    }
+    /// Creates a column vector (n x 1 matrix) from a vector of DCRTPoly elements.
+    fn from_poly_vec_column(params: &<Self::P as Poly>::Params, vec: Vec<Self::P>) -> Self {
+        // Transform the vector into a vector of single-element vectors
+        let wrapped_vec = vec.into_iter().map(|elem| vec![elem]).collect();
+        Self::from_poly_vec(params, wrapped_vec)
+    }
+    fn entry(&self, i: usize, j: usize) -> Self::P;
+    fn set_entry(&mut self, i: usize, j: usize, elem: Self::P);
+    fn get_row(&self, i: usize) -> Vec<Self::P>;
+    fn get_column(&self, j: usize) -> Vec<Self::P>;
+    fn size(&self) -> (usize, usize);
+    fn row_size(&self) -> usize {
+        self.size().0
+    }
+    fn col_size(&self) -> usize {
+        self.size().1
+    }
+    fn slice(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        column_start: usize,
+        column_end: usize,
+    ) -> Self;
+    fn slice_rows(&self, start: usize, end: usize) -> Self {
+        let (_, columns) = self.size();
+        self.slice(start, end, 0, columns)
+    }
+    fn slice_columns(&self, start: usize, end: usize) -> Self {
+        let (rows, _) = self.size();
+        self.slice(0, rows, start, end)
+    }
+    fn zero(params: &<Self::P as Poly>::Params, nrow: usize, ncol: usize) -> Self;
+    fn identity(params: &<Self::P as Poly>::Params, size: usize, scalar: Option<Self::P>) -> Self;
+    fn transpose(&self) -> Self;
+    /// (m * n1), (m * n2) -> (m * (n1 + n2))
+    fn concat_columns(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_columns` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_columns_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_columns(&refs)
+    }
+    /// (m1 * n), (m2 * n) -> ((m1 + m2) * n)
+    fn concat_rows(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_rows` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_rows_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_rows(&refs)
+    }
+    /// (m1 * n1), (m2 * n2) -> ((m1 + m2) * (n1 + n2))
+    fn concat_diag(&self, others: &[&Self]) -> Self;
+    /// Owned variant of `concat_diag` that can consume the first/other inputs.
+    /// Implementations may override this to avoid unnecessary deep clone of `self`.
+    fn concat_diag_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
+        let refs = others.iter().collect::<Vec<_>>();
+        self.concat_diag(&refs)
+    }
+    fn tensor(&self, other: &Self) -> Self;
+    /// Sums selected rows of the tensor product, retaining order and multiplicity.
+    /// Every group must be nonempty and indices must fit the tensor's row count.
+    fn tensor_sum_rows(&self, rhs: &Self, rows: &[Vec<usize>]) -> Self {
+        self.tensor(rhs).sum_rows(rows)
+    }
+    fn unit_column_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {
+        Self::scaled_unit_column_vector(params, size, index, Self::P::const_one(params))
+    }
+    fn scaled_unit_column_vector(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        index: usize,
+        scalar: Self::P,
+    ) -> Self {
+        assert!(index < size, "unit column index must be in range");
+        let mut vec = vec![Self::P::const_zero(params); size];
+        vec[index] = scalar;
+        Self::from_poly_vec_column(params, vec)
+    }
+    fn unit_row_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {
+        let mut coeffs = vec![Self::P::const_zero(params); size];
+        coeffs[index] = Self::P::const_one(params);
+        Self::from_poly_vec_row(params, coeffs)
+    }
+    /// Constructs a gadget matrix Gₙ
+    ///
+    /// Gadget vector g = (b^0, b^1, ..., b^{log_b(q)-1}),
+    /// where g ∈ Z_q^{log_b(q)} and b is the base defined in `params`.
+    ///
+    /// Gₙ = Iₙ ⊗ gᵀ
+    ///
+    /// * `params` - Parameters describing the modulus, the base, and other ring characteristics.
+    /// * `size` - The size of the identity block (n), dictating the final matrix dimensions.
+    ///
+    /// A matrix of dimension n×(n·log_b(q)), in which each block row is a scaled identity
+    /// under the ring modulus.
+    fn gadget_matrix(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        digit_count: Option<usize>,
+    ) -> Self;
+    /// Constructs a compact gadget matrix G_small = I_n ⊗ (1, b, ..., b^{k-1}),
+    /// where k = ceil(crt_bits / base_bits) and b = 2^{base_bits}.
+    fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
+    fn decompose(&self) -> Self;
+    fn decompose_owned(self) -> Self {
+        self.decompose()
+    }
+    /// Returns one row-chunk of `self.decompose()` without changing the column count.
+    /// Each chunk has shape `(self.row_size(), self.col_size())`, and `chunk_count` must match
+    /// the decomposition digit count for the current params.
+    fn decompose_chunk(&self, chunk_idx: usize, chunk_count: usize) -> Self {
+        assert!(chunk_count > 0, "decompose_chunk chunk_count must be > 0");
+        assert!(
+            chunk_idx < chunk_count,
+            "decompose_chunk chunk_idx out of range: chunk_idx={}, chunk_count={}",
+            chunk_idx,
+            chunk_count
+        );
+        let full = self.decompose();
+        let rows_per_chunk = self.row_size();
+        let expected_rows = rows_per_chunk
+            .checked_mul(chunk_count)
+            .expect("decompose_chunk expected row count overflow");
+        assert_eq!(
+            full.row_size(),
+            expected_rows,
+            "decompose_chunk expected decomposed row count {} but got {}",
+            expected_rows,
+            full.row_size()
+        );
+        let row_start =
+            chunk_idx.checked_mul(rows_per_chunk).expect("decompose_chunk row offset overflow");
+        full.slice(row_start, row_start + rows_per_chunk, 0, self.col_size())
+    }
+    /// Returns a compact decomposition matrix D such that
+    /// small_gadget_matrix(size) * D == self
+    /// under the assumption that coefficients are bounded by min(moduli)
+    /// (i.e., the matrix norm is strictly less than the smallest CRT modulus).
+    fn small_decompose(&self) -> Self;
+    fn small_decompose_owned(self) -> Self {
+        self.small_decompose()
+    }
+    /// Returns one row-chunk of `self.small_decompose()` without changing the column count.
+    /// Each chunk has shape `(self.row_size(), self.col_size())`, and `chunk_count` must match
+    /// the compact decomposition digit count for the current params.
+    fn small_decompose_chunk(&self, chunk_idx: usize, chunk_count: usize) -> Self {
+        assert!(chunk_count > 0, "small_decompose_chunk chunk_count must be > 0");
+        assert!(
+            chunk_idx < chunk_count,
+            "small_decompose_chunk chunk_idx out of range: chunk_idx={}, chunk_count={}",
+            chunk_idx,
+            chunk_count
+        );
+        let full = self.small_decompose();
+        let rows_per_chunk = self.row_size();
+        let expected_rows = rows_per_chunk
+            .checked_mul(chunk_count)
+            .expect("small_decompose_chunk expected row count overflow");
+        assert_eq!(
+            full.row_size(),
+            expected_rows,
+            "small_decompose_chunk expected decomposed row count {} but got {}",
+            expected_rows,
+            full.row_size()
+        );
+        let row_start = chunk_idx
+            .checked_mul(rows_per_chunk)
+            .expect("small_decompose_chunk row offset overflow");
+        full.slice(row_start, row_start + rows_per_chunk, 0, self.col_size())
+    }
+    /// Builds one row-chunk of `identity(size, scalar).small_decompose()` without materializing
+    /// the full `(size * chunk_count) x size` matrix.
+    fn small_decomposed_identity_chunk(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        chunk_idx: usize,
+        chunk_count: usize,
+        scalar_by_digit: &[Self::P],
+    ) -> Self {
+        assert!(chunk_count > 0, "small_decomposed_identity_chunk chunk_count must be > 0");
+        assert_eq!(
+            scalar_by_digit.len(),
+            chunk_count,
+            "small_decomposed_identity_chunk requires scalar_by_digit.len() == chunk_count"
+        );
+        let row_start = chunk_idx
+            .checked_mul(size)
+            .expect("small_decomposed_identity_chunk row offset overflow");
+        let mut out = Self::zero(params, size, size);
+        for local_row in 0..size {
+            let global_row = row_start + local_row;
+            let src_row = global_row / chunk_count;
+            let digit = global_row % chunk_count;
+            assert!(
+                src_row < size,
+                "small_decomposed_identity_chunk source row out of bounds: src_row={}, size={}",
+                src_row,
+                size
+            );
+            out.set_entry(local_row, src_row, scalar_by_digit[digit].clone());
+        }
+        out
+    }
+    /// Builds one row-chunk of `identity(size, scalar).small_decompose()`.
+    /// Default implementation preserves exact semantics by materializing the full decomposition
+    /// and slicing out the requested chunk.
+    fn small_decomposed_identity_chunk_from_scalar(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        scalar: &Self::P,
+        chunk_idx: usize,
+        chunk_count: usize,
+    ) -> Self {
+        assert!(
+            chunk_count > 0,
+            "small_decomposed_identity_chunk_from_scalar chunk_count must be > 0"
+        );
+        assert!(
+            chunk_idx < chunk_count,
+            "small_decomposed_identity_chunk_from_scalar chunk_idx out of range: chunk_idx={}, chunk_count={}",
+            chunk_idx,
+            chunk_count
+        );
+        let full = Self::identity(params, size, Some(scalar.clone())).small_decompose();
+        let row_start = chunk_idx
+            .checked_mul(size)
+            .expect("small_decomposed_identity_chunk_from_scalar row offset overflow");
+        full.slice(row_start, row_start + size, 0, size)
+    }
+    fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self;
+    /// Ordinary ring reduction into an exact destination CRT basis, without scaling.
+    fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
+    /// Transfers a single source limb's centered coefficients to a new CRT basis.
+    fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Divides centered coefficients by a fixed positive integer, rounding
+    /// ties toward positive infinity, and returns a polynomial in the same
+    /// CRT ring.
+    fn centered_round_divide(&self, divisor: &BigUint) -> Result<Self, String>;
+    /// Exact block modulus switch with a public positive integer scale.
+    /// Destination is a strict CRT subset; the dropped block is centered as a
+    /// whole before the retained residues are divided by its product.
+    fn block_mod_switch(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: &BigUint,
+    ) -> Result<Self, String>;
+    /// Fused centered RNS ModUp, with contiguous digits stacked in group-major row order.
+    /// The destination must contain every source prime. For a source group Q_j,
+    /// the result is sum_i (Q_j/q_i) * centered(x_i / (Q_j/q_i) mod q_i).
+    /// With normalization, x_i is additionally divided by Q/Q_j modulo q_i.
+    /// This is the approximate sum of centered CRT terms, not a canonical lift.
+    fn rns_mod_up(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self, String>;
+    /// Fused BGV RNS ModDown, dropping the source limbs absent from destination.
+    /// For the product P of dropped primes, returns (x + t*U)/P modulo the
+    /// destination, where U is the centered CRT-term extension of -x/t from P.
+    /// The destination must be a strict subset and t must be invertible modulo P.
+    fn rns_mod_down(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String>;
+    /// Performs the operation S * (identity ⊗ other)
+    fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
+    /// Performs the operation S * (identity ⊗ G^-1(other)),
+    /// where G^-1(other) is bit decomposition of other matrix
+    fn mul_tensor_identity_decompose(&self, other: &Self, identity_size: usize) -> Self;
+    /// j is column and return decomposed matrix of target column
+    fn get_column_matrix_decompose(&self, j: usize) -> Self;
+    /// Stack columns into a single column vector (column-wise vectorization).
+    fn vectorize_columns(&self) -> Self;
+    /// Reads a matrix of given rows and cols with id from files under the given directory.
+    fn read_from_files<P: AsRef<Path> + Send + Sync>(
+        params: &<Self::P as Poly>::Params,
+        nrow: usize,
+        ncol: usize,
+        dir_path: P,
+        id: &str,
+    ) -> Self;
+    /// Extract block entries for parallel processing (used by storage service)
+    fn block_entries(
+        &self,
+        rows: std::ops::Range<usize>,
+        cols: std::ops::Range<usize>,
+    ) -> Vec<Vec<Self::P>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum SmallMatrixError {
+    #[error("small matrix shape is empty or overflows")]
+    InvalidShape,
+    #[error("small matrix shape does not match the expected schema")]
+    ShapeMismatch,
+    #[error("small matrix parameters do not match the expected context")]
+    ParameterMismatch,
+    #[error("small matrix bound does not match the expected schema")]
+    BoundMismatch,
+    #[error("requested preimage bound {requested} is below the minimum {minimum}")]
+    PreimageBoundTooSmall { requested: BigUint, minimum: BigUint },
+    #[error("small matrix coefficient exceeds its inclusive bound")]
+    BoundExceeded,
+    #[error("small matrix coefficient is outside the ring")]
+    CoefficientOutOfRange,
+    #[error("small matrix coefficient modulus does not match the matrix parameters")]
+    CoefficientModulusMismatch,
+    #[error("small matrix payload has invalid length")]
+    PayloadLength,
+    #[error("small matrix payload has an invalid sign byte")]
+    InvalidSign,
+    #[error("small matrix payload contains a non-canonical coefficient")]
+    NonCanonicalCoefficient,
+    #[error("small matrix dimension arithmetic overflows")]
+    DimensionOverflow,
+    #[error("small matrix coefficient width overflows")]
+    WidthOverflow,
+    #[error("small matrix configuration is invalid")]
+    InvalidConfig,
+    #[error(
+        "small matrix resource request ({requested_bytes} bytes) exceeds budget ({budget_bytes} bytes)"
+    )]
+    ResourceExhausted { requested_bytes: usize, budget_bytes: usize },
+    #[error("small matrix owner is on the wrong device")]
+    DeviceMismatch,
+    #[error("small matrix owner belongs to the wrong context")]
+    ContextMismatch,
+    #[error(
+        "small matrix retry budget exhausted at column {column_start} for {column_count} columns after {attempts} attempts"
+    )]
+    AttemptExhausted { column_start: usize, column_count: usize, attempts: usize },
+}
+
+/// A bounded matrix owner that carries no semantic relation kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuSmallMatrix<M: PolyMatrix> {
+    value: M,
+    max_coefficient_bound: BigUint,
+    bound_domain: CoefficientBoundDomain,
+}
+
+fn validate_canonical_coefficient_sign(
+    sign: u8,
+    magnitude: &BigUint,
+    modulus: &BigUint,
+) -> Result<(), SmallMatrixError> {
+    if sign == 0 {
+        return if magnitude.is_zero() {
+            Ok(())
+        } else {
+            Err(SmallMatrixError::NonCanonicalCoefficient)
+        };
+    }
+    if sign != 1 && sign != 2 {
+        return Err(SmallMatrixError::InvalidSign);
+    }
+    if magnitude.is_zero() {
+        return Err(SmallMatrixError::NonCanonicalCoefficient);
+    }
+    if magnitude >= modulus {
+        return Err(SmallMatrixError::CoefficientOutOfRange);
+    }
+    let doubled = magnitude * 2u8;
+    let non_canonical = match sign {
+        1 => doubled > *modulus,
+        2 => doubled >= *modulus,
+        _ => unreachable!("sign was checked above"),
+    };
+    if non_canonical { Err(SmallMatrixError::NonCanonicalCoefficient) } else { Ok(()) }
+}
+
+impl<M: PolyMatrix> CpuSmallMatrix<M> {
+    pub fn new(value: M, max_coefficient_bound: BigUint) -> Result<Self, SmallMatrixError> {
+        Self::new_in_domain(value, max_coefficient_bound, CoefficientBoundDomain::Global)
+    }
+
+    pub fn new_per_crt_limb(
+        value: M,
+        max_coefficient_bound: BigUint,
+    ) -> Result<Self, SmallMatrixError> {
+        Self::new_in_domain(value, max_coefficient_bound, CoefficientBoundDomain::PerCrtLimb)
+    }
+
+    fn new_in_domain(
+        value: M,
+        max_coefficient_bound: BigUint,
+        bound_domain: CoefficientBoundDomain,
+    ) -> Result<Self, SmallMatrixError> {
+        let (rows, columns) = value.size();
+        if rows == 0 || columns == 0 || value.params().ring_dimension() == 0 {
+            return Err(SmallMatrixError::InvalidShape);
+        }
+        let expected_modulus: Arc<BigUint> = PolyParams::modulus(value.params()).into();
+        let modulus = expected_modulus.as_ref().clone();
+        let crt_moduli = value.params().to_crt().0;
+        if crt_moduli.is_empty() {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let moduli: Vec<BigUint> = match bound_domain {
+            CoefficientBoundDomain::Global => vec![modulus.clone()],
+            CoefficientBoundDomain::PerCrtLimb => {
+                crt_moduli.iter().copied().map(BigUint::from).collect()
+            }
+        };
+        for row in 0..rows {
+            for column in 0..columns {
+                for coefficient in value.entry(row, column).coeffs() {
+                    let coefficient_modulus: Arc<BigUint> = coefficient.modulus().clone().into();
+                    if coefficient_modulus != expected_modulus {
+                        return Err(SmallMatrixError::CoefficientModulusMismatch);
+                    }
+                    let residue = coefficient.value();
+                    if residue >= &modulus {
+                        return Err(SmallMatrixError::CoefficientOutOfRange);
+                    }
+                    for local_modulus in &moduli {
+                        let local_residue = residue % local_modulus;
+                        let magnitude = if &local_residue * 2u8 > *local_modulus {
+                            local_modulus - &local_residue
+                        } else {
+                            local_residue
+                        };
+                        if magnitude > max_coefficient_bound {
+                            return Err(SmallMatrixError::BoundExceeded);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self::from_validated_in_domain(value, max_coefficient_bound, bound_domain))
+    }
+
+    /// Constructs an owner after the caller has checked its complete value and metadata.
+    fn from_validated_in_domain(
+        value: M,
+        max_coefficient_bound: BigUint,
+        bound_domain: CoefficientBoundDomain,
+    ) -> Self {
+        Self { value, max_coefficient_bound, bound_domain }
+    }
+
+    pub fn value(&self) -> &M {
+        &self.value
+    }
+
+    pub fn into_value(self) -> M {
+        self.value
+    }
+
+    pub fn max_coefficient_bound(&self) -> &BigUint {
+        &self.max_coefficient_bound
+    }
+
+    pub fn bound_domain(&self) -> CoefficientBoundDomain {
+        self.bound_domain
+    }
+
+    pub fn size(&self) -> (usize, usize) {
+        self.value.size()
+    }
+
+    /// Rebase canonical bounded coefficients without changing their signed
+    /// representative or their declared bound.  The source compact owner is
+    /// already validated at construction, so this path never reconstructs a
+    /// per-coefficient BigInt from a serialized payload.
+    pub fn centered_rebase(
+        &self,
+        destination: &<M::P as Poly>::Params,
+    ) -> Result<Self, SmallMatrixError> {
+        let source_params = self.value.params();
+        if self.bound_domain == CoefficientBoundDomain::PerCrtLimb {
+            if source_params != destination {
+                return Err(SmallMatrixError::ParameterMismatch);
+            }
+            return Ok(self.clone());
+        }
+        self.validate_centered_rebase(destination)?;
+        let source_modulus: Arc<BigUint> = source_params.modulus().into();
+        let destination_modulus: Arc<BigUint> = destination.modulus().into();
+        let entries = (0..self.value.size().0)
+            .map(|row| {
+                (0..self.value.size().1)
+                    .map(|column| {
+                        let coefficients = self
+                            .value
+                            .entry(row, column)
+                            .coeffs()
+                            .into_iter()
+                            .map(|coefficient| {
+                                let residue = coefficient.value().clone();
+                                if &residue * 2u8 > *source_modulus {
+                                    if residue.is_zero() {
+                                        BigUint::from(0u8)
+                                    } else {
+                                        let magnitude = &*source_modulus - residue;
+                                        if magnitude.is_zero() {
+                                            BigUint::from(0u8)
+                                        } else {
+                                            (&*destination_modulus -
+                                                (&magnitude % &*destination_modulus)) %
+                                                &*destination_modulus
+                                        }
+                                    }
+                                } else {
+                                    residue % &*destination_modulus
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        M::P::from_biguints(destination, &coefficients)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::new(M::from_poly_vec(destination, entries), self.max_coefficient_bound.clone())
+    }
+}
+
+/// Common metadata and canonical coefficient transport for bounded owners.
+pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
+    type Params: PolyParams;
+
+    fn params(&self) -> &Self::Params;
+    fn max_coefficient_bound(&self) -> &BigUint;
+    fn bound_domain(&self) -> CoefficientBoundDomain {
+        CoefficientBoundDomain::Global
+    }
+    fn rows(&self) -> usize;
+    fn columns(&self) -> usize;
+    fn size(&self) -> (usize, usize) {
+        (self.rows(), self.columns())
+    }
+    fn is_on_params(&self, params: &Self::Params) -> bool {
+        self.params() == params
+    }
+    /// Check the public domain in which copying signed compact coefficients
+    /// preserves destination canonicality. This is also used before sizing
+    /// the corresponding native operation.
+    fn validate_centered_rebase(&self, destination: &Self::Params) -> Result<(), SmallMatrixError> {
+        if self.bound_domain() == CoefficientBoundDomain::PerCrtLimb && self.params() != destination
+        {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        let source_basis = self.params().to_crt().0;
+        let destination_basis = destination.to_crt().0;
+        let destination_modulus: BigUint =
+            destination_basis.iter().copied().map(BigUint::from).product();
+        if source_basis.is_empty() ||
+            destination_basis.is_empty() ||
+            self.params().ring_dimension() != destination.ring_dimension() ||
+            self.max_coefficient_bound() > &(destination_modulus >> 1)
+        {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        Ok(())
+    }
+    /// Re-encode a compact owner without changing its signed representation.
+    /// Device implementations override this at the primitive boundary.
+    fn centered_rebase(&self, destination: &Self::Params) -> Result<Self, SmallMatrixError> {
+        self.validate_centered_rebase(destination)?;
+        Self::from_canonical_coefficients(
+            destination,
+            self.rows(),
+            self.columns(),
+            self.max_coefficient_bound().clone(),
+            &self.to_canonical_coefficients()?,
+        )
+    }
+    fn validate_metadata(
+        &self,
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: &BigUint,
+    ) -> Result<(), SmallMatrixError> {
+        if self.size() != (rows, columns) {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if self.params() != params {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if self.max_coefficient_bound() != max_coefficient_bound {
+            return Err(SmallMatrixError::BoundMismatch);
+        }
+        Ok(())
+    }
+    fn validate_metadata_in_domain(
+        &self,
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: &BigUint,
+        bound_domain: CoefficientBoundDomain,
+    ) -> Result<(), SmallMatrixError> {
+        self.validate_metadata(params, rows, columns, max_coefficient_bound)?;
+        if self.bound_domain() != bound_domain {
+            return Err(SmallMatrixError::BoundMismatch);
+        }
+        Ok(())
+    }
+    fn to_canonical_coefficients(&self) -> Result<Vec<u8>, SmallMatrixError>;
+    fn from_canonical_coefficients(
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+        payload: &[u8],
+    ) -> Result<Self, SmallMatrixError>;
+
+    fn from_canonical_coefficients_in_domain(
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+        bound_domain: CoefficientBoundDomain,
+        payload: &[u8],
+    ) -> Result<Self, SmallMatrixError> {
+        if bound_domain != CoefficientBoundDomain::Global {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        Self::from_canonical_coefficients(params, rows, columns, max_coefficient_bound, payload)
+    }
+}
+
+/// Operations whose RHS is a bounded compact matrix, kept off `PolyMatrix`.
+pub trait PolyMatrixSmallRhs: PolyMatrix {
+    type SmallMatrix: SmallPolyMatrix<Params = <Self::P as Poly>::Params>;
+
+    fn gadget_decompose(
+        self,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, SmallMatrixError>;
+    fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
+    fn gadget_decompose_row_blocks(
+        blocks: Vec<Self>,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, SmallMatrixError> {
+        let mut blocks = blocks.into_iter();
+        let first = blocks.next().ok_or(SmallMatrixError::ShapeMismatch)?;
+        first.concat_rows_owned(blocks.collect()).gadget_decompose(small, digit_count)
+    }
+    fn multiply_small_rhs_row_blocks(
+        blocks: &[&Self],
+        rhs: &Self::SmallMatrix,
+    ) -> Result<Vec<Self>, SmallMatrixError> {
+        blocks.par_iter().map(|block| block.multiply_small_rhs(rhs)).collect()
+    }
+}
+
+impl<M> SmallPolyMatrix for CpuSmallMatrix<M>
+where
+    M: PolyMatrix,
+    M::P: Poly,
+    <M::P as Poly>::Elem: PolyElem,
+{
+    type Params = <M::P as Poly>::Params;
+
+    fn centered_rebase(&self, destination: &Self::Params) -> Result<Self, SmallMatrixError> {
+        CpuSmallMatrix::centered_rebase(self, destination)
+    }
+
+    fn params(&self) -> &Self::Params {
+        self.value.params()
+    }
+
+    fn max_coefficient_bound(&self) -> &BigUint {
+        &self.max_coefficient_bound
+    }
+
+    fn bound_domain(&self) -> CoefficientBoundDomain {
+        self.bound_domain
+    }
+
+    fn rows(&self) -> usize {
+        self.value.size().0
+    }
+
+    fn columns(&self) -> usize {
+        self.value.size().1
+    }
+
+    fn to_canonical_coefficients(&self) -> Result<Vec<u8>, SmallMatrixError> {
+        let (rows, columns) = self.value.size();
+        let ring_dimension = usize::try_from(self.value.params().ring_dimension())
+            .map_err(|_| SmallMatrixError::DimensionOverflow)?;
+        let moduli = match self.bound_domain {
+            CoefficientBoundDomain::Global => {
+                vec![PolyParams::modulus(self.value.params()).into().as_ref().clone()]
+            }
+            CoefficientBoundDomain::PerCrtLimb => {
+                self.value.params().to_crt().0.into_iter().map(BigUint::from).collect::<Vec<_>>()
+            }
+        };
+        if moduli.is_empty() {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let coefficient_count = rows
+            .checked_mul(columns)
+            .and_then(|count| count.checked_mul(ring_dimension))
+            .and_then(|count| count.checked_mul(moduli.len()))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let bound_bits = self.max_coefficient_bound.bits();
+        let magnitude_bytes = usize::try_from(bound_bits.div_ceil(8))
+            .map_err(|_| SmallMatrixError::WidthOverflow)?
+            .max(1);
+        let encoded_width =
+            1usize.checked_add(magnitude_bytes).ok_or(SmallMatrixError::WidthOverflow)?;
+        let payload_length = coefficient_count
+            .checked_mul(encoded_width)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let mut payload = Vec::with_capacity(payload_length);
+        for row in 0..rows {
+            for column in 0..columns {
+                for coefficient in self.value.entry(row, column).coeffs() {
+                    for modulus in &moduli {
+                        let residue = coefficient.value() % modulus;
+                        let negative = &residue * 2u8 > *modulus;
+                        let magnitude = if negative { modulus - &residue } else { residue };
+                        if magnitude > self.max_coefficient_bound {
+                            return Err(SmallMatrixError::BoundExceeded);
+                        }
+                        let sign = if magnitude.is_zero() {
+                            0
+                        } else if negative {
+                            2
+                        } else {
+                            1
+                        };
+                        payload.push(sign);
+                        let bytes = magnitude.to_bytes_le();
+                        if bytes.len() > magnitude_bytes {
+                            return Err(SmallMatrixError::WidthOverflow);
+                        }
+                        payload.extend_from_slice(&bytes);
+                        payload.resize(payload.len() + magnitude_bytes - bytes.len(), 0);
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(payload.len(), payload_length);
+        Ok(payload)
+    }
+
+    fn from_canonical_coefficients(
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+        payload: &[u8],
+    ) -> Result<Self, SmallMatrixError> {
+        Self::from_canonical_coefficients_in_domain(
+            params,
+            rows,
+            columns,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+            payload,
+        )
+    }
+
+    fn from_canonical_coefficients_in_domain(
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+        bound_domain: CoefficientBoundDomain,
+        payload: &[u8],
+    ) -> Result<Self, SmallMatrixError> {
+        if rows == 0 || columns == 0 || params.ring_dimension() == 0 {
+            return Err(SmallMatrixError::InvalidShape);
+        }
+        let modulus: BigUint = PolyParams::modulus(params).into().as_ref().clone();
+        let moduli = match bound_domain {
+            CoefficientBoundDomain::Global => vec![modulus.clone()],
+            CoefficientBoundDomain::PerCrtLimb => {
+                params.to_crt().0.into_iter().map(BigUint::from).collect::<Vec<_>>()
+            }
+        };
+        if moduli.is_empty() || moduli.iter().product::<BigUint>() != modulus {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let ring_dimension = usize::try_from(params.ring_dimension())
+            .map_err(|_| SmallMatrixError::DimensionOverflow)?;
+        let coefficient_count = rows
+            .checked_mul(columns)
+            .and_then(|count| count.checked_mul(ring_dimension))
+            .and_then(|count| count.checked_mul(moduli.len()))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
+            .map_err(|_| SmallMatrixError::WidthOverflow)?
+            .max(1);
+        let encoded_width =
+            1usize.checked_add(magnitude_bytes).ok_or(SmallMatrixError::WidthOverflow)?;
+        let expected_length = coefficient_count
+            .checked_mul(encoded_width)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        if payload.len() != expected_length {
+            return Err(SmallMatrixError::PayloadLength);
+        }
+        let weights = moduli
+            .iter()
+            .map(|prime| {
+                let partial = &modulus / prime;
+                let inverse = crate::utils::mod_inverse_biguints(&(&partial % prime), prime)
+                    .ok_or(SmallMatrixError::InvalidConfig)?;
+                Ok((&partial * inverse) % &modulus)
+            })
+            .collect::<Result<Vec<BigUint>, SmallMatrixError>>()?;
+        let mut offset = 0usize;
+        let mut entries = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let mut row_entries = Vec::with_capacity(columns);
+            for _ in 0..columns {
+                let mut coefficients = Vec::with_capacity(ring_dimension);
+                for _ in 0..ring_dimension {
+                    let mut reconstructed = BigUint::ZERO;
+                    for (prime, weight) in moduli.iter().zip(&weights) {
+                        let sign = payload[offset];
+                        let magnitude =
+                            BigUint::from_bytes_le(&payload[offset + 1..offset + encoded_width]);
+                        offset += encoded_width;
+                        if magnitude > max_coefficient_bound {
+                            return Err(SmallMatrixError::BoundExceeded);
+                        }
+                        validate_canonical_coefficient_sign(sign, &magnitude, prime)?;
+                        let residue = if sign == 2 { prime - magnitude } else { magnitude };
+                        reconstructed += residue * weight;
+                    }
+                    coefficients.push(reconstructed % &modulus);
+                }
+                row_entries.push(<M::P as Poly>::from_biguints(params, &coefficients));
+            }
+            entries.push(row_entries);
+        }
+        Ok(CpuSmallMatrix::from_validated_in_domain(
+            M::from_poly_vec(params, entries),
+            max_coefficient_bound,
+            bound_domain,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_coefficient_sign_handles_even_modulus_tie() {
+        let modulus = BigUint::from(16u8);
+        let half = BigUint::from(8u8);
+        assert!(validate_canonical_coefficient_sign(1, &half, &modulus).is_ok());
+        assert_eq!(
+            validate_canonical_coefficient_sign(2, &half, &modulus),
+            Err(SmallMatrixError::NonCanonicalCoefficient)
+        );
+    }
+}

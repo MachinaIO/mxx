@@ -42,8 +42,7 @@ impl Neg for &Mat {
 
 #[track_caller]
 fn constant_scalar(matrix: &Mat, value: IntExpr) -> Mat {
-    Ring::new(matrix.matrix_type.modulus.clone(), matrix.matrix_type.ring_dimension.clone())
-        .polynomial([value])
+    Ring::from_ref(matrix.matrix_type.ring.clone()).polynomial([value])
 }
 
 impl<R: Into<IntExpr>> Mul<R> for Mat {
@@ -166,7 +165,7 @@ mod tests {
 
     #[test]
     fn borrowed_matrix_arithmetic_retains_one_sampler() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let sample = ring.gaussian((2, 3), 3, 19);
         let output = -&sample + &sample * 3 + 3 * &sample - sample.clone();
         assert_eq!(output.matrix_type(), sample.matrix_type());
@@ -175,7 +174,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(
             built
                 .graph
@@ -219,13 +218,13 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn boolean_conjunction_preserves_the_closed_decoder_form() {
         use mxx_ir_core::node::{IntBinaryOp, IntCompareOp};
-        let ring = Ring::new(17, 1);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 1);
         let left = ring.bool_input("left");
         let right = ring.bool_input("right");
         let output = left & right;
@@ -247,7 +246,7 @@ mod tests {
 
     #[test]
     fn boolean_operator_results_are_executable_boolean_wires() {
-        let ring = Ring::new(17, 1);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 1);
         let left = ring.bool_input("left");
         let right = ring.bool_input("right");
         let outputs = (&left & &right, &left | false, true ^ &right, !&left);
@@ -256,7 +255,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = built.validate(&ParamEnv::default()).unwrap();
+        let validated = built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(built.graph.outputs().len(), 4);
         assert!(built.graph.outputs().values().all(|output| matches!(
             validated.root_scope().wire_types[&output.value],

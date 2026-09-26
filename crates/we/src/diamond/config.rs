@@ -76,8 +76,8 @@ fn ceil_sqrt(value: usize) -> usize {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiamondWeConfig {
-    pub modulus: BigInt,
-    pub ring_dimension: usize,
+    pub crt_moduli: Vec<u64>,
+    pub ring_dimension: u32,
     pub input_count: usize,
     pub digit_base: usize,
     pub batch_bits: usize,
@@ -97,7 +97,7 @@ impl DiamondWeConfig {
 
     pub fn input_config(&self) -> DiamondInputConfig {
         DiamondInputConfig {
-            modulus: self.modulus.clone(),
+            crt_moduli: self.crt_moduli.clone(),
             ring_dimension: self.ring_dimension,
             input_count: self.input_count,
             digit_base: self.digit_base,
@@ -112,7 +112,14 @@ impl DiamondWeConfig {
     }
 
     pub fn ring(&self) -> Ring {
-        Ring::new(self.modulus.clone(), self.ring_dimension)
+        Ring::from_crt_moduli(
+            self.crt_moduli.iter().copied().map(IntExpr::from).collect(),
+            self.ring_dimension,
+        )
+    }
+
+    pub fn modulus(&self) -> BigInt {
+        self.crt_moduli.iter().copied().map(BigInt::from).product()
     }
 
     pub fn witness_size(&self) -> Result<usize, DiamondConfigError> {

@@ -125,7 +125,7 @@ impl BggTallEncodingCompiler {
         output.canonical_input_exclusive_upper = canonical_sum_upper(
             lhs.canonical_input_exclusive_upper.as_ref(),
             rhs.canonical_input_exclusive_upper.as_ref(),
-            &output.rows.element_type().modulus,
+            &output.rows.element_type().ring,
         );
         Ok(output)
     }
@@ -668,8 +668,7 @@ fn plaintext_count_mismatch(wire: &BggTallEncodingWire) -> bool {
         BggTallPlaintext::Hidden => false,
         BggTallPlaintext::Diagonal(values) => {
             let expected = MatrixType {
-                modulus: wire.rows.element_type().modulus.clone(),
-                ring_dimension: wire.rows.element_type().ring_dimension.clone(),
+                ring: wire.rows.element_type().ring.clone(),
                 rows: IntExpr::constant(1),
                 columns: IntExpr::constant(1),
             };
@@ -682,17 +681,15 @@ fn plaintext_count_mismatch(wire: &BggTallEncodingWire) -> bool {
 fn canonical_sum_upper(
     lhs: Option<&BigUint>,
     rhs: Option<&BigUint>,
-    modulus: &IntExpr,
+    ring: &mxx_ir_core::RingRef,
 ) -> Option<BigUint> {
     let (lhs, rhs) = (lhs?, rhs?);
     if lhs.is_zero() || rhs.is_zero() {
         return None;
     }
-    let IntExpr::Const(modulus) = modulus else {
-        return None;
-    };
+    let modulus = crate::static_ring_modulus(ring)?;
     let upper = lhs + rhs - BigUint::one();
-    (upper <= modulus.to_biguint()?).then_some(upper)
+    (upper <= modulus).then_some(upper)
 }
 
 pub(crate) fn rotate_family(
@@ -763,8 +760,7 @@ fn gather_repeated_lane(
 }
 
 pub(crate) fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
-    lhs.modulus.canonicalize() == rhs.modulus.canonicalize() &&
-        lhs.ring_dimension.canonicalize() == rhs.ring_dimension.canonicalize() &&
+    lhs.ring == rhs.ring &&
         lhs.rows.canonicalize() == rhs.rows.canonicalize() &&
         lhs.columns.canonicalize() == rhs.columns.canonicalize()
 }
@@ -780,32 +776,30 @@ mod tests {
         tall_rotation_encoding::tall_rotation_public_key_tag,
         test_utils::{execute_graph, matrix_output, row},
     };
-    use mxx_dsl::{BuiltGraph, DslContext, Ring};
-    use mxx_gadgets::circuit::{
-        CircuitLoweringTypes, GateInstance, PolyCircuit, SlotOperationLowering, SlotTransferSpec,
-        SubCircuitParamSpec, SubCircuitParamValue,
-    };
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
-    use mxx_primitives::{
+    use mxx_backends::{
+        ExecutionConfig, RuntimeValue,
+        artifact::MemoryArtifactStore,
+        backend::poly::cpu_backend,
+        execute,
         matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
-    };
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
     };
+    use mxx_dsl::{BuiltGraph, DslContext, Ring};
+    use mxx_gadgets::circuit::{
+        CircuitLoweringTypes, GateInstance, PolyCircuit, SlotOperationLowering, SlotTransferSpec,
+        SubCircuitParamSpec, SubCircuitParamValue,
+    };
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use num_bigint::BigInt;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn concrete_ring(parameters: &DCRTPolyParams) -> Ring {
-        Ring::new(
-            BigInt::from(parameters.modulus().as_ref().clone()),
-            parameters.ring_dimension() as usize,
-        )
+        crate::ring_from_params(&parameters)
     }
 
     fn public_matrix(
@@ -930,9 +924,12 @@ mod tests {
             Some(BigUint::from(10u8)),
             "[0, 7) + [0, 4) has exclusive upper bound 10"
         );
-        let IntExpr::Const(modulus) = &left.rows.element_type().modulus else {
-            panic!("test ring has a concrete modulus")
-        };
+        let modulus = IntExpr::RingModulus(left.rows.element_type().ring.clone())
+            .evaluate_with_rings(
+                &ParamEnv::default(),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+            )
+            .expect("test ring has a concrete modulus");
         let mut wrapping_left = left.clone();
         wrapping_left.canonical_input_exclusive_upper = modulus.to_biguint();
         let mut wrapping_right = right.clone();
@@ -1173,8 +1170,7 @@ mod tests {
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
-            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            ring: crate::ring_from_params(&parameters),
             secret_dimension: secret_size,
             digit_count: parameters.modulus_digits(),
             gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
@@ -1250,8 +1246,7 @@ mod tests {
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
-            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            ring: crate::ring_from_params(&parameters),
             secret_dimension: secret_size,
             digit_count: parameters.modulus_digits(),
             gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
@@ -1283,7 +1278,9 @@ mod tests {
                 .expect("family output");
         }
         let built = context.build().expect("build blockwise sampler graph");
-        built.validate(&ParamEnv::default()).expect("valid blockwise sampler graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid blockwise sampler graph");
         let nodes =
             built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::Concat { .. })));
@@ -1318,12 +1315,11 @@ mod tests {
 
     #[test]
     fn tall_anchor_reduce_uses_one_helper_for_all_lanes() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let slots = 4;
         let lane_scalars = vec![BigUint::from(3u8), BigUint::from(5u8)];
         let helper_compiler = TallRotationEncodingCompiler {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
+            ring: Ring::from_crt_moduli(vec![257.into()], 8),
             secret_size: 1,
             slot_count: slots,
             gadget_base: 4.into(),
@@ -1376,7 +1372,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default())
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
     }
 
@@ -1386,8 +1382,7 @@ mod tests {
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
-            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            ring: crate::ring_from_params(&parameters),
             secret_dimension: secret_size,
             digit_count: parameters.modulus_digits(),
             gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
@@ -1433,7 +1428,9 @@ mod tests {
             }
         }
         let built = context.build().expect("build formula graph");
-        built.validate(&ParamEnv::default()).expect("valid formula graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid formula graph");
 
         let public_values = (0..3)
             .map(|block| public_matrix(&parameters, secret_size, columns, 3 + block * 7))
@@ -1489,8 +1486,7 @@ mod tests {
         let secret_size = 2;
         let slots = 1;
         let layout = BggSamplerLayout {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
-            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            ring: crate::ring_from_params(&parameters),
             secret_dimension: secret_size,
             digit_count: parameters.modulus_digits(),
             gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
@@ -1520,7 +1516,9 @@ mod tests {
             .expect("family output")
             .build()
             .expect("build single-block sampler graph");
-        built.validate(&ParamEnv::default()).expect("valid single-block sampler graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid single-block sampler graph");
         assert!(
             !built
                 .graph
@@ -1562,8 +1560,7 @@ mod tests {
         let digits = parameters.modulus_digits();
         let columns = secret_size * digits;
         let compiler = TallRotationEncodingCompiler {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()).into(),
-            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            ring: crate::ring_from_params(&parameters),
             secret_size,
             slot_count: slots,
             gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
@@ -1578,17 +1575,25 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default())
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
 
         let hash_key = [0x42; 32];
-        let producer_inputs =
-            BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]);
+        let producer_inputs = BTreeMap::from([(
+            "hash-key".to_owned(),
+            RuntimeValue::Bytes(hash_key.to_vec().into()),
+        )]);
         let mut store = MemoryArtifactStore::default();
         let mut backend = cpu_backend([parameters.clone()]);
-        let produced =
-            execute(&producer, &mut backend, producer_inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let produced = execute(
+            &producer,
+            &mut backend,
+            producer_inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let production_id = produced.production_id.expect("artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
         assert_eq!(manifest.artifacts.len(), 4);
@@ -1624,6 +1629,7 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production_id, manifest)]),
+                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let secret_rows_values =
@@ -1640,6 +1646,7 @@ mod tests {
                 .collect(),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
 
@@ -1789,7 +1796,7 @@ mod tests {
             graph,
             parameters.clone(),
             BTreeMap::from([
-                ("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x51; 32])),
+                ("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x51; 32].into())),
                 (
                     "input-public".to_owned(),
                     RuntimeValue::matrix(public_matrix(&parameters, secret_size, columns, 3)),
@@ -1801,7 +1808,7 @@ mod tests {
 
     #[test]
     fn tall_rotation_reindex_uses_generated_gather_without_family_pack() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let rows = ring.input_family("rotation-rows", 4, (1, 2));
         let rotated = rotate_family(&rows, 1, 4).expect("generated rotation family");
         let built = DslContext::new("tall-rotation-generated-reindex")
@@ -1809,7 +1816,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).expect("valid generated rotation graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid generated rotation graph");
 
         let nodes =
             built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
@@ -1820,7 +1829,7 @@ mod tests {
 
     #[test]
     fn identity_slot_transfer_uses_the_online_diagonal_mask() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
         let transferred = circuit.slot_transfer_gate(input_gate, &[(0, None), (1, Some(2))]);
@@ -1870,8 +1879,7 @@ mod tests {
             ring.input_family("secret-rows", 2, (1, 1)),
             BggTallEncodingSampler {
                 layout: BggSamplerLayout {
-                    modulus: 257.into(),
-                    ring_dimension: 8.into(),
+                    ring: Ring::from_crt_moduli(vec![257.into()], 8),
                     secret_dimension: 1,
                     digit_count: 2,
                     gadget_base: 4.into(),
@@ -1902,7 +1910,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).expect("valid executable graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid executable graph");
         assert_eq!(
             output.pubkey.matrix.matrix_type(),
             public_output.matrix.matrix_type(),
@@ -1914,7 +1924,7 @@ mod tests {
     fn compact_identity_lane_mask_graph_scales_with_lanes_not_slots() {
         fn build(slot_count: usize, lanes: usize) -> BuiltGraph {
             assert_eq!(slot_count % lanes, 0);
-            let ring = Ring::new(257, 8);
+            let ring = Ring::from_crt_moduli(vec![257.into()], 8);
             let mut circuit = PolyCircuit::<DCRTPoly>::new();
             let input_gate = circuit.input(1).as_single_wire();
             let transferred = circuit.slot_identity_repeated_lanes_gate(
@@ -1982,8 +1992,7 @@ mod tests {
                 ring.input_family("compact-secret-rows", slot_count, (1, 1)),
                 BggTallEncodingSampler {
                     layout: BggSamplerLayout {
-                        modulus: 257.into(),
-                        ring_dimension: 8.into(),
+                        ring: Ring::from_crt_moduli(vec![257.into()], 8),
                         secret_dimension: 1,
                         digit_count: 2,
                         gadget_base: 4.into(),
@@ -2016,7 +2025,9 @@ mod tests {
         let small = build(8, 4);
         let large = build(1 << 16, 4);
         for graph in [&small, &large] {
-            graph.validate(&ParamEnv::default()).expect("valid compact Tall graph");
+            graph
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .expect("valid compact Tall graph");
             let nodes =
                 graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
             assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyPack { .. })));
@@ -2040,7 +2051,7 @@ mod tests {
 
     #[test]
     fn nonidentity_tall_slot_transfer_fails_closed() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let compiler =
             BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() };
         let key =

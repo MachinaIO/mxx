@@ -1,5 +1,5 @@
 use crate::{
-    Graph, IntExpr, ParamEnv, RealExpr, ValidationError, WireType,
+    Graph, IntExpr, ParamEnv, RealExpr, ResolveCrtBasis, ValidationError, WireType,
     expr::ExprError,
     node::{ConcatAxis, NodeKind},
     types::MatrixType,
@@ -26,16 +26,38 @@ pub enum ParamConstraint {
 
 impl ParamConstraint {
     pub fn evaluate(&self, env: &ParamEnv) -> Result<bool, ExprError> {
+        self.evaluate_internal(env, None)
+    }
+
+    pub fn evaluate_with_rings(
+        &self,
+        env: &ParamEnv,
+        resolve_basis: ResolveCrtBasis,
+    ) -> Result<bool, ExprError> {
+        self.evaluate_internal(env, Some(resolve_basis))
+    }
+
+    fn evaluate_internal(
+        &self,
+        env: &ParamEnv,
+        resolve_basis: Option<ResolveCrtBasis>,
+    ) -> Result<bool, ExprError> {
+        let int = |value: &IntExpr| match resolve_basis {
+            Some(resolve_basis) => value.evaluate_with_rings(env, resolve_basis),
+            None => value.evaluate(env),
+        };
+        let real = |value: &RealExpr| match resolve_basis {
+            Some(resolve_basis) => value.evaluate_f64_with_rings(env, resolve_basis),
+            None => value.evaluate_f64(env),
+        };
         Ok(match self {
-            Self::IntPositive { value, .. } => value.evaluate(env)? > BigInt::zero(),
-            Self::IntNonnegative { value, .. } => value.evaluate(env)? >= BigInt::zero(),
-            Self::IntGreaterThan { left, right, .. } => {
-                left.evaluate(env)? > right.evaluate(env)?
-            }
-            Self::IntLessEqual { left, right, .. } => left.evaluate(env)? <= right.evaluate(env)?,
-            Self::IntEqual { left, right, .. } => left.evaluate(env)? == right.evaluate(env)?,
-            Self::RealPositive { value, .. } => value.evaluate_f64(env)? > 0.0,
-            Self::RealNonnegative { value, .. } => value.evaluate_f64(env)? >= 0.0,
+            Self::IntPositive { value, .. } => int(value)? > BigInt::zero(),
+            Self::IntNonnegative { value, .. } => int(value)? >= BigInt::zero(),
+            Self::IntGreaterThan { left, right, .. } => int(left)? > int(right)?,
+            Self::IntLessEqual { left, right, .. } => int(left)? <= int(right)?,
+            Self::IntEqual { left, right, .. } => int(left)? == int(right)?,
+            Self::RealPositive { value, .. } => real(value)? > 0.0,
+            Self::RealNonnegative { value, .. } => real(value)? >= 0.0,
         })
     }
 
@@ -85,6 +107,14 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         label: format!("{prefix}: uniform range must be nonempty"),
                     })
                 }
+                NodeKind::HashIntFamily { count, modulus, .. } => {
+                    nonnegative(&mut constraints, count, format!("{prefix}: hash family count"));
+                    constraints.push(ParamConstraint::IntGreaterThan {
+                        left: modulus.clone(),
+                        right: IntExpr::constant(1),
+                        label: format!("{prefix}: hash family modulus must exceed one"),
+                    });
+                }
                 NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                     nonnegative_real(&mut constraints, sigma, format!("{prefix}: Gaussian sigma"));
                     nonnegative(
@@ -124,6 +154,13 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         right: IntExpr::constant(1),
                         label: format!("{prefix}: gadget base must exceed one"),
                     })
+                }
+                NodeKind::CenteredRoundDivide { divisor } => {
+                    positive(
+                        &mut constraints,
+                        divisor,
+                        format!("{prefix}: centered round divisor"),
+                    );
                 }
                 NodeKind::Slice { rows, columns } => {
                     for (axis, range) in [("row", rows), ("column", columns)] {
@@ -194,6 +231,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
                 NodeKind::RingAutomorphism { .. } |
+                NodeKind::MultiplyMonomial |
+                NodeKind::IntMatrixVectorProduct { .. } |
                 NodeKind::ModulusSwitch { .. } |
                 NodeKind::ModulusReduce { .. } |
                 NodeKind::CenteredRebase { .. } |
@@ -209,6 +248,13 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::PolynomialValues { .. } |
                 NodeKind::SubgraphCall(_) |
                 NodeKind::FamilyGetDynamic => {}
+                NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
+                    positive(
+                        &mut constraints,
+                        plaintext_modulus,
+                        format!("{prefix}: block modulus switch correction factor"),
+                    );
+                }
             }
         }
     }
@@ -221,9 +267,10 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
 pub(crate) fn evaluate_param_constraints(
     graph: &Graph,
     env: &ParamEnv,
+    resolve_basis: ResolveCrtBasis,
 ) -> Result<(), ValidationError> {
     for constraint in derive_param_constraints(graph)? {
-        if !constraint.evaluate(env)? {
+        if !constraint.evaluate_with_rings(env, resolve_basis)? {
             return Err(ValidationError::ParameterConstraint(constraint.label().to_owned()));
         }
     }
@@ -235,8 +282,8 @@ fn derive_wire_constraints(wire_type: &WireType, output: &mut Vec<ParamConstrain
         WireType::Matrix(matrix) => {
             constraints_for_matrix(matrix, output);
         }
-        WireType::SmallMatrix { matrix, max_coefficient_bound } |
-        WireType::Preimage { matrix, max_coefficient_bound } => {
+        WireType::SmallMatrix { matrix, max_coefficient_bound, .. } |
+        WireType::Preimage { matrix, max_coefficient_bound, .. } => {
             constraints_for_matrix(matrix, output);
             nonnegative(output, max_coefficient_bound, "small RHS coefficient bound".to_owned());
         }
@@ -278,18 +325,8 @@ fn derive_wire_constraints(wire_type: &WireType, output: &mut Vec<ParamConstrain
 fn constraints_for_matrix(matrix: &MatrixType, output: &mut Vec<ParamConstraint>) {
     constraints_for_positive(
         output,
-        [
-            (&matrix.modulus, "matrix modulus"),
-            (&matrix.ring_dimension, "ring dimension"),
-            (&matrix.rows, "matrix rows"),
-            (&matrix.columns, "matrix columns"),
-        ],
+        [(&matrix.rows, "matrix rows"), (&matrix.columns, "matrix columns")],
     );
-    output.push(ParamConstraint::IntGreaterThan {
-        left: matrix.modulus.clone(),
-        right: IntExpr::constant(1),
-        label: "matrix modulus must exceed one".to_owned(),
-    });
 }
 
 fn constraints_for_positive<'a>(
@@ -332,6 +369,12 @@ fn int_contains_loop_index(value: &IntExpr) -> bool {
         IntExpr::Log2Ceil(value) => int_contains_loop_index(value),
         IntExpr::Select { selector, branches } => {
             int_contains_loop_index(selector) || branches.iter().any(int_contains_loop_index)
+        }
+        IntExpr::RingModulus(ring) | IntExpr::RingCrtDepth(ring) => {
+            ring.expression().contains_loop_index()
+        }
+        IntExpr::RingCrtModulus { ring, index } => {
+            ring.expression().contains_loop_index() || int_contains_loop_index(index)
         }
         IntExpr::Const(_) | IntExpr::Var(_) => false,
     }

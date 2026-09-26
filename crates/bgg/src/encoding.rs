@@ -12,7 +12,7 @@ use thiserror::Error;
 /// Worst-case BGG product error for a scalar plaintext with the given coefficient l1 norm.
 /// The final term is `x_L * s * (A_R - G D(A_R))`, sharing the actual decomposition residual.
 /// For binary plaintexts pass one; no Gaussian independence assumption is made.
-pub fn multiplication_error_bound<P: mxx_primitives::poly::PolyParams>(
+pub fn multiplication_error_bound<P: mxx_backends::poly::PolyParams>(
     params: &P,
     secret_dimension: usize,
     left_error: &num_bigint::BigUint,
@@ -190,8 +190,7 @@ fn binary_plaintext(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BggSamplerLayout {
-    pub modulus: IntExpr,
-    pub ring_dimension: IntExpr,
+    pub ring: Ring,
     pub secret_dimension: usize,
     pub digit_count: usize,
     pub gadget_base: IntExpr,
@@ -199,7 +198,7 @@ pub struct BggSamplerLayout {
 
 impl BggSamplerLayout {
     pub fn ring(&self) -> Ring {
-        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+        self.ring.clone()
     }
 
     pub fn public_key_columns(&self) -> usize {
@@ -306,8 +305,7 @@ pub(crate) fn same_matrix_type(
     lhs: &mxx_ir_core::types::MatrixType,
     rhs: &mxx_ir_core::types::MatrixType,
 ) -> bool {
-    lhs.modulus.canonicalize() == rhs.modulus.canonicalize() &&
-        lhs.ring_dimension.canonicalize() == rhs.ring_dimension.canonicalize() &&
+    lhs.ring == rhs.ring &&
         lhs.rows.canonicalize() == rhs.rows.canonicalize() &&
         lhs.columns.canonicalize() == rhs.columns.canonicalize()
 }
@@ -319,12 +317,8 @@ mod tests {
         BggPublicKeySampler,
         test_utils::{execute_graph, matrix_output, row},
     };
-    use mxx_dsl::{DslContext, Ring, Subgraph};
-    use mxx_ir_core::{
-        ParamEnv,
-        node::{ConcatAxis, NodeKind},
-    };
-    use mxx_primitives::{
+    use mxx_backends::{
+        RuntimeValue,
         matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
@@ -332,14 +326,17 @@ mod tests {
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
-    use mxx_runtime::RuntimeValue;
+    use mxx_dsl::{DslContext, Ring, Subgraph};
+    use mxx_ir_core::{
+        ParamEnv,
+        node::{ConcatAxis, NodeKind},
+    };
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
     fn concrete_layout(parameters: &DCRTPolyParams, secret_dimension: usize) -> BggSamplerLayout {
         BggSamplerLayout {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(parameters),
             secret_dimension,
             digit_count: parameters.modulus_digits(),
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
@@ -367,7 +364,7 @@ mod tests {
 
     #[test]
     fn repeated_bgg_encoding_schema_defines_a_subgraph() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let matrix = MatType(ring.matrix_type((1, 1)));
         let encoding = BggEncodingType { vector: matrix.clone(), plaintext: Some(matrix) };
         Subgraph::<(BggEncodingWire, BggEncodingWire), _>::define(
@@ -380,7 +377,7 @@ mod tests {
 
     #[test]
     fn reveal_combinations_match_the_encoding_contract() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let compiler = BggEncodingCompiler;
         for left_revealed in [false, true] {
             for right_revealed in [false, true] {
@@ -413,7 +410,7 @@ mod tests {
 
     #[test]
     fn encoding_multiplication_keeps_executable_decompose_multiply_add_and_elaborates() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let compiler = BggEncodingCompiler;
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, 8)),
@@ -445,7 +442,9 @@ mod tests {
         );
         assert!(!kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixScale { .. })));
 
-        built.validate(&ParamEnv::default()).expect("valid executable graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid executable graph");
     }
 
     #[test]
@@ -453,10 +452,7 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
-        let ring = Ring::new(
-            BigInt::from(parameters.modulus().as_ref().clone()),
-            parameters.ring_dimension() as usize,
-        );
+        let ring = crate::ring_from_params(&parameters);
         let compiler = BggEncodingCompiler;
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, columns)),
@@ -488,7 +484,7 @@ mod tests {
                 ("rhs-vector".to_owned(), RuntimeValue::matrix(rhs_vector.clone())),
                 (
                     "rhs-decomposition".to_owned(),
-                    RuntimeValue::small_matrix(
+                    RuntimeValue::preimage(
                         rhs_public.clone().gadget_decompose(false, None).unwrap(),
                     ),
                 ),
@@ -508,7 +504,7 @@ mod tests {
 
     #[test]
     fn cached_multiplication_keeps_public_projection_lazy() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let compiler = BggEncodingCompiler;
         let lhs = BggEncodingWire {
             vector: ring.input("cached-lhs-vector", (1, 4)),
@@ -541,12 +537,14 @@ mod tests {
             1,
             "only the vector-side cached action is emitted; G*K_out stays lazy"
         );
-        built.validate(&ParamEnv::default()).expect("valid cached graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid cached graph");
     }
 
     #[test]
     fn runtime_approximate_multiplication_accounts_for_secret_weighted_residual() {
-        use mxx_primitives::sampler::{
+        use mxx_backends::sampler::{
             PolyUniformSampler, bounds::matrix_within_coefficient_bound,
             uniform::DCRTPolyUniformSampler,
         };
@@ -609,8 +607,7 @@ mod tests {
     #[test]
     fn bgg_sampling_builds_a_packed_executable_graph() {
         let layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
+            ring: Ring::from_crt_moduli(vec![257.into()], 8),
             secret_dimension: 2,
             digit_count: 4,
             gadget_base: 4.into(),
@@ -634,9 +631,9 @@ mod tests {
         )
         .expect("compatible sampler inputs");
         let built = DslContext::new("bgg-sampling")
-            .private_output("constant", encodings[0].vector.clone())
+            .transferred_output("constant", encodings[0].vector.clone())
             .expect("constant output")
-            .private_output("message", encodings[1].vector.clone())
+            .transferred_output("message", encodings[1].vector.clone())
             .expect("message output")
             .build()
             .expect("build");
@@ -668,7 +665,9 @@ mod tests {
         assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
         assert_eq!(gaussian_types.len(), 1, "one packed error sample");
         assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
-        built.validate(&ParamEnv::default()).expect("valid executable graph");
+        built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .expect("valid executable graph");
     }
     #[test]
     fn payload_secret_none_reuses_the_mask_secret() {
@@ -707,7 +706,7 @@ mod tests {
             graph,
             parameters,
             BTreeMap::from([
-                ("key".to_owned(), RuntimeValue::Bytes([7u8; 32].to_vec())),
+                ("key".to_owned(), RuntimeValue::Bytes([7u8; 32].to_vec().into())),
                 ("shared-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
                 ("explicit-mask-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
                 ("explicit-payload-secret".to_owned(), RuntimeValue::matrix(secret_value)),
@@ -767,7 +766,7 @@ mod tests {
             graph,
             parameters.clone(),
             BTreeMap::from([
-                ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
+                ("key".to_owned(), RuntimeValue::Bytes(key.to_vec().into())),
                 ("mask-secret".to_owned(), RuntimeValue::matrix(mask_secret_value.clone())),
                 ("payload-secret".to_owned(), RuntimeValue::matrix(payload_secret_value.clone())),
                 ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),

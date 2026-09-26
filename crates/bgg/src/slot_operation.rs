@@ -125,7 +125,7 @@ mod naive {
             .map(|(source, scalar)| (usize::try_from(*source).expect("u32 fits usize"), *scalar))
             .collect::<Vec<_>>();
         let ty = input.element_type();
-        let ring = Ring::new(ty.modulus.clone(), ty.ring_dimension.clone());
+        let ring = Ring::from_ref(ty.ring.clone());
         let outputs = descriptors
             .into_iter()
             .map(|(source, scalar)| {
@@ -151,7 +151,7 @@ mod naive {
         let mut outputs = Vec::with_capacity(inputs.len());
         for input in inputs {
             let ty = input.element_type();
-            let ring = Ring::new(ty.modulus.clone(), ty.ring_dimension.clone());
+            let ring = Ring::from_ref(ty.ring.clone());
             let mut terms = (0..source_slot_count).map(|source| {
                 input.at(source) *
                     ring.polynomial(
@@ -168,27 +168,23 @@ mod naive {
     mod tests {
         use super::*;
         use crate::test_utils::{execute_graph, matrix_output, row};
-        use mxx_dsl::{DslContext, Family};
-        use mxx_ir_core::ParamEnv;
-        use mxx_primitives::{
+        use mxx_backends::{
+            RuntimeValue,
             matrix::dcrt_poly::DCRTPolyMatrix,
             poly::{
                 Poly, PolyParams,
                 dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
             },
         };
-        use mxx_runtime::RuntimeValue;
-        use num_bigint::BigInt;
+        use mxx_dsl::{DslContext, Family};
+        use mxx_ir_core::ParamEnv;
         use std::collections::BTreeMap;
 
         #[test]
         fn runtime_transfer_and_reduce_match_the_slotwise_primitive_formulas() {
             let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
             let columns = parameters.modulus_digits();
-            let ring = Ring::new(
-                BigInt::from(parameters.modulus().as_ref().clone()),
-                parameters.ring_dimension() as usize,
-            );
+            let ring = crate::ring_from_params(&parameters);
             let mut inputs = BTreeMap::new();
             let mut source_values = BTreeMap::<String, Vec<DCRTPolyMatrix>>::new();
             let mut make_encoding = |prefix: &str| {
@@ -282,7 +278,7 @@ mod naive {
 
         #[test]
         fn slot_transfer_and_reduction_preserve_heterogeneous_member_graphs() {
-            let ring = Ring::new(257, 8);
+            let ring = Ring::from_crt_moduli(vec![257.into()], 8);
             let matrices =
                 Family::pack(vec![ring.gaussian((1, 1), 2, 13), ring.gaussian((1, 1), 3, 20)])
                     .expect("family");
@@ -298,12 +294,14 @@ mod naive {
                 .expect("reduction output")
                 .build()
                 .expect("build");
-            built.validate(&ParamEnv::default()).expect("valid executable graph");
+            built
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .expect("valid executable graph");
         }
 
         #[test]
         fn reduction_rejects_oversized_rotations_during_validation() {
-            let ring = Ring::new(17, 8);
+            let ring = Ring::from_crt_moduli(vec![17.into()], 8);
             let input = NaiveBggPublicKeyVecWire {
                 matrices: Family::pack(
                     (0..9).map(|slot| ring.input(format!("slot-{slot}"), (1, 2))).collect(),
@@ -320,14 +318,14 @@ mod naive {
                 .build()
                 .unwrap();
             let error = graph
-                .validate(&ParamEnv::default())
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
                 .expect_err("rotation exponent exceeds ring dimension");
             assert!(error.to_string().contains("constant polynomial exceeds the ring dimension"));
         }
 
         #[test]
         fn reduction_rejects_heterogeneous_family_metadata() {
-            let ring = Ring::new(17, 8);
+            let ring = Ring::from_crt_moduli(vec![17.into()], 8);
             let rows = Family::pack(vec![ring.input("row-0", (1, 2)), ring.input("row-1", (1, 2))])
                 .unwrap();
             let scalars =
@@ -370,7 +368,7 @@ mod public_key {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId};
+    use mxx_ir_core::artifact::{ArtifactAvailability, ProductionId};
     use rayon::prelude::*;
 
     #[derive(Clone)]
@@ -418,7 +416,7 @@ mod public_key {
                         production.clone(),
                         super::slot_gate_public_key_name(reduction, &identity),
                         (self.public_key_type.rows.clone(), self.public_key_type.columns.clone()),
-                        ArtifactConfidentiality::Public,
+                        ArtifactAvailability::Transferred,
                     )
                 },
             );
@@ -514,10 +512,10 @@ mod public_key {
     mod tests {
         use super::*;
         use crate::{NoPublicLookup, PolyCircuitCompiler};
+        use mxx_backends::poly::dcrt::poly::DCRTPoly;
         use mxx_dsl::{DslContext, Ring};
         use mxx_gadgets::circuit::PolyCircuit;
         use mxx_ir_core::ParamEnv;
-        use mxx_primitives::poly::dcrt::poly::DCRTPoly;
 
         #[test]
         fn public_key_slot_transfer_lowering_builds_and_symbolically_elaborates() {
@@ -526,7 +524,7 @@ mod public_key {
             let transferred = circuit.slot_transfer_gate(input_gate, &[(1, None), (0, Some(3))]);
             circuit.output([transferred]);
 
-            let ring = Ring::new(257, 8);
+            let ring = Ring::from_crt_moduli(vec![257.into()], 8);
             let public_key_type = ring.matrix_type((2, 8));
             let key = |name: &str| BggPublicKeyWire {
                 matrix: ring.input(name, (2, 8)),
@@ -558,7 +556,9 @@ mod public_key {
                 .expect("output")
                 .build()
                 .expect("build");
-            built.validate(&ParamEnv::default()).expect("valid executable graph");
+            built
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .expect("valid executable graph");
         }
     }
 }
@@ -574,7 +574,7 @@ mod artifact {
     use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Ring, Trapdoor};
     use mxx_ir_core::{
         IntExpr, RealExpr,
-        artifact::{ArtifactConfidentiality, ProductionId},
+        artifact::{ArtifactAvailability, ProductionId},
         node::{ConcatAxis, ConstantMatrix, IndexRange},
         types::MatrixType,
     };
@@ -591,8 +591,7 @@ mod artifact {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct BggSlotTransferArtifactCompiler {
-        pub modulus: IntExpr,
-        pub ring_dimension: IntExpr,
+        pub ring: Ring,
         pub secret_size: usize,
         pub slot_count: usize,
         pub digit_count: usize,
@@ -702,10 +701,10 @@ mod artifact {
             base: BggSlotTransferBaseWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             Ok(context
-                .public_output(B0_PUBLIC, base.b0.public_matrix())?
-                .private_trapdoor_output(B0_TRAPDOOR, base.b0)?
-                .public_output(B1_PUBLIC, base.b1.public_matrix())?
-                .private_trapdoor_output(B1_TRAPDOOR, base.b1)?)
+                .transferred_output(B0_PUBLIC, base.b0.public_matrix())?
+                .transferred_trapdoor_output(B0_TRAPDOOR, base.b0)?
+                .transferred_output(B1_PUBLIC, base.b1.public_matrix())?
+                .transferred_trapdoor_output(B1_TRAPDOOR, base.b1)?)
         }
 
         pub fn import_base(
@@ -850,22 +849,20 @@ mod artifact {
             slots: BggSlotTransferSlotWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             let context = context
-                .private_output(SLOT_SECRET, slots.secrets)?
-                .public_output(SLOT_PUBLIC_KEY, slots.public_keys)?;
-            let context = slots
-                .b0_preimage_chunks
-                .into_iter()
-                .enumerate()
-                .try_fold(context, |context, (chunk, family)| {
-                    context.public_output(b0_preimage_name(chunk), family)
-                })?;
-            Ok(slots
-                .b1_preimage_chunks
-                .into_iter()
-                .enumerate()
-                .try_fold(context, |context, (chunk, family)| {
-                    context.public_output(b1_preimage_name(chunk), family)
-                })?)
+                .transferred_output(SLOT_SECRET, slots.secrets)?
+                .transferred_output(SLOT_PUBLIC_KEY, slots.public_keys)?;
+            let context = slots.b0_preimage_chunks.into_iter().enumerate().try_fold(
+                context,
+                |context, (chunk, family)| {
+                    context.transferred_output(b0_preimage_name(chunk), family)
+                },
+            )?;
+            Ok(slots.b1_preimage_chunks.into_iter().enumerate().try_fold(
+                context,
+                |context, (chunk, family)| {
+                    context.transferred_output(b1_preimage_name(chunk), family)
+                },
+            )?)
         }
 
         pub fn import_slots(
@@ -880,7 +877,10 @@ mod artifact {
                     SLOT_SECRET,
                     self.slot_count,
                     (self.secret_size, self.secret_size),
-                    ArtifactConfidentiality::Private,
+                    // Slot secrets are sampled during artifact production;
+                    // consumers receive the exact payload rather than
+                    // regenerating it from public context.
+                    ArtifactAvailability::Transferred,
                 ),
                 public_keys: public.public_keys,
                 b0_preimage_chunks: public.b0_preimage_chunks,
@@ -900,7 +900,7 @@ mod artifact {
                     SLOT_PUBLIC_KEY,
                     self.slot_count,
                     (self.secret_size, self.gadget_columns()),
-                    ArtifactConfidentiality::Public,
+                    ArtifactAvailability::Transferred,
                 ),
                 b0_preimage_chunks: self.import_slot_chunks(
                     &artifacts.production_id,
@@ -1006,10 +1006,9 @@ mod artifact {
             context: DslContext,
             gates: BggSlotTransferGateWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
-            Ok(gates
-                .preimage_chunks
-                .into_iter()
-                .try_fold(context, |context, (name, family)| context.public_output(name, family))?)
+            Ok(gates.preimage_chunks.into_iter().try_fold(context, |context, (name, family)| {
+                context.transferred_output(name, family)
+            })?)
         }
 
         /// Exports the exact public-key expressions used as gate-preimage targets.
@@ -1027,7 +1026,7 @@ mod artifact {
                         (true, identity, output_public_key)
                     }
                 };
-                Ok(context.public_output(
+                Ok(context.transferred_output(
                     super::slot_gate_public_key_name(reduction, identity),
                     output.clone(),
                 )?)
@@ -1060,7 +1059,7 @@ mod artifact {
                         count,
                         (self.b0_public_columns(), range_len(&columns)),
                         self.preimage_max_coefficient_bound.clone(),
-                        ArtifactConfidentiality::Public,
+                        ArtifactAvailability::Transferred,
                     );
                     preimage_chunks.insert(name, family);
                 }
@@ -1216,14 +1215,14 @@ mod artifact {
                         self.slot_count,
                         (rows, range_len(&range)),
                         self.preimage_max_coefficient_bound.clone(),
-                        ArtifactConfidentiality::Public,
+                        ArtifactAvailability::Transferred,
                     )
                 })
                 .collect()
         }
 
         pub(crate) fn ring(&self) -> Ring {
-            Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+            self.ring.clone()
         }
         pub(crate) fn matrix_type(&self, rows: usize, columns: usize) -> MatrixType {
             self.ring().matrix_type((rows, columns))
@@ -1272,8 +1271,8 @@ mod artifact {
     mod tests {
         use super::*;
         use crate::test_utils::{execute_graph, matrix_output, row};
-        use mxx_ir_core::ParamEnv;
-        use mxx_primitives::{
+        use mxx_backends::{
+            ExecutionResult, RuntimeValue,
             matrix::{CpuSmallMatrix, PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
             poly::{
                 Poly, PolyParams,
@@ -1281,26 +1280,22 @@ mod artifact {
             },
             sampler::bounds::default_preimage_cutoff,
         };
-        use mxx_runtime::{ExecutionResult, RuntimeValue, backend::poly::CpuDcrtBackend};
+        use mxx_ir_core::ParamEnv;
         use num_bigint::BigInt;
         use std::collections::BTreeMap;
 
-        fn small_matrix_output(
-            result: &ExecutionResult<CpuDcrtBackend>,
-            name: &str,
-        ) -> CpuSmallMatrix<DCRTPolyMatrix> {
-            let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
-                panic!("{name} must be a compact matrix output")
+        fn preimage_output(result: &ExecutionResult, name: &str) -> CpuSmallMatrix<DCRTPolyMatrix> {
+            let RuntimeValue::Matrix(value) = &result.outputs[name] else {
+                panic!("{name} must be a preimage output")
             };
-            value.as_ref().clone()
+            value.as_cpu_compact().expect("CPU preimage output").clone()
         }
 
         fn compiler() -> BggSlotTransferArtifactCompiler {
             let preimage_max_coefficient_bound = default_preimage_cutoff(8, 4, 4, 4, 5.0)
                 .expect("default preimage cutoff should be computable");
             BggSlotTransferArtifactCompiler {
-                modulus: 65_537.into(),
-                ring_dimension: 8.into(),
+                ring: Ring::from_crt_moduli(vec![65_537.into()], 8),
                 secret_size: 2,
                 slot_count: 3,
                 digit_count: 4,
@@ -1338,8 +1333,7 @@ mod artifact {
             )
             .expect("default preimage cutoff should be computable");
             let compiler = BggSlotTransferArtifactCompiler {
-                modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-                ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+                ring: crate::ring_from_params(&parameters),
                 secret_size,
                 slot_count: 2,
                 digit_count: parameters.modulus_digits(),
@@ -1420,7 +1414,7 @@ mod artifact {
                 context.build().expect("runtime graph"),
                 parameters.clone(),
                 BTreeMap::from([
-                    ("slot_hash_key".to_owned(), RuntimeValue::Bytes(vec![0x42; 32])),
+                    ("slot_hash_key".to_owned(), RuntimeValue::Bytes(vec![0x42; 32].into())),
                     ("input_key".to_owned(), RuntimeValue::matrix(input_key_value.clone())),
                     ("input_key_two".to_owned(), RuntimeValue::matrix(input_key_two_value.clone())),
                     (
@@ -1445,7 +1439,7 @@ mod artifact {
                     let (start, end) = static_range(&range);
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("slot_b0_{chunk}_{slot}")
                             ))
@@ -1462,7 +1456,7 @@ mod artifact {
                         .concat_rows(&[&-(secret.clone() * &gadget.slice_columns(start, end))]);
                     assert_eq!(
                         b1.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("slot_b1_{chunk}_{slot}")
                             ))
@@ -1492,7 +1486,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("gate_transfer_{chunk}_{destination}"),
                             ))
@@ -1515,7 +1509,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("gate_reduce_{chunk}_{destination}"),
                             ))
@@ -1535,7 +1529,7 @@ mod artifact {
                 .expect("base outputs")
                 .build()
                 .expect("base graph")
-                .validate(&ParamEnv::default())
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
                 .expect("valid base graph");
             let slots = compiler
                 .build_slots(compiler.ring().bytes_input("hash-key", 32), &base)
@@ -1545,7 +1539,9 @@ mod artifact {
                 .expect("slot outputs")
                 .build()
                 .expect("slot graph");
-            slot_graph.validate(&ParamEnv::default()).expect("valid slot graph");
+            slot_graph
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .expect("valid slot graph");
 
             let key = compiler.ring().bytes_input("gate-hash-key", 32);
             let input = compiler.ring().hash_matrix(
@@ -1583,7 +1579,9 @@ mod artifact {
                 .expect("gate outputs")
                 .build()
                 .expect("gate graph");
-            gate_graph.validate(&ParamEnv::default()).expect("valid gate graph");
+            gate_graph
+                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .expect("valid gate graph");
         }
     }
 }
@@ -2005,23 +2003,17 @@ mod tall {
     mod tests {
         use super::*;
         use crate::test_utils::{execute_graph, matrix_output};
-        use mxx_dsl::{DslContext, Ring};
-        use mxx_primitives::{
+        use mxx_backends::{
             matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-            poly::{
-                PolyParams,
-                dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
-            },
+            poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
         };
+        use mxx_dsl::DslContext;
         use std::collections::BTreeMap;
 
         #[test]
         fn compact_identity_lane_masks_match_explicit_runtime_sequence() {
             let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
-            let ring = Ring::new(
-                num_bigint::BigInt::from(parameters.modulus().as_ref().clone()),
-                parameters.ring_dimension() as usize,
-            );
+            let ring = crate::ring_from_params(&parameters);
             let lane_scalars = [Some(0), None, Some(5)];
             let masks = identity_repeated_lane_masks(&ring, 6, &lane_scalars)
                 .expect("compact identity lane masks");

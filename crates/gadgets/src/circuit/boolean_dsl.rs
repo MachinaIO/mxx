@@ -337,15 +337,11 @@ mod tests {
     use crate::circuit::{
         BooleanCircuitData, BooleanCircuitShape, BooleanGateData, BooleanGateKind,
     };
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
-    use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
-    use mxx_runtime::{
-        RuntimeValue,
-        artifact::MemoryArtifactStore,
-        backend::poly::{CpuDcrtBackend, cpu_backend},
-        execute,
-        transcript::SamplingMode,
+    use mxx_backends::{
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, poly::dcrt::params::DCRTPolyParams, transcript::SamplingMode,
     };
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use std::collections::BTreeMap;
 
     fn bindings() -> ParamEnv {
@@ -378,25 +374,29 @@ mod tests {
         }
     }
 
-    fn runtime_family(values: &[i32]) -> RuntimeValue<CpuDcrtBackend> {
-        RuntimeValue::IndexedFamily(
-            values.iter().map(|value| RuntimeValue::Int((*value).into())).collect(),
-        )
+    fn runtime_family(values: &[i32]) -> RuntimeValue {
+        RuntimeValue::integer_values(values.iter().map(|value| (*value).into()).collect())
     }
 
     fn execute_predicate(
         predicate: &mxx_dsl::PurePredicateSpec,
         bindings: &ParamEnv,
-        inputs: BTreeMap<String, RuntimeValue<CpuDcrtBackend>>,
+        inputs: BTreeMap<String, RuntimeValue>,
         output: &str,
     ) -> bool {
-        let validated = mxx_ir_core::validate(&predicate.graph, bindings).unwrap();
+        let validated = mxx_ir_core::validate(
+            predicate.graph(),
+            bindings,
+            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+        )
+        .unwrap();
         let result = execute(
             &validated,
             &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         matches!(result.outputs[output], RuntimeValue::Bool(true))
@@ -414,7 +414,7 @@ mod tests {
         let output = evaluate_boolean_family(&params, circuit.clone(), inputs).unwrap();
         let selected = select_boolean_output(&circuit, &output);
         let graph = context.output("result", selected).unwrap().build().unwrap();
-        graph.validate(&bindings()).unwrap();
+        graph.validate(&bindings(), mxx_backends::openfhe_guard::gen_modulus_and_warmup).unwrap();
 
         assert_eq!(
             graph
@@ -451,16 +451,36 @@ mod tests {
         let satisfaction =
             boolean_circuit_satisfaction_predicate(DslContext::new("symbolic-satisfaction"))
                 .unwrap();
-        mxx_ir_core::validate(&validity.graph, &bindings()).unwrap();
-        mxx_ir_core::validate(&satisfaction.graph, &bindings()).unwrap();
+        mxx_ir_core::validate(
+            validity.graph(),
+            &bindings(),
+            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+        )
+        .unwrap();
+        mxx_ir_core::validate(
+            satisfaction.graph(),
+            &bindings(),
+            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+        )
+        .unwrap();
 
         let mut second = bindings();
         second.integers.insert(BooleanCircuitFamilyParams::DEPTH_PARAMETER.to_owned(), 4.into());
         second
             .integers
             .insert(BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER.to_owned(), 5.into());
-        mxx_ir_core::validate(&validity.graph, &second).unwrap();
-        mxx_ir_core::validate(&satisfaction.graph, &second).unwrap();
+        mxx_ir_core::validate(
+            validity.graph(),
+            &second,
+            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+        )
+        .unwrap();
+        mxx_ir_core::validate(
+            satisfaction.graph(),
+            &second,
+            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+        )
+        .unwrap();
     }
 
     #[test]

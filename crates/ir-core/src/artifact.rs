@@ -1,7 +1,7 @@
 use crate::{
     encoding::IR_VERSION,
     serde_support,
-    types::{ConcreteMatrixType, ConcreteWireType, WireId},
+    types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, WireId},
     validate::ValidatedGraph,
 };
 use num_bigint::BigInt;
@@ -27,9 +27,12 @@ pub struct Manifest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum ArtifactConfidentiality {
-    Public,
-    Private,
+pub enum ArtifactAvailability {
+    /// The consumer receives the canonical payload from an external producer.
+    Transferred,
+    /// The consumer can deterministically regenerate the payload from public
+    /// context and uses the stored payload as a cache entry.
+    Cached,
 }
 
 /// Complete validated schema for a compact bounded-coefficient matrix.
@@ -38,6 +41,7 @@ pub struct ConcreteBoundedMatrixSchema {
     pub matrix: ConcreteMatrixType,
     #[serde(with = "serde_support::bigint")]
     pub max_coefficient_bound: BigInt,
+    pub bound_domain: CoefficientBoundDomain,
 }
 
 /// Artifact semantics carried outside the shared compact matrix owner.
@@ -57,11 +61,13 @@ pub enum ArtifactType {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
+        bound_domain: CoefficientBoundDomain,
     },
     Preimage {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
+        bound_domain: CoefficientBoundDomain,
     },
     Bytes {
         length: usize,
@@ -86,16 +92,20 @@ impl ArtifactType {
         match wire_type {
             ConcreteWireType::ConstantInt | ConcreteWireType::Int => Some(Self::Int),
             ConcreteWireType::Matrix(matrix) => Some(Self::Matrix(matrix.clone())),
-            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } => {
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => {
                 Some(Self::SmallMatrix {
                     matrix: matrix.clone(),
                     max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
                 })
             }
-            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => Some(Self::Preimage {
-                matrix: matrix.clone(),
-                max_coefficient_bound: max_coefficient_bound.clone(),
-            }),
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound, bound_domain } => {
+                Some(Self::Preimage {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
+                })
+            }
             ConcreteWireType::Bytes { length } => Some(Self::Bytes { length: *length }),
             ConcreteWireType::Trapdoor {
                 matrix,
@@ -125,17 +135,19 @@ impl ArtifactType {
         &self,
     ) -> Option<(ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind)> {
         match self {
-            Self::SmallMatrix { matrix, max_coefficient_bound } => Some((
+            Self::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => Some((
                 ConcreteBoundedMatrixSchema {
                     matrix: matrix.clone(),
                     max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
                 },
                 SmallMatrixSemanticKind::Generic,
             )),
-            Self::Preimage { matrix, max_coefficient_bound } => Some((
+            Self::Preimage { matrix, max_coefficient_bound, bound_domain } => Some((
                 ConcreteBoundedMatrixSchema {
                     matrix: matrix.clone(),
                     max_coefficient_bound: max_coefficient_bound.clone(),
+                    bound_domain: *bound_domain,
                 },
                 SmallMatrixSemanticKind::Preimage,
             )),
@@ -148,26 +160,18 @@ impl ArtifactType {
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
-    pub confidentiality: ArtifactConfidentiality,
-    pub content_hash: Option<[u8; 32]>,
+    pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ManifestValidationError {
-    #[error("private artifact {name} must not expose a content hash")]
-    PrivateContentHash { name: String },
     #[error("bounded artifact {name} has a negative coefficient bound")]
     NegativeCoefficientBound { name: String },
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationError> {
     for (name, artifact) in &manifest.artifacts {
-        if artifact.confidentiality == ArtifactConfidentiality::Private &&
-            artifact.content_hash.is_some()
-        {
-            return Err(ManifestValidationError::PrivateContentHash { name: name.clone() });
-        }
         let bound = match &artifact.artifact_type {
             ArtifactType::SmallMatrix { max_coefficient_bound, .. } |
             ArtifactType::Preimage { max_coefficient_bound, .. } => Some(max_coefficient_bound),
@@ -185,8 +189,7 @@ pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
-    pub confidentiality: ArtifactConfidentiality,
-    pub content_hash: Option<[u8; 32]>,
+    pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
 
@@ -214,11 +217,7 @@ pub fn export_manifest(
                 ManifestArtifact {
                     artifact_type: artifact.artifact_type.clone(),
                     family_count: artifact.family_count,
-                    confidentiality: artifact.confidentiality,
-                    content_hash: match artifact.confidentiality {
-                        ArtifactConfidentiality::Public => artifact.content_hash,
-                        ArtifactConfidentiality::Private => None,
-                    },
+                    availability: artifact.availability,
                     layout: artifact.layout.clone(),
                 },
             )
@@ -231,7 +230,7 @@ pub fn export_manifest(
 ///
 /// Indexed-family outputs become artifact families; compatible scalar wires
 /// become singular artifacts. Every persisted output must be backed by an
-/// graph output carrying an explicit confidentiality declaration.
+/// graph output carrying an explicit availability declaration.
 pub fn export_validated_manifest(
     production_id: ProductionId,
     graph: &ValidatedGraph,
@@ -241,7 +240,7 @@ pub fn export_validated_manifest(
         .outputs()
         .iter()
         .filter_map(|(name, output)| {
-            let confidentiality = output.confidentiality?;
+            let availability = output.availability?;
             Some((|| {
                 let id = WireId { instantiation_path: Vec::new(), wire: output.value };
                 let wire_type = graph
@@ -263,8 +262,7 @@ pub fn export_validated_manifest(
                         wire: id,
                         artifact_type,
                         family_count: first_class_family_count,
-                        confidentiality,
-                        content_hash: None,
+                        availability,
                         layout: None,
                     },
                 ))
@@ -279,55 +277,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_manifest_artifacts_cannot_expose_content_hashes() {
+    fn cached_manifest_artifacts_validate() {
         let manifest = Manifest {
             ir_version: IR_VERSION,
             production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
             artifacts: BTreeMap::from([(
-                "private".to_owned(),
+                "deterministic-cache".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: Some([3; 32]),
+                    availability: ArtifactAvailability::Cached,
                     layout: None,
                 },
             )]),
         };
 
-        assert!(matches!(
-            validate_manifest(&manifest),
-            Err(ManifestValidationError::PrivateContentHash { name }) if name == "private"
-        ));
+        assert!(validate_manifest(&manifest).is_ok());
     }
 
     #[test]
     fn bounded_artifact_kinds_remain_distinct() {
-        let matrix = ConcreteMatrixType::scalar(BigInt::from(257), 8);
+        let matrix = ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8));
         let small = ConcreteWireType::SmallMatrix {
             matrix: matrix.clone(),
             max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         let preimage = ConcreteWireType::Preimage {
             matrix: matrix.clone(),
             max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         assert_eq!(
             ArtifactType::from_wire_type(&small),
             Some(ArtifactType::SmallMatrix {
                 matrix: matrix.clone(),
                 max_coefficient_bound: BigInt::from(3),
+                bound_domain: CoefficientBoundDomain::Global,
             })
         );
         assert_eq!(
             ArtifactType::from_wire_type(&preimage),
-            Some(ArtifactType::Preimage { matrix, max_coefficient_bound: BigInt::from(3) })
+            Some(ArtifactType::Preimage {
+                matrix,
+                max_coefficient_bound: BigInt::from(3),
+                bound_domain: CoefficientBoundDomain::Global,
+            })
         );
         assert_ne!(ArtifactType::from_wire_type(&small), ArtifactType::from_wire_type(&preimage));
 
-        let schema = ConcreteBoundedMatrixSchema {
-            matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
+        let per_limb = ConcreteWireType::SmallMatrix {
+            matrix: ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8)),
             max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::PerCrtLimb,
+        };
+        assert_ne!(ArtifactType::from_wire_type(&small), ArtifactType::from_wire_type(&per_limb));
+
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8)),
+            max_coefficient_bound: BigInt::from(3),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         assert_eq!(
             ArtifactType::from_wire_type(&small).unwrap().bounded_matrix_schema(),
@@ -348,12 +357,12 @@ mod tests {
                 "negative".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::SmallMatrix {
-                        matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
+                        matrix: ConcreteMatrixType::scalar(crate::ring::test_concrete_ring(257, 8)),
                         max_coefficient_bound: BigInt::from(-1),
+                        bound_domain: CoefficientBoundDomain::Global,
                     },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Public,
-                    content_hash: None,
+                    availability: ArtifactAvailability::Transferred,
                     layout: None,
                 },
             )]),

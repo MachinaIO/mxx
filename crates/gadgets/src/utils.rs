@@ -1,4 +1,4 @@
-pub use mxx_primitives::utils::*;
+pub use mxx_backends::utils::*;
 
 use crate::{
     poly::{

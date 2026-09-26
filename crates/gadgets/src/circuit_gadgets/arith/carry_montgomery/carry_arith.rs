@@ -644,7 +644,7 @@ mod tests {
         test_utils::execute_circuit,
         utils::gen_biguint_for_modulus,
     };
-    use mxx_primitives::poly::{
+    use mxx_backends::poly::{
         PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     };

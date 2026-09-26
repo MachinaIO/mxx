@@ -12,10 +12,9 @@ use std::{
 };
 use thiserror::Error;
 
-// Version 9 adds the serialized `IntExpr::Select` variant.  Bumping the wire
-// format prevents older runtimes from accepting manifests whose integer
-// expressions they cannot decode or evaluate.
-pub const IR_VERSION: u32 = 9;
+// Version 10 replaces product-only rings with ordered CRT expressions and
+// records exact destination bases for ring-changing nodes.
+pub const IR_VERSION: u32 = 11;
 
 #[derive(Debug, Error)]
 pub enum EncodingError {
@@ -124,7 +123,7 @@ mod tests {
         Graph::freeze(
             "tiny-golden",
             Vec::new(),
-            BTreeMap::from([("result".to_owned(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("result".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -209,7 +208,7 @@ mod tests {
         let graph = Graph::freeze(
             "parameterized",
             Vec::new(),
-            BTreeMap::from([("result".to_owned(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("result".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -242,10 +241,10 @@ mod tests {
 
     #[test]
     fn tiny_graph_canonical_json_and_spec_hash_match_the_pre_streaming_golden() {
-        const CANONICAL_JSON: &[u8] = br#"{"effect_roots":[],"name":"tiny-golden","outputs":{"result":{"confidentiality":null,"value":{"node":0,"port":0}}},"parameters":[],"real_constants":{},"scopes":[{"id":{"tag":"Root"},"scope":{"inputs":[],"nodes":[{"arguments":[],"id":0,"kind":{"tag":"ConstantInt","value":"7"},"output_types":[{"tag":"ConstantInt"}]}],"outputs":[{"node":0,"port":0}]}}]}"#;
+        const CANONICAL_JSON: &[u8] = br#"{"graph":{"effect_roots":[],"name":"tiny-golden","outputs":{"result":{"availability":null,"value":{"node":0,"port":0}}},"parameters":[],"real_constants":{},"scopes":[{"id":{"tag":"Root"},"scope":{"inputs":[],"nodes":[{"arguments":[],"id":0,"kind":{"tag":"ConstantInt","value":"7"},"output_types":[{"tag":"ConstantInt"}]}],"outputs":[{"node":0,"port":0}]}}]},"ring_table":[]}"#;
         const SPEC_HASH: [u8; 32] = [
-            8, 90, 9, 182, 175, 97, 67, 133, 225, 175, 203, 101, 88, 208, 23, 166, 88, 180, 206,
-            225, 64, 187, 231, 32, 0, 135, 5, 79, 142, 182, 87, 27,
+            125, 91, 20, 233, 154, 226, 156, 117, 175, 40, 136, 121, 185, 223, 81, 227, 98, 153,
+            240, 77, 131, 32, 163, 68, 146, 126, 246, 224, 168, 27, 58, 149,
         ];
         let graph = tiny_graph();
 

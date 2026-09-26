@@ -89,12 +89,12 @@ impl Wee25PublicParameterCompiler {
         mut context: DslContext,
         wires: Wee25PublicParameterPreprocessingWires,
     ) -> Result<DslContext, DslError> {
-        context = context.public_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
-        context = context.private_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
-        context = context.public_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
+        context = context.transferred_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
+        context = context.transferred_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
+        context = context.transferred_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
         for (index, family) in wires.public_parameters.t_top.into_iter().enumerate() {
             let part_count = self.layout.public_parameter_part_count();
-            context = context.public_output(
+            context = context.transferred_output(
                 self.layout.public_parameter_top_name(index / part_count, index % part_count),
                 family,
             )?;
@@ -208,25 +208,22 @@ mod tests {
     use crate::test_utils::{execute_graph, matrix_output};
     use mxx_dsl::DslContext;
 
-    use mxx_primitives::{
+    use mxx_backends::{
+        ExecutionResult, RuntimeValue,
         matrix::{CpuSmallMatrix, PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
-    use mxx_runtime::{ExecutionResult, RuntimeValue, backend::poly::CpuDcrtBackend};
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
     type HashSampler = DCRTPolyHashSampler<keccak_asm::Keccak256>;
 
-    fn small_matrix_output(
-        result: &ExecutionResult<CpuDcrtBackend>,
-        name: &str,
-    ) -> CpuSmallMatrix<DCRTPolyMatrix> {
-        let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
-            panic!("{name} must be a compact matrix output")
+    fn preimage_output(result: &ExecutionResult, name: &str) -> CpuSmallMatrix<DCRTPolyMatrix> {
+        let RuntimeValue::Matrix(value) = &result.outputs[name] else {
+            panic!("{name} must be a preimage output")
         };
-        value.as_ref().clone()
+        value.as_cpu_compact().expect("CPU preimage output").clone()
     }
 
     fn direct_j_block(
@@ -279,8 +276,7 @@ mod tests {
     fn runtime_parameters_preserve_every_chunk_relation_against_direct_j_and_hash_oracles() {
         let parameters = DCRTPolyParams::new(4, 1, 12, 4, None, None);
         let layout = Wee25CommitmentCompiler {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(&parameters),
             secret_size: 1,
             tree_base: 2,
             digit_count: parameters.modulus_digits(),
@@ -318,7 +314,10 @@ mod tests {
         let result = execute_graph(
             context.build().unwrap(),
             parameters.clone(),
-            BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]),
+            BTreeMap::from([(
+                "hash-key".to_owned(),
+                RuntimeValue::Bytes(hash_key.to_vec().into()),
+            )]),
         );
         let b = matrix_output(&result, "b");
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_size, None);
@@ -343,7 +342,7 @@ mod tests {
                     let expected = gadget.clone() * &j - &(w * bottom);
                     assert_eq!(
                         b.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("top-{digit_row}-{part}-{block}"),
                             ))

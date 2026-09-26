@@ -5,7 +5,7 @@ mod tests {
 
     fn threshold_family_bundle(decoder_uses_residual_lane: bool) -> ClosedProtocolBundle {
         let stage_id = StageId("threshold-family-stage".to_owned());
-        let ring = Ring::new(17, 1);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 1);
         let residuals =
             Family::pack(vec![ring.zero((1, 1)), ring.zero((1, 1))]).expect("residual family");
         let decoder_source =
@@ -81,7 +81,7 @@ mod tests {
     }
 
     fn valid_bundle() -> ClosedProtocolBundle {
-        let ring = Ring::new(17, 1);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 1);
         let stage_value = ring.bool_input("message");
         let stage = DslContext::new("stage")
             .output("result", stage_value)
@@ -91,7 +91,7 @@ mod tests {
         let residual = ring.input("residual", (1, 1));
         let coefficient = residual.clone().extract_coefficient(0);
         let quarter = Int::evaluate(IntExpr::RoundDiv(
-            Box::new(IntExpr::constant(17) - 2),
+            Box::new(ring.modulus() - 2),
             Box::new(IntExpr::constant(4)),
         ));
         let decoded = quarter
@@ -237,9 +237,10 @@ mod tests {
         }
     }
 
-    fn boolean_interval_bundle(decoder_modulus: IntExpr) -> ClosedProtocolBundle {
+    fn boolean_interval_bundle(forged_modulus: Option<IntExpr>) -> ClosedProtocolBundle {
         let stage_id = StageId("interval-stage".to_owned());
-        let ring = Ring::new(17, 1);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 1);
+        let decoder_modulus = forged_modulus.unwrap_or_else(|| ring.modulus());
         let matrix_type = ring.matrix_type((1, 1));
         let residual = ring.input("residual", (1, 1));
         let coefficient = residual.clone().extract_coefficient(0);
@@ -371,9 +372,9 @@ mod tests {
 
     #[test]
     fn boolean_interval_target_rejects_a_forged_interior_modulus() {
-        assert_eq!(boolean_interval_bundle(IntExpr::constant(17)).validate(), Ok(()));
+        assert_eq!(boolean_interval_bundle(None).validate(), Ok(()));
         assert_eq!(
-            boolean_interval_bundle(IntExpr::constant(19)).validate(),
+            boolean_interval_bundle(Some(IntExpr::constant(19))).validate(),
             Err(BundleValidationError::InvalidOperationalDecoderTarget)
         );
     }
@@ -412,14 +413,14 @@ mod tests {
 
     #[test]
     fn boolean_interval_target_rejects_an_unrelated_same_type_residual() {
-        let mut bundle = boolean_interval_bundle(IntExpr::constant(17));
+        let mut bundle = boolean_interval_bundle(None);
         bundle.operational_decoder_targets[0].residual.output = "unrelated-residual".to_owned();
         assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidOperationalDecoderTarget));
     }
 
     #[test]
     fn boolean_interval_target_rejects_an_unrelated_boolean_endpoint() {
-        let mut bundle = boolean_interval_bundle(IntExpr::constant(17));
+        let mut bundle = boolean_interval_bundle(None);
         bundle.endpoints.entries[0].workflow_output.output = "unrelated-result".to_owned();
         let ComparatorSpec::Equality { endpoints } = &mut bundle.comparator else { unreachable!() };
         endpoints[0].actual_input = "unrelated-result".to_owned();
@@ -440,7 +441,7 @@ mod tests {
     #[test]
     fn threshold_target_accepts_a_nonzero_boolean_decoder_port() {
         let mut bundle = threshold_family_bundle(true);
-        let ring = Ring::new(17, 1);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 1);
         let residuals =
             Family::pack(vec![ring.zero((1, 2)), ring.zero((1, 2))]).expect("residual family");
         let second_bit = residuals
@@ -496,8 +497,9 @@ mod tests {
         bundle.input_contract.inputs[1].value = InputValueContract::MatrixLarge { matrix_type };
         assert_eq!(bundle.validate(), Ok(()));
 
-        bundle.input_contract.inputs[1].value =
-            InputValueContract::MatrixLarge { matrix_type: Ring::new(19, 1).matrix_type((1, 1)) };
+        bundle.input_contract.inputs[1].value = InputValueContract::MatrixLarge {
+            matrix_type: Ring::from_crt_moduli(vec![19.into()], 1).matrix_type((1, 1)),
+        };
         assert_eq!(bundle.validate(), Err(BundleValidationError::InputContractTypeMismatch));
     }
 

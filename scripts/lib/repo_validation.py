@@ -58,12 +58,12 @@ def is_gpu_rust_path(path: str) -> bool:
 
 def is_gpu_repeat_validation_trigger(path: str) -> bool:
     normalized = PurePosixPath(path)
-    if normalized.parts[:3] == ("crates", "primitives", "cuda"):
+    if normalized.parts[:3] == ("crates", "backends", "cuda"):
         return True
     return (
         is_gpu_rust_path(path)
         and len(normalized.parts) >= 5
-        and normalized.parts[:3] == ("crates", "primitives", "src")
+        and normalized.parts[:3] == ("crates", "backends", "src")
         and normalized.parts[3] in GPU_REPEAT_SOURCE_DIRS
     )
 
@@ -176,7 +176,7 @@ def maybe_run_gpu_repeat_validation(repo_root: Path, repeat_count: int, log: Tex
     single_run_trigger_paths = gpu_single_run_validation_trigger_paths(edited_paths)
     if not repeat_trigger_paths and not single_run_trigger_paths:
         log.write(
-            "[gpu-repeat] skipped: no edited files under crates/primitives/cuda/ or matching *gpu*.rs in configured crate source paths\n"
+            "[gpu-repeat] skipped: no edited files under crates/backends/cuda/ or matching *gpu*.rs in configured crate source paths\n"
         )
         return 0
 

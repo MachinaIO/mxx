@@ -13,6 +13,7 @@ pub mod inventory;
 pub mod lean;
 pub mod node;
 pub mod protocol;
+pub mod ring;
 mod serde_support;
 pub mod types;
 pub mod validate;
@@ -26,8 +27,9 @@ pub use graph::{
     SourceLocation, SubgraphHandle, ValueHandle, current_construction_scope, with_benchmark_role,
     with_new_construction_scope,
 };
+pub use ring::{ConcreteRing, ResolveCrtBasis, RingExpr, RingRef};
 pub use types::{NodeId, Port, WireRef, WireType};
 pub use validate::{
-    LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError, concretize_wire_type,
-    validate, validate_structure, validate_with_manifests,
+    IntoValidatedGraph, LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError,
+    concretize_wire_type, validate, validate_structure, validate_with_manifests,
 };

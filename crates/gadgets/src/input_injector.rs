@@ -10,8 +10,8 @@ pub const DIAMOND_PREFIX_DIMENSION: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiamondInputConfig {
-    pub modulus: BigInt,
-    pub ring_dimension: usize,
+    pub crt_moduli: Vec<u64>,
+    pub ring_dimension: u32,
     pub input_count: usize,
     pub digit_base: usize,
     pub batch_bits: usize,
@@ -25,8 +25,7 @@ pub struct DiamondInputConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiamondInputParams {
-    pub modulus: IntExpr,
-    pub ring_dimension: IntExpr,
+    pub ring: Ring,
     pub input_count: IntExpr,
     pub digit_base: IntExpr,
     pub batch_bits: IntExpr,
@@ -40,7 +39,7 @@ pub struct DiamondInputParams {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DiamondInputConfigError {
-    #[error("the Diamond input-injection ring modulus must be positive")]
+    #[error("the Diamond input-injection CRT basis must be nonempty with positive moduli")]
     InvalidModulus,
     #[error(
         "the Diamond input-injection ring dimension, input count, and digit count must be positive"
@@ -93,10 +92,11 @@ pub struct DiamondInputInjector {
 
 impl DiamondInputConfig {
     pub fn validate(&self) -> Result<(), DiamondInputConfigError> {
-        if self.modulus <= BigInt::from(0) {
+        if self.crt_moduli.is_empty() || self.crt_moduli.contains(&0) {
             return Err(DiamondInputConfigError::InvalidModulus);
         }
-        if self.ring_dimension == 0 || self.input_count == 0 || self.digit_count == 0 {
+        if !self.ring_dimension.is_power_of_two() || self.input_count == 0 || self.digit_count == 0
+        {
             return Err(DiamondInputConfigError::ZeroDimension);
         }
         if self.batch_bits == 0 || self.batch_bits >= usize::BITS as usize {
@@ -122,7 +122,10 @@ impl DiamondInputConfig {
     }
 
     pub fn ring(&self) -> Ring {
-        Ring::new(self.modulus.clone(), self.ring_dimension)
+        Ring::from_crt_moduli(
+            self.crt_moduli.iter().copied().map(IntExpr::from).collect(),
+            self.ring_dimension,
+        )
     }
 
     pub fn witness_size(&self) -> Result<usize, DiamondInputConfigError> {
@@ -170,8 +173,7 @@ impl DiamondInputConfig {
 
     pub fn params(&self) -> DiamondInputParams {
         DiamondInputParams {
-            modulus: self.modulus.clone().into(),
-            ring_dimension: self.ring_dimension.into(),
+            ring: self.ring(),
             input_count: self.input_count.into(),
             digit_base: self.digit_base.into(),
             batch_bits: self.batch_bits.into(),
@@ -187,7 +189,7 @@ impl DiamondInputConfig {
 
 impl DiamondInputParams {
     pub fn ring(&self) -> Ring {
-        Ring::new(self.modulus.clone(), self.ring_dimension.clone())
+        self.ring.clone()
     }
 
     pub fn witness_size(&self) -> IntExpr {
@@ -371,7 +373,7 @@ mod tests {
 
     fn config() -> DiamondInputConfig {
         DiamondInputConfig {
-            modulus: BigInt::from(257),
+            crt_moduli: vec![257],
             ring_dimension: 8,
             input_count: 2,
             digit_base: 2,
@@ -395,7 +397,11 @@ mod tests {
         assert_eq!(preprocessing.transitions.count(), &IntExpr::constant(12));
         assert_eq!(preprocessing.final_trapdoors.count(), &IntExpr::constant(3));
         let transition = preprocessing.transitions.at(11);
-        assert!(matches!(transition.value_handle().wire_type(), WireType::Preimage { .. }));
+        assert!(matches!(
+            transition.value_handle().wire_type(),
+            WireType::Preimage { bound_domain, .. }
+                if *bound_domain == mxx_ir_core::types::CoefficientBoundDomain::Global
+        ));
         let transition_product = transition.clone().mul_small_rhs(preprocessing.p.clone());
 
         let built = DslContext::new("diamond-input-preprocessing")
@@ -407,7 +413,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = built.validate(&ParamEnv::default()).unwrap();
+        let validated = built
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
         let nodes =
             validated.source.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
         assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::PreimageSample { .. })));
@@ -439,7 +447,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = graph.validate(&ParamEnv::default()).unwrap();
+        let validated = graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
         assert!(
             validated
                 .source

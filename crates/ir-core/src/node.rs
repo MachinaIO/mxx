@@ -1,6 +1,7 @@
 use crate::{
-    artifact::{ArtifactConfidentiality, ProductionId},
+    artifact::{ArtifactAvailability, ProductionId},
     expr::{IntExpr, RealExpr},
+    ring::RingRef,
     types::WireType,
 };
 use num_bigint::{BigInt, BigUint};
@@ -14,7 +15,7 @@ pub enum HashTagComponent {
     Integer(IntExpr),
     Decimal(IntExpr),
     U64Le(IntExpr),
-    /// Index into HashSample arguments, including the key at index zero.
+    /// Index into hash sampler arguments, including the key at index zero.
     Operand(usize),
 }
 
@@ -71,29 +72,42 @@ pub enum NodeKind {
     RingAutomorphism {
         index: IntExpr,
     },
+    /// Multiplies every entry by `X^k` in the negacyclic ring, for the
+    /// runtime integer `k` of argument 1 (any sign, taken modulo `2n`).
+    MultiplyMonomial,
     /// Coefficientwise exact nearest scaling into a divisor ring.
     ModulusSwitch {
-        modulus: IntExpr,
+        destination: RingRef,
     },
     /// Ordinary coefficient-ring reduction, preserving small integer values.
     ModulusReduce {
-        modulus: IntExpr,
+        destination: RingRef,
     },
-    /// Re-encodes centered residues from a single native CRT limb.
+    /// Re-encodes the centered coefficients of a source CRT basis in another ring.
     CenteredRebase {
-        modulus: IntExpr,
+        destination: RingRef,
+    },
+    /// Divides centered coefficients by a positive compile-time divisor and rounds
+    /// to the nearest integer, preserving the matrix ring and shape.
+    CenteredRoundDivide {
+        divisor: IntExpr,
     },
     /// Fused centered CRT digit extension into a multiple modulus.
     RnsModUp {
-        modulus: IntExpr,
-        source_moduli: Vec<u64>,
+        destination: RingRef,
         digit_size: usize,
         normalize: bool,
     },
     /// Fused BGV plaintext-preserving removal of the auxiliary CRT basis.
     RnsModDown {
-        modulus: IntExpr,
-        source_moduli: Vec<u64>,
+        destination: RingRef,
+        plaintext_modulus: IntExpr,
+    },
+    /// Exact block CRT modulus switching. `source_moduli` is the complete
+    /// source basis; `modulus` is the product of a strict non-empty subset.
+    /// The plaintext modulus is the positive correction factor `t`.
+    BlockModSwitch {
+        destination: RingRef,
         plaintext_modulus: IntExpr,
     },
     Transpose,
@@ -130,6 +144,16 @@ pub enum NodeKind {
         base: Option<IntExpr>,
         #[serde(default)]
         digit_count: Option<IntExpr>,
+    },
+    /// `count` integers uniform on `[0, modulus)` for a power-of-two
+    /// `modulus`, keyed like `HashSample`: integer `i` is the first
+    /// `log2(modulus)` bits of the digest stream of coefficient `i` of entry
+    /// `(0, 0)`, so no candidate is ever rejected.
+    HashIntFamily {
+        count: IntExpr,
+        modulus: IntExpr,
+        tag_prefix: Vec<u8>,
+        tag_components: Vec<HashTagComponent>,
     },
     TrapdoorSample {
         matrix_type: crate::types::MatrixType,
@@ -183,6 +207,13 @@ pub enum NodeKind {
     PolynomialValues {
         evaluation: bool,
     },
+    /// The integer product of a row-major matrix family (argument 0) with
+    /// a vector family (argument 1). The vector length fixes the inner
+    /// dimension: `M v` with `out[i] = sum_j M[i, j] v[j]`, or with
+    /// `transpose` `v^T M` with `out[j] = sum_i v[i] M[i, j]`.
+    IntMatrixVectorProduct {
+        transpose: bool,
+    },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),
     SequentialLoop(SequentialLoop),
@@ -202,7 +233,7 @@ pub enum NodeKind {
 pub struct ArtifactInput {
     pub production_id: ProductionId,
     pub artifact_name: String,
-    pub confidentiality: ArtifactConfidentiality,
+    pub availability: ArtifactAvailability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

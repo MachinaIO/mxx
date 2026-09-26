@@ -524,7 +524,7 @@ mod tests {
         circuit::PolyCircuit,
         test_utils::{diagonal_matrix, execute_circuit_with_shape},
     };
-    use mxx_primitives::{
+    use mxx_backends::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly,

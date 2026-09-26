@@ -25,7 +25,7 @@ pub enum CheckError {
     NotTopological { node: NodeId, dependency: NodeId },
     #[error("graph output {name} refers to unavailable node {node:?}")]
     InvalidOutput { name: String, node: NodeId },
-    #[error("matrix modulus or ring dimension mismatch")]
+    #[error("matrix CRT basis or ring dimension mismatch")]
     RingMismatch,
     #[error("matrix shape mismatch: left {left:?}, right {right:?}")]
     ShapeMismatch { left: ConcreteMatrixType, right: ConcreteMatrixType },
@@ -55,7 +55,7 @@ pub fn check_same_ring(
     left: &ConcreteMatrixType,
     right: &ConcreteMatrixType,
 ) -> Result<(), CheckError> {
-    if left.modulus != right.modulus || left.ring_dimension != right.ring_dimension {
+    if left.ring != right.ring {
         return Err(CheckError::RingMismatch);
     }
     Ok(())
@@ -86,10 +86,5 @@ pub fn multiplication_type(
     } else {
         return Err(CheckError::ShapeMismatch { left: left.clone(), right: right.clone() });
     };
-    Ok(ConcreteMatrixType {
-        modulus: left.modulus.clone(),
-        ring_dimension: left.ring_dimension,
-        rows,
-        columns,
-    })
+    Ok(ConcreteMatrixType { ring: left.ring.clone(), rows, columns })
 }

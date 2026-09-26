@@ -16,26 +16,62 @@ use crate::{
     },
     test_utils::{build_circuit_graph, diagonal_matrix},
 };
-use mxx_dsl::{DslContext, Family, Ring, parallel};
-use mxx_ir_core::{ParamEnv, node::NodeKind};
-use mxx_primitives::{
+use mxx_backends::{
+    GpuRuntime, RuntimeValue,
+    artifact::MemoryArtifactStore,
+    backend::{poly::gpu::gpu_backend, poly_gpu::GpuDcrtBackend},
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
         dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
     },
 };
-use mxx_runtime::{
-    RuntimeValue,
-    artifact::MemoryArtifactStore,
-    backend::{poly::gpu::gpu_backend, poly_gpu::GpuFleetMatrix},
-    execute,
-    transcript::SamplingMode,
-};
-use num_bigint::{BigInt, BigUint, Sign};
+use mxx_dsl::{DslContext, Family, parallel};
+use mxx_ir_core::{ParamEnv, ValidatedGraph, node::NodeKind};
+use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::{collections::BTreeMap, sync::Arc};
+
+fn prepare_and_run(
+    graph: ValidatedGraph,
+    backend: GpuDcrtBackend,
+    inputs: BTreeMap<String, RuntimeValue>,
+    store: &mut MemoryArtifactStore,
+) -> BTreeMap<String, DCRTPolyMatrix> {
+    let mut runtime = GpuRuntime::new(backend).expect("construct GPU gadget runtime");
+    let mut plan = runtime.plan(graph, &inputs).expect("prepare GPU gadget graph");
+    let launches_before = plan.compiled_launch_count();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, inputs, store, [0; 32])
+        .expect("execute GPU gadget graph");
+    let outputs = result
+        .output_names()
+        .map(|name| {
+            let output = result.output(name).expect("named GPU gadget output");
+            let matrix =
+                runtime.download_matrix_output(&output).expect("download GPU gadget matrix");
+            (name.to_owned(), matrix)
+        })
+        .collect();
+    drop(result);
+    assert!(
+        plan.compiled_launch_count() > launches_before,
+        "GPU gadget execution must submit the compiled production path"
+    );
+    outputs
+}
+
+fn gpu_input(params: &GpuDCRTPolyParams, value: &DCRTPolyMatrix) -> RuntimeValue {
+    let RuntimeValue::Matrix(typed) = RuntimeValue::matrix(value.clone()) else {
+        unreachable!("CPU matrix constructor returns a matrix")
+    };
+    RuntimeValue::gpu_matrix(
+        typed.wire_type().clone(),
+        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(params, value)),
+    )
+    .expect("GPU input matches its concrete matrix type")
+}
 
 #[test]
 #[serial_test::serial]
@@ -60,32 +96,17 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
         vec![DCRTPoly::from_usize_to_constant(&parameters, 11)],
     );
     let expected = lhs.clone() + &rhs;
-    let mut backend = gpu_backend([gpu_parameters.clone()]);
-    let result = execute(
-        &graph,
-        &mut backend,
+    let backend = gpu_backend([gpu_parameters.clone()]);
+    let result = prepare_and_run(
+        graph,
+        backend,
         BTreeMap::from([
-            (
-                "input-0".to_owned(),
-                RuntimeValue::matrix(GpuFleetMatrix::from_matrix(
-                    GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &lhs),
-                )),
-            ),
-            (
-                "input-1".to_owned(),
-                RuntimeValue::matrix(GpuFleetMatrix::from_matrix(
-                    GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &rhs),
-                )),
-            ),
+            ("input-0".to_owned(), gpu_input(&gpu_parameters, &lhs)),
+            ("input-1".to_owned(), gpu_input(&gpu_parameters, &rhs)),
         ]),
         &mut MemoryArtifactStore::default(),
-        SamplingMode::Fresh,
-    )
-    .expect("execute gadget graph on the GPU runtime backend");
-    let RuntimeValue::Matrix(actual) = &result.outputs["output-0"] else {
-        panic!("gadget output must be a matrix")
-    };
-    assert_eq!(backend.gather_matrix_for_host(actual).unwrap().to_cpu_matrix(), expected);
+    );
+    assert_eq!(result["output-0"], expected);
 }
 
 #[test]
@@ -95,8 +116,7 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
         GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
-    let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
-    let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+    let ring = crate::ring_from_params(&parameters);
     let families = (0..4)
         .map(|_| Family::pack(vec![ring.identity(1), ring.zero((1, 1))]).expect("matrix family"))
         .collect::<Vec<_>>();
@@ -115,31 +135,18 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
         .expect("second output")
         .build()
         .expect("build GPU batch graph");
-    let graph = built.validate(&ParamEnv::default()).expect("validate GPU batch graph");
-    let mut backend = gpu_backend([gpu_parameters]);
-    let execution = execute(
-        &graph,
-        &mut backend,
-        BTreeMap::new(),
-        &mut MemoryArtifactStore::default(),
-        SamplingMode::Fresh,
-    )
-    .expect("execute batched matrix arithmetic on the GPU runtime backend");
-    let RuntimeValue::Matrix(first) = &execution.outputs["first"] else {
-        panic!("first batch output must be a matrix")
-    };
-    let RuntimeValue::Matrix(second) = &execution.outputs["second"] else {
-        panic!("second batch output must be a matrix")
-    };
+    let graph = built
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .expect("validate GPU batch graph");
+    let backend = gpu_backend([gpu_parameters.clone()]);
+    let execution =
+        prepare_and_run(graph, backend, BTreeMap::new(), &mut MemoryArtifactStore::default());
     let four = DCRTPolyMatrix::from_poly_vec_row(
         &parameters,
         vec![DCRTPoly::from_usize_to_constant(&parameters, 4)],
     );
-    assert_eq!(backend.gather_matrix_for_host(first).unwrap().to_cpu_matrix(), four);
-    assert_eq!(
-        backend.gather_matrix_for_host(second).unwrap().to_cpu_matrix(),
-        DCRTPolyMatrix::zero(&parameters, 1, 1)
-    );
+    assert_eq!(execution["first"], four);
+    assert_eq!(execution["second"], DCRTPolyMatrix::zero(&parameters, 1, 1));
 }
 
 #[test]
@@ -196,29 +203,13 @@ fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
     let runtime_inputs = cpu_inputs
         .iter()
         .enumerate()
-        .map(|(index, input)| {
-            (
-                format!("input-{index}"),
-                RuntimeValue::matrix(GpuFleetMatrix::from_matrix(
-                    GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, input),
-                )),
-            )
-        })
+        .map(|(index, input)| (format!("input-{index}"), gpu_input(&gpu_parameters, input)))
         .collect();
-    let mut backend = gpu_backend([gpu_parameters]);
-    let execution = execute(
-        &graph,
-        &mut backend,
-        runtime_inputs,
-        &mut MemoryArtifactStore::default(),
-        SamplingMode::Fresh,
-    )
-    .expect("execute packed nested-RNS addition on the GPU runtime backend");
+    let backend = gpu_backend([gpu_parameters.clone()]);
+    let execution =
+        prepare_and_run(graph, backend, runtime_inputs, &mut MemoryArtifactStore::default());
     for (index, expected) in expected.into_iter().enumerate() {
-        let RuntimeValue::Matrix(actual) = &execution.outputs[&format!("output-{index}")] else {
-            panic!("packed nested-RNS output must be a matrix")
-        };
-        assert_eq!(backend.gather_matrix_for_host(actual).unwrap().to_cpu_matrix(), expected);
+        assert_eq!(execution[&format!("output-{index}")], expected);
     }
 }
 
@@ -311,32 +302,13 @@ fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
     let runtime_inputs = cpu_inputs
         .iter()
         .enumerate()
-        .map(|(index, input)| {
-            (
-                format!("input-{index}"),
-                RuntimeValue::matrix(GpuFleetMatrix::from_matrix(
-                    GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, input),
-                )),
-            )
-        })
+        .map(|(index, input)| (format!("input-{index}"), gpu_input(&gpu_parameters, input)))
         .collect::<BTreeMap<_, _>>();
-    let mut backend = gpu_backend([gpu_parameters]);
-    let execution = execute(
-        &graph,
-        &mut backend,
-        runtime_inputs,
-        &mut MemoryArtifactStore::default(),
-        SamplingMode::Fresh,
-    )
-    .expect("execute Ring-GSW graph on the GPU runtime backend");
+    let backend = gpu_backend([gpu_parameters.clone()]);
+    let execution =
+        prepare_and_run(graph, backend, runtime_inputs, &mut MemoryArtifactStore::default());
     let outputs = (0..circuit.output_gate_ids().len())
-        .map(|index| {
-            let RuntimeValue::Matrix(output) = &execution.outputs[&format!("output-{index}")]
-            else {
-                panic!("Ring-GSW output must be a matrix")
-            };
-            backend.gather_matrix_for_host(output).unwrap().to_cpu_matrix()
-        })
+        .map(|index| execution[&format!("output-{index}")].clone())
         .collect::<Vec<_>>();
 
     let output_width = 2 * context.width();

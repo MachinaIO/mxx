@@ -222,25 +222,25 @@ impl BggPublicKeySampler {
 mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
-    use mxx_dsl::DslContext;
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
-    use mxx_primitives::{
+    use mxx_backends::{
+        RuntimeValue,
         matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
-    use mxx_runtime::RuntimeValue;
+    use mxx_dsl::DslContext;
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
     #[test]
     fn multiplication_is_decompose_then_multiply() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let lhs = BggPublicKeyWire { matrix: ring.input("lhs", (2, 4)), reveal_plaintext: true };
         let rhs = BggPublicKeyWire { matrix: ring.input("rhs", (2, 4)), reveal_plaintext: true };
         let compiler = BggPublicKeyCompiler { ring, base: 2.into(), digit_count: 2.into() };
         let output = compiler.mul(&lhs, &rhs);
         let built = DslContext::new("bgg-public-key-mul")
-            .public_output("output", output.matrix)
+            .transferred_output("output", output.matrix)
             .expect("output")
             .build()
             .expect("build");
@@ -251,12 +251,17 @@ mod tests {
             1
         );
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
-        mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid graph");
+        mxx_ir_core::validate(
+            &built.graph,
+            &ParamEnv::default(),
+            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+        )
+        .expect("valid graph");
     }
 
     #[test]
     fn reveal_metadata_matches_the_public_key_contract() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let compiler =
             BggPublicKeyCompiler { ring: ring.clone(), base: 2.into(), digit_count: 2.into() };
         for left_revealed in [false, true] {
@@ -288,7 +293,7 @@ mod tests {
 
     #[test]
     fn explicit_materialization_reconstructs_output_from_typed_preimage() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let input =
             BggPublicKeyWire { matrix: ring.input("input-cached", (2, 4)), reveal_plaintext: true };
         let decomposition = ring.preimage_input("cached-decomposition", (4, 4), 7);
@@ -307,10 +312,7 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
-        let ring = Ring::new(
-            BigInt::from(parameters.modulus().as_ref().clone()),
-            parameters.ring_dimension() as usize,
-        );
+        let ring = crate::ring_from_params(&parameters);
         let compiler = BggPublicKeyCompiler {
             ring: ring.clone(),
             base: BigInt::from(1u64 << parameters.base_bits()).into(),

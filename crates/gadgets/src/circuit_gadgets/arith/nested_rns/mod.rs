@@ -10,9 +10,6 @@
 //! artifacts. Reconstruction adds one explicit transfer per active q-level, and convolution adds
 //! compact `RepeatedLanes` transfers; coefficient rotations remain artifact-free rotations.
 
-#[cfg(feature = "gpu")]
-mod gpu;
-
 mod context;
 mod decomposed_mul;
 mod encoding;

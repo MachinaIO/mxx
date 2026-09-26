@@ -13,12 +13,12 @@ pub enum SpecificationError {
 
 #[derive(Clone)]
 pub struct IdealSpec {
-    pub graph: Graph,
+    graph: Graph,
 }
 
 #[derive(Clone)]
 pub struct PurePredicateSpec {
-    pub graph: Graph,
+    graph: Graph,
 }
 
 fn require_sampler_free(graph: &Graph) -> Result<(), SpecificationError> {
@@ -30,6 +30,7 @@ fn require_sampler_free(graph: &Graph) -> Result<(), SpecificationError> {
                     NodeKind::UniformIntervalSample { .. } |
                     NodeKind::GaussianSample { .. } |
                     NodeKind::HashSample { .. } |
+                    NodeKind::HashIntFamily { .. } |
                     NodeKind::TrapdoorSample { .. } |
                     NodeKind::PreimageSample { .. }
             )
@@ -45,6 +46,10 @@ impl IdealSpec {
     pub fn new(graph: Graph) -> Result<Self, SpecificationError> {
         require_sampler_free(&graph)?;
         Ok(Self { graph })
+    }
+
+    pub fn graph(&self) -> &Graph {
+        &self.graph
     }
 }
 
@@ -63,5 +68,9 @@ impl PurePredicateSpec {
             return Err(SpecificationError::PredicateOutput);
         }
         Ok(Self { graph })
+    }
+
+    pub fn graph(&self) -> &Graph {
+        &self.graph
     }
 }

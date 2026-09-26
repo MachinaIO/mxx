@@ -13,19 +13,20 @@ use crate::{
         conv_mul::{NegacyclicConvolutionContext, RingGswConvolution},
     },
 };
-use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph, parallel, select};
-use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
-use mxx_primitives::{
+use mxx_backends::{
+    ExecutionConfig, RuntimeValue,
+    artifact::MemoryArtifactStore,
+    backend::poly::cpu_backend,
+    execute,
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
-};
-use mxx_runtime::{
-    RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
     transcript::SamplingMode,
 };
+use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph, parallel, select};
+use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
 use num_bigint::{BigInt, BigUint};
 use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
 
@@ -373,6 +374,17 @@ pub fn execute_circuit_with_shape(
 ) -> Vec<DCRTPolyMatrix> {
     assert!(inputs.iter().all(|input| input.size() == shape), "runtime input shape mismatch");
     let graph = build_circuit_graph(name, parameters, circuit, inputs.len(), shape);
+    // A circuit input that no output reads is not part of the built graph.
+    let declared = graph
+        .source
+        .root_scope()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            mxx_ir_core::node::NodeKind::Input { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     let result = execute(
         &graph,
         &mut cpu_backend([parameters.clone()]),
@@ -380,9 +392,11 @@ pub fn execute_circuit_with_shape(
             .iter()
             .enumerate()
             .map(|(index, value)| (format!("input-{index}"), RuntimeValue::matrix(value.clone())))
+            .filter(|(name, _)| declared.contains(name))
             .collect::<BTreeMap<_, _>>(),
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig::default(),
     )
     .expect("execute runtime unit-test graph");
     (0..circuit.output_gate_ids().len())
@@ -390,7 +404,7 @@ pub fn execute_circuit_with_shape(
             let RuntimeValue::Matrix(value) = &result.outputs[&format!("output-{index}")] else {
                 panic!("gadget output must be a matrix")
             };
-            value.as_ref().clone()
+            value.as_cpu_full().expect("CPU gadget matrix").clone()
         })
         .collect()
 }
@@ -408,10 +422,7 @@ pub(crate) fn build_circuit_graph(
         "each concrete input must correspond to one circuit input wire"
     );
     assert_eq!(shape.0, shape.1, "runtime test wires use square matrices");
-    let ring = Ring::new(
-        BigInt::from(parameters.modulus().as_ref().clone()),
-        parameters.ring_dimension() as usize,
-    );
+    let ring = crate::ring_from_params(&parameters);
     let input_wires = (0..input_count)
         .map(|index| ring.input(format!("input-{index}"), shape))
         .collect::<Vec<_>>();
@@ -425,13 +436,13 @@ pub(crate) fn build_circuit_graph(
     let mut context = DslContext::new(name);
     for (index, output) in outputs.into_iter().enumerate() {
         context = context
-            .public_output(format!("output-{index}"), output)
+            .transferred_output(format!("output-{index}"), output)
             .expect("output names are unique");
     }
     context
         .build()
         .expect("build runtime unit-test graph")
-        .validate(&ParamEnv::default())
+        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
         .expect("validate runtime unit-test graph")
 }
 

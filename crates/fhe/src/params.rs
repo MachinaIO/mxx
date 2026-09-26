@@ -1,7 +1,7 @@
 use crate::FheError;
+use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use mxx_dsl::{Mat, Ring};
 use mxx_ir_core::{IntExpr, ParamEnv, node::SampleRange};
-use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 
@@ -66,10 +66,7 @@ impl FheCommonParams {
     }
 
     pub(crate) fn ring(&self) -> Ring {
-        Ring::new(
-            IntExpr::constant(BigInt::from(self.ring.modulus().as_ref().clone())),
-            self.ring.ring_dimension(),
-        )
+        crate::utils::ring(&self.ring)
     }
 
     pub(crate) fn sample_secret(&self) -> Mat {
@@ -81,11 +78,7 @@ impl FheCommonParams {
     }
 
     pub(crate) fn gaussian(&self, parameters: &DCRTPolyParams, rows: usize, columns: usize) -> Mat {
-        Ring::new(
-            IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            parameters.ring_dimension(),
-        )
-        .gaussian(
+        crate::utils::ring(parameters).gaussian(
             (rows, columns),
             mxx_ir_core::RealExpr::from_f64_exact(self.error_sigma)
                 .expect("validated finite sigma"),

@@ -4,8 +4,8 @@
 
 use mxx_ir_core::{
     CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, Graph, GraphOutput,
-    IntExpr, NodeHandle, ParamEnv, RealExpr, SubgraphHandle, ValueHandle,
-    artifact::{ArtifactConfidentiality, ProductionId},
+    IntExpr, NodeHandle, ParamEnv, RealExpr, RingExpr, RingRef, SubgraphHandle, ValueHandle,
+    artifact::ProductionId,
     graph::with_new_construction_scope,
     node::{
         ArtifactInput, ConstantMatrix, HashTagComponent, HashVariant, IndexRange, MatrixBinaryOp,
@@ -36,8 +36,9 @@ use thiserror::Error;
 
 pub use mxx_ir_core::{
     Rational,
-    artifact::ArtifactConfidentiality as Confidentiality,
+    artifact::ArtifactAvailability,
     protocol::{IdealSpec, PurePredicateSpec},
+    types::CoefficientBoundDomain,
 };
 #[cfg(test)]
 mod bundle_tests;
@@ -45,6 +46,24 @@ mod bundle_tests;
 mod protocol_tests;
 #[cfg(test)]
 mod test_protocol;
+
+#[cfg(test)]
+fn test_resolve_basis(
+    ring_dimension: u32,
+    crt_depth: usize,
+    crt_bits: usize,
+    moduli: Option<Vec<u64>>,
+) -> Result<Vec<u64>, String> {
+    let moduli = moduli.ok_or("DSL tests use explicit CRT bases")?;
+    if !ring_dimension.is_power_of_two() ||
+        moduli.len() != crt_depth ||
+        moduli.iter().map(|q| q.checked_ilog2().map_or(0, |bits| bits as usize + 1)).max() !=
+            Some(crt_bits)
+    {
+        return Err("CRT metadata mismatch".into());
+    }
+    Ok(moduli)
+}
 
 thread_local! {
     /// Lexical loop depth while closure bodies are constructed. Using the depth as the binder
@@ -140,12 +159,14 @@ pub struct BoolType;
 pub struct SmallMatrixType {
     pub matrix: MatrixType,
     pub max_coefficient_bound: IntExpr,
+    pub bound_domain: CoefficientBoundDomain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct PreimageType {
     pub matrix: MatrixType,
     pub max_coefficient_bound: IntExpr,
+    pub bound_domain: CoefficientBoundDomain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -165,8 +186,7 @@ pub struct FamilyType<S> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Ring {
-    modulus: IntExpr,
-    ring_dimension: IntExpr,
+    reference: RingRef,
 }
 
 impl Ring {
@@ -184,18 +204,74 @@ impl Ring {
         Bool { value: node.output(0).expect("boolean input") }
     }
 
-    pub fn new(modulus: impl Into<IntExpr>, ring_dimension: impl Into<IntExpr>) -> Self {
-        Self { modulus: modulus.into(), ring_dimension: ring_dimension.into() }
+    pub fn new(
+        crt_bits: impl Into<IntExpr>,
+        crt_depth: impl Into<IntExpr>,
+        ring_dimension: u32,
+    ) -> Self {
+        Self {
+            reference: RingRef::new(RingExpr::Generated {
+                crt_bits: crt_bits.into(),
+                crt_depth: crt_depth.into(),
+                ring_dimension,
+            }),
+        }
+    }
+
+    pub fn from_crt_moduli(moduli: Vec<IntExpr>, ring_dimension: u32) -> Self {
+        Self { reference: RingRef::new(RingExpr::Explicit { crt_moduli: moduli, ring_dimension }) }
+    }
+
+    pub fn from_ref(reference: RingRef) -> Self {
+        Self { reference }
+    }
+
+    pub fn slice_crt(&self, start: impl Into<IntExpr>, end: impl Into<IntExpr>) -> Self {
+        Self::from_ref(RingRef::new(RingExpr::Slice {
+            source: self.reference.clone(),
+            start: start.into(),
+            end: end.into(),
+        }))
+    }
+
+    pub fn prefix(&self, end: impl Into<IntExpr>) -> Self {
+        self.slice_crt(0, end)
+    }
+
+    pub fn select_crt(&self, indices: Vec<IntExpr>) -> Self {
+        Self::from_ref(RingRef::new(RingExpr::Select { source: self.reference.clone(), indices }))
+    }
+
+    pub fn concat_crt(&self, other: &Self) -> Self {
+        Self::from_ref(RingRef::new(RingExpr::Concat {
+            left: self.reference.clone(),
+            right: other.reference.clone(),
+        }))
+    }
+
+    pub fn modulus(&self) -> IntExpr {
+        IntExpr::RingModulus(self.reference.clone())
+    }
+
+    pub fn crt_depth(&self) -> IntExpr {
+        IntExpr::RingCrtDepth(self.reference.clone())
+    }
+
+    pub fn crt_modulus(&self, index: impl Into<IntExpr>) -> IntExpr {
+        IntExpr::RingCrtModulus { ring: self.reference.clone(), index: Box::new(index.into()) }
+    }
+
+    pub fn ring_dimension(&self) -> u32 {
+        self.reference.ring_dimension()
+    }
+
+    pub fn as_ref(&self) -> &RingRef {
+        &self.reference
     }
 
     pub fn matrix_type(&self, shape: impl IntoShape) -> MatrixType {
         let shape = shape.into_shape();
-        MatrixType {
-            modulus: self.modulus.clone(),
-            ring_dimension: self.ring_dimension.clone(),
-            rows: shape.rows,
-            columns: shape.columns,
-        }
+        MatrixType { ring: self.reference.clone(), rows: shape.rows, columns: shape.columns }
     }
 
     #[track_caller]
@@ -209,13 +285,13 @@ impl Ring {
         production_id: ProductionId,
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
     ) -> Mat {
         let artifact_name = artifact_name.into();
         Mat::source_input(
             artifact_name.clone(),
             self.matrix_type(shape),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name, availability }),
         )
     }
 
@@ -226,10 +302,27 @@ impl Ring {
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
     ) -> SmallMatrix {
-        SmallMatrix::source_input(
+        self.small_matrix_input_with_domain(
+            name,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_input_with_domain(
+        &self,
+        name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+    ) -> SmallMatrix {
+        SmallMatrix::source_input_with_domain(
             name.into(),
             self.matrix_type(shape),
             max_coefficient_bound.into(),
+            bound_domain,
             None,
         )
     }
@@ -241,14 +334,35 @@ impl Ring {
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
+    ) -> SmallMatrix {
+        self.small_matrix_artifact_input_with_domain(
+            production_id,
+            artifact_name,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+            availability,
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_artifact_input_with_domain(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+        availability: ArtifactAvailability,
     ) -> SmallMatrix {
         let artifact_name = artifact_name.into();
-        SmallMatrix::source_input(
+        SmallMatrix::source_input_with_domain(
             artifact_name.clone(),
             self.matrix_type(shape),
             max_coefficient_bound.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            bound_domain,
+            Some(ArtifactInput { production_id, artifact_name, availability }),
         )
     }
 
@@ -259,10 +373,27 @@ impl Ring {
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
     ) -> Preimage {
-        Preimage::source_input(
+        self.preimage_input_with_domain(
+            name,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+        )
+    }
+
+    #[track_caller]
+    pub fn preimage_input_with_domain(
+        &self,
+        name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+    ) -> Preimage {
+        Preimage::source_input_with_domain(
             name.into(),
             self.matrix_type(shape),
             max_coefficient_bound.into(),
+            bound_domain,
             None,
         )
     }
@@ -274,29 +405,36 @@ impl Ring {
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
+    ) -> Preimage {
+        self.preimage_artifact_input_with_domain(
+            production_id,
+            artifact_name,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+            availability,
+        )
+    }
+
+    #[track_caller]
+    pub fn preimage_artifact_input_with_domain(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+        availability: ArtifactAvailability,
     ) -> Preimage {
         let artifact_name = artifact_name.into();
-        let matrix_type = self.matrix_type(shape);
-        let max_coefficient_bound = max_coefficient_bound.into();
-        let wire_type = WireType::Preimage {
-            matrix: matrix_type.clone(),
-            max_coefficient_bound: max_coefficient_bound.clone(),
-        };
-        let node = NodeHandle::new(
-            NodeKind::Input {
-                name: artifact_name.clone(),
-                wire_type: wire_type.clone(),
-                artifact: Some(ArtifactInput { production_id, artifact_name, confidentiality }),
-            },
-            Vec::new(),
-            vec![wire_type],
-        );
-        Preimage {
-            value: node.output(0).expect("preimage artifact input"),
-            matrix_type,
-            max_coefficient_bound,
-        }
+        Preimage::source_input_with_domain(
+            artifact_name.clone(),
+            self.matrix_type(shape),
+            max_coefficient_bound.into(),
+            bound_domain,
+            Some(ArtifactInput { production_id, artifact_name, availability }),
+        )
     }
 
     #[track_caller]
@@ -328,7 +466,7 @@ impl Ring {
             Some(ArtifactInput {
                 production_id: production_id.clone(),
                 artifact_name: public_artifact_name,
-                confidentiality: ArtifactConfidentiality::Public,
+                availability: ArtifactAvailability::Transferred,
             }),
         );
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
@@ -346,7 +484,7 @@ impl Ring {
                 artifact: Some(ArtifactInput {
                     production_id,
                     artifact_name: trapdoor_artifact_name,
-                    confidentiality: ArtifactConfidentiality::Private,
+                    availability: ArtifactAvailability::Transferred,
                 }),
             },
             Vec::new(),
@@ -396,7 +534,7 @@ impl Ring {
             Some(ArtifactInput {
                 production_id: production_id.clone(),
                 artifact_name: public_artifact_name,
-                confidentiality: ArtifactConfidentiality::Public,
+                availability: ArtifactAvailability::Transferred,
             }),
         );
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
@@ -415,7 +553,7 @@ impl Ring {
             Some(ArtifactInput {
                 production_id,
                 artifact_name: trapdoor_artifact_name,
-                confidentiality: ArtifactConfidentiality::Private,
+                availability: ArtifactAvailability::Transferred,
             }),
         )
     }
@@ -444,12 +582,31 @@ impl Ring {
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
     ) -> Family<SmallMatrix> {
+        self.small_matrix_input_family_with_domain(
+            name,
+            count,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_input_family_with_domain(
+        &self,
+        name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+    ) -> Family<SmallMatrix> {
         Family::<SmallMatrix>::source_input(
             name.into(),
-            SmallMatrix::source_input(
+            SmallMatrix::source_input_with_domain(
                 "__small-matrix-family-element".to_owned(),
                 self.matrix_type(shape),
                 max_coefficient_bound.into(),
+                bound_domain,
                 None,
             ),
             count.into(),
@@ -465,14 +622,33 @@ impl Ring {
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
     ) -> Family<Preimage> {
+        self.preimage_input_family_with_domain(
+            name,
+            count,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+        )
+    }
+
+    #[track_caller]
+    pub fn preimage_input_family_with_domain(
+        &self,
+        name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+    ) -> Family<Preimage> {
         let matrix_type = self.matrix_type(shape);
         let max_coefficient_bound = max_coefficient_bound.into();
         Family::<Preimage>::source_input(
             name.into(),
-            Preimage::source_input(
+            Preimage::source_input_with_domain(
                 "__preimage-family-element".to_owned(),
                 matrix_type,
                 max_coefficient_bound,
+                bound_domain,
                 None,
             ),
             count.into(),
@@ -487,14 +663,14 @@ impl Ring {
         artifact_name: impl Into<String>,
         count: impl Into<IntExpr>,
         shape: impl IntoShape,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
     ) -> Family<Mat> {
         let artifact_name = artifact_name.into();
         Family::<Mat>::source_input(
             format!("artifact:{artifact_name}"),
             Mat::source_input("__family-element".to_owned(), self.matrix_type(shape), None),
             count.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name, availability }),
         )
     }
 
@@ -506,19 +682,42 @@ impl Ring {
         count: impl Into<IntExpr>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
+    ) -> Family<SmallMatrix> {
+        self.small_matrix_family_artifact_input_with_domain(
+            production_id,
+            artifact_name,
+            count,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+            availability,
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_family_artifact_input_with_domain(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+        availability: ArtifactAvailability,
     ) -> Family<SmallMatrix> {
         let artifact_name = artifact_name.into();
         Family::<SmallMatrix>::source_input(
             format!("artifact:{artifact_name}"),
-            SmallMatrix::source_input(
+            SmallMatrix::source_input_with_domain(
                 "__small-matrix-family-element".to_owned(),
                 self.matrix_type(shape),
                 max_coefficient_bound.into(),
+                bound_domain,
                 None,
             ),
             count.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name, availability }),
         )
     }
 
@@ -530,21 +729,44 @@ impl Ring {
         count: impl Into<IntExpr>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
+    ) -> Family<Preimage> {
+        self.preimage_family_artifact_input_with_domain(
+            production_id,
+            artifact_name,
+            count,
+            shape,
+            max_coefficient_bound,
+            CoefficientBoundDomain::Global,
+            availability,
+        )
+    }
+
+    #[track_caller]
+    pub fn preimage_family_artifact_input_with_domain(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        bound_domain: CoefficientBoundDomain,
+        availability: ArtifactAvailability,
     ) -> Family<Preimage> {
         let artifact_name = artifact_name.into();
         let matrix_type = self.matrix_type(shape);
         let max_coefficient_bound = max_coefficient_bound.into();
         Family::<Preimage>::source_input(
             format!("artifact:{artifact_name}"),
-            Preimage::source_input(
+            Preimage::source_input_with_domain(
                 "__preimage-family-element".to_owned(),
                 matrix_type,
                 max_coefficient_bound,
+                bound_domain,
                 None,
             ),
             count.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name, availability }),
         )
     }
 
@@ -732,17 +954,20 @@ impl Ring {
         let matrix_type = self.matrix_type(shape);
         let tag = tag.into();
         let base = base.expect("bounded hash requires a gadget base");
-        let max_coefficient_bound = if matches!(variant, HashVariant::SmallDecomposed) {
-            (base.clone() - IntExpr::constant(1)).canonicalize()
-        } else {
-            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2))).canonicalize()
-        };
+        let max_coefficient_bound =
+            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2)))
+                .canonicalize();
 
         let mut arguments = vec![key.value];
         arguments.extend(tag.dynamic);
         let wire_type = WireType::SmallMatrix {
             matrix: matrix_type.clone(),
             max_coefficient_bound: max_coefficient_bound.clone(),
+            bound_domain: if matches!(variant, HashVariant::SmallDecomposed) {
+                CoefficientBoundDomain::PerCrtLimb
+            } else {
+                CoefficientBoundDomain::Global
+            },
         };
         let node = NodeHandle::new(
             NodeKind::HashSample {
@@ -760,6 +985,11 @@ impl Ring {
             value: node.output(0).expect("bounded hash output"),
             matrix_type,
             max_coefficient_bound,
+            bound_domain: if matches!(variant, HashVariant::SmallDecomposed) {
+                CoefficientBoundDomain::PerCrtLimb
+            } else {
+                CoefficientBoundDomain::Global
+            },
         }
     }
 
@@ -842,6 +1072,54 @@ impl Ring {
         }
     }
 
+    /// Constructs a public gadget trapdoor whose fixed execution lowers to
+    /// gadget decomposition of the target.  Unlike [`Self::sample_trapdoor`],
+    /// this node has no secret sampling step and therefore is suitable for
+    /// protocols that expose the deterministic gadget relation directly.
+    #[track_caller]
+    pub fn gadget_trapdoor(
+        &self,
+        rows: impl Into<IntExpr>,
+        base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+    ) -> Trapdoor {
+        let rows = rows.into();
+        let base = base.into();
+        let preimage_max_coefficient_bound =
+            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2)))
+                .canonicalize();
+        let digit_count = digit_count.into();
+        let matrix_type = self.matrix_type(Shape {
+            rows: rows.clone(),
+            columns: (rows * digit_count.clone()).canonicalize(),
+        });
+        let node = NodeHandle::new(
+            NodeKind::GadgetTrapdoor { matrix_type: matrix_type.clone(), base: base.clone() },
+            Vec::new(),
+            vec![WireType::Trapdoor {
+                matrix: matrix_type.clone(),
+                sigma: RealExpr::FromInt(base.clone()),
+                gadget_base: base,
+                digit_count,
+                preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            }],
+        );
+        let public_node = NodeHandle::new(
+            NodeKind::TrapdoorPublic,
+            vec![node.output(0).expect("gadget trapdoor output")],
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
+        Trapdoor {
+            public: Mat {
+                value: public_node.output(0).expect("gadget trapdoor public output"),
+                matrix_type: matrix_type.clone(),
+            },
+            value: node.output(0).expect("gadget trapdoor output"),
+            matrix_type,
+            preimage_max_coefficient_bound,
+        }
+    }
+
     pub fn bytes_input(&self, name: impl Into<String>, length: impl Into<IntExpr>) -> Bytes {
         let name = name.into();
         let ty = WireType::Bytes { length: length.into() };
@@ -859,7 +1137,7 @@ impl Ring {
         production_id: ProductionId,
         artifact_name: impl Into<String>,
         length: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
     ) -> Bytes {
         let artifact_name = artifact_name.into();
         let ty = WireType::Bytes { length: length.into() };
@@ -867,7 +1145,7 @@ impl Ring {
             NodeKind::Input {
                 name: artifact_name.clone(),
                 wire_type: ty.clone(),
-                artifact: Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+                artifact: Some(ArtifactInput { production_id, artifact_name, availability }),
             },
             Vec::new(),
             vec![ty],
@@ -1033,6 +1311,19 @@ impl Mat {
         Self { value: node.output(0).expect("small RHS multiplication"), matrix_type: output_type }
     }
 
+    /// Multiplies every entry by `X^k` in the negacyclic ring for a runtime
+    /// integer `k`, taken modulo twice the ring dimension.
+    #[track_caller]
+    pub fn multiply_monomial(self, exponent: impl Into<Int>) -> Self {
+        let ty = self.matrix_type.clone();
+        let node = NodeHandle::new(
+            NodeKind::MultiplyMonomial,
+            vec![self.value, exponent.into().value],
+            vec![WireType::Matrix(ty.clone())],
+        );
+        Self { value: node.output(0).expect("monomial product"), matrix_type: ty }
+    }
+
     /// Applies the raw negacyclic automorphism `sigma_k: X -> X^k` entrywise.
     #[track_caller]
     pub fn ring_automorphism(self, index: impl Into<IntExpr>) -> Self {
@@ -1043,69 +1334,91 @@ impl Mat {
     /// Rounds each coefficient after scaling by destination/source modulus.
     /// The destination must be an odd divisor of the source modulus.
     #[track_caller]
-    pub fn modulus_switch(self, modulus: impl Into<IntExpr>) -> Self {
-        let modulus = modulus.into();
-        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
-        Self::from_node(NodeKind::ModulusSwitch { modulus }, vec![self], ty)
+    pub fn modulus_switch(self, destination: &Ring) -> Self {
+        let destination = destination.reference.clone();
+        let ty = MatrixType { ring: destination.clone(), ..self.matrix_type.clone() };
+        Self::from_node(NodeKind::ModulusSwitch { destination }, vec![self], ty)
     }
 
     /// Reduces coefficients into a divisor ring without scaling their values.
     #[track_caller]
-    pub fn reduce_modulus(self, modulus: impl Into<IntExpr>) -> Self {
-        let modulus = modulus.into();
-        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
-        Self::from_node(NodeKind::ModulusReduce { modulus }, vec![self], ty)
+    pub fn reduce_modulus(self, destination: &Ring) -> Self {
+        let destination = destination.reference.clone();
+        let ty = MatrixType { ring: destination.clone(), ..self.matrix_type.clone() };
+        Self::from_node(NodeKind::ModulusReduce { destination }, vec![self], ty)
     }
 
-    /// Re-encodes the centered coefficients of a single CRT limb in another ring.
+    /// Re-encodes the centered coefficients of the complete source CRT basis
+    /// in another ring. The backend uses the whole source modulus when
+    /// choosing the centered integer, including for multi-limb inputs.
     #[track_caller]
-    pub fn centered_rebase(self, modulus: impl Into<IntExpr>) -> Self {
-        let modulus = modulus.into();
-        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
-        Self::from_node(NodeKind::CenteredRebase { modulus }, vec![self], ty)
+    pub fn centered_rebase(self, destination: &Ring) -> Self {
+        let destination = destination.reference.clone();
+        let ty = MatrixType { ring: destination.clone(), ..self.matrix_type.clone() };
+        Self::from_node(NodeKind::CenteredRebase { destination }, vec![self], ty)
     }
 
-    /// Extends contiguous CRT digits into `modulus`, stacking digits by rows.
-    /// Normalization includes the inverse complementary digit product.
+    /// Divides centered coefficients by a positive compile-time divisor and
+    /// rounds to the nearest integer, retaining the ring and matrix shape.
     #[track_caller]
-    pub fn rns_mod_up(
-        self,
-        modulus: impl Into<IntExpr>,
-        source_moduli: Vec<u64>,
-        digit_size: usize,
-        normalize: bool,
-    ) -> Self {
-        let modulus = modulus.into();
-        let digits = if digit_size == 0 { 0 } else { source_moduli.len().div_ceil(digit_size) };
-        let ty = MatrixType {
-            modulus: modulus.clone(),
-            rows: self.matrix_type.rows.clone() * IntExpr::constant(digits),
-            ..self.matrix_type.clone()
-        };
+    pub fn centered_round_divide(self, divisor: impl Into<IntExpr>) -> Self {
+        let matrix_type = self.matrix_type.clone();
         Self::from_node(
-            NodeKind::RnsModUp { modulus, source_moduli, digit_size, normalize },
+            NodeKind::CenteredRoundDivide { divisor: divisor.into() },
+            vec![self],
+            matrix_type,
+        )
+    }
+
+    /// Performs an exact CRT block modulus switch. The source basis must be
+    /// registered as the complete basis for this matrix; `modulus` identifies
+    /// the strict destination subset and `plaintext_modulus` is the positive
+    /// correction factor.
+    #[track_caller]
+    pub fn block_mod_switch(
+        self,
+        destination: &Ring,
+        plaintext_modulus: impl Into<IntExpr>,
+    ) -> Self {
+        let destination = destination.reference.clone();
+        let ty = MatrixType { ring: destination.clone(), ..self.matrix_type.clone() };
+        Self::from_node(
+            NodeKind::BlockModSwitch { destination, plaintext_modulus: plaintext_modulus.into() },
             vec![self],
             ty,
         )
     }
 
+    /// Extends contiguous CRT digits into `modulus`, stacking digits by rows.
+    /// Normalization includes the inverse complementary digit product.
+    #[track_caller]
+    pub fn rns_mod_up(self, destination: &Ring, digit_size: usize, normalize: bool) -> Self {
+        let destination = destination.reference.clone();
+        let source_depth = IntExpr::RingCrtDepth(self.matrix_type.ring.clone());
+        let digits = if digit_size == 0 {
+            IntExpr::constant(0)
+        } else {
+            IntExpr::FloorDiv(
+                Box::new(source_depth + IntExpr::constant(digit_size - 1)),
+                Box::new(IntExpr::constant(digit_size)),
+            )
+        };
+        let ty = MatrixType {
+            ring: destination.clone(),
+            rows: (self.matrix_type.rows.clone() * digits).canonicalize(),
+            ..self.matrix_type.clone()
+        };
+        Self::from_node(NodeKind::RnsModUp { destination, digit_size, normalize }, vec![self], ty)
+    }
+
     /// Removes the auxiliary CRT basis using the BGV correction `(x + t*U)/P`.
     /// In key switching, division cancels the evaluation key target's factor P.
     #[track_caller]
-    pub fn rns_mod_down(
-        self,
-        modulus: impl Into<IntExpr>,
-        source_moduli: Vec<u64>,
-        plaintext_modulus: impl Into<IntExpr>,
-    ) -> Self {
-        let modulus = modulus.into();
-        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
+    pub fn rns_mod_down(self, destination: &Ring, plaintext_modulus: impl Into<IntExpr>) -> Self {
+        let destination = destination.reference.clone();
+        let ty = MatrixType { ring: destination.clone(), ..self.matrix_type.clone() };
         Self::from_node(
-            NodeKind::RnsModDown {
-                modulus,
-                source_moduli,
-                plaintext_modulus: plaintext_modulus.into(),
-            },
+            NodeKind::RnsModDown { destination, plaintext_modulus: plaintext_modulus.into() },
             vec![self],
             ty,
         )
@@ -1175,23 +1488,31 @@ impl Mat {
             ..self.matrix_type.clone()
         };
 
-        let max_coefficient_bound = if small {
-            (base.clone() - IntExpr::constant(1)).canonicalize()
-        } else {
-            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2))).canonicalize()
-        };
+        let max_coefficient_bound =
+            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2)))
+                .canonicalize();
         let node = NodeHandle::new(
             NodeKind::GadgetDecompose { base, small, digit_count },
             vec![self.value],
             vec![WireType::Preimage {
                 matrix: ty.clone(),
                 max_coefficient_bound: max_coefficient_bound.clone(),
+                bound_domain: if small {
+                    CoefficientBoundDomain::PerCrtLimb
+                } else {
+                    CoefficientBoundDomain::Global
+                },
             }],
         );
         let preimage = Preimage {
             value: node.output(0).expect("decomposition"),
             matrix_type: ty,
             max_coefficient_bound,
+            bound_domain: if small {
+                CoefficientBoundDomain::PerCrtLimb
+            } else {
+                CoefficientBoundDomain::Global
+            },
         };
         preimage
     }
@@ -1199,7 +1520,7 @@ impl Mat {
     /// Extracts all canonical coefficients of a scalar polynomial in one runtime operation.
     #[track_caller]
     pub fn coefficients(&self) -> Family<Int> {
-        let count = self.matrix_type.ring_dimension.clone();
+        let count = IntExpr::from(self.matrix_type.ring.ring_dimension());
         let node = NodeHandle::new(
             NodeKind::PolynomialValues { evaluation: false },
             vec![self.value.clone()],
@@ -1218,7 +1539,7 @@ impl Mat {
     /// Extracts all canonical slots in the primitive's native evaluation order.
     #[track_caller]
     pub fn evaluations(&self) -> Family<Int> {
-        let count = self.matrix_type.ring_dimension.clone();
+        let count = IntExpr::from(self.matrix_type.ring.ring_dimension());
         let node = NodeHandle::new(
             NodeKind::PolynomialValues { evaluation: true },
             vec![self.value.clone()],
@@ -1347,12 +1668,16 @@ impl Mat {
         values: Vec<Mat>,
         plaintext_moduli: Vec<IntExpr>,
         reconstruction_coefficients: Vec<IntExpr>,
-        modulus: IntExpr,
+        destination: &Ring,
     ) -> Mat {
         let mut ty = values.first().expect("CRT recomposition requires inputs").matrix_type.clone();
-        ty.modulus = modulus.clone();
+        ty.ring = destination.reference.clone();
         Mat::from_node(
-            NodeKind::CrtRecompose { modulus, plaintext_moduli, reconstruction_coefficients },
+            NodeKind::CrtRecompose {
+                modulus: destination.modulus(),
+                plaintext_moduli,
+                reconstruction_coefficients,
+            },
             values,
             ty,
         )
@@ -1400,25 +1725,33 @@ pub struct Preimage {
     value: ValueHandle,
     matrix_type: MatrixType,
     max_coefficient_bound: IntExpr,
+    bound_domain: CoefficientBoundDomain,
 }
 
 impl Preimage {
-    fn source_input(
+    fn source_input_with_domain(
         name: String,
         matrix_type: MatrixType,
         max_coefficient_bound: IntExpr,
+        bound_domain: CoefficientBoundDomain,
         artifact: Option<ArtifactInput>,
     ) -> Self {
         let wire_type = WireType::Preimage {
             matrix: matrix_type.clone(),
             max_coefficient_bound: max_coefficient_bound.clone(),
+            bound_domain,
         };
         let node = NodeHandle::new(
             NodeKind::Input { name, wire_type: wire_type.clone(), artifact },
             Vec::new(),
             vec![wire_type],
         );
-        Self { value: node.output(0).expect("preimage input"), matrix_type, max_coefficient_bound }
+        Self {
+            value: node.output(0).expect("preimage input"),
+            matrix_type,
+            max_coefficient_bound,
+            bound_domain,
+        }
     }
 
     #[doc(hidden)]
@@ -1432,6 +1765,34 @@ impl Preimage {
 
     pub fn max_coefficient_bound(&self) -> &IntExpr {
         &self.max_coefficient_bound
+    }
+
+    pub fn bound_domain(&self) -> CoefficientBoundDomain {
+        self.bound_domain
+    }
+
+    /// Re-encodes bounded coefficients, retaining the bound but not a
+    /// preimage relation at the destination modulus.
+    #[track_caller]
+    pub fn centered_rebase(self, destination: &Ring) -> SmallMatrix {
+        let destination = destination.reference.clone();
+        let matrix_type = MatrixType { ring: destination.clone(), ..self.matrix_type.clone() };
+        let wire_type = WireType::SmallMatrix {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
+        };
+        let node = NodeHandle::new(
+            NodeKind::CenteredRebase { destination },
+            vec![self.value],
+            vec![wire_type],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("centered compact rebase"),
+            matrix_type,
+            max_coefficient_bound: self.max_coefficient_bound,
+            bound_domain: self.bound_domain,
+        }
     }
 
     #[track_caller]
@@ -1488,12 +1849,14 @@ impl Trapdoor {
             vec![WireType::Preimage {
                 matrix: ty.clone(),
                 max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+                bound_domain: CoefficientBoundDomain::Global,
             }],
         );
         let preimage = Preimage {
             value: node.output(0).expect("preimage"),
             matrix_type: ty,
             max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         preimage
     }
@@ -1572,6 +1935,44 @@ impl DslContext {
         Int { value: expression }.add(Int::constant(0))
     }
 
+    /// `count` integers uniform on `[0, modulus)` for a power-of-two `modulus`,
+    /// derived from the 32-byte key, the tag, and each element's index. The
+    /// tag is prefixed with a fixed integer-family domain, so the stream never
+    /// coincides with a `hash_matrix` stream under the same key and tag.
+    #[track_caller]
+    pub fn hash_int_family(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        modulus: impl Into<IntExpr>,
+    ) -> Family<Int> {
+        let count = count.into();
+        let tag = tag.into();
+        let mut tag_prefix = b"mxx/hash-int-family/v1\0".to_vec();
+        tag_prefix.extend(tag.prefix);
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
+        let node = NodeHandle::new(
+            NodeKind::HashIntFamily {
+                count: count.clone(),
+                modulus: modulus.into(),
+                tag_prefix,
+                tag_components: tag.components,
+            },
+            arguments,
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("hash integer family")],
+            element_schema: IntType,
+            count,
+        }
+    }
+
     #[track_caller]
     pub fn int_family_input(
         &self,
@@ -1602,34 +2003,36 @@ impl DslContext {
         Ok(self)
     }
 
-    pub fn public_output<V: GraphValue>(
+    pub fn transferred_output<V: GraphValue>(
         mut self,
         name: impl Into<String>,
         value: V,
     ) -> Result<Self, DslError> {
-        self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Public))?;
+        self.insert_graph_value(name.into(), value, Some(ArtifactAvailability::Transferred))?;
         Ok(self)
     }
 
-    pub fn private_output<V: GraphValue>(
+    /// Declares a deterministic artifact output that consumers obtain from the
+    /// artifact cache rather than by transferring it for each invocation.
+    pub fn cached_output<V: GraphValue>(
         mut self,
         name: impl Into<String>,
         value: V,
     ) -> Result<Self, DslError> {
-        self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Private))?;
+        self.insert_graph_value(name.into(), value, Some(ArtifactAvailability::Cached))?;
         Ok(self)
     }
 
-    pub fn private_trapdoor_output(
+    pub fn transferred_trapdoor_output(
         mut self,
         name: impl Into<String>,
         trapdoor: Trapdoor,
     ) -> Result<Self, DslError> {
-        self.insert_output(name.into(), trapdoor.value, Some(ArtifactConfidentiality::Private))?;
+        self.insert_output(name.into(), trapdoor.value, Some(ArtifactAvailability::Transferred))?;
         Ok(self)
     }
 
-    pub fn private_trapdoor_family_output(
+    pub fn transferred_trapdoor_family_output(
         mut self,
         name: impl Into<String>,
         trapdoors: Family<Trapdoor>,
@@ -1637,7 +2040,7 @@ impl DslContext {
         self.insert_output(
             name.into(),
             trapdoors.values[1].clone(),
-            Some(ArtifactConfidentiality::Private),
+            Some(ArtifactAvailability::Transferred),
         )?;
         Ok(self)
     }
@@ -1646,7 +2049,7 @@ impl DslContext {
         &mut self,
         name: String,
         value: V,
-        confidentiality: Option<ArtifactConfidentiality>,
+        availability: Option<ArtifactAvailability>,
     ) -> Result<(), DslError> {
         let values = value.flatten();
         if values.is_empty() {
@@ -1659,7 +2062,7 @@ impl DslContext {
             return Err(DslError::DuplicateOutput(name.clone()));
         }
         for (name, value) in names.into_iter().zip(values) {
-            self.insert_output(name, value, confidentiality)?;
+            self.insert_output(name, value, availability)?;
         }
         Ok(())
     }
@@ -1668,9 +2071,9 @@ impl DslContext {
         &mut self,
         name: String,
         value: ValueHandle,
-        confidentiality: Option<ArtifactConfidentiality>,
+        availability: Option<ArtifactAvailability>,
     ) -> Result<(), DslError> {
-        if self.outputs.insert(name.clone(), GraphOutput { value, confidentiality }).is_some() {
+        if self.outputs.insert(name.clone(), GraphOutput { value, availability }).is_some() {
             return Err(DslError::DuplicateOutput(name));
         }
         Ok(())
@@ -1695,19 +2098,37 @@ pub struct BuiltGraph {
 }
 
 impl BuiltGraph {
+    /// How many times each primitive operation runs under the default
+    /// parameter bindings, loop iterations and subgraph calls included.
+    pub fn operation_counts(&self) -> Result<BTreeMap<String, u128>, mxx_ir_core::expr::ExprError> {
+        self.graph.operation_counts(&ParamEnv::default())
+    }
+
     pub fn validate(
         &self,
         bindings: &ParamEnv,
+        resolve_basis: mxx_ir_core::ResolveCrtBasis,
     ) -> Result<mxx_ir_core::validate::ValidatedGraph, ValidationBuildError> {
-        Ok(mxx_ir_core::validate(&self.graph, bindings)?)
+        Ok(mxx_ir_core::validate(&self.graph, bindings, resolve_basis)?)
     }
 
     pub fn validate_with_manifests(
         &self,
         bindings: &ParamEnv,
         manifests: &BTreeMap<ProductionId, mxx_ir_core::artifact::Manifest>,
+        resolve_basis: mxx_ir_core::ResolveCrtBasis,
     ) -> Result<mxx_ir_core::validate::ValidatedGraph, ValidationBuildError> {
-        Ok(mxx_ir_core::validate_with_manifests(&self.graph, bindings, manifests)?)
+        Ok(mxx_ir_core::validate_with_manifests(&self.graph, bindings, manifests, resolve_basis)?)
+    }
+}
+
+impl mxx_ir_core::IntoValidatedGraph for BuiltGraph {
+    /// Validates with default parameter bindings.
+    fn into_validated_graph(
+        self,
+        resolve_basis: mxx_ir_core::ResolveCrtBasis,
+    ) -> Result<mxx_ir_core::validate::ValidatedGraph, String> {
+        self.validate(&ParamEnv::default(), resolve_basis).map_err(|error| error.to_string())
     }
 }
 
@@ -1721,18 +2142,21 @@ pub struct SmallMatrix {
     value: ValueHandle,
     matrix_type: MatrixType,
     max_coefficient_bound: IntExpr,
+    bound_domain: CoefficientBoundDomain,
 }
 
 impl SmallMatrix {
-    fn source_input(
+    fn source_input_with_domain(
         name: String,
         matrix_type: MatrixType,
         max_coefficient_bound: IntExpr,
+        bound_domain: CoefficientBoundDomain,
         artifact: Option<ArtifactInput>,
     ) -> Self {
         let wire_type = WireType::SmallMatrix {
             matrix: matrix_type.clone(),
             max_coefficient_bound: max_coefficient_bound.clone(),
+            bound_domain,
         };
         let node = NodeHandle::new(
             NodeKind::Input { name, wire_type: wire_type.clone(), artifact },
@@ -1743,6 +2167,7 @@ impl SmallMatrix {
             value: node.output(0).expect("small matrix input"),
             matrix_type,
             max_coefficient_bound,
+            bound_domain,
         }
     }
 
@@ -1757,6 +2182,35 @@ impl SmallMatrix {
 
     pub fn max_coefficient_bound(&self) -> &IntExpr {
         &self.max_coefficient_bound
+    }
+
+    pub fn bound_domain(&self) -> CoefficientBoundDomain {
+        self.bound_domain
+    }
+
+    /// Re-encodes a bounded compact matrix using the centered integer of its
+    /// complete source CRT basis while retaining its bound and compact wire
+    /// type. No full-DCRT materialization is implied by this DSL operation.
+    #[track_caller]
+    pub fn centered_rebase(self, destination: &Ring) -> Self {
+        let destination = destination.reference.clone();
+        let matrix_type = MatrixType { ring: destination.clone(), ..self.matrix_type.clone() };
+        let wire_type = WireType::SmallMatrix {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
+        };
+        let node = NodeHandle::new(
+            NodeKind::CenteredRebase { destination },
+            vec![self.value],
+            vec![wire_type],
+        );
+        Self {
+            value: node.output(0).expect("centered compact rebase"),
+            matrix_type,
+            max_coefficient_bound: self.max_coefficient_bound,
+            bound_domain: self.bound_domain,
+        }
     }
 }
 
@@ -1815,11 +2269,12 @@ mod tests {
     fn test_polynomial_values_validate_family_shape_and_preserve_runtime_nodes() {
         let context = super::DslContext::new("native-ntt");
         let input = context.int_family_input("values", 8);
-        let ring = super::Ring::new(17, 8);
+        let ring = super::Ring::from_crt_moduli(vec![17.into()], 8);
         let output =
             ring.from_evaluations(&ring.from_coefficients(&input).evaluations()).coefficients();
         let graph = context.output("result", output).unwrap().build().unwrap();
-        let validated = graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        let validated =
+            graph.validate(&mxx_ir_core::ParamEnv::default(), crate::test_resolve_basis).unwrap();
         let lean = mxx_ir_core::lean::export(&validated, &Default::default()).unwrap();
         assert!(lean.source.contains("MxxRuntime.polynomialFromValues"));
         assert!(lean.source.contains("MxxRuntime.polynomialValues"));
@@ -1840,7 +2295,9 @@ mod tests {
         let short = context.int_family_input("values", 7);
         let graph =
             context.output("result", ring.from_coefficients(&short)).unwrap().build().unwrap();
-        assert!(graph.validate(&mxx_ir_core::ParamEnv::default()).is_err());
+        assert!(
+            graph.validate(&mxx_ir_core::ParamEnv::default(), crate::test_resolve_basis).is_err()
+        );
     }
     use super::*;
     use mxx_ir_core::node::LoopInputMode;
@@ -1848,22 +2305,22 @@ mod tests {
 
     #[test]
     fn executable_arithmetic_builds_and_validates() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let input = ring.input("input", (2, 2));
         let output = input.clone() + input;
         let built = DslContext::new("sum").output("sum", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn small_rhs_graph_preserves_bounded_kind_and_has_no_scale_erasure() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let lhs = ring.input("lhs", (2, 3));
         let rhs = ring.small_matrix_input("rhs", (3, 4), 7);
         let output = lhs.mul_small_rhs(rhs);
         let built =
             DslContext::new("small-rhs").output("product", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
 
         let nodes = built.graph.root_scope().nodes();
         assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
@@ -1881,14 +2338,14 @@ mod tests {
 
     #[test]
     fn preimage_rhs_graph_preserves_relation_typed_multiplication() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let lhs = ring.input("lhs", (2, 3));
         let trapdoor = ring.sample_trapdoor(1, 1, 4, 1, 3);
         let rhs = trapdoor.sample_preimage(ring.zero((1, 4)), (3, 4));
         let output = rhs.mul_small_rhs(lhs);
         let built =
             DslContext::new("preimage-rhs").output("product", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
 
         let nodes = built.graph.root_scope().nodes();
         assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
@@ -1897,48 +2354,66 @@ mod tests {
     }
 
     #[test]
+    fn gadget_trapdoor_declares_the_regular_decomposition_bound() {
+        for base in [3, 4, 5] {
+            let ring = Ring::from_crt_moduli(vec![97.into()], 8);
+            let trapdoor = ring.gadget_trapdoor(1, base, 4);
+            let expected = ring.zero((1, 1)).decompose(base, 4);
+            assert_eq!(trapdoor.preimage_max_coefficient_bound(), expected.max_coefficient_bound());
+            let output = trapdoor.sample_preimage(ring.zero((1, 1)), (4, 1));
+            let built = DslContext::new("gadget-trapdoor-bound")
+                .output("preimage", output)
+                .unwrap()
+                .build()
+                .unwrap();
+            built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        }
+    }
+
+    #[test]
     fn gadget_modes_are_relation_typed_and_hash_modes_are_generic_bounded() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let key = ring.bytes_input("key", 32);
         let input = ring.input("input", (1, 1));
         let regular = input.clone().decompose(4, 2);
-        let unsigned = input.small_decompose(4, 2);
+        let small = input.small_decompose(4, 2);
         assert!(matches!(
             regular.value_handle().wire_type(),
-            WireType::Preimage { max_coefficient_bound, .. }
+            WireType::Preimage { max_coefficient_bound, bound_domain, .. }
                 if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 2.into()
+                    && *bound_domain == CoefficientBoundDomain::Global
         ));
         assert!(matches!(
-            unsigned.value_handle().wire_type(),
-            WireType::Preimage { max_coefficient_bound, .. }
-                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 3.into()
+            small.value_handle().wire_type(),
+            WireType::Preimage { max_coefficient_bound, bound_domain, .. }
+                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 2.into()
+                    && *bound_domain == CoefficientBoundDomain::PerCrtLimb
         ));
 
         let balanced_hash = ring.hash_decomposed(key.clone(), tag!("balanced"), (2, 2), 4, 2);
-        let unsigned_hash = ring.hash_small_decomposed(key, tag!("unsigned"), (2, 2), 4, 2);
+        let small_hash = ring.hash_small_decomposed(key, tag!("small"), (2, 2), 4, 2);
         assert!(matches!(
             balanced_hash.value_handle().wire_type(),
-            WireType::SmallMatrix { max_coefficient_bound, .. }
+            WireType::SmallMatrix { max_coefficient_bound, bound_domain, .. }
                 if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 2.into()
+                    && *bound_domain == CoefficientBoundDomain::Global
         ));
         assert!(matches!(
-            unsigned_hash.value_handle().wire_type(),
-            WireType::SmallMatrix { max_coefficient_bound, .. }
-                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 3.into()
+            small_hash.value_handle().wire_type(),
+            WireType::SmallMatrix { max_coefficient_bound, bound_domain, .. }
+                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 2.into()
+                    && *bound_domain == CoefficientBoundDomain::PerCrtLimb
         ));
     }
 
     #[test]
     fn gadget_bounds_and_validation_edges_are_fixed() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let input = ring.input("input", (1, 1));
         let regular = input.clone().decompose(3, 2);
-        let unsigned = input.clone().small_decompose(3, 2);
+        let small = input.clone().small_decompose(3, 2);
         assert_eq!(regular.max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap(), 2.into());
-        assert_eq!(
-            unsigned.max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap(),
-            2.into()
-        );
+        assert_eq!(small.max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap(), 2.into());
 
         for base in [1, 0, -1] {
             let built = DslContext::new("invalid-gadget-base")
@@ -1946,7 +2421,7 @@ mod tests {
                 .unwrap()
                 .build()
                 .unwrap();
-            assert!(built.validate(&ParamEnv::default()).is_err());
+            assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
         }
         for digits in [0, -1] {
             let built = DslContext::new("invalid-gadget-digits")
@@ -1954,7 +2429,7 @@ mod tests {
                 .unwrap()
                 .build()
                 .unwrap();
-            assert!(built.validate(&ParamEnv::default()).is_err());
+            assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
         }
 
         let huge_rows = BigInt::from(usize::MAX);
@@ -1963,12 +2438,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert!(built.validate(&ParamEnv::default()).is_err());
+        assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
     }
 
     #[test]
     fn bounded_families_keep_their_element_wire_kinds() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let small = ring.small_matrix_input_family("small", 2, (2, 2), 3);
         let preimage = ring.preimage_input_family("preimage", 2, (2, 2), 3);
         let small_static = small.at(0);
@@ -1987,7 +2462,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert!(matches!(small.at(0).value_handle().wire_type(), WireType::SmallMatrix { .. }));
         assert!(matches!(preimage.at(0).value_handle().wire_type(), WireType::Preimage { .. }));
         let mut all_nodes = built.graph.scopes().values().flat_map(|scope| scope.nodes());
@@ -1999,8 +2474,56 @@ mod tests {
     }
 
     #[test]
+    fn block_mod_switch_and_compact_centered_rebase_are_typed_operations() {
+        let ring = Ring::from_crt_moduli(vec![17.into(), 97.into()], 8);
+        let destination = Ring::from_crt_moduli(vec![97.into()], 8);
+        let rebase = Ring::from_crt_moduli(vec![257.into()], 8);
+        let matrix = ring.input("matrix", (2, 3)).block_mod_switch(&destination, 3);
+        let small = ring.small_matrix_input("small", (2, 3), 7).centered_rebase(&rebase);
+        let preimage = ring.preimage_input("preimage", (2, 3), 7).centered_rebase(&rebase);
+        let built = DslContext::new("typed-block-operations")
+            .output("matrix", matrix)
+            .unwrap()
+            .output("small", small)
+            .unwrap()
+            .output("preimage", preimage)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        assert!(built.graph.root_scope().nodes().iter().any(|node| {
+            matches!(node.kind(), NodeKind::BlockModSwitch { destination: actual, .. } if actual == destination.as_ref())
+        }));
+        assert_eq!(
+            built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::CenteredRebase { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn centered_round_divide_is_a_typed_matrix_operation() {
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
+        let output = ring.input("matrix", (2, 3)).centered_round_divide(17);
+        let built = DslContext::new("centered-round-divide")
+            .output("result", output)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&mxx_ir_core::ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        assert!(built.graph.root_scope().nodes().iter().any(|node| {
+            matches!(node.kind(), NodeKind::CenteredRoundDivide { divisor } if divisor == &IntExpr::constant(17))
+        }));
+    }
+
+    #[test]
     fn hash_tag_components_preserve_mixed_insertion_order() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let mut tag = HashTag::from(b"ordered-tag:".as_slice());
         tag.push("before");
         tag.push(IntExpr::constant(3));
@@ -2030,12 +2553,12 @@ mod tests {
                 HashTagComponent::Bytes(b"after".to_vec()),
             ]
         );
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn dynamic_integer_hash_tag_is_an_explicit_argument() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let row = Int::constant(7).add(Int::constant(0));
         let mut tag = HashTag::from(b"dynamic-hash/v1:".as_slice());
         tag.push(row);
@@ -2052,12 +2575,12 @@ mod tests {
             .expect("hash sample");
         assert_eq!(hash.arguments().len(), 2);
         assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn unused_values_are_not_retained_by_graph_construction() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let input = ring.input("input", (2, 2));
         let unused = input.clone() + input.clone();
         let built =
@@ -2067,12 +2590,12 @@ mod tests {
             unused.value_handle().node().kind(),
             NodeKind::MatrixBinary(MatrixBinaryOp::Add)
         ));
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn computed_output_is_preserved_in_a_sealed_loop_body() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let captured = ring.input("captured", (1, 1));
         let family = parallel(2, move |_| Ok(captured.clone() + captured.clone())).unwrap();
         let built =
@@ -2083,18 +2606,18 @@ mod tests {
                     matches!(node.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add))
                 })
         }));
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn sampler_cutoff_is_serialized_and_validated() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let sample = ring.gaussian((1, 1), 3, 19);
         let built =
             DslContext::new("bounded-gaussian").output("sample", sample).unwrap().build().unwrap();
         let serialized = serde_json::to_string(&built.graph).unwrap();
         assert!(serialized.contains("max_coefficient_bound"));
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
 
         let parameterized = DslContext::new("parameterized-bounded-gaussian")
             .int_parameter("cutoff")
@@ -2108,19 +2631,19 @@ mod tests {
         };
         let constraints = mxx_ir_core::derive_param_constraints(&parameterized.graph).unwrap();
         assert!(constraints.iter().any(|constraint| !constraint.evaluate(&negative).unwrap()));
-        assert!(parameterized.validate(&negative).is_err());
+        assert!(parameterized.validate(&negative, crate::test_resolve_basis).is_err());
     }
 
     #[test]
     fn decomposition_requires_explicit_positive_metadata_and_preserves_mode() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let input = ring.input("input", (1, 1));
         let regular = DslContext::new("regular-decomposition")
             .output("value", input.clone().decompose(4, 4))
             .unwrap()
             .build()
             .unwrap();
-        regular.validate(&ParamEnv::default()).unwrap();
+        regular.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         let serialized = serde_json::to_string(&regular.graph).unwrap();
         assert!(serialized.contains("digit_count"));
         assert!(serialized.contains("\"small\":false"));
@@ -2130,7 +2653,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        small.validate(&ParamEnv::default()).unwrap();
+        small.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert!(serde_json::to_string(&small.graph).unwrap().contains("\"small\":true"));
 
         let invalid = DslContext::new("negative-decomposition-base")
@@ -2138,12 +2661,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert!(invalid.validate(&ParamEnv::default()).is_err());
+        assert!(invalid.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
     }
 
     #[test]
     fn pure_specs_reject_sampling() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let sampled = DslContext::new("not-pure")
             .output("sample", ring.gaussian((1, 1), 3, 19))
             .unwrap()
@@ -2162,7 +2685,7 @@ mod tests {
         let indices = Family::<Int>::pack(vec![Int::constant(2), Int::constant(0)]).unwrap();
         let gathered = parallel(indices.count().clone(), |i| Ok(values.at(indices.at(i)))).unwrap();
         let built = context.output("gathered", gathered).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
 
         assert!(
             built
@@ -2184,7 +2707,7 @@ mod tests {
 
     #[test]
     fn indexed_parallel_reads_nonartifact_family_inputs() {
-        let ring = Ring::new(97, 4);
+        let ring = Ring::from_crt_moduli(vec![97.into()], 4);
         let family = ring.input_family("label-major-input", 6, (1, 2));
         let output = parallel(2, |label| Ok(family.at(label * 3))).unwrap();
         assert_eq!(output.count(), &IntExpr::constant(2));
@@ -2193,7 +2716,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        graph.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         let foreign = with_new_construction_scope(|_| ring.input_family("escaped", 6, (1, 2)));
         assert!(parallel(2, |label| Ok(foreign.at(label * 3))).is_err());
     }
@@ -2231,8 +2754,64 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(built.graph.outputs().len(), 9);
+    }
+
+    #[test]
+    fn family_clone_and_field_projection_reuse_wires_and_nested_cardinality() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let records =
+            parallel(3, |index| Ok((ring.identity(1), index.clone(), Bool::constant(true))))
+                .expect("record family");
+        let original = records.flatten();
+        let matrices = records.clone().field(|record| record.0).expect("matrix projection");
+        let indices = records.clone().field(|record| record.1).expect("index projection");
+        assert_eq!(matrices.flatten(), vec![original[0].clone()]);
+        assert_eq!(indices.flatten(), vec![original[1].clone()]);
+
+        let nested = parallel(2, |_| {
+            let inner = parallel(4, |_| Ok(Int::constant(7)))?;
+            Ok(inner)
+        })
+        .expect("nested family");
+        let nested_type = nested.schema().wire_types()[0].clone();
+        let built = DslContext::new("family-projection-cardinality")
+            .output("matrices", matrices)
+            .expect("matrices output")
+            .output("indices", indices)
+            .expect("indices output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default(), crate::test_resolve_basis)
+            .expect("validation");
+
+        let all_nodes =
+            built.source.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert!(all_nodes.iter().any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
+        assert!(
+            all_nodes.iter().all(|node| !matches!(node.kind(), NodeKind::FamilyGetStatic { .. }))
+        );
+        assert!(all_nodes.iter().all(|node| !matches!(node.kind(), NodeKind::FamilyGetDynamic)));
+        assert!(all_nodes.iter().all(|node| !matches!(node.kind(), NodeKind::FamilyPack { .. })));
+
+        // Nested indexed families are intentionally not a runtime value kind
+        // yet, but their DSL schema must retain every container cardinality
+        // for the host representative/C06 accounting path.
+        let _nested_graph = DslContext::new("nested-family-schema")
+            .output("nested", nested)
+            .expect("nested output")
+            .build()
+            .expect("nested build");
+        assert!(matches!(
+            nested_type,
+            WireType::IndexedFamily { count: outer, element }
+                if outer == IntExpr::constant(2) && matches!(
+                    element.as_ref(),
+                    WireType::IndexedFamily { count: inner, .. }
+                        if *inner == IntExpr::constant(4)
+                )
+        ));
     }
 
     #[test]
@@ -2242,7 +2821,7 @@ mod tests {
         let indices = parallel(2, |index| Ok(index * 3)).unwrap();
         let gathered = parallel(indices.count().clone(), |i| Ok(values.at(indices.at(i)))).unwrap();
         let built = context.output("gathered", gathered).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
 
         let all_nodes =
             built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
@@ -2280,7 +2859,7 @@ mod tests {
             ]),
             ..ParamEnv::default()
         };
-        built.validate(&bindings).unwrap();
+        built.validate(&bindings, crate::test_resolve_basis).unwrap();
         assert!(
             built
                 .graph
@@ -2302,7 +2881,7 @@ mod tests {
     #[test]
     fn parameterized_trapdoor_families_use_parallel_loop_outputs() {
         let count = IntExpr::Var("count".to_owned());
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let trapdoors =
             parallel(count.clone(), |_| Ok(ring.sample_trapdoor(1, 5, 4, 4, 1_000_000))).unwrap();
         let targets = parallel(count.clone(), |_| Ok(ring.zero((1, 1)))).unwrap();
@@ -2315,11 +2894,11 @@ mod tests {
         .unwrap();
         let built = DslContext::new("parameterized-trapdoor-families")
             .int_parameter("count")
-            .public_output("public", trapdoors.public_matrices())
+            .transferred_output("public", trapdoors.public_matrices())
             .unwrap()
-            .private_trapdoor_family_output("trapdoors", trapdoors)
+            .transferred_trapdoor_family_output("trapdoors", trapdoors)
             .unwrap()
-            .private_output("preimages", preimages)
+            .transferred_output("preimages", preimages)
             .unwrap()
             .build()
             .unwrap();
@@ -2327,11 +2906,11 @@ mod tests {
             integers: BTreeMap::from([("count".to_owned(), 3.into())]),
             ..ParamEnv::default()
         };
-        built.validate(&bindings).unwrap();
+        built.validate(&bindings, crate::test_resolve_basis).unwrap();
         let encoded = serde_json::to_vec(&built.graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, built.graph);
-        mxx_ir_core::validate(&decoded, &bindings).unwrap();
+        mxx_ir_core::validate(&decoded, &bindings, crate::test_resolve_basis).unwrap();
         assert_eq!(
             built
                 .graph
@@ -2346,19 +2925,19 @@ mod tests {
 
     #[test]
     fn trapdoor_families_gather_public_and_secret_wires_together() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let trapdoors = parallel(3, |_| Ok(ring.sample_trapdoor(1, 5, 4, 4, 1_000_000))).unwrap();
         let indices = Family::<Int>::pack(vec![Int::constant(2), Int::constant(0)]).unwrap();
         let gathered =
             parallel(indices.count().clone(), |i| Ok(trapdoors.at(indices.at(i)))).unwrap();
         let built = DslContext::new("trapdoor-family-gather")
-            .public_output("public", gathered.public_matrices())
+            .transferred_output("public", gathered.public_matrices())
             .unwrap()
-            .private_trapdoor_family_output("secret", gathered)
+            .transferred_trapdoor_family_output("secret", gathered)
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         let loop_node = built.graph.root_scope().nodes().iter().find(|node| {
             matches!(node.kind(), NodeKind::ParallelLoop(spec) if spec.input_modes.len() == 3)
         }).expect("one gathered trapdoor has two aligned fields and one index");
@@ -2393,7 +2972,7 @@ mod tests {
 
     #[test]
     fn trapdoor_indexing_rejects_a_source_shorter_than_the_iteration_domain() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let trapdoors = parallel(2, |_| Ok(ring.sample_trapdoor(1, 5, 4, 4, 1_000_000))).unwrap();
         let targets = parallel(3, |_| Ok(ring.zero((1, 1)))).unwrap();
         let output = parallel(targets.count().clone(), |i| {
@@ -2408,7 +2987,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert!(built.validate(&ParamEnv::default()).is_err());
+        assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
     }
 
     #[test]
@@ -2423,7 +3002,7 @@ mod tests {
         })
         .unwrap();
         let built = context.output("outputs", outputs).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(
             built
                 .graph
@@ -2438,17 +3017,17 @@ mod tests {
 
     #[test]
     fn indexed_parallel_keeps_shared_sources_and_round_trips() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let source = ring.input_family("source", 2, (1, 1));
         let shared = ring.input_family("shared", 3, (1, 1));
         let indices = DslContext::new("indices").int_family_input("indices", 2);
         let output = parallel(2, |i| Ok(source.at(&i) + shared.at(indices.at(i)))).unwrap();
         let built = DslContext::new("indexed-with-shared-source")
-            .public_output("output", output)
+            .transferred_output("output", output)
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         let loop_spec = built
             .graph
             .root_scope()
@@ -2470,12 +3049,12 @@ mod tests {
         let encoded = serde_json::to_vec(&built.graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, built.graph);
-        mxx_ir_core::validate(&decoded, &ParamEnv::default()).unwrap();
+        mxx_ir_core::validate(&decoded, &ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn composite_family_pack_rejects_field_count_mismatch() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let left = ring.input_family("left", 2, (1, 1));
         let right = ring.input_family("right", 3, (1, 1));
         assert!(matches!(Family::pack(vec![left, right]), Err(DslError::Schema)));
@@ -2483,7 +3062,7 @@ mod tests {
 
     #[test]
     fn heterogeneous_indexing_preserves_bounded_family_types_and_rejects_escaped_sources() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let context = DslContext::new("heterogeneous-indexing");
         let rows = ring.input_family("rows", 2, (1, 1));
         let indices = context.int_family_input("indices", 2);
@@ -2499,8 +3078,8 @@ mod tests {
             ))
         })
         .unwrap();
-        let built = context.public_output("output", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        let built = context.transferred_output("output", output).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         let loop_node = built
             .graph
             .root_scope()
@@ -2518,7 +3097,7 @@ mod tests {
 
     #[test]
     fn define_accepts_a_formal_nonartifact_family() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let matrix_type = MatType(ring.matrix_type((1, 1)));
         let family_type =
             FamilyType { element: MatType(ring.matrix_type((1, 1))), count: 2.into() };
@@ -2534,7 +3113,7 @@ mod tests {
                 .unwrap();
         let output = subgraph.call((ring.input("matrix", (1, 1)), input_family)).unwrap();
         let built = context.output("output", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
@@ -2546,7 +3125,7 @@ mod tests {
         })
         .unwrap();
         let built = context.output("state", final_state).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
 
         let sequential = built
             .graph
@@ -2579,7 +3158,7 @@ mod tests {
         let encoded = serde_json::to_vec(&built.graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(built.graph, decoded);
-        mxx_ir_core::validate(&decoded, &ParamEnv::default()).unwrap();
+        mxx_ir_core::validate(&decoded, &ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
@@ -2591,10 +3170,13 @@ mod tests {
         .unwrap();
         let built = context.output("values", values).unwrap().build().unwrap();
         built
-            .validate(&ParamEnv {
-                integers: BTreeMap::from([("width".to_owned(), 3.into())]),
-                ..ParamEnv::default()
-            })
+            .validate(
+                &ParamEnv {
+                    integers: BTreeMap::from([("width".to_owned(), 3.into())]),
+                    ..ParamEnv::default()
+                },
+                crate::test_resolve_basis,
+            )
             .unwrap();
         assert!(
             built
@@ -2639,25 +3221,25 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn matrix_family_select_preserves_the_family_wire_type() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let context = DslContext::new("select-matrix-family");
         let selector = context.int_family_input("selector", 1).at(0);
         let one = ring.polynomial([IntExpr::constant(1)]);
         let left = Family::pack(vec![ring.zero((1, 1)), one.clone()]).unwrap();
         let right = Family::pack(vec![one, ring.zero((1, 1))]).unwrap();
         let selected = select(selector, vec![left, right]).unwrap();
-        let built = context.public_output("selected", selected).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        let built = context.transferred_output("selected", selected).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
     }
 
     #[test]
     fn preimage_family_select_preserves_bound_and_rejects_schema_mismatches() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let context = DslContext::new("select-preimage-family");
         let selector = context.int_family_input("selector", 1).at(0);
         let left = ring.preimage_input_family("left", 2, (2, 3), 7);
@@ -2672,8 +3254,8 @@ mod tests {
                         if *max_coefficient_bound == IntExpr::constant(7)
                 ) && *count == IntExpr::constant(2)
         ));
-        let built = context.public_output("selected", selected).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        let built = context.transferred_output("selected", selected).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
 
         let bound_mismatch = select(
             selector.clone(),
@@ -2695,7 +3277,7 @@ mod tests {
 
     #[test]
     fn subgraph_call_carries_canonical_input_exclusive_uppers() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let matrix = MatType(ring.matrix_type((1, 1)));
         let subgraph = Subgraph::<Mat, Mat>::define("bounded-matrix", matrix, |value| Ok(value))
             .expect("subgraph definition");
@@ -2721,7 +3303,8 @@ mod tests {
         let encoded = serde_json::to_vec(&built.graph).expect("serialize graph");
         let decoded: Graph = serde_json::from_slice(&encoded).expect("deserialize graph");
         assert_eq!(built.graph, decoded);
-        mxx_ir_core::validate(&decoded, &ParamEnv::default()).expect("valid graph");
+        mxx_ir_core::validate(&decoded, &ParamEnv::default(), crate::test_resolve_basis)
+            .expect("valid graph");
     }
 
     #[test]

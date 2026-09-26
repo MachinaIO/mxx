@@ -611,9 +611,8 @@ impl NaiveBggEncodingVecSampler {
 mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
-    use mxx_dsl::{DslContext, Ring};
-    use mxx_ir_core::ParamEnv;
-    use mxx_primitives::{
+    use mxx_backends::{
+        RuntimeValue,
         matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
@@ -621,14 +620,14 @@ mod tests {
         },
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
-    use mxx_runtime::RuntimeValue;
+    use mxx_dsl::{DslContext, Ring};
+    use mxx_ir_core::ParamEnv;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
     fn concrete_layout(parameters: &DCRTPolyParams, secret_dimension: usize) -> BggSamplerLayout {
         BggSamplerLayout {
-            modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
-            ring_dimension: IntExpr::constant(parameters.ring_dimension()),
+            ring: crate::ring_from_params(parameters),
             secret_dimension,
             digit_count: parameters.modulus_digits(),
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
@@ -656,7 +655,7 @@ mod tests {
 
     #[test]
     fn native_scalar_family_lift_is_symmetric_for_public_keys_and_encodings() {
-        let ring = Ring::new(257, 8);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let compiler = NaiveBggVecCompiler {
             public_key: BggPublicKeyCompiler {
                 ring: ring.clone(),
@@ -690,8 +689,12 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        graph
+            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
     }
 
     #[test]
@@ -699,10 +702,7 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
-        let ring = Ring::new(
-            BigInt::from(parameters.modulus().as_ref().clone()),
-            parameters.ring_dimension() as usize,
-        );
+        let ring = crate::ring_from_params(&parameters);
         let compiler = NaiveBggVecCompiler {
             public_key: BggPublicKeyCompiler {
                 ring: ring.clone(),
@@ -793,10 +793,7 @@ mod tests {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
-        let ring = Ring::new(
-            BigInt::from(parameters.modulus().as_ref().clone()),
-            parameters.ring_dimension() as usize,
-        );
+        let ring = crate::ring_from_params(&parameters);
         let compiler = NaiveBggVecCompiler {
             public_key: BggPublicKeyCompiler {
                 ring: ring.clone(),
@@ -825,7 +822,7 @@ mod tests {
             &parameters,
             vec![row(&parameters, columns, 2).get_row(0), row(&parameters, columns, 4).get_row(0)],
         );
-        let plaintext = row(&parameters, 1, 6);
+        // The product does not read the plaintext, so it is not a graph input.
         let target = DCRTPolyMatrix::unit_column_vector(&parameters, 2, 1);
         let result = execute_graph(
             graph,
@@ -833,7 +830,6 @@ mod tests {
             BTreeMap::from([
                 ("vector".to_owned(), RuntimeValue::matrix(vector.clone())),
                 ("public".to_owned(), RuntimeValue::matrix(public.clone())),
-                ("plaintext".to_owned(), RuntimeValue::matrix(plaintext)),
                 ("target".to_owned(), RuntimeValue::matrix(target.clone())),
             ]),
         );
@@ -897,7 +893,7 @@ mod tests {
             graph,
             parameters.clone(),
             BTreeMap::from([
-                ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
+                ("key".to_owned(), RuntimeValue::Bytes(key.to_vec().into())),
                 ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
                 ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
                 ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),

@@ -138,7 +138,7 @@ impl WitnessEncryptionProtocolDecl {
             .bundle
             .requirements
             .iter()
-            .map(|requirement| graph_inputs(&requirement.graph))
+            .map(|requirement| graph_inputs(requirement.graph()))
             .collect::<Vec<_>>();
         if requirement_inputs.len() != 3 ||
             !requirement_inputs.contains(&BTreeSet::new()) ||
@@ -147,9 +147,9 @@ impl WitnessEncryptionProtocolDecl {
         {
             return Err(WitnessEncryptionDeclError::InvalidCorrectnessPredicates);
         }
-        if graph_inputs(&protocol.bundle.ideal.graph) !=
+        if graph_inputs(protocol.bundle.ideal.graph()) !=
             BTreeSet::from([interface.message.0.clone()]) ||
-            protocol.bundle.ideal.graph.outputs().len() != 1
+            protocol.bundle.ideal.graph().outputs().len() != 1
         {
             return Err(WitnessEncryptionDeclError::InvalidIdeal);
         }

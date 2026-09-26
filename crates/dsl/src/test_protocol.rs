@@ -3,7 +3,7 @@
 use crate::{DslContext, IdealSpec, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr,
-    artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+    artifact::{ArtifactAvailability, ProductionId, SpecHash},
     protocol::{
         ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
         ComparatorSpec, EndpointBinding, EndpointBindings, EndpointSemanticBinding, EndpointSpecId,
@@ -14,7 +14,14 @@ use mxx_ir_core::{
     },
 };
 pub fn protocol() -> ProtocolDecl {
-    let ring = Ring::new(256, 1);
+    protocol_with_consumer_availability(ArtifactAvailability::Transferred)
+        .expect("toy example protocol is valid")
+}
+
+fn protocol_with_consumer_availability(
+    consumer_availability: ArtifactAvailability,
+) -> Result<ProtocolDecl, mxx_ir_core::protocol::ProtocolError> {
+    let ring = Ring::from_crt_moduli(vec![257.into()], 1);
     let message = ring.bool_input("message");
     let selector = message.clone().to_int();
     let zero = ring.zero((1, 1));
@@ -24,18 +31,24 @@ pub fn protocol() -> ProtocolDecl {
     let ciphertext = encoded.clone() +
         ring.gaussian((1, 1), RealExpr::from_integer(1), IntExpr::Var("cutoff".to_owned()));
     let residual = ciphertext.clone() - encoded;
-    let encrypt = DslContext::new("toy-example-encrypt")
-        .int_parameter("cutoff")
-        .public_output("ciphertext", ciphertext)
-        .expect("unique output")
-        .private_output("operational-residual", residual)
-        .expect("unique operational residual output")
-        .build()
-        .expect("toy encryption graph");
+    let encrypt = DslContext::new("toy-example-encrypt").int_parameter("cutoff");
+    let encrypt = match consumer_availability {
+        ArtifactAvailability::Transferred => encrypt
+            .transferred_output("ciphertext", ciphertext)
+            .expect("unique output")
+            .transferred_output("operational-residual", residual)
+            .expect("unique operational residual output"),
+        ArtifactAvailability::Cached => encrypt
+            .cached_output("ciphertext", ciphertext)
+            .expect("unique output")
+            .transferred_output("operational-residual", residual)
+            .expect("unique operational residual output"),
+    }
+    .build()
+    .expect("toy encryption graph");
 
     let placeholder = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-    let ciphertext =
-        ring.artifact_input(placeholder, "ciphertext", (1, 1), ArtifactConfidentiality::Public);
+    let ciphertext = ring.artifact_input(placeholder, "ciphertext", (1, 1), consumer_availability);
     let decoded = ciphertext
         .threshold_decode_bools(IntExpr::constant(2), 1)
         .into_iter()
@@ -137,7 +150,6 @@ pub fn protocol() -> ProtocolDecl {
             precondition_spec: ProtocolPreconditionSpec::default(),
         },
     })
-    .expect("toy example protocol is valid")
 }
 
 #[cfg(test)]
@@ -163,7 +175,8 @@ mod tests {
             ..ParamEnv::default()
         };
         let production = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-        let producer = validate(&declaration.stages()[0].graph, &bindings).unwrap();
+        let producer =
+            validate(&declaration.stages()[0].graph, &bindings, crate::test_resolve_basis).unwrap();
         let manifest = export_validated_manifest(production.clone(), &producer).unwrap();
         let manifests = BTreeMap::from([(production, manifest)]);
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -192,6 +205,7 @@ mod tests {
             &semantics,
             &manifests,
             &directory,
+            crate::test_resolve_basis,
         )
         .expect("generic export accepts the validated threshold decoder");
 
@@ -202,12 +216,12 @@ mod tests {
         assert!(premises.contains("Ideal.generatedRoot"));
         assert_eq!(premises.matches("(external.input_0)").count(), 2);
         assert!(!premises.contains(".natAbs <"));
-        assert!(premises.contains("ThresholdFixture.zeroCenter 256"));
+        assert!(premises.contains("ThresholdFixture.zeroCenter 257"));
         assert!(!source.contains("MxxWe"));
         assert!(conclusion.contains("Runs hashModel external execution →"));
         assert!(
             conclusion.contains(
-                "(observedResidual execution).natAbs < ThresholdFixture.decoderRadius 256"
+                "(observedResidual execution).natAbs < ThresholdFixture.decoderRadius 257"
             )
         );
         assert!(conclusion.contains("execution.«stage_1» = execution.«ideal»"));
@@ -217,13 +231,109 @@ mod tests {
     }
 
     #[test]
+    fn stage_binding_entry_point_matches_protocol_validation() {
+        let declaration = protocol();
+        assert!(
+            mxx_ir_core::protocol::validate_stage_artifact_bindings(declaration.stages()).is_ok()
+        );
+
+        let mut duplicate = declaration.stages().to_vec();
+        duplicate.push(duplicate[0].clone());
+        assert!(matches!(
+            mxx_ir_core::protocol::validate_stage_artifact_bindings(&duplicate),
+            Err(mxx_ir_core::protocol::ProtocolError::DuplicateStageId)
+        ));
+
+        let consumer_only = vec![declaration.stages()[1].clone()];
+        assert!(matches!(
+            mxx_ir_core::protocol::validate_stage_artifact_bindings(&consumer_only),
+            Err(mxx_ir_core::protocol::ProtocolError::MissingProducerStage)
+        ));
+    }
+
+    #[test]
+    fn artifact_availability_is_checked_against_the_producer_semantics() {
+        for (availability, expected) in
+            [(ArtifactAvailability::Transferred, Ok(())), (ArtifactAvailability::Cached, Ok(()))]
+        {
+            let actual = protocol_with_consumer_availability(availability).map(|_| ());
+            assert_eq!(actual, expected, "consumer declaration: {availability:?}");
+        }
+    }
+
+    #[test]
+    fn sampled_artifacts_are_transferred_but_public_deterministic_cache_is_cached() {
+        use mxx_ir_core::node::NodeKind;
+
+        let ring = Ring::from_crt_moduli(vec![257.into()], 8);
+        let sampled = ring.sample_trapdoor(1, 1, 2, 3, 4);
+        let sampled_public = sampled.public_matrix();
+        let sampled_preimage = sampled.sample_preimage(ring.zero((1, 1)), (5, 1));
+        let sampled_graph = DslContext::new("sampled-artifact-roles")
+            .transferred_output("public", sampled_public)
+            .expect("sampled public output")
+            .transferred_trapdoor_output("trapdoor", sampled)
+            .expect("sampled trapdoor output")
+            .transferred_output("preimage", sampled_preimage)
+            .expect("sampled preimage output")
+            .build()
+            .expect("sampled graph");
+
+        // These values contain fresh randomness and therefore require the
+        // producer payload at the consumer boundary.
+        for name in ["public", "trapdoor", "preimage"] {
+            assert_eq!(
+                sampled_graph.graph.outputs()[name].availability,
+                Some(ArtifactAvailability::Transferred),
+                "sampled artifact {name} must be transferred",
+            );
+        }
+
+        // A cache declaration is reserved for a public deterministic setup
+        // keyed by its production metadata.  It is not a substitute for a
+        // missing secret/trapdoor recipe.
+        let production = ProductionId { spec_hash: SpecHash([17; 32]), execution_nonce: [19; 32] };
+        let cached_producer = DslContext::new("deterministic-cache-producer")
+            .cached_output("lut", ring.identity(1))
+            .expect("cached producer output")
+            .build()
+            .expect("cached producer graph");
+        assert_eq!(
+            cached_producer.graph.outputs()["lut"].availability,
+            Some(ArtifactAvailability::Cached)
+        );
+        let cached = ring.artifact_input(
+            production,
+            "public-deterministic-lut",
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let cached_graph = DslContext::new("deterministic-cache-input")
+            .output("lut", cached)
+            .expect("cache output")
+            .build()
+            .expect("cache graph");
+        let cached_input = cached_graph
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::Input { artifact: Some(artifact), .. } => Some(artifact.availability),
+                _ => None,
+            })
+            .expect("cached artifact input");
+        assert_eq!(cached_input, ArtifactAvailability::Cached);
+    }
+
+    #[test]
     fn test_threshold_export_preserves_each_port_and_symbolic_modulus() {
         use mxx_ir_core::{
             ParamEnv,
             lean::{ExportOptions, export},
         };
         use std::{collections::BTreeMap, fs, path::Path};
-        let ring = Ring::new(256, 2);
+        let ring = Ring::from_crt_moduli(vec![257.into()], 2);
         let input = ring.input("ciphertext", (1, 1));
         let modulus = IntExpr::Var("plaintext_modulus".into());
         let integers = input.clone().threshold_decode_ints(modulus.clone(), 2);
@@ -240,7 +350,7 @@ mod tests {
             integers: BTreeMap::from([("plaintext_modulus".into(), 3.into())]),
             ..ParamEnv::default()
         };
-        let validated = graph.validate(&bindings).unwrap();
+        let validated = graph.validate(&bindings, crate::test_resolve_basis).unwrap();
         let artifact = export(
             &validated,
             &ExportOptions {

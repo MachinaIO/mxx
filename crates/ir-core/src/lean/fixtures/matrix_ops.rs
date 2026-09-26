@@ -8,14 +8,12 @@ use crate::{
     lean::{ExportOptions, export},
     node::{ConcatAxis, IndexRange, LoopInputMode, NodeKind, ParallelLoop},
     types::{MatrixType, WireType},
-    validate,
 };
 use std::collections::BTreeMap;
 
 fn matrix(rows: usize, columns: usize) -> MatrixType {
     MatrixType {
-        modulus: IntExpr::constant(17),
-        ring_dimension: IntExpr::constant(2),
+        ring: crate::ring::test_ring(17, 2),
         rows: IntExpr::constant(rows),
         columns: IntExpr::constant(columns),
     }
@@ -107,10 +105,10 @@ fn export_matrix_ops_fixture() {
         "stage-a-matrix-ops",
         Vec::<CompileParameter>::new(),
         BTreeMap::from([
-            ("rows".into(), GraphOutput { value: rows, confidentiality: None }),
-            ("columns".into(), GraphOutput { value: columns, confidentiality: None }),
-            ("diagonal".into(), GraphOutput { value: diagonal, confidentiality: None }),
-            ("slice".into(), GraphOutput { value: family, confidentiality: None }),
+            ("rows".into(), GraphOutput { value: rows, availability: None }),
+            ("columns".into(), GraphOutput { value: columns, availability: None }),
+            ("diagonal".into(), GraphOutput { value: diagonal, availability: None }),
+            ("slice".into(), GraphOutput { value: family, availability: None }),
         ]),
         vec![],
         vec![],
@@ -118,7 +116,7 @@ fn export_matrix_ops_fixture() {
     )
     .unwrap()
     .0;
-    let checked = validate(&graph, &ParamEnv::default()).unwrap();
+    let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     let artifact = export(&checked, &ExportOptions::default()).unwrap();
     let proof = r#"
 theorem generated_concat_rows_first

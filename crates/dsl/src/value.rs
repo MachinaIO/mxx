@@ -178,6 +178,7 @@ impl GraphValue for SmallMatrix {
         SmallMatrixType {
             matrix: self.matrix_type.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
         }
     }
 
@@ -187,6 +188,7 @@ impl GraphValue for SmallMatrix {
             value: value.clone(),
             matrix_type: schema.matrix.clone(),
             max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            bound_domain: schema.bound_domain,
         })
     }
 }
@@ -195,10 +197,11 @@ impl GraphValueSchema for SmallMatrixType {
     type Value = SmallMatrix;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        SmallMatrix::source_input(
+        SmallMatrix::source_input_with_domain(
             argument_name(next, "small-matrix"),
             self.matrix.clone(),
             self.max_coefficient_bound.clone(),
+            self.bound_domain,
             None,
         )
     }
@@ -207,6 +210,7 @@ impl GraphValueSchema for SmallMatrixType {
         vec![WireType::SmallMatrix {
             matrix: self.matrix.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
         }]
     }
 }
@@ -222,6 +226,7 @@ impl GraphValue for Preimage {
         PreimageType {
             matrix: self.matrix_type.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
         }
     }
 
@@ -231,6 +236,7 @@ impl GraphValue for Preimage {
             value: value.clone(),
             matrix_type: schema.matrix.clone(),
             max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            bound_domain: schema.bound_domain,
         })
     }
 }
@@ -242,6 +248,7 @@ impl GraphValueSchema for PreimageType {
         let wire_type = WireType::Preimage {
             matrix: self.matrix.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
         };
         let node = NodeHandle::new(
             NodeKind::Input {
@@ -256,6 +263,7 @@ impl GraphValueSchema for PreimageType {
             value: node.output(0).expect("preimage argument"),
             matrix_type: self.matrix.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
         }
     }
 
@@ -263,6 +271,7 @@ impl GraphValueSchema for PreimageType {
         vec![WireType::Preimage {
             matrix: self.matrix.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
+            bound_domain: self.bound_domain,
         }]
     }
 }

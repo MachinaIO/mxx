@@ -1,0 +1,62 @@
+[package]
+name = "mxx-backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lattice primitives and concrete execution backends for mxx"
+# Publishes the subgraph-kernel header directory to dependents' build scripts
+# as DEP_MXX_BACKENDS_CUDA_INCLUDE.
+links = "mxx_backends"
+
+[features]
+default = []
+gpu = []
+
+[dependencies]
+bigdecimal.workspace = true
+bincode.workspace = true
+bitvec.workspace = true
+cxx = "1.0"
+digest.workspace = true
+itertools.workspace = true
+keccak-asm.workspace = true
+libc.workspace = true
+mxx-ir-core.workspace = true
+num-integer.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+openfhe.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+mxx-dsl.workspace = true
+serial_test.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+cxx-build = "1.0"
+
+[[bench]]
+name = "bench_matrix_mul_cpu"
+harness = false
+
+[[bench]]
+name = "bench_matrix_mul_gpu"
+harness = false
+
+[[bench]]
+name = "bench_preimage_cpu"
+harness = false
+
+[[bench]]
+name = "bench_preimage_gpu"
+harness = false
+

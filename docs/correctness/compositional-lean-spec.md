@@ -4,8 +4,7 @@
 
 This is a replacement design proposal, not an implemented verification system. It is based on
 `codex/new-IR` at `d84669f79ad2cd4c72c88970da92043187043244`, pulled on 2026-09-05.
-The design branch is `codex/compositional-lean-design`. The companion implementation plan is
-[compositional-lean-plan.md](../plans/compositional-lean-plan.md).
+The design branch is `codex/compositional-lean-design`.
 
 The retained requirement is:
 
@@ -792,8 +791,8 @@ exhaustion require monotonicity for that searched family or an exhaustive policy
 | --- | --- |
 | `crates/ir-core/lean/MxxIR` | Small relational combinators, parameter arithmetic, pointwise/fold rules |
 | `crates/ir-core/src/lean` | Mechanical frozen-IR exporter |
-| `crates/primitives/lean/MxxPrimitives` | Quotient ring, coefficient view, reduction, exact matrix norms |
-| `crates/runtime/lean/MxxRuntime` | Concrete primitive relations and fixed hash interpretation interface |
+| `crates/backends/lean/MxxPrimitives` | Quotient ring, coefficient view, reduction, exact matrix norms |
+| `crates/backends/lean/MxxRuntime` | Concrete primitive relations and fixed hash interpretation interface |
 | `crates/gadgets/lean/MxxGadgets` | Gadget reconstruction, preimage consumption, input-injector algebra |
 | `crates/bgg/lean/MxxBgg` | Full BGG+ invariant, compatible-secret multiplication and gate lemmas |
 | `crates/we/lean` | Generated Diamond program, application scope proofs, bound, decoder, final theorem |

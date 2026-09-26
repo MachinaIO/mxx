@@ -1,5 +1,5 @@
 use crate::{
-    artifact::ArtifactConfidentiality,
+    artifact::ArtifactAvailability,
     expr::RealExpr,
     node::{LoopInputMode, NodeKind, ParallelLoop, SequentialLoop, SubgraphCall},
     types::{NodeId, Port, WireRef, WireType},
@@ -681,13 +681,13 @@ struct SubgraphDefinition {
 #[derive(Clone, Debug)]
 pub struct GraphOutput {
     pub value: ValueHandle,
-    pub confidentiality: Option<ArtifactConfidentiality>,
+    pub availability: Option<ArtifactAvailability>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputRoot {
     pub value: WireRef,
-    pub confidentiality: Option<ArtifactConfidentiality>,
+    pub availability: Option<ArtifactAvailability>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -826,7 +826,7 @@ impl Graph {
                 let value = root_scope
                     .wire_ref(&output.value)
                     .ok_or_else(|| FreezeError::UnreachableOutput { name: name.clone() })?;
-                Ok((name, OutputRoot { value, confidentiality: output.confidentiality }))
+                Ok((name, OutputRoot { value, availability: output.availability }))
             })
             .collect::<Result<BTreeMap<_, _>, FreezeError>>()?;
         let frozen_effects = effect_roots
@@ -889,6 +889,87 @@ impl Graph {
 
     pub fn root_scope(&self) -> &GraphScope {
         self.scope(&FrozenGraphScopeId::Root).expect("a frozen graph always has a root")
+    }
+
+    /// How many times each primitive operation runs when the graph executes
+    /// under `env`: a loop body counts once per iteration and a subgraph once
+    /// per call, each evaluated in its own environment. A kind whose payload
+    /// is a plain operator is keyed with it, as in `MatrixBinary(Multiply)`.
+    pub fn operation_counts(
+        &self,
+        env: &crate::ParamEnv,
+    ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
+        let mut memo = BTreeMap::new();
+        self.scope_operation_counts(&FrozenGraphScopeId::Root, env, &mut memo)
+    }
+
+    fn scope_operation_counts(
+        &self,
+        scope_id: &FrozenGraphScopeId,
+        env: &crate::ParamEnv,
+        memo: &mut BTreeMap<(FrozenGraphScopeId, crate::ParamEnv), BTreeMap<String, u128>>,
+    ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
+        let key = (scope_id.clone(), env.clone());
+        if let Some(counts) = memo.get(&key) {
+            return Ok(counts.clone());
+        }
+        let bound = |parent: &crate::ParamEnv, bindings: &[(String, crate::IntExpr)]| {
+            let mut child = parent.clone();
+            for (name, expression) in bindings {
+                child.integers.insert(name.clone(), expression.evaluate(parent)?);
+            }
+            Ok::<_, crate::expr::ExprError>(child)
+        };
+        let mut counts = BTreeMap::<String, u128>::new();
+        let add = |counts: &mut BTreeMap<String, u128>, inner: BTreeMap<String, u128>| {
+            for (name, count) in inner {
+                *counts.entry(name).or_insert(0) += count;
+            }
+        };
+        let scope = self.scope(scope_id).expect("a child scope id names a frozen scope");
+        for (position, node) in scope.nodes.iter().enumerate() {
+            let kind = serde_json::to_value(node.kind()).unwrap_or_default();
+            let tag = kind["tag"].as_str().unwrap_or("Unknown");
+            let name = match kind["value"].as_str() {
+                Some(operator) if operator.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                    format!("{tag}({operator})")
+                }
+                _ => tag.to_owned(),
+            };
+            *counts.entry(name).or_insert(0) += 1;
+            let child = || {
+                self.child_scope_id(scope_id, NodeId(position as u64))
+                    .expect("a structural node has a child scope")
+            };
+            match node.kind() {
+                NodeKind::SubgraphCall(call) => {
+                    let inner =
+                        self.scope_operation_counts(&child(), &bound(env, &call.bindings)?, memo)?;
+                    add(&mut counts, inner);
+                }
+                NodeKind::ParallelLoop(ParallelLoop { count, index_slot, bindings, .. }) |
+                NodeKind::SequentialLoop(SequentialLoop {
+                    count, index_slot, bindings, ..
+                }) => {
+                    let (child, iterations) = (child(), count.evaluate(env)?);
+                    let mut index = num_bigint::BigInt::from(0u8);
+                    while index < iterations {
+                        let mut loop_env = env.clone();
+                        loop_env.loop_indices.insert(*index_slot, index.clone());
+                        let inner = self.scope_operation_counts(
+                            &child,
+                            &bound(&loop_env, bindings)?,
+                            memo,
+                        )?;
+                        add(&mut counts, inner);
+                        index += 1u8;
+                    }
+                }
+                _ => {}
+            }
+        }
+        memo.insert(key, counts.clone());
+        Ok(counts)
     }
 
     pub fn real_constants(&self) -> &BTreeMap<String, RealExpr> {
@@ -963,13 +1044,23 @@ impl Eq for Graph {}
 
 impl Serialize for Graph {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.serialized().serialize(serializer)
+        let (graph, ring_table) = crate::ring::serialize_with_ring_table(&self.serialized())
+            .map_err(serde::ser::Error::custom)?;
+        serde_json::json!({"ring_table": ring_table, "graph": graph}).serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Graph {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let serialized = SerializedGraph::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct EncodedGraph {
+            ring_table: Vec<serde_json::Value>,
+            graph: serde_json::Value,
+        }
+        let encoded = EncodedGraph::deserialize(deserializer)?;
+        let serialized: SerializedGraph =
+            crate::ring::deserialize_with_ring_table(encoded.graph, encoded.ring_table)
+                .map_err(serde::de::Error::custom)?;
         serialized.into_graph().map_err(serde::de::Error::custom)
     }
 }
@@ -1365,14 +1456,12 @@ mod tests {
     use super::*;
     use crate::{
         IntExpr, encoding::spec_hash, expr::ParamEnv, node::MatrixBinaryOp, types::MatrixType,
-        validate::validate,
     };
     use num_bigint::BigInt;
 
     fn matrix_type() -> MatrixType {
         MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(8),
+            ring: crate::ring::test_ring(17, 8),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         }
@@ -1571,14 +1660,14 @@ mod tests {
             Vec::new(),
             BTreeMap::from([(
                 "output".to_owned(),
-                GraphOutput { value: output, confidentiality: None },
+                GraphOutput { value: output, availability: None },
             )]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
         )
         .unwrap();
-        validate(&graph, &ParamEnv::default()).unwrap();
+        crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -1758,7 +1847,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "sharing",
             Vec::new(),
-            BTreeMap::from([("out".to_owned(), GraphOutput { value: sum, confidentiality: None })]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value: sum, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -1773,7 +1862,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "round-trip",
             Vec::new(),
-            BTreeMap::from([("out".to_owned(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -1800,8 +1889,8 @@ mod tests {
             "root-wiring",
             Vec::new(),
             BTreeMap::from([
-                ("a".to_owned(), GraphOutput { value: input("a"), confidentiality: None }),
-                ("b".to_owned(), GraphOutput { value: input("b"), confidentiality: None }),
+                ("a".to_owned(), GraphOutput { value: input("a"), availability: None }),
+                ("b".to_owned(), GraphOutput { value: input("b"), availability: None }),
             ]),
             vec![input("retained")],
             vec![input("effect")],
@@ -1809,8 +1898,12 @@ mod tests {
         )
         .unwrap();
         let serialized = graph.serialized();
-        let decoded: Graph =
-            serde_json::from_slice(&serde_json::to_vec(&serialized).unwrap()).unwrap();
+        let encode = |serialized: &SerializedGraph| {
+            let (graph, ring_table) = crate::ring::serialize_with_ring_table(serialized).unwrap();
+            serde_json::to_vec(&serde_json::json!({"ring_table": ring_table, "graph": graph}))
+                .unwrap()
+        };
+        let decoded: Graph = serde_json::from_slice(&encode(&serialized)).unwrap();
         assert_eq!(decoded, graph);
 
         let mut swapped = serialized.clone();
@@ -1818,7 +1911,7 @@ mod tests {
         let b = swapped.outputs["b"].value;
         swapped.outputs.get_mut("a").unwrap().value = b;
         swapped.outputs.get_mut("b").unwrap().value = a;
-        assert!(serde_json::from_slice::<Graph>(&serde_json::to_vec(&swapped).unwrap()).is_err());
+        assert!(serde_json::from_slice::<Graph>(&encode(&swapped)).is_err());
 
         let missing_node = WireRef { node: NodeId(u64::MAX), port: Port(0) };
         let missing_port = WireRef { node: a.node, port: Port(u32::MAX) };
@@ -1843,12 +1936,44 @@ mod tests {
                     _ => unreachable!(),
                 }
                 assert!(
-                    serde_json::from_slice::<Graph>(&serde_json::to_vec(&malformed).unwrap())
-                        .is_err(),
+                    serde_json::from_slice::<Graph>(&encode(&malformed)).is_err(),
                     "accepted invalid {location} wire {wire:?}",
                 );
             }
         }
+    }
+
+    #[test]
+    fn graph_ring_table_deduplicates_equal_expressions() {
+        let ty = MatrixType {
+            ring: crate::ring::test_ring(17, 8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let value = NodeHandle::new(
+            NodeKind::Input {
+                name: "source".into(),
+                wire_type: WireType::Matrix(ty.clone()),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![WireType::Matrix(MatrixType { ring: crate::ring::test_ring(17, 8), ..ty })],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "ring-table",
+            Vec::new(),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let encoded = serde_json::to_value(&graph).unwrap();
+        assert_eq!(encoded["ring_table"].as_array().unwrap().len(), 1);
+        assert_eq!(serde_json::from_value::<Graph>(encoded).unwrap(), graph);
     }
 
     #[test]
@@ -1857,7 +1982,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "clone-lifetime",
             Vec::new(),
-            BTreeMap::from([("out".to_owned(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -1881,13 +2006,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "validated-sharing",
             Vec::new(),
-            BTreeMap::from([("out".to_owned(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
         )
         .unwrap();
-        let mut validated = validate(&graph, &ParamEnv::default()).unwrap();
+        let mut validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
 
         assert!(graph.shares_storage_with(&validated.source));
         validated.bindings.integers.insert("independent".to_owned(), BigInt::from(1));
@@ -1953,8 +2078,8 @@ mod tests {
             "ambiguous-body-handle",
             Vec::new(),
             BTreeMap::from([
-                ("left".to_owned(), GraphOutput { value: make_loop(), confidentiality: None }),
-                ("right".to_owned(), GraphOutput { value: make_loop(), confidentiality: None }),
+                ("left".to_owned(), GraphOutput { value: make_loop(), availability: None }),
+                ("right".to_owned(), GraphOutput { value: make_loop(), availability: None }),
             ]),
             Vec::new(),
             Vec::new(),

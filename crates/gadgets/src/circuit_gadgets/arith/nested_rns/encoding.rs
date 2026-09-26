@@ -108,9 +108,6 @@ fn resolve_nested_rns_encoding_layout<P: Poly>(
 }
 
 /// Parallel map helper for producing `output_count` nested-RNS outputs with access to `params`.
-///
-/// Encoding helpers call this instead of open-coding the CPU/GPU split each time. The behavior is
-/// intentionally identical across backends; only the scheduling policy differs.
 pub(crate) fn map_nested_rns_outputs_with_params<P, T, F>(
     params: &P::Params,
     output_count: usize,
@@ -125,18 +122,10 @@ where
         return Vec::new();
     }
 
-    #[cfg(feature = "gpu")]
-    {
-        return gpu::map_nested_rns_outputs_with_params_gpu::<P, T, F>(params, output_count, f);
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    {
-        (0..output_count).into_par_iter().map(|idx| f(idx, params)).collect()
-    }
+    (0..output_count).into_par_iter().map(|idx| f(idx, params)).collect()
 }
 
-/// Backend-aware parallel map helper for plain values.
+/// Parallel map helper for plain values.
 pub(crate) fn map_nested_rns_values<T, F>(count: usize, f: F) -> Vec<T>
 where
     T: Send,
@@ -146,15 +135,7 @@ where
         return Vec::new();
     }
 
-    #[cfg(feature = "gpu")]
-    {
-        return (0..count).map(f).collect();
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    {
-        (0..count).into_par_iter().map(f).collect()
-    }
+    (0..count).into_par_iter().map(f).collect()
 }
 
 /// Resolve the active q-window for encoding- and gadget-related helpers.

@@ -55,7 +55,7 @@ impl<T: GraphValue> Family<T> {
     pub fn at(&self, index: impl Into<Int>) -> T {
         let index = index.into();
         let expression =
-            index.compile_expression().filter(|expression| !integer::has_loop_index(expression));
+            index.compile_expression().filter(|expression| !expression.contains_loop_index());
 
         let values = self
             .values
@@ -130,6 +130,41 @@ impl<T: GraphValue> Family<T> {
             })
             .collect();
         Self { values, element_schema, count }
+    }
+}
+
+impl Family<Int> {
+    /// `M v` for this row-major matrix family `M` whose row length is the
+    /// length of `vector`: `out[i] = sum_j M[i, j] vector[j]`.
+    #[track_caller]
+    pub fn matrix_vector_product(&self, vector: &Family<Int>) -> Family<Int> {
+        self.int_matrix_vector_product(vector, false)
+    }
+
+    /// `v^T M` for this row-major matrix family `M` whose row count is the
+    /// length of `vector`: `out[j] = sum_i vector[i] M[i, j]`.
+    #[track_caller]
+    pub fn vector_matrix_product(&self, vector: &Family<Int>) -> Family<Int> {
+        self.int_matrix_vector_product(vector, true)
+    }
+
+    #[track_caller]
+    fn int_matrix_vector_product(&self, vector: &Family<Int>, transpose: bool) -> Family<Int> {
+        let count = IntExpr::Div(Box::new(self.count.clone()), Box::new(vector.count.clone()))
+            .canonicalize();
+        let node = NodeHandle::new(
+            NodeKind::IntMatrixVectorProduct { transpose },
+            vec![self.value_handle().clone(), vector.value_handle().clone()],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("integer matrix-vector product")],
+            element_schema: IntType,
+            count,
+        }
     }
 }
 
@@ -282,7 +317,7 @@ mod tests {
 
     #[test]
     fn composite_values_preserve_static_metadata_in_pack_select_and_state() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let revealed = TaggedMatrix { matrix: ring.input("a", (1, 1)), revealed: true };
         let hidden = TaggedMatrix { matrix: ring.input("b", (1, 1)), revealed: false };
         assert!(matches!(
@@ -304,7 +339,7 @@ mod tests {
 
     #[test]
     fn field_projection_preserves_producer_and_rejects_computation() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let values =
             parallel(3, |_| Ok((ring.gaussian((1, 1), 1, 4), ring.uniform_residue((1, 1)))))
                 .unwrap();
@@ -320,7 +355,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(
             built
                 .graph
@@ -335,7 +370,7 @@ mod tests {
 
     #[test]
     fn composite_input_index_and_output_use_one_shared_schema() {
-        let ring = Ring::new(17, 8);
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let context = DslContext::new("record-input");
         let schema = FamilyType {
             element: (MatType(ring.matrix_type((1, 1))), IntType, BoolType),
@@ -344,7 +379,7 @@ mod tests {
         let inputs: Family<(Mat, Int, Bool)> = context.input("records", schema).unwrap();
         let output = parallel(4, |i| Ok(inputs.at(i))).unwrap();
         let built = context.output("records", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default()).unwrap();
+        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
         assert_eq!(
             built.graph.outputs().keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["records.0", "records.1", "records.2"]

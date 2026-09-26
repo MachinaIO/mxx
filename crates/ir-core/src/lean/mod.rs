@@ -53,6 +53,7 @@ pub struct PrimitiveNames {
     pub hash_sample: String,
     pub gadget_trapdoor: String,
     pub gadget_decompose: String,
+    pub gadget_decompose_small: String,
     pub matrix_mul_accumulate: String,
     pub extract_coefficient: String,
     pub lift_integer: String,
@@ -61,8 +62,11 @@ pub struct PrimitiveNames {
     pub modulus_switch: String,
     pub modulus_reduce: String,
     pub centered_rebase: String,
+    pub centered_round_divide: String,
+    pub compact_centered_rebase: String,
     pub rns_mod_up: String,
     pub rns_mod_down: String,
+    pub block_mod_switch: String,
     pub ring_automorphism: String,
     pub pack_polynomial: String,
     pub polynomial_from_values: String,
@@ -104,6 +108,7 @@ impl Default for PrimitiveNames {
             hash_sample: "MxxRuntime.hashSample".into(),
             gadget_trapdoor: "MxxRuntime.gadgetTrapdoorRuns".into(),
             gadget_decompose: "MxxRuntime.gadgetDecomposeRuns".into(),
+            gadget_decompose_small: "MxxRuntime.smallGadgetDecomposeRuns".into(),
             matrix_mul_accumulate: "MxxRuntime.matrixMulAccumulate".into(),
             extract_coefficient: "MxxRuntime.extractCoefficient".into(),
             lift_integer: "MxxRuntime.liftInteger".into(),
@@ -112,8 +117,11 @@ impl Default for PrimitiveNames {
             modulus_switch: "MxxRuntime.modulusSwitchRuns".into(),
             modulus_reduce: "MxxRuntime.modulusReduceRuns".into(),
             centered_rebase: "MxxRuntime.centeredRebaseRuns".into(),
+            centered_round_divide: "MxxRuntime.centeredRoundDivideRuns".into(),
+            compact_centered_rebase: "MxxRuntime.compactCenteredRebaseRuns".into(),
             rns_mod_up: "MxxRuntime.rnsModUpRuns".into(),
             rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
+            block_mod_switch: "MxxRuntime.blockModSwitchRuns".into(),
             ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
             polynomial_from_values: "MxxRuntime.polynomialFromValues".into(),
@@ -259,6 +267,10 @@ pub enum ExportError {
     ScopeNameCollision(String),
     #[error("loop-index binder {0} is unavailable at its use site")]
     MissingLoopIndex(u32),
+    #[error(
+        "scope {scope:?} uses a generated CRT basis that depends on a loop index; Lean export requires an exact symbolic basis"
+    )]
+    DynamicGeneratedRing { scope: FrozenGraphScopeId },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -270,6 +282,21 @@ struct LexicalEnv {
     // Cloned child environments share references, but record the resolved lexical name:
     // a child's shadowing index `i` must not mark an outer `i_slot` as used.
     referenced_loop_names: Rc<RefCell<BTreeSet<String>>>,
+    ring_values: BTreeMap<crate::RingRef, crate::ConcreteRing>,
+}
+
+fn has_dynamic_generated_basis(ring: &crate::RingRef) -> bool {
+    use crate::RingExpr;
+    match ring.expression() {
+        RingExpr::Generated { .. } => ring.expression().contains_loop_index(),
+        RingExpr::Explicit { .. } => false,
+        RingExpr::Slice { source, .. } | RingExpr::Select { source, .. } => {
+            has_dynamic_generated_basis(source)
+        }
+        RingExpr::Concat { left, right } => {
+            has_dynamic_generated_basis(left) || has_dynamic_generated_basis(right)
+        }
+    }
 }
 
 impl LexicalEnv {
@@ -309,6 +336,136 @@ impl LexicalEnv {
                 format!("MxxIR.roundDiv ({}) ({})", self.expr(a), self.expr(b))
             }
             IntExpr::Log2Ceil(a) => format!("MxxIR.log2Ceil ({})", self.expr(a)),
+            IntExpr::RingModulus(ring) => self.ring_modulus_expr(ring),
+            IntExpr::RingCrtDepth(ring) => self.ring_depth_expr(ring),
+            IntExpr::RingCrtModulus { ring, index } => {
+                self.ring_crt_modulus_expr(ring, &self.expr(index))
+            }
+        }
+    }
+
+    fn ring_depth_expr(&self, ring: &crate::RingRef) -> String {
+        use crate::RingExpr;
+        if !ring.expression().contains_loop_index() {
+            return self.ring_values[ring].crt_depth().to_string();
+        }
+        match ring.expression() {
+            RingExpr::Generated { .. } => {
+                unreachable!("dynamic generated ring rejected before emission")
+            }
+            RingExpr::Explicit { crt_moduli, .. } => crt_moduli.len().to_string(),
+            RingExpr::Slice { start, end, .. } => {
+                format!("(({}) - ({}))", self.expr(end), self.expr(start))
+            }
+            RingExpr::Select { indices, .. } => indices.len().to_string(),
+            RingExpr::Concat { left, right } => {
+                format!("(({}) + ({}))", self.ring_depth_expr(left), self.ring_depth_expr(right))
+            }
+        }
+    }
+
+    fn ring_max_depth(&self, ring: &crate::RingRef) -> usize {
+        use crate::RingExpr;
+        if !ring.expression().contains_loop_index() {
+            return self.ring_values[ring].crt_depth();
+        }
+        match ring.expression() {
+            RingExpr::Generated { .. } => {
+                unreachable!("dynamic generated ring rejected before emission")
+            }
+            RingExpr::Explicit { crt_moduli, .. } => crt_moduli.len(),
+            RingExpr::Slice { source, .. } => self.ring_max_depth(source),
+            RingExpr::Select { indices, .. } => indices.len(),
+            RingExpr::Concat { left, right } => {
+                self.ring_max_depth(left) + self.ring_max_depth(right)
+            }
+        }
+    }
+
+    fn ring_crt_modulus_expr(&self, ring: &crate::RingRef, index: &str) -> String {
+        use crate::RingExpr;
+        if !ring.expression().contains_loop_index() {
+            return format!(
+                "MxxIR.selectInt ({index}) [{}]",
+                self.ring_values[ring]
+                    .crt_moduli()
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        match ring.expression() {
+            RingExpr::Generated { .. } => {
+                unreachable!("dynamic generated ring rejected before emission")
+            }
+            RingExpr::Explicit { crt_moduli, .. } => format!(
+                "MxxIR.selectInt ({index}) [{}]",
+                crt_moduli
+                    .iter()
+                    .map(|q| format!("({})", self.expr(q)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            RingExpr::Slice { source, start, .. } => {
+                self.ring_crt_modulus_expr(source, &format!("(({}) + ({index}))", self.expr(start)))
+            }
+            RingExpr::Select { source, indices } => format!(
+                "MxxIR.selectInt ({index}) [{}]",
+                indices
+                    .iter()
+                    .map(|selected| { self.ring_crt_modulus_expr(source, &self.expr(selected)) })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            RingExpr::Concat { left, right } => {
+                let depth = self.ring_depth_expr(left);
+                format!(
+                    "(if ({index}) < ({depth}) then {} else {})",
+                    self.ring_crt_modulus_expr(left, index),
+                    self.ring_crt_modulus_expr(right, &format!("(({index}) - ({depth}))"))
+                )
+            }
+        }
+    }
+
+    fn ring_modulus_expr(&self, ring: &crate::RingRef) -> String {
+        use crate::RingExpr;
+        if !ring.expression().contains_loop_index() {
+            return self.ring_values[ring].modulus().to_string();
+        }
+        match ring.expression() {
+            RingExpr::Generated { .. } => {
+                unreachable!("dynamic generated ring rejected before emission")
+            }
+            RingExpr::Explicit { crt_moduli, .. } => {
+                let factors =
+                    crt_moduli.iter().map(|q| format!("({})", self.expr(q))).collect::<Vec<_>>();
+                if factors.is_empty() { "1".into() } else { factors.join(" * ") }
+            }
+            RingExpr::Slice { source, start, end } => {
+                let start = self.expr(start);
+                let end = self.expr(end);
+                let factors = (0..self.ring_max_depth(source))
+                    .map(|index| {
+                        format!(
+                            "(if ({start}) ≤ {index} ∧ {index} < ({end}) then {} else 1)",
+                            self.ring_crt_modulus_expr(source, &index.to_string())
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if factors.is_empty() { "1".into() } else { factors.join(" * ") }
+            }
+            RingExpr::Select { source, indices } => {
+                let factors = indices
+                    .iter()
+                    .map(|selected| self.ring_crt_modulus_expr(source, &self.expr(selected)))
+                    .collect::<Vec<_>>();
+                if factors.is_empty() { "1".into() } else { factors.join(" * ") }
+            }
+            RingExpr::Concat { left, right } => {
+                format!("({}) * ({})", self.ring_modulus_expr(left), self.ring_modulus_expr(right))
+            }
         }
     }
 
@@ -337,6 +494,44 @@ impl LexicalEnv {
 /// invalid IR expression.
 fn expression_guards(expr: &IntExpr, env: &LexicalEnv) -> Vec<String> {
     let mut guards = Vec::new();
+    fn visit_ring(ring: &crate::RingRef, env: &LexicalEnv, guards: &mut Vec<String>) {
+        use crate::RingExpr;
+        match ring.expression() {
+            RingExpr::Generated { crt_bits, crt_depth, .. } => {
+                visit(crt_bits, env, guards);
+                visit(crt_depth, env, guards);
+            }
+            RingExpr::Explicit { crt_moduli, .. } => {
+                for modulus in crt_moduli {
+                    visit(modulus, env, guards);
+                }
+            }
+            RingExpr::Slice { source, start, end } => {
+                visit_ring(source, env, guards);
+                visit(start, env, guards);
+                visit(end, env, guards);
+                guards.push(format!("0 ≤ ({})", env.expr(start)));
+                guards.push(format!("({}) ≤ ({})", env.expr(start), env.expr(end)));
+                guards.push(format!("({}) ≤ ({})", env.expr(end), env.ring_depth_expr(source)));
+            }
+            RingExpr::Select { source, indices } => {
+                visit_ring(source, env, guards);
+                for index in indices {
+                    visit(index, env, guards);
+                    guards.push(format!("0 ≤ ({})", env.expr(index)));
+                    guards.push(format!(
+                        "({}) < ({})",
+                        env.expr(index),
+                        env.ring_depth_expr(source)
+                    ));
+                }
+            }
+            RingExpr::Concat { left, right } => {
+                visit_ring(left, env, guards);
+                visit_ring(right, env, guards);
+            }
+        }
+    }
     fn visit(expr: &IntExpr, env: &LexicalEnv, guards: &mut Vec<String>) {
         match expr {
             IntExpr::Const(_) | IntExpr::Var(_) | IntExpr::LoopIndex(_) => {}
@@ -378,6 +573,15 @@ fn expression_guards(expr: &IntExpr, env: &LexicalEnv) -> Vec<String> {
             IntExpr::Log2Ceil(a) => {
                 visit(a, env, guards);
                 guards.push(format!("{} ≥ 1", env.expr(a)));
+            }
+            IntExpr::RingModulus(ring) | IntExpr::RingCrtDepth(ring) => {
+                visit_ring(ring, env, guards);
+            }
+            IntExpr::RingCrtModulus { ring, index } => {
+                visit_ring(ring, env, guards);
+                visit(index, env, guards);
+                guards.push(format!("0 ≤ ({})", env.expr(index)));
+                guards.push(format!("({}) < {}", env.expr(index), env.ring_depth_expr(ring)));
             }
         }
     }
@@ -695,6 +899,22 @@ impl<'a> Emitter<'a> {
         self.current_witnesses.clear();
         self.current_value_expressions.clear();
         let scope = self.graph.scope(scope_id).expect("scope key came from graph");
+        for node in scope.nodes() {
+            for entries in [
+                crate::ring::serialize_with_ring_table(node.kind())
+                    .map_err(|error| ExportError::Encoding(error.to_string()))?
+                    .1,
+                crate::ring::serialize_with_ring_table(&node.output_types())
+                    .map_err(|error| ExportError::Encoding(error.to_string()))?
+                    .1,
+            ] {
+                let rings = crate::ring::ring_table_refs(entries)
+                    .map_err(|error| ExportError::Encoding(error.to_string()))?;
+                if rings.iter().any(has_dynamic_generated_basis) {
+                    return Err(ExportError::DynamicGeneratedRing { scope: scope_id.clone() });
+                }
+            }
+        }
         self.current_record = matches!(scope_id, FrozenGraphScopeId::Root) ||
             scope.nodes().iter().any(|node| {
                 matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_))
@@ -771,6 +991,13 @@ impl<'a> Emitter<'a> {
                 .collect(),
             missing_loop_index: Cell::new(None),
             referenced_loop_names: Rc::default(),
+            ring_values: self
+                .validated
+                .resolved_rings
+                .iter()
+                .filter(|((scope, _), _)| scope == scope_id)
+                .map(|((_, ring), value)| (ring.clone(), value.clone()))
+                .collect(),
         };
         for (pos, wire) in inputs.iter().enumerate() {
             let value = tuple_projection("inputs", pos, inputs.len());
@@ -1086,7 +1313,7 @@ impl<'a> Emitter<'a> {
                         relations.push(format!(
                             "({}) < {}",
                             env.expr(exponent),
-                            matrix.ring_dimension
+                            matrix.ring.ring_dimension()
                         ));
                         format!("(MxxRuntime.rotationPolynomial ({}) : {ty})", env.expr(exponent))
                     }
@@ -1244,16 +1471,13 @@ impl<'a> Emitter<'a> {
                 ));
             }
             NodeKind::GadgetDecompose { base, digit_count, small } => {
-                if *small {
-                    return self.unsupported(
-                        scope_id,
-                        node_id,
-                        kind,
-                        "small gadget decomposition needs a runtime relation with its centered-digit semantics",
-                    );
-                }
                 let a = arg(0)?;
-                self.require_layout(scope_id, args[0], Some(base), Some(digit_count))?;
+                self.require_layout(
+                    scope_id,
+                    args[0],
+                    Some(base),
+                    if *small { None } else { Some(digit_count) },
+                )?;
                 append_expression_guards(base, env, relations);
                 append_expression_guards(digit_count, env, relations);
                 let decomposition = output(0);
@@ -1262,7 +1486,11 @@ impl<'a> Emitter<'a> {
                 existentials.push((decomposition.clone(), ty));
                 relations.push(format!(
                     "{} backend {} {} {} {}",
-                    self.options.primitives.gadget_decompose,
+                    if *small {
+                        &self.options.primitives.gadget_decompose_small
+                    } else {
+                        &self.options.primitives.gadget_decompose
+                    },
                     env.expr(base),
                     env.expr(digit_count),
                     a,
@@ -1367,6 +1595,30 @@ impl<'a> Emitter<'a> {
                     &[sigma, bound],
                 );
             }
+            NodeKind::MultiplyMonomial => {
+                return self.unsupported(
+                    scope_id,
+                    node_id,
+                    kind,
+                    "runtime monomial multiplication has no Lean ring relation",
+                );
+            }
+            NodeKind::IntMatrixVectorProduct { .. } => {
+                return self.unsupported(
+                    scope_id,
+                    node_id,
+                    kind,
+                    "integer matrix-vector products have no Lean relation",
+                );
+            }
+            NodeKind::HashIntFamily { .. } => {
+                return self.unsupported(
+                    scope_id,
+                    node_id,
+                    kind,
+                    "integer hash families have no Lean sampler relation",
+                );
+            }
             NodeKind::HashSample { variant, tag_prefix, tag_components, .. } => {
                 if *variant != crate::node::HashVariant::Plain {
                     return self.unsupported(
@@ -1418,10 +1670,9 @@ impl<'a> Emitter<'a> {
                     &["hashModel".into(), prefix, format!("[{components}]"), key],
                 );
             }
-            NodeKind::ModulusSwitch { modulus } |
-            NodeKind::ModulusReduce { modulus } |
-            NodeKind::CenteredRebase { modulus } => {
-                append_expression_guards(modulus, env, relations);
+            NodeKind::ModulusSwitch { .. } |
+            NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredRebase { .. } => {
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
                 let relation = if matches!(kind, NodeKind::ModulusSwitch { .. }) {
                     &self.options.primitives.modulus_switch
@@ -1430,12 +1681,47 @@ impl<'a> Emitter<'a> {
                 } else {
                     &self.options.primitives.modulus_reduce
                 };
-                relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+                if let Some(crate::types::ConcreteWireType::SmallMatrix {
+                    max_coefficient_bound,
+                    ..
+                }) = self.validated.scopes[scope_id]
+                    .wire_types
+                    .get(&WireRef { node: node_id, port: crate::types::Port(0) }) &&
+                    matches!(kind, NodeKind::CenteredRebase { .. })
+                {
+                    relations.push(format!(
+                        "{} {} {} {}",
+                        self.options.primitives.compact_centered_rebase,
+                        max_coefficient_bound,
+                        arg(0)?,
+                        output(0)
+                    ));
+                } else {
+                    relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+                }
             }
-            NodeKind::RnsModUp { modulus, source_moduli, digit_size, normalize } => {
-                append_expression_guards(modulus, env, relations);
+            NodeKind::CenteredRoundDivide { divisor } => {
+                append_expression_guards(divisor, env, relations);
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
-                let basis = source_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+                relations.push(format!(
+                    "{} {} {} {}",
+                    self.options.primitives.centered_round_divide,
+                    env.expr(divisor),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::RnsModUp { digit_size, normalize, .. } => {
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let basis = self.validated.scopes[scope_id].wire_types[&args[0]]
+                    .matrix_type()
+                    .expect("validated RNS input")
+                    .ring
+                    .crt_moduli()
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 relations.push(format!(
                     "{} [{}] {} {} {} {}",
                     self.options.primitives.rns_mod_up,
@@ -1446,14 +1732,42 @@ impl<'a> Emitter<'a> {
                     output(0)
                 ));
             }
-            NodeKind::RnsModDown { modulus, source_moduli, plaintext_modulus } => {
-                append_expression_guards(modulus, env, relations);
+            NodeKind::RnsModDown { plaintext_modulus, .. } => {
                 append_expression_guards(plaintext_modulus, env, relations);
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
-                let basis = source_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+                let basis = self.validated.scopes[scope_id].wire_types[&args[0]]
+                    .matrix_type()
+                    .expect("validated RNS input")
+                    .ring
+                    .crt_moduli()
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 relations.push(format!(
                     "{} [{}] ({}) {} {}",
                     self.options.primitives.rns_mod_down,
+                    basis,
+                    env.expr(plaintext_modulus),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
+                append_expression_guards(plaintext_modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let basis = self.validated.scopes[scope_id].wire_types[&args[0]]
+                    .matrix_type()
+                    .expect("validated block-switch input")
+                    .ring
+                    .crt_moduli()
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                relations.push(format!(
+                    "{} [{}] ({}) {} {}",
+                    self.options.primitives.block_mod_switch,
                     basis,
                     env.expr(plaintext_modulus),
                     arg(0)?,
@@ -1925,12 +2239,14 @@ impl<'a> Emitter<'a> {
             .backend_layouts
             .iter()
             .find(|layout| {
-                layout.modulus == matrix.modulus && layout.ring_dimension == matrix.ring_dimension
+                layout.modulus == matrix.ring.modulus() &&
+                    layout.ring_dimension == matrix.ring.ring_dimension() as usize
             })
             .ok_or_else(|| {
                 ExportError::BackendLayout(format!(
                     "missing ring ({}, {})",
-                    matrix.modulus, matrix.ring_dimension
+                    matrix.ring.modulus(),
+                    matrix.ring.ring_dimension()
                 ))
             })?;
         for env in &self.layout_environments[scope] {
@@ -2297,7 +2613,11 @@ impl<'a> Emitter<'a> {
     fn matrix_type(&self, matrix: &crate::types::ConcreteMatrixType, prefix: &str) -> String {
         format!(
             "{} {} {} {} {}",
-            prefix, matrix.modulus, matrix.ring_dimension, matrix.rows, matrix.columns
+            prefix,
+            matrix.ring.modulus(),
+            matrix.ring.ring_dimension(),
+            matrix.rows,
+            matrix.columns
         )
     }
 }
@@ -2466,10 +2786,153 @@ mod tests {
             CompileParameter, GraphOutput, NodeHandle, SubgraphHandle, with_new_construction_scope,
         },
         node::{IndexRange, LoopInputMode, MatrixBinaryOp, ParallelLoop, SequentialLoop},
-        types::{MatrixType, WireType},
+        types::{CoefficientBoundDomain, MatrixType, WireType},
     };
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn ring_property_exports_resolved_crt_value() {
+        let ring = crate::ring::test_ring(17 * 97, 8);
+        let value = NodeHandle::new(
+            NodeKind::EvaluateInt(IntExpr::RingCrtModulus {
+                ring,
+                index: Box::new(IntExpr::constant(1)),
+            }),
+            Vec::new(),
+            vec![WireType::ConstantInt],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "ring-property",
+            Vec::new(),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("MxxIR.selectInt (1) [17, 97]"));
+    }
+
+    fn loop_ring_property_graph(ring: crate::RingRef) -> crate::Graph {
+        let child = with_new_construction_scope(|scope| {
+            let value = NodeHandle::new(
+                NodeKind::EvaluateInt(IntExpr::RingModulus(ring)),
+                vec![],
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("loop-ring-property", scope, vec![], vec![value]).unwrap()
+        });
+        let output = NodeHandle::parallel_loop(
+            child,
+            vec![],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::ConstantInt),
+                count: 2.into(),
+            }],
+            ParallelLoop {
+                count: 2.into(),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: vec![],
+                input_modes: vec![],
+            },
+        )
+        .output(0)
+        .unwrap();
+        Graph::freeze(
+            "loop-ring-property",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: output, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn loop_dependent_explicit_ring_is_symbolic_in_lean() {
+        let variable_modulus = IntExpr::Add(
+            Box::new(17.into()),
+            Box::new(IntExpr::Mul(Box::new(96.into()), Box::new(IntExpr::LoopIndex(0)))),
+        );
+        let ring = crate::RingRef::new(crate::RingExpr::Explicit {
+            crt_moduli: vec![variable_modulus, 97.into()],
+            ring_dimension: 8,
+        });
+        let graph = loop_ring_property_graph(ring.clone());
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        assert!(validated.resolved_rings.keys().all(|(_, candidate)| candidate != &ring));
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("Int.ofNat i_0"));
+        assert!(artifact.source.contains("96"));
+        assert!(!artifact.source.contains("let w_0_0 := 1649"));
+    }
+
+    #[test]
+    fn loop_dependent_generated_basis_fails_lean_export() {
+        let ring = crate::RingRef::new(crate::RingExpr::Generated {
+            crt_bits: IntExpr::Add(Box::new(7.into()), Box::new(IntExpr::LoopIndex(0))),
+            crt_depth: 1.into(),
+            ring_dimension: 8,
+        });
+        let graph = loop_ring_property_graph(ring);
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        assert!(matches!(
+            export(&validated, &ExportOptions::default()),
+            Err(ExportError::DynamicGeneratedRing { .. })
+        ));
+    }
+
+    #[test]
+    fn dynamic_ring_slices_and_selections_keep_loop_binders() {
+        let source = crate::RingRef::new(crate::RingExpr::Explicit {
+            crt_moduli: vec![17.into(), 97.into(), 113.into()],
+            ring_dimension: 8,
+        });
+        let slice = crate::RingRef::new(crate::RingExpr::Slice {
+            source: source.clone(),
+            start: IntExpr::LoopIndex(0),
+            end: IntExpr::Add(Box::new(IntExpr::LoopIndex(0)), Box::new(2.into())),
+        });
+        let selection = crate::RingRef::new(crate::RingExpr::Select {
+            source: source.clone(),
+            indices: vec![IntExpr::LoopIndex(0)],
+        });
+        let combined = crate::RingRef::new(crate::RingExpr::Concat {
+            left: slice.clone(),
+            right: selection.clone(),
+        });
+        let mut env = LexicalEnv::default();
+        env.loop_indices.insert(0, "(Int.ofNat i_0)".into());
+        env.loop_index_nats.insert(0, "i_0".into());
+        env.ring_values.insert(
+            source.clone(),
+            source.resolve(&ParamEnv::default(), crate::ring::test_resolve_basis).unwrap(),
+        );
+        for ring in [&slice, &selection, &combined] {
+            let modulus = env.expr(&IntExpr::RingModulus(ring.clone()));
+            let coefficient = env
+                .expr(&IntExpr::RingCrtModulus { ring: ring.clone(), index: Box::new(0.into()) });
+            assert!(modulus.contains("Int.ofNat i_0"));
+            assert!(coefficient.contains("Int.ofNat i_0"));
+        }
+        let guards = expression_guards(&IntExpr::RingModulus(selection), &env);
+        assert!(guards.iter().any(|guard| guard.contains("Int.ofNat i_0") && guard.contains("<")));
+        let graph = loop_ring_property_graph(slice);
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let exported = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(exported.source.contains("Int.ofNat i_0"));
+    }
 
     fn scalar_input(name: &str) -> crate::graph::ValueHandle {
         NodeHandle::new(
@@ -2501,13 +2964,13 @@ mod tests {
             let (graph, _) = Graph::freeze(
                 "supported-expression",
                 vec![],
-                BTreeMap::from([("value".into(), GraphOutput { value, confidentiality: None })]),
+                BTreeMap::from([("value".into(), GraphOutput { value, availability: None })]),
                 vec![],
                 vec![],
                 BTreeMap::new(),
             )
             .unwrap();
-            let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+            let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
             let artifact = export(&validated, &ExportOptions::default()).unwrap();
             assert!(artifact.source.contains(expected));
         }
@@ -2524,15 +2987,15 @@ mod tests {
             "boundary",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: x.clone(), confidentiality: None }),
-                ("alias".into(), GraphOutput { value: x, confidentiality: None }),
+                ("first".into(), GraphOutput { value: x.clone(), availability: None }),
+                ("alias".into(), GraphOutput { value: x, availability: None }),
             ]),
             vec![retained],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         let root = graph.scope(&FrozenGraphScopeId::Root).unwrap();
         assert_eq!(artifact.root.output_count, root.outputs().len());
@@ -2551,72 +3014,71 @@ mod tests {
     #[test]
     fn export_refresh_transforms_with_heterogeneous_crt_sources() {
         let matrix = |modulus| MatrixType {
-            modulus: IntExpr::constant(modulus),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(modulus, 2),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         };
         let source = NodeHandle::new(
             NodeKind::ConstantMatrix {
-                matrix_type: matrix(45),
+                matrix_type: matrix(17 * 97),
                 value: ConstantMatrix::Polynomial {
                     coefficients: vec![IntExpr::constant(44), IntExpr::constant(23)],
                 },
             },
             vec![],
-            vec![WireType::Matrix(matrix(45))],
+            vec![WireType::Matrix(matrix(17 * 97))],
         )
         .output(0)
         .unwrap();
         let switched = NodeHandle::new(
-            NodeKind::ModulusSwitch { modulus: IntExpr::constant(15) },
+            NodeKind::ModulusSwitch { destination: crate::ring::test_ring(17, 2) },
             vec![source.clone()],
-            vec![WireType::Matrix(matrix(15))],
+            vec![WireType::Matrix(matrix(17))],
         )
         .output(0)
         .unwrap();
         let reduced = NodeHandle::new(
-            NodeKind::ModulusReduce { modulus: IntExpr::constant(5) },
+            NodeKind::ModulusReduce { destination: crate::ring::test_ring(97, 2) },
             vec![source],
-            vec![WireType::Matrix(matrix(5))],
+            vec![WireType::Matrix(matrix(97))],
         )
         .output(0)
         .unwrap();
         let reduced = NodeHandle::new(
-            NodeKind::CenteredRebase { modulus: IntExpr::constant(5) },
+            NodeKind::CenteredRebase { destination: crate::ring::test_ring(97, 2) },
             vec![reduced],
-            vec![WireType::Matrix(matrix(5))],
+            vec![WireType::Matrix(matrix(97))],
         )
         .output(0)
         .unwrap();
         let conjugate = NodeHandle::new(
             NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
             vec![reduced],
-            vec![WireType::Matrix(matrix(5))],
+            vec![WireType::Matrix(matrix(97))],
         )
         .output(0)
         .unwrap();
         let value = NodeHandle::new(
             NodeKind::CrtRecompose {
-                modulus: IntExpr::constant(45),
+                modulus: IntExpr::constant(17 * 97),
                 plaintext_moduli: vec![IntExpr::constant(3), IntExpr::constant(5)],
                 reconstruction_coefficients: vec![IntExpr::constant(10), IntExpr::constant(6)],
             },
             vec![switched, conjugate],
-            vec![WireType::Matrix(matrix(45))],
+            vec![WireType::Matrix(matrix(17 * 97))],
         )
         .output(0)
         .unwrap();
         let (graph, _) = Graph::freeze(
             "refresh_transforms",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("modulusSwitchRuns"));
         assert!(artifact.source.contains("modulusReduceRuns"));
@@ -2629,8 +3091,7 @@ mod tests {
     #[test]
     fn test_export_rns_conversions_preserves_basis_and_normalization() {
         let matrix = |modulus| MatrixType {
-            modulus: IntExpr::constant(modulus),
-            ring_dimension: IntExpr::constant(8),
+            ring: crate::ring::test_ring(modulus, 8),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         };
@@ -2643,8 +3104,7 @@ mod tests {
         .unwrap();
         let lifted = NodeHandle::new(
             NodeKind::RnsModUp {
-                modulus: IntExpr::constant(17 * 97),
-                source_moduli: vec![17],
+                destination: crate::ring::test_ring(17 * 97, 8),
                 digit_size: 1,
                 normalize: false,
             },
@@ -2655,8 +3115,7 @@ mod tests {
         .unwrap();
         let value = NodeHandle::new(
             NodeKind::RnsModDown {
-                modulus: IntExpr::constant(17),
-                source_moduli: vec![17, 97],
+                destination: crate::ring::test_ring(17, 8),
                 plaintext_modulus: IntExpr::constant(2),
             },
             vec![lifted],
@@ -2667,23 +3126,112 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "rns_conversions",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("rnsModUpRuns [17] 1 false"));
         assert!(artifact.source.contains("rnsModDownRuns [17, 97] (2)"));
     }
 
     #[test]
+    fn test_export_block_mod_switch_preserves_basis_and_correction_factor() {
+        let matrix = |modulus| MatrixType {
+            ring: crate::ring::test_ring(modulus, 8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let source = NodeHandle::new(
+            NodeKind::ConstantMatrix { matrix_type: matrix(17 * 97), value: ConstantMatrix::Zero },
+            vec![],
+            vec![WireType::Matrix(matrix(17 * 97))],
+        )
+        .output(0)
+        .unwrap();
+        let switched = NodeHandle::new(
+            NodeKind::BlockModSwitch {
+                destination: crate::ring::test_ring(97, 8),
+                plaintext_modulus: IntExpr::constant(3),
+            },
+            vec![source],
+            vec![WireType::Matrix(matrix(97))],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "block_mod_switch",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: switched, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("blockModSwitchRuns [17, 97] (3)"));
+    }
+
+    #[test]
+    fn test_export_centered_rebase_preserves_multi_limb_compact_contract() {
+        let matrix = |modulus| MatrixType {
+            ring: crate::ring::test_ring(modulus, 8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let source_ty = WireType::SmallMatrix {
+            matrix: matrix(17 * 97),
+            max_coefficient_bound: IntExpr::constant(7),
+            bound_domain: CoefficientBoundDomain::Global,
+        };
+        let source = NodeHandle::new(
+            NodeKind::Input {
+                name: "compact_source".into(),
+                wire_type: source_ty.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![source_ty],
+        )
+        .output(0)
+        .unwrap();
+        // The destination contains both source CRT limbs and adds a third limb.  This exercises
+        // the exact whole-source centered representative relation rather than a per-limb rebase.
+        let rebased = NodeHandle::new(
+            NodeKind::CenteredRebase { destination: crate::ring::test_ring(17 * 97 * 193, 8) },
+            vec![source],
+            vec![WireType::SmallMatrix {
+                matrix: matrix(17 * 97 * 193),
+                max_coefficient_bound: IntExpr::constant(7),
+                bound_domain: CoefficientBoundDomain::Global,
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "centered_rebase_multi_limb_compact",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: rebased, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("compactCenteredRebaseRuns 7"));
+        assert!(artifact.source.contains("ExactMatrix 1649 8 1 1"));
+        assert!(artifact.source.contains("ExactMatrix 318257 8 1 1"));
+    }
+
+    #[test]
     fn export_constant_polynomial_preserves_payload_and_expression_guards() {
         let matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         };
@@ -2708,13 +3256,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "constants",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("matrixPolynomial [(-3), (MxxIR.exactDiv (8) (2))]"));
         let normalized = artifact.source.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2734,13 +3282,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "ssa",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: y, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: y, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("w_0_0 + ") == false);
         assert!(
@@ -2760,8 +3308,7 @@ mod tests {
     #[test]
     fn export_matrix_addition_is_taken_from_frozen_nodes() {
         let matrix = MatrixType {
-            modulus: IntExpr::constant(BigInt::from(17)),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         };
@@ -2783,13 +3330,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "matrix",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: y, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: y, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("matrixAdd w_0_0 w_0_0"));
     }
@@ -2837,16 +3384,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "parallel",
             vec![],
-            BTreeMap::from([(
-                "out".into(),
-                GraphOutput { value: parallel, confidentiality: None },
-            )]),
+            BTreeMap::from([("out".into(), GraphOutput { value: parallel, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("parallel_generatedRoot"));
         assert!(artifact.source.contains("∀ i : Fin 4"));
@@ -2896,16 +3440,13 @@ mod tests {
             let (graph, _) = Graph::freeze(
                 "prefix",
                 vec![],
-                BTreeMap::from([(
-                    "out".into(),
-                    GraphOutput { value: output, confidentiality: None },
-                )]),
+                BTreeMap::from([("out".into(), GraphOutput { value: output, availability: None })]),
                 vec![],
                 vec![],
                 BTreeMap::new(),
             )
             .unwrap();
-            let validated = crate::validate(&graph, &ParamEnv::default());
+            let validated = crate::ring::test_validate(&graph, &ParamEnv::default());
             if count == 4 {
                 assert!(validated.is_err(), "zip must not read beyond the source family");
                 continue;
@@ -2943,13 +3484,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "root-child-inputs",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: call, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: call, availability: None })]),
             vec![],
             vec![root_input],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("(_ : Unit)"));
         assert!(artifact.source.contains("scope_zero_input params ()"));
@@ -2979,13 +3520,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "lazy_select",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         let normalized = artifact.source.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized.contains("((0) = 1 → ((0) ≠ 0)) ∧ outputs ="));
@@ -3031,13 +3572,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "formal-order",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: call, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: call, availability: None })]),
             vec![],
             vec![first, second],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(
             artifact
@@ -3071,12 +3612,8 @@ mod tests {
         )
         .output(0)
         .unwrap();
-        let matrix = MatrixType {
-            modulus: 17.into(),
-            ring_dimension: 2.into(),
-            rows: 1.into(),
-            columns: 1.into(),
-        };
+        let matrix =
+            MatrixType { ring: crate::ring::test_ring(17, 2), rows: 1.into(), columns: 1.into() };
         let sampled = NodeHandle::new(
             NodeKind::HashSample {
                 matrix_type: matrix.clone(),
@@ -3095,15 +3632,15 @@ mod tests {
             "hash-binders",
             vec![],
             BTreeMap::from([
-                ("plain".into(), GraphOutput { value: call, confidentiality: None }),
-                ("sampled".into(), GraphOutput { value: sampled, confidentiality: None }),
+                ("plain".into(), GraphOutput { value: call, availability: None }),
+                ("sampled".into(), GraphOutput { value: sampled, availability: None }),
             ]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("def scope_plain (_ : MxxRuntime.HashModel)"));
         assert!(artifact.source.contains("def generatedRoot (hashModel : MxxRuntime.HashModel)"));
@@ -3143,15 +3680,15 @@ mod tests {
             "two-bindings",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: first, confidentiality: None }),
-                ("second".into(), GraphOutput { value: second, confidentiality: None }),
+                ("first".into(), GraphOutput { value: first, availability: None }),
+                ("second".into(), GraphOutput { value: second, availability: None }),
             ]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert_eq!(artifact.source.matches("def scope_bound ").count(), 1);
         assert_eq!(artifact.root.parameters["k"].lean_type, "Int");
@@ -3164,8 +3701,7 @@ mod tests {
     fn backend_layout_uses_lexical_child_bindings() {
         let child = with_new_construction_scope(|scope| {
             let matrix = MatrixType {
-                modulus: 17.into(),
-                ring_dimension: 2.into(),
+                ring: crate::ring::test_ring(17, 2),
                 rows: 1.into(),
                 columns: 2.into(),
             };
@@ -3205,8 +3741,8 @@ mod tests {
                     kind: crate::graph::CompileParameterKind::Integer,
                 }],
                 BTreeMap::from([
-                    ("gadget".into(), GraphOutput { value, confidentiality: None }),
-                    ("second".into(), GraphOutput { value: second, confidentiality: None }),
+                    ("gadget".into(), GraphOutput { value, availability: None }),
+                    ("second".into(), GraphOutput { value: second, availability: None }),
                 ]),
                 vec![],
                 vec![],
@@ -3221,7 +3757,7 @@ mod tests {
                 ]),
                 ..ParamEnv::default()
             };
-            let validated = crate::validate(&graph, &env).unwrap();
+            let validated = crate::ring::test_validate(&graph, &env).unwrap();
             let options = ExportOptions {
                 backend_layouts: vec![BackendLayout {
                     modulus: 17.into(),
@@ -3278,13 +3814,13 @@ mod tests {
                 )
                 .output(0)
                 .unwrap();
-                (format!("out{index}"), GraphOutput { value, confidentiality: None })
+                (format!("out{index}"), GraphOutput { value, availability: None })
             })
             .collect();
         let (graph, _) =
             Graph::freeze("nested_helpers", vec![], outputs, vec![], vec![], BTreeMap::new())
                 .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("MxxIR.exactDiv (Int.fdiv (8) (2)) (2)"));
         assert!(artifact.source.contains("MxxIR.roundDiv (Int.fmod (7) (4)) (2)"));
@@ -3305,7 +3841,7 @@ mod tests {
                 )
                 .output(0)
                 .unwrap();
-                (format!("out{index:02}"), GraphOutput { value, confidentiality: None })
+                (format!("out{index:02}"), GraphOutput { value, availability: None })
             })
             .collect();
         let (graph, _) = Graph::freeze(
@@ -3322,7 +3858,7 @@ mod tests {
         .unwrap();
         let mut bindings = ParamEnv::default();
         bindings.integers.insert("backend".into(), 1.into());
-        let validated = crate::validate(&graph, &bindings).unwrap();
+        let validated = crate::ring::test_validate(&graph, &bindings).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert_eq!(artifact.source.matches("(params.«backend») ≠ 0").count(), 33);
         assert!(artifact.source.contains("abbrev generatedRoot.constraints_1"));
@@ -3349,7 +3885,7 @@ mod tests {
                 name: "den".into(),
                 kind: crate::graph::CompileParameterKind::Integer,
             }],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3357,7 +3893,7 @@ mod tests {
         .unwrap();
         let mut bindings = ParamEnv::default();
         bindings.integers.insert("den".into(), BigInt::from(3));
-        let validated = crate::validate(&graph, &bindings).unwrap();
+        let validated = crate::ring::test_validate(&graph, &bindings).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("MxxIR.exactDiv (-6) (params.«den»)"));
         assert!(
@@ -3383,13 +3919,13 @@ mod tests {
                 });
                 let value =
                     NodeHandle::subgraph_call(child, vec![], vec![], vec![]).output(0).unwrap();
-                (name.to_owned(), GraphOutput { value, confidentiality: None })
+                (name.to_owned(), GraphOutput { value, availability: None })
             })
             .collect();
         let (graph, _) =
             Graph::freeze("scope-collision", vec![], outputs, vec![], vec![], BTreeMap::new())
                 .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         assert!(matches!(
             export(&validated, &ExportOptions::default()),
             Err(ExportError::ScopeNameCollision(name)) if name == "scope_a_b"
@@ -3399,8 +3935,7 @@ mod tests {
     #[test]
     fn scope_projection_metadata_matches_slice_and_following_node() {
         let matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(2),
             columns: IntExpr::constant(2),
         };
@@ -3432,13 +3967,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "slice_projections",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: result, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: result, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         let proof = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
         assert_eq!(proof.node_constraints[&NodeId(1)], 0..7);
@@ -3467,8 +4002,7 @@ mod tests {
     #[test]
     fn invalid_slice_range_is_rejected_before_export() {
         let matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(2),
             columns: IntExpr::constant(2),
         };
@@ -3496,13 +4030,14 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "invalid-slice",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: slice, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: slice, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let error = crate::validate(&graph, &ParamEnv::default()).unwrap_err().to_string();
+        let error =
+            crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap_err().to_string();
         assert!(error.contains("row slice must be nonempty"));
     }
 
@@ -3540,15 +4075,15 @@ mod tests {
             "sequential",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: first_output, confidentiality: None }),
-                ("second".into(), GraphOutput { value: second_output, confidentiality: None }),
+                ("first".into(), GraphOutput { value: first_output, availability: None }),
+                ("second".into(), GraphOutput { value: second_output, availability: None }),
             ]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("MxxIR.IterRuns"));
         assert!(artifact.source.contains("current") && artifact.source.contains("next"));
@@ -3559,20 +4094,17 @@ mod tests {
     #[test]
     fn export_preserves_trapdoor_pair_and_three_preimage_operands() {
         let trapdoor_matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(3),
         };
         let target_matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         };
         let preimage_matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(3),
             columns: IntExpr::constant(1),
         };
@@ -3618,6 +4150,7 @@ mod tests {
             vec![WireType::Preimage {
                 matrix: preimage_matrix,
                 max_coefficient_bound: IntExpr::constant(4),
+                bound_domain: CoefficientBoundDomain::Global,
             }],
         )
         .output(0)
@@ -3625,16 +4158,13 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "preimage",
             vec![],
-            BTreeMap::from([(
-                "out".into(),
-                GraphOutput { value: preimage, confidentiality: None },
-            )]),
+            BTreeMap::from([("out".into(), GraphOutput { value: preimage, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         assert!(matches!(
             export(&validated, &ExportOptions::default()),
             Err(ExportError::BackendLayout(_))
@@ -3667,8 +4197,7 @@ mod tests {
     #[test]
     fn mismatched_public_preimage_is_rejected_before_export() {
         let matrix = MatrixType {
-            modulus: IntExpr::constant(17),
-            ring_dimension: IntExpr::constant(2),
+            ring: crate::ring::test_ring(17, 2),
             rows: IntExpr::constant(1),
             columns: IntExpr::constant(1),
         };
@@ -3720,6 +4249,7 @@ mod tests {
         let preimage_ty = WireType::Preimage {
             matrix: MatrixType { rows: IntExpr::constant(3), ..matrix },
             max_coefficient_bound: IntExpr::constant(4),
+            bound_domain: CoefficientBoundDomain::Global,
         };
         let out = NodeHandle::new(
             NodeKind::PreimageSample {
@@ -3738,13 +4268,14 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "mismatched-preimage",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: out, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: out, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
         )
         .unwrap();
-        let error = crate::validate(&graph, &ParamEnv::default()).unwrap_err().to_string();
+        let error =
+            crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap_err().to_string();
         assert!(error.contains("preimage public matrix does not match"));
     }
 }

@@ -1,0 +1,125 @@
+//! Environment-variable helpers for native primitives and execution backends.
+
+/// `MXX_CUDA_STREAM_POOL_SIZE`: number of reusable compute streams owned by
+/// each GPU context and device. Default: 32.
+pub fn cuda_stream_pool_size() -> usize {
+    std::env::var("MXX_CUDA_STREAM_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(32)
+}
+
+/// `MXX_GPU_LOGICAL_DEVICES`: comma-separated physical CUDA device ids, one per
+/// logical GPU device. `0,0` exposes two logical devices on physical GPU 0, so
+/// multi-device plans can be exercised on one GPU. Unset: every detected device
+/// is its own logical device.
+pub fn gpu_logical_devices() -> Result<Option<Vec<i32>>, String> {
+    let name = "MXX_GPU_LOGICAL_DEVICES";
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => {
+            value
+                .split(',')
+                .map(|device| {
+                    device.trim().parse::<i32>().ok().filter(|device| *device >= 0).ok_or_else(
+                        || format!("{name} must list physical device ids, got {value:?}"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
+/// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
+pub fn block_size() -> usize {
+    std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)
+}
+
+fn positive_usize(name: &str, default: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("{name} must be a positive unsigned integer, got {value:?}"))
+            .and_then(|parsed| {
+                if parsed == 0 { Err(format!("{name} must be positive")) } else { Ok(parsed) }
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
+/// Maximum number of sampler attempts for each target-column tile.
+///
+/// This is intentionally fail-closed: malformed or zero values are errors,
+/// rather than silently selecting an unbounded retry policy.
+pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
+    positive_usize("MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS", 64)
+}
+
+/// `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS`: columns of a bounded right operand that
+/// one GPU small-RHS product transforms at a time. Each chunk is decoded and
+/// transformed into one reused workspace of `rhs rows x chunk` polynomials, so
+/// the whole right operand is never expanded; larger chunks trade workspace
+/// memory for fewer kernel launches. Default: 16. Zero or malformed values are
+/// errors.
+pub fn gpu_small_rhs_chunk_columns() -> Result<usize, String> {
+    positive_usize("MXX_GPU_SMALL_RHS_CHUNK_COLUMNS", 16)
+}
+
+/// `MXX_GPU_MEMORY_FRACTION`: fraction of each GPU's physical memory one plan's
+/// persistent allocations may use. Graph-owned scratch is admitted separately,
+/// against the memory free at its Graph's first launch. Default: 0.8. Values
+/// outside `(0, 1]` are errors.
+pub fn gpu_memory_fraction() -> Result<f64, String> {
+    let name = "MXX_GPU_MEMORY_FRACTION";
+    match std::env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|fraction| *fraction > 0.0 && *fraction <= 1.0)
+            .ok_or_else(|| format!("{name} must be in (0, 1], got {value:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(0.8),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
+    // Small unit-test defaults; overrides permit the same production path to
+    // exercise larger coefficient vectors and CRT bases without source edits.
+    let dimension = positive_usize("MXX_PRIMITIVE_TEST_RING_DIMENSION", 32).unwrap();
+    let depth = positive_usize("MXX_PRIMITIVE_TEST_CRT_DEPTH", 4).unwrap();
+    let bits = positive_usize("MXX_PRIMITIVE_TEST_CRT_BITS", 30).unwrap();
+    let base_bits = positive_usize("MXX_PRIMITIVE_TEST_BASE_BITS", 2).unwrap();
+    assert!(dimension >= 16 && dimension.is_power_of_two());
+    assert!(depth >= 4);
+    (u32::try_from(dimension).unwrap(), depth, bits, u32::try_from(base_bits).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::positive_usize;
+
+    #[test]
+    #[serial_test::serial]
+    fn positive_parser_uses_default_only_when_unset() {
+        let name = "MXX_TEST_POSITIVE_PARSER";
+        unsafe { std::env::remove_var(name) };
+        assert_eq!(positive_usize(name, 64).unwrap(), 64);
+        unsafe { std::env::set_var(name, "7") };
+        assert_eq!(positive_usize(name, 64).unwrap(), 7);
+        unsafe { std::env::set_var(name, "0") };
+        assert!(positive_usize(name, 64).is_err());
+        unsafe { std::env::set_var(name, "-1") };
+        assert!(positive_usize(name, 64).is_err());
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+// Runtime configuration shares the backend environment namespace.
+pub use crate::runtime_env::{GpuRuntimeConfigError, GpuRuntimeOptions};

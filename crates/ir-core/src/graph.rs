@@ -1225,12 +1225,28 @@ fn freeze_scope(
     let mut roots = outputs.to_vec();
     roots.extend_from_slice(effects);
     roots.extend_from_slice(inputs);
-    let nodes = canonical_postorder(&roots, construction_scope.clone())?;
-    let node_ids = nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| (node.identity(), NodeId(index as u64)))
-        .collect::<HashMap<_, _>>();
+    // Input nodes with one name and one declaration denote one graph input,
+    // however many times a builder created them: every later node resolves
+    // to the first. Different declarations under one name are an error.
+    let mut nodes = Vec::new();
+    let mut node_ids = HashMap::new();
+    let mut input_ids = BTreeMap::<String, (NodeId, NodeHandle)>::new();
+    let mut aliases = Vec::new();
+    for node in canonical_postorder(&roots, construction_scope.clone())? {
+        if let NodeKind::Input { name, .. } = node.kind() {
+            if let Some((id, first)) = input_ids.get(name) {
+                if first.kind() != node.kind() || first.output_types() != node.output_types() {
+                    return Err(FreezeError::DuplicateInput { name: name.clone() });
+                }
+                node_ids.insert(node.identity(), *id);
+                aliases.push(node);
+                continue;
+            }
+            input_ids.insert(name.clone(), (NodeId(nodes.len() as u64), node.clone()));
+        }
+        node_ids.insert(node.identity(), NodeId(nodes.len() as u64));
+        nodes.push(node);
+    }
     let resolve = |value: &ValueHandle| {
         let node = node_ids.get(&value.node.identity()).copied()?;
         Some(WireRef { node, port: value.port })
@@ -1245,13 +1261,7 @@ fn freeze_scope(
         .map(&resolve)
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| FreezeError::ForeignScope { graph: format!("{id:?}") })?;
-    let mut input_names = BTreeSet::new();
-    for node in &nodes {
-        if let NodeKind::Input { name, .. } = node.kind() {
-            if !input_names.insert(name.clone()) {
-                return Err(FreezeError::DuplicateInput { name: name.clone() });
-            }
-        }
+    for node in nodes.iter().chain(&aliases) {
         let node_id = node_ids[&node.identity()];
         for port in 0..node.output_types().len() {
             freeze_map.insert(
@@ -1893,6 +1903,41 @@ mod tests {
         let output = sealed.handle.outputs()[0].node();
         assert_eq!(output.arguments()[0], output.arguments()[1]);
         assert_eq!(output.benchmark_role(), Some(BenchmarkRole::PublicReadout));
+    }
+
+    /// Two input nodes with one name and one declaration freeze to one
+    /// graph input; a second declaration under that name is rejected.
+    #[test]
+    fn identical_input_declarations_freeze_to_one_input() {
+        let add = |lhs: ValueHandle, rhs: ValueHandle| {
+            NodeHandle::new(
+                NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+                vec![lhs, rhs],
+                vec![WireType::Matrix(matrix_type())],
+            )
+            .output(0)
+            .unwrap()
+        };
+        let freeze = |value| {
+            Graph::freeze(
+                "same-input",
+                Vec::new(),
+                BTreeMap::from([("out".to_owned(), GraphOutput { value, availability: None })]),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            )
+        };
+        let (graph, _) = freeze(add(input("x"), input("x"))).unwrap();
+        let root = graph.root_scope();
+        assert_eq!(root.nodes().len(), 2);
+        let sum = root.node(NodeId(1)).unwrap();
+        assert_eq!(root.arguments(sum).unwrap()[0], root.arguments(sum).unwrap()[1]);
+
+        assert!(matches!(
+            freeze(add(input("x"), family_input("x"))),
+            Err(FreezeError::DuplicateInput { name }) if name == "x"
+        ));
     }
 
     #[test]

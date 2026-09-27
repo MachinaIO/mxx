@@ -477,26 +477,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mxx-bgg"
-version = "0.1.0"
-dependencies = [
- "keccak-asm",
- "mxx-backends",
- "mxx-dsl",
- "mxx-gadgets",
- "mxx-ir-core",
- "num-bigint",
- "num-traits",
- "rayon",
- "serial_test",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "mxx-dsl"
 version = "0.1.0"
 dependencies = [
+ "bigdecimal",
+ "mxx-backends",
  "mxx-ir-core",
  "num-bigint",
  "serde",
@@ -529,33 +514,6 @@ name = "mxx-func-enc"
 version = "0.1.0"
 
 [[package]]
-name = "mxx-gadgets"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "bincode",
- "dashmap",
- "digest",
- "itertools",
- "keccak-asm",
- "mxx-backends",
- "mxx-bgg",
- "mxx-dsl",
- "mxx-ir-core",
- "num-bigint",
- "num-integer",
- "num-traits",
- "rand 0.9.2",
- "rayon",
- "serde",
- "serde_json",
- "serial_test",
- "thiserror",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "mxx-io"
 version = "0.1.0"
 
@@ -570,6 +528,33 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "mxx-khe"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "bincode",
+ "dashmap",
+ "digest",
+ "itertools",
+ "keccak-asm",
+ "mxx-backends",
+ "mxx-dsl",
+ "mxx-ir-core",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "rand 0.9.2",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,3 +1,12 @@
+//! Polynomial matrices.
+//!
+//! [`PolyMatrix`] is the primitive matrix trait: arithmetic, batch operations, automorphisms,
+//! slicing, concatenation, tensor products, decomposition, modulus conversions, and the compact
+//! byte codec. `dcrt_poly::DCRTPolyMatrix` implements it with Rayon-parallel entry loops, and
+//! [`CpuSmallMatrix`] stores a bounded matrix with its coefficient bound and bound domain. GPU
+//! matrices are only device allocations that GPU plans bind (`gpu_dcrt_poly::GpuDCRTPolyMatrix`);
+//! no GPU type implements this trait.
+
 use crate::{
     element::PolyElem,
     poly::{Poly, PolyParams},

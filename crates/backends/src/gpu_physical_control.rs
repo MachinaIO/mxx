@@ -4,6 +4,29 @@
 //! selects an artifact member needs an explicit I/O boundary between bounded
 //! Graph replays. Values that change with a device loop index remain physical
 //! values in either form.
+//!
+//! - **Waves.** A parallel loop lowers to a reusable W-lane wave template replayed once per wave
+//!   with fresh lane bindings; a nested wave template is replayed for every active parent
+//!   occurrence. Every lane reads its member of a zipped family from the family's plan owner, which
+//!   execute rebinds for root inputs before the first wave.
+//! - **Vectorized scalar loops.** A parallel loop whose body has only scalar integer and Boolean
+//!   arithmetic, comparisons, selection, and family reads lowers once, with one elementwise
+//!   operation per body node over all lanes.
+//! - **Integer control and status words.** Runtime integer and Boolean operations, selection, and
+//!   sequential loops run on the device. Errors (division by zero, overflow, invalid index, inexact
+//!   division) go to a per-device status word, first error wins, and the word is checked only after
+//!   the launch joins.
+//! - **Sequential-loop carries.** A sequential loop may carry matrices, scalars, and integer
+//!   families. An integer carry is sized by a range closed over every iteration, and a Euclidean
+//!   remainder by a positive constant has the exact range `[0, divisor)`.
+//! - **Scalar kernels.** Hash integer families share the hash-sample primitive and match the CPU
+//!   transcript. Monomial products multiply each evaluation slot by the matching twiddle, with no
+//!   NTT of their own. Integer matrix-vector products use one warp per row (`M v`) or chunked
+//!   atomics per column (`v^T M`) and accumulate exactly in `int64`.
+//! - **Lanes on several devices.** The lanes of an outermost wave loop are spread over the devices:
+//!   lane `l` runs on device `l mod G`. Shared inputs are copied once per loop to each remote
+//!   device, zipped members are copied into the lane inside the template, and a remote lane's
+//!   results are copied home, so family members always live on the first device.
 
 use crate::{
     artifact::ArtifactKey,
@@ -87,10 +110,8 @@ pub(crate) struct PhysicalWave {
     pub body_start: u32,
     pub body_end: u32,
     pub owner_bindings: BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
-    /// Root input family name, selected member index, and the lane value ID
-    /// rebound to that member for this wave.
-    pub zip_inputs: Vec<(String, usize, PhysicalValueId)>,
     /// Resident family source, member index, and physical lane destination.
+    /// A root input source is the plan owner that each execute rebinds.
     pub zip_sources: Vec<(PhysicalValueId, usize, PhysicalValueId)>,
     /// First logical loop occurrence represented by this Graph replay.
     pub start_index: usize,
@@ -350,7 +371,7 @@ pub(super) fn finite_loop_count(
         _ => return Err(format!("{scope:?} node {node:?} is not a structural loop")),
     };
     let value = count
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+        .evaluate(env)
         .map_err(|error| format!("{scope:?} node {node:?} loop count: {error}"))?;
     let count = value.to_u64().ok_or_else(|| {
         format!("{scope:?} node {node:?} loop count is negative or exceeds native u64")
@@ -790,7 +811,7 @@ pub(super) fn lower_control_node(
                 return Ok(());
             }
             let value = expression
-                .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate_f64(env)
                 .map_err(|error| format!("GPU real expression: {error}"))?;
             let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
             let id = allocate_real_value(ctx, ty)?;
@@ -887,7 +908,7 @@ pub(super) fn lower_control_node(
                 return Ok(());
             }
             let value = expression
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| format!("GPU integer expression: {error}"))?;
             let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
             let id = allocate_integer_value(ctx, ty, value.clone()..=value.clone(), Some(&value))?;
@@ -1025,7 +1046,7 @@ pub(super) fn lower_control_node(
                 .arguments(node)
                 .ok_or_else(|| "GPU eager Select arguments are outside their scope".to_owned())?;
             let count = count
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_usize()
                 .ok_or_else(|| "GPU eager Select count is negative or too large".to_owned())?;
@@ -1141,7 +1162,7 @@ pub(super) fn lower_control_node(
                 .ok_or_else(|| "GPU bit extraction has no physical input".to_owned())?;
             integer_range(ctx, source)?;
             let bit = bit
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_u64()
                 .ok_or_else(|| "GPU bit position is negative or exceeds u64".to_owned())?;
@@ -1206,14 +1227,9 @@ pub(super) fn lower_control_node(
                     .output_types()
                     .first()
                     .ok_or_else(|| "GPU dynamic artifact family has no type".to_owned())?;
-                let family_type = concretize_wire_type(
-                    family_type,
-                    env,
-                    scope_id,
-                    family_wire.node,
-                    crate::openfhe_guard::gen_modulus_and_warmup,
-                )
-                .map_err(|error| error.to_string())?;
+                let family_type =
+                    concretize_wire_type(family_type, env, scope_id, family_wire.node)
+                        .map_err(|error| error.to_string())?;
                 let ConcreteWireType::IndexedFamily { element, count } = family_type else {
                     return Err("GPU dynamic artifact source is not a family".into());
                 };
@@ -1308,7 +1324,7 @@ pub(super) fn lower_control_node(
                 return Err("GPU static family selection has the wrong arity".into());
             };
             let index = index
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| format!("GPU static family index: {error}"))?
                 .to_usize()
                 .ok_or_else(|| "GPU static family index is negative or too large".to_owned())?;
@@ -1316,14 +1332,8 @@ pub(super) fn lower_control_node(
                 .output_types()
                 .first()
                 .ok_or_else(|| "GPU static family selection has no output".to_owned())?;
-            let expected = concretize_wire_type(
-                declared,
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let expected = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
             if !ctx.wire_ids.contains_key(family) {
                 let source = scope
                     .node(family.node)
@@ -1346,14 +1356,8 @@ pub(super) fn lower_control_node(
                     .output_types()
                     .first()
                     .ok_or_else(|| "GPU artifact family input has no output type".to_owned())?;
-                let family_ty = concretize_wire_type(
-                    family_type,
-                    env,
-                    scope_id,
-                    family.node,
-                    crate::openfhe_guard::gen_modulus_and_warmup,
-                )
-                .map_err(|error| error.to_string())?;
+                let family_ty = concretize_wire_type(family_type, env, scope_id, family.node)
+                    .map_err(|error| error.to_string())?;
                 let ConcreteWireType::IndexedFamily { element, count } = family_ty else {
                     return Err("GPU static artifact source is not an indexed family".into());
                 };
@@ -1424,7 +1428,7 @@ pub(super) fn lower_control_node(
                 .arguments(node)
                 .ok_or_else(|| "GPU family pack arguments are outside their scope".to_owned())?;
             let count = count
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| format!("GPU family pack count: {error}"))?
                 .to_usize()
                 .ok_or_else(|| "GPU family pack count is negative or too large".to_owned())?;
@@ -1435,14 +1439,8 @@ pub(super) fn lower_control_node(
                 .output_types()
                 .first()
                 .ok_or_else(|| "GPU family pack has no output".to_owned())?;
-            let expected = concretize_wire_type(
-                declared,
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let expected = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
             let ConcreteWireType::IndexedFamily { element, count: expected_count } = &expected
             else {
                 return Err("GPU family pack output is not a family".into());
@@ -1685,9 +1683,7 @@ fn lower_hash_int_family(
         ctx.wire_ids.insert(output, id);
         return Ok(());
     }
-    let modulus = modulus
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| error.to_string())?;
+    let modulus = modulus.evaluate(env).map_err(|error| error.to_string())?;
     let (resource_id, operands) =
         hash_tag_resource(ctx, &arguments, tag_prefix, tag_components, env)?;
     // A family below 2^64 is stored compactly, one word per member.
@@ -1750,14 +1746,7 @@ fn resolved_node_output_type(
     let [declared] = node.output_types() else {
         return Err("GPU integer node needs one output".into());
     };
-    concretize_wire_type(
-        declared,
-        env,
-        scope,
-        node_id,
-        crate::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .map_err(|error| error.to_string())
+    concretize_wire_type(declared, env, scope, node_id).map_err(|error| error.to_string())
 }
 
 /// The per-lane semantic type of a value. Inside a vectorized body a lane
@@ -1871,7 +1860,7 @@ fn lower_device_int_expr_mode(
         !selector.contains_loop_index()
     {
         let index = selector
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate(env)
             .map_err(|error| format!("GPU integer selector: {error}"))?
             .to_usize()
             .ok_or_else(|| "GPU integer selector is negative or too large".to_owned())?;
@@ -1881,9 +1870,8 @@ fn lower_device_int_expr_mode(
         return lower_device_int_expr_mode(ctx, branch, env, force_device);
     }
     if !force_device && !expression.contains_loop_index() {
-        let value = expression
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| format!("GPU scalar expression: {error}"))?;
+        let value =
+            expression.evaluate(env).map_err(|error| format!("GPU scalar expression: {error}"))?;
         return allocate_integer_value(
             ctx,
             ConcreteWireType::Int,
@@ -2085,8 +2073,7 @@ fn lower_device_int_expr_mode(
         IntExpr::RingCrtModulus { .. }
             if !expression.contains_loop_index() =>
         {
-            match expression.evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            {
+            match expression.evaluate(env) {
                 Ok(value) => allocate_integer_value(
                     ctx,
                     ConcreteWireType::Int,
@@ -2108,7 +2095,7 @@ fn lower_device_int_expr_mode(
             }
         }
         IntExpr::RingCrtModulus { ring, index } if !ring.contains_loop_index() => {
-            let concrete = match ring.resolve(env, crate::openfhe_guard::gen_modulus_and_warmup) {
+            let concrete = match ring.resolve(env) {
                 Ok(concrete) => concrete,
                 Err(_) if force_device => return report_invalid_ring_property(ctx),
                 Err(error) => return Err(format!("GPU CRT ring property: {error}")),
@@ -2793,14 +2780,7 @@ fn lower_subgraph_kernel(
         .output_types()
         .iter()
         .map(|ty| {
-            concretize_wire_type(
-                ty,
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())
+            concretize_wire_type(ty, env, scope_id, node_id).map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
     if arguments.len() != kernel.inputs.len() || output_types.len() != kernel.outputs.len() {
@@ -3237,7 +3217,7 @@ fn lower_device_real_expr(
 ) -> Result<PhysicalValueId, String> {
     if !real_contains_loop_index(expression) {
         let value = expression
-            .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate_f64(env)
             .map_err(|error| format!("GPU real scalar expression: {error}"))?;
         let output = allocate_real_value(ctx, ConcreteWireType::Real)?;
         emit_real_operation(ctx, GpuRealOperation::CopyConstant, output, None, None, value)?;
@@ -3668,7 +3648,7 @@ fn scale_matrix_product(
         )
     } else {
         let value = coefficient
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate(env)
             .map_err(|error| format!("GPU accumulated product coefficient: {error}"))?;
         let residues = ty
             .ring
@@ -3843,11 +3823,9 @@ fn lower_gadget_decompose(
     }
     let output_matrix = output_matrix.clone();
     let max_coefficient_bound = max_coefficient_bound.clone();
-    let base = base
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| format!("GPU gadget base: {error}"))?;
+    let base = base.evaluate(env).map_err(|error| format!("GPU gadget base: {error}"))?;
     let digits = digit_count
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+        .evaluate(env)
         .map_err(|error| format!("GPU gadget digits: {error}"))?
         .to_usize()
         .ok_or("GPU gadget digit count does not fit usize")?;
@@ -4517,14 +4495,8 @@ fn lower_threshold_decode(
     }
     let element = if output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
     for (port, declared) in node.output_types().iter().enumerate() {
-        let actual = concretize_wire_type(
-            declared,
-            env,
-            scope_id,
-            node_id,
-            crate::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .map_err(|error| error.to_string())?;
+        let actual = concretize_wire_type(declared, env, scope_id, node_id)
+            .map_err(|error| error.to_string())?;
         if actual != element {
             return Err(format!("GPU threshold port {port} has the wrong output type"));
         }
@@ -4852,9 +4824,8 @@ fn lower_matrix_scale(
         ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
         return Ok(());
     }
-    let value = scalar
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| format!("GPU matrix scale scalar: {error}"))?;
+    let value =
+        scalar.evaluate(env).map_err(|error| format!("GPU matrix scale scalar: {error}"))?;
     let residues = ty
         .ring
         .crt_moduli()
@@ -4990,9 +4961,8 @@ fn lower_centered_round_divide(
         ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, result_coeff);
         return Ok(());
     }
-    let divisor = divisor
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| format!("GPU centered divisor: {error}"))?;
+    let divisor =
+        divisor.evaluate(env).map_err(|error| format!("GPU centered divisor: {error}"))?;
     let (sign, mut words) = divisor.to_u64_digits();
     if sign != num_bigint::Sign::Plus {
         return Err("GPU centered divisor must be positive".into());
@@ -5083,13 +5053,13 @@ fn lower_matrix_slice(
         Some(range) => {
             let start = range
                 .start
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_usize()
                 .ok_or_else(|| "GPU matrix slice start is negative or too large".to_owned())?;
             let end = range
                 .end
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_usize()
                 .ok_or_else(|| "GPU matrix slice end is negative or too large".to_owned())?;
@@ -6371,14 +6341,9 @@ fn lower_sequential_loop(
                 .wire_ids
                 .get(wire)
                 .ok_or_else(|| "GPU zero-iteration carry has no physical value".to_owned())?;
-            let declared = concretize_wire_type(
-                &node.output_types()[position],
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let declared =
+                concretize_wire_type(&node.output_types()[position], env, scope_id, node_id)
+                    .map_err(|error| error.to_string())?;
             let output = if ctx.values[source.0 as usize].ty == declared {
                 source
             } else {
@@ -6744,14 +6709,9 @@ fn lower_sequential_loop(
             imports: body_imports,
         });
         for (position, carried) in carried_ids.into_iter().enumerate() {
-            let declared = concretize_wire_type(
-                &node.output_types()[position],
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let declared =
+                concretize_wire_type(&node.output_types()[position], env, scope_id, node_id)
+                    .map_err(|error| error.to_string())?;
             if ctx.values[carried.0 as usize].ty != declared {
                 return Err("GPU external-I/O loop output differs from its carry".into());
             }
@@ -6817,14 +6777,8 @@ fn lower_sequential_loop(
         let port =
             Port(u32::try_from(position).map_err(|_| "too many GPU loop outputs".to_owned())?);
         let wire = WireRef { node: node_id, port };
-        let declared = concretize_wire_type(
-            &node.output_types()[position],
-            env,
-            scope_id,
-            node_id,
-            crate::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .map_err(|error| error.to_string())?;
+        let declared = concretize_wire_type(&node.output_types()[position], env, scope_id, node_id)
+            .map_err(|error| error.to_string())?;
         if ctx.values[carried.0 as usize].ty != declared {
             return Err("GPU sequential output differs from carried value type".into());
         }
@@ -7078,14 +7032,8 @@ fn lower_vectorized_parallel_loop(
     for (port, id) in outputs?.into_iter().enumerate() {
         let port_id =
             Port(u32::try_from(port).map_err(|_| "GPU parallel loop has too many outputs")?);
-        let declared = concretize_wire_type(
-            &node.output_types()[port],
-            env,
-            scope_id,
-            node_id,
-            crate::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .map_err(|error| error.to_string())?;
+        let declared = concretize_wire_type(&node.output_types()[port], env, scope_id, node_id)
+            .map_err(|error| error.to_string())?;
         // A lane of a constant-typed body value is the loop's declared element.
         let output = if ctx.values[id.0 as usize].ty == declared {
             id
@@ -7129,14 +7077,8 @@ fn lower_parallel_loop(
                 u32::try_from(port)
                     .map_err(|_| "GPU parallel loop has too many outputs".to_owned())?,
             );
-            let ty = concretize_wire_type(
-                declared,
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let ty = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
             if !matches!(&ty, ConcreteWireType::IndexedFamily { count: 0, .. }) {
                 return Err("GPU empty parallel output is not an empty indexed family".into());
             }
@@ -7209,14 +7151,8 @@ fn lower_parallel_loop(
             u32::try_from(port).map_err(|_| "GPU parallel loop has too many outputs".to_owned())?,
         );
         let wire = WireRef { node: node_id, port: port_id };
-        let ty = concretize_wire_type(
-            declared,
-            env,
-            scope_id,
-            node_id,
-            crate::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .map_err(|error| error.to_string())?;
+        let ty = concretize_wire_type(declared, env, scope_id, node_id)
+            .map_err(|error| error.to_string())?;
         let ConcreteWireType::IndexedFamily { element, count: declared_count } = &ty else {
             return Err("GPU parallel loop output is not an indexed family".into());
         };
@@ -7309,10 +7245,9 @@ fn lower_parallel_loop(
     } else {
         choice_site
     };
-    // Root input families rebind by name per execute; families computed in the
-    // graph rebind from their plan-owned members.
-    let mut zip_lanes =
-        Vec::<(Option<String>, usize, usize, PhysicalValueId, PhysicalValueId)>::new();
+    // Every wave rebinds its lanes from the source family's plan owner, which
+    // execute rebinds for root inputs before the first wave.
+    let mut zip_lanes = Vec::<(usize, usize, PhysicalValueId, PhysicalValueId)>::new();
     let mut artifact_zip_lanes = Vec::<ArtifactZipLane>::new();
     let mut result_ids = Vec::<Vec<PhysicalValueId>>::with_capacity(width);
     let mut index_lanes = Vec::with_capacity(width);
@@ -7375,13 +7310,11 @@ fn lower_parallel_loop(
             let source_node = parent
                 .node(wire.node)
                 .ok_or_else(|| "GPU Zip source node is missing".to_owned())?;
-            // Only root inputs are rebound by name per execute; a nested
-            // loop's Zip source is a family already resident in its template.
-            let (name, artifact) = match source_node.kind() {
-                NodeKind::Input { name, artifact, .. } if is_root => {
-                    (Some(name), artifact.as_ref())
-                }
-                _ => (None, None),
+            // Only root artifact inputs are imported per lane; a nested loop's
+            // Zip source is a family already resident in its template.
+            let artifact = match source_node.kind() {
+                NodeKind::Input { artifact, .. } if is_root => artifact.as_ref(),
+                _ => None,
             };
             let index = lane
                 .checked_add(offset)
@@ -7472,7 +7405,7 @@ fn lower_parallel_loop(
                 } else {
                     crate::gpu_physical_lowering::replicate_to_device(ctx, id, lane_device)?
                 });
-                zip_lanes.push((name.cloned(), offset, lane, id, source));
+                zip_lanes.push((offset, lane, id, source));
             }
         }
         let child_env = child_environment(lane)?;
@@ -7584,7 +7517,6 @@ fn lower_parallel_loop(
             body_start,
             body_end,
             owner_bindings: BTreeMap::new(),
-            zip_inputs: Vec::new(),
             zip_sources: Vec::new(),
             start_index: wave_start,
             active_lanes,
@@ -7604,7 +7536,7 @@ fn lower_parallel_loop(
                     .map_err(|_| "GPU parallel device index exceeds u64".to_owned())?,
             ));
         }
-        for (name, offset, lane, id, source_id) in &zip_lanes {
+        for (offset, lane, id, source_id) in &zip_lanes {
             let source = ctx
                 .owners
                 .get(source_id)
@@ -7619,10 +7551,7 @@ fn lower_parallel_loop(
                 return Err("GPU Zip member layout changes between waves".into());
             }
             wave.owner_bindings.insert(*id, selected);
-            match name {
-                Some(name) => wave.zip_inputs.push((name.clone(), member_index, *id)),
-                None => wave.zip_sources.push((*source_id, member_index, *id)),
-            }
+            wave.zip_sources.push((*source_id, member_index, *id));
         }
         for lane in &artifact_zip_lanes {
             if lane.lane >= active_lanes {
@@ -7779,14 +7708,8 @@ fn resolved_scope_types(
                 u32::try_from(port)
                     .map_err(|_| "GPU child node has too many outputs".to_owned())?,
             );
-            let concrete = concretize_wire_type(
-                declared,
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let concrete = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
             types.insert(WireRef { node: node_id, port }, concrete);
         }
     }
@@ -8175,7 +8098,6 @@ fn lower_inlined_child(
             parent_env,
             parent_scope_id,
             parent_node_id,
-            crate::openfhe_guard::gen_modulus_and_warmup,
         )
         .map_err(|error| error.to_string())?;
         if ctx.values[id.0 as usize].ty != expected {
@@ -8267,7 +8189,7 @@ pub(super) fn fixed_child_env(
     }
     for (name, expression) in bindings {
         let value = expression
-            .evaluate_with_rings(parent, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate(parent)
             .map_err(|error| format!("{scope:?} node {node:?} child binding {name}: {error}"))?;
         child.integers.insert(name.clone(), value);
     }
@@ -8338,7 +8260,7 @@ mod tests {
             crt_moduli: params.to_crt().0.into_iter().map(IntExpr::from).collect(),
             ring_dimension: 32,
         })
-        .resolve(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&ParamEnv::default())
         .unwrap();
         let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
             ring: ring.clone(),
@@ -8391,7 +8313,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device])).unwrap();
         // A kernel registered under the subgraph's name for matrix operands.
@@ -8423,7 +8345,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -8460,7 +8382,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -8512,7 +8434,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut random = rand::rng();
         let mut draw = |count: usize, range: std::ops::RangeInclusive<i64>| {
@@ -8680,7 +8602,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let input_type = validated
             .root_scope()
@@ -8763,7 +8685,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let backend = gpu_backend_on([gpu_params.clone()], [device]);
         let zero = DCRTPolyMatrix::new_empty(&cpu_params, 1, 2);
@@ -8817,6 +8739,59 @@ mod tests {
         }
     }
 
+    /// A host integer family read per lane is rebound on every execute: each
+    /// wave, the tail included, reads the members supplied to that execute.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_parallel_waves_read_host_integer_family_input() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu_params = DCRTPolyParams::new(32, 1, 50, 8, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(32, cpu_params.to_crt().0, 8, None);
+        let ring = Ring::from_crt_moduli(
+            gpu_params.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            gpu_params.ring_dimension(),
+        );
+        let context = DslContext::new("direct-parallel-waves-host-integers");
+        let values = context.int_family_input("values", 3);
+        let lifted = parallel(3, |index| {
+            Ok(values.at(index).lift_to_constant_polynomial(ring.matrix_type((1, 1))))
+        })
+        .unwrap();
+        let validated = context
+            .output("lifted", lifted)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs = |values: &[i64]| {
+            BTreeMap::from([(
+                "values".to_owned(),
+                RuntimeValue::integer_values(values.iter().copied().map(BigInt::from).collect()),
+            )])
+        };
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_params], [device])).unwrap();
+        let mut plan = runtime
+            .plan_with_fixed_geometry_for_test(validated, &inputs(&[0, 0, 0]), 1, 2)
+            .unwrap();
+        for values in [[3, 5, 7], [11, 13, 17]] {
+            let result = runtime.execute(&mut plan, inputs(&values)).unwrap();
+            let lifted = result.output("lifted").unwrap();
+            for (index, value) in values.into_iter().enumerate() {
+                let member = runtime.download_matrix_member_output(&lifted, index).unwrap();
+                let expected = DCRTPolyMatrix::from_poly_vec(
+                    &cpu_params,
+                    vec![vec![DCRTPoly::from_biguints(
+                        &cpu_params,
+                        &[num_bigint::BigUint::from(value as u64)],
+                    )]],
+                );
+                assert_eq!(member.entry(0, 0).coeffs(), expected.entry(0, 0).coeffs());
+            }
+        }
+    }
+
     /// Wave lanes run on every logical device (run with
     /// `MXX_GPU_LOGICAL_DEVICES=0,0` on one GPU): broadcast inputs are copied
     /// to each remote lane and every member is copied home, including the
@@ -8842,7 +8817,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let entry = |value: u64| {
             DCRTPoly::from_biguints(
@@ -8934,7 +8909,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let backend = gpu_backend_on([gpu_params.clone()], [device]);
         let zero = DCRTPolyMatrix::new_empty(&cpu_params, 1, 2);
@@ -9018,7 +8993,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -9067,7 +9042,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let initial_ty = consumer
@@ -9150,7 +9124,6 @@ mod tests {
                     production.clone(),
                     store.load_finalized_manifest(&production).unwrap(),
                 )]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let mut bad_plan = runtime

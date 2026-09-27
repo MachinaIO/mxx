@@ -36,11 +36,11 @@ fn bench_gpu_matrix_mul() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let resolved =
         RingRef::new(RingExpr::Explicit { crt_moduli, ring_dimension: params.ring_dimension() })
-            .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .resolve(&ParamEnv::default())
             .unwrap();
     let sampler = DCRTPolyUniformSampler::new();
     let upload = |rows: usize, columns: usize| {

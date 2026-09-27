@@ -1,4 +1,5 @@
-//! GPU runtime settings read once during preparation.
+//! GPU runtime settings read once during preparation; see `crate::gpu_runtime` for the table of
+//! options and their environment variables.
 
 use num_bigint::BigInt;
 use std::{collections::BTreeMap, env, num::NonZeroUsize, ops::RangeInclusive};

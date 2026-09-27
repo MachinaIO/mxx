@@ -1,3 +1,13 @@
+//! Polynomial parameters and polynomials.
+//!
+//! [`PolyParams`] and [`Poly`] are the parameter and polynomial traits.
+//! `dcrt::params::DCRTPolyParams` holds the ring dimension, CRT depth and width, the exact ordered
+//! basis, gadget base bits, and dropped moduli; its constructor checks capability limits
+//! (power-of-two dimension, CRT width at most 60 bits, `base_bits <= ceil(crt_bits / 2)`) and
+//! initializes OpenFHE's tables for the basis. `dcrt::poly::DCRTPoly` wraps an OpenFHE `DCRTPoly`;
+//! repository-owned C++ adapters in `crates/backends/native/` are bridged with `cxx` in
+//! `dcrt::native`.
+
 pub mod dcrt;
 
 use itertools::Itertools;

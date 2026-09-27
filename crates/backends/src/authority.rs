@@ -3,6 +3,11 @@
 //! An authority owns execution state and is the boundary at which a validated
 //! graph becomes executable. GPU execution prepares an exact frozen plan
 //! before its prepared value can run.
+//!
+//! [`ExecutionAuthority`] is the prepare-then-run boundary applications use: `prepare` a validated
+//! graph, then `run` it with inputs, a store, and a nonce. `CpuExecution` implements it with
+//! `execute_prepared`; under `gpu`, `GpuRuntime` implements it with the frozen plan as its prepared
+//! value.
 
 use crate::{
     RuntimeValue,

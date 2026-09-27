@@ -17,15 +17,16 @@ The default `lake build` includes `Certificate` and all handwritten proofs. It r
 selected candidate, because the proofs import generated modules such as `Stage_encrypt`,
 `Stage_decrypt`, `Claim`, and `DiamondProofParameters`. On a fresh checkout, build the reusable
 modules with `lake build Decoder Bounds` before generating the first candidate; this bootstrap
-does not prove the final theorem. The runtime, IR, and BGG Lean dependencies must also be built
+does not prove the final theorem. The runtime, IR, and KHE Lean dependencies must also be built
 before running the production checker.
 
 ## Editing and auditing in VS Code
 
-After parameter search reports a retained candidate directory, run from the repository root:
+After parameter search reports a retained candidate directory, point the ignored `generated`
+link at it, from the repository root:
 
 ```sh
-python3 scripts/select_we_lean_candidate.py <candidate-directory>
+ln -sfn "$(realpath <candidate-directory>)" crates/we/lean/generated
 ```
 
 Then run `lake build` in `crates/we/lean`. Open `Certificate.lean` there and restart the Lean
@@ -33,18 +34,14 @@ server if VS Code still reports imports from the previous configuration. No cust
 is needed. `lake env lean Certificate.lean` checks the same source using the editor's Lake
 environment, and prints the final theorem's axioms.
 
-The selector requires Python 3.11+ and copies only the generated sources declared by the
-`DiamondCandidate` library into a local snapshot under `.lake/editor-candidates`. The ignored
-`generated` symlink switches to that snapshot only after all copies succeed; previous snapshots
-are retained. No compiled artifacts or handwritten proofs are copied. Thus imports use the
-current proof sources here, not the proof copies in the original certificate directory.
-Audit `generated/Claim.lean`, including `Runs`, alongside `Certificate.lean`.
+Lake reads only the modules that the `DiamondCandidate` library declares from `generated`; the
+handwritten proofs always come from the sources here, not from the proof copies in the candidate
+directory. Audit `generated/Claim.lean`, including `Runs`, alongside `Certificate.lean`.
 
 Selection is explicit, not performed for every search candidate. It is not a correctness or
-security check: `lake build` must succeed afterwards. The selected IR is a snapshot, not a live
-view of the Rust DSL. After changing the protocol or parameters, regenerate through parameter
-search and select the new artifact. The original artifact path is recorded in
-`generated/selection.json`. Generated snapshots and the selection link are not committed.
+security check: `lake build` must succeed afterwards. The candidate is a fixed output of parameter
+search, not a live view of the Rust DSL. After changing the protocol or parameters, regenerate through parameter
+search and point the link at the new candidate. The `generated` link is not committed.
 
 ## Candidate verification
 

@@ -7,6 +7,12 @@ use num_traits::Zero;
 
 /// Shared public parameters. The exact CRT layout is owned by the primitive
 /// parameter type; no duplicate per-level or gadget metadata is maintained.
+///
+/// Parameters shared by the FHE schemes.
+///
+/// [`FheCommonParams`] holds the ring parameters, the binary or ternary secret interval, the
+/// Gaussian sigma, and the coefficient cutoff. Level zero keeps the first CRT prime, and higher
+/// levels keep longer prefixes.
 #[derive(Clone, Debug)]
 pub struct FheCommonParams {
     pub ring: DCRTPolyParams,

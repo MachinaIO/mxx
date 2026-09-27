@@ -5,6 +5,16 @@
 //! reach file-backed staging while the Graph continues; after GPU completion,
 //! the pump drains writes, transcodes, commits, and finalizes. Imports are
 //! requested only when the compiled DSL load operation is reached.
+//!
+//! - **On-demand import.** An artifact input is not read at planning time. The plan records the
+//!   operation before which the payload is needed, and at execution the region boundary uploads it
+//!   into a plan-owned destination. A selected family member (`family.at(dynamic_index)`) is
+//!   imported alone, without loading the whole family.
+//! - **Preallocated export slots.** Exported outputs write into export slots reserved at planning
+//!   time. An observer thread forwards ready slots to the I/O worker during the launch, and commits
+//!   happen only after the whole launch succeeds.
+//! - **Producer sessions.** A producer execution opens a session keyed by `ProductionId(spec_hash,
+//!   nonce)` and a digest of the canonical inputs, mirroring CPU `execute_in_session`.
 
 use crate::{
     artifact::ArtifactKey,

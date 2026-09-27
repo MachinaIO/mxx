@@ -5,10 +5,10 @@
     {
       "type": "path",
       "scope": "",
-      "name": "MxxBgg",
+      "name": "MxxKhe",
       "manifestFile": "lake-manifest.json",
       "inherited": false,
-      "dir": "../../bgg/lean",
+      "dir": "../../khe/lean",
       "configFile": "lakefile.toml"
     },
     {
@@ -32,19 +32,10 @@
     {
       "type": "path",
       "scope": "",
-      "name": "MxxGadgets",
-      "manifestFile": "lake-manifest.json",
-      "inherited": true,
-      "dir": "../../bgg/lean/../../gadgets/lean",
-      "configFile": "lakefile.toml"
-    },
-    {
-      "type": "path",
-      "scope": "",
       "name": "mathlib",
       "manifestFile": "lake-manifest.json",
       "inherited": true,
-      "dir": "../../bgg/lean/../../backends/lean/.lake/packages/mathlib",
+      "dir": "../../khe/lean/../../backends/lean/.lake/packages/mathlib",
       "configFile": "lakefile.lean"
     },
     {

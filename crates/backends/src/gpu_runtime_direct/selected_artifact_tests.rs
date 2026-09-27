@@ -58,7 +58,7 @@ fn parallel_body_reading_an_unloaded_root_family_is_a_planning_error() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut store = MemoryArtifactStore::default();
     let production = execute_in_session(
@@ -142,7 +142,6 @@ fn parallel_body_reading_an_unloaded_root_family_is_a_planning_error() {
         &graph,
         &ParamEnv::default(),
         &BTreeMap::from([(production, manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -180,7 +179,7 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut store = MemoryArtifactStore::default();
     let produced = execute_in_session(
@@ -212,7 +211,6 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
         .validate_with_manifests(
             &ParamEnv::default(),
             &BTreeMap::from([(production.clone(), manifest)]),
-            crate::openfhe_guard::gen_modulus_and_warmup,
         )
         .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -287,12 +285,7 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
     )
     .unwrap()
     .0;
-    let producer = mxx_ir_core::validate(
-        &producer,
-        &ParamEnv::default(),
-        crate::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let producer = mxx_ir_core::validate(&producer, &ParamEnv::default()).unwrap();
     let payloads = [vec![0x11], vec![0x22, 0x23, 0x24], vec![0x31, 0x32, 0x33, 0x34, 0x35]];
     let members = payloads
         .iter()
@@ -364,7 +357,6 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
         &consumer,
         &ParamEnv::default(),
         &BTreeMap::from([(production.clone(), manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -432,12 +424,7 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     )
     .unwrap()
     .0;
-    let producer = mxx_ir_core::validate(
-        &producer,
-        &ParamEnv::default(),
-        crate::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let producer = mxx_ir_core::validate(&producer, &ParamEnv::default()).unwrap();
     let values = [
         -(BigInt::from(1u8) << 80usize) + BigInt::from(7u8),
         BigInt::from(42u8),
@@ -502,7 +489,6 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
         &consumer,
         &ParamEnv::default(),
         &BTreeMap::from([(production.clone(), manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -561,11 +547,11 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         parallel(2, move |_| Ok(producer_ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000)))
             .unwrap();
     let producer = DslContext::new("selected-trapdoor-producer")
-        .transferred_trapdoor_family_output("secrets", trapdoors)
+        .transferred_output("secrets", trapdoors)
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut store = MemoryArtifactStore::default();
     let produced = execute_in_session(
@@ -579,7 +565,7 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     .unwrap();
     let production = produced.production_id.expect("producer identity");
     let manifest = store.load_finalized_manifest(&production).unwrap();
-    let descriptor = manifest.artifacts["secrets"].clone();
+    let descriptor = manifest.artifacts["secrets.1"].clone();
 
     let trapdoor_schema = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000);
     let element = trapdoor_schema.value_handle().node().output_types()[1].clone();
@@ -587,11 +573,11 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         WireType::IndexedFamily { element: Box::new(element.clone()), count: IntExpr::constant(2) };
     let artifact = NodeHandle::new(
         NodeKind::Input {
-            name: "secrets".into(),
+            name: "secrets.1".into(),
             wire_type: family.clone(),
             artifact: Some(ArtifactInput {
                 production_id: production.clone(),
-                artifact_name: "secrets".into(),
+                artifact_name: "secrets.1".into(),
                 availability: ArtifactAvailability::Transferred,
             }),
         },
@@ -625,7 +611,6 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         &consumer,
         &ParamEnv::default(),
         &BTreeMap::from([(production.clone(), manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -637,7 +622,7 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     let keys = (0..2)
         .map(|index| ArtifactKey {
             production: production.clone(),
-            name: "secrets".into(),
+            name: "secrets.1".into(),
             index: Some(index),
         })
         .collect::<Vec<_>>();
@@ -791,7 +776,7 @@ fn run_family_consumed_by_later_loop(publish: bool) {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
     let mut plan = runtime.plan(graph, &BTreeMap::new()).unwrap();

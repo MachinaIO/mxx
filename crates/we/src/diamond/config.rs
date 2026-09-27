@@ -1,5 +1,5 @@
 use mxx_dsl::Ring;
-use mxx_gadgets::input_injector::{
+use mxx_khe::input_injector::{
     DIAMOND_PREFIX_DIMENSION, DIAMOND_SECRET_DIMENSION, DiamondInputConfig, DiamondInputConfigError,
 };
 use mxx_ir_core::{IntExpr, ParamEnv, RealExpr};

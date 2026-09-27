@@ -175,8 +175,7 @@ mod tests {
             ..ParamEnv::default()
         };
         let production = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-        let producer =
-            validate(&declaration.stages()[0].graph, &bindings, crate::test_resolve_basis).unwrap();
+        let producer = validate(&declaration.stages()[0].graph, &bindings).unwrap();
         let manifest = export_validated_manifest(production.clone(), &producer).unwrap();
         let manifests = BTreeMap::from([(production, manifest)]);
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -205,7 +204,6 @@ mod tests {
             &semantics,
             &manifests,
             &directory,
-            crate::test_resolve_basis,
         )
         .expect("generic export accepts the validated threshold decoder");
 
@@ -267,12 +265,9 @@ mod tests {
 
         let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let sampled = ring.sample_trapdoor(1, 1, 2, 3, 4);
-        let sampled_public = sampled.public_matrix();
         let sampled_preimage = sampled.sample_preimage(ring.zero((1, 1)), (5, 1));
         let sampled_graph = DslContext::new("sampled-artifact-roles")
-            .transferred_output("public", sampled_public)
-            .expect("sampled public output")
-            .transferred_trapdoor_output("trapdoor", sampled)
+            .transferred_output("trapdoor", sampled)
             .expect("sampled trapdoor output")
             .transferred_output("preimage", sampled_preimage)
             .expect("sampled preimage output")
@@ -281,7 +276,7 @@ mod tests {
 
         // These values contain fresh randomness and therefore require the
         // producer payload at the consumer boundary.
-        for name in ["public", "trapdoor", "preimage"] {
+        for name in ["trapdoor.0", "trapdoor.1", "preimage"] {
             assert_eq!(
                 sampled_graph.graph.outputs()[name].availability,
                 Some(ArtifactAvailability::Transferred),
@@ -350,7 +345,7 @@ mod tests {
             integers: BTreeMap::from([("plaintext_modulus".into(), 3.into())]),
             ..ParamEnv::default()
         };
-        let validated = graph.validate(&bindings, crate::test_resolve_basis).unwrap();
+        let validated = graph.validate(&bindings).unwrap();
         let artifact = export(
             &validated,
             &ExportOptions {

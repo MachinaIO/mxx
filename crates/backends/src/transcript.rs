@@ -1,3 +1,9 @@
+//! Recording and replaying sampled values.
+//!
+//! Executions draw randomness in one of three modes: fresh, recorded to a transcript, or replayed
+//! from one. A transcript keys each sampled value by its [`DrawSite`]: the instantiation path, the
+//! node, and the port.
+
 use mxx_ir_core::{
     artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
     types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port},
@@ -98,7 +104,7 @@ mod tests {
             crt_moduli: vec![mxx_ir_core::IntExpr::constant(17)],
             ring_dimension: 8,
         })
-        .resolve(&mxx_ir_core::ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&mxx_ir_core::ParamEnv::default())
         .expect("transcript test uses a valid explicit CRT ring");
         ConcreteMatrixType { ring, rows: 1, columns: 1 }
     }

@@ -1,6 +1,6 @@
 use super::{DiamondArtifactNames, DiamondConfigError, DiamondWeConfig};
 use crate::{WitnessEncryptionInterface, WitnessEncryptionProtocolDecl};
-use mxx_bgg::{
+use mxx_khe::bgg::{
     BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeySampler,
     BggPublicKeyWire, BggSamplerLayout, CircuitEncoding, DynamicBooleanBggError,
     evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
@@ -8,7 +8,7 @@ use mxx_bgg::{
 use mxx_dsl::{
     Bool, BuiltGraph, DslContext, DslError, Int, Mat, PurePredicateSpec, iterate, parallel, select,
 };
-use mxx_gadgets::{
+use mxx_khe::{
     circuit::{
         BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitError,
         BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanCircuitShape,
@@ -405,7 +405,7 @@ impl DiamondWeProtocolFamily {
             graph_params.input.digit_count.clone(),
         );
         let difference = public_key_compiler.sub(&one_public_key, &circuit_output);
-        let projected_difference = r_decomposed.clone().mul_small_rhs(difference.matrix);
+        let projected_difference = difference.matrix.mul_small_rhs(r_decomposed.clone());
         let decoder_public_key = k_public_key_first + projected_difference;
         let decoder_zero = ring.zero((1, 1));
         let decoder_target = Mat::concat(ConcatAxis::Rows, vec![decoder_public_key, decoder_zero]);
@@ -510,9 +510,9 @@ impl DiamondWeProtocolFamily {
             ArtifactAvailability::Transferred,
         );
         let initial_projection_state = states.at(0);
-        let one_vector = one_preimage.mul_small_rhs(initial_projection_state.clone());
-        let k_vector = k_preimage.mul_small_rhs(initial_projection_state.clone());
-        let decoder = decoder_preimage.mul_small_rhs(initial_projection_state);
+        let one_vector = initial_projection_state.clone().mul_small_rhs(one_preimage);
+        let k_vector = initial_projection_state.clone().mul_small_rhs(k_preimage);
+        let decoder = initial_projection_state.mul_small_rhs(decoder_preimage);
         let one_plaintext_matrix = ring.identity(1);
         let one_public_key = public_keys.at(0);
         let one_encoding =
@@ -528,7 +528,7 @@ impl DiamondWeProtocolFamily {
         );
         let witness_encodings = parallel(witness_size.clone(), |bit| {
             Ok(CircuitEncoding {
-                vector: witness_preimages.at(&bit).mul_small_rhs(states.at(&bit + 1)),
+                vector: states.at(&bit + 1).mul_small_rhs(witness_preimages.at(&bit)),
                 public_key: public_keys.at(&bit + 1).matrix,
                 plaintext: select(witness.at(bit), vec![ring.zero((1, 1)), ring.identity(1)])?,
             })
@@ -579,7 +579,7 @@ impl DiamondWeProtocolFamily {
             ArtifactAvailability::Transferred,
         );
         let one_minus_circuit = one_encoding.vector - circuit_vector;
-        let projected_difference = r_decomposed.mul_small_rhs(one_minus_circuit);
+        let projected_difference = one_minus_circuit.mul_small_rhs(r_decomposed);
         let k_plus_projection = k_vector + projected_difference;
         let noisy_plaintext = decoder - k_plus_projection;
         let decoded =
@@ -989,7 +989,7 @@ mod tests {
         let encryption = compiler.build_encryption().unwrap().graph;
         let bindings = compiler.circuit_bindings().unwrap();
         let validated = encryption
-            .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&bindings)
             .unwrap();
         let output_type = |name: &str| {
             let wire = encryption.graph.outputs()[name].value;
@@ -1077,9 +1077,7 @@ mod tests {
         let validated_decryption = decryption
             .validate_with_manifests(
                 &bindings,
-                &BTreeMap::from([(production, manifest)]),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                &BTreeMap::from([(production, manifest)]))
             .unwrap();
         let decryption_nodes = validated_decryption
             .source
@@ -1149,7 +1147,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
         let mut store = MemoryArtifactStore::default();
@@ -1190,9 +1188,7 @@ mod tests {
         let execute_with = |bindings: &ParamEnv| {
             let validated = mxx_ir_core::validate(
                 predicate.graph(),
-                bindings,
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                bindings)
             .unwrap();
             let result = execute(
                 &validated,

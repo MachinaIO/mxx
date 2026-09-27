@@ -8,7 +8,7 @@ use mxx_backends::{
         dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
     },
 };
-use mxx_gadgets::circuit::{
+use mxx_khe::circuit::{
     BooleanCircuitData, BooleanCircuitShape, BooleanGateData, BooleanGateKind,
 };
 use mxx_we::diamond::{DiamondParameterSearch, DiamondWeRuntime};

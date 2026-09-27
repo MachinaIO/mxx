@@ -1,5 +1,9 @@
 use super::*;
 
+/// A named body defined once and called many times; the frozen graph keeps one scope for it.
+///
+/// `call_with_canonical_input_exclusive_uppers` attaches canonical upper bounds to matrix
+/// arguments.
 pub struct Subgraph<I: GraphValue, O: GraphValue> {
     handle: SubgraphHandle,
     input_schema: I::Schema,

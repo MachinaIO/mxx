@@ -174,7 +174,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(
             built
                 .graph
@@ -218,7 +218,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -255,7 +255,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        let validated = built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(built.graph.outputs().len(), 4);
         assert!(built.graph.outputs().values().all(|output| matches!(
             validated.root_scope().wire_types[&output.value],

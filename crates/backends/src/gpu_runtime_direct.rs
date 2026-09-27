@@ -1,6 +1,97 @@
-//! Direct physical GPU runtime. A plan owns one reusable, actually allocated
-//! frame and explicit native Graph regions. A replay reuses plan-owned output
-//! storage only after the previous GPU and artifact I/O completion boundary.
+//! The GPU runtime: plan a validated graph once, then execute it many times.
+//!
+//! All GPU computation goes through [`GpuRuntime`], which lowers a validated graph to explicit CUDA
+//! Graph regions. There is no eager GPU matrix, polynomial, or sampler API, and whether a matrix is
+//! in coefficient or evaluation form is a property of the plan, not of its allocation.
+//!
+//! ```ignore
+//! let mut runtime = GpuRuntime::new(gpu_backend(gpu_params))?; // reads GpuRuntimeOptions::from_env()
+//! let mut plan = runtime.plan(graph, &inputs)?;                 // a BuiltGraph or a ValidatedGraph
+//! let result = runtime.execute(&mut plan, inputs)?;             // or execute_with_artifacts
+//! let matrix = runtime.download_matrix(&result["result"])?;
+//! ```
+//!
+//! - [`GpuRuntime::plan`] lowers the graph, allocates it, compiles it to CUDA Graph regions,
+//!   measures candidates, and returns a [`GpuExecutionPlan`]. Planning uploads each compiled
+//!   executable, so the first production launch pays no device-side graph setup. `plan_with_store`
+//!   also queries the store for artifact payload sizes, never payload bytes, so integer and
+//!   typed-blob imports get fixed destinations.
+//! - [`GpuRuntime::execute`] draws fresh randomness, rebinds new inputs, and replays the frozen
+//!   program without planning, measuring, or validating again; a plan with artifact inputs or
+//!   outputs runs through `execute_with_artifacts`. A plan runs only on the backend instance that
+//!   planned it. An output of one plan can be bound as an input of any plan, including the same
+//!   one, and stays on the device.
+//! - A [`GpuExecutionResult`] owns its outputs. `result[name]` gives a value that can be kept,
+//!   downloaded, or rebound; `result.output(name)` gives a [`GpuOutputRef`] for typed downloads.
+//!   The next execute writes an output that the caller still holds into fresh storage, and writes
+//!   an output the caller released in place.
+//!
+//! ## Planning
+//!
+//! Planning chooses two numbers: the wave width W, the number of parallel-loop instances one replay
+//! of a wave template handles (shared by every wave loop site, capped at `max_parallel_instances`),
+//! and the column tile width C, the number of matrix columns processed per job. Both come from
+//! geometric grids that always include their extremes. For every `(W, C)` pair the planner lowers
+//! the graph, actually allocates it, checks its persistent allocations against the device budget
+//! (`MXX_GPU_MEMORY_FRACTION`), compiles its regions, and times
+//! `measurement_warmups + measurement_iterations` trials. A candidate whose allocation,
+//! compilation, or trial fails is rejected; no VRAM requirement is predicted. Each region's time is
+//! weighted by how often production replays it, and the fastest feasible candidate is frozen into a
+//! value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected report.
+//!
+//! ## Options
+//!
+//! [`GpuRuntimeOptions`] is read once by `GpuRuntime::new` and can be changed with `options_mut`:
+//!
+//! | Field | Environment variable | Default |
+//! | --- | --- | --- |
+//! | `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 64 |
+//! | `measurement_warmups` | `MXX_GPU_MEASUREMENT_WARMUPS` | 1 |
+//! | `measurement_iterations` | `MXX_GPU_MEASUREMENT_ITERATIONS` | 2 |
+//! | `release_fence_interval` | `MXX_GPU_RELEASE_FENCE_INTERVAL` | unset |
+//! | `integer_input_ranges` | (set in code) | empty |
+//! | `subgraph_kernels` | (set in code) | empty |
+//!
+//! Other settings are read from the environment by [`crate::env`]: `MXX_GPU_MEMORY_FRACTION` (the
+//! fraction of each device's memory one plan may use, default 0.8), `MXX_GPU_LOGICAL_DEVICES`,
+//! `MXX_CUDA_STREAM_POOL_SIZE`, `MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`,
+//! `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS`, and `MXX_GPU_HOST_STAGED_COPIES`. The CUDA library reads
+//! `MXX_GPU_NTT_RADIX`, the butterfly radix of the NTT (a power of two from 2 to 32, default 4).
+//!
+//! ## Inputs and errors
+//!
+//! Inputs and outputs are keyed by their DSL names. GPU execution checks only what addressing
+//! needs: the exact input set, the physical layout of each resident input, and the frozen range of
+//! each host integer while encoding it. A resident integer input carries its producer-proven range;
+//! a host integer input uses its entry in `integer_input_ranges`, or else the full signed range of
+//! the fewest 64-bit words that hold its planning values.
+//!
+//! Planning fails with [`GpuPlanError`]. Execution fails with [`GpuRuntimeError`]: `StalePlan`
+//! means only that the plan came from another backend instance, and an input that does not match
+//! the planned layout fails as `Execution`. A data-dependent failure reported by a device status
+//! word (integer division by zero, an invalid selected index, exhausted preimage retries) is
+//! `DeviceStatus`: outputs are suppressed and the plan remains reusable. An uncertain launch drains
+//! the device and poisons the plan, so later executions fail with `LaunchUncertain`.
+//!
+//! ## Current limitations
+//!
+//! These restrictions are explicit errors. The planner is under active development, so check the
+//! current error messages in the lowering modules before relying on this list.
+//!
+//! - Only matrix products, preimage column tiles, and the lanes of outermost parallel loops are
+//!   spread over multiple GPUs; every other value lives on the first device.
+//! - A parallel loop inside a device body (a sequential-loop, retry, or branch body) runs all of
+//!   its occurrences in one template. A sequential loop inside a device body cannot read artifacts
+//!   per iteration.
+//! - Parallel-loop bodies cannot create their own artifact inputs. Nested loop counts and types
+//!   cannot depend on the enclosing index, and matrix-valued loop outputs must be homogeneous
+//!   matrix families.
+//! - Integer and typed-blob artifact inputs need `plan_with_store`, matrix exports need an
+//!   evaluation-form source, and raw transcoding does not support every wire type.
+//! - Trapdoors and preimages require the exact regular gadget layout, sigma, and shapes.
+//! - Integer matrix-vector products need one-word operands and operand and output ranges within
+//!   `int64`, and cannot run in a vectorized body.
+//! - NTTs support ring dimensions up to 131072.
 
 #[cfg(test)]
 #[path = "gpu_runtime_direct/selected_artifact_tests.rs"]
@@ -1789,9 +1880,7 @@ impl GpuRuntime {
         graph: impl mxx_ir_core::IntoValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue>,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
-        let validated = graph
-            .into_validated_graph(crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(GpuPlanError::InvalidInput)?;
+        let validated = graph.into_validated_graph().map_err(GpuPlanError::InvalidInput)?;
         let inputs = crate::backend::expand_composite_values(inputs.clone());
         let inputs = self.distinct_planning_inputs(inputs).map_err(GpuPlanError::InvalidInput)?;
         self.plan_with_payload_sizes(validated, &inputs, &BTreeMap::new(), false, None)
@@ -2296,7 +2385,7 @@ impl GpuRuntime {
         if plan.poisoned {
             return Err(GpuRuntimeError::LaunchUncertain("plan requires a device drain".into()));
         }
-        // Inputs are a trusted caller contract (docs/architecture.md). Rebinding
+        // Inputs are a trusted caller contract (see `crate::executor`). Rebinding
         // checks only what addressing needs: the exact input set, resident
         // layouts, and host integer ranges while encoding them.
         if self.backend.execution_identity() != plan.backend_execution_identity {
@@ -2730,24 +2819,10 @@ impl GpuRuntime {
                     GpuRuntimeError::Execution("wave occurrence exceeds u64".into())
                 })?,
             );
-            let zip_inputs = wave.zip_inputs.clone();
             let zip_sources = wave.zip_sources.clone();
-            for (name, member_index, value_id) in zip_inputs {
-                let family = inputs.get(&name).ok_or_else(|| {
-                    GpuRuntimeError::Execution(format!("wave Zip input {name} is absent"))
-                })?;
-                let RuntimeValue::Resident(family) = family else {
-                    return Err(GpuRuntimeError::Execution(format!(
-                        "wave Zip input {name} is not a resident family"
-                    )));
-                };
-                let member =
-                    wave_family_member(family, member_index).map_err(GpuRuntimeError::Execution)?;
-                plan.frame.waves[wave_index].owner_bindings.insert(value_id, member);
-            }
             for (family_id, member_index, value_id) in zip_sources {
                 let family = plan.frame.owners.get(&family_id).ok_or_else(|| {
-                    GpuRuntimeError::Execution("nested Zip source family is absent".into())
+                    GpuRuntimeError::Execution("Zip source family is absent".into())
                 })?;
                 let member =
                     wave_family_member(family, member_index).map_err(GpuRuntimeError::Execution)?;

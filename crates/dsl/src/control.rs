@@ -1,6 +1,12 @@
 use super::*;
 
 /// Builds one independent body and returns its ordered results.
+///
+/// The closure runs once, in a new construction scope, with its argument bound to the loop
+/// index. Outer values the body reads become explicit loop arguments: `family.at(i)` gives each
+/// instance one member (and `family.at(i + c)` a shifted one), and every other outer value is
+/// shared by all instances. A sampler inside the body draws a fresh value per instance, and a
+/// zero-count loop samples nothing.
 pub fn parallel<T: GraphValue>(
     count: impl Into<IntExpr>,
     body: impl FnOnce(Int) -> Result<T, DslError>,
@@ -44,6 +50,8 @@ pub fn parallel<T: GraphValue>(
 }
 
 /// Repeatedly computes a new state, returning only the final state.
+///
+/// The state keeps one schema across iterations, and a zero count returns the initial state.
 pub fn iterate<S: GraphValue>(
     count: impl Into<IntExpr>,
     initial: S,
@@ -93,6 +101,9 @@ pub fn iterate<S: GraphValue>(
 
 /// Selects one same-schema value, applying the selector to every field together.
 /// This is value selection, not a lazy control-flow branch.
+///
+/// A [`Bool`] selects candidate 0 for false and 1 for true; an [`Int`] selects a zero-based
+/// candidate.
 pub fn select<T: GraphValue>(selector: impl Into<Int>, candidates: Vec<T>) -> Result<T, DslError> {
     let selector = selector.into();
     let candidates = candidates.into_iter().map(normalize).collect::<Result<Vec<_>, _>>()?;
@@ -194,7 +205,7 @@ mod tests {
             let output = parallel(2, |i| Ok((source.at(&i + offset), source.at(i)))).unwrap();
             let built =
                 DslContext::new("indexed-reads").output("result", output).unwrap().build().unwrap();
-            built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+            built.validate(&ParamEnv::default()).unwrap();
             let spec = built
                 .graph
                 .root_scope()
@@ -230,7 +241,7 @@ mod tests {
         let output = parallel(3, |i| Ok(source.at(i + 1))).unwrap();
         let built =
             DslContext::new("offset-members").output("result", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         let spec = built
             .graph
             .root_scope()
@@ -262,7 +273,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert!((Int::constant(7) / -3).expression().is_err());
         assert!((Int::constant(7) % -3).expression().is_err());
     }

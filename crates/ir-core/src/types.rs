@@ -1,3 +1,12 @@
+//! Node identities, wires, and wire types.
+//!
+//! [`WireType`] is the symbolic type of a wire: scalars (`Int`, `Real`, `Bool` and their constant
+//! forms), `Bytes`, `TypedBlob`, `Matrix`, `Trapdoor`, bounded `SmallMatrix` and `Preimage`
+//! matrices, and `IndexedFamily`. [`ConcreteWireType`] mirrors it with resolved sizes after
+//! validation. A [`MatrixType`] refers to a ring, not a single modulus. [`CoefficientBoundDomain`]
+//! says whether a bounded coefficient is a single `Global` integer or a signed residue per CRT limb
+//! (`PerCrtLimb`).
+
 use crate::{
     expr::{IntExpr, RealExpr},
     ring::{ConcreteRing, RingRef},

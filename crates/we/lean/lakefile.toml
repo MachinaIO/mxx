@@ -15,8 +15,8 @@ name = "mxx-ir-core"
 path = "../../ir-core/lean"
 
 [[require]]
-name = "MxxBgg"
-path = "../../bgg/lean"
+name = "MxxKhe"
+path = "../../khe/lean"
 
 [[lean_lib]]
 name = "DiamondCandidate"

@@ -1,3 +1,19 @@
+//! Rings as ordered CRT bases, and their resolution.
+//!
+//! A [`RingRef`] wraps a [`RingExpr`]: a generated basis (`Generated { crt_bits, crt_depth,
+//! ring_dimension }`), an explicit ordered basis, or a `Slice`, `Select`, or `Concat` of other
+//! rings. Basis order is significant.
+//!
+//! Validation resolves each ring to a [`ConcreteRing`]: ordered `u64` primes plus a dimension. A
+//! concrete ring requires a power-of-two dimension, a nonempty basis, and distinct primes
+//! `2 < q < 2^60` with `q = 1 mod 2N`.
+//!
+//! A generated basis comes from [`generate_crt_basis`], a pure Rust copy of OpenFHE's
+//! `ILDCRTParams(2N, depth, bits)`: the largest prime `q = 1 mod 2N` below `2^bits`, which must
+//! have exactly `bits` bits, then each next smaller one. `mxx-backends` checks it against OpenFHE
+//! over a parameter grid. An explicit basis is checked with a deterministic Miller-Rabin test and
+//! keeps its order.
+
 use crate::expr::{ExprError, IntExpr, ParamEnv};
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
@@ -17,7 +33,7 @@ struct RingSerializationTable {
 thread_local! {
     static SERIALIZING_RINGS: RefCell<Option<RingSerializationTable>> = const { RefCell::new(None) };
     static DESERIALIZING_RINGS: RefCell<Option<Vec<RingRef>>> = const { RefCell::new(None) };
-    static RESOLVED_RINGS: RefCell<Option<BTreeMap<(RingRef, ParamEnv, usize), ConcreteRing>>> = const { RefCell::new(None) };
+    static RESOLVED_RINGS: RefCell<Option<BTreeMap<(RingRef, ParamEnv), ConcreteRing>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn with_resolution_cache<T>(work: impl FnOnce() -> T) -> T {
@@ -89,7 +105,76 @@ pub(crate) fn ring_table_refs(
     deserialize_with_ring_table(references, entries)
 }
 
-pub type ResolveCrtBasis = fn(u32, usize, usize, Option<Vec<u64>>) -> Result<Vec<u64>, String>;
+/// Generates the ordered CRT basis of `crt_depth` primes `q = 1 mod 2N` that OpenFHE's
+/// `ILDCRTParams(2N, crt_depth, crt_bits)` generates: the largest such prime below `2^crt_bits`,
+/// then each next smaller one. The first prime must have exactly `crt_bits` bits.
+pub fn generate_crt_basis(
+    ring_dimension: u32,
+    crt_depth: usize,
+    crt_bits: usize,
+) -> Result<Vec<u64>, String> {
+    if ring_dimension == 0 || !ring_dimension.is_power_of_two() || crt_depth == 0 {
+        return Err("CRT generation needs a power-of-two dimension and a positive depth".into());
+    }
+    if !(2..=60).contains(&crt_bits) {
+        return Err("CRT width must be in 2..=60".into());
+    }
+    let step = 2 * u64::from(ring_dimension);
+    let top = 1u64 << crt_bits;
+    // OpenFHE's `LastPrime` starts at `2^bits + 1 - step` when `step` divides `2^bits`.
+    let mut candidate = if top % step == 0 { top + 1 - step } else { 1 };
+    let mut basis = Vec::with_capacity(crt_depth);
+    while basis.len() < crt_depth {
+        if candidate <= 2 {
+            return Err(format!(
+                "no {crt_depth} primes of at most {crt_bits} bits are 1 mod {step}"
+            ));
+        }
+        if is_prime(candidate) {
+            if basis.is_empty() && 64 - candidate.leading_zeros() as usize != crt_bits {
+                return Err(format!("no {crt_bits}-bit prime is 1 mod {step}"));
+            }
+            basis.push(candidate);
+        }
+        candidate = candidate.saturating_sub(step);
+    }
+    Ok(basis)
+}
+
+/// Deterministic Miller-Rabin test; these bases decide primality for every `u64`.
+pub(crate) fn is_prime(n: u64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    const BASES: [u64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+    if let Some(&base) = BASES.iter().find(|&&base| n % base == 0) {
+        return n == base;
+    }
+    let mul = |a: u64, b: u64| (u128::from(a) * u128::from(b) % u128::from(n)) as u64;
+    let pow = |mut base: u64, mut exponent: u64| {
+        let mut result = 1;
+        while exponent > 0 {
+            if exponent & 1 == 1 {
+                result = mul(result, base);
+            }
+            base = mul(base, base);
+            exponent >>= 1;
+        }
+        result
+    };
+    let shift = (n - 1).trailing_zeros();
+    let odd = (n - 1) >> shift;
+    BASES.iter().all(|&base| {
+        let mut x = pow(base, odd);
+        if x == 1 || x == n - 1 {
+            return true;
+        }
+        (1..shift).any(|_| {
+            x = mul(x, x);
+            x == n - 1
+        })
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RingRef(Arc<RingExpr>);
@@ -172,12 +257,8 @@ impl RingRef {
         }
     }
 
-    pub fn resolve(
-        &self,
-        env: &ParamEnv,
-        resolve_basis: ResolveCrtBasis,
-    ) -> Result<ConcreteRing, ExprError> {
-        resolve_ring(self, env, resolve_basis)
+    pub fn resolve(&self, env: &ParamEnv) -> Result<ConcreteRing, ExprError> {
+        resolve_ring(self, env)
     }
 }
 
@@ -264,12 +345,7 @@ impl ConcreteRing {
         self.crt_moduli().iter().fold(BigInt::one(), |acc, q| acc * q)
     }
 
-    fn checked(
-        moduli: Vec<u64>,
-        n: u32,
-        resolver: ResolveCrtBasis,
-        generated: bool,
-    ) -> Result<Self, ExprError> {
+    fn checked(moduli: Vec<u64>, n: u32) -> Result<Self, ExprError> {
         if n == 0 || !n.is_power_of_two() || moduli.is_empty() {
             return Err(ExprError::RingResolution(
                 "ring dimension must be a positive power of two and the CRT basis must be nonempty"
@@ -279,20 +355,15 @@ impl ConcreteRing {
         let modulus = 2 * u64::from(n);
         let mut seen = BTreeSet::new();
         for &q in &moduli {
-            if q <= 2 || q > (1u64 << 60) - 1 || (q - 1) % modulus != 0 || !seen.insert(q) {
+            if q <= 2 ||
+                q > (1u64 << 60) - 1 ||
+                (q - 1) % modulus != 0 ||
+                !is_prime(q) ||
+                !seen.insert(q)
+            {
                 return Err(ExprError::RingResolution(format!(
                     "invalid, repeated, or unsupported CRT modulus {q}"
                 )));
-            }
-        }
-        let bits = moduli.iter().map(|q| 64 - q.leading_zeros() as usize).max().unwrap();
-        if !generated {
-            let checked = resolver(n, moduli.len(), bits, Some(moduli.clone()))
-                .map_err(ExprError::RingResolution)?;
-            if checked != moduli {
-                return Err(ExprError::RingResolution(
-                    "CRT resolver changed the explicit basis or its order".into(),
-                ));
             }
         }
         Ok(Self(Arc::new(ConcreteRingData {
@@ -302,19 +373,15 @@ impl ConcreteRing {
     }
 }
 
-pub(crate) fn resolve_ring(
-    ring: &RingRef,
-    env: &ParamEnv,
-    resolver: ResolveCrtBasis,
-) -> Result<ConcreteRing, ExprError> {
+pub(crate) fn resolve_ring(ring: &RingRef, env: &ParamEnv) -> Result<ConcreteRing, ExprError> {
     with_resolution_cache(|| {
-        let key = (ring.clone(), env.clone(), resolver as usize);
+        let key = (ring.clone(), env.clone());
         if let Some(hit) = RESOLVED_RINGS
             .with(|cache| cache.borrow().as_ref().and_then(|cache| cache.get(&key).cloned()))
         {
             return Ok(hit);
         }
-        let value = resolve_ring_uncached(ring, env, resolver)?;
+        let value = resolve_ring_uncached(ring, env)?;
         RESOLVED_RINGS.with(|cache| {
             cache
                 .borrow_mut()
@@ -326,21 +393,16 @@ pub(crate) fn resolve_ring(
     })
 }
 
-fn resolve_ring_uncached(
-    ring: &RingRef,
-    env: &ParamEnv,
-    resolver: ResolveCrtBasis,
-) -> Result<ConcreteRing, ExprError> {
+fn resolve_ring_uncached(ring: &RingRef, env: &ParamEnv) -> Result<ConcreteRing, ExprError> {
     let n = ring.ring_dimension();
-    let generated = matches!(ring.expression(), RingExpr::Generated { .. });
     let moduli = match ring.expression() {
         RingExpr::Generated { crt_bits, crt_depth, .. } => {
             let bits = crt_bits
-                .evaluate_with_rings(env, resolver)?
+                .evaluate(env)?
                 .to_usize()
                 .ok_or_else(|| ExprError::RingResolution("CRT bits must fit usize".into()))?;
             let depth = crt_depth
-                .evaluate_with_rings(env, resolver)?
+                .evaluate(env)?
                 .to_usize()
                 .ok_or_else(|| ExprError::RingResolution("CRT depth must fit usize".into()))?;
             if n == 0 || !n.is_power_of_two() || depth == 0 || !(2..=60).contains(&bits) {
@@ -348,7 +410,7 @@ fn resolve_ring_uncached(
                     "invalid generated CRT dimension, depth, or bits".into(),
                 ));
             }
-            let moduli = resolver(n, depth, bits, None).map_err(ExprError::RingResolution)?;
+            let moduli = generate_crt_basis(n, depth, bits).map_err(ExprError::RingResolution)?;
             if moduli.len() != depth ||
                 moduli.iter().any(|q| 64 - q.leading_zeros() as usize != bits)
             {
@@ -361,17 +423,17 @@ fn resolve_ring_uncached(
         RingExpr::Explicit { crt_moduli, .. } => crt_moduli
             .iter()
             .map(|q| {
-                q.evaluate_with_rings(env, resolver)?
+                q.evaluate(env)?
                     .to_u64()
                     .ok_or_else(|| ExprError::RingResolution("CRT modulus must fit u64".into()))
             })
             .collect::<Result<Vec<_>, _>>()?,
         RingExpr::Slice { source, start, end } => {
-            let source = resolve_ring(source, env, resolver)?;
-            let start = start.evaluate_with_rings(env, resolver)?.to_usize().ok_or_else(|| {
+            let source = resolve_ring(source, env)?;
+            let start = start.evaluate(env)?.to_usize().ok_or_else(|| {
                 ExprError::RingResolution("CRT slice start is negative or too large".into())
             })?;
-            let end = end.evaluate_with_rings(env, resolver)?.to_usize().ok_or_else(|| {
+            let end = end.evaluate(env)?.to_usize().ok_or_else(|| {
                 ExprError::RingResolution("CRT slice end is negative or too large".into())
             })?;
             if start >= end || end > source.crt_depth() {
@@ -380,14 +442,13 @@ fn resolve_ring_uncached(
             source.crt_moduli()[start..end].to_vec()
         }
         RingExpr::Select { source, indices } => {
-            let source = resolve_ring(source, env, resolver)?;
+            let source = resolve_ring(source, env)?;
             indices
                 .iter()
                 .map(|index| {
-                    let index =
-                        index.evaluate_with_rings(env, resolver)?.to_usize().ok_or_else(|| {
-                            ExprError::RingResolution("CRT index is negative or too large".into())
-                        })?;
+                    let index = index.evaluate(env)?.to_usize().ok_or_else(|| {
+                        ExprError::RingResolution("CRT index is negative or too large".into())
+                    })?;
                     source.crt_moduli().get(index).copied().ok_or_else(|| {
                         ExprError::RingResolution("CRT index is out of range".into())
                     })
@@ -398,51 +459,12 @@ fn resolve_ring_uncached(
             if left.ring_dimension() != right.ring_dimension() {
                 return Err(ExprError::RingResolution("CRT concat ring dimensions differ".into()));
             }
-            let mut left = resolve_ring(left, env, resolver)?.crt_moduli().to_vec();
-            left.extend_from_slice(resolve_ring(right, env, resolver)?.crt_moduli());
+            let mut left = resolve_ring(left, env)?.crt_moduli().to_vec();
+            left.extend_from_slice(resolve_ring(right, env)?.crt_moduli());
             left
         }
     };
-    ConcreteRing::checked(moduli, n, resolver, generated)
-}
-
-#[cfg(test)]
-pub(crate) fn test_resolve_basis(
-    n: u32,
-    depth: usize,
-    bits: usize,
-    moduli: Option<Vec<u64>>,
-) -> Result<Vec<u64>, String> {
-    const PRIMES: &[u64] = &[17, 97, 113, 193, 241, 257, 65537];
-    match moduli {
-        Some(moduli) => {
-            if moduli.len() != depth ||
-                moduli
-                    .iter()
-                    .any(|q| !PRIMES.contains(q) || 64 - q.leading_zeros() as usize > bits) ||
-                moduli.iter().map(|q| 64 - q.leading_zeros() as usize).max() != Some(bits)
-            {
-                return Err("test basis has unsupported or mismatched moduli".into());
-            }
-            Ok(moduli)
-        }
-        None => {
-            let basis = PRIMES
-                .iter()
-                .copied()
-                .filter(|q| {
-                    64 - q.leading_zeros() as usize == bits &&
-                        n != 0 &&
-                        (q - 1) % (2 * u64::from(n)) == 0
-                })
-                .take(depth)
-                .collect::<Vec<_>>();
-            if basis.len() != depth {
-                return Err("test generator has insufficient moduli".into());
-            }
-            Ok(basis)
-        }
-    }
+    ConcreteRing::checked(moduli, n)
 }
 
 #[cfg(test)]
@@ -463,9 +485,7 @@ pub(crate) fn test_ring(modulus: i64, n: u32) -> RingRef {
 
 #[cfg(test)]
 pub(crate) fn test_concrete_ring(modulus: i64, n: u32) -> ConcreteRing {
-    test_ring(modulus, n)
-        .resolve(&ParamEnv::default(), test_resolve_basis)
-        .expect("valid test ring")
+    test_ring(modulus, n).resolve(&ParamEnv::default()).expect("valid test ring")
 }
 
 #[cfg(test)]
@@ -473,53 +493,45 @@ pub(crate) fn test_validate(
     graph: &crate::Graph,
     env: &ParamEnv,
 ) -> Result<crate::ValidatedGraph, crate::ValidationError> {
-    crate::validate(graph, env, test_resolve_basis)
+    crate::validate(graph, env)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static GENERATED_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    fn counting_resolver(
-        n: u32,
-        depth: usize,
-        bits: usize,
-        moduli: Option<Vec<u64>>,
-    ) -> Result<Vec<u64>, String> {
-        if moduli.is_none() {
-            GENERATED_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-        test_resolve_basis(n, depth, bits, moduli)
-    }
 
     #[test]
-    fn test_ring_resolution_memoizes_generated_basis_per_binding() {
-        GENERATED_CALLS.store(0, Ordering::Relaxed);
+    fn test_generated_basis_follows_openfhe_order() {
+        // 2^7 + 1 - 16 = 113, then the next smaller prime that is 1 mod 16.
+        assert_eq!(generate_crt_basis(8, 2, 7).unwrap(), [113, 97]);
+        assert_eq!(generate_crt_basis(8, 1, 5).unwrap(), [17]);
+        // The largest 1 mod 16 value below 2^6 is 49, which is not prime, so a 6-bit
+        // prime does not exist and the smaller 17 is rejected.
+        assert!(generate_crt_basis(8, 1, 6).is_err());
+        assert!(generate_crt_basis(8, 2, 5).is_err());
+        assert!(generate_crt_basis(64, 1, 5).is_err());
         let ring = RingRef::new(RingExpr::Generated {
             crt_bits: IntExpr::constant(7),
             crt_depth: IntExpr::constant(2),
             ring_dimension: 8,
         });
-        with_resolution_cache(|| {
-            assert_eq!(
-                ring.resolve(&ParamEnv::default(), counting_resolver).unwrap().crt_moduli(),
-                &[97, 113]
-            );
-            assert_eq!(
-                IntExpr::RingCrtDepth(ring.clone())
-                    .evaluate_with_rings(&ParamEnv::default(), counting_resolver)
-                    .unwrap(),
-                BigInt::from(2)
-            );
-        });
-        assert_eq!(GENERATED_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(ring.resolve(&ParamEnv::default()).unwrap().crt_moduli(), &[113, 97]);
+        assert_eq!(
+            IntExpr::RingCrtDepth(ring).evaluate(&ParamEnv::default()).unwrap(),
+            BigInt::from(2)
+        );
     }
 
     #[test]
-    fn test_ring_properties_preserve_order_and_require_resolution() {
+    fn test_primality_matches_trial_division() {
+        let trial = |n: u64| n >= 2 && (2..).take_while(|d| d * d <= n).all(|d| n % d != 0);
+        assert!((0..20_000).all(|n| is_prime(n) == trial(n)));
+        assert!(is_prime((1u64 << 61) - 1));
+        assert!(!is_prime(3_215_031_751));
+    }
+
+    #[test]
+    fn test_ring_properties_preserve_order() {
         let source = RingRef::new(RingExpr::Explicit {
             crt_moduli: vec![IntExpr::constant(17), IntExpr::constant(97)],
             ring_dimension: 8,
@@ -529,36 +541,25 @@ mod tests {
             indices: vec![IntExpr::constant(1), IntExpr::constant(0)],
         });
         let env = ParamEnv::default();
+        assert_eq!(source.resolve(&env).unwrap().crt_moduli(), &[17, 97]);
+        assert_eq!(reversed.resolve(&env).unwrap().crt_moduli(), &[97, 17]);
+        assert_ne!(source.resolve(&env).unwrap(), reversed.resolve(&env).unwrap());
         assert_eq!(
-            IntExpr::RingModulus(source.clone()).evaluate(&env),
-            Err(ExprError::RingResolutionRequired)
-        );
-        assert_eq!(source.resolve(&env, test_resolve_basis).unwrap().crt_moduli(), &[17, 97]);
-        assert_eq!(reversed.resolve(&env, test_resolve_basis).unwrap().crt_moduli(), &[97, 17]);
-        assert_ne!(
-            source.resolve(&env, test_resolve_basis).unwrap(),
-            reversed.resolve(&env, test_resolve_basis).unwrap()
-        );
-        assert_eq!(
-            IntExpr::RingModulus(reversed.clone())
-                .evaluate_with_rings(&env, test_resolve_basis)
-                .unwrap(),
+            IntExpr::RingModulus(reversed.clone()).evaluate(&env).unwrap(),
             BigInt::from(17 * 97)
         );
         assert_eq!(
-            IntExpr::RingCrtDepth(reversed.clone())
-                .evaluate_with_rings(&env, test_resolve_basis)
-                .unwrap(),
+            IntExpr::RingCrtDepth(reversed.clone()).evaluate(&env).unwrap(),
             BigInt::from(2)
         );
         assert_eq!(
             IntExpr::RingCrtModulus { ring: reversed, index: Box::new(IntExpr::constant(0)) }
-                .evaluate_with_rings(&env, test_resolve_basis)
+                .evaluate(&env)
                 .unwrap(),
             BigInt::from(97)
         );
         let real = crate::RealExpr::FromInt(IntExpr::RingCrtDepth(source));
-        assert_eq!(real.evaluate_f64_with_rings(&env, test_resolve_basis).unwrap(), 2.0);
+        assert_eq!(real.evaluate_f64(&env).unwrap(), 2.0);
     }
 
     #[test]
@@ -568,15 +569,15 @@ mod tests {
             source: source.clone(),
             indices: vec![IntExpr::constant(0), IntExpr::constant(0)],
         });
-        assert!(selected.resolve(&ParamEnv::default(), test_resolve_basis).is_err());
+        assert!(selected.resolve(&ParamEnv::default()).is_err());
         let concat =
             RingRef::new(RingExpr::Concat { left: source.clone(), right: test_ring(17, 8) });
-        assert!(concat.resolve(&ParamEnv::default(), test_resolve_basis).is_err());
+        assert!(concat.resolve(&ParamEnv::default()).is_err());
         let empty = RingRef::new(RingExpr::Slice {
             source,
             start: IntExpr::constant(1),
             end: IntExpr::constant(1),
         });
-        assert!(empty.resolve(&ParamEnv::default(), test_resolve_basis).is_err());
+        assert!(empty.resolve(&ParamEnv::default()).is_err());
     }
 }

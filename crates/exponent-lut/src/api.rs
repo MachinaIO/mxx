@@ -16,7 +16,7 @@ use mxx_backends::{
     ArtifactHandle, ArtifactKey, ArtifactPayload, ArtifactStore, ExecutionConfig, ExecutionError,
     FileArtifactError, FileArtifactStore, MemoryArtifactStore, RuntimeValue,
     SessionAliasDescriptor, SessionDescriptor, SessionStatus, SessionStore,
-    artifact::{MemoryArtifactError, ReadSeek},
+    artifact::MemoryArtifactError,
     authority::CpuExecution,
     execute_in_session,
     matrix::dcrt_poly::DCRTPolyMatrix,
@@ -29,7 +29,7 @@ use mxx_ir_core::{
     artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId},
     encoding::spec_hash,
 };
-use std::{collections::BTreeMap, error::Error, io::Write, path::PathBuf};
+use std::{collections::BTreeMap, error::Error, path::PathBuf};
 use thiserror::Error as ThisError;
 
 /// Where stages keep the artifacts they hand to later stages.
@@ -67,12 +67,21 @@ pub enum StageStore {
     File(FileArtifactStore),
 }
 
+/// An artifact a [`StageStore`] encoded and has not yet published, of the
+/// store kind that encoded it.
+pub enum StageEncoded {
+    Memory(mxx_backends::artifact::MemoryEncodedArtifact),
+    File(mxx_backends::artifact::FileEncodedArtifact),
+}
+
 #[derive(Debug, ThisError)]
 pub enum StageStoreError {
     #[error(transparent)]
     Memory(MemoryArtifactError),
     #[error(transparent)]
     File(FileArtifactError),
+    #[error("an encoded artifact was published to another kind of store")]
+    EncodedStoreMismatch,
 }
 
 macro_rules! delegate_store {
@@ -86,6 +95,7 @@ macro_rules! delegate_store {
 
 impl ArtifactStore for StageStore {
     type Error = StageStoreError;
+    type Encoded = StageEncoded;
 
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
         delegate_store!(self, store => store.load_manifest(production))
@@ -128,23 +138,53 @@ impl ArtifactStore for StageStore {
         delegate_store!(self, store => store.stage_raw_chunk(key, total_raw_bytes, offset, bytes))
     }
 
-    fn transcode_staged(
+    fn encode_staged(
         &mut self,
-        key: ArtifactKey,
+        key: &ArtifactKey,
         artifact_type: &ArtifactType,
         availability: ArtifactAvailability,
         layout: Option<&str>,
         payload_kind: u8,
-        encode: &mut dyn FnMut(&mut dyn ReadSeek, &mut dyn Write) -> Result<(), String>,
+        encode: mxx_backends::artifact::StagedEncoder,
+    ) -> Result<mxx_backends::artifact::EncodeJob<Self::Encoded, Self::Error>, Self::Error> {
+        Ok(match self {
+            StageStore::Memory(store) => {
+                let job = store
+                    .encode_staged(key, artifact_type, availability, layout, payload_kind, encode)
+                    .map_err(StageStoreError::Memory)?;
+                Box::new(move || {
+                    job()
+                        .map(|(encoded, bytes)| (StageEncoded::Memory(encoded), bytes))
+                        .map_err(StageStoreError::Memory)
+                })
+            }
+            StageStore::File(store) => {
+                let job = store
+                    .encode_staged(key, artifact_type, availability, layout, payload_kind, encode)
+                    .map_err(StageStoreError::File)?;
+                Box::new(move || {
+                    job()
+                        .map(|(encoded, bytes)| (StageEncoded::File(encoded), bytes))
+                        .map_err(StageStoreError::File)
+                })
+            }
+        })
+    }
+
+    fn publish_encoded(
+        &mut self,
+        key: ArtifactKey,
+        encoded: Self::Encoded,
     ) -> Result<(), Self::Error> {
-        delegate_store!(self, store => store.transcode_staged(
-            key,
-            artifact_type,
-            availability,
-            layout,
-            payload_kind,
-            encode,
-        ))
+        match (self, encoded) {
+            (StageStore::Memory(store), StageEncoded::Memory(encoded)) => {
+                store.publish_encoded(key, encoded).map_err(StageStoreError::Memory)
+            }
+            (StageStore::File(store), StageEncoded::File(encoded)) => {
+                store.publish_encoded(key, encoded).map_err(StageStoreError::File)
+            }
+            _ => Err(StageStoreError::EncodedStoreMismatch),
+        }
     }
 
     fn load_staged(

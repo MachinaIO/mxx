@@ -3,9 +3,7 @@
 This document covers every API a user needs to execute a validated mxx program: choosing ring
 parameters, creating a CPU or GPU backend, passing inputs, running, and reading outputs. It
 assumes familiarity with lattice cryptography and with the DSL concepts in
-`crates/dsl/SPEC.md` (programs, compile parameters, families, artifacts). The rustdoc
-(`cargo doc -p mxx-backends --features gpu --open`) is the authority when this document and the
-code disagree.
+`crates/dsl/SPEC.md` (programs, compile parameters, families, artifacts).
 
 ## 1. Concepts
 

@@ -2,8 +2,7 @@
 
 This document lists every value type and operation of the DSL, grouped by purpose, with how to
 call each one. It is written for readers who know lattice cryptography but not mxx. Read it top
-to bottom: section 1 defines the terms that the rest uses. The rustdoc of each item (`cargo doc
--p mxx-dsl --open`) is the authority when this document and the code disagree.
+to bottom: section 1 defines the terms that the rest uses.
 
 ## 1. Concepts
 

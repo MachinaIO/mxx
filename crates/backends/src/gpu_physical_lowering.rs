@@ -8430,4 +8430,75 @@ mod tests {
             assert!(is_zero_matrix(&difference), "{name}");
         }
     }
+
+    /// Products of hashed polynomials, which go through the forward and
+    /// inverse NTT, match the CPU for rings above a warp of 1024-coefficient
+    /// tiles: 2^16 and 2^17 run their widest stages in the wide-stage kernel.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn wide_ring_products_match_cpu() {
+        for ring_dimension in [1u32 << 15, 1 << 16, 1 << 17] {
+            let cpu = DCRTPolyParams::new(ring_dimension, 2, 28, 8, None, None);
+            let moduli = cpu.to_crt().0;
+            let gpu = GpuDCRTPolyParams::new(ring_dimension, moduli.clone(), 8, None);
+            let ring = Ring::from_crt_moduli(
+                moduli.into_iter().map(IntExpr::from).collect(),
+                ring_dimension,
+            );
+            let key = ring.bytes_input("key", 32);
+            let a = ring.hash_matrix(key.clone(), HashTag::from(b"a".as_slice()), (1, 2));
+            let b = ring.hash_matrix(key, HashTag::from(b"b".as_slice()), (2, 1));
+            let product = a.clone() * b;
+            let validated = DslContext::new("wide-ring-products")
+                .output("product", product.clone())
+                .unwrap()
+                .output(
+                    "shifted",
+                    product +
+                        a.slice(
+                            None,
+                            Some(mxx_ir_core::node::IndexRange {
+                                start: IntExpr::constant(0),
+                                end: IntExpr::constant(1),
+                            }),
+                        ),
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let inputs =
+                BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from([0x5au8; 32])))]);
+            let expected = execute_in_session(
+                &validated,
+                &mut cpu_backend([cpu]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                [0x26; 32],
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let mut runtime =
+                GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+            let mut plan = runtime.plan(validated, &inputs).unwrap();
+            let result = runtime
+                .execute_with_artifacts(
+                    &mut plan,
+                    inputs,
+                    &mut MemoryArtifactStore::default(),
+                    [0x27; 32],
+                )
+                .unwrap();
+            for name in ["product", "shifted"] {
+                let RuntimeValue::Matrix(expected) = &expected.outputs[name] else {
+                    panic!("CPU {name} is a matrix");
+                };
+                let actual = runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+                let expected = expected.as_cpu_full().expect("CPU full matrix");
+                assert!(actual == *expected, "{name} at ring dimension {ring_dimension}");
+            }
+        }
+    }
 }

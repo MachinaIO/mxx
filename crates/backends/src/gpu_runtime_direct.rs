@@ -91,7 +91,7 @@
 //! - Trapdoors and preimages require the exact regular gadget layout, sigma, and shapes.
 //! - Integer matrix-vector products need one-word operands and operand and output ranges within
 //!   `int64`, and cannot run in a vectorized body.
-//! - NTTs support ring dimensions up to 32768.
+//! - NTTs support ring dimensions up to 131072.
 
 #[cfg(test)]
 #[path = "gpu_runtime_direct/selected_artifact_tests.rs"]

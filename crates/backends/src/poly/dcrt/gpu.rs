@@ -17,8 +17,11 @@
 //! `89`), and embeds a hash of the CUDA sources as `MXX_NATIVE_KERNEL_BUILD_REVISION`.
 //!
 //! Raw matrix kernels batch up to 8 CRT limbs per launch. The fused NTT runs up to ten butterfly
-//! stages of a 1024-coefficient tile in shared memory and the stages above one tile with warp
-//! shuffles, for ring dimensions up to 32768. The matrix product splits the inner dimension over
+//! stages of a 1024-coefficient tile in shared memory, and the stages above one tile with warp
+//! shuffles while their butterflies stay within a warp of tiles. A ring above 32 tiles (2^16 and
+//! 2^17) runs each stage whose butterflies lie a warp of tiles or more apart as one global-memory
+//! pass, with one thread per butterfly; ring dimensions up to 131072 are supported. The matrix
+//! product splits the inner dimension over
 //! four thread rows and sums in 128 bits with one reduction per batch. Decomposition peels every
 //! balanced digit of a coefficient in one pass, and integer division uses native 128-bit division
 //! when the magnitudes have at most two words.

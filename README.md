@@ -218,7 +218,9 @@ The backends build on the IR from below: they consume the programs that the laye
 produce. Applications also call the backends directly to run their programs, and the two
 applications never depend on each other.
 
-Each crate's README introduces the crate. The API documentation, built with
+Each crate's README introduces the crate. The DSL's operations are listed in
+[`crates/dsl/SPEC.md`](crates/dsl/SPEC.md), and the API for executing programs in
+[`crates/backends/SPEC.md`](crates/backends/SPEC.md). The API documentation, built with
 `cargo doc --workspace --no-deps --features gpu --open`, is the reference for details such as
 the GPU runtime's options and current limitations.
 

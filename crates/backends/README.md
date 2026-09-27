@@ -5,6 +5,9 @@ and matrices over RNS rings, samplers, trapdoors, and codecs, built on OpenFHE) 
 validated `mxx-ir-core` graphs on the CPU or, with the `gpu` feature, on one or more GPUs. It is
 the only crate with concrete arithmetic, and it depends only on `mxx-ir-core`.
 
+[SPEC.md](SPEC.md) describes every API a user needs to execute a program: ring parameters, the
+CPU and GPU backends, inputs, planning, execution, outputs, and artifact stores.
+
 ## Contents
 
 | Module or directory | What it provides |

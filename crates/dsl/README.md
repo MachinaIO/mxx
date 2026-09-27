@@ -5,6 +5,9 @@ elements, matrices, samplers, trapdoors, and loops as ordinary Rust values and o
 code records an `mxx-ir-core` graph that a backend in `mxx-backends` can validate and execute.
 The DSL library depends only on `mxx-ir-core`; its examples also use `mxx-backends`.
 
+[SPEC.md](SPEC.md) lists every value type and operation, grouped by purpose, with how to call
+it.
+
 ## Contents
 
 | Item | What it provides |

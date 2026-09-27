@@ -1093,7 +1093,7 @@ mod artifact {
                     let destination_chunk = destination_public.slice(None, Some(columns.clone()));
                     let decomposed =
                         destination_chunk.decompose(self.gadget_base.clone(), self.digit_count);
-                    let rhs = decomposed.mul_small_rhs(source_secret * input.clone()) *
+                    let rhs = (source_secret * input.clone()).mul_small_rhs(decomposed) *
                         ring.polynomial([IntExpr::constant(scalar.unwrap_or(1))]);
                     let lhs =
                         destination_secret * output.clone().slice(None, Some(columns.clone()));
@@ -1130,9 +1130,8 @@ mod artifact {
                         destination_chunk.decompose(self.gadget_base.clone(), self.digit_count);
                     let rhs = (0..source_slot_count)
                         .map(|source| {
-                            decomposed
-                                .clone()
-                                .mul_small_rhs(slots.secrets.at(source) * input.clone()) *
+                            (slots.secrets.at(source) * input.clone())
+                                .mul_small_rhs(decomposed.clone()) *
                                 ring.constant(
                                     (1, 1),
                                     ConstantMatrix::Rotation {

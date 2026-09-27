@@ -160,7 +160,7 @@ impl BggTallEncodingCompiler {
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let rows = parallel(lhs.rows.count().clone(), |i| {
-            Ok(decomposed_rhs.clone().mul_small_rhs(lhs.rows.at(&i)) +
+            Ok(lhs.rows.at(&i).mul_small_rhs(decomposed_rhs.clone()) +
                 rhs.rows.at(&i) * lhs_plaintexts.at(i))
         })?;
         let plaintext = match &rhs.plaintext {
@@ -228,7 +228,7 @@ impl BggTallEncodingCompiler {
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let step1 = parallel(transform.left_rows.count().clone(), |i| {
-            Ok(decomposed_input.clone().mul_small_rhs(transform.left_rows.at(&i)) +
+            Ok(transform.left_rows.at(&i).mul_small_rhs(decomposed_input.clone()) +
                 rotated_rows.at(i))
         })?;
         let decomposed_right = transform
@@ -236,7 +236,7 @@ impl BggTallEncodingCompiler {
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let rows = parallel(step1.count().clone(), |i| {
-            Ok(decomposed_right.clone().mul_small_rhs(step1.at(&i)) +
+            Ok(step1.at(&i).mul_small_rhs(decomposed_right.clone()) +
                 rotated_right_rows.at(&i) * rotated_plaintexts.at(i))
         })?;
         Ok(BggTallEncodingWire {
@@ -373,7 +373,7 @@ impl BggTallEncodingCompiler {
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let intermediate = parallel(left_rows.count().clone(), |i| {
-            Ok(decomposed_input.clone().mul_small_rhs(left_rows.at(&i)) +
+            Ok(left_rows.at(&i).mul_small_rhs(decomposed_input.clone()) +
                 left_times_input_rows.at(i))
         })?;
         let decomposed_right = transform
@@ -381,7 +381,7 @@ impl BggTallEncodingCompiler {
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let rows = parallel(intermediate.count().clone(), |i| {
-            Ok(decomposed_right.clone().mul_small_rhs(intermediate.at(&i)) +
+            Ok(intermediate.at(&i).mul_small_rhs(decomposed_right.clone()) +
                 left_message_times_right_rows.at(i))
         })?;
         Ok(BggTallEncodingWire {
@@ -403,16 +403,18 @@ impl BggTallEncodingCompiler {
         left_matrix: &Mat,
         right_matrix: &Mat,
     ) -> BggPublicKeyWire {
-        let first = input
-            .matrix
-            .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .mul_small_rhs(left_matrix.clone());
-        BggPublicKeyWire {
-            matrix: right_matrix
+        let first = left_matrix.clone().mul_small_rhs(
+            input
+                .matrix
                 .clone()
-                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                .mul_small_rhs(first),
+                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone()),
+        );
+        BggPublicKeyWire {
+            matrix: first.mul_small_rhs(
+                right_matrix
+                    .clone()
+                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone()),
+            ),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -457,7 +459,7 @@ impl BggTallEncodingCompiler {
     ) -> Result<BggTallEncodingWire, TallCompileError> {
         let rows = match decomposed_row_factor {
             Some(decomposed) => parallel(input.rows.count().clone(), |i| {
-                Ok(decomposed.clone().mul_small_rhs(input.rows.at(i)))
+                Ok(input.rows.at(i).mul_small_rhs(decomposed.clone()))
             })?,
             None => parallel(input.rows.count().clone(), |i| Ok(input.rows.at(i) * &row_factor))?,
         };

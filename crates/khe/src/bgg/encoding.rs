@@ -146,7 +146,7 @@ impl BggEncodingCompiler {
     ) -> Result<BggEncodingWire, EncodingCompileError> {
         let plaintext = lhs.plaintext.clone().ok_or(EncodingCompileError::MissingLeftPlaintext)?;
         Ok(BggEncodingWire {
-            vector: decomposed_rhs.mul_small_rhs(lhs.vector.clone()) + &rhs.vector * plaintext,
+            vector: lhs.vector.clone().mul_small_rhs(decomposed_rhs) + &rhs.vector * plaintext,
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
     }
@@ -166,7 +166,7 @@ impl BggEncodingCompiler {
         decomposed: Preimage,
     ) -> BggEncodingWire {
         BggEncodingWire {
-            vector: decomposed.mul_small_rhs(input.vector.clone()),
+            vector: input.vector.clone().mul_small_rhs(decomposed),
             plaintext: input.plaintext.clone().map(|value| value * scalar),
         }
     }
@@ -176,7 +176,7 @@ impl BggEncodingCompiler {
         // This is an explicit right action by an arbitrary target matrix.  Its
         // decomposition is used only to consume the input carrier; it does not
         // assert that the projected target itself is a canonical G encoding.
-        BggEncodingWire { vector: decomposed.mul_small_rhs(input.vector.clone()), plaintext: None }
+        BggEncodingWire { vector: input.vector.clone().mul_small_rhs(decomposed), plaintext: None }
     }
 }
 
@@ -558,7 +558,7 @@ mod tests {
             let left_public = ring.input("left-public", (1, columns));
             let right_public = ring.input("right-public", (1, columns));
             let decomposition = right_public.clone().decompose(layout.gadget_base.clone(), columns);
-            let public = decomposition.clone().mul_small_rhs(left_public);
+            let public = left_public.mul_small_rhs(decomposition.clone());
             let output =
                 compiler.mul(&encoding("left"), &encoding("right"), decomposition).unwrap();
             let graph = DslContext::new("approximate-bgg-product")

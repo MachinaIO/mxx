@@ -286,7 +286,7 @@ impl Wee25CommitmentCompiler {
             child_column,
             verifier_cache,
         );
-        Ok(verifier.decompose(self.gadget_base.clone(), self.digit_count).mul_small_rhs(z_prime) +
+        Ok(z_prime.mul_small_rhs(verifier.decompose(self.gadget_base.clone(), self.digit_count)) +
             z_child)
     }
 
@@ -312,12 +312,13 @@ impl Wee25CommitmentCompiler {
                             .at(message_column)
                     })
                     .collect::<Vec<_>>();
-                let scalar = decomposition
-                    .clone()
-                    .mul_small_rhs(self.ring().constant(
+                let scalar = self
+                    .ring()
+                    .constant(
                         (1, (&message.matrix_type().rows * self.digit_count).canonicalize()),
                         ConstantMatrix::UnitRow { index: digit_row.into() },
-                    ))
+                    )
+                    .mul_small_rhs(decomposition.clone())
                     .slice(
                         Some(IndexRange { start: 0.into(), end: 1.into() }),
                         Some(IndexRange {
@@ -329,7 +330,7 @@ impl Wee25CommitmentCompiler {
                 concat_columns(
                     chunks
                         .into_iter()
-                        .map(|chunk| chunk.mul_small_rhs(scalar_identity.clone()))
+                        .map(|chunk| scalar_identity.clone().mul_small_rhs(chunk))
                         .collect(),
                 )
             })
@@ -341,10 +342,11 @@ impl Wee25CommitmentCompiler {
         if !leaf {
             return opening;
         }
-        self.ring()
-            .identity(self.public_columns())
-            .decompose(self.gadget_base.clone(), self.digit_count)
-            .mul_small_rhs(opening)
+        opening.mul_small_rhs(
+            self.ring()
+                .identity(self.public_columns())
+                .decompose(self.gadget_base.clone(), self.digit_count),
+        )
     }
 
     fn verifier_base(&self, parameters: &Wee25PublicParameterWires, leaf: bool) -> Mat {
@@ -356,10 +358,9 @@ impl Wee25CommitmentCompiler {
             return bottom;
         }
         let columns = self.tree_base * self.public_columns();
-        self.ring()
-            .identity(columns)
-            .decompose(self.gadget_base.clone(), self.digit_count)
-            .mul_small_rhs(bottom)
+        bottom.mul_small_rhs(
+            self.ring().identity(columns).decompose(self.gadget_base.clone(), self.digit_count),
+        )
     }
 
     fn verifier_recursive(
@@ -387,15 +388,15 @@ impl Wee25CommitmentCompiler {
                 self.verifier_recursive(base, base_last, child_count, column % child_count, cache);
             let sibling = column / child_count;
             let width = self.public_columns() * self.digit_count;
-            child.decompose(self.gadget_base.clone(), self.digit_count).mul_small_rhs(
-                base.clone().slice(
+            base.clone()
+                .slice(
                     None,
                     Some(IndexRange {
                         start: (width * sibling).into(),
                         end: (width * (sibling + 1)).into(),
                     }),
-                ),
-            )
+                )
+                .mul_small_rhs(child.decompose(self.gadget_base.clone(), self.digit_count))
         };
         cache.insert((block_count, column), result.clone());
         result
@@ -459,7 +460,7 @@ mod tests {
         let bottom = parameters.t_bottom.at(0);
         let lhs =
             compiler.ring().input("lhs", (compiler.public_columns(), compiler.public_columns()));
-        let product = top.clone().mul_small_rhs(lhs);
+        let product = lhs.mul_small_rhs(top.clone());
         let built = DslContext::new("wee25-imported-kinds")
             .output("top", top)
             .unwrap()

@@ -398,7 +398,7 @@ fn gadget_decompose_and_small_rhs_multiply_reconstruct_input() {
         "direct-gadget-decompose-small-rhs",
         move |source| {
             let ring = Ring::from_ref(source.matrix_type().ring.clone());
-            source.decompose(16, digit_count).mul_small_rhs(ring.gadget(2, 16, digit_count))
+            ring.gadget(2, 16, digit_count).mul_small_rhs(source.decompose(16, digit_count))
         },
         |source| source.clone(),
     );
@@ -432,7 +432,7 @@ fn two_digit_gadget_decompose_reconstructs_full_range_input() {
         input,
         move |source| {
             let ring = Ring::from_ref(source.matrix_type().ring.clone());
-            source.decompose(512, digit_count).mul_small_rhs(ring.gadget(2, 512, digit_count))
+            ring.gadget(2, 512, digit_count).mul_small_rhs(source.decompose(512, digit_count))
         },
         |source| source.clone(),
     );
@@ -450,7 +450,7 @@ fn balanced_small_gadget_decompose_reconstructs_full_crt_input() {
             let ring = Ring::from_ref(source.matrix_type().ring.clone());
             let gadget = ring
                 .constant((2, 2 * digits), ConstantMatrix::Gadget { base: 16.into(), small: true });
-            source.small_decompose(16, digits).mul_small_rhs(gadget)
+            gadget.mul_small_rhs(source.small_decompose(16, digits))
         },
         |source| source.clone(),
     );

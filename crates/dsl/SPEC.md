@@ -190,8 +190,7 @@ the GPU. A `HashTag` separates different matrices derived from one key:
 | `a + b`, `a - b`, `-a` | Entrywise addition, subtraction, negation. Operands may be owned or borrowed (`&a + &b`). |
 | `a * b` | The matrix product over `R_Q`. A `1 x 1` operand multiplies as a scalar. |
 | `a * c`, `c * a` | Scaling by an integer constant `c` (a compile expression, or an `i32` on the left). |
-| `a.mul_small_rhs(small)` | The product `a * small` with a bounded right operand, which the backends compute faster. |
-| `preimage.mul_small_rhs(a)` | The product `a * preimage`. |
+| `a.mul_small_rhs(bounded)` | The product `a * bounded` with a bounded right operand (a `SmallMatrix` or a `Preimage`, the two types that implement `BoundedMatrix`), which the backends compute faster than an ordinary product. |
 | `Mat::multi_row_gemm_accumulate(vec![(c_i, a_i, b_i), ...], bias)` | `sum_i c_i * a_i * b_i + bias` as one fused operation. |
 | `a.tensor(b)` | The tensor (Kronecker) product. |
 
@@ -274,10 +273,23 @@ Each conversion takes the destination ring explicitly.
 | `family.at(i)` | Member `i`. `i` may be a compile expression or a runtime `Int`. |
 | `Family::pack(vec![...])` | A family of values of one type. |
 | `family.count()` | The number of members, as a compile expression. |
-| `family.field(\|record\| record.part)` | The family of one field of each member, without a loop. |
+| `family.field(\|record\| record.part)` | The family of one field of the members (see below). |
 | `m.matrix_vector_product(&v)` | For a `Family<Int>` `m` read as a row-major matrix: `M v`, that is `out[i] = sum_j M[i, j] v[j]`. |
 | `m.vector_matrix_product(&v)` | `v^T M`, that is `out[j] = sum_i v[i] M[i, j]`. |
 | `trapdoors.public_matrices()` | The public matrices of a `Family<Trapdoor>`. |
+
+**`field`: taking one field out of a family of records.** A family of records, such as 1024
+BGG+ encodings each with a `vector`, a `public_key`, and a `plaintext`, is stored as one family per
+field (a "struct of arrays"). `field` returns one of those families, so it creates no loop and no
+new graph node:
+
+```rust
+let vectors = encodings.field(|encoding| encoding.vector)?; // Family<Mat>
+```
+
+The closure may only return fields of the member unchanged, or rearrange them into another
+record; any computation on them is rejected with `DslError::Schema`. To compute on each member,
+use `parallel`.
 
 ## 11. Loops, selection, and reusable bodies
 

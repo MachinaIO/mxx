@@ -1190,10 +1190,11 @@ impl TfheParams {
         let digits = parameters.modulus_digits();
         let matrix =
             Mat::concat(ConcatAxis::Rows, vec![multiplier_a.clone(), multiplier_b.clone()]);
-        column
-            .clone()
-            .decompose(IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())), digits)
-            .mul_small_rhs(matrix)
+        matrix.mul_small_rhs(
+            column
+                .clone()
+                .decompose(IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())), digits),
+        )
     }
 }
 

@@ -1320,17 +1320,19 @@ impl Mat {
         &self.matrix_type
     }
 
+    /// The product `self * rhs` with a bounded right operand (a [`SmallMatrix`] or a
+    /// [`Preimage`]), which the backends compute faster than an ordinary product.
     #[track_caller]
-    pub fn mul_small_rhs(self, rhs: SmallMatrix) -> Self {
+    pub fn mul_small_rhs(self, rhs: impl BoundedMatrix) -> Self {
         let output_type = MatrixType {
             rows: self.matrix_type.rows.clone(),
-            columns: rhs.matrix_type.columns.clone(),
+            columns: rhs.bounded_matrix_type().columns.clone(),
             ..self.matrix_type.clone()
         };
 
         let node = NodeHandle::new(
             NodeKind::MatrixMulSmallRhs,
-            vec![self.value, rhs.value],
+            vec![self.value, rhs.bounded_value_handle().clone()],
             vec![WireType::Matrix(output_type.clone())],
         );
         Self { value: node.output(0).expect("small RHS multiplication"), matrix_type: output_type }
@@ -1745,6 +1747,33 @@ impl Neg for Mat {
     }
 }
 
+/// A matrix with a known coefficient bound, usable as the right operand of
+/// [`Mat::mul_small_rhs`]: a [`SmallMatrix`] or a [`Preimage`].
+pub trait BoundedMatrix {
+    fn bounded_value_handle(&self) -> &ValueHandle;
+    fn bounded_matrix_type(&self) -> &MatrixType;
+}
+
+impl BoundedMatrix for SmallMatrix {
+    fn bounded_value_handle(&self) -> &ValueHandle {
+        &self.value
+    }
+
+    fn bounded_matrix_type(&self) -> &MatrixType {
+        &self.matrix_type
+    }
+}
+
+impl BoundedMatrix for Preimage {
+    fn bounded_value_handle(&self) -> &ValueHandle {
+        &self.value
+    }
+
+    fn bounded_matrix_type(&self) -> &MatrixType {
+        &self.matrix_type
+    }
+}
+
 #[derive(Clone)]
 pub struct Preimage {
     value: ValueHandle,
@@ -1818,22 +1847,6 @@ impl Preimage {
             max_coefficient_bound: self.max_coefficient_bound,
             bound_domain: self.bound_domain,
         }
-    }
-
-    #[track_caller]
-    pub fn mul_small_rhs(self, lhs: Mat) -> Mat {
-        let output_type = MatrixType {
-            rows: lhs.matrix_type.rows.clone(),
-            columns: self.matrix_type.columns.clone(),
-            ..lhs.matrix_type.clone()
-        };
-
-        let node = NodeHandle::new(
-            NodeKind::MatrixMulSmallRhs,
-            vec![lhs.value, self.value],
-            vec![WireType::Matrix(output_type.clone())],
-        );
-        Mat { value: node.output(0).expect("preimage multiplication"), matrix_type: output_type }
     }
 }
 
@@ -2348,7 +2361,7 @@ mod tests {
         let lhs = ring.input("lhs", (2, 3));
         let trapdoor = ring.sample_trapdoor(1, 1, 4, 1, 3);
         let rhs = trapdoor.sample_preimage(ring.zero((1, 4)), (3, 4));
-        let output = rhs.mul_small_rhs(lhs);
+        let output = lhs.mul_small_rhs(rhs);
         let built =
             DslContext::new("preimage-rhs").output("product", output).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
@@ -2891,13 +2904,15 @@ mod tests {
         let trapdoors =
             parallel(count.clone(), |_| Ok(ring.sample_trapdoor(1, 5, 4, 4, 1_000_000))).unwrap();
         let targets = parallel(count.clone(), |_| Ok(ring.zero((1, 1)))).unwrap();
-        let preimages = parallel(count, |i| {
-            let trapdoor = trapdoors.at(&i);
-            Ok(trapdoor
-                .sample_preimage(targets.at(i), (trapdoor.public_matrix().matrix_type.columns, 1))
-                .mul_small_rhs(trapdoor.public_matrix()))
-        })
-        .unwrap();
+        let preimages =
+            parallel(count, |i| {
+                let trapdoor = trapdoors.at(&i);
+                Ok(trapdoor.public_matrix().mul_small_rhs(trapdoor.sample_preimage(
+                    targets.at(i),
+                    (trapdoor.public_matrix().matrix_type.columns, 1),
+                )))
+            })
+            .unwrap();
         let built = DslContext::new("parameterized-trapdoor-families")
             .int_parameter("count")
             .transferred_output("trapdoors", trapdoors)
@@ -2980,8 +2995,8 @@ mod tests {
         let output = parallel(targets.count().clone(), |i| {
             let trapdoor = trapdoors.at(&i);
             Ok(trapdoor
-                .sample_preimage(targets.at(i), (6, 1))
-                .mul_small_rhs(trapdoor.public_matrix()))
+                .public_matrix()
+                .mul_small_rhs(trapdoor.sample_preimage(targets.at(i), (6, 1))))
         })
         .unwrap();
         let built = DslContext::new("short-trapdoor-source")

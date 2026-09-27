@@ -139,7 +139,7 @@ impl Wee25PublicParameterCompiler {
                                 end: ((secret_row + 1) * self.layout.digit_count).into(),
                             }),
                         );
-                        row.mul_small_rhs(gadget_block)
+                        gadget_block.mul_small_rhs(row)
                     })
                     .reduce(|sum, term| sum + term)
                     .unwrap_or_else(|| {

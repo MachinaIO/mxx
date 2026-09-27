@@ -92,7 +92,7 @@ impl BggPublicKeyCompiler {
         decomposed_rhs: Preimage,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: decomposed_rhs.mul_small_rhs(lhs.matrix.clone()),
+            matrix: lhs.matrix.clone().mul_small_rhs(decomposed_rhs),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
@@ -112,7 +112,7 @@ impl BggPublicKeyCompiler {
     pub fn matrix_mul(&self, input: &BggPublicKeyWire, target: &Mat) -> BggPublicKeyWire {
         let decomposed = target.clone().decompose(self.base.clone(), self.digit_count.clone());
         BggPublicKeyWire {
-            matrix: decomposed.mul_small_rhs(input.matrix.clone()),
+            matrix: input.matrix.clone().mul_small_rhs(decomposed),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -124,7 +124,7 @@ impl BggPublicKeyCompiler {
         decomposed: Preimage,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: decomposed.mul_small_rhs(input.matrix.clone()),
+            matrix: input.matrix.clone().mul_small_rhs(decomposed),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -142,7 +142,7 @@ impl BggPublicKeyCompiler {
         decomposed: Preimage,
     ) -> BggPublicKeyWire {
         let gadget = self.ring.gadget(matrix_rows, self.base.clone(), self.digit_count.clone());
-        BggPublicKeyWire { matrix: decomposed.mul_small_rhs(gadget), reveal_plaintext }
+        BggPublicKeyWire { matrix: gadget.mul_small_rhs(decomposed), reveal_plaintext }
     }
 
     /// Computes the typed decomposition of `scalar * G` for later reuse.

@@ -350,7 +350,7 @@ impl DiamondInputInjector {
                 let transition_index =
                     &level * &digit_state_count + &digit * &max_state_count + state;
                 let transition = transitions.at(transition_index);
-                Ok(transition.mul_small_rhs(states.at(source_index)))
+                Ok(states.at(source_index).mul_small_rhs(transition))
             })
         })?;
         Ok(DiamondInputEvaluation { states })
@@ -402,7 +402,7 @@ mod tests {
             WireType::Preimage { bound_domain, .. }
                 if *bound_domain == mxx_ir_core::types::CoefficientBoundDomain::Global
         ));
-        let transition_product = transition.clone().mul_small_rhs(preprocessing.p.clone());
+        let transition_product = preprocessing.p.clone().mul_small_rhs(transition.clone());
 
         let built = DslContext::new("diamond-input-preprocessing")
             .output("p", preprocessing.p)

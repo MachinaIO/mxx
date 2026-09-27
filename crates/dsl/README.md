@@ -14,7 +14,7 @@ it.
 | --- | --- |
 | `DslContext`, `BuiltGraph` | Declaring compile parameters, inputs, and outputs; building and validating a graph. |
 | `Ring` | Rings as ordered CRT bases, and the inputs, constants, and samplers over a ring. |
-| `Mat`, `SmallMatrix`, `Preimage`, `Trapdoor` | Matrices, bounded matrices, trapdoors, and their operations. |
+| `Mat`, `SmallMatrix`, `Preimage`, `Trapdoor`, `BoundedMatrix` | Matrices, bounded matrices, trapdoors, and their operations. |
 | `Int`, `Bool`, `Bytes` | Runtime scalars and byte strings. |
 | `Family` | Ordered collections with one element schema. |
 | `parallel`, `iterate`, `select`, `Subgraph` | Independent loops, loops with carried state, runtime selection, and reusable named bodies. |

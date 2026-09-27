@@ -130,9 +130,9 @@ pub fn evaluate_boolean_encoding_layers(
                 public_key_compiler.digit_count.clone(),
             );
             let product = CircuitEncoding {
-                vector: decomposition.clone().mul_small_rhs(left.vector.clone()) +
+                vector: left.vector.clone().mul_small_rhs(decomposition.clone()) +
                     &right.vector * &left.plaintext,
-                public_key: decomposition.mul_small_rhs(left.public_key.clone()),
+                public_key: left.public_key.clone().mul_small_rhs(decomposition),
                 plaintext: &left.plaintext * &right.plaintext,
             };
             let sum = encoding_binary(&public_key_compiler, &left, &right, EncodingOp::Add);

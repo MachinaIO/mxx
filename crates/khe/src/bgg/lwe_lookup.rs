@@ -768,7 +768,7 @@ impl LweLookupCompiler {
         let high = artifacts.high_matrices.at(input_index.clone());
         let output_plaintext = artifacts.output_plaintexts.at(input_index.clone());
         Ok(BggEncodingWire {
-            vector: high.mul_small_rhs(c_b.clone()) + input.vector.clone().mul_small_rhs(low),
+            vector: c_b.clone().mul_small_rhs(high) + input.vector.clone().mul_small_rhs(low),
             plaintext: Some(output_plaintext),
         })
     }
@@ -810,7 +810,7 @@ impl LweLookupCompiler {
             let low = artifact_rows.low_matrices.at(input_index.clone());
             let high = artifact_rows.high_matrices.at(input_index.clone());
             let output_plaintext = artifact_rows.output_plaintexts.at(input_index.clone());
-            Ok((high.mul_small_rhs(c_b) + input_row.mul_small_rhs(low), output_plaintext))
+            Ok((c_b.mul_small_rhs(high) + input_row.mul_small_rhs(low), output_plaintext))
         })?;
         let rows = encodings.field(|pair| pair.0)?;
         let plaintexts = encodings.field(|pair| pair.1)?;
@@ -1437,7 +1437,7 @@ fn tall_lookup_kernel_for(
                 let low = low_matrices.at(input_index.clone());
                 let high = high_matrices.at(input_index.clone());
                 let output_plaintext = output_plaintexts.at(input_index);
-                let row = high.mul_small_rhs(c_b_row) + input_row.mul_small_rhs(low);
+                let row = c_b_row.mul_small_rhs(high) + input_row.mul_small_rhs(low);
                 Ok((row, output_plaintext))
             })?;
             Ok((encodings.field(|pair| pair.0)?, encodings.field(|pair| pair.1)?))
@@ -1989,7 +1989,7 @@ mod tests {
             let output = outputs.at(&index);
             let x = index.add(Int::constant(0)).lift_to_constant_polynomial(scalar_type.clone());
             let y = output.lift_to_constant_polynomial(scalar_type.clone());
-            Ok(high.mul_small_rhs(public_b.clone()) -
+            Ok(public_b.clone().mul_small_rhs(high) -
                 (output_a.clone() -
                     gadget.clone() * y -
                     (input_a.clone() - gadget.clone() * x).mul_small_rhs(low)))

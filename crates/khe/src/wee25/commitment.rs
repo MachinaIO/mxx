@@ -164,12 +164,13 @@ impl Wee25CommitmentCompiler {
                     tag,
                     (self.secret_size, self.public_columns()),
                 );
-                let digit = decomposition
-                    .clone()
-                    .mul_small_rhs(self.ring().constant(
+                let digit = self
+                    .ring()
+                    .constant(
                         (1, self.gadget_rows()),
                         ConstantMatrix::UnitRow { index: digit_row.into() },
-                    ))
+                    )
+                    .mul_small_rhs(decomposition.clone())
                     .slice(
                         Some(IndexRange { start: 0.into(), end: 1.into() }),
                         Some(IndexRange { start: column.into(), end: (column + 1).into() }),

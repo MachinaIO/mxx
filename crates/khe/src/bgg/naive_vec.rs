@@ -82,7 +82,7 @@ impl NaiveBggVecCompiler {
             let key =
                 BggPublicKeyWire { matrix: input.pubkeys.at(&index), reveal_plaintext: reveal };
             let factor = vector_compiler.large_scalar_decomposition(&key, &scalars.at(&index));
-            Ok(factor.mul_small_rhs(input.vectors.at(&index)))
+            Ok(input.vectors.at(&index).mul_small_rhs(factor))
         })?;
         let key_compiler = self.public_key.clone();
         let pubkeys = mxx_dsl::parallel(input.pubkeys.count().clone(), |index| {
@@ -193,7 +193,7 @@ impl NaiveBggVecCompiler {
             let left = lhs.vectors.at(&index);
             let right = rhs.vectors.at(&index);
             let plaintext = lhs_plaintexts.at(&index);
-            Ok(decomposed.mul_small_rhs(left) + right * plaintext)
+            Ok(left.mul_small_rhs(decomposed) + right * plaintext)
         })?;
         let pubkeys =
             self.key_family_binary(lhs, rhs, |compiler, left, right| compiler.mul(left, right))?;
@@ -244,7 +244,7 @@ impl NaiveBggVecCompiler {
         let decomposed = target.clone().decompose(base, digits);
         let vectors = mxx_dsl::parallel(input.vectors.count().clone(), |index| {
             let value = input.vectors.at(&index);
-            Ok(decomposed.clone().mul_small_rhs(value))
+            Ok(value.mul_small_rhs(decomposed.clone()))
         })?;
         let key_compiler = self.public_key.clone();
         let target_for_keys = target.clone();
@@ -374,7 +374,7 @@ impl NaiveBggVecCompiler {
                     reveal_plaintext: input.pubkey_reveal_plaintext,
                 };
                 let factor = self.public_key.large_scalar_decomposition(&key, scalar);
-                Ok(factor.mul_small_rhs(value))
+                Ok(value.mul_small_rhs(factor))
             } else {
                 Ok(value * scalar.clone())
             }

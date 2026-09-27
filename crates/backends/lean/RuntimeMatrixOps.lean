@@ -374,6 +374,23 @@ noncomputable def ringAutomorphismRuns {q n rows columns : Nat} (index : Int)
   0 < index ∧ index < 2 * Int.ofNat n ∧ index % 2 = 1 ∧
   output = ringAutomorphism index.toNat input
 
+/-- Entrywise multiplication by `X^k`. The runtime reduces a signed `k` modulo `2n`, and
+`X^n = -1` in the negacyclic quotient supplies the sign of the wraparound. -/
+noncomputable def multiplyMonomial {q n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) (exponent : Int) : ExactMatrix q n rows columns :=
+  fun row column ↦ input row column *
+    AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (exponent % (2 * (n : Int))).toNat
+
+/-- The exact integer product of a row-major matrix family with a vector family, following the
+runtime: `out[i] = Σ_j M[i * inner + j] v[j]`, or with `transpose`, `out[j] = Σ_i v[i] M[i *
+outer + j]`. Validation fixes `entries = outer * inner`, so the fallback branch is unreachable. -/
+def intMatrixVectorProduct {entries inner outer : Nat} (transpose : Bool)
+    (matrix : Fin entries → Int) (vector : Fin inner → Int) : Fin outer → Int :=
+  fun position ↦ ∑ term : Fin inner,
+    let entry := if transpose then term.val * outer + position.val
+      else position.val * inner + term.val
+    (if h : entry < entries then matrix ⟨entry, h⟩ else 0) * vector term
+
 /-- One heterogeneous CRT level: round using its own source modulus, reduce to the
 plaintext modulus, lift the canonical digit to the destination, and multiply by the
 reconstruction coefficient. This follows `crt_recompose_cpu` term for term. -/

@@ -76,6 +76,9 @@ pub struct PrimitiveNames {
     pub rns_mod_down: String,
     pub block_mod_switch: String,
     pub ring_automorphism: String,
+    pub multiply_monomial: String,
+    pub int_matrix_vector_product: String,
+    pub hash_int_family: String,
     pub pack_polynomial: String,
     pub polynomial_from_values: String,
     pub polynomial_values: String,
@@ -131,6 +134,9 @@ impl Default for PrimitiveNames {
             rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
             block_mod_switch: "MxxRuntime.blockModSwitchRuns".into(),
             ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
+            multiply_monomial: "MxxRuntime.multiplyMonomial".into(),
+            int_matrix_vector_product: "MxxRuntime.intMatrixVectorProduct".into(),
+            hash_int_family: "MxxRuntime.hashIntFamily".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
             polynomial_from_values: "MxxRuntime.polynomialFromValues".into(),
             polynomial_values: "MxxRuntime.polynomialValues".into(),
@@ -683,7 +689,12 @@ impl<'a> Emitter<'a> {
             current_value_expressions: BTreeMap::new(),
             scope_proofs: BTreeMap::new(),
             requires_hash_model: graph.scopes().values().any(|scope| {
-                scope.nodes().iter().any(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+                scope.nodes().iter().any(|node| {
+                    matches!(
+                        node.kind(),
+                        NodeKind::HashSample { .. } | NodeKind::HashIntFamily { .. }
+                    )
+                })
             }),
         }
     }
@@ -1604,27 +1615,37 @@ impl<'a> Emitter<'a> {
                 );
             }
             NodeKind::MultiplyMonomial => {
-                return self.unsupported(
-                    scope_id,
-                    node_id,
-                    kind,
-                    "runtime monomial multiplication has no Lean ring relation",
+                let a = arg(0)?;
+                let exponent = arg(1)?;
+                self.let_output(
+                    &output(0),
+                    &format!("{} {a} {exponent}", self.options.primitives.multiply_monomial),
                 );
             }
-            NodeKind::IntMatrixVectorProduct { .. } => {
-                return self.unsupported(
-                    scope_id,
-                    node_id,
-                    kind,
-                    "integer matrix-vector products have no Lean relation",
+            NodeKind::IntMatrixVectorProduct { transpose } => {
+                let matrix = arg(0)?;
+                let vector = arg(1)?;
+                self.let_output(
+                    &output(0),
+                    &format!(
+                        "{} {transpose} {matrix} {vector}",
+                        self.options.primitives.int_matrix_vector_product
+                    ),
                 );
             }
-            NodeKind::HashIntFamily { .. } => {
-                return self.unsupported(
-                    scope_id,
+            NodeKind::HashIntFamily { modulus, tag_prefix, tag_components, .. } => {
+                append_expression_guards(modulus, env, relations);
+                let key = arg(0)?;
+                self.current_uses_hash_model = true;
+                let (prefix, components) =
+                    hash_tag_terms(tag_prefix, tag_components, args, env, relations);
+                self.sample_one(
+                    scope,
                     node_id,
-                    kind,
-                    "integer hash families have no Lean sampler relation",
+                    existentials,
+                    relations,
+                    &self.options.primitives.hash_int_family,
+                    &["hashModel".into(), env.expr(modulus), prefix, components, key],
                 );
             }
             NodeKind::HashSample { variant, tag_prefix, tag_components, .. } => {
@@ -1638,44 +1659,15 @@ impl<'a> Emitter<'a> {
                 }
                 let key = arg(0)?;
                 self.current_uses_hash_model = true;
-                let components = tag_components
-                    .iter()
-                    .map(|component| {
-                        use crate::node::HashTagComponent;
-                        match component {
-                            HashTagComponent::Bytes(bytes) => format!(
-                                ".bytes [{}]",
-                                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
-                            ),
-                            HashTagComponent::Integer(expression) |
-                            HashTagComponent::Decimal(expression) |
-                            HashTagComponent::U64Le(expression) => {
-                                append_expression_guards(expression, env, relations);
-                                let constructor = match component {
-                                    HashTagComponent::Integer(_) => "integer",
-                                    HashTagComponent::Decimal(_) => "decimal",
-                                    _ => "u64Le",
-                                };
-                                format!(".{constructor} ({})", env.expr(expression))
-                            }
-                            HashTagComponent::Operand(index) => {
-                                format!(".integer {}", wire_name(args[*index]))
-                            }
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = format!(
-                    "[{}]",
-                    tag_prefix.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
-                );
+                let (prefix, components) =
+                    hash_tag_terms(tag_prefix, tag_components, args, env, relations);
                 self.sample_one(
                     scope,
                     node_id,
                     existentials,
                     relations,
                     &self.options.primitives.hash_sample,
-                    &["hashModel".into(), prefix, format!("[{components}]"), key],
+                    &["hashModel".into(), prefix, components, key],
                 );
             }
             NodeKind::ModulusSwitch { .. } |
@@ -2628,6 +2620,44 @@ impl<'a> Emitter<'a> {
             matrix.columns
         )
     }
+}
+
+/// Render a hash tag prefix and its typed components as `MxxRuntime` terms, recording the guards
+/// of every compile-time component.
+fn hash_tag_terms(
+    tag_prefix: &[u8],
+    tag_components: &[crate::node::HashTagComponent],
+    args: &[WireRef],
+    env: &LexicalEnv,
+    relations: &mut Vec<String>,
+) -> (String, String) {
+    use crate::node::HashTagComponent;
+    let components = tag_components
+        .iter()
+        .map(|component| match component {
+            HashTagComponent::Bytes(bytes) => format!(
+                ".bytes [{}]",
+                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
+            ),
+            HashTagComponent::Integer(expression) |
+            HashTagComponent::Decimal(expression) |
+            HashTagComponent::U64Le(expression) => {
+                append_expression_guards(expression, env, relations);
+                let constructor = match component {
+                    HashTagComponent::Integer(_) => "integer",
+                    HashTagComponent::Decimal(_) => "decimal",
+                    _ => "u64Le",
+                };
+                format!(".{constructor} ({})", env.expr(expression))
+            }
+            HashTagComponent::Operand(index) => format!(".integer {}", wire_name(args[*index])),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        format!("[{}]", tag_prefix.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")),
+        format!("[{components}]"),
+    )
 }
 
 fn valid_identifier(name: &str) -> Result<(), ExportError> {

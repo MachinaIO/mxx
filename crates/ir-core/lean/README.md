@@ -18,15 +18,29 @@ IR fixtures are written to `test_data/lean_ir_fixtures/<fixture>/Generated.lean`
 layout fixture is written to `test_data/lean_runtime_fixture/Generated.lean`. Generation tests
 validate and export real frozen graphs; they do not themselves invoke the Lean kernel.
 
-The IR fixtures cover constants, hashes, samplers, gadgets, small/wide preimages, matrix
-operations, quoted keyword identifiers, lexical loop bindings, and empty/nonempty structural
-loops. Their proof text can be checked separately from the repository root, after building the
+The IR fixtures cover constants, hashes, integer hash families, samplers, gadgets, small/wide
+preimages, matrix operations, integer matrix-vector products, runtime monomial multiplication,
+quoted keyword identifiers, lexical loop bindings, and empty/nonempty structural loops. Their proof text can be checked separately from the repository root, after building the
 IR and runtime packages:
 
 ```sh
 LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean \
   lake +leanprover/lean4:v4.28.0 -d crates/backends/lean env lean \
   test_data/lean_ir_fixtures/sampler/Generated.lean
+```
+
+Linked-claim fixtures hold several modules. `cargo test -p mxx-dsl --lib test_lwe_protocol`
+writes `test_data/lean_ir_fixtures/lwe_protocol/`: a two-stage centered-residual integer-LWE claim
+whose ciphertext crosses stages as an integer-family artifact, its proof, and the certificate. Check the modules in import order, writing each `.olean` into a
+directory that is also on `LEAN_PATH`:
+
+```sh
+out=$(mktemp -d)
+for module in LweFixture Stage_encrypt Stage_decrypt Ideal Claim LweProof Certificate; do
+  LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean:$out \
+    lake +leanprover/lean4:v4.28.0 -d crates/backends/lean env lean -o "$out/$module.olean" \
+    "test_data/lean_ir_fixtures/lwe_protocol/$module.lean"
+done
 ```
 
 The explicit toolchain matches `crates/backends/lean/lean-toolchain`: Lake's `-d` selects the

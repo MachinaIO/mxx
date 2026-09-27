@@ -82,6 +82,9 @@ pub struct TrapdoorContractMismatch {
 pub enum EndpointSpecId {
     ToyThresholdDecode,
     DiamondBooleanInterval,
+    /// An exactly compared decoder output whose margin is a centered residual (see
+    /// [`OperationalDecoderKind::CenteredResidual`]).
+    CenteredResidual,
 }
 
 /// A symbolic upper bound explicitly assumed by an external-input contract.
@@ -221,7 +224,11 @@ impl ComparatorSpec {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EndpointSemanticBinding {
     ThresholdDecode,
-    DiamondBoolean { message: ProtocolInputId },
+    DiamondBoolean {
+        message: ProtocolInputId,
+    },
+    /// The decoder output must equal the ideal output exactly; no message input is named.
+    Exact,
 }
 
 /// The executable decoder family selected by an operational target.  This is
@@ -229,8 +236,14 @@ pub enum EndpointSemanticBinding {
 /// decoder threshold or interval.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OperationalDecoderKind {
-    ThresholdDecode { plaintext_modulus: IntExpr },
+    ThresholdDecode {
+        plaintext_modulus: IntExpr,
+    },
     BooleanInterval,
+    /// A decoder in the residual's stage whose output (a Boolean, an integer, or a family of
+    /// either) depends on the residual. The residual is either a scalar polynomial, all of whose
+    /// coefficients form the margin, or an integer reduced by `%` with a compile-time modulus.
+    CenteredResidual,
 }
 
 /// Names the residual and executable decoder whose acceptance margin an application proves.
@@ -545,7 +558,8 @@ impl ClosedProtocolBundle {
                 return Err(BundleValidationError::MissingEndpointBinding);
             }
             match (&endpoint.spec, &endpoint.semantics) {
-                (EndpointSpecId::ToyThresholdDecode, EndpointSemanticBinding::ThresholdDecode) => {}
+                (EndpointSpecId::ToyThresholdDecode, EndpointSemanticBinding::ThresholdDecode) |
+                (EndpointSpecId::CenteredResidual, EndpointSemanticBinding::Exact) => {}
                 (
                     EndpointSpecId::DiamondBooleanInterval,
                     EndpointSemanticBinding::DiamondBoolean { message },
@@ -630,6 +644,12 @@ impl ClosedProtocolBundle {
                 .outputs()
                 .get(&target.residual.output)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            if matches!(target.kind, OperationalDecoderKind::CenteredResidual) ||
+                target.endpoint == EndpointSpecId::CenteredResidual
+            {
+                self.validate_centered_residual_target(target, residual_stage, residual.value)?;
+                continue;
+            }
             let residual_matrix_type = match output_type(&residual_stage.graph, residual.value) {
                 Some(WireType::Matrix(matrix_type)) => matrix_type,
                 Some(WireType::IndexedFamily { element, .. }) => match element.as_ref() {
@@ -725,6 +745,54 @@ impl ClosedProtocolBundle {
         Ok(())
     }
 
+    /// Checks a centered-residual target: its decoder output shares the residual's stage and
+    /// depends on it, and an integer residual is a `%` reduction by a compile-time modulus.
+    fn validate_centered_residual_target(
+        &self,
+        target: &OperationalDecoderTarget,
+        residual_stage: &ProtocolStage,
+        residual: WireRef,
+    ) -> Result<(), BundleValidationError> {
+        if !matches!(target.kind, OperationalDecoderKind::CenteredResidual) ||
+            target.endpoint != EndpointSpecId::CenteredResidual
+        {
+            return Err(BundleValidationError::OperationalDecoderTargetKindMismatch);
+        }
+        let endpoint = self
+            .endpoints
+            .entries
+            .iter()
+            .find(|endpoint| endpoint.spec == target.endpoint)
+            .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+        if endpoint.workflow_output.stage != target.residual.stage {
+            return Err(BundleValidationError::InvalidOperationalDecoderTarget);
+        }
+        let graph = &residual_stage.graph;
+        let decoder = graph
+            .outputs()
+            .get(&endpoint.workflow_output.output)
+            .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?
+            .value;
+        let scalar = |ty: Option<&WireType>| {
+            matches!(ty, Some(WireType::Bool | WireType::ConstantBool | WireType::Int))
+        };
+        let decoder_type_supported = match output_type(graph, decoder) {
+            Some(WireType::IndexedFamily { element, .. }) => scalar(Some(element)),
+            ty => scalar(ty),
+        };
+        let residual_supported = match output_type(graph, residual) {
+            Some(WireType::Matrix(matrix)) => {
+                matrix.rows == IntExpr::constant(1) && matrix.columns == IntExpr::constant(1)
+            }
+            Some(WireType::Int) => integer_modulus(graph, residual).is_some(),
+            _ => false,
+        };
+        if !decoder_type_supported || !residual_supported || !depends_on(graph, decoder, residual) {
+            return Err(BundleValidationError::InvalidOperationalDecoderTarget);
+        }
+        Ok(())
+    }
+
     fn validate_preconditions(&self) -> Result<(), BundleValidationError> {
         if self.precondition_spec.requirement_outputs.len() != self.requirements.len() {
             return Err(BundleValidationError::PreconditionCardinalityMismatch);
@@ -745,6 +813,42 @@ impl ClosedProtocolBundle {
         }
         Ok(())
     }
+}
+
+/// The compile-time modulus of an integer residual `value % modulus`, as the divisor's constant or
+/// symbolic node. Runtime remainders are Euclidean, so the residual is canonical for it.
+pub(crate) fn integer_modulus(graph: &Graph, residual: WireRef) -> Option<&NodeKind> {
+    let (NodeKind::IntBinary(IntBinaryOp::Remainder), [_, divisor]) =
+        node_kind_and_arguments(graph, residual)?
+    else {
+        return None;
+    };
+    let (kind @ (NodeKind::ConstantInt(_) | NodeKind::EvaluateInt(_)), []) =
+        node_kind_and_arguments::<0>(graph, divisor)?
+    else {
+        return None;
+    };
+    Some(kind)
+}
+
+/// Whether `output` is computed from `source` through root-scope node arguments. A loop or call
+/// node counts as depending on every argument it receives.
+fn depends_on(graph: &Graph, output: WireRef, source: WireRef) -> bool {
+    let scope = graph.root_scope();
+    let mut pending = vec![output];
+    let mut visited = BTreeSet::new();
+    while let Some(wire) = pending.pop() {
+        if wire == source {
+            return true;
+        }
+        if !visited.insert(wire.node) {
+            continue;
+        }
+        if let Some(arguments) = scope.node(wire.node).and_then(|node| scope.arguments(node)) {
+            pending.extend(arguments.iter().copied());
+        }
+    }
+    false
 }
 
 fn node_kind_and_arguments<const N: usize>(

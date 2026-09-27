@@ -61,8 +61,10 @@ pub struct ClaimSemantics<'a> {
     pub imports: &'a [&'a str],
     pub hash_model_type: &'a str,
     pub centered_lift: &'a str,
-    /// Lean function `Nat → Bool → Nat` giving the center subtracted from the designated
-    /// residual output. Use zero when the graph has already subtracted the encoded message.
+    /// Lean function giving the center subtracted from the designated residual output: `Nat →
+    /// Bool → Nat` for [`Endpoint::BooleanInterval`], and `Nat → τ → Fin k → Int` for
+    /// [`Endpoint::CenteredResidual`], where `τ` is the ideal output type and `k` the residual's
+    /// coefficient count. Use zero when the graph has already subtracted the encoded message.
     pub message_center: &'a str,
     /// Lean function `Nat → Nat` giving the strict error radius for the declared decoder.
     /// This is part of the conclusion to prove, not an assumed bound on executions.
@@ -78,8 +80,19 @@ pub struct ClaimBackend<'a> {
 /// Application-independent endpoint semantics, with the bound in the conclusion only.
 #[derive(Clone, Debug)]
 pub enum Endpoint {
-    BooleanInterval { residual: Port },
-    MatrixApprox { bound: num_bigint::BigUint },
+    BooleanInterval {
+        residual: Port,
+    },
+    MatrixApprox {
+        bound: num_bigint::BigUint,
+    },
+    /// Exact equality of Boolean, integer, or family endpoints, with every coefficient of the
+    /// residual within the decoder radius after centering. A scalar-polynomial residual uses its
+    /// ring modulus and all coefficients; an integer residual `value % modulus` uses that
+    /// compile-time modulus as its only coefficient.
+    CenteredResidual {
+        residual: Port,
+    },
 }
 
 /// Shared externals, acyclic graph connections and one typed endpoint.
@@ -462,6 +475,58 @@ pub fn assemble_claim(
         source.push_str(&format!("\n/-- The error witness and its bound are conclusions, never execution premises. -/\ndef CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    Mxx.Primitives.Approx ({actual_value}) ({ideal_value}) {bound}\n\nend GeneratedClaim\n"));
         return Ok(source);
     }
+    if let Endpoint::CenteredResidual { residual: residual_port } = &claim.endpoint {
+        let exact = |ty: &ConcreteWireType| match ty {
+            ConcreteWireType::IndexedFamily { element, .. } => {
+                matches!(element.as_ref(), ConcreteWireType::Bool | ConcreteWireType::Int)
+            }
+            ty => matches!(ty, ConcreteWireType::Bool | ConcreteWireType::Int),
+        };
+        if actual.wire_type != ideal.wire_type ||
+            actual.lean_type != ideal.lean_type ||
+            !exact(&actual.wire_type)
+        {
+            return Err("exact endpoint must be a matching Boolean, integer, or family".into());
+        }
+        let residual = output(claim, residual_port)?;
+        let residual_value =
+            project(residual, &format!("execution.«{}»", entries[residual_port.root].1));
+        let (q, count, coefficient) = match &residual.wire_type {
+            ConcreteWireType::Matrix(matrix)
+                if matrix.is_scalar() && matrix.ring.ring_dimension() as usize != 0 =>
+            {
+                (
+                    matrix.ring.modulus().to_string(),
+                    matrix.ring.ring_dimension() as usize,
+                    format!("(({residual_value}) 0 0).coeff index"),
+                )
+            }
+            ConcreteWireType::Int => {
+                let graph = claim.roots[residual_port.root].graph;
+                let modulus = match crate::protocol::integer_modulus(graph, residual.wire) {
+                    Some(crate::node::NodeKind::ConstantInt(value)) => value.clone(),
+                    Some(crate::node::NodeKind::EvaluateInt(expression)) => {
+                        expression.evaluate(bindings).map_err(|error| error.to_string())?
+                    }
+                    _ => return Err("integer residual must be `value % modulus`".into()),
+                };
+                if modulus <= num_bigint::BigInt::from(1) {
+                    return Err("integer residual modulus must exceed one".into());
+                }
+                (modulus.to_string(), 1, format!("(({residual_value} : Int) : ZMod {modulus})"))
+            }
+            _ => return Err("residual must be a scalar polynomial or an integer".into()),
+        };
+        let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
+        let actual_value =
+            project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
+        let centered_lift = semantics.centered_lift;
+        let message_center = semantics.message_center;
+        let decoder_radius = semantics.decoder_radius;
+        source.push_str(&format!("\nnoncomputable def observedResidual (execution : Execution) (index : Fin {count}) : Int :=\n  {centered_lift} {q}\n    ({coefficient} -\n      ({message_center} {q} ({ideal_value}) index : ZMod {q}))\n\n"));
+        source.push_str(&format!("/-- The application proof must establish this proposition; no noise premise is assumed. -/\ndef CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    (∀ index, (observedResidual execution index).natAbs < {decoder_radius} {q}) ∧\n    {actual_value} = {ideal_value}\n\nend GeneratedClaim\n"));
+        return Ok(source);
+    }
     if actual.wire_type != ConcreteWireType::Bool ||
         ideal.wire_type != ConcreteWireType::Bool ||
         actual.lean_type != "Bool" ||
@@ -628,6 +693,62 @@ mod tests {
         assert!(conclusion.contains(") 7"));
         claim.ideal.name = "bit".into();
         assert!(render(&claim).unwrap_err().contains("type mismatch"));
+    }
+
+    #[test]
+    fn centered_residual_bounds_every_polynomial_coefficient_in_the_conclusion() {
+        let (graph, artifact) = exported_graph();
+        let mut claim = linked(&graph, &artifact);
+        claim.endpoint =
+            Endpoint::CenteredResidual { residual: Port { root: 0, name: "residual".into() } };
+        let source = assemble_claim(
+            &claim,
+            &ParamEnv::default(),
+            &ClaimBackend {
+                module_name: "MxxRuntime",
+                context_name: "unusedBackend",
+                layouts: &[],
+            },
+            &ClaimSemantics {
+                imports: &["CenteredResidualFixture"],
+                hash_model_type: "MxxRuntime.HashModel",
+                centered_lift: "Mxx.Primitives.centeredLift",
+                message_center: "CenteredResidualFixture.messageCenter",
+                decoder_radius: "CenteredResidualFixture.decoderRadius",
+            },
+        )
+        .unwrap();
+        let (runs, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
+        assert!(runs.contains("(index : Fin 2)"));
+        assert!(runs.contains("((execution.«producer».2.1) 0 0).coeff index"));
+        assert!(
+            runs.contains("CenteredResidualFixture.messageCenter 17 (execution.«ideal».1) index")
+        );
+        assert!(!runs.contains(".natAbs <"));
+        assert!(conclusion.contains(
+            "(∀ index, (observedResidual execution index).natAbs < CenteredResidualFixture.decoderRadius 17)"
+        ));
+        assert!(conclusion.contains("execution.«producer».1 = execution.«ideal».1"));
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_ir_fixtures/centered_residual_claim");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(format!("{}.lean", artifact.module_name)), &artifact.source)
+            .unwrap();
+        std::fs::write(
+            directory.join("CenteredResidualFixture.lean"),
+            "import MxxRuntime\nnamespace CenteredResidualFixture\ndef messageCenter (_ : Nat) (_ : Bool) (_ : Fin 2) : Int := 0\ndef decoderRadius (q : Nat) : Nat := q / 4\nend CenteredResidualFixture\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("Claim.lean"), source).unwrap();
+
+        claim.endpoint =
+            Endpoint::CenteredResidual { residual: Port { root: 0, name: "bit".into() } };
+        assert!(render(&claim).unwrap_err().contains("scalar polynomial or an integer"));
+        claim.endpoint =
+            Endpoint::CenteredResidual { residual: Port { root: 0, name: "residual".into() } };
+        claim.actual = Port { root: 0, name: "residual".into() };
+        claim.ideal = Port { root: 1, name: "residual".into() };
+        assert!(render(&claim).unwrap_err().contains("exact endpoint"));
     }
 
     #[test]

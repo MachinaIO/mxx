@@ -10,7 +10,8 @@ use crate::{
         },
     },
     protocol::{
-        ComparatorSpec, InputValueContract, ProtocolDecl, ProtocolInputDestination, StageId,
+        ComparatorSpec, InputValueContract, OperationalDecoderKind, ProtocolDecl,
+        ProtocolInputDestination, StageId,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -316,11 +317,20 @@ pub fn assemble_claim(
             .collect(),
         actual: Port { root: actual_position, name: endpoint.workflow_output.output.clone() },
         ideal: Port { root: ideal_position, name: endpoint.ideal_output.clone() },
-        endpoint: claim::Endpoint::BooleanInterval {
-            residual: Port {
+        endpoint: {
+            let residual = Port {
                 root: position(&target.residual.stage)?,
                 name: target.residual.output.clone(),
-            },
+            };
+            match target.kind {
+                OperationalDecoderKind::ThresholdDecode { .. } |
+                OperationalDecoderKind::BooleanInterval => {
+                    claim::Endpoint::BooleanInterval { residual }
+                }
+                OperationalDecoderKind::CenteredResidual => {
+                    claim::Endpoint::CenteredResidual { residual }
+                }
+            }
         },
     };
     claim::assemble_claim(&claim, bindings, backend, semantics)

@@ -96,7 +96,9 @@
 //!   cannot depend on the enclosing index, and matrix-valued loop outputs must be homogeneous
 //!   matrix families.
 //! - Integer and typed-blob artifact inputs need `plan_with_store`, matrix exports need an
-//!   evaluation-form source, and raw transcoding does not support every wire type.
+//!   evaluation-form source, and raw transcoding does not support every wire type. An
+//!   integer-family artifact is imported whole, one member per slot, before its first consumer; its
+//!   planned range is the widest member payload.
 //! - Trapdoors and preimages require the exact regular gadget layout, sigma, and shapes.
 //! - Integer matrix-vector products need one-word operands and operand and output ranges within
 //!   `int64`, and cannot run in a vectorized body.

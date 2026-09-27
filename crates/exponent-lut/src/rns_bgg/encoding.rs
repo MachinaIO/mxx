@@ -1114,23 +1114,18 @@ impl EncodingLowering<'_> {
         Ok((families, sigma_indices))
     }
 
-    /// The switching and switched-key decompositions of LUT branch `index`
-    /// with automorphism `sigma`.
+    /// The switching and switched-key decompositions of a LUT branch with
+    /// automorphism `sigma` and switching ciphertext `b_sigma`.
     fn lut_branch_action(
         &self,
         input: &RnsBggEncoding,
-        switching: &[Family<Mat>],
-        index: Int,
+        b_sigma: RnsBggMatrix,
         sigma: IntExpr,
     ) -> Result<(RnsBggDecomposition, RnsBggDecomposition), DslError> {
         let evaluation_level = self.workload.level(input.wire()).map_err(|_| DslError::Schema)?;
         let decomposition_level = evaluation_level.checked_add(1).ok_or(DslError::Schema)?;
         let target_ring =
             self.parameters.ring(decomposition_level).map_err(|_| DslError::Schema)?;
-        let b_sigma = (
-            (switching[0].at(index.clone()), switching[1].at(index.clone())),
-            (switching[2].at(index.clone()), switching[3].at(index)),
-        );
         let switching_decomposition = compact_decompose_matrix(
             self.parameters,
             evaluation_level,
@@ -1533,7 +1528,6 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             return Err(RnsBggError::Binding("RNS-BGG LUT requires a private input"));
         }
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
-        let count = IntExpr::constant(table.values().len());
         let level = self.workload.level(input.wire())?;
         let (switching, sigmas) = self.lut_switching(input, lut_id, table)?;
         let output = self.site()?.output;
@@ -1551,13 +1545,20 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         let zero = evaluation_ring.zero((1, columns));
         let initial =
             ((zero.clone(), zero.clone()), ((zero.clone(), zero.clone()), (zero.clone(), zero)));
-        let (row, public_key) = mxx_dsl::iterate(count, initial, |index, (row_sum, key_sum)| {
+        let b_at = |index: Int| {
+            (
+                (switching[0].at(index.clone()), switching[1].at(index.clone())),
+                (switching[2].at(index.clone()), switching[3].at(index)),
+            )
+        };
+        let this = &*self;
+        let branch = |index: Int, (row_sum, key_sum), b_sigma| {
             let sigma = IntExpr::Select {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
             let (switching_decomposition, switched_key_decomposition) =
-                self.lut_branch_action(input, &switching, index.clone(), sigma.clone())?;
+                this.lut_branch_action(input, b_sigma, sigma.clone())?;
             let mask = helper.at(index);
             let routed_input = (
                 input.row.0.clone().ring_automorphism(sigma.clone()),
@@ -1571,14 +1572,27 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 ),
             );
             let public_data =
-                self.lut_public_data(level, Int::from(sigma)).map_err(|_| DslError::Schema)?;
+                this.lut_public_data(level, Int::from(sigma)).map_err(|_| DslError::Schema)?;
             let public_key = add_public_matrices(
                 key_sum,
                 multiply_public_action(public_data, switched_key_decomposition),
             );
-            Ok((row, public_key))
-        })
+            Ok::<_, DslError>((row, public_key))
+        };
+        // Each iteration first reads the next branch's switching ciphertext
+        // and carries it to the next iteration, so that load overlaps this
+        // branch's work; the last branch runs after the loop.
+        let last = table.values().len().checked_sub(1).ok_or(RnsBggError::Lut)?;
+        let (sums, b_last) = mxx_dsl::iterate(
+            IntExpr::constant(last),
+            (initial, b_at(Int::constant(0))),
+            |index, (sums, b_sigma)| {
+                let next = b_at(index.clone().add(1usize));
+                Ok((branch(index, sums, b_sigma)?, next))
+            },
+        )
         .map_err(graph)?;
+        let (row, public_key) = branch(Int::constant(last), sums, b_last).map_err(graph)?;
         let mut public_key = RnsBggPublicKey::new(output, public_key);
         let mut row = row;
         if !self

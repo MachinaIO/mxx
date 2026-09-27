@@ -111,9 +111,12 @@ static uint32_t strided_copy_blocks(const MxxStridedCopy &copy, uint32_t threads
 
 __global__ void mxx_export_slot_publish_kernel(MxxExportSlotHeader *header,
     uint64_t occurrence, uint64_t artifact_offset, uint64_t payload_bytes,
-    uint32_t site, uint32_t flags)
+    uint32_t site, uint32_t flags, const uint32_t *gate)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // A failed status word marks the publication suppressed: the payload was
+    // computed by a failed operation and must not be acted on.
+    if (gate && *gate != 0) flags |= MXX_EXPORT_SLOT_SUPPRESSED;
     header->occurrence = occurrence;
     header->artifact_offset = artifact_offset;
     header->payload_bytes = payload_bytes;
@@ -472,6 +475,12 @@ namespace
             {
                 cudaStreamDestroy(owner->release_streams_by_partition[partition]);
                 owner->release_streams_by_partition[partition] = nullptr;
+            }
+            if (partition < owner->transfer_streams_by_partition.size() &&
+                owner->transfer_streams_by_partition[partition])
+            {
+                cudaStreamDestroy(owner->transfer_streams_by_partition[partition]);
+                owner->transfer_streams_by_partition[partition] = nullptr;
             }
             if (partition < owner->compute_streams_by_partition.size())
             {
@@ -1258,6 +1267,7 @@ extern "C"
             {
             gpu_ctx->execution->compute_streams_by_partition.resize(gpu_ctx->gpu_ids.size());
             gpu_ctx->execution->release_streams_by_partition.resize(gpu_ctx->gpu_ids.size(), nullptr);
+            gpu_ctx->execution->transfer_streams_by_partition.resize(gpu_ctx->gpu_ids.size(), nullptr);
             for (size_t partition = 0; partition < gpu_ctx->gpu_ids.size(); ++partition)
             {
                 const int device = gpu_ctx->gpu_ids[partition];
@@ -1278,6 +1288,13 @@ extern "C"
                 }
                 err = cudaStreamCreateWithFlags(
                     &gpu_ctx->execution->release_streams_by_partition[partition],
+                    cudaStreamNonBlocking);
+                if (err != cudaSuccess)
+                {
+                    throw std::runtime_error(cudaGetErrorString(err));
+                }
+                err = cudaStreamCreateWithFlags(
+                    &gpu_ctx->execution->transfer_streams_by_partition[partition],
                     cudaStreamNonBlocking);
                 if (err != cudaSuccess)
                 {
@@ -3035,19 +3052,23 @@ extern "C"
     int mxx_gpu_graph_builder_add_export_publish(MxxGpuGraphBuilder *builder,
         void *device_header, uint64_t occurrence, uint64_t artifact_offset,
         uint64_t payload_bytes, uint32_t site, uint32_t flags,
-        uint32_t header_binding)
+        uint32_t header_binding, const void *gate, uint32_t gate_binding)
     {
         if (!builder || !device_header || (flags & ~1U) != 0)
             return set_error("invalid explicit export publication");
         const void *arguments[] = {&device_header, &occurrence, &artifact_offset,
-            &payload_bytes, &site, &flags};
+            &payload_bytes, &site, &flags, &gate};
         const size_t sizes[] = {sizeof(device_header), sizeof(occurrence),
-            sizeof(artifact_offset), sizeof(payload_bytes), sizeof(site), sizeof(flags)};
-        const MxxGraphPatch patch{nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,
-            0, 0, sizeof(device_header), header_binding, 0};
+            sizeof(artifact_offset), sizeof(payload_bytes), sizeof(site), sizeof(flags),
+            sizeof(gate)};
+        const MxxGraphPatch patches[] = {
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(device_header),
+                header_binding, 0},
+            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 6, 0, sizeof(gate),
+                gate_binding, 0}};
         return mxx_gpu_graph_builder_add_kernel(builder,
             reinterpret_cast<const void *>(mxx_export_slot_publish_kernel),
-            1, 1, 1, 1, 1, 1, 0, arguments, sizes, 6, &patch, 1);
+            1, 1, 1, 1, 1, 1, 0, arguments, sizes, 7, patches, gate ? 2 : 1);
     }
 
     static MxxGraphPatch mxx_direct_pointer_patch(uint32_t argument_index,

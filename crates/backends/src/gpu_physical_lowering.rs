@@ -129,6 +129,7 @@ pub(crate) enum ImportDestination {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct ImportTemplate {
     pub before_operation: u32,
     pub key: ArtifactKey,
@@ -137,6 +138,12 @@ pub(crate) struct ImportTemplate {
     pub staged: bool,
     pub destination: PhysicalValueId,
     pub upload_owner: ImportDestination,
+    /// The member index is entry `position` of this resident integer family,
+    /// read once when its wave group starts; otherwise `key.index` is fixed.
+    pub member: Option<(PhysicalValueId, usize)>,
+    /// A wave import into one of two alternating owners, which the wave group
+    /// starts one wave ahead of its consumers.
+    pub read_ahead: bool,
 }
 
 pub(crate) struct PhysicalFrame {
@@ -1450,6 +1457,9 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub import_templates: &'a mut Vec<ImportTemplate>,
     pub external_io_loops: &'a mut Vec<ExternalIoLoop>,
     pub external_io_imports: &'a mut Vec<ExternalIoImport>,
+    /// Mapped host slots: the import request slots of selected imports, in
+    /// lowering order, then the export slots.
+    pub slots: &'a mut Vec<Arc<GpuExportSlot>>,
     /// Top-level operation ranges of the lanes of each parallel loop.
     pub parallel_lanes: &'a mut Vec<Vec<std::ops::Range<u32>>>,
     /// The top-level operation range each lowered node emitted, in lowering
@@ -1490,12 +1500,13 @@ pub(super) fn record_node_operations(
 
 /// Reserve one reusable lane input for a selected artifact member. The caller
 /// records an ImportTemplate for each wave occurrence, all referencing the
-/// same destination; no family-wide allocation or read occurs. The
+/// same destination, which odd waves may rebind to a twin owner; no
+/// family-wide allocation or read occurs. The
 /// destination is the graph value in `encoding`: a matrix artifact arrives in
 /// evaluation representation and a trapdoor secret leaf in coefficients, and a
 /// consumer of the other encoding converts it once. The returned index is the
-/// first operation emitted after the destination exists, before which the
-/// upload runs.
+/// first operation emitted after the destination exists: the import's load
+/// site, which the plan later moves to its first consumer.
 pub(super) fn allocate_matrix_import_destination(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: &ConcreteMatrixType,
@@ -1676,6 +1687,78 @@ pub(super) fn allocate_typed_import_destination(
     ctx.values.push(physical);
     ctx.owners.insert(destination, resident);
     Ok((destination, destination, upload_owner, before_operation))
+}
+
+/// A second owner of the import destination `destination` with the same
+/// frozen physical layout, for a wave to read ahead into while the previous
+/// wave consumes the first one. `None` for a trapdoor, whose seven leaves are
+/// imported into a single owner set.
+pub(super) fn twin_import_destination(
+    ctx: &PhysicalLoweringContext<'_>,
+    destination: PhysicalValueId,
+    upload_owner: &ImportDestination,
+) -> Result<Option<(ImportDestination, Arc<GpuResidentValue>)>, String> {
+    let planned = ctx
+        .values
+        .get(destination.0 as usize)
+        .ok_or("GPU import destination has no physical metadata")?;
+    // Every part of an import destination, one per CRT limb for a matrix,
+    // views one allocation.
+    let Some(first) = planned.parts.first() else {
+        return Ok(None);
+    };
+    let (storage, device) = (first.storage, first.device);
+    if planned.parts.iter().any(|part| part.storage != storage || part.device != device) {
+        return Ok(None);
+    }
+    let (physical, twin) = match upload_owner {
+        ImportDestination::Matrix { ty, .. } => {
+            let encoding =
+                planned.encodings.first().cloned().ok_or("GPU import has no physical encoding")?;
+            let native = ctx.backend.allocate_physical_matrix(ty, device, encoding.clone())?;
+            let (physical, resident) = physical_matrix(ty, encoding, storage, Arc::clone(&native))?;
+            (physical, (ImportDestination::Matrix { owner: native, ty: ty.clone() }, resident))
+        }
+        ImportDestination::Bounded { ty, .. } => {
+            let (physical, resident, owner, _) =
+                compact_value_owner(ctx.backend, device, ty.clone(), storage)?;
+            (physical, (ImportDestination::Bounded { owner, ty: ty.clone() }, resident))
+        }
+        ImportDestination::Signed { ty, .. } => {
+            let range =
+                planned.integer_ranges.get(&0).ok_or("GPU Int import has no planned range")?;
+            let (physical, resident, owner) = planned_integer_input(
+                ctx.backend,
+                device,
+                ty,
+                &[BigInt::from(0u8)],
+                range,
+                storage,
+            )?;
+            (physical, (ImportDestination::Signed { owner, ty: ty.clone() }, resident))
+        }
+        ImportDestination::Bytes { length, .. } => {
+            let params = ctx.backend.control_parameters_on_device(device)?;
+            let owner = Arc::new(
+                GpuDeviceBytes::new(&params, device, *length).map_err(|error| error.to_string())?,
+            );
+            let resident = GpuResidentValue::new(
+                Arc::new(planned.clone()),
+                BTreeMap::from([(storage, BoundStorage::from_device_bytes(Arc::clone(&owner))?)]),
+                Box::new([]),
+            )
+            .map_err(str::to_owned)?;
+            (
+                planned.clone(),
+                (ImportDestination::Bytes { owner, length: *length }, Arc::new(resident)),
+            )
+        }
+        ImportDestination::Trapdoor { .. } => return Ok(None),
+    };
+    if &physical != planned {
+        return Err("GPU import twin differs from its frozen destination layout".into());
+    }
+    Ok(Some(twin))
 }
 
 /// Copy `source` into new storage on `device` with the same layout, one
@@ -4974,6 +5057,7 @@ pub(super) fn lower_preimage_sample_node(
                 import_templates: &mut *ctx.import_templates,
                 external_io_loops: &mut *ctx.external_io_loops,
                 external_io_imports: &mut *ctx.external_io_imports,
+                slots: &mut *ctx.slots,
                 parallel_lanes: &mut *ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: &mut *ctx.crt_resource_next,
@@ -5332,6 +5416,215 @@ fn activate_import(
     Ok(())
 }
 
+/// Move each import's host boundary from its load site to its first consumer:
+/// the first top-level operation from the load site on that reads the
+/// destination's storage. The host starts the import at the load site and
+/// waits for it only at this boundary, so the Graph work in between overlaps
+/// the read and the upload. A boundary never enters a wave or host-driven loop
+/// body that does not contain the load site: it stops at that body's start,
+/// where the host dispatches the body. A template no wave owns is consumed
+/// outside every wave body, even one starting at its load site. Any operation
+/// that might read the destination counts as a consumer, so a boundary is
+/// never late.
+fn relocate_import_boundaries(
+    operations: &[CompiledGpuOp],
+    values: &[PhysicalValue],
+    bindings: &[GpuBindingSource],
+    waves: &[PhysicalWave],
+    import_templates: &mut [ImportTemplate],
+    external_io_imports: &mut [ExternalIoImport],
+    external_io_loops: &mut [ExternalIoLoop],
+) {
+    let wave_bodies =
+        waves.iter().map(|wave| (wave.body_start, wave.body_end)).collect::<BTreeSet<_>>();
+    let loop_bodies = external_io_loops
+        .iter()
+        .map(|body| (body.body_start, body.body_end))
+        .collect::<BTreeSet<_>>();
+    let wave_owned = waves
+        .iter()
+        .flat_map(|wave| {
+            wave.import_template_indices.iter().chain(wave.invocation_imports.values().flatten())
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let storages_of = |id: PhysicalValueId| {
+        values.get(id.0 as usize).map(|value| value.parts.iter().map(|part| part.storage))
+    };
+    let reads = |operation: &CompiledGpuOp, storages: &BTreeSet<StorageRef>| {
+        fn reads_in(
+            operation: &CompiledGpuOp,
+            reads_value: &dyn Fn(PhysicalValueId) -> bool,
+            reads_binding: &dyn Fn(u32) -> bool,
+        ) -> bool {
+            operation.arguments.iter().any(|argument| match argument {
+                KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) => reads_value(*id),
+                // A U32 may be a binding index; treating one that is not as a
+                // read only moves the boundary earlier.
+                KernelArg::U32(binding) | KernelArg::OptionalBinding(Some(binding)) => {
+                    reads_binding(*binding)
+                }
+                _ => false,
+            }) || operation
+                .body
+                .iter()
+                .flatten()
+                .any(|nested| reads_in(nested, reads_value, reads_binding))
+        }
+        let reads_value = |id: PhysicalValueId| {
+            storages_of(id)
+                .is_some_and(|mut parts| parts.any(|storage| storages.contains(&storage)))
+        };
+        let reads_binding = |binding: u32| match bindings.get(binding as usize) {
+            Some(GpuBindingSource::PhysicalPart { value, .. }) => reads_value(*value),
+            _ => false,
+        };
+        reads_in(operation, &reads_value, &reads_binding)
+    };
+    let boundary = |load_site: u32, destination: PhysicalValueId, in_waves: bool| {
+        let Some(storages) = storages_of(destination).map(|parts| parts.collect::<BTreeSet<_>>())
+        else {
+            return load_site;
+        };
+        // The bodies the boundary may stay in: those containing the load site
+        // that the host runs this import's scope in.
+        let containers = loop_bodies
+            .iter()
+            .chain(wave_bodies.iter().filter(|_| in_waves))
+            .filter(|(start, end)| *start <= load_site && load_site < *end)
+            .collect::<BTreeSet<_>>();
+        let container_end =
+            containers.iter().map(|(_, end)| *end).min().unwrap_or(operations.len() as u32);
+        let nested_starts = loop_bodies
+            .iter()
+            .chain(&wave_bodies)
+            .filter(|body| !containers.contains(body))
+            .filter(|(start, end)| load_site <= *start && *end <= container_end)
+            .map(|(start, _)| *start)
+            .collect::<BTreeSet<_>>();
+        (load_site..container_end)
+            .find(|&index| {
+                nested_starts.contains(&index) || reads(&operations[index as usize], &storages)
+            })
+            .unwrap_or(load_site)
+    };
+    for (index, template) in import_templates.iter_mut().enumerate() {
+        template.before_operation =
+            boundary(template.before_operation, template.destination, wave_owned.contains(&index));
+    }
+    for import in external_io_imports
+        .iter_mut()
+        .chain(external_io_loops.iter_mut().flat_map(|body| body.imports.iter_mut()))
+    {
+        import.before_operation = boundary(import.before_operation, import.destination, true);
+    }
+}
+
+/// Export sites of import request slots start here, above every artifact
+/// export site.
+pub(crate) const IMPORT_REQUEST_SITE_BASE: u32 = 1 << 31;
+
+/// Publish the value of `selector` to a new mapped host slot as soon as its
+/// producer completes: the load site of a selected import. The I/O observer
+/// sees the publication while the Graph keeps running and starts reading the
+/// selected member then. Returns the slot.
+pub(super) fn emit_import_request(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    selector: PhysicalValueId,
+) -> Result<usize, String> {
+    let physical = ctx
+        .values
+        .get(selector.0 as usize)
+        .ok_or("GPU import selector has no physical metadata")?;
+    let [part] = physical.parts.as_ref() else {
+        return Err("GPU import selector is not one contiguous part".into());
+    };
+    let (device, view) = (part.device, part.view.clone());
+    if view.extent.first() != Some(&1) {
+        return Err("GPU import selector is not one integer".into());
+    }
+    let bytes = view
+        .extent
+        .iter()
+        .try_fold(u64::from(view.element_bytes), |bytes, &extent| bytes.checked_mul(extent))
+        .ok_or("GPU import selector size overflows")?;
+    let slot = ctx.slots.len();
+    let site = IMPORT_REQUEST_SITE_BASE
+        .checked_add(u32::try_from(slot).map_err(|_| "too many GPU import request slots")?)
+        .ok_or("too many GPU import request slots")?;
+    ctx.slots.push(Arc::new(
+        GpuExportSlot::new(
+            device,
+            usize::try_from(bytes).map_err(|_| "GPU import selector exceeds usize")?,
+        )
+        .map_err(|error| error.to_string())?,
+    ));
+    let binding = |bindings: &mut Vec<GpuBindingSource>, source| {
+        let index = u32::try_from(bindings.len()).map_err(|_| "too many GPU graph bindings");
+        bindings.push(source);
+        index
+    };
+    let source_binding = binding(
+        ctx.bindings,
+        GpuBindingSource::PhysicalPart { value: selector, part: 0, limb: 0 },
+    )?;
+    let payload_binding = binding(ctx.bindings, GpuBindingSource::ExportSlotPayload { slot })?;
+    let header_binding = binding(ctx.bindings, GpuBindingSource::ExportSlotHeader { slot })?;
+    // A selector computed by a failed integer operation publishes suppressed,
+    // so no member is read for it.
+    let gate = ctx.integer_status.get(&device).copied();
+    let gate_binding = gate
+        .map(|gate| {
+            binding(ctx.bindings, GpuBindingSource::PhysicalPart { value: gate, part: 0, limb: 0 })
+        })
+        .transpose()?;
+    let slot_index = u32::try_from(slot).map_err(|_| "GPU import request slot exceeds u32")?;
+    let copy = ctx.implementations.register(GpuImplementation::export_copy())?;
+    let publish = ctx.implementations.register(GpuImplementation::export_publish())?;
+    let copy_index =
+        u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation: copy,
+        arguments: Box::new([
+            KernelArg::Value(selector),
+            KernelArg::U32(0),
+            KernelArg::U32(slot_index),
+            KernelArg::U64(bytes),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(payload_binding),
+        ]),
+        outputs: Box::new([]),
+        device,
+        grid: [0; 3],
+        block: [0; 3],
+        shared_bytes: 0,
+        predecessors: all_predecessors(ctx.producer, selector),
+        body: None,
+    });
+    ctx.operations.push(CompiledGpuOp {
+        implementation: publish,
+        arguments: Box::new([
+            KernelArg::U32(slot_index),
+            KernelArg::U64(0),
+            KernelArg::U64(0),
+            KernelArg::U64(bytes),
+            KernelArg::U32(site),
+            KernelArg::U32(1),
+            KernelArg::U32(header_binding),
+            KernelArg::OptionalValue(gate),
+            KernelArg::OptionalBinding(gate_binding),
+        ]),
+        outputs: Box::new([]),
+        device,
+        grid: [0; 3],
+        block: [0; 3],
+        shared_bytes: 0,
+        predecessors: Box::new([copy_index]),
+        body: None,
+    });
+    Ok(slot)
+}
+
 /// Stage artifact writes: one pre-allocated host slot per raw fragment and
 /// member, a Graph copy into it, and a publish the I/O worker observes during
 /// execution. Family members (`Some(index)`, in order) share one site per
@@ -5339,7 +5632,6 @@ fn activate_import(
 #[allow(clippy::too_many_arguments)]
 fn emit_artifact_export(
     ctx: &mut PhysicalLoweringContext<'_>,
-    slots: &mut Vec<Arc<GpuExportSlot>>,
     export_templates: &mut Vec<ExportTemplate>,
     name: &str,
     members: &[(Option<usize>, PhysicalValueId)],
@@ -5394,7 +5686,7 @@ fn emit_artifact_export(
         for (index, export_source, export, source_binding_base) in &staged {
             let occurrence = index.unwrap_or(0);
             let fragment = &export.fragments[fragment_index];
-            let slot = slots.len();
+            let slot = ctx.slots.len();
             let payload_bytes = usize::try_from(fragment.raw_bytes)
                 .map_err(|_| "GPU artifact fragment exceeds host address space".to_owned())?;
             let on_device = ctx.device_artifact_exports &&
@@ -5409,7 +5701,7 @@ fn emit_artifact_export(
             } else {
                 GpuExportSlot::new(ctx.device, payload_bytes)
             };
-            slots.push(Arc::new(slot_owner.map_err(|error| error.to_string())?));
+            ctx.slots.push(Arc::new(slot_owner.map_err(|error| error.to_string())?));
             let payload_binding = u32::try_from(ctx.bindings.len())
                 .map_err(|_| "too many GPU graph bindings".to_owned())?;
             ctx.bindings.push(GpuBindingSource::ExportSlotPayload { slot });
@@ -5466,6 +5758,8 @@ fn emit_artifact_export(
                     KernelArg::U32(site),
                     KernelArg::U32(u32::from(final_chunk)),
                     KernelArg::U32(header_binding),
+                    KernelArg::OptionalValue(None),
+                    KernelArg::OptionalBinding(None),
                 ]),
                 outputs: Box::new([]),
                 device: ctx.device,
@@ -5622,6 +5916,8 @@ pub(crate) fn plan_physical_graph(
                         staged: false,
                         destination,
                         upload_owner: ImportDestination::Bytes { owner: native, length: *length },
+                        member: None,
+                        read_ahead: false,
                     },
                 );
                 continue;
@@ -5687,6 +5983,8 @@ pub(crate) fn plan_physical_graph(
                         staged: false,
                         destination,
                         upload_owner: ImportDestination::Bytes { owner: native, length: capacity },
+                        member: None,
+                        read_ahead: false,
                     },
                 );
                 continue;
@@ -5720,6 +6018,8 @@ pub(crate) fn plan_physical_graph(
                         staged: false,
                         destination,
                         upload_owner: ImportDestination::Bounded { owner: native, ty: ty.clone() },
+                        member: None,
+                        read_ahead: false,
                     },
                 );
                 continue;
@@ -5764,6 +6064,8 @@ pub(crate) fn plan_physical_graph(
                         staged: false,
                         destination,
                         upload_owner: ImportDestination::Signed { owner: native, ty: ty.clone() },
+                        member: None,
+                        read_ahead: false,
                     },
                 );
                 continue;
@@ -5804,6 +6106,8 @@ pub(crate) fn plan_physical_graph(
                     staged: false,
                     destination: evaluation,
                     upload_owner: ImportDestination::Matrix { owner: native, ty },
+                    member: None,
+                    read_ahead: false,
                 },
             );
             continue;
@@ -5979,6 +6283,7 @@ pub(crate) fn plan_physical_graph(
                 import_templates: &mut import_templates,
                 external_io_loops: &mut external_io_loops,
                 external_io_imports: &mut external_io_imports,
+                slots: &mut slots,
                 parallel_lanes: &mut parallel_lanes,
                 node_operations: profile_nodes.then_some(&mut node_operations),
                 crt_resource_next: &mut crt_resource_next,
@@ -6004,6 +6309,8 @@ pub(crate) fn plan_physical_graph(
                 staged: false,
                 destination,
                 upload_owner,
+                member: None,
+                read_ahead: false,
             },
         );
     }
@@ -6294,7 +6601,6 @@ pub(crate) fn plan_physical_graph(
                 }
                 emit_artifact_export(
                     &mut ctx,
-                    &mut slots,
                     &mut export_templates,
                     name,
                     &exported,
@@ -6366,7 +6672,6 @@ pub(crate) fn plan_physical_graph(
                 }
                 emit_artifact_export(
                     &mut ctx,
-                    &mut slots,
                     &mut export_templates,
                     name,
                     &exported,
@@ -6634,7 +6939,6 @@ pub(crate) fn plan_physical_graph(
             let mut ctx = root_context!();
             emit_artifact_export(
                 &mut ctx,
-                &mut slots,
                 &mut export_templates,
                 name,
                 &[(None, export_source)],
@@ -6754,10 +7058,31 @@ pub(crate) fn plan_physical_graph(
         let mut ctx = root_context!();
         record_node_operations(&mut ctx, &FrozenGraphScopeId::Root, node, first_operation)?;
     }
+    relocate_import_boundaries(
+        &operations,
+        &values,
+        &bindings,
+        &waves,
+        &mut import_templates,
+        &mut external_io_imports,
+        &mut external_io_loops,
+    );
     let mut site_starts = BTreeMap::<usize, u32>::new();
     for template in &export_templates {
         if template.occurrence == 0 && site_starts.insert(template.slot, template.site).is_some() {
             return Err("GPU export sites start at the same physical slot".into());
+        }
+    }
+    // Each import request slot is a site of its own.
+    for import in
+        external_io_imports.iter().chain(external_io_loops.iter().flat_map(|body| &body.imports))
+    {
+        let site = u32::try_from(import.request_slot)
+            .ok()
+            .and_then(|slot| IMPORT_REQUEST_SITE_BASE.checked_add(slot))
+            .ok_or_else(|| "too many GPU import request slots".to_owned())?;
+        if site_starts.insert(import.request_slot, site).is_some() {
+            return Err("GPU import request slot is shared".into());
         }
     }
     let starts = site_starts.into_iter().collect::<Vec<_>>();

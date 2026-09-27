@@ -1081,11 +1081,22 @@ impl GpuImplementation {
 
     /// Publish readiness only after the copy node has completed. The offset
     /// names a raw staging file range, not a canonical artifact byte offset.
+    /// The optional value and binding are a status word gating the payload.
     pub(crate) fn export_publish() -> Self {
-        use GpuArgumentKind::{U32, U64};
+        use GpuArgumentKind::{OptionalBinding, OptionalValue, U32, U64};
         Self {
             primitive: GpuNativePrimitive::ExportPublish,
-            argument_kinds: Box::new([U32, U64, U64, U64, U32, U32, U32]),
+            argument_kinds: Box::new([
+                U32,
+                U64,
+                U64,
+                U64,
+                U32,
+                U32,
+                U32,
+                OptionalValue,
+                OptionalBinding,
+            ]),
             output_count: 0,
         }
     }
@@ -1314,12 +1325,25 @@ impl CompiledGpuProgram {
                         KernelArg::U32(_),
                         KernelArg::U32(_),
                         KernelArg::U32(header_binding),
+                        KernelArg::OptionalValue(gate),
+                        KernelArg::OptionalBinding(gate_binding),
                     ],
                 ) => {
                     if binding(*header_binding)? !=
                         (GpuBindingSource::ExportSlotHeader { slot: *slot as usize })
                     {
                         return Err("GPU export publication binding does not match its slot");
+                    }
+                    match (gate, gate_binding) {
+                        (None, None) => {}
+                        (Some(gate), Some(gate_binding))
+                            if binding(*gate_binding)? ==
+                                (GpuBindingSource::PhysicalPart {
+                                    value: *gate,
+                                    part: 0,
+                                    limb: 0,
+                                }) => {}
+                        _ => return Err("GPU export publication gate does not match its binding"),
                     }
                     let copy = export_copies
                         .get(slot)
@@ -1549,6 +1573,8 @@ mod gpu_export_slot_tests {
                     KernelArg::U32(7),
                     KernelArg::U32(1),
                     KernelArg::U32(2),
+                    KernelArg::OptionalValue(None),
+                    KernelArg::OptionalBinding(None),
                 ]),
                 outputs: Box::new([]),
                 device: 0,

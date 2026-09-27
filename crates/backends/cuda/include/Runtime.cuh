@@ -216,6 +216,9 @@ int gpu_export_slot_alloc(int physical_device, size_t payload_capacity,
 int gpu_export_slot_alloc_device(int physical_device, size_t payload_capacity,
     void **out_host, void **out_device_header, void **out_device_payload);
 int gpu_export_slot_ready(const void *host_header, int *out_ready);
+// Header flags: bit 0 marks a final chunk; MXX_EXPORT_SLOT_SUPPRESSED marks a
+// payload computed after its gate reported a failure.
+#define MXX_EXPORT_SLOT_SUPPRESSED 2U
 // Persistent device allocations for artifacts kept in GPU memory, and
 // synchronous copies out of them.
 int gpu_device_memory_alloc(int physical_device, size_t bytes, void **out);
@@ -572,10 +575,12 @@ int mxx_gpu_graph_builder_add_memcpy(MxxGpuGraphBuilder *builder,
     const MxxGraphPatch *patches, size_t patch_count);
 int mxx_gpu_graph_builder_add_memset(MxxGpuGraphBuilder *builder,
     void *destination, int value, size_t bytes, const MxxGraphPatch *patch);
+// `gate`, when not null, is a device status word patched through
+// `gate_binding`: a nonzero word publishes with MXX_EXPORT_SLOT_SUPPRESSED.
 int mxx_gpu_graph_builder_add_export_publish(MxxGpuGraphBuilder *builder,
     void *device_header, uint64_t occurrence, uint64_t artifact_offset,
     uint64_t payload_bytes, uint32_t site, uint32_t flags,
-    uint32_t header_binding);
+    uint32_t header_binding, const void *gate, uint32_t gate_binding);
 
 int mxx_gpu_graph_builder_begin_if(MxxGpuGraphBuilder *builder,
     const uint64_t *predicate, uint32_t predicate_binding);
@@ -662,6 +667,9 @@ struct GpuExecutionOwner
     bool registered = false;
     std::vector<std::vector<cudaStream_t>> compute_streams_by_partition;
     std::vector<cudaStream_t> release_streams_by_partition;
+    // Host-to-device uploads into existing owners, on no compute stream, so an
+    // upload from the I/O worker runs beside a launched Graph.
+    std::vector<cudaStream_t> transfer_streams_by_partition;
     PinnedHostReclaimer *pinned_host_reclaimer = nullptr;
     std::atomic<size_t> next_compute_stream{0};
     std::mutex graph_mutex;

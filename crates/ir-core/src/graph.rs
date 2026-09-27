@@ -13,7 +13,10 @@
 //!   [`CapturePolicy::Lexical`], every outer value the body reads becomes a `__capture_N` input
 //!   placeholder. The capture mode is a `LoopInputMode`: `Broadcast` by default; a dynamic family
 //!   read indexed by the parallel binder (optionally plus a nonnegative constant) becomes `Zip` or
-//!   `ZipOffset`, so the loop receives one member per instance instead of the whole family.
+//!   `ZipOffset`, so the loop receives one member per instance instead of the whole family. A read
+//!   `family.at(indices.at(i + c))` of an outer artifact family by an outer integer family becomes
+//!   `Gather` by the `indices` capture: its member keys depend only on outer values and the
+//!   instance index, so a backend can read them ahead.
 //!
 //! [`Graph::freeze`] produces the immutable [`Graph`] and a [`FreezeMap`]:
 //!
@@ -498,7 +501,7 @@ struct ScopeSealer {
     preserved_values: HashSet<(NodeIdentity, Port)>,
     nodes: HashMap<NodeIdentity, NodeHandle>,
     captured: Vec<CapturedValue>,
-    capture_inputs: HashMap<(NodeIdentity, Port, Option<usize>), ValueHandle>,
+    capture_inputs: HashMap<(NodeIdentity, Port, LoopInputMode), ValueHandle>,
 }
 
 impl ScopeSealer {
@@ -523,6 +526,35 @@ impl ScopeSealer {
                     let input = self.capture(family, mode)?;
                     self.nodes.insert(identity, input.node.clone());
                     return Ok(input);
+                }
+                // `family.at(indices.at(i + c))` of an outer artifact family by
+                // an outer index family: every member key is fixed by outer
+                // values and the instance index.
+                if matches!(value.node.kind(), NodeKind::FamilyGetDynamic) &&
+                    let [family, index] = value.node.arguments() &&
+                    family.construction_scope() != self.scope &&
+                    matches!(family.node.kind(), NodeKind::Input { artifact: Some(_), .. }) &&
+                    index.construction_scope() == self.scope &&
+                    matches!(index.node.kind(), NodeKind::FamilyGetDynamic) &&
+                    let [indices, position] = index.node.arguments() &&
+                    indices.construction_scope() != self.scope &&
+                    matches!(index.wire_type(), WireType::Int) &&
+                    parallel_index_offset(position, slot, &self.scope).is_some() &&
+                    self.can_elide_index(position)
+                {
+                    let index_input = self.value(index)?;
+                    if let Some(index_argument) = self.captured.iter().position(|capture| {
+                        capture.placeholder == index_input &&
+                            matches!(
+                                capture.mode,
+                                LoopInputMode::Zip | LoopInputMode::ZipOffset { .. }
+                            )
+                    }) {
+                        let input =
+                            self.capture(family, LoopInputMode::Gather { index_argument })?;
+                        self.nodes.insert(identity, input.node.clone());
+                        return Ok(input);
+                    }
                 }
             }
         }
@@ -580,19 +612,14 @@ impl ScopeSealer {
             NodeKind::Input { artifact, .. } => artifact.clone(),
             _ => None,
         };
-        let offset = match mode {
-            LoopInputMode::Broadcast => None,
-            LoopInputMode::Zip => Some(0),
-            LoopInputMode::ZipOffset { offset } => Some(offset),
-        };
-        let key = (value.node.identity(), value.port, offset);
+        let key = (value.node.identity(), value.port, mode);
         if let Some(input) = self.capture_inputs.get(&key) {
             return Ok(input.clone());
         }
         let name = format!("__capture_{}", self.captured.len());
         let ty = match (mode, value.wire_type()) {
             (
-                LoopInputMode::Zip | LoopInputMode::ZipOffset { .. },
+                LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } | LoopInputMode::Gather { .. },
                 WireType::IndexedFamily { element, .. },
             ) => *element.clone(),
             _ => value.wire_type().clone(),

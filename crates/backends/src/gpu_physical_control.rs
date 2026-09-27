@@ -125,12 +125,15 @@ pub(crate) struct PhysicalWave {
     pub family_members: BTreeMap<String, Vec<(usize, PhysicalValueId)>>,
 }
 
-/// One selected artifact read inside an externally segmented loop body. The
-/// selector is a physical Int value; only its chosen member is read after the
-/// preceding Graph region has completed. Operation indices are global in the
+/// One selected artifact read. The selector is a physical Int value, which
+/// the Graph publishes to `request_slot` at the import's load site; the I/O
+/// observer then reads only the chosen member while the Graph keeps running.
+/// Its first consumer, `before_operation`, starts a region: the host waits
+/// there until the member is uploaded. Operation indices are global in the
 /// flattened program, and the destination is reused after each body replay.
 pub(super) struct ExternalIoImport {
     pub before_operation: u32,
+    pub request_slot: usize,
     pub key: ArtifactKey,
     pub descriptor: ManifestArtifact,
     pub expected_type: ArtifactType,
@@ -207,6 +210,12 @@ struct ArtifactZipLane {
     destination: PhysicalValueId,
     upload_owner: ImportDestination,
     before_operation: u32,
+    /// A `Gather` lane's resident index family and its Zip offset: the lane
+    /// of the wave starting at `w` reads member `indices[w + lane + offset]`.
+    gather: Option<(PhysicalValueId, usize)>,
+    /// The second owner odd waves read into, so each wave's members are read
+    /// while the previous wave runs.
+    twin: Option<(ImportDestination, Arc<GpuResidentValue>)>,
 }
 
 fn selected_import_capacity(
@@ -1251,12 +1260,14 @@ pub(super) fn lower_control_node(
                     name: artifact.artifact_name.clone(),
                     index: None,
                 };
+                let request_slot = crate::gpu_physical_lowering::emit_import_request(ctx, index)?;
                 let (destination, graph_value, upload_owner, before_operation) =
                     crate::gpu_physical_lowering::allocate_typed_import_destination(
                         ctx, &expected, &key, capacity,
                     )?;
                 ctx.external_io_imports.push(ExternalIoImport {
                     before_operation,
+                    request_slot,
                     key,
                     descriptor,
                     expected_type,
@@ -1388,6 +1399,8 @@ pub(super) fn lower_control_node(
                     staged: false,
                     destination,
                     upload_owner,
+                    member: None,
+                    read_ahead: false,
                 });
                 ctx.wire_ids.insert(output, graph_value);
                 return Ok(());
@@ -2241,6 +2254,7 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                slots: ctx.slots,
                 parallel_lanes: ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: ctx.crt_resource_next,
@@ -2302,6 +2316,7 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                slots: ctx.slots,
                 parallel_lanes: ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: ctx.crt_resource_next,
@@ -6535,6 +6550,7 @@ fn lower_sequential_loop(
                 import_templates: &mut body_static_imports,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: &mut body_imports,
+                slots: &mut *ctx.slots,
                 parallel_lanes: ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: ctx.crt_resource_next,
@@ -6857,6 +6873,7 @@ pub(super) fn is_vectorized_scalar_loop(
                     input_node.output_types().first().is_some_and(|ty| match mode {
                         LoopInputMode::Broadcast => scalar_or_family(ty),
                         LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => scalar(ty),
+                        LoopInputMode::Gather { .. } => false,
                     })
             })
         }) &&
@@ -6953,6 +6970,9 @@ fn lower_vectorized_parallel_loop(
             }
             LoopInputMode::Zip => 0,
             LoopInputMode::ZipOffset { offset } => *offset,
+            LoopInputMode::Gather { .. } => {
+                return Err("GPU vectorized loop cannot gather an artifact family".into());
+            }
         };
         // Lane `i` reads member `offset + i` of the source family.
         let family = ctx.values[source.0 as usize].clone();
@@ -7309,6 +7329,31 @@ fn lower_parallel_loop(
                 }
                 LoopInputMode::Zip => 0,
                 LoopInputMode::ZipOffset { offset } => *offset,
+                LoopInputMode::Gather { .. } => 0,
+            };
+            // A gathered member's index is its lane's entry of a resident
+            // integer family, known only when the loop starts.
+            let gather = match mode {
+                LoopInputMode::Gather { index_argument } => {
+                    let indices = source_ids
+                        .get(*index_argument)
+                        .copied()
+                        .flatten()
+                        .ok_or("GPU Gather index family has no physical value")?;
+                    let index_offset = match loop_node.input_modes.get(*index_argument) {
+                        Some(LoopInputMode::Zip) => 0,
+                        Some(LoopInputMode::ZipOffset { offset }) => *offset,
+                        _ => return Err("GPU Gather index is not a zipped family".into()),
+                    };
+                    if !matches!(&ctx.values[indices.0 as usize].ty,
+                        ConcreteWireType::IndexedFamily { element, .. }
+                            if **element == ConcreteWireType::Int)
+                    {
+                        return Err("GPU Gather index is not a resident integer family".into());
+                    }
+                    Some((indices, index_offset))
+                }
+                _ => None,
             };
             let source_node = parent
                 .node(wire.node)
@@ -7344,12 +7389,19 @@ fn lower_parallel_loop(
                 let element_type = element.as_ref().clone();
                 let expected_type = ArtifactType::from_wire_type(element)
                     .ok_or("GPU Zip artifact member has no artifact type")?;
-                if descriptor.family_count != Some(*family_count) || index >= *family_count {
+                if descriptor.family_count != Some(*family_count) ||
+                    (gather.is_none() && index >= *family_count)
+                {
                     return Err("GPU Zip artifact member is outside its validated family".into());
                 }
-                let selected_indexes = (0..count)
-                    .step_by(width)
-                    .filter_map(|start| (start + lane < count).then_some(start + lane + offset));
+                let selected_indexes = if gather.is_some() {
+                    (0..*family_count).collect::<Vec<_>>()
+                } else {
+                    (0..count)
+                        .step_by(width)
+                        .filter_map(|start| (start + lane < count).then_some(start + lane + offset))
+                        .collect()
+                };
                 let capacity = selected_import_capacity(
                     ctx,
                     &element_type,
@@ -7360,7 +7412,7 @@ fn lower_parallel_loop(
                 let key = ArtifactKey {
                     production: artifact.production_id.clone(),
                     name: artifact.artifact_name.clone(),
-                    index: Some(index),
+                    index: gather.is_none().then_some(index),
                 };
                 let (destination, graph_value, upload_owner, before_operation) =
                     crate::gpu_physical_lowering::allocate_typed_import_destination(
@@ -7370,6 +7422,19 @@ fn lower_parallel_loop(
                         capacity,
                     )?;
                 input_ids.push(graph_value);
+                // With more than one wave, odd waves read into a second owner
+                // so that each wave's members are read during the previous
+                // wave. A nested template replays per parent occurrence and
+                // reads in place.
+                let twin = if count > width && parent_template.is_none() {
+                    crate::gpu_physical_lowering::twin_import_destination(
+                        ctx,
+                        destination,
+                        &upload_owner,
+                    )?
+                } else {
+                    None
+                };
                 artifact_zip_lanes.push(ArtifactZipLane {
                     argument,
                     name: artifact.artifact_name.clone(),
@@ -7381,8 +7446,13 @@ fn lower_parallel_loop(
                     destination,
                     upload_owner,
                     before_operation,
+                    gather,
+                    twin,
                 });
             } else {
+                if gather.is_some() {
+                    return Err("GPU Gather needs a root artifact family".into());
+                }
                 let source =
                     source.ok_or_else(|| "GPU Zip family has no physical value".to_owned())?;
                 let owner = ctx
@@ -7556,6 +7626,21 @@ fn lower_parallel_loop(
             wave.owner_bindings.insert(*id, selected);
             wave.zip_sources.push((*source_id, member_index, *id));
         }
+        // Waves alternate between each lane's two owners, when it has two.
+        let odd_wave = (wave_start / width) % 2 == 1;
+        let buffer = |lane: &ArtifactZipLane| -> Result<_, String> {
+            match (&lane.twin, odd_wave) {
+                (Some((upload_owner, owner)), true) => {
+                    Ok((upload_owner.clone(), Arc::clone(owner)))
+                }
+                _ => Ok((
+                    lane.upload_owner.clone(),
+                    Arc::clone(ctx.owners.get(&lane.destination).ok_or_else(|| {
+                        "GPU selected artifact lane has no destination owner".to_owned()
+                    })?),
+                )),
+            }
+        };
         for lane in &artifact_zip_lanes {
             if lane.lane >= active_lanes {
                 let active = artifact_zip_lanes
@@ -7564,37 +7649,54 @@ fn lower_parallel_loop(
                         candidate.argument == lane.argument && candidate.lane == active_lanes - 1
                     })
                     .ok_or_else(|| "GPU tail has no selected artifact member".to_owned())?;
-                let source = ctx.owners.get(&active.destination).ok_or_else(|| {
-                    "GPU selected artifact lane has no destination owner".to_owned()
-                })?;
+                let (_, source) = buffer(active)?;
                 let planned = ctx
                     .values
                     .get(lane.destination.0 as usize)
                     .ok_or_else(|| "GPU tail artifact lane has no physical metadata".to_owned())?;
                 wave.owner_bindings
-                    .insert(lane.destination, alias_read_only_member(planned, source)?);
+                    .insert(lane.destination, alias_read_only_member(planned, &source)?);
                 continue;
             }
-            let member_index = wave_start
-                .checked_add(lane.lane)
-                .and_then(|index| index.checked_add(lane.offset))
-                .ok_or_else(|| "GPU artifact Zip index overflows".to_owned())?;
-            if lane.descriptor.family_count.is_none_or(|count| member_index >= count) {
-                return Err("GPU artifact Zip member is outside its validated family".into());
-            }
+            let (index, member) = match lane.gather {
+                Some((indices, index_offset)) => {
+                    let position = wave_start
+                        .checked_add(lane.lane)
+                        .and_then(|index| index.checked_add(index_offset))
+                        .ok_or_else(|| "GPU artifact Gather index overflows".to_owned())?;
+                    (None, Some((indices, position)))
+                }
+                None => {
+                    let member_index = wave_start
+                        .checked_add(lane.lane)
+                        .and_then(|index| index.checked_add(lane.offset))
+                        .ok_or_else(|| "GPU artifact Zip index overflows".to_owned())?;
+                    if lane.descriptor.family_count.is_none_or(|count| member_index >= count) {
+                        return Err("GPU artifact Zip member is outside its validated family".into());
+                    }
+                    (Some(member_index), None)
+                }
+            };
+            // Every wave binds its active lanes' owners: a previous tail wave,
+            // of this execute or the last one, left an inactive lane aliased
+            // to another lane's owner.
+            let (upload_owner, owner) = buffer(lane)?;
+            wave.owner_bindings.insert(lane.destination, owner);
             let template_index = ctx.import_templates.len();
             ctx.import_templates.push(ImportTemplate {
                 before_operation: lane.before_operation,
                 key: ArtifactKey {
                     production: lane.production.clone(),
                     name: lane.name.clone(),
-                    index: Some(member_index),
+                    index,
                 },
                 descriptor: lane.descriptor.clone(),
                 expected_type: lane.expected_type.clone(),
                 staged: false,
                 destination: lane.destination,
-                upload_owner: lane.upload_owner.clone(),
+                upload_owner,
+                member,
+                read_ahead: lane.twin.is_some(),
             });
             wave.import_template_indices.push(template_index);
         }
@@ -7900,6 +8002,8 @@ fn lower_inlined_child(
                     staged: false,
                     destination,
                     upload_owner,
+                    member: None,
+                    read_ahead: false,
                 });
                 ctx.wire_ids.insert(*input, graph_value);
                 continue;
@@ -9149,5 +9253,311 @@ mod tests {
         assert_eq!(after[0], before[0] + 1);
         assert_eq!(after[1], before[1]);
         assert_eq!(after[2], before[2] + 2);
+    }
+
+    /// Parameters, ring, and an artifact family of `count` constant members
+    /// `1..=count` produced on the CPU into `store`.
+    fn constant_member_family(
+        store: &mut MemoryArtifactStore,
+        count: usize,
+    ) -> (DCRTPolyParams, GpuDCRTPolyParams, Ring, ProductionId) {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute_in_session},
+        };
+        let cpu_params = DCRTPolyParams::new(32, 2, 50, 8, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(32, cpu_params.to_crt().0, 8, None);
+        let ring = Ring::from_crt_moduli(
+            gpu_params.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            gpu_params.ring_dimension(),
+        );
+        let producer_ring = ring.clone();
+        let producer = DslContext::new("constant-member-producer")
+            .cached_output(
+                "members",
+                parallel(count, move |index| {
+                    Ok(producer_ring.polynomial([IntExpr::Add(
+                        Box::new(index.expression()?),
+                        Box::new(1.into()),
+                    )]))
+                })
+                .unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let production = execute_in_session(
+            &producer,
+            &mut cpu_backend([cpu_params.clone()]),
+            BTreeMap::new(),
+            store,
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap()
+        .production_id
+        .expect("producer identity");
+        (cpu_params, gpu_params, ring, production)
+    }
+
+    fn member_keys(production: &ProductionId, count: usize) -> Vec<ArtifactKey> {
+        (0..count)
+            .map(|index| ArtifactKey {
+                production: production.clone(),
+                name: "members".into(),
+                index: Some(index),
+            })
+            .collect()
+    }
+
+    fn test_count(name: &str, default: usize) -> usize {
+        std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
+    }
+
+    /// A parallel loop reads `members.at(i)` (a Zip) and `members.at(x.at(i))`
+    /// (a Gather by the host family `x`) over several waves. Each wave's
+    /// members are read while the previous wave runs, into alternating
+    /// owners; the result matches the CPU and every read member is loaded once
+    /// per read.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_parallel_waves_read_zip_and_gather_artifacts_ahead() {
+        use mxx_ir_core::{artifact::ArtifactAvailability, node::LoopInputMode};
+
+        let count = test_count("MXX_TEST_GATHER_COUNT", 7);
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let context = DslContext::new("direct-gather-consumer");
+        let x = context.int_family_input("x", count);
+        let two = ring.polynomial([IntExpr::constant(2)]);
+        let out =
+            parallel(count, move |i| Ok(members.at(x.at(i.clone())) * two.clone() + members.at(i)))
+                .unwrap();
+        let validated = context
+            .output("out", out)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        let modes = validated
+            .source
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec.input_modes.clone()),
+                _ => None,
+            })
+            .expect("consumer loop");
+        assert!(modes.iter().any(|mode| matches!(mode, LoopInputMode::Gather { .. })), "{modes:?}");
+        assert!(modes.contains(&LoopInputMode::Zip), "{modes:?}");
+
+        let host_x = |values: &[usize]| RuntimeValue::IndexedFamily {
+            element_type: ConcreteWireType::Int,
+            values: values.iter().map(|&value| RuntimeValue::Int(BigInt::from(value))).collect(),
+        };
+        let draw = || (0..count).map(|_| rand::random_range(0..count)).collect::<Vec<_>>();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("x".into(), BigInt::from(0)..=BigInt::from(count - 1));
+        let first = draw();
+        let mut plan = runtime
+            .plan(validated.clone(), &BTreeMap::from([("x".into(), host_x(&first))]))
+            .unwrap();
+        assert!((1..=2).contains(&plan.report().stages[0].wave_instances));
+        // Both lanes' matrices, one part per CRT limb, read ahead into twins.
+        let frame = plan.physical_frame_for_test();
+        assert!(frame.import_templates.iter().all(|template| template.read_ahead));
+        assert!(frame.import_templates.iter().any(|template| template.member.is_some()));
+        let keys = member_keys(&production, count);
+        for (replay, x) in [first, draw()].into_iter().enumerate() {
+            let inputs = BTreeMap::from([("x".to_owned(), host_x(&x))]);
+            let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, inputs, &mut store, rand::random())
+                .unwrap();
+            let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            for (member, key) in keys.iter().enumerate() {
+                let reads = 1 + x.iter().filter(|&&index| index == member).count();
+                assert_eq!(after[member] - before[member], reads, "replay {replay}: {key:?}");
+            }
+            // Member `j` is the constant `j + 1`.
+            for (index, &selected) in x.iter().enumerate() {
+                let expected = DCRTPoly::from_biguint_to_constant(
+                    &cpu_params,
+                    num_bigint::BigUint::from(2 * (selected + 1) + index + 1),
+                );
+                let actual = runtime
+                    .download_matrix_member_output(&result.output("out").unwrap(), index)
+                    .unwrap();
+                assert_eq!(
+                    actual.entry(0, 0).to_bytes(),
+                    expected.to_bytes(),
+                    "replay {replay}, member {index}, x {x:?}"
+                );
+            }
+        }
+    }
+
+    /// A sequential loop whose iteration `k` loads member `k + 1` at the start
+    /// of its body and carries it, adding the member loaded one iteration
+    /// earlier: the multi-stage form of a streamed read. The load starts at
+    /// its load site, and the host waits for it only at the carry copy.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_sequential_loop_carries_member_loaded_one_iteration_ahead() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute_in_session},
+        };
+        use mxx_dsl::{Int, iterate};
+        use mxx_ir_core::artifact::ArtifactAvailability;
+
+        let count = test_count("MXX_TEST_STREAM_COUNT", 5);
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let first = members.at(Int::constant(0));
+        let initial = (ring.zero((1, 1)), first);
+        let (sum, _) = iterate(count - 1, initial, move |k, (sum, current)| {
+            let next = members
+                .at(Int::evaluate(IntExpr::Add(Box::new(k.expression()?), Box::new(1.into()))));
+            Ok((sum + current, next))
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-streamed-sequential-consumer")
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        let expected = execute_in_session(
+            &validated,
+            &mut cpu_backend([cpu_params.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(expected) = &expected.outputs["sum"] else {
+            panic!("CPU sum is a matrix");
+        };
+        let expected = expected.as_cpu_full().expect("CPU matrix").clone();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let keys = member_keys(&production, count);
+        for replay in 0..2 {
+            let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let actual = runtime.download_matrix_output(&result.output("sum").unwrap()).unwrap();
+            assert_eq!(actual.entry(0, 0).to_bytes(), expected.entry(0, 0).to_bytes());
+            let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            for (member, key) in keys.iter().enumerate() {
+                assert_eq!(after[member] - before[member], 1, "replay {replay}: {key:?}");
+            }
+        }
+    }
+
+    /// A producer whose device work fails after its export was published
+    /// leaves no artifact, encoded or raw, in a file store.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_failed_producer_discards_encoded_exports() {
+        use crate::artifact::FileArtifactStore;
+        use mxx_dsl::{Int, iterate};
+
+        let cpu_params = DCRTPolyParams::new(32, 2, 50, 8, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(32, cpu_params.to_crt().0, 8, None);
+        let ring = Ring::from_crt_moduli(
+            gpu_params.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            gpu_params.ring_dimension(),
+        );
+        let exported = ring.polynomial([IntExpr::constant(3)]) + ring.zero((1, 1));
+        // The second iteration selects an invalid ring property, which fails
+        // on the device after the export is published.
+        let invalid_ring_property = ring.crt_modulus(99);
+        let failing = iterate(2, Int::constant(0), move |index, total| {
+            Ok(total +
+                Int::evaluate(IntExpr::Select {
+                    selector: Box::new(index.expression()?),
+                    branches: vec![0.into(), invalid_ring_property.clone()],
+                }))
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-failed-producer")
+            .cached_output("exported", exported)
+            .unwrap()
+            .output("failing", failing)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = FileArtifactStore::new(directory.path()).unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let error = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .err()
+            .expect("the invalid ring property fails the producer");
+        assert!(error.to_string().contains("invalid ring property"), "{error}");
+        drop(store);
+        let mut files = Vec::new();
+        let mut pending = vec![directory.path().to_owned()];
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(
+            files.iter().all(|path| {
+                let name = path.to_string_lossy();
+                !name.contains("exported") && !name.contains("raw-") && !name.contains("canonical-")
+            }),
+            "{files:?}"
+        );
     }
 }

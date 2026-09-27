@@ -119,4 +119,4 @@ security. None of them has run on a GPU. The columns are:
 | `lwr_dimension`, `support_weight`, `input_modulus`, `output_modulus` | PRF parameters ν, h, Q, P |
 | `prf_min_estimator_bits` | Minimum over the eight attacks of `sparse_lwr_estimator.sage.py` |
 | `prf_mitm_bits`, `prf_binding_attack` | Estimator `LWE.mitm` with the split dimension rounded to an integer (it raises `TypeError` on sparse secrets otherwise), and the cheapest attack overall |
-| `level0_matrix_gb`, `stored_artifacts_tb` | One level-0 `(1, columns)` matrix, and the RHS, input-encoding, and public-key artifacts the current implementation stores |
+| `level0_matrix_gb`, `stored_artifacts_tb` | One level-0 `(1, columns)` matrix, and the RHS, input-encoding, and public-key artifacts the implementation at `git_commit` stores, estimated from matrix sizes |

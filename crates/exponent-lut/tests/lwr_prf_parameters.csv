@@ -1,5 +1,6 @@
 date,git_commit,recommended,ring_dimension,crt_bits,base_bits,crt_depth,primes_per_drop,levels,encoding_security_bits,noise_model,failure_exponent,lwr_dimension,support_weight,input_modulus,output_modulus,prf_min_estimator_bits,prf_mitm_bits,prf_binding_attack,level0_matrix_gb,stored_artifacts_tb,notes
-2026-09-27,7f80f77a1,yes,65536,40,10,37,1,37,119,average,100,1024,32,256,32,129.6,114.0,mitm,1.79,27.5,smallest matrices found; base 14 fails the noise audit at n=2^16
+2026-09-28,35e51c083,yes,65536,40,10,36,1,36,124,average,100,1024,31,256,32,127.2,110.9,mitm,1.70,7.8,h=31 removes one PBC block and level; stored size counts only a rows and payloads and RHS bottom rows
+2026-09-27,7f80f77a1,no,65536,40,10,37,1,37,119,average,100,1024,32,256,32,129.6,114.0,mitm,1.79,27.5,previous recommendation; base 14 fails the noise audit at n=2^16
 2026-09-27,7f80f77a1,no,65536,40,8,37,1,37,119,average,100,1024,32,256,32,129.6,114.0,mitm,2.24,34.4,previous choice
 2026-09-27,7f80f77a1,no,131072,60,30,37,1,37,179,average,100,1024,32,256,32,129.6,114.0,mitm,2.69,41.3,smallest at n=2^17; 60-bit primes not checked on GPU
 2026-09-27,7f80f77a1,no,131072,50,17,37,1,37,229,average,100,1024,32,256,32,129.6,114.0,mitm,3.36,51.6,50-bit primes not checked on GPU

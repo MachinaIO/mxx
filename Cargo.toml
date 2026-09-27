@@ -3,10 +3,9 @@ resolver = "3"
 members = [
     "crates/ir-core",
     "crates/dsl",
-    "crates/bgg",
     "crates/backends",
+    "crates/khe",
     "crates/exponent-lut",
-    "crates/gadgets",
     "crates/func-enc",
     "crates/io",
     "crates/fhe",
@@ -23,12 +22,11 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 mxx-backends = { path = "crates/backends" }
-mxx-gadgets = { path = "crates/gadgets" }
+mxx-khe = { path = "crates/khe" }
 mxx-func-enc = { path = "crates/func-enc" }
 mxx-io = { path = "crates/io" }
 mxx-ir-core = { path = "crates/ir-core" }
 mxx-dsl = { path = "crates/dsl" }
-mxx-bgg = { path = "crates/bgg" }
 mxx-fhe = { path = "crates/fhe" }
 bigdecimal = "0.4"
 bincode = "2.0.1"

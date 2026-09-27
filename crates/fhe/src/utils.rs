@@ -427,9 +427,7 @@ pub(crate) fn execute_graph(
         (0..depth).map(|level| common.parameters_at(level).unwrap()).collect::<Vec<_>>();
     parameters
         .extend(moduli.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
-    let validated = graph
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .expect("valid FHE DSL graph");
+    let validated = graph.validate(&ParamEnv::default()).expect("valid FHE DSL graph");
     parameters.extend_from_slice(extra_parameters);
     let mut backend = cpu_backend(parameters);
     let mut store = MemoryArtifactStore::default();

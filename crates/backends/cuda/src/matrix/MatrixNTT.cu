@@ -146,13 +146,24 @@ namespace
     };
     static_assert(sizeof(RawNttBatch) < 4096, "bounded raw NTT kernel arguments");
 
-    // The stages above one tile: the Width lanes of a group hold coefficients
-    // one tile apart, and XOR shuffles realize those butterflies, including
-    // the transform boundary twist (forward) or scaling and untwist (inverse).
+    // Lanes of a tile group that one warp exchanges by XOR shuffles.
+    constexpr uint32_t kWarpNttLanes = 32;
+    // Tile groups of a ring above kWarpNttLanes tiles run their stages whose
+    // lanes lie a warp or more apart in raw_ntt_wide_stage_kernel.
+    constexpr uint32_t kMaxNttLanes = 128;
+
+    // The stages above one tile whose lanes lie less than a warp apart: the
+    // Width lanes of a group hold coefficients one tile apart, and XOR
+    // shuffles within each warp realize those butterflies. A ring of at most
+    // a warp of tiles also takes the transform boundary twist (forward) or
+    // scaling and untwist (inverse) here; a wider ring takes them in
+    // raw_ntt_wide_stage_kernel, which runs its remaining stages.
     template <bool Forward, uint32_t Width>
     __global__ void raw_ntt_fused_top_kernel(RawNttBatch batch, size_t columns,
         size_t poly_offset)
     {
+        constexpr uint32_t Shuffle = Width < kWarpNttLanes ? Width : kWarpNttLanes;
+        constexpr bool Boundary = Width <= kWarpNttLanes;
         const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
         const uint32_t lane = thread % Width;
         const uint32_t column = thread / Width;
@@ -165,13 +176,13 @@ namespace
         const uint64_t modulus = destination.modulus;
         const size_t poly = poly_offset + blockIdx.y;
         uint64_t value = raw_matrix_load(source, poly, coefficient, columns);
-        if constexpr (Forward)
+        if constexpr (Forward && Boundary)
             value = mul_mod_shoup_u64(value, twiddles[coefficient], shoup[coefficient], modulus);
-        uint32_t half_lanes = Forward ? Width / 2 : 1;
-        while (half_lanes >= 1 && half_lanes < Width)
+        uint32_t half_lanes = Forward ? Shuffle / 2 : 1;
+        while (half_lanes >= 1 && half_lanes < Shuffle)
         {
             const uint64_t partner = __shfl_xor_sync(
-                0xffffffffU, static_cast<unsigned long long>(value), half_lanes, Width);
+                0xffffffffU, static_cast<unsigned long long>(value), half_lanes, Shuffle);
             const bool upper_lane = (lane & half_lanes) != 0;
             const uint64_t lower = upper_lane ? partner : value;
             const uint64_t upper = upper_lane ? value : partner;
@@ -193,12 +204,99 @@ namespace
                 half_lanes <<= 1;
             }
         }
-        if constexpr (!Forward)
+        if constexpr (!Forward && Boundary)
         {
             value = mul_mod_shoup_u64(value, *batch.n_inv[limb], *batch.n_inv_shoup[limb], modulus);
             value = mul_mod_shoup_u64(value, twiddles[coefficient], shoup[coefficient], modulus);
         }
         raw_matrix_store(destination, poly, coefficient, columns, value);
+    }
+
+    // One butterfly stage whose two coefficients lie `half_lanes` tiles apart,
+    // a warp of tiles or more, of a ring of `width` tiles; one thread per
+    // butterfly. Forward stages run from the widest down and the first one
+    // applies the boundary twist; inverse stages run from the narrowest up
+    // and the last one applies the scaling and untwist.
+    template <bool Forward>
+    __global__ void raw_ntt_wide_stage_kernel(RawNttBatch batch, size_t columns,
+        size_t poly_offset, uint32_t width, uint32_t half_lanes, bool boundary)
+    {
+        const uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+        const uint32_t half = half_lanes * kFusedNttCoefficients;
+        const uint32_t j = pair % half;
+        const uint32_t lower_index = (pair / half) * 2 * half + j;
+        const uint32_t upper_index = lower_index + half;
+        const uint32_t limb = blockIdx.z;
+        const MxxRawMatrixLimb &source = batch.source[limb];
+        const MxxRawMatrixLimb &destination = batch.destination[limb];
+        const uint64_t *twiddles = batch.twiddles[limb];
+        const uint64_t *shoup = batch.shoup[limb];
+        const uint64_t modulus = destination.modulus;
+        const size_t poly = poly_offset + blockIdx.y;
+        uint64_t lower = raw_matrix_load(source, poly, lower_index, columns);
+        uint64_t upper = raw_matrix_load(source, poly, upper_index, columns);
+        const uint32_t twiddle = (width / half_lanes) * j;
+        if constexpr (Forward)
+        {
+            if (boundary)
+            {
+                lower = mul_mod_shoup_u64(lower, twiddles[lower_index], shoup[lower_index], modulus);
+                upper = mul_mod_shoup_u64(upper, twiddles[upper_index], shoup[upper_index], modulus);
+            }
+            const uint64_t sum = add_mod_u64(lower, upper, modulus);
+            upper = mul_mod_shoup_u64(sub_mod_u64(lower, upper, modulus),
+                twiddles[twiddle], shoup[twiddle], modulus);
+            lower = sum;
+        }
+        else
+        {
+            const uint64_t product =
+                mul_mod_shoup_u64(upper, twiddles[twiddle], shoup[twiddle], modulus);
+            upper = sub_mod_u64(lower, product, modulus);
+            lower = add_mod_u64(lower, product, modulus);
+            if (boundary)
+            {
+                const uint64_t n_inv = *batch.n_inv[limb];
+                const uint64_t n_inv_shoup = *batch.n_inv_shoup[limb];
+                lower = mul_mod_shoup_u64(lower, n_inv, n_inv_shoup, modulus);
+                upper = mul_mod_shoup_u64(upper, n_inv, n_inv_shoup, modulus);
+                lower = mul_mod_shoup_u64(lower, twiddles[lower_index], shoup[lower_index], modulus);
+                upper = mul_mod_shoup_u64(upper, twiddles[upper_index], shoup[upper_index], modulus);
+            }
+        }
+        raw_matrix_store(destination, poly, lower_index, columns, lower);
+        raw_matrix_store(destination, poly, upper_index, columns, upper);
+    }
+
+    // The stages of a ring above a warp of tiles whose lanes lie a warp or
+    // more apart. The forward stages read `batch` first and run before the
+    // warp stages; the inverse ones run after them, in place.
+    template <bool Forward>
+    int launch_raw_ntt_wide(GpuContext *ctx, cudaStream_t stream, const RawNttBatch &batch,
+        const RawNttBatch &in_place, const MxxGraphPatch *patches, size_t patch_count,
+        const MxxGraphPatch *in_place_patches, size_t in_place_patch_count, size_t limbs,
+        uint32_t n, size_t columns, size_t poly_offset, size_t poly_chunk)
+    {
+        const uint32_t width = n / kFusedNttCoefficients;
+        const dim3 grid(n / 2 / kTransformThreads, static_cast<uint32_t>(poly_chunk),
+            static_cast<uint32_t>(limbs));
+        bool first = true;
+        for (uint32_t step = kWarpNttLanes; step < width; step <<= 1)
+        {
+            const uint32_t half_lanes = Forward ? width / 2 / (step / kWarpNttLanes) : step;
+            const bool boundary = Forward ? first : step * 2 == width;
+            const RawNttBatch &views = Forward && first ? batch : in_place;
+            const MxxGraphPatch *views_patches = Forward && first ? patches : in_place_patches;
+            const size_t views_patch_count =
+                Forward && first ? patch_count : in_place_patch_count;
+            const int status = mxx_gpu_launch_kernel(ctx, stream,
+                raw_ntt_wide_stage_kernel<Forward>, grid, dim3(kTransformThreads), 0,
+                views_patches, views_patch_count, views, columns, poly_offset, width,
+                half_lanes, boundary);
+            if (status != 0) return status;
+            first = false;
+        }
+        return 0;
     }
 
     template <bool Forward>
@@ -220,6 +318,8 @@ namespace
             MXX_RAW_NTT_TOP(8);
             MXX_RAW_NTT_TOP(16);
             MXX_RAW_NTT_TOP(32);
+            MXX_RAW_NTT_TOP(64);
+            MXX_RAW_NTT_TOP(128);
 #undef MXX_RAW_NTT_TOP
         }
         return set_error("raw fused NTT has no top-stage width for this ring");
@@ -872,8 +972,9 @@ static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const uint32_t n = source->degree;
     const size_t poly_count = source->rows * source->columns;
-    if (n > kFusedNttCoefficients * 32 || n % kTransformThreads != 0 && n > kFusedNttCoefficients)
-        return set_error("raw fused NTT supports ring dimensions up to 32768");
+    if (n > kFusedNttCoefficients * kMaxNttLanes ||
+        n % kTransformThreads != 0 && n > kFusedNttCoefficients)
+        return set_error("raw fused NTT supports ring dimensions up to 131072");
     const uint32_t radix = configured_ntt_radix();
     if (radix == 0)
         return set_error("MXX_GPU_NTT_RADIX must be a power of two from 2 to 32");
@@ -964,8 +1065,21 @@ static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
             }
             else if (!inverse)
             {
-                status = launch_raw_ntt_top<true>(ctx, stream, batch, source_patches.data(),
-                    source_patches.size(), limbs, n, source->columns, offset, chunk);
+                // A ring above a warp of tiles first runs its widest stages,
+                // which read the source; the warp stages then run in place.
+                const bool wide = n > kFusedNttCoefficients * kWarpNttLanes;
+                if (wide)
+                    status = launch_raw_ntt_wide<true>(ctx, stream, batch, in_place,
+                        source_patches.data(), source_patches.size(),
+                        destination_patches.data(), destination_patches.size(), limbs, n,
+                        source->columns, offset, chunk);
+                if (status == 0)
+                    status = wide ?
+                        launch_raw_ntt_top<true>(ctx, stream, in_place,
+                            destination_patches.data(), destination_patches.size(), limbs, n,
+                            source->columns, offset, chunk) :
+                        launch_raw_ntt_top<true>(ctx, stream, batch, source_patches.data(),
+                            source_patches.size(), limbs, n, source->columns, offset, chunk);
                 if (status == 0)
                     status = tiles(true, in_place, destination_patches, matrix_loader);
             }
@@ -974,6 +1088,11 @@ static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
                 status = tiles(false, batch, source_patches, matrix_loader);
                 if (status == 0)
                     status = launch_raw_ntt_top<false>(ctx, stream, in_place,
+                        destination_patches.data(), destination_patches.size(), limbs, n,
+                        source->columns, offset, chunk);
+                if (status == 0 && n > kFusedNttCoefficients * kWarpNttLanes)
+                    status = launch_raw_ntt_wide<false>(ctx, stream, in_place, in_place,
+                        destination_patches.data(), destination_patches.size(),
                         destination_patches.data(), destination_patches.size(), limbs, n,
                         source->columns, offset, chunk);
             }

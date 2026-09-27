@@ -1,3 +1,6 @@
+//! The functional-encryption interface ([`FuncEnc`]). Its former implementation was removed during
+//! the DSL migration.
+
 pub trait FuncEnc {
     type Params;
     type EncKey;

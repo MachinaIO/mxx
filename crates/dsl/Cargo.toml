@@ -11,5 +11,16 @@ num-bigint.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[features]
+default = []
+# Enables the GPU backend for the examples; the library itself has no GPU code.
+gpu = ["mxx-backends/gpu"]
+
 [dev-dependencies]
+bigdecimal.workspace = true
+mxx-backends.workspace = true
 serde_json.workspace = true
+
+[[example]]
+name = "rlwe_encrypt"
+required-features = ["gpu"]

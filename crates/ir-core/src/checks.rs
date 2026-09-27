@@ -1,3 +1,5 @@
+//! Structural checks and validation warnings shared by validation passes.
+
 use crate::{
     graph::Graph,
     types::{ConcreteMatrixType, NodeId},

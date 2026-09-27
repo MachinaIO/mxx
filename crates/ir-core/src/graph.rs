@@ -1,3 +1,38 @@
+//! Graph construction handles, construction scopes, and frozen graphs.
+//!
+//! Construction uses immutable, reference-counted handles:
+//!
+//! - [`NodeHandle`] wraps a node: its `NodeKind`, argument [`ValueHandle`]s, output wire types,
+//!   source location, construction scope, and optionally a structural child (a subgraph or loop
+//!   body). Equality is by identity, so cloning a handle shares the node rather than duplicating
+//!   it. A [`ValueHandle`] is a `(node, port)` pair.
+//! - Construction scopes ([`with_new_construction_scope`], [`current_construction_scope`]) are a
+//!   thread-local lexical stack. A body may read values from ancestor scopes but never from a
+//!   completed sibling or child scope.
+//! - [`SubgraphHandle::seal`] turns a body into a sealed definition. With
+//!   [`CapturePolicy::Lexical`], every outer value the body reads becomes a `__capture_N` input
+//!   placeholder. The capture mode is a `LoopInputMode`: `Broadcast` by default; a dynamic family
+//!   read indexed by the parallel binder (optionally plus a nonnegative constant) becomes `Zip` or
+//!   `ZipOffset`, so the loop receives one member per instance instead of the whole family.
+//!
+//! [`Graph::freeze`] produces the immutable [`Graph`] and a [`FreezeMap`]:
+//!
+//! - Only nodes reachable from outputs, retained roots, and effect roots are kept; a node shared by
+//!   several handles is frozen once. `NodeId`s are postorder indices within a scope.
+//! - Scopes are keyed by [`FrozenGraphScopeId`]. A named subgraph has exactly one scope regardless
+//!   of how many call sites it has, and each loop body is one scope owned by its loop node; bodies
+//!   are never unrolled.
+//! - Freezing rejects cycles, foreign-scope edges, invalid ports, duplicate input names, and two
+//!   different subgraph definitions with the same name ([`FreezeError`]).
+//! - [`FreezeMap::resolve_unique`] maps a construction handle to its frozen wire, rejecting handles
+//!   reachable along more than one structural path.
+//!
+//! A `Graph` serializes to JSON with a ring table (`{"ring_table": [...], "graph": ...}`), where
+//! rings are interned and referenced as `{"$ring": i}`. Source locations, construction scopes, and
+//! benchmark roles are not serialized. Deserialization checks that node ids are contiguous, edges
+//! point backward, and ports exist; this is a structural consistency check, not an authentication
+//! of provenance.
+
 use crate::{
     artifact::ArtifactAvailability,
     expr::RealExpr,

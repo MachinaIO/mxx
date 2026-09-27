@@ -642,14 +642,7 @@ where
 }
 
 fn validate_stage(graph: &StageGraph, parameters: &ParamEnv) -> Result<ValidatedGraph, ApiError> {
-    graph
-        .graph
-        .validate_with_manifests(
-            parameters,
-            &graph.manifests,
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .map_err(ApiError::graph)
+    graph.graph.validate_with_manifests(parameters, &graph.manifests).map_err(ApiError::graph)
 }
 
 fn finalized_manifest<S: SessionStore>(

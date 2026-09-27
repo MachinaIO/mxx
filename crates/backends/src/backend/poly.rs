@@ -844,7 +844,7 @@ impl CpuDcrtBackend {
             }
             ConstantMatrix::UnitRow { index } if ty.rows == 1 => {
                 let index = index
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .ok()
                     .and_then(|value| value.to_usize())
                     .ok_or(PolyBackendError::InvalidInteger)?;
@@ -852,7 +852,7 @@ impl CpuDcrtBackend {
             }
             ConstantMatrix::UnitColumn { index } if ty.columns == 1 => {
                 let index = index
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .ok()
                     .and_then(|value| value.to_usize())
                     .ok_or(PolyBackendError::InvalidInteger)?;
@@ -862,9 +862,7 @@ impl CpuDcrtBackend {
                 if !ty.columns.is_multiple_of(ty.rows) {
                     return Err(PolyBackendError::InvalidInteger);
                 }
-                let base = base
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|_| PolyBackendError::InvalidInteger)?;
+                let base = base.evaluate(env).map_err(|_| PolyBackendError::InvalidInteger)?;
                 let digit_count = ty.columns / ty.rows;
                 self.validate_gadget_layout(ty, &base, digit_count, *small)?;
                 if *small {
@@ -874,11 +872,9 @@ impl CpuDcrtBackend {
                 }
             }
             ConstantMatrix::PowerOfBase { base, exponent } if ty.rows == 1 && ty.columns == 1 => {
-                let base = base
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|_| PolyBackendError::InvalidInteger)?;
+                let base = base.evaluate(env).map_err(|_| PolyBackendError::InvalidInteger)?;
                 let exponent = exponent
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .ok()
                     .and_then(|value| value.to_u32())
                     .ok_or(PolyBackendError::InvalidInteger)?;
@@ -890,7 +886,7 @@ impl CpuDcrtBackend {
             }
             ConstantMatrix::Rotation { exponent } if ty.rows == 1 && ty.columns == 1 => {
                 let exponent = exponent
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .ok()
                     .and_then(|value| value.to_usize())
                     .ok_or(PolyBackendError::InvalidInteger)?;
@@ -906,7 +902,7 @@ impl CpuDcrtBackend {
                     .iter()
                     .map(|coefficient| {
                         coefficient
-                            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                            .evaluate(env)
                             .map_err(|_| PolyBackendError::InvalidInteger)?
                             .mod_floor(&modulus)
                             .to_biguint()
@@ -1951,7 +1947,7 @@ mod tests {
             crt_moduli: moduli.iter().copied().map(mxx_ir_core::IntExpr::constant).collect(),
             ring_dimension,
         })
-        .resolve(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&ParamEnv::default())
         .expect("test parameters have a valid ordered CRT basis")
     }
 

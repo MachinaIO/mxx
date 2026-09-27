@@ -1,3 +1,11 @@
+//! Canonical JSON encoding and specification hashing.
+//!
+//! [`spec_hash`] hashes canonical JSON of `{ir_version, graph, integer and real bindings}` with
+//! SHA-256. It commits to every binding, so artifacts produced under different dimensions or moduli
+//! cannot be swapped. It depends on the serialized structure (node kinds, postorder ids, canonical
+//! expressions, rings, graph name), not on allocation addresses, source locations, or construction
+//! order.
+
 use crate::{
     artifact::SpecHash,
     expr::{ExprError, ParamEnv, Rational},

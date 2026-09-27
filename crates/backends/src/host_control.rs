@@ -440,11 +440,11 @@ pub fn dispatch_host_primitive(
         }
         NodeKind::ConstantInt(value) => Ok(HostPrimitiveValue::Int(value.clone())),
         NodeKind::EvaluateInt(expression) => expression
-            .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate(environment)
             .map(HostPrimitiveValue::Int)
             .map_err(|error| expression_error(error.to_string())),
         NodeKind::ConstantReal(expression) => expression
-            .evaluate_f64_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate_f64(environment)
             .map(HostPrimitiveValue::Real)
             .map_err(|error| expression_error(error.to_string())),
         NodeKind::ConstantBool(value) => Ok(HostPrimitiveValue::Bool(*value)),
@@ -481,7 +481,7 @@ pub fn dispatch_host_primitive(
         NodeKind::BitExtract { bit } => {
             let value = host_int_input(inputs, 0)?;
             let bit = bit
-                .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(environment)
                 .map_err(|error| expression_error(error.to_string()))?
                 .to_usize()
                 .ok_or_else(|| expression_error("bit index does not fit usize".to_owned()))?;
@@ -573,7 +573,7 @@ pub fn measure_host_container_primitive(
         match kind {
             NodeKind::FamilyPack { count } => {
                 let count = count
-                    .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(environment)
                     .map_err(|error| expression_error(error.to_string()))?
                     .to_usize()
                     .ok_or_else(|| expression_error("family count does not fit usize".into()))?;
@@ -586,7 +586,7 @@ pub fn measure_host_container_primitive(
             }
             NodeKind::FamilyGetStatic { index } => {
                 let index = index
-                    .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(environment)
                     .map_err(|error| expression_error(error.to_string()))?
                     .to_usize()
                     .ok_or_else(|| expression_error("family index does not fit usize".into()))?;
@@ -597,7 +597,7 @@ pub fn measure_host_container_primitive(
             }
             NodeKind::Select { count } => {
                 let count = count
-                    .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(environment)
                     .map_err(|error| expression_error(error.to_string()))?
                     .to_usize()
                     .ok_or_else(|| expression_error("select count does not fit usize".into()))?;
@@ -641,7 +641,7 @@ pub fn measure_runtime_container_primitive(
         match kind {
             NodeKind::FamilyPack { count } => {
                 let count = count
-                    .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(environment)
                     .map_err(|error| expression_error(error.to_string()))?
                     .to_usize()
                     .ok_or_else(|| expression_error("family count does not fit usize".into()))?;
@@ -683,7 +683,7 @@ pub fn measure_runtime_container_primitive(
             }
             NodeKind::Select { count } => {
                 let count = count
-                    .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(environment)
                     .map_err(|error| expression_error(error.to_string()))?
                     .to_usize()
                     .ok_or_else(|| expression_error("select count does not fit usize".into()))?;
@@ -717,7 +717,7 @@ fn runtime_family_get_value<'a>(
     };
     let index = match kind {
         NodeKind::FamilyGetStatic { index } => index
-            .evaluate_with_rings(environment, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate(environment)
             .map_err(|error| expression_error(error.to_string()))?
             .to_usize()
             .ok_or_else(|| expression_error("family index does not fit usize".into()))?,
@@ -799,10 +799,7 @@ fn bind_environment(
     let expression_environment = environment.clone();
     for (name, expression) in bindings {
         let value = expression
-            .evaluate_with_rings(
-                &expression_environment,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
+            .evaluate(&expression_environment)
             .map_err(|error| HostControlError::Expression { node, message: error.to_string() })?;
         environment.integers.insert(name.clone(), value);
     }
@@ -833,7 +830,7 @@ where
         NodeKind::ParallelLoop(loop_node) => {
             let count = loop_node
                 .count
-                .evaluate_with_rings(parent, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(parent)
                 .map_err(|error| HostControlError::Expression { node, message: error.to_string() })?
                 .to_usize()
                 .ok_or(HostControlError::InvalidLoopCount { node })?;
@@ -853,7 +850,7 @@ where
         NodeKind::SequentialLoop(loop_node) => {
             let count = loop_node
                 .count
-                .evaluate_with_rings(parent, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(parent)
                 .map_err(|error| HostControlError::Expression { node, message: error.to_string() })?
                 .to_usize()
                 .ok_or(HostControlError::InvalidLoopCount { node })?;
@@ -938,7 +935,7 @@ where
         NodeKind::ParallelLoop(loop_node) => {
             let count = loop_node
                 .count
-                .evaluate_with_rings(parent, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(parent)
                 .map_err(|error| HostControlError::Expression { node, message: error.to_string() })?
                 .to_usize()
                 .ok_or(HostControlError::InvalidLoopCount { node })?;
@@ -959,7 +956,7 @@ where
         NodeKind::SequentialLoop(loop_node) => {
             let count = loop_node
                 .count
-                .evaluate_with_rings(parent, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(parent)
                 .map_err(|error| HostControlError::Expression { node, message: error.to_string() })?
                 .to_usize()
                 .ok_or(HostControlError::InvalidLoopCount { node })?;

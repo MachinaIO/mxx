@@ -130,9 +130,7 @@ pub fn export_diamond_certificate(
         .ok_or("encrypt stage missing")?;
     let producer = validate(
         &encryption.graph,
-        &bindings,
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    )?;
+        &bindings)?;
     let placeholder = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
     let manifests =
         BTreeMap::from([(placeholder.clone(), export_validated_manifest(placeholder, &producer)?)]);

@@ -82,7 +82,7 @@ pub(crate) enum PhysicalEncoding {
 }
 
 /// Coordinates name logical elements. For a coordinate j, the corresponding
-/// address is base + byte_offset + sum((j[a] - origin[a]) * byte_strides[a]).
+/// address is `base + byte_offset + sum((j[a] - origin[a]) * byte_strides[a])`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(feature = "gpu")]
 pub(crate) struct PhysicalView {

@@ -1035,10 +1035,7 @@ impl IntInterval {
 }
 
 fn interval_of(expression: &IntExpr, loop_bounds: &BTreeMap<u32, IntInterval>) -> IntInterval {
-    if let Ok(value) = expression.evaluate_with_rings(
-        &ParamEnv::default(),
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    ) {
+    if let Ok(value) = expression.evaluate(&ParamEnv::default()) {
         return IntInterval::exact(value);
     }
     match expression {

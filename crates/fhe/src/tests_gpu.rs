@@ -35,7 +35,7 @@ fn test_gpu_integer_family_permutation_across_waves() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut runtime = GpuRuntime::new(backend(&common, None)).unwrap();
     let input_values = (0..count).map(|i| i as i64).collect::<Vec<_>>();
@@ -121,7 +121,7 @@ fn test_gpu_compiled_matrix_product_rebinds_sources() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut coefficients = vec![0; n];
     coefficients[0] = 1;
@@ -189,7 +189,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let backend = backend(&common, Some(&bgv));
     let mut store = MemoryArtifactStore::default();
@@ -267,11 +267,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let evaluator = evaluator
         .build()
         .unwrap()
-        .validate_with_manifests(
-            &ParamEnv::default(),
-            &manifests,
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
+        .validate_with_manifests(&ParamEnv::default(), &manifests)
         .unwrap();
     let (_, evaluation_id) = prepare_and_run(evaluator, &mut runtime, BTreeMap::new(), &mut store);
     let evaluation_id = evaluation_id.unwrap();
@@ -304,11 +300,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let decryption = decryption
         .build()
         .unwrap()
-        .validate_with_manifests(
-            &ParamEnv::default(),
-            &manifests,
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
+        .validate_with_manifests(&ParamEnv::default(), &manifests)
         .unwrap();
     let (result, _) = prepare_and_run(decryption, &mut runtime, BTreeMap::new(), &mut store);
     for (name, _) in outputs {
@@ -356,7 +348,7 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let backend = backend(&common, Some(&bgv));
     let mut store = MemoryArtifactStore::default();
@@ -442,11 +434,7 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
             .transferred_output(format!("rotated{level}"), bgv.decrypt(&secret, &rotated).unwrap())
             .unwrap();
     }
-    let graph = context
-        .build()
-        .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .unwrap();
+    let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
     let backend = backend(&common, Some(&bgv));
     let mut store = MemoryArtifactStore::default();
     let mut runtime = GpuRuntime::new(backend).expect("construct FHE GPU runtime");

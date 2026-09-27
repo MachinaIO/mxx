@@ -43,7 +43,7 @@ fn matrix_wire(parameters: &DCRTPolyParams, rows: usize, columns: usize) -> Conc
         crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: parameters.ring_dimension(),
     })
-    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .resolve(&ParamEnv::default())
     .expect("resolve test CRT basis");
     ConcreteWireType::Matrix(ConcreteMatrixType { ring, rows, columns })
 }
@@ -145,7 +145,7 @@ fn matrix_partial_slice_concat_replays_with_fresh_owners() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let make_cpu = |scalar: u64| {
         DCRTPolyMatrix::identity(
@@ -226,12 +226,7 @@ fn typed_real_boundary_and_trapdoor_public_output_execute() {
     )
     .unwrap()
     .0;
-    let graph = mxx_ir_core::validate(
-        &graph,
-        &ParamEnv::default(),
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let graph = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
     let mut plan = runtime.plan(graph, &BTreeMap::new()).unwrap();
     for seed in [1, 2] {
@@ -288,12 +283,7 @@ fn resident_pack_invalid_bit_and_out_of_range_suppress_publication() {
     )
     .unwrap()
     .0;
-    let graph = mxx_ir_core::validate(
-        &graph,
-        &ParamEnv::default(),
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let graph = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
     let valid = vec![BigInt::from(0); width * 8];
     let mut plan = runtime
@@ -384,7 +374,7 @@ fn resident_multiword_polynomial_primitives_rebind_and_decode() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
     let make_values = |shift: usize| {
@@ -527,9 +517,7 @@ fn all_nodes(graph: &mxx_dsl::BuiltGraph) -> Vec<&mxx_ir_core::NodeHandle> {
 #[test]
 fn resident_control_regression_graph_covers_scalar_and_family_operations() {
     let graph = control_graph(&[17], 8);
-    graph
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .expect("validate resident control graph");
+    graph.validate(&ParamEnv::default()).expect("validate resident control graph");
     let nodes = all_nodes(&graph);
 
     assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
@@ -586,7 +574,7 @@ fn resident_control_parallel_tail_replays_bounded_wave() {
     let gpu_parameters =
         GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
     let graph = control_graph_with_count(parameters.moduli(), parameters.ring_dimension(), 5)
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .expect("validate tail resident graph");
     let anchor = gpu_anchor(&parameters, &gpu_parameters);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
@@ -617,7 +605,7 @@ fn resident_control_sequential_carried_counts_publish_final_state() {
     for (nonce, count) in [0usize, 1, 2, 4].into_iter().enumerate() {
         let graph =
             sequential_control_graph(parameters.moduli(), parameters.ring_dimension(), count)
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .validate(&ParamEnv::default())
                 .expect("validate sequential resident graph");
         let inputs = BTreeMap::from([("anchor".to_owned(), anchor.clone())]);
         let mut plan = runtime.plan(graph, &inputs).expect("plan sequential resident graph");
@@ -671,7 +659,7 @@ fn resident_control_replay_uses_new_family_values_and_signed_semantics() {
     let gpu_parameters =
         GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
     let graph = control_graph(parameters.moduli(), parameters.ring_dimension())
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .expect("validate resident control graph");
     let backend = gpu_backend([gpu_parameters.clone()]);
     let anchor = gpu_anchor(&parameters, &gpu_parameters);
@@ -735,7 +723,7 @@ fn test_gpu_resident_invalid_index_suppresses_outputs() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let anchor = gpu_anchor(&parameters, &gpu_parameters);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters.clone()])).unwrap();
@@ -853,7 +841,7 @@ fn nested_matrix_parallel_loops_bind_every_inner_and_outer_occurrence() {
                 .unwrap()
                 .build()
                 .unwrap()
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .validate(&ParamEnv::default())
                 .unwrap();
             assert_eq!(
                 &matrix_family_constants(graph, "result", 2, max_waves),
@@ -882,7 +870,7 @@ fn sibling_root_matrix_parallel_loops_share_one_plan() {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         // second[index] = 5 * (index + 1) + (index + 1).
         assert_eq!(matrix_family_constants(graph, "second", 2, max_waves), vec![6, 12]);
@@ -913,7 +901,7 @@ fn parallel_loops_inside_sequential_device_loops_run_every_lane() {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let nested_graph = graph.clone();
         // 1 -> 7 -> 31 -> 127 and 2 -> 11 -> 47 -> 191.
@@ -950,7 +938,7 @@ fn sequential_loops_nested_in_device_bodies_restart_every_invocation() {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let lanes_graph = graph.clone();
         // 1 -> 5 -> 21 -> 85 and 1 -> 8 -> 64.

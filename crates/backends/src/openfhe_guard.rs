@@ -2,7 +2,6 @@ use crate::poly::{
     PolyParams,
     dcrt::{native::ffi as exact, params::DCRTPolyParams},
 };
-use openfhe::ffi;
 use std::{
     collections::HashSet,
     sync::{Mutex, OnceLock},
@@ -18,9 +17,9 @@ static NTT_WARMED: OnceLock<Mutex<HashSet<OpenFheParamsKey>>> = OnceLock::new();
 
 /// Resolve an ordered OpenFHE CRT basis and initialize its native tables.
 ///
-/// `None` generates a basis; `Some` validates the exact supplied basis without
-/// changing its order or values. This function is the concrete callback passed
-/// to IR validation by callers using the OpenFHE backend.
+/// `None` generates the basis IR validation generates
+/// (`mxx_ir_core::generate_crt_basis`); `Some` validates the exact supplied basis
+/// without changing its order or values.
 pub fn gen_modulus_and_warmup(
     ring_dimension: u32,
     crt_depth: usize,
@@ -48,16 +47,13 @@ pub fn gen_modulus_and_warmup(
     let mut guard = warmed.lock().map_err(|_| "NTT warmup lock poisoned".to_string())?;
     let moduli = match moduli {
         Some(primes) => primes,
-        None => ffi::GenCRTBasis(ring_dimension, crt_depth, crt_bits)
-            .into_iter()
-            .map(|prime| prime.parse::<u64>().map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()?,
+        None => mxx_ir_core::generate_crt_basis(ring_dimension, crt_depth, crt_bits)?,
     };
     if moduli.len() != crt_depth ||
         moduli.iter().map(|prime| (u64::BITS - prime.leading_zeros()) as usize).max() !=
             Some(crt_bits)
     {
-        return Err("OpenFHE returned a CRT basis with unexpected depth or width".into());
+        return Err("generated CRT basis has unexpected depth or width".into());
     }
     let key = OpenFheParamsKey { ring_dimension, moduli: moduli.clone() };
     if ring_dimension > 1 && !guard.contains(&key) {
@@ -84,15 +80,47 @@ pub(crate) fn ensure_openfhe_warmup(params: &DCRTPolyParams) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openfhe::ffi;
+
+    fn openfhe_basis(ring_dimension: u32, crt_depth: usize, crt_bits: usize) -> Vec<u64> {
+        ffi::GenCRTBasis(ring_dimension, crt_depth, crt_bits)
+            .into_iter()
+            .map(|prime| prime.parse::<u64>().unwrap())
+            .collect()
+    }
+
+    /// IR validation generates bases without OpenFHE; they must be the bases
+    /// OpenFHE's `ILDCRTParams` generates, in the same order.
+    #[test]
+    fn ir_generated_basis_matches_openfhe() {
+        let mut compared = 0;
+        for log_dimension in 1..=15 {
+            let ring_dimension = 1u32 << log_dimension;
+            for crt_bits in (log_dimension + 2..=60).step_by(3) {
+                for crt_depth in [1, 3, 8] {
+                    // OpenFHE aborts when too few primes exist, so compare only
+                    // requests the IR generator can satisfy.
+                    let Ok(generated) =
+                        mxx_ir_core::generate_crt_basis(ring_dimension, crt_depth, crt_bits)
+                    else {
+                        continue;
+                    };
+                    assert_eq!(
+                        generated,
+                        openfhe_basis(ring_dimension, crt_depth, crt_bits),
+                        "N={ring_dimension}, depth={crt_depth}, bits={crt_bits}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 500, "compared only {compared} bases");
+    }
 
     #[test]
     fn generated_basis_matches_openfhe_order_and_explicit_basis_preserves_it() {
         let generated = gen_modulus_and_warmup(8, 2, 20, None).unwrap();
-        let native = ffi::GenCRTBasis(8, 2, 20)
-            .into_iter()
-            .map(|prime| prime.parse::<u64>().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(generated, native);
+        assert_eq!(generated, openfhe_basis(8, 2, 20));
         let mut reversed = generated;
         reversed.reverse();
         assert_eq!(gen_modulus_and_warmup(8, 2, 20, Some(reversed.clone())).unwrap(), reversed);

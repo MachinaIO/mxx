@@ -1,5 +1,20 @@
+//! Compile-time expressions and parameter bindings.
+//!
+//! [`IntExpr`] covers constants, named variables, loop indices, arithmetic, `Div` (exact: a nonzero
+//! remainder is an error), `FloorDiv`, `Rem` (floor remainder), `RoundDiv` (nearest, ties toward
+//! positive infinity), `Log2Ceil`, `Select`, and ring properties (`RingModulus`, `RingCrtDepth`,
+//! `RingCrtModulus`), which evaluation resolves itself. Serialization goes through a canonical
+//! polynomial normal form, so equivalent expressions encode identically.
+//!
+//! [`RealExpr`] is evaluated as an exact [`Rational`] where possible (`evaluate_rational`,
+//! `evaluate_f64`, `close`).
+//!
+//! [`ParamEnv`] binds named integer parameters, real parameters, and loop-index slots (managed by
+//! executors). Runtime integer division in a graph differs from `IntExpr` division: see
+//! `mxx_dsl::Int`.
+
 use crate::{
-    ring::{ResolveCrtBasis, RingRef, resolve_ring},
+    ring::{RingRef, resolve_ring},
     serde_support,
 };
 use num_bigint::{BigInt, BigUint, Sign};
@@ -514,8 +529,6 @@ pub enum ExprError {
     NegativeReal,
     #[error("a floating-point value is not finite")]
     NonFiniteReal,
-    #[error("ring property requires a CRT basis resolver")]
-    RingResolutionRequired,
     #[error("ring resolution failed: {0}")]
     RingResolution(String),
 }
@@ -532,22 +545,6 @@ impl IntExpr {
     }
 
     pub fn evaluate(&self, env: &ParamEnv) -> Result<BigInt, ExprError> {
-        self.evaluate_internal(env, None)
-    }
-
-    pub fn evaluate_with_rings(
-        &self,
-        env: &ParamEnv,
-        resolve_basis: ResolveCrtBasis,
-    ) -> Result<BigInt, ExprError> {
-        self.evaluate_internal(env, Some(resolve_basis))
-    }
-
-    fn evaluate_internal(
-        &self,
-        env: &ParamEnv,
-        resolver: Option<ResolveCrtBasis>,
-    ) -> Result<BigInt, ExprError> {
         match self {
             Self::Const(value) => Ok(value.clone()),
             Self::Var(name) => env
@@ -560,18 +557,12 @@ impl IntExpr {
                 .get(slot)
                 .cloned()
                 .ok_or_else(|| ExprError::UnboundVariable(format!("loop-index[{slot}]"))),
-            Self::Add(lhs, rhs) => {
-                Ok(lhs.evaluate_internal(env, resolver)? + rhs.evaluate_internal(env, resolver)?)
-            }
-            Self::Sub(lhs, rhs) => {
-                Ok(lhs.evaluate_internal(env, resolver)? - rhs.evaluate_internal(env, resolver)?)
-            }
-            Self::Mul(lhs, rhs) => {
-                Ok(lhs.evaluate_internal(env, resolver)? * rhs.evaluate_internal(env, resolver)?)
-            }
+            Self::Add(lhs, rhs) => Ok(lhs.evaluate(env)? + rhs.evaluate(env)?),
+            Self::Sub(lhs, rhs) => Ok(lhs.evaluate(env)? - rhs.evaluate(env)?),
+            Self::Mul(lhs, rhs) => Ok(lhs.evaluate(env)? * rhs.evaluate(env)?),
             Self::Div(lhs, rhs) => {
-                let numerator = lhs.evaluate_internal(env, resolver)?;
-                let denominator = rhs.evaluate_internal(env, resolver)?;
+                let numerator = lhs.evaluate(env)?;
+                let denominator = rhs.evaluate(env)?;
                 if denominator.is_zero() {
                     return Err(ExprError::DivisionByZero);
                 }
@@ -582,22 +573,22 @@ impl IntExpr {
                 Ok(quotient)
             }
             Self::FloorDiv(lhs, rhs) => {
-                let denominator = rhs.evaluate_internal(env, resolver)?;
+                let denominator = rhs.evaluate(env)?;
                 if denominator.is_zero() {
                     return Err(ExprError::DivisionByZero);
                 }
-                Ok(lhs.evaluate_internal(env, resolver)?.div_floor(&denominator))
+                Ok(lhs.evaluate(env)?.div_floor(&denominator))
             }
             Self::Rem(lhs, rhs) => {
-                let denominator = rhs.evaluate_internal(env, resolver)?;
+                let denominator = rhs.evaluate(env)?;
                 if denominator.is_zero() {
                     return Err(ExprError::DivisionByZero);
                 }
-                Ok(lhs.evaluate_internal(env, resolver)?.mod_floor(&denominator))
+                Ok(lhs.evaluate(env)?.mod_floor(&denominator))
             }
             Self::RoundDiv(lhs, rhs) => {
-                let numerator = lhs.evaluate_internal(env, resolver)?;
-                let denominator = rhs.evaluate_internal(env, resolver)?;
+                let numerator = lhs.evaluate(env)?;
+                let denominator = rhs.evaluate(env)?;
                 if denominator <= BigInt::zero() {
                     return Err(ExprError::InvalidRoundDivDenominator);
                 }
@@ -605,7 +596,7 @@ impl IntExpr {
                 Ok((numerator * &two + &denominator).div_floor(&(denominator * two)))
             }
             Self::Log2Ceil(value) => {
-                let value = value.evaluate_internal(env, resolver)?;
+                let value = value.evaluate(env)?;
                 if value < BigInt::one() {
                     return Err(ExprError::InvalidLog2CeilArgument);
                 }
@@ -615,34 +606,23 @@ impl IntExpr {
                 Ok(BigInt::from(if is_power_of_two { floor } else { floor + 1 }))
             }
             Self::Select { selector, branches } => {
-                let index =
-                    selector.evaluate_internal(env, resolver)?.to_usize().ok_or_else(|| {
-                        ExprError::UnboundVariable(
-                            "integer selector is not a nonnegative usize".into(),
-                        )
-                    })?;
+                let index = selector.evaluate(env)?.to_usize().ok_or_else(|| {
+                    ExprError::UnboundVariable("integer selector is not a nonnegative usize".into())
+                })?;
                 branches
                     .get(index)
                     .ok_or_else(|| {
                         ExprError::UnboundVariable("integer selector out of range".into())
                     })?
-                    .evaluate_internal(env, resolver)
+                    .evaluate(env)
             }
-            Self::RingModulus(ring) => {
-                Ok(resolve_ring(ring, env, resolver.ok_or(ExprError::RingResolutionRequired)?)?
-                    .modulus())
-            }
-            Self::RingCrtDepth(ring) => Ok(BigInt::from(
-                resolve_ring(ring, env, resolver.ok_or(ExprError::RingResolutionRequired)?)?
-                    .crt_depth(),
-            )),
+            Self::RingModulus(ring) => Ok(resolve_ring(ring, env)?.modulus()),
+            Self::RingCrtDepth(ring) => Ok(BigInt::from(resolve_ring(ring, env)?.crt_depth())),
             Self::RingCrtModulus { ring, index } => {
-                let index =
-                    index.evaluate_internal(env, resolver)?.to_usize().ok_or_else(|| {
-                        ExprError::RingResolution("CRT index is negative or too large".into())
-                    })?;
-                let ring =
-                    resolve_ring(ring, env, resolver.ok_or(ExprError::RingResolutionRequired)?)?;
+                let index = index.evaluate(env)?.to_usize().ok_or_else(|| {
+                    ExprError::RingResolution("CRT index is negative or too large".into())
+                })?;
+                let ring = resolve_ring(ring, env)?;
                 Ok(BigInt::from(
                     *ring.crt_moduli().get(index).ok_or_else(|| {
                         ExprError::RingResolution("CRT index out of range".into())
@@ -921,22 +901,6 @@ impl RealExpr {
     }
 
     pub fn evaluate_f64(&self, env: &ParamEnv) -> Result<f64, ExprError> {
-        self.evaluate_f64_internal(env, None)
-    }
-
-    pub fn evaluate_f64_with_rings(
-        &self,
-        env: &ParamEnv,
-        resolve_basis: ResolveCrtBasis,
-    ) -> Result<f64, ExprError> {
-        self.evaluate_f64_internal(env, Some(resolve_basis))
-    }
-
-    fn evaluate_f64_internal(
-        &self,
-        env: &ParamEnv,
-        resolver: Option<ResolveCrtBasis>,
-    ) -> Result<f64, ExprError> {
         let value = match self {
             Self::Rational(value) => {
                 let numerator = value.numerator().to_f64().ok_or(ExprError::NegativeReal)?;
@@ -950,30 +914,19 @@ impl RealExpr {
                 let denominator = value.denominator().to_f64().ok_or(ExprError::NegativeReal)?;
                 numerator / denominator
             }
-            Self::FromInt(value) => {
-                value.evaluate_internal(env, resolver)?.to_f64().ok_or(ExprError::NegativeReal)?
-            }
-            Self::Add(lhs, rhs) => {
-                lhs.evaluate_f64_internal(env, resolver)? +
-                    rhs.evaluate_f64_internal(env, resolver)?
-            }
-            Self::Sub(lhs, rhs) => {
-                lhs.evaluate_f64_internal(env, resolver)? -
-                    rhs.evaluate_f64_internal(env, resolver)?
-            }
-            Self::Mul(lhs, rhs) => {
-                lhs.evaluate_f64_internal(env, resolver)? *
-                    rhs.evaluate_f64_internal(env, resolver)?
-            }
+            Self::FromInt(value) => value.evaluate(env)?.to_f64().ok_or(ExprError::NegativeReal)?,
+            Self::Add(lhs, rhs) => lhs.evaluate_f64(env)? + rhs.evaluate_f64(env)?,
+            Self::Sub(lhs, rhs) => lhs.evaluate_f64(env)? - rhs.evaluate_f64(env)?,
+            Self::Mul(lhs, rhs) => lhs.evaluate_f64(env)? * rhs.evaluate_f64(env)?,
             Self::Div(lhs, rhs) => {
-                let denominator = rhs.evaluate_f64_internal(env, resolver)?;
+                let denominator = rhs.evaluate_f64(env)?;
                 if denominator == 0.0 {
                     return Err(ExprError::DivisionByZero);
                 }
-                lhs.evaluate_f64_internal(env, resolver)? / denominator
+                lhs.evaluate_f64(env)? / denominator
             }
             Self::Sqrt(value) => {
-                let value = value.evaluate_f64_internal(env, resolver)?;
+                let value = value.evaluate_f64(env)?;
                 if value < 0.0 {
                     return Err(ExprError::NegativeReal);
                 }
@@ -984,42 +937,22 @@ impl RealExpr {
     }
 
     pub fn evaluate_rational(&self, env: &ParamEnv) -> Result<Rational, ExprError> {
-        self.evaluate_rational_internal(env, None)
-    }
-
-    pub fn evaluate_rational_with_rings(
-        &self,
-        env: &ParamEnv,
-        resolve_basis: ResolveCrtBasis,
-    ) -> Result<Rational, ExprError> {
-        self.evaluate_rational_internal(env, Some(resolve_basis))
-    }
-
-    fn evaluate_rational_internal(
-        &self,
-        env: &ParamEnv,
-        resolver: Option<ResolveCrtBasis>,
-    ) -> Result<Rational, ExprError> {
         match self {
             Self::Rational(value) => Ok(value.clone()),
             Self::Var(name) => {
                 env.reals.get(name).cloned().ok_or_else(|| ExprError::UnboundVariable(name.clone()))
             }
-            Self::FromInt(value) => {
-                Ok(Rational::from_integer(value.evaluate_internal(env, resolver)?))
+            Self::FromInt(value) => Ok(Rational::from_integer(value.evaluate(env)?)),
+            Self::Add(lhs, rhs) => {
+                Ok(lhs.evaluate_rational(env)?.add(&rhs.evaluate_rational(env)?))
             }
-            Self::Add(lhs, rhs) => Ok(lhs
-                .evaluate_rational_internal(env, resolver)?
-                .add(&rhs.evaluate_rational_internal(env, resolver)?)),
-            Self::Sub(lhs, rhs) => Ok(lhs
-                .evaluate_rational_internal(env, resolver)?
-                .sub(&rhs.evaluate_rational_internal(env, resolver)?)),
-            Self::Mul(lhs, rhs) => Ok(lhs
-                .evaluate_rational_internal(env, resolver)?
-                .mul(&rhs.evaluate_rational_internal(env, resolver)?)),
-            Self::Div(lhs, rhs) => lhs
-                .evaluate_rational_internal(env, resolver)?
-                .div(&rhs.evaluate_rational_internal(env, resolver)?),
+            Self::Sub(lhs, rhs) => {
+                Ok(lhs.evaluate_rational(env)?.sub(&rhs.evaluate_rational(env)?))
+            }
+            Self::Mul(lhs, rhs) => {
+                Ok(lhs.evaluate_rational(env)?.mul(&rhs.evaluate_rational(env)?))
+            }
+            Self::Div(lhs, rhs) => lhs.evaluate_rational(env)?.div(&rhs.evaluate_rational(env)?),
             Self::Sqrt(_) => Err(ExprError::InvalidRationalDenominator),
         }
     }
@@ -1028,24 +961,8 @@ impl RealExpr {
     /// as exact symbolic operations. The returned expression is independent
     /// of `env` and is suitable for persisted type descriptors.
     pub fn close(&self, env: &ParamEnv) -> Result<Self, ExprError> {
-        self.close_internal(env, None)
-    }
-
-    pub fn close_with_rings(
-        &self,
-        env: &ParamEnv,
-        resolve_basis: ResolveCrtBasis,
-    ) -> Result<Self, ExprError> {
-        self.close_internal(env, Some(resolve_basis))
-    }
-
-    fn close_internal(
-        &self,
-        env: &ParamEnv,
-        resolver: Option<ResolveCrtBasis>,
-    ) -> Result<Self, ExprError> {
         if !self.contains_sqrt() {
-            return Ok(Self::Rational(self.evaluate_rational_internal(env, resolver)?));
+            return Ok(Self::Rational(self.evaluate_rational(env)?));
         }
         Ok(match self {
             Self::Rational(value) => Self::Rational(value.clone()),
@@ -1055,26 +972,12 @@ impl RealExpr {
                     .cloned()
                     .ok_or_else(|| ExprError::UnboundVariable(name.clone()))?,
             ),
-            Self::FromInt(value) => {
-                Self::FromInt(IntExpr::constant(value.evaluate_internal(env, resolver)?))
-            }
-            Self::Add(lhs, rhs) => Self::Add(
-                Box::new(lhs.close_internal(env, resolver)?),
-                Box::new(rhs.close_internal(env, resolver)?),
-            ),
-            Self::Sub(lhs, rhs) => Self::Sub(
-                Box::new(lhs.close_internal(env, resolver)?),
-                Box::new(rhs.close_internal(env, resolver)?),
-            ),
-            Self::Mul(lhs, rhs) => Self::Mul(
-                Box::new(lhs.close_internal(env, resolver)?),
-                Box::new(rhs.close_internal(env, resolver)?),
-            ),
-            Self::Div(lhs, rhs) => Self::Div(
-                Box::new(lhs.close_internal(env, resolver)?),
-                Box::new(rhs.close_internal(env, resolver)?),
-            ),
-            Self::Sqrt(value) => Self::Sqrt(Box::new(value.close_internal(env, resolver)?)),
+            Self::FromInt(value) => Self::FromInt(IntExpr::constant(value.evaluate(env)?)),
+            Self::Add(lhs, rhs) => Self::Add(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Sub(lhs, rhs) => Self::Sub(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Mul(lhs, rhs) => Self::Mul(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Div(lhs, rhs) => Self::Div(Box::new(lhs.close(env)?), Box::new(rhs.close(env)?)),
+            Self::Sqrt(value) => Self::Sqrt(Box::new(value.close(env)?)),
         })
     }
 

@@ -5,7 +5,7 @@ use mxx_backends::{GpuExecutionResult, GpuRuntime};
 use mxx_backends::{
     RuntimeValue, SessionStore, authority::ExecutionAuthority, executor::ExecutionResult,
 };
-use mxx_gadgets::circuit::{
+use mxx_khe::circuit::{
     BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitData, BooleanCircuitError,
     BooleanCircuitShape,
 };
@@ -125,7 +125,7 @@ where
         let validation_started = Instant::now();
         let bindings = self.compiler.circuit_bindings()?;
         let validated = built
-            .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&bindings)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         debug!(
             elapsed_seconds = validation_started.elapsed().as_secs_f64(),
@@ -196,9 +196,7 @@ where
             .build_encryption()?
             .graph
             .validate(
-                &self.compiler.circuit_bindings()?,
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                &self.compiler.circuit_bindings()?)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         let graph_hash = spec_hash(&encryption_graph.source, &encryption_graph.bindings)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
@@ -231,9 +229,7 @@ where
         let validated = built
             .validate_with_manifests(
                 &self.compiler.circuit_bindings()?,
-                &BTreeMap::from([(ciphertext.encryption.clone(), manifest)]),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                &BTreeMap::from([(ciphertext.encryption.clone(), manifest)]))
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         debug!(
             elapsed_seconds = validation_started.elapsed().as_secs_f64(),
@@ -331,7 +327,7 @@ where
     type Message = bool;
     type Error = DiamondRuntimeError;
 
-    fn shape(&self) -> &mxx_gadgets::circuit::BooleanCircuitShape {
+    fn shape(&self) -> &mxx_khe::circuit::BooleanCircuitShape {
         &self.compiler.shape
     }
 
@@ -366,7 +362,7 @@ mod tests {
         backend::poly::cpu_backend,
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
-    use mxx_gadgets::circuit::{BooleanGateData, BooleanGateKind};
+    use mxx_khe::circuit::{BooleanGateData, BooleanGateKind};
     use mxx_ir_core::{RealExpr, artifact::SpecHash};
     use num_bigint::BigInt;
     use std::collections::BTreeSet;

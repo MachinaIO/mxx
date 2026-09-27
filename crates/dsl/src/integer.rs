@@ -1,11 +1,19 @@
 use super::*;
 use mxx_ir_core::node::IntBinaryOp;
 
+/// A runtime integer.
+///
+/// `+ - * / %` build graph operations, as do `equal`, `less`, `less_equal`, `bit`, and
+/// `lift_to_constant_polynomial`. Division computes `q = floor(a / |b|)` and `r = a - |b| q`, so
+/// `0 <= r < |b|`; division by zero is a runtime error. Runtime integers can select family
+/// members and candidates, but never change a shape or a loop count.
 #[derive(Clone)]
 pub struct Int {
     pub(super) value: ValueHandle,
 }
 
+/// A runtime Boolean. `& | ^ !` and `to_int` build graph operations; Rust `==`, `&&`, and `||`
+/// are not graph operators.
 #[derive(Clone)]
 pub struct Bool {
     pub(super) value: ValueHandle,

@@ -71,13 +71,13 @@ fn sharded_product(
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let input_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: moduli,
         ring_dimension: parameters.ring_dimension(),
     })
-    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .resolve(&ParamEnv::default())
     .unwrap();
     let value = RuntimeValue::gpu_matrix(
         ConcreteWireType::Matrix(ConcreteMatrixType {

@@ -4,7 +4,7 @@ use super::{
 };
 use crate::lean::diamond::{VerifiedDiamondCertificate, verify_diamond_certificate};
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_gadgets::circuit::{BooleanCircuitError, BooleanCircuitShape};
+use mxx_khe::circuit::{BooleanCircuitError, BooleanCircuitShape};
 use mxx_ir_core::RealExpr;
 use num_bigint::{BigInt, BigUint};
 use std::{

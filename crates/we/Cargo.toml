@@ -7,12 +7,11 @@ description = "Witness encryption constructions for mxx"
 
 [features]
 default = []
-gpu = ["mxx-backends/gpu", "mxx-gadgets/gpu"]
+gpu = ["mxx-backends/gpu", "mxx-khe/gpu"]
 
 [dependencies]
 mxx-backends = { path = "../backends" }
-mxx-gadgets = { path = "../gadgets" }
-mxx-bgg = { path = "../bgg" }
+mxx-khe = { path = "../khe" }
 mxx-dsl = { path = "../dsl" }
 mxx-ir-core = { path = "../ir-core" }
 num-bigint = { version = "0.4.6", features = ["serde", "rand"] }

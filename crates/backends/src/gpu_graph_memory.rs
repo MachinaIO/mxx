@@ -15,6 +15,12 @@
 //! operation with a conditional body counts as one top-level operation,
 //! because CUDA forbids memory nodes inside such bodies: scratch used by a
 //! loop body lives across the whole loop.
+//!
+//! `peak_bytes` counts each allocation from its first use until its memory can be reused: after
+//! its last use, or after the end of the outermost parallel loop containing it. An allocation freed
+//! by a later region is freed on the launch stream after that region's launch. Every other scratch
+//! value, together with inputs, outputs, wave-bound members, and imports, is a persistent
+//! allocation of the plan.
 
 use crate::{
     backend::{BoundStorage, GpuResidentValue, poly_gpu::GpuDcrtBackend},

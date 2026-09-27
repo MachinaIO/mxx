@@ -1185,11 +1185,8 @@ pub(crate) fn concrete_ring(value: &Mat) -> Result<ConcreteRing, RnsBggError> {
 }
 
 pub(crate) fn resolve_ring(ring: &mxx_ir_core::RingRef) -> Result<ConcreteRing, RnsBggError> {
-    ring.resolve(
-        &mxx_ir_core::ParamEnv::default(),
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .map_err(|_| RnsBggError::Parameters("matrix ring must be concrete"))
+    ring.resolve(&mxx_ir_core::ParamEnv::default())
+        .map_err(|_| RnsBggError::Parameters("matrix ring must be concrete"))
 }
 
 /// Convert a matrix between concrete CRT rings without constructing an
@@ -1353,7 +1350,7 @@ pub(crate) fn apply_public_alignment_row(
     let Some(action) = parameters.public_alignment_action(source_level, target_level)? else {
         return Ok(row);
     };
-    let aligned = (action.clone().mul_small_rhs(row.0), action.mul_small_rhs(row.1));
+    let aligned = (row.0.mul_small_rhs(action.clone()), row.1.mul_small_rhs(action));
     checked_mod_down_encoding(aligned, &parameters.ring(target_level)?)
 }
 
@@ -1374,8 +1371,8 @@ pub(crate) fn apply_public_alignment_matrix(
         return Ok(matrix);
     };
     let aligned = (
-        (action.clone().mul_small_rhs(matrix.0.0), action.clone().mul_small_rhs(matrix.0.1)),
-        (action.clone().mul_small_rhs(matrix.1.0), action.mul_small_rhs(matrix.1.1)),
+        (matrix.0.0.mul_small_rhs(action.clone()), matrix.0.1.mul_small_rhs(action.clone())),
+        (matrix.1.0.mul_small_rhs(action.clone()), matrix.1.1.mul_small_rhs(action)),
     );
     checked_mod_down_public(aligned, &parameters.ring(target_level)?)
 }
@@ -1390,7 +1387,7 @@ pub(crate) trait RightAction: Clone {
 
 impl RightAction for Preimage {
     fn right_multiply(self, lhs: Mat) -> Mat {
-        self.mul_small_rhs(lhs)
+        lhs.mul_small_rhs(self)
     }
 }
 
@@ -1794,12 +1791,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(
-                &mxx_ir_core::ParamEnv::default(),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .unwrap();
+        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
     }
 
     fn helper_test_parameters() -> RnsBggParameters {

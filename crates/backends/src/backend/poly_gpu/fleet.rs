@@ -1,3 +1,30 @@
+//! The GPU backend fleet and multi-device placement.
+//!
+//! A `GpuDcrtBackend` is the set of registered CUDA contexts: one placement per logical device,
+//! each holding one parameter set per ring, selected by ordered CRT basis and ring dimension. Each
+//! context is single-device and holds every CRT limb of its matrices. On each device the first
+//! registered ring is the anchor and the others are related contexts that share its execution
+//! owner (stream pool, release streams, and Graph builder), so operations mixing rings stay on one
+//! ordered execution. A plan uses every device of its backend, and the first logical device is its
+//! home device.
+//!
+//! - **Logical devices.** A process-wide table maps logical to physical CUDA devices. It is the
+//!   identity unless `MXX_GPU_LOGICAL_DEVICES` is set; `0,0` gives two logical devices on GPU 0, so
+//!   multi-device plans run and are tested on one GPU. Logical devices sharing a physical GPU each
+//!   report its full memory, which is fine for tests but not for capacity planning.
+//! - **One Graph across devices.** Each operation is emitted through the launch stream of its own
+//!   device, and the Graph launches on the home device's stream. Per-launch resources are prepared
+//!   on their own device's stream and joined into the launch stream with events.
+//! - **Copies only.** Cross-device data moves only through copy nodes; no kernel reads remote
+//!   memory. A copy between GPUs without peer access is staged through two pinned host buffers per
+//!   GPU pair; `MXX_GPU_HOST_STAGED_COPIES=1` stages every cross-device copy, which tests that path
+//!   on one GPU.
+//! - **What runs where.** Matrix products split output columns evenly over all devices; a remote
+//!   job computes on copies of the left operand and of its right column window, and its output
+//!   shard is copied home. Preimage sampling assigns column tiles to devices in contiguous blocks,
+//!   each running its whole retry loop on its device. The lanes of outermost parallel loops are
+//!   spread as described in `gpu_physical_control`. Everything else runs on the home device.
+
 use crate::{
     backend::{BoundStorage, GpuResidentValue},
     gpu_execution_plan::{
@@ -6971,9 +6998,7 @@ mod tests {
             ],
             ring_dimension: 8,
         })
-        .resolve(&ParamEnv::default(), |_, _, _, basis| {
-            basis.ok_or_else(|| "explicit test ring has no CRT basis".into())
-        })
+        .resolve(&ParamEnv::default())
         .expect("valid ordered CRT ring");
         let matrix = ConcreteMatrixType { ring, rows: 1, columns: 1 };
         let owners = [Arc::new([0u64; 16]), Arc::new([0u64; 16])];
@@ -7029,9 +7054,7 @@ mod tests {
             crt_moduli: moduli.iter().map(|&prime| mxx_ir_core::IntExpr::constant(prime)).collect(),
             ring_dimension: 8,
         })
-        .resolve(&ParamEnv::default(), |_, _, _, basis| {
-            basis.ok_or_else(|| "explicit test ring has no CRT basis".into())
-        })
+        .resolve(&ParamEnv::default())
         .expect("valid explicit ring")
     }
 

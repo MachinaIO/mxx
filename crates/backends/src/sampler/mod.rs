@@ -1,3 +1,21 @@
+//! Polynomial-matrix samplers.
+//!
+//! - `uniform::DCRTPolyUniformSampler` draws uniform residues, bits, ternary values, and Gaussians.
+//!   With a cutoff, Gaussian sampling resamples each coefficient whose centered magnitude exceeds
+//!   it; it never clips.
+//! - `hash::DCRTPolyHashSampler` derives matrices from `H(key || tag)` with per-entry and
+//!   per-column framing, so a column window matches whole-matrix sampling. Hash integer families
+//!   come from the entry `(0, 0)` coefficient streams of the same transcript.
+//! - `trapdoor::DCRTPolyTrapdoorSampler` samples gadget trapdoors and preimages. Preimage sampling
+//!   redraws a whole candidate that exceeds its cutoff, so the preimage equation always holds.
+//! - `bounds` defines the authoritative cutoffs: `hard_cutoff_from_sigma_bound` is `floor(6.5 *
+//!   sigma)`, and `default_preimage_cutoff` gives the minimum preimage cutoff.
+//!
+//! Correctness uses these enforced cutoffs and deterministic worst-case bounds, while
+//! lattice-security estimation models the ordinary untruncated distributions. Hash tags are encoded
+//! as a fixed prefix followed by typed, length-framed components, so tags such as `(1, 23)` and
+//! `(12, 3)` differ; changing the encoding changes every hash-derived value.
+
 use crate::{
     matrix::{PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError},
     poly::Poly,

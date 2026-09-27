@@ -730,10 +730,7 @@ mod tests {
                                         ring_dimension: 8,
                                     },
                                 )
-                                .resolve(
-                                    &mxx_ir_core::ParamEnv::default(),
-                                    crate::openfhe_guard::gen_modulus_and_warmup,
-                                )
+                                .resolve(&mxx_ir_core::ParamEnv::default())
                                 .expect("valid explicit test ring"),
                                 rows: 1,
                                 columns: 1,

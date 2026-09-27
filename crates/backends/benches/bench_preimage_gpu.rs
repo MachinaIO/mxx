@@ -52,11 +52,11 @@ fn bench_gpu_preimage() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let resolved =
         RingRef::new(RingExpr::Explicit { crt_moduli, ring_dimension: params.ring_dimension() })
-            .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .resolve(&ParamEnv::default())
             .unwrap();
     let target = DCRTPolyUniformSampler::new().sample_uniform(
         &params,

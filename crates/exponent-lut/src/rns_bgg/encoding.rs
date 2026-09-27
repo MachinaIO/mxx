@@ -4932,13 +4932,13 @@ mod test {
         let direct_action = |lhs: RnsBggMatrix, rhs: RnsBggDigits| {
             (
                 (
-                    rhs.0.0.clone().mul_small_rhs(lhs.0.0.clone()) +
-                        rhs.1.0.clone().mul_small_rhs(lhs.0.1.clone()),
-                    rhs.0.1.clone().mul_small_rhs(lhs.0.0) + rhs.1.1.clone().mul_small_rhs(lhs.0.1),
+                    lhs.0.0.clone().mul_small_rhs(rhs.0.0.clone()) +
+                        lhs.0.1.clone().mul_small_rhs(rhs.1.0.clone()),
+                    lhs.0.0.mul_small_rhs(rhs.0.1.clone()) + lhs.0.1.mul_small_rhs(rhs.1.1.clone()),
                 ),
                 (
-                    rhs.0.0.mul_small_rhs(lhs.1.0.clone()) + rhs.1.0.mul_small_rhs(lhs.1.1.clone()),
-                    rhs.0.1.mul_small_rhs(lhs.1.0) + rhs.1.1.mul_small_rhs(lhs.1.1),
+                    lhs.1.0.clone().mul_small_rhs(rhs.0.0) + lhs.1.1.clone().mul_small_rhs(rhs.1.0),
+                    lhs.1.0.mul_small_rhs(rhs.0.1) + lhs.1.1.mul_small_rhs(rhs.1.1),
                 ),
             )
         };
@@ -4949,9 +4949,9 @@ mod test {
         let direct_row_action = |row: RnsBggRow, key: RnsBggMatrix| {
             let decomposition = direct_decompose(key);
             (
-                decomposition.0.0.mul_small_rhs(row.0.clone()) +
-                    decomposition.1.0.mul_small_rhs(row.1.clone()),
-                decomposition.0.1.mul_small_rhs(row.0) + decomposition.1.1.mul_small_rhs(row.1),
+                row.0.clone().mul_small_rhs(decomposition.0.0) +
+                    row.1.clone().mul_small_rhs(decomposition.1.0),
+                row.0.mul_small_rhs(decomposition.0.1) + row.1.mul_small_rhs(decomposition.1.1),
             )
         };
         let mask_of = |key: &RnsBggMatrix| mask_times_key(key);

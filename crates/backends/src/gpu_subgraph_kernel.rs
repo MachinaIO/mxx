@@ -8,6 +8,13 @@
 //! registered lowers to one operation that calls `entry` while the CUDA graph
 //! is built. The entry implements the subgraph's semantics exactly against
 //! `crates/backends/cuda/include/SubgraphKernel.cuh`.
+//!
+//! Matrix operands are passed in evaluation form, integer operands in their signed encoding, and
+//! matrix families as a per-member limb table refreshed before every launch. The runtime allocates
+//! the results, a scratch buffer of `scratch_bytes`, and a status word. The entry adds its kernels
+//! with `mxx_gpu_launch_kernel` or `mxx_gpu_launch_cooperative_kernel`, declaring every resident
+//! address as a patch of its operand's binding so replays rebind it. `mxx-fhe` registers the TFHE
+//! blind rotation this way, running the whole CMUX loop as one cooperative launch.
 
 use std::ffi::{c_int, c_void};
 

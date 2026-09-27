@@ -1,3 +1,15 @@
+//! Artifact stores.
+//!
+//! An [`ArtifactStore`] loads manifests and payloads keyed by [`ArtifactKey`] (production, name,
+//! and member index), reports payload sizes without loading them, stores payloads, and manages
+//! staged family chunks. [`MemoryArtifactStore`] and [`FileArtifactStore`] implement it and
+//! [`crate::session::SessionStore`].
+//!
+//! Stores must return intact payloads produced by the matching backend codec, schema, and
+//! parameters. The compact matrix decoder is not an untrusted-data parser: malformed payloads can
+//! panic, and manifests do not authenticate payload integrity. Applications reading untrusted
+//! storage must establish integrity first.
+
 use mxx_ir_core::{
     artifact::{
         ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId,
@@ -2605,7 +2617,7 @@ mod tests {
             crt_moduli: vec![mxx_ir_core::IntExpr::constant(prime)],
             ring_dimension,
         })
-        .resolve(&mxx_ir_core::ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&mxx_ir_core::ParamEnv::default())
         .expect("artifact test uses a valid explicit CRT ring");
         ConcreteMatrixType { ring, rows, columns }
     }

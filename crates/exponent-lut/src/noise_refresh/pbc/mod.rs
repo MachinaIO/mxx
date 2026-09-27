@@ -752,7 +752,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&Default::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&Default::default())
             .unwrap();
         let mut backend = cpu_backend([poly_parameters]);
         let inputs = runtime_binding.materialize(&mut backend).unwrap();
@@ -2545,7 +2545,6 @@ pub(crate) mod routing_tests {
             .validate_with_manifests(
                 &mxx_ir_core::ParamEnv::default(),
                 &BTreeMap::from([(production, manifest)]),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
             )
             .expect("neutral artifact inputs validate against typed manifest");
     }

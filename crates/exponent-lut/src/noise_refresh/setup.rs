@@ -150,8 +150,5 @@ pub struct RefreshSimulationDecoderTarget {
 
 /// Validates a frozen graph using the common parameter environment.
 pub fn validate_graph(graph: &BuiltGraph) -> Result<(), RefreshSetupError> {
-    graph
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .map(|_| ())
-        .map_err(|_| RefreshSetupError::InvalidManifest)
+    graph.validate(&ParamEnv::default()).map(|_| ()).map_err(|_| RefreshSetupError::InvalidManifest)
 }

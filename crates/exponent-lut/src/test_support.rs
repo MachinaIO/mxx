@@ -28,17 +28,13 @@ pub(crate) fn explicit_ring(moduli: &[u64], ring_dimension: u32) -> Ring {
 pub(crate) fn concrete_ring(moduli: &[u64], ring_dimension: u32) -> ConcreteRing {
     explicit_ring(moduli, ring_dimension)
         .as_ref()
-        .resolve(&ParamEnv::default(), gen_modulus_and_warmup)
+        .resolve(&ParamEnv::default())
         .expect("explicit CRT basis resolves")
 }
 
 /// The product modulus of a graph matrix type's concrete CRT ring.
 pub(crate) fn modulus_of(matrix: &mxx_ir_core::types::MatrixType) -> num_bigint::BigInt {
-    matrix
-        .ring
-        .resolve(&ParamEnv::default(), gen_modulus_and_warmup)
-        .expect("matrix ring resolves")
-        .modulus()
+    matrix.ring.resolve(&ParamEnv::default()).expect("matrix ring resolves").modulus()
 }
 
 /// `count` NTT-friendly primes of `bits` bits for ring dimension `ring_dimension`.
@@ -47,7 +43,7 @@ pub(crate) fn primes(ring_dimension: u32, count: usize, bits: usize) -> Vec<u64>
 }
 
 pub(crate) fn validate(graph: &BuiltGraph) -> ValidatedGraph {
-    graph.validate(&ParamEnv::default(), gen_modulus_and_warmup).expect("graph validates")
+    graph.validate(&ParamEnv::default()).expect("graph validates")
 }
 
 /// Execute a validated graph on the CPU backend with fresh sampling.

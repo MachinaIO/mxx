@@ -40,7 +40,6 @@ pub fn export_claim(
     semantics: &ClaimSemantics<'_>,
     manifests: &BTreeMap<crate::artifact::ProductionId, crate::artifact::Manifest>,
     directory: &std::path::Path,
-    resolve_basis: crate::ResolveCrtBasis,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
         lean::{ExportOptions, export},
@@ -65,7 +64,7 @@ pub fn export_claim(
     declaration.validate()?;
     let mut generated = BTreeMap::new();
     for (name, graph) in graphs {
-        let validated = validate_with_manifests(graph, bindings, manifests, resolve_basis)?;
+        let validated = validate_with_manifests(graph, bindings, manifests)?;
         let artifact = export(
             &validated,
             &ExportOptions {
@@ -96,7 +95,7 @@ pub fn export_claim(
             .collect(),
         ideal: generated.remove("Ideal").expect("exported ideal"),
     };
-    let claim = assemble_claim(protocol, &roots, bindings, backend, semantics, resolve_basis)?;
+    let claim = assemble_claim(protocol, &roots, bindings, backend, semantics)?;
     fs::write(directory.join("Claim.lean"), claim)?;
     Ok(())
 }
@@ -182,7 +181,6 @@ pub fn assemble_claim(
     bindings: &ParamEnv,
     backend: &ClaimBackend<'_>,
     semantics: &ClaimSemantics<'_>,
-    resolve_basis: crate::ResolveCrtBasis,
 ) -> Result<String, ProtocolExportError> {
     declaration.validate().map_err(|error| ProtocolExportError::Invalid(error.to_string()))?;
     let bundle = &declaration.bundle;
@@ -325,7 +323,7 @@ pub fn assemble_claim(
             },
         },
     };
-    claim::assemble_claim(&claim, bindings, backend, semantics, resolve_basis)
+    claim::assemble_claim(&claim, bindings, backend, semantics)
         .map_err(ProtocolExportError::Invalid)
 }
 

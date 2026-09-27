@@ -3,6 +3,39 @@
 //! A frame owns its scratch allocations for the lifetime of the plan. Replays
 //! may replace input owners only after the previous GPU and I/O work finishes;
 //! output owners remain frame-local and must be copied before being returned.
+//!
+//! Lowering turns the validated graph into a `PhysicalFrame`: a compiled program plus the resident
+//! owners, export slots, import templates, control resets, and wave descriptors needed to run it.
+//!
+//! - **Physical values.** A `PhysicalValue` describes a value as one or more parts, each a view
+//!   (origin, extent, stride) into an input, output, or scratch allocation on one logical device.
+//!   Encodings cover full coefficient and evaluation matrices, compact bounded coefficients, signed
+//!   integers, Booleans, reals, bytes, typed blobs, and the public-only gadget trapdoor.
+//! - **Integer family storage.** An integer family is stored as sign-magnitude words or as one
+//!   canonical `u64` word per member. A returned integer family is canonical exactly when its
+//!   proven range lies in `[0, 2^64)`, so its layout depends on its range, not its producer, and
+//!   outputs of different graphs rebind into one another's plans.
+//! - **Compiled operations.** A `CompiledGpuOp` is one native launch with explicit dependency
+//!   edges, so unrelated operations keep independent paths. `DirectGraph::compile` splits the
+//!   operation list into Graph regions at wave-body boundaries, import points, and external-I/O
+//!   loop bodies; one region is one CUDA Graph even when it spans several devices. At bind time a
+//!   region rejects any owner whose physical descriptor differs from the planned one.
+//! - **Conversions only when encodings differ.** An operand that already has the requested encoding
+//!   is used unchanged; otherwise it gets exactly one forward or inverse NTT, shared by all later
+//!   consumers and written in place when the source has no later reader. Coefficient-domain
+//!   operations (automorphisms, modulus and RNS conversions, rounding, CRT recomposition,
+//!   decomposition, samplers, packs, imports, and exports) work on coefficient form directly.
+//! - **Slices, concatenation, and returns.** A matrix slice that is not a root output is a view
+//!   over its source, with no copy. A concatenation piece written only by elementwise or product
+//!   operations is written straight into its window; the other pieces are copied in by one
+//!   operation. A root output that is a whole scratch matrix is returned in place.
+//! - **Preimage retries.** Each preimage column tile is a device loop that derives a per-attempt
+//!   seed, samples a candidate, and checks its cutoff, until acceptance or the frozen attempt bound
+//!   (`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`); exhaustion is a device status error.
+//! - **Graph scratch admission.** CUDA keeps the reservation of a Graph upload that runs out of
+//!   memory, so before uploading any region `admit_graph_scratch` compares the scheduled scratch
+//!   peak with the free memory and rejects the candidate if it does not fit. After each candidate,
+//!   the planner releases the device memory CUDA caches for destroyed Graph executables.
 
 use crate::{
     artifact::ArtifactKey,
@@ -532,14 +565,8 @@ fn append_fixed_child_candidates(
             let port = Port(
                 u32::try_from(port).map_err(|_| "GPU child node has too many ports".to_owned())?,
             );
-            let ty = concretize_wire_type(
-                declared,
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let ty = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
             types.insert(WireRef { node: node_id, port }, ty);
         }
     }
@@ -746,7 +773,6 @@ fn append_fixed_child_candidates(
                                 &child_env,
                                 &child_id,
                                 child_node_id,
-                                crate::openfhe_guard::gen_modulus_and_warmup,
                             )
                             .map_err(|error| error.to_string())?;
                             let current = concretize_wire_type(
@@ -754,7 +780,6 @@ fn append_fixed_child_candidates(
                                 &instance_env,
                                 &child_id,
                                 child_node_id,
-                                crate::openfhe_guard::gen_modulus_and_warmup,
                             )
                             .map_err(|error| error.to_string())?;
                             if first != current {
@@ -2107,14 +2132,8 @@ pub(super) fn lower_sample_matrix_node(
     let (implementation, sigma, max_bound, coefficient_modulus) = match node.kind() {
         NodeKind::UniformResidueSample { .. } => (GpuImplementation::sample(false), 0.0, 0, 1),
         NodeKind::UniformIntervalSample { range, .. } => {
-            let minimum = range
-                .minimum
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
-            let maximum = range
-                .maximum
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let minimum = range.minimum.evaluate(env).map_err(|error| error.to_string())?;
+            let maximum = range.maximum.evaluate(env).map_err(|error| error.to_string())?;
             let (Some(minimum), Some(maximum)) = (minimum.to_i64(), maximum.to_i64()) else {
                 return Err("GPU interval sample bounds exceed the native i64 sampler".into());
             };
@@ -2125,11 +2144,9 @@ pub(super) fn lower_sample_matrix_node(
             (GpuImplementation::sample_interval(), 0.0, 0, 1)
         }
         NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
-            let sigma = sigma
-                .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let sigma = sigma.evaluate_f64(env).map_err(|error| error.to_string())?;
             let max_bound = max_coefficient_bound
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_u64()
                 .ok_or_else(|| "GPU Gaussian coefficient bound exceeds u64".to_owned())?;
@@ -2270,9 +2287,7 @@ fn encode_static_matrix(
         coefficients[(row * ty.columns + column) * degree] = coefficient;
     };
     let evaluate = |expression: &mxx_ir_core::expr::IntExpr| {
-        expression
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())
+        expression.evaluate(env).map_err(|error| error.to_string())
     };
     match value {
         ConstantMatrix::Zero => {}
@@ -2458,9 +2473,7 @@ fn plan_static_matrix(
             return Err("GPU gadget matrix has an invalid shape".into());
         }
         let params = ctx.backend.parameters_on_physical_device(ctx.device, ty)?;
-        let base = base
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())?;
+        let base = base.evaluate(env).map_err(|error| error.to_string())?;
         let digit_count = ty.columns / ty.rows;
         let (_, crt_bits, _) = params.to_crt();
         let expected_base = BigInt::from(1u8) << params.base_bits();
@@ -2604,9 +2617,7 @@ pub(super) fn lower_rns_conversion_node(
             )
         }
         NodeKind::RnsModDown { plaintext_modulus, .. } => {
-            let value = plaintext_modulus
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let value = plaintext_modulus.evaluate(env).map_err(|error| error.to_string())?;
             let plaintext = value
                 .to_biguint()
                 .filter(|value| *value >= num_bigint::BigUint::from(2u8))
@@ -2628,9 +2639,7 @@ pub(super) fn lower_rns_conversion_node(
             )
         }
         NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
-            let value = plaintext_modulus
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let value = plaintext_modulus.evaluate(env).map_err(|error| error.to_string())?;
             let words = value
                 .to_biguint()
                 .filter(|value| *value > num_bigint::BigUint::ZERO)
@@ -2767,16 +2776,13 @@ pub(super) fn lower_crt_recompose_node(
             }
             _ => return Err("GPU CRT recompose needs full matrix inputs".into()),
         };
-        let plaintext = plaintext_moduli[level]
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())?;
+        let plaintext = plaintext_moduli[level].evaluate(env).map_err(|error| error.to_string())?;
         let source_modulus = source_ty.ring.modulus();
         if plaintext <= BigInt::from(1) || plaintext > source_modulus {
             return Err("GPU CRT recompose plaintext modulus is outside its source ring".into());
         }
-        let coefficient = reconstruction_coefficients[level]
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())?;
+        let coefficient =
+            reconstruction_coefficients[level].evaluate(env).map_err(|error| error.to_string())?;
         if coefficient < BigInt::from(0) || coefficient >= destination_ty.ring.modulus() {
             return Err("GPU CRT recompose coefficient is outside its destination ring".into());
         }
@@ -3993,20 +3999,16 @@ pub(super) fn hash_tag_resource(
                 GpuHashTagPart::bytes_component(bytes).map_err(|error| error.to_string())?
             }
             HashTagComponent::Integer(expression) => {
-                let value = expression
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|error| error.to_string())?;
+                let value = expression.evaluate(env).map_err(|error| error.to_string())?;
                 GpuHashTagPart::integer_constant(&value).map_err(|error| error.to_string())?
             }
             HashTagComponent::Decimal(expression) => {
-                let value = expression
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|error| error.to_string())?;
+                let value = expression.evaluate(env).map_err(|error| error.to_string())?;
                 GpuHashTagPart::decimal_constant(&value).map_err(|error| error.to_string())?
             }
             HashTagComponent::U64Le(expression) => {
                 let value = expression
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| error.to_string())?
                     .to_u64()
                     .ok_or("GPU hash U64Le component exceeds u64")?;
@@ -4142,12 +4144,12 @@ pub(super) fn lower_hash_sample_node(
             let base = base
                 .as_ref()
                 .ok_or("GPU decomposed hash has no gadget base")?
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?;
             let count = digit_count
                 .as_ref()
                 .ok_or("GPU decomposed hash has no digit count")?
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_usize()
                 .filter(|count| *count > 0 && output_matrix.rows.is_multiple_of(*count))
@@ -4273,14 +4275,10 @@ pub(super) fn lower_trapdoor_sample_node(
     if !matches!(&secret_ty, ConcreteWireType::Trapdoor {matrix,..} if matrix==&public_ty) {
         return Err("GPU trapdoor outputs disagree on their ordered ring or shape".into());
     }
-    let sigma = sigma
-        .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| error.to_string())?;
-    let base = gadget_base
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| error.to_string())?;
+    let sigma = sigma.evaluate_f64(env).map_err(|error| error.to_string())?;
+    let base = gadget_base.evaluate(env).map_err(|error| error.to_string())?;
     let digits = digit_count
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+        .evaluate(env)
         .map_err(|error| error.to_string())?
         .to_usize()
         .ok_or_else(|| "GPU trapdoor digit count exceeds usize".to_owned())?;
@@ -6945,7 +6943,7 @@ mod tests {
             crt_moduli: moduli.into_iter().map(IntExpr::from).collect(),
             ring_dimension: 8,
         })
-        .resolve(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&ParamEnv::default())
         .expect("explicit ring");
         let per_tower = parameters.crt_bits().div_ceil(parameters.base_bits() as usize);
         for (digits, small) in
@@ -6993,7 +6991,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let source_modulus = source_cpu.modulus();
         let signed = [-7i64, 0, 7, -1, 1];
@@ -7140,7 +7138,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let backend = gpu_backend_on([parameters], [device]);
         let mut inputs = BTreeMap::new();
@@ -7222,7 +7220,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7286,7 +7284,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7329,7 +7327,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let backend = gpu_backend_on([parameters], [device]);
         let mut runtime = GpuRuntime::new(backend).unwrap();
@@ -7373,11 +7371,11 @@ mod tests {
         let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
         let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000);
         let validated = DslContext::new("direct-trapdoor-secret-artifact")
-            .transferred_trapdoor_output("secret", trapdoor)
+            .transferred_output("trapdoor", trapdoor)
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7386,9 +7384,13 @@ mod tests {
             .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [13; 32])
             .unwrap();
         assert!(result.production_id.is_some());
-        assert_eq!(result.artifact_handles["secret"].len(), 1);
-        let RuntimeValue::Resident(secret) = &result.output_value_for_test("secret").unwrap()
+        assert_eq!(result.artifact_handles["trapdoor.1"].len(), 1);
+        // The runtime returns the flattened trapdoor as one composite value.
+        let RuntimeValue::Composite(parts) = &result.output_value_for_test("trapdoor").unwrap()
         else {
+            panic!("GPU trapdoor output is a composite of its public matrix and trapdoor");
+        };
+        let RuntimeValue::Resident(secret) = &parts[1] else {
             panic!("GPU trapdoor must remain resident");
         };
         assert_eq!(secret.physical().encodings.len(), 6);
@@ -7414,7 +7416,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let key_a = RuntimeValue::Bytes(Arc::from([0x31u8; 32]));
         let key_b = RuntimeValue::Bytes(Arc::from([0xa7u8; 32]));
@@ -7494,7 +7496,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let cpu_hash = |key: RuntimeValue| {
             let result = execute_in_session(
@@ -7582,7 +7584,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let inputs =
             BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from([0x5cu8; 32])))]);
@@ -7646,7 +7648,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let key_a = RuntimeValue::Bytes(Arc::from([0x31u8; 32]));
         let key_b = RuntimeValue::Bytes(Arc::from([0xa7u8; 32]));
@@ -7729,7 +7731,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -7757,7 +7759,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production, manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], [device])).unwrap();
@@ -7799,7 +7800,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7929,7 +7930,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         // Each one-column tile runs on its own logical device when several
         // exist (`MXX_GPU_LOGICAL_DEVICES=0,0`).
@@ -8043,7 +8044,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -8091,7 +8092,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -8120,7 +8121,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let key = ArtifactKey { production, name: "stored".into(), index: None };
@@ -8155,7 +8155,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -8179,7 +8179,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest.clone())]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_parameters], [device])).unwrap();
@@ -8228,7 +8227,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let production = execute_in_session(
             &producer,
@@ -8260,7 +8259,6 @@ mod tests {
                 .validate_with_manifests(
                     &ParamEnv::default(),
                     &BTreeMap::from([(source.clone(), manifest)]),
-                    crate::openfhe_guard::gen_modulus_and_warmup,
                 )
                 .unwrap();
             let mut plan = runtime.plan_with_store(consumer, &BTreeMap::new(), store).unwrap();
@@ -8348,11 +8346,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let validated = context
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        let validated = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
         let mut runtime =
             GpuRuntime::new(gpu_backend_on([gpu_parameters], detected_gpu_device_ids())).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -8387,7 +8381,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let production = execute_in_session(
@@ -8423,7 +8417,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let mut runtime =
@@ -8439,6 +8432,77 @@ mod tests {
             let difference =
                 runtime.download_matrix_output(&result.output(&name).unwrap()).unwrap();
             assert!(is_zero_matrix(&difference), "{name}");
+        }
+    }
+
+    /// Products of hashed polynomials, which go through the forward and
+    /// inverse NTT, match the CPU for rings above a warp of 1024-coefficient
+    /// tiles: 2^16 and 2^17 run their widest stages in the wide-stage kernel.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn wide_ring_products_match_cpu() {
+        for ring_dimension in [1u32 << 15, 1 << 16, 1 << 17] {
+            let cpu = DCRTPolyParams::new(ring_dimension, 2, 28, 8, None, None);
+            let moduli = cpu.to_crt().0;
+            let gpu = GpuDCRTPolyParams::new(ring_dimension, moduli.clone(), 8, None);
+            let ring = Ring::from_crt_moduli(
+                moduli.into_iter().map(IntExpr::from).collect(),
+                ring_dimension,
+            );
+            let key = ring.bytes_input("key", 32);
+            let a = ring.hash_matrix(key.clone(), HashTag::from(b"a".as_slice()), (1, 2));
+            let b = ring.hash_matrix(key, HashTag::from(b"b".as_slice()), (2, 1));
+            let product = a.clone() * b;
+            let validated = DslContext::new("wide-ring-products")
+                .output("product", product.clone())
+                .unwrap()
+                .output(
+                    "shifted",
+                    product +
+                        a.slice(
+                            None,
+                            Some(mxx_ir_core::node::IndexRange {
+                                start: IntExpr::constant(0),
+                                end: IntExpr::constant(1),
+                            }),
+                        ),
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let inputs =
+                BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from([0x5au8; 32])))]);
+            let expected = execute_in_session(
+                &validated,
+                &mut cpu_backend([cpu]),
+                inputs.clone(),
+                &mut MemoryArtifactStore::default(),
+                [0x26; 32],
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let mut runtime =
+                GpuRuntime::new(gpu_backend_on([gpu], detected_gpu_device_ids())).unwrap();
+            let mut plan = runtime.plan(validated, &inputs).unwrap();
+            let result = runtime
+                .execute_with_artifacts(
+                    &mut plan,
+                    inputs,
+                    &mut MemoryArtifactStore::default(),
+                    [0x27; 32],
+                )
+                .unwrap();
+            for name in ["product", "shifted"] {
+                let RuntimeValue::Matrix(expected) = &expected.outputs[name] else {
+                    panic!("CPU {name} is a matrix");
+                };
+                let actual = runtime.download_matrix_output(&result.output(name).unwrap()).unwrap();
+                let expected = expected.as_cpu_full().expect("CPU full matrix");
+                assert!(actual == *expected, "{name} at ring dimension {ring_dimension}");
+            }
         }
     }
 }

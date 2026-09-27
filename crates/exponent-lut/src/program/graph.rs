@@ -397,12 +397,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(
-                &mxx_ir_core::ParamEnv::default(),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .unwrap();
+        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -432,11 +427,6 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(
-                &mxx_ir_core::ParamEnv::default(),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .unwrap();
+        graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
     }
 }

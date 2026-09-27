@@ -2489,13 +2489,13 @@ mod test {
         let direct_action = |lhs: RnsBggMatrix, rhs: RnsBggDigits| {
             (
                 (
-                    rhs.0.0.clone().mul_small_rhs(lhs.0.0.clone()) +
-                        rhs.1.0.clone().mul_small_rhs(lhs.0.1.clone()),
-                    rhs.0.1.clone().mul_small_rhs(lhs.0.0) + rhs.1.1.clone().mul_small_rhs(lhs.0.1),
+                    lhs.0.0.clone().mul_small_rhs(rhs.0.0.clone()) +
+                        lhs.0.1.clone().mul_small_rhs(rhs.1.0.clone()),
+                    lhs.0.0.mul_small_rhs(rhs.0.1.clone()) + lhs.0.1.mul_small_rhs(rhs.1.1.clone()),
                 ),
                 (
-                    rhs.0.0.mul_small_rhs(lhs.1.0.clone()) + rhs.1.0.mul_small_rhs(lhs.1.1.clone()),
-                    rhs.0.1.mul_small_rhs(lhs.1.0) + rhs.1.1.mul_small_rhs(lhs.1.1),
+                    lhs.1.0.clone().mul_small_rhs(rhs.0.0) + lhs.1.1.clone().mul_small_rhs(rhs.1.0),
+                    lhs.1.0.mul_small_rhs(rhs.0.1) + lhs.1.1.mul_small_rhs(rhs.1.1),
                 ),
             )
         };
@@ -2830,9 +2830,7 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -2896,9 +2894,7 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
 
         let a_star = checked_modulus_convert_matrix(anchor.matrix, &p_ring).unwrap();
         assert_eq!(a_star.0.0.matrix_type(), &p_ring.matrix_type((1, target_columns)));
@@ -2969,9 +2965,7 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -3180,9 +3174,7 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

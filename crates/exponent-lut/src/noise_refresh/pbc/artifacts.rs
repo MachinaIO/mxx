@@ -368,12 +368,7 @@ fn matrix_type_matches(
     actual: &mxx_ir_core::types::MatrixType,
     expected: &ConcreteMatrixType,
 ) -> bool {
-    actual
-        .ring
-        .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .ok()
-        .as_ref() ==
-        Some(&expected.ring) &&
+    actual.ring.resolve(&ParamEnv::default()).ok().as_ref() == Some(&expected.ring) &&
         actual.rows.evaluate(&ParamEnv::default()).ok().and_then(|value| value.to_usize()) ==
             Some(expected.rows) &&
         actual.columns.evaluate(&ParamEnv::default()).ok().and_then(|value| value.to_usize()) ==
@@ -793,10 +788,7 @@ pub(crate) fn concrete_matrix_type(
             .ok_or(PbcError::ArtifactIdentityMismatch)
     };
     Ok(mxx_ir_core::types::ConcreteMatrixType {
-        ring: matrix
-            .ring
-            .resolve(&env, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|_| PbcError::ArtifactIdentityMismatch)?,
+        ring: matrix.ring.resolve(&env).map_err(|_| PbcError::ArtifactIdentityMismatch)?,
         rows: dimension(&matrix.rows)?,
         columns: dimension(&matrix.columns)?,
     })

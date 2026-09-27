@@ -34,9 +34,7 @@ pub fn export_claim(
             decoder_radius: "MxxWe.decoderRadius",
         },
         manifests,
-        directory,
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    )
+        directory)
 }
 
 #[cfg(test)]

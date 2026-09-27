@@ -197,7 +197,7 @@ pub fn check_generated_modules(directory: &Path, timeout: Duration) -> Result<()
     let extra_paths = [
         crate_path.join("../ir-core/lean/.lake/build/lib/lean"),
         crate_path.join("lean/.lake/build/lib/lean"),
-        crate_path.join("../bgg/lean/.lake/build/lib/lean"),
+        crate_path.join("../khe/lean/.lake/build/lib/lean"),
     ];
     let extra = std::env::join_paths(&extra_paths)
         .map_err(|error| CheckError::Environment(error.to_string()))?;

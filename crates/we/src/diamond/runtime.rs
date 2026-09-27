@@ -5,7 +5,7 @@ use mxx_backends::{GpuExecutionResult, GpuRuntime};
 use mxx_backends::{
     RuntimeValue, SessionStore, authority::ExecutionAuthority, executor::ExecutionResult,
 };
-use mxx_gadgets::circuit::{
+use mxx_khe::circuit::{
     BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitData, BooleanCircuitError,
     BooleanCircuitShape,
 };
@@ -327,7 +327,7 @@ where
     type Message = bool;
     type Error = DiamondRuntimeError;
 
-    fn shape(&self) -> &mxx_gadgets::circuit::BooleanCircuitShape {
+    fn shape(&self) -> &mxx_khe::circuit::BooleanCircuitShape {
         &self.compiler.shape
     }
 
@@ -362,7 +362,7 @@ mod tests {
         backend::poly::cpu_backend,
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
-    use mxx_gadgets::circuit::{BooleanGateData, BooleanGateKind};
+    use mxx_khe::circuit::{BooleanGateData, BooleanGateKind};
     use mxx_ir_core::{RealExpr, artifact::SpecHash};
     use num_bigint::BigInt;
     use std::collections::BTreeSet;

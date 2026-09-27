@@ -1,6 +1,6 @@
 use super::{DiamondArtifactNames, DiamondConfigError, DiamondWeConfig};
 use crate::{WitnessEncryptionInterface, WitnessEncryptionProtocolDecl};
-use mxx_bgg::{
+use mxx_khe::bgg::{
     BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeySampler,
     BggPublicKeyWire, BggSamplerLayout, CircuitEncoding, DynamicBooleanBggError,
     evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
@@ -8,7 +8,7 @@ use mxx_bgg::{
 use mxx_dsl::{
     Bool, BuiltGraph, DslContext, DslError, Int, Mat, PurePredicateSpec, iterate, parallel, select,
 };
-use mxx_gadgets::{
+use mxx_khe::{
     circuit::{
         BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitError,
         BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanCircuitShape,

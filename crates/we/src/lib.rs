@@ -21,7 +21,7 @@
 pub mod diamond;
 pub mod lean;
 
-use mxx_gadgets::circuit::{BooleanCircuitData, BooleanCircuitShape};
+use mxx_khe::circuit::{BooleanCircuitData, BooleanCircuitShape};
 use mxx_ir_core::{
     node::NodeKind,
     protocol::{

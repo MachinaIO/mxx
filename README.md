@@ -193,25 +193,30 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
 | [`mxx-ir-core`](crates/ir-core/README.md) | The executable graph IR: rings, compile expressions, validation, artifact manifests, protocol declarations, and Lean export. |
 | [`mxx-dsl`](crates/dsl/README.md) | The Rust-based DSL that builds graphs. |
 | [`mxx-backends`](crates/backends/README.md) | Polynomial and matrix arithmetic, samplers, the CPU executor, the GPU runtime and native CUDA, and artifacts. |
-| [`mxx-gadgets`](crates/gadgets/README.md) | BGG-independent circuits and reusable circuit gadgets. |
-| [`mxx-bgg`](crates/bgg/README.md) | BGG+ keys, encodings, circuit evaluation, lookups, slot transfer, and commitments. |
+| [`mxx-khe`](crates/khe/README.md) | Key-homomorphic encodings: BGG+ keys, encodings, circuit evaluation, lookups, slot transfer, and commitments, with the circuits and gadgets they evaluate. |
 | [`mxx-fhe`](crates/fhe/README.md) | TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and noise tracking. |
 | `mxx-we` | Diamond witness encryption. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces only; their implementations have been removed. |
 
-Each crate's library builds only on crates in lower layers, and crates in the same layer never
-depend on one another:
+The crates form a pipeline from protocols to execution. An arrow points from a crate to the
+crate it builds on:
 
 ```text
-layer 3   mxx-bgg          mxx-fhe
-layer 2   mxx-gadgets
-layer 1   mxx-dsl          mxx-backends
-layer 0   mxx-ir-core
+  mxx-fhe      mxx-khe        applications: protocols written in the DSL
+       \       /
+        v     v
+        mxx-dsl               records a protocol as a program
+           |
+           v
+      mxx-ir-core             the program: a graph of primitive operations
+           ^
+           |
+      mxx-backends            executes programs on the CPU and GPUs
 ```
 
-For example, `mxx-bgg` implements BGG+ on top of the BGG-independent circuits of `mxx-gadgets`,
-while `mxx-fhe` uses only layers 0 and 1. Tests may use other crates: `mxx-gadgets` tests use
-`mxx-bgg`, and `mxx-backends` tests use `mxx-dsl`.
+The backends build on the IR from below: they consume the programs that the layers above
+produce. Applications also call the backends directly to run their programs, and the two
+applications never depend on each other.
 
 Each crate's README introduces the crate. The API documentation, built with
 `cargo doc --workspace --no-deps --features gpu --open`, is the reference for details such as

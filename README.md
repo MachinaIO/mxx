@@ -212,11 +212,10 @@ another, and this has not succeeded so far.
 
 **In progress: correctness statements generated from the protocol.** Instead, we are developing a
 *statement compiler*. It reads the DSL description of a protocol and deterministically generates
-a correctness statement in Lean, a proof assistant whose small trusted core, the *Lean kernel*,
-checks proofs mechanically. The statement says that, at specific parameters, the noise left at
+a correctness statement in Lean. The statement says that, at specific parameters, the noise left at
 the end of the protocol is below a specific threshold. Anyone who trusts the statement compiler
 and the Lean kernel can then delegate the noise growth simulation and the Lean proofs to an AI.
-A human does not have to audit any of that work, only check that a fixed Lean theorem passes.
+A human does not have to audit all of that work, only check that a fixed Lean theorem passes.
 
 **Goal: security statements as well.** Eventually, we aim to generate the Lean statement of
 security from the DSL description in the same deterministic way. Then a new lattice protocol

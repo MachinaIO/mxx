@@ -17,6 +17,7 @@ encryption, evaluation, and decryption run on the CPU or the GPU. It depends on 
 | `utils` | Parameter helpers, including the standard TFHE Boolean profile used in tests. |
 | `cuda/` | The native TFHE blind-rotation kernel used on the GPU. |
 | `tests/` | GPU round trips for TFHE and BGV. |
+| `scripts/` | A GPU BGV comparison with PhantomFHE: building a pinned external checkout, the comparison driver, and validating and summarizing its measurements. |
 
 ## Design
 

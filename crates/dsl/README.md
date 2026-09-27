@@ -3,7 +3,7 @@
 `mxx-dsl` is the Rust-based DSL for writing lattice protocols. You write a protocol with ring
 elements, matrices, samplers, trapdoors, and loops as ordinary Rust values and operators. The
 code records an `mxx-ir-core` graph that a backend in `mxx-backends` can validate and execute.
-The DSL depends only on `mxx-ir-core`.
+The DSL library depends only on `mxx-ir-core`; its examples also use `mxx-backends`.
 
 ## Contents
 
@@ -17,6 +17,7 @@ The DSL depends only on `mxx-ir-core`.
 | `parallel`, `iterate`, `select`, `Subgraph` | Independent loops, loops with carried state, runtime selection, and reusable named bodies. |
 | `HashTag`, `tag!` | Typed hash tags for hash-derived samples. |
 | `GraphValue`, `GraphValueSchema` | Flattening tuples, vectors, and records into graph wires. |
+| `examples/rlwe_encrypt.rs` | A Ring-LWE round trip on the GPU (`--features gpu`). |
 
 ## Design
 

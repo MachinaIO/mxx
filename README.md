@@ -27,8 +27,8 @@ Gaussian secret, and `e` is Gaussian noise. It then recovers `m` by rounding the
 of `b - a·s`. Every parameter, such as the ring's CRT width and depth, the noise
 width `sigma`, and the gadget base, is a named variable, and it gets a value only when the
 program is bound for a run. The full program is
-[`crates/backends/examples/rlwe_encrypt.rs`](crates/backends/examples/rlwe_encrypt.rs); run it
-with `cargo run -r -p mxx-backends --example rlwe_encrypt --features gpu`.
+[`crates/dsl/examples/rlwe_encrypt.rs`](crates/dsl/examples/rlwe_encrypt.rs); run it
+with `cargo run -r -p mxx-dsl --example rlwe_encrypt --features gpu`.
 
 ```rust
 use bigdecimal::BigDecimal;

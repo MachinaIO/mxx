@@ -1,6 +1,6 @@
 //! Encrypts and decrypts one bit with Ring-LWE on the GPU.
 //!
-//! Run with `cargo run -r -p mxx-backends --example rlwe_encrypt --features gpu`.
+//! Run with `cargo run -r -p mxx-dsl --example rlwe_encrypt --features gpu`.
 
 use bigdecimal::BigDecimal;
 use mxx_backends::{

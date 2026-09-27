@@ -22,7 +22,6 @@ the only crate with concrete arithmetic, and it depends only on `mxx-ir-core`.
 | `cuda/` | Native CUDA sources; `poly::dcrt::gpu` describes them. |
 | `native/` | C++ adapters to OpenFHE, bridged with `cxx`. |
 | `lean/` | Handwritten Lean packages for primitive and runtime relations. |
-| `examples/rlwe_encrypt.rs` | A Ring-LWE round trip on the GPU. |
 | `benches/` | Matrix-product and preimage-sampling benchmarks for the CPU and the GPU. |
 
 ## Design

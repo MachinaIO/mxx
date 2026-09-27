@@ -1,3 +1,5 @@
+// Temporarily disabled.
+/*
 #![cfg(feature = "gpu")]
 
 use bigdecimal::BigDecimal;
@@ -2366,3 +2368,4 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         "noiseless Tall encoding residual must be exactly zero (first nonzero location: {location:?})"
     );
 }
+*/

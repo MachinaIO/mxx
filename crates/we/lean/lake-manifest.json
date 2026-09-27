@@ -35,7 +35,7 @@
       "name": "mathlib",
       "manifestFile": "lake-manifest.json",
       "inherited": true,
-      "dir": "../../bgg/lean/../../backends/lean/.lake/packages/mathlib",
+      "dir": "../../khe/lean/../../backends/lean/.lake/packages/mathlib",
       "configFile": "lakefile.lean"
     },
     {

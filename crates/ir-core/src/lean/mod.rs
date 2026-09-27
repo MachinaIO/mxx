@@ -2414,34 +2414,63 @@ impl<'a> Emitter<'a> {
         if let Some(slot) = child_env.take_missing_loop_index() {
             return Err(ExportError::MissingLoopIndex(slot));
         }
+        // A gathered member is the dynamic family access of its instance
+        // index, bound inside the loop's quantifier.
+        let mut gathered = Vec::<(String, String)>::new();
+        let mut gather_relations = Vec::new();
         let input = if parallel {
             let modes = input_modes.expect("parallel modes");
-            tuple_expr(
-                &args
-                    .iter()
-                    .enumerate()
-                    .map(|(position, wire)| match modes[position] {
-                        crate::node::LoopInputMode::Broadcast => wire_name(*wire),
-                        crate::node::LoopInputMode::Zip => {
-                            let crate::types::ConcreteWireType::IndexedFamily { count, .. } =
-                                &self.validated.scopes[scope_id].wire_types[wire]
-                            else {
-                                unreachable!("validated zip input is an indexed family")
-                            };
-                            if Some(*count) == parallel_count {
-                                format!("({} i)", wire_name(*wire))
-                            } else {
-                                // A zip may read a prefix of a longer family. Validation proves
-                                // its length covers the loop; Lean still needs the Fin coercion.
-                                format!("({} ⟨i.val, by omega⟩)", wire_name(*wire))
-                            }
+            let zipped = |position: usize| {
+                let wire = &args[position];
+                match modes[position] {
+                    crate::node::LoopInputMode::Zip => {
+                        let crate::types::ConcreteWireType::IndexedFamily { count, .. } =
+                            &self.validated.scopes[scope_id].wire_types[wire]
+                        else {
+                            unreachable!("validated zip input is an indexed family")
+                        };
+                        if Some(*count) == parallel_count {
+                            format!("({} i)", wire_name(*wire))
+                        } else {
+                            // A zip may read a prefix of a longer family. Validation proves
+                            // its length covers the loop; Lean still needs the Fin coercion.
+                            format!("({} ⟨i.val, by omega⟩)", wire_name(*wire))
                         }
-                        crate::node::LoopInputMode::ZipOffset { offset } => {
-                            format!("({} ⟨i.val + {}, by omega⟩)", wire_name(*wire), offset)
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )
+                    }
+                    crate::node::LoopInputMode::ZipOffset { offset } => {
+                        format!("({} ⟨i.val + {}, by omega⟩)", wire_name(*wire), offset)
+                    }
+                    _ => wire_name(*wire),
+                }
+            };
+            let mut inputs = Vec::with_capacity(args.len());
+            for (position, wire) in args.iter().enumerate() {
+                inputs.push(match modes[position] {
+                    crate::node::LoopInputMode::Broadcast => wire_name(*wire),
+                    crate::node::LoopInputMode::Gather { index_argument } => {
+                        let crate::types::ConcreteWireType::IndexedFamily { element, count } =
+                            &self.validated.scopes[scope_id].wire_types[wire]
+                        else {
+                            unreachable!("validated gather input is an indexed family")
+                        };
+                        let member = format!("{}_gathered", wire_name(*wire));
+                        let index = zipped(index_argument);
+                        gather_relations.push(format!("0 ≤ {index}"));
+                        gather_relations.push(format!("{index} < {count}"));
+                        gather_relations.push(format!(
+                            "{} {} {} {}",
+                            self.options.primitives.family_get_dynamic,
+                            wire_name(*wire),
+                            index,
+                            member
+                        ));
+                        gathered.push((member.clone(), self.lean_type(element)));
+                        member
+                    }
+                    _ => zipped(position),
+                });
+            }
+            tuple_expr(&inputs)
         } else {
             tuple_expr(&args.iter().map(|wire| wire_name(*wire)).collect::<Vec<_>>())
         };
@@ -2452,9 +2481,14 @@ impl<'a> Emitter<'a> {
                 .collect::<Vec<_>>(),
         );
         let call = if parallel {
+            binding_guards.extend(gather_relations);
             format!(
-                "(∀ i : Fin {}, {}{} {} {} {} {})",
+                "(∀ i : Fin {}, {}{}{} {} {} {} {})",
                 parallel_count.expect("count"),
+                gathered
+                    .iter()
+                    .map(|(member, ty)| format!("∃ {member} : {ty}, "))
+                    .collect::<String>(),
                 if binding_guards.is_empty() {
                     String::new()
                 } else {
@@ -3432,6 +3466,62 @@ mod tests {
         assert!(artifact.source.contains("parallel_generatedRoot_1 params i "));
         assert!(artifact.source.contains("(_ : Nat) (inputs : Int)"));
         assert_eq!(artifact.static_node_visits, 3);
+    }
+
+    #[test]
+    fn export_gather_binds_the_dynamic_member_of_each_instance() {
+        let child = with_new_construction_scope(|scope| {
+            let member = scalar_input("member");
+            let index = scalar_input("index");
+            SubgraphHandle::new("gathered", scope, vec![member.clone(), index], vec![member])
+                .unwrap()
+        });
+        let family = |name: &str, count: usize| {
+            let ty = WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: IntExpr::constant(count),
+            };
+            NodeHandle::new(
+                NodeKind::Input { name: name.into(), wire_type: ty.clone(), artifact: None },
+                vec![],
+                vec![ty],
+            )
+            .output(0)
+            .unwrap()
+        };
+        let parallel = NodeHandle::parallel_loop(
+            child,
+            vec![family("values", 5), family("indices", 3)],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: IntExpr::constant(3),
+            }],
+            ParallelLoop {
+                count: IntExpr::constant(3),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: vec![],
+                input_modes: vec![LoopInputMode::Gather { index_argument: 1 }, LoopInputMode::Zip],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "gather",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: parallel, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        let source = &artifact.source;
+        assert!(source.contains("∀ i : Fin 3, ∃ "), "{source}");
+        assert!(source.contains("_gathered : Int, "), "{source}");
+        assert!(source.contains(" < 5"), "{source}");
+        assert!(source.contains("MxxRuntime.familyGetDynamic "), "{source}");
     }
 
     #[test]

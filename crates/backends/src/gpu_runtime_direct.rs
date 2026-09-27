@@ -134,7 +134,7 @@ use crate::{
         decode_signed_words, read_resident_scalar, runtime_inputs_digest,
         stage_canonical_resident_input,
     },
-    gpu_runtime_import::load_import_template,
+    gpu_runtime_import::{finish_import, import_operation, start_import},
     gpu_runtime_io::{
         PlannedExportSlot, ProducerIoPump, with_checked_producer_io_pump, with_transient_io_pump,
     },
@@ -895,7 +895,7 @@ impl DirectGraph {
     fn bind(&mut self, frame: &PhysicalFrame) -> Result<(), GpuRuntimeError> {
         let mut values = Vec::with_capacity(frame.program.bindings.len());
         let mut checked = BTreeSet::new();
-        for source in &frame.program.bindings {
+        for source in frame.program.bindings.iter() {
             let address = match *source {
                 GpuBindingSource::PhysicalPart { value, part, limb } => {
                     if limb != 0 {
@@ -2767,18 +2767,24 @@ impl GpuRuntime {
             }
             None => Vec::new(),
         };
-        let has_exports = !planned.is_empty();
+        let requests = planned_import_requests(&self.backend, &plan.frame, frame)?;
+        let observing = !planned.is_empty() || !requests.is_empty();
         let io_started = Instant::now();
-        if has_exports {
-            pump.start_export_observer(planned)
+        if observing {
+            pump.start_observer(planned, requests)
                 .map_err(|error| GpuRuntimeError::Artifact(error.to_string()))?;
         }
         let observer_started = Instant::now();
-        let run = self.execute_waves(plan, inputs, execution_nonce, Some(pump));
+        // Artifact inputs of the root scope are read from the start, each
+        // waited for only at its first consumer.
+        let root_imports = scope_import_templates(plan, None);
+        let run = self
+            .start_imports(plan, &mut Some(&mut *pump), root_imports, None, &mut BTreeMap::new())
+            .and_then(|()| self.execute_waves(plan, inputs, execution_nonce, Some(pump)));
         let run_finished = Instant::now();
-        if has_exports {
+        if observing {
             let observed = pump
-                .finish_export_observer(run.is_ok())
+                .finish_observer(run.is_ok())
                 .map_err(|error| GpuRuntimeError::Artifact(error.to_string()));
             if let Err(error) = observed {
                 plan.poisoned = true;
@@ -2812,7 +2818,7 @@ impl GpuRuntime {
             target: "mxx_backends::gpu_execute",
             graph = plan.validated.source.name(),
             waves = !plan.frame.waves.is_empty(),
-            exports = has_exports,
+            observing,
             persisted,
             observer_start_us = %format_args!("{:.1}", (observer_started - io_started).as_secs_f64() * 1e6),
             run_us = %format_args!("{:.1}", (run_finished - observer_started).as_secs_f64() * 1e6),
@@ -2906,7 +2912,7 @@ impl GpuRuntime {
                     // body are planned at the body's first operation; the
                     // wave itself loads only its own imports.
                     if static_imports {
-                        self.load_boundary_imports(plan, pump, operation, active_imports)?;
+                        self.finish_boundary_imports(plan, pump, operation, active_imports)?;
                     }
                     if active {
                         for control in &plan.frame.control_resets {
@@ -2982,7 +2988,7 @@ impl GpuRuntime {
                 continue;
             }
             if static_imports {
-                self.load_boundary_imports(plan, pump, operation, active_imports)?;
+                self.finish_boundary_imports(plan, pump, operation, active_imports)?;
             }
             // Every selected import planned at this boundary: at the root, in a
             // host-driven loop body, or in one lane of a wave body.
@@ -3012,7 +3018,7 @@ impl GpuRuntime {
                     None => &plan.frame.external_io_imports[index],
                     Some(loop_index) => &plan.frame.external_io_loops[loop_index].imports[index],
                 };
-                self.load_selected_import(plan, pump, frame, operation, import)?;
+                self.finish_selected_import(plan, pump, frame, import)?;
             }
             // A plan without waves bound its owners and uploaded its seeds
             // once; a wave rebinds its lanes' owners before each launch.
@@ -3043,9 +3049,15 @@ impl GpuRuntime {
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
     ) -> Result<(), GpuRuntimeError> {
         let group = &groups[group_index];
+        // Each wave's read-ahead members are read while the previous wave
+        // runs, into the owner the wave before that one used.
+        let mut indices = BTreeMap::new();
+        for &ahead in group.waves.iter().take(2) {
+            self.start_read_ahead(plan, pump, Some(ahead), &mut indices)?;
+        }
         // Each wave's `owner_bindings` hold its plan-owned output members, and
         // the family owner was packed from those same members at plan time.
-        for &wave_index in &group.waves {
+        for (ordinal, &wave_index) in group.waves.iter().enumerate() {
             let wave = &plan.frame.waves[wave_index];
             let mut logical_path = parent_path.to_vec();
             logical_path.push(
@@ -3091,6 +3103,14 @@ impl GpuRuntime {
             if let Some(actual) = parent_occurrence {
                 imports.extend(wave.invocation_imports.get(&actual).into_iter().flatten().copied());
             }
+            // The previous wave has joined, so this wave's other imports start
+            // now and are read while the wave runs up to their first consumers.
+            let in_place = imports
+                .iter()
+                .copied()
+                .filter(|&index| !plan.frame.import_templates[index].read_ahead)
+                .collect::<Vec<_>>();
+            self.start_imports(plan, pump, in_place, Some(wave_index), &mut indices)?;
             self.run_region_range(
                 plan,
                 groups,
@@ -3108,6 +3128,9 @@ impl GpuRuntime {
                 control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
             }
             check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
+            // This wave has joined, so the owner it read from is free for the
+            // wave after the next one.
+            self.start_read_ahead(plan, pump, group.waves.get(ordinal + 2).copied(), &mut indices)?;
         }
         Ok(())
     }
@@ -3161,116 +3184,189 @@ impl GpuRuntime {
         })
     }
 
-    /// Load the import templates of the running scope planned before
-    /// `operation`: those of `active_imports` inside a wave, otherwise every
-    /// template that no wave owns.
-    fn load_boundary_imports<E: std::error::Error + Send + Sync + 'static>(
+    /// Wait for the import templates of the running scope whose first
+    /// consumer is `operation`: those of `active_imports` inside a wave,
+    /// otherwise every template that no wave owns. Each was started earlier,
+    /// at its scope's start, and has been read and uploaded meanwhile.
+    fn finish_boundary_imports<E: std::error::Error + Send + Sync + 'static>(
         &self,
         plan: &GpuExecutionPlan,
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
         operation: u32,
         active_imports: Option<&[usize]>,
     ) -> Result<(), GpuRuntimeError> {
-        let templates = match active_imports {
-            Some(indices) => indices.to_vec(),
-            None => (0..plan.frame.import_templates.len())
-                .filter(|index| {
-                    !plan
-                        .frame
-                        .waves
-                        .iter()
-                        .any(|wave| wave.import_template_indices.contains(index))
-                })
-                .collect(),
-        };
-        for index in templates {
-            let template = plan.frame.import_templates.get(index).ok_or_else(|| {
-                GpuRuntimeError::Artifact("scheduled import template is absent".into())
-            })?;
+        let frame = FrameGeneration::new(0, plan.completed_runs);
+        for index in scope_import_templates(plan, active_imports) {
+            let template = &plan.frame.import_templates[index];
             if template.before_operation != operation {
                 continue;
             }
             let pump = pump.as_deref_mut().ok_or_else(|| {
                 GpuRuntimeError::Artifact("scheduled import has no I/O pump".into())
             })?;
-            // SAFETY: every preceding Graph region has joined and execute
-            // exclusively borrows this pointer-stable plan and I/O pump.
-            unsafe {
-                load_import_template(
-                    &self.backend,
-                    pump,
-                    FrameGeneration::new(0, plan.completed_runs),
-                    operation,
-                    template,
-                    &plan.frame.owners,
-                )
-            }
-            .map_err(GpuRuntimeError::Artifact)?;
+            finish_import(pump, frame, template.destination).map_err(GpuRuntimeError::Artifact)?;
         }
         Ok(())
     }
 
-    fn load_selected_import<E: std::error::Error + Send + Sync + 'static>(
+    /// Start the given import templates, whose destinations no GPU work or
+    /// I/O uses until their first consumers. A template of `wave` fills that
+    /// wave's owner of its destination. A gathered member's index is read
+    /// from its index family, downloaded once into `indices`.
+    fn start_imports<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        plan: &GpuExecutionPlan,
+        pump: &mut Option<&mut ProducerIoPump<'_, E>>,
+        templates: impl IntoIterator<Item = usize>,
+        wave: Option<usize>,
+        indices: &mut BTreeMap<PhysicalValueId, Vec<BigInt>>,
+    ) -> Result<(), GpuRuntimeError> {
+        let frame = FrameGeneration::new(0, plan.completed_runs);
+        for index in templates {
+            let template = &plan.frame.import_templates[index];
+            let mut key = template.key.clone();
+            if let Some((family, position)) = template.member {
+                if !indices.contains_key(&family) {
+                    let owner = plan.frame.owners.get(&family).ok_or_else(|| {
+                        GpuRuntimeError::Execution("Gather index family is not resident".into())
+                    })?;
+                    let values =
+                        self.download_integer_family(&RuntimeValue::Resident(Arc::clone(owner)))?;
+                    indices.insert(family, values);
+                }
+                let selected = indices[&family].get(position).ok_or_else(|| {
+                    GpuRuntimeError::Execution("Gather index family is too short".into())
+                })?;
+                let count = template.descriptor.family_count.unwrap_or(0);
+                key.index = Some(num_traits::ToPrimitive::to_usize(selected).filter(|index| *index < count).ok_or_else(
+                    || {
+                        GpuRuntimeError::Artifact(format!(
+                            "gathered artifact index {selected} is outside its family of {count}"
+                        ))
+                    },
+                )?);
+            }
+            let destination = wave
+                .and_then(|wave| plan.frame.waves[wave].owner_bindings.get(&template.destination))
+                .or_else(|| plan.frame.owners.get(&template.destination))
+                .cloned();
+            let pump = pump.as_deref_mut().ok_or_else(|| {
+                GpuRuntimeError::Artifact("scheduled import has no I/O pump".into())
+            })?;
+            // SAFETY: the previous execute or wave joined every use of this
+            // destination, and its next use is its first consumer, which
+            // waits for this import.
+            unsafe { start_import(&self.backend, pump, frame, template, key, destination) }
+                .map_err(GpuRuntimeError::Artifact)?;
+        }
+        Ok(())
+    }
+
+    /// Start the read-ahead imports of `wave`, into owners no running wave
+    /// uses.
+    fn start_read_ahead<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        plan: &GpuExecutionPlan,
+        pump: &mut Option<&mut ProducerIoPump<'_, E>>,
+        wave: Option<usize>,
+        indices: &mut BTreeMap<PhysicalValueId, Vec<BigInt>>,
+    ) -> Result<(), GpuRuntimeError> {
+        let Some(wave) = wave else { return Ok(()) };
+        let templates = plan.frame.waves[wave]
+            .import_template_indices
+            .iter()
+            .copied()
+            .filter(|&index| plan.frame.import_templates[index].read_ahead)
+            .collect::<Vec<_>>();
+        self.start_imports(plan, pump, templates, Some(wave), indices)
+    }
+
+    /// Wait for a selected import the observer started at its load site.
+    fn finish_selected_import<E: std::error::Error + Send + Sync + 'static>(
         &self,
         plan: &GpuExecutionPlan,
         pump: &mut ProducerIoPump<'_, E>,
         frame: FrameGeneration,
-        operation: u32,
         import: &crate::gpu_physical_control::ExternalIoImport,
     ) -> Result<(), GpuRuntimeError> {
-        if import.descriptor.artifact_type != import.expected_type {
-            return Err(GpuRuntimeError::Artifact(
-                "selected artifact bound domain or semantic type differs from its consumer".into(),
-            ));
-        }
         // The selector's producer Graph region has joined. A failed integer
         // operation must suppress the artifact read even if it left index 0.
         for control in &plan.frame.control_resets {
             control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
         }
-        let selector = plan.frame.owners.get(&import.selector).ok_or_else(|| {
-            GpuRuntimeError::Execution("selected artifact import has no resident selector".into())
-        })?;
-        let values = self.download_integer_family(&RuntimeValue::Resident(Arc::clone(selector)))?;
-        let [selected] = values.as_slice() else {
-            return Err(GpuRuntimeError::Execution(
-                "selected artifact import selector is not one integer".into(),
-            ));
-        };
-        let index = usize::try_from(selected).map_err(|_| {
-            GpuRuntimeError::Execution(
-                "selected artifact family index is negative or too large".into(),
-            )
-        })?;
-        let count = import.descriptor.family_count.ok_or_else(|| {
-            GpuRuntimeError::Artifact("selected artifact import has no finite family count".into())
-        })?;
-        if index >= count || import.key.index.is_some() {
-            return Err(GpuRuntimeError::Artifact("selected artifact index is invalid".into()));
-        }
-        let selected = ImportTemplate {
-            before_operation: operation,
-            key: ArtifactKey { index: Some(index), ..import.key.clone() },
-            descriptor: import.descriptor.clone(),
-            expected_type: import.expected_type.clone(),
-            staged: import.staged,
-            destination: import.destination,
-            upload_owner: import.upload_owner.clone(),
-        };
-        // SAFETY: this plan executes exclusively, and both the selector's
-        // producer region and the previous use of this destination have joined.
-        unsafe {
-            load_import_template(
-                &self.backend,
-                pump,
-                frame,
-                operation,
-                &selected,
-                &plan.frame.owners,
-            )
-        }
-        .map_err(GpuRuntimeError::Artifact)
+        finish_import(pump, frame, import.destination).map_err(GpuRuntimeError::Artifact)
     }
+}
+
+/// The import templates of the running scope: `active_imports` inside a wave,
+/// otherwise every template that no wave owns.
+fn scope_import_templates(plan: &GpuExecutionPlan, active_imports: Option<&[usize]>) -> Vec<usize> {
+    match active_imports {
+        Some(indices) => indices.to_vec(),
+        None => (0..plan.frame.import_templates.len())
+            .filter(|index| {
+                !plan.frame.waves.iter().any(|wave| {
+                    wave.import_template_indices.contains(index) ||
+                        wave.invocation_imports.values().flatten().any(|owned| owned == index)
+                })
+            })
+            .collect(),
+    }
+}
+
+/// The load site of every selected import: the Graph publishes its selector
+/// there, and the observer starts reading that member.
+fn planned_import_requests(
+    backend: &GpuDcrtBackend,
+    frame: &PhysicalFrame,
+    generation: FrameGeneration,
+) -> Result<Vec<crate::gpu_runtime_io::PlannedImportRequest>, GpuRuntimeError> {
+    frame
+        .external_io_imports
+        .iter()
+        .chain(frame.external_io_loops.iter().flat_map(|body| &body.imports))
+        .map(|import| {
+            let invalid = |message: &str| GpuRuntimeError::Artifact(message.into());
+            if import.descriptor.artifact_type != import.expected_type {
+                return Err(invalid(
+                    "selected artifact bound domain or semantic type differs from its consumer",
+                ));
+            }
+            let family_count = import
+                .descriptor
+                .family_count
+                .ok_or_else(|| invalid("selected artifact import has no finite family count"))?;
+            let encoding = match frame.program.values[import.selector.0 as usize].encodings.as_ref()
+            {
+                [crate::gpu_execution_plan::PhysicalEncoding::Signed(encoding)] => *encoding,
+                _ => return Err(invalid("selected artifact selector is not a signed integer")),
+            };
+            let template = ImportTemplate {
+                before_operation: import.before_operation,
+                key: import.key.clone(),
+                descriptor: import.descriptor.clone(),
+                expected_type: import.expected_type.clone(),
+                staged: import.staged,
+                destination: import.destination,
+                upload_owner: import.upload_owner.clone(),
+                member: None,
+                read_ahead: false,
+            };
+            let (backend, destination) =
+                (backend.clone(), frame.owners.get(&import.destination).cloned());
+            Ok(crate::gpu_runtime_io::PlannedImportRequest {
+                frame: generation,
+                slot: Arc::clone(&frame.slots[import.request_slot]),
+                destination: import.destination.0,
+                key: import.key.clone(),
+                family_count,
+                encoding,
+                operation: Box::new(move |key| {
+                    import_operation(&backend, &template, key, destination.clone())
+                }),
+            })
+        })
+        .collect()
 }
 
 fn planned_export_slots(

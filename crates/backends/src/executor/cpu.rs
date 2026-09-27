@@ -2963,6 +2963,111 @@ mod tests {
     }
 
     #[test]
+    fn gathered_artifact_members_follow_the_index_family() {
+        use mxx_ir_core::node::LoopInputMode;
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = ring(&parameters);
+        let count = 4usize;
+        let producer_ring = ring.clone();
+        let members = parallel(count, move |index| {
+            Ok(producer_ring.polynomial([mxx_ir_core::IntExpr::Add(
+                Box::new(index.expression()?),
+                Box::new(1.into()),
+            )]))
+        })
+        .expect("artifact family");
+        let producer = DslContext::new("cpu-gather-producer")
+            .cached_output("members", members)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let production = execute_in_session(
+            &producer,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap()
+        .production_id
+        .expect("producer identity");
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let family = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let context = DslContext::new("cpu-gather-consumer");
+        let indices = context.int_family_input("x", 3);
+        let gathered = parallel(3, move |i| Ok(family.at(indices.at(i)))).unwrap();
+        let mut context = context;
+        for instance in 0..3 {
+            context = context
+                .output(
+                    format!("gathered-{instance}"),
+                    gathered.at(Int::constant(instance)) + ring.zero((1, 1)),
+                )
+                .unwrap();
+        }
+        let consumer = context
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        assert!(consumer.source.scopes().values().flat_map(|scope| scope.nodes()).any(|node| {
+            matches!(node.kind(), NodeKind::ParallelLoop(spec)
+                if spec.input_modes.iter().any(|mode| matches!(mode, LoopInputMode::Gather { .. })))
+        }));
+        let x = (0..3).map(|_| rand::random_range(0..count)).collect::<Vec<_>>();
+        let keys = (0..count)
+            .map(|index| ArtifactKey {
+                production: production.clone(),
+                name: "members".to_owned(),
+                index: Some(index),
+            })
+            .collect::<Vec<_>>();
+        let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+        let consumed = execute(
+            &consumer,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([(
+                "x".to_owned(),
+                RuntimeValue::IndexedFamily {
+                    element_type: mxx_ir_core::types::ConcreteWireType::Int,
+                    values: x.iter().map(|&value| RuntimeValue::Int(BigInt::from(value))).collect(),
+                },
+            )]),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        for (instance, &selected) in x.iter().enumerate() {
+            let expected = DCRTPolyMatrix::from_poly_vec(
+                &parameters,
+                vec![vec![DCRTPoly::from_biguint_to_constant(
+                    &parameters,
+                    num_bigint::BigUint::from(selected + 1),
+                )]],
+            );
+            assert_eq!(matrix_output(&consumed, &format!("gathered-{instance}")), &expected);
+        }
+        for (member, key) in keys.iter().enumerate() {
+            let reads = x.iter().filter(|&&selected| selected == member).count();
+            assert_eq!(store.load_count(key), before[member] + reads, "{key:?}");
+        }
+    }
+
+    #[test]
     fn loop_ring_modulus_uses_each_instance_index() {
         let first_prime = IntExpr::Add(
             Box::new(17.into()),

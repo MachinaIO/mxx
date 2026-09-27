@@ -1555,6 +1555,8 @@ unsafe extern "C" {
         site: u32,
         flags: u32,
         header_binding: u32,
+        gate: *const c_void,
+        gate_binding: u32,
     ) -> c_int;
     fn mxx_gpu_graph_builder_begin_if(
         builder: *mut MxxGpuGraphBuilderOpaque,
@@ -1907,6 +1909,10 @@ impl<T> Drop for PinnedHostBuffer<T> {
         }
     }
 }
+
+/// `GpuExportSlotHeader::flags` bit of a publication whose gate reported a
+/// failure: the payload came from a failed operation and must not be used.
+pub const GPU_EXPORT_SLOT_SUPPRESSED: u32 = 2;
 
 /// Fixed ABI for one artifact fragment in mapped pinned host memory.
 #[repr(C, align(8))]
@@ -2810,7 +2816,9 @@ impl GpuExportSlot {
         let header = unsafe { ptr::read(self.host.as_ptr().cast::<GpuExportSlotHeader>()) };
         let payload_bytes = usize::try_from(header.payload_bytes)
             .map_err(|_| GpuNativeGraphError::Native("export payload length overflow".into()))?;
-        if payload_bytes > self.payload_capacity || header.flags & !1 != 0 {
+        if payload_bytes > self.payload_capacity ||
+            header.flags & !(1 | GPU_EXPORT_SLOT_SUPPRESSED) != 0
+        {
             return Err(GpuNativeGraphError::Native(
                 "invalid published export slot metadata".into(),
             ));
@@ -6685,7 +6693,9 @@ impl GpuNativeGraphBuilder {
     }
 
     /// Append a system-scope release publication after the operation's
-    /// payload nodes. The slot address is patched for each execution.
+    /// payload nodes. The slot address is patched for each execution. With a
+    /// `gate` (a device status word's address, span, and binding), a nonzero
+    /// word publishes with [`GPU_EXPORT_SLOT_SUPPRESSED`].
     pub fn add_export_publish(
         &mut self,
         slot: &GpuExportSlot,
@@ -6695,6 +6705,7 @@ impl GpuNativeGraphBuilder {
         site: u32,
         final_chunk: bool,
         header_binding: u32,
+        gate: Option<(u64, usize, u32)>,
     ) -> Result<(), GpuNativeGraphError> {
         if slot.physical_device != self.stream.physical_device {
             return Err(GpuNativeGraphError::Native("export slot belongs to another GPU".into()));
@@ -6707,6 +6718,9 @@ impl GpuNativeGraphBuilder {
             slot.header_span(),
             self.global_binding(header_binding),
         )?;
+        if let Some((address, span, binding)) = gate {
+            self.bind_resident_address(address, span, self.global_binding(binding))?;
+        }
         let status = unsafe {
             mxx_gpu_graph_builder_add_export_publish(
                 self.raw,
@@ -6717,6 +6731,8 @@ impl GpuNativeGraphBuilder {
                 site,
                 u32::from(final_chunk),
                 header_binding,
+                gate.map_or(ptr::null(), |(address, _, _)| address as *const c_void),
+                gate.map_or(u32::MAX, |(_, _, binding)| binding),
             )
         };
         if status != 0 {

@@ -1081,11 +1081,22 @@ impl GpuImplementation {
 
     /// Publish readiness only after the copy node has completed. The offset
     /// names a raw staging file range, not a canonical artifact byte offset.
+    /// The optional value and binding are a status word gating the payload.
     pub(crate) fn export_publish() -> Self {
-        use GpuArgumentKind::{U32, U64};
+        use GpuArgumentKind::{OptionalBinding, OptionalValue, U32, U64};
         Self {
             primitive: GpuNativePrimitive::ExportPublish,
-            argument_kinds: Box::new([U32, U64, U64, U64, U32, U32, U32]),
+            argument_kinds: Box::new([
+                U32,
+                U64,
+                U64,
+                U64,
+                U32,
+                U32,
+                U32,
+                OptionalValue,
+                OptionalBinding,
+            ]),
             output_count: 0,
         }
     }
@@ -1227,11 +1238,13 @@ impl CompiledGpuOp {
 #[derive(Clone, Debug)]
 #[cfg(feature = "gpu")]
 pub(crate) struct CompiledGpuProgram {
-    pub values: Box<[PhysicalValue]>,
+    /// Shared, so that each Graph region's program copies only its own
+    /// operations.
+    pub values: Arc<[PhysicalValue]>,
     pub implementations: GpuImplementationRegistry,
     pub operations: Box<[CompiledGpuOp]>,
     /// Dense, plan-global binding indices used by native patch records.
-    pub bindings: Box<[GpuBindingSource]>,
+    pub bindings: Arc<[GpuBindingSource]>,
     pub export_slots: Box<[GpuExportSlotRange]>,
     /// The registered kernels `SubgraphKernel` operations name by index.
     pub subgraph_kernels: Box<[crate::gpu_subgraph_kernel::GpuSubgraphKernel]>,
@@ -1314,12 +1327,25 @@ impl CompiledGpuProgram {
                         KernelArg::U32(_),
                         KernelArg::U32(_),
                         KernelArg::U32(header_binding),
+                        KernelArg::OptionalValue(gate),
+                        KernelArg::OptionalBinding(gate_binding),
                     ],
                 ) => {
                     if binding(*header_binding)? !=
                         (GpuBindingSource::ExportSlotHeader { slot: *slot as usize })
                     {
                         return Err("GPU export publication binding does not match its slot");
+                    }
+                    match (gate, gate_binding) {
+                        (None, None) => {}
+                        (Some(gate), Some(gate_binding))
+                            if binding(*gate_binding)? ==
+                                (GpuBindingSource::PhysicalPart {
+                                    value: *gate,
+                                    part: 0,
+                                    limb: 0,
+                                }) => {}
+                        _ => return Err("GPU export publication gate does not match its binding"),
                     }
                     let copy = export_copies
                         .get(slot)
@@ -1381,7 +1407,7 @@ impl CompiledGpuProgram {
                 }
             }
         }
-        for source in &self.bindings {
+        for source in self.bindings.iter() {
             if let GpuBindingSource::PhysicalPart { value, part, limb } = *source {
                 let physical = self
                     .values
@@ -1549,6 +1575,8 @@ mod gpu_export_slot_tests {
                     KernelArg::U32(7),
                     KernelArg::U32(1),
                     KernelArg::U32(2),
+                    KernelArg::OptionalValue(None),
+                    KernelArg::OptionalBinding(None),
                 ]),
                 outputs: Box::new([]),
                 device: 0,
@@ -1576,10 +1604,10 @@ mod gpu_export_slot_tests {
             },
         ];
         let program = CompiledGpuProgram {
-            values: Box::new([byte_value()]),
+            values: Arc::new([byte_value()]),
             implementations,
             operations: operations.clone().into_boxed_slice(),
-            bindings: Box::new([
+            bindings: Arc::new([
                 GpuBindingSource::PhysicalPart { value: PhysicalValueId(0), part: 0, limb: 0 },
                 GpuBindingSource::ExportSlotPayload { slot: 0 },
                 GpuBindingSource::ExportSlotHeader { slot: 0 },

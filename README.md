@@ -199,17 +199,20 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
 | `mxx-we` | Diamond witness encryption. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces only; their implementations have been removed. |
 
-Dependencies point downward, and application crates never depend on one another:
+Each crate's library builds only on crates in lower layers, and crates in the same layer never
+depend on one another:
 
 ```text
-mxx-ir-core   (no workspace crates)
-mxx-dsl       -> mxx-ir-core
-mxx-backends  -> mxx-ir-core
-mxx-gadgets   -> mxx-dsl, mxx-ir-core, mxx-backends
-mxx-bgg       -> mxx-ir-core, mxx-dsl, mxx-gadgets, mxx-backends
-mxx-fhe       -> mxx-dsl, mxx-ir-core, mxx-backends
-mxx-we        -> mxx-backends, mxx-gadgets, mxx-bgg, mxx-dsl, mxx-ir-core
+layer 4   mxx-we           (temporarily disabled)
+layer 3   mxx-bgg          mxx-fhe
+layer 2   mxx-gadgets
+layer 1   mxx-dsl          mxx-backends
+layer 0   mxx-ir-core
 ```
+
+For example, `mxx-bgg` implements BGG+ on top of the BGG-independent circuits of `mxx-gadgets`,
+while `mxx-fhe` uses only layers 0 and 1. Tests may use other crates: `mxx-gadgets` tests use
+`mxx-bgg`, and `mxx-backends` tests use `mxx-dsl`.
 
 Each crate's README introduces the crate. The API documentation, built with
 `cargo doc --workspace --no-deps --features gpu --open`, is the reference for details such as

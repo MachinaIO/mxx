@@ -139,7 +139,8 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
   small (bounded) coefficients, lattice trapdoors and their preimages, integers, Booleans, byte
   strings, and indexed collections of these. `+`, `-`, and `*` behave as in the math.
 - **Standard lattice operations.** mxx provides NTT-based polynomial arithmetic, gadget
-  decomposition, ring automorphisms, modulus switching and reduction, and threshold decoding.
+  decomposition, ring automorphisms, modulus switching and reduction, threshold decoding, and
+  more.
 - **Sampling built in.** You can draw uniform, interval, and discrete Gaussian samples, generate
   lattice trapdoors, and sample trapdoor preimages. You write a sample where the protocol needs
   it, and every run draws fresh randomness automatically.

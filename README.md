@@ -192,6 +192,37 @@ The API for running programs on the CPU and GPUs is described in
   stage is its own program. A stage can export its results, and another party's stage can
   import them as inputs, from memory or from disk, loading only the parts it uses.
 
+## Choosing parameters, and the plan for Lean
+
+mxx runs a protocol with whatever parameters you bind. It does not yet tell you which
+parameters make the protocol correct and secure.
+
+**Today: each application chooses its own parameters.** To find concrete lattice parameters,
+such as the ring dimension, the moduli, and the noise widths, you need two checks for each
+application:
+
+- a *noise growth simulation*, which tracks how the error terms grow through the protocol and
+  confirms that decryption or decoding still succeeds; and
+- a *security check*, which confirms that the underlying lattice problems are hard enough at
+  those parameters.
+
+At present, each application must implement both itself. We tried to estimate noise growth
+automatically from the DSL description, but what counts as noise differs from one application to
+another, and this has not succeeded so far.
+
+**In progress: correctness statements generated from the protocol.** Instead, we are developing a
+*statement compiler*. It reads the DSL description of a protocol and deterministically generates
+a correctness statement in Lean, a proof assistant whose small trusted core, the *Lean kernel*,
+checks proofs mechanically. The statement says that, at specific parameters, the noise left at
+the end of the protocol is below a specific threshold. Anyone who trusts the statement compiler
+and the Lean kernel can then delegate the noise growth simulation and the Lean proofs to an AI.
+A human does not have to audit any of that work, only check that a fixed Lean theorem passes.
+
+**Goal: security statements as well.** Eventually, we aim to generate the Lean statement of
+security from the DSL description in the same deterministic way. Then a new lattice protocol
+proposed by an AI could be checked automatically for both correctness and security, which would
+make autoresearch in lattice cryptography, research carried out by AI systems, feasible.
+
 ## Repository layout
 
 | Crate | Responsibility |

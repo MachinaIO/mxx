@@ -404,18 +404,12 @@ fn fixture(
             let monomial = DCRTPoly::const_rotate_poly(&poly_parameters, rotation % dimension);
             if rotation >= dimension { -monomial } else { monomial }
         })
+        .chain(std::iter::once(one.clone()))
         .collect::<Vec<_>>();
 
-    // The accumulator starts at mono(0) = 1, and `a` is split into one family
-    // per block that first reads its coordinates. No private plaintext is
-    // copied into the online call.
-    let a_families = program
-        .input_families()
-        .iter()
-        .map(|(wire, coordinates)| {
-            (*wire, coordinates.iter().map(|coordinate| a_values[*coordinate].clone()).collect())
-        })
-        .collect::<BTreeMap<_, Vec<_>>>();
+    // The accumulator starts at mono(0) = 1 and the family is `a` followed by
+    // the encoding of zero read by dummy and padding cells. No private
+    // plaintext is copied into the online call.
     let mut lhs = BTreeMap::new();
     for (wire, declaration) in program.program().encryption_inputs().inputs() {
         let value = match (declaration.knowledge(), declaration.shape()) {
@@ -423,7 +417,7 @@ fn fixture(
                 InputBinding::Scalar(one.clone())
             }
             (AttributeKnowledge::PublicPayload, InputBinding::Family(_)) => {
-                InputBinding::Family(a_families[wire].clone())
+                InputBinding::Family(a_values.clone())
             }
             (knowledge, shape) => panic!("unexpected input declaration: {knowledge:?} {shape:?}"),
         };
@@ -431,19 +425,16 @@ fn fixture(
     }
 
     // Selectors are fixed private RHS plaintexts: each output's key selects
-    // one cell per block of its layout, among the block's cell groups.
+    // one cell per block of its layout.
     let rhs = program
         .selection_families()
         .iter()
         .map(|family| {
             let bits =
                 program.selector_bits(family.output, &keys[family.output]).expect("key bits");
-            let values = family
-                .slots
+            let values = bits[family.bucket]
                 .iter()
-                .map(
-                    |slot| if bits[family.bucket][*slot] == 1 { one.clone() } else { zero.clone() },
-                )
+                .map(|bit| if *bit == 1 { one.clone() } else { zero.clone() })
                 .collect();
             (family.selector, InputBinding::Family(values))
         })

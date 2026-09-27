@@ -556,8 +556,8 @@ fn noise_refresh_end_to_end() {
     let prf_poly_parameters = prf_parameters.level(0).expect("PRF level zero").clone();
     let zero = DCRTPoly::const_zero(&prf_poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
-    // The shared public vector `a`, as stride-aware signed monomials, split
-    // into one family per block that first reads its coordinates.
+    // The shared public vector `a`, as stride-aware signed monomials,
+    // followed by the encoding of zero read by dummy and padding cells.
     let a_values = (0..prf.profile().lwr_dimension)
         .map(|coordinate| {
             let dimension = prf_poly_parameters.ring_dimension() as usize;
@@ -566,35 +566,25 @@ fn noise_refresh_end_to_end() {
             let monomial = DCRTPoly::const_rotate_poly(&prf_poly_parameters, rotation % dimension);
             if rotation >= dimension { -monomial } else { monomial }
         })
+        .chain(std::iter::once(one.clone()))
         .collect::<Vec<_>>();
-    let a_families = prf
-        .input_families()
-        .iter()
-        .map(|(wire, coordinates)| {
-            (*wire, coordinates.iter().map(|coordinate| a_values[*coordinate].clone()).collect())
-        })
-        .collect::<BTreeMap<_, Vec<_>>>();
     let mut prf_lhs = BTreeMap::new();
     for (&wire, declaration) in prf_program.encryption_inputs().inputs() {
         let value = match declaration.shape() {
             InputBinding::Scalar(_) => InputBinding::Scalar(one.clone()),
-            InputBinding::Family(_) => InputBinding::Family(a_families[&wire].clone()),
+            InputBinding::Family(_) => InputBinding::Family(a_values.clone()),
         };
         prf_lhs.insert(wire, value);
     }
-    // Each output's key selects one cell per block of its layout, among the
-    // block's cell groups.
+    // Each output's key selects one cell per block of its layout.
     let prf_rhs = prf
         .selection_families()
         .iter()
         .map(|family| {
             let bits = prf.selector_bits(family.output, &keys[family.output]).expect("key bits");
-            let values = family
-                .slots
+            let values = bits[family.bucket]
                 .iter()
-                .map(
-                    |slot| if bits[family.bucket][*slot] == 1 { one.clone() } else { zero.clone() },
-                )
+                .map(|bit| if *bit == 1 { one.clone() } else { zero.clone() })
                 .collect();
             (family.selector, InputBinding::Family(values))
         })

@@ -139,18 +139,14 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
   small (bounded) coefficients, lattice trapdoors and their preimages, integers, Booleans, byte
   strings, and indexed collections of these. `+`, `-`, and `*` behave as in the math.
 - **Standard lattice operations.** mxx provides NTT-based polynomial arithmetic, gadget
-  decomposition, ring automorphisms, multiplication by `X^k`, modulus switching and reduction,
-  RNS basis extension and reduction (as used in hybrid key switching), CRT recomposition,
-  coefficient extraction and packing, and threshold decoding.
+  decomposition, ring automorphisms, modulus switching and reduction, and threshold decoding.
 - **Sampling built in.** You can draw uniform, interval, and discrete Gaussian samples, generate
   lattice trapdoors, and sample trapdoor preimages. You write a sample where the protocol needs
-  it, and every run draws fresh randomness automatically. A sample written outside a loop is
-  drawn once and shared, and a sample written inside a loop is drawn fresh in every iteration.
+  it, and every run draws fresh randomness automatically.
 - **Seeds instead of large public matrices.** A matrix that is sampled from public random coins
   can instead be derived from a fixed-size random seed with a hash function (a random oracle).
   One party then sends only the 32-byte seed, not the matrix, and the other parties recompute the
-  same matrix from it, which cuts communication. The derived values are identical on the CPU and
-  the GPU.
+  same matrix from it, which cuts communication.
 - **Loops, choices, and reusable pieces.** You can loop over independent items (`parallel`), or
   repeat a step that updates a state, such as rounds of an evaluation (`iterate`). You can pick
   one of several computed values using a value known only at run time (`select`), and define a
@@ -163,7 +159,7 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
 
 ### Running it on GPUs
 
-- **One description for GPU and CPU.** The same program runs on the GPU or on the CPU, so there
+- **One description for CPU and GPU.** The same program runs both on the CPU and GPU, so there
   is no separate GPU implementation to keep in sync.
 - **Automatic tuning under a memory budget.** On a GPU, more parallelism, for example batching
   more matrix operations together, lowers latency but needs more GPU memory. mxx automatically
@@ -173,35 +169,26 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
   plan fixes the parallelism described above and a schedule for allocating and freeing GPU
   memory. Once the plan exists, you can run the program any number of times on new inputs with
   those tuned settings, without planning again.
-- **Several GPUs.** A single plan can spread work over several GPUs. At present only large
+- **Multiple GPUs.** A single plan can spread work over multiple GPUs. At present only large
   matrix products, preimage sampling, and independent loop iterations are spread; other steps
-  run on one GPU. Multi-GPU execution has so far been tested only with several virtual devices on
-  one physical GPU.
+  run on one GPU.
 - **(Advanced) Your own CUDA kernel when it matters.** If part of a protocol needs a specialized
   kernel for better performance, you write only that kernel. The rest of the protocol stays in the
   DSL, and the automatic tuning of parallelism and memory scheduling still applies around your
-  kernel, so you do not reimplement it. TFHE blind rotation uses this option.
+  kernel, so you do not reimplement it. TFHE blind rotation uses this option: see
+  [`TfheParams::gpu_blind_rotation_kernel`](crates/fhe/src/tfhe.rs#L1124).
 
-### Protocols with several parties
+### Protocols with multiple parties
 
 - **Using other parties' outputs.** Real protocols run in stages, often by different parties:
   one party runs setup and publishes public keys, another encrypts, and a third decrypts. Each
   stage is its own program. A stage can export its results, and another party's stage can
   import them as inputs, from memory or from disk, loading only the parts it uses.
 
-### Constructions included
-
-| Crate | What you get |
-| --- | --- |
-| `mxx-fhe` | TFHE with NAND bootstrapping, and leveled BGV with SIMD slots, rotations, relinearization, hybrid RNS key switching, and noise tracking. |
-| `mxx-bgg` | BGG+ public keys and encodings, circuit evaluation, LWE lookup tables, slot transfer, Tall encodings, and WEE25 commitments. |
-| `mxx-gadgets` | Circuit models and reusable building blocks: nested-RNS arithmetic, NTT circuits, Ring-GSW, a Goldreich PRG, and noise refresh. |
-| `mxx-we` | Diamond witness encryption with a Lean-checked parameter search. Temporarily disabled; see [Workspace layout](#workspace-layout). |
-
 For the design in depth, including how the GPU runtime plans and runs a program and its current
 limitations, start with `docs/architecture.md`.
 
-## Workspace layout
+## Repository layout
 
 | Crate | Responsibility |
 | --- | --- |
@@ -213,12 +200,6 @@ limitations, start with `docs/architecture.md`.
 | `mxx-fhe` | DSL-based TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and ciphertext noise tracking. |
 | `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
-
-There is no symbolic IR and no probabilistic noise simulator. Correctness uses enforced integer
-coefficient cutoffs and deterministic worst-case bounds. CPU and GPU samplers enforce the same
-cutoffs: Gaussian draws are resampled until they meet the bound, and preimage sampling retries
-whole candidates that exceed it. Lattice-security estimation intentionally continues to model
-the corresponding ordinary untruncated distributions separately.
 
 ## Requirements and building
 

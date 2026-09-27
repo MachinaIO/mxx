@@ -371,6 +371,7 @@ fn preprocessing_checkpoint_round_trips_exact_warmup_report() {
         limiting_stage: None,
         stages: Vec::new(),
         reason: "checkpoint-test".to_owned(),
+        node_costs: Vec::new(),
     };
     let checkpoint = PreprocessingCheckpoint {
         hash_key: [5; 32],

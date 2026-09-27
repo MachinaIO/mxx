@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mxx graph</title>
+<style>
+:root {
+  --bg: #f7f7f8; --panel: #ffffff; --ink: #1d1f23; --muted: #6b7078; --line: #d9dbe0;
+  --node: #ffffff; --node-line: #b9bdc6; --edge: #9aa0aa; --accent: #2f6fde;
+  --cold: #eef1f5; --hot: #d93a3a; --tip: #ffffff; --shadow: rgba(20, 24, 32, .16);
+  --input: #e7f0ff; --control: #f3ecff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a; --panel: #1d2024; --ink: #e8e9eb; --muted: #9aa0a8; --line: #33373d;
+    --node: #23272c; --node-line: #4a5058; --edge: #6c737d; --accent: #6ea0ff;
+    --cold: #262a30; --hot: #ff5a52; --tip: #23272c; --shadow: rgba(0, 0, 0, .5);
+    --input: #1f2b3f; --control: #2b2340;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+#app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+#crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; color: var(--muted); }
+#crumbs button { border: 0; background: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
+#crumbs span.current { color: var(--ink); font-weight: 600; }
+#total { margin-left: auto; font-variant-numeric: tabular-nums; }
+#total b { font-size: 15px; }
+main { display: grid; grid-template-columns: 1fr 360px; min-height: 0; }
+#canvas { position: relative; overflow: hidden; min-height: 0; cursor: grab; }
+#canvas.dragging { cursor: grabbing; }
+svg { width: 100%; height: 100%; display: block; }
+#tools { position: absolute; left: 12px; top: 12px; display: flex; gap: 6px; }
+#tools button, #tools input { font: inherit; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink); border-radius: 6px; padding: 4px 8px; }
+#tools input { width: 180px; }
+aside { border-left: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 12px 14px; }
+aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  margin: 14px 0 6px; font-weight: 600; }
+aside h2:first-child { margin-top: 0; }
+.rank { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 5px 6px; border-radius: 6px; cursor: pointer; }
+.rank:hover { background: var(--cold); }
+.rank .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rank .time { font-variant-numeric: tabular-nums; color: var(--muted); }
+.rank .where { grid-column: 1 / 3; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar { grid-column: 1 / 3; height: 4px; border-radius: 2px; background: var(--cold); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--hot); }
+.note { color: var(--muted); }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+.kv span:nth-child(odd) { color: var(--muted); }
+.legend { height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--cold), var(--hot)); }
+.legend-labels { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+g.node { cursor: default; }
+g.node.opens { cursor: pointer; }
+g.node rect.box { stroke: var(--node-line); stroke-width: 1; }
+g.node.opens rect.box { stroke-width: 2; stroke-dasharray: 5 3; }
+g.node text { fill: var(--ink); font-size: 12px; pointer-events: none; }
+g.node text.sub { fill: var(--muted); font-size: 11px; }
+g.node.hot text.sub { fill: var(--ink); }
+g.node.match rect.box, g.node.focus rect.box { stroke: var(--accent); stroke-width: 3; stroke-dasharray: none; }
+g.output rect { fill: var(--panel); stroke: var(--accent); stroke-width: 1.5; }
+g.output text { fill: var(--accent); font-size: 12px; }
+path.edge { fill: none; stroke: var(--edge); stroke-width: 1.2; opacity: .7; }
+path.edge.lit { stroke: var(--accent); stroke-width: 2.2; opacity: 1; }
+svg.hovering path.edge:not(.lit) { opacity: .18; }
+svg.hovering g.node:not(.lit) { opacity: .45; }
+#tip { position: fixed; z-index: 10; max-width: 460px; pointer-events: none; display: none;
+  background: var(--tip); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  box-shadow: 0 6px 24px var(--shadow); }
+#tip h3 { margin: 0 0 4px; font-size: 13px; }
+#tip .detail { color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow: hidden; margin-top: 6px; }
+#tip ul { margin: 2px 0 4px; padding-left: 16px; }
+#tip .cost { margin: 6px 0; font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) {
+  main { grid-template-columns: 1fr; grid-template-rows: 60vh auto; }
+  aside { border-left: 0; border-top: 1px solid var(--line); }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1 id="title"></h1>
+    <nav id="crumbs"></nav>
+    <div id="total"></div>
+  </header>
+  <main>
+    <div id="canvas">
+      <svg id="svg"><g id="viewport"></g></svg>
+      <div id="tools">
+        <button id="fit" title="Fit the scope to the view">Fit</button>
+        <input id="search" placeholder="Find a node (Enter)" autocomplete="off">
+      </div>
+    </div>
+    <aside id="side"></aside>
+  </main>
+</div>
+<div id="tip"></div>
+<script>
+"use strict";
+const DATA = /*GRAPH_DATA*/null;
+const NS = "http://www.w3.org/2000/svg";
+const scopes = new Map(DATA.scopes.map(scope => [scope.id, scope]));
+const ROOT = DATA.root;
+const predicted = DATA.predicted_seconds;
+const hasCosts = predicted != null && DATA.scopes.some(s => s.nodes.some(n => n.total_seconds != null));
+const $ = id => document.getElementById(id);
+const esc = text => String(text).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+let path = [ROOT];
+let focusNode = null;
+
+function seconds(value) {
+  if (value == null) return "–";
+  const a = Math.abs(value);
+  if (a >= 1) return value.toFixed(3) + " s";
+  if (a >= 1e-3) return (value * 1e3).toFixed(3) + " ms";
+  if (a >= 1e-6) return (value * 1e6).toFixed(1) + " µs";
+  return (value * 1e9).toFixed(0) + " ns";
+}
+const share = value => predicted > 0 && value != null ? value / predicted : 0;
+const percent = value => (share(value) * 100).toFixed(share(value) < 0.1 ? 2 : 1) + "%";
+
+// Colors are interpolated in JS so the heat scale follows the active theme.
+function cssColor(name) {
+  const probe = document.createElement("div");
+  probe.style.color = `var(${name})`;
+  document.body.appendChild(probe);
+  const rgb = getComputedStyle(probe).color.match(/\d+/g).map(Number);
+  probe.remove();
+  return rgb;
+}
+let cold, hot;
+function readTheme() { cold = cssColor("--cold"); hot = cssColor("--hot"); }
+function heat(fraction) {
+  // A square root keeps small but real costs visible next to one dominant node.
+  const t = Math.sqrt(Math.max(0, Math.min(1, fraction)));
+  return `rgb(${cold.map((c, i) => Math.round(c + (hot[i] - c) * t)).join(",")})`;
+}
+
+// Find a chain of scopes from the root to `id`, through the first call or loop that opens it.
+function pathTo(id) {
+  if (id === ROOT) return [ROOT];
+  for (const scope of DATA.scopes) {
+    if (scope.nodes.some(node => node.child === id)) {
+      if (scope.id === id) continue;
+      const parent = pathTo(scope.id);
+      if (parent) return [...parent, id];
+    }
+  }
+  return [ROOT, id];
+}
+
+// Layered layout: longest-path layers, dummy nodes on long edges, barycenter ordering sweeps.
+const layouts = new Map();
+function layout(scope) {
+  if (layouts.has(scope.id)) return layouts.get(scope.id);
+  const W = 210, H = 48, GX = 26, GY = 64;
+  const items = new Map();
+  scope.nodes.forEach(node => items.set("n" + node.id, { key: "n" + node.id, node, w: W, h: H }));
+  scope.outputs.forEach((output, i) => items.set("o" + i, { key: "o" + i, output, w: 160, h: 30 }));
+  const edges = [];
+  for (const node of scope.nodes) {
+    node.inputs.forEach((input, position) => {
+      if (input.node != null && items.has("n" + input.node)) {
+        edges.push({ from: "n" + input.node, to: "n" + node.id, type: input.type, port: input.port, position });
+      }
+    });
+  }
+  scope.outputs.forEach((output, i) => {
+    if (items.has("n" + output.node)) edges.push({ from: "n" + output.node, to: "o" + i, type: "", port: output.port });
+  });
+  const preds = new Map([...items.keys()].map(k => [k, []]));
+  const succs = new Map([...items.keys()].map(k => [k, []]));
+  for (const e of edges) { preds.get(e.to).push(e.from); succs.get(e.from).push(e.to); }
+  // Kahn order; a graph is acyclic, but stay total if it is not.
+  const indegree = new Map([...items.keys()].map(k => [k, preds.get(k).length]));
+  const order = [...items.keys()].filter(k => indegree.get(k) === 0);
+  for (let i = 0; i < order.length; i++) {
+    for (const s of succs.get(order[i])) {
+      indegree.set(s, indegree.get(s) - 1);
+      if (indegree.get(s) === 0) order.push(s);
+    }
+  }
+  const ordered = new Set(order);
+  for (const k of items.keys()) if (!ordered.has(k)) order.push(k);
+  const layer = new Map();
+  for (const k of order) layer.set(k, Math.max(0, ...preds.get(k).map(p => (layer.get(p) ?? -1) + 1)));
+  // Pull sources (inputs, constants) down next to their first consumer.
+  for (const k of order.slice().reverse()) {
+    if (preds.get(k).length === 0 && succs.get(k).length) {
+      layer.set(k, Math.max(0, Math.min(...succs.get(k).map(s => layer.get(s))) - 1));
+    }
+  }
+  const outputRow = Math.max(0, ...[...items.keys()].filter(k => k[0] === "n").map(k => layer.get(k))) + 1;
+  for (const k of items.keys()) if (k[0] === "o") layer.set(k, outputRow);
+  // Dummy chains for edges that skip layers.
+  const chains = [];
+  let dummies = 0;
+  const up = new Map(), down = new Map();
+  const link = (a, b) => { (down.get(a) || down.set(a, []).get(a)).push(b); (up.get(b) || up.set(b, []).get(b)).push(a); };
+  for (const e of edges) {
+    const chain = [e.from];
+    for (let l = layer.get(e.from) + 1; l < layer.get(e.to); l++) {
+      const key = "d" + dummies++;
+      items.set(key, { key, dummy: true, w: 12, h: H });
+      layer.set(key, l);
+      chain.push(key);
+    }
+    chain.push(e.to);
+    for (let i = 0; i + 1 < chain.length; i++) link(chain[i], chain[i + 1]);
+    chains.push({ edge: e, chain });
+  }
+  const rows = [];
+  for (const k of items.keys()) (rows[layer.get(k)] ||= []).push(k);
+  for (let i = 0; i < rows.length; i++) rows[i] ||= [];
+  const position = new Map();
+  const index = () => rows.forEach(row => row.forEach((k, i) => position.set(k, i)));
+  index();
+  const barycenter = (k, neighbours) => {
+    const list = neighbours.get(k) || [];
+    return list.length ? list.reduce((sum, n) => sum + position.get(n), 0) / list.length : position.get(k);
+  };
+  for (let sweep = 0; sweep < 8; sweep++) {
+    const downward = sweep % 2 === 0;
+    const range = downward ? rows.map((_, i) => i).slice(1) : rows.map((_, i) => i).reverse().slice(1);
+    for (const r of range) {
+      const weights = new Map(rows[r].map(k => [k, barycenter(k, downward ? up : down)]));
+      rows[r].sort((a, b) => weights.get(a) - weights.get(b));
+      rows[r].forEach((k, i) => position.set(k, i));
+    }
+  }
+  let width = 0;
+  const x = new Map(), y = new Map();
+  rows.forEach((row, r) => {
+    const rowWidth = row.reduce((sum, k) => sum + items.get(k).w, 0) + GX * Math.max(0, row.length - 1);
+    width = Math.max(width, rowWidth);
+    let cursor = -rowWidth / 2;
+    for (const k of row) { x.set(k, cursor + items.get(k).w / 2); cursor += items.get(k).w + GX; y.set(k, r * (H + GY)); }
+  });
+  const result = { items, chains, x, y, width, height: rows.length * (H + GY), H };
+  layouts.set(scope.id, result);
+  return result;
+}
+
+function edgePath(points) {
+  let d = `M${points[0][0]},${points[0][1]}`;
+  for (let i = 1; i < points.length; i++) {
+    const [x0, y0] = points[i - 1], [x1, y1] = points[i];
+    const dy = (y1 - y0) / 2;
+    d += ` C${x0},${y0 + dy} ${x1},${y1 - dy} ${x1},${y1}`;
+  }
+  return d;
+}
+
+function el(name, attributes, parent) {
+  const node = document.createElementNS(NS, name);
+  for (const [k, v] of Object.entries(attributes || {})) node.setAttribute(k, v);
+  if (parent) parent.appendChild(node);
+  return node;
+}
+
+const clip = (text, n) => text.length > n ? text.slice(0, n - 1) + "…" : text;
+function shortType(type) {
+  const m = /^(\w+) (\d+)×(\d+) over N=(\d+), (\d+) CRT limbs/.exec(type || "");
+  return m ? `${m[1]} ${m[2]}×${m[3]} · N=${m[4]} · ${m[5]} limbs` : clip(type || "", 34);
+}
+
+let view = { x: 0, y: 0, k: 1 };
+const svg = $("svg"), viewport = $("viewport");
+function applyView() { viewport.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`); }
+function fit(target) {
+  const bounds = viewport.getBBox(), box = svg.getBoundingClientRect();
+  if (!bounds.width || !box.width) return;
+  if (target) {
+    view.k = Math.min(1.2, Math.max(view.k, 0.6));
+    view.x = box.width / 2 - target[0] * view.k;
+    view.y = box.height / 2 - target[1] * view.k;
+  } else {
+    view.k = Math.min(1.4, 0.92 * Math.min(box.width / bounds.width, box.height / bounds.height));
+    view.x = box.width / 2 - (bounds.x + bounds.width / 2) * view.k;
+    view.y = 24 - bounds.y * view.k;
+  }
+  applyView();
+}
+
+function draw() {
+  const scope = scopes.get(path[path.length - 1]);
+  const L = layout(scope);
+  viewport.replaceChildren();
+  const edgeLayer = el("g", {}, viewport), nodeLayer = el("g", {}, viewport);
+  const edgeElements = [];
+  for (const { edge, chain } of L.chains) {
+    const points = chain.map((k, i) => {
+      const item = L.items.get(k);
+      const cy = L.y.get(k) + (i === 0 ? item.h : i === chain.length - 1 ? 0 : item.h / 2);
+      return [L.x.get(k), cy];
+    });
+    const p = el("path", { class: "edge", d: edgePath(points) }, edgeLayer);
+    p.dataset.from = edge.from; p.dataset.to = edge.to;
+    edgeElements.push(p);
+  }
+  const nodeElements = new Map();
+  for (const [k, item] of L.items) {
+    if (item.dummy) continue;
+    const x = L.x.get(k) - item.w / 2, y = L.y.get(k);
+    if (item.output) {
+      const g = el("g", { class: "output", transform: `translate(${x},${y})` }, nodeLayer);
+      el("rect", { width: item.w, height: item.h, rx: 15 }, g);
+      el("text", { x: item.w / 2, y: 19, "text-anchor": "middle" }, g).textContent = "⇥ " + clip(item.output.name, 20);
+      continue;
+    }
+    const node = item.node;
+    const cost = node.total_seconds;
+    const classes = ["node"];
+    if (node.child && scopes.has(node.child)) classes.push("opens");
+    if (hasCosts && share(cost) > 0.25) classes.push("hot");
+    if (focusNode === node.id) classes.push("focus");
+    const g = el("g", { class: classes.join(" "), transform: `translate(${x},${y})` }, nodeLayer);
+    g.dataset.key = k;
+    let fill = "var(--node)";
+    if (hasCosts && cost != null) fill = heat(share(cost));
+    else if (node.kind === "Input") fill = "var(--input)";
+    else if (node.child) fill = "var(--control)";
+    el("rect", { class: "box", width: item.w, height: item.h, rx: 7, fill }, g);
+    el("text", { x: 10, y: 19 }, g).textContent = clip(`#${node.id} ${node.label}`, 30);
+    const sub = hasCosts && cost != null
+      ? `${seconds(cost)} · ${percent(cost)}${node.child ? " (incl. body)" : ""}`
+      : shortType(node.outputs[0]);
+    el("text", { class: "sub", x: 10, y: 37 }, g).textContent = sub;
+    nodeElements.set(k, g);
+    g.addEventListener("mouseenter", event => {
+      svg.classList.add("hovering");
+      g.classList.add("lit");
+      for (const e of edgeElements) {
+        if (e.dataset.from === k || e.dataset.to === k) {
+          e.classList.add("lit");
+          nodeElements.get(e.dataset.from === k ? e.dataset.to : e.dataset.from)?.classList.add("lit");
+        }
+      }
+      showTip(event, scope, node);
+    });
+    g.addEventListener("mousemove", moveTip);
+    g.addEventListener("mouseleave", () => {
+      svg.classList.remove("hovering");
+      viewport.querySelectorAll(".lit").forEach(e => e.classList.remove("lit"));
+      $("tip").style.display = "none";
+    });
+    g.addEventListener("click", () => {
+      if (!moved && node.child && scopes.has(node.child)) { path = [...path, node.child]; focusNode = null; render(); }
+    });
+  }
+  return L;
+}
+
+function showTip(event, scope, node) {
+  const typeOf = input => input.node == null ? "captured" : `#${input.node}.${input.port}`;
+  let html = `<h3>#${node.id} ${esc(node.label)}</h3><div class="note">${esc(node.kind)} in ${esc(scope.label)}</div>`;
+  if (hasCosts && node.total_seconds != null) {
+    html += `<div class="cost"><b>${seconds(node.total_seconds)}</b> per execute (${percent(node.total_seconds)} of ${seconds(predicted)})`;
+    if (node.child) html += `<br>own operations ${seconds(node.self_seconds)}, body ${seconds(node.total_seconds - node.self_seconds)}`;
+    html += `</div>`;
+  } else if (hasCosts) {
+    html += `<div class="cost note">no GPU operations of its own</div>`;
+  }
+  if (node.inputs.length) {
+    html += `<b>Arguments</b><ul>${node.inputs.map(i => `<li><code>${esc(typeOf(i))}</code> ${esc(i.type)}</li>`).join("")}</ul>`;
+  }
+  if (node.outputs.length) {
+    html += `<b>Outputs</b><ul>${node.outputs.map((t, i) => `<li><code>.${i}</code> ${esc(t)}</li>`).join("")}</ul>`;
+  }
+  if (node.location) html += `<div class="note">built at <code>${esc(node.location)}</code></div>`;
+  if (node.child && scopes.has(node.child)) html += `<div class="note">Click to open its body.</div>`;
+  html += `<div class="detail">${esc(node.detail)}</div>`;
+  $("tip").innerHTML = html;
+  $("tip").style.display = "block";
+  moveTip(event);
+}
+function moveTip(event) {
+  const tip = $("tip"), pad = 14;
+  let x = event.clientX + pad, y = event.clientY + pad;
+  if (x + tip.offsetWidth > innerWidth) x = event.clientX - tip.offsetWidth - pad;
+  if (y + tip.offsetHeight > innerHeight) y = Math.max(4, innerHeight - tip.offsetHeight - 4);
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+
+function rankRow(scope, node, value, showScope) {
+  const row = document.createElement("div");
+  row.className = "rank";
+  row.innerHTML = `<span class="name">#${node.id} ${esc(node.label)}</span><span class="time">${seconds(value)} · ${percent(value)}</span>` +
+    (showScope ? `<span class="where">${esc(scope.label)}</span>` : "") +
+    `<span class="bar"><i style="width:${(share(value) * 100).toFixed(2)}%"></i></span>`;
+  row.addEventListener("click", () => { path = pathTo(scope.id); focusNode = node.id; render(true); });
+  return row;
+}
+
+function sidebar() {
+  const side = $("side");
+  side.replaceChildren();
+  const scope = scopes.get(path[path.length - 1]);
+  const section = (title) => { const h = document.createElement("h2"); h.textContent = title; side.appendChild(h); };
+  if (hasCosts) {
+    const attributed = scopes.get(ROOT).nodes.reduce((sum, n) => sum + (n.total_seconds || 0), 0);
+    section("Predicted time");
+    const kv = document.createElement("div");
+    kv.className = "kv";
+    kv.innerHTML = `<span>per execute</span><span><b>${seconds(predicted)}</b></span>` +
+      `<span>attributed to nodes</span><span>${seconds(attributed)}</span>` +
+      `<span>unattributed</span><span>${seconds(Math.max(0, predicted - attributed))}</span>`;
+    side.appendChild(kv);
+    const legend = document.createElement("div");
+    legend.innerHTML = `<div class="legend" style="margin-top:10px"></div><div class="legend-labels"><span>0%</span><span>share of one execute (√ scale)</span><span>100%</span></div>`;
+    side.appendChild(legend);
+    section("Bottlenecks (own operations)");
+    const all = DATA.scopes.flatMap(s => s.nodes.filter(n => n.self_seconds > 0).map(n => [s, n]));
+    all.sort((a, b) => b[1].self_seconds - a[1].self_seconds);
+    all.slice(0, 15).forEach(([s, n]) => side.appendChild(rankRow(s, n, n.self_seconds, true)));
+    section(`In ${scope.label} (including bodies)`);
+    const here = scope.nodes.filter(n => n.total_seconds > 0).sort((a, b) => b.total_seconds - a.total_seconds);
+    if (!here.length) side.insertAdjacentHTML("beforeend", `<div class="note">No node of this scope has measured GPU work.</div>`);
+    here.slice(0, 15).forEach(n => side.appendChild(rankRow(scope, n, n.total_seconds, false)));
+    side.insertAdjacentHTML("beforeend", `<p class="note">Each node's time is measured by launching every node's GPU operations as its own Graph region while planning, less the fixed per-launch cost that makes a region's nodes add up to its measured time in the selected plan. A body node sums every lane, wave, and call of its scope.</p>`);
+  } else {
+    section("Timing");
+    side.insertAdjacentHTML("beforeend", `<p class="note">No predicted costs. Plan with <code>MXX_GPU_PROFILE_NODES=1</code> (or <code>options_mut().profile_nodes = true</code>) and render the plan with <code>GpuExecutionPlan::render_html</code> to color nodes by their predicted time.</p>`);
+  }
+  section(`Operations in ${scope.label}`);
+  const counts = new Map();
+  for (const n of scope.nodes) counts.set(n.kind, (counts.get(n.kind) || 0) + 1);
+  const kv = document.createElement("div");
+  kv.className = "kv";
+  kv.innerHTML = [...counts].sort((a, b) => b[1] - a[1]).map(([k, c]) => `<span>${esc(k)}</span><span>${c}</span>`).join("");
+  side.appendChild(kv);
+  if (DATA.bindings) {
+    section("Parameters");
+    const params = document.createElement("div");
+    params.className = "kv";
+    params.innerHTML = Object.entries(DATA.bindings).map(([k, v]) => `<span>${esc(k)}</span><span><code>${esc(v)}</code></span>`).join("");
+    side.appendChild(params);
+  }
+}
+
+function crumbs() {
+  const nav = $("crumbs");
+  nav.replaceChildren();
+  path.forEach((id, i) => {
+    if (i) nav.appendChild(document.createTextNode("›"));
+    const label = scopes.get(id)?.label ?? id;
+    if (i === path.length - 1) {
+      const s = document.createElement("span"); s.className = "current"; s.textContent = label; nav.appendChild(s);
+    } else {
+      const b = document.createElement("button"); b.textContent = label;
+      b.addEventListener("click", () => { path = path.slice(0, i + 1); focusNode = null; render(); });
+      nav.appendChild(b);
+    }
+  });
+}
+
+function render(centerFocus) {
+  // The hovered node is replaced without a mouseleave, so drop its hover state.
+  svg.classList.remove("hovering");
+  $("tip").style.display = "none";
+  const L = draw();
+  crumbs();
+  sidebar();
+  const key = focusNode != null ? "n" + focusNode : null;
+  if (centerFocus && key && L.items.has(key)) fit([L.x.get(key), L.y.get(key) + L.H / 2]);
+  else fit();
+}
+
+// Pan by dragging, zoom with the wheel around the cursor.
+let drag = null, moved = false;
+$("canvas").addEventListener("mousedown", event => {
+  if (event.target.closest("#tools")) return;
+  drag = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y }; moved = false;
+  $("canvas").classList.add("dragging");
+});
+addEventListener("mousemove", event => {
+  if (!drag) return;
+  const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+  view.x = drag.vx + dx; view.y = drag.vy + dy; applyView();
+});
+addEventListener("mouseup", () => { drag = null; $("canvas").classList.remove("dragging"); setTimeout(() => { moved = false; }); });
+svg.addEventListener("wheel", event => {
+  event.preventDefault();
+  const box = svg.getBoundingClientRect();
+  const px = event.clientX - box.left, py = event.clientY - box.top;
+  const k = Math.min(4, Math.max(0.05, view.k * Math.exp(-event.deltaY * 0.0015)));
+  view.x = px - (px - view.x) * k / view.k; view.y = py - (py - view.y) * k / view.k; view.k = k;
+  applyView();
+}, { passive: false });
+$("fit").addEventListener("click", () => fit());
+$("search").addEventListener("input", event => {
+  const query = event.target.value.trim().toLowerCase();
+  viewport.querySelectorAll("g.node").forEach(g => {
+    const node = scopes.get(path[path.length - 1]).nodes.find(n => "n" + n.id === g.dataset.key);
+    const text = `#${node.id} ${node.label} ${node.kind}`.toLowerCase();
+    g.classList.toggle("match", query !== "" && text.includes(query));
+  });
+});
+$("search").addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  const match = viewport.querySelector("g.node.match");
+  if (!match) return;
+  const L = layout(scopes.get(path[path.length - 1]));
+  fit([L.x.get(match.dataset.key), L.y.get(match.dataset.key) + L.H / 2]);
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readTheme(); render(); });
+
+document.title = `${DATA.name} · mxx graph`;
+$("title").textContent = DATA.name;
+if (hasCosts) $("total").innerHTML = `predicted <b>${seconds(predicted)}</b> per execute`;
+readTheme();
+render();
+</script>
+</body>
+</html>

@@ -2030,7 +2030,9 @@ impl<S: SessionStore> Executor<'_, S> {
                         let offset = match mode {
                             LoopInputMode::Zip => 0,
                             LoopInputMode::ZipOffset { offset } => *offset,
-                            LoopInputMode::Broadcast => unreachable!(),
+                            LoopInputMode::Broadcast | LoopInputMode::Gather { .. } => {
+                                unreachable!()
+                            }
                         };
                         let index = index.checked_add(offset).ok_or(
                             ExecutionError::SelectIndexOutOfRange {
@@ -2040,6 +2042,38 @@ impl<S: SessionStore> Executor<'_, S> {
                             },
                         )?;
                         let member = self.family_member_value(values, *wire, index)?;
+                        let member = self.materialize_value(member)?;
+                        self.value_for_placement(member, placement)?
+                    }
+                    LoopInputMode::Gather { index_argument } => {
+                        let offset = match modes.get(*index_argument) {
+                            Some(LoopInputMode::Zip) => 0,
+                            Some(LoopInputMode::ZipOffset { offset }) => *offset,
+                            _ => {
+                                return Err(ExecutionError::ValueKind(WireRef {
+                                    node: node.id,
+                                    port: Port(0),
+                                }));
+                            }
+                        };
+                        let indices = node.args[*index_argument];
+                        let selected = match self
+                            .family_member_value(values, indices, index + offset)
+                            .and_then(|selected| self.materialize_value(selected))?
+                        {
+                            RuntimeValue::Int(selected) => selected,
+                            _ => return Err(ExecutionError::ValueKind(indices)),
+                        };
+                        let count = self.family_count(values, *wire)?;
+                        let Some(selected) = selected.to_usize().filter(|index| *index < count)
+                        else {
+                            return Err(ExecutionError::SelectIndexOutOfRange {
+                                node: node.id,
+                                index: selected,
+                                count,
+                            });
+                        };
+                        let member = self.family_member_value(values, *wire, selected)?;
                         let member = self.materialize_value(member)?;
                         self.value_for_placement(member, placement)?
                     }

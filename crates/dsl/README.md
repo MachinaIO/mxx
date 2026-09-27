@@ -12,7 +12,7 @@ it.
 
 | Item | What it provides |
 | --- | --- |
-| `DslContext`, `BuiltGraph` | Declaring compile parameters, inputs, and outputs; building and validating a graph. |
+| `DslContext`, `BuiltGraph` | Declaring compile parameters, inputs, and outputs; building, validating, and drawing a graph (`render_html`). |
 | `Ring` | Rings as ordered CRT bases, and the inputs, constants, and samplers over a ring. |
 | `Mat`, `SmallMatrix`, `Preimage`, `Trapdoor`, `BoundedMatrix` | Matrices, bounded matrices, trapdoors, and their operations. |
 | `Int`, `Bool`, `Bytes` | Runtime scalars and byte strings. |

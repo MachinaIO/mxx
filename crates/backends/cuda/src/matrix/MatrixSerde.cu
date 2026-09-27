@@ -418,13 +418,20 @@ extern "C" int gpu_matrix_load_rns_batch(
         }
 
         int device = -1;
-        cudaStream_t stream = nullptr;
         int status = matrix_limb_device(mat, limb_id, &device);
         if (status != 0)
         {
             return status;
         }
-        status = matrix_limb_stream(mat, limb_id, &stream);
+        // Upload on the partition's transfer stream, which no Graph launches
+        // on, ordered after the limb's previous write.
+        const auto &transfer = mat->ctx->execution->transfer_streams_by_partition;
+        if (limb_id.x >= transfer.size() || !transfer[limb_id.x])
+        {
+            return set_error("missing transfer stream in gpu_matrix_load_rns_batch");
+        }
+        cudaStream_t stream = transfer[limb_id.x];
+        status = matrix_wait_limb_stream(mat, limb_id, device, stream);
         if (status != 0)
         {
             return status;

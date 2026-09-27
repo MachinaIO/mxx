@@ -2131,6 +2131,12 @@ impl BuiltGraph {
         self.graph.operation_counts(&ParamEnv::default())
     }
 
+    /// An interactive HTML view of the graph with its symbolic types; see
+    /// [`mxx_ir_core::visualize::render_html`] for concrete shapes and costs.
+    pub fn render_html(&self) -> String {
+        mxx_ir_core::visualize::render_html(&self.graph, None, None)
+    }
+
     pub fn validate(
         &self,
         bindings: &ParamEnv,
@@ -2321,6 +2327,77 @@ mod tests {
     use super::*;
     use mxx_ir_core::node::LoopInputMode;
     use num_bigint::BigInt;
+
+    /// The graph data embedded in a rendered page.
+    fn rendered_data(html: &str) -> serde_json::Value {
+        let start = html.find("const DATA = ").expect("rendered data") + "const DATA = ".len();
+        let end = start + html[start..].find(";\nconst NS").expect("end of rendered data");
+        serde_json::from_str(&html[start..end]).unwrap()
+    }
+
+    #[test]
+    fn test_render_html_shows_symbolic_and_concrete_shapes_of_every_scope() {
+        let ring = Ring::new(IntExpr::Var("crt_bits".into()), IntExpr::from(2), 16);
+        let columns = IntExpr::Var("columns".into());
+        let context =
+            DslContext::new("render-</SCRIPT>").int_parameter("crt_bits").int_parameter("columns");
+        let left = ring.input("left", (1, columns.clone()));
+        let right = ring.input("right", (columns.clone(), columns));
+        let body_right = right.clone();
+        let family = crate::parallel(3, move |_| Ok(&left * &body_right)).unwrap();
+        let built = context.output("products", family).unwrap().build().unwrap();
+        let html = built.render_html();
+        assert!(!html.contains("render-</SCRIPT>"), "embedded data cannot close the script");
+        let symbolic = rendered_data(&html);
+        assert!(symbolic["predicted_seconds"].is_null());
+        let scopes = symbolic["scopes"].as_array().unwrap();
+        assert_eq!(scopes.len(), 2);
+        let root = scopes.iter().find(|scope| scope["id"] == symbolic["root"]).unwrap();
+        let body = scopes.iter().find(|scope| scope["id"] != symbolic["root"]).unwrap();
+        let loop_node = root["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["child"].is_string())
+            .unwrap();
+        assert_eq!(loop_node["child"], body["id"]);
+        assert_eq!(loop_node["label"], "ParallelLoop ×3");
+        let input = |scope: &serde_json::Value, name: &str| {
+            scope["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["label"] == format!("Input {name}"))
+                .unwrap()["outputs"][0]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            input(root, "right"),
+            "Matrix columns×columns over N=16, 2 CRT limbs of crt_bits bits"
+        );
+        let bindings = ParamEnv {
+            integers: BTreeMap::from([
+                ("crt_bits".to_owned(), BigInt::from(20)),
+                ("columns".to_owned(), BigInt::from(4)),
+            ]),
+            ..ParamEnv::default()
+        };
+        let validated = built.validate(&bindings).unwrap();
+        let concrete = rendered_data(&mxx_ir_core::visualize::render_html(
+            &validated.source,
+            Some(&validated),
+            None,
+        ));
+        let root = concrete["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["id"] == concrete["root"]);
+        assert!(input(root.unwrap(), "right").starts_with("Matrix 4×4 over N=16, 2 CRT limbs"));
+        assert_eq!(concrete["bindings"]["columns"], "4");
+    }
 
     #[test]
     fn executable_arithmetic_builds_and_validates() {

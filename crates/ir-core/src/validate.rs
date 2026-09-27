@@ -192,35 +192,7 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         }
     }
 
-    let empty_dependencies = graph
-        .scopes()
-        .keys()
-        .cloned()
-        .map(|scope| (scope, BTreeSet::<String>::new()))
-        .collect::<BTreeMap<_, _>>();
-    let mut loop_dependent_by_scope = empty_dependencies.clone();
-    loop {
-        let mut next = empty_dependencies.clone();
-        for (scope_id, scope) in graph.scopes() {
-            let parent = loop_dependent_by_scope.get(scope_id).cloned().unwrap_or_default();
-            for (position, node) in scope.nodes().iter().enumerate() {
-                let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
-                    continue;
-                };
-                let bindings = match node.kind() {
-                    NodeKind::SubgraphCall(call) => &call.bindings,
-                    NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
-                    NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
-                    _ => continue,
-                };
-                next.entry(child).or_default().extend(child_loop_dependencies(&parent, bindings));
-            }
-        }
-        if next == loop_dependent_by_scope {
-            break;
-        }
-        loop_dependent_by_scope = next;
-    }
+    let loop_dependent_by_scope = loop_dependent_variables(graph);
 
     for (scope_id, scope) in graph.scopes() {
         let allowed_slots = structural_loop_slots(graph, scope_id);
@@ -351,7 +323,7 @@ fn collect_expression_references(
     }
 }
 
-fn collect_serialized_references<T: serde::Serialize>(
+pub(crate) fn collect_serialized_references<T: serde::Serialize>(
     value: &T,
     variables: &mut BTreeSet<String>,
     loop_slots: &mut BTreeSet<u32>,
@@ -362,6 +334,43 @@ fn collect_serialized_references<T: serde::Serialize>(
     for entry in ring_table {
         collect_expression_references(&entry, variables, loop_slots);
     }
+}
+
+/// The compile variables of each scope whose value depends on an enclosing
+/// loop index, directly or through subgraph and loop bindings.
+pub(crate) fn loop_dependent_variables(
+    graph: &Graph,
+) -> BTreeMap<FrozenGraphScopeId, BTreeSet<String>> {
+    let empty_dependencies = graph
+        .scopes()
+        .keys()
+        .cloned()
+        .map(|scope| (scope, BTreeSet::<String>::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut loop_dependent_by_scope = empty_dependencies.clone();
+    loop {
+        let mut next = empty_dependencies.clone();
+        for (scope_id, scope) in graph.scopes() {
+            let parent = loop_dependent_by_scope.get(scope_id).cloned().unwrap_or_default();
+            for (position, node) in scope.nodes().iter().enumerate() {
+                let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
+                    continue;
+                };
+                let bindings = match node.kind() {
+                    NodeKind::SubgraphCall(call) => &call.bindings,
+                    NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
+                    NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
+                    _ => continue,
+                };
+                next.entry(child).or_default().extend(child_loop_dependencies(&parent, bindings));
+            }
+        }
+        if next == loop_dependent_by_scope {
+            break;
+        }
+        loop_dependent_by_scope = next;
+    }
+    loop_dependent_by_scope
 }
 
 fn child_loop_dependencies(
@@ -473,7 +482,7 @@ fn validate_with_manifests_inner(
     })
 }
 
-fn collect_scope_bindings(
+pub(crate) fn collect_scope_bindings(
     graph: &Graph,
     scope_id: &FrozenGraphScopeId,
     env: ParamEnv,
@@ -1651,7 +1660,9 @@ fn validate_structural_boundaries(
                     "child input count does not match call arguments",
                 );
             }
-            for ((arg, input), mode) in args.iter().zip(child_scope.inputs()).zip(modes) {
+            for ((arg, input), mode) in
+                args.iter().zip(child_scope.inputs()).zip(modes.iter().copied())
+            {
                 let outer =
                     validated.wire_types.get(arg).ok_or_else(|| ValidationError::MissingWire {
                         scope: scope_id.clone(),
@@ -1685,6 +1696,29 @@ fn validate_structural_boundaries(
                             if iterations > 0 && *count < iterations.saturating_add(offset) {
                                 return node_error(scope_id, node_id, "zipped family is too short");
                             }
+                        }
+                        element.as_ref()
+                    }
+                    LoopInputMode::Gather { index_argument } => {
+                        let ConcreteWireType::IndexedFamily { element, .. } = outer else {
+                            return node_error(scope_id, node_id, "gathered input is not a family");
+                        };
+                        let index = args.get(index_argument).and_then(|index| {
+                            validated.wire_types.get(index).map(|ty| (ty, modes[index_argument]))
+                        });
+                        let Some((ConcreteWireType::IndexedFamily { element: index, .. }, mode)) =
+                            index
+                        else {
+                            return node_error(scope_id, node_id, "gather index is not a family");
+                        };
+                        if !matches!(mode, LoopInputMode::Zip | LoopInputMode::ZipOffset { .. }) ||
+                            **index != ConcreteWireType::Int
+                        {
+                            return node_error(
+                                scope_id,
+                                node_id,
+                                "gather index is not a zipped integer family",
+                            );
                         }
                         element.as_ref()
                     }

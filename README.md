@@ -130,6 +130,21 @@ coefficient decoding, and whose edges carry values between them. Computation hap
 a backend executes the graph. This is why one description can run on a GPU or on a CPU. Export
 of the same graph to Lean, for machine-checked correctness proofs, is a work in progress.
 
+To see the recorded graph, write `rlwe_program(ring_dimension)?.render_html()` to a file and open
+it in a browser. Hovering a node shows its operation and the shapes it reads and writes, still in
+terms of the named parameters, and a loop or call opens its body. Below, the pointer is on the
+subtraction `b - a·s` of the decryption:
+
+![The graph of the RLWE example, with the tooltip of the subtraction b - a·s](images/rlwe-graph.png)
+
+A plan made with `MXX_GPU_PROFILE_NODES=1` also measures every node while planning, and
+`plan.render_html()` shows the concrete shapes, colors each node by its predicted share of one
+execution, and ranks the bottlenecks. Below is the relinearization step of the BGV integration
+test (`crates/fhe/tests/gpu_bgv.rs`), planned on an RTX 4080 SUPER, with the pointer on its
+key-switching matrix product:
+
+![The BGV relinearization graph with predicted node times](images/bgv-relinearize-costs.png)
+
 ## What mxx does for you
 
 ### Describing a protocol

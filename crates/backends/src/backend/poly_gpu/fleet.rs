@@ -5193,9 +5193,25 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::U32(site),
                 KernelArg::U32(final_chunk),
                 KernelArg::U32(slot_binding),
+                KernelArg::OptionalValue(gate),
+                KernelArg::OptionalBinding(gate_binding),
             ] = op.arguments.as_ref()
             else {
                 return Err(invalid("compiled export publication has the wrong arguments"));
+            };
+            let gate = match (gate, gate_binding) {
+                (Some(gate), Some(binding)) => {
+                    let owner = owners
+                        .get(gate)
+                        .ok_or_else(|| invalid("compiled publication gate has no owner"))?;
+                    let part = &owner.physical().parts[0];
+                    let storage = owner
+                        .storage(part.storage)
+                        .ok_or_else(|| invalid("compiled publication gate has no storage"))?;
+                    builder.retain_owner(Arc::clone(owner));
+                    Some((storage.address + part.view.byte_offset, 4, *binding))
+                }
+                _ => None,
             };
             let slot = slots
                 .get(*slot_index as usize)
@@ -5214,6 +5230,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 *site,
                 *final_chunk == 1,
                 *slot_binding,
+                gate,
             )?;
             builder.retain_owner(Arc::clone(slot));
         }
@@ -6617,6 +6634,8 @@ pub(crate) fn transcode_raw_artifact<R: Read + Seek + ?Sized, W: Write + ?Sized>
 
 /// Registered physical CUDA contexts used by direct GPU plans. A ring is
 /// selected by its ordered CRT basis and dimension, never by a host owner type.
+/// A clone shares the same contexts.
+#[derive(Clone)]
 pub struct GpuDcrtBackend {
     devices: Vec<(i32, Vec<GpuDCRTPolyParams>)>,
     execution_identity: u64,

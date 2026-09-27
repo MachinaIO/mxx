@@ -26,10 +26,11 @@
 //! for a runtime `k` of any sign taken modulo `2n`.
 //!
 //! Control nodes carry their own metadata. A [`ParallelLoop`] runs independent instances over
-//! `0..count`, each argument with a [`LoopInputMode`] (`Broadcast`, `Zip`, `ZipOffset`), and
-//! returns indexed families. In a [`SequentialLoop`] the first `carried_count` arguments are the
-//! carried state and the rest are captures. `Select` eagerly selects one candidate by a runtime
-//! selector; both candidates are part of the graph, so selection is not lazy branching.
+//! `0..count`, each argument with a [`LoopInputMode`] (`Broadcast`, `Zip`, `ZipOffset`, or
+//! `Gather` by another argument's instance value), and returns indexed families. In a
+//! [`SequentialLoop`] the first `carried_count` arguments are the carried state and the rest are
+//! captures. `Select` eagerly selects one candidate by a runtime selector; both candidates are part
+//! of the graph, so selection is not lazy branching.
 
 use crate::{
     artifact::{ArtifactAvailability, ProductionId},
@@ -376,9 +377,19 @@ pub struct SequentialLoop {
     pub carried_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum LoopInputMode {
     Broadcast,
     Zip,
-    ZipOffset { offset: usize },
+    ZipOffset {
+        offset: usize,
+    },
+    /// Instance `i` receives the member of this family whose index is the
+    /// instance's value of argument `index_argument`, a `Zip` or `ZipOffset`
+    /// integer family. The member keys then depend only on values from outside
+    /// the loop and the instance index, so a backend can read members ahead
+    /// of the instances that consume them.
+    Gather {
+        index_argument: usize,
+    },
 }

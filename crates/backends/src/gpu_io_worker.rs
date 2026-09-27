@@ -4,8 +4,13 @@
 //! frame. One scoped worker owns it for the duration of execution. Mapped
 //! export slots are preallocated before Graph launch and queued by reference
 //! when their ready headers become visible. The worker writes raw fragments
-//! to file-backed staging immediately, then transcodes and commits only after
-//! all required fragments and GPU work have succeeded.
+//! to file-backed staging immediately. Once every fragment of an export is
+//! staged, the worker encodes it into its canonical format on the rayon pool
+//! (at most `MXX_ARTIFACT_ENCODE_PARALLELISM` at once) while the GPU keeps
+//! running, and publishes and commits it only after all GPU work has
+//! succeeded. An encoding that is never published is discarded. An import is
+//! read and uploaded into its planned owner by the worker in one command, so
+//! both overlap the Graph work that runs before the import's first consumer.
 //!
 //! The transient and producer clients are separate types on purpose.  A
 //! transient operation can import or export an artifact, but it cannot access
@@ -30,7 +35,6 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
-    pin::Pin,
     sync::{
         Arc,
         mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -56,34 +60,25 @@ impl FrameGeneration {
     }
 }
 
-/// A heap-pinned payload whose allocation remains stable while an asynchronous
-/// worker owns it. The worker never stores a borrowed pointer into a
-/// store-owned buffer.
-#[derive(Debug)]
-pub struct RuntimeOwnedPayload(Pin<Box<ArtifactPayload>>);
-
-impl RuntimeOwnedPayload {
-    pub fn new(payload: ArtifactPayload) -> Self {
-        Self(Box::pin(payload))
-    }
-
-    pub fn into_payload(self) -> ArtifactPayload {
-        *Pin::<Box<ArtifactPayload>>::into_inner(self.0)
-    }
+/// An imported artifact as its store holds it.
+pub(crate) enum ImportedArtifact {
+    Host(ArtifactPayload),
+    /// The artifact is held in GPU memory by the store.
+    Device(Arc<DeviceArtifact>),
 }
+
+/// Fills an import's planned GPU owner with the artifact the worker read. The
+/// worker runs it right after the read, so the upload overlaps GPU work that
+/// does not use that owner.
+pub(crate) type ImportDelivery = Box<dyn FnOnce(ImportedArtifact) -> Result<(), String> + Send>;
 
 /// The operation represented by a reply.  Every variant carries the exact
 /// frame token supplied with its command.
 #[derive(Debug)]
 pub enum IoCompletion {
+    /// The artifact was read and uploaded into its planned owner.
     Imported {
         frame: FrameGeneration,
-        payload: RuntimeOwnedPayload,
-    },
-    /// The artifact is held in GPU memory by the store.
-    ImportedDevice {
-        frame: FrameGeneration,
-        artifact: Arc<DeviceArtifact>,
     },
     Exported {
         frame: FrameGeneration,
@@ -91,7 +86,7 @@ pub enum IoCompletion {
     ArtifactCommitted {
         frame: FrameGeneration,
     },
-    Transcoded {
+    Published {
         frame: FrameGeneration,
     },
     #[cfg(test)]
@@ -106,11 +101,10 @@ pub enum IoCompletion {
 impl IoCompletion {
     pub fn frame(&self) -> FrameGeneration {
         match self {
-            Self::Imported { frame, .. } |
-            Self::ImportedDevice { frame, .. } |
+            Self::Imported { frame } |
             Self::Exported { frame, .. } |
             Self::ArtifactCommitted { frame } |
-            Self::Transcoded { frame } |
+            Self::Published { frame } |
             Self::SessionFinalized { frame } => *frame,
             #[cfg(test)]
             Self::TranscriptRecorded { frame } => *frame,
@@ -128,8 +122,12 @@ pub enum IoWorkerError<E: std::error::Error + 'static> {
     Panicked,
     #[error("invalid GPU export slot: {0}")]
     InvalidExport(String),
+    #[error("imported artifact upload failed: {0}")]
+    Upload(String),
     #[error("I/O worker has already failed; later operations are suppressed")]
     PriorFailure,
+    #[error("invalid I/O worker configuration: {0}")]
+    Configuration(String),
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -150,6 +148,11 @@ pub struct IoRequest<'scope, E: std::error::Error + 'static> {
 }
 
 impl<'scope, E: std::error::Error + 'static> IoRequest<'scope, E> {
+    /// A request another thread submitted within the same worker scope.
+    pub(crate) fn from_receiver(receiver: IoReplyReceiver<E>) -> Self {
+        Self { receiver, _scope: PhantomData }
+    }
+
     pub fn wait(self) -> Result<IoCompletion, IoWorkerError<E>> {
         self.receiver.recv().unwrap_or(Err(IoWorkerError::Closed))
     }
@@ -161,6 +164,7 @@ pub(crate) enum IoCommand<E: std::error::Error + 'static> {
         key: ArtifactKey,
         descriptor: ManifestArtifact,
         staged: bool,
+        deliver: ImportDelivery,
         reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
     },
     ExportSlot {
@@ -173,6 +177,7 @@ pub(crate) enum IoCommand<E: std::error::Error + 'static> {
         raw_bytes: u64,
         final_chunk: bool,
         total_raw_bytes: u64,
+        encoding: Option<ExportEncoding>,
         reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
     },
     Commit {
@@ -180,7 +185,9 @@ pub(crate) enum IoCommand<E: std::error::Error + 'static> {
         handle: crate::session::ArtifactHandle,
         reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
     },
-    Transcode {
+    /// Publish an export whose raw stage is complete: finish it in GPU
+    /// memory, or wait for its canonical encoding and publish that.
+    Publish {
         frame: FrameGeneration,
         handle: crate::session::ArtifactHandle,
         payload_kind: u8,
@@ -223,6 +230,16 @@ impl<'scope, E: std::error::Error + 'static> IoClientCore<'scope, E> {
 
 pub(crate) type IoReplyReceiver<E> = Receiver<Result<IoCompletion, IoWorkerError<E>>>;
 
+/// What an export committed to a session is encoded into once all of its raw
+/// chunks are staged. The worker starts that encoding immediately, while the
+/// GPU keeps running, and publishes it only on a later publish command.
+#[derive(Clone)]
+pub(crate) struct ExportEncoding {
+    pub(crate) handle: crate::session::ArtifactHandle,
+    pub(crate) payload_kind: u8,
+    pub(crate) export: Arc<PhysicalExport>,
+}
+
 pub(crate) fn submit_export_slot<E: std::error::Error + 'static>(
     sender: &SyncSender<IoCommand<E>>,
     frame: FrameGeneration,
@@ -234,6 +251,7 @@ pub(crate) fn submit_export_slot<E: std::error::Error + 'static>(
     raw_bytes: u64,
     final_chunk: bool,
     total_raw_bytes: u64,
+    encoding: Option<ExportEncoding>,
 ) -> Result<IoReplyReceiver<E>, IoSubmitError> {
     let (reply, receiver) = mpsc::sync_channel(1);
     sender
@@ -247,12 +265,32 @@ pub(crate) fn submit_export_slot<E: std::error::Error + 'static>(
             raw_bytes,
             final_chunk,
             total_raw_bytes,
+            encoding,
             reply,
         })
         .map_err(|error| match error {
             TrySendError::Full(_) => IoSubmitError::Full,
             TrySendError::Disconnected(_) => IoSubmitError::Closed,
         })?;
+    Ok(receiver)
+}
+
+/// Submit an import from the observer thread, which holds only a sender.
+pub(crate) fn submit_import<E: std::error::Error + 'static>(
+    sender: &SyncSender<IoCommand<E>>,
+    frame: FrameGeneration,
+    key: ArtifactKey,
+    descriptor: ManifestArtifact,
+    staged: bool,
+    deliver: ImportDelivery,
+) -> Result<IoReplyReceiver<E>, IoSubmitError> {
+    let (reply, receiver) = mpsc::sync_channel(1);
+    sender.try_send(IoCommand::Import { frame, key, descriptor, staged, deliver, reply }).map_err(
+        |error| match error {
+            TrySendError::Full(_) => IoSubmitError::Full,
+            TrySendError::Disconnected(_) => IoSubmitError::Closed,
+        },
+    )?;
     Ok(receiver)
 }
 
@@ -266,14 +304,22 @@ impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
     pub(crate) fn observer_sender(&self) -> SyncSender<IoCommand<E>> {
         self.core.sender.clone()
     }
-    pub fn try_import(
+    pub(crate) fn try_import(
         &self,
         frame: FrameGeneration,
         key: ArtifactKey,
         descriptor: ManifestArtifact,
         staged: bool,
+        deliver: ImportDelivery,
     ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
-        self.core.submit_with(|reply| IoCommand::Import { frame, key, descriptor, staged, reply })
+        self.core.submit_with(|reply| IoCommand::Import {
+            frame,
+            key,
+            descriptor,
+            staged,
+            deliver,
+            reply,
+        })
     }
 
     pub fn try_commit(
@@ -284,14 +330,14 @@ impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
         self.core.submit_with(|reply| IoCommand::Commit { frame, handle, reply })
     }
 
-    pub(crate) fn try_transcode(
+    pub(crate) fn try_publish(
         &self,
         frame: FrameGeneration,
         handle: crate::session::ArtifactHandle,
         payload_kind: u8,
         export: Arc<PhysicalExport>,
     ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
-        self.core.submit_with(|reply| IoCommand::Transcode {
+        self.core.submit_with(|reply| IoCommand::Publish {
             frame,
             handle,
             payload_kind,
@@ -335,9 +381,11 @@ pub fn with_scoped_producer_io_worker<S, R>(
 where
     S: SessionStore + Send,
 {
+    let encode_parallelism =
+        crate::env::artifact_encode_parallelism().map_err(IoWorkerError::Configuration)?;
     thread::scope(|scope| {
         let (sender, receiver) = mpsc::sync_channel(window.get().saturating_add(1));
-        let worker = scope.spawn(move || worker_loop(store, receiver));
+        let worker = scope.spawn(move || worker_loop(store, receiver, encode_parallelism));
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             run(ProducerIoClient { core: IoClientCore { sender, _scope: PhantomData } })
         }));
@@ -359,7 +407,60 @@ impl Drop for TimingGuard<'_> {
     }
 }
 
-fn worker_loop<S>(store: &mut S, receiver: Receiver<IoCommand<S::Error>>)
+/// Canonical encodings of complete raw stages, running on the rayon pool at
+/// most `limit` at a time. An encoding that is never published is dropped,
+/// which discards its output.
+struct PendingEncodings<T, E> {
+    limit: usize,
+    running: std::collections::VecDeque<(ArtifactKey, Receiver<EncodeResult<T, E>>)>,
+    finished: BTreeMap<ArtifactKey, EncodeResult<T, E>>,
+}
+
+/// An encoding's artifact and payload bytes, or the panic that ended it.
+type EncodeResult<T, E> = std::thread::Result<Result<(T, u64), E>>;
+
+impl<T: Send + 'static, E: Send + 'static> PendingEncodings<T, E> {
+    fn new(limit: usize) -> Self {
+        Self { limit, running: Default::default(), finished: BTreeMap::new() }
+    }
+
+    fn start(&mut self, key: ArtifactKey, job: crate::artifact::EncodeJob<T, E>) {
+        while self.running.len() >= self.limit {
+            self.finish_oldest();
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        rayon::spawn(move || {
+            let _ = sender.send(panic::catch_unwind(AssertUnwindSafe(job)));
+        });
+        self.running.push_back((key, receiver));
+    }
+
+    fn finish_oldest(&mut self) {
+        if let Some((key, receiver)) = self.running.pop_front() {
+            let result = receiver.recv().unwrap_or_else(|_| Err(Box::new("encoding vanished")));
+            self.finished.insert(key, result);
+        }
+    }
+
+    /// Wait for the encoding of `key`, if one was started.
+    fn take(&mut self, key: &ArtifactKey) -> Option<EncodeResult<T, E>> {
+        while self.running.iter().any(|(running, _)| running == key) {
+            self.finish_oldest();
+        }
+        self.finished.remove(key)
+    }
+}
+
+impl<T, E> Drop for PendingEncodings<T, E> {
+    fn drop(&mut self) {
+        // No encoding outlives the worker that owns its store.
+        for (_, receiver) in self.running.drain(..) {
+            let _ = receiver.recv();
+        }
+    }
+}
+
+fn worker_loop<S>(store: &mut S, receiver: Receiver<IoCommand<S::Error>>, encode_parallelism: usize)
 where
     S: SessionStore + Send,
 {
@@ -373,8 +474,9 @@ where
     let mut stored = [(0u64, 0u64); 2];
     let mut raw_by_key: BTreeMap<String, u64> = BTreeMap::new();
     // Exports whose chunks the store holds in GPU memory, awaiting their
-    // transcode command, which finishes them without transcoding.
+    // publish command, which finishes them without encoding.
     let mut device_staged = std::collections::BTreeSet::<ArtifactKey>::new();
+    let mut encodings = PendingEncodings::new(encode_parallelism);
     while let Ok(command) = receiver.recv() {
         let started = std::time::Instant::now();
         let (kind, bytes) = match &command {
@@ -390,15 +492,15 @@ where
                 ("export_slot", *raw_bytes)
             }
             IoCommand::Commit { .. } => ("commit", 0),
-            IoCommand::Transcode { export, .. } => (
+            IoCommand::Publish { export, .. } => (
                 match &export.physical.ty {
-                    mxx_ir_core::types::ConcreteWireType::Matrix(_) => "transcode:matrix",
+                    mxx_ir_core::types::ConcreteWireType::Matrix(_) => "publish:matrix",
                     mxx_ir_core::types::ConcreteWireType::SmallMatrix { .. } => {
-                        "transcode:small_matrix"
+                        "publish:small_matrix"
                     }
-                    mxx_ir_core::types::ConcreteWireType::Preimage { .. } => "transcode:preimage",
-                    mxx_ir_core::types::ConcreteWireType::Trapdoor { .. } => "transcode:trapdoor",
-                    _ => "transcode:other",
+                    mxx_ir_core::types::ConcreteWireType::Preimage { .. } => "publish:preimage",
+                    mxx_ir_core::types::ConcreteWireType::Trapdoor { .. } => "publish:trapdoor",
+                    _ => "publish:other",
                 },
                 0,
             ),
@@ -436,7 +538,7 @@ where
         entry.2 += bytes;
         let _timing = TimingGuard { started, entry: &mut entry.1 };
         match command {
-            IoCommand::Import { frame, key, descriptor, staged, reply } => {
+            IoCommand::Import { frame, key, descriptor, staged, deliver, reply } => {
                 if failed {
                     let _ = reply.send(Err(IoWorkerError::PriorFailure));
                     continue;
@@ -449,19 +551,21 @@ where
                             artifact.availability == descriptor.availability &&
                             artifact.layout == descriptor.layout
                     });
-                let result = match device {
-                    Some(artifact) => Ok(IoCompletion::ImportedDevice { frame, artifact }),
+                let artifact = match device {
+                    Some(artifact) => Ok(ImportedArtifact::Device(artifact)),
                     None => if staged {
                         store.load_staged(&key, &descriptor)
                     } else {
                         store.load(&key, &descriptor)
                     }
-                    .map(|payload| IoCompletion::Imported {
-                        frame,
-                        payload: RuntimeOwnedPayload::new(payload),
-                    })
+                    .map(ImportedArtifact::Host)
                     .map_err(IoWorkerError::Store),
                 };
+                let result = artifact.and_then(|artifact| {
+                    deliver(artifact)
+                        .map(|()| IoCompletion::Imported { frame })
+                        .map_err(IoWorkerError::Upload)
+                });
                 failed = result.is_err();
                 let _ = reply.send(result);
             }
@@ -475,12 +579,14 @@ where
                 raw_bytes,
                 final_chunk,
                 total_raw_bytes,
+                encoding,
                 reply,
             } => {
                 if failed {
                     let _ = reply.send(Err(IoWorkerError::PriorFailure));
                     continue;
                 }
+                let staged_key = key.clone();
                 let result = slot
                     .ready()
                     .map_err(|error| IoWorkerError::InvalidExport(error.to_string()))
@@ -509,11 +615,12 @@ where
                         match ready.payload {
                             GpuExportPayload::Host(bytes) => store
                                 .stage_raw_chunk(key, total_raw_bytes, offset, bytes)
-                                .map(|_| IoCompletion::Exported { frame })
                                 .map_err(IoWorkerError::Store),
                             GpuExportPayload::Device { physical_device, address, bytes } => {
                                 if let Some(device) = store.device_artifacts() {
                                     device_staged.insert(key.clone());
+                                    // A device stage is finished on publish,
+                                    // without encoding.
                                     return device
                                         .stage_chunk(
                                             key,
@@ -523,7 +630,7 @@ where
                                             address,
                                             bytes,
                                         )
-                                        .map(|_| IoCompletion::Exported { frame })
+                                        .map(|_| false)
                                         .map_err(IoWorkerError::InvalidExport);
                                 }
                                 // A plan made for a device store executes with
@@ -535,10 +642,31 @@ where
                                     })?;
                                 store
                                     .stage_raw_chunk(key, total_raw_bytes, offset, &host)
-                                    .map(|_| IoCompletion::Exported { frame })
                                     .map_err(IoWorkerError::Store)
                             }
                         }
+                    })
+                    .and_then(|complete| {
+                        // Encode a complete raw stage while the GPU keeps
+                        // running; only its publication waits for the launch.
+                        let Some(encoding) = encoding.filter(|_| complete) else {
+                            return Ok(IoCompletion::Exported { frame });
+                        };
+                        let ExportEncoding { handle, payload_kind, export } = encoding;
+                        let job = store
+                            .encode_staged(
+                                &staged_key,
+                                &handle.artifact_type,
+                                handle.availability,
+                                handle.layout.as_deref(),
+                                payload_kind,
+                                Box::new(move |source, sink| {
+                                    transcode_raw_artifact(&export, source, sink)
+                                }),
+                            )
+                            .map_err(IoWorkerError::Store)?;
+                        encodings.start(staged_key, job);
+                        Ok(IoCompletion::Exported { frame })
                     });
                 failed = result.is_err();
                 let _ = reply.send(result);
@@ -555,7 +683,7 @@ where
                 failed = result.is_err();
                 let _ = reply.send(result);
             }
-            IoCommand::Transcode { frame, handle, payload_kind, export, reply } => {
+            IoCommand::Publish { frame, handle, payload_kind, export, reply } => {
                 if failed {
                     let _ = reply.send(Err(IoWorkerError::PriorFailure));
                     continue;
@@ -604,7 +732,7 @@ where
                                 )
                                 .map_err(IoWorkerError::InvalidExport)
                         })
-                        .map(|()| IoCompletion::Transcoded { frame });
+                        .map(|()| IoCompletion::Published { frame });
                     if result.is_ok() {
                         stored[class].0 += raw_bytes;
                         stored[class].1 += 1;
@@ -613,25 +741,21 @@ where
                     let _ = reply.send(result);
                     continue;
                 }
-                let mut written_bytes = 0u64;
-                let mut encode = |source: &mut dyn crate::artifact::ReadSeek,
-                                  sink: &mut dyn std::io::Write| {
-                    transcode_raw_artifact(&export, source, sink).map(|written| {
-                        written_bytes = written;
-                    })
+                let result = match encodings.take(&handle.key) {
+                    None => Err(IoWorkerError::InvalidExport(
+                        "published export was never completely staged".into(),
+                    )),
+                    Some(Err(_)) => Err(IoWorkerError::Panicked),
+                    Some(Ok(encoded)) => {
+                        encoded.map_err(IoWorkerError::Store).and_then(|(encoded, written)| {
+                            store
+                                .publish_encoded(handle.key, encoded)
+                                .map(|()| written)
+                                .map_err(IoWorkerError::Store)
+                        })
+                    }
                 };
-                let result = store
-                    .transcode_staged(
-                        handle.key,
-                        &handle.artifact_type,
-                        handle.availability,
-                        handle.layout.as_deref(),
-                        payload_kind,
-                        &mut encode,
-                    )
-                    .map(|()| IoCompletion::Transcoded { frame })
-                    .map_err(IoWorkerError::Store);
-                if result.is_ok() {
+                if let Ok(written_bytes) = result {
                     stored[class].0 += written_bytes;
                     stored[class].1 += 1;
                     tracing::debug!(
@@ -640,11 +764,11 @@ where
                         class,
                         written_bytes,
                         raw_bytes = raw_by_key.get(&artifact_name).copied().unwrap_or(0),
-                        "transcoded artifact"
+                        "published artifact"
                     );
                 }
                 failed = result.is_err();
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|_| IoCompletion::Published { frame }));
             }
             #[cfg(test)]
             IoCommand::TranscriptRecord { frame, production, entries, reply } => {
@@ -751,7 +875,13 @@ mod tests {
         open_store(&mut store);
         with_scoped_producer_io_worker(&mut store, NonZeroUsize::new(2).unwrap(), |client| {
             let request = client
-                .try_import(FrameGeneration::new(1, 0), key(), descriptor(), false)
+                .try_import(
+                    FrameGeneration::new(1, 0),
+                    key(),
+                    descriptor(),
+                    false,
+                    Box::new(|_| Ok(())),
+                )
                 .expect("import command");
             drop(request);
         })

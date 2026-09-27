@@ -4,8 +4,10 @@ use super::*;
 ///
 /// The closure runs once, in a new construction scope, with its argument bound to the loop
 /// index. Outer values the body reads become explicit loop arguments: `family.at(i)` gives each
-/// instance one member (and `family.at(i + c)` a shifted one), and every other outer value is
-/// shared by all instances. A sampler inside the body draws a fresh value per instance, and a
+/// instance one member (and `family.at(i + c)` a shifted one), `artifacts.at(indices.at(i))` of
+/// an outer artifact family by an outer integer family gives each instance the member it names
+/// (so a backend can read those members ahead), and every other outer value is shared by all
+/// instances. A sampler inside the body draws a fresh value per instance, and a
 /// zero-count loop samples nothing.
 pub fn parallel<T: GraphValue>(
     count: impl Into<IntExpr>,
@@ -230,6 +232,90 @@ mod tests {
                     .values()
                     .flat_map(|scope| scope.nodes())
                     .any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
+            );
+        }
+    }
+
+    fn parallel_input_modes(built: &crate::BuiltGraph) -> Vec<mxx_ir_core::node::LoopInputMode> {
+        built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec.input_modes.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn artifact_read_by_an_outer_index_family_is_gathered() {
+        use mxx_ir_core::{
+            artifact::{ArtifactAvailability, ProductionId, SpecHash},
+            node::LoopInputMode,
+        };
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let production = ProductionId { spec_hash: SpecHash([3; 32]), execution_nonce: [4; 32] };
+        let members = ring.family_artifact_input(
+            production,
+            "members",
+            5,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let context = DslContext::new("gathered-members");
+        let indices = context.int_family_input("indices", 4);
+        for offset in [0, 1] {
+            let (members, indices) = (members.clone(), indices.clone());
+            let output =
+                parallel(3, move |i| Ok(members.at(indices.at(&i + offset)) + members.at(i)))
+                    .unwrap();
+            let built = DslContext::new("gathered-members")
+                .output("result", output)
+                .unwrap()
+                .build()
+                .unwrap();
+            let modes = parallel_input_modes(&built);
+            let index_mode =
+                if offset == 0 { LoopInputMode::Zip } else { LoopInputMode::ZipOffset { offset } };
+            let index_argument = modes.iter().position(|mode| *mode == index_mode).unwrap();
+            assert!(modes.contains(&LoopInputMode::Gather { index_argument }), "{modes:?}");
+            // The member read by the instance index stays a plain Zip.
+            assert!(modes.contains(&LoopInputMode::Zip), "{modes:?}");
+        }
+    }
+
+    #[test]
+    fn computed_or_resident_family_reads_are_not_gathered() {
+        use mxx_ir_core::{
+            artifact::{ArtifactAvailability, ProductionId, SpecHash},
+            node::LoopInputMode,
+        };
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let production = ProductionId { spec_hash: SpecHash([3; 32]), execution_nonce: [4; 32] };
+        let members = ring.family_artifact_input(
+            production,
+            "members",
+            5,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let resident = ring.input_family("resident", 5, (1, 1));
+        let context = DslContext::new("not-gathered");
+        let indices = context.int_family_input("indices", 3);
+        // An index computed in the body depends on more than the instance.
+        let computed = {
+            let (members, indices) = (members.clone(), indices.clone());
+            parallel(3, move |i| Ok(members.at(indices.at(i) + 1))).unwrap()
+        };
+        let resident_read = parallel(3, move |i| Ok(resident.at(indices.at(i)))).unwrap();
+        for (name, output) in [("computed", computed), ("resident", resident_read)] {
+            let built = DslContext::new(name).output("result", output).unwrap().build().unwrap();
+            let modes = parallel_input_modes(&built);
+            assert!(
+                !modes.iter().any(|mode| matches!(mode, LoopInputMode::Gather { .. })),
+                "{name}: {modes:?}"
             );
         }
     }

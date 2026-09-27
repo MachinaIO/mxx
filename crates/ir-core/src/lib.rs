@@ -9,6 +9,7 @@
 //! ([`graph`]); [`graph::Graph::freeze`] keeps the reachable nodes, one scope per body.
 //! [`validate::validate`] then resolves parameters, rings, and concrete wire types under a
 //! [`ParamEnv`] and returns a [`ValidatedGraph`], which executors and the Lean exporter consume.
+//! [`visualize::render_html`] draws either stage as an interactive HTML page.
 
 pub mod artifact;
 pub mod checks;
@@ -24,6 +25,7 @@ pub mod ring;
 mod serde_support;
 pub mod types;
 pub mod validate;
+pub mod visualize;
 
 pub use constraints::{ParamConstraint, derive_param_constraints};
 pub use expr::{IntExpr, ParamEnv, Rational, RealExpr};

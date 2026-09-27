@@ -60,6 +60,9 @@ pub enum ArtifactPayload {
 /// Corrupt compact matrix payloads can panic during decoding.
 pub trait ArtifactStore {
     type Error: std::error::Error + Send + Sync + 'static;
+    /// A canonical payload encoded from a raw stage and not yet visible to
+    /// loads. Dropping it without publishing discards it.
+    type Encoded: Send + 'static;
 
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error>;
     fn load(
@@ -92,17 +95,26 @@ pub trait ArtifactStore {
         bytes: &[u8],
     ) -> Result<bool, Self::Error>;
 
-    /// Convert a complete raw stage into the existing canonical artifact
-    /// format using bounded working memory. The encoder may seek the raw file
-    /// for multiple passes, but writes the output incrementally.
-    fn transcode_staged(
+    /// Take the complete raw stage of `key` out of the store as a job that
+    /// converts it into the canonical artifact format with bounded working
+    /// memory. The encoder may seek the raw stage for multiple passes, but
+    /// writes the output incrementally. The job borrows nothing from the
+    /// store, so independent artifacts encode concurrently, and its result
+    /// stays invisible to loads until [`Self::publish_encoded`].
+    fn encode_staged(
         &mut self,
-        key: ArtifactKey,
+        key: &ArtifactKey,
         artifact_type: &ArtifactType,
         availability: ArtifactAvailability,
         layout: Option<&str>,
         payload_kind: u8,
-        encode: &mut dyn FnMut(&mut dyn ReadSeek, &mut dyn Write) -> Result<(), String>,
+        encode: StagedEncoder,
+    ) -> Result<EncodeJob<Self::Encoded, Self::Error>, Self::Error>;
+    /// Make an encoded artifact visible to loads under `key`.
+    fn publish_encoded(
+        &mut self,
+        key: ArtifactKey,
+        encoded: Self::Encoded,
     ) -> Result<(), Self::Error>;
     /// Loads a runtime-staged payload before a final manifest exists.
     fn load_staged(
@@ -123,6 +135,15 @@ pub trait ArtifactStore {
 
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
+
+/// Converts one raw stage into its canonical payload and returns the payload
+/// bytes written.
+pub type StagedEncoder =
+    Box<dyn FnOnce(&mut dyn ReadSeek, &mut dyn Write) -> Result<u64, String> + Send>;
+
+/// An encoding job of [`ArtifactStore::encode_staged`]: its encoded artifact
+/// and the payload bytes written.
+pub type EncodeJob<T, E> = Box<dyn FnOnce() -> Result<(T, u64), E> + Send>;
 
 /// Captures exact serialized lengths for a scalar artifact or every member of
 /// a family. The returned indices are suitable for the estimator's private
@@ -282,10 +303,27 @@ impl std::fmt::Debug for FileArtifactStore {
 
 impl Drop for FileArtifactStore {
     fn drop(&mut self) {
-        for stage in self.raw_stages.values() {
-            let _ = fs::remove_file(&stage.temporary);
-        }
+        self.raw_stages.clear();
         self.locks.clear();
+    }
+}
+
+impl Drop for FileRawStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+/// A canonical artifact file encoded beside its final path. Publishing links
+/// it there; the temporary name is always removed.
+pub struct FileEncodedArtifact {
+    temporary: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for FileEncodedArtifact {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
     }
 }
 
@@ -676,6 +714,7 @@ impl FileArtifactStore {
 
 impl ArtifactStore for FileArtifactStore {
     type Error = FileArtifactError;
+    type Encoded = FileEncodedArtifact;
 
     fn stage_raw_chunk(
         &mut self,
@@ -749,15 +788,15 @@ impl ArtifactStore for FileArtifactStore {
         Ok(stage.written_bytes == total_raw_bytes)
     }
 
-    fn transcode_staged(
+    fn encode_staged(
         &mut self,
-        key: ArtifactKey,
+        key: &ArtifactKey,
         artifact_type: &ArtifactType,
         availability: ArtifactAvailability,
         layout: Option<&str>,
         payload_kind: u8,
-        encode: &mut dyn FnMut(&mut dyn ReadSeek, &mut dyn Write) -> Result<(), String>,
-    ) -> Result<(), Self::Error> {
+        encode: StagedEncoder,
+    ) -> Result<EncodeJob<Self::Encoded, Self::Error>, Self::Error> {
         let _lock = self.lock_session_mutation(&key.production)?;
         let valid_kind = matches!(
             (artifact_type, payload_kind),
@@ -768,113 +807,118 @@ impl ArtifactStore for FileArtifactStore {
                 (ArtifactType::TypedBlob { .. }, 4)
         );
         if !valid_kind {
-            return Err(FileArtifactError::PayloadTypeMismatch(key));
+            return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
         }
         let stage = self
             .raw_stages
-            .remove(&key)
+            .remove(key)
             .ok_or_else(|| FileArtifactError::InvalidChunk(key.clone()))?;
-        let result = (|| {
-            if stage.written_bytes != stage.total_raw_bytes {
-                return Err(FileArtifactError::InvalidChunk(key.clone()));
+        if stage.written_bytes != stage.total_raw_bytes {
+            return Err(FileArtifactError::InvalidChunk(key.clone()));
+        }
+        let path = self.artifact_path(key);
+        if path.exists() {
+            return Err(FileArtifactError::ArtifactConflict(key.clone()));
+        }
+        let header = FileStoredHeader {
+            artifact_type: artifact_type.clone(),
+            availability,
+            layout: layout.map(str::to_owned),
+            payload_kind,
+        };
+        let encoded_header = serde_json::to_vec(&header)
+            .map_err(|error| FileArtifactError::Encode(error.to_string()))?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let temporary = path.with_extension(format!("canonical-{}-{stamp}", std::process::id()));
+        let (key, artifact_type) = (key.clone(), artifact_type.clone());
+        Ok(Box::new(move || {
+            let encoded = FileEncodedArtifact { temporary, path };
+            let temporary = encoded.temporary.clone();
+            let mut source = fs::File::open(&stage.temporary).map_err(|source| {
+                FileArtifactError::Io { path: stage.temporary.clone(), source }
+            })?;
+            let mut sink = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?;
+            sink.write_all(&(encoded_header.len() as u64).to_le_bytes())
+                .and_then(|()| sink.write_all(&encoded_header))
+                .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?;
+            let written = encode(&mut source, &mut sink).map_err(FileArtifactError::Encode)?;
+            // The raw stage is no longer needed once its canonical form exists.
+            drop(source);
+            drop(stage);
+            let payload_start = 8u64 + encoded_header.len() as u64;
+            let payload_len = sink
+                .metadata()
+                .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?
+                .len()
+                .checked_sub(payload_start)
+                .ok_or_else(|| FileArtifactError::InvalidChunk(key.clone()))?;
+            if matches!(artifact_type, ArtifactType::Bytes { length }
+                if u64::try_from(length).ok() != Some(payload_len))
+            {
+                return Err(FileArtifactError::PayloadTypeMismatch(key));
             }
-            let path = self.artifact_path(&key);
-            if path.exists() {
-                return Err(FileArtifactError::ArtifactConflict(key.clone()));
+            if matches!(artifact_type, ArtifactType::Int) {
+                let tail_len = payload_len.min(2) as usize;
+                let mut tail = [0u8; 2];
+                sink.seek(SeekFrom::Start(payload_start + payload_len - tail_len as u64))
+                    .and_then(|_| sink.read_exact(&mut tail[..tail_len]))
+                    .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?;
+                if !canonical_signed_integer_bytes(&tail[..tail_len]) {
+                    return Err(FileArtifactError::PayloadTypeMismatch(key));
+                }
             }
-            let header = FileStoredHeader {
-                artifact_type: artifact_type.clone(),
-                availability,
-                layout: layout.map(str::to_owned),
-                payload_kind,
-            };
-            let encoded_header = serde_json::to_vec(&header)
-                .map_err(|error| FileArtifactError::Encode(error.to_string()))?;
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            let temporary =
-                path.with_extension(format!("canonical-{}-{stamp}", std::process::id()));
-            let encoded_result = (|| {
-                let mut source = fs::File::open(&stage.temporary).map_err(|source| {
-                    FileArtifactError::Io { path: stage.temporary.clone(), source }
-                })?;
-                let mut sink = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&temporary)
+            if matches!(artifact_type, ArtifactType::Trapdoor { .. }) {
+                if payload_len < 16 {
+                    return Err(FileArtifactError::PayloadTypeMismatch(key));
+                }
+                let mut raw = [0u8; 8];
+                sink.seek(SeekFrom::Start(payload_start))
+                    .and_then(|_| sink.read_exact(&mut raw))
                     .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?;
-                sink.write_all(&(encoded_header.len() as u64).to_le_bytes())
-                    .and_then(|()| sink.write_all(&encoded_header))
+                let secret_len_at = 8u64
+                    .checked_add(u64::from_le_bytes(raw))
+                    .filter(|at| at.checked_add(8).is_some_and(|end| end <= payload_len))
+                    .ok_or_else(|| FileArtifactError::PayloadTypeMismatch(key.clone()))?;
+                sink.seek(SeekFrom::Start(payload_start + secret_len_at))
+                    .and_then(|_| sink.read_exact(&mut raw))
                     .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?;
-                encode(&mut source, &mut sink).map_err(FileArtifactError::Encode)?;
-                let payload_start = 8u64 + encoded_header.len() as u64;
-                let payload_len = sink
-                    .metadata()
-                    .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?
-                    .len()
-                    .checked_sub(payload_start)
-                    .ok_or_else(|| FileArtifactError::InvalidChunk(key.clone()))?;
-                if matches!(artifact_type, ArtifactType::Bytes { length }
-                    if u64::try_from(*length).ok() != Some(payload_len))
+                if secret_len_at
+                    .checked_add(8)
+                    .and_then(|at| at.checked_add(u64::from_le_bytes(raw))) !=
+                    Some(payload_len)
                 {
-                    return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
+                    return Err(FileArtifactError::PayloadTypeMismatch(key));
                 }
-                if matches!(artifact_type, ArtifactType::Int) {
-                    let tail_len = payload_len.min(2) as usize;
-                    let mut tail = [0u8; 2];
-                    sink.seek(SeekFrom::Start(payload_start + payload_len - tail_len as u64))
-                        .and_then(|_| sink.read_exact(&mut tail[..tail_len]))
-                        .map_err(|source| FileArtifactError::Io {
-                            path: temporary.clone(),
-                            source,
-                        })?;
-                    if !canonical_signed_integer_bytes(&tail[..tail_len]) {
-                        return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
-                    }
-                }
-                if matches!(artifact_type, ArtifactType::Trapdoor { .. }) {
-                    if payload_len < 16 {
-                        return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
-                    }
-                    let mut raw = [0u8; 8];
-                    sink.seek(SeekFrom::Start(payload_start))
-                        .and_then(|_| sink.read_exact(&mut raw))
-                        .map_err(|source| FileArtifactError::Io {
-                            path: temporary.clone(),
-                            source,
-                        })?;
-                    let secret_len_at = 8u64
-                        .checked_add(u64::from_le_bytes(raw))
-                        .filter(|at| at.checked_add(8).is_some_and(|end| end <= payload_len))
-                        .ok_or_else(|| FileArtifactError::PayloadTypeMismatch(key.clone()))?;
-                    sink.seek(SeekFrom::Start(payload_start + secret_len_at))
-                        .and_then(|_| sink.read_exact(&mut raw))
-                        .map_err(|source| FileArtifactError::Io {
-                            path: temporary.clone(),
-                            source,
-                        })?;
-                    if secret_len_at
-                        .checked_add(8)
-                        .and_then(|at| at.checked_add(u64::from_le_bytes(raw))) !=
-                        Some(payload_len)
-                    {
-                        return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
-                    }
-                }
-                sink.sync_all()
-                    .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?;
-                fs::hard_link(&temporary, &path)
-                    .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
-                sync_parent(path.parent().expect("artifact path has a parent"))
-            })();
-            let _ = fs::remove_file(&temporary);
-            encoded_result
-        })();
-        let _ = fs::remove_file(&stage.temporary);
-        result
+            }
+            sink.sync_all()
+                .map_err(|source| FileArtifactError::Io { path: temporary.clone(), source })?;
+            Ok((encoded, written))
+        }))
+    }
+
+    fn publish_encoded(
+        &mut self,
+        key: ArtifactKey,
+        encoded: Self::Encoded,
+    ) -> Result<(), Self::Error> {
+        let _lock = self.lock_session_mutation(&key.production)?;
+        if encoded.path != self.artifact_path(&key) {
+            return Err(FileArtifactError::InvalidChunk(key));
+        }
+        if encoded.path.exists() {
+            return Err(FileArtifactError::ArtifactConflict(key));
+        }
+        fs::hard_link(&encoded.temporary, &encoded.path)
+            .map_err(|source| FileArtifactError::Io { path: encoded.path.clone(), source })?;
+        sync_parent(encoded.path.parent().expect("artifact path has a parent"))
     }
 
     fn load_payload_size(
@@ -1175,7 +1219,7 @@ impl SessionStore for FileArtifactStore {
                 let Err(source) = fs::remove_file(&stage.temporary) &&
                 cleanup.is_ok()
             {
-                cleanup = Err(FileArtifactError::Io { path: stage.temporary, source });
+                cleanup = Err(FileArtifactError::Io { path: stage.temporary.clone(), source });
             }
         }
         self.locks.remove(production);
@@ -1587,6 +1631,14 @@ pub struct MemoryArtifactStore {
     /// Artifacts kept in GPU memory, when the store was created on the device.
     #[cfg(feature = "gpu")]
     device: Option<crate::device_artifact::DeviceArtifacts>,
+}
+
+/// A canonical payload decoded from a raw stage, stored on publication.
+pub struct MemoryEncodedArtifact {
+    artifact_type: ArtifactType,
+    availability: ArtifactAvailability,
+    layout: Option<String>,
+    payload: ArtifactPayload,
 }
 
 #[derive(Clone, Debug)]
@@ -2064,6 +2116,7 @@ impl MemoryArtifactStore {
 
 impl ArtifactStore for MemoryArtifactStore {
     type Error = MemoryArtifactError;
+    type Encoded = MemoryEncodedArtifact;
 
     fn stage_raw_chunk(
         &mut self,
@@ -2104,29 +2157,41 @@ impl ArtifactStore for MemoryArtifactStore {
         Ok(stage.written_bytes == total_raw_bytes)
     }
 
-    fn transcode_staged(
+    fn encode_staged(
         &mut self,
-        key: ArtifactKey,
+        key: &ArtifactKey,
         artifact_type: &ArtifactType,
         availability: ArtifactAvailability,
         layout: Option<&str>,
         payload_kind: u8,
-        encode: &mut dyn FnMut(&mut dyn ReadSeek, &mut dyn Write) -> Result<(), String>,
-    ) -> Result<(), Self::Error> {
+        encode: StagedEncoder,
+    ) -> Result<EncodeJob<Self::Encoded, Self::Error>, Self::Error> {
         self.ensure_session_mutable(&key.production)?;
         let stage = self
             .raw_stages
-            .remove(&key)
+            .remove(key)
             .ok_or_else(|| MemoryArtifactError::InvalidChunk(key.clone()))?;
         if stage.written_bytes != stage.bytes.len() as u64 {
-            return Err(MemoryArtifactError::InvalidChunk(key));
+            return Err(MemoryArtifactError::InvalidChunk(key.clone()));
         }
-        let mut source = io::Cursor::new(stage.bytes);
-        let mut sink = Vec::new();
-        encode(&mut source, &mut sink).map_err(MemoryArtifactError::Encode)?;
-        let payload =
-            decode_stored_payload(payload_kind, &sink).map_err(MemoryArtifactError::Encode)?;
-        self.store(key, artifact_type, availability, layout, payload)
+        let (artifact_type, layout) = (artifact_type.clone(), layout.map(str::to_owned));
+        Ok(Box::new(move || {
+            let mut sink = Vec::new();
+            let written = encode(&mut io::Cursor::new(stage.bytes), &mut sink)
+                .map_err(MemoryArtifactError::Encode)?;
+            let payload =
+                decode_stored_payload(payload_kind, &sink).map_err(MemoryArtifactError::Encode)?;
+            Ok((MemoryEncodedArtifact { artifact_type, availability, layout, payload }, written))
+        }))
+    }
+
+    fn publish_encoded(
+        &mut self,
+        key: ArtifactKey,
+        encoded: Self::Encoded,
+    ) -> Result<(), Self::Error> {
+        let MemoryEncodedArtifact { artifact_type, availability, layout, payload } = encoded;
+        self.store(key, &artifact_type, availability, layout.as_deref(), payload)
     }
 
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
@@ -2634,6 +2699,122 @@ mod tests {
         ProductionId { spec_hash: SpecHash([seed; 32]), execution_nonce: [seed + 1; 32] }
     }
 
+    fn copy_encoder(source: &mut dyn ReadSeek, sink: &mut dyn Write) -> Result<u64, String> {
+        io::copy(source, sink).map_err(|error| error.to_string())
+    }
+
+    fn bytes_descriptor(length: usize) -> ManifestArtifact {
+        ManifestArtifact {
+            artifact_type: ArtifactType::Bytes { length },
+            family_count: Some(4),
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        }
+    }
+
+    /// Encodes the raw stages of `keys` on concurrent threads and publishes
+    /// them afterwards, as the GPU I/O worker does.
+    fn encode_and_publish_concurrently<S: ArtifactStore>(store: &mut S, keys: &[ArtifactKey]) {
+        let jobs = keys
+            .iter()
+            .map(|key| {
+                store
+                    .encode_staged(
+                        key,
+                        &ArtifactType::Bytes { length: 3 },
+                        ArtifactAvailability::Transferred,
+                        None,
+                        2,
+                        Box::new(copy_encoder),
+                    )
+                    .expect("take raw stage")
+            })
+            .collect::<Vec<_>>();
+        let encoded = jobs
+            .into_iter()
+            .map(std::thread::spawn)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| thread.join().expect("encode thread").expect("encode").0)
+            .collect::<Vec<_>>();
+        for (key, encoded) in keys.iter().zip(encoded) {
+            store.publish_encoded(key.clone(), encoded).expect("publish");
+        }
+    }
+
+    fn family_keys() -> Vec<ArtifactKey> {
+        (0..4).map(|index| ArtifactKey { index: Some(index), ..key() }).collect()
+    }
+
+    #[test]
+    fn test_file_store_encodes_raw_stages_concurrently() {
+        let directory = tempdir().expect("temp directory");
+        let mut store = FileArtifactStore::new(directory.path()).expect("file store");
+        let keys = family_keys();
+        store
+            .open_session(&SessionDescriptor::new(key().production, "parallel", [6; 32]))
+            .expect("open session");
+        for (index, key) in keys.iter().enumerate() {
+            let bytes = [index as u8, 7, 9];
+            assert!(store.stage_raw_chunk(key.clone(), 3, 0, &bytes).expect("stage"));
+        }
+        encode_and_publish_concurrently(&mut store, &keys);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                store.load_staged(key, &bytes_descriptor(3)).expect("load"),
+                ArtifactPayload::Bytes(vec![index as u8, 7, 9])
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_store_encodes_raw_stages_concurrently() {
+        let mut store = MemoryArtifactStore::default();
+        let keys = family_keys();
+        store
+            .open_session(&SessionDescriptor::new(key().production, "parallel", [6; 32]))
+            .expect("open session");
+        for (index, key) in keys.iter().enumerate() {
+            let bytes = [index as u8, 7, 9];
+            assert!(store.stage_raw_chunk(key.clone(), 3, 0, &bytes).expect("stage"));
+        }
+        encode_and_publish_concurrently(&mut store, &keys);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                store.load_staged(key, &bytes_descriptor(3)).expect("load"),
+                ArtifactPayload::Bytes(vec![index as u8, 7, 9])
+            );
+        }
+    }
+
+    #[test]
+    fn test_unpublished_encoding_leaves_no_file() {
+        let directory = tempdir().expect("temp directory");
+        let mut store = FileArtifactStore::new(directory.path()).expect("file store");
+        let key = key();
+        store
+            .open_session(&SessionDescriptor::new(key.production.clone(), "discard", [8; 32]))
+            .expect("open session");
+        assert!(store.stage_raw_chunk(key.clone(), 3, 0, &[1, 2, 3]).expect("stage"));
+        let job = store
+            .encode_staged(
+                &key,
+                &ArtifactType::Bytes { length: 3 },
+                ArtifactAvailability::Transferred,
+                None,
+                2,
+                Box::new(copy_encoder),
+            )
+            .expect("take raw stage");
+        let (encoded, _) = job().expect("encode");
+        let temporary = encoded.temporary.clone();
+        assert!(temporary.exists());
+        // A failed GPU launch drops its encoded exports instead of publishing.
+        drop(encoded);
+        assert!(!temporary.exists());
+        assert!(!store.artifact_path(&key).exists());
+    }
+
     #[test]
     fn test_raw_export_stages_progress_before_canonical_publication() {
         let directory = tempdir().expect("temp directory");
@@ -2649,22 +2830,24 @@ mod tests {
         assert!(raw_path.exists());
         assert!(!store.artifact_path(&key).exists());
         assert!(store.stage_raw_chunk(key.clone(), 5, 0, &[1, 2]).expect("stage earlier fragment"));
-        let mut copy = |source: &mut dyn ReadSeek, sink: &mut dyn Write| {
-            io::copy(source, sink).map_err(|error| error.to_string())?;
-            Ok(())
-        };
         let ty = ArtifactType::Bytes { length: 5 };
-        store
-            .transcode_staged(
-                key.clone(),
+        let job = store
+            .encode_staged(
+                &key,
                 &ty,
                 ArtifactAvailability::Transferred,
                 None,
                 2,
-                &mut copy,
+                Box::new(copy_encoder),
             )
-            .expect("publish canonical artifact");
+            .expect("take raw stage");
+        // The job borrows nothing from the store and runs on another thread.
+        let (encoded, written) =
+            std::thread::spawn(job).join().expect("encode thread").expect("encode");
+        assert_eq!(written, 5);
         assert!(!raw_path.exists());
+        assert!(!store.artifact_path(&key).exists(), "an encoded artifact is not yet visible");
+        store.publish_encoded(key.clone(), encoded).expect("publish canonical artifact");
         let payload = store
             .load_staged(
                 &key,

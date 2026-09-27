@@ -203,7 +203,6 @@ Each crate's library builds only on crates in lower layers, and crates in the sa
 depend on one another:
 
 ```text
-layer 4   mxx-we           (temporarily disabled)
 layer 3   mxx-bgg          mxx-fhe
 layer 2   mxx-gadgets
 layer 1   mxx-dsl          mxx-backends

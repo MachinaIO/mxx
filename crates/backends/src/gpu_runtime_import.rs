@@ -1,7 +1,11 @@
 //! On-demand import of one selected artifact into a planned GPU owner.
+//!
+//! [`start_import`] hands the read to the I/O worker together with the upload
+//! into the owner, which the worker runs as soon as the read completes;
+//! [`finish_import`] waits for both at the owner's first consumer.
 
 use crate::{
-    artifact::ArtifactPayload,
+    artifact::{ArtifactKey, ArtifactPayload},
     backend::{
         GpuResidentValue,
         poly::decode_small_matrix_artifact,
@@ -9,7 +13,7 @@ use crate::{
     },
     device_artifact::DeviceArtifact,
     gpu_execution_plan::PhysicalValueId,
-    gpu_io_worker::{FrameGeneration, IoCompletion},
+    gpu_io_worker::{FrameGeneration, ImportDelivery, ImportedArtifact, IoCompletion},
     gpu_physical_lowering::{ImportDestination, ImportTemplate},
     gpu_runtime_io::{ProducerIoPump, RuntimeIoOperation},
     poly::{
@@ -20,7 +24,7 @@ use crate::{
 use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use std::{collections::BTreeMap, error::Error, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 /// Copy an artifact held in GPU memory into `destination` when both describe
 /// the same elements. The artifact holds each part densely; each part is
@@ -141,14 +145,15 @@ fn trapdoor_leaf_types(
 /// Fill the preallocated owner selected by one validated artifact descriptor.
 ///
 /// # Safety
-/// The caller has joined all prior uses of this plan's owners, including GPU
-/// regions and artifact I/O readers, and holds the plan's exclusive execute gate.
+/// No GPU operation or I/O uses the owner while it is overwritten: its
+/// previous use has completed, and its next one waits for this upload.
 unsafe fn upload_selected_payload(
     backend: &GpuDcrtBackend,
-    template: &ImportTemplate,
+    expected_type: &ArtifactType,
+    upload_owner: &ImportDestination,
     payload: ArtifactPayload,
 ) -> Result<(), String> {
-    match (&template.expected_type, &template.upload_owner, payload) {
+    match (expected_type, upload_owner, payload) {
         (
             ArtifactType::Matrix(expected),
             ImportDestination::Matrix { owner, ty },
@@ -288,71 +293,85 @@ unsafe fn upload_selected_payload(
     }
 }
 
-/// Load only the selected artifact at its first dependent Graph operation.
+/// Start reading the artifact `key` into `template`'s planned owner. The
+/// worker reads it and uploads it right away, while the caller keeps launching
+/// GPU work that does not use the owner; [`finish_import`] waits for it at the
+/// owner's first consumer.
 ///
 /// # Safety
-/// The caller must have joined the preceding GPU region and all earlier I/O
-/// readers, and must hold exclusive access to this plan through the dependent
-/// launch. The mutable pump borrow alone does not establish these conditions.
-pub(crate) unsafe fn load_import_template<E: Error + Send + Sync + 'static>(
+/// The previous use of the owner has completed, and no GPU operation or I/O
+/// uses it until `finish_import` returns for this request.
+pub(crate) unsafe fn start_import<E: Error + Send + Sync + 'static>(
     backend: &GpuDcrtBackend,
     pump: &mut ProducerIoPump<'_, E>,
     frame: FrameGeneration,
-    operation: u32,
     template: &ImportTemplate,
-    owners: &BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    key: ArtifactKey,
+    destination: Option<Arc<GpuResidentValue>>,
 ) -> Result<(), String> {
-    if operation != template.before_operation {
-        return Err("artifact import is not at its planned first consumer".into());
-    }
+    let operation = import_operation(backend, template, key, destination)?;
+    pump.ready(frame, template.destination.0, operation).map_err(|error| error.to_string())
+}
+
+/// The worker command that reads `key` and uploads it into `template`'s owner.
+/// `destination` is the resident value an artifact held in GPU memory is
+/// copied into when both have the same layout.
+pub(crate) fn import_operation(
+    backend: &GpuDcrtBackend,
+    template: &ImportTemplate,
+    key: ArtifactKey,
+    destination: Option<Arc<GpuResidentValue>>,
+) -> Result<RuntimeIoOperation, String> {
     if template.descriptor.artifact_type != template.expected_type {
         return Err("artifact bound domain or semantic type differs from its consumer".into());
     }
+    // A trapdoor import fills seven owners; only single-owner destinations
+    // take a device copy from an artifact held in GPU memory.
+    let destination = destination
+        .filter(|_| !matches!(template.upload_owner, ImportDestination::Trapdoor { .. }));
+    let (backend, expected_type, upload_owner) =
+        (backend.clone(), template.expected_type.clone(), template.upload_owner.clone());
+    let name = key.name.clone();
+    let deliver: ImportDelivery = Box::new(move |artifact| {
+        let payload = match artifact {
+            ImportedArtifact::Host(payload) => payload,
+            ImportedArtifact::Device(artifact) => {
+                if let Some(destination) = &destination &&
+                    copy_device_artifact(&artifact, destination)?
+                {
+                    return Ok(());
+                }
+                tracing::debug!(
+                    target: "mxx_backends::gpu_execute",
+                    artifact = %name,
+                    "device artifact layout differs from its import; transcoding on the host"
+                );
+                artifact.host_payload()?
+            }
+        };
+        // SAFETY: `start_import`'s contract keeps every other user of the
+        // owner away until this request is consumed.
+        unsafe { upload_selected_payload(&backend, &expected_type, &upload_owner, payload) }
+    });
+    Ok(RuntimeIoOperation::Import {
+        key,
+        descriptor: template.descriptor.clone(),
+        staged: template.staged,
+        deliver,
+    })
+}
 
-    pump.ready(
-        frame,
-        operation,
-        RuntimeIoOperation::Import {
-            key: template.key.clone(),
-            descriptor: template.descriptor.clone(),
-            staged: template.staged,
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    let reply = pump.done(frame, operation).map_err(|error| error.to_string())?;
-    let (completed_frame, payload) = match reply.completion {
-        IoCompletion::Imported { frame, payload } => (frame, payload.into_payload()),
-        IoCompletion::ImportedDevice { frame: completed_frame, artifact } => {
-            if completed_frame != frame {
-                return Err("artifact import returned a stale frame completion".into());
-            }
-            // A trapdoor import fills seven owners; only single-owner
-            // destinations take the device copy.
-            let destination = match template.upload_owner {
-                ImportDestination::Trapdoor { .. } => None,
-                _ => owners.get(&template.destination),
-            };
-            // SAFETY: as for the upload below, no GPU or I/O operation uses
-            // the destination while it is overwritten.
-            if let Some(destination) = destination &&
-                copy_device_artifact(&artifact, destination)?
-            {
-                return Ok(());
-            }
-            tracing::debug!(
-                target: "mxx_backends::gpu_execute",
-                artifact = %template.key.name,
-                "device artifact layout differs from its import; transcoding on the host"
-            );
-            (completed_frame, artifact.host_payload()?)
+/// Wait until the oldest started import of `destination` has filled it.
+pub(crate) fn finish_import<E: Error + Send + Sync + 'static>(
+    pump: &mut ProducerIoPump<'_, E>,
+    frame: FrameGeneration,
+    destination: PhysicalValueId,
+) -> Result<(), String> {
+    match pump.done(frame, destination.0).map_err(|error| error.to_string())?.completion {
+        IoCompletion::Imported { frame: completed } if completed == frame => Ok(()),
+        IoCompletion::Imported { .. } => {
+            Err("artifact import returned a stale frame completion".into())
         }
-        _ => return Err("artifact import returned a different I/O completion".into()),
-    };
-    if completed_frame != frame {
-        return Err("artifact import returned a stale frame completion".into());
+        _ => Err("artifact import returned a different I/O completion".into()),
     }
-    // SAFETY: the runtime calls this function only after the previous Graph
-    // region and every earlier I/O reader have completed. A plan executes at
-    // most once at a time, so this owner has no concurrent GPU or I/O users.
-    unsafe { upload_selected_payload(backend, template, payload) }
 }

@@ -1660,7 +1660,9 @@ fn validate_structural_boundaries(
                     "child input count does not match call arguments",
                 );
             }
-            for ((arg, input), mode) in args.iter().zip(child_scope.inputs()).zip(modes) {
+            for ((arg, input), mode) in
+                args.iter().zip(child_scope.inputs()).zip(modes.iter().copied())
+            {
                 let outer =
                     validated.wire_types.get(arg).ok_or_else(|| ValidationError::MissingWire {
                         scope: scope_id.clone(),
@@ -1694,6 +1696,29 @@ fn validate_structural_boundaries(
                             if iterations > 0 && *count < iterations.saturating_add(offset) {
                                 return node_error(scope_id, node_id, "zipped family is too short");
                             }
+                        }
+                        element.as_ref()
+                    }
+                    LoopInputMode::Gather { index_argument } => {
+                        let ConcreteWireType::IndexedFamily { element, .. } = outer else {
+                            return node_error(scope_id, node_id, "gathered input is not a family");
+                        };
+                        let index = args.get(index_argument).and_then(|index| {
+                            validated.wire_types.get(index).map(|ty| (ty, modes[index_argument]))
+                        });
+                        let Some((ConcreteWireType::IndexedFamily { element: index, .. }, mode)) =
+                            index
+                        else {
+                            return node_error(scope_id, node_id, "gather index is not a family");
+                        };
+                        if !matches!(mode, LoopInputMode::Zip | LoopInputMode::ZipOffset { .. }) ||
+                            **index != ConcreteWireType::Int
+                        {
+                            return node_error(
+                                scope_id,
+                                node_id,
+                                "gather index is not a zipped integer family",
+                            );
                         }
                         element.as_ref()
                     }

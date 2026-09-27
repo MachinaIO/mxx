@@ -123,3 +123,12 @@ mod tests {
 
 // Runtime configuration shares the backend environment namespace.
 pub use crate::runtime_env::{GpuRuntimeConfigError, GpuRuntimeOptions};
+
+/// `MXX_ARTIFACT_ENCODE_PARALLELISM`: artifact exports a GPU I/O worker
+/// encodes into their canonical format at once, on the rayon pool, while the
+/// GPU keeps running. Each encode holds its raw stage and its canonical output
+/// (both in host memory for an in-memory store), so this bounds that memory.
+/// Default: 4. Zero or malformed values are errors.
+pub fn artifact_encode_parallelism() -> Result<usize, String> {
+    positive_usize("MXX_ARTIFACT_ENCODE_PARALLELISM", 4)
+}

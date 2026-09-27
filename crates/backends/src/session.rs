@@ -305,6 +305,7 @@ impl<'store, S: SessionStore + ?Sized> crate::artifact::ArtifactStore
     for ProducerSession<'store, S>
 {
     type Error = ProducerSessionError<S::Error>;
+    type Encoded = S::Encoded;
 
     fn stage_raw_chunk(
         &mut self,
@@ -318,21 +319,28 @@ impl<'store, S: SessionStore + ?Sized> crate::artifact::ArtifactStore
             .map_err(ProducerSessionError::Store)
     }
 
-    fn transcode_staged(
+    fn encode_staged(
         &mut self,
-        key: ArtifactKey,
+        key: &ArtifactKey,
         artifact_type: &ArtifactType,
         availability: ArtifactAvailability,
         layout: Option<&str>,
         payload_kind: u8,
-        encode: &mut dyn FnMut(
-            &mut dyn crate::artifact::ReadSeek,
-            &mut dyn std::io::Write,
-        ) -> Result<(), String>,
+        encode: crate::artifact::StagedEncoder,
+    ) -> Result<crate::artifact::EncodeJob<Self::Encoded, Self::Error>, Self::Error> {
+        let job = self
+            .store
+            .encode_staged(key, artifact_type, availability, layout, payload_kind, encode)
+            .map_err(ProducerSessionError::Store)?;
+        Ok(Box::new(move || job().map_err(ProducerSessionError::Store)))
+    }
+
+    fn publish_encoded(
+        &mut self,
+        key: ArtifactKey,
+        encoded: Self::Encoded,
     ) -> Result<(), Self::Error> {
-        self.store
-            .transcode_staged(key, artifact_type, availability, layout, payload_kind, encode)
-            .map_err(ProducerSessionError::Store)
+        self.store.publish_encoded(key, encoded).map_err(ProducerSessionError::Store)
     }
 
     #[cfg(feature = "gpu")]

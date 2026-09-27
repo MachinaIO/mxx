@@ -39,6 +39,14 @@
 //! weighted by how often production replays it, and the fastest feasible candidate is frozen into a
 //! value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected report.
 //!
+//! With `profile_nodes`, planning then lowers the selected candidate once more with a Graph region
+//! boundary at every graph node's operations and times it the same way. Every separate launch pays
+//! a fixed launch and join cost, estimated per region as the cost that makes its nodes' times sum
+//! to the region's measured time; each node keeps its time beyond that cost, so the report's
+//! `node_costs` divide `predicted_seconds`.
+//! [`GpuExecutionPlan::render_html`] draws the graph with those costs; a profiling failure is
+//! logged and leaves `node_costs` empty.
+//!
 //! ## Options
 //!
 //! [`GpuRuntimeOptions`] is read once by `GpuRuntime::new` and can be changed with `options_mut`:
@@ -49,6 +57,7 @@
 //! | `measurement_warmups` | `MXX_GPU_MEASUREMENT_WARMUPS` | 1 |
 //! | `measurement_iterations` | `MXX_GPU_MEASUREMENT_ITERATIONS` | 2 |
 //! | `release_fence_interval` | `MXX_GPU_RELEASE_FENCE_INTERVAL` | unset |
+//! | `profile_nodes` | `MXX_GPU_PROFILE_NODES` | false |
 //! | `integer_input_ranges` | (set in code) | empty |
 //! | `subgraph_kernels` | (set in code) | empty |
 //!
@@ -94,6 +103,9 @@
 //! - NTTs support ring dimensions up to 131072.
 
 #[cfg(test)]
+#[path = "gpu_runtime_direct/node_profile_tests.rs"]
+mod node_profile_tests;
+#[cfg(test)]
 #[path = "gpu_runtime_direct/selected_artifact_tests.rs"]
 mod selected_artifact_tests;
 
@@ -133,8 +145,9 @@ use crate::{
     session::{ArtifactHandle, SessionDescriptor, SessionStore},
 };
 use mxx_ir_core::{
-    ValidatedGraph,
+    FrozenGraphScopeId, NodeId, ValidatedGraph,
     artifact::{ArtifactType, Manifest, ProductionId},
+    visualize::NodeCost,
 };
 use num_bigint::BigInt;
 use sha2::{Digest, Sha256};
@@ -454,6 +467,117 @@ fn run_trial_regions(
     Ok(seconds)
 }
 
+/// Divide each production region's measured time (`production_regions`,
+/// start operation and seconds) among the node ranges `spans` recorded while
+/// lowering, from the separately measured `segments` of a frame split at
+/// every range boundary.
+fn attribute_node_costs(
+    spans: Vec<(FrozenGraphScopeId, NodeId, std::ops::Range<u32>)>,
+    segments: &[(u32, f64)],
+    production_regions: &[(u32, f64)],
+) -> Result<Vec<NodeCost>, String> {
+    // The selected candidate lowered the same plan, so each of its region
+    // starts is also a segment start.
+    if production_regions
+        .iter()
+        .any(|(start, _)| segments.binary_search_by_key(start, |(start, _)| *start).is_err())
+    {
+        return Err("profiled frame does not refine the measured Graph regions".into());
+    }
+    let production_of = |start: u32| {
+        production_regions.partition_point(|(region_start, _)| *region_start <= start) - 1
+    };
+    // A production region launches and joins once; each of its segments
+    // pays that cost again.
+    let overhead = production_regions
+        .iter()
+        .enumerate()
+        .map(|(region, &(_, measured))| {
+            per_launch_overhead(
+                segments
+                    .iter()
+                    .filter(|(start, _)| production_of(*start) == region)
+                    .map(|(_, seconds)| *seconds)
+                    .collect(),
+                measured,
+            )
+        })
+        .collect::<Vec<_>>();
+    let own = |start: u32, seconds: f64| (seconds - overhead[production_of(start)]).max(0.0);
+    let mut profiled = vec![0.0; production_regions.len()];
+    for &(start, seconds) in segments {
+        profiled[production_of(start)] += own(start, seconds);
+    }
+    // Node ranges nest, so after sorting outer ranges first the ranges
+    // open at a segment start form a stack whose top is the innermost. A
+    // node is recorded after the body nodes it encloses, so of equal
+    // ranges the later recorded one is outer.
+    let mut spans = spans.into_iter().enumerate().collect::<Vec<_>>();
+    spans.sort_by_key(|(recorded, (_, _, range))| {
+        (range.start, std::cmp::Reverse(range.end), std::cmp::Reverse(*recorded))
+    });
+    let spans = spans.into_iter().map(|(_, span)| span).collect::<Vec<_>>();
+    let mut costs = BTreeMap::<(FrozenGraphScopeId, NodeId), (f64, f64)>::new();
+    let mut open = Vec::<usize>::new();
+    let mut next_span = 0;
+    for &(start, seconds) in segments {
+        let region = production_of(start);
+        let predicted = if profiled[region] > 0.0 {
+            own(start, seconds) * production_regions[region].1 / profiled[region]
+        } else {
+            0.0
+        };
+        open.retain(|&span| spans[span].2.end > start);
+        while spans.get(next_span).is_some_and(|(_, _, range)| range.start <= start) {
+            if spans[next_span].2.end > start {
+                open.push(next_span);
+            }
+            next_span += 1;
+        }
+        for (depth, &span) in open.iter().enumerate() {
+            let (scope, node, _) = &spans[span];
+            // A node appears once per segment in its inclusive total.
+            if open[..depth]
+                .iter()
+                .any(|&outer| &spans[outer].0 == scope && spans[outer].1 == *node)
+            {
+                continue;
+            }
+            let cost = costs.entry((scope.clone(), *node)).or_default();
+            cost.1 += predicted;
+        }
+        if let Some(&innermost) = open.last() {
+            let (scope, node, _) = &spans[innermost];
+            costs.get_mut(&(scope.clone(), *node)).expect("open node has a cost").0 += predicted;
+        }
+    }
+    Ok(costs
+        .into_iter()
+        .map(|((scope, node), (self_seconds, total_seconds))| NodeCost {
+            scope,
+            node,
+            self_seconds,
+            total_seconds,
+        })
+        .collect())
+}
+
+/// The fixed cost each separately launched segment of a region pays: the
+/// `overhead` that leaves `sum(max(segment - overhead, 0))` equal to the
+/// region's `measured` time, or zero when the segments sum to less.
+fn per_launch_overhead(mut segments: Vec<f64>, measured: f64) -> f64 {
+    segments.sort_by(|left, right| right.total_cmp(left));
+    let mut longest = 0.0;
+    for (count, &seconds) in segments.iter().enumerate() {
+        longest += seconds;
+        let overhead = (longest - measured) / (count + 1) as f64;
+        if overhead >= segments.get(count + 1).copied().unwrap_or(0.0) {
+            return overhead.max(0.0);
+        }
+    }
+    0.0
+}
+
 /// Production launch count of each region: a region inside a wave group body
 /// replays once per wave for every active parent occurrence of its innermost
 /// group; other regions run once.
@@ -510,7 +634,14 @@ impl DirectGraph {
         Ok(first..last + 1)
     }
 
-    fn compile(backend: &GpuDcrtBackend, frame: &mut PhysicalFrame) -> Result<Self, GpuPlanError> {
+    /// Compile `frame` into Graph regions. Regions start where the host must
+    /// act between launches (waves, imports, external-I/O loops) and at every
+    /// `extra_starts` operation, which only splits a region for measurement.
+    fn compile(
+        backend: &GpuDcrtBackend,
+        frame: &mut PhysicalFrame,
+        extra_starts: &[usize],
+    ) -> Result<Self, GpuPlanError> {
         frame.program.validate().map_err(|error| GpuPlanError::GraphCompile(error.into()))?;
         let params = match frame.program.values.iter().find_map(|value| value.ty.matrix_type()) {
             Some(matrix) => backend.physical_matrix_parameters(matrix, frame.device),
@@ -628,6 +759,7 @@ impl DirectGraph {
             }
             previous_end = end;
         }
+        starts.extend(extra_starts.iter().copied().filter(|&start| start < length));
         starts.sort_unstable();
         starts.dedup();
         let mut scratch = crate::gpu_graph_memory::plan_graph_scratch(backend, frame, &starts)
@@ -1564,6 +1696,14 @@ impl GpuExecutionPlan {
     pub fn report(&self) -> &GpuWarmupReport {
         &self.report
     }
+    /// An interactive HTML view of the planned graph with concrete shapes.
+    /// With `GpuRuntimeOptions::profile_nodes`, nodes are colored by their
+    /// predicted share of one execute and the bottlenecks are ranked.
+    pub fn render_html(&self) -> String {
+        let costs = (!self.report.node_costs.is_empty())
+            .then_some((self.report.predicted_seconds, self.report.node_costs.as_slice()));
+        mxx_ir_core::visualize::render_html(&self.validated.source, Some(&self.validated), costs)
+    }
     pub fn measured_costs(&self) -> &GpuMeasuredCostCache {
         &self.measured_costs
     }
@@ -2017,6 +2157,136 @@ impl GpuRuntime {
         self.plan_with_payload_sizes(validated, inputs, &sizes, device_artifact_exports, None)
     }
 
+    /// Time `measurement_warmups + measurement_iterations` trials of a bound
+    /// Graph and return each region's start operation with its mean measured
+    /// seconds, weighted by how often production replays the region.
+    fn measure_regions(
+        &mut self,
+        frame: &PhysicalFrame,
+        graph: &mut DirectGraph,
+    ) -> Result<Vec<(u32, f64)>, GpuPlanError> {
+        let total_trials = self
+            .options
+            .measurement_warmups
+            .checked_add(self.options.measurement_iterations.get())
+            .ok_or_else(|| GpuPlanError::Measurement("measurement count overflows".into()))?;
+        let replays = region_replay_counts(frame, graph).map_err(GpuPlanError::Measurement)?;
+        let mut measured = vec![0.0; graph.regions.len()];
+        for trial_index in 0..total_trials {
+            for control in &frame.control_resets {
+                control.reset_for_replay().map_err(GpuPlanError::Measurement)?;
+            }
+            reset_preimage_replays(frame).map_err(GpuPlanError::Measurement)?;
+            let region_seconds = match run_trial_regions(graph, frame) {
+                Ok(region_seconds) => region_seconds,
+                Err(error) => {
+                    self.backend.drain_uncertain_launches().map_err(|drain| {
+                        GpuPlanError::Measurement(format!(
+                            "trial failed ({error}) and GPU drain failed ({drain})"
+                        ))
+                    })?;
+                    return Err(GpuPlanError::Measurement(error.to_string()));
+                }
+            };
+            // Trial inputs and artifact destinations are not production
+            // data, so device status words (integer control, preimage
+            // retries) are data-dependent and belong to execute; a trial only
+            // measures the joined Graph.
+            if trial_index >= self.options.measurement_warmups {
+                for ((total, seconds), replays) in
+                    measured.iter_mut().zip(&region_seconds).zip(&replays)
+                {
+                    *total += seconds * replays;
+                }
+            }
+            for slot in &frame.slots {
+                // SAFETY: this trial's GPU completion has been joined and no
+                // artifact observer or reader was started.
+                unsafe { slot.reset_after_completion() }
+                    .map_err(|error| GpuPlanError::Measurement(error.to_string()))?;
+            }
+        }
+        let iterations = self.options.measurement_iterations.get() as f64;
+        Ok(graph
+            .regions
+            .iter()
+            .zip(measured)
+            .map(|(region, seconds)| (region.start_operation, seconds / iterations))
+            .collect())
+    }
+
+    /// Complete the frees of dropped candidate owners and Graphs and return
+    /// the pools' retained memory, so the next frame is admitted on its own.
+    fn release_candidate_memory(
+        &self,
+        contract: &crate::gpu_execution_plan::GpuPlanContract,
+    ) -> Result<(), GpuPlanError> {
+        for device in contract_devices(contract)? {
+            self.backend
+                .control_parameters_on_device(device)
+                .and_then(|params| params.release_cached_memory(device))
+                .map_err(GpuPlanError::Resource)?;
+            tracing::debug!(
+                device,
+                free = crate::poly::dcrt::gpu::gpu_memory_info(device)
+                    .map_err(GpuPlanError::Resource)?
+                    .free,
+                graph_reserved = crate::poly::dcrt::gpu::gpu_graph_memory_reserved(device)
+                    .map_err(GpuPlanError::Resource)?,
+                pool = ?crate::poly::dcrt::gpu::gpu_default_mempool_usage(device)
+                    .map_err(GpuPlanError::Resource)?,
+                "released GPU plan candidate memory"
+            );
+        }
+        Ok(())
+    }
+
+    /// Predict how much of the selected plan's time each graph node takes.
+    /// Another frame of the selected plan is compiled with a Graph region
+    /// boundary at every node's operation range and timed like a candidate.
+    /// Each separate launch pays a fixed launch and join cost, so the measured
+    /// time of each production region (`production_regions`, from the
+    /// selected candidate) is split among its profiled segments by their time
+    /// beyond that cost; the predictions keep the measured total.
+    #[allow(clippy::too_many_arguments)]
+    fn profile_node_costs(
+        &mut self,
+        validated: &ValidatedGraph,
+        logical: &FrozenGpuPlan,
+        contract: &crate::gpu_execution_plan::GpuPlanContract,
+        inputs: &BTreeMap<String, RuntimeValue>,
+        artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
+        device_artifact_exports: bool,
+        production_regions: &[(u32, f64)],
+    ) -> Result<Vec<NodeCost>, GpuPlanError> {
+        let mut frame = plan_physical_graph(
+            &self.backend,
+            validated,
+            logical,
+            inputs,
+            &self.options.integer_input_ranges,
+            artifact_payload_sizes,
+            &self.options.subgraph_kernels,
+            device_artifact_exports,
+            true,
+        )
+        .map_err(GpuPlanError::Resource)?;
+        validate_allocated_budget(&frame, contract, None)?;
+        wait_for_bound_inputs(&frame).map_err(GpuPlanError::Measurement)?;
+        frame.bind_return_outputs(&self.backend).map_err(GpuPlanError::Resource)?;
+        let spans = std::mem::take(&mut frame.node_operations);
+        let boundaries = spans
+            .iter()
+            .flat_map(|(_, _, range)| [range.start as usize, range.end as usize])
+            .collect::<Vec<_>>();
+        let mut graph = DirectGraph::compile(&self.backend, &mut frame, &boundaries)?;
+        validate_allocated_budget(&frame, contract, Some(&graph))?;
+        graph.bind(&frame).map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
+        let segments = self.measure_regions(&frame, &mut graph)?;
+        attribute_node_costs(spans, &segments, production_regions)
+            .map_err(GpuPlanError::Measurement)
+    }
+
     fn plan_with_payload_sizes(
         &mut self,
         validated: ValidatedGraph,
@@ -2130,7 +2400,7 @@ impl GpuRuntime {
             .max()
             .unwrap_or(1)
             .min(self.options.max_parallel_instances.get());
-        let mut best = None::<(usize, usize, f64)>;
+        let mut best = None::<(usize, usize, f64, Vec<(u32, f64)>)>;
         let mut measured = GpuMeasuredCostCache::default();
         let mut rejected = Vec::new();
         let candidate_columns = match fixed_geometry.map(|(column, _)| column) {
@@ -2150,7 +2420,7 @@ impl GpuRuntime {
             .iter()
             .flat_map(|&w| candidate_columns.iter().copied().map(move |c| (w, c)))
         {
-            let trial = (|| -> Result<f64, GpuPlanError> {
+            let trial = (|| -> Result<Vec<(u32, f64)>, GpuPlanError> {
                 let logical = single_root_physical_plan(
                     &validated,
                     contract.clone(),
@@ -2167,85 +2437,26 @@ impl GpuRuntime {
                     artifact_payload_sizes,
                     &self.options.subgraph_kernels,
                     device_artifact_exports,
+                    false,
                 )
                 .map_err(GpuPlanError::Resource)?;
                 validate_allocated_budget(&frame, &contract, None)?;
                 wait_for_bound_inputs(&frame).map_err(GpuPlanError::Measurement)?;
                 frame.bind_return_outputs(&self.backend).map_err(GpuPlanError::Resource)?;
-                let mut graph = DirectGraph::compile(&self.backend, &mut frame)?;
+                let mut graph = DirectGraph::compile(&self.backend, &mut frame, &[])?;
                 validate_allocated_budget(&frame, &contract, Some(&graph))?;
                 graph
                     .bind(&frame)
                     .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
-                let total_trials = self
-                    .options
-                    .measurement_warmups
-                    .checked_add(self.options.measurement_iterations.get())
-                    .ok_or_else(|| {
-                        GpuPlanError::Measurement("measurement count overflows".into())
-                    })?;
-                let replays =
-                    region_replay_counts(&frame, &graph).map_err(GpuPlanError::Measurement)?;
-                let mut measured_seconds = 0.0;
-                for trial_index in 0..total_trials {
-                    for control in &frame.control_resets {
-                        control.reset_for_replay().map_err(GpuPlanError::Measurement)?;
-                    }
-                    reset_preimage_replays(&frame).map_err(GpuPlanError::Measurement)?;
-                    let trial_result = run_trial_regions(&mut graph, &frame);
-                    let region_seconds = match trial_result {
-                        Ok(region_seconds) => region_seconds,
-                        Err(error) => {
-                            self.backend.drain_uncertain_launches().map_err(|drain| {
-                                GpuPlanError::Measurement(format!(
-                                    "trial failed ({error}) and GPU drain failed ({drain})"
-                                ))
-                            })?;
-                            return Err(GpuPlanError::Measurement(error.to_string()));
-                        }
-                    };
-                    // Trial inputs and artifact destinations are not production
-                    // data, so device status words (integer control, preimage
-                    // retries) are data-dependent and belong to
-                    // execute; a trial only measures the joined Graph.
-                    if trial_index >= self.options.measurement_warmups {
-                        measured_seconds += region_seconds
-                            .iter()
-                            .zip(&replays)
-                            .map(|(seconds, replays)| seconds * replays)
-                            .sum::<f64>();
-                    }
-                    for slot in &frame.slots {
-                        // SAFETY: this trial's GPU completion has been joined
-                        // and no artifact observer or reader was started.
-                        unsafe { slot.reset_after_completion() }
-                            .map_err(|error| GpuPlanError::Measurement(error.to_string()))?;
-                    }
-                }
-                Ok(measured_seconds / self.options.measurement_iterations.get() as f64)
+                self.measure_regions(&frame, &mut graph)
             })();
             // The candidate's owners and Graphs are gone; complete their
             // frees and return the pools' retained memory so the next
             // candidate, and the selected plan, are admitted on their own.
-            for device in contract_devices(&contract)? {
-                self.backend
-                    .control_parameters_on_device(device)
-                    .and_then(|params| params.release_cached_memory(device))
-                    .map_err(GpuPlanError::Resource)?;
-                tracing::debug!(
-                    device,
-                    free = crate::poly::dcrt::gpu::gpu_memory_info(device)
-                        .map_err(GpuPlanError::Resource)?
-                        .free,
-                    graph_reserved = crate::poly::dcrt::gpu::gpu_graph_memory_reserved(device)
-                        .map_err(GpuPlanError::Resource)?,
-                    pool = ?crate::poly::dcrt::gpu::gpu_default_mempool_usage(device)
-                        .map_err(GpuPlanError::Resource)?,
-                    "released GPU plan candidate memory"
-                );
-            }
+            self.release_candidate_memory(&contract)?;
             match trial {
-                Ok(seconds) if seconds.is_finite() => {
+                Ok(regions) if regions.iter().all(|(_, seconds)| seconds.is_finite()) => {
+                    let seconds = regions.iter().map(|(_, seconds)| seconds).sum::<f64>();
                     tracing::debug!(
                         candidate_w,
                         candidate_c,
@@ -2253,8 +2464,8 @@ impl GpuRuntime {
                         "measured GPU plan candidate"
                     );
                     measured.insert(candidate_w, candidate_c, seconds);
-                    if best.as_ref().is_none_or(|(_, _, current)| seconds < *current) {
-                        best = Some((candidate_w, candidate_c, seconds));
+                    if best.as_ref().is_none_or(|(_, _, current, _)| seconds < *current) {
+                        best = Some((candidate_w, candidate_c, seconds, regions));
                     }
                 }
                 Ok(_) => {
@@ -2266,16 +2477,35 @@ impl GpuRuntime {
                 }
             }
         }
-        let (selected_w, selected_c, selected_seconds) = best.ok_or_else(|| {
-            GpuPlanError::Resource(format!(
-                "no feasible measured (W,C) candidate: {}",
-                rejected.join("; ")
-            ))
-        })?;
+        let (selected_w, selected_c, selected_seconds, selected_regions) =
+            best.ok_or_else(|| {
+                GpuPlanError::Resource(format!(
+                    "no feasible measured (W,C) candidate: {}",
+                    rejected.join("; ")
+                ))
+            })?;
         tracing::debug!(selected_w, selected_c, "selected GPU plan candidate");
         let logical =
             single_root_physical_plan(&validated, contract.clone(), selected_c, selected_w)
                 .map_err(GpuPlanError::InvalidInput)?;
+        let node_costs = if self.options.profile_nodes {
+            let profile = self.profile_node_costs(
+                &validated,
+                &logical,
+                &contract,
+                inputs,
+                artifact_payload_sizes,
+                device_artifact_exports,
+                &selected_regions,
+            );
+            self.release_candidate_memory(&contract)?;
+            profile.unwrap_or_else(|error| {
+                tracing::warn!(%error, "GPU node profiling failed; the plan has no node costs");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
         let mut frame = plan_physical_graph(
             &self.backend,
             &validated,
@@ -2285,10 +2515,11 @@ impl GpuRuntime {
             artifact_payload_sizes,
             &self.options.subgraph_kernels,
             device_artifact_exports,
+            false,
         )
         .map_err(GpuPlanError::Resource)?;
         validate_allocated_budget(&frame, &contract, None)?;
-        let graph = DirectGraph::compile(&self.backend, &mut frame)?;
+        let graph = DirectGraph::compile(&self.backend, &mut frame, &[])?;
         validate_allocated_budget(&frame, &contract, Some(&graph))?;
         let report = GpuWarmupReport {
             predicted_seconds: selected_seconds,
@@ -2302,6 +2533,7 @@ impl GpuRuntime {
                 "minimum measured compute time among {} actually feasible (W,C) candidates",
                 measured.len()
             ),
+            node_costs,
         };
         self.measured_costs = measured.clone();
         Ok(GpuExecutionPlan {
@@ -3165,7 +3397,48 @@ fn artifact_payload_kind(artifact: &ArtifactType) -> u8 {
 
 #[cfg(test)]
 mod candidate_tests {
-    use super::geometric_candidates;
+    use super::{attribute_node_costs, geometric_candidates, per_launch_overhead};
+    use mxx_ir_core::{FrozenGraphScopeId, NodeId};
+
+    #[test]
+    fn attribute_node_costs_gives_equal_ranges_to_the_innermost_node() {
+        let body = FrozenGraphScopeId::Subgraph { canonical_name: "body".into() };
+        let root = FrozenGraphScopeId::Root;
+        // A call whose only operations come from one body node is recorded
+        // after it with the same range.
+        let spans = vec![
+            (body.clone(), NodeId(0), 0..2),
+            (root.clone(), NodeId(1), 0..2),
+            (root.clone(), NodeId(2), 2..3),
+        ];
+        // One production region of 2 s, profiled as 3 s and 1.5 s: each
+        // launch pays 1.25 s, leaving 1.75 s and 0.25 s.
+        let costs = attribute_node_costs(spans, &[(0, 3.0), (2, 1.5)], &[(0, 2.0)]).unwrap();
+        let cost = |scope: &FrozenGraphScopeId, node| {
+            let cost = costs.iter().find(|cost| &cost.scope == scope && cost.node == node).unwrap();
+            (cost.self_seconds, cost.total_seconds)
+        };
+        let close = |(left, right): (f64, f64), (expected_left, expected_right): (f64, f64)| {
+            (left - expected_left).abs() < 1e-12 && (right - expected_right).abs() < 1e-12
+        };
+        assert!(close(cost(&body, NodeId(0)), (1.75, 1.75)));
+        assert!(close(cost(&root, NodeId(1)), (0.0, 1.75)));
+        assert!(close(cost(&root, NodeId(2)), (0.25, 0.25)));
+        assert!(attribute_node_costs(Vec::new(), &[(1, 1.0)], &[(0, 1.0)]).is_err());
+    }
+
+    #[test]
+    fn per_launch_overhead_leaves_the_measured_region_time() {
+        // Three segments pay 2 each on top of 10, 1, and 0.
+        let overhead = per_launch_overhead(vec![12.0, 3.0, 2.0], 11.0);
+        assert!((overhead - 2.0).abs() < 1e-12);
+        // A segment below the overhead keeps no time.
+        let overhead = per_launch_overhead(vec![12.0, 3.0, 0.5], 11.0);
+        assert!((overhead - 2.0).abs() < 1e-12);
+        // Segments that sum to less than the region pay no overhead.
+        assert_eq!(per_launch_overhead(vec![1.0, 2.0], 5.0), 0.0);
+        assert_eq!(per_launch_overhead(Vec::new(), 5.0), 0.0);
+    }
 
     #[test]
     fn geometric_candidates_keep_both_extremes_without_duplicates() {

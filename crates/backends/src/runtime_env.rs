@@ -16,6 +16,9 @@ pub struct GpuRuntimeOptions {
     /// Subgraphs the planner executes with their registered native kernel
     /// instead of their body; empty runs every subgraph from its body.
     pub subgraph_kernels: Vec<crate::gpu_subgraph_kernel::GpuSubgraphKernel>,
+    /// After selecting a candidate, time every graph node's operations
+    /// separately and report each node's predicted share of the plan's time.
+    pub profile_nodes: bool,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -56,6 +59,14 @@ fn nonnegative_usize(name: &str, default: usize) -> Result<usize, GpuRuntimeConf
     })
 }
 
+fn flag(name: &str) -> Result<bool, GpuRuntimeConfigError> {
+    match env::var(name).as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0" | "false") => Ok(false),
+        Ok("1" | "true") => Ok(true),
+        _ => Err(GpuRuntimeConfigError::Invalid(format!("{name} must be 0, 1, false, or true"))),
+    }
+}
+
 impl GpuRuntimeOptions {
     /// Read all runtime settings exactly once.  Callers should retain this
     /// value in the runtime/plan and use it as the frozen preparation policy.
@@ -74,6 +85,7 @@ impl GpuRuntimeOptions {
                     .expect("positive_usize rejects zero"),
             ),
         };
+        let profile_nodes = flag("MXX_GPU_PROFILE_NODES")?;
         Ok(Self {
             max_parallel_instances,
             measurement_warmups,
@@ -81,6 +93,7 @@ impl GpuRuntimeOptions {
             release_fence_interval,
             integer_input_ranges: BTreeMap::new(),
             subgraph_kernels: Vec::new(),
+            profile_nodes,
         })
     }
 }
@@ -98,6 +111,7 @@ mod tests {
             "MXX_GPU_MEASUREMENT_WARMUPS",
             "MXX_GPU_MEASUREMENT_ITERATIONS",
             "MXX_GPU_RELEASE_FENCE_INTERVAL",
+            "MXX_GPU_PROFILE_NODES",
         ] {
             unsafe { std::env::remove_var(name) };
         }
@@ -106,6 +120,7 @@ mod tests {
         assert_eq!(options.measurement_warmups, 1);
         assert_eq!(options.measurement_iterations.get(), 2);
         assert_eq!(options.release_fence_interval, None);
+        assert!(!options.profile_nodes);
     }
 
     #[test]
@@ -116,17 +131,20 @@ mod tests {
             std::env::set_var("MXX_GPU_MEASUREMENT_WARMUPS", "0");
             std::env::set_var("MXX_GPU_MEASUREMENT_ITERATIONS", "5");
             std::env::set_var("MXX_GPU_RELEASE_FENCE_INTERVAL", "7");
+            std::env::set_var("MXX_GPU_PROFILE_NODES", "1");
         }
         let options = GpuRuntimeOptions::from_env().unwrap();
         assert_eq!(options.max_parallel_instances.get(), 3);
         assert_eq!(options.measurement_warmups, 0);
         assert_eq!(options.measurement_iterations.get(), 5);
         assert_eq!(options.release_fence_interval.map(NonZeroUsize::get), Some(7));
+        assert!(options.profile_nodes);
         unsafe {
             std::env::remove_var("MXX_GPU_MAX_PARALLEL_INSTANCES");
             std::env::remove_var("MXX_GPU_MEASUREMENT_WARMUPS");
             std::env::remove_var("MXX_GPU_MEASUREMENT_ITERATIONS");
             std::env::remove_var("MXX_GPU_RELEASE_FENCE_INTERVAL");
+            std::env::remove_var("MXX_GPU_PROFILE_NODES");
         }
     }
 }

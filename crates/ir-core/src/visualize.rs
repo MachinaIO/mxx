@@ -43,8 +43,8 @@ pub fn render_html(
     costs: Option<(f64, &[NodeCost])>,
 ) -> String {
     let data = graph_data(graph, validated, costs).to_string();
-    // A JSON string may contain "</script>"; escaping the slash keeps it inside the script.
-    TEMPLATE.replacen(DATA_PLACEHOLDER, &data.replace("</", "<\\/"), 1)
+    // No `<` reaches the script, so no string can end it or open a comment.
+    TEMPLATE.replacen(DATA_PLACEHOLDER, &data.replace('<', "\\u003c"), 1)
 }
 
 fn graph_data(
@@ -62,6 +62,7 @@ fn graph_data(
         .unwrap_or_default();
     // Every binding each scope is instantiated with: a named subgraph has one
     // per distinct call binding. A validated graph already checked them all.
+    let loop_dependent = crate::validate::loop_dependent_variables(graph);
     let scope_envs = validated.map(|validated| {
         let mut envs = BTreeMap::new();
         crate::validate::collect_scope_bindings(
@@ -78,7 +79,10 @@ fn graph_data(
         .iter()
         .map(|(id, scope)| {
             let key = scope_key(id);
-            let envs = scope_envs.as_ref().and_then(|envs| envs.get(id)).map(Vec::as_slice);
+            let envs = scope_envs
+                .as_ref()
+                .and_then(|envs| envs.get(id))
+                .map(|envs| (envs.as_slice(), &loop_dependent[id]));
             let nodes = scope
                 .nodes()
                 .iter()
@@ -130,6 +134,7 @@ fn graph_data(
     });
     json!({
         "name": graph.name(),
+        "root": scope_key(&FrozenGraphScopeId::Root),
         "bindings": bindings,
         "predicted_seconds": costs.map(|(seconds, _)| seconds),
         "scopes": scopes,
@@ -146,13 +151,15 @@ fn node_data(
     scope_id: &FrozenGraphScopeId,
     node_id: NodeId,
     node: &NodeHandle,
-    envs: Option<&[ParamEnv]>,
+    envs: Option<(&[ParamEnv], &BTreeSet<String>)>,
     cost: Option<&&NodeCost>,
 ) -> Value {
     let wire_type = |wire: WireRef, symbolic: &WireType| {
         envs.map_or_else(
             || symbolic_type(symbolic),
-            |envs| instantiated_type(symbolic, envs, scope_id, wire.node),
+            |(envs, loop_dependent)| {
+                instantiated_type(symbolic, envs, loop_dependent, scope_id, wire.node)
+            },
         )
     };
     let inputs = node
@@ -185,7 +192,7 @@ fn node_data(
     };
     json!({
         "id": node_id.0,
-        "label": node_label(node.kind(), envs),
+        "label": node_label(node.kind(), envs.map(|(envs, _)| envs)),
         "kind": kind_name(node.kind()),
         "detail": detail,
         "inputs": inputs,
@@ -231,17 +238,10 @@ fn node_label(kind: &NodeKind, envs: Option<&[ParamEnv]>) -> String {
     }
 }
 
+/// A unique key per scope: its structured serialization, so no subgraph name
+/// can collide with a body path.
 fn scope_key(id: &FrozenGraphScopeId) -> String {
-    match id {
-        FrozenGraphScopeId::Root => "root".to_owned(),
-        FrozenGraphScopeId::Subgraph { canonical_name } => format!("subgraph:{canonical_name}"),
-        FrozenGraphScopeId::ParallelBody { parent, owner } => {
-            format!("{}/parallel#{}", scope_key(parent), owner.0)
-        }
-        FrozenGraphScopeId::SequentialBody { parent, owner } => {
-            format!("{}/sequential#{}", scope_key(parent), owner.0)
-        }
-    }
+    serde_json::to_string(id).expect("a scope ID serializes")
 }
 
 fn scope_label(id: &FrozenGraphScopeId) -> String {
@@ -266,15 +266,19 @@ fn scope_parent(id: &FrozenGraphScopeId) -> Option<FrozenGraphScopeId> {
 
 /// The concrete type of a wire when every instantiation of its scope gives the
 /// same one. Validation resolves a loop body at index zero, so a type that
-/// depends on the loop index stays symbolic, as does one that differs between
-/// the calls of a named subgraph.
+/// reads a loop index, directly or through a `loop_dependent` variable of its
+/// scope, stays symbolic, as does one that differs between the calls of a
+/// named subgraph.
 fn instantiated_type(
     symbolic: &WireType,
     envs: &[ParamEnv],
+    loop_dependent: &BTreeSet<String>,
     scope: &FrozenGraphScopeId,
     node: NodeId,
 ) -> String {
-    if uses_loop_index(symbolic) {
+    let (mut variables, mut loop_slots) = (BTreeSet::new(), BTreeSet::new());
+    crate::validate::collect_serialized_references(symbolic, &mut variables, &mut loop_slots);
+    if !loop_slots.is_empty() || !variables.is_disjoint(loop_dependent) {
         return format!("{} (depends on the loop index)", symbolic_type(symbolic));
     }
     let concrete = envs
@@ -286,30 +290,6 @@ fn instantiated_type(
         (1, Some(ty)) => concrete_type(ty),
         (0, _) => symbolic_type(symbolic),
         (count, _) => format!("{} ({count} shapes across calls)", symbolic_type(symbolic)),
-    }
-}
-
-/// Whether a shape shown by `symbolic_type` depends on a loop index.
-fn uses_loop_index(ty: &WireType) -> bool {
-    let matrix = |matrix: &MatrixType| {
-        matrix.rows.contains_loop_index() ||
-            matrix.columns.contains_loop_index() ||
-            matrix.ring.contains_loop_index()
-    };
-    match ty {
-        WireType::Matrix(value) => matrix(value),
-        WireType::Trapdoor { matrix: value, gadget_base, digit_count, .. } => {
-            matrix(value) || gadget_base.contains_loop_index() || digit_count.contains_loop_index()
-        }
-        WireType::SmallMatrix { matrix: value, max_coefficient_bound, .. } |
-        WireType::Preimage { matrix: value, max_coefficient_bound, .. } => {
-            matrix(value) || max_coefficient_bound.contains_loop_index()
-        }
-        WireType::IndexedFamily { element, count } => {
-            uses_loop_index(element) || count.contains_loop_index()
-        }
-        WireType::Bytes { length } => length.contains_loop_index(),
-        _ => false,
     }
 }
 
@@ -447,7 +427,7 @@ mod tests {
         };
         let by_parameter = matrix(IntExpr::Var("rows".into()));
         let shown = |ty: &WireType, envs: &[ParamEnv]| {
-            instantiated_type(ty, envs, &FrozenGraphScopeId::Root, NodeId(0))
+            instantiated_type(ty, envs, &BTreeSet::new(), &FrozenGraphScopeId::Root, NodeId(0))
         };
         assert!(shown(&by_parameter, &[env(2), env(2)]).starts_with("Matrix 2×1 over N=8"));
         assert_eq!(
@@ -458,5 +438,24 @@ mod tests {
             shown(&matrix(IntExpr::LoopIndex(0)), &[env(2)])
                 .ends_with("(depends on the loop index)")
         );
+        // A parameter bound to an enclosing loop index is loop dependent too.
+        let bound_to_index = instantiated_type(
+            &by_parameter,
+            &[env(2)],
+            &BTreeSet::from(["rows".to_owned()]),
+            &FrozenGraphScopeId::Root,
+            NodeId(0),
+        );
+        assert!(bound_to_index.ends_with("(depends on the loop index)"));
+    }
+
+    #[test]
+    fn test_scope_keys_do_not_collide_with_body_paths() {
+        let named = FrozenGraphScopeId::Subgraph { canonical_name: "x/parallel#1".into() };
+        let body = FrozenGraphScopeId::ParallelBody {
+            parent: Box::new(FrozenGraphScopeId::Subgraph { canonical_name: "x".into() }),
+            owner: NodeId(1),
+        };
+        assert_ne!(scope_key(&named), scope_key(&body));
     }
 }

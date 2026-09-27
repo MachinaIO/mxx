@@ -108,11 +108,12 @@ svg.hovering g.node:not(.lit) { opacity: .45; }
 const DATA = /*GRAPH_DATA*/null;
 const NS = "http://www.w3.org/2000/svg";
 const scopes = new Map(DATA.scopes.map(scope => [scope.id, scope]));
+const ROOT = DATA.root;
 const predicted = DATA.predicted_seconds;
 const hasCosts = predicted != null && DATA.scopes.some(s => s.nodes.some(n => n.total_seconds != null));
 const $ = id => document.getElementById(id);
 const esc = text => String(text).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-let path = ["root"];
+let path = [ROOT];
 let focusNode = null;
 
 function seconds(value) {
@@ -145,7 +146,7 @@ function heat(fraction) {
 
 // Find a chain of scopes from the root to `id`, through the first call or loop that opens it.
 function pathTo(id) {
-  if (id === "root") return ["root"];
+  if (id === ROOT) return [ROOT];
   for (const scope of DATA.scopes) {
     if (scope.nodes.some(node => node.child === id)) {
       if (scope.id === id) continue;
@@ -153,7 +154,7 @@ function pathTo(id) {
       if (parent) return [...parent, id];
     }
   }
-  return ["root", id];
+  return [ROOT, id];
 }
 
 // Layered layout: longest-path layers, dummy nodes on long edges, barycenter ordering sweeps.
@@ -405,7 +406,7 @@ function sidebar() {
   const scope = scopes.get(path[path.length - 1]);
   const section = (title) => { const h = document.createElement("h2"); h.textContent = title; side.appendChild(h); };
   if (hasCosts) {
-    const attributed = scopes.get("root").nodes.reduce((sum, n) => sum + (n.total_seconds || 0), 0);
+    const attributed = scopes.get(ROOT).nodes.reduce((sum, n) => sum + (n.total_seconds || 0), 0);
     section("Predicted time");
     const kv = document.createElement("div");
     kv.className = "kv";

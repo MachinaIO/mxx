@@ -165,8 +165,8 @@ pub(crate) struct PhysicalFrame {
     /// Top-level operation ranges of the lanes of each parallel loop. Lanes
     /// are independent, so their Graph scratch chains run concurrently.
     pub parallel_lanes: Vec<Vec<std::ops::Range<u32>>>,
-    /// The top-level operation range each lowered graph node emitted; see
-    /// `PhysicalLoweringContext::node_operations`.
+    /// The top-level operation range each lowered graph node emitted when
+    /// node profiling asked for them; see `PhysicalLoweringContext::node_operations`.
     pub node_operations: Vec<(FrozenGraphScopeId, NodeId, std::ops::Range<u32>)>,
     /// One caller handle per output, reused while the output's plan owner is
     /// unchanged (keyed by that owner's address). A handle with another strong
@@ -1453,9 +1453,10 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// Top-level operation ranges of the lanes of each parallel loop.
     pub parallel_lanes: &'a mut Vec<Vec<std::ops::Range<u32>>>,
     /// The top-level operation range each lowered node emitted, in lowering
-    /// order. A body node's range lies inside its loop or call node's range;
-    /// nodes lowered inside a device body are covered by that body's node.
-    pub node_operations: &'a mut Vec<(FrozenGraphScopeId, NodeId, std::ops::Range<u32>)>,
+    /// order, recorded only for node profiling. A body node's range lies
+    /// inside its loop or call node's range. A device body records none: its
+    /// operations are nested in one top-level operation of its node.
+    pub node_operations: Option<&'a mut Vec<(FrozenGraphScopeId, NodeId, std::ops::Range<u32>)>>,
     pub crt_resource_next: &'a mut u32,
     /// A full CRT matrix value and its counterpart in the other full encoding.
     /// A conversion is emitted once per value and shared by later consumers
@@ -1469,21 +1470,21 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub subgraph_kernels: &'a [GpuSubgraphKernel],
 }
 
-/// Record the top-level operations `node` emitted since `first_operation`.
-/// Operations lowered into a device body are nested inside one top-level
-/// operation, which the node enclosing that body records.
+/// Record the top-level operations `node` emitted since `first_operation`,
+/// when the context records node operations.
 pub(super) fn record_node_operations(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &FrozenGraphScopeId,
     node: NodeId,
     first_operation: usize,
 ) -> Result<(), String> {
-    if ctx.device_body || first_operation == ctx.operations.len() {
+    let end = ctx.operations.len();
+    let Some(spans) = ctx.node_operations.as_deref_mut().filter(|_| first_operation < end) else {
         return Ok(());
-    }
-    let end = u32::try_from(ctx.operations.len())
+    };
+    let end = u32::try_from(end)
         .map_err(|_| "too many GPU operations for node attribution".to_owned())?;
-    ctx.node_operations.push((scope.clone(), node, first_operation as u32..end));
+    spans.push((scope.clone(), node, first_operation as u32..end));
     Ok(())
 }
 
@@ -4974,7 +4975,7 @@ pub(super) fn lower_preimage_sample_node(
                 external_io_loops: &mut *ctx.external_io_loops,
                 external_io_imports: &mut *ctx.external_io_imports,
                 parallel_lanes: &mut *ctx.parallel_lanes,
-                node_operations: &mut *ctx.node_operations,
+                node_operations: None,
                 crt_resource_next: &mut *ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -5503,6 +5504,7 @@ pub(crate) fn plan_physical_graph(
     artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
     subgraph_kernels: &[GpuSubgraphKernel],
     device_artifact_exports: bool,
+    profile_nodes: bool,
 ) -> Result<PhysicalFrame, String> {
     let device = i32::try_from(
         *logical
@@ -5978,7 +5980,7 @@ pub(crate) fn plan_physical_graph(
                 external_io_loops: &mut external_io_loops,
                 external_io_imports: &mut external_io_imports,
                 parallel_lanes: &mut parallel_lanes,
-                node_operations: &mut node_operations,
+                node_operations: profile_nodes.then_some(&mut node_operations),
                 crt_resource_next: &mut crt_resource_next,
                 converted: &mut converted,
                 integer_status: &mut integer_status,

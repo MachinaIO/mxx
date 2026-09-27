@@ -192,35 +192,7 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         }
     }
 
-    let empty_dependencies = graph
-        .scopes()
-        .keys()
-        .cloned()
-        .map(|scope| (scope, BTreeSet::<String>::new()))
-        .collect::<BTreeMap<_, _>>();
-    let mut loop_dependent_by_scope = empty_dependencies.clone();
-    loop {
-        let mut next = empty_dependencies.clone();
-        for (scope_id, scope) in graph.scopes() {
-            let parent = loop_dependent_by_scope.get(scope_id).cloned().unwrap_or_default();
-            for (position, node) in scope.nodes().iter().enumerate() {
-                let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
-                    continue;
-                };
-                let bindings = match node.kind() {
-                    NodeKind::SubgraphCall(call) => &call.bindings,
-                    NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
-                    NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
-                    _ => continue,
-                };
-                next.entry(child).or_default().extend(child_loop_dependencies(&parent, bindings));
-            }
-        }
-        if next == loop_dependent_by_scope {
-            break;
-        }
-        loop_dependent_by_scope = next;
-    }
+    let loop_dependent_by_scope = loop_dependent_variables(graph);
 
     for (scope_id, scope) in graph.scopes() {
         let allowed_slots = structural_loop_slots(graph, scope_id);
@@ -351,7 +323,7 @@ fn collect_expression_references(
     }
 }
 
-fn collect_serialized_references<T: serde::Serialize>(
+pub(crate) fn collect_serialized_references<T: serde::Serialize>(
     value: &T,
     variables: &mut BTreeSet<String>,
     loop_slots: &mut BTreeSet<u32>,
@@ -362,6 +334,43 @@ fn collect_serialized_references<T: serde::Serialize>(
     for entry in ring_table {
         collect_expression_references(&entry, variables, loop_slots);
     }
+}
+
+/// The compile variables of each scope whose value depends on an enclosing
+/// loop index, directly or through subgraph and loop bindings.
+pub(crate) fn loop_dependent_variables(
+    graph: &Graph,
+) -> BTreeMap<FrozenGraphScopeId, BTreeSet<String>> {
+    let empty_dependencies = graph
+        .scopes()
+        .keys()
+        .cloned()
+        .map(|scope| (scope, BTreeSet::<String>::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut loop_dependent_by_scope = empty_dependencies.clone();
+    loop {
+        let mut next = empty_dependencies.clone();
+        for (scope_id, scope) in graph.scopes() {
+            let parent = loop_dependent_by_scope.get(scope_id).cloned().unwrap_or_default();
+            for (position, node) in scope.nodes().iter().enumerate() {
+                let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
+                    continue;
+                };
+                let bindings = match node.kind() {
+                    NodeKind::SubgraphCall(call) => &call.bindings,
+                    NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
+                    NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
+                    _ => continue,
+                };
+                next.entry(child).or_default().extend(child_loop_dependencies(&parent, bindings));
+            }
+        }
+        if next == loop_dependent_by_scope {
+            break;
+        }
+        loop_dependent_by_scope = next;
+    }
+    loop_dependent_by_scope
 }
 
 fn child_loop_dependencies(

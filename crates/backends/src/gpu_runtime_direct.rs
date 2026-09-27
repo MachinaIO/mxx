@@ -2268,6 +2268,7 @@ impl GpuRuntime {
             artifact_payload_sizes,
             &self.options.subgraph_kernels,
             device_artifact_exports,
+            true,
         )
         .map_err(GpuPlanError::Resource)?;
         validate_allocated_budget(&frame, contract, None)?;
@@ -2436,6 +2437,7 @@ impl GpuRuntime {
                     artifact_payload_sizes,
                     &self.options.subgraph_kernels,
                     device_artifact_exports,
+                    false,
                 )
                 .map_err(GpuPlanError::Resource)?;
                 validate_allocated_budget(&frame, &contract, None)?;
@@ -2513,6 +2515,7 @@ impl GpuRuntime {
             artifact_payload_sizes,
             &self.options.subgraph_kernels,
             device_artifact_exports,
+            false,
         )
         .map_err(GpuPlanError::Resource)?;
         validate_allocated_budget(&frame, &contract, None)?;

@@ -2332,7 +2332,7 @@ mod tests {
     fn rendered_data(html: &str) -> serde_json::Value {
         let start = html.find("const DATA = ").expect("rendered data") + "const DATA = ".len();
         let end = start + html[start..].find(";\nconst NS").expect("end of rendered data");
-        serde_json::from_str(&html[start..end].replace("<\\/", "</")).unwrap()
+        serde_json::from_str(&html[start..end]).unwrap()
     }
 
     #[test]
@@ -2340,20 +2340,20 @@ mod tests {
         let ring = Ring::new(IntExpr::Var("crt_bits".into()), IntExpr::from(2), 16);
         let columns = IntExpr::Var("columns".into());
         let context =
-            DslContext::new("render-</script>").int_parameter("crt_bits").int_parameter("columns");
+            DslContext::new("render-</SCRIPT>").int_parameter("crt_bits").int_parameter("columns");
         let left = ring.input("left", (1, columns.clone()));
         let right = ring.input("right", (columns.clone(), columns));
         let body_right = right.clone();
         let family = crate::parallel(3, move |_| Ok(&left * &body_right)).unwrap();
         let built = context.output("products", family).unwrap().build().unwrap();
         let html = built.render_html();
-        assert!(!html.contains("render-</script>"), "embedded data cannot close the script");
+        assert!(!html.contains("render-</SCRIPT>"), "embedded data cannot close the script");
         let symbolic = rendered_data(&html);
         assert!(symbolic["predicted_seconds"].is_null());
         let scopes = symbolic["scopes"].as_array().unwrap();
         assert_eq!(scopes.len(), 2);
-        let root = scopes.iter().find(|scope| scope["id"] == "root").unwrap();
-        let body = scopes.iter().find(|scope| scope["id"] != "root").unwrap();
+        let root = scopes.iter().find(|scope| scope["id"] == symbolic["root"]).unwrap();
+        let body = scopes.iter().find(|scope| scope["id"] != symbolic["root"]).unwrap();
         let loop_node = root["nodes"]
             .as_array()
             .unwrap()
@@ -2390,8 +2390,11 @@ mod tests {
             Some(&validated),
             None,
         ));
-        let root =
-            concrete["scopes"].as_array().unwrap().iter().find(|scope| scope["id"] == "root");
+        let root = concrete["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["id"] == concrete["root"]);
         assert!(input(root.unwrap(), "right").starts_with("Matrix 4×4 over N=16, 2 CRT limbs"));
         assert_eq!(concrete["bindings"]["columns"], "4");
     }

@@ -893,7 +893,7 @@ impl DirectGraph {
     fn bind(&mut self, frame: &PhysicalFrame) -> Result<(), GpuRuntimeError> {
         let mut values = Vec::with_capacity(frame.program.bindings.len());
         let mut checked = BTreeSet::new();
-        for source in &frame.program.bindings {
+        for source in frame.program.bindings.iter() {
             let address = match *source {
                 GpuBindingSource::PhysicalPart { value, part, limb } => {
                     if limb != 0 {

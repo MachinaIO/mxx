@@ -1441,8 +1441,9 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// Device-owned loop index values in the current native control body.
     pub device_loop_indices: BTreeMap<u32, PhysicalValueId>,
     /// Lane count of a vectorized scalar loop body: each non-constant scalar
-    /// holds one value per lane on its value-index axis. One outside it.
-    pub lanes: usize,
+    /// holds one value per lane on its value-index axis. `None` outside it,
+    /// so a one-lane body still keeps its lane axis.
+    pub lanes: Option<usize>,
     /// Current reusable parallel template, identified by site and static lane.
     /// Logical occurrence is supplied by the replay scheduler, not frozen here.
     pub active_parallel_template: Option<(GpuLoopSiteKey, usize)>,
@@ -4107,6 +4108,23 @@ pub(super) fn hash_tag_resource(
             HashTagComponent::Bytes(bytes) => {
                 GpuHashTagPart::bytes_component(bytes).map_err(|error| error.to_string())?
             }
+            // A loop body is lowered once for every iteration, so an index
+            // the device advances is read from its resident scalar.
+            HashTagComponent::Integer(expression) |
+            HashTagComponent::Decimal(expression) |
+            HashTagComponent::U64Le(expression)
+                if expression.contains_loop_index() =>
+            {
+                let id = crate::gpu_physical_control::lower_device_int_expr(ctx, expression, env)?;
+                let binding = register_preimage_control_binding(ctx, id)?;
+                let operand_index = operands.len();
+                operands.push((id, 0, binding));
+                match component {
+                    HashTagComponent::Integer(_) => GpuHashTagPart::Integer(operand_index),
+                    HashTagComponent::Decimal(_) => GpuHashTagPart::Decimal(operand_index),
+                    _ => GpuHashTagPart::U64Le(operand_index),
+                }
+            }
             HashTagComponent::Integer(expression) => {
                 let value = expression.evaluate(env).map_err(|error| error.to_string())?;
                 GpuHashTagPart::integer_constant(&value).map_err(|error| error.to_string())?
@@ -6273,7 +6291,7 @@ pub(crate) fn plan_physical_graph(
                 real_owners: &mut real_owners,
                 indexed_tables: &mut indexed_tables,
                 device_loop_indices: BTreeMap::new(),
-                lanes: 1,
+                lanes: None,
                 active_parallel_template: None,
                 active_parallel_instances: Vec::new(),
                 device_body: false,
@@ -7146,10 +7164,10 @@ pub(crate) fn plan_physical_graph(
         .copied()
         .collect::<BTreeSet<_>>();
     let program = CompiledGpuProgram {
-        values: values.into_boxed_slice(),
+        values: values.into(),
         implementations,
         operations: operations.into_boxed_slice(),
-        bindings: bindings.into_boxed_slice(),
+        bindings: bindings.into(),
         export_slots: reserve_gpu_export_slots(slot_ranges).map_err(str::to_owned)?,
         subgraph_kernels: subgraph_kernels.to_vec().into_boxed_slice(),
     };
@@ -7832,6 +7850,117 @@ mod tests {
             expected_b
         );
         assert_eq!(plan.compiled_launch_count(), 2);
+    }
+
+    /// Hash tags that name a loop index match the CPU transcript in waves of
+    /// a parallel loop, in a nested loop, and in a sequential body, which is
+    /// lowered once while the device advances its index.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn hash_tags_read_device_loop_indices_like_cpu() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 1, 28, 8, None, None);
+        let modulus = cpu.to_crt().0[0];
+        let gpu = GpuDCRTPolyParams::new(32, vec![modulus], 8, None);
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
+        let key = ring.bytes_input("key", 32);
+        let plain = mxx_dsl::parallel(40, |i| {
+            let mut tag = HashTag::from(b"loop-hash/plain:".as_slice());
+            tag.push(i.expression()?);
+            Ok(ring.hash_matrix(key.clone(), tag, (1, 1)))
+        })
+        .unwrap();
+        let select = mxx_dsl::parallel(3, |j| {
+            let rows = mxx_dsl::parallel(5, |i| {
+                let mut tag = HashTag::from(b"loop-hash/select:".as_slice());
+                tag.push(IntExpr::Select {
+                    selector: Box::new(i.expression()?),
+                    branches: [5u8, 2, 7, 1, 9].into_iter().map(IntExpr::from).collect(),
+                });
+                tag.push(j.expression()?);
+                Ok(ring.hash_matrix(key.clone(), tag, (1, 1)))
+            })?;
+            Ok(rows.at(Int::constant(1)) + rows.at(Int::constant(3)))
+        })
+        .unwrap();
+        let hash_at = |label: &str, member: IntExpr| {
+            let mut tag = HashTag::from(label.as_bytes());
+            tag.push(member);
+            ring.hash_matrix(key.clone(), tag, (1, 1))
+        };
+        let first = hash_at("loop-hash/iterate:", IntExpr::from(0u8)) +
+            hash_at("loop-hash/iterate:", IntExpr::from(1u8));
+        let iterated = mxx_dsl::iterate(IntExpr::from(3u8), first, |i, state| {
+            Ok(state + hash_at("loop-hash/iterate:", i.add(2usize).expression()?))
+        })
+        .unwrap();
+        let single = mxx_dsl::parallel(1, |i| {
+            Ok(hash_at(
+                "loop-hash/single:",
+                IntExpr::Select {
+                    selector: Box::new(i.expression()?),
+                    branches: vec![IntExpr::from(6u8)],
+                },
+            ))
+        })
+        .unwrap();
+        let validated = DslContext::new("loop-hash-tags")
+            .output("iterated", iterated)
+            .unwrap()
+            .output("single", single)
+            .unwrap()
+            .output("plain", plain)
+            .unwrap()
+            .output("select", select)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs =
+            BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from([0x31u8; 32])))]);
+        let mut cpu_exec = cpu_backend([cpu.clone()]);
+        let mut cpu_store = MemoryArtifactStore::default();
+        let mut result = execute_in_session(
+            &validated,
+            &mut cpu_exec,
+            inputs.clone(),
+            &mut cpu_store,
+            [0x25; 32],
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], [device])).unwrap();
+        let mut plan = runtime.plan(validated, &inputs).unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let gpu_result =
+            runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0x41; 32]).unwrap();
+        let RuntimeValue::Matrix(matrix) =
+            result.materialize_output("iterated", &cpu_exec, &mut cpu_store).unwrap()
+        else {
+            panic!("iterated is a matrix")
+        };
+        assert_eq!(
+            runtime.download_matrix_output(&gpu_result.output("iterated").unwrap()).unwrap(),
+            matrix.as_cpu_full().unwrap().clone(),
+            "iterated"
+        );
+        for name in ["plain", "select", "single"] {
+            let RuntimeValue::IndexedFamily { values, .. } =
+                result.materialize_output(name, &cpu_exec, &mut cpu_store).unwrap()
+            else {
+                panic!("CPU {name} is a family");
+            };
+            for (index, value) in values.iter().enumerate() {
+                let RuntimeValue::Matrix(matrix) = value else { panic!("member is a matrix") };
+                let expected = matrix.as_cpu_full().unwrap().clone();
+                let actual = runtime
+                    .download_matrix_member_output(&gpu_result.output(name).unwrap(), index)
+                    .unwrap();
+                assert_eq!(actual, expected, "{name}[{index}]");
+            }
+        }
     }
 
     /// Hash integer families match the CPU transcript for one- and two-word

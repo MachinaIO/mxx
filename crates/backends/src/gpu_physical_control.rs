@@ -1770,11 +1770,7 @@ fn lane_type<'c>(
 ) -> &'c ConcreteWireType {
     let ty = &ctx.values[id.0 as usize].ty;
     match ty {
-        ConcreteWireType::IndexedFamily { element, count }
-            if ctx.lanes > 1 && *count == ctx.lanes =>
-        {
-            element
-        }
+        ConcreteWireType::IndexedFamily { element, count } if ctx.lanes == Some(*count) => element,
         _ => ty,
     }
 }
@@ -1854,7 +1850,7 @@ fn widen_integer(
 /// static subexpressions become plan-owned constants; arithmetic remains in
 /// the Graph and keeps the full proven signed range, including multiword
 /// magnitudes.
-fn lower_device_int_expr(
+pub(super) fn lower_device_int_expr(
     ctx: &mut PhysicalLoweringContext<'_>,
     expression: &IntExpr,
     env: &ParamEnv,
@@ -2424,7 +2420,7 @@ fn allocate_integer_value_with_storage(
     let params = ctx.backend.control_parameters_on_device(ctx.device)?;
     // A vectorized body holds one value per lane; constants stay scalar and
     // broadcast to every lane.
-    let lanes = if constant.is_some() { 1 } else { ctx.lanes };
+    let lanes = if constant.is_some() { None } else { ctx.lanes };
     let words = usize::try_from(range.start().bits().max(range.end().bits()).div_ceil(64))
         .map_err(|_| "GPU integer width exceeds host address space".to_owned())?
         .max(1);
@@ -2455,11 +2451,14 @@ fn allocate_integer_value_with_storage(
             .map_err(|error| error.to_string())?,
         ),
         None => Arc::new(
-            GpuSignedValues::allocate(&params, ctx.device, lanes, encoding)
+            GpuSignedValues::allocate(&params, ctx.device, lanes.unwrap_or(1), encoding)
                 .map_err(|error| error.to_string())?,
         ),
     };
-    let lanes = u64::try_from(lanes).map_err(|_| "GPU lane count exceeds u64".to_owned())?;
+    let lanes = lanes
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| "GPU lane count exceeds u64".to_owned())?;
     let actual_encoding = if constant.is_some() && !boolean {
         GpuSignedValuesEncoding::SignedWords(words)
     } else {
@@ -2477,7 +2476,7 @@ fn allocate_integer_value_with_storage(
     } else {
         (ty, vec![0, 0], vec![1, word_count as u64], vec![bytes, 8])
     };
-    let ty = if lanes > 1 {
+    let ty = if let Some(lanes) = lanes {
         origin.insert(0, 0);
         extent.insert(0, lanes);
         byte_strides.insert(0, byte_strides[0]);
@@ -4081,7 +4080,7 @@ fn lower_int_matrix_vector_product(
     env: &ParamEnv,
     transpose: bool,
 ) -> Result<(), String> {
-    if ctx.lanes > 1 {
+    if ctx.lanes.is_some() {
         return Err("GPU integer matrix-vector product is not supported in a vectorized body".into());
     }
     let arguments = scope.arguments(node).ok_or("GPU matrix-vector arguments are out of scope")?;
@@ -6911,7 +6910,7 @@ fn lower_vectorized_parallel_loop(
     env: &ParamEnv,
     count: usize,
 ) -> Result<(), String> {
-    if ctx.lanes != 1 {
+    if ctx.lanes.is_some() {
         return Err("GPU vectorized loop is nested in another vectorized body".into());
     }
     let child_id = graph
@@ -7012,7 +7011,7 @@ fn lower_vectorized_parallel_loop(
     }
     let child_env =
         fixed_child_env(scope_id, node_id, env, &loop_node.bindings, Some(loop_node.index_slot))?;
-    ctx.lanes = count;
+    ctx.lanes = Some(count);
     let lowered = lower_inlined_child(
         ctx,
         graph,
@@ -7051,7 +7050,7 @@ fn lower_vectorized_parallel_loop(
             })
             .collect::<Result<Vec<_>, String>>()
     });
-    ctx.lanes = 1;
+    ctx.lanes = None;
     for (port, id) in outputs?.into_iter().enumerate() {
         let port_id =
             Port(u32::try_from(port).map_err(|_| "GPU parallel loop has too many outputs")?);
@@ -8507,8 +8506,9 @@ mod tests {
         }
     }
 
-    /// A vectorized gather over a mixed pack, and polynomial imports/exports
-    /// in both domains, agree with the CPU executor.
+    /// A vectorized gather over a mixed pack, including a one-lane gather,
+    /// and polynomial imports/exports in both domains, agree with the CPU
+    /// executor.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     #[serial_test::serial(gpu_context)]
@@ -8528,10 +8528,13 @@ mod tests {
             Family::pack(vec![x.at(0), Int::constant(0), Int::constant(7), x.at(1)]).unwrap();
         let indices = Family::pack([3, 2, 1, 0].into_iter().map(Int::constant).collect()).unwrap();
         let gathered = parallel(4, |i| Ok(packed.at(indices.at(i)))).unwrap();
+        let single = parallel(1, |i| Ok(packed.at(indices.at(i)))).unwrap();
         let from_eval = ring.from_evaluations(&values);
         let from_coeff = ring.from_coefficients(&values);
         let validated = context
             .output("gathered", gathered)
+            .unwrap()
+            .output("single", single)
             .unwrap()
             .output("eval_coeff", from_eval.coefficients())
             .unwrap()
@@ -8572,7 +8575,7 @@ mod tests {
         let mut store = MemoryArtifactStore::default();
         let result =
             runtime.execute_with_artifacts(&mut plan, inputs, &mut store, rand::random()).unwrap();
-        for name in ["gathered", "eval_coeff", "eval_eval", "coeff_eval", "coeff_coeff"] {
+        for name in ["gathered", "single", "eval_coeff", "eval_eval", "coeff_eval", "coeff_coeff"] {
             let RuntimeValue::IndexedFamily { values: expected, .. } =
                 cpu.materialize_output(name, &cpu_backend, &mut cpu_store).unwrap()
             else {

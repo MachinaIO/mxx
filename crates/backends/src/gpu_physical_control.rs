@@ -46,9 +46,9 @@ use crate::{
         lower_crt_recompose_node, lower_gadget_trapdoor_node, lower_hash_sample_node,
         lower_matrix_node, lower_preimage_sample_node, lower_rns_conversion_node,
         lower_sample_matrix_node, lower_static_matrix_node, lower_trapdoor_sample_node,
-        pack_trapdoor_leaves, physical_matrix, push_hash_sample, register_bindings,
-        register_preimage_control_binding, root_matrix_operation_identity, trapdoor_leaf_types,
-        value_id,
+        pack_trapdoor_leaves, physical_matrix, push_hash_sample, record_node_operations,
+        register_bindings, register_preimage_control_binding, root_matrix_operation_identity,
+        trapdoor_leaf_types, value_id,
     },
     gpu_subgraph_kernel::GpuKernelOperandKind,
     poly::{
@@ -2242,6 +2242,7 @@ fn lower_lazy_int_expr_select(
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
                 parallel_lanes: ctx.parallel_lanes,
+                node_operations: ctx.node_operations,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -2302,6 +2303,7 @@ fn lower_lazy_int_expr_select(
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
                 parallel_lanes: ctx.parallel_lanes,
+                node_operations: ctx.node_operations,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -6534,6 +6536,7 @@ fn lower_sequential_loop(
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: &mut body_imports,
                 parallel_lanes: ctx.parallel_lanes,
+                node_operations: ctx.node_operations,
                 crt_resource_next: ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -7955,6 +7958,7 @@ fn lower_inlined_child(
                     continue;
                 }
             }
+            let first_operation = ctx.operations.len();
             if matches!(child_node.kind(), NodeKind::MatrixBinary(_)) {
                 let choices = ctx
                     .logical
@@ -8069,6 +8073,7 @@ fn lower_inlined_child(
                     child_env,
                 )?;
             }
+            record_node_operations(ctx, child_scope_id, child_node_id, first_operation)?;
         }
         // Child boundaries hand matrices to their parent (families, carries,
         // and call results) in the evaluation domain.

@@ -79,7 +79,7 @@ use mxx_ir_core::{
     node::{
         ConstantMatrix, HashTagComponent, HashVariant, LoopInputMode, MatrixBinaryOp, NodeKind,
     },
-    types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, Port, WireRef},
+    types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef},
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -165,6 +165,9 @@ pub(crate) struct PhysicalFrame {
     /// Top-level operation ranges of the lanes of each parallel loop. Lanes
     /// are independent, so their Graph scratch chains run concurrently.
     pub parallel_lanes: Vec<Vec<std::ops::Range<u32>>>,
+    /// The top-level operation range each lowered graph node emitted; see
+    /// `PhysicalLoweringContext::node_operations`.
+    pub node_operations: Vec<(FrozenGraphScopeId, NodeId, std::ops::Range<u32>)>,
     /// One caller handle per output, reused while the output's plan owner is
     /// unchanged (keyed by that owner's address). A handle with another strong
     /// reference is held by a caller: the next execute writes that output into
@@ -406,7 +409,7 @@ fn append_matrix_candidate(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
     env: &ParamEnv,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     types: &BTreeMap<WireRef, ConcreteWireType>,
     columns_per_job: usize,
@@ -482,7 +485,7 @@ fn append_matrix_candidate(
 fn append_preimage_candidate(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     types: &BTreeMap<WireRef, ConcreteWireType>,
     columns_per_job: usize,
     devices: usize,
@@ -558,7 +561,7 @@ fn append_fixed_child_candidates(
         .ok_or_else(|| "GPU child candidate scope is missing".to_owned())?;
     let mut types = BTreeMap::new();
     for (index, node) in scope.nodes().iter().enumerate() {
-        let node_id = mxx_ir_core::types::NodeId(
+        let node_id = NodeId(
             u64::try_from(index).map_err(|_| "GPU child scope has too many nodes".to_owned())?,
         );
         for (port, declared) in node.output_types().iter().enumerate() {
@@ -571,7 +574,7 @@ fn append_fixed_child_candidates(
         }
     }
     for (index, node) in scope.nodes().iter().enumerate() {
-        let node_id = mxx_ir_core::types::NodeId(
+        let node_id = NodeId(
             u64::try_from(index).map_err(|_| "GPU child scope has too many nodes".to_owned())?,
         );
         match node.kind() {
@@ -766,7 +769,7 @@ fn append_fixed_child_candidates(
                         .scope(&child_id)
                         .ok_or_else(|| "GPU sequential body is missing".to_owned())?;
                     for (child_index, child_node) in child.nodes().iter().enumerate() {
-                        let child_node_id = mxx_ir_core::types::NodeId(child_index as u64);
+                        let child_node_id = NodeId(child_index as u64);
                         for declared in child_node.output_types() {
                             let first = concretize_wire_type(
                                 declared,
@@ -1449,6 +1452,10 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub external_io_imports: &'a mut Vec<ExternalIoImport>,
     /// Top-level operation ranges of the lanes of each parallel loop.
     pub parallel_lanes: &'a mut Vec<Vec<std::ops::Range<u32>>>,
+    /// The top-level operation range each lowered node emitted, in lowering
+    /// order. A body node's range lies inside its loop or call node's range;
+    /// nodes lowered inside a device body are covered by that body's node.
+    pub node_operations: &'a mut Vec<(FrozenGraphScopeId, NodeId, std::ops::Range<u32>)>,
     pub crt_resource_next: &'a mut u32,
     /// A full CRT matrix value and its counterpart in the other full encoding.
     /// A conversion is emitted once per value and shared by later consumers
@@ -1460,6 +1467,24 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub integer_status: &'a mut BTreeMap<i32, PhysicalValueId>,
     /// Kernels that execute registered subgraphs; a call names one by index.
     pub subgraph_kernels: &'a [GpuSubgraphKernel],
+}
+
+/// Record the top-level operations `node` emitted since `first_operation`.
+/// Operations lowered into a device body are nested inside one top-level
+/// operation, which the node enclosing that body records.
+pub(super) fn record_node_operations(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+    first_operation: usize,
+) -> Result<(), String> {
+    if ctx.device_body || first_operation == ctx.operations.len() {
+        return Ok(());
+    }
+    let end = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU operations for node attribution".to_owned())?;
+    ctx.node_operations.push((scope.clone(), node, first_operation as u32..end));
+    Ok(())
 }
 
 /// Reserve one reusable lane input for a selected artifact member. The caller
@@ -1837,7 +1862,7 @@ fn matrix_columns_on_device(
 pub(super) fn lower_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
     choice: &GpuNodeChoice,
@@ -2066,7 +2091,7 @@ pub(super) fn lower_matrix_node(
 
 pub(super) fn lower_zero_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
 ) -> Result<(), String> {
     let wire = WireRef { node: node_id, port: Port(0) };
@@ -2123,7 +2148,7 @@ pub(super) fn lower_zero_matrix_node(
 pub(super) fn lower_sample_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -2440,7 +2465,7 @@ fn encode_static_matrix(
 
 pub(super) fn lower_static_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -2508,7 +2533,7 @@ fn plan_static_matrix(
 
 pub(super) fn lower_gadget_trapdoor_node(
     ctx: &mut PhysicalLoweringContext<'_>,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -2559,7 +2584,7 @@ pub(super) fn lower_gadget_trapdoor_node(
 pub(super) fn lower_rns_conversion_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -2717,7 +2742,7 @@ pub(super) fn lower_rns_conversion_node(
 pub(super) fn lower_crt_recompose_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -2850,7 +2875,7 @@ pub(super) fn lower_crt_recompose_node(
 pub(super) fn lower_centered_rebase_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
 ) -> Result<(), String> {
@@ -3323,7 +3348,7 @@ pub(super) fn emit_matrix_operation(
 fn allocate_device_seed(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     label: u8,
 ) -> Result<PhysicalValueId, String> {
     let site = mxx_ir_core::encoding::hash_canonical(&(scope_id, node_id, label, ctx.values.len()))
@@ -3537,7 +3562,7 @@ pub(super) fn allocate_compact_value(
 fn emit_fresh_matrix_sample_parts(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     label: u8,
     ty: &ConcreteMatrixType,
     gaussian_sigma: Option<f64>,
@@ -3595,7 +3620,7 @@ fn emit_fresh_matrix_sample_parts(
 fn emit_fresh_matrix_sample(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     label: u8,
     ty: &ConcreteMatrixType,
     gaussian_sigma: Option<f64>,
@@ -3950,7 +3975,7 @@ pub(super) fn register_preimage_control_binding(
 fn derive_preimage_stage_seed(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     attempt: PhysicalValueId,
     domain: u64,
 ) -> Result<PhysicalValueId, String> {
@@ -4103,7 +4128,7 @@ pub(super) fn push_hash_sample(
 pub(super) fn lower_hash_sample_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -4253,7 +4278,7 @@ pub(super) fn lower_hash_sample_node(
 pub(super) fn lower_trapdoor_sample_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -4580,7 +4605,7 @@ fn copy_compact_block_home(
 pub(super) fn lower_preimage_sample_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
-    node_id: mxx_ir_core::types::NodeId,
+    node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
@@ -4949,6 +4974,7 @@ pub(super) fn lower_preimage_sample_node(
                 external_io_loops: &mut *ctx.external_io_loops,
                 external_io_imports: &mut *ctx.external_io_imports,
                 parallel_lanes: &mut *ctx.parallel_lanes,
+                node_operations: &mut *ctx.node_operations,
                 crt_resource_next: &mut *ctx.crt_resource_next,
                 converted: &mut BTreeMap::new(),
                 integer_status: &mut *ctx.integer_status,
@@ -5507,7 +5533,7 @@ pub(crate) fn plan_physical_graph(
         let NodeKind::Input { name, artifact, .. } = node.kind() else { continue };
         let node_id =
             u64::try_from(index).map_err(|_| "GPU graph has too many nodes".to_owned())?;
-        let wire = WireRef { node: mxx_ir_core::types::NodeId(node_id), port: Port(0) };
+        let wire = WireRef { node: NodeId(node_id), port: Port(0) };
         if let Some(artifact) = artifact {
             let used = scope.nodes().iter().any(|consumer| {
                 scope.arguments(consumer).is_some_and(|arguments| arguments.contains(&wire))
@@ -5912,6 +5938,7 @@ pub(crate) fn plan_physical_graph(
     let mut external_io_loops = Vec::<ExternalIoLoop>::new();
     let mut external_io_imports = Vec::<ExternalIoImport>::new();
     let mut parallel_lanes = Vec::new();
+    let mut node_operations = Vec::new();
     let mut crt_resource_next = 0u32;
     let mut converted = BTreeMap::new();
     let mut integer_status = BTreeMap::new();
@@ -5951,6 +5978,7 @@ pub(crate) fn plan_physical_graph(
                 external_io_loops: &mut external_io_loops,
                 external_io_imports: &mut external_io_imports,
                 parallel_lanes: &mut parallel_lanes,
+                node_operations: &mut node_operations,
                 crt_resource_next: &mut crt_resource_next,
                 converted: &mut converted,
                 integer_status: &mut integer_status,
@@ -5981,9 +6009,8 @@ pub(crate) fn plan_physical_graph(
         if matches!(node.kind(), NodeKind::Input { .. }) {
             continue;
         }
-        let node_id = mxx_ir_core::types::NodeId(
-            u64::try_from(index).map_err(|_| "GPU graph has too many nodes".to_owned())?,
-        );
+        let node_id =
+            NodeId(u64::try_from(index).map_err(|_| "GPU graph has too many nodes".to_owned())?);
         let arguments = scope
             .arguments(node)
             .ok_or_else(|| "GPU root node has no validated arguments".to_owned())?;
@@ -6085,6 +6112,7 @@ pub(crate) fn plan_physical_graph(
             }
         }
         let mut ctx = root_context!();
+        let first_operation = ctx.operations.len();
         if matches!(node.kind(), NodeKind::MatrixBinary(_)) {
             let choices = logical
                 .nodes
@@ -6195,8 +6223,18 @@ pub(crate) fn plan_physical_graph(
                 &validated.bindings,
             )?;
         }
+        record_node_operations(&mut ctx, &FrozenGraphScopeId::Root, node_id, first_operation)?;
     }
+    // Materializing an output (its export or return copy) is attributed to
+    // the root node that produces it.
+    let mut output_operations = None::<(NodeId, usize)>;
     for (name, output_root) in validated.source.outputs() {
+        if let Some((node, first_operation)) =
+            output_operations.replace((output_root.value.node, operations.len()))
+        {
+            let mut ctx = root_context!();
+            record_node_operations(&mut ctx, &FrozenGraphScopeId::Root, node, first_operation)?;
+        }
         activate_import(
             output_root.value,
             &mut pending_imports,
@@ -6710,6 +6748,10 @@ pub(crate) fn plan_physical_graph(
         producer.insert(returned, vec![(ColumnRange { start: 0, end: matrix.columns }, op_index)]);
         output_ids.insert(name.clone(), returned);
     }
+    if let Some((node, first_operation)) = output_operations {
+        let mut ctx = root_context!();
+        record_node_operations(&mut ctx, &FrozenGraphScopeId::Root, node, first_operation)?;
+    }
     let mut site_starts = BTreeMap::<usize, u32>::new();
     for template in &export_templates {
         if template.occurrence == 0 && site_starts.insert(template.slot, template.site).is_some() {
@@ -6809,6 +6851,7 @@ pub(crate) fn plan_physical_graph(
         external_io_loops,
         external_io_imports,
         parallel_lanes,
+        node_operations,
         output_handles: std::sync::Mutex::new(BTreeMap::new()),
         scratch_protected: protected,
     })
@@ -7043,9 +7086,8 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, node)| {
-                matches!(node.kind(), NodeKind::Input { name, .. } if name == "small").then_some(
-                    WireRef { node: mxx_ir_core::types::NodeId(index as u64), port: Port(0) },
-                )
+                matches!(node.kind(), NodeKind::Input { name, .. } if name == "small")
+                    .then_some(WireRef { node: NodeId(index as u64), port: Port(0) })
             })
             .unwrap();
         let physical = PhysicalValue {
@@ -7151,10 +7193,7 @@ mod tests {
                 .enumerate()
                 .find_map(|(node_index, node)| match node.kind() {
                     NodeKind::Input { name: input_name, .. } if input_name == name => {
-                        Some(WireRef {
-                            node: mxx_ir_core::types::NodeId(node_index as u64),
-                            port: Port(0),
-                        })
+                        Some(WireRef { node: NodeId(node_index as u64), port: Port(0) })
                     }
                     _ => None,
                 })

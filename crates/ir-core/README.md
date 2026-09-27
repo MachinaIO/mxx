@@ -22,6 +22,7 @@ workspace crate.
 | `protocol` | Multi-stage protocol declarations, ideal specifications, and predicates. |
 | `lean` | Export of validated graphs and protocol claims to Lean. |
 | `inventory` | A structural snapshot of a graph for checkers, without evaluation. |
+| `visualize` | A standalone HTML view of every scope, with shapes and optional predicted node costs. |
 
 The handwritten Lean package that generated relations build on lives in `lean/`; see
 `lean/README.md`.

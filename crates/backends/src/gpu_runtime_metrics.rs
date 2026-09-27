@@ -3,6 +3,7 @@
 //! timing values rank only those feasible candidates.
 
 use crate::gpu_execution_plan::GpuExecutionSiteKey;
+use mxx_ir_core::visualize::NodeCost;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -19,6 +20,9 @@ pub struct GpuWarmupReport {
     pub limiting_stage: Option<GpuExecutionSiteKey>,
     pub stages: Vec<GpuStageReport>,
     pub reason: String,
+    /// Each graph node's predicted seconds per execute, measured only when
+    /// `GpuRuntimeOptions::profile_nodes` is set; empty otherwise.
+    pub node_costs: Vec<NodeCost>,
 }
 
 #[derive(Clone, Debug, Default)]

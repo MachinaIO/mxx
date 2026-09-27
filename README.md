@@ -130,6 +130,15 @@ coefficient decoding, and whose edges carry values between them. Computation hap
 a backend executes the graph. This is why one description can run on a GPU or on a CPU. Export
 of the same graph to Lean, for machine-checked correctness proofs, is a work in progress.
 
+To see the recorded graph, write `rlwe_program(ring_dimension)?.render_html()` to a file and open
+it in a browser: hovering a node shows its operation and shapes, and a loop or call opens its
+body. A plan made with `MXX_GPU_PROFILE_NODES=1` also measures every node while planning, and
+`plan.render_html()` colors each node by its predicted share of one execution and ranks the
+bottlenecks.
+
+![The BGV relinearization graph of the FHE integration test, planned on an RTX 4080 SUPER, with
+the tooltip of its key-switching matrix product](images/graph-visualization.png)
+
 ## What mxx does for you
 
 ### Describing a protocol

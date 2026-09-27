@@ -580,10 +580,13 @@ mod artifact {
     use std::collections::BTreeMap;
     use thiserror::Error;
 
-    const B0_PUBLIC: &str = "slot_transfer_b0_public";
-    const B0_TRAPDOOR: &str = "slot_transfer_b0_trapdoor";
-    const B1_PUBLIC: &str = "slot_transfer_b1_public";
-    const B1_TRAPDOOR: &str = "slot_transfer_b1_trapdoor";
+    // A trapdoor output flattens into its public matrix (`.0`) and its trapdoor (`.1`).
+    const B0: &str = "slot_transfer_b0";
+    const B0_PUBLIC: &str = "slot_transfer_b0.0";
+    const B0_TRAPDOOR: &str = "slot_transfer_b0.1";
+    const B1: &str = "slot_transfer_b1";
+    const B1_PUBLIC: &str = "slot_transfer_b1.0";
+    const B1_TRAPDOOR: &str = "slot_transfer_b1.1";
     const SLOT_SECRET: &str = "slot_transfer_slot_secret";
     const SLOT_PUBLIC_KEY: &str = "slot_transfer_slot_a";
 
@@ -698,11 +701,7 @@ mod artifact {
             context: DslContext,
             base: BggSlotTransferBaseWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
-            Ok(context
-                .transferred_output(B0_PUBLIC, base.b0.public_matrix())?
-                .transferred_trapdoor_output(B0_TRAPDOOR, base.b0)?
-                .transferred_output(B1_PUBLIC, base.b1.public_matrix())?
-                .transferred_trapdoor_output(B1_TRAPDOOR, base.b1)?)
+            Ok(context.transferred_output(B0, base.b0)?.transferred_output(B1, base.b1)?)
         }
 
         pub fn import_base(

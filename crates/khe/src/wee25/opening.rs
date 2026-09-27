@@ -12,7 +12,7 @@ use mxx_ir_core::{
 use rayon::prelude::*;
 use std::{collections::BTreeMap, ops::Range};
 
-pub const WEE25_PUBLIC_B: &str = "wee25_public_b";
+pub const WEE25_PUBLIC_B: &str = "wee25_public_b.0";
 pub const WEE25_T_TOP: &str = "wee25_t_top";
 pub const WEE25_T_BOTTOM: &str = "wee25_t_bottom";
 pub const WEE25_COMMITMENT: &str = "wee25_commitment";

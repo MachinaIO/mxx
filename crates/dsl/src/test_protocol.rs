@@ -265,12 +265,9 @@ mod tests {
 
         let ring = Ring::from_crt_moduli(vec![257.into()], 8);
         let sampled = ring.sample_trapdoor(1, 1, 2, 3, 4);
-        let sampled_public = sampled.public_matrix();
         let sampled_preimage = sampled.sample_preimage(ring.zero((1, 1)), (5, 1));
         let sampled_graph = DslContext::new("sampled-artifact-roles")
-            .transferred_output("public", sampled_public)
-            .expect("sampled public output")
-            .transferred_trapdoor_output("trapdoor", sampled)
+            .transferred_output("trapdoor", sampled)
             .expect("sampled trapdoor output")
             .transferred_output("preimage", sampled_preimage)
             .expect("sampled preimage output")
@@ -279,7 +276,7 @@ mod tests {
 
         // These values contain fresh randomness and therefore require the
         // producer payload at the consumer boundary.
-        for name in ["public", "trapdoor", "preimage"] {
+        for name in ["trapdoor.0", "trapdoor.1", "preimage"] {
             assert_eq!(
                 sampled_graph.graph.outputs()[name].availability,
                 Some(ArtifactAvailability::Transferred),

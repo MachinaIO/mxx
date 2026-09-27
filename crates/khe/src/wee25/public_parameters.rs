@@ -1,8 +1,7 @@
 //! WEE25 public-parameter preprocessing expressed with the declarative DSL.
 
 use crate::wee25::{
-    WEE25_PUBLIC_B, WEE25_T_BOTTOM, Wee25CommitmentCompiler, Wee25CommitmentError,
-    Wee25PublicParameterWires,
+    WEE25_T_BOTTOM, Wee25CommitmentCompiler, Wee25CommitmentError, Wee25PublicParameterWires,
 };
 use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Trapdoor};
 use mxx_ir_core::{
@@ -10,7 +9,10 @@ use mxx_ir_core::{
     node::{ConstantMatrix, IndexRange},
 };
 
-pub const WEE25_PUBLIC_B_TRAPDOOR: &str = "wee25_public_b_trapdoor";
+/// The trapdoor of the public matrix `b`. The trapdoor output flattens into `b` itself
+/// ([`WEE25_PUBLIC_B`](crate::wee25::WEE25_PUBLIC_B), `.0`) and this trapdoor (`.1`).
+pub const WEE25_PUBLIC_B_TRAPDOOR: &str = "wee25_public_b.1";
+const WEE25_PUBLIC_B_OUTPUT: &str = "wee25_public_b";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Wee25PublicParameterCompiler {
@@ -89,8 +91,8 @@ impl Wee25PublicParameterCompiler {
         mut context: DslContext,
         wires: Wee25PublicParameterPreprocessingWires,
     ) -> Result<DslContext, DslError> {
-        context = context.transferred_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
-        context = context.transferred_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
+        // The trapdoor output also exports `b`, which is the trapdoor's public matrix.
+        context = context.transferred_output(WEE25_PUBLIC_B_OUTPUT, wires.b_trapdoor)?;
         context = context.transferred_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
         for (index, family) in wires.public_parameters.t_top.into_iter().enumerate() {
             let part_count = self.layout.public_parameter_part_count();

@@ -547,7 +547,7 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         parallel(2, move |_| Ok(producer_ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000)))
             .unwrap();
     let producer = DslContext::new("selected-trapdoor-producer")
-        .transferred_trapdoor_family_output("secrets", trapdoors)
+        .transferred_output("secrets", trapdoors)
         .unwrap()
         .build()
         .unwrap()
@@ -565,7 +565,7 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     .unwrap();
     let production = produced.production_id.expect("producer identity");
     let manifest = store.load_finalized_manifest(&production).unwrap();
-    let descriptor = manifest.artifacts["secrets"].clone();
+    let descriptor = manifest.artifacts["secrets.1"].clone();
 
     let trapdoor_schema = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000);
     let element = trapdoor_schema.value_handle().node().output_types()[1].clone();
@@ -573,11 +573,11 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         WireType::IndexedFamily { element: Box::new(element.clone()), count: IntExpr::constant(2) };
     let artifact = NodeHandle::new(
         NodeKind::Input {
-            name: "secrets".into(),
+            name: "secrets.1".into(),
             wire_type: family.clone(),
             artifact: Some(ArtifactInput {
                 production_id: production.clone(),
-                artifact_name: "secrets".into(),
+                artifact_name: "secrets.1".into(),
                 availability: ArtifactAvailability::Transferred,
             }),
         },
@@ -622,7 +622,7 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     let keys = (0..2)
         .map(|index| ArtifactKey {
             production: production.clone(),
-            name: "secrets".into(),
+            name: "secrets.1".into(),
             index: Some(index),
         })
         .collect::<Vec<_>>();

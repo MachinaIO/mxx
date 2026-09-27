@@ -7371,7 +7371,7 @@ mod tests {
         let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
         let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000);
         let validated = DslContext::new("direct-trapdoor-secret-artifact")
-            .transferred_trapdoor_output("secret", trapdoor)
+            .transferred_output("trapdoor", trapdoor)
             .unwrap()
             .build()
             .unwrap()
@@ -7384,9 +7384,13 @@ mod tests {
             .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [13; 32])
             .unwrap();
         assert!(result.production_id.is_some());
-        assert_eq!(result.artifact_handles["secret"].len(), 1);
-        let RuntimeValue::Resident(secret) = &result.output_value_for_test("secret").unwrap()
+        assert_eq!(result.artifact_handles["trapdoor.1"].len(), 1);
+        // The runtime returns the flattened trapdoor as one composite value.
+        let RuntimeValue::Composite(parts) = &result.output_value_for_test("trapdoor").unwrap()
         else {
+            panic!("GPU trapdoor output is a composite of its public matrix and trapdoor");
+        };
+        let RuntimeValue::Resident(secret) = &parts[1] else {
             panic!("GPU trapdoor must remain resident");
         };
         assert_eq!(secret.physical().encodings.len(), 6);

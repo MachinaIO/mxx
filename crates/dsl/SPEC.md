@@ -69,9 +69,8 @@ let validated = built.validate(&bindings)?; // bindings: ParamEnv with a value f
 | `context.evaluate_int(expr)` | Turns a compile expression into an `Int` value. |
 | `context.hash_int_family(key, tag, count, modulus)` | `count` integers uniform in `[0, modulus)` derived from a 32-byte key and a tag (`modulus` a power of two). |
 | `.output(name, value)` | Names an output. A composite value (tuple, vector, record) is flattened into outputs `name.0`, `name.1`, ... |
-| `.transferred_output(name, value)` | An output exported as an artifact that consumers receive from the producer. |
+| `.transferred_output(name, value)` | An output exported as an artifact that consumers receive from the producer. A `Trapdoor` (or `Family<Trapdoor>`) exports as `name.0`, its public matrix, and `name.1`, the trapdoor with its secret; `trapdoor_artifact_input` imports the pair. |
 | `.cached_output(name, value)` | An output exported as an artifact that consumers could recompute from public data; the stored bytes are a cache. |
-| `.transferred_trapdoor_output(name, trapdoor)`, `.transferred_trapdoor_family_output(name, trapdoors)` | Export a trapdoor, or a family of trapdoors, with its secret. |
 | `.build()` | Freezes the reachable part of the graph and checks its structure; returns `BuiltGraph`. |
 | `built.validate(&bindings)` | Binds every compile parameter (`ParamEnv`), resolves rings, and checks every node's types and shapes; returns the `ValidatedGraph` that backends execute. |
 | `built.validate_with_manifests(&bindings, &manifests)` | As `validate`, also checking artifact inputs against the manifests of their producers. |

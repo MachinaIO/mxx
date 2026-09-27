@@ -2058,28 +2058,6 @@ impl DslContext {
         Ok(self)
     }
 
-    pub fn transferred_trapdoor_output(
-        mut self,
-        name: impl Into<String>,
-        trapdoor: Trapdoor,
-    ) -> Result<Self, DslError> {
-        self.insert_output(name.into(), trapdoor.value, Some(ArtifactAvailability::Transferred))?;
-        Ok(self)
-    }
-
-    pub fn transferred_trapdoor_family_output(
-        mut self,
-        name: impl Into<String>,
-        trapdoors: Family<Trapdoor>,
-    ) -> Result<Self, DslError> {
-        self.insert_output(
-            name.into(),
-            trapdoors.values[1].clone(),
-            Some(ArtifactAvailability::Transferred),
-        )?;
-        Ok(self)
-    }
-
     fn insert_graph_value<V: GraphValue>(
         &mut self,
         name: String,
@@ -2922,9 +2900,7 @@ mod tests {
         .unwrap();
         let built = DslContext::new("parameterized-trapdoor-families")
             .int_parameter("count")
-            .transferred_output("public", trapdoors.public_matrices())
-            .unwrap()
-            .transferred_trapdoor_family_output("trapdoors", trapdoors)
+            .transferred_output("trapdoors", trapdoors)
             .unwrap()
             .transferred_output("preimages", preimages)
             .unwrap()
@@ -2959,9 +2935,7 @@ mod tests {
         let gathered =
             parallel(indices.count().clone(), |i| Ok(trapdoors.at(indices.at(i)))).unwrap();
         let built = DslContext::new("trapdoor-family-gather")
-            .transferred_output("public", gathered.public_matrices())
-            .unwrap()
-            .transferred_trapdoor_family_output("secret", gathered)
+            .transferred_output("trapdoors", gathered)
             .unwrap()
             .build()
             .unwrap();

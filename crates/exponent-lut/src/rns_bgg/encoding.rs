@@ -18,8 +18,8 @@ use crate::{
     },
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
-        ExponentLutProgramBuilder, GraphFamilyExecution, GraphParallelLowering, InputBinding,
-        LoweringSite, LutTable, Operand, ProgramLoweringContext, RhsId, WireId, family_of_fields,
+        ExponentLutProgramBuilder, GraphParallelLowering, InputBinding, LoweringSite, LutTable,
+        Operand, ProgramLoweringContext, RhsId, WireId, family_of_fields,
     },
 };
 use mxx_backends::{
@@ -417,22 +417,151 @@ fn encoding_family(
     family_of_fields(&element, count, &fields).map_err(ApiError::scheme)
 }
 
+/// A family bound for online evaluation.
+///
+/// A stored family holds complete members. An input family holds only what
+/// encryption stores, each member's row and, for a public input, its payload;
+/// a member read samples the member's public key from the hash key in place
+/// (`sampled_key`), so no stage materializes the keys of a whole family.
+#[derive(Clone)]
+pub enum OnlineWireFamily {
+    Stored(Family<RnsBggEncoding>),
+    Input {
+        wire: WireId,
+        level: usize,
+        knowledge: AttributeKnowledge,
+        hash_key: Bytes,
+        rows: Family<RnsBggRow>,
+        payloads: Option<Family<Mat>>,
+    },
+}
+
+/// A family RHS bound for online evaluation: the stored bottom row of each
+/// member's compact ciphertext. A member read samples its top row from the
+/// hash key in place (`rhs_top`).
+#[derive(Clone)]
+pub struct OnlineRhsFamily {
+    rhs: RhsId,
+    program: crate::program::ExponentLutProgramId,
+    level: usize,
+    hash_key: Bytes,
+    bottoms: Family<RnsBggRow>,
+}
+
+/// Online family execution over graph families, which derives the
+/// hash-sampled parts of input and RHS family members where they are read.
+pub struct OnlineFamilies<'a> {
+    parameters: &'a RnsBggParameters,
+}
+
+impl OnlineFamilies<'_> {
+    fn member(
+        &self,
+        family: &OnlineWireFamily,
+        index: IntExpr,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
+        match family {
+            OnlineWireFamily::Stored(family) => Ok(family.at(Int::evaluate(index))),
+            OnlineWireFamily::Input { wire, level, knowledge, hash_key, rows, payloads } => {
+                let key = super::public_key::sampled_key(
+                    self.parameters,
+                    *level,
+                    hash_key.clone(),
+                    *wire,
+                    *knowledge,
+                    Some(index.clone()),
+                )?;
+                let index = Int::evaluate(index);
+                let payload = payloads.as_ref().map(|payloads| payloads.at(index.clone()));
+                Ok(RnsBggEncoding::new(key, rows.at(index), payload))
+            }
+        }
+    }
+
+    fn count(family: &OnlineWireFamily) -> IntExpr {
+        match family {
+            OnlineWireFamily::Stored(family) => family.count().clone(),
+            OnlineWireFamily::Input { rows, .. } => rows.count().clone(),
+        }
+    }
+}
+
+impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineFamilies<'b> {
+    type WireFamily = OnlineWireFamily;
+    type RhsFamily = OnlineRhsFamily;
+
+    fn wire_at(
+        &mut self,
+        family: &Self::WireFamily,
+        index: &IntExpr,
+    ) -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>> {
+        self.member(family, index.clone()).map_err(crate::program::ProgramLowerError::Backend)
+    }
+
+    fn rhs_at(
+        &mut self,
+        family: &Self::RhsFamily,
+        index: &IntExpr,
+    ) -> Result<RnsBggMatrix, crate::program::ProgramLowerError<RnsBggError>> {
+        let top = super::public_key::rhs_top(
+            self.parameters,
+            family.program,
+            family.hash_key.clone(),
+            family.rhs,
+            family.level,
+            Some(index.clone()),
+        )
+        .map_err(crate::program::ProgramLowerError::Backend)?;
+        Ok((top, family.bottoms.at(Int::evaluate(index.clone()))))
+    }
+
+    fn parallel(
+        &mut self,
+        evaluator: &mut EncodingLowering<'a>,
+        range: &crate::program::FamilyRange,
+        body: impl FnOnce(
+            &mut Self,
+            &mut EncodingLowering<'a>,
+            IntExpr,
+        )
+            -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>>,
+    ) -> Result<Self::WireFamily, crate::program::ProgramLowerError<RnsBggError>> {
+        crate::program::graph_parallel(self, evaluator, range, body).map(OnlineWireFamily::Stored)
+    }
+
+    fn sum(
+        &mut self,
+        evaluator: &mut EncodingLowering<'a>,
+        family: &Self::WireFamily,
+    ) -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>> {
+        use crate::program::ProgramLowerError;
+        crate::program::graph_sum(evaluator, Self::count(family), |index| {
+            let index = index.expression().map_err(ProgramLowerError::Dsl)?;
+            self.member(family, index).map_err(ProgramLowerError::Backend)
+        })
+    }
+}
+
 /// Import every RHS of `program` from `preprocess`, for binding before the
-/// Program is lowered. Preprocessing publishes each compact RHS at the level
-/// after its consumer's, so it is imported once at that level; a family RHS
-/// is one family per matrix port. `name` maps a role to its artifact name.
+/// Program is lowered. Preprocessing publishes the bottom row of each compact
+/// RHS at the level after its consumer's, so it is imported once at that
+/// level; a family RHS is one family per row port, and each member's top row
+/// is sampled where the member is read. `name` maps a role to its artifact
+/// name.
 fn import_rhs_bindings(
     parameters: &RnsBggParameters,
     program: &ExponentLutProgram,
     workload: &RnsBggDerivedWorkload,
     preprocess: &ProductionId,
+    hash_key: &Bytes,
     name: impl Fn(String) -> String,
-) -> Result<Vec<(RhsId, InputBinding<RnsBggMatrix, Family<RnsBggMatrix>>)>, ApiError> {
+) -> Result<Vec<(RhsId, InputBinding<RnsBggMatrix, OnlineRhsFamily>)>, ApiError> {
     let mut bindings = Vec::with_capacity(program.rhs_inputs().len());
     for (rhs, shape) in program.rhs_inputs() {
-        let level = workload.rhs_level(*rhs).map_err(ApiError::scheme)?.checked_add(1).ok_or_else(
-            || ApiError::scheme(RnsBggError::Parameters("RHS target level overflow")),
-        )?;
+        let consumer_level = workload.rhs_level(*rhs).map_err(ApiError::scheme)?;
+        let level = consumer_level.checked_add(1).ok_or_else(|| {
+            ApiError::scheme(RnsBggError::Parameters("RHS target level overflow"))
+        })?;
         let ring = parameters.ring(level).map_err(ApiError::scheme)?;
         let columns = parameters.component_columns(level).map_err(ApiError::scheme)?;
         let binding = match shape {
@@ -445,10 +574,19 @@ fn import_rhs_bindings(
                         ArtifactAvailability::Transferred,
                     )
                 };
-                InputBinding::Scalar(((port(0), port(1)), (port(2), port(3))))
+                let top = super::public_key::rhs_top(
+                    parameters,
+                    program.id(),
+                    hash_key.clone(),
+                    *rhs,
+                    consumer_level,
+                    None,
+                )
+                .map_err(ApiError::scheme)?;
+                InputBinding::Scalar((top, (port(0), port(1))))
             }
             InputBinding::Family(count) => {
-                let ports = (0..4)
+                let ports = (0..2)
                     .map(|port| {
                         ring.family_artifact_input(
                             preprocess.clone(),
@@ -459,13 +597,18 @@ fn import_rhs_bindings(
                         )
                     })
                     .collect::<Vec<_>>();
-                let first = |port: usize| ports[port].at(Int::constant(0));
-                let element: RnsBggMatrix = ((first(0), first(1)), (first(2), first(3)));
+                let element: RnsBggRow =
+                    (ports[0].at(Int::constant(0)), ports[1].at(Int::constant(0)));
                 let fields =
                     ports.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
-                InputBinding::Family(
-                    family_of_fields(&element, count.clone(), &fields).map_err(ApiError::scheme)?,
-                )
+                InputBinding::Family(OnlineRhsFamily {
+                    rhs: *rhs,
+                    program: program.id(),
+                    level: consumer_level,
+                    hash_key: hash_key.clone(),
+                    bottoms: family_of_fields(&element, count.clone(), &fields)
+                        .map_err(ApiError::scheme)?,
+                })
             }
         };
         bindings.push((*rhs, binding));
@@ -1796,7 +1939,6 @@ impl<'a> RnsEncryptBuild<'a> {
             .mask_secret
             .as_ref()
             .ok_or_else(|| ApiError::input("refresh PRF child mask is not bound"))?;
-        let ring = child.parameters.ring(0).map_err(ApiError::scheme)?;
         let commitment = *declaration.commitment();
         let helper_keys =
             canonical_lut_helper_keys(child.parameters, inputs).map_err(ApiError::scheme)?;
@@ -1822,10 +1964,15 @@ impl<'a> RnsEncryptBuild<'a> {
                 )
                 .map_err(ApiError::scheme)?;
         }
+        let workload = RnsBggDerivedWorkload::from_program(declaration.prepared().program())
+            .map_err(ApiError::scheme)?;
         for (wire, declaration_input) in inputs.inputs() {
+            // Each input is encoded at its logical level in the PRF Program.
+            let level = workload.level(*wire).map_err(ApiError::scheme)?;
+            let ring = child.parameters.ring(level).map_err(ApiError::scheme)?;
             let columns = child
                 .parameters
-                .key_component_columns(0, declaration_input.knowledge())
+                .key_component_columns(level, declaration_input.knowledge())
                 .map_err(ApiError::scheme)?;
             let key = RnsBggPublicKey {
                 wire: *wire,
@@ -1865,10 +2012,11 @@ impl<'a> RnsEncryptBuild<'a> {
                 .get(wire)
                 .ok_or_else(|| ApiError::input("refresh PRF child plaintext is not bound"))?;
             let encode = |key: RnsBggPublicKey, plaintext: Mat| {
+                let plaintext = checked_modulus_convert(plaintext, &ring)?;
                 if matches!(declaration_input.knowledge(), AttributeKnowledge::PublicPayload) {
-                    child.encode_public(&key, 0, mask, plaintext)
+                    child.encode_public(&key, level, mask, plaintext)
                 } else {
-                    child.encode_private(&key, 0, payload, mask, plaintext)
+                    child.encode_private(&key, level, payload, mask, plaintext)
                 }
             };
             graph = match value {
@@ -2317,10 +2465,9 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             .inputs
             .clone()
             .ok_or_else(|| ApiError::input("encryption inputs are not bound"))?;
-        let production = self
-            .preprocess
-            .clone()
-            .ok_or_else(|| ApiError::input("preprocess artifacts are not bound"))?;
+        if self.preprocess.is_none() {
+            return Err(ApiError::input("preprocess artifacts are not bound"));
+        }
         let payload = self
             .payload_secret
             .clone()
@@ -2355,91 +2502,70 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                 .transferred_output(format!("lut-helper/{level}/{sigma}"), helper)
                 .map_err(ApiError::scheme)?;
         }
+        // Each input is encoded at its logical level under a public key
+        // sampled from the hash key; only the row and, for a public input, the
+        // payload are stored, and every later stage samples the key again.
+        let binding =
+            self.binding.as_ref().ok_or_else(|| ApiError::input("preprocess is not bound"))?;
         for (wire, declaration) in inputs.inputs() {
-            let columns = self
-                .parameters
-                .key_component_columns(0, declaration.knowledge())
-                .map_err(ApiError::scheme)?;
-            let scalar_key = || RnsBggPublicKey {
-                wire: *wire,
-                matrix: (
-                    (
-                        ring.artifact_input(
-                            production.clone(),
-                            format!("public-key/{wire:?}.0"),
-                            (1, columns),
-                            ArtifactAvailability::Cached,
-                        ),
-                        ring.artifact_input(
-                            production.clone(),
-                            format!("public-key/{wire:?}.1"),
-                            (1, columns),
-                            ArtifactAvailability::Cached,
-                        ),
-                    ),
-                    (
-                        ring.artifact_input(
-                            production.clone(),
-                            format!("public-key/{wire:?}.2"),
-                            (1, columns),
-                            ArtifactAvailability::Cached,
-                        ),
-                        ring.artifact_input(
-                            production.clone(),
-                            format!("public-key/{wire:?}.3"),
-                            (1, columns),
-                            ArtifactAvailability::Cached,
-                        ),
-                    ),
-                ),
-            };
+            let level = binding.input_levels().get(wire).copied().unwrap_or(0);
+            let input_ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
+            let knowledge = declaration.knowledge();
+            let public = matches!(knowledge, AttributeKnowledge::PublicPayload);
             let value = self
                 .plaintexts
                 .get(wire)
                 .ok_or_else(|| ApiError::input("missing encryption plaintext"))?;
-            let encode = |key: RnsBggPublicKey, plaintext: Mat| {
-                if matches!(declaration.knowledge(), AttributeKnowledge::PublicPayload) {
-                    self.encode_public(&key, 0, &mask, plaintext)
+            let encode = |member: Option<IntExpr>, plaintext: Mat| {
+                let key = super::public_key::sampled_key(
+                    self.parameters,
+                    level,
+                    hash_key.clone(),
+                    *wire,
+                    knowledge,
+                    member,
+                )?;
+                let plaintext = checked_modulus_convert(plaintext, &input_ring)?;
+                if public {
+                    self.encode_public(&key, level, &mask, plaintext)
                 } else {
-                    self.encode_private(&key, 0, &payload, &mask, plaintext)
+                    self.encode_private(&key, level, &payload, &mask, plaintext)
                 }
             };
-            graph = match value {
-                InputBinding::Scalar(value) => graph
-                    .transferred_output(
-                        format!("input-{wire:?}"),
-                        encode(scalar_key(), value.clone()).map_err(ApiError::scheme)?,
-                    )
-                    .map_err(ApiError::scheme)?,
-                InputBinding::Family(values) => {
-                    let family_count = values.count().clone();
-                    let key_parts = (0..4)
-                        .map(|port| {
-                            ring.family_artifact_input(
-                                production.clone(),
-                                format!("public-key/{wire:?}.{port}"),
-                                family_count.clone(),
-                                (1, columns),
-                                ArtifactAvailability::Cached,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let encodings = mxx_dsl::parallel(values.count().clone(), |member| {
-                        let key = RnsBggPublicKey {
-                            wire: *wire,
-                            matrix: (
-                                (key_parts[0].at(member.clone()), key_parts[1].at(member.clone())),
-                                (key_parts[2].at(member.clone()), key_parts[3].at(member.clone())),
-                            ),
-                        };
-                        encode(key, values.at(member)).map_err(|_| DslError::Schema)
+            let name = format!("input-{wire:?}");
+            graph = match (value, public) {
+                (InputBinding::Scalar(value), true) => {
+                    let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
+                    let payload = encoding
+                        .public_payload
+                        .ok_or_else(|| ApiError::input("public encoding has no payload"))?;
+                    graph.transferred_output(name, (encoding.row.0, encoding.row.1, payload))
+                }
+                (InputBinding::Scalar(value), false) => {
+                    let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
+                    graph.transferred_output(name, encoding.row)
+                }
+                (InputBinding::Family(values), true) => {
+                    let stored = mxx_dsl::parallel(values.count().clone(), |index| {
+                        let encoding = encode(Some(index.expression()?), values.at(index))
+                            .map_err(|_| DslError::Schema)?;
+                        let payload = encoding.public_payload.ok_or(DslError::Schema)?;
+                        Ok((encoding.row.0, encoding.row.1, payload))
                     })
                     .map_err(ApiError::scheme)?;
-                    graph
-                        .transferred_output(format!("input-{wire:?}"), encodings)
-                        .map_err(ApiError::scheme)?
+                    graph.transferred_output(name, stored)
                 }
-            };
+                (InputBinding::Family(values), false) => {
+                    let stored = mxx_dsl::parallel(values.count().clone(), |index| {
+                        encode(Some(index.expression()?), values.at(index))
+                            .map(|encoding| encoding.row)
+                            .map_err(|_| DslError::Schema)
+                    })
+                    .map_err(ApiError::scheme)?;
+                    graph.transferred_output(name, stored)
+                }
+            }
+            .map_err(ApiError::scheme)?;
         }
         if let Some(declaration) = self.refresh_declaration.clone() {
             for slot in declaration.slots() {
@@ -2481,9 +2607,8 @@ pub struct RnsOnlineBuild<'a> {
     hash_key_commitment: [u8; 32],
     hash_key: Vec<u8>,
     evaluator: Option<EncodingLowering<'a>>,
-    families: GraphFamilyExecution,
-    environment:
-        Environment<RnsBggEncoding, RnsBggMatrix, Family<RnsBggEncoding>, Family<RnsBggMatrix>>,
+    families: OnlineFamilies<'a>,
+    environment: Environment<RnsBggEncoding, RnsBggMatrix, OnlineWireFamily, OnlineRhsFamily>,
     pending_refresh: Option<(usize, RefreshDeclaration, BTreeMap<usize, RnsOnlineBuild<'a>>)>,
     refreshed_input: Option<(RefreshDeclaration, RnsBggEncoding)>,
     refresh_prf: Option<(usize, crate::program::ExponentLutProgramId, [u8; 32])>,
@@ -2499,7 +2624,7 @@ impl<'a> RnsOnlineBuild<'a> {
             hash_key_commitment: [0; 32],
             hash_key: Vec::new(),
             evaluator: None,
-            families: GraphFamilyExecution,
+            families: OnlineFamilies { parameters },
             environment: Environment::new(),
             pending_refresh: None,
             refreshed_input: None,
@@ -2560,18 +2685,18 @@ impl<'a> RnsOnlineBuild<'a> {
             Arc::new(RnsBggDerivedWorkload::from_program(prepared).map_err(ApiError::scheme)?);
         self.hash_key_commitment = expected_hash_key;
         self.hash_key = hash_key.to_vec();
-        // The prepared PRF encryption stage publishes its coefficient rows at
-        // the raw source (q) level (`append_refresh_prf_child` uses level 0).
-        // Keep this child projection at that same level; the refresh route
-        // applies the per-slot p-level action and performs q→p explicitly.
-        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        // The prepared PRF encryption stage publishes each input at its
+        // logical level (`append_refresh_prf_child`), with its public key; the
+        // refresh route applies the per-slot p-level action to the outputs.
         let commitment = *declaration.commitment();
         self.environment = Environment::new();
         for (wire, input) in prepared.inputs() {
             let public = matches!(input.knowledge(), AttributeKnowledge::PublicPayload);
+            let level = workload.level(*wire).map_err(ApiError::scheme)?;
+            let ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
             let columns = self
                 .parameters
-                .key_component_columns(0, input.knowledge())
+                .key_component_columns(level, input.knowledge())
                 .map_err(ApiError::scheme)?;
             let scalar = || {
                 RnsBggEncoding::new(
@@ -2706,13 +2831,13 @@ impl<'a> RnsOnlineBuild<'a> {
                             ArtifactAvailability::Transferred,
                         )
                     });
-                    InputBinding::Family(encoding_family(
+                    InputBinding::Family(OnlineWireFamily::Stored(encoding_family(
                         *wire,
                         &key_parts,
                         &rows,
                         payload.as_ref(),
                         count.clone(),
-                    )?)
+                    )?))
                 }
             };
             self.environment
@@ -2720,12 +2845,18 @@ impl<'a> RnsOnlineBuild<'a> {
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
         let commitment = *declaration.commitment();
+        let hash_key = self
+            .parameters
+            .ring(0)
+            .map_err(ApiError::scheme)?
+            .bytes_input(super::HASH_KEY_INPUT, 32);
         for (rhs, binding) in import_rhs_bindings(
             self.parameters,
             prepared,
             &workload,
             &preprocess_production,
-            |role| refresh_prf_artifact_name(commitment, slot, &role),
+            &hash_key,
+            |role: String| refresh_prf_artifact_name(commitment, slot, &role),
         )? {
             self.environment
                 .bind_rhs(rhs, binding)
@@ -2740,11 +2871,7 @@ impl<'a> RnsOnlineBuild<'a> {
             manifests,
             refresh_prf_namespace: Some((*declaration.commitment(), slot)),
             current_site: None,
-            hash_key: self
-                .parameters
-                .ring(0)
-                .map_err(ApiError::scheme)?
-                .bytes_input(super::HASH_KEY_INPUT, 32),
+            hash_key,
         });
         Ok(())
     }
@@ -3006,9 +3133,19 @@ impl<'a> RnsOnlineBuild<'a> {
         sources.sort();
         sources.dedup();
         let preprocess = sources.first().cloned().unwrap_or_else(|| production.clone());
-        for (rhs, binding) in
-            import_rhs_bindings(self.parameters, program, &workload, &preprocess, |role| role)?
-        {
+        let hash_key = self
+            .parameters
+            .ring(0)
+            .map_err(ApiError::scheme)?
+            .bytes_input(super::HASH_KEY_INPUT, 32);
+        for (rhs, binding) in import_rhs_bindings(
+            self.parameters,
+            program,
+            &workload,
+            &preprocess,
+            &hash_key,
+            |role| role,
+        )? {
             environment
                 .bind_rhs(rhs, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
@@ -3029,11 +3166,7 @@ impl<'a> RnsOnlineBuild<'a> {
             manifests,
             refresh_prf_namespace: None,
             current_site: None,
-            hash_key: self
-                .parameters
-                .ring(0)
-                .map_err(ApiError::scheme)?
-                .bytes_input(super::HASH_KEY_INPUT, 32),
+            hash_key,
         });
         self.environment = environment;
         self.refreshed_public_key = Some(public_key.clone());
@@ -3118,7 +3251,10 @@ impl<'a> RnsOnlineBuild<'a> {
                     .labels()
                     .label(index)
                     .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
-                if matches!(refresh_label, RefreshPrfLabel::Mask { slot: owner, .. } if owner != *slot)
+                if !refresh_label
+                    .slots(declaration.slots().len())
+                    .map_err(RnsBggError::Refresh)?
+                    .contains(slot)
                 {
                     continue;
                 }
@@ -3289,13 +3425,8 @@ impl<'a> RnsOnlineBuild<'a> {
     ) -> Result<
         (
             &mut EncodingLowering<'a>,
-            &mut GraphFamilyExecution,
-            &mut Environment<
-                RnsBggEncoding,
-                RnsBggMatrix,
-                Family<RnsBggEncoding>,
-                Family<RnsBggMatrix>,
-            >,
+            &mut OnlineFamilies<'a>,
+            &mut Environment<RnsBggEncoding, RnsBggMatrix, OnlineWireFamily, OnlineRhsFamily>,
         ),
         ApiError,
     > {
@@ -3589,7 +3720,7 @@ fn build_refresh_checkpoint_graph(
 
 impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
     type Evaluator = EncodingLowering<'a>;
-    type Families = GraphFamilyExecution;
+    type Families = OnlineFamilies<'a>;
     type PreprocessDescriptor = RnsBggPreprocessOnlineDescriptor;
     type EncryptDescriptor = RnsBggEncryptionDescriptor;
 
@@ -3599,12 +3730,7 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
         (
             &mut Self::Evaluator,
             &mut Self::Families,
-            &mut Environment<
-                RnsBggEncoding,
-                RnsBggMatrix,
-                Family<RnsBggEncoding>,
-                Family<RnsBggMatrix>,
-            >,
+            &mut Environment<RnsBggEncoding, RnsBggMatrix, OnlineWireFamily, OnlineRhsFamily>,
         ),
         ApiError,
     > {
@@ -3671,112 +3797,74 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
             Arc::new(RnsBggDerivedWorkload::from_program(program).map_err(ApiError::scheme)?);
         self.hash_key_commitment = expected_hash_key;
         self.hash_key = hash_key.to_vec();
-        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        // Encryption stores each input's row (and public payload) at its
+        // logical level; its public key is sampled from the hash key here, or
+        // where a family member is read.
+        let hash_key = self
+            .parameters
+            .ring(0)
+            .map_err(ApiError::scheme)?
+            .bytes_input(super::HASH_KEY_INPUT, 32);
         for (wire, declaration) in program.inputs() {
+            let level = workload.level(*wire).map_err(ApiError::scheme)?;
+            let ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
+            let knowledge = declaration.knowledge();
             let columns = self
                 .parameters
-                .key_component_columns(0, declaration.knowledge())
+                .key_component_columns(level, knowledge)
                 .map_err(ApiError::scheme)?;
-            let public = matches!(declaration.knowledge(), AttributeKnowledge::PublicPayload);
-            let bind_scalar = |suffix: &str| {
-                let key = RnsBggPublicKey::new(
-                    *wire,
-                    (
-                        (
-                            ring.artifact_input(
-                                encryption_production.clone(),
-                                format!("input-{wire:?}.{suffix}0"),
-                                (1, columns),
-                                ArtifactAvailability::Transferred,
-                            ),
-                            ring.artifact_input(
-                                encryption_production.clone(),
-                                format!("input-{wire:?}.{suffix}1"),
-                                (1, columns),
-                                ArtifactAvailability::Transferred,
-                            ),
-                        ),
-                        (
-                            ring.artifact_input(
-                                encryption_production.clone(),
-                                format!("input-{wire:?}.{suffix}2"),
-                                (1, columns),
-                                ArtifactAvailability::Transferred,
-                            ),
-                            ring.artifact_input(
-                                encryption_production.clone(),
-                                format!("input-{wire:?}.{suffix}3"),
-                                (1, columns),
-                                ArtifactAvailability::Transferred,
-                            ),
-                        ),
-                    ),
-                );
-                let row = (
-                    ring.artifact_input(
-                        encryption_production.clone(),
-                        format!("input-{wire:?}.{suffix}4"),
-                        (1, columns),
-                        ArtifactAvailability::Transferred,
-                    ),
-                    ring.artifact_input(
-                        encryption_production.clone(),
-                        format!("input-{wire:?}.{suffix}5"),
-                        (1, columns),
-                        ArtifactAvailability::Transferred,
-                    ),
-                );
-                let payload = public.then(|| {
-                    ring.artifact_input(
-                        encryption_production.clone(),
-                        format!("input-{wire:?}.{suffix}6"),
-                        (1, 1),
-                        ArtifactAvailability::Transferred,
-                    )
-                });
-                RnsBggEncoding::new(key, row, payload)
-            };
+            let public = matches!(knowledge, AttributeKnowledge::PublicPayload);
             let binding = match declaration.shape() {
-                InputBinding::Scalar(()) => InputBinding::Scalar(bind_scalar("")),
-                InputBinding::Family(count) => {
-                    let key_parts = (0..4)
-                        .map(|port| {
-                            ring.family_artifact_input(
-                                encryption_production.clone(),
-                                format!("input-{wire:?}.{port}"),
-                                count.clone(),
-                                (1, columns),
-                                ArtifactAvailability::Transferred,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let rows = (0..2)
-                        .map(|port| {
-                            ring.family_artifact_input(
-                                encryption_production.clone(),
-                                format!("input-{wire:?}.{}", port + 4),
-                                count.clone(),
-                                (1, columns),
-                                ArtifactAvailability::Transferred,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let payload = public.then(|| {
-                        ring.family_artifact_input(
+                InputBinding::Scalar(()) => {
+                    let port = |port: usize, columns: usize| {
+                        ring.artifact_input(
                             encryption_production.clone(),
-                            format!("input-{wire:?}.6"),
-                            count.clone(),
-                            (1, 1),
+                            format!("input-{wire:?}.{port}"),
+                            (1, columns),
                             ArtifactAvailability::Transferred,
                         )
-                    });
-                    InputBinding::Family(encoding_family(
+                    };
+                    let key = super::public_key::sampled_key(
+                        self.parameters,
+                        level,
+                        hash_key.clone(),
                         *wire,
-                        &key_parts,
-                        &rows,
-                        payload.as_ref(),
-                        count.clone(),
-                    )?)
+                        knowledge,
+                        None,
+                    )
+                    .map_err(ApiError::scheme)?;
+                    InputBinding::Scalar(RnsBggEncoding::new(
+                        key,
+                        (port(0, columns), port(1, columns)),
+                        public.then(|| port(2, 1)),
+                    ))
+                }
+                InputBinding::Family(count) => {
+                    let port = |port: usize, columns: usize| {
+                        ring.family_artifact_input(
+                            encryption_production.clone(),
+                            format!("input-{wire:?}.{port}"),
+                            count.clone(),
+                            (1, columns),
+                            ArtifactAvailability::Transferred,
+                        )
+                    };
+                    let row_ports = [port(0, columns), port(1, columns)];
+                    let element: RnsBggRow =
+                        (row_ports[0].at(Int::constant(0)), row_ports[1].at(Int::constant(0)));
+                    let fields = row_ports
+                        .iter()
+                        .map(|family| family.value_handle().clone())
+                        .collect::<Vec<_>>();
+                    InputBinding::Family(OnlineWireFamily::Input {
+                        wire: *wire,
+                        level,
+                        knowledge,
+                        hash_key: hash_key.clone(),
+                        rows: family_of_fields(&element, count.clone(), &fields)
+                            .map_err(ApiError::scheme)?,
+                        payloads: public.then(|| port(2, 1)),
+                    })
                 }
             };
             self.environment
@@ -3788,6 +3876,7 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
             program,
             &workload,
             &preprocess_production,
+            &hash_key,
             |role| role,
         )? {
             self.environment
@@ -3803,11 +3892,7 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
             manifests,
             refresh_prf_namespace: None,
             current_site: None,
-            hash_key: self
-                .parameters
-                .ring(0)
-                .map_err(ApiError::scheme)?
-                .bytes_input(super::HASH_KEY_INPUT, 32),
+            hash_key,
         });
         Ok(())
     }
@@ -4499,11 +4584,13 @@ mod test {
         let scalar_program =
             Arc::new(scalar_builder.finish(vec![Operand::Scalar(scalar_output)]).unwrap());
         let scalar_lowerer = lowerer(&scalar_program, scalar_output);
+        let hash_key = scalar_lowerer.hash_key.clone();
         let bindings = import_rhs_bindings(
             &parameters,
             &scalar_program,
             &scalar_lowerer.workload,
             &production,
+            &hash_key,
             |role| role,
         )
         .unwrap();
@@ -4548,6 +4635,7 @@ mod test {
             &family_program,
             &family_lowerer.workload,
             &production,
+            &hash_key,
             |role| role,
         )
         .unwrap();
@@ -4555,19 +4643,32 @@ mod test {
             panic!("one family RHS binding expected");
         };
         assert_eq!(*id, family_rhs);
-        // The family is the imported port families themselves: no loop reads them.
-        assert!(family.flatten().iter().all(|value| matches!(
+        // Only the bottom rows are imported, as the port families themselves:
+        // no loop reads them.
+        assert_eq!(family.bottoms.flatten().len(), 2);
+        assert!(family.bottoms.flatten().iter().all(|value| matches!(
             value.node().kind(),
             mxx_ir_core::node::NodeKind::Input { artifact: Some(_), .. }
         )));
-        let member = family.at(Int::constant(1));
+        let mut families = OnlineFamilies { parameters: &parameters };
+        let mut member_at = |index: IntExpr| {
+            <OnlineFamilies<'_> as crate::program::FamilyExecution<EncodingLowering<'_>>>::rhs_at(
+                &mut families,
+                family,
+                &index,
+            )
+            .unwrap()
+        };
+        let member = member_at(IntExpr::constant(1));
         assert_compact(&member);
         let family_action = family_lowerer.rhs_decomposition(&member, 0).unwrap();
         assert_eq!(family_action.0.0.matrix_type(), &decomposed_type);
         assert_eq!(family_action.0.0.max_coefficient_bound(), &decomposed_bound);
         let family_name = format!("rhs/{family_rhs:?}/family");
         let family_members = mxx_dsl::parallel(IntExpr::constant(2), |index| {
-            family_lowerer.rhs_decomposition(&family.at(index), 0).map_err(|_| DslError::Schema)
+            family_lowerer
+                .rhs_decomposition(&member_at(index.expression()?), 0)
+                .map_err(|_| DslError::Schema)
         })
         .unwrap();
         let family_graph = DslContext::new("rhs-family-consumer-schema")
@@ -4721,7 +4822,10 @@ mod test {
         let output = builder
             .mul_public(Operand::Scalar(public_input), Operand::Scalar(private_level_one))
             .unwrap();
-        let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
+        // Also an output, the public input stays at level zero and is aligned.
+        let program = Arc::new(
+            builder.finish(vec![Operand::Scalar(output), Operand::Scalar(public_input)]).unwrap(),
+        );
         let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
         let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
         let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();

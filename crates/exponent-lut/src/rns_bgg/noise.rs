@@ -1081,10 +1081,26 @@ pub(crate) struct WorkloadCollector<'a> {
     parameters: Option<&'a RnsBggParameters>,
     levels: BTreeMap<WireId, usize>,
     rhs_levels: BTreeMap<RhsId, usize>,
+    /// For each public Program input, the lowest level at which it is
+    /// consumed, or `None` once any use needs it at its own level.
+    public_input_uses: BTreeMap<WireId, Option<usize>>,
     current_site: Option<crate::program::LoweringSite>,
 }
 
 impl<'a> WorkloadCollector<'a> {
+    /// Record one use of `wire`. A public input consumed only as the public
+    /// left operand of a product with a private right operand can be encoded
+    /// at that product's level, which is set by the right operand alone;
+    /// `consumed_at` is then that level. Any other use pins it.
+    fn note_use(&mut self, wire: WireId, consumed_at: Option<usize>) {
+        if let Some(entry) = self.public_input_uses.get_mut(&wire) {
+            *entry = match (*entry, consumed_at) {
+                (Some(current), Some(level)) => Some(current.min(level)),
+                _ => None,
+            };
+        }
+    }
+
     fn site(&self) -> Result<&crate::program::LoweringSite, RnsBggError> {
         self.current_site
             .as_ref()
@@ -1116,28 +1132,67 @@ impl RnsBggDerivedWorkload {
         Self::derive(program, Some(parameters))
     }
 
+    /// Public inputs are encoded at the level where they are first consumed,
+    /// so that no stage stores or aligns them at a higher modulus than they
+    /// are used at. The first pass finds those levels with every input at
+    /// level zero; the second derives the workload with them.
     fn derive<'a>(
         program: &'a ExponentLutProgram,
         parameters: Option<&'a RnsBggParameters>,
     ) -> Result<Self, RnsBggError> {
+        let first = Self::derive_with_input_levels(program, parameters, &BTreeMap::new())?;
+        let input_levels = first
+            .1
+            .into_iter()
+            .filter_map(|(wire, level)| level.filter(|level| *level > 0).map(|level| (wire, level)))
+            .collect::<BTreeMap<_, _>>();
+        if input_levels.is_empty() {
+            return Ok(first.0);
+        }
+        Ok(Self::derive_with_input_levels(program, parameters, &input_levels)?.0)
+    }
+
+    fn derive_with_input_levels<'a>(
+        program: &'a ExponentLutProgram,
+        parameters: Option<&'a RnsBggParameters>,
+        input_levels: &BTreeMap<WireId, usize>,
+    ) -> Result<(Self, BTreeMap<WireId, Option<usize>>), RnsBggError> {
+        let input_level = |id: &WireId| input_levels.get(id).copied().unwrap_or(0);
         let mut collector = WorkloadCollector {
             program,
             parameters,
-            levels: program.inputs().keys().map(|id| (*id, 0)).collect(),
+            levels: program.inputs().keys().map(|id| (*id, input_level(id))).collect(),
             rhs_levels: BTreeMap::new(),
+            public_input_uses: program
+                .inputs()
+                .iter()
+                .filter(|(_, declaration)| {
+                    matches!(
+                        declaration.knowledge(),
+                        crate::program::AttributeKnowledge::PublicPayload
+                    )
+                })
+                .map(|(id, _)| (*id, Some(usize::MAX)))
+                .collect(),
             current_site: None,
         };
+        // A public input that is itself an output keeps its own level.
+        for output in program.outputs() {
+            let (crate::program::Operand::Scalar(wire) |
+            crate::program::Operand::Member { family: wire, .. }) = output;
+            collector.public_input_uses.insert(*wire, None);
+        }
         let mut environment = Environment::new();
         for id in program.inputs().keys() {
             match program.inputs().get(id).expect("input declaration").shape() {
                 InputBinding::Scalar(()) => {
-                    environment.bind_wire(*id, InputBinding::Scalar((*id, 0)))
+                    environment.bind_wire(*id, InputBinding::Scalar((*id, input_level(id))))
                 }
                 InputBinding::Family(count) => environment.bind_wire(
                     *id,
                     InputBinding::Family((
                         *id,
-                        0,
+                        input_level(id),
                         FamilyRange::full(count.clone())
                             .map_err(|_| RnsBggError::Binding("invalid family range"))?,
                     )),
@@ -1167,11 +1222,20 @@ impl RnsBggDerivedWorkload {
                 ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
                 ProgramLowerError::UnsupportedStructure { reason } => RnsBggError::Graph(reason),
             })?;
-        Ok(Self {
-            program: program.id(),
-            levels: collector.levels,
-            rhs_levels: collector.rhs_levels,
-        })
+        let uses = collector
+            .public_input_uses
+            .iter()
+            .filter(|(wire, _)| program.inputs().contains_key(wire))
+            .map(|(wire, level)| (*wire, level.filter(|level| *level != usize::MAX)))
+            .collect();
+        Ok((
+            Self {
+                program: program.id(),
+                levels: collector.levels,
+                rhs_levels: collector.rhs_levels,
+            },
+            uses,
+        ))
     }
     /// Return the logical level of a wire.
     pub fn level(&self, wire: WireId) -> Result<usize, RnsBggError> {
@@ -1198,6 +1262,8 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
     type Rhs = RhsId;
     type Error = RnsBggError;
     fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
+        self.note_use(lhs.0, None);
+        self.note_use(rhs.0, None);
         if lhs.1 != rhs.1 {
             return Err(RnsBggError::Parameters("add operands have different logical levels"));
         }
@@ -1222,6 +1288,9 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         if lhs_knowledge != crate::program::AttributeKnowledge::PublicPayload {
             return Err(RnsBggError::Parameters("MulPublic LHS must be public"));
         }
+        let private_rhs = rhs_knowledge == crate::program::AttributeKnowledge::PrivatePayload;
+        self.note_use(lhs.0, private_rhs.then_some(rhs.1));
+        self.note_use(rhs.0, None);
         let target = self.parameters.map_or(Ok(rhs.1), |parameters| {
             parameters.mul_public_target_level(lhs.1, rhs.1, rhs_knowledge)
         })?;
@@ -1241,6 +1310,7 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         {
             return Err(RnsBggError::Parameters("RNS-BGG MulPrivate requires a private input"));
         }
+        self.note_use(input.0, None);
         let output = self.site()?.output;
         let level = input.1;
         if let Some(&rhs_level) = self.rhs_levels.get(rhs) {
@@ -1267,6 +1337,7 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         {
             return Err(RnsBggError::Parameters("RNS-BGG LUT requires a private input"));
         }
+        self.note_use(input.0, None);
         let output = self.site()?.output;
         let next = if matches!(
             table.output_representation(),
@@ -4329,15 +4400,36 @@ impl<'a> RnsNoiseBuild<'a> {
         }
         let output = {
             let mut refresh = super::RnsBggRefresh::new(evaluator, inputs);
-            crate::api::apply_refresh(declaration, &mut refresh, |callback_declaration, _| {
+            crate::api::apply_refresh(declaration, &mut refresh, |callback_declaration, labels| {
                 let mut per_label =
                     BTreeMap::<PrfLabel, BTreeMap<usize, (WireId, RnsBggNoiseValue)>>::new();
+                let label_positions = labels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| (label.clone(), index))
+                    .collect::<BTreeMap<_, _>>();
                 for slot in 0..callback_declaration.slots().len() {
                     let mut channel = channels
                         .remove(&slot)
                         .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
                     let outputs = channel.lower_refresh_prf(callback_declaration)?;
                     for (label, output) in outputs {
+                        // Every slot's PRF Program yields every label; a mask
+                        // label is kept only from the slot that owns it, as
+                        // in preprocessing.
+                        if let Some(&label_index) = label_positions.get(&label) {
+                            let refresh_label = declaration
+                                .labels()
+                                .label(label_index)
+                                .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+                            if !refresh_label
+                                .slots(callback_declaration.slots().len())
+                                .map_err(RnsBggError::Refresh)?
+                                .contains(&slot)
+                            {
+                                continue;
+                            }
+                        }
                         if per_label.entry(label).or_default().insert(slot, output).is_some() {
                             return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
                         }
@@ -4537,6 +4629,43 @@ mod test {
         };
         assert_eq!(family.validate_support().unwrap(), BigUint::from(4u8));
         assert_eq!(family.max_nonzero_payloads, BigUint::from(1u8));
+    }
+
+    /// A public input consumed only as the public left operand of products
+    /// with private right operands takes the lowest of their levels; one also
+    /// consumed any other way stays at level zero.
+    #[test]
+    fn workload_encodes_public_inputs_at_their_first_consuming_level() {
+        use crate::program::{AttributeKnowledge, Operand};
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let state = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let moved = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let pinned = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let second_rhs = builder.rhs_input().unwrap();
+        let level_one = builder.mul_private(Operand::Scalar(state), Operand::Scalar(rhs)).unwrap();
+        let level_two =
+            builder.mul_private(Operand::Scalar(level_one), Operand::Scalar(second_rhs)).unwrap();
+        let first = builder.mul_public(Operand::Scalar(moved), Operand::Scalar(level_one)).unwrap();
+        let second =
+            builder.mul_public(Operand::Scalar(moved), Operand::Scalar(level_two)).unwrap();
+        let third =
+            builder.mul_public(Operand::Scalar(pinned), Operand::Scalar(level_two)).unwrap();
+        let program = builder
+            .finish(vec![
+                Operand::Scalar(first),
+                Operand::Scalar(second),
+                Operand::Scalar(third),
+                Operand::Scalar(pinned),
+            ])
+            .unwrap();
+        let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+        assert_eq!(workload.level(state).unwrap(), 0);
+        assert_eq!(workload.level(moved).unwrap(), 1);
+        assert_eq!(workload.level(pinned).unwrap(), 0);
+        assert_eq!(workload.level(first).unwrap(), 1);
+        assert_eq!(workload.level(second).unwrap(), 2);
+        assert_eq!(workload.level(third).unwrap(), 2);
     }
 
     #[test]

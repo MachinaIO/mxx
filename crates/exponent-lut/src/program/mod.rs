@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use builder::ExponentLutProgramBuilder;
-pub(crate) use graph::GraphParallelLowering;
 pub use graph::{GraphFamilyExecution, RhsRef, family_of_fields};
+pub(crate) use graph::{GraphParallelLowering, graph_parallel, graph_sum};
 pub(crate) use lowering::lower_program;
 pub use lowering::{
     Environment, FamilyExecution, LoweringSite, ProgramLowerError, ProgramLoweringContext,

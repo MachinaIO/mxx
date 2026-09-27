@@ -123,35 +123,7 @@ where
         range: &FamilyRange,
         body: impl FnOnce(&mut Self, &mut E, IntExpr) -> Result<E::Wire, ProgramLowerError<E::Error>>,
     ) -> Result<Self::WireFamily, ProgramLowerError<E::Error>> {
-        let mut failure = None;
-        let start = range.start().clone();
-        let family = mxx_dsl::parallel(range.count().clone(), |local| {
-            if failure.is_some() {
-                return Err(mxx_dsl::DslError::Schema);
-            }
-            let index = local.expression().map_err(|_| mxx_dsl::DslError::CompileTimeIndex)?;
-            evaluator.begin_graph_parallel();
-            match body(
-                self,
-                evaluator,
-                IntExpr::Add(Box::new(start.clone()), Box::new(index)).canonicalize(),
-            ) {
-                Ok(value) => {
-                    evaluator.finish_graph_parallel().map_err(|_| mxx_dsl::DslError::Schema)?;
-                    Ok(value)
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    Err(mxx_dsl::DslError::Schema)
-                }
-            }
-        });
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        let wires = family.map_err(ProgramLowerError::Dsl)?;
-        evaluator.commit_graph_parallel().map_err(ProgramLowerError::Backend)?;
-        Ok(wires)
+        graph_parallel(self, evaluator, range, body)
     }
 
     fn sum(
@@ -159,44 +131,106 @@ where
         evaluator: &mut E,
         family: &Self::WireFamily,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
-        let count = family.count().clone();
-        if let Ok(count_value) = count.evaluate(&mxx_ir_core::ParamEnv::default()) &&
-            count_value <= 0.into()
-        {
-            return Err(ProgramLowerError::UnsupportedStructure {
-                reason: "cannot reduce an empty family".into(),
-            });
+        graph_sum(evaluator, family.count().clone(), |index| Ok(family.at(index)))
+    }
+}
+
+/// Lower `body` once as a graph parallel loop over `range`, for any family
+/// execution whose parallel results are graph families. The body receives
+/// the absolute member index.
+pub(crate) fn graph_parallel<X, E>(
+    execution: &mut X,
+    evaluator: &mut E,
+    range: &FamilyRange,
+    body: impl FnOnce(&mut X, &mut E, IntExpr) -> Result<E::Wire, ProgramLowerError<E::Error>>,
+) -> Result<mxx_dsl::Family<E::Wire>, ProgramLowerError<E::Error>>
+where
+    E: GraphParallelLowering,
+    E::Wire: mxx_dsl::GraphValue,
+{
+    let mut failure = None;
+    let start = range.start().clone();
+    let family = mxx_dsl::parallel(range.count().clone(), |local| {
+        if failure.is_some() {
+            return Err(mxx_dsl::DslError::Schema);
         }
-        let first = family.at(mxx_dsl::Int::constant(0));
-        if count.evaluate(&mxx_ir_core::ParamEnv::default()).is_ok_and(|count| count == 1.into()) {
-            return Ok(first);
+        let index = local.expression().map_err(|_| mxx_dsl::DslError::CompileTimeIndex)?;
+        evaluator.begin_graph_parallel();
+        match body(
+            execution,
+            evaluator,
+            IntExpr::Add(Box::new(start.clone()), Box::new(index)).canonicalize(),
+        ) {
+            Ok(value) => {
+                evaluator.finish_graph_parallel().map_err(|_| mxx_dsl::DslError::Schema)?;
+                Ok(value)
+            }
+            Err(error) => {
+                failure = Some(error);
+                Err(mxx_dsl::DslError::Schema)
+            }
         }
-        // A sum is labelled with the reduction's output wire, which a family
-        // member is not. Add the first two members before the loop so that
-        // every loop state carries that label and the state schema is the
-        // same in each iteration.
-        let initial = evaluator
-            .add(&first, &family.at(mxx_dsl::Int::constant(1)))
-            .map_err(ProgramLowerError::Backend)?;
-        let mut failure = None;
-        let result = mxx_dsl::iterate(count - 2usize, initial, |index, state| {
-            if failure.is_some() {
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let wires = family.map_err(ProgramLowerError::Dsl)?;
+    evaluator.commit_graph_parallel().map_err(ProgramLowerError::Backend)?;
+    Ok(wires)
+}
+
+/// Sum the `count` members that `member` reads by index, as one graph
+/// reduction. A family execution passes how it reads one member.
+pub(crate) fn graph_sum<E>(
+    evaluator: &mut E,
+    count: IntExpr,
+    mut member: impl FnMut(mxx_dsl::Int) -> Result<E::Wire, ProgramLowerError<E::Error>>,
+) -> Result<E::Wire, ProgramLowerError<E::Error>>
+where
+    E: ExponentLUTProgramLowering,
+    E::Wire: mxx_dsl::GraphValue,
+{
+    let count_value = count.evaluate(&mxx_ir_core::ParamEnv::default()).ok();
+    if count_value.as_ref().is_some_and(|count| *count <= 0.into()) {
+        return Err(ProgramLowerError::UnsupportedStructure {
+            reason: "cannot reduce an empty family".into(),
+        });
+    }
+    let first = member(mxx_dsl::Int::constant(0))?;
+    if count_value.as_ref().is_some_and(|count| *count == 1.into()) {
+        return Ok(first);
+    }
+    // A sum is labelled with the reduction's output wire, which a family
+    // member is not. Add the first two members before the loop so that
+    // every loop state carries that label and the state schema is the
+    // same in each iteration.
+    let initial = evaluator
+        .add(&first, &member(mxx_dsl::Int::constant(1))?)
+        .map_err(ProgramLowerError::Backend)?;
+    let mut failure = None;
+    let result = mxx_dsl::iterate(count - 2usize, initial, |index, state| {
+        if failure.is_some() {
+            return Err(mxx_dsl::DslError::Schema);
+        }
+        let rhs = match member(index.add(2usize)) {
+            Ok(rhs) => rhs,
+            Err(error) => {
+                failure = Some(error);
                 return Err(mxx_dsl::DslError::Schema);
             }
-            let rhs = family.at(index.add(2usize));
-            match evaluator.add(&state, &rhs) {
-                Ok(value) => Ok(value),
-                Err(error) => {
-                    failure = Some(ProgramLowerError::Backend(error));
-                    Err(mxx_dsl::DslError::Schema)
-                }
+        };
+        match evaluator.add(&state, &rhs) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                failure = Some(ProgramLowerError::Backend(error));
+                Err(mxx_dsl::DslError::Schema)
             }
-        });
-        if let Some(error) = failure {
-            return Err(error);
         }
-        result.map_err(ProgramLowerError::Dsl)
+    });
+    if let Some(error) = failure {
+        return Err(error);
     }
+    result.map_err(ProgramLowerError::Dsl)
 }
 
 impl GraphFamilyExecution {

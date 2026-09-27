@@ -759,16 +759,38 @@ impl RnsBggParameters {
         digest.finalize().into()
     }
 
-    /// Validate the exact four-level schedule required by a prepared PRF
-    /// child: `[q, q, q, p]`.  The final successor supplies the coefficient
-    /// decomposition width for the level-two q carrier.
+    /// The number of `q` levels in a prepared PRF child's schedule
+    /// `[q, ..., q, p]`. The PRF outputs are coefficient LUT outputs, which
+    /// stay at their LUT's input level with the key width of the next level,
+    /// so `q` runs through the level after the outputs and `p` follows,
+    /// supplying that width.
+    fn refresh_prf_q_levels(declaration: &RefreshDeclaration) -> Result<usize, RnsBggError> {
+        let workload = RnsBggDerivedWorkload::from_program(declaration.prepared().program())?;
+        let mut levels = declaration
+            .prepared()
+            .declaration()
+            .ordered_outputs()
+            .map(|(_, wire)| workload.level(wire));
+        let level =
+            levels.next().ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))??;
+        if levels.any(|other| other.ok() != Some(level)) {
+            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+        }
+        level.checked_add(2).ok_or(RnsBggError::Parameters("refresh PRF level overflow"))
+    }
+
+    /// Validate the schedule required by a prepared PRF child: `q` at every
+    /// level through the PRF outputs, then `p`.
     pub(crate) fn validate_refresh_prf_schedule(
         &self,
         declaration: &RefreshDeclaration,
         slot: usize,
     ) -> Result<(), RnsBggError> {
-        if self.levels.len() != 4 || slot >= declaration.slots().len() {
-            return Err(RnsBggError::Binding("refresh PRF parameter schedule is not [q,q,q,p]"));
+        const MISMATCH: RnsBggError =
+            RnsBggError::Binding("refresh PRF parameter schedule is not [q, ..., q, p]");
+        let q_levels = Self::refresh_prf_q_levels(declaration)?;
+        if self.levels.len() != q_levels + 1 || slot >= declaration.slots().len() {
+            return Err(MISMATCH);
         }
         let declared_slot = declaration
             .slots()
@@ -782,16 +804,14 @@ impl RnsBggParameters {
             .p
             .to_biguint()
             .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-        if self.level(0)?.modulus().as_ref() != &q ||
-            self.level(1)?.modulus().as_ref() != &q ||
-            self.level(2)?.modulus().as_ref() != &q ||
-            self.level(3)?.modulus().as_ref() != &p ||
-            self.level(1)? != self.level(0)? ||
-            self.level(2)? != self.level(0)?
+        let first = self.level(0)?;
+        if first.modulus().as_ref() != &q ||
+            self.levels[..q_levels].iter().any(|level| level != first) ||
+            self.level(q_levels)?.modulus().as_ref() != &p
         {
-            return Err(RnsBggError::Binding("refresh PRF parameter schedule is not [q,q,q,p]"));
+            return Err(MISMATCH);
         }
-        if self.component_columns(2)? != self.level(3)?.modulus_digits() {
+        if self.component_columns(q_levels - 1)? != self.level(q_levels)?.modulus_digits() {
             return Err(RnsBggError::Binding(
                 "refresh PRF coefficient output width does not match successor level",
             ));
@@ -824,19 +844,15 @@ impl RnsBggParameters {
                     self.levels[*level + 1].modulus().as_ref() == &p
             })
             .ok_or(RnsBggError::Binding("refresh q/p successor is not configured"))?;
+        let q_levels = Self::refresh_prf_q_levels(declaration)?;
         let q_parameters = self.level(q_level)?.clone();
         let p_parameters = self.level(q_level + 1)?.clone();
         let expected = Self::new(
-            vec![
-                q_parameters.clone(),
-                q_parameters.clone(),
-                q_parameters.clone(),
-                p_parameters.clone(),
-            ],
+            std::iter::repeat_n(q_parameters, q_levels).chain([p_parameters]).collect(),
             self.encoding_error_sigma.clone(),
             self.operations_per_drop,
         )?;
-        if expected.component_columns(2)? != self.component_columns(q_level)? {
+        if expected.component_columns(q_levels - 1)? != self.component_columns(q_level)? {
             return Err(RnsBggError::Binding(
                 "refresh PRF coefficient output width does not match source q carrier",
             ));
@@ -1028,6 +1044,9 @@ pub(crate) struct RnsBggArtifactBinding {
     hash_key_commitment: [u8; 32],
     sources: Vec<mxx_ir_core::artifact::ProductionId>,
     refresh_commitment: Option<[u8; 32]>,
+    /// The logical level of each Program input, which encryption encodes it
+    /// at.
+    input_levels: BTreeMap<WireId, usize>,
 }
 
 impl RnsBggArtifactBinding {
@@ -1048,11 +1067,23 @@ impl RnsBggArtifactBinding {
             hash_key_commitment,
             sources: Vec::new(),
             refresh_commitment: None,
+            input_levels: BTreeMap::new(),
         };
         for source in sources {
             binding = binding.with_source(source)?;
         }
         Ok(binding)
+    }
+
+    /// Records the logical level of each Program input.
+    pub(crate) fn with_input_levels(mut self, input_levels: BTreeMap<WireId, usize>) -> Self {
+        self.input_levels = input_levels;
+        self
+    }
+
+    /// The logical level of each Program input.
+    pub(crate) fn input_levels(&self) -> &BTreeMap<WireId, usize> {
+        &self.input_levels
     }
 
     /// Binds a refresh declaration to this stage's artifact identity.

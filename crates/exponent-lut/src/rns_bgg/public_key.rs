@@ -137,13 +137,55 @@ pub(super) fn lut_public_matrix(
     Ok(matrix_from_hash(&ring, key, tag, columns))
 }
 
-fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::HashTag {
+/// The member enters the tag as an index expression in every stage, so a
+/// member read by a loop index and one read by a table of indices share it.
+fn input_hash_tag(wire: WireId, level: usize, member: Option<IntExpr>) -> mxx_dsl::HashTag {
     let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/input/{wire:?}/{level}").into_bytes());
     if let Some(member) = member {
         tag.push("member");
         tag.push(member);
     }
     tag
+}
+
+/// The top row of RHS `rhs`'s compact ciphertext consumed at `level`, or of
+/// member `member` of a family RHS. It is sampled from the hash key, so only
+/// the bottom row is stored and each reader derives this one.
+///
+/// The tag names the parameter set, the Program, the RHS, and the member, so
+/// no two ciphertexts under one payload secret share a top row: the bottom
+/// rows of two that did would differ by their plaintext difference times the
+/// secret, revealing whether the plaintexts differ.
+pub(crate) fn rhs_top(
+    parameters: &RnsBggParameters,
+    program: crate::program::ExponentLutProgramId,
+    hash_key: Bytes,
+    rhs: RhsId,
+    level: usize,
+    member: Option<IntExpr>,
+) -> Result<RnsBggRow, RnsBggError> {
+    let next_level = level.checked_add(1).ok_or(RnsBggError::Parameters("RHS level overflow"))?;
+    let ring = parameters.ring(next_level)?;
+    let columns = parameters.component_columns(next_level)?;
+    let identity = parameters
+        .parameter_identity()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut tag = mxx_dsl::HashTag::from(
+        format!("rns-bgg/rhs/{identity}/{program:?}/{rhs:?}/{level}/{next_level}").into_bytes(),
+    );
+    if let Some(member) = member {
+        tag.push("member");
+        tag.push(member);
+    }
+    let component = |index: u64| {
+        let mut tag = tag.clone();
+        tag.push("component");
+        tag.push(mxx_ir_core::IntExpr::constant(index));
+        ring.hash_matrix(hash_key.clone(), tag, (1, columns))
+    };
+    Ok((component(0), component(1)))
 }
 
 fn decompose_matrix(
@@ -226,13 +268,16 @@ fn lut_payload_target(scale: Mat, coefficient: Mat, payload: RnsBggRow, gadget: 
     )
 }
 
-fn sampled_key(
+/// The public key of input `wire` at `level`, or of member `member` of an
+/// input family. It is sampled from the hash key alone, so every stage derives
+/// it where it needs it and no stage stores it.
+pub(crate) fn sampled_key(
     parameters: &RnsBggParameters,
     level: usize,
     hash_key: Bytes,
     wire: WireId,
     knowledge: AttributeKnowledge,
-    member: Option<Int>,
+    member: Option<IntExpr>,
 ) -> Result<RnsBggPublicKey, RnsBggError> {
     let ring = parameters.ring(level)?;
     let columns = parameters.key_component_columns(level, knowledge)?;
@@ -389,6 +434,10 @@ impl<'a> PublicKeyLowering<'a> {
             .program
             .wire_knowledge(wire)
             .map_err(|_| RnsBggError::Binding("wire knowledge"))?;
+        let member =
+            member.as_ref().map(Int::expression).transpose().map_err(|_| {
+                RnsBggError::Binding("input member index is not an index expression")
+            })?;
         sampled_key(
             self.parameters,
             self.workload.level(wire)?,
@@ -430,17 +479,29 @@ impl<'a> PublicKeyLowering<'a> {
             self.parameters.scalar(next_level, self.parameters.message_scale(next_level)?)?;
         let target = (payload.0.clone() * gadget.clone(), payload.1.clone() * gadget);
         let desired = (target.0 * scale.clone() * nu.clone(), target.1 * scale * nu);
-        let tag = mxx_dsl::HashTag::from(
-            format!("rns-bgg/rhs/{:?}/{level}/{next_level}", rhs.id).into_bytes(),
-        );
-        let top_matrix = matrix_from_hash(&next_ring, self.hash_key.clone(), tag, target_columns);
+        // The member enters the tag as an index expression, as it does where
+        // online evaluation reads the member.
+        let member = rhs
+            .index
+            .as_ref()
+            .map(Int::expression)
+            .transpose()
+            .map_err(|_| RnsBggError::Binding("RHS member index is not an index expression"))?;
+        let top = rhs_top(
+            self.parameters,
+            self.program.id(),
+            self.hash_key.clone(),
+            rhs.id,
+            level,
+            member,
+        )?;
         let error =
             crate::rns_bgg::encoding::fresh_error(self.parameters, next_level, target_columns)?;
         let bottom = (
-            desired.0 - payload.0.clone() * top_matrix.0.0.clone() + error.0,
-            desired.1 - payload.0 * top_matrix.0.1.clone() + error.1,
+            desired.0 - payload.0.clone() * top.0.clone() + error.0,
+            desired.1 - payload.0 * top.1.clone() + error.1,
         );
-        Ok(((top_matrix.0.0, top_matrix.0.1), bottom))
+        Ok((top, bottom))
     }
     /// Materialize setup-fixed compact `B_sigma` switching ciphertexts for a
     /// complete LUT/layout identity.  Gadget decomposition is deferred until
@@ -1019,26 +1080,6 @@ fn validate_refresh_target_modulus(
     Ok(())
 }
 
-fn expected_refresh_slots(
-    label: &RefreshPrfLabel,
-    slot_count: usize,
-) -> Result<Vec<usize>, RnsBggError> {
-    match label {
-        RefreshPrfLabel::Mask { slot, .. } => {
-            if *slot >= slot_count {
-                return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-            }
-            Ok(vec![*slot])
-        }
-        RefreshPrfLabel::FreshError { .. } => {
-            if slot_count == 0 {
-                return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-            }
-            Ok((0..slot_count).collect())
-        }
-    }
-}
-
 fn refresh_crt_weight(
     slots: &[crate::noise_refresh::refresh::RefreshSlot],
     slot: usize,
@@ -1162,7 +1203,7 @@ impl PublicKeyLowering<'_> {
                     true
                 }
             };
-            let expected_slots = expected_refresh_slots(&label, slot_count)?;
+            let expected_slots = label.slots(slot_count).map_err(RnsBggError::Refresh)?;
             if channels.len() != expected_slots.len() ||
                 channels.keys().copied().ne(expected_slots.iter().copied())
             {
@@ -1581,10 +1622,9 @@ impl<'a> RnsPreprocessBuild<'a> {
                                 .labels()
                                 .label(label_index)
                                 .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
-                            let expected_slots = expected_refresh_slots(
-                                &refresh_label,
-                                callback_declaration.slots().len(),
-                            )?;
+                            let expected_slots = refresh_label
+                                .slots(callback_declaration.slots().len())
+                                .map_err(RnsBggError::Refresh)?;
                             if !expected_slots.contains(&slot) {
                                 continue;
                             }
@@ -1622,6 +1662,7 @@ impl<'a> RnsPreprocessBuild<'a> {
     }
 }
 
+/// The stored part of a family of RHS ciphertexts: each member's bottom row.
 fn merge_runtime(
     destination: &mut BTreeMap<String, RuntimeValue>,
     source: BTreeMap<String, RuntimeValue>,
@@ -1833,29 +1874,10 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             deduplicate_outputs(evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?);
         let mut graph = DslContext::new("rns-bgg-preprocess");
 
-        // Input public keys are sampled from the hash key alone. Publish all
-        // declared inputs, including private-payload and family inputs, under
-        // the names consumed by the encoding stage. A raw input can also be a
-        // declared Program output; the output loop below skips that wire so
-        // the shared public-key name is emitted exactly once.
-        for (wire, declaration) in evaluator.program.inputs() {
-            let name = format!("public-key/{wire:?}");
-            match declaration.shape() {
-                InputBinding::Scalar(()) => {
-                    let key = evaluator.sample_input_public_key(*wire).map_err(ApiError::scheme)?;
-                    graph = graph.cached_output(name, key).map_err(ApiError::scheme)?;
-                }
-                InputBinding::Family(count) => {
-                    let keys = mxx_dsl::parallel(count.clone(), |index| {
-                        evaluator
-                            .sample_input_public_key_member(*wire, Some(index))
-                            .map_err(|_| DslError::Schema)
-                    })
-                    .map_err(ApiError::scheme)?;
-                    graph = graph.cached_output(name, keys).map_err(ApiError::scheme)?;
-                }
-            }
-        }
+        // Input public keys are sampled from the hash key alone, so no stage
+        // stores them: encryption and online evaluation derive them where
+        // they need them. A raw input that is also a Program output is
+        // skipped here for the same reason.
         for output in outputs {
             if evaluator.program.inputs().contains_key(&output.wire) {
                 continue;
@@ -1924,7 +1946,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                                         *slot,
                                         &format!("rhs/{rhs:?}"),
                                     ),
-                                    value.clone(),
+                                    value.1.clone(),
                                 )
                                 .map_err(ApiError::scheme)?;
                         }
@@ -1936,7 +1958,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                                         *slot,
                                         &format!("rhs/{rhs:?}/family"),
                                     ),
-                                    value.clone(),
+                                    value.field(|matrix| matrix.1).map_err(ApiError::scheme)?,
                                 )
                                 .map_err(ApiError::scheme)?;
                         }
@@ -1957,16 +1979,21 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 }
             }
         }
+        // Only the bottom row of each RHS ciphertext is stored; its top row
+        // is sampled from the hash key (`rhs_top`).
         for (rhs, prepared) in &evaluator.rhs_material {
             match prepared {
                 InputBinding::Scalar(value) => {
                     graph = graph
-                        .transferred_output(format!("rhs/{rhs:?}"), value.clone())
+                        .transferred_output(format!("rhs/{rhs:?}"), value.1.clone())
                         .map_err(ApiError::scheme)?;
                 }
                 InputBinding::Family(value) => {
                     graph = graph
-                        .transferred_output(format!("rhs/{rhs:?}/family"), value.clone())
+                        .transferred_output(
+                            format!("rhs/{rhs:?}/family"),
+                            value.field(|matrix| matrix.1).map_err(ApiError::scheme)?,
+                        )
                         .map_err(ApiError::scheme)?;
                 }
             }
@@ -2020,6 +2047,13 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 .map_err(ApiError::scheme)?;
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
+        let input_levels = evaluator
+            .program
+            .inputs()
+            .keys()
+            .map(|wire| Ok((*wire, evaluator.workload.level(*wire)?)))
+            .collect::<Result<BTreeMap<_, _>, RnsBggError>>()
+            .map_err(ApiError::scheme)?;
         let mut binding = RnsBggArtifactBinding::new(
             self.context,
             evaluator.program.id(),
@@ -2027,7 +2061,8 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             self.hash_key_commitment,
             Vec::<ProductionId>::new(),
         )
-        .map_err(ApiError::scheme)?;
+        .map_err(ApiError::scheme)?
+        .with_input_levels(input_levels);
         if let Some(declaration) = &self.refresh_declaration {
             binding = binding.with_refresh_declaration(declaration);
         }
@@ -2093,12 +2128,13 @@ mod test {
         let owned_program = Arc::new(program.clone());
         let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
         let ring = parameters.ring(0).unwrap();
+        let hash_key = ring.bytes_input("equal-luts-hash-key", 32);
         let mut public = PublicKeyLowering::new(
             &parameters,
             owned_program.clone(),
             workload.clone(),
             RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None },
-            ring.bytes_input("equal-luts-hash-key", 32),
+            hash_key.clone(),
         );
         let input_key = public.sample_input_public_key(input).unwrap();
         let mut public_environment = Environment::new();
@@ -2126,7 +2162,7 @@ mod test {
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: None,
-            hash_key: ring.bytes_input("equal-luts-hash-key", 32),
+            hash_key,
         };
         let row = ring.input("equal-luts-input", (1, parameters.component_columns(0).unwrap()));
         let mut online_environment = Environment::new();
@@ -2158,6 +2194,13 @@ mod test {
                 assert_eq!(entry.matrix_type(), &expected);
             }
         }
+        // Both LUTs read the helpers of level zero; a graph with both
+        // outputs declares each helper input once.
+        let mut context = mxx_dsl::DslContext::new("equal-luts-online");
+        for (index, encoding) in online_outputs.iter().enumerate() {
+            context = context.output(format!("row-{index}"), encoding.row.1.clone()).unwrap();
+        }
+        context.build().unwrap();
     }
     use mxx_ir_core::ParamEnv;
 
@@ -2350,8 +2393,16 @@ mod test {
                 crate::program::Operand::Scalar(private_rhs),
             )
             .unwrap();
-        let program =
-            Arc::new(builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap());
+        // The public input is also an output, which keeps it at level zero,
+        // so the product must align it to the private operand's level.
+        let program = Arc::new(
+            builder
+                .finish(vec![
+                    crate::program::Operand::Scalar(output),
+                    crate::program::Operand::Scalar(public_input),
+                ])
+                .unwrap(),
+        );
         let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
         let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
         let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
@@ -2569,18 +2620,6 @@ mod test {
         );
         assert!(matches!(result, Err(ProgramValidationError::InvalidStructure(message))
             if message == "MulPublic requires a public exponent LHS"));
-    }
-
-    #[test]
-    fn refresh_routes_masks_to_owner_and_fresh_error_to_every_slot() {
-        let refresh_id = [0xabu8; 32];
-        let mask =
-            RefreshPrfLabel::Mask { refresh_id, slot: 1, component: 0, coefficient: 0, digit: 0 };
-        let fresh =
-            RefreshPrfLabel::FreshError { refresh_id, component: 0, coefficient: 0, digit: 0 };
-        assert_eq!(expected_refresh_slots(&mask, 3).unwrap(), vec![1]);
-        assert_eq!(expected_refresh_slots(&fresh, 3).unwrap(), vec![0, 1, 2]);
-        assert!(expected_refresh_slots(&mask, 1).is_err());
     }
 
     #[test]

@@ -107,6 +107,18 @@ pub(crate) enum RefreshPrfLabel {
 }
 
 impl RefreshPrfLabel {
+    /// The CRT slots whose PRF outputs carry this label: a mask belongs to
+    /// its own slot, and the shared fresh error to every slot.  Every slot's
+    /// PRF Program yields every label, so a stage keeps a label only from
+    /// these slots.
+    pub(crate) fn slots(&self, slot_count: usize) -> Result<Vec<usize>, RefreshError> {
+        match self {
+            Self::Mask { slot, .. } if *slot < slot_count => Ok(vec![*slot]),
+            Self::FreshError { .. } if slot_count > 0 => Ok((0..slot_count).collect()),
+            _ => Err(RefreshError::InvalidLayout),
+        }
+    }
+
     /// Returns the canonical bytes used for the sparse-LWR PRF output identity.
     pub(crate) fn canonical_bytes(self) -> Vec<u8> {
         let mut raw = Vec::with_capacity(1 + 32 + 4 * std::mem::size_of::<u64>());
@@ -614,6 +626,18 @@ mod tests {
             self.finished = true;
             Ok(outputs.values().sum())
         }
+    }
+
+    #[test]
+    fn refresh_routes_masks_to_owner_and_fresh_error_to_every_slot() {
+        let refresh_id = [0xabu8; 32];
+        let mask =
+            RefreshPrfLabel::Mask { refresh_id, slot: 1, component: 0, coefficient: 0, digit: 0 };
+        let fresh =
+            RefreshPrfLabel::FreshError { refresh_id, component: 0, coefficient: 0, digit: 0 };
+        assert_eq!(mask.slots(3).unwrap(), vec![1]);
+        assert_eq!(fresh.slots(3).unwrap(), vec![0, 1, 2]);
+        assert!(mask.slots(1).is_err());
     }
 
     #[test]

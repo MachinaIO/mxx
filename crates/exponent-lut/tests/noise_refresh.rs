@@ -274,17 +274,28 @@ fn build_candidate(
         PreparedSparseLwrPrf::new(prf.clone(), [0x73; 32]).map_err(|error| error.to_string())?;
     let source_q = parameters.level(source_level).map_err(|error| error.to_string())?;
     let prf_terminal = parameters.level(p_level).map_err(|error| error.to_string())?.clone();
+    // The PRF runs at q through the level after its coefficient outputs,
+    // followed by p, which supplies the width of those q carriers.
+    let prf_workload =
+        RnsBggDerivedWorkload::from_program(prf.program()).map_err(|error| error.to_string())?;
+    let prf_output_level = prf_workload
+        .level(prf.ordered_outputs().next().ok_or("PRF has no output")?.1)
+        .map_err(|error| error.to_string())?;
     let prf_parameters = RnsBggParameters::new(
-        vec![source_q.clone(), source_q.clone(), source_q.clone(), prf_terminal],
+        std::iter::repeat_n(source_q.clone(), prf_output_level + 2)
+            .chain(std::iter::once(prf_terminal))
+            .collect(),
         parameters.encoding_error_sigma().clone(),
         parameters.operations_per_drop(),
     )
     .map_err(|error| error.to_string())?;
-    let prf_q = prf_parameters.level(2).map_err(|error| error.to_string())?;
+    let prf_q = prf_parameters.level(prf_output_level + 1).map_err(|error| error.to_string())?;
     if prf_q.modulus() != source_q.modulus() ||
         prf_q.modulus_digits() != source_q.modulus_digits() ||
         prf_q.ring_dimension() != source_q.ring_dimension() ||
-        prf_parameters.component_columns(2).map_err(|error| error.to_string())? !=
+        prf_parameters
+            .component_columns(prf_output_level + 1)
+            .map_err(|error| error.to_string())? !=
             parameters.component_columns(source_level).map_err(|error| error.to_string())?
     {
         return Err("PRF coefficient output schema does not match source q carrier".to_owned());
@@ -545,8 +556,8 @@ fn noise_refresh_end_to_end() {
     let prf_poly_parameters = prf_parameters.level(0).expect("PRF level zero").clone();
     let zero = DCRTPoly::const_zero(&prf_poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
-    // The shared public vector `a`, as stride-aware signed monomials,
-    // followed by the encoding of zero read by dummy and padding cells.
+    // The shared public vector `a`, as stride-aware signed monomials, split
+    // into one family per block that first reads its coordinates.
     let a_values = (0..prf.profile().lwr_dimension)
         .map(|coordinate| {
             let dimension = prf_poly_parameters.ring_dimension() as usize;
@@ -555,25 +566,35 @@ fn noise_refresh_end_to_end() {
             let monomial = DCRTPoly::const_rotate_poly(&prf_poly_parameters, rotation % dimension);
             if rotation >= dimension { -monomial } else { monomial }
         })
-        .chain(std::iter::once(one.clone()))
         .collect::<Vec<_>>();
+    let a_families = prf
+        .input_families()
+        .iter()
+        .map(|(wire, coordinates)| {
+            (*wire, coordinates.iter().map(|coordinate| a_values[*coordinate].clone()).collect())
+        })
+        .collect::<BTreeMap<_, Vec<_>>>();
     let mut prf_lhs = BTreeMap::new();
     for (&wire, declaration) in prf_program.encryption_inputs().inputs() {
         let value = match declaration.shape() {
             InputBinding::Scalar(_) => InputBinding::Scalar(one.clone()),
-            InputBinding::Family(_) => InputBinding::Family(a_values.clone()),
+            InputBinding::Family(_) => InputBinding::Family(a_families[&wire].clone()),
         };
         prf_lhs.insert(wire, value);
     }
-    // Each output's key selects one cell per block of its layout.
+    // Each output's key selects one cell per block of its layout, among the
+    // block's cell groups.
     let prf_rhs = prf
         .selection_families()
         .iter()
         .map(|family| {
             let bits = prf.selector_bits(family.output, &keys[family.output]).expect("key bits");
-            let values = bits[family.bucket]
+            let values = family
+                .slots
                 .iter()
-                .map(|bit| if *bit == 1 { one.clone() } else { zero.clone() })
+                .map(
+                    |slot| if bits[family.bucket][*slot] == 1 { one.clone() } else { zero.clone() },
+                )
                 .collect();
             (family.selector, InputBinding::Family(values))
         })
@@ -584,9 +605,19 @@ fn noise_refresh_end_to_end() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
-    let gpu_levels = parameters.distinct_levels().into_iter().map(|level| {
-        GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
-    });
+    // The refresh decodes each CRT slot in its own single-prime ring.
+    let residues = parameters
+        .refresh_residue_parameters(declaration.target_level())
+        .expect("refresh residue parameters");
+    let gpu_levels =
+        parameters.distinct_levels().into_iter().cloned().chain(residues).map(|level| {
+            GpuDCRTPolyParams::new(
+                level.ring_dimension(),
+                level.to_crt().0,
+                level.base_bits(),
+                None,
+            )
+        });
     let mut runtime = GpuRuntime::new(gpu_backend_on(gpu_levels, devices)).expect("GPU runtime");
     let directory = tempfile::tempdir().expect("artifact directory");
     let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");

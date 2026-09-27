@@ -217,17 +217,24 @@ impl<'de> Deserialize<'de> for SparseLwrPrfProfile {
 /// A sparse-key LWR weak PRF evaluated over encodings.
 ///
 /// Every output `o` computes `wPRF_{k_o}(a) = rho(<a, k_o> mod Q)` on the
-/// same public vector `a in Z_Q^nu`, supplied as one public-payload input
-/// family of `nu + 1` members (member `nu` is the encoding of zero, read by
-/// dummy and padding cells), with its own sparse key `k_o`. Key `k_o` is represented by its own
-/// probabilistic-batch-code layout: block `j` of that layout holds candidate
-/// coordinates of `a`, and a private one-hot selector family chooses the
-/// block's coordinate of the key support (or a dummy, contributing zero).
-/// Starting from the accumulator `mono(0)`, block `j` multiplies the
-/// accumulator by each candidate `a` coordinate (a public-by-private
-/// product), weights the branch by its selector bit (a private
-/// multiplication), and sums the branches; a terminal coefficient LUT reads
-/// out `rho`.
+/// same public vector `a in Z_Q^nu`, with its own sparse key `k_o`. Key `k_o`
+/// is represented by its own probabilistic-batch-code layout: block `j` of
+/// that layout holds candidate coordinates of `a`, and a private one-hot
+/// selector chooses the block's coordinate of the key support (or a dummy,
+/// contributing zero). Starting from the accumulator `mono(0)`, block `j`
+/// multiplies the accumulator by each candidate `a` coordinate (a
+/// public-by-private product), weights the branch by its selector bit (a
+/// private multiplication), and sums the branches; a dummy or padding cell
+/// weights the accumulator itself. A terminal coefficient LUT reads out
+/// `rho`.
+///
+/// Block `j` runs at level `j`, so `a` is supplied as one public-payload
+/// input family per block: the coordinates that block reads first, over all
+/// outputs. Each family is then encoded at the level of its first use rather
+/// than at level zero. Within block `j`, the cells are grouped by the family
+/// of their coordinate (and the dummy and padding cells form one more
+/// group); each group has its own selector family and one family body, and
+/// the block sums the groups.
 #[derive(Clone)]
 pub struct SparseLwrPrfProgram {
     pub accumulation: ExponentLutProgram,
@@ -235,9 +242,9 @@ pub struct SparseLwrPrfProgram {
     pub(crate) initial_input: WireId,
     pub(crate) output: WireId,
     pub(crate) profile: SparseLwrPrfProfile,
-    /// Public input family `a`, one member per LWR coordinate plus the
-    /// encoding of zero for dummy and padding cells.
-    input_vector: WireId,
+    /// Public input families of `a` and the coordinates of their members, one
+    /// family per block that first reads them.
+    input_families: Vec<(WireId, Vec<usize>)>,
     /// Public key layout of each output, in output order.
     layouts: Vec<PbcPublicLayout>,
     /// One selector family per output and block.
@@ -246,16 +253,17 @@ pub struct SparseLwrPrfProgram {
     outputs: Vec<WireId>,
 }
 
-/// The one-hot selector family of one output's block.
+/// The one-hot selector family of one cell group of one output's block.
 ///
 /// The ID refers to a declaration in [`SparseLwrPrfProgram::accumulation`].
-/// Member `i` selects cell `i` of block `bucket` in the output's layout.
+/// Member `i` selects cell `slots[i]` of block `bucket` in the output's layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrfSelectionFamily {
     pub output: usize,
     pub bucket: usize,
     pub selector: RhsId,
     pub capacity: usize,
+    pub slots: Vec<usize>,
 }
 
 /// Identity of the setup-owned PRF declaration.
@@ -313,10 +321,39 @@ impl SparseLwrPrfProgram {
         let readout = profile.canonical_readout()?;
         let mut builder = ExponentLutProgramBuilder::new();
         let initial_input = builder.input(AttributeKnowledge::PrivatePayload)?;
-        let input_vector = builder.input_family(
-            IntExpr::constant(profile.lwr_dimension + 1),
-            AttributeKnowledge::PublicPayload,
-        )?;
+        // The block that first reads each coordinate, over every output.
+        let mut first_block = vec![None::<usize>; profile.lwr_dimension];
+        for layout in &layouts {
+            for (bucket, cells) in layout.cells.iter().enumerate() {
+                for cell in cells {
+                    if let PbcCell::Real { coordinate, .. } = cell {
+                        let first = first_block
+                            .get_mut(*coordinate)
+                            .ok_or(PrfError::InvalidSparseLwrBlock)?;
+                        *first = Some(first.map_or(bucket, |first| first.min(bucket)));
+                    }
+                }
+            }
+        }
+        let mut coordinates_by_block = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+        for (coordinate, block) in first_block.iter().enumerate() {
+            if let Some(block) = block {
+                coordinates_by_block.entry(*block).or_default().push(coordinate);
+            }
+        }
+        // Coordinate -> (input family position, member).
+        let mut location = vec![None::<(usize, usize)>; profile.lwr_dimension];
+        let mut input_families = Vec::with_capacity(coordinates_by_block.len());
+        for coordinates in coordinates_by_block.into_values() {
+            let wire = builder.input_family(
+                IntExpr::constant(coordinates.len()),
+                AttributeKnowledge::PublicPayload,
+            )?;
+            for (member, coordinate) in coordinates.iter().enumerate() {
+                location[*coordinate] = Some((input_families.len(), member));
+            }
+            input_families.push((wire, coordinates));
+        }
         // The accumulator stays in exponent representation; this terminal
         // LUT performs the sole conversion to the coefficient-valued output.
         let lut = builder.register_lut(LutTable::unary(
@@ -331,45 +368,91 @@ impl SparseLwrPrfProgram {
         for (output, layout) in layouts.iter().enumerate() {
             let mut state = initial_input;
             for (bucket, cells) in layout.cells.iter().enumerate() {
-                // Block `bucket` of this output is consumed by the
-                // level-`bucket` private multiplication, so its selector is
-                // its own RHS family.
-                let selector = builder.rhs_family(IntExpr::constant(cells.len()))?;
-                // One family body covers every cell of the block, so the
-                // one-hot selector bounds the whole block sum. A real cell
-                // reads its `a` coordinate; dummy and padding cells read the
-                // zero member `nu`.
-                let coordinates = cells
-                    .iter()
-                    .map(|cell| match cell {
-                        PbcCell::Real { coordinate, .. } => *coordinate,
-                        PbcCell::Dummy | PbcCell::Padding => profile.lwr_dimension,
-                    })
-                    .collect::<Vec<_>>();
-                let range = FamilyRange::full(IntExpr::constant(cells.len()))?;
-                let family = builder.parallel(range, |builder, slot| {
-                    let coordinate = IntExpr::Select {
-                        selector: Box::new(slot.clone()),
-                        branches: coordinates.iter().copied().map(IntExpr::constant).collect(),
+                // The cells of this block by input family; `None` holds the
+                // dummy and padding cells.
+                let mut groups = std::collections::BTreeMap::<Option<usize>, Vec<usize>>::new();
+                for (slot, cell) in cells.iter().enumerate() {
+                    let group = match cell {
+                        PbcCell::Real { coordinate, .. } => {
+                            Some(location[*coordinate].ok_or(PrfError::InvalidSparseLwrBlock)?.0)
+                        }
+                        PbcCell::Dummy | PbcCell::Padding => None,
                     };
-                    // X^(acc + a_r), then weighted by the cell's selector bit.
-                    let shifted = builder.mul_public(
-                        Operand::Member { family: input_vector, index: coordinate },
-                        Operand::Scalar(state),
-                    )?;
-                    let weighted = builder.mul_private(
-                        Operand::Scalar(shifted),
-                        Operand::Member { family: selector, index: slot },
-                    )?;
-                    Ok(Operand::Scalar(weighted))
-                })?;
-                state = builder.sum(family)?;
-                selection_families.push(PrfSelectionFamily {
-                    output,
-                    bucket,
-                    selector,
-                    capacity: cells.len(),
-                });
+                    groups.entry(group).or_default().push(slot);
+                }
+                let mut block_sum = None;
+                for (group, slots) in groups {
+                    // Block `bucket` is consumed by the level-`bucket`
+                    // private multiplication, so each group's selector is its
+                    // own RHS family. The one-hot selector bounds the block
+                    // sum across all of its groups.
+                    let selector = builder.rhs_family(IntExpr::constant(slots.len()))?;
+                    let members = match group {
+                        Some(_) => slots
+                            .iter()
+                            .map(|slot| match &cells[*slot] {
+                                PbcCell::Real { coordinate, .. } => location[*coordinate]
+                                    .map(|(_, member)| member)
+                                    .ok_or(PrfError::InvalidSparseLwrBlock),
+                                _ => Err(PrfError::InvalidSparseLwrBlock),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                        None => Vec::new(),
+                    };
+                    let source = group.map(|group| input_families[group].0);
+                    // One cell: `slot` selects it, and its `a` member is `member`.
+                    // A real cell yields X^(acc + a_r) weighted by its selector
+                    // bit; a dummy or padding cell weights X^acc itself.
+                    let cell = |builder: &mut ExponentLutProgramBuilder,
+                                slot: IntExpr,
+                                member: IntExpr|
+                     -> Result<Operand<WireId>, ProgramValidationError> {
+                        let weighted_input = match source {
+                            Some(wire) => builder.mul_public(
+                                Operand::Member { family: wire, index: member },
+                                Operand::Scalar(state),
+                            )?,
+                            None => state,
+                        };
+                        let weighted = builder.mul_private(
+                            Operand::Scalar(weighted_input),
+                            Operand::Member { family: selector, index: slot },
+                        )?;
+                        Ok(Operand::Scalar(weighted))
+                    };
+                    let sum = if slots.len() == 1 {
+                        // A group of one cell needs no family body.
+                        let member = IntExpr::constant(members.first().copied().unwrap_or(0));
+                        match cell(&mut builder, IntExpr::constant(0), member)? {
+                            Operand::Scalar(wire) => wire,
+                            Operand::Member { .. } => return Err(PrfError::InvalidSparseLwrBlock),
+                        }
+                    } else {
+                        let range = FamilyRange::full(IntExpr::constant(slots.len()))?;
+                        let family = builder.parallel(range, |builder, slot| {
+                            let member = IntExpr::Select {
+                                selector: Box::new(slot.clone()),
+                                branches: members.iter().copied().map(IntExpr::constant).collect(),
+                            };
+                            cell(builder, slot, member)
+                        })?;
+                        builder.sum(family)?
+                    };
+                    block_sum = Some(match block_sum {
+                        Some(previous) => {
+                            builder.add(Operand::Scalar(previous), Operand::Scalar(sum))?
+                        }
+                        None => sum,
+                    });
+                    selection_families.push(PrfSelectionFamily {
+                        output,
+                        bucket,
+                        selector,
+                        capacity: slots.len(),
+                        slots,
+                    });
+                }
+                state = block_sum.ok_or(PrfError::InvalidSparseLwrBlock)?;
             }
             outputs.push(builder.lut(Operand::Scalar(state), lut)?);
         }
@@ -382,7 +465,7 @@ impl SparseLwrPrfProgram {
             initial_input,
             output,
             profile,
-            input_vector,
+            input_families,
             layouts,
             selection_families,
             output_labels,
@@ -391,15 +474,16 @@ impl SparseLwrPrfProgram {
     }
 
     /// The selector families of every output's blocks, output-major and in
-    /// block order.
+    /// block order; a block has one family per cell group.
     pub fn selection_families(&self) -> &[PrfSelectionFamily] {
         &self.selection_families
     }
 
-    /// The public input family `a`: one member per LWR coordinate, then the
-    /// encoding of zero read by dummy and padding cells.
-    pub fn input_vector(&self) -> WireId {
-        self.input_vector
+    /// The public input families of `a`, each with the LWR coordinates of its
+    /// members, in Program declaration order. A coordinate that no block reads
+    /// is in none of them.
+    pub fn input_families(&self) -> &[(WireId, Vec<usize>)] {
+        &self.input_families
     }
 
     /// The public key layout of each output, in output order.
@@ -692,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn outputs_share_a_and_each_output_block_has_its_own_selector() {
+    fn outputs_share_a_and_each_output_block_has_its_own_selectors() {
         let keys = [toy_key(&[0, 3, 5, 9], 0), toy_key(&[1, 2, 6, 7], 100)];
         let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
         let program =
@@ -700,18 +784,60 @@ mod tests {
         let workload =
             crate::rns_bgg::RnsBggDerivedWorkload::from_program(program.program()).unwrap();
         let families = program.selection_families();
-        assert_eq!(
-            families.len(),
-            layouts.iter().map(|layout| layout.parameters.bucket_count).sum::<usize>()
-        );
         let selectors = families.iter().map(|family| family.selector).collect::<BTreeSet<_>>();
-        assert_eq!(selectors.len(), families.len(), "every block has its own selector");
+        assert_eq!(selectors.len(), families.len(), "every cell group has its own selector");
+        for (output, layout) in layouts.iter().enumerate() {
+            for (bucket, cells) in layout.cells.iter().enumerate() {
+                // The groups of a block partition its cells.
+                let mut slots = families
+                    .iter()
+                    .filter(|family| family.output == output && family.bucket == bucket)
+                    .flat_map(|family| family.slots.iter().copied())
+                    .collect::<Vec<_>>();
+                slots.sort_unstable();
+                assert_eq!(slots, (0..cells.len()).collect::<Vec<_>>());
+            }
+        }
         for family in families {
-            let layout = &layouts[family.output];
-            assert_eq!(family.capacity, layout.cells[family.bucket].len());
+            assert_eq!(family.capacity, family.slots.len());
             // Block `b` is consumed by the level-`b` private multiplication.
             assert_eq!(workload.rhs_level(family.selector).unwrap(), family.bucket);
         }
+        // Each input family holds the coordinates one block reads first, over
+        // both outputs, and is encoded at that block's level.
+        let mut covered = Vec::new();
+        for (wire, coordinates) in program.input_families() {
+            let first = coordinates
+                .iter()
+                .map(|coordinate| {
+                    layouts
+                        .iter()
+                        .filter_map(|layout| {
+                            layout.cells.iter().position(|cells| {
+                                cells.iter().any(|cell| {
+                                    matches!(cell, PbcCell::Real { coordinate: c, .. } if c == coordinate)
+                                })
+                            })
+                        })
+                        .min()
+                        .unwrap()
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(first.len(), 1, "one first block per input family");
+            assert_eq!(workload.level(*wire).unwrap(), *first.first().unwrap());
+            covered.extend(coordinates.iter().copied());
+        }
+        covered.sort_unstable();
+        covered.dedup();
+        let read = layouts
+            .iter()
+            .flat_map(|layout| layout.cells.iter().flatten())
+            .filter_map(|cell| match cell {
+                PbcCell::Real { coordinate, .. } => Some(*coordinate),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covered, read.into_iter().collect::<Vec<_>>());
         let public_families = program
             .program()
             .inputs()
@@ -719,7 +845,10 @@ mod tests {
             .filter(|(_, declaration)| matches!(declaration.shape(), InputBinding::Family(_)))
             .map(|(wire, _)| *wire)
             .collect::<Vec<_>>();
-        assert_eq!(public_families, vec![program.input_vector()], "one shared `a` family");
+        assert_eq!(
+            public_families,
+            program.input_families().iter().map(|(wire, _)| *wire).collect::<Vec<_>>()
+        );
         assert_eq!(program.ordered_outputs().count(), 2);
     }
 

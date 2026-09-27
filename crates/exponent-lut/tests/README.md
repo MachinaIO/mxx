@@ -102,3 +102,21 @@ There is no alternate scheme selector or stage-skip switch. Internal
 structural regressions belong to the crate's unit tests; these external
 targets exercise the public, artifact-backed workflow and its noise/security
 acceptance gates.
+
+## Recorded Sparse-LWR parameters
+
+`lwr_prf_parameters.csv` records parameter sets found for `lwr_prf.rs`, one
+row per set, with the date and the commit the simulation ran on. Every row
+passed the simulation-only run (`MXX_EXPONENT_LUT_LWR_PRF_SIMULATION_ONLY=1`)
+at a 100-bit target: the average-case noise audit and the encoding lattice
+security. None of them has run on a GPU. The columns are:
+
+| Column | Meaning |
+| --- | --- |
+| `ring_dimension`, `crt_bits`, `base_bits`, `crt_depth`, `primes_per_drop`, `levels` | RNS-BGG encoding parameters of the accepted candidate |
+| `encoding_security_bits` | Lattice security of the encoding from `lattice-estimator-cli` |
+| `noise_model`, `failure_exponent` | Noise model of the audit and, for `average`, its failure budget `2^-failure_exponent` |
+| `lwr_dimension`, `support_weight`, `input_modulus`, `output_modulus` | PRF parameters ν, h, Q, P |
+| `prf_min_estimator_bits` | Minimum over the eight attacks of `sparse_lwr_estimator.sage.py` |
+| `prf_mitm_bits`, `prf_binding_attack` | Estimator `LWE.mitm` with the split dimension rounded to an integer (it raises `TypeError` on sparse secrets otherwise), and the cheapest attack overall |
+| `level0_matrix_gb`, `stored_artifacts_tb` | One level-0 `(1, columns)` matrix, and the RHS, input-encoding, and public-key artifacts the current implementation stores |

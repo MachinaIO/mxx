@@ -6971,9 +6971,7 @@ mod tests {
             ],
             ring_dimension: 8,
         })
-        .resolve(&ParamEnv::default(), |_, _, _, basis| {
-            basis.ok_or_else(|| "explicit test ring has no CRT basis".into())
-        })
+        .resolve(&ParamEnv::default())
         .expect("valid ordered CRT ring");
         let matrix = ConcreteMatrixType { ring, rows: 1, columns: 1 };
         let owners = [Arc::new([0u64; 16]), Arc::new([0u64; 16])];
@@ -7029,9 +7027,7 @@ mod tests {
             crt_moduli: moduli.iter().map(|&prime| mxx_ir_core::IntExpr::constant(prime)).collect(),
             ring_dimension: 8,
         })
-        .resolve(&ParamEnv::default(), |_, _, _, basis| {
-            basis.ok_or_else(|| "explicit test ring has no CRT basis".into())
-        })
+        .resolve(&ParamEnv::default())
         .expect("valid explicit ring")
     }
 

@@ -1881,9 +1881,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let loops = built
             .graph
@@ -2002,7 +2000,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
 
         let execute_once = |parameters: &DCRTPolyParams| {
@@ -2182,7 +2180,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut producer_inputs = BTreeMap::from([(
             "output-public".to_owned(),
@@ -2375,8 +2373,7 @@ mod tests {
             graph
                 .validate_with_manifests(
                     &ParamEnv::default(),
-                    &BTreeMap::from([(production_id.clone(), v1_manifest)]),
-                    mxx_backends::openfhe_guard::gen_modulus_and_warmup,
+                    &BTreeMap::from([(production_id.clone(), v1_manifest)])
                 )
                 .is_err(),
             "a v1 artifact namespace must not satisfy the v2 evaluator graph"
@@ -2385,7 +2382,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production_id, manifest)]),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let result = execute(
@@ -2487,9 +2483,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         let root_calls = built
             .graph
             .root_scope()
@@ -2760,9 +2754,7 @@ mod tests {
             context = entry.export(context).unwrap();
         }
         let built = context.build().unwrap();
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let table_family_packs = built
             .graph
@@ -2843,11 +2835,7 @@ mod tests {
         for entry in entries {
             context = entry.export(context).unwrap();
         }
-        context
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        context.build().unwrap().validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

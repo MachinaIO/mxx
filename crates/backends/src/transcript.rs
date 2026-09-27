@@ -98,7 +98,7 @@ mod tests {
             crt_moduli: vec![mxx_ir_core::IntExpr::constant(17)],
             ring_dimension: 8,
         })
-        .resolve(&mxx_ir_core::ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&mxx_ir_core::ParamEnv::default())
         .expect("transcript test uses a valid explicit CRT ring");
         ConcreteMatrixType { ring, rows: 1, columns: 1 }
     }

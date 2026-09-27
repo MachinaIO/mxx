@@ -251,12 +251,7 @@ mod tests {
             1
         );
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
-        mxx_ir_core::validate(
-            &built.graph,
-            &ParamEnv::default(),
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .expect("valid graph");
+        mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid graph");
     }
 
     #[test]

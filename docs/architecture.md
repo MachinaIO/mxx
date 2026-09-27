@@ -32,7 +32,7 @@ typed dataflow graph and then interpreted by several consumers. The life of a co
         |  builds immutable node handles
         v
  Graph (mxx-ir-core)      Graph::freeze keeps reachable nodes, one scope per body
-        |  validate(graph, ParamEnv, CRT-basis resolver) [+ artifact manifests]
+        |  validate(graph, ParamEnv) [+ artifact manifests]
         v
  ValidatedGraph           concrete wire types, rings, execution order, liveness
         |
@@ -107,8 +107,8 @@ mxx-io        -> (no dependencies)
 
 Rules that follow from this layout:
 
-- `mxx-ir-core` is the bottom layer. It knows nothing about the DSL or any backend; the CRT basis
-  resolver it needs is passed in as a function pointer (`ResolveCrtBasis`).
+- `mxx-ir-core` is the bottom layer. It knows nothing about the DSL or any backend; it generates
+  CRT bases itself (`generate_crt_basis`), so validation needs no backend callback.
 - `mxx-dsl` and `mxx-backends` are siblings over `mxx-ir-core`. The backend executes core graphs
   and does not depend on the DSL (it uses the DSL only in tests).
 - Application crates (`mxx-fhe`, `mxx-we`, `mxx-func-enc`, `mxx-io`) never depend on one another.
@@ -127,7 +127,13 @@ Rules that follow from this layout:
   directory as `DEP_MXX_BACKENDS_CUDA_INCLUDE` (its `links = "mxx_backends"` key).
 
 Diamond iO and AKY24 iO, and the AKY24 functional-encryption implementation, were removed from
-this branch during the DSL migration; `README.md` links the `main`-branch implementations.
+this branch during the DSL migration. Their latest implementations remain on the
+[`main` branch](https://github.com/MachinaIO/mxx/tree/main):
+[Diamond iO](https://github.com/MachinaIO/mxx/blob/main/src/io/diamond_io.rs) and
+[AKY24 iO](https://github.com/MachinaIO/mxx/blob/main/src/io/aky24_io.rs). For a fixed reference,
+`main` pointed to
+[`d5d6fba26f1d20f11d4648a3fd1c9b35241ff4a9`](https://github.com/MachinaIO/mxx/tree/d5d6fba26f1d20f11d4648a3fd1c9b35241ff4a9)
+when they were removed.
 
 ## 3. `mxx-ir-core`: the executable graph IR
 
@@ -262,10 +268,12 @@ Rings are ordered CRT bases (`crates/ir-core/src/ring.rs`):
 - Validation resolves each ring to a `ConcreteRing` (ordered `u64` primes plus dimension).
   `ConcreteRing` requires a power-of-two dimension, a nonempty basis, and distinct primes
   `2 < q < 2^60` with `q = 1 mod 2N`.
-- The actual prime generation or checking is delegated to a `ResolveCrtBasis` callback,
-  `fn(ring_dimension, crt_depth, crt_bits, explicit_moduli) -> Result<Vec<u64>, String>`.
-  Production callers pass `mxx_backends::openfhe_guard::gen_modulus_and_warmup`. For an explicit
-  basis the resolver must return it unchanged and in the same order.
+- A generated basis comes from `generate_crt_basis(ring_dimension, crt_depth, crt_bits)`
+  (`crates/ir-core/src/ring.rs`), a pure Rust copy of OpenFHE's `ILDCRTParams(2N, depth, bits)`:
+  the largest prime `q = 1 mod 2N` below `2^bits`, which must have exactly `bits` bits, then each
+  next smaller one. `ir_generated_basis_matches_openfhe` in
+  `crates/backends/src/openfhe_guard.rs` checks it against OpenFHE over a parameter grid. An
+  explicit basis is checked with a deterministic Miller-Rabin test and kept in its order.
 
 ### 3.4 Compile expressions and parameters
 
@@ -290,8 +298,8 @@ Runtime integer division is different from `IntExpr` division: see section 4.3.
 
 ### 3.5 Validation
 
-`validate(graph, bindings, resolve_basis)` and `validate_with_manifests(graph, bindings,
-manifests, resolve_basis)` (`crates/ir-core/src/validate.rs`) produce a `ValidatedGraph`:
+`validate(graph, bindings)` and `validate_with_manifests(graph, bindings, manifests)`
+(`crates/ir-core/src/validate.rs`) produce a `ValidatedGraph`:
 
 ```text
 ValidatedGraph { source: Graph, bindings: ParamEnv,
@@ -385,9 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = ring.input("input", (2, 2));
     let doubled = &input + &input;
     let built = DslContext::new("double").output("result", doubled)?.build()?;
-    // The CRT-basis resolver is supplied by the backend; mxx-dsl itself does not depend on it.
-    let _validated =
-        built.validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)?;
+    let _validated = built.validate(&ParamEnv::default())?;
     Ok(())
 }
 ```
@@ -408,8 +414,8 @@ types), and execution or analysis (a backend or the Lean exporter consumes the
   names must be unique after flattening. `hash_int_family` builds a `HashIntFamily` node and
   prefixes the tag with the domain `mxx/hash-int-family/v1\0`, so its stream never coincides
   with a `hash_matrix` stream under the same key and tag.
-- `BuiltGraph { graph }` has `validate(bindings, resolve_basis)` and
-  `validate_with_manifests(bindings, manifests, resolve_basis)`.
+- `BuiltGraph { graph }` has `validate(bindings)` and
+  `validate_with_manifests(bindings, manifests)`.
 - `Ring` wraps a `RingRef`: `Ring::new(crt_bits, crt_depth, ring_dimension)` (generated basis),
   `Ring::from_crt_moduli(moduli, ring_dimension)` (explicit ordered basis), and `from_ref`. Basis
   operations `slice_crt`, `prefix`, `select_crt`, and `concat_crt` build related rings;
@@ -543,8 +549,9 @@ store)`; staged family members are removed with `ExecutionResult::cleanup_staged
   polynomial traits. `DCRTPolyParams` (`crates/backends/src/poly/dcrt/params.rs`) holds the ring
   dimension, CRT depth and bit width, the exact ordered basis `moduli`, gadget base bits, and
   dropped moduli. `try_new` validates capability limits (power-of-two dimension, CRT width at
-  most 60 bits, `base_bits <= ceil(crt_bits / 2)`) and generates or checks the basis through
-  `openfhe_guard::gen_modulus_and_warmup`.
+  most 60 bits, `base_bits <= ceil(crt_bits / 2)`), and `openfhe_guard::gen_modulus_and_warmup`
+  generates or checks the basis the way IR validation does and initializes OpenFHE's native tables
+  for it.
 - `DCRTPoly` (`crates/backends/src/poly/dcrt/poly.rs`) wraps an OpenFHE `DCRTPoly`. The OpenFHE
   Rust bindings come from the `openfhe` crate; repository-owned C++ adapters in
   `crates/backends/native/ExactBasis.{h,cc}` are bridged with `cxx` in
@@ -1321,10 +1328,9 @@ caller's responsibility.
 - `utils.rs` provides parameter helpers and GPU helpers used by the GPU tests; default error
   cutoffs come from `mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound`.
 
-Execution follows the general pattern: build with `DslContext`, validate with the backend CRT
-resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV and TFHE) with the
-backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactStore`.
-`README.md` summarizes the FHE API.
+Execution follows the general pattern: build with `DslContext`, validate with the parameter
+bindings, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV and TFHE)
+with the backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactStore`.
 
 ### 7.4 `mxx-we`: Diamond witness encryption
 
@@ -1414,7 +1420,7 @@ The description below is kept for that work.
 | `BUILDER.md` | Implementation, debugging, design style, testing, and benchmark rules. |
 | `REVIEWER.md` | Review criteria and result format. |
 | `GPU.md` | GPU dataflow, synchronization, memory complexity, and GPU validation requirements. |
-| `README.md` | Project overview, FHE API summary, and requirements (OpenFHE, OpenMP, CUDA). |
+| `README.md` | Project overview, a runnable GPU example, and requirements (OpenFHE, OpenMP, CUDA). |
 | `docs/correctness/` | Correctness specifications, for example `docs/correctness/operational-protocol-inventory.md`. |
 | `docs/plans/` | Local design plans and progress records; ignored by git and not part of the repository. |
 | `crates/ir-core/lean/README.md`, `crates/we/lean/README.md` | Lean packages and fixture workflows. |

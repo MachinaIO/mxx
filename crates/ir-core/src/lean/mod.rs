@@ -2915,10 +2915,7 @@ mod tests {
         let mut env = LexicalEnv::default();
         env.loop_indices.insert(0, "(Int.ofNat i_0)".into());
         env.loop_index_nats.insert(0, "i_0".into());
-        env.ring_values.insert(
-            source.clone(),
-            source.resolve(&ParamEnv::default(), crate::ring::test_resolve_basis).unwrap(),
-        );
+        env.ring_values.insert(source.clone(), source.resolve(&ParamEnv::default()).unwrap());
         for ring in [&slice, &selection, &combined] {
             let modulus = env.expr(&IntExpr::RingModulus(ring.clone()));
             let coefficient = env

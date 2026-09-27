@@ -1789,9 +1789,7 @@ impl GpuRuntime {
         graph: impl mxx_ir_core::IntoValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue>,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
-        let validated = graph
-            .into_validated_graph(crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(GpuPlanError::InvalidInput)?;
+        let validated = graph.into_validated_graph().map_err(GpuPlanError::InvalidInput)?;
         let inputs = crate::backend::expand_composite_values(inputs.clone());
         let inputs = self.distinct_planning_inputs(inputs).map_err(GpuPlanError::InvalidInput)?;
         self.plan_with_payload_sizes(validated, &inputs, &BTreeMap::new(), false, None)
@@ -2730,24 +2728,10 @@ impl GpuRuntime {
                     GpuRuntimeError::Execution("wave occurrence exceeds u64".into())
                 })?,
             );
-            let zip_inputs = wave.zip_inputs.clone();
             let zip_sources = wave.zip_sources.clone();
-            for (name, member_index, value_id) in zip_inputs {
-                let family = inputs.get(&name).ok_or_else(|| {
-                    GpuRuntimeError::Execution(format!("wave Zip input {name} is absent"))
-                })?;
-                let RuntimeValue::Resident(family) = family else {
-                    return Err(GpuRuntimeError::Execution(format!(
-                        "wave Zip input {name} is not a resident family"
-                    )));
-                };
-                let member =
-                    wave_family_member(family, member_index).map_err(GpuRuntimeError::Execution)?;
-                plan.frame.waves[wave_index].owner_bindings.insert(value_id, member);
-            }
             for (family_id, member_index, value_id) in zip_sources {
                 let family = plan.frame.owners.get(&family_id).ok_or_else(|| {
-                    GpuRuntimeError::Execution("nested Zip source family is absent".into())
+                    GpuRuntimeError::Execution("Zip source family is absent".into())
                 })?;
                 let member =
                     wave_family_member(family, member_index).map_err(GpuRuntimeError::Execution)?;

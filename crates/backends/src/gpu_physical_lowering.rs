@@ -532,14 +532,8 @@ fn append_fixed_child_candidates(
             let port = Port(
                 u32::try_from(port).map_err(|_| "GPU child node has too many ports".to_owned())?,
             );
-            let ty = concretize_wire_type(
-                declared,
-                env,
-                scope_id,
-                node_id,
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
-            .map_err(|error| error.to_string())?;
+            let ty = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
             types.insert(WireRef { node: node_id, port }, ty);
         }
     }
@@ -746,7 +740,6 @@ fn append_fixed_child_candidates(
                                 &child_env,
                                 &child_id,
                                 child_node_id,
-                                crate::openfhe_guard::gen_modulus_and_warmup,
                             )
                             .map_err(|error| error.to_string())?;
                             let current = concretize_wire_type(
@@ -754,7 +747,6 @@ fn append_fixed_child_candidates(
                                 &instance_env,
                                 &child_id,
                                 child_node_id,
-                                crate::openfhe_guard::gen_modulus_and_warmup,
                             )
                             .map_err(|error| error.to_string())?;
                             if first != current {
@@ -2107,14 +2099,8 @@ pub(super) fn lower_sample_matrix_node(
     let (implementation, sigma, max_bound, coefficient_modulus) = match node.kind() {
         NodeKind::UniformResidueSample { .. } => (GpuImplementation::sample(false), 0.0, 0, 1),
         NodeKind::UniformIntervalSample { range, .. } => {
-            let minimum = range
-                .minimum
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
-            let maximum = range
-                .maximum
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let minimum = range.minimum.evaluate(env).map_err(|error| error.to_string())?;
+            let maximum = range.maximum.evaluate(env).map_err(|error| error.to_string())?;
             let (Some(minimum), Some(maximum)) = (minimum.to_i64(), maximum.to_i64()) else {
                 return Err("GPU interval sample bounds exceed the native i64 sampler".into());
             };
@@ -2125,11 +2111,9 @@ pub(super) fn lower_sample_matrix_node(
             (GpuImplementation::sample_interval(), 0.0, 0, 1)
         }
         NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
-            let sigma = sigma
-                .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let sigma = sigma.evaluate_f64(env).map_err(|error| error.to_string())?;
             let max_bound = max_coefficient_bound
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_u64()
                 .ok_or_else(|| "GPU Gaussian coefficient bound exceeds u64".to_owned())?;
@@ -2270,9 +2254,7 @@ fn encode_static_matrix(
         coefficients[(row * ty.columns + column) * degree] = coefficient;
     };
     let evaluate = |expression: &mxx_ir_core::expr::IntExpr| {
-        expression
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())
+        expression.evaluate(env).map_err(|error| error.to_string())
     };
     match value {
         ConstantMatrix::Zero => {}
@@ -2458,9 +2440,7 @@ fn plan_static_matrix(
             return Err("GPU gadget matrix has an invalid shape".into());
         }
         let params = ctx.backend.parameters_on_physical_device(ctx.device, ty)?;
-        let base = base
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())?;
+        let base = base.evaluate(env).map_err(|error| error.to_string())?;
         let digit_count = ty.columns / ty.rows;
         let (_, crt_bits, _) = params.to_crt();
         let expected_base = BigInt::from(1u8) << params.base_bits();
@@ -2604,9 +2584,7 @@ pub(super) fn lower_rns_conversion_node(
             )
         }
         NodeKind::RnsModDown { plaintext_modulus, .. } => {
-            let value = plaintext_modulus
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let value = plaintext_modulus.evaluate(env).map_err(|error| error.to_string())?;
             let plaintext = value
                 .to_biguint()
                 .filter(|value| *value >= num_bigint::BigUint::from(2u8))
@@ -2628,9 +2606,7 @@ pub(super) fn lower_rns_conversion_node(
             )
         }
         NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
-            let value = plaintext_modulus
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                .map_err(|error| error.to_string())?;
+            let value = plaintext_modulus.evaluate(env).map_err(|error| error.to_string())?;
             let words = value
                 .to_biguint()
                 .filter(|value| *value > num_bigint::BigUint::ZERO)
@@ -2767,16 +2743,13 @@ pub(super) fn lower_crt_recompose_node(
             }
             _ => return Err("GPU CRT recompose needs full matrix inputs".into()),
         };
-        let plaintext = plaintext_moduli[level]
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())?;
+        let plaintext = plaintext_moduli[level].evaluate(env).map_err(|error| error.to_string())?;
         let source_modulus = source_ty.ring.modulus();
         if plaintext <= BigInt::from(1) || plaintext > source_modulus {
             return Err("GPU CRT recompose plaintext modulus is outside its source ring".into());
         }
-        let coefficient = reconstruction_coefficients[level]
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())?;
+        let coefficient =
+            reconstruction_coefficients[level].evaluate(env).map_err(|error| error.to_string())?;
         if coefficient < BigInt::from(0) || coefficient >= destination_ty.ring.modulus() {
             return Err("GPU CRT recompose coefficient is outside its destination ring".into());
         }
@@ -3993,20 +3966,16 @@ pub(super) fn hash_tag_resource(
                 GpuHashTagPart::bytes_component(bytes).map_err(|error| error.to_string())?
             }
             HashTagComponent::Integer(expression) => {
-                let value = expression
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|error| error.to_string())?;
+                let value = expression.evaluate(env).map_err(|error| error.to_string())?;
                 GpuHashTagPart::integer_constant(&value).map_err(|error| error.to_string())?
             }
             HashTagComponent::Decimal(expression) => {
-                let value = expression
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|error| error.to_string())?;
+                let value = expression.evaluate(env).map_err(|error| error.to_string())?;
                 GpuHashTagPart::decimal_constant(&value).map_err(|error| error.to_string())?
             }
             HashTagComponent::U64Le(expression) => {
                 let value = expression
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| error.to_string())?
                     .to_u64()
                     .ok_or("GPU hash U64Le component exceeds u64")?;
@@ -4142,12 +4111,12 @@ pub(super) fn lower_hash_sample_node(
             let base = base
                 .as_ref()
                 .ok_or("GPU decomposed hash has no gadget base")?
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?;
             let count = digit_count
                 .as_ref()
                 .ok_or("GPU decomposed hash has no digit count")?
-                .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(env)
                 .map_err(|error| error.to_string())?
                 .to_usize()
                 .filter(|count| *count > 0 && output_matrix.rows.is_multiple_of(*count))
@@ -4273,14 +4242,10 @@ pub(super) fn lower_trapdoor_sample_node(
     if !matches!(&secret_ty, ConcreteWireType::Trapdoor {matrix,..} if matrix==&public_ty) {
         return Err("GPU trapdoor outputs disagree on their ordered ring or shape".into());
     }
-    let sigma = sigma
-        .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| error.to_string())?;
-    let base = gadget_base
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| error.to_string())?;
+    let sigma = sigma.evaluate_f64(env).map_err(|error| error.to_string())?;
+    let base = gadget_base.evaluate(env).map_err(|error| error.to_string())?;
     let digits = digit_count
-        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+        .evaluate(env)
         .map_err(|error| error.to_string())?
         .to_usize()
         .ok_or_else(|| "GPU trapdoor digit count exceeds usize".to_owned())?;
@@ -6945,7 +6910,7 @@ mod tests {
             crt_moduli: moduli.into_iter().map(IntExpr::from).collect(),
             ring_dimension: 8,
         })
-        .resolve(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&ParamEnv::default())
         .expect("explicit ring");
         let per_tower = parameters.crt_bits().div_ceil(parameters.base_bits() as usize);
         for (digits, small) in
@@ -6993,7 +6958,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let source_modulus = source_cpu.modulus();
         let signed = [-7i64, 0, 7, -1, 1];
@@ -7140,7 +7105,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let backend = gpu_backend_on([parameters], [device]);
         let mut inputs = BTreeMap::new();
@@ -7222,7 +7187,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7286,7 +7251,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7329,7 +7294,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let backend = gpu_backend_on([parameters], [device]);
         let mut runtime = GpuRuntime::new(backend).unwrap();
@@ -7377,7 +7342,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7414,7 +7379,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let key_a = RuntimeValue::Bytes(Arc::from([0x31u8; 32]));
         let key_b = RuntimeValue::Bytes(Arc::from([0xa7u8; 32]));
@@ -7494,7 +7459,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let cpu_hash = |key: RuntimeValue| {
             let result = execute_in_session(
@@ -7582,7 +7547,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let inputs =
             BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(Arc::from([0x5cu8; 32])))]);
@@ -7646,7 +7611,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let key_a = RuntimeValue::Bytes(Arc::from([0x31u8; 32]));
         let key_b = RuntimeValue::Bytes(Arc::from([0xa7u8; 32]));
@@ -7729,7 +7694,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -7757,7 +7722,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production, manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu], [device])).unwrap();
@@ -7799,7 +7763,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -7929,7 +7893,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         // Each one-column tile runs on its own logical device when several
         // exist (`MXX_GPU_LOGICAL_DEVICES=0,0`).
@@ -8043,7 +8007,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -8091,7 +8055,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -8120,7 +8084,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let key = ArtifactKey { production, name: "stored".into(), index: None };
@@ -8155,7 +8118,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -8179,7 +8142,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest.clone())]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_parameters], [device])).unwrap();
@@ -8228,7 +8190,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let production = execute_in_session(
             &producer,
@@ -8260,7 +8222,6 @@ mod tests {
                 .validate_with_manifests(
                     &ParamEnv::default(),
                     &BTreeMap::from([(source.clone(), manifest)]),
-                    crate::openfhe_guard::gen_modulus_and_warmup,
                 )
                 .unwrap();
             let mut plan = runtime.plan_with_store(consumer, &BTreeMap::new(), store).unwrap();
@@ -8348,11 +8309,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let validated = context
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        let validated = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
         let mut runtime =
             GpuRuntime::new(gpu_backend_on([gpu_parameters], detected_gpu_device_ids())).unwrap();
         let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
@@ -8387,7 +8344,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let production = execute_in_session(
@@ -8423,7 +8380,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let mut runtime =

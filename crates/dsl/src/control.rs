@@ -194,7 +194,7 @@ mod tests {
             let output = parallel(2, |i| Ok((source.at(&i + offset), source.at(i)))).unwrap();
             let built =
                 DslContext::new("indexed-reads").output("result", output).unwrap().build().unwrap();
-            built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+            built.validate(&ParamEnv::default()).unwrap();
             let spec = built
                 .graph
                 .root_scope()
@@ -230,7 +230,7 @@ mod tests {
         let output = parallel(3, |i| Ok(source.at(i + 1))).unwrap();
         let built =
             DslContext::new("offset-members").output("result", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         let spec = built
             .graph
             .root_scope()
@@ -262,7 +262,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert!((Int::constant(7) / -3).expression().is_err());
         assert!((Int::constant(7) % -3).expression().is_err());
     }

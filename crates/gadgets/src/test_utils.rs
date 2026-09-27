@@ -442,7 +442,7 @@ pub(crate) fn build_circuit_graph(
     context
         .build()
         .expect("build runtime unit-test graph")
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .expect("validate runtime unit-test graph")
 }
 

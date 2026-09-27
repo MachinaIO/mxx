@@ -355,7 +355,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(
             built
                 .graph
@@ -379,7 +379,7 @@ mod tests {
         let inputs: Family<(Mat, Int, Bool)> = context.input("records", schema).unwrap();
         let output = parallel(4, |i| Ok(inputs.at(i))).unwrap();
         let built = context.output("records", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(
             built.graph.outputs().keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["records.0", "records.1", "records.2"]

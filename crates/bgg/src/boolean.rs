@@ -254,9 +254,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        public_graph
-            .validate(&bindings(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        public_graph.validate(&bindings()).unwrap();
 
         let (encoding_context, encoding_params) =
             BooleanCircuitFamilyParams::declare(DslContext::new("dynamic-bgg-encoding"));
@@ -308,9 +306,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        encoding_graph
-            .validate(&bindings(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        encoding_graph.validate(&bindings()).unwrap();
         let decomposition_count = encoding_graph
             .graph
             .scopes()

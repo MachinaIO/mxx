@@ -135,9 +135,7 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
         .expect("second output")
         .build()
         .expect("build GPU batch graph");
-    let graph = built
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .expect("validate GPU batch graph");
+    let graph = built.validate(&ParamEnv::default()).expect("validate GPU batch graph");
     let backend = gpu_backend([gpu_parameters.clone()]);
     let execution =
         prepare_and_run(graph, backend, BTreeMap::new(), &mut MemoryArtifactStore::default());

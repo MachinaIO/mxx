@@ -37,9 +37,7 @@ pub fn execute_graph(
     parameters: DCRTPolyParams,
     inputs: BTreeMap<String, RuntimeValue>,
 ) -> ExecutionResult {
-    let validated = graph
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .expect("valid runtime graph");
+    let validated = graph.validate(&ParamEnv::default()).expect("valid runtime graph");
     for (index, node) in validated.root_scope().execution_order.iter().enumerate() {
         let NodeKind::Input { name, artifact: None, .. } = node.kind() else {
             continue;

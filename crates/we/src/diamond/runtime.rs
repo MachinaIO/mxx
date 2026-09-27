@@ -125,7 +125,7 @@ where
         let validation_started = Instant::now();
         let bindings = self.compiler.circuit_bindings()?;
         let validated = built
-            .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&bindings)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         debug!(
             elapsed_seconds = validation_started.elapsed().as_secs_f64(),
@@ -196,9 +196,7 @@ where
             .build_encryption()?
             .graph
             .validate(
-                &self.compiler.circuit_bindings()?,
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                &self.compiler.circuit_bindings()?)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         let graph_hash = spec_hash(&encryption_graph.source, &encryption_graph.bindings)
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
@@ -231,9 +229,7 @@ where
         let validated = built
             .validate_with_manifests(
                 &self.compiler.circuit_bindings()?,
-                &BTreeMap::from([(ciphertext.encryption.clone(), manifest)]),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                &BTreeMap::from([(ciphertext.encryption.clone(), manifest)]))
             .map_err(|error| DiamondRuntimeError::Validation(error.to_string()))?;
         debug!(
             elapsed_seconds = validation_started.elapsed().as_secs_f64(),

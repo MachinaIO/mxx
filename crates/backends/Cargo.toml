@@ -60,3 +60,7 @@ harness = false
 name = "bench_preimage_gpu"
 harness = false
 
+
+[[example]]
+name = "rlwe_encrypt"
+required-features = ["gpu"]

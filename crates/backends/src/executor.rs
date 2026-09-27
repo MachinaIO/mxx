@@ -198,22 +198,8 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
                         };
                         let evaluate = |range: &mxx_ir_core::node::IndexRange| {
                             Some((
-                                range
-                                    .start
-                                    .evaluate_with_rings(
-                                        &validated.bindings,
-                                        crate::openfhe_guard::gen_modulus_and_warmup,
-                                    )
-                                    .ok()?
-                                    .to_usize()?,
-                                range
-                                    .end
-                                    .evaluate_with_rings(
-                                        &validated.bindings,
-                                        crate::openfhe_guard::gen_modulus_and_warmup,
-                                    )
-                                    .ok()?
-                                    .to_usize()?,
+                                range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                                range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
                             ))
                         };
                         let row_range = range.as_ref().map_or(Some((0, input_type.rows)), evaluate);
@@ -299,22 +285,8 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
                 };
                 let evaluate = |range: &mxx_ir_core::node::IndexRange| {
                     Some((
-                        range
-                            .start
-                            .evaluate_with_rings(
-                                &validated.bindings,
-                                crate::openfhe_guard::gen_modulus_and_warmup,
-                            )
-                            .ok()?
-                            .to_usize()?,
-                        range
-                            .end
-                            .evaluate_with_rings(
-                                &validated.bindings,
-                                crate::openfhe_guard::gen_modulus_and_warmup,
-                            )
-                            .ok()?
-                            .to_usize()?,
+                        range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                        range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
                     ))
                 };
                 let selected = rows.as_ref().map_or(Some((0, parent_type.rows)), evaluate);
@@ -536,22 +508,8 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
                     };
                     let range = |range: &mxx_ir_core::node::IndexRange| {
                         Some((
-                            range
-                                .start
-                                .evaluate_with_rings(
-                                    &validated.bindings,
-                                    crate::openfhe_guard::gen_modulus_and_warmup,
-                                )
-                                .ok()?
-                                .to_usize()?,
-                            range
-                                .end
-                                .evaluate_with_rings(
-                                    &validated.bindings,
-                                    crate::openfhe_guard::gen_modulus_and_warmup,
-                                )
-                                .ok()?
-                                .to_usize()?,
+                            range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                            range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
                         ))
                     };
                     let rows = rows.as_ref().map_or(Some((0, product_type.rows)), range);
@@ -595,22 +553,8 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
             let NodeKind::Slice { rows, columns } = slice.kind() else { break };
             let range = |range: &mxx_ir_core::node::IndexRange| {
                 Some((
-                    range
-                        .start
-                        .evaluate_with_rings(
-                            &validated.bindings,
-                            crate::openfhe_guard::gen_modulus_and_warmup,
-                        )
-                        .ok()?
-                        .to_usize()?,
-                    range
-                        .end
-                        .evaluate_with_rings(
-                            &validated.bindings,
-                            crate::openfhe_guard::gen_modulus_and_warmup,
-                        )
-                        .ok()?
-                        .to_usize()?,
+                    range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                    range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
                 ))
             };
             let row_range = match rows {
@@ -1885,10 +1829,7 @@ impl<S: SessionStore> Executor<'_, S> {
         };
         let public = value.public_matrix().cpu_full_arc().ok_or(ExecutionError::ValueKind(wire))?;
         let sigma = sigma
-            .evaluate_f64_with_rings(
-                &ParamEnv::default(),
-                crate::openfhe_guard::gen_modulus_and_warmup,
-            )
+            .evaluate_f64(&ParamEnv::default())
             .map_err(|error| self.expression_error(wire.node, error))?;
         let secret = value.cpu_secret_arc();
         let gadget_small = secret.is_none().then_some(false);
@@ -1952,14 +1893,8 @@ impl<S: SessionStore> Executor<'_, S> {
             .ok_or_else(|| {
                 ExecutionError::MissingMetadata(WireId { instantiation_path: Vec::new(), wire })
             })?;
-        mxx_ir_core::concretize_wire_type(
-            declaration,
-            env,
-            scope_id,
-            wire.node,
-            crate::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .map_err(|error| self.expression_error(wire.node, error))
+        mxx_ir_core::concretize_wire_type(declaration, env, scope_id, wire.node)
+            .map_err(|error| self.expression_error(wire.node, error))
     }
 
     fn matrix_type(
@@ -2094,7 +2029,7 @@ impl<S: SessionStore> Executor<'_, S> {
         env: &ParamEnv,
     ) -> Result<usize, ExecutionError> {
         expression
-            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+            .evaluate(env)
             .map_err(|error| self.expression_error(node, error))?
             .to_usize()
             .ok_or_else(|| ExecutionError::Expression {
@@ -2651,10 +2586,7 @@ mod tests {
             parameters.ring_dimension(),
         );
         ConcreteMatrixType {
-            ring: ring
-                .as_ref()
-                .resolve(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
-                .expect("test CRT basis resolves"),
+            ring: ring.as_ref().resolve(&ParamEnv::default()).expect("test CRT basis resolves"),
             rows: 1,
             columns: 1,
         }
@@ -2725,14 +2657,14 @@ mod tests {
             .expect("generic output")
             .build()
             .expect("generic graph")
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .expect("generic validation");
         let preimage = DslContext::new("preimage-session-input")
             .output("value", ring.preimage_input("value", (1, 1), 1))
             .expect("preimage output")
             .build()
             .expect("preimage graph")
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .expect("preimage validation");
         let native =
             CpuSmallMatrix::new(DCRTPolyMatrix::identity(&parameters, 1, None), 1u8.into())

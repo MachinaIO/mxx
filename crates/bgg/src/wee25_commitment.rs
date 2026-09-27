@@ -290,12 +290,8 @@ mod tests {
             .expect("family output")
             .build()
             .expect("build");
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("validate");
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("elaborate");
+        built.validate(&ParamEnv::default()).expect("validate");
+        built.validate(&ParamEnv::default()).expect("elaborate");
     }
 
     #[test]
@@ -360,9 +356,7 @@ mod tests {
                 context.output(format!("cache-{index}"), tree.cached_nodes.at(index)).unwrap();
         }
         let built = context.build().unwrap();
-        let validated = built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        let validated = built.validate(&ParamEnv::default()).unwrap();
         let result = execute(
             &validated,
             &mut cpu_backend([parameters.clone()]),

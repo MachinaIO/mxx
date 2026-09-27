@@ -47,24 +47,6 @@ mod protocol_tests;
 #[cfg(test)]
 mod test_protocol;
 
-#[cfg(test)]
-fn test_resolve_basis(
-    ring_dimension: u32,
-    crt_depth: usize,
-    crt_bits: usize,
-    moduli: Option<Vec<u64>>,
-) -> Result<Vec<u64>, String> {
-    let moduli = moduli.ok_or("DSL tests use explicit CRT bases")?;
-    if !ring_dimension.is_power_of_two() ||
-        moduli.len() != crt_depth ||
-        moduli.iter().map(|q| q.checked_ilog2().map_or(0, |bits| bits as usize + 1)).max() !=
-            Some(crt_bits)
-    {
-        return Err("CRT metadata mismatch".into());
-    }
-    Ok(moduli)
-}
-
 thread_local! {
     /// Lexical loop depth while closure bodies are constructed. Using the depth as the binder
     /// slot is deterministic across builds and keeps nested loop indices distinct.
@@ -2107,28 +2089,23 @@ impl BuiltGraph {
     pub fn validate(
         &self,
         bindings: &ParamEnv,
-        resolve_basis: mxx_ir_core::ResolveCrtBasis,
     ) -> Result<mxx_ir_core::validate::ValidatedGraph, ValidationBuildError> {
-        Ok(mxx_ir_core::validate(&self.graph, bindings, resolve_basis)?)
+        Ok(mxx_ir_core::validate(&self.graph, bindings)?)
     }
 
     pub fn validate_with_manifests(
         &self,
         bindings: &ParamEnv,
         manifests: &BTreeMap<ProductionId, mxx_ir_core::artifact::Manifest>,
-        resolve_basis: mxx_ir_core::ResolveCrtBasis,
     ) -> Result<mxx_ir_core::validate::ValidatedGraph, ValidationBuildError> {
-        Ok(mxx_ir_core::validate_with_manifests(&self.graph, bindings, manifests, resolve_basis)?)
+        Ok(mxx_ir_core::validate_with_manifests(&self.graph, bindings, manifests)?)
     }
 }
 
 impl mxx_ir_core::IntoValidatedGraph for BuiltGraph {
     /// Validates with default parameter bindings.
-    fn into_validated_graph(
-        self,
-        resolve_basis: mxx_ir_core::ResolveCrtBasis,
-    ) -> Result<mxx_ir_core::validate::ValidatedGraph, String> {
-        self.validate(&ParamEnv::default(), resolve_basis).map_err(|error| error.to_string())
+    fn into_validated_graph(self) -> Result<mxx_ir_core::validate::ValidatedGraph, String> {
+        self.validate(&ParamEnv::default()).map_err(|error| error.to_string())
     }
 }
 
@@ -2273,8 +2250,7 @@ mod tests {
         let output =
             ring.from_evaluations(&ring.from_coefficients(&input).evaluations()).coefficients();
         let graph = context.output("result", output).unwrap().build().unwrap();
-        let validated =
-            graph.validate(&mxx_ir_core::ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        let validated = graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
         let lean = mxx_ir_core::lean::export(&validated, &Default::default()).unwrap();
         assert!(lean.source.contains("MxxRuntime.polynomialFromValues"));
         assert!(lean.source.contains("MxxRuntime.polynomialValues"));
@@ -2295,9 +2271,7 @@ mod tests {
         let short = context.int_family_input("values", 7);
         let graph =
             context.output("result", ring.from_coefficients(&short)).unwrap().build().unwrap();
-        assert!(
-            graph.validate(&mxx_ir_core::ParamEnv::default(), crate::test_resolve_basis).is_err()
-        );
+        assert!(graph.validate(&mxx_ir_core::ParamEnv::default()).is_err());
     }
     use super::*;
     use mxx_ir_core::node::LoopInputMode;
@@ -2309,7 +2283,7 @@ mod tests {
         let input = ring.input("input", (2, 2));
         let output = input.clone() + input;
         let built = DslContext::new("sum").output("sum", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -2320,7 +2294,7 @@ mod tests {
         let output = lhs.mul_small_rhs(rhs);
         let built =
             DslContext::new("small-rhs").output("product", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let nodes = built.graph.root_scope().nodes();
         assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
@@ -2345,7 +2319,7 @@ mod tests {
         let output = rhs.mul_small_rhs(lhs);
         let built =
             DslContext::new("preimage-rhs").output("product", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let nodes = built.graph.root_scope().nodes();
         assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
@@ -2366,7 +2340,7 @@ mod tests {
                 .unwrap()
                 .build()
                 .unwrap();
-            built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+            built.validate(&ParamEnv::default()).unwrap();
         }
     }
 
@@ -2421,7 +2395,7 @@ mod tests {
                 .unwrap()
                 .build()
                 .unwrap();
-            assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
+            assert!(built.validate(&ParamEnv::default()).is_err());
         }
         for digits in [0, -1] {
             let built = DslContext::new("invalid-gadget-digits")
@@ -2429,7 +2403,7 @@ mod tests {
                 .unwrap()
                 .build()
                 .unwrap();
-            assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
+            assert!(built.validate(&ParamEnv::default()).is_err());
         }
 
         let huge_rows = BigInt::from(usize::MAX);
@@ -2438,7 +2412,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
+        assert!(built.validate(&ParamEnv::default()).is_err());
     }
 
     #[test]
@@ -2462,7 +2436,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert!(matches!(small.at(0).value_handle().wire_type(), WireType::SmallMatrix { .. }));
         assert!(matches!(preimage.at(0).value_handle().wire_type(), WireType::Preimage { .. }));
         let mut all_nodes = built.graph.scopes().values().flat_map(|scope| scope.nodes());
@@ -2490,7 +2464,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert!(built.graph.root_scope().nodes().iter().any(|node| {
             matches!(node.kind(), NodeKind::BlockModSwitch { destination: actual, .. } if actual == destination.as_ref())
         }));
@@ -2515,7 +2489,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&mxx_ir_core::ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
         assert!(built.graph.root_scope().nodes().iter().any(|node| {
             matches!(node.kind(), NodeKind::CenteredRoundDivide { divisor } if divisor == &IntExpr::constant(17))
         }));
@@ -2553,7 +2527,7 @@ mod tests {
                 HashTagComponent::Bytes(b"after".to_vec()),
             ]
         );
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -2575,7 +2549,7 @@ mod tests {
             .expect("hash sample");
         assert_eq!(hash.arguments().len(), 2);
         assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -2590,7 +2564,7 @@ mod tests {
             unused.value_handle().node().kind(),
             NodeKind::MatrixBinary(MatrixBinaryOp::Add)
         ));
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -2606,7 +2580,7 @@ mod tests {
                     matches!(node.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add))
                 })
         }));
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -2617,7 +2591,7 @@ mod tests {
             DslContext::new("bounded-gaussian").output("sample", sample).unwrap().build().unwrap();
         let serialized = serde_json::to_string(&built.graph).unwrap();
         assert!(serialized.contains("max_coefficient_bound"));
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let parameterized = DslContext::new("parameterized-bounded-gaussian")
             .int_parameter("cutoff")
@@ -2631,7 +2605,7 @@ mod tests {
         };
         let constraints = mxx_ir_core::derive_param_constraints(&parameterized.graph).unwrap();
         assert!(constraints.iter().any(|constraint| !constraint.evaluate(&negative).unwrap()));
-        assert!(parameterized.validate(&negative, crate::test_resolve_basis).is_err());
+        assert!(parameterized.validate(&negative).is_err());
     }
 
     #[test]
@@ -2643,7 +2617,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        regular.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        regular.validate(&ParamEnv::default()).unwrap();
         let serialized = serde_json::to_string(&regular.graph).unwrap();
         assert!(serialized.contains("digit_count"));
         assert!(serialized.contains("\"small\":false"));
@@ -2653,7 +2627,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        small.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        small.validate(&ParamEnv::default()).unwrap();
         assert!(serde_json::to_string(&small.graph).unwrap().contains("\"small\":true"));
 
         let invalid = DslContext::new("negative-decomposition-base")
@@ -2661,7 +2635,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert!(invalid.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
+        assert!(invalid.validate(&ParamEnv::default()).is_err());
     }
 
     #[test]
@@ -2685,7 +2659,7 @@ mod tests {
         let indices = Family::<Int>::pack(vec![Int::constant(2), Int::constant(0)]).unwrap();
         let gathered = parallel(indices.count().clone(), |i| Ok(values.at(indices.at(i)))).unwrap();
         let built = context.output("gathered", gathered).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         assert!(
             built
@@ -2716,7 +2690,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
         let foreign = with_new_construction_scope(|_| ring.input_family("escaped", 6, (1, 2)));
         assert!(parallel(2, |label| Ok(foreign.at(label * 3))).is_err());
     }
@@ -2754,7 +2728,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(built.graph.outputs().len(), 9);
     }
 
@@ -2783,7 +2757,7 @@ mod tests {
             .expect("indices output")
             .build()
             .expect("build")
-            .validate(&ParamEnv::default(), crate::test_resolve_basis)
+            .validate(&ParamEnv::default())
             .expect("validation");
 
         let all_nodes =
@@ -2821,7 +2795,7 @@ mod tests {
         let indices = parallel(2, |index| Ok(index * 3)).unwrap();
         let gathered = parallel(indices.count().clone(), |i| Ok(values.at(indices.at(i)))).unwrap();
         let built = context.output("gathered", gathered).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let all_nodes =
             built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
@@ -2859,7 +2833,7 @@ mod tests {
             ]),
             ..ParamEnv::default()
         };
-        built.validate(&bindings, crate::test_resolve_basis).unwrap();
+        built.validate(&bindings).unwrap();
         assert!(
             built
                 .graph
@@ -2906,11 +2880,11 @@ mod tests {
             integers: BTreeMap::from([("count".to_owned(), 3.into())]),
             ..ParamEnv::default()
         };
-        built.validate(&bindings, crate::test_resolve_basis).unwrap();
+        built.validate(&bindings).unwrap();
         let encoded = serde_json::to_vec(&built.graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, built.graph);
-        mxx_ir_core::validate(&decoded, &bindings, crate::test_resolve_basis).unwrap();
+        mxx_ir_core::validate(&decoded, &bindings).unwrap();
         assert_eq!(
             built
                 .graph
@@ -2937,7 +2911,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         let loop_node = built.graph.root_scope().nodes().iter().find(|node| {
             matches!(node.kind(), NodeKind::ParallelLoop(spec) if spec.input_modes.len() == 3)
         }).expect("one gathered trapdoor has two aligned fields and one index");
@@ -2987,7 +2961,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert!(built.validate(&ParamEnv::default(), crate::test_resolve_basis).is_err());
+        assert!(built.validate(&ParamEnv::default()).is_err());
     }
 
     #[test]
@@ -3002,7 +2976,7 @@ mod tests {
         })
         .unwrap();
         let built = context.output("outputs", outputs).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(
             built
                 .graph
@@ -3027,7 +3001,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         let loop_spec = built
             .graph
             .root_scope()
@@ -3049,7 +3023,7 @@ mod tests {
         let encoded = serde_json::to_vec(&built.graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, built.graph);
-        mxx_ir_core::validate(&decoded, &ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        mxx_ir_core::validate(&decoded, &ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -3079,7 +3053,7 @@ mod tests {
         })
         .unwrap();
         let built = context.transferred_output("output", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
         let loop_node = built
             .graph
             .root_scope()
@@ -3113,7 +3087,7 @@ mod tests {
                 .unwrap();
         let output = subgraph.call((ring.input("matrix", (1, 1)), input_family)).unwrap();
         let built = context.output("output", output).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -3125,7 +3099,7 @@ mod tests {
         })
         .unwrap();
         let built = context.output("state", final_state).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let sequential = built
             .graph
@@ -3158,7 +3132,7 @@ mod tests {
         let encoded = serde_json::to_vec(&built.graph).unwrap();
         let decoded: Graph = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(built.graph, decoded);
-        mxx_ir_core::validate(&decoded, &ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        mxx_ir_core::validate(&decoded, &ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -3170,13 +3144,10 @@ mod tests {
         .unwrap();
         let built = context.output("values", values).unwrap().build().unwrap();
         built
-            .validate(
-                &ParamEnv {
-                    integers: BTreeMap::from([("width".to_owned(), 3.into())]),
-                    ..ParamEnv::default()
-                },
-                crate::test_resolve_basis,
-            )
+            .validate(&ParamEnv {
+                integers: BTreeMap::from([("width".to_owned(), 3.into())]),
+                ..ParamEnv::default()
+            })
             .unwrap();
         assert!(
             built
@@ -3221,7 +3192,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -3234,7 +3205,7 @@ mod tests {
         let right = Family::pack(vec![one, ring.zero((1, 1))]).unwrap();
         let selected = select(selector, vec![left, right]).unwrap();
         let built = context.transferred_output("selected", selected).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -3255,7 +3226,7 @@ mod tests {
                 ) && *count == IntExpr::constant(2)
         ));
         let built = context.transferred_output("selected", selected).unwrap().build().unwrap();
-        built.validate(&ParamEnv::default(), crate::test_resolve_basis).unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
 
         let bound_mismatch = select(
             selector.clone(),
@@ -3303,8 +3274,7 @@ mod tests {
         let encoded = serde_json::to_vec(&built.graph).expect("serialize graph");
         let decoded: Graph = serde_json::from_slice(&encoded).expect("deserialize graph");
         assert_eq!(built.graph, decoded);
-        mxx_ir_core::validate(&decoded, &ParamEnv::default(), crate::test_resolve_basis)
-            .expect("valid graph");
+        mxx_ir_core::validate(&decoded, &ParamEnv::default()).expect("valid graph");
     }
 
     #[test]

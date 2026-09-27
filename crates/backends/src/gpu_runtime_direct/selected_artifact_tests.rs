@@ -58,7 +58,7 @@ fn parallel_body_reading_an_unloaded_root_family_is_a_planning_error() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut store = MemoryArtifactStore::default();
     let production = execute_in_session(
@@ -142,7 +142,6 @@ fn parallel_body_reading_an_unloaded_root_family_is_a_planning_error() {
         &graph,
         &ParamEnv::default(),
         &BTreeMap::from([(production, manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -180,7 +179,7 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut store = MemoryArtifactStore::default();
     let produced = execute_in_session(
@@ -212,7 +211,6 @@ fn root_dynamic_family_get_loads_only_selected_artifact_on_each_replay() {
         .validate_with_manifests(
             &ParamEnv::default(),
             &BTreeMap::from([(production.clone(), manifest)]),
-            crate::openfhe_guard::gen_modulus_and_warmup,
         )
         .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -287,12 +285,7 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
     )
     .unwrap()
     .0;
-    let producer = mxx_ir_core::validate(
-        &producer,
-        &ParamEnv::default(),
-        crate::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let producer = mxx_ir_core::validate(&producer, &ParamEnv::default()).unwrap();
     let payloads = [vec![0x11], vec![0x22, 0x23, 0x24], vec![0x31, 0x32, 0x33, 0x34, 0x35]];
     let members = payloads
         .iter()
@@ -364,7 +357,6 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
         &consumer,
         &ParamEnv::default(),
         &BTreeMap::from([(production.clone(), manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -432,12 +424,7 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
     )
     .unwrap()
     .0;
-    let producer = mxx_ir_core::validate(
-        &producer,
-        &ParamEnv::default(),
-        crate::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let producer = mxx_ir_core::validate(&producer, &ParamEnv::default()).unwrap();
     let values = [
         -(BigInt::from(1u8) << 80usize) + BigInt::from(7u8),
         BigInt::from(42u8),
@@ -502,7 +489,6 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
         &consumer,
         &ParamEnv::default(),
         &BTreeMap::from([(production.clone(), manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -565,7 +551,7 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut store = MemoryArtifactStore::default();
     let produced = execute_in_session(
@@ -625,7 +611,6 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
         &consumer,
         &ParamEnv::default(),
         &BTreeMap::from([(production.clone(), manifest)]),
-        crate::openfhe_guard::gen_modulus_and_warmup,
     )
     .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
@@ -791,7 +776,7 @@ fn run_family_consumed_by_later_loop(publish: bool) {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
     let mut plan = runtime.plan(graph, &BTreeMap::new()).unwrap();

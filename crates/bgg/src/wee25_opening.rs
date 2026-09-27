@@ -804,7 +804,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let result = execute(
             &graph,
@@ -899,9 +899,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        let validated = built.validate(&ParamEnv::default()).unwrap();
         let block = |offset| {
             DCRTPolyMatrix::from_poly_vec(
                 &parameters,

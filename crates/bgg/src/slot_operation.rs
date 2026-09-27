@@ -294,9 +294,7 @@ mod naive {
                 .expect("reduction output")
                 .build()
                 .expect("build");
-            built
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-                .expect("valid executable graph");
+            built.validate(&ParamEnv::default()).expect("valid executable graph");
         }
 
         #[test]
@@ -318,7 +316,7 @@ mod naive {
                 .build()
                 .unwrap();
             let error = graph
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .validate(&ParamEnv::default())
                 .expect_err("rotation exponent exceeds ring dimension");
             assert!(error.to_string().contains("constant polynomial exceeds the ring dimension"));
         }
@@ -556,9 +554,7 @@ mod public_key {
                 .expect("output")
                 .build()
                 .expect("build");
-            built
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-                .expect("valid executable graph");
+            built.validate(&ParamEnv::default()).expect("valid executable graph");
         }
     }
 }
@@ -1529,7 +1525,7 @@ mod artifact {
                 .expect("base outputs")
                 .build()
                 .expect("base graph")
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+                .validate(&ParamEnv::default())
                 .expect("valid base graph");
             let slots = compiler
                 .build_slots(compiler.ring().bytes_input("hash-key", 32), &base)
@@ -1539,9 +1535,7 @@ mod artifact {
                 .expect("slot outputs")
                 .build()
                 .expect("slot graph");
-            slot_graph
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-                .expect("valid slot graph");
+            slot_graph.validate(&ParamEnv::default()).expect("valid slot graph");
 
             let key = compiler.ring().bytes_input("gate-hash-key", 32);
             let input = compiler.ring().hash_matrix(
@@ -1579,9 +1573,7 @@ mod artifact {
                 .expect("gate outputs")
                 .build()
                 .expect("gate graph");
-            gate_graph
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-                .expect("valid gate graph");
+            gate_graph.validate(&ParamEnv::default()).expect("valid gate graph");
         }
     }
 }

@@ -89,13 +89,13 @@ fn run_shape_case_on(
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let input_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: parameters.ring_dimension(),
     })
-    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .resolve(&ParamEnv::default())
     .unwrap();
     let value = RuntimeValue::gpu_matrix(
         ConcreteWireType::Matrix(ConcreteMatrixType { ring: input_ring, rows: 2, columns: 2 }),
@@ -186,14 +186,14 @@ fn run_crt_case_with_prime(
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let input = cpu_crt_input(source);
     let concrete_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: source.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: source.ring_dimension(),
     })
-    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .resolve(&ParamEnv::default())
     .unwrap();
     let value = RuntimeValue::gpu_matrix(
         ConcreteWireType::Matrix(ConcreteMatrixType { ring: concrete_ring, rows: 2, columns: 2 }),
@@ -251,18 +251,13 @@ fn run_manual_matrix_case(
     )
     .unwrap()
     .0;
-    let graph = mxx_ir_core::validate(
-        &graph,
-        &ParamEnv::default(),
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let graph = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
     let input = cpu_input(&parameters);
     let concrete_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: parameters.ring_dimension(),
     })
-    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .resolve(&ParamEnv::default())
     .unwrap();
     let value = RuntimeValue::gpu_matrix(
         ConcreteWireType::Matrix(ConcreteMatrixType { ring: concrete_ring, rows: 2, columns: 2 }),
@@ -495,14 +490,14 @@ fn multiply_monomial_matches_cpu_for_runtime_exponents() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let input = cpu_input(&parameters);
     let input_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: parameters.ring_dimension(),
     })
-    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .resolve(&ParamEnv::default())
     .unwrap();
     let matrix = RuntimeValue::gpu_matrix(
         ConcreteWireType::Matrix(ConcreteMatrixType { ring: input_ring, rows: 2, columns: 2 }),
@@ -785,17 +780,12 @@ fn run_loop_index_matrix_scale_case_impl(
     )
     .unwrap()
     .0;
-    let graph = mxx_ir_core::validate(
-        &graph,
-        &ParamEnv::default(),
-        mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-    )
-    .unwrap();
+    let graph = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
     let concrete_ring = RingRef::new(RingExpr::Explicit {
         crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
         ring_dimension: parameters.ring_dimension(),
     })
-    .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+    .resolve(&ParamEnv::default())
     .unwrap();
     let wire =
         ConcreteWireType::Matrix(ConcreteMatrixType { ring: concrete_ring, rows: 2, columns: 2 });
@@ -992,7 +982,7 @@ fn crt_recompose_matches_independent_cpu_formula() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let make_coefficients = |modulus: u64| {
         [
@@ -1037,7 +1027,7 @@ fn crt_recompose_matches_independent_cpu_formula() {
             crt_moduli: parameters.moduli().iter().copied().map(Into::into).collect(),
             ring_dimension: parameters.ring_dimension(),
         })
-        .resolve(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&ParamEnv::default())
         .unwrap();
         ConcreteWireType::Matrix(ConcreteMatrixType { ring, rows: 1, columns: 1 })
     };
@@ -1092,7 +1082,7 @@ fn hash_sample_matches_cpu_for_fixed_key_and_tag() {
         .unwrap()
         .build()
         .unwrap()
-        .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+        .validate(&ParamEnv::default())
         .unwrap();
     let expected = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
         &parameters,

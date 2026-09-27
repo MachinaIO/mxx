@@ -415,7 +415,7 @@ mod tests {
                 .collect(),
             ring_dimension: context.ring_dimension,
         })
-        .resolve(&mxx_ir_core::ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&mxx_ir_core::ParamEnv::default())
         .unwrap();
         let matrix = ConcreteMatrixType { ring, rows: 1, columns: 1 };
         assert!(context.validate_request(&matrix, &16.into(), 4, LeanGadgetMode::Regular).is_ok());

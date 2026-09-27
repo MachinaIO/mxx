@@ -49,7 +49,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 return Err(ExecutionError::ValueKind(wire));
             }
             schema.max_coefficient_bound = max_coefficient_bound
-                .evaluate_with_rings(&envs[index], crate::openfhe_guard::gen_modulus_and_warmup)
+                .evaluate(&envs[index])
                 .map_err(|error| self.expression_error(node.id, error))?;
             self.backend
                 .validate_preimage_bound(
@@ -200,10 +200,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     let input_type =
                         self.matrix_type(scope_id, &paths[index], &envs[index], node.args[0])?;
                     let base = base
-                        .evaluate_with_rings(
-                            &envs[index],
-                            crate::openfhe_guard::gen_modulus_and_warmup,
-                        )
+                        .evaluate(&envs[index])
                         .map_err(|error| self.expression_error(node.id, error))?;
                     let digits = self.eval_usize(node.id, digit_count, &envs[index])?;
                     self.backend
@@ -634,10 +631,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     for (product, coefficient) in coefficients.iter().enumerate() {
                         products.push((
                             coefficient
-                                .evaluate_with_rings(
-                                    env,
-                                    crate::openfhe_guard::gen_modulus_and_warmup,
-                                )
+                                .evaluate(env)
                                 .map_err(|error| self.expression_error(node.id, error))?,
                             self.matrix(instance, node.args[2 * product])?,
                             self.matrix(instance, node.args[2 * product + 1])?,
@@ -667,7 +661,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     let instance = &mut values[*index];
                     let value = self.matrix(instance, node.args[0])?;
                     let scalar = scalar
-                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?;
                     inputs.push((value, scalar));
                 }
@@ -707,14 +701,14 @@ impl<S: SessionStore> Executor<'_, S> {
                 }
                 HashTagComponent::Integer(expression) => {
                     let value = expression
-                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?;
                     tag.push(1);
                     append_tag_integer(&mut tag, &value);
                 }
                 HashTagComponent::Decimal(expression) => {
                     let value = expression
-                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?;
                     let decimal = value.to_string();
                     tag.push(2);
@@ -723,7 +717,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 }
                 HashTagComponent::U64Le(expression) => {
                     let value = expression
-                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?
                         .to_u64()
                         .ok_or_else(|| ExecutionError::Expression {
@@ -931,7 +925,6 @@ impl<S: SessionStore> Executor<'_, S> {
                     env,
                     scope_id,
                     node.id,
-                    crate::openfhe_guard::gen_modulus_and_warmup,
                 )
                 .map_err(|error| self.expression_error(node.id, error))?;
                 let ConcreteWireType::Matrix(ty) = concrete else { unreachable!() };
@@ -1029,7 +1022,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 for (product, coefficient) in coefficients.iter().enumerate() {
                     products.push((
                         coefficient
-                            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                            .evaluate(env)
                             .map_err(|error| self.expression_error(node.id, error))?,
                         self.matrix(values, node.args[2 * product])?,
                         self.matrix(values, node.args[2 * product + 1])?,
@@ -1053,9 +1046,8 @@ impl<S: SessionStore> Executor<'_, S> {
             }
             NodeKind::MatrixScale { scalar } => {
                 let input = self.matrix(values, node.args[0])?;
-                let scalar = scalar
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|error| self.expression_error(node.id, error))?;
+                let scalar =
+                    scalar.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
                 let output =
                     self.backend.scale_integer(&input, &scalar).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
@@ -1125,11 +1117,11 @@ impl<S: SessionStore> Executor<'_, S> {
                 let range = RuntimeSampleRange {
                     minimum: range
                         .minimum
-                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?,
                     maximum: range
                         .maximum
-                        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                        .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?,
                 };
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
@@ -1141,10 +1133,10 @@ impl<S: SessionStore> Executor<'_, S> {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, env, wire)?;
                 let sigma = sigma
-                    .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate_f64(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let max_coefficient_bound = max_coefficient_bound
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
                     backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)
@@ -1156,7 +1148,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     self.hash_key_and_tag(values, node, env, tag_prefix, tag_components)?;
                 let count = self.eval_usize(node.id, count, env)?;
                 let modulus = modulus
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?
                     .to_biguint()
                     .ok_or_else(|| ExecutionError::Expression {
@@ -1183,8 +1175,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 let gadget_base = base
                     .as_ref()
                     .map(|base| {
-                        base.evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                            .map_err(|error| self.expression_error(node.id, error))
+                        base.evaluate(env).map_err(|error| self.expression_error(node.id, error))
                     })
                     .transpose()?;
                 let digit_count = digit_count
@@ -1246,10 +1237,10 @@ impl<S: SessionStore> Executor<'_, S> {
                 let trapdoor_wire = WireRef { node: node.id, port: Port(1) };
                 let ty = self.matrix_type(scope_id, path, env, matrix_wire)?;
                 let sigma = sigma
-                    .evaluate_f64_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate_f64(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let gadget_base = gadget_base
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?
                     .abs();
                 let digit_count = self.eval_usize(node.id, digit_count, env)?;
@@ -1283,7 +1274,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 let (mut schema, semantic_kind) =
                     self.bounded_matrix_schema(scope_id, path, env, wire)?;
                 schema.max_coefficient_bound = max_coefficient_bound
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 if semantic_kind != SmallMatrixSemanticKind::Preimage {
                     return Err(ExecutionError::Manifest(
@@ -1371,9 +1362,8 @@ impl<S: SessionStore> Executor<'_, S> {
                     env,
                     WireRef { node: node.id, port: Port(0) },
                 )?;
-                let base = base
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|error| self.expression_error(node.id, error))?;
+                let base =
+                    base.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
                 let digit_count = self.eval_usize(node.id, digit_count, env)?;
                 self.backend
                     .validate_gadget_layout(&input_type, &base, digit_count, *small)
@@ -1455,9 +1445,8 @@ impl<S: SessionStore> Executor<'_, S> {
             }
             NodeKind::CenteredRoundDivide { divisor } => {
                 let input = self.matrix(values, node.args[0])?;
-                let divisor = divisor
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                    .map_err(|error| self.expression_error(node.id, error))?;
+                let divisor =
+                    divisor.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
                 let output = self
                     .backend
                     .centered_round_divide(&input, &divisor)
@@ -1491,7 +1480,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     WireRef { node: node.id, port: Port(0) },
                 )?;
                 let plaintext_modulus = plaintext_modulus
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?
                     .to_u64()
                     .ok_or_else(|| {
@@ -1514,7 +1503,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     WireRef { node: node.id, port: Port(0) },
                 )?;
                 let plaintext_modulus = plaintext_modulus
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let output = self
                     .backend
@@ -1610,7 +1599,7 @@ impl<S: SessionStore> Executor<'_, S> {
             NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
                 let input = self.matrix(values, node.args[0])?;
                 let plaintext = plaintext_modulus
-                    .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+                    .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let length = self.eval_usize(node.id, length, env)?;
                 let decoded = crate::host_control::dispatch_threshold_decode(
@@ -1638,17 +1627,13 @@ impl<S: SessionStore> Executor<'_, S> {
                 let plaintext_moduli = plaintext_moduli
                     .iter()
                     .map(|value| {
-                        value
-                            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                            .map_err(|error| self.expression_error(node.id, error))
+                        value.evaluate(env).map_err(|error| self.expression_error(node.id, error))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let reconstruction_coefficients = reconstruction_coefficients
                     .iter()
                     .map(|value| {
-                        value
-                            .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
-                            .map_err(|error| self.expression_error(node.id, error))
+                        value.evaluate(env).map_err(|error| self.expression_error(node.id, error))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let destination = self.matrix_type(
@@ -2481,7 +2466,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut backend = cpu_backend([parameters.clone()]);
         let mut store = MemoryArtifactStore::default();
@@ -2529,7 +2514,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut backend = cpu_backend([parameters]);
         let mut store = MemoryArtifactStore::default();
@@ -2577,7 +2562,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let matrices = [1u8, 3, 5, 7].map(|value| {
             DCRTPolyMatrix::from_poly_vec_row(
@@ -2638,7 +2623,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
         assert_eq!(plan.concats.len(), 1);
@@ -2716,7 +2701,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
         assert_eq!(plan.tensor_row_sum_groups.len(), 1);
@@ -2785,11 +2770,7 @@ mod tests {
             if mode == 2 {
                 context = context.output("transpose", product.transpose()).unwrap();
             }
-            let graph = context
-                .build()
-                .unwrap()
-                .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
-                .unwrap();
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
             let plans = root_row_sum_plans(&graph);
             assert_eq!(plans.len(), 2);
             if mode == 0 {
@@ -2851,7 +2832,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut store = MemoryArtifactStore::default();
         let produced = execute_in_session(
@@ -2880,7 +2861,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production.clone(), manifest)]),
-                crate::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let keys = (0..3)
@@ -2921,7 +2901,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut backend = cpu_backend([]);
         let mut store = MemoryArtifactStore::default();
@@ -2965,7 +2945,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let result = execute(
             &graph,

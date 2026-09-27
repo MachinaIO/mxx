@@ -1,172 +1,234 @@
 # mxx
 
-`mxx` is a Rust and CUDA workspace for lattice-cryptography research. It contains
-polynomial and matrix primitives, bounded samplers, an executable graph IR and DSL, reusable BGG+
-and circuit gadgets, runtime backends, and application-specific Lean correctness proofs.
+**Write a lattice-based cryptographic protocol in a Rust-based DSL, much as you would write it on paper, and
+run it on GPUs, with no CUDA and no hand-tuning of GPU memory or parallelism.**
+
+> **Status:** research code under active development. It has not been audited.
+
+## Why mxx
+
+Lattice-based schemes spend most of their time on polynomial matrix arithmetic, gadget
+decomposition, and preimage sampling, which is work that GPUs do well. Running such a scheme on a
+GPU usually requires three kinds of work:
+
+- hand-writing CUDA kernels for each operation,
+- splitting the work into batches small enough to fit in GPU memory, and
+- retuning those batch sizes whenever the parameters, the protocol, or the GPU changes.
+
+With mxx you write only the protocol. You state its steps in terms of ring elements, matrices,
+and samples, and mxx executes them on the GPU. It also chooses the degree of parallelism that fits
+in GPU memory and runs fastest.
+
+## What it looks like
+
+The example below encrypts a polynomial of bits `m(X)` with Ring-LWE and decrypts it on the GPU.
+It computes `b = a·s + e + floor(Q/2)·m(X)`, where `a` is a public element derived from a seed,
+`s` is a Gaussian secret, and `e` is Gaussian noise. It then recovers `m(X)` by rounding the
+coefficients of `b - a·s`. Every parameter, such as the ring's CRT width and depth, the noise
+width `sigma`, and the gadget base, is a named variable, and it gets a value only when the
+program is bound for a run. The full program is
+[`crates/backends/examples/rlwe_encrypt.rs`](crates/backends/examples/rlwe_encrypt.rs); run it
+with `cargo run -r -p mxx-backends --example rlwe_encrypt --features gpu`.
+
+```rust
+use bigdecimal::BigDecimal;
+use mxx_backends::{
+    GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::dcrt::gpu::GpuDCRTPolyParams,
+    sampler::bounds::hard_cutoff_from_sigma_bound,
+};
+use mxx_dsl::{BuiltGraph, DslContext, DslError, Family, HashTag, Ring};
+use mxx_ir_core::{IntExpr, ParamEnv, Rational, RealExpr, generate_crt_basis};
+use num_bigint::BigInt;
+use std::{collections::BTreeMap, sync::Arc};
+
+/// Describes the protocol. Named parameters stay symbolic until they are bound.
+fn rlwe_program(ring_dimension: u32) -> Result<BuiltGraph, DslError> {
+    let sigma = RealExpr::Var("sigma".into());
+    let cutoff = IntExpr::Var("cutoff".into());
+    // R_Q = Z_Q[X]/(X^N + 1), where Q is a product of `crt_depth` primes of `crt_bits` bits.
+    let ring = Ring::new(
+        IntExpr::Var("crt_bits".into()),
+        IntExpr::Var("crt_depth".into()),
+        ring_dimension,
+    );
+    let context = DslContext::new("rlwe-encrypt")
+        .int_parameter("crt_bits")
+        .int_parameter("crt_depth")
+        .int_parameter("gadget_base_bits")
+        .int_parameter("cutoff")
+        .real_parameter("sigma");
+
+    // Inputs supplied at run time: a 32-byte public seed and one message bit per coefficient.
+    let seed = ring.bytes_input("seed", 32);
+    let bits = context.int_family_input("bits", ring_dimension);
+
+    // The public element a is derived from the seed, so another party can recompute it.
+    let a = ring.hash_matrix(seed, HashTag::from(b"rlwe-example/a".as_slice()), (1, 1));
+    let s = ring.gaussian((1, 1), sigma.clone(), cutoff.clone());
+    let e = ring.gaussian((1, 1), sigma, cutoff);
+
+    // Encrypt m(X) as b = a*s + e + floor(Q/2) * m(X).
+    let delta = ring.polynomial([ring.modulus().floor_div(2)]);
+    let b = &a * &s + e + &delta * &ring.from_coefficients(&bits);
+
+    // Decrypt: round each coefficient of b - a*s to the nearest multiple of Q/2.
+    let decrypted = (b.clone() - &a * &s).threshold_decode_ints(2, ring_dimension as usize);
+
+    context.output("ciphertext", b)?.output("decrypted", Family::pack(decrypted)?)?.build()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ring_dimension = 4096;
+    let (crt_bits, crt_depth, gadget_base_bits) = (60, 3, 20);
+    let sigma = 4;
+    let cutoff = hard_cutoff_from_sigma_bound(&BigDecimal::from(sigma)); // 6.5 sigma
+
+    // Bind the parameters, then check the whole program under them.
+    let bindings = ParamEnv {
+        integers: BTreeMap::from([
+            ("crt_bits".to_owned(), BigInt::from(crt_bits)),
+            ("crt_depth".to_owned(), BigInt::from(crt_depth)),
+            ("gadget_base_bits".to_owned(), BigInt::from(gadget_base_bits)),
+            ("cutoff".to_owned(), BigInt::from(cutoff)),
+        ]),
+        reals: BTreeMap::from([("sigma".to_owned(), Rational::from_integer(BigInt::from(sigma)))]),
+        ..ParamEnv::default()
+    };
+    let program = rlwe_program(ring_dimension)?.validate(&bindings)?;
+
+    // Register the same ring with a GPU backend.
+    let moduli = generate_crt_basis(ring_dimension, crt_depth, crt_bits)?;
+    let gpu_params = GpuDCRTPolyParams::new(ring_dimension, moduli, gadget_base_bits, None);
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params]))?;
+
+    let message = |seed: usize| {
+        (0..ring_dimension as usize).map(|i| BigInt::from((i * 7 + seed) % 2)).collect::<Vec<_>>()
+    };
+    let inputs = |seed: usize| {
+        BTreeMap::from([
+            ("seed".to_owned(), RuntimeValue::Bytes(Arc::from([seed as u8; 32]))),
+            ("bits".to_owned(), RuntimeValue::integer_values(message(seed))),
+        ])
+    };
+
+    // Planning picks the parallelism and memory schedule that fit this GPU.
+    let mut plan = runtime.plan(program, &inputs(1))?;
+
+    // The plan then runs on new inputs without being planned again.
+    for seed in 1..=3 {
+        let result = runtime.execute(&mut plan, inputs(seed))?;
+        let decrypted = result.output("decrypted").ok_or("missing output")?;
+        let decrypted = runtime.download_integer_family_output(&decrypted)?;
+        assert_eq!(decrypted, message(seed), "decryption mismatch for seed {seed}");
+        println!("seed {seed}: {ring_dimension} bits decrypted correctly");
+    }
+    Ok(())
+}
+```
+
+Running `rlwe_program` does not compute anything. It records the protocol as a program: a graph
+whose nodes are primitive operations, such as a matrix product, a Gaussian sample, or a
+coefficient decoding, and whose edges carry values between them. Computation happens only when
+a backend executes the graph. This is why one description can run on a GPU or on a CPU. Export
+of the same graph to Lean, for machine-checked correctness proofs, is a work in progress.
+
+## What mxx does for you
+
+### Describing a protocol
+
+- **Lattice objects as values.** You work with matrices of polynomials over RNS rings
+  `Z_Q[X]/(X^N + 1)`, where Q is a product of word-sized primes. You also work with matrices of
+  small (bounded) coefficients, lattice trapdoors and their preimages, integers, Booleans, byte
+  strings, and indexed collections of these. `+`, `-`, and `*` behave as in the math.
+- **Standard lattice operations.** mxx provides NTT-based polynomial arithmetic, gadget
+  decomposition, ring automorphisms, multiplication by `X^k`, modulus switching and reduction,
+  RNS basis extension and reduction (as used in hybrid key switching), CRT recomposition,
+  coefficient extraction and packing, and threshold decoding.
+- **Sampling built in.** You can draw uniform, interval, and discrete Gaussian samples, generate
+  lattice trapdoors, and sample trapdoor preimages. You write a sample where the protocol needs
+  it, and every run draws fresh randomness automatically. A sample written outside a loop is
+  drawn once and shared, and a sample written inside a loop is drawn fresh in every iteration.
+- **Seeds instead of large public matrices.** A matrix that is sampled from public random coins
+  can instead be derived from a fixed-size random seed with a hash function (a random oracle).
+  One party then sends only the 32-byte seed, not the matrix, and the other parties recompute the
+  same matrix from it, which cuts communication. The derived values are identical on the CPU and
+  the GPU.
+- **Loops, choices, and reusable pieces.** You can loop over independent items (`parallel`), or
+  repeat a step that updates a state, such as rounds of an evaluation (`iterate`). You can pick
+  one of several computed values using a value known only at run time (`select`), and define a
+  named block once and call it many times (`Subgraph`). Loops are recorded once, not copied per
+  iteration, so a protocol with thousands of iterations stays a small program.
+- **Parameters that vary.** Dimensions, loop counts, moduli, and sampler widths can be named
+  parameters, so one protocol description serves many parameter sets.
+- **Errors caught before running.** Before execution, mxx checks every step for matching shapes,
+  rings, and bounds under the chosen parameters.
+
+### Running it on GPUs
+
+- **One description for GPU and CPU.** The same program runs on the GPU or on the CPU, so there
+  is no separate GPU implementation to keep in sync.
+- **Automatic tuning under a memory budget.** On a GPU, more parallelism, for example batching
+  more matrix operations together, lowers latency but needs more GPU memory. mxx automatically
+  chooses the parallelism with the lowest latency that fits within the memory of the machine it
+  runs on.
+- **Plan once, run many times.** Before the first run, mxx builds a *plan* for the program. The
+  plan fixes the parallelism described above and a schedule for allocating and freeing GPU
+  memory. Once the plan exists, you can run the program any number of times on new inputs with
+  those tuned settings, without planning again.
+- **Several GPUs.** A single plan can spread work over several GPUs. At present only large
+  matrix products, preimage sampling, and independent loop iterations are spread; other steps
+  run on one GPU. Multi-GPU execution has so far been tested only with several virtual devices on
+  one physical GPU.
+- **(Advanced) Your own CUDA kernel when it matters.** If part of a protocol needs a specialized
+  kernel for better performance, you write only that kernel. The rest of the protocol stays in the
+  DSL, and the automatic tuning of parallelism and memory scheduling still applies around your
+  kernel, so you do not reimplement it. TFHE blind rotation uses this option.
+
+### Protocols with several parties
+
+- **Using other parties' outputs.** Real protocols run in stages, often by different parties:
+  one party runs setup and publishes public keys, another encrypts, and a third decrypts. Each
+  stage is its own program. A stage can export its results, and another party's stage can
+  import them as inputs, from memory or from disk, loading only the parts it uses.
+
+### Constructions included
+
+| Crate | What you get |
+| --- | --- |
+| `mxx-fhe` | TFHE with NAND bootstrapping, and leveled BGV with SIMD slots, rotations, relinearization, hybrid RNS key switching, and noise tracking. |
+| `mxx-bgg` | BGG+ public keys and encodings, circuit evaluation, LWE lookup tables, slot transfer, Tall encodings, and WEE25 commitments. |
+| `mxx-gadgets` | Circuit models and reusable building blocks: nested-RNS arithmetic, NTT circuits, Ring-GSW, a Goldreich PRG, and noise refresh. |
+| `mxx-we` | Diamond witness encryption with a Lean-checked parameter search. Temporarily disabled; see [Workspace layout](#workspace-layout). |
+
+For the design in depth, including how the GPU runtime plans and runs a program and its current
+limitations, start with `docs/architecture.md`.
 
 ## Workspace layout
 
 | Crate | Responsibility |
 | --- | --- |
-| `mxx-backends` | Polynomial/matrix operations, CPU/GPU kernels and execution, concrete samplers, transcripts, sessions, and artifacts. |
-| `mxx-ir-core` | Executable DAG, protocol declarations, structural validation, artifact manifests, and Lean claim generation. |
-| `mxx-dsl` | Typed graph construction and sampler-free ideal/predicate builders. |
+| `mxx-ir-core` | Executable graph IR, protocol declarations, validation, artifact manifests, and Lean claim generation. |
+| `mxx-dsl` | Typed graph construction and sampler-free ideal and predicate builders. |
+| `mxx-backends` | Polynomial and matrix operations, samplers, the CPU executor, the GPU runtime and native CUDA, transcripts, sessions, and artifacts. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
 | `mxx-fhe` | DSL-based TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and ciphertext noise tracking. |
-| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Excluded from the workspace; build it with `--manifest-path crates/we/Cargo.toml`. |
+| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
 
-The retired symbolic IR and probabilistic noise simulator are not part of the workspace.
-Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU and
-GPU samplers enforce the same cutoffs: Gaussian draws are resampled until they meet the bound, and
-preimage sampling retries whole candidates that exceed it. Lattice-security estimation intentionally continues to model the corresponding
-ordinary untruncated distributions separately.
+There is no symbolic IR and no probabilistic noise simulator. Correctness uses enforced integer
+coefficient cutoffs and deterministic worst-case bounds. CPU and GPU samplers enforce the same
+cutoffs: Gaussian draws are resampled until they meet the bound, and preimage sampling retries
+whole candidates that exceed it. Lattice-security estimation intentionally continues to model
+the corresponding ordinary untruncated distributions separately.
 
-See `docs/architecture.md` (the design entry point, covering the IR, DSL, CPU executor, and GPU
-runtime) and `docs/correctness/operational-protocol-inventory.md`.
-
-## FHE graphs
-
-`mxx-fhe` constructs cryptographic graphs; its methods do not encrypt eagerly.
-Key generation, sampling, polynomial arithmetic, and decryption execute when
-`mxx-backends` runs the validated graph. CPU and GPU backends use the same FHE DSL.
-TFHE implements NAND bootstrapping; BGV is leveled and has no bootstrapping.
-
-| API | Representation and behavior |
-| --- | --- |
-| `FheCommonParams` | Existing `DCRTPolyParams`, binary/ternary secret interval, Gaussian sigma, and coefficient cutoff. Level zero keeps the first CRT prime; higher levels keep longer prefixes. |
-| `FheScheme` | Shared matrix-plaintext `keygen`, `encrypt`, `decrypt`, `add`, and `mul` graph builders, with scheme-specific plaintext, multiplication operand, and evaluation-key types. BGV implements it; TFHE has its own integer LWE API. |
-| `TfheParams` | `new(common, lwe_dimension, lwe_modulus, lwe_error_sigma, lwe_error_cutoff)`; integer LWE over a power-of-two modulus q with binary secrets, plus the CRT ring R_Q for blind rotation. Gaussian cutoffs must be at least 16 sigma. |
-| `LweCiphertext` | `Family<Int>` vector `a` and `Int` `b` with phase `b - <a, s>` mod q; a bit is encoded as `+floor(q/8)` (true) or `-floor(q/8)` (false). |
-| `TfheKeys` | Output of `keygen(hash_key)`: LWE and ring secrets, a `BootstrappingKey` (ring-GSW encryptions of each LWE secret coordinate, stored as `RingCiphertext`s), and a flat `KeySwitchKey` (base `2^b` with `d` digits of the rounded leading `b * d` bits of each coefficient, both set in `TfheParams::new`). |
-| `BgvParams` | `new(common, plaintext_modulus)`; messages are `Family<Int>` with 1 to N SIMD slots modulo t. Supports addition, multiplication with relinearization, CRT modulus switching, SIMD, and rotations. |
-| `BgvCiphertext` | Components are descending coefficients in `-s`: `(a,b)` for ordinary ciphertexts or three rows before relinearization. `correction_factor` tracks the plaintext multiplier modulo t, while `noise_bound` tracks coefficient noise. |
-
-TFHE `encrypt(secret, bit, hash_key)` and `decrypt(secret, ciphertext)` work on
-single bits. `nand(lhs, rhs, bootstrapping_key, key_switch_key)`
-forms `nand_input` (`floor(q/8) - ct1 - ct2`) and bootstraps it with the
-`nand_accumulator` sign LUT. `bootstrap` runs four public stages that can also
-be built as separate graphs: `pre_blind_rotation`, `blind_rotation` (one
-external product per LWE secret coordinate), `sample_extract` (with rounded
-Q-to-q modulus switching), and `key_switch`. LWE `a` vectors are hash-derived
-with `DslContext::hash_int_family`, so every ciphertext and every `keygen` call
-needs a fresh 32-byte key from a CSPRNG; secrets and errors are independent
-samples.
-
-BGV decrypts modulo its separate plaintext modulus t.
-For BGV multiplication, `mul` takes a relinearization key; alternatively,
-`mul_unrelinearized` and `relinearize` expose the two steps explicitly.
-
-BGV uses SIMD by default and requires a prime t with `t = 1 mod 2N`.
-Call `encrypt(&key, &slots)` directly; `decrypt(&secret, &ciphertext)` returns
-all N slots. Inputs with 1 to N integers fill successive slots, and unused slots
-are zero. A single integer occupies slot zero without broadcasting. Returning
-all slots preserves values moved into initially unused positions by rotations,
-without storing an input length in the ciphertext.
-
-Slots are interpreted as evaluation values in the plaintext ring R_t. Internal
-encoding uses the native inverse NTT modulo t, centers and lifts the resulting
-coefficients into R_Q, and uses the native evaluation representation for
-ciphertext arithmetic. The t-to-Q coefficient lift is necessary; copying
-R_t evaluation values directly into R_Q would change the message polynomial.
-Encoding and decoding are internal details, so callers need no separate steps.
-Slots occupy two rows of N/2 entries.
-`rotate_rows` rotates both rows (positive offsets move entries left), and
-`swap_rows` exchanges them. Nontrivial rotations and row swaps need their
-respective evaluation keys at the ciphertext's level. CRT modulus switching
-operates on residues without reconstructing whole ciphertext coefficients.
-
-BGV uses hybrid RNS key switching (ePrint 2021/204, Appendix B.2.3), including
-relinearization, rotations, and row swaps. `BgvParams::new(common, t, None)`
-selects approximately three CRT digits and a disjoint 60-bit auxiliary basis P
-large enough to cover the largest digit. Pass `Some(BgvHybridParams {
-digit_size, auxiliary_primes })` to specify the partition width and P explicitly.
-Evaluation keys are 2-by-ceil((level+1)/digit_size) matrices over Q_level*P;
-use `key_switch_parameters(level)` when importing them. Ciphertexts remain over
-Q_level, and switching preserves their correction factor. Parameter security
-must be assessed at Q*P, including the secret-dependent evaluation keys.
-
-The evaluator normalizes CRT digits, approximately extends them to QP, multiplies
-the evaluation key, and removes P with the BGV correction `(S+t*U)/P`, where
-`U = -S/t mod P`. Dedicated `RnsModUp` and `RnsModDown` nodes execute fused
-CPU/CUDA primitives: inverse-transform each input once, accumulate centered CRT
-terms in coefficient form, and forward-transform each output digit once.
-Normalization factors and division inverses are cached per worker and basis;
-GPU coefficients stay on the device. CUDA computes cofactor weights once per
-conversion using a setup kernel, without a host metadata allocation or upload. The GPU conversion batches all entries, digits, and destination
-limbs in one coefficient kernel, with stream-ordered temporary lifetimes.
-The tracked added noise is
-bounded by `ceil((N*error_cutoff*sum_j(alpha_j*floor(Q_j/2)) +
-(N+1)*k*floor(P/2))/P)`, where alpha_j is the number of primes in digit j and k is
-the number of auxiliary primes. This includes approximate-extension error.
-
-For manual CPU key-switch timing, run
-`FHE_TEST_RING_DIMENSION=1024 cargo test -r -p mxx-fhe --lib test_cpu_key_switch_evaluation_timing -- --ignored --nocapture`.
-The fixture uses production evaluation with pre-generated keys and inputs,
-excludes key generation and graph construction, warms up once, and records
-20 execution-plus-output-materialization samples (`FHE_BENCH_REPEATS` overrides
-the count). Other `FHE_TEST_*` variables control the test parameters.
-
-To execute a graph:
-
-1. Construct a `DslContext`, declare inputs, and use the FHE methods to build
-   encryption, evaluation, and decryption nodes. Mark secrets and decoded values
-   as private outputs.
-2. Build and validate the graph with a `ParamEnv`. Register the exact ordered
-   ciphertext CRT bases with the runtime backend. For BGV,
-   `runtime_parameters()` supplies all ciphertext, hybrid, single-prime, and
-   plaintext rings in their exact tower order; `TfheParams::runtime_parameters()`
-   supplies the CRT prefixes and single-prime rings TFHE uses.
-3. Call runtime `execute` with inputs, a backend, a `MemoryArtifactStore`, and a
-   sampling mode. Materialize lazy family outputs before inspecting their values.
-
-Noise bounds propagate with each ciphertext through evaluation. `can_decrypt`
-checks a conservative sufficient correctness condition; it does not measure
-secret runtime values. Declared input bounds and compatible keys remain caller
-obligations. DSL schemas retain public metadata, but a matrix artifact alone does
-not contain correction factors or bounds: carry those alongside components when
-connecting separate protocol stages. Artifacts remain in memory or are passed as
-direct runtime inputs.
-
-Start with the runtime unit tests in `crates/fhe/src/tfhe.rs` (NAND truth
-tables and LWE round trips) and `crates/fhe/src/bgv.rs` (slot arithmetic,
-measured noise, and staged evaluation). `crates/fhe/src/tests_gpu.rs` executes
-the BGV production graphs on GPU, including a public evaluator that receives no
-secret key. The integration test `crates/fhe/tests/gpu_tfhe.rs` is a TFHE round trip on
-GPU with the standard TFHE Boolean profile (`utils::tfhe_params`): it
-generates keys, encrypts bits, evaluates the NAND truth table and chained
-bootstrapped gates, and decrypts every result, with keys kept resident
-between plans.
-
-```sh
-cargo test -r -p mxx-fhe --lib
-cargo test -r -p mxx-fhe --lib --features gpu test_gpu_fhe
-```
-
-Run GPU tests outside the sandbox on a CUDA-capable machine. The unit-test toy
-parameters are configurable through `FHE_TEST_RING_DIMENSION`,
-`FHE_TEST_CRT_DEPTH`, `FHE_TEST_CRT_BITS`, `FHE_TEST_BASE_BITS`, `FHE_TEST_SIGMA`,
-and `FHE_TEST_ERROR_CUTOFF`; parameter changes must preserve decoding margins
-and each test's batching requirements. Defaults are correctness fixtures, not
-security parameter recommendations.
-
-## Diamond iO and AKY24 iO implementations
-
-Diamond iO and AKY24 iO were removed from this branch as part of the migration to a
-DSL-based design. The disabled AKY24 functional-encryption implementation was also removed.
-The latest implementations of Diamond iO and AKY24 iO remain on the
-[`main` branch](https://github.com/MachinaIO/mxx/tree/main):
-[Diamond iO](https://github.com/MachinaIO/mxx/blob/main/src/io/diamond_io.rs) and
-[AKY24 iO](https://github.com/MachinaIO/mxx/blob/main/src/io/aky24_io.rs).
-For a fixed reference, `main` pointed to
-[`d5d6fba26f1d20f11d4648a3fd1c9b35241ff4a9`](https://github.com/MachinaIO/mxx/tree/d5d6fba26f1d20f11d4648a3fd1c9b35241ff4a9)
-when this removal was made. Diamond WE remains available in this branch.
-
-## Requirements
+## Requirements and building
 
 - Rust with edition 2024 support.
 - OpenFHE and OpenMP.
-- CUDA toolkit for the optional `gpu` feature.
+- CUDA toolkit for the optional `gpu` feature (`CUDA_ARCH` defaults to `89`).
 
-Rust formatting uses `cargo +nightly fmt --all`.
+```sh
+cargo test -r --workspace --lib
+cargo test -r --workspace --lib --features gpu
+```

@@ -413,9 +413,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        let validated = built.validate(&ParamEnv::default()).unwrap();
         let nodes =
             validated.source.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
         assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::PreimageSample { .. })));
@@ -447,9 +445,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let validated = graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        let validated = graph.validate(&ParamEnv::default()).unwrap();
         assert!(
             validated
                 .source

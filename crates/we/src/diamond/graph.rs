@@ -989,7 +989,7 @@ mod tests {
         let encryption = compiler.build_encryption().unwrap().graph;
         let bindings = compiler.circuit_bindings().unwrap();
         let validated = encryption
-            .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&bindings)
             .unwrap();
         let output_type = |name: &str| {
             let wire = encryption.graph.outputs()[name].value;
@@ -1077,9 +1077,7 @@ mod tests {
         let validated_decryption = decryption
             .validate_with_manifests(
                 &bindings,
-                &BTreeMap::from([(production, manifest)]),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                &BTreeMap::from([(production, manifest)]))
             .unwrap();
         let decryption_nodes = validated_decryption
             .source
@@ -1149,7 +1147,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
         let mut store = MemoryArtifactStore::default();
@@ -1190,9 +1188,7 @@ mod tests {
         let execute_with = |bindings: &ParamEnv| {
             let validated = mxx_ir_core::validate(
                 predicate.graph(),
-                bindings,
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+                bindings)
             .unwrap();
             let result = execute(
                 &validated,

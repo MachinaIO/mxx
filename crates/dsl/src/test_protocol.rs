@@ -175,8 +175,7 @@ mod tests {
             ..ParamEnv::default()
         };
         let production = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-        let producer =
-            validate(&declaration.stages()[0].graph, &bindings, crate::test_resolve_basis).unwrap();
+        let producer = validate(&declaration.stages()[0].graph, &bindings).unwrap();
         let manifest = export_validated_manifest(production.clone(), &producer).unwrap();
         let manifests = BTreeMap::from([(production, manifest)]);
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -205,7 +204,6 @@ mod tests {
             &semantics,
             &manifests,
             &directory,
-            crate::test_resolve_basis,
         )
         .expect("generic export accepts the validated threshold decoder");
 
@@ -350,7 +348,7 @@ mod tests {
             integers: BTreeMap::from([("plaintext_modulus".into(), 3.into())]),
             ..ParamEnv::default()
         };
-        let validated = graph.validate(&bindings, crate::test_resolve_basis).unwrap();
+        let validated = graph.validate(&bindings).unwrap();
         let artifact = export(
             &validated,
             &ExportOptions {

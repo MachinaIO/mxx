@@ -2605,7 +2605,7 @@ mod tests {
             crt_moduli: vec![mxx_ir_core::IntExpr::constant(prime)],
             ring_dimension,
         })
-        .resolve(&mxx_ir_core::ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+        .resolve(&mxx_ir_core::ParamEnv::default())
         .expect("artifact test uses a valid explicit CRT ring");
         ConcreteMatrixType { ring, rows, columns }
     }

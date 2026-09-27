@@ -689,12 +689,8 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
-        graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

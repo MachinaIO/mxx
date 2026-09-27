@@ -1124,9 +1124,7 @@ mod tests {
             .expect("output")
             .build()
             .expect("build");
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("validation");
+        built.validate(&ParamEnv::default()).expect("validation");
     }
 
     #[test]
@@ -1184,9 +1182,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(calls, vec![&bounds, &bounds, &bounds]);
-        graph
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("validation");
+        graph.validate(&ParamEnv::default()).expect("validation");
     }
 
     #[test]

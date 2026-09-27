@@ -156,7 +156,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let values = [2usize, 3, 5, 7].map(|value| {
             DCRTPolyMatrix::from_poly_vec_row(

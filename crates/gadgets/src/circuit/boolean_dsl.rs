@@ -384,12 +384,7 @@ mod tests {
         inputs: BTreeMap<String, RuntimeValue>,
         output: &str,
     ) -> bool {
-        let validated = mxx_ir_core::validate(
-            predicate.graph(),
-            bindings,
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .unwrap();
+        let validated = mxx_ir_core::validate(predicate.graph(), bindings).unwrap();
         let result = execute(
             &validated,
             &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
@@ -414,7 +409,7 @@ mod tests {
         let output = evaluate_boolean_family(&params, circuit.clone(), inputs).unwrap();
         let selected = select_boolean_output(&circuit, &output);
         let graph = context.output("result", selected).unwrap().build().unwrap();
-        graph.validate(&bindings(), mxx_backends::openfhe_guard::gen_modulus_and_warmup).unwrap();
+        graph.validate(&bindings()).unwrap();
 
         assert_eq!(
             graph
@@ -451,36 +446,16 @@ mod tests {
         let satisfaction =
             boolean_circuit_satisfaction_predicate(DslContext::new("symbolic-satisfaction"))
                 .unwrap();
-        mxx_ir_core::validate(
-            validity.graph(),
-            &bindings(),
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .unwrap();
-        mxx_ir_core::validate(
-            satisfaction.graph(),
-            &bindings(),
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .unwrap();
+        mxx_ir_core::validate(validity.graph(), &bindings()).unwrap();
+        mxx_ir_core::validate(satisfaction.graph(), &bindings()).unwrap();
 
         let mut second = bindings();
         second.integers.insert(BooleanCircuitFamilyParams::DEPTH_PARAMETER.to_owned(), 4.into());
         second
             .integers
             .insert(BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER.to_owned(), 5.into());
-        mxx_ir_core::validate(
-            validity.graph(),
-            &second,
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .unwrap();
-        mxx_ir_core::validate(
-            satisfaction.graph(),
-            &second,
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
-        .unwrap();
+        mxx_ir_core::validate(validity.graph(), &second).unwrap();
+        mxx_ir_core::validate(satisfaction.graph(), &second).unwrap();
     }
 
     #[test]

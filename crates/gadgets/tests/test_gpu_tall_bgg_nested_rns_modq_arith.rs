@@ -821,9 +821,8 @@ fn prepare_candidate(
     let bindings = ParamEnv::default();
     let preprocessing_validate_started = Instant::now();
     log_graph_phase("preprocessing_validate", "start", None);
-    let validated_preprocessing = preprocessing
-        .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-        .map_err(|error| error.to_string())?;
+    let validated_preprocessing =
+        preprocessing.validate(&bindings).map_err(|error| error.to_string())?;
     log_graph_phase("preprocessing_validate", "end", Some(&preprocessing_validate_started));
 
     let spec_hash_started = Instant::now();
@@ -1705,10 +1704,8 @@ fn end_to_end_processing(
         let mut hash_key = [0u8; 32];
         rand::rng().fill(&mut hash_key);
         let started = Instant::now();
-        let preprocessing = selected
-            .preprocessing
-            .validate(&bindings, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .map_err(|error| error.to_string())?;
+        let preprocessing =
+            selected.preprocessing.validate(&bindings).map_err(|error| error.to_string())?;
         info!(elapsed = ?started.elapsed(), "timed preprocessing graph validation");
 
         let mut preprocessing_store = MemoryArtifactStore::default();
@@ -1807,11 +1804,7 @@ fn end_to_end_processing(
     let encoding_pass_started = Instant::now();
     let started = Instant::now();
     let encoding_graph = encoding_graph_source
-        .validate_with_manifests(
-            &bindings,
-            &manifests,
-            mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-        )
+        .validate_with_manifests(&bindings, &manifests)
         .map_err(|error| error.to_string())?;
     info!(elapsed = ?started.elapsed(), "timed Tall encoding graph validation");
     let input_started = Instant::now();

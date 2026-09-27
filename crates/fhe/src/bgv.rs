@@ -1069,7 +1069,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&env, mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&env)
             .unwrap();
         let mut message = vec![0i64; n];
         message[0] = 3;
@@ -1122,11 +1122,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate_with_manifests(
-                &env,
-                &manifests,
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+            .validate_with_manifests(&env, &manifests)
             .unwrap();
         // The evaluator imports only the ciphertext and public evaluation key.
         let evaluation = execute(
@@ -1174,11 +1170,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate_with_manifests(
-                &env,
-                &manifests,
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+            .validate_with_manifests(&env, &manifests)
             .unwrap();
         let mut result = execute(
             &decryption,
@@ -1205,11 +1197,7 @@ mod tests {
                 .unwrap()
                 .build()
                 .unwrap()
-                .validate_with_manifests(
-                    &env,
-                    &manifests,
-                    mxx_backends::openfhe_guard::gen_modulus_and_warmup
-                )
+                .validate_with_manifests(&env, &manifests)
                 .is_err()
         );
     }
@@ -1653,7 +1641,7 @@ mod benchmarks {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let mut backend = cpu_backend(bgv.runtime_parameters().unwrap());
         let mut store = MemoryArtifactStore::default();
@@ -1678,7 +1666,7 @@ mod benchmarks {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let repeats =
             std::env::var("FHE_BENCH_REPEATS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);

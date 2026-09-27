@@ -57,9 +57,7 @@ impl PolyMatrix {
                 .collect(),
             ring_dimension: params.ring_dimension(),
         })
-        .resolve(&ParamEnv::default(), |_, _, _, basis| {
-            basis.ok_or_else(|| "trusted CPU matrix has no explicit CRT basis".into())
-        })
+        .resolve(&ParamEnv::default())
         .expect("CPU matrix parameters carry a validated CRT basis");
         let (rows, columns) = value.size();
         let matrix = ConcreteMatrixType { ring, rows, columns };

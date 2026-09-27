@@ -1,5 +1,5 @@
 use crate::{
-    Graph, IntExpr, ParamEnv, RealExpr, ResolveCrtBasis, ValidationError, WireType,
+    Graph, IntExpr, ParamEnv, RealExpr, ValidationError, WireType,
     expr::ExprError,
     node::{ConcatAxis, NodeKind},
     types::MatrixType,
@@ -26,30 +26,8 @@ pub enum ParamConstraint {
 
 impl ParamConstraint {
     pub fn evaluate(&self, env: &ParamEnv) -> Result<bool, ExprError> {
-        self.evaluate_internal(env, None)
-    }
-
-    pub fn evaluate_with_rings(
-        &self,
-        env: &ParamEnv,
-        resolve_basis: ResolveCrtBasis,
-    ) -> Result<bool, ExprError> {
-        self.evaluate_internal(env, Some(resolve_basis))
-    }
-
-    fn evaluate_internal(
-        &self,
-        env: &ParamEnv,
-        resolve_basis: Option<ResolveCrtBasis>,
-    ) -> Result<bool, ExprError> {
-        let int = |value: &IntExpr| match resolve_basis {
-            Some(resolve_basis) => value.evaluate_with_rings(env, resolve_basis),
-            None => value.evaluate(env),
-        };
-        let real = |value: &RealExpr| match resolve_basis {
-            Some(resolve_basis) => value.evaluate_f64_with_rings(env, resolve_basis),
-            None => value.evaluate_f64(env),
-        };
+        let int = |value: &IntExpr| value.evaluate(env);
+        let real = |value: &RealExpr| value.evaluate_f64(env);
         Ok(match self {
             Self::IntPositive { value, .. } => int(value)? > BigInt::zero(),
             Self::IntNonnegative { value, .. } => int(value)? >= BigInt::zero(),
@@ -267,10 +245,9 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
 pub(crate) fn evaluate_param_constraints(
     graph: &Graph,
     env: &ParamEnv,
-    resolve_basis: ResolveCrtBasis,
 ) -> Result<(), ValidationError> {
     for constraint in derive_param_constraints(graph)? {
-        if !constraint.evaluate_with_rings(env, resolve_basis)? {
+        if !constraint.evaluate(env)? {
             return Err(ValidationError::ParameterConstraint(constraint.label().to_owned()));
         }
     }

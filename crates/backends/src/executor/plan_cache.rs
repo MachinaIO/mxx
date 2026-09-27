@@ -83,7 +83,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
         let initial = get(&graph, RootBlockAliases::default);
         assert!(Arc::ptr_eq(&initial, &get(&graph, RootBlockAliases::default)));

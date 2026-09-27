@@ -27,7 +27,7 @@ pub use graph::{
     SourceLocation, SubgraphHandle, ValueHandle, current_construction_scope, with_benchmark_role,
     with_new_construction_scope,
 };
-pub use ring::{ConcreteRing, ResolveCrtBasis, RingExpr, RingRef};
+pub use ring::{ConcreteRing, RingExpr, RingRef, generate_crt_basis};
 pub use types::{NodeId, Port, WireRef, WireType};
 pub use validate::{
     IntoValidatedGraph, LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError,

@@ -181,9 +181,7 @@ mod graph_tests {
                 .expect("unique output");
         }
         let built = context.build().expect("build merge Graph IR");
-        let validated = built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid merge Graph IR");
+        let validated = built.validate(&ParamEnv::default()).expect("valid merge Graph IR");
         let input_values = (0..6)
             .map(|index| {
                 DCRTPolyMatrix::from_poly_vec_row(

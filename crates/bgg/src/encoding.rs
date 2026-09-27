@@ -442,9 +442,7 @@ mod tests {
         );
         assert!(!kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixScale { .. })));
 
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid executable graph");
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
 
     #[test]
@@ -537,9 +535,7 @@ mod tests {
             1,
             "only the vector-side cached action is emitted; G*K_out stays lazy"
         );
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid cached graph");
+        built.validate(&ParamEnv::default()).expect("valid cached graph");
     }
 
     #[test]
@@ -665,9 +661,7 @@ mod tests {
         assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
         assert_eq!(gaussian_types.len(), 1, "one packed error sample");
         assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid executable graph");
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
     #[test]
     fn payload_secret_none_reuses_the_mask_secret() {

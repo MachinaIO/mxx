@@ -925,10 +925,7 @@ mod tests {
             "[0, 7) + [0, 4) has exclusive upper bound 10"
         );
         let modulus = IntExpr::RingModulus(left.rows.element_type().ring.clone())
-            .evaluate_with_rings(
-                &ParamEnv::default(),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
-            )
+            .evaluate(&ParamEnv::default())
             .expect("test ring has a concrete modulus");
         let mut wrapping_left = left.clone();
         wrapping_left.canonical_input_exclusive_upper = modulus.to_biguint();
@@ -1278,9 +1275,7 @@ mod tests {
                 .expect("family output");
         }
         let built = context.build().expect("build blockwise sampler graph");
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid blockwise sampler graph");
+        built.validate(&ParamEnv::default()).expect("valid blockwise sampler graph");
         let nodes =
             built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::Concat { .. })));
@@ -1372,7 +1367,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
     }
 
@@ -1428,9 +1423,7 @@ mod tests {
             }
         }
         let built = context.build().expect("build formula graph");
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid formula graph");
+        built.validate(&ParamEnv::default()).expect("valid formula graph");
 
         let public_values = (0..3)
             .map(|block| public_matrix(&parameters, secret_size, columns, 3 + block * 7))
@@ -1516,9 +1509,7 @@ mod tests {
             .expect("family output")
             .build()
             .expect("build single-block sampler graph");
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid single-block sampler graph");
+        built.validate(&ParamEnv::default()).expect("valid single-block sampler graph");
         assert!(
             !built
                 .graph
@@ -1575,7 +1566,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
+            .validate(&ParamEnv::default())
             .unwrap();
 
         let hash_key = [0x42; 32];
@@ -1629,7 +1620,6 @@ mod tests {
             .validate_with_manifests(
                 &ParamEnv::default(),
                 &BTreeMap::from([(production_id, manifest)]),
-                mxx_backends::openfhe_guard::gen_modulus_and_warmup,
             )
             .unwrap();
         let secret_rows_values =
@@ -1816,9 +1806,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid generated rotation graph");
+        built.validate(&ParamEnv::default()).expect("valid generated rotation graph");
 
         let nodes =
             built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
@@ -1910,9 +1898,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        built
-            .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-            .expect("valid executable graph");
+        built.validate(&ParamEnv::default()).expect("valid executable graph");
         assert_eq!(
             output.pubkey.matrix.matrix_type(),
             public_output.matrix.matrix_type(),
@@ -2025,9 +2011,7 @@ mod tests {
         let small = build(8, 4);
         let large = build(1 << 16, 4);
         for graph in [&small, &large] {
-            graph
-                .validate(&ParamEnv::default(), mxx_backends::openfhe_guard::gen_modulus_and_warmup)
-                .expect("valid compact Tall graph");
+            graph.validate(&ParamEnv::default()).expect("valid compact Tall graph");
             let nodes =
                 graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
             assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::FamilyPack { .. })));

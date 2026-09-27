@@ -32,17 +32,17 @@ fn rlwe_program(ring_dimension: u32) -> Result<BuiltGraph, DslError> {
 
     // Inputs supplied at run time: a 32-byte public seed and the message bit (0 or 1).
     let seed = ring.bytes_input("seed", 32);
-    let bit: Int = context.input("bit", IntType)?;
+    let message: Int = context.input("message", IntType)?;
 
     // The public element a is derived from the seed, so another party can recompute it.
     let a = ring.hash_matrix(seed, HashTag::from(b"rlwe-example/a".as_slice()), (1, 1));
     let s = ring.gaussian((1, 1), sigma.clone(), cutoff.clone());
     let e = ring.gaussian((1, 1), sigma, cutoff);
 
-    // Encrypt the bit as the constant term: b = a*s + e + floor(Q/2) * bit.
+    // Encrypt the message as the constant term: b = a*s + e + floor(Q/2) * message.
     let delta = ring.polynomial([ring.modulus().floor_div(2)]);
-    let message = bit.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
-    let b = &a * &s + e + &delta * &message;
+    let plaintext = message.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
+    let b = &a * &s + e + &delta * &plaintext;
 
     // Decrypt: round the constant term of b - a*s to the nearest multiple of Q/2.
     let decrypted = (b.clone() - &a * &s).threshold_decode_bools(2, 1).remove(0);
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inputs = |seed: u8, bit: bool| {
         BTreeMap::from([
             ("seed".to_owned(), RuntimeValue::Bytes(Arc::from([seed; 32]))),
-            ("bit".to_owned(), RuntimeValue::Int(BigInt::from(bit))),
+            ("message".to_owned(), RuntimeValue::Int(BigInt::from(bit))),
         ])
     };
 

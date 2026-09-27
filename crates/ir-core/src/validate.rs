@@ -473,7 +473,7 @@ fn validate_with_manifests_inner(
     })
 }
 
-fn collect_scope_bindings(
+pub(crate) fn collect_scope_bindings(
     graph: &Graph,
     scope_id: &FrozenGraphScopeId,
     env: ParamEnv,

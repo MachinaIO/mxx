@@ -467,6 +467,101 @@ fn run_trial_regions(
     Ok(seconds)
 }
 
+/// Divide each production region's measured time (`production_regions`,
+/// start operation and seconds) among the node ranges `spans` recorded while
+/// lowering, from the separately measured `segments` of a frame split at
+/// every range boundary.
+fn attribute_node_costs(
+    spans: Vec<(FrozenGraphScopeId, NodeId, std::ops::Range<u32>)>,
+    segments: &[(u32, f64)],
+    production_regions: &[(u32, f64)],
+) -> Result<Vec<NodeCost>, String> {
+    // The selected candidate lowered the same plan, so each of its region
+    // starts is also a segment start.
+    if production_regions
+        .iter()
+        .any(|(start, _)| segments.binary_search_by_key(start, |(start, _)| *start).is_err())
+    {
+        return Err("profiled frame does not refine the measured Graph regions".into());
+    }
+    let production_of = |start: u32| {
+        production_regions.partition_point(|(region_start, _)| *region_start <= start) - 1
+    };
+    // A production region launches and joins once; each of its segments
+    // pays that cost again.
+    let overhead = production_regions
+        .iter()
+        .enumerate()
+        .map(|(region, &(_, measured))| {
+            per_launch_overhead(
+                segments
+                    .iter()
+                    .filter(|(start, _)| production_of(*start) == region)
+                    .map(|(_, seconds)| *seconds)
+                    .collect(),
+                measured,
+            )
+        })
+        .collect::<Vec<_>>();
+    let own = |start: u32, seconds: f64| (seconds - overhead[production_of(start)]).max(0.0);
+    let mut profiled = vec![0.0; production_regions.len()];
+    for &(start, seconds) in segments {
+        profiled[production_of(start)] += own(start, seconds);
+    }
+    // Node ranges nest, so after sorting outer ranges first the ranges
+    // open at a segment start form a stack whose top is the innermost. A
+    // node is recorded after the body nodes it encloses, so of equal
+    // ranges the later recorded one is outer.
+    let mut spans = spans.into_iter().enumerate().collect::<Vec<_>>();
+    spans.sort_by_key(|(recorded, (_, _, range))| {
+        (range.start, std::cmp::Reverse(range.end), std::cmp::Reverse(*recorded))
+    });
+    let spans = spans.into_iter().map(|(_, span)| span).collect::<Vec<_>>();
+    let mut costs = BTreeMap::<(FrozenGraphScopeId, NodeId), (f64, f64)>::new();
+    let mut open = Vec::<usize>::new();
+    let mut next_span = 0;
+    for &(start, seconds) in segments {
+        let region = production_of(start);
+        let predicted = if profiled[region] > 0.0 {
+            own(start, seconds) * production_regions[region].1 / profiled[region]
+        } else {
+            0.0
+        };
+        open.retain(|&span| spans[span].2.end > start);
+        while spans.get(next_span).is_some_and(|(_, _, range)| range.start <= start) {
+            if spans[next_span].2.end > start {
+                open.push(next_span);
+            }
+            next_span += 1;
+        }
+        for (depth, &span) in open.iter().enumerate() {
+            let (scope, node, _) = &spans[span];
+            // A node appears once per segment in its inclusive total.
+            if open[..depth]
+                .iter()
+                .any(|&outer| &spans[outer].0 == scope && spans[outer].1 == *node)
+            {
+                continue;
+            }
+            let cost = costs.entry((scope.clone(), *node)).or_default();
+            cost.1 += predicted;
+        }
+        if let Some(&innermost) = open.last() {
+            let (scope, node, _) = &spans[innermost];
+            costs.get_mut(&(scope.clone(), *node)).expect("open node has a cost").0 += predicted;
+        }
+    }
+    Ok(costs
+        .into_iter()
+        .map(|((scope, node), (self_seconds, total_seconds))| NodeCost {
+            scope,
+            node,
+            self_seconds,
+            total_seconds,
+        })
+        .collect())
+}
+
 /// The fixed cost each separately launched segment of a region pays: the
 /// `overhead` that leaves `sum(max(segment - overhead, 0))` equal to the
 /// region's `measured` time, or zero when the segments sum to less.
@@ -2178,7 +2273,7 @@ impl GpuRuntime {
         validate_allocated_budget(&frame, contract, None)?;
         wait_for_bound_inputs(&frame).map_err(GpuPlanError::Measurement)?;
         frame.bind_return_outputs(&self.backend).map_err(GpuPlanError::Resource)?;
-        let mut spans = std::mem::take(&mut frame.node_operations);
+        let spans = std::mem::take(&mut frame.node_operations);
         let boundaries = spans
             .iter()
             .flat_map(|(_, _, range)| [range.start as usize, range.end as usize])
@@ -2187,87 +2282,8 @@ impl GpuRuntime {
         validate_allocated_budget(&frame, contract, Some(&graph))?;
         graph.bind(&frame).map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
         let segments = self.measure_regions(&frame, &mut graph)?;
-        // The selected candidate lowered the same plan, so each of its region
-        // starts is also a segment start.
-        if production_regions
-            .iter()
-            .any(|(start, _)| segments.binary_search_by_key(start, |(start, _)| *start).is_err())
-        {
-            return Err(GpuPlanError::Measurement(
-                "profiled frame does not refine the measured Graph regions".into(),
-            ));
-        }
-        let production_of = |start: u32| {
-            production_regions.partition_point(|(region_start, _)| *region_start <= start) - 1
-        };
-        // A production region launches and joins once; each of its segments
-        // pays that cost again.
-        let overhead = production_regions
-            .iter()
-            .enumerate()
-            .map(|(region, &(_, measured))| {
-                per_launch_overhead(
-                    segments
-                        .iter()
-                        .filter(|(start, _)| production_of(*start) == region)
-                        .map(|(_, seconds)| *seconds)
-                        .collect(),
-                    measured,
-                )
-            })
-            .collect::<Vec<_>>();
-        let own = |start: u32, seconds: f64| (seconds - overhead[production_of(start)]).max(0.0);
-        let mut profiled = vec![0.0; production_regions.len()];
-        for &(start, seconds) in &segments {
-            profiled[production_of(start)] += own(start, seconds);
-        }
-        // Node ranges nest, so after sorting outer ranges first the ranges
-        // open at a segment start form a stack whose top is the innermost.
-        spans.sort_by_key(|(_, _, range)| (range.start, std::cmp::Reverse(range.end)));
-        let mut costs = BTreeMap::<(FrozenGraphScopeId, NodeId), (f64, f64)>::new();
-        let mut open = Vec::<usize>::new();
-        let mut next_span = 0;
-        for &(start, seconds) in &segments {
-            let region = production_of(start);
-            let predicted = if profiled[region] > 0.0 {
-                own(start, seconds) * production_regions[region].1 / profiled[region]
-            } else {
-                0.0
-            };
-            open.retain(|&span| spans[span].2.end > start);
-            while spans.get(next_span).is_some_and(|(_, _, range)| range.start <= start) {
-                if spans[next_span].2.end > start {
-                    open.push(next_span);
-                }
-                next_span += 1;
-            }
-            for (depth, &span) in open.iter().enumerate() {
-                let (scope, node, _) = &spans[span];
-                // A node appears once per segment in its inclusive total.
-                if open[..depth]
-                    .iter()
-                    .any(|&outer| &spans[outer].0 == scope && spans[outer].1 == *node)
-                {
-                    continue;
-                }
-                let cost = costs.entry((scope.clone(), *node)).or_default();
-                cost.1 += predicted;
-            }
-            if let Some(&innermost) = open.last() {
-                let (scope, node, _) = &spans[innermost];
-                costs.get_mut(&(scope.clone(), *node)).expect("open node has a cost").0 +=
-                    predicted;
-            }
-        }
-        Ok(costs
-            .into_iter()
-            .map(|((scope, node), (self_seconds, total_seconds))| NodeCost {
-                scope,
-                node,
-                self_seconds,
-                total_seconds,
-            })
-            .collect())
+        attribute_node_costs(spans, &segments, production_regions)
+            .map_err(GpuPlanError::Measurement)
     }
 
     fn plan_with_payload_sizes(
@@ -3378,7 +3394,35 @@ fn artifact_payload_kind(artifact: &ArtifactType) -> u8 {
 
 #[cfg(test)]
 mod candidate_tests {
-    use super::{geometric_candidates, per_launch_overhead};
+    use super::{attribute_node_costs, geometric_candidates, per_launch_overhead};
+    use mxx_ir_core::{FrozenGraphScopeId, NodeId};
+
+    #[test]
+    fn attribute_node_costs_gives_equal_ranges_to_the_innermost_node() {
+        let body = FrozenGraphScopeId::Subgraph { canonical_name: "body".into() };
+        let root = FrozenGraphScopeId::Root;
+        // A call whose only operations come from one body node is recorded
+        // after it with the same range.
+        let spans = vec![
+            (body.clone(), NodeId(0), 0..2),
+            (root.clone(), NodeId(1), 0..2),
+            (root.clone(), NodeId(2), 2..3),
+        ];
+        // One production region of 2 s, profiled as 3 s and 1.5 s: each
+        // launch pays 1.25 s, leaving 1.75 s and 0.25 s.
+        let costs = attribute_node_costs(spans, &[(0, 3.0), (2, 1.5)], &[(0, 2.0)]).unwrap();
+        let cost = |scope: &FrozenGraphScopeId, node| {
+            let cost = costs.iter().find(|cost| &cost.scope == scope && cost.node == node).unwrap();
+            (cost.self_seconds, cost.total_seconds)
+        };
+        let close = |(left, right): (f64, f64), (expected_left, expected_right): (f64, f64)| {
+            (left - expected_left).abs() < 1e-12 && (right - expected_right).abs() < 1e-12
+        };
+        assert!(close(cost(&body, NodeId(0)), (1.75, 1.75)));
+        assert!(close(cost(&root, NodeId(1)), (0.0, 1.75)));
+        assert!(close(cost(&root, NodeId(2)), (0.25, 0.25)));
+        assert!(attribute_node_costs(Vec::new(), &[(1, 1.0)], &[(0, 1.0)]).is_err());
+    }
 
     #[test]
     fn per_launch_overhead_leaves_the_measured_region_time() {

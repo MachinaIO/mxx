@@ -8,7 +8,7 @@
 //! the bottlenecks. The page has no external dependencies.
 
 use crate::{
-    ValidatedGraph,
+    ParamEnv, ValidatedGraph, concretize_wire_type,
     expr::IntExpr,
     graph::{FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
     node::NodeKind,
@@ -17,7 +17,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const TEMPLATE: &str = include_str!("visualize.html");
 const DATA_PLACEHOLDER: &str = "/*GRAPH_DATA*/null";
@@ -60,12 +60,25 @@ fn graph_data(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    // Every binding each scope is instantiated with: a named subgraph has one
+    // per distinct call binding. A validated graph already checked them all.
+    let scope_envs = validated.map(|validated| {
+        let mut envs = BTreeMap::new();
+        crate::validate::collect_scope_bindings(
+            graph,
+            &FrozenGraphScopeId::Root,
+            validated.bindings.clone(),
+            &mut envs,
+        )
+        .expect("a validated graph has scope bindings");
+        envs
+    });
     let scopes = graph
         .scopes()
         .iter()
         .map(|(id, scope)| {
             let key = scope_key(id);
-            let wire_types = validated.and_then(|validated| validated.scope(id));
+            let envs = scope_envs.as_ref().and_then(|envs| envs.get(id)).map(Vec::as_slice);
             let nodes = scope
                 .nodes()
                 .iter()
@@ -73,7 +86,7 @@ fn graph_data(
                 .map(|(index, node)| {
                     let node_id = NodeId(index as u64);
                     let cost = cost_of.get(&(key.clone(), node_id));
-                    node_data(graph, scope, id, node_id, node, validated, wire_types, cost)
+                    node_data(graph, scope, id, node_id, node, envs, cost)
                 })
                 .collect::<Vec<_>>();
             let outputs = if *id == FrozenGraphScopeId::Root {
@@ -127,21 +140,20 @@ fn output_data(name: &str, wire: WireRef) -> Value {
     json!({ "name": name, "node": wire.node.0, "port": wire.port.0 })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn node_data(
     graph: &Graph,
     scope: &GraphScope,
     scope_id: &FrozenGraphScopeId,
     node_id: NodeId,
     node: &NodeHandle,
-    validated: Option<&ValidatedGraph>,
-    wire_types: Option<&crate::ValidatedScope>,
+    envs: Option<&[ParamEnv]>,
     cost: Option<&&NodeCost>,
 ) -> Value {
     let wire_type = |wire: WireRef, symbolic: &WireType| {
-        wire_types
-            .and_then(|scope| scope.wire_types.get(&wire))
-            .map_or_else(|| symbolic_type(symbolic), concrete_type)
+        envs.map_or_else(
+            || symbolic_type(symbolic),
+            |envs| instantiated_type(symbolic, envs, scope_id, wire.node),
+        )
     };
     let inputs = node
         .arguments()
@@ -173,7 +185,7 @@ fn node_data(
     };
     json!({
         "id": node_id.0,
-        "label": node_label(node.kind(), validated),
+        "label": node_label(node.kind(), envs),
         "kind": kind_name(node.kind()),
         "detail": detail,
         "inputs": inputs,
@@ -192,11 +204,19 @@ fn kind_name(kind: &NodeKind) -> String {
     debug.split(['(', ' ', '{']).next().unwrap_or_default().to_owned()
 }
 
-fn node_label(kind: &NodeKind, validated: Option<&ValidatedGraph>) -> String {
+fn node_label(kind: &NodeKind, envs: Option<&[ParamEnv]>) -> String {
+    // A count is shown as a number only when every instantiation agrees.
     let count = |count: &IntExpr| {
-        validated
-            .and_then(|validated| count.evaluate(&validated.bindings).ok())
-            .map_or_else(|| int_expr(count), |count| count.to_string())
+        let values = envs
+            .unwrap_or_default()
+            .iter()
+            .map(|env| count.evaluate(env).ok())
+            .collect::<Option<BTreeSet<_>>>()
+            .unwrap_or_default();
+        match (values.len(), values.first()) {
+            (1, Some(value)) => value.to_string(),
+            _ => int_expr(count),
+        }
     };
     match kind {
         NodeKind::Input { name, .. } => format!("Input {name}"),
@@ -241,6 +261,55 @@ fn scope_parent(id: &FrozenGraphScopeId) -> Option<FrozenGraphScopeId> {
         FrozenGraphScopeId::ParallelBody { parent, .. } |
         FrozenGraphScopeId::SequentialBody { parent, .. } => Some(parent.as_ref().clone()),
         FrozenGraphScopeId::Root | FrozenGraphScopeId::Subgraph { .. } => None,
+    }
+}
+
+/// The concrete type of a wire when every instantiation of its scope gives the
+/// same one. Validation resolves a loop body at index zero, so a type that
+/// depends on the loop index stays symbolic, as does one that differs between
+/// the calls of a named subgraph.
+fn instantiated_type(
+    symbolic: &WireType,
+    envs: &[ParamEnv],
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+) -> String {
+    if uses_loop_index(symbolic) {
+        return format!("{} (depends on the loop index)", symbolic_type(symbolic));
+    }
+    let concrete = envs
+        .iter()
+        .map(|env| concretize_wire_type(symbolic, env, scope, node).ok())
+        .collect::<Option<BTreeSet<_>>>()
+        .unwrap_or_default();
+    match (concrete.len(), concrete.first()) {
+        (1, Some(ty)) => concrete_type(ty),
+        (0, _) => symbolic_type(symbolic),
+        (count, _) => format!("{} ({count} shapes across calls)", symbolic_type(symbolic)),
+    }
+}
+
+/// Whether a shape shown by `symbolic_type` depends on a loop index.
+fn uses_loop_index(ty: &WireType) -> bool {
+    let matrix = |matrix: &MatrixType| {
+        matrix.rows.contains_loop_index() ||
+            matrix.columns.contains_loop_index() ||
+            matrix.ring.contains_loop_index()
+    };
+    match ty {
+        WireType::Matrix(value) => matrix(value),
+        WireType::Trapdoor { matrix: value, gadget_base, digit_count, .. } => {
+            matrix(value) || gadget_base.contains_loop_index() || digit_count.contains_loop_index()
+        }
+        WireType::SmallMatrix { matrix: value, max_coefficient_bound, .. } |
+        WireType::Preimage { matrix: value, max_coefficient_bound, .. } => {
+            matrix(value) || max_coefficient_bound.contains_loop_index()
+        }
+        WireType::IndexedFamily { element, count } => {
+            uses_loop_index(element) || count.contains_loop_index()
+        }
+        WireType::Bytes { length } => length.contains_loop_index(),
+        _ => false,
     }
 }
 
@@ -355,5 +424,39 @@ fn int_expr(expression: &IntExpr) -> String {
         IntExpr::RingCrtModulus { ring: value, index } => {
             format!("q[{}]({})", int_expr(index), ring(value))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::BigInt;
+
+    #[test]
+    fn test_instantiated_type_is_concrete_only_when_every_instantiation_agrees() {
+        let ring = RingRef::new(RingExpr::Explicit {
+            crt_moduli: vec![IntExpr::from(17)],
+            ring_dimension: 8,
+        });
+        let matrix = |rows: IntExpr| {
+            WireType::Matrix(MatrixType { ring: ring.clone(), rows, columns: IntExpr::from(1) })
+        };
+        let env = |rows: i64| ParamEnv {
+            integers: BTreeMap::from([("rows".to_owned(), BigInt::from(rows))]),
+            ..ParamEnv::default()
+        };
+        let by_parameter = matrix(IntExpr::Var("rows".into()));
+        let shown = |ty: &WireType, envs: &[ParamEnv]| {
+            instantiated_type(ty, envs, &FrozenGraphScopeId::Root, NodeId(0))
+        };
+        assert!(shown(&by_parameter, &[env(2), env(2)]).starts_with("Matrix 2×1 over N=8"));
+        assert_eq!(
+            shown(&by_parameter, &[env(2), env(3)]),
+            "Matrix rows×1 over N=8, 1 explicit CRT limbs (2 shapes across calls)"
+        );
+        assert!(
+            shown(&matrix(IntExpr::LoopIndex(0)), &[env(2)])
+                .ends_with("(depends on the loop index)")
+        );
     }
 }

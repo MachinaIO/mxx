@@ -21,7 +21,9 @@ pub struct GpuWarmupReport {
     pub stages: Vec<GpuStageReport>,
     pub reason: String,
     /// Each graph node's predicted seconds per execute, measured only when
-    /// `GpuRuntimeOptions::profile_nodes` is set; empty otherwise.
+    /// `GpuRuntimeOptions::profile_nodes` is set; empty otherwise, and in a
+    /// report saved before node costs existed.
+    #[serde(default)]
     pub node_costs: Vec<NodeCost>,
 }
 
@@ -41,5 +43,20 @@ impl GpuMeasuredCostCache {
 
     pub fn len(&self) -> usize {
         self.points.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GpuWarmupReport;
+
+    #[test]
+    fn a_report_saved_without_node_costs_still_loads() {
+        let report: GpuWarmupReport = serde_json::from_str(
+            r#"{"predicted_seconds":1.5,"limiting_stage":null,"stages":[],"reason":"saved"}"#,
+        )
+        .unwrap();
+        assert_eq!(report.predicted_seconds, 1.5);
+        assert!(report.node_costs.is_empty());
     }
 }

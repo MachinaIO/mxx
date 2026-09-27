@@ -134,6 +134,9 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
 
 ### Describing a protocol
 
+Every supported value type, primitive operation, and sampler is listed, with how to call it, in
+[`crates/dsl/SPEC.md`](crates/dsl/SPEC.md).
+
 - **Lattice objects as values.** You work with matrices of polynomials over RNS rings
   `Z_Q[X]/(X^N + 1)`, where Q is a product of word-sized primes. You also work with matrices of
   small (bounded) coefficients, lattice trapdoors and their preimages, integers, Booleans, byte
@@ -159,6 +162,9 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
   rings, and bounds under the chosen parameters.
 
 ### Running it on GPUs
+
+The API for running programs on the CPU and GPUs is described in
+[`crates/backends/SPEC.md`](crates/backends/SPEC.md).
 
 - **One description for CPU and GPU.** The same program runs both on the CPU and GPU, so there
   is no separate GPU implementation to keep in sync.

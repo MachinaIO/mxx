@@ -13,8 +13,6 @@
 //! - `naive_vec`, `slot_operation`: per-slot vectors, slot transfer, and rotation.
 //! - `tall_encoding`, `tall_rotation_encoding`: Tall encodings with one row per slot and their
 //!   linear-transform preprocessing.
-//! - `wee25_commitment`, `wee25_opening`, `wee25_public_parameters`: WEE25 commitments and public
-//!   parameters. The commitment-backed lookup evaluator is intentionally absent.
 
 pub mod boolean;
 pub mod circuit;
@@ -25,9 +23,6 @@ pub mod public_key;
 pub mod slot_operation;
 pub mod tall_encoding;
 pub mod tall_rotation_encoding;
-pub mod wee25_commitment;
-pub mod wee25_opening;
-pub mod wee25_public_parameters;
 
 pub(crate) fn static_ring_modulus(ring: &mxx_ir_core::RingRef) -> Option<num_bigint::BigUint> {
     use mxx_ir_core::{IntExpr, RingExpr};
@@ -40,7 +35,7 @@ pub(crate) fn static_ring_modulus(ring: &mxx_ir_core::RingRef) -> Option<num_big
 }
 
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;
 
 pub use boolean::{
     BggEncodingFamily, BggPublicKeyFamily, CircuitEncoding, CircuitEncodingType,
@@ -89,16 +84,3 @@ pub use tall_rotation_encoding::{
     TallRotationEncodingPreprocessingWires, required_tall_anchor_reduce_encoding,
     required_tall_rotation_encodings,
 };
-pub use wee25_commitment::{
-    Wee25CommitmentCompiler, Wee25CommitmentError, Wee25CommitmentTreeWire,
-};
-pub use wee25_opening::{
-    WEE25_COMMITMENT, WEE25_COMMITMENT_NODES, WEE25_PUBLIC_B, WEE25_T_BOTTOM, WEE25_T_TOP,
-    Wee25CommitmentArtifacts, Wee25PublicParameterArtifacts, Wee25PublicParameterWires,
-    Wee25VerificationWire,
-};
-pub use wee25_public_parameters::{
-    WEE25_PUBLIC_B_TRAPDOOR, Wee25PublicParameterCompiler, Wee25PublicParameterPreprocessingWires,
-};
-
-// The WEE25 commitment-backed lookup evaluator remains intentionally absent.

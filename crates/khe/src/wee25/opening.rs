@@ -1,6 +1,6 @@
 //! Standalone WEE25 opening and verification graphs.
 
-use crate::bgg::{Wee25CommitmentCompiler, Wee25CommitmentError};
+use crate::wee25::{Wee25CommitmentCompiler, Wee25CommitmentError};
 use mxx_dsl::{Family, Mat, Preimage};
 #[cfg(test)]
 use mxx_ir_core::types::CoefficientBoundDomain;
@@ -420,7 +420,7 @@ fn checked_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bgg::Wee25PublicParameterCompiler;
+    use crate::wee25::Wee25PublicParameterCompiler;
     use mxx_backends::{
         ExecutionConfig, RuntimeValue,
         artifact::MemoryArtifactStore,

@@ -1,6 +1,6 @@
 //! WEE25 public-parameter preprocessing expressed with the declarative DSL.
 
-use crate::bgg::{
+use crate::wee25::{
     WEE25_PUBLIC_B, WEE25_T_BOTTOM, Wee25CommitmentCompiler, Wee25CommitmentError,
     Wee25PublicParameterWires,
 };

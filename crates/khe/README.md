@@ -2,16 +2,17 @@
 
 `mxx-khe` implements key-homomorphic encodings with the mxx DSL. Its main scheme is BGG+:
 public keys and encodings, the evaluation of polynomial and Boolean circuits over them, lookup
-tables, slot operations, Tall encodings, and WEE25 commitments. It also holds what these
-encodings evaluate: scheme-independent circuit models, the framework that lowers a circuit to an
-encoding scheme, and reusable gadgets such as nested-RNS arithmetic, NTT circuits, and Ring-GSW.
-It depends on `mxx-dsl`, `mxx-ir-core`, and `mxx-backends`.
+tables, slot operations, and Tall encodings. The crate also holds what these encodings evaluate
+(scheme-independent circuit models, the framework that lowers a circuit to an encoding scheme,
+and reusable gadgets such as nested-RNS arithmetic, NTT circuits, and Ring-GSW) and WEE25
+commitments. It depends on `mxx-dsl`, `mxx-ir-core`, and `mxx-backends`.
 
 ## Contents
 
 | Module | What it provides |
 | --- | --- |
-| `bgg` | BGG+ public keys and encodings, circuit compilation into public-key and encoding graphs, Boolean circuit evaluation, LWE lookup tables, slot transfer, Tall encodings, and WEE25 commitments. |
+| `bgg` | BGG+ public keys and encodings, circuit compilation into public-key and encoding graphs, Boolean circuit evaluation, LWE lookup tables, slot transfer, and Tall encodings. |
+| `wee25` | WEE25 commitment trees, public-parameter preprocessing, and openings with their verification. |
 | `circuit` | Polynomial and Boolean circuits, public lookup programs, serialization, and the lowering traits an encoding scheme implements. |
 | `circuit_gadgets` | Modular and nested-RNS arithmetic, negacyclic convolution, NTT circuits, nested-RNS modulus switching, Ring-GSW, a Goldreich PRG, and secret inner products. |
 | `decoder` | Masked-decoder and PRG layout helpers. |

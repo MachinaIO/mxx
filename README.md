@@ -193,7 +193,7 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
 | [`mxx-ir-core`](crates/ir-core/README.md) | The executable graph IR: rings, compile expressions, validation, artifact manifests, protocol declarations, and Lean export. |
 | [`mxx-dsl`](crates/dsl/README.md) | The Rust-based DSL that builds graphs. |
 | [`mxx-backends`](crates/backends/README.md) | Polynomial and matrix arithmetic, samplers, the CPU executor, the GPU runtime and native CUDA, and artifacts. |
-| [`mxx-khe`](crates/khe/README.md) | Key-homomorphic encodings: BGG+ keys, encodings, circuit evaluation, lookups, slot transfer, and commitments, with the circuits and gadgets they evaluate. |
+| [`mxx-khe`](crates/khe/README.md) | Key-homomorphic encodings: BGG+ keys, encodings, circuit evaluation, lookups, and slot transfer, with the circuits and gadgets they evaluate, and WEE25 commitments. |
 | [`mxx-fhe`](crates/fhe/README.md) | TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and noise tracking. |
 | `mxx-we` | Diamond witness encryption. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces only; their implementations have been removed. |

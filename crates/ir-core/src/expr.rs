@@ -1,3 +1,18 @@
+//! Compile-time expressions and parameter bindings.
+//!
+//! [`IntExpr`] covers constants, named variables, loop indices, arithmetic, `Div` (exact: a nonzero
+//! remainder is an error), `FloorDiv`, `Rem` (floor remainder), `RoundDiv` (nearest, ties toward
+//! positive infinity), `Log2Ceil`, `Select`, and ring properties (`RingModulus`, `RingCrtDepth`,
+//! `RingCrtModulus`), which evaluation resolves itself. Serialization goes through a canonical
+//! polynomial normal form, so equivalent expressions encode identically.
+//!
+//! [`RealExpr`] is evaluated as an exact [`Rational`] where possible (`evaluate_rational`,
+//! `evaluate_f64`, `close`).
+//!
+//! [`ParamEnv`] binds named integer parameters, real parameters, and loop-index slots (managed by
+//! executors). Runtime integer division in a graph differs from `IntExpr` division: see
+//! `mxx_dsl::Int`.
+
 use crate::{
     ring::{RingRef, resolve_ring},
     serde_support,

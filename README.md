@@ -177,7 +177,7 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
   kernel for better performance, you write only that kernel. The rest of the protocol stays in the
   DSL, and the automatic tuning of parallelism and memory scheduling still applies around your
   kernel, so you do not reimplement it. TFHE blind rotation uses this option: see
-  [`TfheParams::gpu_blind_rotation_kernel`](crates/fhe/src/tfhe.rs#L1124).
+  [`TfheParams::gpu_blind_rotation_kernel`](crates/fhe/src/tfhe.rs#L1144).
 
 ### Protocols with multiple parties
 
@@ -186,21 +186,34 @@ of the same graph to Lean, for machine-checked correctness proofs, is a work in 
   stage is its own program. A stage can export its results, and another party's stage can
   import them as inputs, from memory or from disk, loading only the parts it uses.
 
-For the design in depth, including how the GPU runtime plans and runs a program and its current
-limitations, start with `docs/architecture.md`.
-
 ## Repository layout
 
 | Crate | Responsibility |
 | --- | --- |
-| `mxx-ir-core` | Executable graph IR, protocol declarations, validation, artifact manifests, and Lean claim generation. |
-| `mxx-dsl` | Typed graph construction and sampler-free ideal and predicate builders. |
-| `mxx-backends` | Polynomial and matrix operations, samplers, the CPU executor, the GPU runtime and native CUDA, transcripts, sessions, and artifacts. |
-| `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
-| `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
-| `mxx-fhe` | DSL-based TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and ciphertext noise tracking. |
-| `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
-| `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
+| [`mxx-ir-core`](crates/ir-core/README.md) | The executable graph IR: rings, compile expressions, validation, artifact manifests, protocol declarations, and Lean export. |
+| [`mxx-dsl`](crates/dsl/README.md) | The Rust-based DSL that builds graphs. |
+| [`mxx-backends`](crates/backends/README.md) | Polynomial and matrix arithmetic, samplers, the CPU executor, the GPU runtime and native CUDA, and artifacts. |
+| [`mxx-gadgets`](crates/gadgets/README.md) | BGG-independent circuits and reusable circuit gadgets. |
+| [`mxx-bgg`](crates/bgg/README.md) | BGG+ keys, encodings, circuit evaluation, lookups, slot transfer, and commitments. |
+| [`mxx-fhe`](crates/fhe/README.md) | TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and noise tracking. |
+| `mxx-we` | Diamond witness encryption. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
+| `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces only; their implementations have been removed. |
+
+Dependencies point downward, and application crates never depend on one another:
+
+```text
+mxx-ir-core   (no workspace crates)
+mxx-dsl       -> mxx-ir-core
+mxx-backends  -> mxx-ir-core
+mxx-gadgets   -> mxx-dsl, mxx-ir-core, mxx-backends
+mxx-bgg       -> mxx-ir-core, mxx-dsl, mxx-gadgets, mxx-backends
+mxx-fhe       -> mxx-dsl, mxx-ir-core, mxx-backends
+mxx-we        -> mxx-backends, mxx-gadgets, mxx-bgg, mxx-dsl, mxx-ir-core
+```
+
+Each crate's README introduces the crate. The API documentation, built with
+`cargo doc --workspace --no-deps --features gpu --open`, is the reference for details such as
+the GPU runtime's options and current limitations.
 
 ## Requirements and building
 

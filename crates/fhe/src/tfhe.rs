@@ -450,6 +450,26 @@ impl GraphValueSchema for TfheKeysSchema {
 /// and the ring dimension must be at least four for the signed NAND LUT;
 /// sample extraction performs rounded `Q -> q` modulus switching before the
 /// flat key switch.
+///
+/// TFHE with NAND bootstrapping.
+///
+/// [`TfheParams::new`] pairs integer LWE over a power-of-two modulus `q` with binary secrets and
+/// the CRT ring `R_Q` used for blind rotation; both Gaussian cutoffs must be at least 16 sigma. An
+/// [`LweCiphertext`] has phase `b - <a, s>` modulo `q` and encodes a bit as `+floor(q/8)` (true) or
+/// `-floor(q/8)` (false). `keygen(hash_key)` returns [`TfheKeys`]: the LWE and ring secrets, a
+/// [`BootstrappingKey`] of ring-GSW encryptions of each LWE secret coordinate, and a flat
+/// [`KeySwitchKey`] with base `2^b` and `d` digits, both set in `TfheParams::new`.
+///
+/// `encrypt`, `decrypt`, and `can_decrypt` work on single bits. `nand(lhs, rhs, ..)` forms
+/// `floor(q/8) - ct1 - ct2` and bootstraps it with a sign lookup table. `bootstrap` chains four
+/// public stages that can also be built as separate graphs: `pre_blind_rotation`,
+/// `blind_rotation` (one external product per LWE secret coordinate), `sample_extract` (with
+/// rounded `Q`-to-`q` modulus switching), and `key_switch`. On the GPU, the blind rotation runs as
+/// one native subgraph kernel (`TfheParams::gpu_blind_rotation_kernel`, under the `gpu` feature).
+///
+/// LWE `a` vectors are hash-derived with `DslContext::hash_int_family`, so every ciphertext and
+/// every `keygen` call needs a fresh 32-byte key from a CSPRNG; secrets and errors are independent
+/// samples.
 #[derive(Clone, Debug)]
 pub struct TfheParams {
     pub common: FheCommonParams,

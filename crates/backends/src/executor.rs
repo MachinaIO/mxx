@@ -1,3 +1,30 @@
+//! The CPU executor.
+//!
+//! [`execute`] runs a validated graph on a `CpuDcrtBackend`, which is constructed from the
+//! parameters of every ring the graph uses; a missing ring is an error. [`execute_in_session`]
+//! opens or resumes a durable session for `ProductionId(spec_hash, nonce)` bound to a digest of the
+//! inputs, [`execute_prepared`] uses a session only when the graph exports artifacts, and
+//! [`execute_with_trace`] also returns every intermediate value. The sampling mode is `Fresh`,
+//! `Record`, or `Replay` (see [`crate::transcript`]).
+//!
+//! The executor walks each scope's validated execution order, releasing values after their last
+//! use unless retained (trace mode retains everything). Subgraph calls and sequential loops
+//! instantiate their body scope with an extended instantiation path. A parallel loop runs in waves
+//! of at most [`ExecutionConfig::max_parallel_instances`] instances: shared inputs are
+//! materialized once, per-instance family members are supplied one per instance, and the
+//! instances of a wave run node by node in lockstep, so arithmetic and preimage sampling become
+//! batched backend requests. Artifact family outputs are streamed to the store per wave.
+//! Dispatch-only fusions (row sums, concatenation and slice aliases) never change the graph, its
+//! identity, or its outputs, and are disabled in trace mode. Parallelism lives in the primitives,
+//! which use Rayon; the executor orders nodes deterministically.
+//!
+//! Execution, on the CPU and the GPU, accepts trusted, complete inputs prepared for the exact
+//! validated graph and bindings. Matrix dimensions, ring dimension, ordered CRT basis,
+//! representation, and bound metadata must match the concrete wire type, recursively for family
+//! members, and a trapdoor's public matrix and secret must come from the same construction. A
+//! session nonce binds an immutable input map: changing inputs requires a new nonce, and retrying
+//! with the original nonce resumes the original inputs.
+
 use crate::{
     artifact::{ArtifactKey, ArtifactPayload, ArtifactStore},
     backend::{

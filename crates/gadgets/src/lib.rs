@@ -1,7 +1,10 @@
-//! Reusable lattice-cryptographic gadgets and protocol components.
+//! Reusable, BGG-independent circuits and circuit gadgets.
 //!
-//! This crate sits above `mxx-backends` and below complete functional
-//! encryption, witness encryption, and indistinguishability obfuscation schemes.
+//! The crate sits between `mxx-backends` and the constructions built on it. [`circuit`] defines the
+//! circuit models and the lowering framework that an encoding scheme such as `mxx-bgg` implements;
+//! [`circuit_gadgets`] provides gadgets written as circuits or DSL graphs. [`ring_from_params`]
+//! converts backend parameters into a DSL ring with the same ordered basis, and the `test-support`
+//! feature exposes `test_utils` to dependent crates' tests.
 
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]

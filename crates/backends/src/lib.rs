@@ -1,7 +1,10 @@
 //! Lattice-cryptography primitives and concrete graph execution.
 //!
-//! This crate owns polynomial and matrix representations, samplers, RLWE
-//! encryption helpers, OpenFHE integration, CPU/GPU backends, and artifacts.
+//! This is the only crate with concrete arithmetic. Its primitive layer (`element`, `poly`,
+//! `matrix`, `sampler`, `modulus`, `openfhe_guard`) implements polynomials, matrices, samplers,
+//! and codecs over OpenFHE. Its execution layer runs validated `mxx-ir-core` graphs: runtime values
+//! ([`backend`]), the CPU executor ([`executor`]), artifacts, sessions, transcripts, execution
+//! authorities, and, under the `gpu` feature, the GPU runtime (`gpu_runtime`).
 
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]

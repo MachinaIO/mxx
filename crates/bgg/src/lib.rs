@@ -1,4 +1,20 @@
 //! BGG+ constructions expressed directly with the declarative graph DSL.
+//!
+//! - `public_key` and `encoding` define BGG+ public keys and encodings: their wires, schemas, and
+//!   samplers.
+//! - `circuit`: `PolyCircuitCompiler` lowers a polynomial circuit to public-key or encoding graphs,
+//!   in naive and Tall variants. Encoding compilation takes a decomposition provider called with
+//!   each gate instance; it returns the preprocessed preimage for each multiplication, so the
+//!   online encoding graph never builds public-key matrices or gadget decompositions. The producer
+//!   must bind each cached decomposition to the right gate; shapes and bounds alone do not
+//!   establish that binding.
+//! - `boolean`: BGG+ evaluation of dynamic Boolean circuit families.
+//! - `lwe_lookup`: LWE-based public lookup tables with preprocessing artifacts.
+//! - `naive_vec`, `slot_operation`: per-slot vectors, slot transfer, and rotation.
+//! - `tall_encoding`, `tall_rotation_encoding`: Tall encodings with one row per slot and their
+//!   linear-transform preprocessing.
+//! - `wee25_commitment`, `wee25_opening`, `wee25_public_parameters`: WEE25 commitments and public
+//!   parameters. The commitment-backed lookup evaluator is intentionally absent.
 
 pub mod boolean;
 pub mod circuit;

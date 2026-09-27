@@ -2,6 +2,10 @@ use super::*;
 
 /// An ordered collection of values with one common element schema.
 /// Composite elements retain their fields; leaf families are an internal representation.
+///
+/// `family.at(i)` reads a member statically when `i` is known at construction time and
+/// loop-independent, and dynamically otherwise. Families of families are not supported, but an
+/// `iterate` state, a `select` candidate, or a subgraph argument may be a whole family.
 #[derive(Clone)]
 pub struct Family<T: GraphValue> {
     pub(super) values: Vec<ValueHandle>,

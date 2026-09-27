@@ -3,6 +3,39 @@
 //! A frame owns its scratch allocations for the lifetime of the plan. Replays
 //! may replace input owners only after the previous GPU and I/O work finishes;
 //! output owners remain frame-local and must be copied before being returned.
+//!
+//! Lowering turns the validated graph into a `PhysicalFrame`: a compiled program plus the resident
+//! owners, export slots, import templates, control resets, and wave descriptors needed to run it.
+//!
+//! - **Physical values.** A `PhysicalValue` describes a value as one or more parts, each a view
+//!   (origin, extent, stride) into an input, output, or scratch allocation on one logical device.
+//!   Encodings cover full coefficient and evaluation matrices, compact bounded coefficients, signed
+//!   integers, Booleans, reals, bytes, typed blobs, and the public-only gadget trapdoor.
+//! - **Integer family storage.** An integer family is stored as sign-magnitude words or as one
+//!   canonical `u64` word per member. A returned integer family is canonical exactly when its
+//!   proven range lies in `[0, 2^64)`, so its layout depends on its range, not its producer, and
+//!   outputs of different graphs rebind into one another's plans.
+//! - **Compiled operations.** A `CompiledGpuOp` is one native launch with explicit dependency
+//!   edges, so unrelated operations keep independent paths. `DirectGraph::compile` splits the
+//!   operation list into Graph regions at wave-body boundaries, import points, and external-I/O
+//!   loop bodies; one region is one CUDA Graph even when it spans several devices. At bind time a
+//!   region rejects any owner whose physical descriptor differs from the planned one.
+//! - **Conversions only when encodings differ.** An operand that already has the requested encoding
+//!   is used unchanged; otherwise it gets exactly one forward or inverse NTT, shared by all later
+//!   consumers and written in place when the source has no later reader. Coefficient-domain
+//!   operations (automorphisms, modulus and RNS conversions, rounding, CRT recomposition,
+//!   decomposition, samplers, packs, imports, and exports) work on coefficient form directly.
+//! - **Slices, concatenation, and returns.** A matrix slice that is not a root output is a view
+//!   over its source, with no copy. A concatenation piece written only by elementwise or product
+//!   operations is written straight into its window; the other pieces are copied in by one
+//!   operation. A root output that is a whole scratch matrix is returned in place.
+//! - **Preimage retries.** Each preimage column tile is a device loop that derives a per-attempt
+//!   seed, samples a candidate, and checks its cutoff, until acceptance or the frozen attempt bound
+//!   (`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`); exhaustion is a device status error.
+//! - **Graph scratch admission.** CUDA keeps the reservation of a Graph upload that runs out of
+//!   memory, so before uploading any region `admit_graph_scratch` compares the scheduled scratch
+//!   peak with the free memory and rejects the candidate if it does not fit. After each candidate,
+//!   the planner releases the device memory CUDA caches for destroyed Graph executables.
 
 use crate::{
     artifact::ArtifactKey,

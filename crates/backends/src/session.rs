@@ -1,3 +1,11 @@
+//! Durable execution sessions.
+//!
+//! A [`SessionStore`] adds sessions to an artifact store: a [`SessionDescriptor`] (production id,
+//! graph name, IR version, input digest), a [`SessionStatus`], transcript recording, artifact
+//! commits, and finalization (payloads, then commit, then the manifest last). Stable aliases
+//! ([`SessionAliasDescriptor`]) resolve to a durable nonce. A failed execution can leave a durable
+//! session descriptor behind.
+
 use crate::{
     artifact::{ArtifactKey, ArtifactStore},
     transcript::{DrawSite, RecordedValue},

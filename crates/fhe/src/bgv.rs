@@ -29,6 +29,31 @@ pub struct BgvHybridParams {
     pub auxiliary_primes: Vec<u64>,
 }
 
+/// [`BgvParams::new`] takes the common parameters, a plaintext modulus `t`, and optional hybrid
+/// key-switching parameters. Messages are SIMD slots: 1 to N integers modulo a prime
+/// `t = 1 mod 2N`. `encrypt(&key, &slots)` fills successive slots (unused slots are zero, and a
+/// single integer occupies slot zero without broadcasting), and `decrypt` returns all N slots, so
+/// values moved into unused positions by rotations are kept. Slots are evaluation values in the
+/// plaintext ring `R_t`; encoding lifts their centered inverse NTT modulo `t` into `R_Q`, which is
+/// necessary because copying `R_t` evaluations into `R_Q` would change the message.
+///
+/// A [`BgvCiphertext`] holds components in descending powers of `-s` (two rows, or three before
+/// relinearization), a `correction_factor` tracking the plaintext multiplier modulo `t`, and a
+/// `noise_bound`. Supported operations are addition, `mul` with relinearization (or
+/// `mul_unrelinearized` then `relinearize`), CRT modulus switching, `rotate_rows` (positive offsets
+/// move entries left) and `swap_rows` on the two rows of N/2 slots.
+///
+/// Key switching (relinearization, rotations, and row swaps) is hybrid RNS key switching (ePrint
+/// 2021/204, Appendix B.2.3). With no explicit hybrid parameters, `BgvParams::new` selects about
+/// three CRT digits and a disjoint 60-bit auxiliary basis P that covers the largest digit.
+/// Evaluation keys are matrices over `Q_level * P`, so security must be assessed at `Q * P`;
+/// [`BgvParams::key_switch_parameters`] gives the ring for importing them. The evaluator
+/// normalizes CRT digits, extends them to `QP` (`RnsModUp`), multiplies the evaluation key, and
+/// removes P with the correction `(S + t*U) / P` where `U = -S/t mod P` (`RnsModDown`). The tracked
+/// added noise is at most
+/// `ceil((N*error_cutoff*sum_j(alpha_j*floor(Q_j/2)) + (N+1)*k*floor(P/2)) / P)`, where `alpha_j`
+/// is the number of primes in digit `j` and `k` the number of auxiliary primes; this includes the
+/// approximate-extension error.
 #[derive(Clone)]
 pub struct BgvParams {
     pub common: FheCommonParams,

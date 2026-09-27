@@ -1,4 +1,22 @@
 //! Witness-encryption protocols expressed as validated declarative graphs.
+//!
+//! The crate is excluded from the workspace until its ring-parameterized protocol family is
+//! redesigned, so no workspace command builds it; build and test it with
+//! `--manifest-path crates/we/Cargo.toml`.
+//!
+//! - `diamond::graph`: the parameter-independent Diamond WE protocol declaration and the compiler
+//!   that builds its encryption and decryption graphs. Circuit shape parameters are compile
+//!   parameters, while gate opcodes and predecessor indices are runtime families. Layers run in one
+//!   sequential loop and gates in parallel loops with dynamic predecessor reads; encryption exports
+//!   input-injector transitions, BGG+ public keys, and witness projection preimages, which
+//!   decryption imports.
+//! - `diamond::runtime`: runs encryption and decryption through any execution authority,
+//!   including the GPU runtime.
+//! - `diamond::parameter_search`: searches ring dimension and CRT depth for a fixed circuit shape.
+//!   A candidate is accepted only after Lean checks a freshly generated theorem for the same frozen
+//!   workflow, backend layout, and parameters. The search is a heuristic, not a minimality claim.
+//! - `lean`: WE decoder semantics, Lean checking, and numeric certificates. Handwritten proofs live
+//!   in `crates/we/lean/`, with `crates/we/lean/Certificate.lean` as the audit entry point.
 
 pub mod diamond;
 pub mod lean;

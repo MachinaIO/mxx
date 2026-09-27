@@ -1,3 +1,36 @@
+//! The executable node vocabulary.
+//!
+//! [`NodeKind`] is the complete set of operations an executor must implement:
+//!
+//! | Category | Variants |
+//! | --- | --- |
+//! | Inputs and constants | `Input`, `ConstantInt`, `EvaluateInt`, `ConstantReal`, `ConstantBool`, `ConstantMatrix` |
+//! | Trapdoor structure | `GadgetTrapdoor`, `TrapdoorPublic` |
+//! | Scalar arithmetic | `IntBinary`, `IntCompare`, `BitExtract`, `IntToReal`, `BoolToInt`, `RealBinary`, `RealSqrt`, `IntMatrixVectorProduct` |
+//! | Matrix arithmetic | `MatrixBinary`, `MatrixMulAccumulate`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism`, `MultiplyMonomial` |
+//! | Ring and modulus conversion | `ModulusSwitch`, `ModulusReduce`, `CenteredRebase`, `CenteredRoundDivide`, `RnsModUp`, `RnsModDown`, `BlockModSwitch` |
+//! | Shape | `Transpose`, `Slice`, `Tensor`, `Concat` |
+//! | Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample`, `HashSample`, `HashIntFamily`, `TrapdoorSample`, `PreimageSample` |
+//! | Decomposition and coefficients | `GadgetDecompose`, `ExtractCoefficient`, `LiftIntegerToConstantPolynomial`, `PackPolynomialCoefficients`, `PolynomialFromValues`, `PolynomialValues` |
+//! | Decoding and CRT | `ThresholdDecode`, `CrtRecompose` |
+//! | Control | `SubgraphCall`, `ParallelLoop`, `SequentialLoop`, `Select` |
+//! | Families | `FamilyPack`, `FamilyGetStatic`, `FamilyGetDynamic` |
+//!
+//! Hash-tag components are typed ([`HashTagComponent`]), so different framings cannot collide.
+//! `HashIntFamily` returns `count` integers uniform on `[0, modulus)` for a power-of-two modulus;
+//! integer `i` is coefficient `i` of entry `(0, 0)` of the `HashSample` transcript, truncated to
+//! `log2(modulus)` bits, so no candidate is rejected.
+//!
+//! The ring-conversion nodes are fused CRT operations with explicit destination rings, not a
+//! generic implicit modulus-changing mechanism. `MultiplyMonomial` multiplies every entry by `X^k`
+//! for a runtime `k` of any sign taken modulo `2n`.
+//!
+//! Control nodes carry their own metadata. A [`ParallelLoop`] runs independent instances over
+//! `0..count`, each argument with a [`LoopInputMode`] (`Broadcast`, `Zip`, `ZipOffset`), and
+//! returns indexed families. In a [`SequentialLoop`] the first `carried_count` arguments are the
+//! carried state and the rest are captures. `Select` eagerly selects one candidate by a runtime
+//! selector; both candidates are part of the graph, so selection is not lazy branching.
+
 use crate::{
     artifact::{ArtifactAvailability, ProductionId},
     expr::{IntExpr, RealExpr},

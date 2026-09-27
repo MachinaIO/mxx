@@ -1,3 +1,15 @@
+//! Circuit models and their lowering to encoding schemes.
+//!
+//! - `poly_circuit`: [`PolyCircuit`], polynomial circuits with gates ([`PolyGate`],
+//!   [`PolyGateKind`]), sub-circuit calls, and serialization.
+//! - `boolean`: Boolean circuit shapes and data with constant, copy, not, and, and xor gates.
+//! - `boolean_dsl`: DSL-level Boolean circuit families and their validity and satisfaction
+//!   predicates.
+//! - `public_lut`: public lookup programs.
+//! - `lowering`: the traits a concrete encoding scheme implements (arithmetic, slot operations,
+//!   public lookups, and structured lowering) and `lower_circuit`, which drives them gate by gate
+//!   with a [`GateInstance`] (call path, local gate, and operation occurrence).
+
 pub mod boolean;
 pub mod boolean_dsl;
 pub mod gate;

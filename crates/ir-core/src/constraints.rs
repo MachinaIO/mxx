@@ -1,3 +1,9 @@
+//! Parameter-only constraints of a graph.
+//!
+//! [`derive_param_constraints`] collects the conditions on compile parameters (such as positive
+//! dimensions or valid sampler widths) that concrete validation also enforces, so a caller can
+//! check a parameter set without validating the graph.
+
 use crate::{
     Graph, IntExpr, ParamEnv, RealExpr, ValidationError, WireType,
     expr::ExprError,

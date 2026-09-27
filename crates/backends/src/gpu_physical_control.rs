@@ -4,6 +4,29 @@
 //! selects an artifact member needs an explicit I/O boundary between bounded
 //! Graph replays. Values that change with a device loop index remain physical
 //! values in either form.
+//!
+//! - **Waves.** A parallel loop lowers to a reusable W-lane wave template replayed once per wave
+//!   with fresh lane bindings; a nested wave template is replayed for every active parent
+//!   occurrence. Every lane reads its member of a zipped family from the family's plan owner, which
+//!   execute rebinds for root inputs before the first wave.
+//! - **Vectorized scalar loops.** A parallel loop whose body has only scalar integer and Boolean
+//!   arithmetic, comparisons, selection, and family reads lowers once, with one elementwise
+//!   operation per body node over all lanes.
+//! - **Integer control and status words.** Runtime integer and Boolean operations, selection, and
+//!   sequential loops run on the device. Errors (division by zero, overflow, invalid index, inexact
+//!   division) go to a per-device status word, first error wins, and the word is checked only after
+//!   the launch joins.
+//! - **Sequential-loop carries.** A sequential loop may carry matrices, scalars, and integer
+//!   families. An integer carry is sized by a range closed over every iteration, and a Euclidean
+//!   remainder by a positive constant has the exact range `[0, divisor)`.
+//! - **Scalar kernels.** Hash integer families share the hash-sample primitive and match the CPU
+//!   transcript. Monomial products multiply each evaluation slot by the matching twiddle, with no
+//!   NTT of their own. Integer matrix-vector products use one warp per row (`M v`) or chunked
+//!   atomics per column (`v^T M`) and accumulate exactly in `int64`.
+//! - **Lanes on several devices.** The lanes of an outermost wave loop are spread over the devices:
+//!   lane `l` runs on device `l mod G`. Shared inputs are copied once per loop to each remote
+//!   device, zipped members are copied into the lane inside the template, and a remote lane's
+//!   results are copied home, so family members always live on the first device.
 
 use crate::{
     artifact::ArtifactKey,

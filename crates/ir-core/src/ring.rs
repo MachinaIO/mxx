@@ -1,3 +1,19 @@
+//! Rings as ordered CRT bases, and their resolution.
+//!
+//! A [`RingRef`] wraps a [`RingExpr`]: a generated basis (`Generated { crt_bits, crt_depth,
+//! ring_dimension }`), an explicit ordered basis, or a `Slice`, `Select`, or `Concat` of other
+//! rings. Basis order is significant.
+//!
+//! Validation resolves each ring to a [`ConcreteRing`]: ordered `u64` primes plus a dimension. A
+//! concrete ring requires a power-of-two dimension, a nonempty basis, and distinct primes
+//! `2 < q < 2^60` with `q = 1 mod 2N`.
+//!
+//! A generated basis comes from [`generate_crt_basis`], a pure Rust copy of OpenFHE's
+//! `ILDCRTParams(2N, depth, bits)`: the largest prime `q = 1 mod 2N` below `2^bits`, which must
+//! have exactly `bits` bits, then each next smaller one. `mxx-backends` checks it against OpenFHE
+//! over a parameter grid. An explicit basis is checked with a deterministic Miller-Rabin test and
+//! keeps its order.
+
 use crate::expr::{ExprError, IntExpr, ParamEnv};
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};

@@ -1,8 +1,16 @@
 //! Mechanical extraction of a validated frozen graph into ordinary Lean relations.
 //!
-//! This module is deliberately application agnostic.  It does not construct a graph, inspect
-//! Diamond roles, or provide semantic fallbacks for an operation it cannot translate.  Primitive
+//! This module is deliberately application agnostic. It does not construct a graph, inspect
+//! Diamond roles, or provide semantic fallbacks for an operation it cannot translate. Primitive
 //! names are supplied by the package owning those primitive relations.
+//!
+//! [`export`] emits one Lean relation per frozen scope, referencing backend-owned primitive
+//! relations ([`PrimitiveNames`]) and concrete CRT layouts ([`BackendLayout`]). Loops are not
+//! unrolled; families remain functions on `Fin N`. [`claim::assemble_claim`] renders an
+//! application-independent linked claim, and [`protocol::export_claim`] exports every stage,
+//! requirement, and ideal graph of a protocol declaration and writes the final `Claim.lean`. No
+//! noise bound is inferred; applications supply decoder semantics and proofs. The handwritten Lean
+//! package `crates/ir-core/lean/` supplies shared definitions such as `IterRuns`.
 
 pub mod claim;
 #[cfg(test)]

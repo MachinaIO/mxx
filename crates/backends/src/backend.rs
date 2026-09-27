@@ -1,3 +1,28 @@
+//! Runtime values and the concrete CPU and GPU backends.
+//!
+//! [`RuntimeValue`] is what executors accept as inputs and return as outputs:
+//!
+//! | Variant | Meaning |
+//! | --- | --- |
+//! | `Int`, `Real`, `Bool`, `Bytes` | Host scalars and byte strings. |
+//! | `TypedBlob` | An opaque typed payload. |
+//! | `Matrix` | A matrix with its concrete wire type; also used for bounded and preimage wires. |
+//! | `Trapdoor` | A public matrix plus its secret trapdoor. |
+//! | `Resident` (`gpu` only) | A non-matrix value resident on the device. |
+//! | `IndexedFamily` | An in-memory family. |
+//! | `LazyArtifact`, `LazyArtifactFamily` | An artifact reference not yet loaded from the store. |
+//! | `StagedArtifact`, `StagedArtifactFamily` | Family members streamed to the store during execution. |
+//!
+//! [`PolyMatrix`] pairs a concrete wire type with shared storage: a full CPU matrix, a compact
+//! bounded CPU matrix, a GPU allocation (under `gpu`), or encoded bytes. Its constructors check
+//! that the storage agrees with the wire type (shape, ring dimension, ordered CRT basis, and
+//! bound), and clones are shallow. Lazy and staged values are materialized by
+//! `ExecutionResult::materialize_output`.
+//!
+//! A composite DSL value (a ciphertext, a key) flattens into the graph leaves `name.0`, `name.1`,
+//! ...; the GPU runtime accepts and returns it as one `RuntimeValue::Composite`
+//! ([`expand_composite_values`], [`group_composite_values`]).
+
 use crate::{
     matrix::{
         CpuSmallMatrix, PolyMatrix as PrimitivePolyMatrix, PolyMatrixColumnSource,

@@ -1,3 +1,9 @@
+//! Recording and replaying sampled values.
+//!
+//! Executions draw randomness in one of three modes: fresh, recorded to a transcript, or replayed
+//! from one. A transcript keys each sampled value by its [`DrawSite`]: the instantiation path, the
+//! node, and the port.
+
 use mxx_ir_core::{
     artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
     types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port},

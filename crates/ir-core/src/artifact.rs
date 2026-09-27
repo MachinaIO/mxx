@@ -1,3 +1,14 @@
+//! Artifact identities and manifests.
+//!
+//! A [`ProductionId`] (`spec_hash` plus an execution nonce) identifies one execution of one graph
+//! instantiation. A [`Manifest`] lists each exported [`ManifestArtifact`] with its type, optional
+//! family count, availability, and layout; [`export_validated_manifest`] builds it for the outputs
+//! that declare an availability.
+//!
+//! [`ArtifactAvailability::Transferred`] means the consumer receives the payload from an external
+//! producer; `Cached` means the consumer could regenerate it deterministically from public context
+//! and uses stored bytes as a cache. Availability is about transport, not secrecy.
+
 use crate::{
     encoding::IR_VERSION,
     serde_support,

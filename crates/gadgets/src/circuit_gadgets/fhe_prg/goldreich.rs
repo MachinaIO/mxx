@@ -419,10 +419,10 @@ impl GoldreichGraph {
 
     /// Generates one interval using the same public graph domain as the full conceptual range.
     ///
-    /// This is more expensive than [`generate_range`] because it replays full-range generation up
-    /// to `range_start + range_len`, including duplicate-rejection state. It is needed when a
-    /// caller persists artifacts against the full-range graph and later wants to evaluate only one
-    /// contiguous output chunk without changing the graph semantics.
+    /// This is more expensive than [`Self::generate_range`] because it replays full-range
+    /// generation up to `range_start + range_len`, including duplicate-rejection state. It is
+    /// needed when a caller persists artifacts against the full-range graph and later wants to
+    /// evaluate only one contiguous output chunk without changing the graph semantics.
     pub fn generate_full_domain_range(
         input_size: usize,
         conceptual_output_size: usize,
@@ -461,7 +461,8 @@ impl GoldreichGraph {
         .next_range(range_start, range_len)
     }
 
-    /// Validates an explicit public Goldreich graph against the same invariants as [`generate`].
+    /// Validates an explicit public Goldreich graph against the same invariants as
+    /// [`Self::generate`].
     ///
     /// This is useful for tests or for callers that want to pin a hand-written public graph while
     /// still enforcing distinct indices, in-range vertices, and the configured duplicate-rejection
@@ -526,7 +527,7 @@ impl GoldreichGraph {
 ///
 /// This struct owns the Ring-GSW context together with the fixed public graph and fixed PRG
 /// dimensions. Those values are setup-time constants rather than runtime circuit inputs; the only
-/// runtime inputs to [`GoldreichFhePrg::evaluate`] are encrypted secret bits.
+/// runtime inputs to [`GoldreichFhePrg::evaluate_uniform`] are encrypted secret bits.
 #[derive(Debug, Clone)]
 pub struct GoldreichFhePrg<P: Poly, C: BooleanCiphertext<P>> {
     ring_gsw: Arc<C::Context>,

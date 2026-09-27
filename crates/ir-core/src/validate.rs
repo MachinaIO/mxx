@@ -1,3 +1,21 @@
+//! Structural and concrete validation.
+//!
+//! [`validate`] and [`validate_with_manifests`] produce a [`ValidatedGraph`]: the source graph, its
+//! bindings, and per scope an execution order, a liveness schedule, and concrete wire types.
+//!
+//! The steps are structural validation (topological order, declared compile variables, legal
+//! loop-index use, dynamic family access in loop-dependent reads, subgraph bound arity), manifest
+//! checks, parameter bindings and constraints, then per-scope concrete type checking of every node,
+//! ring resolution, and checks that call and loop boundaries agree with their child scopes. Each
+//! loop body is checked once as a template at loop index zero rather than per iteration. A named
+//! subgraph is one scope for all of its calls, so it is checked once under each distinct call
+//! binding; the stored scope is the first call's, and a ring is recorded in `resolved_rings` only
+//! when every call resolves it to the same value. `execution_order` is the frozen postorder, and
+//! [`LivenessSchedule::last_use`] lets executors release intermediates after their last reader.
+//!
+//! Validation proves structural and type correctness under concrete parameters. It does not prove
+//! cryptographic norm bounds; those are application-owned.
+
 use crate::{
     artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId, validate_manifest},
     checks::{

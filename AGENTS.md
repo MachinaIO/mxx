@@ -14,7 +14,7 @@ mxx implements lattice-cryptography operations in Rust and CUDA, including polyn
 
 - Use `BUILDER.md` for implementation and debugging, and `REVIEWER.md` for explicit reviews. Simple prose or instruction-file edits need only the relevant document sections.
 - Read `GPU.md` before editing or reviewing CUDA, GPU wrappers, GPU tests, or GPU-facing performance-sensitive behavior.
-- Use `docs/architecture.md` for crate boundaries and dependency changes. `Cargo.toml` is the authoritative workspace member list; there is no root facade crate. Application crates never depend on one another. Reusable gadgets live in `crates/gadgets/`, with circuit gadgets in `circuit_gadgets`.
+- Documentation lives with the code: each crate's rustdoc is the authority for implementation details, each crate's `README.md` introduces the crate, and the repository layout in `README.md` gives crate boundaries and the dependency direction. Use them for crate boundaries and dependency changes, and update the rustdoc of the code you change. `Cargo.toml` is the authoritative workspace member list; there is no root facade crate. Application crates never depend on one another. Reusable gadgets live in `crates/gadgets/`, with circuit gadgets in `circuit_gadgets`.
 - Load a skill when its specific workflow applies. Read only its relevant supporting documents; editing a skill does not authorize executing its examples or remote workflow.
 
 ## Repository Requirements

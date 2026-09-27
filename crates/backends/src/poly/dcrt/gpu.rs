@@ -1,3 +1,28 @@
+//! Rust bindings to the native CUDA layer in `crates/backends/cuda/`.
+//!
+//! Headers in `include/` declare only cross-file and Rust-facing functions, and bodies live in
+//! `src/`:
+//!
+//! | File | Role |
+//! | --- | --- |
+//! | `src/Runtime.cu` | C ABI for contexts, execution owners, streams, memory, export slots, the explicit Graph builder (including conditional nodes), binding, launch, and events. |
+//! | `src/Control.cu` | Device integer control operations, integer matrix-vector products, and status codes. |
+//! | `src/Primitive.cu` | Scalar-polynomial primitives (values, coefficient extraction, packing, threshold decoding). |
+//! | `src/Real.cu` | Device `f64` operations with their own status word. |
+//! | `src/ChaCha.cu` | Device ChaCha random number generation. |
+//! | `src/matrix/Matrix.cu` | Unity build of the matrix layer: NTT, data movement, decomposition, sampling, trapdoors, serialization, CRT and RNS conversions, small right operands, preimages, and hashing. |
+//!
+//! `build.rs` compiles `Runtime.cu`, `Primitive.cu`, `Control.cu`, `Real.cu`, and
+//! `matrix/Matrix.cu` into the `gpupoly` library under the `gpu` feature (`CUDA_ARCH`, default
+//! `89`), and embeds a hash of the CUDA sources as `MXX_NATIVE_KERNEL_BUILD_REVISION`.
+//!
+//! Raw matrix kernels batch up to 8 CRT limbs per launch. The fused NTT runs up to ten butterfly
+//! stages of a 1024-coefficient tile in shared memory and the stages above one tile with warp
+//! shuffles, for ring dimensions up to 32768. The matrix product splits the inner dimension over
+//! four thread rows and sums in 128 bits with one reduction per batch. Decomposition peels every
+//! balanced digit of a coefficient in one pass, and integer division uses native 128-bit division
+//! when the magnitudes have at most two words.
+
 use crate::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
 use num_traits::One;

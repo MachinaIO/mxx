@@ -1,6 +1,32 @@
-//! Declarative typed construction API for mxx graphs.
+//! Typed Rust DSL that builds `mxx-ir-core` graphs.
 //!
-//! Executable operations create immutable `mxx-ir-core` nodes immediately.
+//! Running construction code builds core nodes immediately; there is no separate parser or
+//! symbolic reinterpretation layer. Ordinary Rust (`if`, `for`, functions, tuples, vectors)
+//! organizes construction, but it runs once at construction time and cannot branch on a graph
+//! [`Bool`].
+//!
+//! ```
+//! use mxx_dsl::{DslContext, Ring};
+//! use mxx_ir_core::ParamEnv;
+//!
+//! // Ring dimension 8 with a generated basis of two 30-bit CRT primes.
+//! let ring = Ring::new(30, 2, 8);
+//! let input = ring.input("input", (2, 2));
+//! let doubled = &input + &input;
+//! let built = DslContext::new("double").output("result", doubled)?.build()?;
+//! let validated = built.validate(&ParamEnv::default())?;
+//! # let _ = validated;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! The three stages are construction ([`DslContext::build`] freezes the reachable outputs and runs
+//! structural validation), validation ([`BuiltGraph::validate`] resolves parameters, rings, and
+//! concrete types), and execution or analysis by a backend or the Lean exporter.
+//!
+//! Value handles are [`Mat`], [`SmallMatrix`], [`Preimage`], [`Trapdoor`], [`Int`], [`Bool`],
+//! [`Bytes`], and [`Family`]. Cloning a handle shares the value; it never re-samples. The
+//! [`GraphValue`] and [`GraphValueSchema`] traits let tuples, vectors, and domain records flatten
+//! into wires. Control flow is [`parallel`], [`iterate`], [`select`], and [`Subgraph`].
 
 use mxx_ir_core::{
     CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, Graph, GraphOutput,
@@ -166,6 +192,14 @@ pub struct FamilyType<S> {
     pub count: IntExpr,
 }
 
+/// A ring `Z_Q[X]/(X^N + 1)` given by an ordered CRT basis.
+///
+/// [`Ring::new`] generates a basis, [`Ring::from_crt_moduli`] takes an explicit ordered basis,
+/// and `slice_crt`, `prefix`, `select_crt`, and `concat_crt` build related rings. Ring methods
+/// declare inputs (including bounded, preimage, family, and artifact inputs), constants, and
+/// samplers: `uniform_residue`, `uniform_interval`, `gaussian`, `hash_matrix`,
+/// `hash_decomposed`, `hash_small_decomposed`, and `sample_trapdoor`. Gaussian and preimage
+/// samplers always take explicit integer coefficient cutoffs.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Ring {
     reference: RingRef,
@@ -1216,6 +1250,15 @@ impl HashTagPart for Int {
     }
 }
 
+/// A matrix over a [`Ring`].
+///
+/// `+`, `-`, `*`, and unary `-` work on owned and borrowed operands; a `1 x 1` matrix multiplies
+/// as a scalar. Other operations include products with accumulation and small right operands,
+/// automorphisms, `multiply_monomial` (by `X^k` for a runtime [`Int`] `k`), shape operations,
+/// gadget decomposition, coefficient access, threshold decoding, concatenation (with the
+/// `concat_rows!`, `concat_cols!`, and `concat_diag!` macros), CRT recomposition, and ring
+/// conversions that take a destination ring: `modulus_switch` (scale and round),
+/// `reduce_modulus`, `centered_rebase`, `block_mod_switch`, `rns_mod_up`, and `rns_mod_down`.
 #[derive(Clone)]
 pub struct Mat {
     value: ValueHandle,
@@ -1794,6 +1837,10 @@ impl Preimage {
     }
 }
 
+/// A lattice trapdoor with its public matrix.
+///
+/// [`Trapdoor::sample_preimage`] returns a [`Preimage`] whose cutoff comes from the trapdoor
+/// schema.
 #[derive(Clone)]
 pub struct Trapdoor {
     public: Mat,
@@ -1844,6 +1891,12 @@ impl Trapdoor {
     }
 }
 
+/// Builds one graph: declares compile parameters and inputs, and names its outputs.
+///
+/// Output methods consume and return the context. Composite outputs are flattened as `x.0`,
+/// `x.1`, ...; names must be unique after flattening. `hash_int_family` prefixes its tag with
+/// the domain `mxx/hash-int-family/v1\0`, so its stream never coincides with a `hash_matrix`
+/// stream under the same key and tag.
 pub struct DslContext {
     name: String,
     parameters: Vec<CompileParameter>,
@@ -2075,6 +2128,7 @@ impl DslContext {
     }
 }
 
+/// A frozen, structurally valid graph that still has symbolic parameters.
 pub struct BuiltGraph {
     pub graph: Graph,
 }

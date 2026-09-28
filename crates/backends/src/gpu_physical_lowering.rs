@@ -82,7 +82,7 @@ use mxx_ir_core::{
     types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef},
 };
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
+use num_traits::{ToPrimitive, Zero};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -90,6 +90,7 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Clone)]
 pub(crate) struct ExportTemplate {
     pub name: String,
     pub index: Option<usize>,
@@ -101,6 +102,10 @@ pub(crate) struct ExportTemplate {
     pub artifact_type: ArtifactType,
     pub availability: ArtifactAvailability,
     pub export: Arc<PhysicalExport>,
+    /// Written by the runtime after the wave that published it, from a slot
+    /// its lane reuses in every wave (`PhysicalWave::streamed_exports`),
+    /// rather than observed from a slot of its own.
+    pub streamed: bool,
 }
 
 /// A canonical artifact is requested only at its first dependent Graph
@@ -126,6 +131,12 @@ pub(crate) enum ImportDestination {
     Trapdoor {
         public: (Arc<GpuDCRTPolyMatrix>, ConcreteMatrixType),
         secret: [(Arc<GpuDCRTPolyMatrix>, ConcreteMatrixType); 6],
+    },
+    /// An evaluation matrix held in plan scratch placed for the import's
+    /// live span, from its load site to its last use; the upload writes the
+    /// storage the destination value is bound to.
+    Placed {
+        ty: ConcreteMatrixType,
     },
 }
 
@@ -183,6 +194,9 @@ pub(crate) struct PhysicalFrame {
     /// Values whose storage the host binds, reads, or rebinds between Graph
     /// launches; their scratch is never Graph-owned.
     pub scratch_protected: BTreeSet<PhysicalValueId>,
+    /// Root nodes lowered as the running sum of a parallel loop's members.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fused_nodes: BTreeSet<NodeId>,
 }
 
 pub(crate) struct SampleSeed {
@@ -1461,6 +1475,11 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// Mapped host slots: the import request slots of selected imports, in
     /// lowering order, then the export slots.
     pub slots: &'a mut Vec<Arc<GpuExportSlot>>,
+    /// Artifact write sites, in site order.
+    pub export_templates: &'a mut Vec<ExportTemplate>,
+    /// Root nodes a root parallel loop already lowered as the running sum of
+    /// its members (see `fused_member_sums`); the root pass skips them.
+    pub fused_nodes: &'a mut BTreeSet<NodeId>,
     /// Top-level operation ranges of the lanes of each parallel loop.
     pub parallel_lanes: &'a mut Vec<Vec<std::ops::Range<u32>>>,
     /// The top-level operation range each lowered node emitted, in lowering
@@ -1524,6 +1543,31 @@ pub(super) fn allocate_matrix_import_destination(
     let before_operation =
         u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
     Ok((destination, native, before_operation))
+}
+
+/// Describe an evaluation matrix import destination whose memory plan
+/// scratch places for the import's live span, and return it with the
+/// operation index its consumers start at.
+pub(super) fn allocate_placed_import_destination(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+) -> Result<(PhysicalValueId, u32), String> {
+    let storage = StorageRef::Input(
+        u32::try_from(ctx.values.len()).map_err(|_| "too many GPU import storages".to_owned())?,
+    );
+    let (physical, owner) = crate::gpu_graph_memory::deferred_scratch_matrix(
+        ctx.backend,
+        ctx.device,
+        ty,
+        PhysicalEncoding::FullEval,
+        storage,
+    )?;
+    let destination = value_id(ctx.values.len())?;
+    ctx.values.push(physical);
+    ctx.owners.insert(destination, owner);
+    let before_operation =
+        u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
+    Ok((destination, before_operation))
 }
 
 /// Allocate only the selected member's typed owner. Trapdoor imports insert
@@ -1754,6 +1798,16 @@ pub(super) fn twin_import_destination(
                 (ImportDestination::Bytes { owner, length: *length }, Arc::new(resident)),
             )
         }
+        ImportDestination::Placed { ty } => {
+            let (physical, resident) = crate::gpu_graph_memory::deferred_scratch_matrix(
+                ctx.backend,
+                device,
+                ty,
+                PhysicalEncoding::FullEval,
+                storage,
+            )?;
+            (physical, (ImportDestination::Placed { ty: ty.clone() }, resident))
+        }
         ImportDestination::Trapdoor { .. } => return Ok(None),
     };
     if &physical != planned {
@@ -1880,7 +1934,7 @@ fn allocate_device_matrix(
 
 /// Copy the equal-shape matrix view `source` into `destination` on `device`
 /// after `predecessors`, recording the copy as the destination's writer.
-fn copy_matrix_view(
+pub(super) fn copy_matrix_view(
     ctx: &mut PhysicalLoweringContext<'_>,
     source: PhysicalValueId,
     destination: PhysicalValueId,
@@ -1944,6 +1998,207 @@ fn matrix_columns_on_device(
     replicate_to_device(ctx, dense, device)
 }
 
+/// The gadget constant a lazy gadget read through `wire` comes from, and
+/// whether a centered rebase lifts it into `wire`'s ring.
+fn gadget_origin(scope: &mxx_ir_core::graph::GraphScope, wire: WireRef) -> Option<(WireRef, bool)> {
+    let is_gadget = |wire: WireRef| {
+        scope.nodes().get(wire.node.0 as usize).is_some_and(|node| {
+            matches!(
+                node.kind(),
+                NodeKind::ConstantMatrix { value: ConstantMatrix::Gadget { .. }, .. }
+            )
+        })
+    };
+    if is_gadget(wire) {
+        return Some((wire, false));
+    }
+    let node = scope.nodes().get(wire.node.0 as usize)?;
+    match (node.kind(), scope.arguments(node)?.as_slice()) {
+        (NodeKind::CenteredRebase { .. }, [source]) if is_gadget(*source) => Some((*source, true)),
+        _ => None,
+    }
+}
+
+/// Whether `wire` has readers in `scope`, each using it as the right factor
+/// of a product with a one-row left factor, and is not a scope output.
+fn read_by_row_products(
+    scope: &mxx_ir_core::graph::GraphScope,
+    wire: WireRef,
+    wire_types: &BTreeMap<WireRef, ConcreteWireType>,
+) -> bool {
+    let Some(right) = wire_types.get(&wire).and_then(ConcreteWireType::matrix_type) else {
+        return false;
+    };
+    if scope.outputs().contains(&wire) {
+        return false;
+    }
+    let mut read = false;
+    for consumer in scope.nodes() {
+        let Some(arguments) = scope.arguments(consumer) else { return false };
+        if !arguments.contains(&wire) {
+            continue;
+        }
+        read = true;
+        let row_product = matches!(
+            consumer.kind(),
+            NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)
+        ) && matches!(arguments.as_slice(), [left, right_wire] if *right_wire == wire && *left != wire &&
+        wire_types.get(left).and_then(ConcreteWireType::matrix_type).is_some_and(|left| {
+            left.rows == 1 && left.columns == right.rows && left.ring == right.ring
+        }));
+        if !row_product {
+            return false;
+        }
+    }
+    read
+}
+
+/// Whether `wire`, a gadget constant or its centered rebase, is never stored:
+/// every product reading it scales its row by the gadget's entries (see
+/// `lower_gadget_product`). A gadget constant qualifies when each reader is
+/// such a product or a rebase that qualifies.
+fn lazy_gadget(
+    scope: &mxx_ir_core::graph::GraphScope,
+    wire: WireRef,
+    wire_types: &BTreeMap<WireRef, ConcreteWireType>,
+) -> bool {
+    match gadget_origin(scope, wire) {
+        Some((_, true)) => read_by_row_products(scope, wire, wire_types),
+        Some((_, false)) => {
+            if scope.outputs().contains(&wire) {
+                return false;
+            }
+            let mut read = false;
+            for (index, consumer) in scope.nodes().iter().enumerate() {
+                let Some(arguments) = scope.arguments(consumer) else { return false };
+                if !arguments.contains(&wire) {
+                    continue;
+                }
+                read = true;
+                let rebase = WireRef { node: NodeId(index as u64), port: Port(0) };
+                let lazy_rebase = matches!(consumer.kind(), NodeKind::CenteredRebase { .. }) &&
+                    read_by_row_products(scope, rebase, wire_types);
+                if !lazy_rebase && !read_by_row_products(scope, wire, wire_types) {
+                    return false;
+                }
+            }
+            read
+        }
+        None => false,
+    }
+}
+
+/// The product `left * G` of a one-row `left` and a gadget `G = I_r (x) g`
+/// that is never stored: output column `i * d + t` is `left[i] * g_t`, a
+/// scale by an integer written into its window of the output.
+fn lower_gadget_product(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &mxx_ir_core::graph::GraphScope,
+    node_id: NodeId,
+    left_wire: WireRef,
+    gadget_wire: WireRef,
+    wire_types: &BTreeMap<WireRef, ConcreteWireType>,
+) -> Result<(), String> {
+    let (constant, rebased) =
+        gadget_origin(scope, gadget_wire).ok_or("GPU lazy gadget has no gadget constant")?;
+    let NodeKind::ConstantMatrix { value: value @ ConstantMatrix::Gadget { base, small }, .. } =
+        scope.nodes()[constant.node.0 as usize].kind()
+    else {
+        return Err("GPU lazy gadget is not a gadget constant".into());
+    };
+    let gadget_ty = wire_types
+        .get(&constant)
+        .and_then(ConcreteWireType::matrix_type)
+        .ok_or_else(|| "GPU lazy gadget has no matrix type".to_owned())?
+        .clone();
+    let wire = WireRef { node: node_id, port: Port(0) };
+    let output_ty = wire_types
+        .get(&wire)
+        .and_then(ConcreteWireType::matrix_type)
+        .ok_or_else(|| "GPU gadget product has no matrix type".to_owned())?
+        .clone();
+    let env = &ctx.validated.bindings;
+    let per_tower = gadget_digits_per_tower(ctx, &gadget_ty, value, env)?;
+    let base = base.evaluate(env).map_err(|error| error.to_string())?;
+    let digits = gadget_ty.columns / gadget_ty.rows;
+    let mut row = gadget_row(&gadget_ty, &base, *small, digits, per_tower)?;
+    // A centered rebase reads each entry as its centered representative.
+    if rebased {
+        let modulus = gadget_ty.ring.modulus();
+        let half = &modulus / 2;
+        for entry in &mut row {
+            let mut value = ((&*entry % &modulus) + &modulus) % &modulus;
+            if value > half {
+                value -= &modulus;
+            }
+            *entry = value;
+        }
+    }
+    let left = *ctx
+        .wire_ids
+        .get(&left_wire)
+        .ok_or_else(|| "GPU gadget product left factor has no physical value".to_owned())?;
+    let left = full_eval_value(ctx, left)?;
+    if output_ty.rows != 1 || output_ty.columns != gadget_ty.columns {
+        return Err("GPU gadget product shape differs from its factors".into());
+    }
+    let output = allocate_scratch_matrix(ctx, &output_ty, PhysicalEncoding::FullEval)?;
+    let implementation =
+        ctx.implementations.register(GpuImplementation::matrix_scale()).map_err(str::to_owned)?;
+    let column_ty = ConcreteMatrixType { columns: 1, ..output_ty.clone() };
+    let mut writers = Vec::with_capacity(output_ty.columns);
+    for entry in 0..gadget_ty.rows {
+        let source =
+            if gadget_ty.rows == 1 { left } else { matrix_view(ctx, left, 0, 1, entry, 1)? };
+        for (digit, coefficient) in row.iter().enumerate() {
+            let column = entry * digits + digit;
+            let window = matrix_view(ctx, output, 0, 1, column, 1)?;
+            let scaled = allocate_scratch_matrix(ctx, &column_ty, PhysicalEncoding::FullEval)?;
+            let residues = column_ty
+                .ring
+                .crt_moduli()
+                .iter()
+                .map(|prime| {
+                    let modulus = BigInt::from(*prime);
+                    let mut residue = coefficient % &modulus;
+                    if residue.sign() == num_bigint::Sign::Minus {
+                        residue += modulus;
+                    }
+                    residue.to_u64().ok_or_else(|| "GPU gadget residue exceeds u64".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
+            let output_binding = register_bindings(ctx.bindings, ctx.values, scaled)?;
+            let operation = u32::try_from(ctx.operations.len())
+                .map_err(|_| "too many GPU gadget product operations".to_owned())?;
+            ctx.operations.push(CompiledGpuOp {
+                implementation,
+                arguments: Box::new([
+                    KernelArg::Value(source),
+                    KernelArg::U32(0),
+                    KernelArg::Value(scaled),
+                    KernelArg::U32(0),
+                    KernelArg::U64List(residues.into_boxed_slice()),
+                    KernelArg::U32(source_binding),
+                    KernelArg::U32(output_binding),
+                ]),
+                outputs: Box::new([scaled]),
+                device: ctx.device,
+                grid: [1; 3],
+                block: [1; 3],
+                shared_bytes: 0,
+                predecessors: all_predecessors(ctx.producer, source),
+                body: None,
+            });
+            let copy = copy_matrix_view(ctx, scaled, window, Box::new([operation]))?;
+            writers.push((ColumnRange { start: column, end: column + 1 }, copy));
+        }
+    }
+    ctx.producer.insert(output, writers);
+    ctx.wire_ids.insert(wire, output);
+    Ok(())
+}
+
 pub(super) fn lower_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
@@ -1958,6 +2213,9 @@ pub(super) fn lower_matrix_node(
     let [left_wire, right_wire] = arguments.as_slice() else {
         return Err("GPU matrix operation has the wrong arity".into());
     };
+    if !ctx.wire_ids.contains_key(right_wire) && lazy_gadget(scope, *right_wire, wire_types) {
+        return lower_gadget_product(ctx, scope, node_id, *left_wire, *right_wire, wire_types);
+    }
     let left = *ctx
         .wire_ids
         .get(left_wire)
@@ -2184,6 +2442,16 @@ pub(super) fn lower_zero_matrix_node(
         .get(&wire)
         .and_then(ConcreteWireType::matrix_type)
         .ok_or_else(|| "GPU zero output has no concrete matrix type".to_owned())?;
+    let output = emit_zero_matrix(ctx, ty)?;
+    ctx.wire_ids.insert(wire, output);
+    Ok(())
+}
+
+/// A scratch matrix of type `ty` that an operation emitted here sets to zero.
+pub(super) fn emit_zero_matrix(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+) -> Result<PhysicalValueId, String> {
     let storage = StorageRef::Scratch(
         u32::try_from(ctx.values.len()).map_err(|_| "too many GPU scratch storages".to_owned())?,
     );
@@ -2201,7 +2469,6 @@ pub(super) fn lower_zero_matrix_node(
     let output = value_id(ctx.values.len())?;
     ctx.values.push(physical);
     ctx.owners.insert(output, resident);
-    ctx.wire_ids.insert(wire, output);
     let binding = register_bindings(ctx.bindings, ctx.values, output)?;
     let implementation =
         ctx.implementations.register(GpuImplementation::zero()).map_err(str::to_owned)?;
@@ -2224,7 +2491,7 @@ pub(super) fn lower_zero_matrix_node(
         body: None,
     });
     ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: ty.columns }, index)]);
-    Ok(())
+    Ok(output)
 }
 
 /// A direct device sample uses a plan-owned seed. The execution nonce is
@@ -2380,7 +2647,53 @@ pub(super) fn lower_sample_matrix_node(
 /// Encode immutable IR coefficients in the one canonical coefficient codec.
 /// This performs only static data preparation; every runtime matrix operation
 /// remains in the direct GPU graph.
-fn encode_static_matrix(
+/// The `digits` entries of one row of the gadget matrix of type `ty`: powers
+/// of `base`, per CRT tower for a regular gadget.
+pub(super) fn gadget_row(
+    ty: &ConcreteMatrixType,
+    base: &BigInt,
+    small: bool,
+    digits: usize,
+    regular_gadget_digits_per_tower: Option<usize>,
+) -> Result<Vec<BigInt>, String> {
+    let values = if small {
+        (0..digits)
+            .map(|digit| {
+                u32::try_from(digit)
+                    .map(|exponent| base.pow(exponent))
+                    .map_err(|_| "GPU small gadget exponent exceeds u32".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let moduli = ty.ring.crt_moduli();
+        let per_tower = regular_gadget_digits_per_tower
+            .ok_or_else(|| "GPU regular gadget has no parameter layout".to_owned())?;
+        if per_tower == 0 || digits % per_tower != 0 || digits / per_tower > moduli.len() {
+            return Err("GPU regular gadget digits do not span whole CRT towers".into());
+        }
+        let modulus = ty.ring.modulus();
+        let mut values = Vec::with_capacity(digits);
+        for &prime in moduli.iter().take(digits / per_tower) {
+            let prime_big = BigInt::from(prime);
+            let quotient = &modulus / &prime_big;
+            let quotient_mod = (&quotient % &prime_big)
+                .to_u64()
+                .ok_or_else(|| "GPU gadget CRT residue exceeds u64".to_owned())?;
+            let inverse = crate::utils::mod_inverse(quotient_mod, prime)
+                .ok_or_else(|| "GPU gadget CRT basis is not invertible".to_owned())?;
+            let idempotent = quotient * BigInt::from(inverse);
+            for digit in 0..per_tower {
+                let exponent = u32::try_from(digit)
+                    .map_err(|_| "GPU gadget exponent exceeds u32".to_owned())?;
+                values.push((&idempotent * base.pow(exponent)) % &modulus);
+            }
+        }
+        values
+    };
+    Ok(values)
+}
+
+pub(super) fn encode_static_matrix(
     ty: &ConcreteMatrixType,
     value: &ConstantMatrix,
     env: &ParamEnv,
@@ -2392,9 +2705,13 @@ fn encode_static_matrix(
         .checked_mul(ty.columns)
         .and_then(|n| n.checked_mul(degree))
         .ok_or_else(|| "GPU constant matrix shape overflows".to_owned())?;
-    let mut coefficients = vec![BigInt::from(0); count];
+    // Only nonzero coefficients are held, by their position in the
+    // coefficient-major payload: constants other than dense polynomials have
+    // at most one per entry, so a large constant never materializes one
+    // integer per coefficient on the host.
+    let mut coefficients = Vec::<(usize, BigInt)>::new();
     let mut set_constant = |row: usize, column: usize, coefficient: BigInt| {
-        coefficients[(row * ty.columns + column) * degree] = coefficient;
+        coefficients.push(((row * ty.columns + column) * degree, coefficient));
     };
     let evaluate = |expression: &mxx_ir_core::expr::IntExpr| {
         expression.evaluate(env).map_err(|error| error.to_string())
@@ -2429,40 +2746,7 @@ fn encode_static_matrix(
         {
             let base = evaluate(base)?;
             let digits = ty.columns / ty.rows;
-            let values = if *small {
-                (0..digits)
-                    .map(|digit| {
-                        u32::try_from(digit)
-                            .map(|exponent| base.pow(exponent))
-                            .map_err(|_| "GPU small gadget exponent exceeds u32".to_owned())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                let moduli = ty.ring.crt_moduli();
-                let per_tower = regular_gadget_digits_per_tower
-                    .ok_or_else(|| "GPU regular gadget has no parameter layout".to_owned())?;
-                if per_tower == 0 || digits % per_tower != 0 || digits / per_tower > moduli.len() {
-                    return Err("GPU regular gadget digits do not span whole CRT towers".into());
-                }
-                let modulus = ty.ring.modulus();
-                let mut values = Vec::with_capacity(digits);
-                for &prime in moduli.iter().take(digits / per_tower) {
-                    let prime_big = BigInt::from(prime);
-                    let quotient = &modulus / &prime_big;
-                    let quotient_mod = (&quotient % &prime_big)
-                        .to_u64()
-                        .ok_or_else(|| "GPU gadget CRT residue exceeds u64".to_owned())?;
-                    let inverse = crate::utils::mod_inverse(quotient_mod, prime)
-                        .ok_or_else(|| "GPU gadget CRT basis is not invertible".to_owned())?;
-                    let idempotent = quotient * BigInt::from(inverse);
-                    for digit in 0..per_tower {
-                        let exponent = u32::try_from(digit)
-                            .map_err(|_| "GPU gadget exponent exceeds u32".to_owned())?;
-                        values.push((&idempotent * base.pow(exponent)) % &modulus);
-                    }
-                }
-                values
-            };
+            let values = gadget_row(ty, &base, *small, digits, regular_gadget_digits_per_tower)?;
             for row in 0..ty.rows {
                 for (digit, value) in values.iter().enumerate() {
                     set_constant(row, row * digits + digit, value.clone());
@@ -2480,14 +2764,16 @@ fn encode_static_matrix(
                 .to_usize()
                 .ok_or_else(|| "GPU constant rotation exponent is invalid".to_owned())?;
             let position = exponent % (2 * degree);
-            coefficients[position % degree] =
-                if position < degree { BigInt::from(1) } else { BigInt::from(-1) };
+            coefficients.push((
+                position % degree,
+                if position < degree { BigInt::from(1) } else { BigInt::from(-1) },
+            ));
         }
         ConstantMatrix::Polynomial { coefficients: declared }
             if ty.rows == 1 && ty.columns == 1 && declared.len() <= degree =>
         {
             for (index, expression) in declared.iter().enumerate() {
-                coefficients[index] = evaluate(expression)?;
+                coefficients.push((index, evaluate(expression)?));
             }
         }
         _ => return Err("GPU static constant has an unsupported shape or gadget layout".into()),
@@ -2496,28 +2782,28 @@ fn encode_static_matrix(
     let half = &modulus / 2;
     let centered = coefficients
         .into_iter()
-        .map(|value| {
+        .map(|(position, value)| {
             let residue = ((value % &modulus) + &modulus) % &modulus;
-            if residue > half { (true, &modulus - residue) } else { (false, residue) }
-        })
-        .map(|(negative, magnitude)| {
+            let (negative, magnitude) =
+                if residue > half { (true, &modulus - residue) } else { (false, residue) };
             let magnitude = magnitude
                 .to_biguint()
                 .ok_or_else(|| "GPU constant has negative magnitude".to_owned())?;
-            Ok::<_, String>((negative, magnitude))
+            Ok::<_, String>((position, negative, magnitude))
         })
+        .filter(|term| term.as_ref().map_or(true, |(_, _, magnitude)| !magnitude.is_zero()))
         .collect::<Result<Vec<_>, _>>()?;
     let maximum_bits =
-        centered.iter().map(|(_, magnitude)| magnitude.bits() as usize).max().unwrap_or(0);
+        centered.iter().map(|(_, _, magnitude)| magnitude.bits() as usize).max().unwrap_or(0);
     let bit_width = if maximum_bits == 0 { 0 } else { maximum_bits + 1 };
     let bit_width = u16::try_from(bit_width)
         .map_err(|_| "GPU constant coefficient bit width exceeds u16".to_owned())?;
-    let total_bits = centered
-        .len()
+    let total_bits = count
         .checked_mul(bit_width as usize)
         .ok_or_else(|| "GPU constant payload size overflows".to_owned())?;
     let mut payload = vec![0u8; total_bits.div_ceil(8)];
-    for (index, (negative, magnitude)) in centered.iter().enumerate() {
+    for (index, negative, magnitude) in &centered {
+        let (index, negative) = (*index, *negative);
         let bytes = magnitude.to_bytes_le();
         let base = index * bit_width as usize;
         for bit in 0..bit_width.saturating_sub(1) as usize {
@@ -2526,7 +2812,7 @@ fn encode_static_matrix(
                 payload[position / 8] |= 1 << (position % 8);
             }
         }
-        if *negative {
+        if negative {
             let position = base + bit_width as usize - 1;
             payload[position / 8] |= 1 << (position % 8);
         }
@@ -2550,6 +2836,7 @@ fn encode_static_matrix(
 
 pub(super) fn lower_static_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &mxx_ir_core::graph::GraphScope,
     node_id: NodeId,
     node: &mxx_ir_core::graph::NodeHandle,
     env: &ParamEnv,
@@ -2562,6 +2849,12 @@ pub(super) fn lower_static_matrix_node(
         return lower_zero_matrix_node(ctx, node_id, wire_types);
     }
     let wire = WireRef { node: node_id, port: Port(0) };
+    // A gadget read only as the right factor of row products is never
+    // stored: each product scales its row by the gadget's entries.
+    if lazy_gadget(scope, wire, wire_types) {
+        return Ok(());
+    }
+
     let ty = wire_types
         .get(&wire)
         .and_then(ConcreteWireType::matrix_type)
@@ -2571,12 +2864,14 @@ pub(super) fn lower_static_matrix_node(
     Ok(())
 }
 
-fn plan_static_matrix(
-    ctx: &mut PhysicalLoweringContext<'_>,
+/// For a regular gadget constant of type `ty`, its digits per CRT tower,
+/// after checking the gadget's layout against the registered parameters.
+fn gadget_digits_per_tower(
+    ctx: &PhysicalLoweringContext<'_>,
     ty: &ConcreteMatrixType,
     value: &ConstantMatrix,
     env: &ParamEnv,
-) -> Result<PhysicalValueId, String> {
+) -> Result<Option<usize>, String> {
     let mut regular_gadget_digits_per_tower = None;
     if let ConstantMatrix::Gadget { base, small } = value {
         if ty.rows == 0 || !ty.columns.is_multiple_of(ty.rows) {
@@ -2606,6 +2901,16 @@ fn plan_static_matrix(
             regular_gadget_digits_per_tower = Some(crt_bits.div_ceil(params.base_bits() as usize));
         }
     }
+    Ok(regular_gadget_digits_per_tower)
+}
+
+fn plan_static_matrix(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: &ConcreteMatrixType,
+    value: &ConstantMatrix,
+    env: &ParamEnv,
+) -> Result<PhysicalValueId, String> {
+    let regular_gadget_digits_per_tower = gadget_digits_per_tower(ctx, ty, value, env)?;
     let canonical = encode_static_matrix(ty, value, env, regular_gadget_digits_per_tower)?;
     let (coefficient, native, _) =
         allocate_matrix_import_destination(ctx, ty, PhysicalEncoding::FullCoeff)?;
@@ -2966,6 +3271,9 @@ pub(super) fn lower_centered_rebase_node(
 ) -> Result<(), String> {
     if !matches!(node.kind(), NodeKind::CenteredRebase { .. }) {
         return Err("GPU centered rebase lowerer received another node".into());
+    }
+    if lazy_gadget(scope, WireRef { node: node_id, port: Port(0) }, wire_types) {
+        return Ok(());
     }
     let arguments = scope
         .arguments(node)
@@ -3515,7 +3823,7 @@ fn allocate_preimage_control(
     Ok(id)
 }
 
-fn compact_value_owner(
+pub(crate) fn compact_value_owner(
     backend: &GpuDcrtBackend,
     device: i32,
     ty: ConcreteWireType,
@@ -3642,6 +3950,105 @@ pub(super) fn allocate_compact_value(
     ctx.values.push(physical);
     ctx.owners.insert(id, resident);
     Ok((id, magnitude_bytes))
+}
+
+/// A compact scratch value whose memory is chosen when the plan's Graph is
+/// compiled, possibly bytes another value used before: its producer must
+/// write every byte it leaves meaningful. A producer that relies on memory
+/// starting at zero, such as preimage sampling's retries, uses
+/// `allocate_compact_value`.
+pub(super) fn allocate_deferred_compact_value(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    ty: ConcreteWireType,
+) -> Result<PhysicalValueId, String> {
+    let storage = StorageRef::Scratch(
+        u32::try_from(ctx.values.len()).map_err(|_| "too many GPU compact storages".to_owned())?,
+    );
+    let (physical, resident, _) = deferred_compact_value(ctx.backend, ctx.device, ty, storage)?;
+    let id = value_id(ctx.values.len())?;
+    ctx.values.push(physical);
+    ctx.owners.insert(id, resident);
+    Ok(id)
+}
+
+/// A compact scratch value whose memory the plan chooses when its Graph is
+/// compiled, laid out as `compact_value_owner` lays out an allocated one.
+fn deferred_compact_value(
+    backend: &GpuDcrtBackend,
+    device: i32,
+    ty: ConcreteWireType,
+    storage: StorageRef,
+) -> Result<(PhysicalValue, Arc<GpuResidentValue>, usize), String> {
+    let (matrix, max_coefficient_bound, bound_domain) = match &ty {
+        ConcreteWireType::Preimage { matrix, max_coefficient_bound, bound_domain } |
+        ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => {
+            (matrix, max_coefficient_bound, *bound_domain)
+        }
+        _ => return Err("GPU compact scratch has no bounded matrix type".into()),
+    };
+    let bound = max_coefficient_bound
+        .to_biguint()
+        .ok_or_else(|| "GPU compact bound is negative".to_owned())?;
+    let params = backend.parameters_on_physical_device(device, matrix)?;
+    let descriptor = GpuSmallMatrixOutputDescriptor::for_shape_in_domain(
+        params,
+        matrix.rows,
+        matrix.columns,
+        bound,
+        bound_domain,
+    )
+    .map_err(|error| error.to_string())?;
+    // The native layout: coefficients of `1 + magnitude` bytes, limb-minor.
+    let width = descriptor.magnitude_bytes + 1;
+    let per_limb = bound_domain == CoefficientBoundDomain::PerCrtLimb;
+    let limbs = if per_limb { matrix.ring.crt_depth() } else { 1 };
+    let n = matrix.ring.ring_dimension() as usize;
+    let coefficient = limbs * width;
+    let column = n * coefficient;
+    let row = matrix.columns * column;
+    if row * matrix.rows != descriptor.payload_bytes {
+        return Err("GPU compact scratch layout disagrees with its descriptor".into());
+    }
+    let (encoding, extent, byte_strides) = if per_limb {
+        (
+            PhysicalEncoding::CompactCoeffPerCrtLimb {
+                magnitude_bytes: descriptor.magnitude_bytes,
+            },
+            vec![matrix.rows as u64, matrix.columns as u64, n as u64, limbs as u64, width as u64],
+            vec![row as u64, column as u64, coefficient as u64, width as u64, 1],
+        )
+    } else {
+        (
+            PhysicalEncoding::CompactCoeff { magnitude_bytes: descriptor.magnitude_bytes },
+            vec![matrix.rows as u64, matrix.columns as u64, n as u64, width as u64],
+            vec![row as u64, column as u64, coefficient as u64, 1],
+        )
+    };
+    let physical = PhysicalValue {
+        ty: ty.clone(),
+        encodings: Box::new([encoding.clone()]),
+        parts: Box::new([PhysicalPart {
+            leaf: 0,
+            storage,
+            device,
+            view: PhysicalView {
+                byte_offset: 0,
+                origin: vec![0; extent.len()].into_boxed_slice(),
+                extent: extent.into_boxed_slice(),
+                byte_strides: byte_strides.into_boxed_slice(),
+                element_bytes: 1,
+            },
+        }]),
+        integer_ranges: BTreeMap::new(),
+    };
+    let resident = crate::gpu_graph_memory::deferred_scratch_compact(
+        device,
+        ty,
+        descriptor.payload_bytes,
+        storage,
+        physical.clone(),
+    )?;
+    Ok((physical, resident, descriptor.magnitude_bytes))
 }
 
 fn emit_fresh_matrix_sample_parts(
@@ -5076,6 +5483,8 @@ pub(super) fn lower_preimage_sample_node(
                 external_io_loops: &mut *ctx.external_io_loops,
                 external_io_imports: &mut *ctx.external_io_imports,
                 slots: &mut *ctx.slots,
+                export_templates: &mut *ctx.export_templates,
+                fused_nodes: &mut *ctx.fused_nodes,
                 parallel_lanes: &mut *ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: &mut *ctx.crt_resource_next,
@@ -5648,9 +6057,8 @@ pub(super) fn emit_import_request(
 /// execution. Family members (`Some(index)`, in order) share one site per
 /// fragment as consecutive occurrences.
 #[allow(clippy::too_many_arguments)]
-fn emit_artifact_export(
+pub(super) fn emit_artifact_export(
     ctx: &mut PhysicalLoweringContext<'_>,
-    export_templates: &mut Vec<ExportTemplate>,
     name: &str,
     members: &[(Option<usize>, PhysicalValueId)],
     artifact_type: ArtifactType,
@@ -5699,7 +6107,7 @@ fn emit_artifact_export(
     let publish =
         ctx.implementations.register(GpuImplementation::export_publish()).map_err(str::to_owned)?;
     for fragment_index in 0..fragment_count {
-        let site = u32::try_from(export_templates.len())
+        let site = u32::try_from(ctx.export_templates.len())
             .map_err(|_| "too many GPU artifact export sites".to_owned())?;
         for (index, export_source, export, source_binding_base) in &staged {
             let occurrence = index.unwrap_or(0);
@@ -5787,7 +6195,7 @@ fn emit_artifact_export(
                 predecessors: Box::new([copy_index]),
                 body: None,
             });
-            export_templates.push(ExportTemplate {
+            ctx.export_templates.push(ExportTemplate {
                 name: name.to_owned(),
                 index: *index,
                 occurrence,
@@ -5798,6 +6206,7 @@ fn emit_artifact_export(
                 artifact_type: artifact_type.clone(),
                 availability,
                 export: Arc::clone(export),
+                streamed: false,
             });
         }
     }
@@ -6094,15 +6503,20 @@ pub(crate) fn plan_physical_graph(
                 .and_then(ConcreteWireType::matrix_type)
                 .ok_or_else(|| "GPU artifact import currently needs one matrix".to_owned())?
                 .clone();
-            // A matrix artifact holds evaluation residues.
-            let native =
-                backend.allocate_physical_matrix(&ty, device, PhysicalEncoding::FullEval)?;
+            // A matrix artifact holds evaluation residues, in plan scratch
+            // placed from the start of execution, when root imports are read,
+            // to their last use.
             let storage = StorageRef::Input(
                 u32::try_from(values.len())
                     .map_err(|_| "too many GPU import storages".to_owned())?,
             );
-            let (physical, owner) =
-                physical_matrix(&ty, PhysicalEncoding::FullEval, storage, Arc::clone(&native))?;
+            let (physical, owner) = crate::gpu_graph_memory::deferred_scratch_matrix(
+                backend,
+                device,
+                &ty,
+                PhysicalEncoding::FullEval,
+                storage,
+            )?;
             let evaluation = value_id(values.len())?;
             values.push(physical);
             owners.insert(evaluation, owner);
@@ -6123,7 +6537,7 @@ pub(crate) fn plan_physical_graph(
                     .ok_or("GPU import has no artifact type")?,
                     staged: false,
                     destination: evaluation,
-                    upload_owner: ImportDestination::Matrix { owner: native, ty },
+                    upload_owner: ImportDestination::Placed { ty },
                     member: None,
                     read_ahead: false,
                 },
@@ -6250,6 +6664,7 @@ pub(crate) fn plan_physical_graph(
         BTreeMap::<(PhysicalValueId, usize), Vec<(ColumnRange, u32)>>::new();
     let mut slots = Vec::<Arc<GpuExportSlot>>::new();
     let mut export_templates = Vec::<ExportTemplate>::new();
+    let mut fused_nodes = BTreeSet::<NodeId>::new();
     let mut export_sources = BTreeMap::<PhysicalValueId, PhysicalValueId>::new();
     let mut control_resets = Vec::<ControlReset>::new();
     let mut sample_seeds = Vec::<SampleSeed>::new();
@@ -6302,6 +6717,8 @@ pub(crate) fn plan_physical_graph(
                 external_io_loops: &mut external_io_loops,
                 external_io_imports: &mut external_io_imports,
                 slots: &mut slots,
+                export_templates: &mut export_templates,
+                fused_nodes: &mut fused_nodes,
                 parallel_lanes: &mut parallel_lanes,
                 node_operations: profile_nodes.then_some(&mut node_operations),
                 crt_resource_next: &mut crt_resource_next,
@@ -6338,6 +6755,9 @@ pub(crate) fn plan_physical_graph(
         }
         let node_id =
             NodeId(u64::try_from(index).map_err(|_| "GPU graph has too many nodes".to_owned())?);
+        if fused_nodes.contains(&node_id) {
+            continue;
+        }
         let arguments = scope
             .arguments(node)
             .ok_or_else(|| "GPU root node has no validated arguments".to_owned())?;
@@ -6458,6 +6878,7 @@ pub(crate) fn plan_physical_graph(
         } else if matches!(node.kind(), NodeKind::ConstantMatrix { .. }) {
             lower_static_matrix_node(
                 &mut ctx,
+                scope,
                 node_id,
                 node,
                 &validated.bindings,
@@ -6568,6 +6989,11 @@ pub(crate) fn plan_physical_graph(
             &operations,
             &mut import_templates,
         )?;
+        // A family its loop's waves already wrote member by member has no
+        // resident copy to publish, and is not returned.
+        if export_templates.iter().any(|site| site.streamed && site.name == *name) {
+            continue;
+        }
         let source = *wire_ids
             .get(&output_root.value)
             .ok_or_else(|| format!("GPU output {name} has no physical value"))?;
@@ -6619,7 +7045,6 @@ pub(crate) fn plan_physical_graph(
                 }
                 emit_artifact_export(
                     &mut ctx,
-                    &mut export_templates,
                     name,
                     &exported,
                     ArtifactType::Int,
@@ -6688,15 +7113,7 @@ pub(crate) fn plan_physical_graph(
                     }
                     exported.push((Some(index), full_eval_value(&mut ctx, id)?));
                 }
-                emit_artifact_export(
-                    &mut ctx,
-                    &mut export_templates,
-                    name,
-                    &exported,
-                    artifact_type,
-                    availability,
-                    None,
-                )?;
+                emit_artifact_export(&mut ctx, name, &exported, artifact_type, availability, None)?;
             }
             output_ids.insert(name.clone(), source);
             continue;
@@ -6957,7 +7374,6 @@ pub(crate) fn plan_physical_graph(
             let mut ctx = root_context!();
             emit_artifact_export(
                 &mut ctx,
-                &mut export_templates,
                 name,
                 &[(None, export_source)],
                 artifact_type,
@@ -7087,7 +7503,12 @@ pub(crate) fn plan_physical_graph(
     );
     let mut site_starts = BTreeMap::<usize, u32>::new();
     for template in &export_templates {
-        if template.occurrence == 0 && site_starts.insert(template.slot, template.site).is_some() {
+        // A streamed lane's slot starts the same site in every wave.
+        if template.occurrence == 0 &&
+            site_starts
+                .insert(template.slot, template.site)
+                .is_some_and(|site| !template.streamed || site != template.site)
+        {
             return Err("GPU export sites start at the same physical slot".into());
         }
     }
@@ -7154,8 +7575,18 @@ pub(crate) fn plan_physical_graph(
         .values()
         .chain(output_ids.values())
         .chain(waves.iter().flat_map(|wave| wave.owner_bindings.keys()))
-        .chain(import_templates.iter().map(|import| &import.destination))
-        .chain(external_io_imports.iter().map(|import| &import.destination))
+        .chain(
+            import_templates
+                .iter()
+                .filter(|import| !matches!(import.upload_owner, ImportDestination::Placed { .. }))
+                .map(|import| &import.destination),
+        )
+        .chain(
+            external_io_imports
+                .iter()
+                .filter(|import| !matches!(import.upload_owner, ImportDestination::Placed { .. }))
+                .map(|import| &import.destination),
+        )
         .chain(external_io_loops.iter().flat_map(|body| {
             body.carried_ids.iter().chain(body.imports.iter().map(|import| &import.destination))
         }))
@@ -7176,6 +7607,7 @@ pub(crate) fn plan_physical_graph(
         program,
         owners,
         slots,
+        fused_nodes,
         device,
         input_ids,
         integer_input_owners,

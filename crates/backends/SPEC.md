@@ -167,6 +167,11 @@ program.
 | `subgraph_kernels` | (code only) | empty | Native kernels that replace named subgraphs on the GPU. |
 | — | `MXX_GPU_MEMORY_FRACTION` | 0.8 | The fraction of each GPU's memory one plan may use. |
 | — | `MXX_GPU_LOGICAL_DEVICES` | one per GPU | Maps logical devices to physical GPUs; `0,0` simulates two devices on GPU 0. |
+| — | `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` | 1 | Columns of a bounded right operand one small-RHS product transforms at a time. Each extra column adds a workspace of the right operand's rows × one column, so a wider chunk means fewer launches and more memory. |
+
+The small-RHS chunk width is chosen by hand for now: planning does not search it, so a setting
+that does not fit in memory fails planning rather than falling back to a narrower chunk. TODO:
+choose it automatically, as the wave width and tile width are.
 
 ### 4.7 Errors
 

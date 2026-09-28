@@ -1491,17 +1491,6 @@ extern "C"
         return 0;
     }
 
-    // Free a Graph-owned allocation of an earlier Graph after the work already
-    // enqueued on `stream`.
-    int gpu_graph_allocation_free_async(uint64_t address, void *stream)
-    {
-        if (address == 0 || !stream) return set_error("invalid graph allocation free");
-        const cudaError_t err = cudaFreeAsync(
-            reinterpret_cast<void *>(address), reinterpret_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess) return set_error(err);
-        return 0;
-    }
-
     // Graph-reserved physical memory currently mapped on `device`.
     int gpu_device_graph_memory_reserved(int device, size_t *out_reserved_bytes)
     {
@@ -2322,17 +2311,8 @@ extern "C"
         std::vector<void *> host_staging;
     };
 
-    // A graph-owned buffer, mapped only on its owning GPU.
-    struct GraphAllocationRecord
-    {
-        uint64_t address = 0;
-        size_t bytes = 0;
-        int device = -1;
-    };
-
     struct MxxGpuGraphBuilder
     {
-        std::vector<GraphAllocationRecord> allocations;
         GpuContext *context = nullptr;
         int device = -1;
         cudaStream_t stream = nullptr;
@@ -2806,21 +2786,11 @@ extern "C"
             // the driver cannot run one whose operands are both on another
             // GPU. Only a copy within the graph's GPU stays a memcpy node; any
             // other copy is a kernel: on the operands' GPU when they share
-            // one, otherwise on the GPU owning a graph-allocated operand (a
-            // graph allocation is mapped on its owner only), otherwise on the
-            // graph's GPU. A conditional body keeps every node on its GPU.
+            // one, otherwise on the graph's GPU. A conditional body keeps
+            // every node on its GPU.
             const int graph_device = builder->conditional_body_active &&
                     builder->body_device >= 0 ?
                 builder->body_device : mxx_physical_device(builder->device);
-            auto graph_owner = [builder](const void *pointer, size_t length) {
-                const auto address = reinterpret_cast<uint64_t>(pointer);
-                for (const auto &allocation : builder->allocations)
-                    if (address >= allocation.address &&
-                        address - allocation.address < allocation.bytes &&
-                        length <= allocation.bytes - (address - allocation.address))
-                        return allocation.device;
-                return -1;
-            };
             if (cudaPointerGetAttributes(&source_attributes, source) == cudaSuccess &&
                 cudaPointerGetAttributes(&destination_attributes, destination) == cudaSuccess &&
                 cudaGetDevice(&current) == cudaSuccess &&
@@ -2830,19 +2800,8 @@ extern "C"
                     destination_attributes.device != graph_device))
             {
                 const bool shared = source_attributes.device == destination_attributes.device;
-                const int source_graph = graph_owner(source, bytes);
-                const int destination_graph = graph_owner(destination, bytes);
-                int executor = graph_device;
-                if (!builder->conditional_body_active)
-                {
-                    if (shared) executor = source_attributes.device;
-                    else if (source_graph >= 0) executor = source_graph;
-                    else if (destination_graph >= 0) executor = destination_graph;
-                }
-                if ((source_graph >= 0 && source_graph != executor) ||
-                    (destination_graph >= 0 && destination_graph != executor))
-                    return set_error("graph copy between two GPUs' graph allocations "
-                        "cannot run on one GPU");
+                const int executor = !builder->conditional_body_active && shared ?
+                    source_attributes.device : graph_device;
                 if (reaches(executor, source_attributes.device) &&
                     reaches(executor, destination_attributes.device))
                 {
@@ -3301,50 +3260,18 @@ extern "C"
         return 0;
     }
 
-    // Allocate one graph-owned device buffer ordered after the memory nodes
-    // `after`. The address is fixed for the graph's lifetime.
-    int mxx_gpu_graph_builder_add_memory_alloc(MxxGpuGraphBuilder *builder, int device,
-        size_t bytes, const uint32_t *after, size_t after_count, uint32_t *out_token,
-        uint64_t *out_address)
-    {
-        if (!builder || !out_token || !out_address || bytes == 0 ||
-            builder->operation_active || builder->conditional_body_active ||
-            builder->generic_body_mode || builder->graph != builder->root_graph)
-            return set_error("invalid graph memory allocation");
-        if (builder->memory_nodes.size() >= UINT32_MAX)
-            return set_error("graph memory node token overflow");
-        const int owner = mxx_physical_device(device);
-        cudaMemAllocNodeParams params{};
-        params.poolProps.allocType = cudaMemAllocationTypePinned;
-        params.poolProps.location.type = cudaMemLocationTypeDevice;
-        params.poolProps.location.id = owner;
-        params.bytesize = bytes;
-        std::vector<cudaGraphNode_t> dependencies;
-        if (append_memory_dependencies(builder, after, after_count, dependencies) != 0) return 1;
-        cudaGraphNode_t node = nullptr;
-        const cudaError_t error = cudaGraphAddMemAllocNode(&node, builder->root_graph,
-            dependencies.data(), dependencies.size(), &params);
-        if (error != cudaSuccess) return set_error(error);
-        builder->memory_nodes.push_back(node);
-        *out_token = static_cast<uint32_t>(builder->memory_nodes.size() - 1);
-        *out_address = reinterpret_cast<uint64_t>(params.dptr);
-        builder->allocations.push_back(
-            GraphAllocationRecord{*out_address, bytes, owner});
-        return 0;
-    }
-
-    // Free one graph allocation after the memory nodes `after` and after the
-    // emitted top-level operations that use it. CUDA checks memset and memcpy
-    // nodes against the allocation's lifetime, so a free is created only once
-    // every operation using the allocation exists.
-    int mxx_gpu_graph_builder_add_memory_free(MxxGpuGraphBuilder *builder, uint64_t address,
+    // An empty node ordered after the memory nodes `after` and after the
+    // emitted top-level `operations`. Scratch the plan places in its own
+    // memory is ordered by these nodes as CUDA orders Graph allocations: an
+    // allocation follows the free of any memory it reuses.
+    int mxx_gpu_graph_builder_add_memory_barrier(MxxGpuGraphBuilder *builder,
         const uint32_t *operations, size_t operation_count, const uint32_t *after,
         size_t after_count, uint32_t *out_token)
     {
-        if (!builder || !out_token || address == 0 || (operation_count && !operations) ||
+        if (!builder || !out_token || (operation_count && !operations) ||
             builder->operation_active || builder->conditional_body_active ||
             builder->generic_body_mode || builder->graph != builder->root_graph)
-            return set_error("invalid graph memory free");
+            return set_error("invalid graph memory barrier");
         if (builder->memory_nodes.size() >= UINT32_MAX)
             return set_error("graph memory node token overflow");
         std::vector<cudaGraphNode_t> dependencies;
@@ -3352,21 +3279,21 @@ extern "C"
         for (size_t index = 0; index < operation_count; ++index)
         {
             if (operations[index] >= builder->terminals.size())
-                return set_error("graph memory free operation is unknown");
+                return set_error("graph memory barrier operation is unknown");
             const cudaGraphNode_t terminal = builder->terminals[operations[index]];
             if (std::find(dependencies.begin(), dependencies.end(), terminal) ==
                 dependencies.end()) dependencies.push_back(terminal);
         }
         cudaGraphNode_t node = nullptr;
-        const cudaError_t error = cudaGraphAddMemFreeNode(&node, builder->root_graph,
-            dependencies.data(), dependencies.size(), reinterpret_cast<void *>(address));
+        const cudaError_t error = cudaGraphAddEmptyNode(&node, builder->root_graph,
+            dependencies.data(), dependencies.size());
         if (error != cudaSuccess) return set_error(error);
         builder->memory_nodes.push_back(node);
         *out_token = static_cast<uint32_t>(builder->memory_nodes.size() - 1);
         return 0;
     }
 
-    // The next top-level operation starts after these allocation nodes.
+    // The next top-level operation starts after these memory barriers.
     int mxx_gpu_graph_builder_set_pending_memory_dependencies(MxxGpuGraphBuilder *builder,
         const uint32_t *tokens, size_t count)
     {

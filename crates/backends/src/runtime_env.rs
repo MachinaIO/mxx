@@ -23,6 +23,8 @@ pub struct GpuRuntimeOptions {
     /// each root wave group runs its first this many waves and each root
     /// host-driven loop that many iterations, their exports are discarded
     /// with the trial session, and the report adds an I/O-inclusive estimate.
+    /// A plan whose store is on the host or on disk always runs this trial,
+    /// with 2 waves when unset; a GPU-resident store runs it only when set.
     pub io_trial_waves: Option<NonZeroUsize>,
 }
 

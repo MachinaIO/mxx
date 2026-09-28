@@ -372,7 +372,9 @@ fn root_dynamic_typed_blob_import_preserves_selected_length_on_replay() {
             index: Some(index),
         })
         .collect::<Vec<_>>();
-    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0; 3]);
+    // The planning I/O trial of this memory store reads the selected member
+    // itself, since its type has no zero payload to emulate the load with.
+    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0, 0, 1]);
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
@@ -504,7 +506,9 @@ fn root_dynamic_integer_import_replays_mixed_signed_widths() {
             index: Some(index),
         })
         .collect::<Vec<_>>();
-    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0; 3]);
+    // The planning I/O trial of this memory store reads the selected member
+    // itself, since its type has no zero payload to emulate the load with.
+    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0, 0, 1]);
 
     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();

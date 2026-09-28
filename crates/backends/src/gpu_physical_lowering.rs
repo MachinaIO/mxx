@@ -2161,8 +2161,8 @@ fn lazy_gadget(
 }
 
 /// The product `left * G` of a one-row `left` and a gadget `G = I_r (x) g`
-/// that is never stored: output column `i * d + t` is `left[i] * g_t`, a
-/// scale by an integer written into its window of the output.
+/// that is never stored: output column `i * d + t` is `left[i] * g_t`, all
+/// written by one gadget-scale operation.
 fn lower_gadget_product(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
@@ -2215,57 +2215,50 @@ fn lower_gadget_product(
         return Err("GPU gadget product shape differs from its factors".into());
     }
     let output = allocate_scratch_matrix(ctx, &output_ty, PhysicalEncoding::FullEval)?;
-    let implementation =
-        ctx.implementations.register(GpuImplementation::matrix_scale()).map_err(str::to_owned)?;
-    let column_ty = ConcreteMatrixType { columns: 1, ..output_ty.clone() };
-    let mut writers = Vec::with_capacity(output_ty.columns);
-    for entry in 0..gadget_ty.rows {
-        let source =
-            if gadget_ty.rows == 1 { left } else { matrix_view(ctx, left, 0, 1, entry, 1)? };
-        for (digit, coefficient) in row.iter().enumerate() {
-            let column = entry * digits + digit;
-            let window = matrix_view(ctx, output, 0, 1, column, 1)?;
-            let scaled = allocate_scratch_matrix(ctx, &column_ty, PhysicalEncoding::FullEval)?;
-            let residues = column_ty
-                .ring
-                .crt_moduli()
-                .iter()
-                .map(|prime| {
-                    let modulus = BigInt::from(*prime);
-                    let mut residue = coefficient % &modulus;
-                    if residue.sign() == num_bigint::Sign::Minus {
-                        residue += modulus;
-                    }
-                    residue.to_u64().ok_or_else(|| "GPU gadget residue exceeds u64".to_owned())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
-            let output_binding = register_bindings(ctx.bindings, ctx.values, scaled)?;
-            let operation = u32::try_from(ctx.operations.len())
-                .map_err(|_| "too many GPU gadget product operations".to_owned())?;
-            ctx.operations.push(CompiledGpuOp {
-                implementation,
-                arguments: Box::new([
-                    KernelArg::Value(source),
-                    KernelArg::U32(0),
-                    KernelArg::Value(scaled),
-                    KernelArg::U32(0),
-                    KernelArg::U64List(residues.into_boxed_slice()),
-                    KernelArg::U32(source_binding),
-                    KernelArg::U32(output_binding),
-                ]),
-                outputs: Box::new([scaled]),
-                device: ctx.device,
-                grid: [1; 3],
-                block: [1; 3],
-                shared_bytes: 0,
-                predecessors: all_predecessors(ctx.producer, source),
-                body: None,
-            });
-            let copy = copy_matrix_view(ctx, scaled, window, Box::new([operation]))?;
-            writers.push((ColumnRange { start: column, end: column + 1 }, copy));
+    // Digit-major residues of the gadget row in the output's CRT basis.
+    let mut residues = Vec::with_capacity(row.len() * output_ty.ring.crt_moduli().len());
+    for coefficient in &row {
+        for prime in output_ty.ring.crt_moduli() {
+            let modulus = BigInt::from(*prime);
+            let mut residue = coefficient % &modulus;
+            if residue.sign() == num_bigint::Sign::Minus {
+                residue += modulus;
+            }
+            residues
+                .push(residue.to_u64().ok_or_else(|| "GPU gadget residue exceeds u64".to_owned())?);
         }
     }
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::matrix_gadget_scale())
+        .map_err(str::to_owned)?;
+    let source_binding = register_bindings(ctx.bindings, ctx.values, left)?;
+    let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
+    let operation = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU gadget product operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: Box::new([
+            KernelArg::Value(left),
+            KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::U64(
+                u64::try_from(digits).map_err(|_| "GPU gadget digit count exceeds u64")?,
+            ),
+            KernelArg::U64List(residues.into_boxed_slice()),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(output_binding),
+        ]),
+        outputs: Box::new([output]),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors: all_predecessors(ctx.producer, left),
+        body: None,
+    });
+    let writers = vec![(ColumnRange { start: 0, end: output_ty.columns }, operation)];
     ctx.producer.insert(output, writers);
     ctx.wire_ids.insert(wire, output);
     Ok(())
@@ -7072,7 +7065,8 @@ pub(crate) fn plan_physical_graph(
             &mut import_templates,
         )?;
         // A family its loop's waves already wrote member by member has no
-        // resident copy to publish, and is not returned.
+        // resident copy to publish; the runtime returns it as its committed
+        // artifact family.
         if export_templates.iter().any(|site| site.streamed && site.name == *name) {
             continue;
         }

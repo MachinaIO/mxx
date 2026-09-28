@@ -323,6 +323,10 @@ int gpu_raw_matrix_scale(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     const uint64_t *scalar_residues, size_t residue_count,
     uint32_t source_binding_base, uint32_t destination_binding_base);
+int gpu_raw_matrix_gadget_scale(GpuContext *ctx, void *stream,
+    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+    const uint64_t *residues, size_t digits,
+    uint32_t source_binding_base, uint32_t destination_binding_base);
 int gpu_raw_matrix_scale_dynamic(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
     const void *scalar, int scalar_encoding, uint32_t *status,

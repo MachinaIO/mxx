@@ -34,16 +34,16 @@
 //! matrix any scope computes. Both come from geometric grids that always include their extremes.
 //! Wider tiles and narrower waves are preferred: the planner narrows C from the widest at the
 //! narrowest W, then widens W at the chosen C. A candidate replaces the best only when it is 5%
-//! faster, and each sweep stops at the first candidate that is not; widening W also stops at a
-//! rejection. For each `(W, C)` candidate it lowers the graph, actually allocates it, checks its
-//! persistent allocations against the device budget (`MXX_GPU_MEMORY_FRACTION`), compiles its
-//! regions, and times `measurement_warmups + measurement_iterations` trials. A trial does not
-//! launch a region whose work (operations, value types and shapes, and launch shapes, not where the
-//! data is) a trial of this runtime already timed: that time is reused per launch. A candidate
-//! whose allocation, compilation, or trial fails is rejected; no VRAM requirement is predicted.
-//! Each region's time is weighted by how often production replays it, and the fastest feasible
-//! candidate is frozen into a value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the
-//! selected report.
+//! faster; each sweep measures all of its candidates, since times are not monotonic in either
+//! width, and only widening W stops at a rejection. For each `(W, C)` candidate it lowers the
+//! graph, actually allocates it, checks its persistent allocations against the device budget
+//! (`MXX_GPU_MEMORY_FRACTION`), compiles its regions, and times `measurement_warmups +
+//! measurement_iterations` trials. A trial does not launch a region whose work (operations, value
+//! types and shapes, and launch shapes, not where the data is) a trial of this runtime already
+//! timed: that time is reused per launch. A candidate whose allocation, compilation, or trial fails
+//! is rejected; no VRAM requirement is predicted. Each region's time is weighted by how often
+//! production replays it, and the fastest feasible candidate is frozen into a value-only
+//! `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected report.
 //!
 //! With `profile_nodes`, planning then lowers the selected candidate once more with a Graph region
 //! boundary at every graph node's operations and times it the same way. Every separate launch pays
@@ -1782,9 +1782,6 @@ pub struct GpuRuntime {
     /// Set only while an I/O trial executes a plan: it limits the root wave
     /// groups and host-driven loops and records their times.
     io_trial: Option<IoTrial>,
-    /// Seconds one store load took for each artifact descriptor (without its
-    /// family count) an I/O trial measured, reused by later trials.
-    trial_loads: Vec<(ManifestArtifact, f64)>,
     /// Seconds one launch of a region took in a trial, keyed by its work
     /// (`region_key`), reused by every later trial of this runtime.
     region_launch_seconds: BTreeMap<u64, f64>,
@@ -1856,7 +1853,6 @@ impl GpuRuntime {
             options: GpuRuntimeOptions::from_env()?,
             measured_costs: GpuMeasuredCostCache::default(),
             io_trial: None,
-            trial_loads: Vec::new(),
             region_launch_seconds: BTreeMap::new(),
         })
     }
@@ -2353,13 +2349,14 @@ impl GpuRuntime {
     }
 
     /// The load seconds of each artifact descriptor `frame` imports, measured
-    /// once per descriptor and runtime: a zero payload of its type is stored
+    /// once per descriptor in `store` on every call, since the latency is the
+    /// store's own: a zero payload of its type is stored
     /// under a fresh production, dropped from the store's cache, loaded once
     /// under a timer, and removed. Only the load is timed. A descriptor whose
     /// type has no zero payload is left out, so the trial reads the artifact
     /// itself.
     fn measure_trial_loads<S: SessionStore>(
-        &mut self,
+        &self,
         frame: &PhysicalFrame,
         store: &mut S,
     ) -> Result<Vec<(ManifestArtifact, f64)>, GpuPlanError> {
@@ -2380,12 +2377,6 @@ impl GpuRuntime {
         let mut loads = Vec::<(ManifestArtifact, f64)>::new();
         for descriptor in descriptors {
             if loads.iter().any(|(measured, _)| same_payload(measured, descriptor)) {
-                continue;
-            }
-            if let Some(known) =
-                self.trial_loads.iter().find(|(measured, _)| same_payload(measured, descriptor))
-            {
-                loads.push(known.clone());
                 continue;
             }
             let descriptor = ManifestArtifact { family_count: None, ..descriptor.clone() };
@@ -2433,7 +2424,6 @@ impl GpuRuntime {
                 seconds,
                 "GPU I/O trial measured one artifact load"
             );
-            self.trial_loads.push((descriptor.clone(), seconds));
             loads.push((descriptor, seconds));
         }
         Ok(loads)
@@ -2744,9 +2734,9 @@ impl GpuRuntime {
         // Wider tiles and narrower waves are preferred: the tile width
         // shrinks from the widest at the narrowest wave, then the wave width
         // grows at the chosen tile, and a candidate replaces the best only
-        // when it is `PREFERENCE` faster. A sweep stops at the first
-        // candidate that is not; a wider wave also stops at a rejection,
-        // since it only needs more memory.
+        // when it is `PREFERENCE` faster. Times are not monotonic in either
+        // width, so each sweep measures every candidate past a plateau; only
+        // a wider wave stops at a rejection, since it only needs more memory.
         const PREFERENCE: f64 = 0.05;
         let mut waves = candidate_waves.clone();
         waves.sort_unstable();
@@ -2808,8 +2798,6 @@ impl GpuRuntime {
                             seconds < *current * (1.0 - PREFERENCE)
                         }) {
                             best = Some((candidate_w, candidate_c, seconds, regions));
-                        } else {
-                            break;
                         }
                     }
                     Ok(_) => {
@@ -3085,13 +3073,12 @@ impl GpuRuntime {
         with_checked_producer_io_pump(store, descriptor, digest, window, |pump, finalized| {
             // A finalized production is replayed: the GPU recomputes the
             // outputs, and its artifacts are the ones already committed.
-            let handles = finalized_export_handles(
-                &plan.frame,
-                finalized.as_ref().unwrap_or(&manifest),
-                &production,
-            )?;
+            let committed = finalized.as_ref().unwrap_or(&manifest);
+            let handles = finalized_export_handles(&plan.frame, committed, &production)?;
+            let streamed = streamed_family_outputs(&plan.frame, committed, &production)?;
             let persist = finalized.is_none().then(|| (production.clone(), manifest));
             let mut result = self.execute_io(plan, &inputs, execution_nonce, pump, persist)?;
+            result.outputs.extend(streamed);
             result.production_id = Some(production);
             result.artifact_handles = handles;
             Ok(result)
@@ -3916,6 +3903,34 @@ fn finalized_export_handles(
         });
     }
     Ok(handles.into_iter().map(|(name, indexed)| (name, indexed.into_values().collect())).collect())
+}
+
+/// The outputs whose members a parallel loop's waves exported one by one
+/// (`ExportTemplate::streamed`): no resident copy of them is kept, so each is
+/// returned as its committed artifact family.
+fn streamed_family_outputs(
+    frame: &PhysicalFrame,
+    manifest: &Manifest,
+    production: &ProductionId,
+) -> Result<BTreeMap<String, RuntimeValue>, GpuRuntimeError> {
+    let mut outputs = BTreeMap::new();
+    for site in frame.export_templates.iter().filter(|site| site.streamed) {
+        if outputs.contains_key(&site.name) {
+            continue;
+        }
+        let descriptor = manifest.artifacts.get(&site.name).ok_or_else(|| {
+            GpuRuntimeError::Artifact(format!("missing manifest artifact {}", site.name))
+        })?;
+        outputs.insert(
+            site.name.clone(),
+            RuntimeValue::LazyArtifactFamily {
+                production: production.clone(),
+                name: site.name.clone(),
+                descriptor: descriptor.clone(),
+            },
+        );
+    }
+    Ok(outputs)
 }
 
 fn artifact_payload_kind(artifact: &ArtifactType) -> u8 {

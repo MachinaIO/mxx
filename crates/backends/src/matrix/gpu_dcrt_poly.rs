@@ -321,6 +321,7 @@ impl GpuSmallMatrix {
             .ok_or(SmallMatrixError::DimensionOverflow)
     }
 
+    /// A compact owner whose payload bytes are all zero once it is ready.
     pub(crate) fn new_empty_checked_in_domain(
         params: &GpuDCRTPolyParams,
         rows: usize,
@@ -485,7 +486,8 @@ impl GpuSmallMatrixOutputDescriptor {
         })
     }
 
-    /// Allocate exactly the compact owner described by this frozen contract.
+    /// Allocate exactly the compact owner described by this frozen contract,
+    /// with every payload byte zero.
     pub fn allocate(&self) -> Result<GpuSmallMatrix, SmallMatrixError> {
         GpuSmallMatrix::new_empty_checked_in_domain(
             &self.params,

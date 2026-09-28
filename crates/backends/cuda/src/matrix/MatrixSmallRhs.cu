@@ -321,6 +321,10 @@ extern "C" int gpu_small_matrix_create(
     if (err == cudaSuccess)
         err = cudaMallocAsync(reinterpret_cast<void **>(&mat->payload), mat->payload_bytes, mat->stream);
     if (err == cudaSuccess)
+        // A new owner starts zeroed: pool memory may hold another value's bytes, and
+        // producers such as preimage sampling rely on every unwritten byte being zero.
+        err = cudaMemsetAsync(mat->payload, 0, mat->payload_bytes, mat->stream);
+    if (err == cudaSuccess)
         err = cudaEventRecord(mat->write_done, mat->stream);
     if (err != cudaSuccess)
     {

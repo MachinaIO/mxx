@@ -4011,6 +4011,9 @@ pub(crate) fn compact_value_owner(
     Ok((physical, Arc::new(resident), owner, descriptor.magnitude_bytes))
 }
 
+/// A compact value allocated now for the plan, with every byte zero: a
+/// producer may leave bytes it does not write, such as the columns a retry has
+/// not published yet.
 pub(super) fn allocate_compact_value(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,
@@ -4035,7 +4038,7 @@ pub(super) fn allocate_compact_value(
 /// compiled, possibly bytes another value used before: its producer must
 /// write every byte it leaves meaningful. A producer that relies on memory
 /// starting at zero, such as preimage sampling's retries, uses
-/// `allocate_compact_value`.
+/// `allocate_compact_value`, whose memory is zeroed when it is allocated.
 pub(super) fn allocate_deferred_compact_value(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,

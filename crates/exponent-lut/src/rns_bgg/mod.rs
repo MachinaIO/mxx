@@ -1211,6 +1211,125 @@ fn map_matrix(matrix: RnsBggMatrix, mut operation: impl FnMut(Mat) -> Mat) -> Rn
 }
 
 /// Resolve the concrete ordered CRT ring of a graph matrix.
+/// The nonzero coefficients of `value`, centered into `(-q/2, q/2]`, and its
+/// ring dimension.
+fn centered_terms<P: mxx_backends::poly::Poly>(value: &P) -> (usize, Vec<(usize, BigInt)>) {
+    use mxx_backends::element::PolyElem;
+    let coefficients = value.coeffs();
+    let terms = coefficients
+        .iter()
+        .enumerate()
+        .filter(|(_, coefficient)| !coefficient.value().is_zero())
+        .map(|(index, coefficient)| {
+            let modulus: std::sync::Arc<BigUint> = coefficient.modulus().clone().into();
+            let value = BigInt::from(coefficient.value().clone());
+            let centered = if coefficient.value() > &(modulus.as_ref() >> 1usize) {
+                value - BigInt::from(modulus.as_ref().clone())
+            } else {
+                value
+            };
+            (index, centered)
+        })
+        .collect();
+    (coefficients.len(), terms)
+}
+
+/// The coefficient of a constant polynomial with these terms.
+fn constant_term(terms: &[(usize, BigInt)]) -> Option<BigInt> {
+    match terms {
+        [] => Some(BigInt::zero()),
+        [(0, coefficient)] => Some(coefficient.clone()),
+        _ => None,
+    }
+}
+
+/// The exponent `k` in `[0, 2n)` of a signed monomial `X^k` with these terms,
+/// where `X^(j+n) = -X^j`.
+fn monomial_exponent(dimension: usize, terms: &[(usize, BigInt)]) -> Option<usize> {
+    match terms {
+        [(position, coefficient)] if coefficient.is_one() => Some(*position),
+        [(position, coefficient)] if (-coefficient).is_one() => Some(position + dimension),
+        _ => None,
+    }
+}
+
+/// A graph constant with these terms, sized by them rather than by the ring
+/// dimension where it can be: a constant polynomial keeps one coefficient and a
+/// signed monomial is a rotation. Any other polynomial keeps its coefficients
+/// up to its last nonzero one.
+fn constant_from_terms(ring: &Ring, dimension: usize, terms: &[(usize, BigInt)]) -> Mat {
+    if let Some(coefficient) = constant_term(terms) {
+        return ring.polynomial([IntExpr::constant(coefficient)]);
+    }
+    if let Some(exponent) = monomial_exponent(dimension, terms) {
+        return ring.constant(
+            (1, 1),
+            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: IntExpr::constant(exponent) },
+        );
+    }
+    let length = terms.last().map_or(0, |(position, _)| position + 1);
+    let mut coefficients = vec![IntExpr::constant(0); length];
+    for (position, coefficient) in terms {
+        coefficients[*position] = IntExpr::constant(coefficient.clone());
+    }
+    ring.polynomial(coefficients)
+}
+
+/// A caller's plaintext polynomial as a graph constant over `ring`, sized by
+/// its nonzero terms (see `constant_from_terms`).
+pub(crate) fn plaintext_constant<P: mxx_backends::poly::Poly>(ring: &Ring, value: &P) -> Mat {
+    let (dimension, terms) = centered_terms(value);
+    constant_from_terms(ring, dimension, &terms)
+}
+
+/// A caller's plaintext family as one `(c, k)` pair per member, the member
+/// being `c * X^k`. Members are read in parallel. A family member with more
+/// than one nonzero coefficient is refused: a family is read member by member
+/// inside loop bodies (see `plaintext_member`), so it is never a resident
+/// family of full matrices.
+pub(crate) fn plaintext_terms<P: mxx_backends::poly::Poly>(
+    values: &[P],
+) -> Result<Vec<(BigInt, usize)>, String> {
+    use rayon::prelude::*;
+    values
+        .par_iter()
+        .map(|value| match centered_terms(value).1.as_slice() {
+            [] => Ok((BigInt::zero(), 0)),
+            [(exponent, coefficient)] => Ok((coefficient.clone(), *exponent)),
+            _ => Err("a plaintext family member must have at most one nonzero coefficient".into()),
+        })
+        .collect()
+}
+
+/// Member `index` of a plaintext family given by `plaintext_terms`, built
+/// where it is read from compile-time tables of its coefficient and exponent.
+pub(crate) fn plaintext_member(
+    ring: &Ring,
+    terms: &[(BigInt, usize)],
+    index: mxx_dsl::Int,
+) -> Result<Mat, mxx_dsl::DslError> {
+    let index = index.expression()?;
+    let table = |values: Vec<IntExpr>| {
+        mxx_dsl::Int::evaluate(IntExpr::Select {
+            selector: Box::new(index.clone()),
+            branches: values,
+        })
+    };
+    let member = if terms.iter().all(|(coefficient, _)| coefficient.is_one()) {
+        ring.polynomial([IntExpr::constant(1)])
+    } else {
+        table(terms.iter().map(|(coefficient, _)| IntExpr::constant(coefficient.clone())).collect())
+            .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+    };
+    Ok(if terms.iter().all(|(_, exponent)| *exponent == 0) {
+        member
+    } else {
+        member.multiply_monomial(table(
+            terms.iter().map(|(_, exponent)| IntExpr::constant(*exponent)).collect(),
+        ))
+    })
+}
+
 pub(crate) fn concrete_ring(value: &Mat) -> Result<ConcreteRing, RnsBggError> {
     resolve_ring(&value.matrix_type().ring)
 }
@@ -1317,37 +1436,101 @@ pub(crate) fn compact_decompose_matrix(
     Ok(centered_rebase_compact(value, &evaluation_ring))
 }
 
+/// The compact decomposition of each column of `matrix`, its two entries
+/// stacked: `G^-1([m00; m10])` and `G^-1([m01; m11])`. Digits of stacked
+/// rows are stacked, so a product with `[a | b]` gives `a u + b w` in one
+/// product, with no product of each entry held for a sum.
+pub(crate) fn compact_decompose_columns(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    decomposition_level: usize,
+    matrix: RnsBggMatrix,
+) -> Result<(SmallMatrix, SmallMatrix), RnsBggError> {
+    let evaluation_ring = parameters.ring(evaluation_level)?;
+    let evaluation = resolve_ring(evaluation_ring.as_ref())?;
+    let decomposition = parameters.level(decomposition_level)?;
+    let decomposition_ring = resolve_ring(parameters.ring(decomposition_level)?.as_ref())?;
+    for entry in [&matrix.0.0, &matrix.0.1, &matrix.1.0, &matrix.1.1] {
+        if concrete_ring(entry)? != decomposition_ring {
+            return Err(RnsBggError::Parameters(
+                "compact action matrix does not match its decomposition ring",
+            ));
+        }
+    }
+    if evaluation.modulus() < decomposition_ring.modulus() {
+        return Err(RnsBggError::Parameters(
+            "evaluation modulus must contain the decomposition modulus",
+        ));
+    }
+    let base = 1u64
+        .checked_shl(decomposition.base_bits())
+        .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
+    let count = decomposition.modulus_digits();
+    let ((top_left, top_right), (bottom_left, bottom_right)) = matrix;
+    let column = |top: Mat, bottom: Mat| {
+        Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, vec![top, bottom])
+            .decompose(base, count)
+            .centered_rebase(&evaluation_ring)
+    };
+    Ok((column(top_left, bottom_left), column(top_right, bottom_right)))
+}
+
+/// `row * action` for every row of `rows`, with the action given as the
+/// stacked decompositions of its columns (`compact_decompose_columns`):
+/// each column is one product of all rows, both halves side by side.
+pub(crate) fn multiply_rows_by_columns<D: RightAction>(
+    rows: Vec<RnsBggRow>,
+    columns: (D, D),
+) -> Vec<RnsBggRow> {
+    let heights = rows.iter().map(|(a, _)| a.matrix_type().rows.clone()).collect::<Vec<_>>();
+    let (lefts, rights): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    let stack = |values: Vec<Mat>| match <[Mat; 1]>::try_from(values) {
+        Ok([value]) => value,
+        Err(values) => Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, values),
+    };
+    let both =
+        Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![stack(lefts), stack(rights)]);
+    let split = |value: Mat| {
+        if heights.len() == 1 {
+            return vec![value];
+        }
+        let mut start = IntExpr::constant(0);
+        heights
+            .iter()
+            .map(|height| {
+                let end = (start.clone() + height.clone()).canonicalize();
+                let range =
+                    mxx_ir_core::node::IndexRange { start: start.clone(), end: end.clone() };
+                start = end;
+                value.clone().slice(Some(range), None)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (first, second) = columns;
+    let first = split(first.right_multiply(both.clone()));
+    let second = split(second.right_multiply(both));
+    first.into_iter().zip(second).collect()
+}
+
+/// An encoding's row and public-key matrix under an action given by its
+/// stacked column decompositions, as one product per column.
+pub(crate) fn multiply_row_and_public_by_columns<D: RightAction>(
+    row: RnsBggRow,
+    matrix: RnsBggMatrix,
+    columns: (D, D),
+) -> (RnsBggRow, RnsBggMatrix) {
+    let (top, bottom) = matrix;
+    let mut rows = multiply_rows_by_columns(vec![row, top, bottom], columns).into_iter();
+    let row = rows.next().expect("three rows");
+    let top = rows.next().expect("three rows");
+    (row, (top, rows.next().expect("three rows")))
+}
+
 pub(crate) fn centered_rebase_compact(value: RnsBggDigits, ring: &Ring) -> RnsBggDecomposition {
     (
         (value.0.0.centered_rebase(ring), value.0.1.centered_rebase(ring)),
         (value.1.0.centered_rebase(ring), value.1.1.centered_rebase(ring)),
     )
-}
-
-/// Apply a compact right action to an encoding row.
-pub(crate) fn compact_right_action_row(
-    parameters: &RnsBggParameters,
-    evaluation_level: usize,
-    decomposition_level: usize,
-    row: RnsBggRow,
-    matrix: RnsBggMatrix,
-) -> Result<RnsBggRow, RnsBggError> {
-    let decomposition =
-        compact_decompose_matrix(parameters, evaluation_level, decomposition_level, matrix)?;
-    Ok(multiply_encoding_action(row, decomposition))
-}
-
-/// Apply a compact right action to a public matrix.
-pub(crate) fn compact_right_action_public(
-    parameters: &RnsBggParameters,
-    evaluation_level: usize,
-    decomposition_level: usize,
-    matrix: RnsBggMatrix,
-    action: RnsBggMatrix,
-) -> Result<RnsBggMatrix, RnsBggError> {
-    let decomposition =
-        compact_decompose_matrix(parameters, evaluation_level, decomposition_level, action)?;
-    Ok(multiply_public_action(matrix, decomposition))
 }
 
 fn validate_public_alignment_entry(
@@ -1428,22 +1611,53 @@ impl RightAction for SmallMatrix {
     }
 }
 
+/// `row * rhs` for every row of `rows`, each a pair of blocks. Each right
+/// factor multiplies all rows at once, stacked, so every factor has one use:
+/// the rows' later consumers never keep a factor, which is as large as the
+/// product's column count squared, alive after its products.
+pub(crate) fn multiply_rows_action<D: RightAction>(
+    rows: Vec<RnsBggRow>,
+    rhs: ((D, D), (D, D)),
+) -> Vec<RnsBggRow> {
+    let ((u, v), (w, x)) = rhs;
+    if let [(a, b)] = rows.as_slice() {
+        let (a, b) = (a.clone(), b.clone());
+        return vec![(
+            u.right_multiply(a.clone()) + w.right_multiply(b.clone()),
+            v.right_multiply(a) + x.right_multiply(b),
+        )];
+    }
+    let heights = rows.iter().map(|(a, _)| a.matrix_type().rows.clone()).collect::<Vec<_>>();
+    let (lefts, rights): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    let left = Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, lefts);
+    let right = Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, rights);
+    let split = |value: Mat| {
+        let mut start = IntExpr::constant(0);
+        heights
+            .iter()
+            .map(|height| {
+                let end = (start.clone() + height.clone()).canonicalize();
+                let range =
+                    mxx_ir_core::node::IndexRange { start: start.clone(), end: end.clone() };
+                start = end;
+                value.clone().slice(Some(range), None)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = split(u.right_multiply(left.clone()) + w.right_multiply(right.clone()));
+    let second = split(v.right_multiply(left) + x.right_multiply(right));
+    first.into_iter().zip(second).collect()
+}
+
+/// `lhs * rhs` for 2x2 matrices of blocks.
 pub(crate) fn multiply_public_action<D: RightAction>(
     lhs: RnsBggMatrix,
     rhs: ((D, D), (D, D)),
 ) -> RnsBggMatrix {
-    let ((a, b), (c, d)) = lhs;
-    let ((u, v), (w, x)) = rhs;
-    (
-        (
-            u.clone().right_multiply(a.clone()) + w.clone().right_multiply(b.clone()),
-            v.clone().right_multiply(a) + x.clone().right_multiply(b),
-        ),
-        (
-            u.right_multiply(c.clone()) + w.right_multiply(d.clone()),
-            v.right_multiply(c) + x.right_multiply(d),
-        ),
-    )
+    let (top, bottom) = lhs;
+    let mut rows = multiply_rows_action(vec![top, bottom], rhs).into_iter();
+    let top = rows.next().expect("two rows");
+    (top, rows.next().expect("two rows"))
 }
 
 pub(crate) fn multiply_encoding_action<D: RightAction>(
@@ -1741,7 +1955,10 @@ mod tests {
         let high_ring = parameters.ring(0).unwrap();
         let high_one = high_ring.polynomial([mxx_ir_core::IntExpr::constant(BigInt::from(1u8))]);
         let row = (high_one.clone(), high_one);
-        let result = compact_right_action_row(&parameters, 0, 1, row.clone(), action).unwrap();
+        let result = multiply_encoding_action(
+            row.clone(),
+            compact_decompose_matrix(&parameters, 0, 1, action).unwrap(),
+        );
         assert_eq!(result.0.matrix_type(), row.0.matrix_type());
     }
 

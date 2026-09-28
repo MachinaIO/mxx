@@ -13,8 +13,8 @@ use crate::{
     },
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
-        GraphFamilyExecution, GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable,
-        ProgramLoweringContext, RhsId, RhsRef, WireId, lower_program,
+        GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, ProgramLoweringContext,
+        RhsId, RhsRef, WireId, lower_program,
     },
 };
 use mxx_backends::{RuntimeValue, poly::Poly};
@@ -287,6 +287,107 @@ pub(crate) fn sampled_key(
     ))
 }
 
+/// A family bound for preprocessing.
+///
+/// A stored family holds complete public keys. An input family holds only what
+/// its keys are sampled from: a member read samples that member's key from the
+/// hash key in place (`sampled_key`), as online evaluation does, so no stage
+/// materializes the keys of a whole input family.
+#[derive(Clone)]
+pub enum PreprocessWireFamily {
+    Stored(Family<RnsBggPublicKey>),
+    Input {
+        wire: WireId,
+        level: usize,
+        knowledge: AttributeKnowledge,
+        hash_key: Bytes,
+        count: IntExpr,
+    },
+}
+
+impl PreprocessWireFamily {
+    /// Read one member: an input member's key is sampled from the hash key.
+    fn member(
+        &self,
+        parameters: &RnsBggParameters,
+        index: IntExpr,
+    ) -> Result<RnsBggPublicKey, RnsBggError> {
+        match self {
+            Self::Stored(family) => Ok(family.at(Int::evaluate(index))),
+            Self::Input { wire, level, knowledge, hash_key, .. } => {
+                sampled_key(parameters, *level, hash_key.clone(), *wire, *knowledge, Some(index))
+            }
+        }
+    }
+
+    fn count(&self) -> IntExpr {
+        match self {
+            Self::Stored(family) => family.count().clone(),
+            Self::Input { count, .. } => count.clone(),
+        }
+    }
+}
+
+/// Preprocessing reads families through the same execution as online
+/// evaluation, which samples an input member's public key where it is read.
+impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
+    for super::encoding::OnlineFamilies<'b>
+{
+    type WireFamily = PreprocessWireFamily;
+    type RhsFamily = Family<RhsRef<Int>>;
+
+    fn wire_at(
+        &mut self,
+        family: &Self::WireFamily,
+        index: &IntExpr,
+    ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
+        family
+            .member(self.parameters, index.clone())
+            .map_err(crate::program::ProgramLowerError::Backend)
+    }
+
+    fn rhs_at(
+        &mut self,
+        family: &Self::RhsFamily,
+        index: &IntExpr,
+    ) -> Result<RhsRef<Int>, crate::program::ProgramLowerError<RnsBggError>> {
+        // A member reference names its member by the index expression itself,
+        // so a read can tell the loop member it belongs to.
+        Ok(RhsRef {
+            id: mxx_dsl::GraphValue::schema(family).element.id,
+            index: Some(Int::evaluate(index.clone())),
+        })
+    }
+
+    fn parallel(
+        &mut self,
+        evaluator: &mut PublicKeyLowering<'a>,
+        range: &crate::program::FamilyRange,
+        body: impl FnOnce(
+            &mut Self,
+            &mut PublicKeyLowering<'a>,
+            IntExpr,
+        )
+            -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>>,
+    ) -> Result<Self::WireFamily, crate::program::ProgramLowerError<RnsBggError>> {
+        crate::program::graph_parallel(self, evaluator, range, body)
+            .map(PreprocessWireFamily::Stored)
+    }
+
+    fn sum(
+        &mut self,
+        evaluator: &mut PublicKeyLowering<'a>,
+        family: &Self::WireFamily,
+    ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
+        use crate::program::ProgramLowerError;
+        let parameters = self.parameters;
+        crate::program::graph_sum(evaluator, family.count(), |index| {
+            let index = index.expression().map_err(ProgramLowerError::Dsl)?;
+            family.member(parameters, index).map_err(ProgramLowerError::Backend)
+        })
+    }
+}
+
 /// Classify a lowered public-key carrier for the preprocess artifact graph.
 ///
 /// Raw input keys are sampled only from the hash key, so they are cacheable
@@ -367,7 +468,8 @@ pub struct PublicKeyLowering<'a> {
     pub(crate) workload: Arc<RnsBggDerivedWorkload>,
     pub(crate) payload_secret: RnsBggPayloadSecret,
     pub(crate) hash_key: Bytes,
-    pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, Family<Mat>>>,
+    /// RHS plaintexts; a family keeps `plaintext_terms`, read member by member.
+    pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, Vec<(BigInt, usize)>>>,
     /// Setup-fixed RHS ciphertexts.  These are compact matrices; their signed
     /// decompositions are constructed at the consuming level only.
     pub(crate) rhs_material: BTreeMap<RhsId, InputBinding<RnsBggMatrix, Family<RnsBggMatrix>>>,
@@ -383,6 +485,16 @@ pub struct PublicKeyLowering<'a> {
     pub(crate) refresh_targets: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
     pub(crate) refresh_label_targets: BTreeMap<([u8; 32], usize, usize), RnsBggMatrix>,
     pub(crate) current_site: Option<LoweringSite>,
+    /// Open parallel bodies, outermost first: each one's instance count and
+    /// member index, and the RHS family members it prepared.
+    parallel_bodies: Vec<(IntExpr, IntExpr, Vec<(RhsId, RnsBggMatrix)>)>,
+    /// The RHS families of each finished body, awaiting its loop's commit.
+    finished_bodies: Vec<Vec<RhsId>>,
+    /// RHS families whose members the loop reading them prepares (see
+    /// `streamed_rhs_member`), with the family that loop returned.
+    streamed_rhs: BTreeMap<RhsId, Option<Family<RnsBggMatrix>>>,
+    /// RHS families read from the materials prepared at binding.
+    prepared_rhs_reads: std::collections::BTreeSet<RhsId>,
 }
 
 impl<'a> PublicKeyLowering<'a> {
@@ -408,6 +520,75 @@ impl<'a> PublicKeyLowering<'a> {
             refresh_targets: BTreeMap::new(),
             refresh_label_targets: BTreeMap::new(),
             current_site: None,
+            parallel_bodies: Vec::new(),
+            finished_bodies: Vec::new(),
+            streamed_rhs: BTreeMap::new(),
+            prepared_rhs_reads: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// The material of RHS family member `rhs` when the root-level loop that
+    /// reads it prepares it: the member is that loop's own member, and the
+    /// loop runs once per family member. The body prepares it once and the
+    /// loop returns it for export, so no stage keeps the family's materials
+    /// resident. A family read any other way uses the materials prepared at
+    /// binding, and may not also be read this way.
+    fn streamed_rhs_member(
+        &mut self,
+        rhs: &RhsRef<Int>,
+    ) -> Result<Option<RnsBggMatrix>, RnsBggError> {
+        let Some(InputBinding::Family(terms)) = self.rhs.get(&rhs.id) else { return Ok(None) };
+        let members = terms.len();
+        let index = rhs
+            .index
+            .as_ref()
+            .map(Int::expression)
+            .transpose()
+            .map_err(|_| RnsBggError::Binding("RHS member index is not an index expression"))?
+            .map(|index| index.canonicalize());
+        let own_member = match (self.parallel_bodies.as_slice(), &index) {
+            ([(count, member, _)], Some(index)) => {
+                member == index &&
+                    count
+                        .evaluate(&mxx_ir_core::ParamEnv::default())
+                        .is_ok_and(|count| count == BigInt::from(members))
+            }
+            _ => false,
+        };
+        if !own_member || self.prepared_rhs_reads.contains(&rhs.id) {
+            if self.streamed_rhs.contains_key(&rhs.id) {
+                return Err(RnsBggError::Binding(
+                    "an RHS family its loop prepares is also read elsewhere",
+                ));
+            }
+            self.prepared_rhs_reads.insert(rhs.id);
+            return Ok(None);
+        }
+        if matches!(self.streamed_rhs.get(&rhs.id), Some(Some(_))) {
+            return Err(RnsBggError::Binding("an RHS family is read by two loops"));
+        }
+        if let Some((_, material)) =
+            self.parallel_bodies[0].2.iter().find(|(prepared, _)| *prepared == rhs.id)
+        {
+            return Ok(Some(material.clone()));
+        }
+        let material = self.prepare_rhs_material(rhs)?;
+        self.parallel_bodies[0].2.push((rhs.id, material.clone()));
+        self.streamed_rhs.insert(rhs.id, None);
+        Ok(Some(material))
+    }
+
+    /// The materials an RHS family publishes: those its loop prepared, or
+    /// else those `prepared` at binding.
+    fn published_rhs_family(
+        &self,
+        rhs: &RhsId,
+        prepared: &Family<RnsBggMatrix>,
+    ) -> Result<Family<RnsBggMatrix>, ApiError> {
+        match self.streamed_rhs.get(rhs) {
+            Some(Some(streamed)) => Ok(streamed.clone()),
+            Some(None) => Err(ApiError::input("an RHS family loop was not committed")),
+            None => Ok(prepared.clone()),
         }
     }
     fn site(&self) -> Result<&LoweringSite, RnsBggError> {
@@ -462,9 +643,12 @@ impl<'a> PublicKeyLowering<'a> {
         // into the artifact identity or the online lowerer.
         let plaintext = match self.rhs.get(&rhs.id) {
             Some(InputBinding::Scalar(value)) => value.clone(),
-            Some(InputBinding::Family(values)) => {
-                values.at(rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?)
-            }
+            Some(InputBinding::Family(terms)) => super::plaintext_member(
+                &self.parameters.ring(0)?,
+                terms,
+                rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?,
+            )
+            .map_err(|error| RnsBggError::Graph(error.to_string()))?,
             None => return Err(RnsBggError::Binding("RHS plaintext was not bound")),
         };
         // Plaintext handles are canonicalized in the caller's natural input
@@ -699,12 +883,14 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         {
             return Err(RnsBggError::Binding("RNS-BGG MulPrivate requires a private input"));
         }
-        let compact = match self.rhs_material.get(&rhs.id) {
-            Some(InputBinding::Scalar(value)) => value.clone(),
-            Some(InputBinding::Family(values)) => {
+        let streamed = self.streamed_rhs_member(rhs)?;
+        let compact = match (streamed, self.rhs_material.get(&rhs.id)) {
+            (Some(material), _) => material,
+            (None, Some(InputBinding::Scalar(value))) => value.clone(),
+            (None, Some(InputBinding::Family(values))) => {
                 values.at(rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?)
             }
-            None => return Err(RnsBggError::Binding("RHS material was not prepared")),
+            (None, None) => return Err(RnsBggError::Binding("RHS material was not prepared")),
         };
         let evaluation_level = self.workload.level(input.wire)?;
         let rhs_level = self.workload.rhs_level(rhs.id)?;
@@ -856,15 +1042,34 @@ impl ProgramLoweringContext for PublicKeyLowering<'_> {
 }
 
 impl GraphParallelLowering for PublicKeyLowering<'_> {
-    type SideOutput = ();
+    /// The RHS family members the body prepared (`streamed_rhs_member`).
+    type SideOutput = Vec<RnsBggMatrix>;
 
-    fn begin_graph_parallel(&mut self) {}
-
-    fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error> {
-        Ok(())
+    fn begin_graph_parallel(&mut self, count: &IntExpr, index: &IntExpr) {
+        self.parallel_bodies.push((count.clone(), index.canonicalize(), Vec::new()));
     }
 
-    fn commit_graph_parallel(&mut self) -> Result<(), Self::Error> {
+    fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error> {
+        let (_, _, prepared) = self
+            .parallel_bodies
+            .pop()
+            .ok_or(RnsBggError::Binding("a parallel body finished before it began"))?;
+        let (families, materials): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+        self.finished_bodies.push(families);
+        Ok(materials)
+    }
+
+    fn commit_graph_parallel(&mut self, side: Family<Self::SideOutput>) -> Result<(), Self::Error> {
+        let families = self
+            .finished_bodies
+            .pop()
+            .ok_or(RnsBggError::Binding("a parallel loop committed before its body finished"))?;
+        for (position, rhs) in families.into_iter().enumerate() {
+            let family = side
+                .field(|materials| materials.into_iter().nth(position).expect("side output field"))
+                .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+            self.streamed_rhs.insert(rhs, Some(family));
+        }
         Ok(())
     }
 }
@@ -1379,9 +1584,9 @@ pub struct RnsPreprocessBuild<'a> {
     context: [u8; 32],
     hash_key_commitment: [u8; 32],
     evaluator: Option<PublicKeyLowering<'a>>,
-    families: GraphFamilyExecution,
+    families: super::encoding::OnlineFamilies<'a>,
     environment:
-        Environment<RnsBggPublicKey, RhsRef<Int>, Family<RnsBggPublicKey>, Family<RhsRef<Int>>>,
+        Environment<RnsBggPublicKey, RhsRef<Int>, PreprocessWireFamily, Family<RhsRef<Int>>>,
     runtime: BTreeMap<String, RuntimeValue>,
     refresh_declaration: Option<crate::noise_refresh::refresh::RefreshDeclaration>,
     pending_refresh: Option<(usize, RnsBggPublicKey)>,
@@ -1396,7 +1601,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             context,
             hash_key_commitment: [0; 32],
             evaluator: None,
-            families: GraphFamilyExecution,
+            families: super::encoding::OnlineFamilies { parameters },
             environment: Environment::new(),
             runtime: BTreeMap::new(),
             refresh_declaration: None,
@@ -1689,7 +1894,7 @@ fn merge_runtime(
 
 impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
     type Evaluator = PublicKeyLowering<'a>;
-    type Families = GraphFamilyExecution;
+    type Families = super::encoding::OnlineFamilies<'a>;
     type PayloadSecret = RnsBggPayloadSecret;
     type EncryptDescriptor = RnsBggPreprocessEncryptDescriptor;
     type OnlineDescriptor = RnsBggPreprocessOnlineDescriptor;
@@ -1704,7 +1909,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             &mut Environment<
                 RnsBggPublicKey,
                 RhsRef<Int>,
-                Family<RnsBggPublicKey>,
+                PreprocessWireFamily,
                 Family<RhsRef<Int>>,
             >,
         ),
@@ -1746,15 +1951,17 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 InputBinding::Scalar(()) => InputBinding::Scalar(
                     evaluator.sample_input_public_key(*wire).map_err(ApiError::scheme)?,
                 ),
-                InputBinding::Family(count) => {
-                    let family = mxx_dsl::parallel(count.clone(), |index| {
-                        evaluator
-                            .sample_input_public_key_member(*wire, Some(index))
-                            .map_err(|_| DslError::Schema)
-                    })
-                    .map_err(ApiError::scheme)?;
-                    InputBinding::Family(family)
-                }
+                // Each member's key is sampled where it is read.
+                InputBinding::Family(count) => InputBinding::Family(PreprocessWireFamily::Input {
+                    wire: *wire,
+                    level: evaluator.workload.level(*wire).map_err(ApiError::scheme)?,
+                    knowledge: evaluator
+                        .program
+                        .wire_knowledge(*wire)
+                        .map_err(|_| ApiError::input("input wire knowledge"))?,
+                    hash_key: evaluator.hash_key.clone(),
+                    count: count.clone(),
+                }),
             };
             self.environment
                 .bind_wire(*wire, binding)
@@ -1764,11 +1971,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             let value = rhs.get(id).ok_or_else(|| ApiError::input("missing RHS plaintext"))?;
             match (declaration, value) {
                 (InputBinding::Scalar(()), InputBinding::Scalar(poly)) => {
-                    let plaintext = ring.polynomial(
-                        poly.coeffs_biguints()
-                            .into_iter()
-                            .map(|v| IntExpr::constant(BigInt::from(v))),
-                    );
+                    let plaintext = super::plaintext_constant(&ring, poly);
                     evaluator.rhs.insert(*id, InputBinding::Scalar(plaintext));
                     let reference = RhsRef { id: *id, index: None::<Int> };
                     let material =
@@ -1788,20 +1991,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                     if expected != values.len() {
                         return Err(ApiError::input("RHS family count does not match Program"));
                     }
-                    let plaintexts = Family::pack(
-                        values
-                            .iter()
-                            .map(|value| {
-                                ring.polynomial(
-                                    value
-                                        .coeffs_biguints()
-                                        .into_iter()
-                                        .map(|v| IntExpr::constant(BigInt::from(v))),
-                                )
-                            })
-                            .collect(),
-                    )
-                    .map_err(|error| ApiError::input(error.to_string()))?;
+                    let plaintexts = super::plaintext_terms(values).map_err(ApiError::input)?;
                     evaluator.rhs.insert(*id, InputBinding::Family(plaintexts));
                     let prepared = mxx_dsl::parallel(IntExpr::constant(values.len()), |index| {
                         evaluator
@@ -1821,9 +2011,8 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 _ => return Err(ApiError::input("RHS plaintext shape does not match Program")),
             }
         }
-        // Plaintext RHS graph handles are needed only while preparing compact
-        // setup-fixed ciphertexts.  Never retain them for online lowering.
-        evaluator.rhs.clear();
+        // Plaintext RHS graph handles stay for lowering: a loop that reads an
+        // RHS family member prepares its compact ciphertext there.
         self.runtime.insert(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.into()));
         if let Some(binding) = &payload.binding {
             binding.bind(&mut self.runtime);
@@ -1958,7 +2147,10 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                                         *slot,
                                         &format!("rhs/{rhs:?}/family"),
                                     ),
-                                    value.field(|matrix| matrix.1).map_err(ApiError::scheme)?,
+                                    child
+                                        .published_rhs_family(rhs, value)?
+                                        .field(|matrix| matrix.1)
+                                        .map_err(ApiError::scheme)?,
                                 )
                                 .map_err(ApiError::scheme)?;
                         }
@@ -1992,7 +2184,10 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                     graph = graph
                         .transferred_output(
                             format!("rhs/{rhs:?}/family"),
-                            value.field(|matrix| matrix.1).map_err(ApiError::scheme)?,
+                            evaluator
+                                .published_rhs_family(rhs, value)?
+                                .field(|matrix| matrix.1)
+                                .map_err(ApiError::scheme)?,
                         )
                         .map_err(ApiError::scheme)?;
                 }
@@ -2094,7 +2289,10 @@ impl NoiseRefresh for RnsBggRefresh<'_, PublicKeyLowering<'_>> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{api::execute_graph, program::ProgramValidationError};
+    use crate::{
+        api::execute_graph,
+        program::{GraphFamilyExecution, ProgramValidationError},
+    };
     use mxx_backends::{MemoryArtifactStore, backend::poly::cpu_backend};
 
     #[test]
@@ -3145,13 +3343,7 @@ mod test {
         );
         lowering.rhs.insert(
             rhs,
-            InputBinding::Family(
-                Family::pack(vec![
-                    ring.polynomial([IntExpr::constant(BigInt::from(2u8))]),
-                    ring.polynomial([IntExpr::constant(BigInt::from(5u8))]),
-                ])
-                .unwrap(),
-            ),
+            InputBinding::Family(vec![(BigInt::from(2u8), 0), (BigInt::from(5u8), 0)]),
         );
         let first = lowering
             .prepare_rhs_material(&RhsRef { id: rhs, index: Some(Int::constant(0usize)) })

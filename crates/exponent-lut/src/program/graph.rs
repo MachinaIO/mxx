@@ -83,13 +83,17 @@ pub struct GraphFamilyExecution;
 pub(crate) trait GraphParallelLowering:
     ExponentLUTProgramLowering + ProgramLoweringContext
 {
-    /// Backend-local side state produced for one parallel body.  The ordinary
-    /// `parallel` adapter only uses the hook for lifecycle bookkeeping; graph
-    /// values are handled by `parallel_with_side_outputs` below.
-    type SideOutput;
-    fn begin_graph_parallel(&mut self);
+    /// Graph values one parallel body produces besides its result, returned
+    /// by the same loop as a family of their own.
+    type SideOutput: mxx_dsl::GraphValue;
+    /// A body of `count` instances starts; `index` is its member index.
+    fn begin_graph_parallel(&mut self, count: &IntExpr, index: &IntExpr);
     fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error>;
-    fn commit_graph_parallel(&mut self) -> Result<(), Self::Error>;
+    /// The loop was built: `side` holds each instance's side output.
+    fn commit_graph_parallel(
+        &mut self,
+        side: mxx_dsl::Family<Self::SideOutput>,
+    ) -> Result<(), Self::Error>;
 }
 
 impl<E> FamilyExecution<E> for GraphFamilyExecution
@@ -155,15 +159,13 @@ where
             return Err(mxx_dsl::DslError::Schema);
         }
         let index = local.expression().map_err(|_| mxx_dsl::DslError::CompileTimeIndex)?;
-        evaluator.begin_graph_parallel();
-        match body(
-            execution,
-            evaluator,
-            IntExpr::Add(Box::new(start.clone()), Box::new(index)).canonicalize(),
-        ) {
+        let index = IntExpr::Add(Box::new(start.clone()), Box::new(index)).canonicalize();
+        evaluator.begin_graph_parallel(range.count(), &index);
+        match body(execution, evaluator, index) {
             Ok(value) => {
-                evaluator.finish_graph_parallel().map_err(|_| mxx_dsl::DslError::Schema)?;
-                Ok(value)
+                let side =
+                    evaluator.finish_graph_parallel().map_err(|_| mxx_dsl::DslError::Schema)?;
+                Ok((value, side))
             }
             Err(error) => {
                 failure = Some(error);
@@ -174,8 +176,10 @@ where
     if let Some(error) = failure {
         return Err(error);
     }
-    let wires = family.map_err(ProgramLowerError::Dsl)?;
-    evaluator.commit_graph_parallel().map_err(ProgramLowerError::Backend)?;
+    let family = family.map_err(ProgramLowerError::Dsl)?;
+    let wires = family.field(|value| value.0).map_err(ProgramLowerError::Dsl)?;
+    let side = family.field(|value| value.1).map_err(ProgramLowerError::Dsl)?;
+    evaluator.commit_graph_parallel(side).map_err(ProgramLowerError::Backend)?;
     Ok(wires)
 }
 
@@ -394,12 +398,15 @@ mod tests {
     }
 
     impl super::GraphParallelLowering for GraphEvaluator {
-        type SideOutput = ();
-        fn begin_graph_parallel(&mut self) {}
+        type SideOutput = Vec<mxx_dsl::Mat>;
+        fn begin_graph_parallel(&mut self, _: &IntExpr, _: &IntExpr) {}
         fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error> {
-            Ok(())
+            Ok(Vec::new())
         }
-        fn commit_graph_parallel(&mut self) -> Result<(), Self::Error> {
+        fn commit_graph_parallel(
+            &mut self,
+            _: mxx_dsl::Family<Self::SideOutput>,
+        ) -> Result<(), Self::Error> {
             Ok(())
         }
     }

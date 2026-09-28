@@ -532,11 +532,7 @@ int mxx_gpu_graph_builder_create(GpuContext *ctx, int physical_device,
     void *stream, MxxGpuGraphBuilder **out_builder);
 int gpu_device_release_cached_memory(const GpuContext *ctx, int device);
 int gpu_device_graph_memory_reserved(int device, size_t *out_reserved_bytes);
-int gpu_graph_allocation_free_async(uint64_t address, void *stream);
-int mxx_gpu_graph_builder_add_memory_alloc(MxxGpuGraphBuilder *builder, int device,
-    size_t bytes, const uint32_t *after, size_t after_count, uint32_t *out_token,
-    uint64_t *out_address);
-int mxx_gpu_graph_builder_add_memory_free(MxxGpuGraphBuilder *builder, uint64_t address,
+int mxx_gpu_graph_builder_add_memory_barrier(MxxGpuGraphBuilder *builder,
     const uint32_t *operations, size_t operation_count, const uint32_t *after,
     size_t after_count, uint32_t *out_token);
 int mxx_gpu_graph_builder_set_pending_memory_dependencies(MxxGpuGraphBuilder *builder,

@@ -264,23 +264,49 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
         "MXX_EXPONENT_LUT_LWR_PRF_OPERATIONS_PER_DROP must be positive"
     );
     let average = noise_model("MXX_EXPONENT_LUT_LWR_PRF_").expect("noise-model configuration");
-    let candidates = ring_dimension_candidates(
-        "MXX_EXPONENT_LUT_LWR_PRF_MIN_LOG_RING_DIMENSION",
-        "MXX_EXPONENT_LUT_LWR_PRF_MAX_LOG_RING_DIMENSION",
-        5,
-        16,
-    )
-    .expect("ring-dimension configuration");
+    // `n,crt_depth,primes_per_drop` of a candidate already selected by a
+    // full search. It replaces the search, and its lattice security estimate
+    // is not repeated; the noise audit still builds its parameter chain.
+    let selected = env::var("MXX_EXPONENT_LUT_LWR_PRF_SELECTED_PARAMETERS").ok().map(|value| {
+        let fields = value
+            .split(',')
+            .map(|field| field.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .expect(
+                "MXX_EXPONENT_LUT_LWR_PRF_SELECTED_PARAMETERS must be n,crt_depth,primes_per_drop",
+            );
+        let [ring_dimension, crt_depth, primes_per_drop] = fields[..] else {
+            panic!(
+                "MXX_EXPONENT_LUT_LWR_PRF_SELECTED_PARAMETERS must be n,crt_depth,primes_per_drop"
+            );
+        };
+        let ring_dimension =
+            u32::try_from(ring_dimension).expect("selected LWR ring dimension does not fit u32");
+        (ring_dimension, crt_depth, primes_per_drop)
+    });
+    let candidates = match selected {
+        Some((ring_dimension, _, _)) => vec![ring_dimension],
+        None => ring_dimension_candidates(
+            "MXX_EXPONENT_LUT_LWR_PRF_MIN_LOG_RING_DIMENSION",
+            "MXX_EXPONENT_LUT_LWR_PRF_MAX_LOG_RING_DIMENSION",
+            5,
+            16,
+        )
+        .expect("ring-dimension configuration"),
+    };
     let mut failures = Vec::new();
     for ring_dimension in candidates {
         let (profile, program, keys) = profile_and_program(ring_dimension);
         let noise = noise_bindings(&program, sigma);
         let terminal_bounds = terminal_value_bounds(&profile, &program);
-        let depth_candidates = (1..=max_crt_depth)
-            .flat_map(|depth| {
-                (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
-            })
-            .collect::<Vec<_>>();
+        let depth_candidates = match selected {
+            Some((_, crt_depth, primes_per_drop)) => vec![(crt_depth, primes_per_drop)],
+            None => (1..=max_crt_depth)
+                .flat_map(|depth| {
+                    (1..=max_primes_per_drop).map(move |primes_per_drop| (depth, primes_per_drop))
+                })
+                .collect::<Vec<_>>(),
+        };
         // Candidates are independent, so they are audited in parallel; the
         // first accepted one in (CRT depth, primes per drop) order wins.
         let rejected = std::sync::Mutex::new(Vec::new());
@@ -348,8 +374,15 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
                 ));
             }
             let source = parameters.level(0).expect("source level").clone();
-            let achieved = lattice_security_bits(&source, sigma)
-                .expect("lattice security estimator must be available");
+            let achieved = if selected.is_some() {
+                eprintln!(
+                    "selected LWR parameters were supplied: the lattice security estimate is not repeated"
+                );
+                required_security
+            } else {
+                lattice_security_bits(&source, sigma)
+                    .expect("lattice security estimator must be available")
+            };
             if achieved < required_security {
                 return reject(format!("security {achieved} < {required_security}"));
             }
@@ -396,15 +429,17 @@ fn fixture(
     // `a` is a public LHS family supplied at encrypt time. Convert each
     // exponent to its stride-aware signed monomial, including the
     // X^n = -1 negacyclic sign when the rotation crosses the boundary.
+    // Each monomial is built from all n coefficients, so build them in
+    // parallel.
     let a_values = a_exponents
-        .iter()
+        .par_iter()
         .map(|exponent| {
             let dimension = poly_parameters.ring_dimension() as usize;
             let rotation = (*exponent as usize * profile.layout.stride()) % (2 * dimension);
             let monomial = DCRTPoly::const_rotate_poly(&poly_parameters, rotation % dimension);
             if rotation >= dimension { -monomial } else { monomial }
         })
-        .chain(std::iter::once(one.clone()))
+        .chain(rayon::iter::once(one.clone()))
         .collect::<Vec<_>>();
 
     // The accumulator starts at mono(0) = 1 and the family is `a` followed by
@@ -616,6 +651,12 @@ fn round_trip(
         ["preprocess", "encrypt", "online_eval"],
         "observers must see the exact three production graphs"
     );
+    // In estimate mode (`MXX_EXPONENT_LUT_ESTIMATE_ONLY=1`) the GPU stages
+    // were only planned, so there are no outputs to verify.
+    if env::var("MXX_EXPONENT_LUT_ESTIMATE_ONLY").is_ok_and(|value| value == "1") {
+        eprintln!("estimate mode: every stage was planned; outputs are not verified");
+        return;
+    }
     // Compute every output's expected readout independently from `a` and
     // its key. The coefficient LUT returns the signed readout as the
     // constant polynomial, so the expected plaintext is built in the source

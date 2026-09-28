@@ -67,7 +67,7 @@ use mxx_ir_core::{
     artifact::{ArtifactType, ManifestArtifact, ProductionId},
     concretize_wire_type,
     graph::{FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
-    node::{ConcatAxis, LoopInputMode, NodeKind},
+    node::{ConcatAxis, LoopInputMode, MatrixBinaryOp, NodeKind},
     types::{
         CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef,
         WireType,
@@ -123,6 +123,10 @@ pub(crate) struct PhysicalWave {
     /// several actual parent occurrences. No payloads are read during plan.
     pub invocation_imports: BTreeMap<usize, Vec<usize>>,
     pub family_members: BTreeMap<String, Vec<(usize, PhysicalValueId)>>,
+    /// Export templates of this wave's streamed members, which the runtime
+    /// writes once the wave has joined, before the next wave reuses their
+    /// slots.
+    pub streamed_exports: Vec<usize>,
 }
 
 /// One selected artifact read. The selector is a physical Int value, which
@@ -133,6 +137,8 @@ pub(crate) struct PhysicalWave {
 /// flattened program, and the destination is reused after each body replay.
 pub(super) struct ExternalIoImport {
     pub before_operation: u32,
+    /// The first operation of the load site that publishes the selector.
+    pub request_operation: u32,
     pub request_slot: usize,
     pub key: ArtifactKey,
     pub descriptor: ManifestArtifact,
@@ -1260,13 +1266,31 @@ pub(super) fn lower_control_node(
                     name: artifact.artifact_name.clone(),
                     index: None,
                 };
+                let request_operation = u32::try_from(ctx.operations.len())
+                    .map_err(|_| "too many GPU operations".to_owned())?;
                 let request_slot = crate::gpu_physical_lowering::emit_import_request(ctx, index)?;
+                // A matrix member lives from its load site to its last use,
+                // in plan scratch placed for that span.
                 let (destination, graph_value, upload_owner, before_operation) =
-                    crate::gpu_physical_lowering::allocate_typed_import_destination(
-                        ctx, &expected, &key, capacity,
-                    )?;
+                    if let ConcreteWireType::Matrix(matrix) = &expected {
+                        let (destination, before_operation) =
+                            crate::gpu_physical_lowering::allocate_placed_import_destination(
+                                ctx, matrix,
+                            )?;
+                        (
+                            destination,
+                            destination,
+                            ImportDestination::Placed { ty: matrix.clone() },
+                            before_operation,
+                        )
+                    } else {
+                        crate::gpu_physical_lowering::allocate_typed_import_destination(
+                            ctx, &expected, &key, capacity,
+                        )?
+                    };
                 ctx.external_io_imports.push(ExternalIoImport {
                     before_operation,
+                    request_operation,
                     request_slot,
                     key,
                     descriptor,
@@ -2189,6 +2213,31 @@ fn lower_lazy_int_expr_select(
     }
     let selector = lower_device_int_expr_mode(ctx, selector, env, force_device)?;
     integer_range(ctx, selector)?;
+    // Branches the host evaluates are one constant table read by a single
+    // Gather, which checks the selector bound itself: a device IF per branch
+    // would cost a conditional node, whose instantiated Graph memory is far
+    // larger than a kernel's.
+    let constants = branches
+        .iter()
+        .map(|branch| (!branch.contains_loop_index()).then(|| branch.evaluate(env).ok()).flatten())
+        .collect::<Option<Vec<_>>>();
+    if let Some(constants) = constants {
+        let table = allocate_integer_table(ctx, &constants)?;
+        let range = constants.iter().min().cloned().unwrap_or_default()..=
+            constants.iter().max().cloned().unwrap_or_default();
+        let result = allocate_integer_value(ctx, ConcreteWireType::Int, range, None)?;
+        emit_integer_operation(
+            ctx,
+            GpuIntegerOperation::Gather,
+            result,
+            table,
+            Some(selector),
+            None,
+            u64::try_from(constants.len())
+                .map_err(|_| "GPU integer Select branch count exceeds u64".to_owned())?,
+        )?;
+        return Ok(result);
+    }
     let zero = BigInt::from(0);
     let zero_id = allocate_integer_value(
         ctx,
@@ -2251,6 +2300,8 @@ fn lower_lazy_int_expr_select(
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
                 slots: ctx.slots,
+                export_templates: ctx.export_templates,
+                fused_nodes: ctx.fused_nodes,
                 parallel_lanes: ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: ctx.crt_resource_next,
@@ -2313,6 +2364,8 @@ fn lower_lazy_int_expr_select(
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
                 slots: ctx.slots,
+                export_templates: ctx.export_templates,
+                fused_nodes: ctx.fused_nodes,
                 parallel_lanes: ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: ctx.crt_resource_next,
@@ -2393,6 +2446,61 @@ fn allocate_integer_value(
     constant: Option<&BigInt>,
 ) -> Result<PhysicalValueId, String> {
     allocate_integer_value_with_storage(ctx, ty, range, constant, false)
+}
+
+/// A resident Int family holding `values`, laid out like a lane vector of
+/// scalars, which a dynamic Gather reads.
+fn allocate_integer_table(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    values: &[BigInt],
+) -> Result<PhysicalValueId, String> {
+    let (Some(lower), Some(upper)) = (values.iter().min(), values.iter().max()) else {
+        return Err("GPU integer table is empty".into());
+    };
+    let words = usize::try_from(lower.bits().max(upper.bits()).div_ceil(64))
+        .map_err(|_| "GPU integer width exceeds host address space".to_owned())?
+        .max(1);
+    let params = ctx.backend.control_parameters_on_device(ctx.device)?;
+    let owner = Arc::new(
+        GpuSignedValues::from_bigints_with_words(&params, ctx.device, values, words)
+            .map_err(|error| error.to_string())?,
+    );
+    let word_count = words + 1;
+    let slot =
+        u32::try_from(ctx.values.len()).map_err(|_| "too many GPU scalar storages".to_owned())?;
+    let storage = StorageRef::Scratch(slot);
+    let physical = PhysicalValue {
+        ty: ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: values.len(),
+        },
+        encodings: Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedWords(
+            words,
+        ))]),
+        parts: Box::new([PhysicalPart {
+            leaf: 0,
+            storage,
+            device: ctx.device,
+            view: PhysicalView {
+                byte_offset: 0,
+                origin: Box::new([0, 0, 0]),
+                extent: Box::new([values.len() as u64, 1, word_count as u64]),
+                byte_strides: Box::new([word_count as u64 * 8, word_count as u64 * 8, 8]),
+                element_bytes: 8,
+            },
+        }]),
+        integer_ranges: BTreeMap::from([(0, lower.clone()..=upper.clone())]),
+    };
+    let resident = GpuResidentValue::new(
+        Arc::new(physical.clone()),
+        BTreeMap::from([(storage, BoundStorage::from_signed_values(owner)?)]),
+        Box::new([]),
+    )
+    .map_err(str::to_owned)?;
+    let id = value_id(ctx.values.len())?;
+    ctx.values.push(physical);
+    ctx.owners.insert(id, Arc::new(resident));
+    Ok(id)
 }
 
 pub(super) fn allocate_return_integer_value(
@@ -3570,6 +3678,9 @@ fn lower_matrix_mul_small_rhs(
     // and transforms it one column chunk at a time into a reused workspace of
     // `rhs rows x chunk` polynomials and multiplies each chunk into its output
     // columns, so no full copy of the right operand is ever resident.
+    // A tall right operand (many gadget digits) makes each workspace column
+    // as large as a column of the output times its row count, so the chunk
+    // is narrow by default.
     let chunk = crate::env::gpu_small_rhs_chunk_columns()?.min(right_ty.columns);
     let workspace_ty = ConcreteMatrixType { columns: chunk, ..right_ty.clone() };
     let workspace = allocate_scratch_matrix(ctx, &workspace_ty, PhysicalEncoding::FullEval)?;
@@ -3875,9 +3986,36 @@ fn lower_gadget_decompose(
     };
     // The signed digits are written directly into the compact bounded
     // output; no full coefficient-domain digit matrix is materialized.
-    let (output, _) = crate::gpu_physical_lowering::allocate_compact_value(ctx, output_ty, true)?;
+    let output = crate::gpu_physical_lowering::allocate_deferred_compact_value(ctx, output_ty)?;
     let source_binding = register_bindings(ctx.bindings, ctx.values, source_coefficient)?;
     let destination_binding = scalar_binding(ctx, output)?;
+    // The decomposition writes only the digits of the CRT limbs it keeps; the
+    // others must read as zero, and the output's memory may hold another
+    // value's bytes, so it is cleared first.
+    let bytes = ctx.owners[&output]
+        .storages()
+        .next()
+        .map(|(_, storage)| storage.bytes)
+        .ok_or("GPU gadget decomposition output has no storage")?;
+    let zero = ctx.implementations.register(GpuImplementation::zero()).map_err(str::to_owned)?;
+    let cleared = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU gadget decomposition operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation: zero,
+        arguments: Box::new([
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::U64(bytes),
+            KernelArg::U32(destination_binding),
+        ]),
+        outputs: Box::new([output]),
+        device: ctx.device,
+        grid: [0; 3],
+        block: [0; 3],
+        shared_bytes: 0,
+        predecessors: Box::new([]),
+        body: None,
+    });
     let implementation = ctx
         .implementations
         .register(GpuImplementation::gadget_decompose_compact())
@@ -3905,7 +4043,11 @@ fn lower_gadget_decompose(
         grid: [1; 3],
         block: [1; 3],
         shared_bytes: 0,
-        predecessors: all_predecessors(ctx.producer, source_coefficient),
+        predecessors: all_predecessors(ctx.producer, source_coefficient)
+            .iter()
+            .copied()
+            .chain([cleared])
+            .collect(),
         body: None,
     });
     ctx.producer
@@ -6550,6 +6692,8 @@ fn lower_sequential_loop(
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: &mut body_imports,
                 slots: &mut *ctx.slots,
+                export_templates: &mut *ctx.export_templates,
+                fused_nodes: &mut *ctx.fused_nodes,
                 parallel_lanes: ctx.parallel_lanes,
                 node_operations: None,
                 crt_resource_next: ctx.crt_resource_next,
@@ -6815,15 +6959,6 @@ fn replay_matrix_owner(
         .values
         .get(id.0 as usize)
         .ok_or_else(|| "GPU loop member has no physical metadata".to_owned())?;
-    let ty = planned
-        .ty
-        .matrix_type()
-        .ok_or_else(|| "GPU loop can return only matrix members".to_owned())?;
-    let encoding = planned
-        .encodings
-        .first()
-        .cloned()
-        .ok_or_else(|| "GPU loop member has no physical encoding".to_owned())?;
     let slot = planned
         .parts
         .first()
@@ -6832,12 +6967,35 @@ fn replay_matrix_owner(
     if planned.parts.iter().any(|part| part.storage != slot) {
         return Err("GPU loop member has multiple storage owners".into());
     }
-    let native = ctx.backend.allocate_physical_matrix(ty, ctx.device, encoding.clone())?;
-    let (physical, owner) = physical_matrix(ty, encoding, slot, native)?;
-    if &physical != planned {
-        return Err("GPU loop replay owner differs from frozen member layout".into());
-    }
-    Ok(owner)
+    // The owner takes the frozen member's layout at an allocation of its own,
+    // bound by address: a raw buffer of the member's storage size.
+    let bytes = ctx
+        .owners
+        .get(&id)
+        .and_then(|owner| owner.storage(slot))
+        .map(|storage| storage.bytes)
+        .ok_or_else(|| "GPU loop member has no planned storage".to_owned())?;
+    let stream = ctx
+        .backend
+        .parameters_on_device(ctx.device)?
+        .native_launch_stream(ctx.device)
+        .map_err(|error| error.to_string())?;
+    let buffer = Arc::new(
+        crate::poly::dcrt::gpu::GpuDeviceBuffer::allocate(
+            &stream,
+            usize::try_from(bytes).map_err(|_| "GPU loop member size exceeds usize")?,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let storage =
+        BoundStorage { device: ctx.device, address: buffer.as_ptr() as u64, bytes, owner: buffer };
+    GpuResidentValue::new(
+        Arc::new(planned.clone()),
+        BTreeMap::from([(slot, storage)]),
+        Box::new([]),
+    )
+    .map(Arc::new)
+    .map_err(str::to_owned)
 }
 
 /// A parallel loop whose body is only scalar Int/Bool arithmetic and family
@@ -7082,6 +7240,169 @@ fn lower_vectorized_parallel_loop(
 /// they reach. It never names a physical value.
 const UNLOADED_FAMILY: PhysicalValueId = PhysicalValueId(u32::MAX);
 
+/// The root sum of every member of some output ports of the root parallel
+/// loop `loop_id`, in the form a member-by-member sum lowers to: members 0 and
+/// 1 read (`FamilyGetStatic`) and added (`MatrixBinary(Add)`), then a
+/// sequential loop over the other `count - 2` members whose body adds member
+/// `index + 2` (`FamilyGetDynamic`) to its carried state. Returns that
+/// sequential loop and, per output port it sums, the two member reads, their
+/// sum, and its carried position. Every argument of the sequential loop must
+/// be one of these sums or a summed port, and its body may hold nothing else.
+fn fused_member_sums(
+    graph: &Graph,
+    loop_id: NodeId,
+    ports: usize,
+    count: usize,
+    env: &ParamEnv,
+) -> Option<(NodeId, Vec<Option<(NodeId, NodeId, NodeId, usize)>>)> {
+    if count < 3 {
+        return None;
+    }
+    let root = graph.root_scope();
+    let nodes = root.nodes();
+    let node = |id: NodeId| nodes.get(id.0 as usize);
+    let output = |id: NodeId| WireRef { node: id, port: Port(0) };
+    let consumers = |wire: WireRef| {
+        nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(index, consumer)| {
+                root.arguments(consumer)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .filter(move |(_, argument)| *argument == wire)
+                    .map(move |(position, _)| (NodeId(index as u64), position))
+            })
+            .collect::<Vec<_>>()
+    };
+    let returned = |wire: WireRef| graph.outputs().values().any(|output| output.value == wire);
+    let evaluates_to = |expression: &IntExpr, value: usize| {
+        expression.evaluate(env).is_ok_and(|actual| actual == BigInt::from(value))
+    };
+    let mut sequential = None;
+    let mut summed = vec![None; ports];
+    for (port, summed_port) in summed.iter_mut().enumerate() {
+        let wire = WireRef { node: loop_id, port: Port(u32::try_from(port).ok()?) };
+        let uses = consumers(wire);
+        if returned(wire) || uses.len() != 3 {
+            continue;
+        }
+        let member_read = |member: usize| {
+            uses.iter().map(|(id, _)| *id).find(|id| {
+                node(*id).is_some_and(|read| {
+                    matches!(read.kind(), NodeKind::FamilyGetStatic { index } if evaluates_to(index, member))
+                })
+            })
+        };
+        let (Some(first), Some(second)) = (member_read(0), member_read(1)) else { continue };
+        let Some(&(loop_node, capture)) = uses.iter().find(|(id, _)| {
+            node(*id).is_some_and(|use_| matches!(use_.kind(), NodeKind::SequentialLoop(_)))
+        }) else {
+            continue;
+        };
+        let (first_uses, second_uses) = (consumers(output(first)), consumers(output(second)));
+        let ([(add, _)], [(other, _)]) = (first_uses.as_slice(), second_uses.as_slice()) else {
+            continue;
+        };
+        if add != other ||
+            !node(*add).is_some_and(|add| {
+                matches!(add.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add))
+            }) ||
+            [first, second, *add].into_iter().any(|id| returned(output(id)))
+        {
+            continue;
+        }
+        let [(carrier, carried)] = consumers(output(*add))[..] else { continue };
+        let Some(NodeKind::SequentialLoop(spec)) = node(loop_node).map(|node| node.kind()) else {
+            continue;
+        };
+        if carrier != loop_node ||
+            carried >= spec.carried_count ||
+            capture < spec.carried_count ||
+            !evaluates_to(&spec.count, count - 2)
+        {
+            continue;
+        }
+        // The body adds member `index + 2` of the captured family to the state.
+        let child_id = graph.child_scope_id(&FrozenGraphScopeId::Root, loop_node)?;
+        let child = graph.scope(&child_id)?;
+        let (state, family) = (*child.inputs().get(carried)?, *child.inputs().get(capture)?);
+        let result = *child.outputs().get(carried)?;
+        let child_node = |wire: WireRef| child.nodes().get(wire.node.0 as usize);
+        let body_add = child_node(result)?;
+        let arguments = child.arguments(body_add)?;
+        let read = match (body_add.kind(), arguments.as_slice()) {
+            (NodeKind::MatrixBinary(MatrixBinaryOp::Add), [left, right]) if *left == state => {
+                *right
+            }
+            (NodeKind::MatrixBinary(MatrixBinaryOp::Add), [left, right]) if *right == state => {
+                *left
+            }
+            _ => continue,
+        };
+        let read_node = child_node(read)?;
+        let [source, index] = child.arguments(read_node)?[..] else { continue };
+        let plus_two = IntExpr::Add(
+            Box::new(IntExpr::LoopIndex(spec.index_slot)),
+            Box::new(IntExpr::constant(2)),
+        )
+        .canonicalize();
+        let index_node = child_node(index)?;
+        let loop_index_plus_two = match index_node.kind() {
+            NodeKind::EvaluateInt(expression) => expression.clone().canonicalize() == plus_two,
+            NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add) => {
+                let operands = child.arguments(index_node)?;
+                let kinds = operands
+                    .iter()
+                    .map(|operand| child_node(*operand).map(|node| node.kind().clone()))
+                    .collect::<Option<Vec<_>>>()?;
+                let is_index = |kind: &NodeKind| matches!(kind, NodeKind::EvaluateInt(IntExpr::LoopIndex(slot)) if *slot == spec.index_slot);
+                let is_two = |kind: &NodeKind| matches!(kind, NodeKind::ConstantInt(value) if *value == BigInt::from(2));
+                matches!(kinds.as_slice(), [a, b] if (is_index(a) && is_two(b)) || (is_two(a) && is_index(b)))
+            }
+            _ => false,
+        };
+        if !matches!(read_node.kind(), NodeKind::FamilyGetDynamic) ||
+            source != family ||
+            !loop_index_plus_two
+        {
+            continue;
+        }
+        if *sequential.get_or_insert(loop_node) != loop_node {
+            return None;
+        }
+        *summed_port = Some((first, second, *add, carried));
+    }
+    let sequential = sequential?;
+    let loop_node = node(sequential)?;
+    let NodeKind::SequentialLoop(spec) = loop_node.kind() else { return None };
+    let accounted = root.arguments(loop_node)?.iter().enumerate().all(|(position, argument)| {
+        if position < spec.carried_count {
+            summed
+                .iter()
+                .flatten()
+                .any(|(_, _, add, carried)| *carried == position && argument.node == *add)
+        } else {
+            argument.node == loop_id &&
+                summed.get(argument.port.0 as usize).is_some_and(Option::is_some)
+        }
+    });
+    let child = graph.scope(&graph.child_scope_id(&FrozenGraphScopeId::Root, sequential)?)?;
+    let plain_body = child.nodes().iter().all(|node| {
+        matches!(
+            node.kind(),
+            NodeKind::Input { .. } |
+                NodeKind::EvaluateInt(_) |
+                NodeKind::ConstantInt(_) |
+                NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add) |
+                NodeKind::FamilyGetDynamic |
+                NodeKind::MatrixBinary(MatrixBinaryOp::Add)
+        )
+    });
+    (accounted && plain_body).then_some((sequential, summed))
+}
+
 fn lower_parallel_loop(
     ctx: &mut PhysicalLoweringContext<'_>,
     graph: &Graph,
@@ -7196,6 +7517,52 @@ fn lower_parallel_loop(
         outputs_by_port.push((ty, Vec::<Arc<GpuResidentValue>>::with_capacity(count)));
         names_by_port.push(names);
     }
+    // Root output ports that no node reads after the loop: at most their
+    // artifact exports do. Each wave writes their members as soon as it has
+    // produced them, from slots its lanes reuse, so the loop keeps no member
+    // of them resident.
+    let streamed_ports = names_by_port
+        .iter()
+        .enumerate()
+        .map(|(port, names)| {
+            let wire = WireRef { node: node_id, port: Port(port as u32) };
+            let root = graph.root_scope();
+            is_root &&
+                !ctx.device_body &&
+                ctx.active_parallel_template.is_none() &&
+                names.iter().all(|name| {
+                    graph.outputs().get(name).is_some_and(|output| output.availability.is_some())
+                }) &&
+                !root.nodes().iter().any(|consumer| {
+                    root.arguments(consumer).is_some_and(|arguments| arguments.contains(&wire))
+                })
+        })
+        .collect::<Vec<_>>();
+    // Output ports whose only reads sum their members: each wave adds its
+    // lanes' members to a running sum, so no member stays resident. A tail
+    // wave's inactive lanes would add again, so the width divides the count.
+    let fused_sum = (is_root && !ctx.device_body && ctx.active_parallel_template.is_none())
+        .then(|| fused_member_sums(graph, node_id, node.output_types().len(), count, env))
+        .flatten();
+    if fused_sum.is_some() && count % width != 0 {
+        return Err("GPU summed parallel loop needs a wave width dividing its count".into());
+    }
+    let summed_ports = (0..node.output_types().len())
+        .map(|port| fused_sum.as_ref().is_some_and(|(_, ports)| ports[port].is_some()))
+        .collect::<Vec<_>>();
+    // Each running sum is set to zero before the loop's first wave.
+    let mut accumulators = BTreeMap::new();
+    for (port, _) in summed_ports.iter().enumerate().filter(|(_, summed)| **summed) {
+        let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
+            return Err("GPU summed parallel output is not a family".into());
+        };
+        let ConcreteWireType::Matrix(ty) = element.as_ref() else {
+            return Err("GPU summed parallel output has no matrix members".into());
+        };
+        accumulators.insert(port, crate::gpu_physical_lowering::emit_zero_matrix(ctx, ty)?);
+    }
+    // Per lane, the export templates of its streamed members.
+    let mut streamed_templates = Vec::<Vec<usize>>::with_capacity(width);
     let child_environment = |index: usize| -> Result<ParamEnv, String> {
         let mut child_env = fixed_child_env(
             scope_id,
@@ -7413,13 +7780,29 @@ fn lower_parallel_loop(
                     name: artifact.artifact_name.clone(),
                     index: gather.is_none().then_some(index),
                 };
+                // A matrix member lives in plan scratch placed for its wave
+                // loop, from the loop's first reads to its last wave.
                 let (destination, graph_value, upload_owner, before_operation) =
-                    crate::gpu_physical_lowering::allocate_typed_import_destination(
-                        ctx,
-                        &element_type,
-                        &key,
-                        capacity,
-                    )?;
+                    match (&element_type, gather) {
+                        (ConcreteWireType::Matrix(matrix), None) => {
+                            let (destination, before_operation) =
+                                crate::gpu_physical_lowering::allocate_placed_import_destination(
+                                    ctx, matrix,
+                                )?;
+                            (
+                                destination,
+                                destination,
+                                ImportDestination::Placed { ty: matrix.clone() },
+                                before_operation,
+                            )
+                        }
+                        _ => crate::gpu_physical_lowering::allocate_typed_import_destination(
+                            ctx,
+                            &element_type,
+                            &key,
+                            capacity,
+                        )?,
+                    };
                 input_ids.push(graph_value);
                 // With more than one wave, odd waves read into a second owner
                 // so that each wave's members are read during the previous
@@ -7537,12 +7920,132 @@ fn lower_parallel_loop(
                 ));
             }
         }
+        let mut lane_templates = Vec::new();
+        for (port, id) in outputs.iter().copied().enumerate() {
+            if !streamed_ports[port] {
+                continue;
+            }
+            let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
+                return Err("GPU parallel output is not a family".into());
+            };
+            let artifact_type = ArtifactType::from_wire_type(element)
+                .ok_or_else(|| "GPU streamed family member has no artifact type".to_owned())?;
+            let source = crate::gpu_physical_lowering::full_eval_value(ctx, id)?;
+            for name in &names_by_port[port] {
+                let availability = graph
+                    .outputs()
+                    .get(name)
+                    .and_then(|output| output.availability)
+                    .ok_or_else(|| "GPU streamed export has no availability".to_owned())?;
+                let (first, first_operation) = (ctx.export_templates.len(), ctx.operations.len());
+                crate::gpu_physical_lowering::emit_artifact_export(
+                    ctx,
+                    name,
+                    &[(Some(lane), source)],
+                    artifact_type.clone(),
+                    availability,
+                    None,
+                )?;
+                // Each lane's export is a site of its own, reused by every
+                // wave: its slot is the site's first, whichever member it
+                // names.
+                for template in &mut ctx.export_templates[first..] {
+                    template.streamed = true;
+                    template.occurrence = 0;
+                }
+                let publish = ctx
+                    .implementations
+                    .register(GpuImplementation::export_publish())
+                    .map_err(str::to_owned)?;
+                for operation in &mut ctx.operations[first_operation..] {
+                    if operation.implementation == publish {
+                        operation.arguments[1] = KernelArg::U64(0);
+                    }
+                }
+                lane_templates.extend(first..ctx.export_templates.len());
+            }
+        }
+        streamed_templates.push(lane_templates);
         result_ids.push(outputs);
         lane_operations.push(
             lane_start..
                 u32::try_from(ctx.operations.len())
                     .map_err(|_| "too many GPU parallel body operations".to_owned())?,
         );
+    }
+    // After its lanes, each wave adds their members to the running sum of a
+    // summed port, with the frozen choice of the sum's first addition; the
+    // sequential loop's result is that running sum.
+    if let Some((sequential, ports)) = &fused_sum {
+        let validated = ctx.validated;
+        let root = validated.source.root_scope();
+        let wire_types = &validated.root_scope().wire_types;
+        for (port, fused) in ports.iter().enumerate() {
+            let Some((first, second, add, carried)) = *fused else { continue };
+            let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
+                return Err("GPU summed parallel output is not a family".into());
+            };
+            let ConcreteWireType::Matrix(ty) = element.as_ref() else {
+                return Err("GPU summed parallel output has no matrix members".into());
+            };
+            let accumulator = accumulators[&port];
+            let choice = ctx
+                .logical
+                .nodes
+                .iter()
+                .find(|choice| {
+                    choice.key.site == add.0 &&
+                        choice.key.shape_class == 0 &&
+                        choice.key.instance_class == 0 &&
+                        choice.loop_site.is_none()
+                })
+                .cloned()
+                .ok_or_else(|| "GPU member sum has no frozen root choice".to_owned())?;
+            let add_node = &root.nodes()[add.0 as usize];
+            let [left, right] = root
+                .arguments(add_node)
+                .ok_or_else(|| "GPU member sum has no arguments".to_owned())?[..]
+            else {
+                return Err("GPU member sum is not binary".into());
+            };
+            let sum = WireRef { node: add, port: Port(0) };
+            let mut total = accumulator;
+            for ids in &result_ids {
+                ctx.wire_ids.insert(left, total);
+                ctx.wire_ids.insert(right, ids[port]);
+                crate::gpu_physical_lowering::lower_matrix_node(
+                    ctx, root, add, add_node, wire_types, &choice,
+                )?;
+                total = *ctx
+                    .wire_ids
+                    .get(&sum)
+                    .ok_or_else(|| "GPU member sum produced no value".to_owned())?;
+            }
+            for wire in [left, right, sum] {
+                ctx.wire_ids.remove(&wire);
+            }
+            let predecessors = all_predecessors(ctx.producer, total);
+            let copy = crate::gpu_physical_lowering::copy_matrix_view(
+                ctx,
+                total,
+                accumulator,
+                predecessors,
+            )?;
+            ctx.producer
+                .insert(accumulator, vec![(ColumnRange { start: 0, end: ty.columns }, copy)]);
+            ctx.wire_ids.insert(
+                WireRef {
+                    node: *sequential,
+                    port: Port(
+                        u32::try_from(carried)
+                            .map_err(|_| "GPU member sum port exceeds u32".to_owned())?,
+                    ),
+                },
+                accumulator,
+            );
+            ctx.fused_nodes.extend([first, second, add]);
+        }
+        ctx.fused_nodes.insert(*sequential);
     }
     let body_end = u32::try_from(ctx.operations.len())
         .map_err(|_| "too many GPU parallel body operations".to_owned())?;
@@ -7596,6 +8099,7 @@ fn lower_parallel_loop(
             import_template_indices: body_imports.clone(),
             invocation_imports: BTreeMap::new(),
             family_members: BTreeMap::new(),
+            streamed_exports: Vec::new(),
         };
         for (lane, (_, owner)) in index_lanes.iter().enumerate() {
             let actual = wave_start
@@ -7701,7 +8205,9 @@ fn lower_parallel_loop(
         }
         for (lane, ids) in result_ids.iter().enumerate() {
             for (port, id) in ids.iter().copied().enumerate() {
-                let owner = if wave_start == 0 {
+                // A streamed member lives only until its wave's export, so
+                // every wave reuses the lane's first-wave owner.
+                let owner = if wave_start == 0 || streamed_ports[port] || summed_ports[port] {
                     Arc::clone(
                         ctx.owners
                             .get(&id)
@@ -7710,7 +8216,11 @@ fn lower_parallel_loop(
                 } else {
                     replay_matrix_owner(ctx, id)?
                 };
-                wave.owner_bindings.insert(id, Arc::clone(&owner));
+                // A streamed or summed member keeps its owner in every wave,
+                // so no wave rebinds it and its memory stays plan scratch.
+                if !(streamed_ports[port] || summed_ports[port]) {
+                    wave.owner_bindings.insert(id, Arc::clone(&owner));
+                }
                 if lane < active_lanes {
                     let index = wave_start + lane;
                     outputs_by_port[port].1.push(owner);
@@ -7720,10 +8230,29 @@ fn lower_parallel_loop(
                 }
             }
         }
+        // The first wave writes the lanes' own templates; a later one writes
+        // copies naming its members, from the same slots and sites.
+        for (lane, templates) in streamed_templates.iter().enumerate().take(active_lanes) {
+            for &template in templates {
+                let index = if wave_start == 0 {
+                    template
+                } else {
+                    let mut member = ctx.export_templates[template].clone();
+                    member.index = Some(wave_start + lane);
+                    ctx.export_templates.push(member);
+                    ctx.export_templates.len() - 1
+                };
+                wave.streamed_exports.push(index);
+            }
+        }
         bind_template_aliases(ctx, &mut wave, template_values.clone())?;
         ctx.waves.push(wave);
     }
     for (port, (ty, members)) in outputs_by_port.into_iter().enumerate() {
+        // Nothing reads a streamed or summed port as a family.
+        if streamed_ports[port] || summed_ports[port] {
+            continue;
+        }
         let family = pack_resident_family(ty, &members, ctx.device)?;
         let id = value_id(ctx.values.len())?;
         ctx.values.push(family.physical().as_ref().clone());
@@ -8104,7 +8633,7 @@ fn lower_inlined_child(
                 }
                 lower_matrix_node(ctx, child, child_node_id, child_node, &types, choice)?;
             } else if matches!(child_node.kind(), NodeKind::ConstantMatrix { .. }) {
-                lower_static_matrix_node(ctx, child_node_id, child_node, child_env, &types)?;
+                lower_static_matrix_node(ctx, child, child_node_id, child_node, child_env, &types)?;
             } else if matches!(
                 child_node.kind(),
                 NodeKind::UniformResidueSample { .. } |
@@ -9053,8 +9582,10 @@ mod tests {
         }
         let mut runtime = GpuRuntime::new(backend).unwrap();
         runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
-        let mut plan = runtime.plan(validated, &inputs).unwrap();
-        assert!((1..=2).contains(&plan.report().stages[0].wave_instances));
+        // Two lanes, each streaming its members from a slot of its own, over
+        // a full wave and a partial one.
+        let mut plan = runtime.plan_with_fixed_geometry_for_test(validated, &inputs, 2, 2).unwrap();
+        assert_eq!(plan.report().stages[0].wave_instances, 2);
         let mut store = MemoryArtifactStore::default();
         let result =
             runtime.execute_with_artifacts(&mut plan, inputs, &mut store, [0x73; 32]).unwrap();
@@ -9071,6 +9602,55 @@ mod tests {
             assert!(
                 store.load(&key, &manifest.artifacts["sum"]).is_ok(),
                 "missing family artifact member {index}"
+            );
+        }
+    }
+
+    /// A family that only a member-by-member sum reads is summed wave by
+    /// wave into one running sum, which starts at zero in every execute.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_parallel_member_sum_accumulates_by_wave() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu_params = DCRTPolyParams::new(32, 2, 50, 8, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(32, cpu_params.to_crt().0, 8, None);
+        let ring = Ring::from_crt_moduli(
+            gpu_params.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            gpu_params.ring_dimension(),
+        );
+        let member_ring = ring.clone();
+        let family = parallel(8, move |index| {
+            Ok(index.add(3).lift_to_constant_polynomial(member_ring.matrix_type((1, 1))))
+        })
+        .unwrap();
+        let first = family.at(mxx_dsl::Int::constant(0)) + family.at(mxx_dsl::Int::constant(1));
+        let rest = family.clone();
+        let sum = mxx_dsl::iterate(6, first, move |index, state| Ok(state + rest.at(index.add(2))))
+            .unwrap();
+        let validated = DslContext::new("direct-parallel-member-sum")
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let backend = gpu_backend_on([gpu_params.clone()], [device]);
+        let mut runtime = GpuRuntime::new(backend).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        assert!(
+            !plan.physical_frame_for_test().fused_nodes.is_empty(),
+            "the member sum is lowered as a running sum"
+        );
+        // Twice: the second execute sums from zero again.
+        for _ in 0..2 {
+            let result = runtime.execute(&mut plan, BTreeMap::new()).unwrap();
+            let output = result.output("sum").expect("sum output");
+            let sum = runtime.download_matrix_output(&output).unwrap();
+            assert_eq!(
+                sum.entry(0, 0).coeffs_biguints()[0],
+                num_bigint::BigUint::from((0..8u32).map(|index| index + 3).sum::<u32>())
             );
         }
     }

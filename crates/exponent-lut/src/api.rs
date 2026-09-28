@@ -203,6 +203,10 @@ impl ArtifactStore for StageStore {
         delegate_store!(self, store => store.store_manifest(manifest))
     }
 
+    fn evict_cached(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.evict_cached(key))
+    }
+
     #[cfg(feature = "gpu")]
     fn device_artifacts(&mut self) -> Option<&mut mxx_backends::device_artifact::DeviceArtifacts> {
         match self {
@@ -229,6 +233,10 @@ impl SessionStore for StageStore {
 
     fn release_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
         delegate_store!(self, store => store.release_session(production))
+    }
+
+    fn discard_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
+        delegate_store!(self, store => store.discard_session(production))
     }
 
     fn transcript_entry(
@@ -324,7 +332,9 @@ pub struct StageOutputs {
 /// return owned outputs, and verification downloads single matrices.
 pub trait StageExecution<S: SessionStore> {
     /// Execute an artifact-producing graph in the session selected by
-    /// `execution_nonce` and return its production identity.
+    /// `execution_nonce` and return its production identity. An execution
+    /// that only estimates stages may plan the graph without executing it and
+    /// return the identity its execution would have.
     fn produce(
         &mut self,
         validated: ValidatedGraph,
@@ -333,7 +343,9 @@ pub trait StageExecution<S: SessionStore> {
         execution_nonce: [u8; 32],
     ) -> Result<ProductionId, ApiError>;
 
-    /// Execute a graph and return owned copies of all of its outputs.
+    /// Execute a graph and return owned copies of all of its outputs. An
+    /// execution that only estimates stages may plan a graph that reads or
+    /// writes artifacts without executing it and return no outputs.
     fn evaluate(
         &mut self,
         validated: ValidatedGraph,
@@ -668,10 +680,11 @@ where
     let validated = validate_stage(&graph, parameters)?;
     before_execute(&validated)?;
     let (execution_nonce, session) = fresh_execution_session(&validated, store, identity)?;
+    let (production, manifest) = stage_production(&validated, execution_nonce)?;
     let validated_at = std::time::Instant::now();
-    let production = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    let produced = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    check_production(&produced, &production)?;
     let produced_at = std::time::Instant::now();
-    let manifest = finalized_manifest(store, &session, &production)?;
     tracing::info!(
         validate_ms = (validated_at - started).as_millis() as u64,
         produce_ms = (produced_at - validated_at).as_millis() as u64,
@@ -685,20 +698,29 @@ fn validate_stage(graph: &StageGraph, parameters: &ParamEnv) -> Result<Validated
     graph.graph.validate_with_manifests(parameters, &graph.manifests).map_err(ApiError::graph)
 }
 
-fn finalized_manifest<S: SessionStore>(
-    store: &mut S,
-    session: &SessionAliasDescriptor,
-    production: &ProductionId,
-) -> Result<Manifest, ApiError> {
-    let manifest = store
-        .load_finalized_named_manifest(session)
-        .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))?;
-    if &manifest.production_id != production {
-        return Err(ApiError::compatibility(
-            "finalized named session returned a different production identity",
-        ));
+/// The production a stage executed with `execution_nonce` publishes and its
+/// manifest, both determined by the validated graph alone. Stage records are
+/// built from them before execution, so a later stage can be built and
+/// planned whether or not this one has executed; a consumer's store read
+/// checks that the production was finalized.
+fn stage_production(
+    validated: &ValidatedGraph,
+    execution_nonce: [u8; 32],
+) -> Result<(ProductionId, Manifest), ApiError> {
+    let specification =
+        spec_hash(&validated.source, &validated.bindings).map_err(ApiError::graph)?;
+    let production = mxx_ir_core::artifact::production_id(specification, execution_nonce);
+    let manifest = mxx_ir_core::artifact::export_validated_manifest(production.clone(), validated)
+        .map_err(ApiError::graph)?;
+    Ok((production, manifest))
+}
+
+fn check_production(produced: &ProductionId, expected: &ProductionId) -> Result<(), ApiError> {
+    if produced == expected {
+        Ok(())
+    } else {
+        Err(ApiError::compatibility("stage execution returned a different production identity"))
     }
-    Ok(manifest)
 }
 
 /// Reload a finalized stage from its named session after an application
@@ -874,12 +896,13 @@ where
         store,
         domain_identity(encryption_identity, b"preprocess"),
     )?;
+    let (production, manifest) = stage_production(&validated, execution_nonce)?;
     let validated_at = std::time::Instant::now();
-    let production = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    let produced = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
+    check_production(&produced, &production)?;
     let produced_at = std::time::Instant::now();
     let (encrypt_descriptor, online_descriptor) =
         T::finalize_descriptors(&production, (encrypt_descriptor, online_descriptor))?;
-    let manifest = finalized_manifest(store, &session, &production)?;
     tracing::info!(
         bind_ms = (bound_at - started).as_millis() as u64,
         lower_ms = (lowered_at - bound_at).as_millis() as u64,

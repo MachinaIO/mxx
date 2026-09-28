@@ -2,7 +2,14 @@
 //!
 //! Each stage graph is planned once with the artifact store (so artifact
 //! imports get fixed destinations), executed once, and its outputs are copied
-//! into value-owned storage before the plan is dropped.
+//! into value-owned storage before the plan is dropped. Each plan logs its
+//! estimate ("planned Exponent-LUT GPU stage"), including the I/O-inclusive
+//! one when the runtime runs an I/O trial.
+//!
+//! | Environment variable | Effect |
+//! | --- | --- |
+//! | `MXX_EXPONENT_LUT_ESTIMATE_ONLY=1` | Estimate mode: a stage that reads or writes artifacts is planned and its plan dropped without executing. A producer returns the production its execution would have, and an evaluation returns no outputs. A stage without artifact I/O, such as secret sampling, still executes, since later stages bind its outputs. Planning times each candidate with one trial and no warmup unless `MXX_GPU_MEASUREMENT_WARMUPS` or `MXX_GPU_MEASUREMENT_ITERATIONS` is set. |
+//! | `MXX_EXPONENT_LUT_PLAN_HTML_DIR=<dir>` | Each plan's `render_html` view is written there as `<sequence>-<graph>.html`. |
 
 use crate::api::{ApiError, StageExecution, StageOutputs};
 use mxx_backends::{
@@ -10,31 +17,64 @@ use mxx_backends::{
     matrix::dcrt_poly::DCRTPolyMatrix,
 };
 use mxx_ir_core::{ValidatedGraph, artifact::ProductionId};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use tracing::info;
 
 fn gpu_error(error: impl std::fmt::Display) -> ApiError {
     ApiError::Runtime(ExecutionError::Backend(error.to_string()))
 }
 
-fn plan<S: SessionStore>(
+fn estimate_only() -> bool {
+    std::env::var("MXX_EXPONENT_LUT_ESTIMATE_ONLY").is_ok_and(|value| value == "1")
+}
+
+/// Plans written to `MXX_EXPONENT_LUT_PLAN_HTML_DIR`, numbering their files.
+static PLAN_VIEWS: AtomicUsize = AtomicUsize::new(0);
+
+fn plan<S: SessionStore + Send>(
     runtime: &mut GpuRuntime,
     validated: ValidatedGraph,
     inputs: &BTreeMap<String, RuntimeValue>,
     store: &mut S,
 ) -> Result<GpuExecutionPlan, ApiError> {
     let name = validated.source.name().to_owned();
+    // An estimate only compares candidates: one trial run each, unless the
+    // environment asks for more.
+    if estimate_only() {
+        let options = runtime.options_mut();
+        if std::env::var_os("MXX_GPU_MEASUREMENT_WARMUPS").is_none() {
+            options.measurement_warmups = 0;
+        }
+        if std::env::var_os("MXX_GPU_MEASUREMENT_ITERATIONS").is_none() {
+            options.measurement_iterations = std::num::NonZeroUsize::MIN;
+        }
+    }
+    let started = std::time::Instant::now();
     let plan = runtime.plan_with_store(validated, inputs, store).map_err(gpu_error)?;
     let report = plan.report();
     info!(
         graph = name,
+        plan_seconds = started.elapsed().as_secs_f64(),
         predicted_seconds = report.predicted_seconds,
+        io_predicted_seconds = ?report.io_predicted_seconds,
         limiting_stage = ?report.limiting_stage,
         reason = report.reason,
         regions = plan.compiled_region_count(),
         launches = plan.compiled_launch_count(),
         "planned Exponent-LUT GPU stage"
     );
+    if let Ok(directory) = std::env::var("MXX_EXPONENT_LUT_PLAN_HTML_DIR") {
+        let directory = std::path::Path::new(&directory);
+        let sequence = PLAN_VIEWS.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("{sequence:02}-{name}.html"));
+        std::fs::create_dir_all(directory)
+            .and_then(|()| std::fs::write(&path, plan.render_html()))
+            .map_err(gpu_error)?;
+        info!(graph = name, path = %path.display(), "wrote Exponent-LUT GPU plan view");
+    }
     Ok(plan)
 }
 
@@ -48,7 +88,14 @@ impl<S: SessionStore + Send> StageExecution<S> for GpuRuntime {
     ) -> Result<ProductionId, ApiError> {
         let name = validated.source.name().to_owned();
         let started = std::time::Instant::now();
+        let specification =
+            mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
+                .map_err(gpu_error)?;
         let mut plan = plan(self, validated, &inputs, store)?;
+        if estimate_only() {
+            info!(graph = name, "estimate mode: the stage is not executed");
+            return Ok(mxx_ir_core::artifact::production_id(specification, execution_nonce));
+        }
         let planned = std::time::Instant::now();
         let result = self
             .execute_with_artifacts(&mut plan, inputs, store, execution_nonce)
@@ -74,6 +121,10 @@ impl<S: SessionStore + Send> StageExecution<S> for GpuRuntime {
         let name = validated.source.name().to_owned();
         let started = std::time::Instant::now();
         let mut plan = plan(self, validated, &inputs, store)?;
+        if estimate_only() && plan.has_artifact_io() {
+            info!(graph = name, "estimate mode: the stage is not executed");
+            return Ok(StageOutputs { outputs: BTreeMap::new() });
+        }
         let planned = std::time::Instant::now();
         let result = self
             .execute_with_artifacts(&mut plan, inputs, store, execution_nonce)

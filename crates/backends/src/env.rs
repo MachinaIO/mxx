@@ -64,15 +64,15 @@ pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
 /// one GPU small-RHS product transforms at a time. Each chunk is decoded and
 /// transformed into one reused workspace of `rhs rows x chunk` polynomials, so
 /// the whole right operand is never expanded; larger chunks trade workspace
-/// memory for fewer kernel launches. Default: 16. Zero or malformed values are
+/// memory for fewer kernel launches. Default: 1. Zero or malformed values are
 /// errors.
 pub fn gpu_small_rhs_chunk_columns() -> Result<usize, String> {
-    positive_usize("MXX_GPU_SMALL_RHS_CHUNK_COLUMNS", 16)
+    positive_usize("MXX_GPU_SMALL_RHS_CHUNK_COLUMNS", 1)
 }
 
 /// `MXX_GPU_MEMORY_FRACTION`: fraction of each GPU's physical memory one plan's
-/// persistent allocations may use. Graph-owned scratch is admitted separately,
-/// against the memory free at its Graph's first launch. Default: 0.8. Values
+/// persistent allocations, its scratch arena and region scratch pool
+/// included, may use. Default: 0.8. Values
 /// outside `(0, 1]` are errors.
 pub fn gpu_memory_fraction() -> Result<f64, String> {
     let name = "MXX_GPU_MEMORY_FRACTION";

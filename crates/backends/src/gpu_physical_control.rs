@@ -1577,11 +1577,61 @@ pub(super) fn lower_control_node(
                     .ok_or_else(|| "GPU family pack member has no physical value".to_owned())?;
                 // Matrix family members share the evaluation-domain layout.
                 let source_id = full_eval_value(ctx, source_id)?;
+                source_ids.push(source_id);
+            }
+            // Every lane of a Zip over the family replays one template, so its
+            // members share one layout: when they differ (a native input
+            // packed with scratch results, for example), each member that is
+            // not in the scratch layout is copied into scratch.
+            let layout = |physical: &PhysicalValue| {
+                let mut layout = physical.clone();
+                for part in layout.parts.iter_mut() {
+                    part.storage = StorageRef::Input(0);
+                    part.view.byte_offset = 0;
+                }
+                layout
+            };
+            let first_layout = source_ids.first().map(|id| layout(&ctx.values[id.0 as usize]));
+            if source_ids.iter().any(|id| Some(layout(&ctx.values[id.0 as usize])) != first_layout)
+            {
+                for source_id in source_ids.iter_mut() {
+                    let physical = &ctx.values[source_id.0 as usize];
+                    let Some(ty) = physical.ty.matrix_type().cloned() else { continue };
+                    let [encoding] = physical.encodings.as_ref() else { continue };
+                    let (scratch, _) = crate::gpu_graph_memory::deferred_scratch_matrix(
+                        ctx.backend,
+                        ctx.device,
+                        &ty,
+                        encoding.clone(),
+                        StorageRef::Input(0),
+                    )?;
+                    if layout(physical) == layout(&scratch) {
+                        continue;
+                    }
+                    let destination = crate::gpu_physical_lowering::allocate_scratch_matrix(
+                        ctx,
+                        &ty,
+                        encoding.clone(),
+                    )?;
+                    let predecessors = all_predecessors(ctx.producer, *source_id);
+                    let copy = crate::gpu_physical_lowering::copy_matrix_view(
+                        ctx,
+                        *source_id,
+                        destination,
+                        predecessors,
+                    )?;
+                    ctx.producer.insert(
+                        destination,
+                        vec![(ColumnRange { start: 0, end: ty.columns }, copy)],
+                    );
+                    *source_id = destination;
+                }
+            }
+            for &source_id in &source_ids {
                 let owner = ctx
                     .owners
                     .get(&source_id)
                     .ok_or_else(|| "GPU family pack member owner is missing".to_owned())?;
-                source_ids.push(source_id);
                 members.push(Arc::clone(owner));
                 let writers = ctx.producer.get(&source_id).cloned().unwrap_or_default();
                 producers.extend(writers.iter().copied());

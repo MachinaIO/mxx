@@ -53,15 +53,18 @@
 //! [`GpuExecutionPlan::render_html`] draws the graph with those costs; a profiling failure is
 //! logged and leaves `node_costs` empty.
 //!
-//! The trials above time the Graph alone, without artifact reads or writes. With `io_trial_waves`,
-//! `plan_with_store` then executes the selected plan once with its artifact I/O: each root wave
-//! group runs only its first `io_trial_waves` waves and each root host-driven loop that many
-//! iterations. Planning never reads the artifacts a plan imports, so they need not exist yet:
+//! The trials above time the Graph alone, without artifact reads or writes. With a host or file
+//! store, or with `io_trial_waves` set, `plan_with_store` then executes the selected plan once with
+//! its artifact I/O: each root wave group runs only its first `io_trial_waves` waves (2 when unset)
+//! and each root host-driven loop that many iterations. A store that keeps artifacts on the GPU
+//! runs the trial only when `io_trial_waves` is set. Planning reads only the imported artifacts
+//! whose type has no zero payload, such as integers; the others need not exist yet:
 //!
 //! - Before the trial, one load is timed per imported artifact type. A zero payload of the type is
 //!   stored under a fresh production, dropped from the store's cache
 //!   (`ArtifactStore::evict_cached`), loaded under a timer, and removed. The result is kept by the
-//!   runtime and reused for that type by later trials.
+//!   runtime and reused for that type by later trials. A type without a zero payload is not timed
+//!   and the trial reads its stored artifact.
 //! - In the trial, each import waits on the I/O worker for its type's load time and delivers a zero
 //!   payload, which is decoded and uploaded as a real one.
 //! - Exports go to a fresh trial production. After the run their writes are published and committed
@@ -83,7 +86,7 @@
 //! | `measurement_iterations` | `MXX_GPU_MEASUREMENT_ITERATIONS` | 2 |
 //! | `release_fence_interval` | `MXX_GPU_RELEASE_FENCE_INTERVAL` | unset |
 //! | `profile_nodes` | `MXX_GPU_PROFILE_NODES` | false |
-//! | `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset |
+//! | `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset (2 for a host or file store) |
 //! | `integer_input_ranges` | (set in code) | empty |
 //! | `subgraph_kernels` | (set in code) | empty |
 //!
@@ -1836,6 +1839,10 @@ impl IoTrial {
 }
 
 /// Whether artifacts with these descriptors have the same stored payload.
+/// Waves of each root wave group, and iterations of each root host-driven
+/// loop, an I/O trial runs when `io_trial_waves` is unset.
+const DEFAULT_IO_TRIAL_WAVES: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2).unwrap();
+
 fn same_payload(left: &ManifestArtifact, right: &ManifestArtifact) -> bool {
     left.artifact_type == right.artifact_type &&
         left.availability == right.availability &&
@@ -2279,7 +2286,13 @@ impl GpuRuntime {
         let device_artifact_exports = store.device_artifacts().is_some();
         let mut plan =
             self.plan_with_payload_sizes(validated, inputs, &sizes, device_artifact_exports, None)?;
-        if let Some(waves) = self.options.io_trial_waves {
+        // A host or file store's reads and writes take time the Graph trials
+        // do not measure, so its plans always run an I/O trial.
+        let waves = self
+            .options
+            .io_trial_waves
+            .or_else(|| (!device_artifact_exports).then_some(DEFAULT_IO_TRIAL_WAVES));
+        if let Some(waves) = waves {
             plan.report.io_predicted_seconds =
                 self.io_trial(&mut plan, inputs, store, waves.get())?;
         }
@@ -2342,7 +2355,9 @@ impl GpuRuntime {
     /// The load seconds of each artifact descriptor `frame` imports, measured
     /// once per descriptor and runtime: a zero payload of its type is stored
     /// under a fresh production, dropped from the store's cache, loaded once
-    /// under a timer, and removed. Only the load is timed.
+    /// under a timer, and removed. Only the load is timed. A descriptor whose
+    /// type has no zero payload is left out, so the trial reads the artifact
+    /// itself.
     fn measure_trial_loads<S: SessionStore>(
         &mut self,
         frame: &PhysicalFrame,
@@ -2383,9 +2398,13 @@ impl GpuRuntime {
                 name: "io-trial-load".into(),
                 index: None,
             };
-            let payload =
+            // A type without a zero payload is not emulated: the trial loads
+            // the stored artifact itself.
+            let Ok(payload) =
                 crate::backend::poly_gpu::zero_artifact_payload(&descriptor.artifact_type)
-                    .map_err(|error| failed(&error))?;
+            else {
+                continue;
+            };
             let measured = store
                 .store_manifest(Manifest {
                     ir_version: mxx_ir_core::encoding::IR_VERSION,

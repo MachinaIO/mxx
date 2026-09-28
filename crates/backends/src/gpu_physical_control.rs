@@ -41,14 +41,16 @@ use crate::{
     },
     gpu_physical_lowering::{
         ImportDestination, ImportTemplate, IndexedMatrixTableReplay, PhysicalLoweringContext,
-        all_predecessors, allocate_compact_value, allocate_scratch_matrix, emit_matrix_operation,
-        full_coeff_value, full_eval_value, hash_tag_resource, lower_centered_rebase_node,
-        lower_crt_recompose_node, lower_gadget_trapdoor_node, lower_hash_sample_node,
-        lower_matrix_node, lower_preimage_sample_node, lower_rns_conversion_node,
-        lower_sample_matrix_node, lower_static_matrix_node, lower_trapdoor_sample_node,
-        pack_trapdoor_leaves, physical_matrix, push_hash_sample, record_node_operations,
-        register_bindings, register_preimage_control_binding, root_matrix_operation_identity,
-        trapdoor_leaf_types, value_id,
+        all_predecessors, allocate_compact_value, allocate_deferred_compact_value,
+        allocate_scratch_matrix, column_block_view, copy_compact_block_home, copy_matrix_view,
+        device_column_blocks, emit_matrix_operation, full_coeff_value, full_eval_value,
+        hash_tag_resource, lower_centered_rebase_node, lower_crt_recompose_node,
+        lower_gadget_trapdoor_node, lower_hash_sample_node, lower_matrix_node,
+        lower_preimage_sample_node, lower_rns_conversion_node, lower_sample_matrix_node,
+        lower_static_matrix_node, lower_trapdoor_sample_node, matrix_columns_on_device,
+        pack_trapdoor_leaves, physical_matrix, predecessors_for, push_hash_sample,
+        record_node_operations, register_bindings, register_preimage_control_binding,
+        replicate_to_device, root_matrix_operation_identity, trapdoor_leaf_types, value_id,
     },
     gpu_subgraph_kernel::GpuKernelOperandKind,
     poly::{
@@ -3681,53 +3683,90 @@ fn lower_matrix_mul_small_rhs(
     // A tall right operand (many gadget digits) makes each workspace column
     // as large as a column of the output times its row count, so the chunk
     // is narrow by default.
-    let chunk = crate::env::gpu_small_rhs_chunk_columns()?.min(right_ty.columns);
-    let workspace_ty = ConcreteMatrixType { columns: chunk, ..right_ty.clone() };
-    let workspace = allocate_scratch_matrix(ctx, &workspace_ty, PhysicalEncoding::FullEval)?;
+    let chunk = crate::env::gpu_small_rhs_chunk_columns()?;
     let output = allocate_scratch_matrix(ctx, &expected, PhysicalEncoding::FullEval)?;
     let implementation = ctx
         .implementations
         .register(GpuImplementation::matrix_mul_small_rhs())
         .map_err(str::to_owned)?;
-    let left_binding = register_bindings(ctx.bindings, ctx.values, left)?;
-    let right_binding = scalar_binding(ctx, right)?;
-    let workspace_binding = register_bindings(ctx.bindings, ctx.values, workspace)?;
-    let output_binding = register_bindings(ctx.bindings, ctx.values, output)?;
-    let predecessors = all_predecessors(ctx.producer, left)
-        .iter()
-        .chain(all_predecessors(ctx.producer, right).iter())
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let index = u32::try_from(ctx.operations.len())
-        .map_err(|_| "too many GPU small-RHS product operations".to_owned())?;
-    ctx.operations.push(CompiledGpuOp {
-        implementation,
-        arguments: Box::new([
-            KernelArg::Value(left),
-            KernelArg::U32(0),
-            KernelArg::Value(right),
-            KernelArg::U32(0),
-            KernelArg::Value(workspace),
-            KernelArg::U32(0),
-            KernelArg::Value(output),
-            KernelArg::U32(0),
-            KernelArg::U32(left_binding),
-            KernelArg::U32(right_binding),
-            KernelArg::U32(workspace_binding),
-            KernelArg::U32(output_binding),
-        ]),
-        outputs: Box::new([output, workspace]),
-        device: ctx.device,
-        grid: [1; 3],
-        block: [1; 3],
-        shared_bytes: 0,
-        predecessors,
-        body: None,
-    });
-    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: expected.columns }, index)]);
+    // The output columns split into one block per device. A remote block
+    // multiplies copies of the left operand and of the bounded right operand,
+    // and its product is copied home into its columns.
+    let home = ctx.device;
+    let blocks = device_column_blocks(ctx, expected.columns)?;
+    let whole = blocks.len() == 1;
+    let mut producers = Vec::with_capacity(blocks.len());
+    for (device, block) in blocks {
+        let width = block.end - block.start;
+        let (block_left, block_right) = if device == home {
+            (left, right)
+        } else {
+            (replicate_to_device(ctx, left, device)?, replicate_to_device(ctx, right, device)?)
+        };
+        let predecessors = all_predecessors(ctx.producer, block_left)
+            .iter()
+            .chain(all_predecessors(ctx.producer, block_right).iter())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let block_right =
+            if whole { block_right } else { column_block_view(ctx, block_right, block)? };
+        ctx.device = device;
+        let workspace_ty = ConcreteMatrixType { columns: chunk.min(width), ..right_ty.clone() };
+        let workspace = allocate_scratch_matrix(ctx, &workspace_ty, PhysicalEncoding::FullEval);
+        let destination = if whole {
+            Ok(output)
+        } else if device == home {
+            column_block_view(ctx, output, block)
+        } else {
+            let ty = ConcreteMatrixType { columns: width, ..expected.clone() };
+            allocate_scratch_matrix(ctx, &ty, PhysicalEncoding::FullEval)
+        };
+        ctx.device = home;
+        let (workspace, destination) = (workspace?, destination?);
+        let left_binding = register_bindings(ctx.bindings, ctx.values, block_left)?;
+        let right_binding = scalar_binding(ctx, block_right)?;
+        let workspace_binding = register_bindings(ctx.bindings, ctx.values, workspace)?;
+        let destination_binding = register_bindings(ctx.bindings, ctx.values, destination)?;
+        let index = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU small-RHS product operations".to_owned())?;
+        ctx.operations.push(CompiledGpuOp {
+            implementation,
+            arguments: Box::new([
+                KernelArg::Value(block_left),
+                KernelArg::U32(0),
+                KernelArg::Value(block_right),
+                KernelArg::U32(0),
+                KernelArg::Value(workspace),
+                KernelArg::U32(0),
+                KernelArg::Value(destination),
+                KernelArg::U32(0),
+                KernelArg::U32(left_binding),
+                KernelArg::U32(right_binding),
+                KernelArg::U32(workspace_binding),
+                KernelArg::U32(destination_binding),
+            ]),
+            outputs: Box::new([destination, workspace]),
+            device,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_bytes: 0,
+            predecessors,
+            body: None,
+        });
+        if device == home {
+            producers.push((block, index));
+            continue;
+        }
+        ctx.producer.insert(destination, vec![(ColumnRange { start: 0, end: width }, index)]);
+        let gathered = replicate_to_device(ctx, destination, home)?;
+        let home_block = column_block_view(ctx, output, block)?;
+        let copy_predecessors = all_predecessors(ctx.producer, gathered);
+        producers.push((block, copy_matrix_view(ctx, gathered, home_block, copy_predecessors)?));
+    }
+    ctx.producer.insert(output, producers);
     ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
     Ok(())
 }
@@ -3986,72 +4025,124 @@ fn lower_gadget_decompose(
     };
     // The signed digits are written directly into the compact bounded
     // output; no full coefficient-domain digit matrix is materialized.
-    let output = crate::gpu_physical_lowering::allocate_deferred_compact_value(ctx, output_ty)?;
-    let source_binding = register_bindings(ctx.bindings, ctx.values, source_coefficient)?;
-    let destination_binding = scalar_binding(ctx, output)?;
-    // The decomposition writes only the digits of the CRT limbs it keeps; the
-    // others must read as zero, and the output's memory may hold another
-    // value's bytes, so it is cleared first.
-    let bytes = ctx.owners[&output]
-        .storages()
-        .next()
-        .map(|(_, storage)| storage.bytes)
-        .ok_or("GPU gadget decomposition output has no storage")?;
+    let output = allocate_deferred_compact_value(ctx, output_ty.clone())?;
     let zero = ctx.implementations.register(GpuImplementation::zero()).map_err(str::to_owned)?;
-    let cleared = u32::try_from(ctx.operations.len())
-        .map_err(|_| "too many GPU gadget decomposition operations".to_owned())?;
-    ctx.operations.push(CompiledGpuOp {
-        implementation: zero,
-        arguments: Box::new([
-            KernelArg::Value(output),
-            KernelArg::U32(0),
-            KernelArg::U64(bytes),
-            KernelArg::U32(destination_binding),
-        ]),
-        outputs: Box::new([output]),
-        device: ctx.device,
-        grid: [0; 3],
-        block: [0; 3],
-        shared_bytes: 0,
-        predecessors: Box::new([]),
-        body: None,
-    });
     let implementation = ctx
         .implementations
         .register(GpuImplementation::gadget_decompose_compact())
         .map_err(str::to_owned)?;
-    let index = u32::try_from(ctx.operations.len())
-        .map_err(|_| "too many GPU gadget decomposition operations".to_owned())?;
-    ctx.operations.push(CompiledGpuOp {
-        implementation,
-        arguments: Box::new([
-            KernelArg::Value(source_coefficient),
-            KernelArg::U32(0),
-            KernelArg::Value(output),
-            KernelArg::U32(0),
-            KernelArg::U32(params.base_bits()),
-            KernelArg::U32(
-                u32::try_from(dropped.unwrap_or(0))
-                    .map_err(|_| "GPU dropped CRT count exceeds u32")?,
-            ),
-            KernelArg::U32(u32::from(small)),
-            KernelArg::U32(source_binding),
-            KernelArg::U32(destination_binding),
-        ]),
-        outputs: Box::new([output]),
-        device: ctx.device,
-        grid: [1; 3],
-        block: [1; 3],
-        shared_bytes: 0,
-        predecessors: all_predecessors(ctx.producer, source_coefficient)
-            .iter()
-            .copied()
-            .chain([cleared])
-            .collect(),
-        body: None,
-    });
-    ctx.producer
-        .insert(output, vec![(ColumnRange { start: 0, end: output_matrix.columns }, index)]);
+    let dropped =
+        u32::try_from(dropped.unwrap_or(0)).map_err(|_| "GPU dropped CRT count exceeds u32")?;
+    // The decomposition writes only the digits of the CRT limbs it keeps; the
+    // others must read as zero, and the output's memory may hold another
+    // value's bytes, so it is cleared first.
+    let clear = |ctx: &mut PhysicalLoweringContext<'_>, value: PhysicalValueId, device: i32| {
+        let bytes = ctx.owners[&value]
+            .storages()
+            .next()
+            .map(|(_, storage)| storage.bytes)
+            .ok_or("GPU gadget decomposition output has no storage")?;
+        let binding = scalar_binding(ctx, value)?;
+        let index = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU gadget decomposition operations".to_owned())?;
+        ctx.operations.push(CompiledGpuOp {
+            implementation: zero,
+            arguments: Box::new([
+                KernelArg::Value(value),
+                KernelArg::U32(0),
+                KernelArg::U64(bytes),
+                KernelArg::U32(binding),
+            ]),
+            outputs: Box::new([value]),
+            device,
+            grid: [0; 3],
+            block: [0; 3],
+            shared_bytes: 0,
+            predecessors: Box::new([]),
+            body: None,
+        });
+        Ok::<_, String>(index)
+    };
+    let home = ctx.device;
+    let cleared = clear(ctx, output, home)?;
+    // The columns split into one block per device. A remote block decomposes
+    // a copy of its source columns into a block of its own, which is copied
+    // home row by row into its columns.
+    let blocks = device_column_blocks(ctx, output_matrix.columns)?;
+    let whole = blocks.len() == 1;
+    let mut producers = Vec::with_capacity(blocks.len());
+    for (device, block) in blocks {
+        let width = block.end - block.start;
+        let origin =
+            usize::try_from(ctx.values[source_coefficient.0 as usize].parts[0].view.origin[1])
+                .map_err(|_| "GPU column origin exceeds usize")?;
+        let range = ColumnRange { start: origin + block.start, end: origin + block.end };
+        // A column view has no writers of its own: a home block waits for
+        // the writers of its source columns.
+        let (source_block, destination, block_cleared, source_writers) = if whole {
+            let writers = all_predecessors(ctx.producer, source_coefficient);
+            (source_coefficient, output, cleared, writers)
+        } else if device == home {
+            let writers = predecessors_for(ctx.producer, source_coefficient, range);
+            (
+                column_block_view(ctx, source_coefficient, block)?,
+                column_block_view(ctx, output, block)?,
+                cleared,
+                writers,
+            )
+        } else {
+            let source_block = matrix_columns_on_device(ctx, source_coefficient, range, device)?;
+            let mut block_ty = output_ty.clone();
+            if let ConcreteWireType::Preimage { matrix, .. } = &mut block_ty {
+                matrix.columns = width;
+            }
+            ctx.device = device;
+            let destination = allocate_deferred_compact_value(ctx, block_ty);
+            ctx.device = home;
+            let destination = destination?;
+            let block_cleared = clear(ctx, destination, device)?;
+            let writers = all_predecessors(ctx.producer, source_block);
+            (source_block, destination, block_cleared, writers)
+        };
+        let source_binding = register_bindings(ctx.bindings, ctx.values, source_block)?;
+        let destination_binding = scalar_binding(ctx, destination)?;
+        let index = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU gadget decomposition operations".to_owned())?;
+        ctx.operations.push(CompiledGpuOp {
+            implementation,
+            arguments: Box::new([
+                KernelArg::Value(source_block),
+                KernelArg::U32(0),
+                KernelArg::Value(destination),
+                KernelArg::U32(0),
+                KernelArg::U32(params.base_bits()),
+                KernelArg::U32(dropped),
+                KernelArg::U32(u32::from(small)),
+                KernelArg::U32(source_binding),
+                KernelArg::U32(destination_binding),
+            ]),
+            outputs: Box::new([destination]),
+            device,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_bytes: 0,
+            predecessors: source_writers.iter().copied().chain([block_cleared]).collect(),
+            body: None,
+        });
+        if device == home {
+            producers.push((block, index));
+            continue;
+        }
+        ctx.producer.insert(destination, vec![(ColumnRange { start: 0, end: width }, index)]);
+        // The copies overwrite the home block after the home output is cleared.
+        for copy in copy_compact_block_home(ctx, destination, output, block)? {
+            let operation = &mut ctx.operations[copy as usize];
+            operation.predecessors =
+                operation.predecessors.iter().copied().chain([cleared]).collect();
+            producers.push((block, copy));
+        }
+    }
+    ctx.producer.insert(output, producers);
     ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, output);
     Ok(())
 }

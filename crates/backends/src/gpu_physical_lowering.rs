@@ -426,6 +426,54 @@ fn balanced_owner_intervals(columns: usize, devices: usize) -> Vec<GpuColumnInte
         .collect()
 }
 
+/// The device of each block of an operation's `columns` output columns. On
+/// the plan's home device and outside a device-resident body, the columns
+/// split into one nearly equal block per device of the plan; a lane running
+/// on another device, or a body that replays on one device, keeps them all.
+pub(super) fn device_column_blocks(
+    ctx: &PhysicalLoweringContext<'_>,
+    columns: usize,
+) -> Result<Vec<(i32, ColumnRange)>, String> {
+    let devices = ctx
+        .logical
+        .contract
+        .logical_to_physical_devices
+        .iter()
+        .map(|&device| i32::try_from(device).map_err(|_| "GPU device ID overflows".to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ctx.device_body || devices.len() < 2 || devices.first() != Some(&ctx.device) {
+        return Ok(vec![(ctx.device, ColumnRange { start: 0, end: columns })]);
+    }
+    Ok(balanced_owner_intervals(columns, devices.len())
+        .into_iter()
+        .map(|interval| {
+            (devices[interval.device], ColumnRange { start: interval.start, end: interval.end })
+        })
+        .collect())
+}
+
+/// The `block` columns, counted from its first column, of the matrix or
+/// bounded matrix `source`.
+pub(super) fn column_block_view(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+    block: ColumnRange,
+) -> Result<PhysicalValueId, String> {
+    let origin = ctx
+        .values
+        .get(source.0 as usize)
+        .and_then(|value| value.parts.first())
+        .map(|part| part.view.origin[1])
+        .ok_or("GPU column block source has no physical part")?;
+    let origin = usize::try_from(origin).map_err(|_| "GPU column origin exceeds usize")?;
+    matrix_column_view(
+        ctx.values,
+        ctx.owners,
+        source,
+        ColumnRange { start: origin + block.start, end: origin + block.end },
+    )
+}
+
 fn append_matrix_candidate(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
@@ -1846,8 +1894,34 @@ pub(super) fn replicate_to_device(
         *span = (span.0.min(view.byte_offset), span.1.max(last));
     }
     let parameters = ctx.backend.control_parameters_on_device(device)?;
+    // A full or compact bounded matrix in one storage is scratch placed for
+    // the replica's live span; other values keep a copy of their own for the
+    // plan.
+    let deferred = spans.len() == 1 &&
+        matches!(
+            (&physical.ty, physical.encodings.as_ref()),
+            (
+                ConcreteWireType::Matrix(_),
+                [PhysicalEncoding::FullCoeff] | [PhysicalEncoding::FullEval]
+            ) | (
+                ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. },
+                [PhysicalEncoding::CompactCoeff { .. }] |
+                    [PhysicalEncoding::CompactCoeffPerCrtLimb { .. }]
+            )
+        );
     let mut storage = BTreeMap::new();
     for (&slot, &(start, end)) in &spans {
+        if deferred {
+            storage.insert(
+                slot,
+                crate::gpu_graph_memory::deferred_scratch_storage(
+                    device,
+                    physical.ty.clone(),
+                    end - start,
+                ),
+            );
+            continue;
+        }
         let bytes = usize::try_from(end - start)
             .map_err(|_| "GPU replica exceeds host address space".to_owned())?;
         let copy =
@@ -1908,24 +1982,20 @@ pub(super) fn replicate_to_device(
     Ok(replica)
 }
 
-/// Allocate a full-Eval matrix on `device` with its physical metadata.
+/// Allocate a full `encoding` matrix on `device` with its physical metadata.
 fn allocate_device_matrix(
     backend: &GpuDcrtBackend,
     values: &mut Vec<PhysicalValue>,
     owners: &mut BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
     ty: &ConcreteMatrixType,
+    encoding: PhysicalEncoding,
     device: i32,
 ) -> Result<PhysicalValueId, String> {
     let storage = StorageRef::Scratch(
         u32::try_from(values.len()).map_err(|_| "too many GPU scratch storages".to_owned())?,
     );
-    let (physical, resident) = crate::gpu_graph_memory::deferred_scratch_matrix(
-        backend,
-        device,
-        ty,
-        PhysicalEncoding::FullEval,
-        storage,
-    )?;
+    let (physical, resident) =
+        crate::gpu_graph_memory::deferred_scratch_matrix(backend, device, ty, encoding, storage)?;
     let id = value_id(values.len())?;
     values.push(physical);
     owners.insert(id, resident);
@@ -1969,10 +2039,10 @@ pub(super) fn copy_matrix_view(
     Ok(index)
 }
 
-/// The `range` columns of a full-Eval matrix as a new matrix on `device`: a
-/// column window is first packed into a dense matrix on its own device, and
-/// the dense matrix then moves in one contiguous copy.
-fn matrix_columns_on_device(
+/// The `range` columns of a full-CRT matrix as a new matrix of the same
+/// encoding on `device`: a column window is first packed into a dense matrix
+/// on its own device, and the dense matrix then moves in one contiguous copy.
+pub(super) fn matrix_columns_on_device(
     ctx: &mut PhysicalLoweringContext<'_>,
     source: PhysicalValueId,
     range: ColumnRange,
@@ -1988,8 +2058,10 @@ fn matrix_columns_on_device(
     } else {
         let window = matrix_column_view(ctx.values, ctx.owners, source, range)?;
         let home = ctx.values[source.0 as usize].parts[0].device;
+        let encoding = ctx.values[source.0 as usize].encodings[0].clone();
         let ty = ConcreteMatrixType { columns: range.end - range.start, ..ty };
-        let dense = allocate_device_matrix(ctx.backend, ctx.values, ctx.owners, &ty, home)?;
+        let dense =
+            allocate_device_matrix(ctx.backend, ctx.values, ctx.owners, &ty, encoding, home)?;
         let predecessors = predecessors_for(ctx.producer, source, range);
         let copy = copy_matrix_view(ctx, window, dense, predecessors)?;
         ctx.producer.insert(dense, vec![(ColumnRange { start: 0, end: ty.columns }, copy)]);
@@ -2377,7 +2449,14 @@ pub(super) fn lower_matrix_node(
                 columns: output_range.end - output_range.start,
                 ..output_ty.clone()
             };
-            allocate_device_matrix(ctx.backend, ctx.values, ctx.owners, &ty, job_device)?
+            allocate_device_matrix(
+                ctx.backend,
+                ctx.values,
+                ctx.owners,
+                &ty,
+                PhysicalEncoding::FullEval,
+                job_device,
+            )?
         };
         let left_binding = register_bindings(ctx.bindings, ctx.values, left_tile)?;
         let right_binding = register_bindings(ctx.bindings, ctx.values, right_tile)?;
@@ -5047,7 +5126,7 @@ fn lower_public_gadget_preimage(
 /// Copy a device's compact column block into the `block` columns of the
 /// home owner `destination`, one contiguous copy per row of the row-major
 /// payload, after the block's writers.
-fn copy_compact_block_home(
+pub(super) fn copy_compact_block_home(
     ctx: &mut PhysicalLoweringContext<'_>,
     source: PhysicalValueId,
     destination: PhysicalValueId,

@@ -9,8 +9,10 @@
 //! per device the plan owns: CUDA reserves address space for each Graph's
 //! allocations for the Graph's lifetime and caps the total at about twice the
 //! device memory, which a plan of many regions would exceed. The barriers of
-//! a region form a chain in operation order, so a free precedes every later
-//! allocation and that allocation may take the freed bytes. Inside a parallel
+//! each device's pool in a region form a chain in operation order, so a free
+//! precedes every later allocation from that pool and that allocation may take
+//! the freed bytes; the pools of different devices order nothing between them,
+//! so each device's work waits only for its own memory. Inside a parallel
 //! loop, whose lanes are independent, every allocation follows only the chain
 //! at the loop's start, and memory freed inside the loop is reused only by
 //! the lane that freed it: a free joining several readers must not gate
@@ -27,7 +29,9 @@
 //! region's uses.
 //!
 //! Other scratch lives in memory the plan owns. A scratch value that is written before it is read
-//! and used on one device shares one arena per device with the others: it takes a byte range for
+//! shares one arena per device with the others, in the arena of the device that holds it even when
+//! operations on other devices use it (a copy between devices, for example), since every region
+//! joins all devices before the next one launches: it takes a byte range for
 //! its live span, from the region of its first use to the region of its last, widened to every
 //! replayed wave or host-loop body it overlaps, since a replay runs the whole body again. Spans are
 //! regions because operations of one region may run concurrently while regions launch in order.
@@ -73,6 +77,21 @@ pub(crate) fn is_graph_managed(bound: &BoundStorage) -> bool {
 fn placeholder_address() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1 << 62);
     NEXT.fetch_add(1 << 40, Ordering::Relaxed)
+}
+
+/// Storage of `bytes` for a scratch value of type `ty` on `device`, whose
+/// memory is chosen when the plan's Graph regions are compiled.
+pub(crate) fn deferred_scratch_storage(
+    device: i32,
+    ty: ConcreteWireType,
+    bytes: u64,
+) -> BoundStorage {
+    BoundStorage {
+        device,
+        address: placeholder_address(),
+        bytes,
+        owner: Arc::new(GpuDeferredScratch { ty, device }),
+    }
 }
 
 /// Describe a compact scratch value of the bounded type `ty`, whose payload
@@ -177,28 +196,29 @@ pub(crate) struct GraphScratchPlan {
     loops: Vec<Range<usize>>,
     /// Operation ranges of each loop's lanes.
     lanes: BTreeMap<(usize, usize), Vec<Range<usize>>>,
-    /// Memory nodes the next memory node outside a parallel loop follows.
-    chain: Vec<u32>,
+    /// Per device, the memory nodes its pool's next memory node outside a
+    /// parallel loop follows.
+    chain: BTreeMap<i32, Vec<u32>>,
     /// Start of the region whose builder issued the `chain` tokens.
     chain_region: Option<usize>,
-    /// The outermost open parallel loop: its end, the memory nodes created
-    /// inside it so far, and each lane's chain. Its nodes follow `chain`,
-    /// frozen meanwhile, and a lane's own nodes also follow its chain.
-    open_loop: Option<(usize, Vec<u32>, Vec<Option<Vec<u32>>>)>,
+    /// The outermost open parallel loop: its end, and per device the memory
+    /// nodes created inside it so far and each lane's chain. Its nodes follow
+    /// `chain`, frozen meanwhile, and a lane's own nodes also follow its chain.
+    open_loop: Option<(usize, BTreeMap<i32, Vec<u32>>, Vec<BTreeMap<i32, Vec<u32>>>)>,
     /// First loop of `loops` not reached yet.
     next_loop: usize,
     /// Each device's region scratch pool.
     pools: BTreeMap<i32, Arc<GpuDeviceBuffer>>,
 }
 
-fn visit(op: &CompiledGpuOp, each: &mut dyn FnMut(PhysicalValueId, bool, i32)) {
+fn visit(op: &CompiledGpuOp, each: &mut dyn FnMut(PhysicalValueId, bool)) {
     for argument in op.arguments.iter() {
         if let KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) = argument {
-            each(*id, false, op.device);
+            each(*id, false);
         }
     }
     for output in op.outputs.iter() {
-        each(*output, true, op.device);
+        each(*output, true);
     }
     for inner in op.body.iter().flatten() {
         visit(inner, each);
@@ -230,10 +250,11 @@ fn rebind(
 
 /// Decide every deferred scratch allocation of `frame` for the Graph regions
 /// starting at `starts`, a sorted list whose first entry is 0. Scratch
-/// written before it is read, used on one device, and live within one region,
-/// or on the home device across regions that each run once per execution,
-/// takes a range of a region scratch pool. Every other deferred allocation is
-/// allocated for the plan here, and the pools are allocated too.
+/// written before it is read and live within one region, or held on the home
+/// device across regions that each run once per execution, takes a range of
+/// its device's region scratch pool, whichever devices use it. Every other
+/// deferred allocation is allocated for the plan here, and the pools are
+/// allocated too.
 pub(crate) fn plan_graph_scratch(
     backend: &GpuDcrtBackend,
     frame: &mut PhysicalFrame,
@@ -244,7 +265,7 @@ pub(crate) fn plan_graph_scratch(
         members: Vec<PhysicalValueId>,
         eligible: bool,
         /// Whether an arena range may hold it: one storage the host never
-        /// binds, used on its own device.
+        /// binds.
         packable: bool,
         references: BTreeSet<usize>,
         first_write: Option<usize>,
@@ -297,7 +318,9 @@ pub(crate) fn plan_graph_scratch(
         }
     }
     for (index, op) in frame.program.operations.iter().enumerate() {
-        visit(op, &mut |id, written, device| {
+        // Operations of any device may share one allocation: its barriers
+        // order every use, and only copies reach across devices.
+        visit(op, &mut |id, written| {
             let Some(group) = group_of.get(&id).and_then(|pointer| groups.get_mut(pointer)) else {
                 return;
             };
@@ -305,8 +328,6 @@ pub(crate) fn plan_graph_scratch(
             if written {
                 group.first_write = Some(group.first_write.map_or(index, |first| first.min(index)));
             }
-            group.eligible &= device == group.placeholder.device;
-            group.packable &= device == group.placeholder.device;
         });
     }
     // A placed import is written by the host from its load site on: every
@@ -388,7 +409,7 @@ pub(crate) fn plan_graph_scratch(
         referenced_by: BTreeMap::new(),
         loops,
         lanes,
-        chain: Vec::new(),
+        chain: BTreeMap::new(),
         chain_region: None,
         open_loop: None,
         next_loop: 0,
@@ -727,46 +748,57 @@ impl GraphScratchPlan {
             self.chain.clear();
             if let Some((_, created, lanes)) = &mut self.open_loop {
                 created.clear();
-                lanes.iter_mut().for_each(|lane| *lane = None);
+                lanes.iter_mut().for_each(BTreeMap::clear);
             }
         }
         if let Some((end, _, _)) = &self.open_loop &&
             index >= *end
         {
             let (_, created, _) = self.open_loop.take().expect("the loop is open");
-            self.chain.extend(created);
+            for (device, created) in created {
+                self.chain.entry(device).or_default().extend(created);
+            }
         }
         while let Some(range) = self.loops.get(self.next_loop) &&
             range.start <= index
         {
             if self.open_loop.is_none() && index < range.end {
                 let lanes = self.lanes[&(range.start, range.end)].len();
-                self.open_loop = Some((range.end, Vec::new(), vec![None; lanes]));
+                self.open_loop = Some((range.end, BTreeMap::new(), vec![BTreeMap::new(); lanes]));
             }
             self.next_loop += 1;
         }
     }
 
-    /// The memory nodes the next memory node of `allocation` follows: its
-    /// lane's chain inside the open loop, otherwise `self.chain`.
+    /// The memory nodes the next memory node of `allocation` follows, of its
+    /// device's pool: its lane's chain inside the open loop, otherwise
+    /// `self.chain`.
     fn chain_of(&self, allocation: usize) -> &[u32] {
-        match (&self.open_loop, self.allocations[allocation].lane) {
-            (Some((_, _, lanes)), Some(lane)) => lanes[lane].as_deref().unwrap_or(&self.chain),
-            _ => &self.chain,
+        let (device, lane) =
+            (self.allocations[allocation].device, self.allocations[allocation].lane);
+        let chain = self.chain.get(&device).map_or(&[][..], Vec::as_slice);
+        match (&self.open_loop, lane) {
+            (Some((_, _, lanes)), Some(lane)) => {
+                lanes[lane].get(&device).map_or(chain, Vec::as_slice)
+            }
+            _ => chain,
         }
     }
 
     /// Record a memory node of `allocation` created after `chain_of`.
     fn push_memory_node(&mut self, allocation: usize, token: u32) {
-        let lane = self.allocations[allocation].lane;
+        let (device, lane) =
+            (self.allocations[allocation].device, self.allocations[allocation].lane);
         match &mut self.open_loop {
             Some((_, created, lanes)) => {
-                created.push(token);
+                created.entry(device).or_default().push(token);
                 if let Some(lane) = lane {
-                    lanes[lane] = Some(vec![token]);
+                    lanes[lane].insert(device, vec![token]);
                 }
             }
-            None => self.chain = vec![token],
+            None => {
+                self.chain.insert(device, vec![token]);
+            }
         }
     }
 

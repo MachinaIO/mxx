@@ -163,6 +163,7 @@ program.
 | --- | --- | --- | --- |
 | `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 64 | The most parallel-loop iterations one wave runs. |
 | `measurement_warmups`, `measurement_iterations` | `MXX_GPU_MEASUREMENT_WARMUPS`, `MXX_GPU_MEASUREMENT_ITERATIONS` | 1, 2 | Trials per candidate during planning. |
+| `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset | Waves of each root wave group (and iterations of each root host-driven loop) that `plan_with_store` executes with artifact I/O to add an I/O-inclusive estimate to the report. A host or file store always runs this trial, with 2 waves when unset; a GPU-resident store runs it only when set. |
 | `integer_input_ranges` | (code only) | empty | Declared value ranges of host integer inputs. |
 | `subgraph_kernels` | (code only) | empty | Native kernels that replace named subgraphs on the GPU. |
 | — | `MXX_GPU_MEMORY_FRACTION` | 0.8 | The fraction of each GPU's memory one plan may use. |

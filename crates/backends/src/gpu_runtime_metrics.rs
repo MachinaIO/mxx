@@ -26,7 +26,8 @@ pub struct GpuWarmupReport {
     #[serde(default)]
     pub node_costs: Vec<NodeCost>,
     /// Predicted seconds per execute including artifact reads and writes,
-    /// measured only when `GpuRuntimeOptions::io_trial_waves` is set: the
+    /// measured by `plan_with_store` for a host or file store, or for any
+    /// store when `GpuRuntimeOptions::io_trial_waves` is set: the
     /// I/O trial's wall time, with each root wave group and host-driven loop
     /// extrapolated from its last measured wave or iteration. `None` without
     /// a trial or for a plan without artifact I/O.

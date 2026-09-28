@@ -2341,6 +2341,80 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(source_owner));
             builder.retain_owner(Arc::clone(destination_owner));
         }
+        GpuNativePrimitive::MatrixGadgetScale => {
+            let [
+                KernelArg::Value(source_id),
+                KernelArg::U32(source_part),
+                KernelArg::Value(destination_id),
+                KernelArg::U32(destination_part),
+                KernelArg::U64(digits),
+                KernelArg::U64List(residues),
+                KernelArg::U32(source_binding),
+                KernelArg::U32(destination_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled gadget scale has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*destination_id] {
+                return Err(invalid("compiled gadget scale output disagrees with destination"));
+            }
+            let source_owner = owners
+                .get(source_id)
+                .ok_or_else(|| invalid("compiled gadget scale source is missing"))?;
+            let destination_owner = owners
+                .get(destination_id)
+                .ok_or_else(|| invalid("compiled gadget scale destination is missing"))?;
+            let (ConcreteWireType::Matrix(source_ty), ConcreteWireType::Matrix(destination_ty)) =
+                (source_owner.wire_type(), destination_owner.wire_type())
+            else {
+                return Err(invalid("compiled gadget scale requires ordinary matrices"));
+            };
+            let source_encoding = source_owner
+                .physical()
+                .encodings
+                .first()
+                .ok_or_else(|| invalid("compiled gadget scale source encoding is missing"))?;
+            if !matches!(source_encoding, PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval) ||
+                destination_owner.physical().encodings.first() != Some(source_encoding)
+            {
+                return Err(invalid("compiled gadget scale encoding changes"));
+            }
+            let (_, source, source_bindings) =
+                compiled_raw_matrix_part(source_owner, *source_part, source_encoding.clone())?;
+            let (_, destination, destination_bindings) = compiled_raw_matrix_part(
+                destination_owner,
+                *destination_part,
+                source_encoding.clone(),
+            )?;
+            let digit_count = usize::try_from(*digits)
+                .map_err(|_| invalid("compiled gadget scale digit count exceeds usize"))?;
+            if source_ty.ring != destination_ty.ring ||
+                !same_raw_limbs(&source, &destination) ||
+                source.physical_device != op.device ||
+                source.rows != 1 ||
+                destination.rows != 1 ||
+                source.columns.checked_mul(*digits) != Some(destination.columns) ||
+                source.limbs.len().checked_mul(digit_count) != Some(residues.len())
+            {
+                return Err(invalid("compiled gadget scale layouts or residues disagree"));
+            }
+            bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
+            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+            let parameters = backend
+                .parameters_on_physical_device(op.device, source_ty)
+                .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
+            parameters.emit_raw_matrix_gadget_scale(
+                builder.launch_stream(),
+                &source,
+                &destination,
+                residues,
+                digit_count,
+                *source_binding,
+                *destination_binding,
+            )?;
+            builder.retain_owner(Arc::clone(source_owner));
+            builder.retain_owner(Arc::clone(destination_owner));
+        }
         GpuNativePrimitive::MatrixScaleDynamic => {
             let [
                 KernelArg::Value(source_id),
@@ -6196,30 +6270,18 @@ fn transcode_raw_typed_blob<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     Ok(logical_length)
 }
 
-fn transcode_raw_small_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
-    layout: &PhysicalExport,
-    source: &mut R,
-    sink: &mut W,
+/// The small-matrix artifact header of `matrix` under `bound`, its
+/// coefficient magnitude bytes, and its payload length.
+fn small_matrix_header(
     matrix: &ConcreteMatrixType,
     bound: &BigInt,
     bound_domain: mxx_ir_core::types::CoefficientBoundDomain,
     semantic_tag: u8,
-) -> Result<u64, String> {
+) -> Result<(Vec<u8>, usize, usize), String> {
     let bound = bound.to_biguint().ok_or("small matrix bound is negative")?;
     let magnitude_bytes = usize::try_from(bound.bits().div_ceil(8))
         .map_err(|_| "small matrix bound width overflows")?
         .max(1);
-    let expected_encoding = match bound_domain {
-        mxx_ir_core::types::CoefficientBoundDomain::Global => {
-            PhysicalEncoding::CompactCoeff { magnitude_bytes }
-        }
-        mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb => {
-            PhysicalEncoding::CompactCoeffPerCrtLimb { magnitude_bytes }
-        }
-    };
-    if layout.physical.encodings.as_ref() != [expected_encoding] {
-        return Err("small matrix raw encoding does not match its bound".into());
-    }
     let coefficient_width =
         magnitude_bytes.checked_add(1).ok_or("small matrix coefficient width overflows")?;
     let logical_count = matrix
@@ -6261,6 +6323,71 @@ fn transcode_raw_small_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
             .to_le_bytes(),
     );
     header.extend_from_slice(&(count as u64).to_le_bytes());
+    Ok((header, magnitude_bytes, payload_len))
+}
+
+/// A canonical artifact payload of `artifact_type` whose values are all zero,
+/// with the exact length of any payload of that type. An I/O trial delivers
+/// it in place of an artifact it does not read.
+pub(crate) fn zero_artifact_payload(
+    artifact_type: &mxx_ir_core::artifact::ArtifactType,
+) -> Result<crate::artifact::ArtifactPayload, String> {
+    use crate::artifact::ArtifactPayload;
+    use mxx_ir_core::artifact::ArtifactType;
+    // Zero residues and zero sign-magnitude coefficients pack to zero bytes,
+    // so the payload is its header followed by zeros.
+    let zeros = |header: Vec<u8>, payload_len: usize| {
+        let mut bytes = vec![0u8; header.len() + payload_len];
+        bytes[..header.len()].copy_from_slice(&header);
+        bytes
+    };
+    match artifact_type {
+        ArtifactType::Matrix(matrix) => {
+            let header = EvalMatrixHeader::new(
+                matrix.rows,
+                matrix.columns,
+                matrix.ring.ring_dimension() as usize,
+                matrix.ring.crt_moduli().to_vec(),
+            )
+            .map_err(|error| error.to_string())?;
+            let payload_len = header.payload_len().ok_or("matrix payload length overflows")?;
+            Ok(ArtifactPayload::Matrix(zeros(header.encoded_header(), payload_len)))
+        }
+        ArtifactType::SmallMatrix { matrix, max_coefficient_bound, bound_domain } |
+        ArtifactType::Preimage { matrix, max_coefficient_bound, bound_domain } => {
+            let semantic_tag = u8::from(matches!(artifact_type, ArtifactType::Preimage { .. }));
+            let (header, _, payload_len) =
+                small_matrix_header(matrix, max_coefficient_bound, *bound_domain, semantic_tag)?;
+            Ok(ArtifactPayload::SmallMatrix(zeros(header, payload_len)))
+        }
+        ArtifactType::Bytes { length } => Ok(ArtifactPayload::Bytes(vec![0; *length])),
+        _ => Err("an I/O trial has no zero payload for this artifact type".into()),
+    }
+}
+
+fn transcode_raw_small_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
+    layout: &PhysicalExport,
+    source: &mut R,
+    sink: &mut W,
+    matrix: &ConcreteMatrixType,
+    bound: &BigInt,
+    bound_domain: mxx_ir_core::types::CoefficientBoundDomain,
+    semantic_tag: u8,
+) -> Result<u64, String> {
+    let (header, magnitude_bytes, payload_len) =
+        small_matrix_header(matrix, bound, bound_domain, semantic_tag)?;
+    let expected_encoding = match bound_domain {
+        mxx_ir_core::types::CoefficientBoundDomain::Global => {
+            PhysicalEncoding::CompactCoeff { magnitude_bytes }
+        }
+        mxx_ir_core::types::CoefficientBoundDomain::PerCrtLimb => {
+            PhysicalEncoding::CompactCoeffPerCrtLimb { magnitude_bytes }
+        }
+    };
+    if layout.physical.encodings.as_ref() != [expected_encoding] {
+        return Err("small matrix raw encoding does not match its bound".into());
+    }
+    let coefficient_width = magnitude_bytes + 1;
     sink.write_all(&header).map_err(|error| error.to_string())?;
     let mut output = Vec::with_capacity(64 * 1024);
     for row in 0..matrix.rows as u64 {
@@ -6684,7 +6811,7 @@ impl GpuDcrtBackend {
         self.devices.iter().map(|(physical, _)| *physical).collect()
     }
 
-    pub(super) fn parameters_on_device(&self, physical: i32) -> Result<&GpuDCRTPolyParams, String> {
+    pub(crate) fn parameters_on_device(&self, physical: i32) -> Result<&GpuDCRTPolyParams, String> {
         self.devices
             .iter()
             .find(|(device, _)| *device == physical)

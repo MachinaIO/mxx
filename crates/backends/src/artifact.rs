@@ -125,6 +125,12 @@ pub trait ArtifactStore {
     /// Removes an internal runtime-staged payload. Missing entries are ignored.
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error>;
     fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error>;
+    /// Drop the stored bytes of `key` from any cache in front of its storage,
+    /// so the next load reads them from the storage itself. A store without
+    /// such a cache does nothing.
+    fn evict_cached(&mut self, _key: &ArtifactKey) -> Result<(), Self::Error> {
+        Ok(())
+    }
     /// The artifacts this store keeps in GPU memory, if it keeps any there.
     /// GPU exports of such a store stay on the device.
     #[cfg(feature = "gpu")]
@@ -1118,6 +1124,29 @@ impl ArtifactStore for FileArtifactStore {
             Err(error) => Err(error),
         }
     }
+
+    /// Advise the kernel to drop the artifact file's pages from the page
+    /// cache (`POSIX_FADV_DONTNEED`); the file is already synced.
+    fn evict_cached(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+        let path = self.artifact_path(key);
+        let file = fs::File::open(&path)
+            .map_err(|source| FileArtifactError::Io { path: path.clone(), source })?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor stays open for the call.
+            let status =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if status != 0 {
+                return Err(FileArtifactError::Io {
+                    path,
+                    source: io::Error::from_raw_os_error(status),
+                });
+            }
+        }
+        drop(file);
+        Ok(())
+    }
 }
 
 impl SessionStore for FileArtifactStore {
@@ -1225,6 +1254,25 @@ impl SessionStore for FileArtifactStore {
         self.locks.remove(production);
         self.active_sessions.remove(production);
         cleanup
+    }
+
+    fn discard_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
+        let session_path = self.session_path(production);
+        if session_path.exists() {
+            let session: FileSession = Self::read_encoded(&session_path)?;
+            if session.status == SessionStatus::Finalized {
+                return Err(FileArtifactError::SessionFinalized(production.clone()));
+            }
+        }
+        if self.active_sessions.contains(production) {
+            self.release_session(production)?;
+        }
+        let directory = self.production_dir(production);
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(FileArtifactError::Io { path: directory, source }),
+        }
     }
 
     fn transcript_entry(
@@ -2413,6 +2461,28 @@ impl SessionStore for MemoryArtifactStore {
         Ok(())
     }
 
+    fn discard_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
+        if self
+            .sessions
+            .get(production)
+            .is_some_and(|session| session.status == SessionStatus::Finalized)
+        {
+            return Err(MemoryArtifactError::SessionFinalized(production.clone()));
+        }
+        self.sessions.remove(production);
+        self.active_sessions.remove(production);
+        self.read_sessions.remove(production);
+        self.raw_stages.retain(|key, _| &key.production != production);
+        self.entries.retain(|key, _| &key.production != production);
+        self.loads.retain(|key, _| &key.production != production);
+        self.manifests.remove(production);
+        #[cfg(feature = "gpu")]
+        if let Some(device) = &mut self.device {
+            device.remove_production(production);
+        }
+        Ok(())
+    }
+
     fn transcript_entry(
         &mut self,
         production: &ProductionId,
@@ -2785,6 +2855,54 @@ mod tests {
                 ArtifactPayload::Bytes(vec![index as u8, 7, 9])
             );
         }
+    }
+
+    /// Discarding an unfinalized session removes its transcript and staged
+    /// data, so the production reopens afresh under another descriptor; a
+    /// missing session is already discarded and a finalized one is kept.
+    fn check_discard_session<S: SessionStore>(store: &mut S, discarded: impl Fn(&S) -> bool) {
+        let key = key();
+        let production = key.production.clone();
+        store.open_session(&SessionDescriptor::new(production.clone(), "trial", [9; 32])).unwrap();
+        assert!(store.stage_raw_chunk(key.clone(), 3, 0, &[1, 2, 3]).unwrap());
+        let site = DrawSite { instantiation_path: Vec::new(), node: NodeId(4), port: Port(0) };
+        let value = RecordedValue::Matrix {
+            matrix_type: concrete_matrix_type(17, 2, 1, 1),
+            bytes: vec![1, 2],
+        };
+        store.record_transcript_batch(&production, &[(site.clone(), value)]).unwrap();
+        store.discard_session(&production).unwrap();
+        assert!(discarded(store));
+        let reopened = SessionDescriptor::new(production.clone(), "other", [10; 32]);
+        assert_eq!(store.open_session(&reopened).unwrap(), SessionStatus::Running);
+        assert_eq!(store.transcript_entry(&production, &site).unwrap(), None);
+        store
+            .finalize_session(Manifest {
+                ir_version: IR_VERSION,
+                production_id: production.clone(),
+                artifacts: BTreeMap::new(),
+            })
+            .unwrap();
+        store.release_session(&production).unwrap();
+        assert!(store.discard_session(&production).is_err());
+        store.discard_session(&self::production(40)).unwrap();
+    }
+
+    #[test]
+    fn test_file_discard_session_removes_its_directory() {
+        let directory = tempdir().expect("temp directory");
+        let mut store = FileArtifactStore::new(directory.path()).expect("file store");
+        check_discard_session(&mut store, |store| {
+            !store.production_dir(&key().production).exists()
+        });
+    }
+
+    #[test]
+    fn test_memory_discard_session_removes_its_state() {
+        let mut store = MemoryArtifactStore::default();
+        check_discard_session(&mut store, |store| {
+            !store.sessions.contains_key(&key().production) && store.raw_stages.is_empty()
+        });
     }
 
     #[test]

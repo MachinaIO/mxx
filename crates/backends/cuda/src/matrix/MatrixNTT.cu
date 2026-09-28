@@ -31,15 +31,17 @@ namespace
             // 32-bit Shoup product needs no 64-bit multiplies.
             const uint32_t q = static_cast<uint32_t>(modulus);
             const uint32_t quotient = __umulhi(static_cast<uint32_t>(value),
-                static_cast<uint32_t>(multiplier_shoup >> 32));
+                                               static_cast<uint32_t>(multiplier_shoup >> 32));
             uint32_t reduced = static_cast<uint32_t>(value) * static_cast<uint32_t>(multiplier) -
-                quotient * q;
-            if (reduced >= q) reduced -= q;
+                               quotient * q;
+            if (reduced >= q)
+                reduced -= q;
             return reduced;
         }
         const uint64_t quotient = __umul64hi(value, multiplier_shoup);
         uint64_t reduced = value * multiplier - quotient * modulus;
-        if (reduced >= modulus) reduced -= modulus;
+        if (reduced >= modulus)
+            reduced -= modulus;
         return reduced;
     }
 
@@ -59,8 +61,8 @@ namespace
         const size_t row = poly / columns;
         const size_t column = poly - row * columns;
         return reinterpret_cast<uint8_t *>(limb.address +
-            row * limb.row_stride_bytes + column * limb.column_stride_bytes +
-            coefficient * limb.coefficient_stride_bytes);
+                                           row * limb.row_stride_bytes + column * limb.column_stride_bytes +
+                                           coefficient * limb.coefficient_stride_bytes);
     }
 
     __device__ __forceinline__ uint64_t raw_matrix_load(
@@ -68,8 +70,7 @@ namespace
         size_t columns)
     {
         const uint8_t *address = raw_matrix_cell(limb, poly, coefficient, columns);
-        return limb.word_bytes == 4 ? *reinterpret_cast<const uint32_t *>(address) :
-            *reinterpret_cast<const uint64_t *>(address);
+        return limb.word_bytes == 4 ? *reinterpret_cast<const uint32_t *>(address) : *reinterpret_cast<const uint64_t *>(address);
     }
 
     __device__ __forceinline__ void raw_matrix_store(
@@ -77,12 +78,14 @@ namespace
         size_t columns, uint64_t value)
     {
         uint8_t *address = raw_matrix_cell(limb, poly, coefficient, columns);
-        if (limb.word_bytes == 4) *reinterpret_cast<uint32_t *>(address) = static_cast<uint32_t>(value);
-        else *reinterpret_cast<uint64_t *>(address) = value;
+        if (limb.word_bytes == 4)
+            *reinterpret_cast<uint32_t *>(address) = static_cast<uint32_t>(value);
+        else
+            *reinterpret_cast<uint64_t *>(address) = value;
     }
 
     __device__ uint64_t raw_pow_mod(uint64_t base, uint32_t exponent,
-        uint64_t modulus)
+                                    uint64_t modulus)
     {
         uint64_t value = 1;
         base %= modulus;
@@ -91,7 +94,8 @@ namespace
             if ((exponent & 1U) != 0)
                 value = mul_mod_u64(value, base, modulus);
             exponent >>= 1;
-            if (exponent != 0) base = mul_mod_u64(base, base, modulus);
+            if (exponent != 0)
+                base = mul_mod_u64(base, base, modulus);
         }
         return value;
     }
@@ -104,7 +108,8 @@ namespace
         size_t degree, size_t poly_offset, bool gadget)
     {
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
+        if (coefficient >= degree)
+            return;
         const size_t poly = poly_offset + blockIdx.y;
         const uint64_t row = row_origin + poly / columns;
         const uint64_t column = column_origin + poly % columns - column_base;
@@ -117,15 +122,15 @@ namespace
                 value = 1;
             else if (slot / digits_per_tower == destination.crt_limb_index)
                 value = raw_pow_mod(base_residue,
-                    static_cast<uint32_t>(slot % digits_per_tower),
-                    destination.modulus);
+                                    static_cast<uint32_t>(slot % digits_per_tower),
+                                    destination.modulus);
         }
         raw_matrix_store(destination, poly, coefficient, columns, value);
     }
 
     // One fused transform launch covers up to this many CRT limbs; each limb
     // carries its own views and NTT tables through the kernel arguments.
-    constexpr size_t kRawNttLimbs = 8;
+    constexpr size_t kRawNttLimbs = 16;
     constexpr uint32_t kFusedNttCoefficients = 1024;
 
     // The views of one operand for every limb of a launch; blockIdx.z picks
@@ -160,7 +165,7 @@ namespace
     // raw_ntt_wide_stage_kernel, which runs its remaining stages.
     template <bool Forward, uint32_t Width>
     __global__ void raw_ntt_fused_top_kernel(RawNttBatch batch, size_t columns,
-        size_t poly_offset)
+                                             size_t poly_offset)
     {
         constexpr uint32_t Shuffle = Width < kWarpNttLanes ? Width : kWarpNttLanes;
         constexpr bool Boundary = Width <= kWarpNttLanes;
@@ -191,8 +196,8 @@ namespace
             if constexpr (Forward)
             {
                 value = upper_lane ? mul_mod_shoup_u64(sub_mod_u64(lower, upper, modulus),
-                    twiddles[twiddle], shoup[twiddle], modulus)
-                    : add_mod_u64(lower, upper, modulus);
+                                                       twiddles[twiddle], shoup[twiddle], modulus)
+                                   : add_mod_u64(lower, upper, modulus);
                 half_lanes >>= 1;
             }
             else
@@ -200,7 +205,7 @@ namespace
                 const uint64_t product =
                     mul_mod_shoup_u64(upper, twiddles[twiddle], shoup[twiddle], modulus);
                 value = upper_lane ? sub_mod_u64(lower, product, modulus)
-                    : add_mod_u64(lower, product, modulus);
+                                   : add_mod_u64(lower, product, modulus);
                 half_lanes <<= 1;
             }
         }
@@ -219,7 +224,7 @@ namespace
     // and the last one applies the scaling and untwist.
     template <bool Forward>
     __global__ void raw_ntt_wide_stage_kernel(RawNttBatch batch, size_t columns,
-        size_t poly_offset, uint32_t width, uint32_t half_lanes, bool boundary)
+                                              size_t poly_offset, uint32_t width, uint32_t half_lanes, bool boundary)
     {
         const uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
         const uint32_t half = half_lanes * kFusedNttCoefficients;
@@ -245,7 +250,7 @@ namespace
             }
             const uint64_t sum = add_mod_u64(lower, upper, modulus);
             upper = mul_mod_shoup_u64(sub_mod_u64(lower, upper, modulus),
-                twiddles[twiddle], shoup[twiddle], modulus);
+                                      twiddles[twiddle], shoup[twiddle], modulus);
             lower = sum;
         }
         else
@@ -273,13 +278,13 @@ namespace
     // warp stages; the inverse ones run after them, in place.
     template <bool Forward>
     int launch_raw_ntt_wide(GpuContext *ctx, cudaStream_t stream, const RawNttBatch &batch,
-        const RawNttBatch &in_place, const MxxGraphPatch *patches, size_t patch_count,
-        const MxxGraphPatch *in_place_patches, size_t in_place_patch_count, size_t limbs,
-        uint32_t n, size_t columns, size_t poly_offset, size_t poly_chunk)
+                            const RawNttBatch &in_place, const MxxGraphPatch *patches, size_t patch_count,
+                            const MxxGraphPatch *in_place_patches, size_t in_place_patch_count, size_t limbs,
+                            uint32_t n, size_t columns, size_t poly_offset, size_t poly_chunk)
     {
         const uint32_t width = n / kFusedNttCoefficients;
         const dim3 grid(n / 2 / kTransformThreads, static_cast<uint32_t>(poly_chunk),
-            static_cast<uint32_t>(limbs));
+                        static_cast<uint32_t>(limbs));
         bool first = true;
         for (uint32_t step = kWarpNttLanes; step < width; step <<= 1)
         {
@@ -290,10 +295,11 @@ namespace
             const size_t views_patch_count =
                 Forward && first ? patch_count : in_place_patch_count;
             const int status = mxx_gpu_launch_kernel(ctx, stream,
-                raw_ntt_wide_stage_kernel<Forward>, grid, dim3(kTransformThreads), 0,
-                views_patches, views_patch_count, views, columns, poly_offset, width,
-                half_lanes, boundary);
-            if (status != 0) return status;
+                                                     raw_ntt_wide_stage_kernel<Forward>, grid, dim3(kTransformThreads), 0,
+                                                     views_patches, views_patch_count, views, columns, poly_offset, width,
+                                                     half_lanes, boundary);
+            if (status != 0)
+                return status;
             first = false;
         }
         return 0;
@@ -301,18 +307,18 @@ namespace
 
     template <bool Forward>
     int launch_raw_ntt_top(GpuContext *ctx, cudaStream_t stream, const RawNttBatch &batch,
-        const MxxGraphPatch *patches, size_t patch_count, size_t limbs, uint32_t n,
-        size_t columns, size_t poly_offset, size_t poly_chunk)
+                           const MxxGraphPatch *patches, size_t patch_count, size_t limbs, uint32_t n,
+                           size_t columns, size_t poly_offset, size_t poly_chunk)
     {
         const dim3 grid(n / kTransformThreads, static_cast<uint32_t>(poly_chunk),
-            static_cast<uint32_t>(limbs));
+                        static_cast<uint32_t>(limbs));
         switch (n / kFusedNttCoefficients)
         {
-#define MXX_RAW_NTT_TOP(width) \
-        case width: \
-            return mxx_gpu_launch_kernel(ctx, stream, raw_ntt_fused_top_kernel<Forward, width>, \
-                grid, dim3(kTransformThreads), 0, patches, patch_count, batch, columns, \
-                poly_offset)
+#define MXX_RAW_NTT_TOP(width)                                                                               \
+    case width:                                                                                              \
+        return mxx_gpu_launch_kernel(ctx, stream, raw_ntt_fused_top_kernel<Forward, width>,                  \
+                                     grid, dim3(kTransformThreads), 0, patches, patch_count, batch, columns, \
+                                     poly_offset)
             MXX_RAW_NTT_TOP(2);
             MXX_RAW_NTT_TOP(4);
             MXX_RAW_NTT_TOP(8);
@@ -344,8 +350,10 @@ namespace
     // also owns the whole tile when the block has at most 32 threads.
     __device__ __forceinline__ void raw_ntt_blocked_sync(bool warp_local)
     {
-        if (warp_local || blockDim.x <= 32) __syncwarp();
-        else __syncthreads();
+        if (warp_local || blockDim.x <= 32)
+            __syncwarp();
+        else
+            __syncthreads();
     }
 
     // Blocked-NTT arithmetic on one Word per coefficient. The 32-bit word
@@ -405,8 +413,8 @@ namespace
     // 2 n / tile; `stage_twiddles[k]` and `stage_shoup[k]` hold the k-th.
     template <bool Forward, uint32_t RP, typename Word>
     __device__ __forceinline__ void raw_ntt_blocked_pass(Word *values, uint32_t tile,
-        uint32_t log_tile, uint32_t log_span, const Word *stage_twiddles,
-        const Word *stage_shoup, Word modulus)
+                                                         uint32_t log_tile, uint32_t log_span, const Word *stage_twiddles,
+                                                         const Word *stage_shoup, Word modulus)
     {
         constexpr uint32_t log_rp = raw_ntt_log2(RP);
         const uint32_t log_stride = Forward ? log_span - log_rp : log_span;
@@ -414,10 +422,11 @@ namespace
         for (uint32_t group = threadIdx.x; group < tile / RP; group += blockDim.x)
         {
             const uint32_t base = ((group >> log_stride) << (log_stride + log_rp)) |
-                (group & (stride - 1));
+                                  (group & (stride - 1));
             Word x[RP];
 #pragma unroll
-            for (uint32_t k = 0; k < RP; ++k) x[k] = values[base + k * stride];
+            for (uint32_t k = 0; k < RP; ++k)
+                x[k] = values[base + k * stride];
 #pragma unroll
             for (uint32_t level = 0; level < log_rp; ++level)
             {
@@ -427,7 +436,8 @@ namespace
 #pragma unroll
                 for (uint32_t k = 0; k < RP; ++k)
                 {
-                    if (k & half) continue;
+                    if (k & half)
+                        continue;
                     const uint32_t offset = (base + k * stride) & ((1U << log_length) - 1);
                     const uint32_t twiddle = offset << (log_tile - log_length);
                     const Word lower = x[k];
@@ -436,19 +446,20 @@ namespace
                     {
                         x[k] = raw_ntt_add(lower, upper, modulus);
                         x[k + half] = raw_ntt_mul(raw_ntt_sub(lower, upper, modulus),
-                            stage_twiddles[twiddle], stage_shoup[twiddle], modulus);
+                                                  stage_twiddles[twiddle], stage_shoup[twiddle], modulus);
                     }
                     else
                     {
                         const Word product = raw_ntt_mul(upper, stage_twiddles[twiddle],
-                            stage_shoup[twiddle], modulus);
+                                                         stage_shoup[twiddle], modulus);
                         x[k] = raw_ntt_add(lower, product, modulus);
                         x[k + half] = raw_ntt_sub(lower, product, modulus);
                     }
                 }
             }
 #pragma unroll
-            for (uint32_t k = 0; k < RP; ++k) values[base + k * stride] = x[k];
+            for (uint32_t k = 0; k < RP; ++k)
+                values[base + k * stride] = x[k];
         }
     }
 
@@ -468,7 +479,7 @@ namespace
         uint64_t first_limb;
 
         __device__ __forceinline__ uint64_t load(const RawNttBatch &batch, uint32_t limb,
-            size_t poly, size_t coefficient, size_t columns) const
+                                                 size_t poly, size_t coefficient, size_t columns) const
         {
             return raw_matrix_load(batch.source[limb], poly, coefficient, columns);
         }
@@ -476,7 +487,7 @@ namespace
 
     template <bool Forward, uint32_t R, typename Word, typename Source>
     __global__ void raw_ntt_blocked_kernel(RawNttBatch batch, size_t columns, uint32_t n,
-        uint32_t tile, size_t poly_offset, Source source)
+                                           uint32_t tile, size_t poly_offset, Source source)
     {
         extern __shared__ uint64_t shared_words[];
         Word *values = reinterpret_cast<Word *>(shared_words);
@@ -499,7 +510,8 @@ namespace
         for (uint32_t k = 0; k < (R + 1) / 2; ++k)
         {
             const uint32_t index = threadIdx.x + k * blockDim.x;
-            if (index >= tile / 2) break;
+            if (index >= tile / 2)
+                break;
             const uint32_t twiddle = index << (log_n - log_tile + 1);
             stage_twiddles[index] = static_cast<Word>(twiddles[twiddle]);
             stage_shoup[index] = raw_ntt_shoup<Word>(shoup[twiddle]);
@@ -514,7 +526,7 @@ namespace
             {
                 if (tile == n)
                     value = raw_ntt_mul(value, static_cast<Word>(twiddles[index]),
-                        raw_ntt_shoup<Word>(shoup[index]), modulus);
+                                        raw_ntt_shoup<Word>(shoup[index]), modulus);
             }
             values[index] = value;
         }
@@ -528,15 +540,16 @@ namespace
         bool previous_local = false;
         while (remaining != 0)
         {
-            const uint32_t bits = Forward && remaining % log_r != 0 ? remaining % log_r :
-                (remaining < log_r ? remaining : log_r);
+            const uint32_t bits = Forward && remaining % log_r != 0 ? remaining % log_r : (remaining < log_r ? remaining : log_r);
             const uint32_t log_stride = Forward ? log_span - bits : log_span;
             const bool local = bits == log_r && log_stride <= 5;
             raw_ntt_blocked_sync(previous_local && local);
             previous_local = local;
             switch (bits)
             {
-            case 1: raw_ntt_blocked_pass<Forward, 2, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus); break;
+            case 1:
+                raw_ntt_blocked_pass<Forward, 2, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus);
+                break;
             case 2:
                 if constexpr (R >= 4)
                     raw_ntt_blocked_pass<Forward, 4, Word>(values, tile, log_tile, log_span, stage_twiddles, stage_shoup, modulus);
@@ -568,13 +581,13 @@ namespace
                 if (tile == n)
                 {
                     value = raw_ntt_mul(value, static_cast<Word>(*batch.n_inv[limb]),
-                        raw_ntt_shoup<Word>(*batch.n_inv_shoup[limb]), modulus);
+                                        raw_ntt_shoup<Word>(*batch.n_inv_shoup[limb]), modulus);
                     value = raw_ntt_mul(value, static_cast<Word>(twiddles[index]),
-                        raw_ntt_shoup<Word>(shoup[index]), modulus);
+                                        raw_ntt_shoup<Word>(shoup[index]), modulus);
                 }
             }
             raw_matrix_store(destination, poly, first + index, columns,
-                static_cast<uint64_t>(value));
+                             static_cast<uint64_t>(value));
         }
     }
 
@@ -582,13 +595,15 @@ namespace
     // a power of two from 2 to 32, 4 when unset, and 0 when invalid.
     uint32_t configured_ntt_radix()
     {
-        static const uint32_t radix = [] {
+        static const uint32_t radix = []
+        {
             const char *text = std::getenv("MXX_GPU_NTT_RADIX");
-            if (!text || !*text) return kDefaultNttRadix;
+            if (!text || !*text)
+                return kDefaultNttRadix;
             char *end = nullptr;
             const unsigned long value = std::strtoul(text, &end, 10);
             const bool valid = *end == '\0' && value >= 2 && value <= kMaxNttRadix &&
-                (value & (value - 1)) == 0;
+                               (value & (value - 1)) == 0;
             return valid ? static_cast<uint32_t>(value) : 0U;
         }();
         return radix;
@@ -596,9 +611,9 @@ namespace
 
     template <bool Forward, typename Source>
     int launch_raw_ntt_blocked(GpuContext *ctx, cudaStream_t stream, const RawNttBatch &batch,
-        const MxxGraphPatch *patches, size_t patch_count, uint32_t radix, uint32_t n,
-        uint32_t tile, size_t columns, size_t poly_offset, size_t poly_chunk, size_t limbs,
-        const Source &source)
+                               const MxxGraphPatch *patches, size_t patch_count, uint32_t radix, uint32_t n,
+                               uint32_t tile, size_t columns, size_t poly_offset, size_t poly_chunk, size_t limbs,
+                               const Source &source)
     {
         const dim3 grid(n / tile, static_cast<uint32_t>(poly_chunk), static_cast<uint32_t>(limbs));
         bool narrow = true;
@@ -608,22 +623,23 @@ namespace
             static_cast<size_t>(tile) * 2 * (narrow ? sizeof(uint32_t) : sizeof(uint64_t));
         // A whole 4096-coefficient ring of 64-bit words takes 64 KiB, above
         // the default dynamic shared-memory limit of the current device.
-        const auto launch = [&](auto kernel, uint32_t r) {
+        const auto launch = [&](auto kernel, uint32_t r)
+        {
             if (shared > 48 * 1024)
             {
                 const cudaError_t error = cudaFuncSetAttribute(kernel,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared));
-                if (error != cudaSuccess) return set_error(error);
+                                                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared));
+                if (error != cudaSuccess)
+                    return set_error(error);
             }
             return mxx_gpu_launch_kernel(ctx, stream, kernel, grid, dim3(tile / r), shared,
-                patches, patch_count, batch, columns, n, tile, poly_offset, source);
+                                         patches, patch_count, batch, columns, n, tile, poly_offset, source);
         };
         switch (radix)
         {
 #define MXX_RAW_NTT_BLOCKED(r) \
-        case r: \
-            return narrow ? launch(raw_ntt_blocked_kernel<Forward, r, uint32_t, Source>, r) : \
-                launch(raw_ntt_blocked_kernel<Forward, r, uint64_t, Source>, r)
+    case r:                    \
+        return narrow ? launch(raw_ntt_blocked_kernel<Forward, r, uint32_t, Source>, r) : launch(raw_ntt_blocked_kernel<Forward, r, uint64_t, Source>, r)
             MXX_RAW_NTT_BLOCKED(2);
             MXX_RAW_NTT_BLOCKED(4);
             MXX_RAW_NTT_BLOCKED(8);
@@ -646,14 +662,15 @@ namespace
     static_assert(sizeof(RawCopyBatch) < 4096, "bounded raw copy kernel arguments");
 
     __global__ void raw_matrix_copy_batch_kernel(RawCopyBatch batch, size_t degree,
-        size_t poly_offset)
+                                                 size_t poly_offset)
     {
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         const uint32_t entry = blockIdx.z;
         const size_t poly = poly_offset + blockIdx.y;
-        if (coefficient >= degree || poly >= batch.polys[entry]) return;
+        if (coefficient >= degree || poly >= batch.polys[entry])
+            return;
         raw_matrix_store(batch.destination[entry], poly, coefficient, batch.columns[entry],
-            raw_matrix_load(batch.source[entry], poly, coefficient, batch.columns[entry]));
+                         raw_matrix_load(batch.source[entry], poly, coefficient, batch.columns[entry]));
     }
 
     __global__ void raw_matrix_add_sub_kernel(
@@ -665,26 +682,69 @@ namespace
         const MxxRawMatrixLimb &right = rights.limb[blockIdx.z];
         const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.z];
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
+        if (coefficient >= degree)
+            return;
         const size_t poly = poly_offset + blockIdx.y;
         const uint64_t lhs = raw_matrix_load(left, poly, coefficient, columns);
         const uint64_t rhs = raw_matrix_load(right, poly, coefficient, columns);
         raw_matrix_store(destination, poly, coefficient, columns,
-            subtract ? sub_mod_u64(lhs, rhs, destination.modulus) :
-                add_mod_u64(lhs, rhs, destination.modulus));
+                         subtract ? sub_mod_u64(lhs, rhs, destination.modulus) : add_mod_u64(lhs, rhs, destination.modulus));
     }
 
+    // One residue per limb of a launch, picked by blockIdx.z.
+    struct RawLimbResidues
+    {
+        uint64_t residue[kRawNttLimbs];
+    };
+
     __global__ void raw_matrix_scale_kernel(
-        MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
-        uint64_t scalar_residue, size_t columns, size_t degree,
+        RawLimbSet sources, RawLimbSet destinations,
+        RawLimbResidues residues, size_t columns, size_t degree,
         size_t poly_offset)
     {
+        const MxxRawMatrixLimb &source = sources.limb[blockIdx.z];
+        const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.z];
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
+        if (coefficient >= degree)
+            return;
         const size_t poly = poly_offset + blockIdx.y;
         const uint64_t value = raw_matrix_load(source, poly, coefficient, columns);
         raw_matrix_store(destination, poly, coefficient, columns,
-            mul_mod_u64(value, scalar_residue, destination.modulus));
+                         mul_mod_u64(value, residues.residue[blockIdx.z], destination.modulus));
+    }
+
+    // Residues of the gadget entries of one launch, digit-major within its
+    // limbs: entry (digit, limb) is residue[digit * limbs + limb].
+    constexpr size_t kGadgetScaleResidues = 256;
+    struct RawGadgetResidues
+    {
+        uint64_t residue[kGadgetScaleResidues];
+    };
+    static_assert(2 * sizeof(RawLimbSet) + sizeof(RawGadgetResidues) + 8 * sizeof(size_t) < 4096,
+                  "bounded raw gadget scale kernel arguments");
+
+    // destination[0, entry * digits + first_digit + digit] =
+    // source[0, entry] * g_(first_digit + digit), for the digit_count digits
+    // of this launch; blockIdx.y enumerates (entry, digit), blockIdx.z the limb.
+    __global__ void raw_matrix_gadget_scale_kernel(
+        RawLimbSet sources, RawLimbSet destinations,
+        RawGadgetResidues residues, size_t source_columns,
+        size_t destination_columns, size_t digits, size_t first_digit,
+        size_t digit_count, size_t limbs, size_t degree, size_t poly_offset)
+    {
+        const MxxRawMatrixLimb &source = sources.limb[blockIdx.z];
+        const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.z];
+        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coefficient >= degree)
+            return;
+        const size_t local = poly_offset + blockIdx.y;
+        const size_t entry = local / digit_count;
+        const size_t digit = local - entry * digit_count;
+        const uint64_t value = raw_matrix_load(source, entry, coefficient, source_columns);
+        raw_matrix_store(destination, entry * digits + first_digit + digit, coefficient,
+                         destination_columns,
+                         mul_mod_u64(value, residues.residue[digit * limbs + blockIdx.z],
+                                     destination.modulus));
     }
 
     __global__ void raw_matrix_scale_dynamic_kernel(
@@ -697,7 +757,7 @@ namespace
         if (threadIdx.x == 0)
         {
             scalar_valid = scalar_encoding == 0 || scalar_encoding == 1 ||
-                (scalar_encoding > 2 && scalar[0] <= 1);
+                           (scalar_encoding > 2 && scalar[0] <= 1);
             scalar_residue = 0;
             if (scalar_valid)
             {
@@ -718,7 +778,8 @@ namespace
                     for (int word = scalar_encoding - 2; word > 0; --word)
                         scalar_residue = static_cast<uint64_t>(
                             ((static_cast<unsigned __int128>(scalar_residue) << 64) |
-                                scalar[word]) % modulus);
+                             scalar[word]) %
+                            modulus);
                 }
                 if (negative && scalar_residue != 0)
                     scalar_residue = modulus - scalar_residue;
@@ -727,13 +788,15 @@ namespace
                 atomicCAS(status, 0U, 2U);
         }
         __syncthreads();
-        if (!scalar_valid) return;
+        if (!scalar_valid)
+            return;
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
+        if (coefficient >= degree)
+            return;
         const size_t poly = poly_offset + blockIdx.y;
         const uint64_t value = raw_matrix_load(source, poly, coefficient, columns);
         raw_matrix_store(destination, poly, coefficient, columns,
-            mul_mod_u64(value, scalar_residue, destination.modulus));
+                         mul_mod_u64(value, scalar_residue, destination.modulus));
     }
 
     constexpr unsigned kMulCoefficients = 64;
@@ -774,7 +837,8 @@ namespace
         const uint64_t modulus = destination.modulus;
         const unsigned bits = 64 - __clzll(modulus);
         const unsigned headroom = bits <= 63 ? 128 - 2 * bits : 0;
-        const size_t batch = headroom >= 6 ? 63 : headroom ? (size_t(1) << headroom) - 1 : 0;
+        const size_t batch = headroom >= 6 ? 63 : headroom ? (size_t(1) << headroom) - 1
+                                                           : 0;
         uint64_t sum = 0;
         if (active)
         {
@@ -784,10 +848,9 @@ namespace
             {
                 const uint64_t lhs = raw_matrix_load(
                     left, row * left_columns + inner, coefficient, left_columns);
-                const size_t rhs_poly = transpose_rhs ?
-                    column * left_columns + inner : inner * right_columns + column;
+                const size_t rhs_poly = transpose_rhs ? column * left_columns + inner : inner * right_columns + column;
                 const uint64_t rhs = raw_matrix_load(right, rhs_poly, coefficient,
-                    transpose_rhs ? left_columns : right_columns);
+                                                     transpose_rhs ? left_columns : right_columns);
                 if (!batch)
                 {
                     sum = add_mod_u64(sum, mul_mod_u64(lhs, rhs, modulus), modulus);
@@ -800,32 +863,37 @@ namespace
                     pending = 0;
                 }
             }
-            if (batch) sum = static_cast<uint64_t>(raw_wide_mod(wide, modulus));
+            if (batch)
+                sum = static_cast<uint64_t>(raw_wide_mod(wide, modulus));
         }
         partial[threadIdx.y][threadIdx.x] = sum;
         __syncthreads();
-        if (threadIdx.y != 0 || !active) return;
+        if (threadIdx.y != 0 || !active)
+            return;
         for (unsigned slice = 1; slice < kMulSlices; ++slice)
             sum = add_mod_u64(sum, partial[slice][threadIdx.x], modulus);
         if (accumulate)
-            sum = add_mod_u64(sum, raw_matrix_load(
-                addends.limb[blockIdx.z], output_poly, coefficient, output_columns), modulus);
+            sum = add_mod_u64(sum, raw_matrix_load(addends.limb[blockIdx.z], output_poly, coefficient, output_columns), modulus);
         raw_matrix_store(destination, output_poly, coefficient, output_columns, sum);
     }
 
     // Multiply every polynomial of `matrix` by the single polynomial of
     // `scalar` in the evaluation domain.
     __global__ void raw_matrix_mul_scalar_kernel(
-        MxxRawMatrixLimb matrix, MxxRawMatrixLimb scalar,
-        MxxRawMatrixLimb destination, size_t columns, size_t degree,
+        RawLimbSet matrices, RawLimbSet scalars,
+        RawLimbSet destinations, size_t columns, size_t degree,
         size_t poly_offset)
     {
+        const MxxRawMatrixLimb &matrix = matrices.limb[blockIdx.z];
+        const MxxRawMatrixLimb &scalar = scalars.limb[blockIdx.z];
+        const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.z];
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
+        if (coefficient >= degree)
+            return;
         const size_t poly = poly_offset + blockIdx.y;
         raw_matrix_store(destination, poly, coefficient, columns,
-            mul_mod_u64(raw_matrix_load(matrix, poly, coefficient, columns),
-                raw_matrix_load(scalar, 0, coefficient, 1), destination.modulus));
+                         mul_mod_u64(raw_matrix_load(matrix, poly, coefficient, columns),
+                                     raw_matrix_load(scalar, 0, coefficient, 1), destination.modulus));
     }
 
     __global__ void raw_matrix_transpose_kernel(
@@ -834,13 +902,14 @@ namespace
         size_t degree, size_t poly_offset)
     {
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
+        if (coefficient >= degree)
+            return;
         const size_t output_poly = poly_offset + blockIdx.y;
         const size_t row = output_poly / destination_columns;
         const size_t column = output_poly - row * destination_columns;
         const size_t input_poly = column * source_columns + row;
         raw_matrix_store(destination, output_poly, coefficient, destination_columns,
-            raw_matrix_load(source, input_poly, coefficient, source_columns));
+                         raw_matrix_load(source, input_poly, coefficient, source_columns));
     }
 
     __global__ void raw_matrix_tensor_kernel(
@@ -853,18 +922,19 @@ namespace
         const MxxRawMatrixLimb &right = rights.limb[blockIdx.z];
         const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.z];
         const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (coefficient >= degree) return;
+        if (coefficient >= degree)
+            return;
         const size_t output_poly = poly_offset + blockIdx.y;
         const size_t output_row = output_poly / output_columns;
         const size_t output_column = output_poly - output_row * output_columns;
         const size_t left_poly = (output_row / right_rows) * left_columns +
-            output_column / right_columns;
+                                 output_column / right_columns;
         const size_t right_poly = (output_row % right_rows) * right_columns +
-            output_column % right_columns;
+                                  output_column % right_columns;
         const uint64_t lhs = raw_matrix_load(left, left_poly, coefficient, left_columns);
         const uint64_t rhs = raw_matrix_load(right, right_poly, coefficient, right_columns);
         raw_matrix_store(destination, output_poly, coefficient, output_columns,
-            mul_mod_u64(lhs, rhs, destination.modulus));
+                         mul_mod_u64(lhs, rhs, destination.modulus));
     }
 
     int validate_raw_view(GpuContext *ctx, const MxxRawMatrixView *view, void *stream)
@@ -882,10 +952,12 @@ namespace
             const auto &limb = view->limbs[limb_index];
             const unsigned __int128 column_span =
                 static_cast<unsigned __int128>(view->degree - 1) *
-                limb.coefficient_stride_bytes + limb.word_bytes;
+                    limb.coefficient_stride_bytes +
+                limb.word_bytes;
             const unsigned __int128 row_span =
                 static_cast<unsigned __int128>(view->columns - 1) *
-                limb.column_stride_bytes + column_span;
+                    limb.column_stride_bytes +
+                column_span;
             if (!limb.address || (limb.word_bytes != 4 && limb.word_bytes != 8) ||
                 limb.crt_limb_index >= ctx->limb_gpu_ids.size() ||
                 limb.crt_limb_index >= ctx->limb_prime_ids.size() ||
@@ -910,10 +982,12 @@ namespace
             left->degree != right->degree || left->row_origin != right->row_origin ||
             left->column_origin != right->column_origin ||
             left->rows != right->rows || left->columns != right->columns ||
-            left->limb_count != right->limb_count) return false;
+            left->limb_count != right->limb_count)
+            return false;
         for (size_t limb = 0; limb < left->limb_count; ++limb)
             if (left->limbs[limb].crt_limb_index != right->limbs[limb].crt_limb_index ||
-                left->limbs[limb].modulus != right->limbs[limb].modulus) return false;
+                left->limbs[limb].modulus != right->limbs[limb].modulus)
+                return false;
         return true;
     }
 }
@@ -923,17 +997,17 @@ namespace
 // `column_shift` columns after the bound address; the graph builder records
 // that offset from the captured address.
 static void raw_limb_set(const MxxRawMatrixView *view, size_t first, size_t limbs,
-    uint32_t argument, uint32_t binding_base, RawLimbSet &set,
-    std::vector<MxxGraphPatch> &patches, size_t column_shift = 0)
+                         uint32_t argument, uint32_t binding_base, RawLimbSet &set,
+                         std::vector<MxxGraphPatch> &patches, size_t column_shift = 0)
 {
     for (size_t local = 0; local < limbs; ++local)
     {
         set.limb[local] = view->limbs[first + local];
         set.limb[local].address += column_shift * set.limb[local].column_stride_bytes;
         patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, argument,
-            static_cast<uint32_t>(local * sizeof(MxxRawMatrixLimb) +
-                offsetof(MxxRawMatrixLimb, address)),
-            sizeof(void *), binding_base + static_cast<uint32_t>(first + local), 0});
+                           static_cast<uint32_t>(local * sizeof(MxxRawMatrixLimb) +
+                                                 offsetof(MxxRawMatrixLimb, address)),
+                           sizeof(void *), binding_base + static_cast<uint32_t>(first + local), 0});
     }
 }
 
@@ -941,8 +1015,7 @@ static void raw_limb_set(const MxxRawMatrixView *view, size_t first, size_t limb
 // with no separate launch for the stages above a tile.
 static uint32_t raw_ntt_tile(uint32_t n, uint32_t radix)
 {
-    return n <= kBlockedNttMaxCoefficients && n / std::min(radix, n) <= kBlockedNttMaxThreads ?
-        n : kFusedNttCoefficients;
+    return n <= kBlockedNttMaxCoefficients && n / std::min(radix, n) <= kBlockedNttMaxThreads ? n : kFusedNttCoefficients;
 }
 
 static bool raw_ntt_whole_ring(uint32_t n)
@@ -957,9 +1030,9 @@ static bool raw_ntt_whole_ring(uint32_t n)
 // read once, and `loader_patches` patch its kernel argument.
 template <typename Source>
 static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    int inverse, uint32_t source_binding_base, uint32_t destination_binding_base,
-    const Source &loader, const std::vector<MxxGraphPatch> &loader_patches)
+                          const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+                          int inverse, uint32_t source_binding_base, uint32_t destination_binding_base,
+                          const Source &loader, const std::vector<MxxGraphPatch> &loader_patches)
 {
     if (validate_raw_view(ctx, source, stream_raw) != 0 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
@@ -1030,33 +1103,34 @@ static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
                 offsetof(RawNttBatch, destination) + local * sizeof(MxxRawMatrixLimb) +
                 offsetof(MxxRawMatrixLimb, address));
             source_patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                source_offset, sizeof(void *), source_binding, 0});
+                                      source_offset, sizeof(void *), source_binding, 0});
             source_patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                destination_offset, sizeof(void *), destination_binding, 0});
+                                      destination_offset, sizeof(void *), destination_binding, 0});
             destination_patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                source_offset, sizeof(void *), destination_binding, 0});
+                                           source_offset, sizeof(void *), destination_binding, 0});
             destination_patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                destination_offset, sizeof(void *), destination_binding, 0});
+                                           destination_offset, sizeof(void *), destination_binding, 0});
         }
         source_patches.insert(source_patches.end(), loader_patches.begin(), loader_patches.end());
         Source group_loader = loader;
         group_loader.first_limb = first;
         const RawNttMatrixSource matrix_loader{first};
         RawNttBatch in_place = batch;
-        for (size_t local = 0; local < limbs; ++local) in_place.source[local] = batch.destination[local];
+        for (size_t local = 0; local < limbs; ++local)
+            in_place.source[local] = batch.destination[local];
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
             const auto tiles = [&](bool forward, const RawNttBatch &views,
                                    const std::vector<MxxGraphPatch> &patches,
-                                   const auto &input) {
-                return forward ?
-                    launch_raw_ntt_blocked<true>(ctx, stream, views, patches.data(),
-                        patches.size(), tile_radix, n, tile, source->columns, offset, chunk,
-                        limbs, input) :
-                    launch_raw_ntt_blocked<false>(ctx, stream, views, patches.data(),
-                        patches.size(), tile_radix, n, tile, source->columns, offset, chunk,
-                        limbs, input);
+                                   const auto &input)
+            {
+                return forward ? launch_raw_ntt_blocked<true>(ctx, stream, views, patches.data(),
+                                                              patches.size(), tile_radix, n, tile, source->columns, offset, chunk,
+                                                              limbs, input)
+                               : launch_raw_ntt_blocked<false>(ctx, stream, views, patches.data(),
+                                                               patches.size(), tile_radix, n, tile, source->columns, offset, chunk,
+                                                               limbs, input);
             };
             int status = 0;
             if (tile == n)
@@ -1070,16 +1144,15 @@ static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
                 const bool wide = n > kFusedNttCoefficients * kWarpNttLanes;
                 if (wide)
                     status = launch_raw_ntt_wide<true>(ctx, stream, batch, in_place,
-                        source_patches.data(), source_patches.size(),
-                        destination_patches.data(), destination_patches.size(), limbs, n,
-                        source->columns, offset, chunk);
+                                                       source_patches.data(), source_patches.size(),
+                                                       destination_patches.data(), destination_patches.size(), limbs, n,
+                                                       source->columns, offset, chunk);
                 if (status == 0)
-                    status = wide ?
-                        launch_raw_ntt_top<true>(ctx, stream, in_place,
-                            destination_patches.data(), destination_patches.size(), limbs, n,
-                            source->columns, offset, chunk) :
-                        launch_raw_ntt_top<true>(ctx, stream, batch, source_patches.data(),
-                            source_patches.size(), limbs, n, source->columns, offset, chunk);
+                    status = wide ? launch_raw_ntt_top<true>(ctx, stream, in_place,
+                                                             destination_patches.data(), destination_patches.size(), limbs, n,
+                                                             source->columns, offset, chunk)
+                                  : launch_raw_ntt_top<true>(ctx, stream, batch, source_patches.data(),
+                                                             source_patches.size(), limbs, n, source->columns, offset, chunk);
                 if (status == 0)
                     status = tiles(true, in_place, destination_patches, matrix_loader);
             }
@@ -1088,29 +1161,31 @@ static int raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
                 status = tiles(false, batch, source_patches, matrix_loader);
                 if (status == 0)
                     status = launch_raw_ntt_top<false>(ctx, stream, in_place,
-                        destination_patches.data(), destination_patches.size(), limbs, n,
-                        source->columns, offset, chunk);
+                                                       destination_patches.data(), destination_patches.size(), limbs, n,
+                                                       source->columns, offset, chunk);
                 if (status == 0 && n > kFusedNttCoefficients * kWarpNttLanes)
                     status = launch_raw_ntt_wide<false>(ctx, stream, in_place, in_place,
-                        destination_patches.data(), destination_patches.size(),
-                        destination_patches.data(), destination_patches.size(), limbs, n,
-                        source->columns, offset, chunk);
+                                                        destination_patches.data(), destination_patches.size(),
+                                                        destination_patches.data(), destination_patches.size(), limbs, n,
+                                                        source->columns, offset, chunk);
             }
-            if (status != 0) return status;
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 extern "C" int gpu_context_ntt_tables(GpuContext *ctx, const MxxRawMatrixView *view,
-    MxxNttTables *out_tables)
+                                      MxxNttTables *out_tables)
 {
     if (!ctx || !view || !out_tables || (view->limb_count && !view->limbs))
         return set_error("invalid NTT table query");
     for (size_t limb = 0; limb < view->limb_count; ++limb)
     {
         const uint32_t crt = view->limbs[limb].crt_limb_index;
-        if (crt >= ctx->limb_gpu_ids.size()) return set_error("NTT table limb is out of range");
+        if (crt >= ctx->limb_gpu_ids.size())
+            return set_error("NTT table limb is out of range");
         const dim3 partition = ctx->limb_gpu_ids[crt];
         if (partition.x >= ctx->ntt_device_constants.size())
             return set_error("missing NTT device constants");
@@ -1122,26 +1197,26 @@ extern "C" int gpu_context_ntt_tables(GpuContext *ctx, const MxxRawMatrixView *v
             return set_error("invalid NTT device constants");
         const size_t table = static_cast<size_t>(partition.y) * view->degree;
         out_tables[limb] = MxxNttTables{constants.twiddle_forward + table,
-            constants.twiddle_shoup_forward + table, constants.twiddle_inverse + table,
-            constants.twiddle_shoup_inverse + table, constants.n_inv + partition.y,
-            constants.n_inv_shoup + partition.y};
+                                        constants.twiddle_shoup_forward + table, constants.twiddle_inverse + table,
+                                        constants.twiddle_shoup_inverse + table, constants.n_inv + partition.y,
+                                        constants.n_inv_shoup + partition.y};
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    int inverse, uint32_t source_binding_base, uint32_t destination_binding_base)
+                                  const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+                                  int inverse, uint32_t source_binding_base, uint32_t destination_binding_base)
 {
     return raw_matrix_ntt(ctx, stream_raw, source, destination, inverse, source_binding_base,
-        destination_binding_base, RawNttMatrixSource{0}, {});
+                          destination_binding_base, RawNttMatrixSource{0}, {});
 }
 
 extern "C" int gpu_raw_matrix_add_sub(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *left, const MxxRawMatrixView *right,
-    const MxxRawMatrixView *destination, int subtract,
-    uint32_t left_binding_base, uint32_t right_binding_base,
-    uint32_t destination_binding_base)
+                                      const MxxRawMatrixView *left, const MxxRawMatrixView *right,
+                                      const MxxRawMatrixView *destination, int subtract,
+                                      uint32_t left_binding_base, uint32_t right_binding_base,
+                                      uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, left, stream_raw) != 0 ||
         validate_raw_view(ctx, right, stream_raw) != 0 ||
@@ -1171,19 +1246,20 @@ extern "C" int gpu_raw_matrix_add_sub(GpuContext *ctx, void *stream_raw,
                 static_cast<uint32_t>((left->degree + kTransformThreads - 1) / kTransformThreads),
                 static_cast<uint32_t>(poly_chunk), static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_add_sub_kernel,
-                grid, dim3(kTransformThreads), 0, patches.data(), patches.size(),
-                lefts, rights, destinations, left->columns,
-                static_cast<size_t>(left->degree), poly_offset, subtract != 0);
-            if (status != 0) return status;
+                                                     grid, dim3(kTransformThreads), 0, patches.data(), patches.size(),
+                                                     lefts, rights, destinations, left->columns,
+                                                     static_cast<size_t>(left->degree), poly_offset, subtract != 0);
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_scale(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    const uint64_t *scalar_residues, size_t residue_count,
-    uint32_t source_binding_base, uint32_t destination_binding_base)
+                                    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+                                    const uint64_t *scalar_residues, size_t residue_count,
+                                    uint32_t source_binding_base, uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, source, stream_raw) != 0 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
@@ -1197,37 +1273,107 @@ extern "C" int gpu_raw_matrix_scale(GpuContext *ctx, void *stream_raw,
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = source->rows * source->columns;
     for (size_t limb = 0; limb < source->limb_count; ++limb)
-    {
         if (scalar_residues[limb] >= source->limbs[limb].modulus)
             return set_error("raw matrix scalar residue exceeds CRT modulus");
-        const MxxGraphPatch patches[] = {
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(void *),
-                static_cast<uint32_t>(source_binding_base + limb), 0},
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
-                static_cast<uint32_t>(destination_binding_base + limb), 0},
-        };
+    for (size_t first = 0; first < source->limb_count; first += kRawNttLimbs)
+    {
+        const size_t limbs = std::min(kRawNttLimbs, source->limb_count - first);
+        RawLimbSet sources{}, destinations{};
+        RawLimbResidues residues{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(source, first, limbs, 0, source_binding_base, sources, patches);
+        raw_limb_set(destination, first, limbs, 1, destination_binding_base, destinations,
+                     patches);
+        for (size_t local = 0; local < limbs; ++local)
+            residues.residue[local] = scalar_residues[first + local];
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
             const dim3 grid(
                 static_cast<uint32_t>((source->degree + kTransformThreads - 1) / kTransformThreads),
-                static_cast<uint32_t>(chunk));
+                static_cast<uint32_t>(chunk), static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_scale_kernel,
-                grid, dim3(kTransformThreads), 0, patches, 2,
-                source->limbs[limb], destination->limbs[limb],
-                scalar_residues[limb], source->columns,
-                static_cast<size_t>(source->degree), offset);
-            if (status != 0) return status;
+                                                     grid, dim3(kTransformThreads), 0, patches.data(), patches.size(),
+                                                     sources, destinations, residues, source->columns,
+                                                     static_cast<size_t>(source->degree), offset);
+            if (status != 0)
+                return status;
+        }
+    }
+    return 0;
+}
+
+extern "C" int gpu_raw_matrix_gadget_scale(GpuContext *ctx, void *stream_raw,
+                                           const MxxRawMatrixView *source,
+                                           const MxxRawMatrixView *destination,
+                                           const uint64_t *residues, size_t digits,
+                                           uint32_t source_binding_base,
+                                           uint32_t destination_binding_base)
+{
+    if (validate_raw_view(ctx, source, stream_raw) != 0 ||
+        validate_raw_view(ctx, destination, stream_raw) != 0 || !residues || digits == 0 ||
+        source->rows != 1 || destination->rows != 1 ||
+        source->physical_device != destination->physical_device ||
+        source->limb_count != destination->limb_count ||
+        source->columns > SIZE_MAX / digits || destination->columns != source->columns * digits ||
+        source_binding_base > UINT32_MAX - source->limb_count ||
+        destination_binding_base > UINT32_MAX - destination->limb_count)
+        return set_error("invalid raw matrix gadget scale views or residues");
+    for (size_t limb = 0; limb < source->limb_count; ++limb)
+    {
+        if (source->limbs[limb].crt_limb_index != destination->limbs[limb].crt_limb_index ||
+            source->limbs[limb].modulus != destination->limbs[limb].modulus)
+            return set_error("raw matrix gadget scale limbs disagree");
+        for (size_t digit = 0; digit < digits; ++digit)
+            if (residues[digit * source->limb_count + limb] >= source->limbs[limb].modulus)
+                return set_error("raw matrix gadget residue exceeds CRT modulus");
+    }
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
+        return set_error(cudaGetLastError());
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    for (size_t first = 0; first < source->limb_count; first += kRawNttLimbs)
+    {
+        const size_t limbs = std::min(kRawNttLimbs, source->limb_count - first);
+        // As many digits as the launch's residue table holds for its limbs.
+        const size_t digit_chunk = kGadgetScaleResidues / limbs;
+        RawLimbSet sources{}, destinations{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(source, first, limbs, 0, source_binding_base, sources, patches);
+        raw_limb_set(destination, first, limbs, 1, destination_binding_base, destinations,
+                     patches);
+        for (size_t first_digit = 0; first_digit < digits; first_digit += digit_chunk)
+        {
+            const size_t digit_count = std::min(digit_chunk, digits - first_digit);
+            RawGadgetResidues table{};
+            for (size_t digit = 0; digit < digit_count; ++digit)
+                for (size_t local = 0; local < limbs; ++local)
+                    table.residue[digit * limbs + local] =
+                        residues[(first_digit + digit) * source->limb_count + first + local];
+            const size_t poly_count = source->columns * digit_count;
+            for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+            {
+                const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+                const dim3 grid(
+                    static_cast<uint32_t>((source->degree + kTransformThreads - 1) / kTransformThreads),
+                    static_cast<uint32_t>(chunk), static_cast<uint32_t>(limbs));
+                const int status = mxx_gpu_launch_kernel(
+                    ctx, stream, raw_matrix_gadget_scale_kernel, grid, dim3(kTransformThreads), 0,
+                    patches.data(), patches.size(), sources, destinations, table,
+                    source->columns, destination->columns, digits, first_digit, digit_count, limbs,
+                    static_cast<size_t>(source->degree), offset);
+                if (status != 0)
+                    return status;
+            }
         }
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_scale_dynamic(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    const void *scalar, int scalar_encoding, uint32_t *status,
-    uint32_t source_binding_base, uint32_t destination_binding_base,
-    uint32_t scalar_binding, uint32_t status_binding)
+                                            const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+                                            const void *scalar, int scalar_encoding, uint32_t *status,
+                                            uint32_t source_binding_base, uint32_t destination_binding_base,
+                                            uint32_t scalar_binding, uint32_t status_binding)
 {
     if (!ctx || !scalar || !status || scalar_encoding < 0 || scalar_encoding == 2 ||
         validate_raw_view(ctx, source, stream_raw) != 0 ||
@@ -1244,15 +1390,15 @@ extern "C" int gpu_raw_matrix_scale_dynamic(GpuContext *ctx, void *stream_raw,
     {
         const MxxGraphPatch patches[] = {
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                offsetof(MxxRawMatrixLimb, address), sizeof(void *),
-                static_cast<uint32_t>(source_binding_base + limb), 0},
+             offsetof(MxxRawMatrixLimb, address), sizeof(void *),
+             static_cast<uint32_t>(source_binding_base + limb), 0},
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1,
-                offsetof(MxxRawMatrixLimb, address), sizeof(void *),
-                static_cast<uint32_t>(destination_binding_base + limb), 0},
+             offsetof(MxxRawMatrixLimb, address), sizeof(void *),
+             static_cast<uint32_t>(destination_binding_base + limb), 0},
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 2, 0, sizeof(void *),
-                scalar_binding, 0},
+             scalar_binding, 0},
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 4, 0, sizeof(void *),
-                status_binding, 0},
+             status_binding, 0},
         };
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
@@ -1261,21 +1407,22 @@ extern "C" int gpu_raw_matrix_scale_dynamic(GpuContext *ctx, void *stream_raw,
                 static_cast<uint32_t>((source->degree + kTransformThreads - 1) / kTransformThreads),
                 static_cast<uint32_t>(chunk));
             const int result = mxx_gpu_launch_kernel(ctx, stream,
-                raw_matrix_scale_dynamic_kernel, grid, dim3(kTransformThreads), 0,
-                patches, std::size(patches), source->limbs[limb], destination->limbs[limb],
-                static_cast<const uint64_t *>(scalar), scalar_encoding, status,
-                source->columns, static_cast<size_t>(source->degree), offset);
-            if (result != 0) return result;
+                                                     raw_matrix_scale_dynamic_kernel, grid, dim3(kTransformThreads), 0,
+                                                     patches, std::size(patches), source->limbs[limb], destination->limbs[limb],
+                                                     static_cast<const uint64_t *>(scalar), scalar_encoding, status,
+                                                     source->columns, static_cast<size_t>(source->degree), offset);
+            if (result != 0)
+                return result;
         }
     }
     return 0;
 }
 
 static int raw_matrix_mul_impl(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *left, const MxxRawMatrixView *right,
-    const MxxRawMatrixView *destination, int accumulate, bool transpose_rhs,
-    uint32_t left_binding_base, uint32_t right_binding_base,
-    uint32_t destination_binding_base)
+                               const MxxRawMatrixView *left, const MxxRawMatrixView *right,
+                               const MxxRawMatrixView *destination, int accumulate, bool transpose_rhs,
+                               uint32_t left_binding_base, uint32_t right_binding_base,
+                               uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, left, stream_raw) != 0 ||
         validate_raw_view(ctx, right, stream_raw) != 0 ||
@@ -1324,33 +1471,34 @@ static int raw_matrix_mul_impl(GpuContext *ctx, void *stream_raw,
                 static_cast<uint32_t>((destination->degree + kMulCoefficients - 1) / kMulCoefficients),
                 static_cast<uint32_t>(chunk), static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_mul_kernel,
-                grid, dim3(kMulCoefficients, kMulSlices), 0, patches.data(), patches.size(),
-                lefts, rights, destinations, addends,
-                left->columns, right->columns, destination->columns,
-                destination->rows,
-                static_cast<size_t>(destination->degree), offset,
-                accumulate != 0, transpose_rhs);
-            if (status != 0) return status;
+                                                     grid, dim3(kMulCoefficients, kMulSlices), 0, patches.data(), patches.size(),
+                                                     lefts, rights, destinations, addends,
+                                                     left->columns, right->columns, destination->columns,
+                                                     destination->rows,
+                                                     static_cast<size_t>(destination->degree), offset,
+                                                     accumulate != 0, transpose_rhs);
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_mul(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *left, const MxxRawMatrixView *right,
-    const MxxRawMatrixView *destination, int accumulate,
-    uint32_t left_binding_base, uint32_t right_binding_base,
-    uint32_t destination_binding_base)
+                                  const MxxRawMatrixView *left, const MxxRawMatrixView *right,
+                                  const MxxRawMatrixView *destination, int accumulate,
+                                  uint32_t left_binding_base, uint32_t right_binding_base,
+                                  uint32_t destination_binding_base)
 {
     return raw_matrix_mul_impl(ctx, stream_raw, left, right, destination,
-        accumulate, false, left_binding_base, right_binding_base,
-        destination_binding_base);
+                               accumulate, false, left_binding_base, right_binding_base,
+                               destination_binding_base);
 }
 
 extern "C" int gpu_raw_matrix_mul_scalar(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *matrix, const MxxRawMatrixView *scalar,
-    const MxxRawMatrixView *destination, uint32_t matrix_binding_base,
-    uint32_t scalar_binding_base, uint32_t destination_binding_base)
+                                         const MxxRawMatrixView *matrix, const MxxRawMatrixView *scalar,
+                                         const MxxRawMatrixView *destination, uint32_t matrix_binding_base,
+                                         uint32_t scalar_binding_base, uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, matrix, stream_raw) != 0 ||
         validate_raw_view(ctx, scalar, stream_raw) != 0 ||
@@ -1372,47 +1520,47 @@ extern "C" int gpu_raw_matrix_mul_scalar(GpuContext *ctx, void *stream_raw,
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = destination->rows * destination->columns;
-    for (size_t limb = 0; limb < matrix->limb_count; ++limb)
+    for (size_t first = 0; first < matrix->limb_count; first += kRawNttLimbs)
     {
-        const MxxGraphPatch patches[] = {
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(void *),
-                static_cast<uint32_t>(matrix_binding_base + limb), 0},
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
-                static_cast<uint32_t>(scalar_binding_base + limb), 0},
-            {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 2, 0, sizeof(void *),
-                static_cast<uint32_t>(destination_binding_base + limb), 0},
-        };
+        const size_t limbs = std::min(kRawNttLimbs, matrix->limb_count - first);
+        RawLimbSet matrices{}, scalars{}, destinations{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(matrix, first, limbs, 0, matrix_binding_base, matrices, patches);
+        raw_limb_set(scalar, first, limbs, 1, scalar_binding_base, scalars, patches);
+        raw_limb_set(destination, first, limbs, 2, destination_binding_base, destinations,
+                     patches);
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
             const dim3 grid(
                 static_cast<uint32_t>((destination->degree + kTransformThreads - 1) / kTransformThreads),
-                static_cast<uint32_t>(chunk));
+                static_cast<uint32_t>(chunk), static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_mul_scalar_kernel,
-                grid, dim3(kTransformThreads), 0, patches, 3,
-                matrix->limbs[limb], scalar->limbs[limb], destination->limbs[limb],
-                static_cast<size_t>(destination->columns),
-                static_cast<size_t>(destination->degree), offset);
-            if (status != 0) return status;
+                                                     grid, dim3(kTransformThreads), 0, patches.data(), patches.size(),
+                                                     matrices, scalars, destinations,
+                                                     static_cast<size_t>(destination->columns),
+                                                     static_cast<size_t>(destination->degree), offset);
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_mul_transpose_rhs(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *left, const MxxRawMatrixView *right,
-    const MxxRawMatrixView *destination,
-    uint32_t left_binding_base, uint32_t right_binding_base,
-    uint32_t destination_binding_base)
+                                                const MxxRawMatrixView *left, const MxxRawMatrixView *right,
+                                                const MxxRawMatrixView *destination,
+                                                uint32_t left_binding_base, uint32_t right_binding_base,
+                                                uint32_t destination_binding_base)
 {
     return raw_matrix_mul_impl(ctx, stream_raw, left, right, destination,
-        0, true, left_binding_base, right_binding_base,
-        destination_binding_base);
+                               0, true, left_binding_base, right_binding_base,
+                               destination_binding_base);
 }
 
 extern "C" int gpu_raw_matrix_transpose(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
-    uint32_t source_binding_base, uint32_t destination_binding_base)
+                                        const MxxRawMatrixView *source, const MxxRawMatrixView *destination,
+                                        uint32_t source_binding_base, uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, source, stream_raw) != 0 ||
         validate_raw_view(ctx, destination, stream_raw) != 0 ||
@@ -1438,9 +1586,9 @@ extern "C" int gpu_raw_matrix_transpose(GpuContext *ctx, void *stream_raw,
     {
         const MxxGraphPatch patches[] = {
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(void *),
-                static_cast<uint32_t>(source_binding_base + limb), 0},
+             static_cast<uint32_t>(source_binding_base + limb), 0},
             {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *),
-                static_cast<uint32_t>(destination_binding_base + limb), 0},
+             static_cast<uint32_t>(destination_binding_base + limb), 0},
         };
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
         {
@@ -1449,21 +1597,22 @@ extern "C" int gpu_raw_matrix_transpose(GpuContext *ctx, void *stream_raw,
                 static_cast<uint32_t>((source->degree + kTransformThreads - 1) / kTransformThreads),
                 static_cast<uint32_t>(chunk));
             const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_transpose_kernel,
-                grid, dim3(kTransformThreads), 0, patches, 2,
-                source->limbs[limb], destination->limbs[limb],
-                source->columns, destination->columns,
-                static_cast<size_t>(source->degree), offset);
-            if (status != 0) return status;
+                                                     grid, dim3(kTransformThreads), 0, patches, 2,
+                                                     source->limbs[limb], destination->limbs[limb],
+                                                     source->columns, destination->columns,
+                                                     static_cast<size_t>(source->degree), offset);
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_tensor(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *left, const MxxRawMatrixView *right,
-    const MxxRawMatrixView *destination,
-    uint32_t left_binding_base, uint32_t right_binding_base,
-    uint32_t destination_binding_base)
+                                     const MxxRawMatrixView *left, const MxxRawMatrixView *right,
+                                     const MxxRawMatrixView *destination,
+                                     uint32_t left_binding_base, uint32_t right_binding_base,
+                                     uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, left, stream_raw) != 0 ||
         validate_raw_view(ctx, right, stream_raw) != 0 ||
@@ -1508,19 +1657,20 @@ extern "C" int gpu_raw_matrix_tensor(GpuContext *ctx, void *stream_raw,
                 static_cast<uint32_t>((destination->degree + kTransformThreads - 1) / kTransformThreads),
                 static_cast<uint32_t>(chunk), static_cast<uint32_t>(limbs));
             const int status = mxx_gpu_launch_kernel(ctx, stream, raw_matrix_tensor_kernel,
-                grid, dim3(kTransformThreads), 0, patches.data(), patches.size(),
-                lefts, rights, destinations,
-                left->columns, right->rows, right->columns, destination->columns,
-                static_cast<size_t>(destination->degree), offset);
-            if (status != 0) return status;
+                                                     grid, dim3(kTransformThreads), 0, patches.data(), patches.size(),
+                                                     lefts, rights, destinations,
+                                                     left->columns, right->rows, right->columns, destination->columns,
+                                                     static_cast<size_t>(destination->degree), offset);
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_copy(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *sources, const MxxRawMatrixView *destinations, size_t count,
-    const uint32_t *source_binding_bases, const uint32_t *destination_binding_bases)
+                                   const MxxRawMatrixView *sources, const MxxRawMatrixView *destinations, size_t count,
+                                   const uint32_t *source_binding_bases, const uint32_t *destination_binding_bases)
 {
     if (!sources || !destinations || !count || !source_binding_bases ||
         !destination_binding_bases)
@@ -1571,34 +1721,36 @@ extern "C" int gpu_raw_matrix_copy(GpuContext *ctx, void *stream_raw,
             batch.columns[local] = sources[pair].columns;
             batch.polys[local] = sources[pair].rows * sources[pair].columns;
             patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                static_cast<uint32_t>(offsetof(RawCopyBatch, source) +
-                    local * sizeof(MxxRawMatrixLimb) + offsetof(MxxRawMatrixLimb, address)),
-                sizeof(void *), source_binding_bases[pair] + static_cast<uint32_t>(limb), 0});
+                               static_cast<uint32_t>(offsetof(RawCopyBatch, source) +
+                                                     local * sizeof(MxxRawMatrixLimb) + offsetof(MxxRawMatrixLimb, address)),
+                               sizeof(void *), source_binding_bases[pair] + static_cast<uint32_t>(limb), 0});
             patches.push_back({nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0,
-                static_cast<uint32_t>(offsetof(RawCopyBatch, destination) +
-                    local * sizeof(MxxRawMatrixLimb) + offsetof(MxxRawMatrixLimb, address)),
-                sizeof(void *), destination_binding_bases[pair] + static_cast<uint32_t>(limb), 0});
+                               static_cast<uint32_t>(offsetof(RawCopyBatch, destination) +
+                                                     local * sizeof(MxxRawMatrixLimb) + offsetof(MxxRawMatrixLimb, address)),
+                               sizeof(void *), destination_binding_bases[pair] + static_cast<uint32_t>(limb), 0});
         }
         for (size_t offset = 0; offset < max_polys; offset += kMaxGridY)
         {
             const size_t chunk = std::min(kMaxGridY, max_polys - offset);
             const dim3 grid(static_cast<uint32_t>((degree + kTransformThreads - 1) /
-                kTransformThreads), static_cast<uint32_t>(chunk),
-                static_cast<uint32_t>(chunk_entries));
+                                                  kTransformThreads),
+                            static_cast<uint32_t>(chunk),
+                            static_cast<uint32_t>(chunk_entries));
             const int status = mxx_gpu_launch_kernel(ctx, stream,
-                raw_matrix_copy_batch_kernel, grid, dim3(kTransformThreads), 0,
-                patches.data(), patches.size(), batch, degree, offset);
-            if (status != 0) return status;
+                                                     raw_matrix_copy_batch_kernel, grid, dim3(kTransformThreads), 0,
+                                                     patches.data(), patches.size(), batch, degree, offset);
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 static int raw_matrix_fill_impl(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *destination, uint64_t rows,
-    uint64_t column_base, uint32_t digits_per_tower,
-    const uint64_t *base_residues, bool gadget,
-    uint32_t destination_binding_base)
+                                const MxxRawMatrixView *destination, uint64_t rows,
+                                uint64_t column_base, uint32_t digits_per_tower,
+                                const uint64_t *base_residues, bool gadget,
+                                uint32_t destination_binding_base)
 {
     if (validate_raw_view(ctx, destination, stream_raw) != 0 ||
         !rows || !digits_per_tower ||
@@ -1616,7 +1768,7 @@ static int raw_matrix_fill_impl(GpuContext *ctx, void *stream_raw,
         destination->column_origin < column_base ||
         destination->column_origin - column_base > rows * slots_per_row ||
         destination->columns > rows * slots_per_row -
-            (destination->column_origin - column_base))
+                                   (destination->column_origin - column_base))
         return set_error("raw structured fill window mismatch");
     if (mxx_set_device(destination->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
@@ -1635,34 +1787,36 @@ static int raw_matrix_fill_impl(GpuContext *ctx, void *stream_raw,
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
             const dim3 grid(
                 static_cast<uint32_t>((destination->degree + kTransformThreads - 1) /
-                    kTransformThreads), static_cast<uint32_t>(chunk));
+                                      kTransformThreads),
+                static_cast<uint32_t>(chunk));
             const int status = mxx_gpu_launch_kernel(ctx, stream,
-                raw_matrix_structured_fill_kernel, grid, dim3(kTransformThreads), 0,
-                &patch, 1, destination->limbs[limb], rows,
-                destination->columns, destination->row_origin,
-                destination->column_origin, column_base, slots_per_row,
-                digits_per_tower, base_residue,
-                static_cast<size_t>(destination->degree), offset, gadget);
-            if (status != 0) return status;
+                                                     raw_matrix_structured_fill_kernel, grid, dim3(kTransformThreads), 0,
+                                                     &patch, 1, destination->limbs[limb], rows,
+                                                     destination->columns, destination->row_origin,
+                                                     destination->column_origin, column_base, slots_per_row,
+                                                     digits_per_tower, base_residue,
+                                                     static_cast<size_t>(destination->degree), offset, gadget);
+            if (status != 0)
+                return status;
         }
     }
     return 0;
 }
 
 extern "C" int gpu_raw_matrix_identity_fill(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *destination, uint64_t square_size,
-    uint64_t column_base, uint32_t destination_binding_base)
+                                            const MxxRawMatrixView *destination, uint64_t square_size,
+                                            uint64_t column_base, uint32_t destination_binding_base)
 {
     return raw_matrix_fill_impl(ctx, stream_raw, destination, square_size,
-        column_base, 1, nullptr, false, destination_binding_base);
+                                column_base, 1, nullptr, false, destination_binding_base);
 }
 
 extern "C" int gpu_raw_matrix_gadget_fill(GpuContext *ctx, void *stream_raw,
-    const MxxRawMatrixView *destination, uint64_t rows,
-    uint32_t digits_per_tower, const uint64_t *base_residues,
-    uint64_t column_base, uint32_t destination_binding_base)
+                                          const MxxRawMatrixView *destination, uint64_t rows,
+                                          uint32_t digits_per_tower, const uint64_t *base_residues,
+                                          uint64_t column_base, uint32_t destination_binding_base)
 {
     return raw_matrix_fill_impl(ctx, stream_raw, destination, rows,
-        column_base, digits_per_tower, base_residues, true,
-        destination_binding_base);
+                                column_base, digits_per_tower, base_residues, true,
+                                destination_binding_base);
 }

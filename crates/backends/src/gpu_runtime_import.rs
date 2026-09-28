@@ -151,9 +151,74 @@ unsafe fn upload_selected_payload(
     backend: &GpuDcrtBackend,
     expected_type: &ArtifactType,
     upload_owner: &ImportDestination,
+    destination: Option<&GpuResidentValue>,
     payload: ArtifactPayload,
 ) -> Result<(), String> {
     match (expected_type, upload_owner, payload) {
+        (
+            ArtifactType::Matrix(expected),
+            ImportDestination::Placed { ty },
+            ArtifactPayload::Matrix(bytes),
+        ) if expected == ty => {
+            // Each limb's view of the placed scratch says where its
+            // coefficients go and how wide each one is.
+            let (header, residues) = crate::matrix::eval_artifact::decode_eval_matrix(&bytes)
+                .map_err(|error| error.to_string())?;
+            if (header.rows, header.columns) != (ty.rows, ty.columns) ||
+                header.ring_dimension != ty.ring.ring_dimension() as usize ||
+                header.moduli != ty.ring.crt_moduli()
+            {
+                return Err("evaluation import differs from its concrete matrix type".into());
+            }
+            let destination = destination.ok_or("placed import has no bound storage")?;
+            let (_, bound) =
+                destination.storages().next().ok_or("placed import has no bound storage")?;
+            let buffer = bound
+                .owner
+                .downcast_ref::<crate::poly::dcrt::gpu::GpuDeviceBuffer>()
+                .ok_or("placed import is not bound to plan scratch")?;
+            let (n, limbs) = (header.ring_dimension, header.moduli.len());
+            let mut words =
+                vec![0u8; usize::try_from(bound.bytes).map_err(|_| "placed import exceeds usize")?];
+            let parts = &destination.physical().parts;
+            if parts.len() != limbs {
+                return Err("placed import has one view per CRT limb".into());
+            }
+            // Each polynomial's limbs lie back to back in one block of the
+            // polynomial stride, so blocks are filled independently.
+            let poly_stride = parts[0].view.byte_strides.get(1).copied().unwrap_or(0) as usize;
+            if poly_stride == 0 ||
+                words.len() != ty.rows * ty.columns * poly_stride ||
+                parts.iter().any(|part| {
+                    let (view, strides) = (&part.view, &part.view.byte_strides);
+                    strides.len() != 4 ||
+                        strides[0] as usize != ty.columns * poly_stride ||
+                        strides[1] as usize != poly_stride ||
+                        (view.element_bytes != 4 && view.element_bytes != 8) ||
+                        view.byte_offset as usize + n * strides[3] as usize > poly_stride
+                })
+            {
+                return Err("placed import view is not a dense matrix of limbs".into());
+            }
+            {
+                use rayon::prelude::*;
+                words.par_chunks_mut(poly_stride).enumerate().for_each(|(poly, block)| {
+                    for (limb, part) in parts.iter().enumerate() {
+                        let view = &part.view;
+                        let (width, step) =
+                            (view.element_bytes as usize, view.byte_strides[3] as usize);
+                        let source = &residues[(poly * limbs + limb) * n..][..n];
+                        for (coefficient, residue) in source.iter().enumerate() {
+                            let at = view.byte_offset as usize + coefficient * step;
+                            block[at..at + width].copy_from_slice(&residue.to_le_bytes()[..width]);
+                        }
+                    }
+                });
+            }
+            let offset = usize::try_from(bound.address - buffer.as_ptr() as u64)
+                .map_err(|_| "placed import offset exceeds usize")?;
+            buffer.upload_initial(offset, &words).map_err(|error| error.to_string())
+        }
         (
             ArtifactType::Matrix(expected),
             ImportDestination::Matrix { owner, ty },
@@ -308,19 +373,23 @@ pub(crate) unsafe fn start_import<E: Error + Send + Sync + 'static>(
     template: &ImportTemplate,
     key: ArtifactKey,
     destination: Option<Arc<GpuResidentValue>>,
+    emulated_load: Option<std::time::Duration>,
 ) -> Result<(), String> {
-    let operation = import_operation(backend, template, key, destination)?;
+    let operation = import_operation(backend, template, key, destination, emulated_load)?;
     pump.ready(frame, template.destination.0, operation).map_err(|error| error.to_string())
 }
 
 /// The worker command that reads `key` and uploads it into `template`'s owner.
 /// `destination` is the resident value an artifact held in GPU memory is
-/// copied into when both have the same layout.
+/// copied into when both have the same layout. With `emulated_load`, an I/O
+/// trial's, the worker waits that long instead of reading `key` and uploads a
+/// zero payload of the artifact's type.
 pub(crate) fn import_operation(
     backend: &GpuDcrtBackend,
     template: &ImportTemplate,
     key: ArtifactKey,
     destination: Option<Arc<GpuResidentValue>>,
+    emulated_load: Option<std::time::Duration>,
 ) -> Result<RuntimeIoOperation, String> {
     if template.descriptor.artifact_type != template.expected_type {
         return Err("artifact bound domain or semantic type differs from its consumer".into());
@@ -351,12 +420,21 @@ pub(crate) fn import_operation(
         };
         // SAFETY: `start_import`'s contract keeps every other user of the
         // owner away until this request is consumed.
-        unsafe { upload_selected_payload(&backend, &expected_type, &upload_owner, payload) }
+        unsafe {
+            upload_selected_payload(
+                &backend,
+                &expected_type,
+                &upload_owner,
+                destination.as_deref(),
+                payload,
+            )
+        }
     });
     Ok(RuntimeIoOperation::Import {
         key,
         descriptor: template.descriptor.clone(),
         staged: template.staged,
+        emulated_load,
         deliver,
     })
 }

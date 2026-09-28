@@ -27,6 +27,7 @@ pub(crate) use fleet::{
     GpuPreparedNativeResources, PhysicalExport, RawExportLeaf, emit_compiled_gpu_op,
     emit_compiled_monomial_difference, emit_compiled_small_rhs_sum, emit_compiled_subgraph_kernel,
     physical_raw_matrix_view, prepare_compiled_gpu_program, strided_copy, transcode_raw_artifact,
+    zero_artifact_payload,
 };
 
 impl GpuDcrtBackend {

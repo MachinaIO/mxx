@@ -163,10 +163,16 @@ program.
 | --- | --- | --- | --- |
 | `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 64 | The most parallel-loop iterations one wave runs. |
 | `measurement_warmups`, `measurement_iterations` | `MXX_GPU_MEASUREMENT_WARMUPS`, `MXX_GPU_MEASUREMENT_ITERATIONS` | 1, 2 | Trials per candidate during planning. |
+| `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset | Waves of each root wave group (and iterations of each root host-driven loop) that `plan_with_store` executes with artifact I/O to add an I/O-inclusive estimate to the report. A host or file store always runs this trial, with 2 waves when unset; a GPU-resident store runs it only when set. |
 | `integer_input_ranges` | (code only) | empty | Declared value ranges of host integer inputs. |
 | `subgraph_kernels` | (code only) | empty | Native kernels that replace named subgraphs on the GPU. |
 | — | `MXX_GPU_MEMORY_FRACTION` | 0.8 | The fraction of each GPU's memory one plan may use. |
 | — | `MXX_GPU_LOGICAL_DEVICES` | one per GPU | Maps logical devices to physical GPUs; `0,0` simulates two devices on GPU 0. |
+| — | `MXX_GPU_SMALL_RHS_CHUNK_COLUMNS` | 1 | Columns of a bounded right operand one small-RHS product transforms at a time. Each extra column adds a workspace of the right operand's rows × one column, so a wider chunk means fewer launches and more memory. |
+
+The small-RHS chunk width is chosen by hand for now: planning does not search it, so a setting
+that does not fit in memory fails planning rather than falling back to a narrower chunk. TODO:
+choose it automatically, as the wave width and tile width are.
 
 ### 4.7 Errors
 

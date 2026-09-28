@@ -84,8 +84,9 @@ fn run_shape_case_on(
         parameters.moduli().iter().copied().map(Into::into).collect(),
         parameters.ring_dimension(),
     );
+    let (rows, columns) = input.size();
     let graph = DslContext::new(label)
-        .output("result", expression(ring.input("source", (2, 2))))
+        .output("result", expression(ring.input("source", (rows, columns))))
         .unwrap()
         .build()
         .unwrap()
@@ -98,7 +99,7 @@ fn run_shape_case_on(
     .resolve(&ParamEnv::default())
     .unwrap();
     let value = RuntimeValue::gpu_matrix(
-        ConcreteWireType::Matrix(ConcreteMatrixType { ring: input_ring, rows: 2, columns: 2 }),
+        ConcreteWireType::Matrix(ConcreteMatrixType { ring: input_ring, rows, columns }),
         Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &input)),
     )
     .unwrap();
@@ -402,6 +403,40 @@ fn gadget_decompose_and_small_rhs_multiply_reconstruct_input() {
         },
         |source| source.clone(),
     );
+}
+
+/// A one-row matrix times a gadget constant is lowered without storing the
+/// gadget; every output column must still equal the stored product.
+#[test]
+#[serial_test::serial]
+fn row_times_gadget_matches_stored_gadget_product() {
+    let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let digit_count = parameters.modulus_digits();
+    let entry = |constant: u64| {
+        let coefficients = (0..parameters.ring_dimension() as u64)
+            .map(|index| BigUint::from(constant * 1_000 + index * 37 + 1))
+            .collect::<Vec<_>>();
+        DCRTPoly::from_biguints(&parameters, &coefficients)
+    };
+    for columns in [1usize, 2] {
+        let input = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![(0..columns as u64).map(|column| entry(column + 1)).collect()],
+        );
+        run_shape_case_on(
+            &format!("direct-row-times-gadget-{columns}"),
+            &parameters,
+            input,
+            move |source| {
+                let ring = Ring::from_ref(source.matrix_type().ring.clone());
+                source * ring.gadget(columns, 16, digit_count)
+            },
+            move |source| {
+                source.clone() *
+                    DCRTPolyMatrix::gadget_matrix(source.params(), columns, Some(digit_count))
+            },
+        );
+    }
 }
 
 /// A base of `ceil(crt_bits / 2)` bits leaves two digits per limb; residues

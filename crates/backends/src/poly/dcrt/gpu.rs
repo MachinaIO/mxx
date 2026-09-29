@@ -6293,6 +6293,7 @@ unsafe impl Send for GpuDeviceBuffer {}
 unsafe impl Sync for GpuDeviceBuffer {}
 
 impl GpuDeviceBuffer {
+    /// A buffer of `bytes` on the stream's device, zeroed in stream order.
     pub(crate) fn allocate(
         stream: &GpuNativeLaunchStream,
         bytes: usize,
@@ -7324,6 +7325,28 @@ mod tests {
         graph.launch(&stream).unwrap().wait().unwrap();
         assert_eq!(status.read().unwrap(), 2);
         assert_eq!(read_coefficient(0), 0);
+    }
+
+    /// A new device buffer reads zero even when the pool hands it the memory
+    /// a buffer filled with other bytes freed on the same stream just before.
+    #[test]
+    #[sequential(gpu_context)]
+    fn device_buffer_starts_zeroed_after_the_pool_reuses_memory() {
+        let Some(&device) = detected_gpu_device_ids().first() else {
+            return;
+        };
+        let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
+        let stream = params.native_launch_stream(device).unwrap();
+        let bytes = 1 << 20;
+        for _ in 0..4 {
+            let dirty = GpuDeviceBuffer::allocate(&stream, bytes).unwrap();
+            dirty.upload(0, &vec![0xA5; bytes]).unwrap();
+            drop(dirty);
+            let fresh = GpuDeviceBuffer::allocate(&stream, bytes).unwrap();
+            let mut read = vec![0xFF; bytes];
+            fresh.download(0, &mut read).unwrap();
+            assert!(read.iter().all(|byte| *byte == 0), "a reused buffer keeps old bytes");
+        }
     }
 
     #[test]

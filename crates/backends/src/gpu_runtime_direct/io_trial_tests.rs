@@ -123,3 +123,57 @@ fn io_trial_plans_without_the_imported_artifacts_and_leaves_no_trial_data() {
         );
     }
 }
+
+/// An I/O trial runs only its first waves, yet exports a family that a later
+/// loop also reads after the loop, members of its skipped waves included:
+/// those are read from plan memory no operation wrote, which starts zeroed
+/// (`device_buffer_starts_zeroed_after_the_pool_reuses_memory`), so they
+/// encode as zero and planning succeeds. The plan then computes every member.
+#[test]
+#[serial_test::serial]
+fn io_trial_exports_the_members_of_skipped_waves() {
+    let cpu_params = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+    let gpu_params = GpuDCRTPolyParams::new(
+        cpu_params.ring_dimension(),
+        cpu_params.moduli().to_vec(),
+        cpu_params.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        cpu_params.moduli().iter().copied().map(Into::into).collect(),
+        cpu_params.ring_dimension(),
+    );
+    let member_ring = ring.clone();
+    let members = parallel(6, move |index| {
+        Ok(index.add(3).lift_to_constant_polynomial(member_ring.matrix_type((1, 1))))
+    })
+    .unwrap();
+    let consumed = members.clone();
+    let sum =
+        mxx_dsl::iterate(6, ring.zero((1, 1)), move |index, sum| Ok(sum + consumed.at(index)))
+            .unwrap();
+    let graph = DslContext::new("io-trial-skipped-waves")
+        .transferred_output("members", members)
+        .unwrap()
+        .output("sum", sum)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = FileArtifactStore::new(directory.path()).unwrap();
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+    // One lane per wave: six waves, of which the trial runs two.
+    runtime.options_mut().max_parallel_instances = NonZeroUsize::new(1).unwrap();
+    runtime.options_mut().io_trial_waves = NonZeroUsize::new(2);
+    let mut plan = runtime.plan_with_store(graph, &BTreeMap::new(), &mut store).unwrap();
+    assert_eq!(plan.frame.waves.len(), 6);
+    assert!(plan.frame.export_templates.iter().all(|template| !template.streamed));
+    assert!(plan.report().io_predicted_seconds.is_some(), "the trial ran");
+    let result =
+        runtime.execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, [0x5a; 32]).unwrap();
+    let sum = runtime.download_matrix_output(&result.output("sum").expect("sum output")).unwrap();
+    // 3 + 4 + ... + 8.
+    assert_eq!(sum.entry(0, 0).coeffs_biguints()[0], num_bigint::BigUint::from(33u8));
+}

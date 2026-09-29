@@ -101,6 +101,13 @@ fn io_trial_plans_without_the_imported_artifacts_and_leaves_no_trial_data() {
         .execute_with_artifacts(&mut producer_plan, BTreeMap::new(), &mut store, nonce)
         .unwrap();
     assert_eq!(produced.production_id.as_ref(), Some(&production));
+    // The streamed family keeps no resident copy; it is returned as its
+    // committed artifact family.
+    assert!(matches!(
+        &produced["members"],
+        crate::RuntimeValue::LazyArtifactFamily { production: returned, name, descriptor }
+            if returned == &production && name == "members" && descriptor.family_count == Some(8)
+    ));
     drop(produced);
     assert_eq!(productions(), 1);
     let result = runtime

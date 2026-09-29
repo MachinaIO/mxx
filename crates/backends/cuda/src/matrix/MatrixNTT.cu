@@ -713,6 +713,40 @@ namespace
                          mul_mod_u64(value, residues.residue[blockIdx.z], destination.modulus));
     }
 
+    // Residues of the gadget entries of one launch, digit-major within its
+    // limbs: entry (digit, limb) is residue[digit * limbs + limb].
+    constexpr size_t kGadgetScaleResidues = 256;
+    struct RawGadgetResidues
+    {
+        uint64_t residue[kGadgetScaleResidues];
+    };
+    static_assert(2 * sizeof(RawLimbSet) + sizeof(RawGadgetResidues) + 8 * sizeof(size_t) < 4096,
+                  "bounded raw gadget scale kernel arguments");
+
+    // destination[0, entry * digits + first_digit + digit] =
+    // source[0, entry] * g_(first_digit + digit), for the digit_count digits
+    // of this launch; blockIdx.y enumerates (entry, digit), blockIdx.z the limb.
+    __global__ void raw_matrix_gadget_scale_kernel(
+        RawLimbSet sources, RawLimbSet destinations,
+        RawGadgetResidues residues, size_t source_columns,
+        size_t destination_columns, size_t digits, size_t first_digit,
+        size_t digit_count, size_t limbs, size_t degree, size_t poly_offset)
+    {
+        const MxxRawMatrixLimb &source = sources.limb[blockIdx.z];
+        const MxxRawMatrixLimb &destination = destinations.limb[blockIdx.z];
+        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coefficient >= degree)
+            return;
+        const size_t local = poly_offset + blockIdx.y;
+        const size_t entry = local / digit_count;
+        const size_t digit = local - entry * digit_count;
+        const uint64_t value = raw_matrix_load(source, entry, coefficient, source_columns);
+        raw_matrix_store(destination, entry * digits + first_digit + digit, coefficient,
+                         destination_columns,
+                         mul_mod_u64(value, residues.residue[digit * limbs + blockIdx.z],
+                                     destination.modulus));
+    }
+
     __global__ void raw_matrix_scale_dynamic_kernel(
         MxxRawMatrixLimb source, MxxRawMatrixLimb destination,
         const uint64_t *scalar, int scalar_encoding, uint32_t *status,
@@ -1264,6 +1298,72 @@ extern "C" int gpu_raw_matrix_scale(GpuContext *ctx, void *stream_raw,
                                                      static_cast<size_t>(source->degree), offset);
             if (status != 0)
                 return status;
+        }
+    }
+    return 0;
+}
+
+extern "C" int gpu_raw_matrix_gadget_scale(GpuContext *ctx, void *stream_raw,
+                                           const MxxRawMatrixView *source,
+                                           const MxxRawMatrixView *destination,
+                                           const uint64_t *residues, size_t digits,
+                                           uint32_t source_binding_base,
+                                           uint32_t destination_binding_base)
+{
+    if (validate_raw_view(ctx, source, stream_raw) != 0 ||
+        validate_raw_view(ctx, destination, stream_raw) != 0 || !residues || digits == 0 ||
+        source->rows != 1 || destination->rows != 1 ||
+        source->physical_device != destination->physical_device ||
+        source->limb_count != destination->limb_count ||
+        source->columns > SIZE_MAX / digits || destination->columns != source->columns * digits ||
+        source_binding_base > UINT32_MAX - source->limb_count ||
+        destination_binding_base > UINT32_MAX - destination->limb_count)
+        return set_error("invalid raw matrix gadget scale views or residues");
+    for (size_t limb = 0; limb < source->limb_count; ++limb)
+    {
+        if (source->limbs[limb].crt_limb_index != destination->limbs[limb].crt_limb_index ||
+            source->limbs[limb].modulus != destination->limbs[limb].modulus)
+            return set_error("raw matrix gadget scale limbs disagree");
+        for (size_t digit = 0; digit < digits; ++digit)
+            if (residues[digit * source->limb_count + limb] >= source->limbs[limb].modulus)
+                return set_error("raw matrix gadget residue exceeds CRT modulus");
+    }
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
+        return set_error(cudaGetLastError());
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    for (size_t first = 0; first < source->limb_count; first += kRawNttLimbs)
+    {
+        const size_t limbs = std::min(kRawNttLimbs, source->limb_count - first);
+        // As many digits as the launch's residue table holds for its limbs.
+        const size_t digit_chunk = kGadgetScaleResidues / limbs;
+        RawLimbSet sources{}, destinations{};
+        std::vector<MxxGraphPatch> patches;
+        raw_limb_set(source, first, limbs, 0, source_binding_base, sources, patches);
+        raw_limb_set(destination, first, limbs, 1, destination_binding_base, destinations,
+                     patches);
+        for (size_t first_digit = 0; first_digit < digits; first_digit += digit_chunk)
+        {
+            const size_t digit_count = std::min(digit_chunk, digits - first_digit);
+            RawGadgetResidues table{};
+            for (size_t digit = 0; digit < digit_count; ++digit)
+                for (size_t local = 0; local < limbs; ++local)
+                    table.residue[digit * limbs + local] =
+                        residues[(first_digit + digit) * source->limb_count + first + local];
+            const size_t poly_count = source->columns * digit_count;
+            for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+            {
+                const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+                const dim3 grid(
+                    static_cast<uint32_t>((source->degree + kTransformThreads - 1) / kTransformThreads),
+                    static_cast<uint32_t>(chunk), static_cast<uint32_t>(limbs));
+                const int status = mxx_gpu_launch_kernel(
+                    ctx, stream, raw_matrix_gadget_scale_kernel, grid, dim3(kTransformThreads), 0,
+                    patches.data(), patches.size(), sources, destinations, table,
+                    source->columns, destination->columns, digits, first_digit, digit_count, limbs,
+                    static_cast<size_t>(source->degree), offset);
+                if (status != 0)
+                    return status;
+            }
         }
     }
     return 0;

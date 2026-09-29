@@ -2341,6 +2341,80 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(source_owner));
             builder.retain_owner(Arc::clone(destination_owner));
         }
+        GpuNativePrimitive::MatrixGadgetScale => {
+            let [
+                KernelArg::Value(source_id),
+                KernelArg::U32(source_part),
+                KernelArg::Value(destination_id),
+                KernelArg::U32(destination_part),
+                KernelArg::U64(digits),
+                KernelArg::U64List(residues),
+                KernelArg::U32(source_binding),
+                KernelArg::U32(destination_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled gadget scale has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*destination_id] {
+                return Err(invalid("compiled gadget scale output disagrees with destination"));
+            }
+            let source_owner = owners
+                .get(source_id)
+                .ok_or_else(|| invalid("compiled gadget scale source is missing"))?;
+            let destination_owner = owners
+                .get(destination_id)
+                .ok_or_else(|| invalid("compiled gadget scale destination is missing"))?;
+            let (ConcreteWireType::Matrix(source_ty), ConcreteWireType::Matrix(destination_ty)) =
+                (source_owner.wire_type(), destination_owner.wire_type())
+            else {
+                return Err(invalid("compiled gadget scale requires ordinary matrices"));
+            };
+            let source_encoding = source_owner
+                .physical()
+                .encodings
+                .first()
+                .ok_or_else(|| invalid("compiled gadget scale source encoding is missing"))?;
+            if !matches!(source_encoding, PhysicalEncoding::FullCoeff | PhysicalEncoding::FullEval) ||
+                destination_owner.physical().encodings.first() != Some(source_encoding)
+            {
+                return Err(invalid("compiled gadget scale encoding changes"));
+            }
+            let (_, source, source_bindings) =
+                compiled_raw_matrix_part(source_owner, *source_part, source_encoding.clone())?;
+            let (_, destination, destination_bindings) = compiled_raw_matrix_part(
+                destination_owner,
+                *destination_part,
+                source_encoding.clone(),
+            )?;
+            let digit_count = usize::try_from(*digits)
+                .map_err(|_| invalid("compiled gadget scale digit count exceeds usize"))?;
+            if source_ty.ring != destination_ty.ring ||
+                !same_raw_limbs(&source, &destination) ||
+                source.physical_device != op.device ||
+                source.rows != 1 ||
+                destination.rows != 1 ||
+                source.columns.checked_mul(*digits) != Some(destination.columns) ||
+                source.limbs.len().checked_mul(digit_count) != Some(residues.len())
+            {
+                return Err(invalid("compiled gadget scale layouts or residues disagree"));
+            }
+            bind_raw_matrix_part(builder, *source_binding, &source_bindings)?;
+            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+            let parameters = backend
+                .parameters_on_physical_device(op.device, source_ty)
+                .map_err(|error| GpuNativeGraphError::Native(error.to_string()))?;
+            parameters.emit_raw_matrix_gadget_scale(
+                builder.launch_stream(),
+                &source,
+                &destination,
+                residues,
+                digit_count,
+                *source_binding,
+                *destination_binding,
+            )?;
+            builder.retain_owner(Arc::clone(source_owner));
+            builder.retain_owner(Arc::clone(destination_owner));
+        }
         GpuNativePrimitive::MatrixScaleDynamic => {
             let [
                 KernelArg::Value(source_id),

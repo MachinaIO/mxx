@@ -980,6 +980,16 @@ unsafe extern "C" {
         source_binding_base: u32,
         destination_binding_base: u32,
     ) -> c_int;
+    fn gpu_raw_matrix_gadget_scale(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        source: *const GpuRawMatrixViewAbi,
+        destination: *const GpuRawMatrixViewAbi,
+        residues: *const u64,
+        digits: usize,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> c_int;
     fn gpu_raw_matrix_scale_dynamic(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
@@ -3529,6 +3539,51 @@ impl GpuDCRTPolyParams {
                 &destination,
                 scalar_residues.as_ptr(),
                 scalar_residues.len(),
+                source_binding_base,
+                destination_binding_base,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Write the product of a one-row `source` and the gadget `I_r (x) g` into
+    /// the one-row `destination` of `r * digits` columns in one launch per
+    /// limb batch: column `i * digits + t` is `source[0, i] * g_t`. The
+    /// residues are digit-major, `residues[t * limbs + limb]` for `g_t`.
+    pub fn emit_raw_matrix_gadget_scale(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        source: &GpuRawMatrixView,
+        destination: &GpuRawMatrixView,
+        residues: &[u64],
+        digits: usize,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if source.physical_device != stream.physical_device ||
+            destination.physical_device != stream.physical_device ||
+            source.degree != self.ring_dimension ||
+            destination.degree != self.ring_dimension ||
+            digits == 0 ||
+            source.limbs.len().checked_mul(digits) != Some(residues.len())
+        {
+            return Err(GpuNativeGraphError::Native(
+                "raw gadget scale view/context mismatch".into(),
+            ));
+        }
+        let source = source.abi();
+        let destination = destination.abi();
+        if unsafe {
+            gpu_raw_matrix_gadget_scale(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &source,
+                &destination,
+                residues.as_ptr(),
+                digits,
                 source_binding_base,
                 destination_binding_base,
             )

@@ -431,6 +431,7 @@ pub(crate) enum GpuNativePrimitive {
     MatrixTranspose,
     MatrixTensor,
     MatrixScale,
+    MatrixGadgetScale,
     MatrixScaleDynamic,
     MatrixIndexedCopy,
     MatrixSliceDynamic,
@@ -704,6 +705,15 @@ impl GpuImplementation {
         Self {
             primitive: GpuNativePrimitive::MatrixScale,
             argument_kinds: Box::new([Value, U32, Value, U32, U64List, U32, U32]),
+            output_count: 1,
+        }
+    }
+
+    pub(crate) fn matrix_gadget_scale() -> Self {
+        use GpuArgumentKind::{U32, U64, U64List, Value};
+        Self {
+            primitive: GpuNativePrimitive::MatrixGadgetScale,
+            argument_kinds: Box::new([Value, U32, Value, U32, U64, U64List, U32, U32]),
             output_count: 1,
         }
     }

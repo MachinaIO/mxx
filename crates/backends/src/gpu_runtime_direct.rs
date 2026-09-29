@@ -68,7 +68,9 @@
 //! - In the trial, each import waits on the I/O worker for its type's load time and delivers a zero
 //!   payload, which is decoded and uploaded as a real one.
 //! - Exports go to a fresh trial production. After the run their writes are published and committed
-//!   under a timer, never finalized, and `SessionStore::discard_session` removes the production.
+//!   under a timer, never finalized, and `SessionStore::discard_session` removes the production. An
+//!   export that includes what a skipped wave or iteration would have written reads the plan
+//!   memory's initial zeros there.
 //!
 //! The report's `io_predicted_seconds` is the trial's wall time, with every unrun wave or iteration
 //! counted at the time of its group's or loop's last measured one, and every unwritten export of

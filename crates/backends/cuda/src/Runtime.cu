@@ -2061,6 +2061,11 @@ extern "C"
                 reinterpret_cast<void **>(&buffer->address), bytes, buffer->allocation_stream);
         }
         if (status == cudaSuccess)
+            // A new buffer starts zeroed: pool memory may hold another owner's bytes, and a
+            // plan may read bytes no operation wrote, such as the members of the waves an
+            // I/O trial skips.
+            status = cudaMemsetAsync(buffer->address, 0, bytes, buffer->allocation_stream);
+        if (status == cudaSuccess)
         {
             status = cudaEventCreateWithFlags(&buffer->producer, cudaEventDisableTiming);
         }

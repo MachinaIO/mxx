@@ -1,0 +1,208 @@
+diff -ruN base-88491/crates/backends/SPEC.md snap1/crates/backends/SPEC.md
+--- base-88491/crates/backends/SPEC.md	2026-09-28 21:06:25.000000000 +0900
++++ snap1/crates/backends/SPEC.md	2026-09-29 00:12:47.249377738 +0900
+@@ -163,6 +163,7 @@
+ | --- | --- | --- | --- |
+ | `max_parallel_instances` | `MXX_GPU_MAX_PARALLEL_INSTANCES` | 64 | The most parallel-loop iterations one wave runs. |
+ | `measurement_warmups`, `measurement_iterations` | `MXX_GPU_MEASUREMENT_WARMUPS`, `MXX_GPU_MEASUREMENT_ITERATIONS` | 1, 2 | Trials per candidate during planning. |
++| `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset | Waves of each root wave group (and iterations of each root host-driven loop) that `plan_with_store` executes with artifact I/O to add an I/O-inclusive estimate to the report. A host or file store always runs this trial, with 2 waves when unset; a GPU-resident store runs it only when set. |
+ | `integer_input_ranges` | (code only) | empty | Declared value ranges of host integer inputs. |
+ | `subgraph_kernels` | (code only) | empty | Native kernels that replace named subgraphs on the GPU. |
+ | — | `MXX_GPU_MEMORY_FRACTION` | 0.8 | The fraction of each GPU's memory one plan may use. |
+diff -ruN base-88491/crates/backends/src/gpu_graph_memory.rs snap1/crates/backends/src/gpu_graph_memory.rs
+--- base-88491/crates/backends/src/gpu_graph_memory.rs	2026-09-28 21:06:25.000000000 +0900
++++ snap1/crates/backends/src/gpu_graph_memory.rs	2026-09-29 00:12:47.242946595 +0900
+@@ -75,6 +75,21 @@
+     NEXT.fetch_add(1 << 40, Ordering::Relaxed)
+ }
+ 
++/// Storage of `bytes` for a scratch value of type `ty` on `device`, whose
++/// memory is chosen when the plan's Graph regions are compiled.
++pub(crate) fn deferred_scratch_storage(
++    device: i32,
++    ty: ConcreteWireType,
++    bytes: u64,
++) -> BoundStorage {
++    BoundStorage {
++        device,
++        address: placeholder_address(),
++        bytes,
++        owner: Arc::new(GpuDeferredScratch { ty, device }),
++    }
++}
++
+ /// Describe a compact scratch value of the bounded type `ty`, whose payload
+ /// `layout` holds, without allocating it.
+ pub(crate) fn deferred_scratch_compact(
+diff -ruN base-88491/crates/backends/src/gpu_physical_lowering.rs snap1/crates/backends/src/gpu_physical_lowering.rs
+--- base-88491/crates/backends/src/gpu_physical_lowering.rs	2026-09-28 21:06:25.000000000 +0900
++++ snap1/crates/backends/src/gpu_physical_lowering.rs	2026-09-29 00:12:47.243413856 +0900
+@@ -1846,8 +1846,29 @@
+         *span = (span.0.min(view.byte_offset), span.1.max(last));
+     }
+     let parameters = ctx.backend.control_parameters_on_device(device)?;
++    // A full matrix in one storage is scratch placed for the replica's live
++    // span; other values keep a copy of their own for the plan.
++    let deferred = spans.len() == 1 &&
++        matches!(
++            (&physical.ty, physical.encodings.as_ref()),
++            (
++                ConcreteWireType::Matrix(_),
++                [PhysicalEncoding::FullCoeff] | [PhysicalEncoding::FullEval]
++            )
++        );
+     let mut storage = BTreeMap::new();
+     for (&slot, &(start, end)) in &spans {
++        if deferred {
++            storage.insert(
++                slot,
++                crate::gpu_graph_memory::deferred_scratch_storage(
++                    device,
++                    physical.ty.clone(),
++                    end - start,
++                ),
++            );
++            continue;
++        }
+         let bytes = usize::try_from(end - start)
+             .map_err(|_| "GPU replica exceeds host address space".to_owned())?;
+         let copy =
+diff -ruN base-88491/crates/backends/src/gpu_runtime_direct/selected_artifact_tests.rs snap1/crates/backends/src/gpu_runtime_direct/selected_artifact_tests.rs
+--- base-88491/crates/backends/src/gpu_runtime_direct/selected_artifact_tests.rs	2026-09-28 21:06:25.000000000 +0900
++++ snap1/crates/backends/src/gpu_runtime_direct/selected_artifact_tests.rs	2026-09-29 00:12:47.250363878 +0900
+@@ -372,7 +372,9 @@
+             index: Some(index),
+         })
+         .collect::<Vec<_>>();
+-    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0; 3]);
++    // The planning I/O trial of this memory store reads the selected member
++    // itself, since its type has no zero payload to emulate the load with.
++    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0, 0, 1]);
+ 
+     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
+         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+@@ -504,7 +506,9 @@
+             index: Some(index),
+         })
+         .collect::<Vec<_>>();
+-    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0; 3]);
++    // The planning I/O trial of this memory store reads the selected member
++    // itself, since its type has no zero payload to emulate the load with.
++    assert_eq!(keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>(), [0, 0, 1]);
+ 
+     for (replay, index) in [2, 0, 1].into_iter().enumerate() {
+         let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+diff -ruN base-88491/crates/backends/src/gpu_runtime_direct.rs snap1/crates/backends/src/gpu_runtime_direct.rs
+--- base-88491/crates/backends/src/gpu_runtime_direct.rs	2026-09-28 21:06:25.000000000 +0900
++++ snap1/crates/backends/src/gpu_runtime_direct.rs	2026-09-29 00:12:47.246459392 +0900
+@@ -53,15 +53,18 @@
+ //! [`GpuExecutionPlan::render_html`] draws the graph with those costs; a profiling failure is
+ //! logged and leaves `node_costs` empty.
+ //!
+-//! The trials above time the Graph alone, without artifact reads or writes. With `io_trial_waves`,
+-//! `plan_with_store` then executes the selected plan once with its artifact I/O: each root wave
+-//! group runs only its first `io_trial_waves` waves and each root host-driven loop that many
+-//! iterations. Planning never reads the artifacts a plan imports, so they need not exist yet:
++//! The trials above time the Graph alone, without artifact reads or writes. With a host or file
++//! store, or with `io_trial_waves` set, `plan_with_store` then executes the selected plan once with
++//! its artifact I/O: each root wave group runs only its first `io_trial_waves` waves (2 when unset)
++//! and each root host-driven loop that many iterations. A store that keeps artifacts on the GPU
++//! runs the trial only when `io_trial_waves` is set. Planning reads only the imported artifacts
++//! whose type has no zero payload, such as integers; the others need not exist yet:
+ //!
+ //! - Before the trial, one load is timed per imported artifact type. A zero payload of the type is
+ //!   stored under a fresh production, dropped from the store's cache
+ //!   (`ArtifactStore::evict_cached`), loaded under a timer, and removed. The result is kept by the
+-//!   runtime and reused for that type by later trials.
++//!   runtime and reused for that type by later trials. A type without a zero payload is not timed
++//!   and the trial reads its stored artifact.
+ //! - In the trial, each import waits on the I/O worker for its type's load time and delivers a zero
+ //!   payload, which is decoded and uploaded as a real one.
+ //! - Exports go to a fresh trial production. After the run their writes are published and committed
+@@ -83,7 +86,7 @@
+ //! | `measurement_iterations` | `MXX_GPU_MEASUREMENT_ITERATIONS` | 2 |
+ //! | `release_fence_interval` | `MXX_GPU_RELEASE_FENCE_INTERVAL` | unset |
+ //! | `profile_nodes` | `MXX_GPU_PROFILE_NODES` | false |
+-//! | `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset |
++//! | `io_trial_waves` | `MXX_GPU_IO_TRIAL_WAVES` | unset (2 for a host or file store) |
+ //! | `integer_input_ranges` | (set in code) | empty |
+ //! | `subgraph_kernels` | (set in code) | empty |
+ //!
+@@ -1836,6 +1839,10 @@
+ }
+ 
+ /// Whether artifacts with these descriptors have the same stored payload.
++/// Waves of each root wave group, and iterations of each root host-driven
++/// loop, an I/O trial runs when `io_trial_waves` is unset.
++const DEFAULT_IO_TRIAL_WAVES: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2).unwrap();
++
+ fn same_payload(left: &ManifestArtifact, right: &ManifestArtifact) -> bool {
+     left.artifact_type == right.artifact_type &&
+         left.availability == right.availability &&
+@@ -2279,7 +2286,13 @@
+         let device_artifact_exports = store.device_artifacts().is_some();
+         let mut plan =
+             self.plan_with_payload_sizes(validated, inputs, &sizes, device_artifact_exports, None)?;
+-        if let Some(waves) = self.options.io_trial_waves {
++        // A host or file store's reads and writes take time the Graph trials
++        // do not measure, so its plans always run an I/O trial.
++        let waves = self
++            .options
++            .io_trial_waves
++            .or_else(|| (!device_artifact_exports).then_some(DEFAULT_IO_TRIAL_WAVES));
++        if let Some(waves) = waves {
+             plan.report.io_predicted_seconds =
+                 self.io_trial(&mut plan, inputs, store, waves.get())?;
+         }
+@@ -2342,7 +2355,9 @@
+     /// The load seconds of each artifact descriptor `frame` imports, measured
+     /// once per descriptor and runtime: a zero payload of its type is stored
+     /// under a fresh production, dropped from the store's cache, loaded once
+-    /// under a timer, and removed. Only the load is timed.
++    /// under a timer, and removed. Only the load is timed. A descriptor whose
++    /// type has no zero payload is left out, so the trial reads the artifact
++    /// itself.
+     fn measure_trial_loads<S: SessionStore>(
+         &mut self,
+         frame: &PhysicalFrame,
+@@ -2383,9 +2398,13 @@
+                 name: "io-trial-load".into(),
+                 index: None,
+             };
+-            let payload =
++            // A type without a zero payload is not emulated: the trial loads
++            // the stored artifact itself.
++            let Ok(payload) =
+                 crate::backend::poly_gpu::zero_artifact_payload(&descriptor.artifact_type)
+-                    .map_err(|error| failed(&error))?;
++            else {
++                continue;
++            };
+             let measured = store
+                 .store_manifest(Manifest {
+                     ir_version: mxx_ir_core::encoding::IR_VERSION,
+diff -ruN base-88491/crates/backends/src/gpu_runtime_metrics.rs snap1/crates/backends/src/gpu_runtime_metrics.rs
+--- base-88491/crates/backends/src/gpu_runtime_metrics.rs	2026-09-28 21:06:25.000000000 +0900
++++ snap1/crates/backends/src/gpu_runtime_metrics.rs	2026-09-29 00:12:47.248316997 +0900
+@@ -26,7 +26,8 @@
+     #[serde(default)]
+     pub node_costs: Vec<NodeCost>,
+     /// Predicted seconds per execute including artifact reads and writes,
+-    /// measured only when `GpuRuntimeOptions::io_trial_waves` is set: the
++    /// measured by `plan_with_store` for a host or file store, or for any
++    /// store when `GpuRuntimeOptions::io_trial_waves` is set: the
+     /// I/O trial's wall time, with each root wave group and host-driven loop
+     /// extrapolated from its last measured wave or iteration. `None` without
+     /// a trial or for a plan without artifact I/O.
+diff -ruN base-88491/crates/backends/src/runtime_env.rs snap1/crates/backends/src/runtime_env.rs
+--- base-88491/crates/backends/src/runtime_env.rs	2026-09-28 21:06:25.000000000 +0900
++++ snap1/crates/backends/src/runtime_env.rs	2026-09-29 00:12:47.247486239 +0900
+@@ -23,6 +23,8 @@
+     /// each root wave group runs its first this many waves and each root
+     /// host-driven loop that many iterations, their exports are discarded
+     /// with the trial session, and the report adds an I/O-inclusive estimate.
++    /// A plan whose store is on the host or on disk always runs this trial,
++    /// with 2 waves when unset; a GPU-resident store runs it only when set.
+     pub io_trial_waves: Option<NonZeroUsize>,
+ }
+ 

@@ -164,6 +164,10 @@ pub(crate) enum IoCommand<E: std::error::Error + 'static> {
         key: ArtifactKey,
         descriptor: ManifestArtifact,
         staged: bool,
+        /// Set by an I/O trial: instead of reading the store, wait this long
+        /// (the load time measured for the artifact's type) and deliver a
+        /// zero payload of that type.
+        emulated_load: Option<std::time::Duration>,
         deliver: ImportDelivery,
         reply: SyncSender<Result<IoCompletion, IoWorkerError<E>>>,
     },
@@ -282,15 +286,24 @@ pub(crate) fn submit_import<E: std::error::Error + 'static>(
     key: ArtifactKey,
     descriptor: ManifestArtifact,
     staged: bool,
+    emulated_load: Option<std::time::Duration>,
     deliver: ImportDelivery,
 ) -> Result<IoReplyReceiver<E>, IoSubmitError> {
     let (reply, receiver) = mpsc::sync_channel(1);
-    sender.try_send(IoCommand::Import { frame, key, descriptor, staged, deliver, reply }).map_err(
-        |error| match error {
+    sender
+        .try_send(IoCommand::Import {
+            frame,
+            key,
+            descriptor,
+            staged,
+            emulated_load,
+            deliver,
+            reply,
+        })
+        .map_err(|error| match error {
             TrySendError::Full(_) => IoSubmitError::Full,
             TrySendError::Disconnected(_) => IoSubmitError::Closed,
-        },
-    )?;
+        })?;
     Ok(receiver)
 }
 
@@ -310,6 +323,7 @@ impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
         key: ArtifactKey,
         descriptor: ManifestArtifact,
         staged: bool,
+        emulated_load: Option<std::time::Duration>,
         deliver: ImportDelivery,
     ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
         self.core.submit_with(|reply| IoCommand::Import {
@@ -317,6 +331,7 @@ impl<'scope, E: std::error::Error + 'static> ProducerIoClient<'scope, E> {
             key,
             descriptor,
             staged,
+            emulated_load,
             deliver,
             reply,
         })
@@ -538,9 +553,23 @@ where
         entry.2 += bytes;
         let _timing = TimingGuard { started, entry: &mut entry.1 };
         match command {
-            IoCommand::Import { frame, key, descriptor, staged, deliver, reply } => {
+            IoCommand::Import { frame, key, descriptor, staged, emulated_load, deliver, reply } => {
                 if failed {
                     let _ = reply.send(Err(IoWorkerError::PriorFailure));
+                    continue;
+                }
+                if let Some(duration) = emulated_load {
+                    std::thread::sleep(duration);
+                    let result =
+                        crate::backend::poly_gpu::zero_artifact_payload(&descriptor.artifact_type)
+                            .map_err(IoWorkerError::Upload)
+                            .and_then(|payload| {
+                                deliver(ImportedArtifact::Host(payload))
+                                    .map(|()| IoCompletion::Imported { frame })
+                                    .map_err(IoWorkerError::Upload)
+                            });
+                    failed = result.is_err();
+                    let _ = reply.send(result);
                     continue;
                 }
                 let device = store
@@ -587,6 +616,7 @@ where
                     continue;
                 }
                 let staged_key = key.clone();
+                let mut early_reply = Some(reply);
                 let result = slot
                     .ready()
                     .map_err(|error| IoWorkerError::InvalidExport(error.to_string()))
@@ -613,9 +643,19 @@ where
                         }
                         let offset = ready.header.artifact_offset;
                         match ready.payload {
-                            GpuExportPayload::Host(bytes) => store
-                                .stage_raw_chunk(key, total_raw_bytes, offset, bytes)
-                                .map_err(IoWorkerError::Store),
+                            // The slot is free once its bytes are copied: the
+                            // producer reuses it for its next wave while the
+                            // copy is written. A write failure fails every
+                            // later command, the publication included.
+                            GpuExportPayload::Host(bytes) => {
+                                let bytes = bytes.to_vec();
+                                if let Some(reply) = early_reply.take() {
+                                    let _ = reply.send(Ok(IoCompletion::Exported { frame }));
+                                }
+                                store
+                                    .stage_raw_chunk(key, total_raw_bytes, offset, &bytes)
+                                    .map_err(IoWorkerError::Store)
+                            }
                             GpuExportPayload::Device { physical_device, address, bytes } => {
                                 if let Some(device) = store.device_artifacts() {
                                     device_staged.insert(key.clone());
@@ -669,7 +709,16 @@ where
                         Ok(IoCompletion::Exported { frame })
                     });
                 failed = result.is_err();
-                let _ = reply.send(result);
+                match early_reply {
+                    Some(reply) => {
+                        let _ = reply.send(result);
+                    }
+                    None => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "staging a copied export failed");
+                        }
+                    }
+                }
             }
             IoCommand::Commit { frame, handle, reply } => {
                 if failed {
@@ -880,6 +929,7 @@ mod tests {
                     key(),
                     descriptor(),
                     false,
+                    None,
                     Box::new(|_| Ok(())),
                 )
                 .expect("import command");

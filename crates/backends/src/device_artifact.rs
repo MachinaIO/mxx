@@ -12,7 +12,7 @@ use crate::{
     backend::poly_gpu::{PhysicalExport, transcode_raw_artifact},
     poly::dcrt::gpu::GpuDeviceMemory,
 };
-use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType};
+use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType, ProductionId};
 use std::{collections::BTreeMap, sync::Arc};
 
 /// One finished artifact in GPU memory.
@@ -181,6 +181,12 @@ impl DeviceArtifacts {
     pub(crate) fn remove(&mut self, key: &ArtifactKey) {
         self.stages.remove(key);
         self.entries.remove(key);
+    }
+
+    /// Drop every staged or finished artifact of `production`.
+    pub(crate) fn remove_production(&mut self, production: &ProductionId) {
+        self.stages.retain(|key, _| &key.production != production);
+        self.entries.retain(|key, _| &key.production != production);
     }
 
     /// Total raw bytes of the finished artifacts.

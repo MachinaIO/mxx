@@ -107,6 +107,12 @@ pub trait SessionStore: ArtifactStore {
 
     fn release_session(&mut self, production: &ProductionId) -> Result<(), Self::Error>;
 
+    /// Remove everything stored under an unfinalized production: its session
+    /// with what it recorded or staged, and any artifacts or manifest stored
+    /// without a session, as if the production had never been written. A
+    /// finalized session is kept and reported as an error.
+    fn discard_session(&mut self, production: &ProductionId) -> Result<(), Self::Error>;
+
     fn transcript_entry(
         &mut self,
         production: &ProductionId,
@@ -396,6 +402,10 @@ impl<'store, S: SessionStore + ?Sized> crate::artifact::ArtifactStore
     fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
         self.store.store_manifest(manifest).map_err(ProducerSessionError::Store)
     }
+
+    fn evict_cached(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+        self.store.evict_cached(key).map_err(ProducerSessionError::Store)
+    }
 }
 
 impl<'store, S: SessionStore + ?Sized> SessionStore for ProducerSession<'store, S> {
@@ -415,6 +425,10 @@ impl<'store, S: SessionStore + ?Sized> SessionStore for ProducerSession<'store, 
 
     fn release_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
         self.store.release_session(production).map_err(ProducerSessionError::Store)
+    }
+
+    fn discard_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
+        self.store.discard_session(production).map_err(ProducerSessionError::Store)
     }
 
     fn transcript_entry(

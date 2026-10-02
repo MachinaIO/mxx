@@ -980,6 +980,16 @@ unsafe extern "C" {
         source_binding_base: u32,
         destination_binding_base: u32,
     ) -> c_int;
+    fn gpu_raw_matrix_gadget_scale(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        source: *const GpuRawMatrixViewAbi,
+        destination: *const GpuRawMatrixViewAbi,
+        residues: *const u64,
+        digits: usize,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> c_int;
     fn gpu_raw_matrix_scale_dynamic(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
@@ -1465,19 +1475,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn gpu_device_release_cached_memory(ctx: *const GpuContextOpaque, device: c_int) -> c_int;
     fn gpu_device_graph_memory_reserved(device: c_int, out_reserved_bytes: *mut usize) -> c_int;
-    fn gpu_graph_allocation_free_async(address: u64, stream: *mut c_void) -> c_int;
-    fn mxx_gpu_graph_builder_add_memory_alloc(
+    fn mxx_gpu_graph_builder_add_memory_barrier(
         builder: *mut MxxGpuGraphBuilderOpaque,
-        device: c_int,
-        bytes: usize,
-        after: *const u32,
-        after_count: usize,
-        out_token: *mut u32,
-        out_address: *mut u64,
-    ) -> c_int;
-    fn mxx_gpu_graph_builder_add_memory_free(
-        builder: *mut MxxGpuGraphBuilderOpaque,
-        address: u64,
         operations: *const u32,
         operation_count: usize,
         after: *const u32,
@@ -3540,6 +3539,51 @@ impl GpuDCRTPolyParams {
                 &destination,
                 scalar_residues.as_ptr(),
                 scalar_residues.len(),
+                source_binding_base,
+                destination_binding_base,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Write the product of a one-row `source` and the gadget `I_r (x) g` into
+    /// the one-row `destination` of `r * digits` columns in one launch per
+    /// limb batch: column `i * digits + t` is `source[0, i] * g_t`. The
+    /// residues are digit-major, `residues[t * limbs + limb]` for `g_t`.
+    pub fn emit_raw_matrix_gadget_scale(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        source: &GpuRawMatrixView,
+        destination: &GpuRawMatrixView,
+        residues: &[u64],
+        digits: usize,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if source.physical_device != stream.physical_device ||
+            destination.physical_device != stream.physical_device ||
+            source.degree != self.ring_dimension ||
+            destination.degree != self.ring_dimension ||
+            digits == 0 ||
+            source.limbs.len().checked_mul(digits) != Some(residues.len())
+        {
+            return Err(GpuNativeGraphError::Native(
+                "raw gadget scale view/context mismatch".into(),
+            ));
+        }
+        let source = source.abi();
+        let destination = destination.abi();
+        if unsafe {
+            gpu_raw_matrix_gadget_scale(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &source,
+                &destination,
+                residues.as_ptr(),
+                digits,
                 source_binding_base,
                 destination_binding_base,
             )
@@ -5660,15 +5704,6 @@ impl Drop for GpuContext {
 }
 
 impl GpuNativeLaunchStream {
-    /// Free a Graph-owned allocation of an earlier Graph once the work already
-    /// enqueued on this stream completes.
-    pub fn free_graph_allocation(&self, address: u64) -> Result<(), GpuNativeGraphError> {
-        if unsafe { gpu_graph_allocation_free_async(address, self.raw) } != 0 {
-            return Err(GpuNativeGraphError::Native(last_error_string()));
-        }
-        Ok(())
-    }
-
     pub fn begin_graph(&self) -> Result<GpuNativeGraphBuilder, GpuNativeGraphError> {
         let mut raw = ptr::null_mut();
         let status = unsafe {
@@ -6269,6 +6304,7 @@ unsafe impl Send for GpuDeviceBuffer {}
 unsafe impl Sync for GpuDeviceBuffer {}
 
 impl GpuDeviceBuffer {
+    /// A buffer of `bytes` on the stream's device, zeroed in stream order.
     pub(crate) fn allocate(
         stream: &GpuNativeLaunchStream,
         bytes: usize,
@@ -6305,6 +6341,10 @@ impl GpuDeviceBuffer {
 
     pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.device_address(0, self.bytes)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes
     }
 
     fn device_address(&self, offset: usize, bytes: usize) -> *mut c_void {
@@ -6448,45 +6488,17 @@ impl GpuNativeGraphBuilder {
         std::mem::replace(&mut self.stream, stream)
     }
 
-    /// Allocate one graph-owned buffer on `device`, ordered after the memory
-    /// nodes `after`, and return its token and fixed address.
-    pub fn add_memory_alloc(
+    /// An empty node after the memory nodes `after` and after the emitted
+    /// top-level `operations`, returning its token.
+    pub fn add_memory_barrier(
         &mut self,
-        device: i32,
-        bytes: usize,
-        after: &[u32],
-    ) -> Result<(u32, u64), GpuNativeGraphError> {
-        let (mut token, mut address) = (0, 0);
-        if unsafe {
-            mxx_gpu_graph_builder_add_memory_alloc(
-                self.raw,
-                device,
-                bytes,
-                after.as_ptr(),
-                after.len(),
-                &mut token,
-                &mut address,
-            )
-        } != 0
-        {
-            return Err(GpuNativeGraphError::Native(last_error_string()));
-        }
-        Ok((token, address))
-    }
-
-    /// Free one graph allocation after the memory nodes `after` and after the
-    /// emitted top-level `operations` that use it, and return its token.
-    pub fn add_memory_free(
-        &mut self,
-        address: u64,
         operations: &[u32],
         after: &[u32],
     ) -> Result<u32, GpuNativeGraphError> {
         let mut token = 0;
         if unsafe {
-            mxx_gpu_graph_builder_add_memory_free(
+            mxx_gpu_graph_builder_add_memory_barrier(
                 self.raw,
-                address,
                 operations.as_ptr(),
                 operations.len(),
                 after.as_ptr(),
@@ -6500,7 +6512,7 @@ impl GpuNativeGraphBuilder {
         Ok(token)
     }
 
-    /// Make the next top-level operation start after these allocations.
+    /// Make the next top-level operation start after these memory barriers.
     pub fn set_pending_memory_dependencies(
         &mut self,
         tokens: &[u32],
@@ -7324,6 +7336,28 @@ mod tests {
         graph.launch(&stream).unwrap().wait().unwrap();
         assert_eq!(status.read().unwrap(), 2);
         assert_eq!(read_coefficient(0), 0);
+    }
+
+    /// A new device buffer reads zero even when the pool hands it the memory
+    /// a buffer filled with other bytes freed on the same stream just before.
+    #[test]
+    #[sequential(gpu_context)]
+    fn device_buffer_starts_zeroed_after_the_pool_reuses_memory() {
+        let Some(&device) = detected_gpu_device_ids().first() else {
+            return;
+        };
+        let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
+        let stream = params.native_launch_stream(device).unwrap();
+        let bytes = 1 << 20;
+        for _ in 0..4 {
+            let dirty = GpuDeviceBuffer::allocate(&stream, bytes).unwrap();
+            dirty.upload(0, &vec![0xA5; bytes]).unwrap();
+            drop(dirty);
+            let fresh = GpuDeviceBuffer::allocate(&stream, bytes).unwrap();
+            let mut read = vec![0xFF; bytes];
+            fresh.download(0, &mut read).unwrap();
+            assert!(read.iter().all(|byte| *byte == 0), "a reused buffer keeps old bytes");
+        }
     }
 
     #[test]

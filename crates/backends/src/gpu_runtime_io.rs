@@ -65,7 +65,14 @@ use thiserror::Error;
 /// production during replay.
 pub(crate) enum RuntimeIoOperation {
     /// Read one artifact and upload it with `deliver` on the worker.
-    Import { key: ArtifactKey, descriptor: ManifestArtifact, staged: bool, deliver: ImportDelivery },
+    Import {
+        key: ArtifactKey,
+        descriptor: ManifestArtifact,
+        staged: bool,
+        /// See `IoCommand::Import`.
+        emulated_load: Option<std::time::Duration>,
+        deliver: ImportDelivery,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -167,8 +174,8 @@ impl<'scope, E: std::error::Error + 'static> IoSubmitter<'scope, E>
         operation: RuntimeIoOperation,
     ) -> Result<IoRequest<'scope, E>, IoSubmitError> {
         match operation {
-            RuntimeIoOperation::Import { key, descriptor, staged, deliver } => {
-                self.try_import(frame, key, descriptor, staged, deliver)
+            RuntimeIoOperation::Import { key, descriptor, staged, emulated_load, deliver } => {
+                self.try_import(frame, key, descriptor, staged, emulated_load, deliver)
             }
         }
     }
@@ -315,6 +322,9 @@ pub struct ProducerIoPump<'scope, E: std::error::Error + Send + Sync + 'static> 
     pending_publishes:
         BTreeMap<ArtifactKey, (FrameGeneration, ArtifactHandle, u8, Arc<PhysicalExport>)>,
     observer: Option<IoObserver<E>>,
+    /// Streamed export writes by template, submitted by the runtime after the
+    /// wave that published them (see `export_streamed`).
+    streamed: BTreeMap<usize, PlannedExportSlot>,
     _scope: PhantomData<&'scope ()>,
 }
 
@@ -325,8 +335,69 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
             pending_commits: Vec::new(),
             pending_publishes: BTreeMap::new(),
             observer: None,
+            streamed: BTreeMap::new(),
             _scope: PhantomData,
         }
+    }
+
+    /// Plan the streamed export writes of this execute, by export template.
+    pub(crate) fn set_streamed_exports(&mut self, slots: BTreeMap<usize, PlannedExportSlot>) {
+        self.streamed = slots;
+    }
+
+    /// Write the streamed export of `template` once its wave has joined:
+    /// submit its published slot, wait until the worker has staged it, queue
+    /// its publication, and rearm the slot for the next wave, which writes
+    /// another member into it. A template this execute does not write (a
+    /// consumer, or a finalized replay) is skipped.
+    pub(crate) fn export_streamed(&mut self, template: usize) -> Result<(), IoPumpError<E>> {
+        let Some(slot) = self.streamed.remove(&template) else { return Ok(()) };
+        let handle = slot.commit_to_session.then(|| ArtifactHandle {
+            key: slot.key.clone(),
+            artifact_type: slot.artifact_type.clone(),
+            availability: slot.availability,
+            layout: slot.layout.clone(),
+        });
+        let encoding = handle.clone().map(|handle| ExportEncoding {
+            handle,
+            payload_kind: slot.payload_kind,
+            export: Arc::clone(&slot.export),
+        });
+        let completion = submit_export_slot(
+            &self.core.client.observer_sender(),
+            slot.frame,
+            slot.key,
+            Arc::clone(&slot.slot),
+            slot.site,
+            slot.occurrence,
+            slot.raw_offset,
+            slot.raw_bytes,
+            slot.final_chunk,
+            slot.export.raw_total_bytes,
+            encoding,
+        )
+        .map_err(IoPumpError::Submit)?
+        .recv()
+        .unwrap_or(Err(IoWorkerError::Closed))
+        .map_err(IoPumpError::Worker)?;
+        if completion.frame() != slot.frame {
+            return Err(IoPumpError::StaleFrame {
+                expected: slot.frame,
+                actual: completion.frame(),
+            });
+        }
+        if let Some(handle) = handle {
+            self.pending_publishes.entry(handle.key.clone()).or_insert((
+                slot.frame,
+                handle,
+                slot.payload_kind,
+                slot.export,
+            ));
+        }
+        // SAFETY: the wave that wrote the slot has joined, and the worker has
+        // finished reading it.
+        unsafe { slot.slot.reset_after_completion() }
+            .map_err(|error| IoPumpError::Observer(error.to_string()))
     }
 
     /// Begin observing the preallocated write slots and the import request
@@ -424,10 +495,23 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
                         })
                         .and_then(|index| {
                             let key = ArtifactKey { index: Some(index), ..request.key.clone() };
-                            let RuntimeIoOperation::Import { key, descriptor, staged, deliver } =
-                                (request.operation)(key)?;
-                            submit_import(&sender, request.frame, key, descriptor, staged, deliver)
-                                .map_err(|error| error.to_string())
+                            let RuntimeIoOperation::Import {
+                                key,
+                                descriptor,
+                                staged,
+                                emulated_load,
+                                deliver,
+                            } = (request.operation)(key)?;
+                            submit_import(
+                                &sender,
+                                request.frame,
+                                key,
+                                descriptor,
+                                staged,
+                                emulated_load,
+                                deliver,
+                            )
+                            .map_err(|error| error.to_string())
                         });
                     // A consumer that is gone has already failed its execute.
                     let _ = started_sender.send((request.destination, request.frame, started));
@@ -517,8 +601,16 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
         frame: FrameGeneration,
         manifest: mxx_ir_core::artifact::Manifest,
     ) -> Result<IoRequest<'scope, E>, IoPumpError<E>> {
+        self.publish_and_commit()?;
+        self.core.client.try_finalize(frame, manifest).map_err(IoPumpError::Submit)
+    }
+
+    /// Publish every observed export and commit it to the session, and return
+    /// how many artifacts were published.
+    pub(crate) fn publish_and_commit(&mut self) -> Result<usize, IoPumpError<E>> {
         self.finish_observer(true)?;
         self.core.drain()?;
+        let published = self.pending_publishes.len();
         for (_, (write_frame, handle, payload_kind, export)) in
             std::mem::take(&mut self.pending_publishes)
         {
@@ -556,7 +648,7 @@ impl<'scope, E: std::error::Error + Send + Sync + 'static> ProducerIoPump<'scope
                 });
             }
         }
-        self.core.client.try_finalize(frame, manifest).map_err(IoPumpError::Submit)
+        Ok(published)
     }
 }
 

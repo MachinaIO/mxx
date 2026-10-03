@@ -404,4 +404,82 @@ theorem mul_private {q m m' bound : Nat} (hn : 0 < n) (hq1 : 1 < q)
     (fun j ↦ coeffBound_smul hn hμ (heB j))
   exact habs
 
+set_option maxHeartbeats 1000000 in
+/-- Private multiplication that drops the factor `p = q / q'`: the stacked encoding of `μ` with
+scale `p` is acted on by the decomposition of the preprocessed RHS `(top, bot)` at `q'`, and the
+row and key are moved down. The payload relation `r₀ top_j + bot_j = T_j + e_B` gives an encoding
+of `μ T_j` at `q'`. -/
+theorem mul_private_down {q q' p m m' bound : Nat} (hn : 0 < n) (hq : q = p * q') (hq1 : 1 < q)
+    (hq' : 1 < q') (hp : 0 < p)
+    {backend : BackendContext} {base digits : Int} (layout : RegularLayout q')
+    (hlayout : backend.regularLayout q' n = some layout) (hexact : layout.droppedModuli = 0)
+    {g' : ExactMatrix q' n 1 m} (hg' : gadgetMatrixRuns backend base digits g')
+    {g : ExactMatrix q n 1 m} (hg : centeredRebaseRuns g' g)
+    {sm sp μ : ErrorPoly n} (hsm : polyNorm sm ≤ 1) {A : Fin 2 → Fin 2 → ExactMatrix q n 1 m}
+    {c : Fin 2 → ExactMatrix q n 1 m} {B : Nat}
+    (henc : Rel sm A (fun j ↦ reducePoly q n ((p : Int) * μ * unitPair sp j) • g) c B)
+    {l01 r01 : ExactMatrix q n (1 + 1) m} {l r : ExactMatrix q n (1 + 1 + 1) m}
+    {both : ExactMatrix q n (1 + 1 + 1) (m + m)}
+    (hl01 : concatRows (c 0) (A 0 0) l01) (hl : concatRows l01 (A 1 0) l)
+    (hr01 : concatRows (c 1) (A 0 1) r01) (hr : concatRows r01 (A 1 1) r)
+    (hboth : concatColumns l r both)
+    {top bot : Fin 2 → ExactMatrix q' n 1 m'} {Xb : Fin 2 → ExactMatrix q' n (1 + 1) m'}
+    (hXb : ∀ j, concatRows (top j) (bot j) (Xb j))
+    {D' : Fin 2 → ExactMatrix q' n (m + m) m'}
+    (hD' : ∀ j, gadgetDecomposeRuns backend base digits (Xb j) (D' j))
+    {D : Fin 2 → ExactMatrix q n (m + m) m'} (hD : ∀ j, compactCenteredRebaseRuns bound (D' j) (D j))
+    {T : Fin 2 → ExactMatrix q' n 1 m'} {eB : Fin 2 → ErrorMatrix n 1 m'} {BB : Nat}
+    (hrhs : ∀ j, reducePoly q' n sp • top j + bot j = T j + reduceMatrix q' n 1 m' (eB j))
+    (heB : ∀ j, CoeffBound (eB j) BB) (hμ : polyNorm μ ≤ 1)
+    {X : Fin 2 → ExactMatrix q n 1 m'} {M : Fin 2 → Fin 2 → ExactMatrix q n 1 m'}
+    (hX : ∀ j, sliceMatrix (matrixMul both (D j)) 0 1 0 m' (X j))
+    (hM0 : ∀ j, sliceMatrix (matrixMul both (D j)) 1 2 0 m' (M 0 j))
+    (hM1 : ∀ j, sliceMatrix (matrixMul both (D j)) 2 3 0 m' (M 1 j))
+    {basis : List Nat} {c' : Fin 2 → ExactMatrix q' n 1 m'}
+    {A' : Fin 2 → Fin 2 → ExactMatrix q' n 1 m'}
+    (hc' : ∀ j, blockModSwitchRuns basis 1 (X j) (c' j))
+    (hA' : ∀ k j, blockModSwitchRuns basis 1 (M k j) (A' k j)) :
+    Rel sm A' (fun j ↦ reducePoly q' n μ • T j) c'
+      (((m + m) * n * B * bound + (n + 2) * (p / 2)) / p + n * 1 * BB) := by
+  have hrows := fun j ↦ stacked_row hl01 hl hr01 hr hboth (D j)
+  choose d hd using fun j ↦ (hD j).2.2.2
+  have hDd : ∀ j, D j = reduceMatrix q n (m + m) m' (d j) := fun j ↦ (hd j).1
+  have hact := henc.action hn d (fun j ↦ (hd j).2)
+  simp only [← hDd] at hact
+  have hXe : ∀ j, X j = pairMul c (D j) := by
+    intro j
+    rw [sliceMatrix_row (rows := 1 + 1 + 1) 0 (hX j), ← pair_eta c]
+    exact (hrows j).1
+  have hMe : ∀ k j, M k j = pairMul (A k) (D j) := by
+    intro k j
+    match k with
+    | 0 =>
+      rw [sliceMatrix_row (rows := 1 + 1 + 1) 1 (hM0 j), ← pair_eta (A 0)]
+      exact (hrows j).2.1
+    | 1 =>
+      rw [sliceMatrix_row (rows := 1 + 1 + 1) 2 (hM1 j), ← pair_eta (A 1)]
+      exact (hrows j).2.2
+  have ht : ∀ j, pairMul (fun i ↦ reducePoly q n ((p : Int) * μ * unitPair sp i) • g) (D j) =
+      scaleUpMatrix q p (reducePoly q' n μ • T j + reduceMatrix q' n 1 m' (μ • eB j)) := by
+    intro j
+    have hgad := gadget_action_scaleUp hq hq' hn layout hlayout hexact hg' hg (hD' j) (hD j)
+      (fun i ↦ μ * unitPair sp i)
+    simp only [← mul_assoc] at hgad
+    rw [hgad, (concatRows_two (hXb j)).1, (concatRows_two (hXb j)).2, reduceMatrix_smul,
+      ← smul_add, ← hrhs j]
+    congr 1
+    simp only [unitPair, Matrix.cons_val_zero, Matrix.cons_val_one, map_mul, mul_one, smul_add,
+      smul_smul]
+  have hpq : q / q' = p := by rw [hq, Nat.mul_div_cancel _ (by omega)]
+  have hdown := hact.modDown hn hq hq1 hq' hp hsm (A' := A') (c' := c') ht
+    (fun k j ↦ by
+      obtain ⟨r, hr, hrel⟩ := blockModSwitchRuns_scaleUp hn (hA' k j)
+      rw [hpq] at hr hrel
+      exact ⟨r, hr, by rw [hrel, hMe k j]⟩)
+    (fun j ↦ by
+      obtain ⟨r, hr, hrel⟩ := blockModSwitchRuns_scaleUp hn (hc' j)
+      rw [hpq] at hr hrel
+      exact ⟨r, hr, by rw [hrel, hXe j]⟩)
+  exact hdown.absorb (f := fun j ↦ μ • eB j) (fun j ↦ coeffBound_smul hn hμ (heB j))
+
 end MxxExponentLut

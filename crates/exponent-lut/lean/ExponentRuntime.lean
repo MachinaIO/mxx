@@ -71,6 +71,20 @@ theorem gaussian_bound {q rows columns : Nat} {sigma : Rat} {cutoff : Int}
   obtain ⟨w, hw, hb⟩ := gaussianSample_bounded h
   exact ⟨w, hw, fun i j k ↦ (coeff_natAbs_le_polyNorm _ k).trans (hb i j)⟩
 
+/-- A ternary tape sample as one integer polynomial. -/
+theorem ternary_poly_at (hn : 0 < n) {q : Nat} {tape : SampleTape} {site : List Nat}
+    {output : ExactMatrix q n 1 1} (h : uniformIntervalSampleAt tape site (-1) 1 output) :
+    ∃ s : ErrorPoly n, output = (fun _ _ ↦ reducePoly q n s) ∧ polyNorm s ≤ 1 :=
+  ternary_poly (uniformIntervalSampleAt_sample hn h)
+
+/-- A Gaussian tape sample as an integer matrix within its cutoff. -/
+theorem gaussian_bound_at (hn : 0 < n) {q rows columns : Nat} {tape : SampleTape} {site : List Nat}
+    {sigma : Rat} {cutoff : Int} {output : ExactMatrix q n rows columns}
+    (h : gaussianSampleAt tape site sigma cutoff output) :
+    ∃ e : ErrorMatrix n rows columns, output = reduceMatrix q n rows columns e ∧
+      CoeffBound e cutoff.toNat :=
+  gaussian_bound (gaussianSampleAt_sample hn h)
+
 /-- The plaintext `c X^e`. -/
 noncomputable def message (coefficient exponent : Int) : ErrorPoly n :=
   (coefficient : ErrorPoly n) *

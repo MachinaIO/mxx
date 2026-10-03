@@ -330,7 +330,7 @@ theorem ideal_value {a : Fin 17 → Int} {s0 s1 s2 s3 s4 : Fin 14 → Int} {out 
   congr 3
   simp only [selectedSum, Fin.sum_univ_succ, Fin.sum_univ_zero, coords]
   simp
-  ring
+  ring_nf
 
 /-! ## Plaintexts of the run -/
 

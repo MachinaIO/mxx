@@ -135,8 +135,7 @@ fn select_candidate(
         .unwrap_or_else(|error| panic!("invalid NAND maximum CRT depth: {error}"));
     let operations_per_drop = env_usize("MXX_EXPONENT_LUT_NAND_OPERATIONS_PER_DROP", 2)
         .unwrap_or_else(|error| panic!("invalid NAND operations-per-drop: {error}"));
-    // Each drop removes up to this many CRT primes; the drop quotient is the
-    // message scale that the level noise must stay below half of.
+    // Each drop removes up to this many CRT primes.
     let max_primes_per_drop = env_usize("MXX_EXPONENT_LUT_NAND_MAX_PRIMES_PER_DROP", 4)
         .unwrap_or_else(|error| panic!("invalid NAND maximum primes-per-drop: {error}"));
     assert!(max_primes_per_drop > 0, "MXX_EXPONENT_LUT_NAND_MAX_PRIMES_PER_DROP must be positive");

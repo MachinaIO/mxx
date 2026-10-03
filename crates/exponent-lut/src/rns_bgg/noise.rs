@@ -347,14 +347,15 @@ impl RnsBggParameters {
         Ok((error * 2u8 + (&n + 2u8) * (p - 1u8) + &twice_p - 1u8) / twice_p)
     }
 
-    /// Check the deterministic q/4 correctness threshold and q/2 message
-    /// scaling condition.
+    /// Check the deterministic q/4 correctness threshold.
+    ///
+    /// The noise need not stay below half of the level's drop: the message is
+    /// part of the gadget term `p_level x r G`, which ModDown divides exactly,
+    /// so noise above `p_level / 2` only remains as noise at the next level,
+    /// where [`Self::lut_mod_down_bound`] and the inherited LUT term carry it.
     pub fn noise_fits(&self, level: usize, noise: &RnsBggNoiseBound) -> Result<bool, RnsBggError> {
         let q = self.level(level)?.modulus();
-        Ok(q.as_ref() > &(&noise.error * 4u8) &&
-            (level + 1 == self.levels().len() ||
-                self.scale(level)? == &BigUint::one() ||
-                self.scale(level)? > &(&noise.error * 2u8)))
+        Ok(q.as_ref() > &(&noise.error * 4u8))
     }
 
     /// Deterministic public-key/encoding conversion transfer for
@@ -3701,9 +3702,7 @@ pub struct RnsBggPlanRequest {
     pub terminal_value_bound: BigUint,
     /// Logical operations per physical drop.
     pub operations_per_drop: usize,
-    /// CRT primes removed by each physical drop. The drop quotient is the
-    /// message scale that a level's noise must stay below half of, so its
-    /// width, not only the drop cadence, decides whether a level fits.
+    /// CRT primes removed by each physical drop.
     pub primes_per_drop: usize,
 }
 
@@ -3905,23 +3904,11 @@ impl RnsBggParameters {
                     4u8.into(),
                 )
                 .map_err(|_| RnsBggError::Parameters("invalid average-case rational budget"))?;
-                // A coefficient LUT output keeps its noise at the scale
-                // before its one scale-and-round; the finalized output is
-                // checked against the terminal modulus below.
-                let coefficient_output = program
-                    .wire_is_coefficient_output(*wire)
-                    .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?;
-                let scale_fits = coefficient_output ||
-                    level + 1 == self.levels.len() ||
-                    self.scale(level)? == &BigUint::one() ||
-                    moments.fits(
-                        &NonnegativeRational::new(self.scale(level)?.clone(), 2u8.into()).map_err(
-                            |_| RnsBggError::Parameters("invalid average-case rational budget"),
-                        )?,
-                        z_squared,
-                    );
-                let modulus_fits = moments.fits(&modulus_limit, z_squared);
-                if !modulus_fits || !scale_fits {
+                // Only the q/4 threshold applies. ModDown divides the noise
+                // and the modulus by the same drop, so a wire over this limit
+                // also fails the terminal decode; noise above half the drop
+                // only remains as tracked noise at the next level.
+                if !moments.fits(&modulus_limit, z_squared) {
                     tracing::info!(
                         wire = wire.0,
                         level,
@@ -3930,8 +3917,6 @@ impl RnsBggParameters {
                             moments.variance.denominator.bits() as i64,
                         modulus_bits = self.level(level)?.modulus().bits(),
                         scale_bits = self.scale(level)?.bits(),
-                        modulus_fits,
-                        scale_fits,
                         z_squared_log2 = variance_log2(z_squared),
                         top_modulus_bits = self.levels[0].modulus().bits(),
                         first_scale_bits = self.scale(0)?.bits(),
@@ -5606,6 +5591,19 @@ mod test {
         assert!(
             !parameters
                 .noise_fits(1, &RnsBggNoiseBound { error: above, payload_l1: BigUint::zero() })
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn intermediate_noise_may_exceed_half_the_drop() {
+        let parameters = nested_alignment_parameters();
+        let q = parameters.level(0).unwrap().modulus().as_ref().clone();
+        let drop = parameters.scale(0).unwrap().clone();
+        assert!(&drop * 4u8 < q);
+        assert!(
+            parameters
+                .noise_fits(0, &RnsBggNoiseBound { error: drop, payload_l1: BigUint::zero() })
                 .unwrap()
         );
     }

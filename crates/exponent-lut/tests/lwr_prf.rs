@@ -251,8 +251,7 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
     assert!(max_crt_depth > 0, "MXX_EXPONENT_LUT_LWR_PRF_MAX_CRT_DEPTH must be positive");
     let operations_per_drop = env_usize("MXX_EXPONENT_LUT_LWR_PRF_OPERATIONS_PER_DROP", 1)
         .expect("operations-per-drop configuration");
-    // Each drop removes up to this many CRT primes; the drop quotient is the
-    // message scale that the level noise must stay below half of.
+    // Each drop removes up to this many CRT primes.
     let max_primes_per_drop = env_usize("MXX_EXPONENT_LUT_LWR_PRF_MAX_PRIMES_PER_DROP", 4)
         .expect("maximum primes-per-drop configuration");
     assert!(

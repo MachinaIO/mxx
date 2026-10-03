@@ -75,8 +75,7 @@ fn select_rns_candidate() -> SelectedCandidate {
     assert!(max_crt_depth >= 2, "MXX_EXPONENT_LUT_NOISE_REFRESH_MAX_CRT_DEPTH must be at least 2");
     let operations_per_drop = env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_OPERATIONS_PER_DROP", 1)
         .expect("valid operations-per-drop setting");
-    // Each drop removes up to this many CRT primes; the drop quotient is the
-    // message scale that the level noise must stay below half of.
+    // Each drop removes up to this many CRT primes.
     let max_primes_per_drop = env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_MAX_PRIMES_PER_DROP", 4)
         .expect("valid maximum primes-per-drop setting");
     assert!(max_primes_per_drop > 0);

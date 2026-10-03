@@ -639,6 +639,19 @@ impl IntExpr {
         Polynomial::from_expr(self).into_expr()
     }
 
+    /// The constant this expression's terms cancel to, such as the width
+    /// `(h + 1) - h` of a unit slice. Unlike [`Self::canonicalize`], a
+    /// cancelled partial generator (a division or remainder) is dropped: the
+    /// caller evaluates the original bounds, which keep it.
+    pub fn cancelled_constant(&self) -> Option<BigInt> {
+        let polynomial = Polynomial::from_expr(self);
+        match polynomial.terms.len() {
+            0 => Some(BigInt::zero()),
+            1 => polynomial.terms.get(&Vec::new()).cloned(),
+            _ => None,
+        }
+    }
+
     pub fn contains_variable(&self, variable: &str) -> bool {
         match self {
             Self::Const(_) => false,
@@ -878,6 +891,18 @@ impl Rational {
 }
 
 impl RealExpr {
+    pub fn contains_loop_index(&self) -> bool {
+        match self {
+            Self::FromInt(value) => value.contains_loop_index(),
+            Self::Add(left, right) |
+            Self::Sub(left, right) |
+            Self::Mul(left, right) |
+            Self::Div(left, right) => left.contains_loop_index() || right.contains_loop_index(),
+            Self::Sqrt(value) => value.contains_loop_index(),
+            Self::Rational(_) | Self::Var(_) => false,
+        }
+    }
+
     pub fn from_integer(value: impl Into<BigInt>) -> Self {
         Self::Rational(Rational::from_integer(value.into()))
     }
@@ -1273,6 +1298,16 @@ pub fn euclidean_div_rem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_constant_drops_cancelled_partial_generators() {
+        let remainder =
+            IntExpr::Rem(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(3)));
+        let width = (remainder.clone() + IntExpr::constant(1)) - remainder.clone();
+        assert_eq!(width.cancelled_constant(), Some(BigInt::from(1)));
+        assert!(width.canonicalize().contains_loop_index());
+        assert_eq!(remainder.cancelled_constant(), None);
+    }
 
     #[test]
     fn test_integer_division_remainder_and_negation_preserve_existing_semantics() {

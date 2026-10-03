@@ -150,6 +150,48 @@ pub enum ConcreteWireType {
     },
 }
 
+impl WireType {
+    /// Whether this type's shape, ring, or bounds depend on a loop index.
+    pub fn contains_loop_index(&self) -> bool {
+        let matrix = |matrix: &MatrixType| {
+            matrix.ring.contains_loop_index() ||
+                matrix.rows.contains_loop_index() ||
+                matrix.columns.contains_loop_index()
+        };
+        match self {
+            Self::ConstantInt |
+            Self::ConstantReal |
+            Self::ConstantBool |
+            Self::Int |
+            Self::Real |
+            Self::Bool |
+            Self::TypedBlob { .. } => false,
+            Self::Bytes { length } => length.contains_loop_index(),
+            Self::Matrix(type_) => matrix(type_),
+            Self::Trapdoor {
+                matrix: type_,
+                sigma,
+                gadget_base,
+                digit_count,
+                preimage_max_coefficient_bound,
+            } => {
+                matrix(type_) ||
+                    sigma.contains_loop_index() ||
+                    gadget_base.contains_loop_index() ||
+                    digit_count.contains_loop_index() ||
+                    preimage_max_coefficient_bound.contains_loop_index()
+            }
+            Self::SmallMatrix { matrix: type_, max_coefficient_bound, .. } |
+            Self::Preimage { matrix: type_, max_coefficient_bound, .. } => {
+                matrix(type_) || max_coefficient_bound.contains_loop_index()
+            }
+            Self::IndexedFamily { element, count } => {
+                element.contains_loop_index() || count.contains_loop_index()
+            }
+        }
+    }
+}
+
 impl ConcreteWireType {
     pub fn matrix_type(&self) -> Option<&ConcreteMatrixType> {
         match self {

@@ -764,14 +764,20 @@ impl<'a> PublicKeyLowering<'a> {
             member,
             level,
         );
-        let companion_key = |j| {
-            let key = super::companion_key(self.parameters, level, self.hash_key.clone(), &tag, j)?;
+        let rows = [&key.0, &key.1].map(super::join_row);
+        let key_entry = |_, r: usize, a| Ok(super::row_entry(&rows[r], a));
+        let companion_key = |_, a, j| {
+            let key =
+                super::companion_key(self.parameters, level, self.hash_key.clone(), &tag, a, j)?;
             Ok(match &sigma {
                 Some(sigma) => map_matrix(key, |entry| entry.ring_automorphism(sigma.clone())),
                 None => key,
             })
         };
-        Ok(super::companion_columns(self.parameters, level, key, &companion_key, None, false)?.0)
+        let columns = self.parameters.component_columns(level + 1)?;
+        let rows =
+            super::companion_columns(self.parameters, level, 1, &key_entry, &companion_key, None)?;
+        Ok((super::split_row(&rows[0], columns), super::split_row(&rows[1], columns)))
     }
 
     /// Sample an input key with shape selected from Program knowledge.
@@ -1134,11 +1140,6 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                         .map_err(|_| DslError::Schema)?,
                 };
                 let switched_public_key = super::mod_down_public(switched, &target_ring);
-                let switched_key_decomposition = super::centered_rebase_compact(
-                    decompose_matrix(self.parameters, next_level, switched_public_key)
-                        .map_err(|_| DslError::Schema)?,
-                    &source_ring,
-                );
                 // A_sigma is sampled in its own branch, so one is resident.
                 let data = lut_public_matrix(
                     self.parameters,
@@ -1147,10 +1148,27 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                     Int::from(sigma),
                 )
                 .map_err(|_| DslError::Schema)?;
-                Ok(super::add_public_matrices(
-                    sum,
-                    public_lut_branch(data, switched_key_decomposition),
-                ))
+                let branch = if switching_ciphertexts.is_some() {
+                    let switched_key_decomposition = super::centered_rebase_compact(
+                        decompose_matrix(self.parameters, next_level, switched_public_key)
+                            .map_err(|_| DslError::Schema)?,
+                        &source_ring,
+                    );
+                    public_lut_branch(data, switched_key_decomposition)
+                } else {
+                    // Dynamic: the rounded key is decomposed one column at a
+                    // time.
+                    let rows = super::column_action(
+                        self.parameters,
+                        source_level,
+                        next_level,
+                        &switched_public_key,
+                        vec![super::join_row(&data.0), super::join_row(&data.1)],
+                    )
+                    .map_err(|_| DslError::Schema)?;
+                    (super::split_row(&rows[0], columns), super::split_row(&rows[1], columns))
+                };
+                Ok(super::add_public_matrices(sum, branch))
             })
             .map_err(graph)?;
         let output = self.output()?;

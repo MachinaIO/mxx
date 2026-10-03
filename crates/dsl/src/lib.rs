@@ -1469,17 +1469,18 @@ impl Mat {
         self.transpose()
     }
 
+    /// A sub-matrix. A range's extent is its constant width when its bounds
+    /// cancel to one, so a window at a loop-dependent offset, such as
+    /// `h..h+1` for a remainder `h` of the loop index, keeps a loop-free type.
     #[track_caller]
     pub fn slice(self, rows: Option<IndexRange>, columns: Option<IndexRange>) -> Self {
+        let extent = |range: &IndexRange| {
+            let width = range.end.clone() - range.start.clone();
+            width.cancelled_constant().map_or_else(|| width.canonicalize(), IntExpr::Const)
+        };
         let ty = MatrixType {
-            rows: rows.as_ref().map_or_else(
-                || self.matrix_type.rows.clone(),
-                |range| (range.end.clone() - range.start.clone()).canonicalize(),
-            ),
-            columns: columns.as_ref().map_or_else(
-                || self.matrix_type.columns.clone(),
-                |range| (range.end.clone() - range.start.clone()).canonicalize(),
-            ),
+            rows: rows.as_ref().map_or_else(|| self.matrix_type.rows.clone(), extent),
+            columns: columns.as_ref().map_or_else(|| self.matrix_type.columns.clone(), extent),
             ..self.matrix_type.clone()
         };
         Self::from_node(NodeKind::Slice { rows, columns }, vec![self], ty)

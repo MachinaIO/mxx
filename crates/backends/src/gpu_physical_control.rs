@@ -6662,7 +6662,7 @@ fn lower_sequential_loop(
     let mut child_env =
         fixed_child_env(scope_id, node_id, env, &loop_node.bindings, Some(loop_node.index_slot))?;
     let first_types = resolved_scope_types(child, &child_id, &child_env)?;
-    for index in 1..count {
+    for index in (1..count).filter(|_| types_depend_on_loop_index(child)) {
         child_env.loop_indices.insert(loop_node.index_slot, BigInt::from(index));
         if resolved_scope_types(child, &child_id, &child_env)? != first_types {
             return Err("GPU sequential loop has instance-dependent physical types".into());
@@ -6988,10 +6988,13 @@ fn lower_sequential_loop(
             ctx.import_templates.push(import);
         }
         for import in &mut body_imports {
-            import.before_operation = import
-                .before_operation
-                .checked_add(body_start)
-                .ok_or_else(|| "GPU external-I/O import index overflows".to_owned())?;
+            let rebase = |operation: u32| {
+                operation
+                    .checked_add(body_start)
+                    .ok_or_else(|| "GPU external-I/O import index overflows".to_owned())
+            };
+            import.before_operation = rebase(import.before_operation)?;
+            import.request_operation = rebase(import.request_operation)?;
             if import.before_operation >= body_end {
                 return Err("GPU external-I/O import is outside its body".into());
             }
@@ -7719,14 +7722,15 @@ fn lower_parallel_loop(
         Ok(child_env)
     };
     let first_types = resolved_scope_types(child, &child_id, &child_environment(0)?)?;
-    for index in 1..count {
+    let indexed_types = types_depend_on_loop_index(child);
+    for index in (1..count).filter(|_| indexed_types) {
         let types = resolved_scope_types(child, &child_id, &child_environment(index)?)?;
         if types != first_types {
             return Err("GPU parallel loop has instance-dependent physical types".into());
         }
     }
     for (_, parent_env) in &ctx.active_parallel_instances {
-        if parent_template.is_none() {
+        if parent_template.is_none() || !indexed_types {
             break;
         }
         let mut instance_env = fixed_child_env(
@@ -8468,6 +8472,12 @@ fn bind_template_aliases(
         }
     }
     Ok(())
+}
+
+/// Whether a declared output type in `scope` names a loop index; otherwise its
+/// types are the same for every loop instance.
+fn types_depend_on_loop_index(scope: &GraphScope) -> bool {
+    scope.nodes().iter().any(|node| node.output_types().iter().any(|ty| ty.contains_loop_index()))
 }
 
 fn resolved_scope_types(

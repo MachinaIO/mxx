@@ -40,10 +40,11 @@
 //! (`MXX_GPU_MEMORY_FRACTION`), compiles its regions, and times `measurement_warmups +
 //! measurement_iterations` trials. A trial does not launch a region whose work (operations, value
 //! types and shapes, and launch shapes, not where the data is) a trial of this runtime already
-//! timed: that time is reused per launch. A candidate whose allocation, compilation, or trial fails
-//! is rejected; no VRAM requirement is predicted. Each region's time is weighted by how often
-//! production replays it, and the fastest feasible candidate is frozen into a value-only
-//! `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected report.
+//! timed: that time is reused per launch, and a host-driven loop's body runs for its first
+//! iteration only, its time counting for every iteration. A candidate whose allocation,
+//! compilation, or trial fails is rejected; no VRAM requirement is predicted. Each region's time
+//! is weighted by how often production replays it, and the fastest feasible candidate is frozen
+//! into a value-only `FrozenGpuPlan`. [`GpuExecutionPlan::report`] returns the selected report.
 //!
 //! With `profile_nodes`, planning then lowers the selected candidate once more with a Graph region
 //! boundary at every graph node's operations and times it the same way. Every separate launch pays
@@ -312,6 +313,14 @@ struct DirectGraph {
     regions: Vec<GraphRegion>,
     /// When the current execute first launched a region.
     first_launch: Option<Instant>,
+    /// Each binding's bound value, and the bindings of each physical value.
+    values: Vec<GpuGraphBindingValue>,
+    bindings_of: BTreeMap<PhysicalValueId, Vec<usize>>,
+    /// Values whose owners a wave replaced since the regions were bound.
+    rebound: BTreeSet<PhysicalValueId>,
+    /// Whether the sample seeds hold the root invocation's; a wave clears it
+    /// when it uploads its own.
+    root_seeds: bool,
 }
 
 #[derive(Clone)]
@@ -416,9 +425,10 @@ fn geometric_candidates(maximum: usize, value: impl Fn(usize) -> usize) -> Vec<u
 }
 
 /// Run every region of `graph` once, and each body region of a host-driven
-/// loop once per iteration, returning each region's seconds and launch count.
-/// A region with a `cached` launch time is not launched: that time counts for
-/// each of its launches instead.
+/// loop once, returning each region's seconds and launch count. Every
+/// iteration replays the same body work, so the first iteration's time counts
+/// for each later one. A region with a `cached` launch time is not launched:
+/// that time counts for each of its launches instead.
 fn run_trial_regions(
     graph: &mut DirectGraph,
     frame: &PhysicalFrame,
@@ -437,6 +447,7 @@ fn run_trial_regions(
         seconds[region] += started.elapsed().as_secs_f64();
         Ok(())
     };
+    let mut repeated = Vec::new();
     let mut region = 0usize;
     let mut next_loop = 0usize;
     while region < graph.regions.len() {
@@ -456,15 +467,16 @@ fn run_trial_regions(
                         "trial external-I/O loop has no matching Graph body end".into(),
                     ));
                 }
-                for iteration in 0..loop_body.count {
+                if loop_body.count > 0 {
                     loop_body
                         .index_owner
-                        .upload_u64(&[iteration])
+                        .upload_u64(&[0])
                         .and_then(|()| loop_body.index_owner.wait_until_ready())
                         .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
                     for body_region in region..end {
                         timed(graph, body_region)?;
                     }
+                    repeated.push((region..end, loop_body.count));
                 }
                 region = end;
                 next_loop += 1;
@@ -483,6 +495,12 @@ fn run_trial_regions(
         return Err(GpuRuntimeError::Execution(
             "trial external-I/O loop did not reach its Graph region".into(),
         ));
+    }
+    for (body, count) in repeated {
+        for region in body {
+            seconds[region] *= count as f64;
+            launches[region] *= usize::try_from(count).unwrap_or(usize::MAX);
+        }
     }
     Ok((seconds, launches))
 }
@@ -746,7 +764,14 @@ impl DirectGraph {
                     "empty physical Graph has scheduled work".into(),
                 ));
             }
-            return Ok(Self { regions: Vec::new(), first_launch: None });
+            return Ok(Self {
+                regions: Vec::new(),
+                first_launch: None,
+                values: Vec::new(),
+                bindings_of: BTreeMap::new(),
+                rebound: BTreeSet::new(),
+                root_seeds: false,
+            });
         }
         let mut starts = vec![0usize];
         for wave in &frame.waves {
@@ -957,99 +982,138 @@ impl DirectGraph {
                 .upload(&launch_stream)
                 .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
         }
-        let graph = Self { regions, first_launch: None };
+        let graph = Self {
+            regions,
+            first_launch: None,
+            values: Vec::new(),
+            bindings_of: BTreeMap::new(),
+            rebound: BTreeSet::new(),
+            root_seeds: false,
+        };
         wave_groups(frame, &graph).map_err(GpuPlanError::GraphCompile)?;
         Ok(graph)
     }
 
-    /// The program is immutable after its plan-time validation; only the
-    /// owners bound to each value are checked here, once per value.
+    /// Bind every region to the frame's current owners. The program is
+    /// immutable after its plan-time validation; only the owners bound to
+    /// each value are checked here, once per value.
     fn bind(&mut self, frame: &PhysicalFrame) -> Result<(), GpuRuntimeError> {
-        let mut values = Vec::with_capacity(frame.program.bindings.len());
         let mut checked = BTreeSet::new();
-        for source in frame.program.bindings.iter() {
-            let address = match *source {
-                GpuBindingSource::PhysicalPart { value, part, limb } => {
-                    if limb != 0 {
-                        return Err(GpuRuntimeError::Execution(
-                            "physical binding must name one exact CRT-limb part".into(),
-                        ));
-                    }
-                    let owner = frame.owners.get(&value).ok_or_else(|| {
-                        GpuRuntimeError::Execution("physical graph owner is missing".into())
-                    })?;
-                    let planned = frame.program.values.get(value.0 as usize).ok_or_else(|| {
-                        GpuRuntimeError::Execution("physical graph value is missing".into())
-                    })?;
-                    if checked.insert(value) && owner.physical().as_ref() != planned {
-                        return Err(GpuRuntimeError::Execution(
-                            "rebound physical metadata differs from plan".into(),
-                        ));
-                    }
-                    let part = planned.parts.get(part as usize).ok_or_else(|| {
-                        GpuRuntimeError::Execution("physical graph part is missing".into())
-                    })?;
-                    let storage = owner.storage(part.storage).ok_or_else(|| {
-                        GpuRuntimeError::Execution("physical graph storage is missing".into())
-                    })?;
-                    let offset = part.view.byte_offset;
-                    if storage.device != part.device || offset >= storage.bytes {
-                        return Err(GpuRuntimeError::Execution(
-                            "physical binding exceeds allocation".into(),
-                        ));
-                    }
-                    storage.address.checked_add(offset).ok_or_else(|| {
-                        GpuRuntimeError::Execution("physical binding address overflows".into())
-                    })?
+        self.values = (0..frame.program.bindings.len())
+            .map(|index| self.binding_value(frame, index, &mut checked))
+            .collect::<Result<_, _>>()?;
+        self.bindings_of.clear();
+        for (index, source) in frame.program.bindings.iter().enumerate() {
+            if let GpuBindingSource::PhysicalPart { value, .. } = *source {
+                self.bindings_of.entry(value).or_default().push(index);
+            }
+        }
+        self.rebound.clear();
+        for region in &mut self.regions {
+            region.executable.bind(&self.values)?;
+        }
+        Ok(())
+    }
+
+    /// Rebind only the bindings of the values a wave replaced, and the regions
+    /// only if one of their addresses changed.
+    fn rebind(&mut self, frame: &PhysicalFrame) -> Result<(), GpuRuntimeError> {
+        let mut checked = BTreeSet::new();
+        let mut changed = false;
+        for value in std::mem::take(&mut self.rebound) {
+            for index in self.bindings_of.get(&value).cloned().unwrap_or_default() {
+                let bound = self.binding_value(frame, index, &mut checked)?;
+                changed |= std::mem::replace(&mut self.values[index], bound) != bound;
+            }
+        }
+        if changed {
+            for region in &mut self.regions {
+                region.executable.bind(&self.values)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn binding_value(
+        &self,
+        frame: &PhysicalFrame,
+        index: usize,
+        checked: &mut BTreeSet<PhysicalValueId>,
+    ) -> Result<GpuGraphBindingValue, GpuRuntimeError> {
+        let address = match frame.program.bindings[index] {
+            GpuBindingSource::PhysicalPart { value, part, limb } => {
+                if limb != 0 {
+                    return Err(GpuRuntimeError::Execution(
+                        "physical binding must name one exact CRT-limb part".into(),
+                    ));
                 }
-                GpuBindingSource::ExportSlotPayload { slot } => frame
-                    .slots
-                    .get(slot)
-                    .ok_or_else(|| {
-                        GpuRuntimeError::Execution("export payload slot is missing".into())
-                    })?
-                    .device_payload_address(),
-                GpuBindingSource::ExportSlotHeader { slot } => frame
-                    .slots
-                    .get(slot)
-                    .ok_or_else(|| {
-                        GpuRuntimeError::Execution("export header slot is missing".into())
-                    })?
-                    .device_header_address(),
-                GpuBindingSource::PreparedWorkspace { kind, resource_id, component } => {
-                    let mut resolved = None;
-                    for region in &self.regions {
-                        if let Some(range) =
-                            region.resources.workspace_binding(kind, resource_id, component)
-                        {
-                            if let Some(previous) = resolved.replace(range) {
-                                if previous != range {
-                                    return Err(GpuRuntimeError::Execution(
-                                        "prepared workspace changes allocation across Graph regions".into(),
-                                    ));
-                                }
+                let owner = frame.owners.get(&value).ok_or_else(|| {
+                    GpuRuntimeError::Execution("physical graph owner is missing".into())
+                })?;
+                let planned = frame.program.values.get(value.0 as usize).ok_or_else(|| {
+                    GpuRuntimeError::Execution("physical graph value is missing".into())
+                })?;
+                if checked.insert(value) && owner.physical().as_ref() != planned {
+                    return Err(GpuRuntimeError::Execution(
+                        "rebound physical metadata differs from plan".into(),
+                    ));
+                }
+                let part = planned.parts.get(part as usize).ok_or_else(|| {
+                    GpuRuntimeError::Execution("physical graph part is missing".into())
+                })?;
+                let storage = owner.storage(part.storage).ok_or_else(|| {
+                    GpuRuntimeError::Execution("physical graph storage is missing".into())
+                })?;
+                let offset = part.view.byte_offset;
+                if storage.device != part.device || offset >= storage.bytes {
+                    return Err(GpuRuntimeError::Execution(
+                        "physical binding exceeds allocation".into(),
+                    ));
+                }
+                storage.address.checked_add(offset).ok_or_else(|| {
+                    GpuRuntimeError::Execution("physical binding address overflows".into())
+                })?
+            }
+            GpuBindingSource::ExportSlotPayload { slot } => frame
+                .slots
+                .get(slot)
+                .ok_or_else(|| GpuRuntimeError::Execution("export payload slot is missing".into()))?
+                .device_payload_address(),
+            GpuBindingSource::ExportSlotHeader { slot } => frame
+                .slots
+                .get(slot)
+                .ok_or_else(|| GpuRuntimeError::Execution("export header slot is missing".into()))?
+                .device_header_address(),
+            GpuBindingSource::PreparedWorkspace { kind, resource_id, component } => {
+                let mut resolved = None;
+                for region in &self.regions {
+                    if let Some(range) =
+                        region.resources.workspace_binding(kind, resource_id, component)
+                    {
+                        if let Some(previous) = resolved.replace(range) {
+                            if previous != range {
+                                return Err(GpuRuntimeError::Execution(
+                                    "prepared workspace changes allocation across Graph regions"
+                                        .into(),
+                                ));
                             }
                         }
                     }
-                    let (device, address, bytes) = resolved.ok_or_else(|| {
-                        GpuRuntimeError::Execution(
-                            "prepared workspace binding has no allocated owner".into(),
-                        )
-                    })?;
-                    if device < 0 || address == 0 || bytes == 0 {
-                        return Err(GpuRuntimeError::Execution(
-                            "prepared workspace has an invalid device or allocation".into(),
-                        ));
-                    }
-                    address
                 }
-            };
-            values.push(GpuGraphBindingValue::DeviceAddress(address));
-        }
-        for region in &mut self.regions {
-            region.executable.bind(&values)?;
-        }
-        Ok(())
+                let (device, address, bytes) = resolved.ok_or_else(|| {
+                    GpuRuntimeError::Execution(
+                        "prepared workspace binding has no allocated owner".into(),
+                    )
+                })?;
+                if device < 0 || address == 0 || bytes == 0 {
+                    return Err(GpuRuntimeError::Execution(
+                        "prepared workspace has an invalid device or allocation".into(),
+                    ));
+                }
+                address
+            }
+        };
+        Ok(GpuGraphBindingValue::DeviceAddress(address))
     }
 
     fn launch_region(
@@ -2993,6 +3057,7 @@ impl GpuRuntime {
             upload_sample_seeds(&plan.frame, execution_nonce, &[0])
                 .map_err(GpuRuntimeError::Execution)?;
         }
+        plan.graph.root_seeds = false;
         plan.graph.bind(&plan.frame)?;
         if !plan.frame.waves.is_empty() {
             if plan.frame.import_templates.is_empty() && plan.frame.export_templates.is_empty() {
@@ -3405,13 +3470,16 @@ impl GpuRuntime {
                 self.finish_selected_import(plan, pump, frame, import)?;
             }
             // A plan without waves bound its owners and uploaded its seeds
-            // once; a wave rebinds its lanes' owners before each launch.
+            // once; after a wave rebound its lanes' owners and uploaded its
+            // seeds, the next launch rebinds, and a root launch restores the
+            // root seeds.
             if !plan.frame.waves.is_empty() {
-                if active_wave.is_none() {
+                if active_wave.is_none() && !plan.graph.root_seeds {
                     upload_sample_seeds(&plan.frame, execution_nonce, &[0])
                         .map_err(GpuRuntimeError::Execution)?;
+                    plan.graph.root_seeds = true;
                 }
-                plan.graph.bind(&plan.frame)?;
+                plan.graph.rebind(&plan.frame)?;
             }
             let completion = plan.graph.launch_region(&plan.frame, region)?;
             plan.launches.fetch_add(1, Ordering::AcqRel);
@@ -3477,7 +3545,9 @@ impl GpuRuntime {
                     event.wait()?;
                 }
                 plan.frame.owners.insert(id, owner);
+                plan.graph.rebound.insert(id);
             }
+            plan.graph.root_seeds = false;
             for control in &plan.frame.control_resets {
                 control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
             }

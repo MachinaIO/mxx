@@ -1675,6 +1675,9 @@ pub struct MemoryArtifactStore {
     /// `active_sessions`, which denotes the sole mutable writer, so opening a
     /// finalized session can never accidentally authorize a write.
     read_sessions: BTreeSet<ProductionId>,
+    /// The validated manifest of each finalized production, checked against
+    /// its committed artifacts once rather than on every member load.
+    finalized_manifests: BTreeMap<ProductionId, Manifest>,
     raw_stages: BTreeMap<ArtifactKey, MemoryRawStage>,
     /// Artifacts kept in GPU memory, when the store was created on the device.
     #[cfg(feature = "gpu")]
@@ -2243,7 +2246,18 @@ impl ArtifactStore for MemoryArtifactStore {
     }
 
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
-        self.validated_manifest_snapshot(production)
+        if let Some(manifest) = self.finalized_manifests.get(production) {
+            return Ok(manifest.clone());
+        }
+        let manifest = self.validated_manifest_snapshot(production)?;
+        if self
+            .sessions
+            .get(production)
+            .is_some_and(|session| session.status == SessionStatus::Finalized)
+        {
+            self.finalized_manifests.insert(production.clone(), manifest.clone());
+        }
+        Ok(manifest)
     }
 
     fn load(

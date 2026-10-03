@@ -426,13 +426,23 @@ pub(crate) fn plan_graph_scratch(
                 // the region after its last use. It must not live across a
                 // replayed region's relaunches, unless every use lies in one
                 // replayed body: each replay then runs its whole life again,
-                // after the previous replay's has ended.
+                // after the previous replay's has ended. Nor may it end or
+                // begin inside a body nested in that one, such as a loop in a
+                // wave, which would free or allocate it on that body's first
+                // replay only.
                 let one_body = replayed_bodies
                     .iter()
                     .any(|&(body_start, body_end)| body_start <= first && last < body_end);
+                let nested = replayed_bodies.iter().all(|&(body_start, body_end)| {
+                    last < body_start ||
+                        first >= body_end ||
+                        (body_start <= first && last < body_end) ||
+                        (first < body_start && last >= body_end)
+                });
                 group.first_write.is_some_and(|write| write <= first) &&
                     (first_region == last_region ||
                         ((one_body || (!replayed(first_region) && !replayed(last_region))) &&
+                            nested &&
                             group.placeholder.device == frame.device))
             }
             _ => false,

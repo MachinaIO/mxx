@@ -50,6 +50,19 @@ preprocessing receives no secret and no RHS plaintexts, the single secret is
 sampled afterwards, and encryption binds the RHS plaintexts with a fresh batch
 identifier. The noise model applies to both modes.
 
+For quick iterations, fix small parameters and keep the stage artifacts in GPU
+memory with `*_STORAGE=device`. For example, the Dynamic Sparse-LWR target
+with a width-4 LUT and a 4-dimensional key:
+
+```sh
+MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic MXX_EXPONENT_LUT_LWR_PRF_STORAGE=device \
+MXX_EXPONENT_LUT_LWR_PRF_SELECTED_PARAMETERS=32,7,1 \
+MXX_EXPONENT_LUT_LWR_PRF_INPUT_MODULUS=8 MXX_EXPONENT_LUT_LWR_PRF_OUTPUT_MODULUS=2 \
+MXX_EXPONENT_LUT_LWR_PRF_LWR_DIMENSION=4 MXX_EXPONENT_LUT_LWR_PRF_SUPPORT_WEIGHT=1 \
+cargo test -r -p mxx-exponent-lut --features gpu \
+  --test lwr_prf lwr_prf_end_to_end -- --nocapture
+```
+
 Compile all three targets without running them:
 
 ```sh

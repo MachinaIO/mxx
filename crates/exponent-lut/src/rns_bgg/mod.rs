@@ -124,14 +124,14 @@ pub(crate) fn lut_switching_role(
     format!("lut-switching/{level}/{}/{lut:?}/{layout:?}{suffix}", level + 1)
 }
 
-/// Number `m_(i+1)` of stored digit-companion elements, one per output
-/// column, of one Dynamic ciphertext consumed at `level`.
-pub(crate) fn companion_columns_count(
+/// Number `N_i = m_i m_(i+1)` of digit-companion encodings of one Dynamic
+/// ciphertext consumed at `level`: one per digit row and output column.
+pub(crate) fn companion_count(
     parameters: &RnsBggParameters,
     level: usize,
 ) -> Result<usize, RnsBggError> {
     let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
-    Ok(2 * parameters.component_columns(next)?)
+    Ok(4 * parameters.component_columns(level)? * parameters.component_columns(next)?)
 }
 
 /// Build the canonical refresh-checkpoint artifact path.
@@ -1551,131 +1551,208 @@ pub(crate) fn companion_tag(
     tag
 }
 
-/// The public keys `B_{:,j}` of output column `j` of the ciphertext named by
-/// `tag` (see [`companion_tag`]) at `level`: the `2 x M_i` keys `B_{a,j}` of
-/// all `m_i` digit rows, each of the four blocks flattened into one
-/// `1 x m_i D_i` row whose entries `a D_i .. (a+1) D_i` are block `B_{a,j}`.
-/// A digit is a public attribute encoded under the full current-level
-/// public gadget, so each block has `D_i` columns.
+/// The public key `B_{a,j}` of digit row `a` of output column `j` of the
+/// ciphertext named by `tag` (see [`companion_tag`]): a `2 x M_i` key at
+/// `level`, as four `1 x D_i` blocks, since a digit is a public attribute
+/// encoded under the full current-level public gadget.
 pub(crate) fn companion_key(
     parameters: &RnsBggParameters,
     level: usize,
     hash_key: mxx_dsl::Bytes,
     tag: &mxx_dsl::HashTag,
+    a: IntExpr,
     j: IntExpr,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let mut tag = tag.clone();
     tag.push("column");
     tag.push(j);
+    tag.push("digit-row");
+    tag.push(a);
     Ok(public_key::matrix_from_hash(
         &parameters.ring(level)?,
         hash_key,
         tag,
-        companion_width(parameters, level)?,
+        parameters.level(level)?.modulus_digits(),
     ))
 }
 
-/// Width `m_i D_i` of one flattened block of the digit-companion keys and
-/// encodings of an output column at `level`.
-pub(crate) fn companion_width(
-    parameters: &RnsBggParameters,
-    level: usize,
-) -> Result<usize, RnsBggError> {
-    Ok(2 * parameters.component_columns(level)? * parameters.level(level)?.modulus_digits())
+/// The `1 x width` unit row at a loop-dependent `index`: a window of one
+/// constant row, so no constant depends on the loop.
+pub(crate) fn unit_row(ring: &Ring, width: usize, index: IntExpr) -> Mat {
+    let start = (IntExpr::constant(width - 1) - index).canonicalize();
+    ring.constant(
+        (1, 2 * width - 1),
+        mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(width - 1) },
+    )
+    .slice(
+        None,
+        Some(mxx_ir_core::node::IndexRange {
+            start: start.clone(),
+            end: (start + IntExpr::constant(width)).canonicalize(),
+        }),
+    )
 }
 
-/// The pre-rounding key `T` and companion row `E` of a Dynamic product by a
-/// ciphertext `C` at `level` (spec Eq. 049): for every output column `j`,
+/// Entry `index` of a `1 x n` row.
+pub(crate) fn row_entry(row: &Mat, index: IntExpr) -> Mat {
+    row.clone().slice(
+        None,
+        Some(mxx_ir_core::node::IndexRange {
+            start: index.clone(),
+            end: (index + IntExpr::constant(1)).canonicalize(),
+        }),
+    )
+}
+
+/// The two blocks of a `1 x 2c` row.
+pub(crate) fn split_row(row: &Mat, columns: usize) -> RnsBggRow {
+    let block = |start: usize| {
+        row.clone().slice(
+            None,
+            Some(mxx_ir_core::node::IndexRange {
+                start: IntExpr::constant(start),
+                end: IntExpr::constant(start + columns),
+            }),
+        )
+    };
+    (block(0), block(columns))
+}
+
+/// A row's two blocks as one row.
+pub(crate) fn join_row(row: &RnsBggRow) -> Mat {
+    Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![row.0.clone(), row.1.clone()])
+}
+
+/// The pre-rounding keys `T_s` and companion rows `E_s` of the Dynamic
+/// products of `branches` state keys `A_s` at `level` (spec Eq. 049, 086,
+/// 087): for every branch `s`, output column `j < m_(i+1)`, and digit row
+/// `a < m_i`,
 ///
-/// `T_j = sum_a B_{a,j} U_{:,a}` and `E_j = sum_a z_{a,j} U_{:,a}`,
+/// `T_{s,j} = sum_a B_{s,a,j} U_{s,:,a}` and `E_{s,j} = sum_a z_{s,a,j} U_{s,:,a}`,
 ///
-/// where `U = Dec_{q_i}(A)` is the full current-level gadget decomposition
-/// of the state key `key = A`, `a` ranges over the `m_i` columns of `A`, and
-/// `j` over the `m_(i+1)` output columns. `companion_key(j)` is `B_{:,j}` and
-/// `companion(j)` the encodings `z_{a,j} = s B_{a,j} - d_{a,j} s G + eps` of
-/// the digits `d_{a,j} = Dec_{q_(i+1)}(C)_{a,j}`, both flattened over `a` as
-/// in [`companion_key`]. Then
-/// `E + c Dec(C) = s T - x (s H_i Dec(C)) + eps U + e Dec(C)`: the unit
-/// column `e_a` is a preimage of `H_i e_a` under the next-level gadget, so
-/// `s H_i Dec(C) = s C` up to multiples of `q_(i+1)`, which the scale `p_i`
-/// of the private payload annihilates. `T` depends only on public keys.
+/// with `U_s = Dec_{q_i}(A_s)`. `key_entry(s, r, a)` is entry `(r, a)` of
+/// `A_s`, `companion_key(s, a, j)` the key `B_{s,a,j}`, and `companion(s, a,
+/// j)` the encoding `z = s B - d s G + eps` of digit `d = Dec(C_s)_{a,j}`.
+/// Then `E_s + c_s Dec(C_s) = s T_s - x (s H_i Dec(C_s)) + eps U + e Dec(C_s)`:
+/// the unit column `e_a` is a preimage of `H_i e_a` under the next-level
+/// gadget, so `s H_i Dec(C_s) = s C_s` up to multiples of `q_(i+1)`, which
+/// the scale `p_i` of the private payload annihilates. `T_s` depends only on
+/// public keys. The caller adds `c_s Dec(C_s)` (see [`column_action`]).
 ///
-/// Flattened over `a`, both sums are one product per key row with
-/// `vec(U_r) = Dec(A_r^T)`, whose rows `a D_i .. (a+1) D_i` decompose entry
-/// `a` of key row `r`. Each output column reads only its own keys and
-/// companions; the columns are a loop, or unrolled when `unroll` is set
-/// because the product runs inside a Program family body, where a loop may
-/// not read stored companions. The caller adds the
-/// ciphertext row `c Dec(C)` and applies the single scale-and-round.
+/// One flat loop visits every `(s, j, a)` and holds only column `a` of
+/// `A_s`, its `M_i` digits, one key, and two companions (the current one and
+/// the next one, read ahead), so the graph and the working set are linear in
+/// `M_i + m_i + branches m_(i+1)`; a single loop also reads stored
+/// companions inside a Program family body. Returns
+/// the key rows and, given companions, the companion row, each
+/// `1 x branches m_(i+1)` with branch `s` at columns `s m_(i+1) ..`.
 pub(crate) fn companion_columns(
     parameters: &RnsBggParameters,
     level: usize,
-    key: &RnsBggMatrix,
-    companion_key: &dyn Fn(IntExpr) -> Result<RnsBggMatrix, RnsBggError>,
-    companion: Option<&dyn Fn(IntExpr) -> Result<RnsBggRow, RnsBggError>>,
-    unroll: bool,
-) -> Result<(RnsBggMatrix, Option<RnsBggRow>), RnsBggError> {
+    branches: usize,
+    key_entry: &dyn Fn(IntExpr, usize, IntExpr) -> Result<Mat, RnsBggError>,
+    companion_key: &dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>,
+    companion: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggRow, RnsBggError>>,
+) -> Result<Vec<Mat>, RnsBggError> {
     let ring = parameters.ring(level)?;
     let current = parameters.level(level)?;
     let base = public_gadget_base(current.base_bits())?;
     let digits = current.modulus_digits();
     let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
-    let output_columns = parameters.component_columns(next)?;
-    let width = 2 * output_columns;
-    let row = |left: &Mat, right: &Mat| {
-        Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![left.clone(), right.clone()])
+    let digit_rows = 2 * parameters.component_columns(level)?;
+    let output_columns = 2 * parameters.component_columns(next)?;
+    let width = branches * output_columns;
+    let schema = |_| mxx_dsl::DslError::Schema;
+    let total = width * digit_rows;
+    // `k = (s m_(i+1) + j) m_i + a`: its output column `k / m_i`, branch,
+    // column within the branch, and digit row.
+    let coordinates = |k: IntExpr| {
+        let k = Box::new(k);
+        let digit_rows = Box::new(IntExpr::constant(digit_rows));
+        let column = IntExpr::FloorDiv(k.clone(), digit_rows.clone()).canonicalize();
+        let output_columns = Box::new(IntExpr::constant(output_columns));
+        let branch =
+            IntExpr::FloorDiv(Box::new(column.clone()), output_columns.clone()).canonicalize();
+        let j = IntExpr::Rem(Box::new(column.clone()), output_columns).canonicalize();
+        (column, branch, j, IntExpr::Rem(k, digit_rows).canonicalize())
     };
-    let [u0, u1] = [row(&key.0.0, &key.0.1), row(&key.1.0, &key.1.1)]
-        .map(|row| row.transpose().decompose(base, digits));
-    let act =
-        |(left, right): RnsBggRow| left.mul_small_rhs(u0.clone()) + right.mul_small_rhs(u1.clone());
-    // Column `j`'s terms, added at column `j` by its unit row.
-    let terms = |j: IntExpr| -> Result<Vec<Mat>, RnsBggError> {
-        let (top, bottom) = companion_key(j.clone())?;
-        let mut terms = vec![act(top), act(bottom)];
-        if let Some(companion) = companion {
-            terms.push(act(companion(j)?));
-        }
-        Ok(terms)
+    let read = |k: IntExpr| {
+        let (_, branch, j, a) = coordinates(k);
+        companion.map(|companion| companion(branch, a, j)).transpose()
     };
-    let units = (0..width)
-        .map(|column| {
-            ring.constant(
-                (1, width),
-                mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(column) },
-            )
-        })
-        .collect::<Vec<_>>();
-    let add = |rows: Vec<Mat>, terms: Vec<Mat>, unit: Mat| -> Vec<Mat> {
-        rows.into_iter().zip(terms).map(|(row, term)| row + term * unit.clone()).collect()
-    };
-    let zero = vec![ring.zero((1, width)); if companion.is_some() { 3 } else { 2 }];
-    let rows = if unroll {
-        // Inside a Program family body a loop may not read stored
-        // companions, so the columns are unrolled.
-        units.into_iter().enumerate().try_fold(zero, |rows, (j, unit)| {
-            Ok::<_, RnsBggError>(add(rows, terms(IntExpr::constant(j))?, unit))
-        })?
-    } else {
-        // The unit rows are read from a family: a constant whose index
-        // depends on the loop would be fixed when the loop body is planned.
-        let units = Family::pack(units)?;
-        mxx_dsl::iterate(width, zero, |j, rows: Vec<Mat>| {
-            let unit = units.at(j.clone());
-            Ok(add(rows, terms(j.expression()?).map_err(|_| mxx_dsl::DslError::Schema)?, unit))
-        })?
-    };
-    let block = |row: &Mat, start: usize| {
-        row.clone().slice(
-            None,
-            Some(mxx_ir_core::node::IndexRange {
-                start: IntExpr::constant(start),
-                end: IntExpr::constant(start + output_columns),
-            }),
+    // Each iteration reads the next companion (the first again after the
+    // last) and carries it, so that load overlaps this iteration's work.
+    let mut initial = vec![ring.zero((1, width)); if companion.is_some() { 3 } else { 2 }];
+    if let Some((left, right)) = read(IntExpr::constant(0))? {
+        initial.extend([left, right]);
+    }
+    Ok(mxx_dsl::iterate(total, initial, |k, mut carried: Vec<Mat>| {
+        let k = k.expression()?;
+        let next = IntExpr::Rem(
+            Box::new(k.clone() + IntExpr::constant(1)),
+            Box::new(IntExpr::constant(total)),
         )
-    };
-    let split = |row: &Mat| (block(row, 0), block(row, output_columns));
-    Ok(((split(&rows[0]), split(&rows[1])), rows.get(2).map(split)))
+        .canonicalize();
+        let (column, branch, j, a) = coordinates(k);
+        let [u0, u1] = [0, 1].map(|r| {
+            key_entry(branch.clone(), r, a.clone()).map(|entry| entry.decompose(base, digits))
+        });
+        let (u0, u1) = (u0.map_err(schema)?, u1.map_err(schema)?);
+        let act = |(left, right): RnsBggRow| {
+            left.mul_small_rhs(u0.clone()) + right.mul_small_rhs(u1.clone())
+        };
+        let (top, bottom) = companion_key(branch, a, j).map_err(schema)?;
+        let mut terms = vec![act(top), act(bottom)];
+        let prefetched = read(next).map_err(schema)?;
+        if let Some((left, right)) = prefetched {
+            let current = carried.split_off(3);
+            terms.push(act((current[0].clone(), current[1].clone())));
+            carried.extend([left, right]);
+        }
+        let unit = unit_row(&ring, width, column);
+        for (row, term) in carried.iter_mut().zip(terms) {
+            *row = row.clone() + term * unit.clone();
+        }
+        Ok(carried)
+    })?
+    .into_iter()
+    .take(if companion.is_some() { 3 } else { 2 })
+    .collect())
+}
+
+/// `row Dec(matrix)` for every row of `rows`, one column at a time: column
+/// `j` of `matrix` (a `2 x m_(i+1)` matrix at `decomposition_level`) is
+/// sliced before it is decomposed, so only its `m_i` digits are held, never
+/// the whole `m_i x m_(i+1)` decomposition. Each row is `1 x m_i` at
+/// `evaluation_level`; the results are `1 x m_(i+1)`.
+pub(crate) fn column_action(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    decomposition_level: usize,
+    matrix: &RnsBggMatrix,
+    rows: Vec<Mat>,
+) -> Result<Vec<Mat>, RnsBggError> {
+    let ring = parameters.ring(evaluation_level)?;
+    let decomposition = parameters.level(decomposition_level)?;
+    let base = public_gadget_base(decomposition.base_bits())?;
+    let digits = decomposition.modulus_digits();
+    let width = 2 * parameters.component_columns(decomposition_level)?;
+    let [top, bottom] = [&matrix.0, &matrix.1].map(join_row);
+    Ok(mxx_dsl::iterate(width, vec![ring.zero((1, width)); rows.len()], |j, sums: Vec<Mat>| {
+        let j = j.expression()?;
+        let column = Mat::concat(
+            mxx_ir_core::node::ConcatAxis::Rows,
+            vec![row_entry(&top, j.clone()), row_entry(&bottom, j.clone())],
+        )
+        .decompose(base, digits)
+        .centered_rebase(&ring);
+        let unit = unit_row(&ring, width, j);
+        Ok(sums
+            .into_iter()
+            .zip(&rows)
+            .map(|(sum, row)| sum + row.clone().mul_small_rhs(column.clone()) * unit.clone())
+            .collect())
+    })?)
 }
 
 /// Decompose a compact right-action matrix at its declared decomposition

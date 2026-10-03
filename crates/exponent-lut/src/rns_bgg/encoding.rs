@@ -1036,9 +1036,8 @@ impl EncodingLowering<'_> {
     }
 
     /// The encryption's family of digit-companion encodings of `members`
-    /// ciphertexts consumed at `level`, stored under `role`: the encodings of
-    /// member `t`'s output column `j`, flattened over the digit rows (see
-    /// [`super::companion_key`]), at `t m_(i+1) + j`.
+    /// ciphertexts consumed at `level`, stored under `role`: member `t`,
+    /// output column `j`, and digit row `a` at `(t m_(i+1) + j) m_i + a`.
     fn companion_family(
         &self,
         level: usize,
@@ -1046,9 +1045,9 @@ impl EncodingLowering<'_> {
         members: IntExpr,
     ) -> Result<Family<RnsBggRow>, RnsBggError> {
         let ring = self.parameters.ring(level)?;
-        let columns = companion_width(self.parameters, level)?;
-        let count = (members * IntExpr::constant(companion_columns_count(self.parameters, level)?))
-            .canonicalize();
+        let columns = self.parameters.level(level)?.modulus_digits();
+        let count =
+            (members * IntExpr::constant(companion_count(self.parameters, level)?)).canonicalize();
         let families = [0, 1].map(|port| {
             ring.family_artifact_input(
                 self.encryption.clone(),
@@ -1065,55 +1064,69 @@ impl EncodingLowering<'_> {
         family_of_fields(&element, count, &fields).map_err(graph)
     }
 
-    /// The pre-rounding Dynamic product key `T` and companion row `E` of
-    /// state key `key` at `level` (see [`super::companion_columns`]), with
-    /// member `member`'s companions `z_{a,j}` read from `companions`. A LUT
-    /// branch passes its automorphism `sigma`: the stored `z^0` encodes the
-    /// inverse-automorphed digit under `B^0`, so `sigma(z^0)` encodes the
-    /// digit under `sigma(B^0)` and the transformed secret.
-    fn companion_product(
+    /// The pre-rounding Dynamic key rows `T` and companion row `E` (see
+    /// [`super::companion_columns`]) of state key `key` at `level`, with the
+    /// companions read from `companions`. An RHS product passes the RHS
+    /// `member`. A LUT passes its automorphism indices `sigmas`: branch `s`
+    /// is member `s`, its key is `sigma_s(A)`, and its stored `z^0` encodes
+    /// the inverse-automorphed digit under `B^0`, so `sigma_s(z^0)` encodes
+    /// the digit under `sigma_s(B^0)` and the transformed secret.
+    fn companion_rows(
         &self,
         level: usize,
         key: &RnsBggMatrix,
         material: String,
         member: Option<IntExpr>,
-        sigma: Option<IntExpr>,
+        sigmas: Option<&[usize]>,
         companions: &Family<RnsBggRow>,
-    ) -> Result<(RnsBggMatrix, RnsBggRow), RnsBggError> {
-        let tag = super::companion_tag(
-            self.parameters,
-            &self.context,
-            self.program.id(),
-            self.refresh_prf_namespace,
-            material,
-            member.clone(),
-            level,
-        );
-        let automorphism = |entry: Mat| match &sigma {
-            Some(sigma) => entry.ring_automorphism(sigma.clone()),
+    ) -> Result<Vec<Mat>, RnsBggError> {
+        let count = companion_count(self.parameters, level)?;
+        let digit_rows = 2 * self.parameters.component_columns(level)?;
+        let automorphism = |branch: &IntExpr, entry: Mat| match sigmas {
+            Some(sigmas) => entry.ring_automorphism(IntExpr::Select {
+                selector: Box::new(branch.clone()),
+                branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
+            }),
             None => entry,
         };
-        let offset = member.unwrap_or(IntExpr::constant(0)) *
-            IntExpr::constant(companion_columns_count(self.parameters, level)?);
-        let companion_key = |j| {
-            let key = super::companion_key(self.parameters, level, self.hash_key.clone(), &tag, j)?;
-            Ok(map_matrix(key, automorphism))
+        let member_of = |branch: &IntExpr| match sigmas {
+            Some(_) => Some(branch.clone()),
+            None => member.clone(),
         };
-        let companion = |j: IntExpr| {
-            let index = (offset.clone() + j).canonicalize();
-            Ok(map_row(companions.at(Int::evaluate(index)), automorphism))
+        let rows = [&key.0, &key.1].map(super::join_row);
+        let key_entry =
+            |branch: IntExpr, r: usize, a| Ok(automorphism(&branch, super::row_entry(&rows[r], a)));
+        let companion_key = |branch: IntExpr, a, j| {
+            let tag = super::companion_tag(
+                self.parameters,
+                &self.context,
+                self.program.id(),
+                self.refresh_prf_namespace,
+                material.clone(),
+                member_of(&branch),
+                level,
+            );
+            let key =
+                super::companion_key(self.parameters, level, self.hash_key.clone(), &tag, a, j)?;
+            Ok(map_matrix(key, |entry| automorphism(&branch, entry)))
         };
-        // Inside a Program family body the columns are unrolled.
-        let unroll = !self.site()?.indices.is_empty();
-        let (key, row) = super::companion_columns(
+        let companion = |branch: IntExpr, a: IntExpr, j: IntExpr| {
+            let index = member_of(&branch).unwrap_or(IntExpr::constant(0)) *
+                IntExpr::constant(count) +
+                j * IntExpr::constant(digit_rows) +
+                a;
+            Ok(map_row(companions.at(Int::evaluate(index.canonicalize())), |entry| {
+                automorphism(&branch, entry)
+            }))
+        };
+        super::companion_columns(
             self.parameters,
             level,
-            key,
+            sigmas.map_or(1, <[usize]>::len),
+            &key_entry,
             &companion_key,
             Some(&companion),
-            unroll,
-        )?;
-        Ok((key, row.ok_or(RnsBggError::Binding("companion row"))?))
+        )
     }
 
     /// Compute the native Walsh/automorphism branch polynomial for one unary
@@ -1322,7 +1335,6 @@ impl EncodingLowering<'_> {
         input: &RnsBggEncoding,
         b_sigma: RnsBggMatrix,
         sigma: IntExpr,
-        companions: Option<(&Family<RnsBggRow>, crate::program::LutId, IntExpr)>,
     ) -> Result<(RnsBggRow, (SmallMatrix, SmallMatrix)), DslError> {
         let evaluation_level = self.workload.level(input.wire()).map_err(|_| DslError::Schema)?;
         let decomposition_level = evaluation_level.checked_add(1).ok_or(DslError::Schema)?;
@@ -1342,27 +1354,8 @@ impl EncodingLowering<'_> {
             input.row.0.clone().ring_automorphism(sigma.clone()),
             input.row.1.clone().ring_automorphism(sigma.clone()),
         );
-        let (switched_row, switched_matrix) = match companions {
-            None => multiply_row_and_public_by_columns(routed_row, routed, switching_decomposition),
-            // Dynamic: the digits of the actual ciphertext act on the routed
-            // row; the key and the companion row replace its key product.
-            Some((companions, lut, branch)) => {
-                let row = multiply_rows_by_columns(vec![routed_row], switching_decomposition)
-                    .pop()
-                    .ok_or(DslError::Schema)?;
-                let (key, companion_row) = self
-                    .companion_product(
-                        evaluation_level,
-                        &routed,
-                        format!("lut/{lut:?}"),
-                        Some(branch),
-                        Some(sigma.clone()),
-                        companions,
-                    )
-                    .map_err(|_| DslError::Schema)?;
-                (add_encoding_rows(row, companion_row), key)
-            }
-        };
+        let (switched_row, switched_matrix) =
+            multiply_row_and_public_by_columns(routed_row, routed, switching_decomposition);
         let switched_public_key = mod_down_public(switched_matrix, &target_ring);
         let switched_key_decomposition = compact_decompose_columns(
             self.parameters,
@@ -1711,7 +1704,6 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         }
         let evaluation_level = self.workload.level(input.wire())?;
         let (ciphertext, reference) = rhs;
-        let action = self.rhs_decomposition(ciphertext, evaluation_level)?;
         let output = self.site()?.output;
         let target_level = self.workload.level(output)?;
         let target_ring = self.parameters.ring(target_level)?;
@@ -1719,7 +1711,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             RhsMode::Static => multiply_row_and_public_by_columns(
                 input.row.clone(),
                 input.public_key.matrix.clone(),
-                action,
+                self.rhs_decomposition(ciphertext, evaluation_level)?,
             ),
             // Dynamic: `c Dec(C)` plus the companion row, with the key
             // fixed in preprocessing from public companion keys (Eq. 049).
@@ -1734,10 +1726,8 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                     .map(Int::expression)
                     .transpose()
                     .map_err(|_| RnsBggError::Binding("RHS member index"))?;
-                let row = multiply_rows_by_columns(vec![input.row.clone()], action)
-                    .pop()
-                    .ok_or(RnsBggError::Binding("RHS product row"))?;
-                let (key, companion_row) = self.companion_product(
+                let columns = self.parameters.component_columns(evaluation_level + 1)?;
+                let rows = self.companion_rows(
                     evaluation_level,
                     &input.public_key.matrix,
                     format!("rhs/{:?}", reference.id),
@@ -1745,7 +1735,15 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                     None,
                     companions,
                 )?;
-                (add_encoding_rows(row, companion_row), key)
+                let product = super::column_action(
+                    self.parameters,
+                    evaluation_level,
+                    evaluation_level + 1,
+                    ciphertext,
+                    vec![super::join_row(&input.row)],
+                )?;
+                let split = |row: &Mat| super::split_row(row, columns);
+                (split(&(product[0].clone() + rows[2].clone())), (split(&rows[0]), split(&rows[1])))
             }
         };
         let public_key = RnsBggPublicKey::new(output, mod_down_public(matrix, &target_ring));
@@ -1802,13 +1800,8 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            let branch = index.expression()?;
-            let (switched_row, switched_key_decomposition) = this.lut_branch_action(
-                input,
-                b_sigma,
-                sigma.clone(),
-                companions.as_ref().map(|companions| (companions, lut_id, branch)),
-            )?;
+            let (switched_row, switched_key_decomposition) =
+                this.lut_branch_action(input, b_sigma, sigma.clone())?;
             let mask = (helper.0.at(index.clone()), helper.1.at(index));
             let public_data =
                 this.lut_public_data(level, Int::from(sigma)).map_err(|_| DslError::Schema)?;
@@ -1822,14 +1815,92 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         // and carries it to the next iteration, so that load overlaps this
         // branch's work; the last branch runs after the loop.
         let last = table.values().len().checked_sub(1).ok_or(RnsBggError::Lut)?;
-        let (row, public_key) = if companions.is_some() {
-            // Dynamic branches are unrolled, so each branch's companion loop
-            // reads the stored companions in a loop of its own.
-            (0..=last)
-                .try_fold(initial, |sums, index| {
-                    branch(Int::constant(index), sums, b_at(Int::constant(index)))
-                })
-                .map_err(graph)?
+        let (row, public_key) = if let Some(companions) = companions {
+            // Dynamic: one flat loop first builds every branch's key rows
+            // `T_s` and companion row `E_s` (block `s` of each row), so the
+            // stored companions are read in a single loop; the branch loop
+            // then adds `sigma(c) Dec(C_sigma) + E_s` and acts with the
+            // rounded `T_s` on the helper and `A_sigma`, one column at a
+            // time.
+            let rows = self.companion_rows(
+                level,
+                &input.public_key.matrix,
+                format!("lut/{lut_id:?}"),
+                None,
+                Some(&sigmas),
+                &companions,
+            )?;
+            let width = 2 * columns;
+            let next = level + 1;
+            let target_ring = self.parameters.ring(next)?;
+            let split = |row: &Mat| super::split_row(row, columns);
+            let schema = |_| DslError::Schema;
+            let count = sigmas.len();
+            let ((row, key), _) = mxx_dsl::iterate(
+                IntExpr::constant(count),
+                (initial, b_at(Int::constant(0))),
+                |index, ((row_sum, key_sum), b_sigma)| {
+                    // Read the next branch's switching ciphertext (the first
+                    // again after the last) while this branch runs.
+                    let b_next = b_at(Int::evaluate(
+                        IntExpr::Rem(
+                            Box::new(index.expression()? + IntExpr::constant(1)),
+                            Box::new(IntExpr::constant(count)),
+                        )
+                        .canonicalize(),
+                    ));
+                    let start = (index.expression()? * IntExpr::constant(width)).canonicalize();
+                    let block = |row: &Mat| {
+                        split(&row.clone().slice(
+                            None,
+                            Some(mxx_ir_core::node::IndexRange {
+                                start: start.clone(),
+                                end: (start.clone() + IntExpr::constant(width)).canonicalize(),
+                            }),
+                        ))
+                    };
+                    let sigma = IntExpr::Select {
+                        selector: Box::new(index.expression()?),
+                        branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
+                    };
+                    let routed_row =
+                        map_row(input.row.clone(), |entry| entry.ring_automorphism(sigma.clone()));
+                    let product = super::column_action(
+                        this.parameters,
+                        level,
+                        next,
+                        &b_sigma,
+                        vec![super::join_row(&routed_row)],
+                    )
+                    .map_err(schema)?;
+                    let switched_row = add_encoding_rows(split(&product[0]), block(&rows[2]));
+                    let switched_key =
+                        mod_down_public((block(&rows[0]), block(&rows[1])), &target_ring);
+                    let mask = (helper.0.at(index.clone()), helper.1.at(index));
+                    let data = this.lut_public_data(level, Int::from(sigma)).map_err(schema)?;
+                    let actions = super::column_action(
+                        this.parameters,
+                        level,
+                        next,
+                        &switched_key,
+                        vec![
+                            super::join_row(&mask),
+                            super::join_row(&data.0),
+                            super::join_row(&data.1),
+                        ],
+                    )
+                    .map_err(schema)?;
+                    let row = add_encoding_rows(
+                        row_sum,
+                        add_encoding_rows(split(&actions[0]), switched_row),
+                    );
+                    let key =
+                        add_public_matrices(key_sum, (split(&actions[1]), split(&actions[2])));
+                    Ok(((row, key), b_next))
+                },
+            )
+            .map_err(graph)?;
+            (row, key)
         } else {
             let (sums, b_last) = mxx_dsl::iterate(
                 IntExpr::constant(last),
@@ -2786,12 +2857,12 @@ impl<'a> RnsEncryptBuild<'a> {
     /// The digit-companion encodings, under the single secret, of `members`
     /// ciphertexts consumed at `level`, member `t`'s stored ciphertext being
     /// `ciphertext(t)` and its companion-key tag `tag(t)`. Element
-    /// `t m_(i+1) + j` holds, flattened over the digit rows `a` (see
-    /// [`super::companion_key`]), `z_{a,j} = s B_{a,j} - d_{a,j} s G + eps`
-    /// for the digits `d_{a,j} = Dec_{q_(i+1)}(C)_{a,j}` of column `j` of the
-    /// stored ciphertext, rebased to `q_i`; a LUT branch encodes
+    /// `(t m_(i+1) + j) m_i + a` (see [`Self::companion_family`]) is
+    /// `z_{a,j} = s B_{a,j} - d_{a,j} s G_i + eps` under
+    /// [`super::companion_key`] for digit `d_{a,j} = Dec_{q_(i+1)}(C)_{a,j}`
+    /// of the stored ciphertext, rebased to `q_i`; a LUT branch encodes
     /// `sigma^-1(d)`, with the inverse automorphism index `inverse_sigma(t)`
-    /// (spec Eq. 045, 084). Flattened, `d_{a,j} G` is `d_j^T (x) G`.
+    /// (spec Eq. 045, 084). Each lane decomposes only column `j` of `C`.
     fn companion_encodings(
         &self,
         level: usize,
@@ -2809,54 +2880,43 @@ impl<'a> RnsEncryptBuild<'a> {
             .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
         let digits = next_parameters.modulus_digits();
         let digit_rows = 2 * self.parameters.component_columns(level)?;
-        let columns = companion_columns_count(self.parameters, level)?;
-        let width = companion_width(self.parameters, level)?;
+        let output_columns = 2 * self.parameters.component_columns(next)?;
+        let count = companion_count(self.parameters, level)?;
         let gadget = self.parameters.public_gadget(level)?;
+        let width = self.parameters.level(level)?.modulus_digits();
         let mask = &self.payload_secret.as_ref().ok_or(RnsBggError::Binding("secret"))?.row;
-        let entry_range = |start: usize| mxx_ir_core::node::IndexRange {
-            start: IntExpr::constant(start),
-            end: IntExpr::constant(start + 1),
-        };
-        mxx_dsl::parallel(IntExpr::constant(members * columns), |index| {
+        mxx_dsl::parallel(IntExpr::constant(members * count), |index| {
             let index = Box::new(index.expression()?);
-            let count = Box::new(IntExpr::constant(columns));
-            let member = IntExpr::FloorDiv(index.clone(), count.clone()).canonicalize();
-            let column = IntExpr::Rem(index, count).canonicalize();
-            // Column `j` of the ciphertext, read from its entries in
-            // row-major order.
-            let ((c00, c01), (c10, c11)) = ciphertext(Int::evaluate(member.clone()));
-            let entries = Family::pack(
-                [c00, c01, c10, c11]
-                    .into_iter()
-                    .flat_map(|block| {
-                        (0..columns / 2)
-                            .map(move |entry| block.clone().slice(None, Some(entry_range(entry))))
-                    })
-                    .collect(),
-            )?;
-            let column_entries = [IntExpr::constant(0), IntExpr::constant(columns)]
-                .map(|row| entries.at(Int::evaluate((row + column.clone()).canonicalize())));
-            let column_digits =
-                Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, column_entries.to_vec())
-                    .decompose(base, digits)
-                    .centered_rebase(&ring);
-            let mut row_digits = ring.identity(digit_rows).mul_small_rhs(column_digits).transpose();
-            if let Some(inverse_sigma) = inverse_sigma {
-                row_digits = row_digits.ring_automorphism(inverse_sigma(member.clone()));
-            }
-            let key = super::companion_key(
-                self.parameters,
-                level,
-                hash_key.clone(),
-                &tag(member),
-                column,
+            let quotient = |divisor: usize| {
+                IntExpr::FloorDiv(index.clone(), Box::new(IntExpr::constant(divisor)))
+                    .canonicalize()
+            };
+            let member = quotient(count);
+            let column = quotient(digit_rows);
+            let j = IntExpr::Rem(Box::new(column), Box::new(IntExpr::constant(output_columns)))
+                .canonicalize();
+            let a = IntExpr::Rem(index, Box::new(IntExpr::constant(digit_rows))).canonicalize();
+            let ciphertext = ciphertext(Int::evaluate(member.clone()));
+            let [top, bottom] = [&ciphertext.0, &ciphertext.1].map(super::join_row);
+            let column_digits = Mat::concat(
+                mxx_ir_core::node::ConcatAxis::Rows,
+                vec![super::row_entry(&top, j.clone()), super::row_entry(&bottom, j.clone())],
             )
-            .map_err(|_| DslError::Schema)?;
+            .decompose(base, digits)
+            .centered_rebase(&ring);
+            let mut digit =
+                super::unit_row(&ring, digit_rows, a.clone()).mul_small_rhs(column_digits);
+            if let Some(inverse_sigma) = inverse_sigma {
+                digit = digit.ring_automorphism(inverse_sigma(member.clone()));
+            }
+            let key =
+                super::companion_key(self.parameters, level, hash_key.clone(), &tag(member), a, j)
+                    .map_err(|_| DslError::Schema)?;
             public_encoding_row(
                 self.parameters,
                 key,
                 mask,
-                row_digits.tensor(gadget.clone()),
+                digit.tensor(gadget.clone()),
                 width,
                 level,
             )
@@ -6355,6 +6415,48 @@ mod test {
                 BTreeMap::from([
                     (first, InputBinding::Scalar(y)),
                     (second, InputBinding::Family(vec![z0, z1])),
+                ]),
+                expected,
+                wrong,
+            )
+        });
+    }
+
+    /// Dynamic products inside a Program family body, each by the RHS member
+    /// the body index selects, summed and multiplied by a scalar RHS.
+    #[test]
+    fn dynamic_family_body_products_verify_indexed_rhs_members() {
+        let parameters = dynamic_test_parameters();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let inputs =
+            builder.input_family(IntExpr::constant(2), AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let scale = builder.rhs_input().unwrap();
+        let range = crate::program::FamilyRange::full(IntExpr::constant(2)).unwrap();
+        let products = builder
+            .parallel(range, |builder, index| {
+                builder
+                    .mul_private(
+                        Operand::Member { family: inputs, index: index.clone() },
+                        Operand::Member { family: rhs, index },
+                    )
+                    .map(Operand::Scalar)
+            })
+            .unwrap();
+        let sum = builder.sum(products).unwrap();
+        let output = builder.mul_private(Operand::Scalar(sum), Operand::Scalar(scale)).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let dimension = parameters.level(0).unwrap().ring_dimension() as usize;
+        check_dynamic_batches(&parameters, &program, || {
+            let exponents = [0; 5].map(|_| rand::random::<u32>() as usize % dimension);
+            let [x0, x1, y0, y1, z] = exponents.map(|exponent| monomial(&parameters, exponent));
+            let expected = (x0.clone() * y0.clone() + x1.clone() * y1.clone()) * z.clone();
+            let wrong = expected.clone() * monomial(&parameters, 1);
+            (
+                BTreeMap::from([(inputs, InputBinding::Family(vec![x0, x1]))]),
+                BTreeMap::from([
+                    (rhs, InputBinding::Family(vec![y0, y1])),
+                    (scale, InputBinding::Scalar(z)),
                 ]),
                 expected,
                 wrong,

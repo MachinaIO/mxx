@@ -83,6 +83,14 @@ theorem modulusReduce_one {q p : Nat} (hq : 1 < q) (hp : 1 < p) {out : ExactMatr
   rw [Subsingleton.elim i 0, Subsingleton.elim j 0]
   simp
 
+/-- A family read at a natural-number index. -/
+theorem familyGet_eq {α : Type} {count k : Nat} {f : Fin count → α} {out : α}
+    (h : familyGetDynamic f (Int.ofNat k) out) : ∃ hk : k < count, out = f ⟨k, hk⟩ := by
+  obtain ⟨position, hposition, hout⟩ := h
+  have hk : position.val = k := Int.ofNat.inj hposition
+  subst hk
+  exact ⟨position.isLt, hout⟩
+
 /-- A ternary sample as one integer polynomial. -/
 theorem ternary_poly {q : Nat} {output : ExactMatrix q N 1 1}
     (h : uniformIntervalSample (-1) 1 output) :
@@ -142,6 +150,28 @@ theorem sigma_mod (i : Fin 16) : (sigma i).toNat % 64 = 1 + 2 * 2 * i.val := by
 /-- The negacyclic root `X`. -/
 noncomputable abbrev X (q : Nat) : ExactPoly q N := AdjoinRoot.root (negacyclicModulus N (ZMod q))
 
+/-- The monomial `X^k` with integer coefficients. -/
+noncomputable abbrev Xe (k : Nat) : ErrorPoly N := AdjoinRoot.root (negacyclicModulus N Int) ^ k
+
+theorem polyNorm_Xe (k : Nat) : polyNorm (Xe k) ≤ 1 := by
+  have h := polyNorm_root_pow_mul_le (n := N) (by decide) k 1
+  rw [mul_one] at h
+  refine h.trans (polyNorm_le_of_coeff fun i ↦ ?_)
+  have h1 := Negacyclic.coeff_root_pow (R := Int) (n := N) (by decide) ⟨0, by decide⟩ i
+  rw [show ((⟨0, by decide⟩ : Fin N) : Nat) = 0 from rfl, pow_zero] at h1
+  rw [h1]
+  split <;> simp
+
+theorem reducePoly_Xe {q : Nat} (k : Nat) : reducePoly q N (Xe k) = X q ^ k := by
+  rw [map_pow]
+  congr 1
+  simp [reducePoly]
+
+theorem polyNorm_substitution_Xe (i : Fin 16) (k : Nat) :
+    polyNorm (substitution (sigma i).toNat (sigma_odd i) (Xe k)) ≤ 1 := by
+  rw [substitution_root_pow]
+  exact polyNorm_Xe _
+
 /-- The coefficient `C_σ = W⁻¹ Σ_k X^(T k) σ(X^(-k))` of a width-16 LUT with table `T`. -/
 noncomputable def lutCoefficient (q inverse : Nat) (table : Fin 16 → Nat) (σ : Nat) : ExactPoly q N :=
   lutFourierCoefficient 32 (X q) (inverse : ExactPoly q N) (fun k ↦ X q ^ table k) σ
@@ -195,6 +225,23 @@ abbrev inverse6 : Nat := 1656419084768677916369117227758191167904054695734225248
 abbrev inverse5 : Nat := 1506504390455695168269303022545438576397038817847440089317221
 abbrev inverse4 : Nat := 1370157767855665020950234418224971312905348255901
 abbrev inverse3 : Nat := 1246151236331995168128710588131142041
+
+theorem natCast_self_poly (q : Nat) : (q : ExactPoly q N) = 0 := by
+  rw [← map_natCast (algebraMap (ZMod q) (ExactPoly q N)), ZMod.natCast_self, map_zero]
+
+theorem inverse_mul {q inverse k : Nat} (h : inverse * 16 = 1 + q * k) :
+    (inverse : ExactPoly q N) * ((16 : Nat) : ExactPoly q N) = 1 := by
+  rw [← Nat.cast_mul, h, Nat.cast_add, Nat.cast_mul, natCast_self_poly, zero_mul, add_zero,
+    Nat.cast_one]
+
+theorem inverse6_mul : (inverse6 : ExactPoly Q6 N) * ((16 : Nat) : ExactPoly Q6 N) = 1 :=
+  inverse_mul (k := 15) (by norm_num)
+theorem inverse5_mul : (inverse5 : ExactPoly Q5 N) * ((16 : Nat) : ExactPoly Q5 N) = 1 :=
+  inverse_mul (k := 15) (by norm_num)
+theorem inverse4_mul : (inverse4 : ExactPoly Q4 N) * ((16 : Nat) : ExactPoly Q4 N) = 1 :=
+  inverse_mul (k := 15) (by norm_num)
+theorem inverse3_mul : (inverse3 : ExactPoly Q3 N) * ((16 : Nat) : ExactPoly Q3 N) = 1 :=
+  inverse_mul (k := 15) (by norm_num)
 
 /-! ## RHS hash tags -/
 

@@ -166,6 +166,10 @@ theorem Rel.add {A A' : Fin 2 → Fin 2 → ExactMatrix q n 1 m} {t t' c c' : Fi
   simp only [Pi.add_apply, hc j, hc' j, reduceMatrix_add, smul_add]
   abel
 
+theorem Rel.target_eq {A : Fin 2 → Fin 2 → ExactMatrix q n 1 m} {t t' c : Fin 2 → ExactMatrix q n 1 m}
+    {B : Nat} (h : Rel sm A t c B) (ht : t = t') : Rel sm A t' c B :=
+  ht ▸ h
+
 theorem Rel.zero : Rel (q := q) (m := m) sm 0 0 0 0 := by
   refine ⟨0, fun j ↦ coeffBound_zero, fun j ↦ ?_⟩
   funext row column

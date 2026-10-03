@@ -36,6 +36,13 @@ theorem centeredRebaseRuns_unique {q p rows columns : Nat} {x : ExactMatrix q n 
     {y z : ExactMatrix p n rows columns} (hy : centeredRebaseRuns x y)
     (hz : centeredRebaseRuns x z) : y = z := hy.2.trans hz.2.symm
 
+/-- Rebasing to the same modulus is the identity. -/
+theorem centeredRebaseRuns_self {q rows columns : Nat} (hq : 1 < q) (hn : 0 < n)
+    (x : ExactMatrix q n rows columns) : centeredRebaseRuns x x := by
+  refine ⟨hq, ?_⟩
+  funext row column
+  rw [centeredRebase_eq, reducePoly_centeredIntLift hq hn]
+
 /-! ## Reconstruction at the decomposition modulus -/
 
 /-- The one-row gadget times the digits of a two-row target, scaled per row. -/

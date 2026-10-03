@@ -272,7 +272,7 @@ theorem preprocess_switch0 {model : HashModel} {key : ByteArray} {payload : Exac
     simp [ho0, ho1, ho2, ho3, matrixAdd, matrixNeg, Matrix.mul_apply, unitPair, he0, he1, hw4, hw5,
       hw117, reduceMatrix, matrixPolynomial_single, Fin.sum_univ_succ,
       MxxExponentLutNand.table, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
-      rotationPolynomial, substitution_root_pow, map_ofNat, reducePoly_substitution, sigma] <;>
+      rotationPolynomial, substitution_root_pow, reducePoly_substitution, sigma] <;>
     ring
 
 set_option maxHeartbeats 8000000 in
@@ -330,7 +330,7 @@ theorem preprocess_switch1 {model : HashModel} {key : ByteArray} {payload : Exac
     simp [ho0, ho1, ho2, ho3, matrixAdd, matrixNeg, Matrix.mul_apply, unitPair, he0, he1, hw4, hw5,
       hw117, reduceMatrix, matrixPolynomial_single, Fin.sum_univ_succ,
       MxxExponentLutNand.table, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
-      rotationPolynomial, substitution_root_pow, map_ofNat, reducePoly_substitution, sigma] <;>
+      rotationPolynomial, substitution_root_pow, reducePoly_substitution, sigma] <;>
     ring
 
 set_option maxHeartbeats 8000000 in
@@ -388,7 +388,7 @@ theorem preprocess_switch2 {model : HashModel} {key : ByteArray} {payload : Exac
     simp [ho0, ho1, ho2, ho3, matrixAdd, matrixNeg, Matrix.mul_apply, unitPair, he0, he1, hw4, hw5,
       hw117, reduceMatrix, matrixPolynomial_single, Fin.sum_univ_succ,
       MxxExponentLutNand.table, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
-      rotationPolynomial, substitution_root_pow, map_ofNat, reducePoly_substitution, sigma] <;>
+      rotationPolynomial, substitution_root_pow, reducePoly_substitution, sigma] <;>
     ring
 
 set_option maxHeartbeats 8000000 in

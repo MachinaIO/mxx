@@ -52,9 +52,9 @@ theorem encrypt_input {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1} 
         hashSample_eq h22, hashSample_eq h24]
   simp only [hkey]
   fin_cases j <;> funext r c <;> obtain rfl : r = 0 := Subsingleton.elim _ _ <;>
-    simp [matrixAdd, matrixSub, matrixMulScalarRight_eq, Matrix.mul_apply,
-      multiplyMonomial_liftInteger, unitPair, he0, he1, reduceMatrix, matrixPolynomial_single] <;>
-    ring
+    (simp [matrixAdd, matrixSub, matrixMulScalarRight_eq, Matrix.mul_apply,
+      multiplyMonomial_liftInteger, unitPair, he0, he1, reduceMatrix, matrixPolynomial_single]
+     try ring)
 
 set_option maxHeartbeats 4000000 in
 /-- The level-one helpers: encryptions at `Q7` of `P7 σ_i(s)` against the gadget of `Q6`. -/
@@ -94,8 +94,7 @@ theorem encrypt_helper1 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   fin_cases j <;> funext r c <;> obtain rfl : r = 0 := Subsingleton.elim _ _ <;>
     simp [matrixAdd, matrixSub, Matrix.mul_apply, unitPair, he0, he1, reduceMatrix,
       matrixPolynomial_single, ho0, ho1, hw10, hw23, reducePoly_substitution, sigma,
-      map_ofNat] <;>
-    ring
+      map_ofNat]
 
 set_option maxHeartbeats 4000000 in
 /-- The level-3 helpers: encryptions at `Q6` of `P6 σ_i(s)` against the gadget of `Q5`. -/
@@ -138,8 +137,7 @@ theorem encrypt_helper3 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   fin_cases j <;> funext r c <;> obtain rfl : r = 0 := Subsingleton.elim _ _ <;>
     simp [matrixAdd, matrixSub, Matrix.mul_apply, unitPair, he0, he1, reduceMatrix,
       matrixPolynomial_single, ho0, ho1, hw12, hw25, reducePoly_substitution, sigma,
-      map_ofNat] <;>
-    ring
+      map_ofNat]
 
 set_option maxHeartbeats 4000000 in
 /-- The level-5 helpers: encryptions at `Q5` of `P5 σ_i(s)` against the gadget of `Q4`. -/
@@ -182,8 +180,7 @@ theorem encrypt_helper5 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   fin_cases j <;> funext r c <;> obtain rfl : r = 0 := Subsingleton.elim _ _ <;>
     simp [matrixAdd, matrixSub, Matrix.mul_apply, unitPair, he0, he1, reduceMatrix,
       matrixPolynomial_single, ho0, ho1, hw12, hw25, reducePoly_substitution, sigma,
-      map_ofNat] <;>
-    ring
+      map_ofNat]
 
 set_option maxHeartbeats 4000000 in
 /-- The level-7 helpers: encryptions at `Q4` of `P4 σ_i(s)` against the gadget of `Q3`. -/
@@ -226,7 +223,6 @@ theorem encrypt_helper7 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   fin_cases j <;> funext r c <;> obtain rfl : r = 0 := Subsingleton.elim _ _ <;>
     simp [matrixAdd, matrixSub, Matrix.mul_apply, unitPair, he0, he1, reduceMatrix,
       matrixPolynomial_single, ho0, ho1, hw12, hw25, reducePoly_substitution, sigma,
-      map_ofNat] <;>
-    ring
+      map_ofNat]
 
 end NandProof

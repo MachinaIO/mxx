@@ -22,4 +22,4 @@ roots = [
 # The proof of the generated claim.
 [[lean_lib]]
 name = "NandProof"
-roots = ["NandSetup", "NandEncrypt", "NandPreprocess"]
+roots = ["NandSetup", "NandEncrypt", "NandPreprocess", "NandOnline0", "NandOnline1", "NandOnline2", "NandOnline3", "NandCertificate"]

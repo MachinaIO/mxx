@@ -11,6 +11,11 @@
 //! requirement, and ideal graph of a protocol declaration and writes the final `Claim.lean`. No
 //! noise bound is inferred; applications supply decoder semantics and proofs. The handwritten Lean
 //! package `crates/ir-core/lean/` supplies shared definitions such as `IterRuns`.
+//!
+//! By default a sampler relation admits any value within the sampler's support, so a claim holds
+//! for every execution. With [`ExportOptions::sampling_tape`], each sampled coefficient is instead
+//! a sampling-tape entry keyed by its occurrence, which a claim with a failure probability
+//! ([`claim::ClaimSemantics::failure_probability_log2`]) measures under the ideal sampler laws.
 
 pub mod claim;
 #[cfg(test)]
@@ -3334,6 +3339,46 @@ mod tests {
         assert!(
             artifact.source.contains(&format!("MxxRuntime.packedPolynomial {width} 128 {table}"))
         );
+    }
+
+    #[test]
+    fn test_export_sampling_tape_reads_each_occurrence_site() {
+        let matrix = MatrixType {
+            ring: crate::ring::test_ring(257, 8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let value = NodeHandle::new(
+            NodeKind::GaussianSample {
+                matrix_type: matrix.clone(),
+                sigma: crate::expr::RealExpr::from_f64_exact(3.0).unwrap(),
+                max_coefficient_bound: IntExpr::constant(48),
+            },
+            vec![],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "sampled",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let taped =
+            export(&validated, &ExportOptions { sampling_tape: true, ..Default::default() })
+                .unwrap();
+        assert!(taped.root.requires_sampling_tape);
+        assert!(taped.source.contains("MxxRuntime.gaussianSampleAt tape (path ++ [0])"));
+        assert!(taped.source.contains("(tape : MxxRuntime.SampleTape) (path : List Nat)"));
+        let plain = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(!plain.root.requires_sampling_tape);
+        assert!(plain.source.contains("MxxRuntime.gaussianSample ("));
+        assert!(!plain.source.contains("SampleTape"));
     }
 
     #[test]

@@ -49,6 +49,18 @@ package without changing the repository-root working directory or Elan's initial
 The fixtures prove consequences of generated execution relations, not sampler termination or
 distribution. The runtime fixture additionally supplies the concrete CRT gadget layout.
 
+A claim with a failure probability (`ClaimSemantics::failure_probability_log2`) instead reads each
+sampled coefficient from a sampling tape. Stage `i` reads the site prefix `[i]`; a subgraph call
+extends the site with its node, a loop body with its node and iteration, and a sampler reads
+`path ++ [node]`. `MxxRuntime.tapeMeasure` in `crates/backends/lean/RuntimeSampling.lean` makes
+every key independent with its sampler's law: the truncated discrete Gaussian, or a uniform
+interval or residue. This is the ideal-sampler assumption, and `randomOracle` is the matching
+law of hash models. The claim bounds the tape measure of the tapes that have a failing run, for
+every hash model and external input. `RuntimeProbability.lean` and `RuntimeGaussian.lean` supply
+protocol-independent tools: exponential moments bounded one block of fresh coordinates at a time,
+Chernoff and Hoeffding tail bounds, and the sub-Gaussian moment of the truncated discrete
+Gaussian.
+
 Families remain functions on `Fin N`; sequential loops use `MxxIR.IterRuns` with a single shared
 state tuple. Changing closed counts does not enumerate lanes or steps. `MxxIR.IterRuns.invariant`
 provides the reusable initial/step invariant elimination rule.

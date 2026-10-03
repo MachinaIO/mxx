@@ -203,7 +203,7 @@ theorem accSeq_phase (W : World) (t : SampleTape) (hs : ∀ j, lweSecret t j = 0
             reducePoly Q N (bskError t i 0 (Fin.castAdd 6 c) * Dw (Fin.castAdd 6 c) 0) -
               z * (lweSecret t i : ExactPoly Q N) * (gadgetRow 0 c * D (Fin.castAdd 6 c) 0) := by
           simp only [bskRows, gswA, gswB, Fin.val_castAdd, c.isLt, dif_pos, Fin.eta, if_pos,
-            one_ne_zero, if_false, if_true]
+            one_ne_zero, if_false]
           rw [dif_neg (show ¬ (6 ≤ c.val) by omega), map_mul, ← hD]
           ring
         have hnat (c : Fin 6) : bskRows t i 1 (Fin.natAdd 6 c) * D (Fin.natAdd 6 c) 0 -

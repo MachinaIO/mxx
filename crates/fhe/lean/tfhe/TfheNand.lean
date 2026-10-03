@@ -34,29 +34,6 @@ theorem cast_emod_Q (a : Int) : ((a % 5234636801 : Int) : ZMod Q) = a := ZMod.in
 
 theorem cast_emod_2048 (a : Int) : ((a % 2048 : Int) : ZMod 2048) = a := ZMod.intCast_mod a 2048
 
-/-- Equal residues differ by a multiple of the modulus. -/
-theorem exists_of_cast_eq {m : Nat} {a b : Int} (h : (a : ZMod m) = b) :
-    ∃ k : Int, a = b + m * k := by
-  obtain ⟨k, hk⟩ := (ZMod.intCast_eq_intCast_iff_dvd_sub b a m).mp h.symm
-  exact ⟨k, by linarith⟩
-
-theorem abs_sum_le_card {ι : Type} [Fintype ι] (x : ι → Int) (b : Int) (h : ∀ i, |x i| ≤ b) :
-    |∑ i, x i| ≤ Fintype.card ι * b := by
-  refine (Finset.abs_sum_le_sum_abs _ _).trans ?_
-  simpa using Finset.sum_le_sum fun i (_ : i ∈ Finset.univ) ↦ h i
-
-theorem abs_binary_mul_le {s x b : Int} (hs : s = 0 ∨ s = 1) (h : |x| ≤ b) (hb : 0 ≤ b) :
-    |s * x| ≤ b := by
-  rcases hs with rfl | rfl <;> simpa
-
-/-- `|∑ s_j x_j| ≤ (∑ s_j) b` for bits `s_j` and `|x_j| ≤ b`. -/
-theorem abs_sum_binary_le {ι : Type} [Fintype ι] (s x : ι → Int) (hs : ∀ i, s i = 0 ∨ s i = 1)
-    {b : Int} (hx : ∀ i, |x i| ≤ b) : |∑ i, s i * x i| ≤ (∑ i, s i) * b := by
-  refine (Finset.abs_sum_le_sum_abs _ _).trans ?_
-  rw [Finset.sum_mul]
-  refine Finset.sum_le_sum fun i _ ↦ ?_
-  rcases hs i with h | h <;> rw [h] <;> simp [hx i]
-
 /-- Rounding `x q / Q` to the nearest integer moves `Q` times the result by at most `Q / 2`. -/
 theorem switch_bound (x : Int) :
     |5234636801 * ((x * 4294967296 + 2617318400) / 5234636801) - 4294967296 * x| ≤
@@ -99,23 +76,6 @@ theorem sum_digits_reindex (f : Fin 8192 → Int) (g : Fin 1024 → Int) :
   have hdiv : (⟨(j.val * 8 + k.val) / 8, by omega⟩ : Fin 1024) = j := Fin.ext (by simp only; omega)
   have hmod : (j.val * 8 + k.val) % 8 = k.val := by omega
   simp only [hdiv, hmod]
-  ring
-
-/-- Key switching cancels the key masks against the output mask: only the encrypted digit
-values remain. -/
-theorem ks_algebra {R : Type} [CommRing R] {I J : Type} [Fintype I] [Fintype J] (b : R)
-    (a : I → J → R) (s : J → R) (d c e : I → R) :
-    b - ∑ i, (∑ j, a i j * s j + c i + e i) * d i - ∑ j, (0 - ∑ i, a i j * d i) * s j =
-      b - ∑ i, d i * (c i + e i) := by
-  have h : ∑ j, (∑ i, a i j * d i) * s j = ∑ i, (∑ j, a i j * s j) * d i := by
-    simp only [Finset.sum_mul]
-    rw [Finset.sum_comm]
-    exact Finset.sum_congr rfl fun i _ ↦ Finset.sum_congr rfl fun j _ ↦ by ring
-  simp only [zero_sub, neg_mul, Finset.sum_neg_distrib, add_mul, Finset.sum_add_distrib,
-    sub_neg_eq_add, h]
-  rw [show ∑ i, c i * d i = ∑ i, d i * c i from Finset.sum_congr rfl fun _ _ ↦ mul_comm _ _,
-    show ∑ i, e i * d i = ∑ i, d i * e i from Finset.sum_congr rfl fun _ _ ↦ mul_comm _ _]
-  simp only [mul_add, Finset.sum_add_distrib]
   ring
 
 /-! ## The explicit key-switching digits and the noise linear form -/
@@ -224,7 +184,7 @@ theorem nand_spec {W : World} {t : SampleTape} (hs : ∀ j, lweSecret t j = 0 �
     refine congrArg₂ (· + ·) rfl (Finset.sum_congr rfl fun i _ ↦ ?_)
     rw [dif_pos i.isLt]
     simp only [Fin.eta, stepShift, Nat.cast_mul]
-    rw [Int.toNat_of_nonneg (show 0 ≤ lweSecret t i by rcases hs i with h | h <;> rw [h] <;> norm_num),
+    rw [Int.toNat_of_nonneg (show 0 ≤ lweSecret t i by rcases hs i with h | h <;> rw [h]; norm_num),
       Int.toNat_of_nonneg (show 0 ≤ rotation W i from (roundRing_range _).1)]
   have hTmod : ((T % (2 * N) : Nat) : Int) = (-(rb - sr)) % 2048 := by
     have hcast : ((T : Int) : ZMod 2048) = ((-(rb - sr) : Int) : ZMod 2048) := by

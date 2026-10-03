@@ -620,6 +620,10 @@ mod tests {
     use crate::{IntExpr, ParamEnv};
 
     fn exported_graph() -> (Graph, LeanArtifact) {
+        exported_graph_with(false)
+    }
+
+    fn exported_graph_with(sampling_tape: bool) -> (Graph, LeanArtifact) {
         use crate::{
             GraphOutput, NodeHandle,
             node::{ConstantMatrix, NodeKind},
@@ -655,8 +659,11 @@ mod tests {
         .unwrap()
         .0;
         let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
-        let artifact =
-            super::super::export(&validated, &super::super::ExportOptions::default()).unwrap();
+        let artifact = super::super::export(
+            &validated,
+            &super::super::ExportOptions { sampling_tape, ..Default::default() },
+        )
+        .unwrap();
         (graph, artifact)
     }
 
@@ -712,6 +719,50 @@ mod tests {
         assert!(conclusion.contains("(observedResidual execution).natAbs <"));
         assert!(conclusion.contains("execution.«producer»"));
         assert!(conclusion.contains("execution.«ideal»"));
+    }
+
+    #[test]
+    fn failure_probability_bounds_the_tape_measure_of_failing_runs() {
+        let (graph, artifact) = exported_graph_with(true);
+        let claim = linked(&graph, &artifact);
+        let semantics = |failure_probability_log2| ClaimSemantics {
+            imports: &["OtherApplication.Semantics"],
+            hash_model_type: "OtherApplication.HashModel",
+            centered_lift: "OtherApplication.centeredLift",
+            message_center: "OtherApplication.messageCenter",
+            decoder_radius: "OtherApplication.decoderRadius",
+            failure_probability_log2,
+        };
+        let backend =
+            ClaimBackend { module_name: "Backend", context_name: "Backend.context", layouts: &[] };
+        let source =
+            assemble_claim(&claim, &ParamEnv::default(), &backend, &semantics(Some(40))).unwrap();
+        let (runs, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
+        assert!(runs.contains("(external : ExternalInputs) (tape : MxxRuntime.SampleTape)"));
+        assert!(runs.contains("tape [0] producer_params"));
+        assert!(runs.contains("tape [1] ideal_params"));
+        assert!(conclusion.contains(
+            "MxxRuntime.tapeMeasure {tape | ∃ execution, Runs hashModel external tape execution ∧"
+        ));
+        assert!(conclusion.contains("¬ ((observedResidual execution).natAbs <"));
+        assert!(conclusion.contains("≤ (2 : ENNReal)⁻¹ ^ 40"));
+        // Tape-reading roots and a deterministic claim do not mix, in either direction.
+        assert!(
+            assemble_claim(&claim, &ParamEnv::default(), &backend, &semantics(None))
+                .unwrap_err()
+                .contains("sampling tape")
+        );
+        let (graph, artifact) = exported_graph();
+        assert!(
+            assemble_claim(
+                &linked(&graph, &artifact),
+                &ParamEnv::default(),
+                &backend,
+                &semantics(Some(40))
+            )
+            .unwrap_err()
+            .contains("sampling tape")
+        );
     }
 
     #[test]

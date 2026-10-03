@@ -1101,5 +1101,47 @@ theorem digit_sum (b x : Nat) : ∀ k : Nat,
     rw [Finset.sum_range_succ, digit_sum b x k, Nat.mod_pow_succ]
     ring
 
+/-! ## Integer and residue arithmetic for noise proofs -/
+
+/-- Equal residues differ by a multiple of the modulus. -/
+theorem exists_of_cast_eq {m : Nat} {a b : Int} (h : (a : ZMod m) = b) :
+    ∃ k : Int, a = b + m * k := by
+  obtain ⟨k, hk⟩ := (ZMod.intCast_eq_intCast_iff_dvd_sub b a m).mp h.symm
+  exact ⟨k, by linarith⟩
+
+theorem abs_sum_le_card {ι : Type} [Fintype ι] (x : ι → Int) (b : Int) (h : ∀ i, |x i| ≤ b) :
+    |∑ i, x i| ≤ Fintype.card ι * b := by
+  refine (Finset.abs_sum_le_sum_abs _ _).trans ?_
+  simpa using Finset.sum_le_sum fun i (_ : i ∈ Finset.univ) ↦ h i
+
+theorem abs_binary_mul_le {s x b : Int} (hs : s = 0 ∨ s = 1) (h : |x| ≤ b) (hb : 0 ≤ b) :
+    |s * x| ≤ b := by
+  rcases hs with rfl | rfl <;> simpa
+
+/-- `|∑ s_j x_j| ≤ (∑ s_j) b` for bits `s_j` and `|x_j| ≤ b`. -/
+theorem abs_sum_binary_le {ι : Type} [Fintype ι] (s x : ι → Int) (hs : ∀ i, s i = 0 ∨ s i = 1)
+    {b : Int} (hx : ∀ i, |x i| ≤ b) : |∑ i, s i * x i| ≤ (∑ i, s i) * b := by
+  refine (Finset.abs_sum_le_sum_abs _ _).trans ?_
+  rw [Finset.sum_mul]
+  refine Finset.sum_le_sum fun i _ ↦ ?_
+  rcases hs i with h | h <;> rw [h] <;> simp [hx i]
+
+/-- Key switching cancels the key masks against the output mask: only the encrypted digit
+values remain. -/
+theorem ks_algebra {R : Type} [CommRing R] {I J : Type} [Fintype I] [Fintype J] (b : R)
+    (a : I → J → R) (s : J → R) (d c e : I → R) :
+    b - ∑ i, (∑ j, a i j * s j + c i + e i) * d i - ∑ j, (0 - ∑ i, a i j * d i) * s j =
+      b - ∑ i, d i * (c i + e i) := by
+  have h : ∑ j, (∑ i, a i j * d i) * s j = ∑ i, (∑ j, a i j * s j) * d i := by
+    simp only [Finset.sum_mul]
+    rw [Finset.sum_comm]
+    exact Finset.sum_congr rfl fun i _ ↦ Finset.sum_congr rfl fun j _ ↦ by ring
+  simp only [zero_sub, neg_mul, Finset.sum_neg_distrib, add_mul, Finset.sum_add_distrib,
+    sub_neg_eq_add, h]
+  rw [show ∑ i, c i * d i = ∑ i, d i * c i from Finset.sum_congr rfl fun _ _ ↦ mul_comm _ _,
+    show ∑ i, e i * d i = ∑ i, d i * e i from Finset.sum_congr rfl fun _ _ ↦ mul_comm _ _]
+  simp only [mul_add, Finset.sum_add_distrib]
+  ring
+
 end MxxRuntime
 

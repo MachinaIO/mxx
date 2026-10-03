@@ -36,13 +36,28 @@ encryption, evaluation, and decryption run on the CPU or the GPU. It depends on 
 
 `lean/tfhe` and `lean/bgv` each hold the statement modules generated from a protocol
 declaration in `generated/`, and handwritten proofs of its `GeneratedClaim.CorrectnessClaim`.
-The TFHE claim, at the worst-case profile selected by `FHE_TEST_TFHE_PROFILE=worst-case`, states
-that keygen, two encryptions, one bootstrapped NAND gate, and decryption decode `1 - m1 m2`,
-with the decryption phase within `Δ` of the encoded bit. The BGV claim states that the
-multiply, relinearize, and modulus-switch round trip decrypts the slotwise product, with the
-phase within the exported bound. The proofs follow each stage through integer witnesses: input
-rounding, blind rotation, sample extraction, and key switching for TFHE, and hybrid key
-switching and modulus switching for BGV.
+Both use the parameters of the GPU integration tests.
+
+- **TFHE** (`utils::tfhe_params`): keygen, two encryptions, one bootstrapped NAND gate, and
+  decryption should decode `1 - m1 m2`, with the decryption phase within `Δ` of the encoded bit.
+  These parameters are correct only with high probability, so the claim states that, for every
+  hash model and external input, the sampled values with a failing run have probability at most
+  `2^-128`. The probability assumes ideal samplers: every sampled coefficient is an independent
+  draw from its sampler's law, the truncated discrete Gaussian or a uniform distribution. It
+  needs no assumption on hash outputs and none of the usual noise heuristics (independence of
+  noise terms, uniform digits, Gaussian tails).
+- **BGV** (`utils::bgv_params`): the multiply, relinearize, and modulus-switch round trip
+  decrypts the slotwise product, with the phase within the exported bound, for every execution.
+
+The TFHE proof (`TfheStages`, `TfheRotation`, `TfheNand`, `TfheDependence`, `TfheBound`,
+`TfheProof`) restates each stage against the sampling tape and models the blind rotation as
+explicit functions of it. A run fails only if the LWE secret has more than 506 ones, which
+Hoeffding's bound makes rarer than `2^-168`, or if a linear form of the sampled key errors
+exceeds `Δ` less a deterministic rounding allowance. That linear form is sub-Gaussian: each
+blind-rotation step multiplies fresh key errors by digits of at most 32 that read only earlier
+keys, and key switching multiplies its fresh errors by digits of at most 3, giving a tail below
+`2^-129`. The BGV proof follows each stage through integer witnesses, including hybrid key
+switching and modulus switching.
 
 Regenerate the statements with the GPU-gated export tests, then check both proofs inside each
 package directory:

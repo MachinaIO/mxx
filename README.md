@@ -232,7 +232,9 @@ the end of the protocol is below a specific threshold. Anyone who trusts the sta
 and the Lean kernel can then delegate the noise growth simulation and the Lean proofs to an AI.
 A human does not have to audit all of that work, only check that a fixed Lean theorem passes.
 The TFHE NAND gate and the BGV round trip of `mxx-fhe` already have generated statements
-with complete Lean proofs; see the [`mxx-fhe` README](crates/fhe/README.md#lean-correctness-proofs).
+with complete Lean proofs at their test parameters; the TFHE statement bounds the failure
+probability by `2^-128`, assuming ideal samplers. See the
+[`mxx-fhe` README](crates/fhe/README.md#lean-correctness-proofs).
 
 **Goal: security statements as well.** Eventually, we aim to generate the Lean statement of
 security from the DSL description in the same deterministic way. Then a new lattice protocol

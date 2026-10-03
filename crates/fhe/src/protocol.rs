@@ -5,9 +5,10 @@
 //! value must equal the ideal output, and the decryption phase, exported by the decryption stage
 //! next to the decoded value, is the residual whose centered coefficients the claim bounds.
 //!
-//! The GPU-gated tests `test_export_tfhe_gate_claim` (worst-case TFHE profile) and
-//! `test_export_bgv_round_trip_claim` write the generated statement modules and the certificate to
-//! `crates/fhe/lean/{tfhe,bgv}/generated`. The handwritten proofs beside them prove each
+//! The GPU-gated tests `test_export_tfhe_gate_claim` and `test_export_bgv_round_trip_claim` write
+//! the generated statement modules and the certificate to `crates/fhe/lean/{tfhe,bgv}/generated`.
+//! The TFHE claim bounds the failure probability of one gate by `2^-128` over the sampled values;
+//! the BGV claim holds for every execution. The handwritten proofs beside them prove each
 //! certificate's `GeneratedClaim.CorrectnessClaim`; `lake build` in each package checks them.
 
 use crate::{BgvCiphertext, BgvParams, FheError, FheScheme, LweCiphertext, TfheParams, utils};

@@ -13,6 +13,7 @@ its claim is `GeneratedClaim.CorrectnessClaim`, and the package of that paramete
 | `lean/<test>/` | Lemmas about the program of integration test `<test>` that hold at every parameter set, and `parameters.csv` |
 | `lean/<test>/<parameter id>/` | The proof of one parameter set (a Lake package) |
 | `lean/<test>/<parameter id>/generated/` | The claim the integration test exported deterministically; never edited by hand |
+| `lean/lwr_prf/generator/` | The script that writes the proof modules and the Lake package of an average-case `lwr_prf` parameter set from its exported claim |
 
 `<test>` is `nand_circuit` (`tests/nand_circuit.rs`) or `lwr_prf` (`tests/lwr_prf.rs`). Each
 package requires the package one directory up, and Mathlib and the ir-core Lean library come from
@@ -131,6 +132,16 @@ its claim from the same stage graphs without executing them:
 ```sh
 MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1 MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=average-n65536-crt36x40 \
   cargo test -r -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
+```
+
+The proof of an average-case `lwr_prf` parameter set is written by the generator from its row and its
+exported claim; it writes every proof module and the Lake package files, and regenerating
+`average-n65536-crt36x40` reproduces its proof byte for byte. The cells, the block sums, and the
+readout LUT of `average-n32-crt7x40` are its templates.
+
+```sh
+cd crates/exponent-lut/lean/lwr_prf
+python3 generator/gen.py average-n65536-crt36x40
 ```
 
 Check a proof in its parameter directory:

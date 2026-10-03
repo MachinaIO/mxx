@@ -19,10 +19,16 @@ roots = [
   "Stage_preprocess", "Stage_encrypt", "Stage_online", "Stage_decode"
 ]
 
-
-# The proof of the generated claim. The certificate chains 34 blocks in one proof, whose kernel
-# check needs a larger thread stack than the default.
+# The proof of the generated claim, written by `../generator/gen.py`. The certificate chains the
+# 34 blocks in one proof, whose kernel check needs a larger thread stack than the default.
 [[lean_lib]]
 name = "LwrProof"
 moreLeanArgs = ["--tstack=512000"]
-roots = ["LwrSetup", "LwrInputs", "LwrEncrypt", "LwrPreprocess", "LwrCells", "LwrBlock0", "LwrBlock1", "LwrBlock2", "LwrBlock3", "LwrBlock4", "LwrBlock5", "LwrBlock6", "LwrBlock7", "LwrBlock8", "LwrBlock9", "LwrBlock10", "LwrBlock11", "LwrBlock12", "LwrBlock13", "LwrBlock14", "LwrBlock15", "LwrBlock16", "LwrBlock17", "LwrBlock18", "LwrBlock19", "LwrBlock20", "LwrBlock21", "LwrBlock22", "LwrBlock23", "LwrBlock24", "LwrBlock25", "LwrBlock26", "LwrBlock27", "LwrBlock28", "LwrBlock29", "LwrBlock30", "LwrBlock31", "LwrBlock32", "LwrBlock33", "LwrLut", "LwrCertificate"]
+roots = [
+"LwrSetup", "LwrInputs", "LwrEncrypt", "LwrPreprocess", "LwrCells", "LwrBlock0", "LwrBlock1",
+  "LwrBlock2", "LwrBlock3", "LwrBlock4", "LwrBlock5", "LwrBlock6", "LwrBlock7", "LwrBlock8",
+  "LwrBlock9", "LwrBlock10", "LwrBlock11", "LwrBlock12", "LwrBlock13", "LwrBlock14", "LwrBlock15",
+  "LwrBlock16", "LwrBlock17", "LwrBlock18", "LwrBlock19", "LwrBlock20", "LwrBlock21", "LwrBlock22",
+  "LwrBlock23", "LwrBlock24", "LwrBlock25", "LwrBlock26", "LwrBlock27", "LwrBlock28", "LwrBlock29",
+  "LwrBlock30", "LwrBlock31", "LwrBlock32", "LwrBlock33", "LwrLut", "LwrCertificate"
+]

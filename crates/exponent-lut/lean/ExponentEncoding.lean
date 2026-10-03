@@ -118,6 +118,25 @@ theorem coeffBound_smul (hn : 0 < n) {rows columns : Nat} {x : ErrorPoly n}
   apply (polyNorm_mul_le_tight hn _ _).trans
   exact Nat.mul_le_mul (Nat.mul_le_mul_left n hx) (coeffBound_polyNorm he row column)
 
+/-- Multiplication by `x` multiplies every coefficient bound by the gain `K`. -/
+def SmulGain (x : ErrorPoly n) (K : Nat) : Prop :=
+  ∀ {rows columns : Nat} {e : ErrorMatrix n rows columns} {b : Nat}, CoeffBound e b →
+    CoeffBound (x • e) (K * b)
+
+/-- A polynomial of coefficient bound `a` has gain `n a`. -/
+theorem smulGain_of_polyNorm (hn : 0 < n) {x : ErrorPoly n} {a : Nat} (hx : polyNorm x ≤ a) :
+    SmulGain x (n * a) :=
+  fun he ↦ coeffBound_smul hn hx he
+
+/-- A monomial `X^k` has gain `1`: it permutes the coefficients up to sign. -/
+theorem smulGain_root_pow (hn : 1 < n) (k : Nat) :
+    SmulGain (AdjoinRoot.root (negacyclicModulus n Int) ^ k) 1 := by
+  intro rows columns e b he row column coefficient
+  apply (coeff_natAbs_le_polyNorm _ coefficient).trans
+  change polyNorm (AdjoinRoot.root (negacyclicModulus n Int) ^ k * e row column) ≤ 1 * b
+  rw [one_mul]
+  exact (polyNorm_root_pow_mul_le hn k _).trans (coeffBound_polyNorm he row column)
+
 theorem coeffBound_pairMul (hn : 0 < n) {m m' : Nat} {x : Fin 2 → ErrorMatrix n 1 m}
     {d : ErrorMatrix n (m + m) m'} {a b : Nat} (hx : ∀ j, CoeffBound (x j) a)
     (hd : CoeffBound d b) : CoeffBound (pairMul x d) ((m + m) * n * a * b) := by

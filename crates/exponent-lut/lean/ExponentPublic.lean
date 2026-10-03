@@ -140,11 +140,11 @@ theorem align_down {q q' p m m' : Nat} (hn : 0 < n) (hq : q = p * q') (hq1 : 1 <
 set_option maxHeartbeats 1000000 in
 /-- Public multiplication: the stacked public encoding of `α` acting on the decomposition of the
 private key `A_s`, plus `α` times the private row, encodes `α t_s` under the acted key. -/
-theorem mul_public {q m m' bound : Nat} (hn : 0 < n) (hq1 : 1 < q)
+theorem mul_public_gain {q m m' bound : Nat} (hn : 0 < n) (hq1 : 1 < q)
     {backend : BackendContext} {base digits : Int} (layout : RegularLayout q)
     (hlayout : backend.regularLayout q n = some layout) (hexact : layout.droppedModuli = 0)
     {G : ExactMatrix q n 1 m} (hG : gadgetMatrixRuns backend base digits G)
-    {sm α : ErrorPoly n} (hα : polyNorm α ≤ 1)
+    {sm α : ErrorPoly n} {K : Nat} (hα : SmulGain α K)
     {Aa : Fin 2 → Fin 2 → ExactMatrix q n 1 m} {ca : Fin 2 → ExactMatrix q n 1 m} {Ba : Nat}
     (ha : Rel sm Aa (fun j ↦ reducePoly q n (α * unitPair sm j) • G) ca Ba)
     {As : Fin 2 → Fin 2 → ExactMatrix q n 1 m'} {ts cs : Fin 2 → ExactMatrix q n 1 m'} {Bs : Nat}
@@ -165,7 +165,7 @@ theorem mul_public {q m m' bound : Nat} (hn : 0 < n) (hq1 : 1 < q)
     (hA1 : ∀ j, sliceMatrix (matrixMul both (D j)) 2 3 0 m' (A' 1 j))
     {c' : Fin 2 → ExactMatrix q n 1 m'}
     (hc' : ∀ j, c' j = Y j + matrixMulScalarRight (cs j) payload) :
-    Rel sm A' (fun j ↦ reducePoly q n α • ts j) c' ((m + m) * n * Ba * bound + n * 1 * Bs) := by
+    Rel sm A' (fun j ↦ reducePoly q n α • ts j) c' ((m + m) * n * Ba * bound + K * Bs) := by
   have hrows := fun j ↦ stacked_row hl01 hl hr01 hr hboth (D j)
   choose d hd using fun j ↦ (hD j).2.2.2
   have hDd : ∀ j, D j = reduceMatrix q n (m + m) m' (d j) := fun j ↦ (hd j).1
@@ -196,12 +196,41 @@ theorem mul_public {q m m' bound : Nat} (hn : 0 < n) (hq1 : 1 < q)
   obtain ⟨ea, hea, hca⟩ := hact
   obtain ⟨es, hes, hcs⟩ := hs
   beta_reduce at hca
-  refine ⟨fun j ↦ ea j + α • es j, fun j ↦ coeffBound_add (hea j) (coeffBound_smul hn hα (hes j)),
+  refine ⟨fun j ↦ ea j + α • es j, fun j ↦ coeffBound_add (hea j) (hα (hes j)),
     fun j ↦ ?_⟩
   beta_reduce
   rw [hc' j, hYe j, hca j, ht j, matrixMulScalarRight_smul, hcs j, hpayload, hAe 0 j, hAe 1 j,
     reduceMatrix_add, reduceMatrix_smul]
   simp only [smul_add, smul_sub]
   abel
+
+/-- `mul_public_gain` for a public plaintext of coefficient bound `1`. -/
+theorem mul_public {q m m' bound : Nat} (hn : 0 < n) (hq1 : 1 < q)
+    {backend : BackendContext} {base digits : Int} (layout : RegularLayout q)
+    (hlayout : backend.regularLayout q n = some layout) (hexact : layout.droppedModuli = 0)
+    {G : ExactMatrix q n 1 m} (hG : gadgetMatrixRuns backend base digits G)
+    {sm α : ErrorPoly n} (hα : polyNorm α ≤ 1)
+    {Aa : Fin 2 → Fin 2 → ExactMatrix q n 1 m} {ca : Fin 2 → ExactMatrix q n 1 m} {Ba : Nat}
+    (ha : Rel sm Aa (fun j ↦ reducePoly q n (α * unitPair sm j) • G) ca Ba)
+    {As : Fin 2 → Fin 2 → ExactMatrix q n 1 m'} {ts cs : Fin 2 → ExactMatrix q n 1 m'} {Bs : Nat}
+    (hs : Rel sm As ts cs Bs)
+    {l01 r01 : ExactMatrix q n (1 + 1) m} {l r : ExactMatrix q n (1 + 1 + 1) m}
+    {both : ExactMatrix q n (1 + 1 + 1) (m + m)}
+    (hl01 : concatRows (ca 0) (Aa 0 0) l01) (hl : concatRows l01 (Aa 1 0) l)
+    (hr01 : concatRows (ca 1) (Aa 0 1) r01) (hr : concatRows r01 (Aa 1 1) r)
+    (hboth : concatColumns l r both)
+    {Xs : Fin 2 → ExactMatrix q n (1 + 1) m'} (hXs : ∀ j, concatRows (As 0 j) (As 1 j) (Xs j))
+    {D' : Fin 2 → ExactMatrix q n (m + m) m'}
+    (hD' : ∀ j, gadgetDecomposeRuns backend base digits (Xs j) (D' j))
+    {D : Fin 2 → ExactMatrix q n (m + m) m'} (hD : ∀ j, compactCenteredRebaseRuns bound (D' j) (D j))
+    {payload : ExactMatrix q n 1 1} (hpayload : payload = fun _ _ ↦ reducePoly q n α)
+    {Y : Fin 2 → ExactMatrix q n 1 m'} {A' : Fin 2 → Fin 2 → ExactMatrix q n 1 m'}
+    (hY : ∀ j, sliceMatrix (matrixMul both (D j)) 0 1 0 m' (Y j))
+    (hA0 : ∀ j, sliceMatrix (matrixMul both (D j)) 1 2 0 m' (A' 0 j))
+    (hA1 : ∀ j, sliceMatrix (matrixMul both (D j)) 2 3 0 m' (A' 1 j))
+    {c' : Fin 2 → ExactMatrix q n 1 m'}
+    (hc' : ∀ j, c' j = Y j + matrixMulScalarRight (cs j) payload) :
+    Rel sm A' (fun j ↦ reducePoly q n α • ts j) c' ((m + m) * n * Ba * bound + n * 1 * Bs) :=
+  mul_public_gain hn hq1 layout hlayout hexact hG (smulGain_of_polyNorm hn hα) ha hs hl01 hl hr01 hr hboth hXs hD' hD hpayload hY hA0 hA1 hc'
 
 end MxxExponentLut

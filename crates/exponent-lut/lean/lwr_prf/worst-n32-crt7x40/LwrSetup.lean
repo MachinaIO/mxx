@@ -5,6 +5,7 @@ import ExponentWalsh
 import ExponentPublic
 import ExponentRuntime
 import LwrProgram
+import ExponentIterate
 
 /-!
 # The parameter set
@@ -190,37 +191,41 @@ theorem inverse1_mul : (inverse1 : ExactPoly Q1 N) * ((16 : Nat) : ExactPoly Q1 
 
 /-! ## The key layout of output 0 -/
 
-/-- The coordinate of `a` read by cell `i` of block `b`; dummy and padding cells read member
+/-- The coordinates of `a` read by the cells of every block; dummy and padding cells read member
 `16`. -/
-def coords : Fin 5 → Fin 14 → Nat :=
-  ![![4, 5, 10, 11, 12, 14, 15, 16, 16, 16, 16, 16, 16, 16],
-    ![0, 1, 2, 4, 6, 7, 8, 9, 12, 13, 14, 15, 16, 16],
-    ![0, 1, 2, 3, 5, 8, 9, 10, 11, 12, 15, 16, 16, 16],
-    ![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16],
-    ![3, 6, 7, 13, 14, 16, 16, 16, 16, 16, 16, 16, 16, 16]]
+def coordsTable : Fin 5 → List Nat :=
+  ![
+    [4, 5, 10, 11, 12, 14, 15, 16, 16, 16, 16, 16, 16, 16],
+    [0, 1, 2, 4, 6, 7, 8, 9, 12, 13, 14, 15, 16, 16],
+    [0, 1, 2, 3, 5, 8, 9, 10, 11, 12, 15, 16, 16, 16],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16],
+    [3, 6, 7, 13, 14, 16, 16, 16, 16, 16, 16, 16, 16, 16]]
 
-theorem coords_lt (b : Fin 5) (i : Fin 14) : coords b i < 17 := by
-  fin_cases b <;> fin_cases i <;> decide
+/-- The coordinate of `a` read by cell `i` of block `b`. -/
+def coords (b : Fin 5) (i : Fin 14) : Nat := (coordsTable b).getD i 0
+
+theorem coords_lt (b : Fin 5) (i : Fin 14) : coords b i < 17 :=
+  getD_lt_of_all (by norm_num) (by revert b; decide) i
 
 theorem selectInt_coords0 (i : Fin 14) :
-    MxxIR.selectInt (Int.ofNat i) [(4), (5), (10), (11), (12), (14), (15), (16), (16), (16), (16), (16), (16), (16)] = Int.ofNat (coords 0 i) := by
-  fin_cases i <;> rfl
+    MxxIR.selectInt (Int.ofNat i) [(4), (5), (10), (11), (12), (14), (15), (16), (16), (16), (16), (16), (16), (16)] = Int.ofNat (coords 0 i) :=
+  selectInt_map_ofNat (coordsTable 0) i
 
 theorem selectInt_coords1 (i : Fin 14) :
-    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (4), (6), (7), (8), (9), (12), (13), (14), (15), (16), (16)] = Int.ofNat (coords 1 i) := by
-  fin_cases i <;> rfl
+    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (4), (6), (7), (8), (9), (12), (13), (14), (15), (16), (16)] = Int.ofNat (coords 1 i) :=
+  selectInt_map_ofNat (coordsTable 1) i
 
 theorem selectInt_coords2 (i : Fin 14) :
-    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (3), (5), (8), (9), (10), (11), (12), (15), (16), (16), (16)] = Int.ofNat (coords 2 i) := by
-  fin_cases i <;> rfl
+    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (3), (5), (8), (9), (10), (11), (12), (15), (16), (16), (16)] = Int.ofNat (coords 2 i) :=
+  selectInt_map_ofNat (coordsTable 2) i
 
 theorem selectInt_coords3 (i : Fin 14) :
-    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (13), (16)] = Int.ofNat (coords 3 i) := by
-  fin_cases i <;> rfl
+    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (13), (16)] = Int.ofNat (coords 3 i) :=
+  selectInt_map_ofNat (coordsTable 3) i
 
 theorem selectInt_coords4 (i : Fin 14) :
-    MxxIR.selectInt (Int.ofNat i) [(3), (6), (7), (13), (14), (16), (16), (16), (16), (16), (16), (16), (16), (16)] = Int.ofNat (coords 4 i) := by
-  fin_cases i <;> rfl
+    MxxIR.selectInt (Int.ofNat i) [(3), (6), (7), (13), (14), (16), (16), (16), (16), (16), (16), (16), (16), (16)] = Int.ofNat (coords 4 i) :=
+  selectInt_map_ofNat (coordsTable 4) i
 
 /-! ## Hash tags -/
 

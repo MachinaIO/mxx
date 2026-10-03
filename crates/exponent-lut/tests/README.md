@@ -131,6 +131,11 @@ reproduced, verify the round trip and the decrypted output, and export the graph
 stages as a closed protocol to `lean/<test>/<parameter id>/generated`. See `lean/README.md` for the
 meaning of each column and the proofs of the exported claims.
 
+`lwr_prf.rs` with `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1` as well builds and validates the same
+stage graphs without a round trip: only the secret sampling executes, on the CPU, and the claim is
+exported. It exports parameter sets whose round trip does not fit the local GPU; the stage graphs,
+and so the claim, do not depend on whether the stages executed.
+
 ```sh
 MXX_EXPONENT_LUT_NAND_PARAMETER_ID=worst-n32-crt7x40 \
   cargo test -p mxx-exponent-lut --features gpu --test nand_circuit -- --nocapture

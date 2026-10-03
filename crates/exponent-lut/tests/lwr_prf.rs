@@ -4,14 +4,19 @@
 //!
 //! With `MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID`, the workflow runs the recorded parameter set of
 //! that ID in `lean/lwr_prf/parameters.csv` instead of searching, and exports the Lean correctness
-//! claim of the executed graphs to `lean/lwr_prf/<parameter id>/generated`.
+//! claim of the executed graphs to `lean/lwr_prf/<parameter id>/generated`. With
+//! `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1` as well, it builds and validates the same stage graphs
+//! but executes only the secret sampling (on the CPU), and exports the claim without a round trip;
+//! this exports parameter sets too large for the local GPU.
 
 mod common;
 
 use bigdecimal::BigDecimal;
 use mxx_backends::{
-    GpuRuntime,
+    GpuRuntime, RuntimeValue,
+    authority::CpuExecution,
     backend::poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+    matrix::dcrt_poly::DCRTPolyMatrix,
     poly::{
         Poly, PolyParams,
         dcrt::{
@@ -73,6 +78,53 @@ fn setting(recorded: Option<&ParameterRow>, column: &str, name: &str, default: u
     match recorded {
         Some(row) => common::column(row, column),
         None => env_usize(name, default).unwrap_or_else(|error| panic!("{name}: {error}")),
+    }
+}
+
+/// `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1`: build and export the claim without a round trip.
+fn export_only() -> bool {
+    env::var("MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY").is_ok_and(|value| value == "1")
+}
+
+/// A stage execution that executes only the secret sampling, on the CPU. Every other stage is
+/// validated and recorded by its caller, returns the production its execution would have (which
+/// depends only on the validated graph), and yields no outputs.
+struct GraphOnly(CpuExecution);
+
+impl api::StageExecution<api::StageStore> for GraphOnly {
+    fn produce(
+        &mut self,
+        validated: ValidatedGraph,
+        _: BTreeMap<String, RuntimeValue>,
+        _: &mut api::StageStore,
+        execution_nonce: [u8; 32],
+    ) -> Result<mxx_ir_core::artifact::ProductionId, api::ApiError> {
+        let specification =
+            mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
+                .expect("stage specification hash");
+        Ok(mxx_ir_core::artifact::production_id(specification, execution_nonce))
+    }
+
+    fn evaluate(
+        &mut self,
+        validated: ValidatedGraph,
+        inputs: BTreeMap<String, RuntimeValue>,
+        store: &mut api::StageStore,
+        execution_nonce: [u8; 32],
+    ) -> Result<api::StageOutputs, api::ApiError> {
+        if validated.source.name() == "rns-bgg-secret" {
+            self.0.evaluate(validated, inputs, store, execution_nonce)
+        } else {
+            Ok(api::StageOutputs { outputs: BTreeMap::new() })
+        }
+    }
+
+    fn download_matrix(&self, value: &RuntimeValue) -> Result<DCRTPolyMatrix, api::ApiError> {
+        api::StageExecution::<api::StageStore>::download_matrix(&self.0, value)
+    }
+
+    fn download_integers(&self, value: &RuntimeValue) -> Result<Vec<BigInt>, api::ApiError> {
+        api::StageExecution::<api::StageStore>::download_integers(&self.0, value)
     }
 }
 
@@ -619,6 +671,28 @@ fn lwr_prf_end_to_end() {
         search_fixture(&sigma, row);
         return;
     }
+    if export_only() {
+        assert!(row.is_some(), "export-only mode needs MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID");
+        let (parameters, poly_parameters, profile, program, keys, trace) =
+            search_fixture(&sigma, row);
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let store = api::StageStorage::File(directory.path().into()).open().expect("stage storage");
+        let mut execution = GraphOnly(CpuExecution::new(mxx_backends::backend::poly::cpu_backend(
+            parameters.levels().iter().cloned(),
+        )));
+        round_trip(
+            parameters,
+            poly_parameters,
+            profile,
+            program,
+            keys,
+            trace,
+            &mut execution,
+            store,
+            recorded,
+        );
+        return;
+    }
     let devices = detected_gpu_device_ids();
     if devices.is_empty() {
         // This target is GPU-only; the sequential runtime lock is applied by
@@ -762,6 +836,40 @@ fn round_trip(
         eprintln!("estimate mode: every stage was planned; outputs are not verified");
         return;
     }
+    if export_only() {
+        // No stage was evaluated: build the decryption graph on placeholder online outputs,
+        // record it, and export the claim.
+        let placeholder = api::StageOutputs {
+            outputs: [1, 3, 5]
+                .into_iter()
+                .map(|port| (format!("output-0.{port}"), RuntimeValue::Int(BigInt::from(0))))
+                .collect(),
+        };
+        let decoded = decode_output(
+            program.program(),
+            &placeholder,
+            0,
+            &parameters,
+            &mask,
+            &[0],
+            runtime,
+            &mut store,
+            record(&graphs, "decode"),
+        );
+        assert!(decoded.is_err(), "the export-only decryption graph is not executed");
+        let (id, row) = recorded.expect("export-only mode exports a recorded parameter set");
+        export_claim(
+            &id,
+            &row,
+            &profile,
+            &program,
+            graphs,
+            &payload,
+            &mask,
+            (preprocess.production().clone(), encrypted.production().clone()),
+        );
+        return;
+    }
     // Compute every output's expected readout independently from `a` and
     // its key. The coefficient LUT returns the signed readout as the
     // constant polynomial, so the expected plaintext is built in the source
@@ -811,19 +919,36 @@ fn round_trip(
     assert_eq!(decoded, vec![BigInt::from(readout % 2)], "decrypted LWR output parity");
 
     if let Some((id, row)) = recorded {
-        let directory = common::generated_directory("lwr_prf", &id);
-        let protocol = lwr_protocol(
+        export_claim(
+            &id,
+            &row,
             &profile,
             &program,
-            graphs.into_inner(),
+            graphs,
             &payload,
             &mask,
             (preprocess.production().clone(), encrypted.production().clone()),
-            &row,
         );
-        mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("LWR claim export");
-        eprintln!("exported the LWR correctness claim to {}", directory.display());
     }
+}
+
+/// Export the claim of the recorded stage graphs to `lean/lwr_prf/<id>/generated`.
+#[allow(clippy::too_many_arguments)]
+fn export_claim(
+    id: &str,
+    row: &ParameterRow,
+    profile: &SparseLwrPrfProfile,
+    program: &SparseLwrPrfProgram,
+    graphs: StageGraphs,
+    payload: &mxx_exponent_lut::rns_bgg::RnsBggPayloadSecret,
+    mask: &mxx_exponent_lut::rns_bgg::RnsBggMaskSecret,
+    productions: (mxx_ir_core::artifact::ProductionId, mxx_ir_core::artifact::ProductionId),
+) {
+    let directory = common::generated_directory("lwr_prf", id);
+    let protocol =
+        lwr_protocol(profile, program, graphs.into_inner(), payload, mask, productions, row);
+    mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("LWR claim export");
+    eprintln!("exported the LWR correctness claim to {}", directory.display());
 }
 
 /// The executed LWR workflow of output 0 as a closed protocol: payload and mask sampling,
@@ -887,7 +1012,18 @@ fn lwr_protocol(
     assert_eq!(selector_families.len(), blocks.len(), "one selector family per block");
 
     // The ideal output: the parity of `rho(z) = floor(p' (z mod Q/2) / (Q/2)) + 1` for
-    // `z = sum_j a[cells[j][selected_j]]`.
+    // `z = sum_j a[cells[j][selected_j]]`. Block `j` adds `selector_j[c] a[cells[j][c]]` over its
+    // cells `c` in a loop; the cell coordinate is selected from the constant table of the block.
+    let block_sum = |selector: &Family<Int>, a: &Family<Int>, coordinates: &[usize]| {
+        mxx_dsl::iterate(coordinates.len(), Int::constant(0), |cell, total| {
+            let coordinate = mxx_dsl::select(
+                cell.clone(),
+                coordinates.iter().map(|coordinate| Int::constant(*coordinate as i64)).collect(),
+            )?;
+            Ok(total.add(selector.at(cell).mul(a.at(coordinate))))
+        })
+        .expect("block sum loop")
+    };
     let ideal = DslContext::new("lwr-ideal");
     let a = ideal.input::<Family<Int>>("a", family(members)).expect("ideal a");
     let mut z = Int::constant(0);
@@ -895,37 +1031,38 @@ fn lwr_protocol(
         let selector = ideal
             .input::<Family<Int>>(format!("selector_{block}"), family(coordinates.len()))
             .expect("ideal selector");
-        for (slot, coordinate) in coordinates.iter().enumerate() {
-            z = z.add(selector.at(slot).mul(a.at(*coordinate)));
-        }
+        z = z.add(block_sum(&selector, &a, coordinates));
     }
     let readout = z.rem(width).mul(profile.p_prime).div(width).add(1);
     let ideal = IdealSpec::new(ideal.output("bit", readout.rem(2)).unwrap().build().unwrap().graph)
         .unwrap();
 
-    // The requirement: `±X^e = X^(stride a)` member by member, and one-hot selectors.
+    // The requirement: `±X^e = X^(stride a)` member by member, and one-hot selectors, each
+    // checked in a loop.
     let requirement = DslContext::new("lwr-inputs");
     let a = requirement.input::<Family<Int>>("a", family(members)).unwrap();
     let coefficient = requirement.input::<Family<Int>>("a_coefficient", family(members)).unwrap();
     let exponent = requirement.input::<Family<Int>>("a_exponent", family(members)).unwrap();
-    let mut valid = Int::constant(0).equal(0);
-    for member in 0..members {
-        let sign = coefficient.at(member);
+    let mut valid = mxx_dsl::iterate(members, Int::constant(0).equal(0), |member, valid| {
+        let sign = coefficient.at(member.clone());
         // `2 e + n (1 - c) = 2 stride a` with `c = ±1`.
-        valid = valid &
+        Ok(valid &
             sign.clone().mul(sign.clone()).equal(1) &
             exponent
-                .at(member)
+                .at(member.clone())
                 .mul(2)
                 .add(Int::constant(1).sub(sign).mul(ring_dimension))
-                .equal(a.at(member).mul(2 * stride));
-    }
+                .equal(a.at(member).mul(2 * stride)))
+    })
+    .unwrap();
     for (block, coordinates) in blocks.iter().enumerate() {
         let selector = requirement
             .input::<Family<Int>>(format!("selector_{block}"), family(coordinates.len()))
             .unwrap();
-        let total = (0..coordinates.len())
-            .fold(Int::constant(0), |total, slot| total.add(selector.at(slot)));
+        let total = mxx_dsl::iterate(coordinates.len(), Int::constant(0), |cell, total| {
+            Ok(total.add(selector.at(cell)))
+        })
+        .unwrap();
         valid = valid & total.equal(1);
     }
     let requirement =

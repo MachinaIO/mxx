@@ -85,26 +85,26 @@ theorem generated_final_public_witness
 layout that also constructs the public gadget. -/
 theorem final_public_digits (params : Stage_encrypt.Params)
     {decoder key one digits half publicInputs publicCircuit}
-    (w : FinalPublicWitness DiamondBackend.backend params decoder key one digits half
+    (w : FinalPublicWitness Backend.backend params decoder key one digits half
       publicInputs publicCircuit) :
     w.gadget * digits = w.target ∧
       ∃ lift : ErrorMatrix n ell 1, digits = reduceMatrix q n ell 1 lift ∧ CoeffBound lift D := by
   obtain ⟨layout, hlayout, _, _, hwidth, hd, _⟩ := w.decompositionRun
-  have hl : layout = DiamondBackend.layout0 := by
-    simpa [DiamondBackend.backend] using hlayout.symm
+  have hl : layout = Backend.layout0 := by
+    simpa [Backend.backend] using hlayout.symm
   subst layout
-  have hd' : digits = regularDecomposeMatrix DiamondBackend.layout0 w.target := by
+  have hd' : digits = regularDecomposeMatrix Backend.layout0 w.target := by
     simpa [castMatrixRows] using hd
   obtain ⟨layout, hlayout, _, _, hwidth, hg⟩ := w.gadgetRun
-  have hl : layout = DiamondBackend.layout0 := by
-    simpa [DiamondBackend.backend] using hlayout.symm
+  have hl : layout = Backend.layout0 := by
+    simpa [Backend.backend] using hlayout.symm
   subst layout
-  have hg' : w.gadget = regularGadgetMatrix (n := n) DiamondBackend.layout0 := by
+  have hg' : w.gadget = regularGadgetMatrix (n := n) Backend.layout0 := by
     simpa [castMatrixColumns] using hg
   constructor
   · exact (congrArg₂ (fun g d ↦ g * d) hg' hd').trans
       (regularGadgetMatrix_reconstruct _ _ (by decide) (by decide) (by decide))
-  · have hb := regularDecomposeMatrix_bounded DiamondBackend.layout0 w.target
+  · have hb := regularDecomposeMatrix_bounded Backend.layout0 w.target
       (by decide) (by decide)
     obtain ⟨lift, hlift, hbound⟩ := hb
     exact ⟨lift, hd'.trans hlift, hbound⟩
@@ -164,7 +164,7 @@ theorem final_negative_rounded_half (modulus dimension : Nat) :
 /-- The encrypted negative rounded half uses the exact decoder message center. -/
 theorem final_public_message_center (params : Stage_encrypt.Params)
     {decoder key one digits half publicInputs publicCircuit}
-    (w : FinalPublicWitness DiamondBackend.backend params decoder key one digits half
+    (w : FinalPublicWitness Backend.backend params decoder key one digits half
       publicInputs publicCircuit) (hq : params.diamond_modulus = (q : Int)) (message : Bool) :
     -(if message then half else 0) =
       matrixPolynomial [(MxxWe.messageCenter q message : Int)] := by

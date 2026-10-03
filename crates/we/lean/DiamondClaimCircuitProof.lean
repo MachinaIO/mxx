@@ -22,7 +22,7 @@ noncomputable def claimCircuitSecret {hashModel external execution}
 theorem claim_witness_slot_encoding {hashModel external execution}
     (w : ClaimInjectorWitness hashModel external execution) (slot : Fin witnessSlots)
     (key output : ExactMatrix q n 1 ell) (message : ExactMatrix q n 1 1)
-    (ho : Stage_decrypt.parallel_generatedRoot_22 DiamondBackend.backend stage_1_params slot
+    (ho : Stage_decrypt.parallel_generatedRoot_22 Backend.backend stage_1_params slot
       (w.decryptRoot.w_6_0 ⟨slot.val + 1, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val + 1 < 2; omega⟩,
         execution.stage_0.2.2.2.2.2.2.2.1 slot,
         execution.stage_0.2.2.2.2.1 ⟨slot.val + 1, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val + 1 < 2; omega⟩,
@@ -94,14 +94,14 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
     have hi' : i = 0 := Fin.ext (by omega)
     simpa only [hi'] using hv
   have hslotsRun : ∀ slot : Fin witnessSlots,
-      Stage_decrypt.parallel_generatedRoot_22 DiamondBackend.backend stage_1_params slot
+      Stage_decrypt.parallel_generatedRoot_22 Backend.backend stage_1_params slot
         (w.decryptRoot.w_6_0 ⟨slot.val + 1, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val + 1 < 2; omega⟩,
           execution.stage_0.2.2.2.2.2.2.2.1 slot,
           execution.stage_0.2.2.2.2.1 ⟨slot.val + 1, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val + 1 < 2; omega⟩,
           external.input_6 ⟨slot.val, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val < 3; omega⟩, ())
         (w.decryptRoot.w_22_0 slot, w.decryptRoot.w_22_1 slot, w.decryptRoot.w_22_2 slot, ()) := by tauto
   have hinitialRun : ∀ lane : Fin circuitWidth,
-      Stage_decrypt.parallel_generatedRoot_28 DiamondBackend.backend stage_1_params lane
+      Stage_decrypt.parallel_generatedRoot_28 Backend.backend stage_1_params lane
         (stage_1_params.instance_width,
           stage_1_params.instance_width + (stage_1_params.diamond_batch_bits * stage_1_params.diamond_input_count) - 1,
           0, w.decryptRoot.w_22_0, external.input_5 lane,
@@ -112,7 +112,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
     simp only [matrixSub, sub_self, matrixMul] at hn
     tauto
   have hloop : MxxIR.IterRuns
-      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33 DiamondBackend.backend
+      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33 Backend.backend
         stage_1_params layer (current.1, current.2.1, current.2.2.1,
           external.input_0, w.decryptRoot.w_7_0 * execution.stage_0.2.2.2.1,
           external.input_1, external.input_2, external.input_3, w.decryptRoot.w_24_0, 1, ()) next)
@@ -151,7 +151,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
   have hplain : CircuitPlaintextAgrees
       (w.decryptRoot.w_28_0, w.decryptRoot.w_28_1, w.decryptRoot.w_28_2, ()) referenceInitial := by
     intro lane
-    obtain ⟨facts⟩ := generated_initial_lane_facts DiamondBackend.backend stage_1_params lane
+    obtain ⟨facts⟩ := generated_initial_lane_facts Backend.backend stage_1_params lane
       stage_1_params.instance_width
       (stage_1_params.instance_width + (stage_1_params.diamond_batch_bits * stage_1_params.diamond_input_count) - 1)
       (external.input_5 lane) 0 (w.decryptRoot.w_7_0 * execution.stage_0.2.2.2.1)
@@ -174,7 +174,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
     rw [honeKey, hstate0]
     exact initial_one_encoding stage_0_params w.finalPublic (claimCircuitSecret w)
       selector _ claimInjectorNoise stage_0_params.diamond_preimage_max_coefficient_bound.toNat
-      hsecret hzero (generated_final_preimages_bounded DiamondBackend.backend hashModel
+      hsecret hzero (generated_final_preimages_bounded Backend.backend hashModel
         stage_0_params henc).2.2
   have hslots : ∀ slot : Fin witnessSlots,
       BooleanEncodingWithin (claimCircuitSecret w) (w.decryptRoot.w_22_1 slot)
@@ -193,7 +193,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
   have hinitial : CircuitStateWithin (claimCircuitSecret w) claimInitialNoise
       (w.decryptRoot.w_28_0, w.decryptRoot.w_28_1, w.decryptRoot.w_28_2, ()) := by
     intro lane
-    exact generated_initial_lane_within DiamondBackend.backend stage_1_params lane claimInitialNoise
+    exact generated_initial_lane_within Backend.backend stage_1_params lane claimInitialNoise
       _ _ _ (claimCircuitSecret w) _ _ _ _ _ _ hone hslots (hinitialRun lane)
   have hfinal := generated_circuit_iteration_within stage_1_params stage_1_params.depth.toNat
     claimInitialNoise (claimCircuitSecret w)
@@ -215,14 +215,14 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
     have hi' : i = 0 := Fin.ext (by omega)
     simpa only [hi', ← hepublic, ← honeKey] using hv
   have heindex : ∀ lane : Fin circuitWidth,
-      Stage_encrypt.parallel_generatedRoot_20 DiamondBackend.backend hashModel stage_0_params lane
+      Stage_encrypt.parallel_generatedRoot_20 Backend.backend hashModel stage_0_params lane
         (stage_1_params.instance_width,
           stage_1_params.instance_width + (stage_1_params.diamond_batch_bits * stage_1_params.diamond_input_count) - 1, ())
         (w.encryptRoot.w_20_0 lane) := by
     simpa only [add_zero] using
       (show ∀ lane : Fin circuitWidth, Stage_encrypt.parallel_generatedRoot_20 _ _ _ _ _ _ from by tauto)
   have heinitialRun : ∀ lane : Fin circuitWidth,
-      Stage_encrypt.parallel_generatedRoot_22 DiamondBackend.backend hashModel stage_0_params lane
+      Stage_encrypt.parallel_generatedRoot_22 Backend.backend hashModel stage_0_params lane
         (stage_1_params.instance_width,
           stage_1_params.instance_width + (stage_1_params.diamond_batch_bits * stage_1_params.diamond_input_count) - 1,
           0, w.encryptRoot.w_8_0, w.encryptRoot.w_20_0 lane, external.input_5 lane,
@@ -231,7 +231,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
     simp only [matrixSub, sub_self] at hn
     tauto
   have heloop : MxxIR.IterRuns
-      (fun layer current next ↦ Stage_encrypt.sequential_generatedRoot_27 DiamondBackend.backend
+      (fun layer current next ↦ Stage_encrypt.sequential_generatedRoot_27 Backend.backend
         hashModel stage_0_params layer (current, external.input_0, w.encryptRoot.w_9_0,
           external.input_1, external.input_2, external.input_3, ()) next)
       stage_0_params.depth.toNat w.encryptRoot.w_22_0 w.encryptRoot.w_27_0 := by tauto
@@ -239,7 +239,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
   have hecircuit : familyGetDynamic w.encryptRoot.w_27_0 w.encryptRoot.w_29_0 w.encryptRoot.w_30_0 := by tauto
   have heinitial : w.decryptRoot.w_28_1 = w.encryptRoot.w_22_0 := by
     funext lane
-    obtain ⟨facts⟩ := generated_initial_lane_facts DiamondBackend.backend stage_1_params lane
+    obtain ⟨facts⟩ := generated_initial_lane_facts Backend.backend stage_1_params lane
       _ _ _ _ _ _ _ _ _ _ _ _ _ (hinitialRun lane)
     have hkeys : ∀ slot : Fin witnessSlots, w.decryptRoot.w_22_1 slot =
         w.encryptRoot.w_8_0 ⟨slot.val + 1, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val + 1 < 2; omega⟩ := by
@@ -250,7 +250,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
       obtain ⟨_, _, _, _, _, hout⟩ := hs
       simpa only [hepublic] using congrArg (fun x ↦ x.2.1) hout
     have honePublic : w.decryptRoot.w_24_0 = w.encryptRoot.w_8_0 0 := honeKey.trans (congrFun hepublic 0)
-    apply generated_initial_public_lane_agrees DiamondBackend.backend hashModel stage_0_params
+    apply generated_initial_public_lane_agrees Backend.backend hashModel stage_0_params
       lane _ _ (external.input_5 lane) _ 0 (w.decryptRoot.w_7_0 * execution.stage_0.2.2.2.1)
       w.encryptRoot.w_8_0 w.decryptRoot.w_22_0 w.decryptRoot.w_22_1 w.decryptRoot.w_22_2
       (w.decryptRoot.w_28_0 lane, w.decryptRoot.w_28_1 lane, w.decryptRoot.w_28_2 lane, ())
@@ -258,7 +258,7 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
       (by simpa only [honePublic] using facts) hkeys (heindex lane)
     simpa only [heone, honePublic] using heinitialRun lane
   have hpublicFinal : w.decryptRoot.w_33_1 = w.encryptRoot.w_27_0 :=
-    generated_circuit_public_iteration_agrees DiamondBackend.backend hashModel stage_1_params
+    generated_circuit_public_iteration_agrees Backend.backend hashModel stage_1_params
       stage_0_params stage_1_params.depth.toNat
       (w.decryptRoot.w_28_0, w.decryptRoot.w_28_1, w.decryptRoot.w_28_2, ())
       (w.decryptRoot.w_33_0, w.decryptRoot.w_33_1, w.decryptRoot.w_33_2, ())

@@ -342,7 +342,7 @@ pub fn export_diamond_certificate(
     fs::write(
         directory.join("NumericCertificate.lean"),
         format!(
-            "import Claim\n{}\n\
+            "import Claim\nimport Decoder\n{}\n\
              open MxxWe DiamondGeneratedProof DiamondProofParameters\n\n\
              namespace DiamondNumericCertificate\n\n\
              set_option maxRecDepth 8192\n\n\

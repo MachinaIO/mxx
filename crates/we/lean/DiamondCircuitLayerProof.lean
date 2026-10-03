@@ -130,7 +130,7 @@ theorem generated_circuit_layer_within
     (hone : BooleanEncodingWithin secret onePublic 1 oneCipher B)
     (honeMessage : oneMessage 0 0 = 1)
     (hinvariant : CircuitStateWithin secret B current)
-    (hrun : Stage_decrypt.sequential_generatedRoot_33 DiamondBackend.backend params layer
+    (hrun : Stage_decrypt.sequential_generatedRoot_33 Backend.backend params layer
       (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
         rightSources, onePublic, oneMessage, ()) next) :
     CircuitStateWithin secret (factor * B) next := by
@@ -138,7 +138,7 @@ theorem generated_circuit_layer_within
   rw [hout]
   intro lane
   obtain ⟨kind, left, right, digits, sc, sp, sm, _, _, _, hd, hc, hp, hm, hmc, hmp, hmm⟩ :=
-    generated_circuit_lane_facts DiamondBackend.backend params layer lane active current
+    generated_circuit_lane_facts Backend.backend params layer lane active current
       kinds leftSources rightSources oneCipher onePublic oneMessage _ _ _ (hlanes lane)
   obtain ⟨hlWithin, hlBool⟩ := hinvariant left
   obtain ⟨hrWithin, hrBool⟩ := hinvariant right
@@ -212,7 +212,7 @@ theorem generated_circuit_iteration_within
     (hinitial : CircuitStateWithin secret B initial)
     (hrun : MxxIR.IterRuns
       (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33
-        DiamondBackend.backend params layer
+        Backend.backend params layer
         (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources, rightSources,
           onePublic, oneMessage, ()) next) count initial output) :
     CircuitStateWithin secret (factor ^ count * B) output := by

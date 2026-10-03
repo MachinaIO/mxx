@@ -718,7 +718,7 @@ impl TfheParams {
             self.lwe_dimension,
             IntExpr::constant(BigInt::from(self.lwe_modulus.clone())),
         );
-        let dot = inner_product(&a, secret);
+        let dot = self.inner_product(&a, secret);
         let signed_bit = message.clone().mul(2).sub(1);
         let encoded = signed_bit.mul(Int::constant(BigInt::from(self.delta())));
         let b = dot.add(encoded).add(self.lwe_error()?).rem(modulus);
@@ -749,7 +749,7 @@ impl TfheParams {
         self.validate_lwe(ciphertext, self.lwe_dimension, &self.lwe_modulus)?;
         check_family(secret, self.lwe_dimension)?;
         let q = Int::constant(BigInt::from(self.lwe_modulus.clone()));
-        Ok(ciphertext.b.clone().sub(inner_product(&ciphertext.a, secret)).rem(q))
+        Ok(ciphertext.b.clone().sub(self.inner_product(&ciphertext.a, secret)).rem(q))
     }
 
     /// Decodes a canonical decryption phase to 1 when its centered value is nonnegative.
@@ -1207,9 +1207,31 @@ impl TfheParams {
     }
 }
 
-/// `<lhs, rhs>` as one integer matrix-vector product, so the dot product is one graph node.
-fn inner_product(lhs: &Family<Int>, rhs: &Family<Int>) -> Int {
-    lhs.matrix_vector_product(rhs).at(0)
+impl TfheParams {
+    /// `<a, s>` for a mask `a` in `[0, q)` and a binary secret `s`. When the sum fits one signed
+    /// word, one integer matrix-vector product keeps it a single graph node, which the GPU
+    /// accumulates in one word; wider moduli sum a shallow tree of multiword products.
+    fn inner_product(&self, mask: &Family<Int>, secret: &Family<Int>) -> Int {
+        let bound = BigUint::from(self.lwe_dimension) * (&self.lwe_modulus - 1u8);
+        if bound <= BigUint::from(i64::MAX as u64) {
+            return mask.matrix_vector_product(secret).at(0);
+        }
+        let mut terms = (0..self.lwe_dimension)
+            .map(|index| mask.at(index).mul(secret.at(index)))
+            .collect::<Vec<_>>();
+        while terms.len() > 1 {
+            let mut pairs = terms.into_iter();
+            let mut next = Vec::new();
+            while let Some(left) = pairs.next() {
+                next.push(match pairs.next() {
+                    Some(right) => left.add(right),
+                    None => left,
+                });
+            }
+            terms = next;
+        }
+        terms.pop().unwrap_or_else(|| Int::constant(0))
+    }
 }
 
 fn center_residue(value: Int, modulus: &BigUint) -> Result<Int, DslError> {

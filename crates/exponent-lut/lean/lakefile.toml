@@ -7,21 +7,14 @@ relaxedAutoImplicit = false
 pp.unicode.fun = true
 
 [[require]]
-name = "MxxPrimitives"
-path = "../../primitives/lean"
-
-[[require]]
-name = "MxxBgg"
-path = "../../bgg/lean"
-
-[[require]]
-name = "MxxRuntime"
-path = "../../runtime/lean"
+name = "mathlib"
+path = "../../ir-core/lean/.lake/packages/mathlib"
 
 [[require]]
 name = "mxx-ir-core"
 path = "../../ir-core/lean"
 
+# Lemmas that hold for every exponent-LUT program and parameter set.
 [[lean_lib]]
 name = "MxxExponentLut"
-roots = ["ExponentBfv", "ExponentTransfers", "ExponentRefreshBounds", "ExponentAutomorphism", "ExponentReadout", "ExponentSetup", "ExponentCrt", "ExponentProgram", "ExponentReadoutSetup", "ExponentMonomial", "ExponentSparseDecomposition", "ExponentRounding", "ExponentLut", "ExponentPairedSwitch", "ExponentTrace", "ExponentSecret", "ExponentLutFourier", "ExponentDecoder", "ExponentRefreshDecode", "ExponentRefreshDigits", "ExponentRefreshNormalize", "ExponentInputSlice", "ExponentNativeProgram", "ExponentReadoutStage", "ExponentReadoutFunction", "ExponentRefreshRoutes", "ExponentRefreshRouteTargets", "ExponentRefreshDecomposition", "ExponentRefreshCrt"]
+roots = ["ExponentAutomorphism", "ExponentScale", "ExponentEncoding", "ExponentGadget", "ExponentWalsh"]

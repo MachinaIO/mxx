@@ -1,10 +1,82 @@
-import ExponentTrace
-import ExponentMonomial
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Algebra.BigOperators.Fin
 import Mathlib.Data.Nat.ModEq
+import Mathlib.Tactic.Ring
+import Mathlib.Tactic.Positivity
+import Mathlib.Algebra.Ring.Parity
+import Mathlib.Logic.Equiv.Fin.Basic
+
+/-!
+# LUT interpolation by automorphism traces
+
+A LUT of width `W = 2^log` is evaluated as `Σ_i σ_i(X^e) · C_{σ_i}` with
+`C_σ = W⁻¹ Σ_k T(k) · σ(X^{-k})` over the `W` automorphisms `σ_i(X) = X^{1 + 2·quotient·i}` of the
+native exponent group. In any commutative ring where the root `ζ` satisfies `ζ^{nativeWidth} = -1`,
+the sum over the subgroup cancels every exponent outside `W ℤ`, which leaves `T(e)` on the lookup
+domain (`lut_fourier_table_value`). No field or integral-domain hypothesis is needed.
+-/
 
 namespace MxxExponentLut
-open Mxx.Primitives
+
 open scoped BigOperators
+
+/-- The sum of the odd powers `ζ^{(2j + 1) e}`, `j < width`. -/
+def oddTrace {R : Type} [CommRing R] (width : Nat) (root : R) (exponent : Nat) : R :=
+  ∑ j ∈ Finset.range width, root ^ ((2 * j + 1) * exponent)
+
+private theorem oddTrace_double {R : Type} [CommRing R] (width exponent : Nat) (root : R)
+    (hroot : root ^ (2 * width) = -1) :
+    oddTrace (2 * width) root exponent =
+      oddTrace width root exponent + oddTrace width root exponent * (-1) ^ exponent := by
+  unfold oddTrace
+  rw [show 2 * width = width + width by omega, Finset.sum_range_add]
+  congr 1
+  rw [Finset.sum_mul]
+  apply Finset.sum_congr rfl
+  intro j hj
+  rw [show (2 * (width + j) + 1) * exponent =
+    (2 * j + 1) * exponent + (2 * width) * exponent by ring, pow_add, pow_mul root (2 * width) exponent, hroot]
+
+private theorem oddTrace_even {R : Type} [CommRing R] (width exponent : Nat) (root : R) :
+    oddTrace width root (2 * exponent) = oddTrace width (root ^ 2) exponent := by
+  unfold oddTrace
+  apply Finset.sum_congr rfl
+  intro j hj
+  rw [← pow_mul]
+  congr 1
+  ring
+
+/-- Exact odd-residue trace for every power-of-two width. Cancellation is
+proved inside the ring; no field or integral-domain hypothesis is required. -/
+theorem oddTrace_power_two {R : Type} [CommRing R] (log exponent : Nat) (root : R)
+    (hroot : root ^ (2 ^ log) = -1) (hexponent : exponent < 2 * 2 ^ log) :
+    oddTrace (2 ^ log) root exponent =
+      if exponent = 0 then ((2 ^ log : Nat) : R)
+      else if exponent = 2 ^ log then -((2 ^ log : Nat) : R) else 0 := by
+  induction log generalizing root exponent with
+  | zero =>
+    have he : exponent = 0 ∨ exponent = 1 := by omega
+    rcases he with rfl | rfl
+    · simp [oddTrace]
+    · simpa [oddTrace] using hroot
+  | succ log ih =>
+    have hwidth : 2 ^ (log + 1) = 2 * 2 ^ log := by rw [pow_succ]; ring
+    rw [hwidth] at hroot hexponent ⊢
+    rw [oddTrace_double _ _ _ hroot]
+    rcases Nat.even_or_odd exponent with heven | hodd
+    · obtain ⟨half, rfl⟩ := heven
+      have htwice : half + half = 2 * half := by omega
+      rw [htwice, oddTrace_even]
+      have hroot' : (root ^ 2) ^ (2 ^ log) = -1 := by rw [← pow_mul]; exact hroot
+      rw [ih half (root ^ 2) hroot' (by omega)]
+      have heven : Even (2 * half) := by exact even_two_mul half
+      rw [heven.neg_one_pow]
+      split_ifs <;> simp_all <;> ring
+    · rw [hodd.neg_one_pow]
+      have hparity := Nat.odd_iff.mp hodd
+      have hnotzero : exponent ≠ 0 := by omega
+      have hnotwidth : exponent ≠ 2 * 2 ^ log := by omega
+      simp [hnotzero, hnotwidth]
 
 private theorem power_mod {R : Type} [CommRing R] (root : R) (period exponent : Nat)
     (hperiod : root ^ period = 1) : root ^ exponent = root ^ (exponent % period) := by
@@ -174,159 +246,5 @@ theorem lut_fourier_table_value {R : Type} [CommRing R]
   rw [lut_fourier_interpolation log nativeWidth quotient input.val root inverse table
     hnative hnpos hroot hinverse index permutation hindex]
   simp [Nat.mod_eq_of_lt input.isLt]
-
-/-- Ring expression emitted for one Rust LUT coefficient: the table output
-is not automorphed, while the negative input monomial is automorphed. -/
-noncomputable def nativeLutFourierCoefficient {q n width stride : Nat}
-    (nativeWidth : Nat) (inverse : ExactPoly q n) (table : Fin width → ExactPoly q n)
-    (index : Nat) (hodd : Odd index) : ExactPoly q n :=
-  inverse * ∑ k, table k * readoutAutomorphismHom index hodd
-    (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * (2 * nativeWidth - k.val)))
-
-private theorem nativeCoefficient_eq {q n width stride : Nat}
-    (nativeWidth : Nat) (inverse : ExactPoly q n) (table : Fin width → ExactPoly q n)
-    (index : Nat) (hodd : Odd index) :
-    nativeLutFourierCoefficient (stride := stride) nativeWidth inverse table index hodd =
-      lutFourierCoefficient nativeWidth
-        (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ stride) inverse table index := by
-  unfold nativeLutFourierCoefficient lutFourierCoefficient
-  congr 1
-  apply Finset.sum_congr rfl
-  intro k hk
-  congr 1
-  rw [map_pow]
-  have hr : readoutAutomorphismHom index hodd (AdjoinRoot.root (negacyclicModulus n (ZMod q))) =
-      AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ index := by simp [readoutAutomorphismHom]
-  rw [hr, ← pow_mul, ← pow_mul]
-  congr 1
-  ring
-
-/-- Actual native Fourier expressions interpolate with their full-domain
-monomial extension, retaining the operation width independently of the native width. -/
-theorem native_lut_fourier_interpolation {q n stride log : Nat}
-    (nativeWidth quotient exponent : Nat) (inverse : ExactPoly q n)
-    (table : Fin (2 ^ log) → ExactPoly q n)
-    (hdimension : n = stride * nativeWidth) (hnative : nativeWidth = quotient * 2 ^ log)
-    (hnpos : 0 < nativeWidth) (hinverse : inverse * ((2 ^ log : Nat) : ExactPoly q n) = 1)
-    (index : Fin (2 ^ log) → Nat) (hodd : ∀ i, Odd (index i))
-    (permutation : Fin (2 ^ log) ≃ Fin (2 ^ log))
-    (hindex : ∀ i, index i % (2 * nativeWidth) = 1 + 2 * quotient * (permutation i).val) :
-    (∑ i, readoutAutomorphismHom (index i) (hodd i)
-      (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * exponent)) *
-      nativeLutFourierCoefficient (stride := stride) nativeWidth inverse table (index i) (hodd i)) =
-    (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ stride) ^ (exponent - exponent % (2 ^ log)) *
-      table ⟨exponent % (2 ^ log), Nat.mod_lt _ (by positivity)⟩ := by
-  have hr (i : Fin (2 ^ log)) :
-      readoutAutomorphismHom (index i) (hodd i)
-        (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * exponent)) =
-      (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ stride) ^ (index i * exponent) := by
-    rw [map_pow]
-    have hroot : readoutAutomorphismHom (index i) (hodd i)
-        (AdjoinRoot.root (negacyclicModulus n (ZMod q))) =
-        AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ index i := by simp [readoutAutomorphismHom]
-    rw [hroot, ← pow_mul, ← pow_mul]
-    congr 1
-    ring
-  simp_rw [hr, nativeCoefficient_eq]
-  apply lut_fourier_interpolation log nativeWidth quotient exponent _ inverse table hnative hnpos _
-    hinverse index permutation hindex
-  rw [← pow_mul, ← hdimension]
-  exact Negacyclic.root_pow_n
-
-/-- Exponent-valued output tables preserve the exact strided input contract
-on the full native domain, enabling subsequent nonlinear Program operations. -/
-theorem native_lut_exponent_closure {q n stride log : Nat}
-    (nativeWidth quotient exponent : Nat) (inverse : ExactPoly q n)
-    (table : Fin (2 ^ log) → Fin (2 * nativeWidth))
-    (hdimension : n = stride * nativeWidth) (hnative : nativeWidth = quotient * 2 ^ log)
-    (hnpos : 0 < nativeWidth) (hinverse : inverse * ((2 ^ log : Nat) : ExactPoly q n) = 1)
-    (index : Fin (2 ^ log) → Nat) (hodd : ∀ i, Odd (index i))
-    (permutation : Fin (2 ^ log) ≃ Fin (2 ^ log))
-    (hindex : ∀ i, index i % (2 * nativeWidth) = 1 + 2 * quotient * (permutation i).val) :
-    ∃ output : Fin (2 * nativeWidth),
-      (∑ i, readoutAutomorphismHom (index i) (hodd i)
-        (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * exponent)) *
-        nativeLutFourierCoefficient (stride := stride) nativeWidth inverse
-          (fun k => AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * (table k).val))
-          (index i) (hodd i)) =
-      AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * output.val) := by
-  let selected : Fin (2 ^ log) := ⟨exponent % (2 ^ log), Nat.mod_lt _ (by positivity)⟩
-  let total := exponent - exponent % (2 ^ log) + (table selected).val
-  refine ⟨⟨total % (2 * nativeWidth), Nat.mod_lt _ (by omega)⟩, ?_⟩
-  rw [native_lut_fourier_interpolation nativeWidth quotient exponent inverse _ hdimension hnative
-    hnpos hinverse index hodd permutation hindex]
-  let root : ExactPoly q n := AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ stride
-  have hp : root ^ (2 * nativeWidth) = 1 := by
-    have hr : root ^ nativeWidth = -1 := by
-      dsimp [root]
-      rw [← pow_mul, ← hdimension]
-      exact Negacyclic.root_pow_n
-    rw [Nat.mul_comm, pow_mul, hr]
-    ring
-  change root ^ (exponent - exponent % (2 ^ log)) *
-    AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * (table selected).val) = _
-  rw [pow_mul]
-  change root ^ (exponent - exponent % (2 ^ log)) * root ^ (table selected).val = _
-  rw [← pow_add]
-  change root ^ total = _
-  rw [power_mod root (2 * nativeWidth) total hp]
-  exact (pow_mul _ _ _).symm
-
-/-- The derived strided exponent witness supplies the gate-level signed
-monomial contract with its exponent strictly below the full negacyclic period. -/
-theorem strided_exponent_signedMonomial {q n stride nativeWidth : Nat}
-    (hn : 0 < n) (hdimension : n = stride * nativeWidth) {value : ExactPoly q n}
-    (hvalue : ∃ output : Fin (2 * nativeWidth), value =
-      AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * output.val)) :
-    SignedMonomial value := by
-  obtain ⟨output, hout⟩ := hvalue
-  have hs : 0 < stride := by nlinarith
-  have hbound : stride * output.val < 2 * n := by
-    have h := Nat.mul_lt_mul_of_pos_left output.isLt hs
-    nlinarith
-  exact ⟨⟨stride * output.val, hbound⟩, hout⟩
-
-/-- Subsequent private/public/LUT gates obtain an actual unit-L1 integer
-message witness from Fourier interpolation, without assuming output closure. -/
-theorem native_lut_integer_lift {q n stride log : Nat} (hn : 0 < n)
-    (nativeWidth quotient exponent : Nat) (inverse : ExactPoly q n)
-    (table : Fin (2 ^ log) → Fin (2 * nativeWidth))
-    (hdimension : n = stride * nativeWidth) (hnative : nativeWidth = quotient * 2 ^ log)
-    (hnpos : 0 < nativeWidth) (hinverse : inverse * ((2 ^ log : Nat) : ExactPoly q n) = 1)
-    (index : Fin (2 ^ log) → Nat) (hodd : ∀ i, Odd (index i))
-    (permutation : Fin (2 ^ log) ≃ Fin (2 ^ log))
-    (hindex : ∀ i, index i % (2 * nativeWidth) = 1 + 2 * quotient * (permutation i).val) :
-    ∃ lift : ErrorPoly n,
-      reducePoly q n lift =
-        (∑ i, readoutAutomorphismHom (index i) (hodd i)
-          (AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * exponent)) *
-          nativeLutFourierCoefficient (stride := stride) nativeWidth inverse
-            (fun k => AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (stride * (table k).val))
-            (index i) (hodd i)) ∧ polynomialL1 lift ≤ 1 := by
-  apply signedMonomial_integer_lift hn
-  apply strided_exponent_signedMonomial hn hdimension
-  exact native_lut_exponent_closure nativeWidth quotient exponent inverse table hdimension hnative
-    hnpos hinverse index hodd permutation hindex
-
-/-- Each negative-monomial automorphism in the actual coefficient producer
-can be consumed directly, connecting its generated matrix sum to the Fourier
-expression above. This premise is execution, not an interpolation equation. -/
-theorem native_lut_coefficient_runs {q n stride width : Nat} (hq : 1 < q) (hn : 0 < n)
-    (nativeWidth index : Nat) (hodd : Odd index) (inverse : ExactPoly q n)
-    (table : Fin width → ExactPoly q n) (rotated : Fin width → ExactMatrix q n 1 1)
-    (hrun : ∀ k, MxxRuntime.ringAutomorphismRuns (index : Int)
-      (fun _ _ => AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^
-        (stride * (2 * nativeWidth - k.val))) (rotated k)) :
-    inverse * (∑ k, table k * rotated k 0 0) =
-      nativeLutFourierCoefficient (stride := stride) nativeWidth inverse table index hodd := by
-  unfold nativeLutFourierCoefficient
-  congr 1
-  apply Finset.sum_congr rfl
-  intro k hk
-  congr 1
-  obtain ⟨_, _, _, hout⟩ := hrun k
-  rw [hout]
-  simp only [Int.toNat_natCast]
-  rw [readoutAutomorphismHom_runtime hq hn index hodd]
 
 end MxxExponentLut

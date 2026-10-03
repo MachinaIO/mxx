@@ -154,6 +154,34 @@ theorem lutCoefficient_eq {q inverse σ : Nat} (hσ : Odd σ) :
     rw [hsplit, pow_add, pow_mul (X q) 32 σ, hroot, hσ.neg_one_pow]
     ring
 
+theorem polyNorm_substitution_Xe (i : Fin 16) (k : Nat) :
+    polyNorm (substitution (sigma i).toNat (sigma_odd i) (Xe (n := N) k)) ≤ 1 := by
+  rw [substitution_root_pow]
+  exact polyNorm_Xe hN1 _
+
+/-- The readout of the exponent `z`: `(-1)^⌊z / 16⌋ τ(z mod 16)`. -/
+noncomputable def lutValue (z : Nat) : ErrorPoly N :=
+  (((-1 : Int) ^ (z / 16) * (MxxExponentLutLwr.readout 2 16 (z % 16) : Int) : Int) : ErrorPoly N)
+
+/-- The readout LUT on the state `X^(2z)`. -/
+theorem lut_walsh_value {q inverse : Nat}
+    (hinverse : (inverse : ExactPoly q N) * ((16 : Nat) : ExactPoly q N) = 1) (z : Nat) :
+    ∑ i : Fin 16, reducePoly q N (substitution (sigma i).toNat (sigma_odd i) (Xe (2 * z))) *
+        lutCoefficient q inverse (sigma i).toNat = reducePoly q N (lutValue z) := by
+  have h := lut_walsh hinverse z
+  have hY : Y q ^ (z - z % 16) = (-1) ^ (z / 16) := by
+    rw [show z - z % 16 = 16 * (z / 16) by have := Nat.div_add_mod z 16; omega, pow_mul, Y_pow_16]
+  rw [hY] at h
+  have hvalue : reducePoly q N (lutValue z) =
+      (-1) ^ (z / 16) * readoutPoly q ⟨z % 16, Nat.mod_lt _ (by norm_num)⟩ := by
+    simp [lutValue, readoutPoly]
+  rw [hvalue, ← h]
+  apply Finset.sum_congr rfl
+  intro i _
+  rw [substitution_root_pow, reducePoly_Xe, Y, ← pow_mul]
+  congr 2
+  ring
+
 /-- The inverse of the LUT width `16` modulo `Q1`. -/
 abbrev inverse1 : Nat := 1030792149421
 

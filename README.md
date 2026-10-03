@@ -26,7 +26,8 @@ The example below encrypts one bit `m` with Ring-LWE and decrypts it on the GPU.
 Gaussian secret, and `e` is Gaussian noise. It then recovers `m` by rounding the constant term
 of `b - a·s`. Every parameter, such as the ring's CRT width and depth, the noise
 width `sigma`, and the gadget base, is a named variable, and it gets a value only when the
-program is bound for a run. The full program is
+program is bound for a run. The example also exports the Lean statement that every execution
+decrypts its message, which a machine-checked proof establishes. The full program is
 [`crates/dsl/examples/rlwe_encrypt.rs`](crates/dsl/examples/rlwe_encrypt.rs); run it
 with `cargo run -r -p mxx-dsl --example rlwe_encrypt --features gpu`.
 
@@ -36,8 +37,17 @@ use mxx_backends::{
     GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::dcrt::gpu::GpuDCRTPolyParams,
     sampler::bounds::hard_cutoff_from_sigma_bound,
 };
-use mxx_dsl::{BuiltGraph, DslContext, DslError, HashTag, Int, IntType, Ring};
-use mxx_ir_core::{IntExpr, ParamEnv, Rational, RealExpr, generate_crt_basis};
+use mxx_dsl::{BuiltGraph, DslContext, DslError, HashTag, IdealSpec, Int, IntType, Ring};
+use mxx_ir_core::{
+    IntExpr, ParamEnv, Rational, RealExpr, generate_crt_basis,
+    protocol::{
+        ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec, EndpointBinding,
+        EndpointBindings, EndpointSemanticBinding, EndpointSpecId, InputContract,
+        InputContractEntry, InputValueContract, OutputRef, ParameterDecl, ParameterKind,
+        ProtocolDecl, ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId,
+        ProtocolPreconditionSpec, ProtocolStage, StageId, StageInputName, Workflow,
+    },
+};
 use num_bigint::BigInt;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -96,7 +106,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reals: BTreeMap::from([("sigma".to_owned(), Rational::from_integer(BigInt::from(sigma)))]),
         ..ParamEnv::default()
     };
-    let program = rlwe_program(ring_dimension)?.validate(&bindings)?;
+    let program = rlwe_program(ring_dimension)?;
+
+    // State the program's correctness in Lean: for every seed and message bit, the decrypted bit
+    // is the message. `lake build` in `crates/dsl/examples/rlwe` checks the proof.
+    let lean = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated");
+    mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean)?;
+
+    let program = program.validate(&bindings)?;
 
     // Register the same ring with a GPU backend.
     let moduli = generate_crt_basis(ring_dimension, crt_depth, crt_bits)?;
@@ -122,13 +139,110 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/// The program as a one-stage protocol whose ideal functionality returns the message bit.
+fn correctness_protocol(
+    program: &BuiltGraph,
+    bindings: &ParamEnv,
+) -> Result<ProtocolDecl, Box<dyn std::error::Error>> {
+    // Every graph of a protocol declares the same parameters.
+    let params = [
+        ("crt_bits", ParameterKind::Integer),
+        ("crt_depth", ParameterKind::Integer),
+        ("gadget_base_bits", ParameterKind::Integer),
+        ("cutoff", ParameterKind::Integer),
+        ("sigma", ParameterKind::Rational),
+    ]
+    .into_iter()
+    .map(|(name, kind)| ParameterDecl { name: name.to_owned(), kind })
+    .collect();
+    let ideal = DslContext::new("rlwe-ideal")
+        .int_parameter("crt_bits")
+        .int_parameter("crt_depth")
+        .int_parameter("gadget_base_bits")
+        .int_parameter("cutoff")
+        .real_parameter("sigma");
+    let message: Int = ideal.input("message", IntType)?;
+    let ideal =
+        IdealSpec::new(ideal.output("decrypted", Int::constant(0).less(message))?.build()?.graph)?;
+
+    let stage = StageId("rlwe".to_owned());
+    let endpoint = EndpointSpecId::Exact;
+    let destination = |input: &str| ProtocolInputDestination::WorkflowStage {
+        stage: stage.clone(),
+        input: StageInputName(input.to_owned()),
+    };
+    let (contracts, input_bindings) = [
+        ("seed", InputValueContract::Bytes { length: 32.into() }, vec![destination("seed")]),
+        (
+            "message",
+            InputValueContract::IntegerRange { lower: 0.into(), upper: 1.into() },
+            vec![
+                destination("message"),
+                ProtocolInputDestination::Ideal { input: "message".to_owned() },
+            ],
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value, destinations)| {
+        (
+            InputContractEntry { id: ProtocolInputId::from(name), name: name.to_owned(), value },
+            ProtocolInputBinding { input: ProtocolInputId::from(name), destinations },
+        )
+    })
+    .unzip();
+    Ok(ProtocolDecl::new(ProtocolDecl {
+        params,
+        bindings: bindings.clone(),
+        // The Gaussian samples are truncated, so every execution decrypts correctly.
+        failure_probability_log2: None,
+        bundle: ClosedProtocolBundle {
+            workflow: Workflow {
+                stages: vec![ProtocolStage {
+                    id: stage.clone(),
+                    graph: program.graph.clone(),
+                    bindings: Vec::new(),
+                }],
+                entrypoint: stage.clone(),
+            },
+            ideal,
+            requirements: Vec::new(),
+            comparator: ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: "decrypted".to_owned(),
+                    ideal_input: "decrypted".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            },
+            endpoints: EndpointBindings {
+                entries: vec![EndpointBinding {
+                    spec: endpoint,
+                    semantics: EndpointSemanticBinding::Exact,
+                    workflow_output: OutputRef { stage, output: "decrypted".to_owned() },
+                    ideal_output: "decrypted".to_owned(),
+                }],
+            },
+            operational_decoder_targets: Vec::new(),
+            endpoint_specs: vec![endpoint],
+            input_contract: InputContract { inputs: contracts },
+            input_bindings,
+            precondition_spec: ProtocolPreconditionSpec::default(),
+        },
+    })?)
+}
 ```
 
 Running `rlwe_program` does not compute anything. It records the protocol as a program: a graph
 whose nodes are primitive operations, such as a matrix product, a Gaussian sample, or a
 coefficient decoding, and whose edges carry values between them. Computation happens only when
-a backend executes the graph. This is why one description can run on a GPU or on a CPU. Export
-of the same graph to Lean, for machine-checked correctness proofs, is a work in progress.
+a backend executes the graph. This is why one description can run on a GPU or on a CPU.
+
+The same graph also becomes a Lean theorem. `correctness_protocol` declares it as a protocol whose
+ideal functionality returns the message bit, and `main` exports the statement that every
+execution decrypts its message. The proof in [`crates/dsl/examples/rlwe`](crates/dsl/examples/rlwe)
+checks it with `lake build`; see [Correctness in Lean](#choosing-parameters-and-correctness-in-lean).
 
 To see the recorded graph, write `rlwe_program(ring_dimension)?.render_html()` to a file and open
 it in a browser. Hovering a node shows its operation and the shapes it reads and writes, still in
@@ -207,7 +321,7 @@ The API for running programs on the CPU and GPUs is described in
   stage is its own program. A stage can export its results, and another party's stage can
   import them as inputs, from memory or from disk, loading only the parts it uses.
 
-## Choosing parameters, and the plan for Lean
+## Choosing parameters, and correctness in Lean
 
 mxx runs a protocol with whatever parameters you bind. It does not yet tell you which
 parameters make the protocol correct and secure.
@@ -225,17 +339,28 @@ At present, each application must implement both itself. We tried to estimate no
 automatically from the DSL description, but what counts as noise differs from one application to
 another, and this has not succeeded so far.
 
-**In progress: correctness statements generated from the protocol.** Instead, we are developing a
-*statement compiler*. It reads the DSL description of a protocol and deterministically generates
-a correctness statement in Lean. The statement says that, at specific parameters, the protocol
+**Correctness statements generated from the protocol.** Instead, mxx has a *statement
+compiler*. It reads the DSL description of a protocol and deterministically generates a
+correctness statement in Lean. The statement says that, at specific parameters, the protocol
 returns what its ideal functionality computes, for every execution or except with a stated
 failure probability. Anyone who trusts the statement compiler and the Lean kernel can then
 delegate the noise growth simulation and the Lean proofs to an AI. A human does not have to audit
 all of that work, only check that a fixed Lean theorem passes.
-The TFHE NAND gate and the BGV round trip of `mxx-fhe` already have generated statements
-with complete Lean proofs at their test parameters; the TFHE statement bounds the failure
-probability by `2^-128`, assuming ideal samplers. See the
-[`mxx-fhe` README](crates/fhe/README.md#lean-correctness-proofs).
+
+A protocol declares its stages, its ideal functionality, and the contracts of its external
+inputs, then calls `mxx_ir_core::lean::protocol::export(&protocol, &directory)`, which writes the
+generated statement `GeneratedClaim.CorrectnessClaim`. A proof package beside it proves the
+statement, and a three-line certificate checks the proof against it with `lake build`. These
+protocols have complete proofs at their parameters:
+
+| Protocol | Statement | Proof |
+| --- | --- | --- |
+| The RLWE example above | every execution decrypts its message | [`crates/dsl/examples/rlwe`](crates/dsl/examples/rlwe) |
+| The TFHE NAND gate of `mxx-fhe` | the gate fails with probability at most `2^-128`, assuming ideal samplers | [`crates/fhe/lean/tfhe`](crates/fhe/README.md#lean-correctness-proofs) |
+| The BGV multiply, relinearize, and modulus-switch round trip | every execution decrypts the slotwise product | [`crates/fhe/lean/bgv`](crates/fhe/README.md#lean-correctness-proofs) |
+
+[`crates/ir-core/SPEC.md`](crates/ir-core/SPEC.md) specifies the declaration, the generated
+modules, the statement, and how a proof package checks it.
 
 **Goal: security statements as well.** Eventually, we aim to generate the Lean statement of
 security from the DSL description in the same deterministic way. Then a new lattice protocol
@@ -275,8 +400,9 @@ produce. Applications also call the backends directly to run their programs, and
 applications never depend on each other.
 
 Each crate's README introduces the crate. The DSL's operations are listed in
-[`crates/dsl/SPEC.md`](crates/dsl/SPEC.md), and the API for executing programs in
-[`crates/backends/SPEC.md`](crates/backends/SPEC.md). The API documentation, built with
+[`crates/dsl/SPEC.md`](crates/dsl/SPEC.md), the API for executing programs in
+[`crates/backends/SPEC.md`](crates/backends/SPEC.md), and the Lean correctness statements and
+their proofs in [`crates/ir-core/SPEC.md`](crates/ir-core/SPEC.md). The API documentation, built with
 `cargo doc --workspace --no-deps --features gpu --open`, is the reference for details such as
 the GPU runtime's options and current limitations.
 

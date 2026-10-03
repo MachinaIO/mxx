@@ -20,12 +20,14 @@ workspace crate.
 | `encoding` | Canonical JSON and specification hashes. |
 | `artifact` | Production identities and artifact manifests. |
 | `protocol` | Multi-stage protocol declarations, ideal specifications, and predicates. |
-| `lean` | Export of validated graphs and protocol claims to Lean. |
+| `lean` | Export of validated graphs and of a protocol's correctness statement to Lean (`lean::protocol::export`). |
 | `inventory` | A structural snapshot of a graph for checkers, without evaluation. |
 | `visualize` | A standalone HTML view of every scope, with shapes and optional predicted node costs. |
 
-The handwritten Lean package that generated relations build on lives in `lean/`; see
-`lean/README.md`.
+[SPEC.md](SPEC.md) specifies the Lean correctness statement of a protocol: the declaration, the
+modules `lean::protocol::export` writes, the statement they state, and how a proof package checks
+a proof of it. The handwritten Lean package that generated relations build on (`MxxIR`,
+`MxxPrimitives`, `MxxRuntime`) lives in `lean/`; see `lean/README.md`.
 
 ## Design
 

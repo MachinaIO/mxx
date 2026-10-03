@@ -42,10 +42,6 @@ def gadget : Fin 3 → Int :=
 
 theorem hn : 0 < n := by decide
 
-theorem matrixPolynomial_single {q : Nat} (c : Int) (i j : Fin 1) :
-    (matrixPolynomial [c] : ExactMatrix q n 1 1) i j = (c : ExactPoly q n) := by
-  simp [matrixPolynomial]
-
 theorem keygen_spec {outputs}
     (h : Stage_keygen.generatedRoot { unit := () } () outputs) :
     ∃ (S E : ErrorPoly n) (Erk : Fin 3 → ErrorPoly n) (D : ErrorPoly n),

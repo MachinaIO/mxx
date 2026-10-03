@@ -33,22 +33,54 @@ encryption, evaluation, and decryption run on the CPU or the GPU. It depends on 
 
 ## Lean correctness proofs
 
-Each GPU integration test declares the graphs it executes as a closed protocol and calls
-`mxx_ir_core::lean::protocol::export`, which writes the statement modules to `generated/` of
-`lean/tfhe` or `lean/bgv`. Each package holds handwritten proofs of the generated
-`GeneratedClaim.CorrectnessClaim` and a three-line `Certificate.lean` that checks the proof
-against it. The claim states only that decryption returns the ideal output; noise bounds are
-steps of the proofs, not part of the statement.
+The TFHE NAND gate and the BGV round trip have machine-checked correctness proofs at the
+parameters of the GPU integration tests. The statements are not written by hand: each
+integration test declares the graphs it executes as a protocol and calls
+`mxx_ir_core::lean::protocol::export`, which deterministically writes the statement
+`GeneratedClaim.CorrectnessClaim` to `generated/` of `lean/tfhe` or `lean/bgv`.
+[`crates/ir-core/SPEC.md`](../ir-core/SPEC.md) specifies the generated modules and statement.
 
-- **TFHE** (`utils::tfhe_params`): keygen, two encryptions, one bootstrapped NAND gate, and
-  decryption should decode `1 - m1 m2`. These parameters are correct only with high probability,
-  so the claim states that, for every hash model and external input, the sampled values with a
-  failing run have probability at most `2^-128`. The probability assumes ideal samplers: every sampled coefficient is an independent
-  draw from its sampler's law, the truncated discrete Gaussian or a uniform distribution. It
-  needs no assumption on hash outputs and none of the usual noise heuristics (independence of
-  noise terms, uniform digits, Gaussian tails).
-- **BGV** (`utils::bgv_params`): the multiply, relinearize, and modulus-switch round trip
-  decrypts the slotwise product for every execution.
+### What is proved
+
+| | TFHE (`utils::tfhe_params`) | BGV (`utils::bgv_params`) |
+| --- | --- | --- |
+| Stages | keygen, two encryptions, one bootstrapped NAND gate, decryption | keygen, two encryptions, multiply, relinearize, modulus switch, decryption |
+| Ideal output | `1 - m1 m2` for message bits `m1`, `m2` | `x[i] * y[i] mod t` for every slot `i` |
+| Input contracts | bits in `[0, 1]`, 32-byte hash keys | slots in `[0, t - 1]` |
+| Statement | the decrypted bit differs from the ideal one with probability at most `2^-128` | every execution decrypts the ideal slots |
+
+In Lean, the two statements read:
+
+```lean
+-- TFHE: the sampling tapes with a failing execution have measure at most 2^-128.
+∀ hashModel external,
+  MxxRuntime.tapeMeasure {tape | ∃ execution, Runs hashModel external tape execution ∧
+    ¬ (execution.«stage_4» = execution.«ideal»)} ≤ (2 : ENNReal)⁻¹ ^ 128
+
+-- BGV: every execution decrypts correctly.
+∀ hashModel external execution, Runs hashModel external execution →
+  execution.«stage_6» = execution.«ideal»
+```
+
+`Runs` links the generated stage relations exactly as the test passes outputs from one execution
+to the next, and requires the input contracts. The statements say only that decryption returns
+the ideal output; noise bounds are steps of the proofs, not part of the statements.
+
+### Assumptions
+
+- **Ideal samplers (TFHE).** The TFHE parameters are correct only with high probability. Every
+  sampled coefficient is read from a sampling tape whose entries are independent draws from
+  their sampler's law: the truncated discrete Gaussian, or a uniform interval or residue. The
+  proof needs none of the usual noise heuristics, such as independent noise terms, uniform
+  digits, or Gaussian tails.
+- **Truncated samplers (BGV).** Every sample lies within its cutoff, so the BGV statement holds
+  for every execution, with no probability.
+- **No assumption on hashes.** Both statements hold for every hash model, that is, for every
+  function from hash inputs to outputs.
+- **Trusted base.** The statement compiler in `mxx-ir-core`, the relations of the `MxxRuntime`
+  Lean library, which describe what each runtime primitive computes, and the Lean kernel.
+
+### How the proofs work
 
 The TFHE proof (`TfheStages`, `TfheRotation`, `TfheNand`, `TfheDependence`, `TfheBound`,
 `TfheProof`) restates each stage against the sampling tape and models the blind rotation as
@@ -57,9 +89,21 @@ Hoeffding's bound makes rarer than `2^-168`, or if a linear form of the sampled 
 exceeds `Δ` less a deterministic rounding allowance. That linear form is sub-Gaussian: each
 blind-rotation step multiplies fresh key errors by digits of at most 32 that read only earlier
 keys, and key switching multiplies its fresh errors by digits of at most 3, giving a tail below
-`2^-129`. The BGV proof follows each stage through integer witnesses, including hybrid key
-switching and modulus switching, and bounds the final phase so that decoding is exact. It reads
-the slot permutations from the packed tables the generated stages define.
+`2^-129`.
+
+The BGV proof (`BgvStages`, `BgvProof`) follows each stage through integer witnesses, including
+hybrid key switching and modulus switching, and bounds the final phase so that decoding is exact.
+It reads the slot permutations from the packed tables the generated stages define.
+
+### Package layout
+
+| Path | Contents |
+| --- | --- |
+| `lean/{tfhe,bgv}/generated/` | The modules `export` writes: one per stage, `Ideal`, `Backend`, and `Claim`. Never edited by hand. |
+| `lean/{tfhe,bgv}/*.lean` | The handwritten proof of `GeneratedClaim.CorrectnessClaim`. |
+| `lean/{tfhe,bgv}/Certificate.lean` | `theorem certificate : GeneratedClaim.CorrectnessClaim := <proof>` and `#print axioms certificate`. |
+
+### Regenerating and checking
 
 Regenerate the statements with the GPU integration tests, then check both proofs inside each
 package directory:
@@ -76,5 +120,6 @@ cd crates/fhe/lean/tfhe && lake build
 cd crates/fhe/lean/bgv && lake build
 ```
 
-Each package's `Certificate.lean` prints the axioms of the checked theorem, which are only
-`propext`, `Classical.choice`, and `Quot.sound`.
+Regenerating at unchanged parameters writes byte-identical modules. Each package's
+`Certificate.lean` prints the axioms of the checked theorem, which are only `propext`,
+`Classical.choice`, and `Quot.sound`.

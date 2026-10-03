@@ -44,7 +44,11 @@ def layout{index} : MxxRuntime.RegularLayout {q} :=
         )
         .expect("writing to a string");
     }
-    source.push_str("def backend : MxxRuntime.BackendContext where\n  regularLayout q n :=\n");
+    // Without layouts the lookup ignores its ring, so its binders are anonymous.
+    let binders = if layouts.is_empty() { "_ _" } else { "q n" };
+    source.push_str(&format!(
+        "def backend : MxxRuntime.BackendContext where\n  regularLayout {binders} :=\n"
+    ));
     for (index, layout) in layouts.iter().enumerate() {
         writeln!(
             source,

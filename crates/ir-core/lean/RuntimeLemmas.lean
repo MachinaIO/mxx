@@ -658,6 +658,11 @@ theorem exists_of_reducePoly_eq {q : Nat} (hq : 1 < q) (hn : 0 < n) {x y : Error
   rw [Int.mul_ediv_cancel' hdvd]
   ring
 
+/-- A one-coefficient constant matrix is that integer constant. -/
+theorem matrixPolynomial_single {q : Nat} (c : Int) (i j : Fin 1) :
+    (matrixPolynomial [c] : ExactMatrix q n 1 1) i j = (c : ExactPoly q n) := by
+  simp [matrixPolynomial]
+
 theorem reducePoly_intCast (q : Nat) (c : Int) :
     reducePoly q n (c : ErrorPoly n) = (c : ExactPoly q n) := map_intCast _ c
 

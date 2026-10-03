@@ -1,5 +1,11 @@
 name = "mxx-ir-core"
-defaultTargets = ["MxxIR"]
+version = "0.1.0"
+defaultTargets = ["MxxIR", "MxxPrimitives", "MxxRuntime", "RuntimeExamples"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "v4.28.0"
 
 [[lean_lib]]
 name = "MxxIR"
@@ -11,3 +17,40 @@ roots = [
   "IRScopeSpec",
   "MxxIR",
 ]
+
+[[lean_lib]]
+name = "MxxPrimitives"
+leanOptions = { relaxedAutoImplicit = false }
+roots = [
+  "MxxPrimitives",
+  "PrimitivesBounds",
+  "PrimitivesCrtDecomposition",
+  "PrimitivesCrtRadix",
+  "PrimitivesMatrix",
+  "PrimitivesNegacyclic",
+  "PrimitivesPreimage",
+  "PrimitivesRadix",
+  "PrimitivesReduction",
+  "PrimitivesSampling",
+]
+
+[[lean_lib]]
+name = "MxxRuntime"
+leanOptions = { relaxedAutoImplicit = false }
+roots = [
+  "MxxRuntime",
+  "RuntimeGaussian",
+  "RuntimeHash",
+  "RuntimeLemmas",
+  "RuntimeMatrixOps",
+  "RuntimeModulusSwitch",
+  "RuntimePrimitives",
+  "RuntimeProbability",
+  "RuntimeSampling",
+]
+
+# Concrete layouts checking the runtime facts generated relations rely on.
+[[lean_lib]]
+name = "RuntimeExamples"
+leanOptions = { relaxedAutoImplicit = false }
+roots = ["RuntimeLayoutExamples"]

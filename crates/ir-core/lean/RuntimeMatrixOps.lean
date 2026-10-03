@@ -190,10 +190,14 @@ def nttEvaluations {n : Nat} (q bits root : Nat)
         coefficients coefficient * (root : Int) ^ ((2 * index.val + 1) * coefficient.val)) %
         (q : Int)
 
+/-- The root the native transform uses modulo `prime`: the least primitive `2n`-th root of unity,
+which OpenFHE and the CUDA runtime (`compute_2nth_unity_root_u64`) both select. -/
+noncomputable def nativeNttRoot (prime n : Nat) : Nat :=
+  sInf {root | nttPrimitiveRoot prime n root}
+
 /-- Native negacyclic NTT semantics, including CRT rings with distinct prime limbs.
-`root` witnesses the CRT lift of the registered native primitive roots. The relation
-permits any such roots: native root selection is not numerical minimization. This
-is a relation over admissible transforms, not a claim that root selection is unique.
+`root` is the CRT lift of the native root of every prime limb, so every transform of one ring
+uses the same evaluation points; this is what makes a forward transform invert an inverse one.
 Forward maps coefficients to bit-reversed evaluations; inverse reverses that same relation.
 In either direction the returned integers are canonical residues modulo the full modulus. -/
 def polynomialNttRuns {n : Nat} (q : Nat) (inverse : Bool)
@@ -202,19 +206,20 @@ def polynomialNttRuns {n : Nat} (q : Nat) (inverse : Bool)
   (∀ prime : Nat, prime.Prime → ¬ (prime * prime) ∣ q) ∧
   ∃ bits root : Nat, n = 2 ^ bits ∧ root < q ∧
     (∀ prime : Nat, prime.Prime → prime ∣ q →
-      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime)) ∧
+      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime) ∧
+        root % prime = nativeNttRoot prime n) ∧
     (∀ index, 0 ≤ output index ∧ output index < (q : Int)) ∧
     (if inverse then nttEvaluations q bits root output input
      else nttEvaluations q bits root input output)
 
-/-- Registered native roots need not be the least primitive roots. This constructor
-keeps that choice explicit in proofs without adding an unsupported ordering premise. -/
+/-- Builds the relation from the native root of every prime limb. -/
 theorem polynomialNttRuns_of_nativeRoot {n q bits root : Nat} {inverse : Bool}
     {input output : Fin n → Int}
     (hq : 1 < q) (hsquarefree : ∀ prime : Nat, prime.Prime → ¬ (prime * prime) ∣ q)
     (hn : n = 2 ^ bits) (hroot : root < q)
     (hlimbs : ∀ prime : Nat, prime.Prime → prime ∣ q →
-      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime))
+      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime) ∧
+        root % prime = nativeNttRoot prime n)
     (hcanonical : ∀ index, 0 ≤ output index ∧ output index < (q : Int))
     (hevaluation : if inverse then nttEvaluations q bits root output input
       else nttEvaluations q bits root input output) :
@@ -226,6 +231,15 @@ noncomputable def polynomialOfCoefficients {q n : Nat} (values : Fin n → Int) 
     ExactPoly q n :=
   ∑ i : Fin n, (values i : ExactPoly q n) *
     AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ i.val
+
+/-- Field `index` of `width`-bit little-endian fields packed into one natural number. -/
+def packedEntry (width table index : Nat) : Nat := (table >>> (width * index)) % 2 ^ width
+
+/-- A long nonnegative coefficient literal packed into one natural number, so the kernel reads
+it with native arithmetic. Coefficient `i < count` is field `i`; the others are zero. -/
+noncomputable def packedPolynomial {q n : Nat} (width count table : Nat) : ExactMatrix q n 1 1 :=
+  fun _ _ ↦ polynomialOfCoefficients fun i ↦
+    if i.val < count then (packedEntry width table i.val : Int) else 0
 
 /-- Runtime import reduces arbitrary integers; evaluation imports use the native inverse NTT. -/
 noncomputable def polynomialFromValues {q n : Nat} (evaluation : Bool)
@@ -373,6 +387,23 @@ noncomputable def ringAutomorphismRuns {q n rows columns : Nat} (index : Int)
     (input output : ExactMatrix q n rows columns) : Prop :=
   0 < index ∧ index < 2 * Int.ofNat n ∧ index % 2 = 1 ∧
   output = ringAutomorphism index.toNat input
+
+/-- Entrywise multiplication by `X^k`. The runtime reduces a signed `k` modulo `2n`, and
+`X^n = -1` in the negacyclic quotient supplies the sign of the wraparound. -/
+noncomputable def multiplyMonomial {q n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) (exponent : Int) : ExactMatrix q n rows columns :=
+  fun row column ↦ input row column *
+    AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (exponent % (2 * (n : Int))).toNat
+
+/-- The exact integer product of a row-major matrix family with a vector family, following the
+runtime: `out[i] = Σ_j M[i * inner + j] v[j]`, or with `transpose`, `out[j] = Σ_i v[i] M[i *
+outer + j]`. Validation fixes `entries = outer * inner`, so the fallback branch is unreachable. -/
+def intMatrixVectorProduct {entries inner outer : Nat} (transpose : Bool)
+    (matrix : Fin entries → Int) (vector : Fin inner → Int) : Fin outer → Int :=
+  fun position ↦ ∑ term : Fin inner,
+    let entry := if transpose then term.val * outer + position.val
+      else position.val * inner + term.val
+    (if h : entry < entries then matrix ⟨entry, h⟩ else 0) * vector term
 
 /-- One heterogeneous CRT level: round using its own source modulus, reduce to the
 plaintext modulus, lift the canonical digit to the destination, and multiply by the

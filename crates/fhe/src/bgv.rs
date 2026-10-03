@@ -226,6 +226,11 @@ impl BgvParams {
         (phase + BigUint::from(self.plaintext_modulus / 2)) / self.plaintext_modulus
     }
 
+    /// The static bound on the centered decryption phase of `ct`, from its tracked noise.
+    pub fn phase_bound(&self, ct: &BgvCiphertext) -> BigUint {
+        self.phase_from_noise(&ct.noise_bound)
+    }
+
     /// Sufficient correctness condition for the tracked integer phase to avoid wrapping Q.
     pub fn can_decrypt(&self, ct: &BgvCiphertext) -> Result<bool, FheError> {
         self.ciphertext_rows(ct)?;
@@ -477,6 +482,38 @@ impl BgvParams {
     }
 }
 
+impl BgvParams {
+    /// The decryption phase `sum_i c_i (-s)^i` at the ciphertext level; its centered
+    /// coefficients are `f m + t e` while they stay below half the level modulus.
+    pub fn decryption_phase(&self, secret: &Mat, ct: &BgvCiphertext) -> Result<Mat, FheError> {
+        let rows = self.ciphertext_rows(ct)?;
+        utils::check_matrix(&self.common.ring, secret, 1, 1)?;
+        let params = self.common.parameters_at(self.level_of(&ct.components)?)?;
+        let minus_s = -secret.clone().reduce_modulus(&utils::ring(&params));
+        // Horner evaluation supports both ordinary pairs and unrelinearized
+        // triples with the same descending-in-minus-s component convention.
+        let mut phase = row(&ct.components, 0);
+        for index in 1..rows {
+            phase = phase * &minus_s + row(&ct.components, index);
+        }
+        Ok(phase)
+    }
+
+    /// Decodes a decryption phase of `ct` to its N canonical slot residues in [0, t).
+    pub fn decode_phase(&self, phase: &Mat, ct: &BgvCiphertext) -> Result<Family<Int>, FheError> {
+        let params = self.common.parameters_at(self.level_of(&ct.components)?)?;
+        utils::check_matrix(&params, phase, 1, 1)?;
+        // The centered phase reduces to f*m modulo t. Undo the public factor
+        // to recover m even after modulus switching has made f different from 1.
+        let inverse = mod_inverse(ct.correction_factor, self.plaintext_modulus)
+            .ok_or(FheError::InvalidCorrectionFactor)?;
+        let plaintext_ring = utils::plaintext_ring(self.plaintext_modulus, params.ring_dimension());
+        let plaintext = phase.clone().centered_rebase(&plaintext_ring) *
+            plaintext_ring.polynomial([IntExpr::constant(inverse)]);
+        self.decode_slots(&plaintext)
+    }
+}
+
 impl FheScheme for BgvParams {
     type Plaintext = Family<Int>;
     type Ciphertext = BgvCiphertext;
@@ -517,26 +554,7 @@ impl FheScheme for BgvParams {
     }
     /// Returns all N canonical slot residues in [0, t), including unused slots.
     fn decrypt(&self, secret: &Mat, ct: &BgvCiphertext) -> Result<Family<Int>, FheError> {
-        let rows = self.ciphertext_rows(ct)?;
-        utils::check_matrix(&self.common.ring, secret, 1, 1)?;
-        let params = self.common.parameters_at(self.level_of(&ct.components)?)?;
-        let minus_s = -secret.clone().reduce_modulus(&utils::ring(&params));
-        // Horner evaluation supports both ordinary pairs and unrelinearized
-        // triples with the same descending-in-minus-s component convention.
-        let mut phase = row(&ct.components, 0);
-        for index in 1..rows {
-            phase = phase * &minus_s + row(&ct.components, index);
-        }
-        // The centered phase reduces to f*m modulo t. Undo the public factor
-        // to recover m even after modulus switching has made f different from 1.
-        let inverse = mod_inverse(ct.correction_factor, self.plaintext_modulus)
-            .ok_or(FheError::InvalidCorrectionFactor)?;
-        let plaintext = phase.centered_rebase(&utils::plaintext_ring(
-            self.plaintext_modulus,
-            params.ring_dimension(),
-        )) * utils::plaintext_ring(self.plaintext_modulus, params.ring_dimension())
-            .polynomial([IntExpr::constant(inverse)]);
-        self.decode_slots(&plaintext)
+        self.decode_phase(&self.decryption_phase(secret, ct)?, ct)
     }
     fn add(&self, lhs: &BgvCiphertext, rhs: &BgvCiphertext) -> Result<BgvCiphertext, FheError> {
         let rows = self.ciphertext_rows(lhs)?;
@@ -619,6 +637,26 @@ impl BgvParams {
             .collect())
     }
 
+    /// The public slot permutations `(encode, decode)`: encoding reads logical slot `encode[j]`
+    /// into native evaluation `j`, and decoding reads native evaluation `decode[i]` into logical
+    /// slot `i`, so `encode[decode[i]] = i`.
+    pub fn slot_tables(&self) -> Result<(Vec<usize>, Vec<usize>), FheError> {
+        let decode = self.batching_indices()?;
+        let mut encode = vec![0; decode.len()];
+        for (slot, &native) in decode.iter().enumerate() {
+            encode[native] = slot;
+        }
+        Ok((encode, decode))
+    }
+
+    /// A public slot permutation as the coefficients of one constant plaintext polynomial: every
+    /// index is below N < t, so one constant node replaces N packed integer constants.
+    fn index_table(&self, indices: Vec<usize>) -> Family<Int> {
+        utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
+            .polynomial(indices.into_iter().map(IntExpr::from))
+            .coefficients()
+    }
+
     /// Encodes row-major slots as the plaintext polynomial in R_t, through the
     /// primitive inverse NTT at modulus t.
     fn encode_slots(&self, slots: &Family<Int>) -> Result<Mat, FheError> {
@@ -639,11 +677,7 @@ impl BgvParams {
                 (0..n).map(|i| if i < count { slots.at(i) } else { Int::constant(0) }).collect(),
             )?
         };
-        let mut inverse = vec![0; n];
-        for (slot, native) in self.batching_indices()?.into_iter().enumerate() {
-            inverse[native] = slot;
-        }
-        let indices = Family::pack(inverse.into_iter().map(Int::constant).collect())?;
+        let indices = self.index_table(self.slot_tables()?.0);
         let native = parallel(n, |i| Ok(slots.at(indices.at(i))))?;
         Ok(utils::plaintext_ring(self.plaintext_modulus, self.common.ring.ring_dimension())
             .from_evaluations(&native))
@@ -653,8 +687,7 @@ impl BgvParams {
     /// primitive forward NTT at modulus t.
     fn decode_slots(&self, plaintext: &Mat) -> Result<Family<Int>, FheError> {
         let n = self.common.ring.ring_dimension() as usize;
-        let indices =
-            Family::pack(self.batching_indices()?.into_iter().map(Int::constant).collect())?;
+        let indices = self.index_table(self.slot_tables()?.1);
         let native = plaintext.evaluations();
         Ok(parallel(n, |i| Ok(native.at(indices.at(i))))?)
     }

@@ -2,6 +2,7 @@ import RuntimePrimitives
 import RuntimeMatrixOps
 import RuntimeModulusSwitch
 import RuntimeHash
+import RuntimeSampling
 
 /-! Concrete successful-sampling relations used by generated scope relations.
 

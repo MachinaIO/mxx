@@ -1,0 +1,29 @@
+name = "MxxFheBgv"
+version = "0.1.0"
+defaultTargets = ["BgvGenerated", "MxxFheBgv"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../../ir-core/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../../ir-core/lean"
+
+# Modules written by `test_gpu_bgv_round_trip` (`crates/fhe/tests/gpu_bgv.rs`).
+[[lean_lib]]
+name = "BgvGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "Ideal", "Stage_keygen", "Stage_encrypt_x", "Stage_encrypt_y",
+  "Stage_multiply", "Stage_relinearize", "Stage_modswitch", "Stage_decrypt"
+]
+
+# Handwritten proofs of the generated claim.
+[[lean_lib]]
+name = "MxxFheBgv"
+roots = ["BgvStages", "BgvProof", "Certificate"]

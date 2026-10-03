@@ -798,15 +798,20 @@ impl<S: SessionStore> Executor<'_, S> {
                                 .to_owned(),
                         ));
                     }
-                    values.insert(
-                        wire,
-                        RuntimeValue::LazyArtifact {
-                            production: artifact.production_id.clone(),
-                            name: artifact.artifact_name.clone(),
-                            index: None,
-                            descriptor,
-                        },
-                    );
+                    let lazy = RuntimeValue::LazyArtifact {
+                        production: artifact.production_id.clone(),
+                        name: artifact.artifact_name.clone(),
+                        index: None,
+                        descriptor,
+                    };
+                    // Integer readers take host scalars directly, so a scalar integer artifact is
+                    // decoded at its input; deferring it would save no memory.
+                    let value = if artifact_type == ArtifactType::Int {
+                        self.materialize_value(lazy)?
+                    } else {
+                        lazy
+                    };
+                    values.insert(wire, value);
                 } else {
                     let wire = WireRef { node: node.id, port: Port(0) };
                     let concrete = self.resolved_wire_type(scope_id, wire, env)?;
@@ -2438,6 +2443,75 @@ mod tests {
         types::CoefficientBoundDomain,
     };
     use num_bigint::BigInt;
+
+    /// A record of an integer family and an integer crosses stages as per-leaf artifacts.
+    #[test]
+    fn integer_record_artifacts_round_trip_between_stages() {
+        use mxx_dsl::{GraphValue, IntType};
+        let producer = DslContext::new("integer-record-producer");
+        let record =
+            (producer.int_family_input("mask", 3), producer.input::<Int>("body", IntType).unwrap());
+        let schema = record.schema();
+        let producer = producer
+            .transferred_output("ciphertext", record)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let produced = crate::executor::execute_in_session(
+            &producer,
+            &mut backend,
+            BTreeMap::from([
+                (
+                    "mask".to_owned(),
+                    RuntimeValue::integer_values([5, -6, 7].map(BigInt::from).to_vec()),
+                ),
+                ("body".to_owned(), RuntimeValue::Int(BigInt::from(10))),
+            ]),
+            &mut store,
+            [0x61; 32],
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let production = produced.production_id.expect("producer identity");
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+
+        let consumer = DslContext::new("integer-record-consumer");
+        let (mask, body): (Family<Int>, Int) = consumer
+            .artifact_input(
+                production.clone(),
+                "ciphertext",
+                schema,
+                ArtifactAvailability::Transferred,
+            )
+            .unwrap();
+        let consumer = consumer
+            .output("sum", body.add(mask.at(1)).add(mask.at(2)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let result = crate::executor::execute_in_session(
+            &consumer,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            [0x62; 32],
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&result.outputs["sum"], RuntimeValue::Int(value) if *value == BigInt::from(11))
+        );
+    }
 
     fn ring(parameters: &DCRTPolyParams) -> Ring {
         Ring::from_crt_moduli(

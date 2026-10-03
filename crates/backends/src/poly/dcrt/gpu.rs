@@ -6252,6 +6252,17 @@ impl GpuSignedValues {
         self.count
     }
 
+    /// A one-value view of member `index`, sharing this owner's device buffer.
+    pub(crate) fn member(&self, index: usize) -> Self {
+        assert!(index < self.count, "signed value member is out of range");
+        Self {
+            buffer: Arc::clone(&self.buffer),
+            offset: self.offset + index,
+            count: 1,
+            encoding: self.encoding,
+        }
+    }
+
     pub fn encoding(&self) -> GpuSignedValuesEncoding {
         self.encoding
     }

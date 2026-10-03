@@ -1,4 +1,6 @@
-//! Encrypts and decrypts one bit with Ring-LWE on the GPU.
+//! Encrypts and decrypts one bit with Ring-LWE on the GPU, and exports the Lean statement that
+//! every execution decrypts its message to `crates/dsl/examples/rlwe/generated`, where
+//! `lake build` checks its proof.
 //!
 //! Run with `cargo run -r -p mxx-dsl --example rlwe_encrypt --features gpu`.
 
@@ -7,8 +9,17 @@ use mxx_backends::{
     GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::dcrt::gpu::GpuDCRTPolyParams,
     sampler::bounds::hard_cutoff_from_sigma_bound,
 };
-use mxx_dsl::{BuiltGraph, DslContext, DslError, HashTag, Int, IntType, Ring};
-use mxx_ir_core::{IntExpr, ParamEnv, Rational, RealExpr, generate_crt_basis};
+use mxx_dsl::{BuiltGraph, DslContext, DslError, HashTag, IdealSpec, Int, IntType, Ring};
+use mxx_ir_core::{
+    IntExpr, ParamEnv, Rational, RealExpr, generate_crt_basis,
+    protocol::{
+        ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec, EndpointBinding,
+        EndpointBindings, EndpointSemanticBinding, EndpointSpecId, InputContract,
+        InputContractEntry, InputValueContract, OutputRef, ParameterDecl, ParameterKind,
+        ProtocolDecl, ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId,
+        ProtocolPreconditionSpec, ProtocolStage, StageId, StageInputName, Workflow,
+    },
+};
 use num_bigint::BigInt;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -67,7 +78,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reals: BTreeMap::from([("sigma".to_owned(), Rational::from_integer(BigInt::from(sigma)))]),
         ..ParamEnv::default()
     };
-    let program = rlwe_program(ring_dimension)?.validate(&bindings)?;
+    let program = rlwe_program(ring_dimension)?;
+
+    // State the program's correctness in Lean: for every seed and message bit, the decrypted bit
+    // is the message. `lake build` in `crates/dsl/examples/rlwe` checks the proof.
+    let lean = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated");
+    mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean)?;
+
+    let program = program.validate(&bindings)?;
 
     // Register the same ring with a GPU backend.
     let moduli = generate_crt_basis(ring_dimension, crt_depth, crt_bits)?;
@@ -92,4 +110,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("bit {bit} decrypted correctly");
     }
     Ok(())
+}
+
+/// The program as a one-stage protocol whose ideal functionality returns the message bit.
+fn correctness_protocol(
+    program: &BuiltGraph,
+    bindings: &ParamEnv,
+) -> Result<ProtocolDecl, Box<dyn std::error::Error>> {
+    // Every graph of a protocol declares the same parameters.
+    let params = [
+        ("crt_bits", ParameterKind::Integer),
+        ("crt_depth", ParameterKind::Integer),
+        ("gadget_base_bits", ParameterKind::Integer),
+        ("cutoff", ParameterKind::Integer),
+        ("sigma", ParameterKind::Rational),
+    ]
+    .into_iter()
+    .map(|(name, kind)| ParameterDecl { name: name.to_owned(), kind })
+    .collect();
+    let ideal = DslContext::new("rlwe-ideal")
+        .int_parameter("crt_bits")
+        .int_parameter("crt_depth")
+        .int_parameter("gadget_base_bits")
+        .int_parameter("cutoff")
+        .real_parameter("sigma");
+    let message: Int = ideal.input("message", IntType)?;
+    let ideal =
+        IdealSpec::new(ideal.output("decrypted", Int::constant(0).less(message))?.build()?.graph)?;
+
+    let stage = StageId("rlwe".to_owned());
+    let endpoint = EndpointSpecId::Exact;
+    let destination = |input: &str| ProtocolInputDestination::WorkflowStage {
+        stage: stage.clone(),
+        input: StageInputName(input.to_owned()),
+    };
+    let (contracts, input_bindings) = [
+        ("seed", InputValueContract::Bytes { length: 32.into() }, vec![destination("seed")]),
+        (
+            "message",
+            InputValueContract::IntegerRange { lower: 0.into(), upper: 1.into() },
+            vec![
+                destination("message"),
+                ProtocolInputDestination::Ideal { input: "message".to_owned() },
+            ],
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value, destinations)| {
+        (
+            InputContractEntry { id: ProtocolInputId::from(name), name: name.to_owned(), value },
+            ProtocolInputBinding { input: ProtocolInputId::from(name), destinations },
+        )
+    })
+    .unzip();
+    Ok(ProtocolDecl::new(ProtocolDecl {
+        params,
+        bindings: bindings.clone(),
+        // The Gaussian samples are truncated, so every execution decrypts correctly.
+        failure_probability_log2: None,
+        bundle: ClosedProtocolBundle {
+            workflow: Workflow {
+                stages: vec![ProtocolStage {
+                    id: stage.clone(),
+                    graph: program.graph.clone(),
+                    bindings: Vec::new(),
+                }],
+                entrypoint: stage.clone(),
+            },
+            ideal,
+            requirements: Vec::new(),
+            comparator: ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: "decrypted".to_owned(),
+                    ideal_input: "decrypted".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            },
+            endpoints: EndpointBindings {
+                entries: vec![EndpointBinding {
+                    spec: endpoint,
+                    semantics: EndpointSemanticBinding::Exact,
+                    workflow_output: OutputRef { stage, output: "decrypted".to_owned() },
+                    ideal_output: "decrypted".to_owned(),
+                }],
+            },
+            operational_decoder_targets: Vec::new(),
+            endpoint_specs: vec![endpoint],
+            input_contract: InputContract { inputs: contracts },
+            input_bindings,
+            precondition_spec: ProtocolPreconditionSpec::default(),
+        },
+    })?)
 }

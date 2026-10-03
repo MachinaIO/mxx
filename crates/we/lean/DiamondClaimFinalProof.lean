@@ -16,15 +16,15 @@ theorem generated_claim_ideal {hashModel external execution}
   obtain ⟨_, h⟩ := hrun.2.2.2.2.2.2.1
   exact h
 
-/-- The final whole-polynomial estimate supplies the observed residual and operational decoder.
-    The numeric gate and estimate are local obligations, not a proof of CorrectnessClaim. -/
+/-- The final whole-polynomial estimate, within the decoder radius, makes the operational decoder
+    return the ideal message. The numeric gate and estimate are local obligations, not a proof of
+    CorrectnessClaim. -/
 theorem generated_claim_decoder_of_approx {hashModel external execution B}
     (hrun : Runs hashModel external execution)
     (hbound : B < MxxWe.decoderRadius q)
     (happrox : Approx execution.stage_1.2.1
       (matrixPolynomial [(MxxWe.messageCenter q external.input_7 : Int)]) B) :
-    (observedResidual execution).natAbs < MxxWe.decoderRadius q ∧
-      execution.stage_1.1 = execution.ideal := by
+    execution.stage_1.1 = execution.ideal := by
   have hcenter :
       ((matrixPolynomial [(MxxWe.messageCenter q external.input_7 : Int)] :
         ExactMatrix q n 1 1) 0 0).coeff ⟨0, by decide⟩ =
@@ -44,11 +44,8 @@ theorem generated_claim_decoder_of_approx {hashModel external execution B}
   have h := final_approx_decoder (by decide : 4 ≤ q) (by decide : 0 < n)
     hbound external.input_7 _ _ happrox hcenter
   have hideal := generated_claim_ideal hrun
-  constructor
-  · simpa only [observedResidual, hideal] using h.1
-  · rw [generated_final_decoder DiamondBackend.backend stage_1_params rfl hrun.2.2.1,
-      hideal]
-    exact h.2
+  rw [generated_final_decoder Backend.backend stage_1_params rfl hrun.2.2.1, hideal]
+  exact h.2
 
 #print axioms generated_claim_ideal
 #print axioms generated_claim_decoder_of_approx

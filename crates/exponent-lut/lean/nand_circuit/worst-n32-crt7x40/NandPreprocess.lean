@@ -30,7 +30,7 @@ theorem preprocess_rhs0 {model : HashModel} {key : ByteArray} {payload : ExactMa
       reducePoly Q7 N sp • rhsTop model key Q7 12 rhsPrefix0 j +
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1,
             outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
-        reducePoly Q7 N (((P7 : Nat) : Int) * message c0 e0 * unitPair sp j) • g +
+        reducePoly Q7 N (((P7 : Nat) : Int) * message (n := N) c0 e0 * unitPair sp j) • g +
           reduceMatrix Q7 N 1 12 (e j) := by
   obtain ⟨w, hb⟩ := h
   unfold Stage_preprocess.generatedRoot.body at hb
@@ -73,7 +73,7 @@ theorem preprocess_rhs1 {model : HashModel} {key : ByteArray} {payload : ExactMa
     ∃ e : Fin 2 → ErrorMatrix N 1 10, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
       reducePoly Q6 N sp • rhsTop model key Q6 10 rhsPrefix1 j +
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
-        reducePoly Q6 N (((P6 : Nat) : Int) * message c1 e1 * unitPair sp j) • g +
+        reducePoly Q6 N (((P6 : Nat) : Int) * message (n := N) c1 e1 * unitPair sp j) • g +
           reduceMatrix Q6 N 1 10 (e j) := by
   obtain ⟨w, hb⟩ := h
   unfold Stage_preprocess.generatedRoot.body at hb
@@ -90,10 +90,10 @@ theorem preprocess_rhs1 {model : HashModel} {key : ByteArray} {payload : ExactMa
   have hout := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
   subst hout hpayload
   dsimp (config := { zetaDelta := true }) only at h69_0 h95_0 h79_0
-  have hpay := modulusReduce_poly hQ7 hQ6 h69_0
-  have hone := modulusReduce_one hQ7 hQ6 h95_0
+  have hpay := modulusReduce_poly hQ7 hQ6 hN h69_0
+  have hone := modulusReduce_one hQ7 hQ6 hN h95_0
   rw [multiplyMonomial_liftInteger] at h79_0
-  have hnu := modulusReduce_poly hQ7 hQ6 h79_0
+  have hnu := modulusReduce_poly hQ7 hQ6 hN h79_0
   have hgg' := gadgetMatrixRuns_unique h70_0 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h71_0 hg
@@ -125,7 +125,7 @@ theorem preprocess_rhs2 {model : HashModel} {key : ByteArray} {payload : ExactMa
     ∃ e : Fin 2 → ErrorMatrix N 1 8, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
       reducePoly Q5 N sp • rhsTop model key Q5 8 rhsPrefix2 j +
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
-        reducePoly Q5 N (((P5 : Nat) : Int) * message c2 e2 * unitPair sp j) • g +
+        reducePoly Q5 N (((P5 : Nat) : Int) * message (n := N) c2 e2 * unitPair sp j) • g +
           reduceMatrix Q5 N 1 8 (e j) := by
   obtain ⟨w, hb⟩ := h
   unfold Stage_preprocess.generatedRoot.body at hb
@@ -142,10 +142,10 @@ theorem preprocess_rhs2 {model : HashModel} {key : ByteArray} {payload : ExactMa
   have hout := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
   subst hout hpayload
   dsimp (config := { zetaDelta := true }) only at h120_0 h146_0 h130_0
-  have hpay := modulusReduce_poly hQ7 hQ5 h120_0
-  have hone := modulusReduce_one hQ7 hQ5 h146_0
+  have hpay := modulusReduce_poly hQ7 hQ5 hN h120_0
+  have hone := modulusReduce_one hQ7 hQ5 hN h146_0
   rw [multiplyMonomial_liftInteger] at h130_0
-  have hnu := modulusReduce_poly hQ7 hQ5 h130_0
+  have hnu := modulusReduce_poly hQ7 hQ5 hN h130_0
   have hgg' := gadgetMatrixRuns_unique h121_0 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h122_0 hg
@@ -177,7 +177,7 @@ theorem preprocess_rhs3 {model : HashModel} {key : ByteArray} {payload : ExactMa
     ∃ e : Fin 2 → ErrorMatrix N 1 6, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
       reducePoly Q4 N sp • rhsTop model key Q4 6 rhsPrefix3 j +
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
-        reducePoly Q4 N (((P4 : Nat) : Int) * message c3 e3 * unitPair sp j) • g +
+        reducePoly Q4 N (((P4 : Nat) : Int) * message (n := N) c3 e3 * unitPair sp j) • g +
           reduceMatrix Q4 N 1 6 (e j) := by
   obtain ⟨w, hb⟩ := h
   unfold Stage_preprocess.generatedRoot.body at hb
@@ -194,10 +194,10 @@ theorem preprocess_rhs3 {model : HashModel} {key : ByteArray} {payload : ExactMa
   have hout := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
   subst hout hpayload
   dsimp (config := { zetaDelta := true }) only at h171_0 h197_0 h181_0
-  have hpay := modulusReduce_poly hQ7 hQ4 h171_0
-  have hone := modulusReduce_one hQ7 hQ4 h197_0
+  have hpay := modulusReduce_poly hQ7 hQ4 hN h171_0
+  have hone := modulusReduce_one hQ7 hQ4 hN h197_0
   rw [multiplyMonomial_liftInteger] at h181_0
-  have hnu := modulusReduce_poly hQ7 hQ4 h181_0
+  have hnu := modulusReduce_poly hQ7 hQ4 hN h181_0
   have hgg' := gadgetMatrixRuns_unique h172_0 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h173_0 hg
@@ -240,14 +240,14 @@ theorem preprocess_switch0 {model : HashModel} {key : ByteArray} {payload : Exac
   subst hout hpayload
   obtain ⟨w_1_0, w_2_0, w_4_0, w_5_0, w_12_0, w_17_0, w_23_0, w_28_0, w_35_0, w_40_0, w_46_0, w_51_0, w_59_0, w_64_0, w_70_0, w_75_0, w_82_0, w_87_0, w_93_0, w_98_0, w_107_0, w_108_0, w_111_0, w_117_0, w_121_0, -, -, h1_0, -, -, h2_0, h4_0, -, -, h5_0, -, -, -, -, -, -, h12_0, -, -, -, -, -, -, h17_0, -, -, -, -, -, -, h23_0, -, -, -, -, -, -, h28_0, -, -, -, -, -, -, h35_0, -, -, -, -, -, -, h40_0, -, -, -, -, -, -, h46_0, -, -, -, -, -, -, h51_0, -, -, -, -, -, -, h59_0, -, -, -, -, -, -, h64_0, -, -, -, -, -, -, h70_0, -, -, -, -, -, -, h75_0, -, -, -, -, -, -, h82_0, -, -, -, -, -, -, h87_0, -, -, -, -, -, -, h93_0, -, -, -, -, -, -, h98_0, h107_0, h108_0, h111_0, h117_0, h121_0, hout⟩ := h3_3 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ6 hN h5_0
-  have hw4 := modulusReduce_poly hQ7 hQ6 h4_0
+  have hw4 := modulusReduce_poly hQ7 hQ6 hN h4_0
   have hgg' := gadgetMatrixRuns_unique h107_0 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h108_0 hg
   subst hgg
   obtain ⟨e0', he0, hb0⟩ := gaussian_bound h111_0
   obtain ⟨e1', he1, hb1⟩ := gaussian_bound h121_0
-  have hw117 := modulusReduce_one hQ7 hQ6 h117_0
+  have hw117 := modulusReduce_one hQ7 hQ6 hN h117_0
   obtain ⟨_, a0⟩ := ringAutomorphismRuns_eq hQ6 hN h12_0
   obtain ⟨_, a1⟩ := ringAutomorphismRuns_eq hQ6 hN h17_0
   obtain ⟨_, a2⟩ := ringAutomorphismRuns_eq hQ6 hN h23_0
@@ -298,14 +298,14 @@ theorem preprocess_switch1 {model : HashModel} {key : ByteArray} {payload : Exac
   subst hout hpayload
   obtain ⟨w_1_0, w_2_0, w_4_0, w_5_0, w_12_0, w_17_0, w_23_0, w_28_0, w_35_0, w_40_0, w_46_0, w_51_0, w_59_0, w_64_0, w_70_0, w_75_0, w_82_0, w_87_0, w_93_0, w_98_0, w_107_0, w_108_0, w_111_0, w_117_0, w_121_0, -, -, h1_0, -, -, h2_0, h4_0, -, -, h5_0, -, -, -, -, -, -, h12_0, -, -, -, -, -, -, h17_0, -, -, -, -, -, -, h23_0, -, -, -, -, -, -, h28_0, -, -, -, -, -, -, h35_0, -, -, -, -, -, -, h40_0, -, -, -, -, -, -, h46_0, -, -, -, -, -, -, h51_0, -, -, -, -, -, -, h59_0, -, -, -, -, -, -, h64_0, -, -, -, -, -, -, h70_0, -, -, -, -, -, -, h75_0, -, -, -, -, -, -, h82_0, -, -, -, -, -, -, h87_0, -, -, -, -, -, -, h93_0, -, -, -, -, -, -, h98_0, h107_0, h108_0, h111_0, h117_0, h121_0, hout⟩ := h4_3 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ5 hN h5_0
-  have hw4 := modulusReduce_poly hQ7 hQ5 h4_0
+  have hw4 := modulusReduce_poly hQ7 hQ5 hN h4_0
   have hgg' := gadgetMatrixRuns_unique h107_0 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h108_0 hg
   subst hgg
   obtain ⟨e0', he0, hb0⟩ := gaussian_bound h111_0
   obtain ⟨e1', he1, hb1⟩ := gaussian_bound h121_0
-  have hw117 := modulusReduce_one hQ7 hQ5 h117_0
+  have hw117 := modulusReduce_one hQ7 hQ5 hN h117_0
   obtain ⟨_, a0⟩ := ringAutomorphismRuns_eq hQ5 hN h12_0
   obtain ⟨_, a1⟩ := ringAutomorphismRuns_eq hQ5 hN h17_0
   obtain ⟨_, a2⟩ := ringAutomorphismRuns_eq hQ5 hN h23_0
@@ -356,14 +356,14 @@ theorem preprocess_switch2 {model : HashModel} {key : ByteArray} {payload : Exac
   subst hout hpayload
   obtain ⟨w_1_0, w_2_0, w_4_0, w_5_0, w_12_0, w_17_0, w_23_0, w_28_0, w_35_0, w_40_0, w_46_0, w_51_0, w_59_0, w_64_0, w_70_0, w_75_0, w_82_0, w_87_0, w_93_0, w_98_0, w_107_0, w_108_0, w_111_0, w_117_0, w_121_0, -, -, h1_0, -, -, h2_0, h4_0, -, -, h5_0, -, -, -, -, -, -, h12_0, -, -, -, -, -, -, h17_0, -, -, -, -, -, -, h23_0, -, -, -, -, -, -, h28_0, -, -, -, -, -, -, h35_0, -, -, -, -, -, -, h40_0, -, -, -, -, -, -, h46_0, -, -, -, -, -, -, h51_0, -, -, -, -, -, -, h59_0, -, -, -, -, -, -, h64_0, -, -, -, -, -, -, h70_0, -, -, -, -, -, -, h75_0, -, -, -, -, -, -, h82_0, -, -, -, -, -, -, h87_0, -, -, -, -, -, -, h93_0, -, -, -, -, -, -, h98_0, h107_0, h108_0, h111_0, h117_0, h121_0, hout⟩ := h5_3 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ4 hN h5_0
-  have hw4 := modulusReduce_poly hQ7 hQ4 h4_0
+  have hw4 := modulusReduce_poly hQ7 hQ4 hN h4_0
   have hgg' := gadgetMatrixRuns_unique h107_0 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h108_0 hg
   subst hgg
   obtain ⟨e0', he0, hb0⟩ := gaussian_bound h111_0
   obtain ⟨e1', he1, hb1⟩ := gaussian_bound h121_0
-  have hw117 := modulusReduce_one hQ7 hQ4 h117_0
+  have hw117 := modulusReduce_one hQ7 hQ4 hN h117_0
   obtain ⟨_, a0⟩ := ringAutomorphismRuns_eq hQ4 hN h12_0
   obtain ⟨_, a1⟩ := ringAutomorphismRuns_eq hQ4 hN h17_0
   obtain ⟨_, a2⟩ := ringAutomorphismRuns_eq hQ4 hN h23_0
@@ -413,10 +413,10 @@ theorem preprocess_switch3 {model : HashModel} {key : ByteArray} {payload : Exac
   subst hout hpayload
   obtain ⟨w_1_0, w_2_0, w_4_0, w_5_0, w_12_0, w_17_0, w_23_0, w_28_0, w_35_0, w_40_0, w_46_0, w_51_0, w_59_0, w_64_0, w_70_0, w_75_0, w_82_0, w_87_0, w_93_0, w_98_0, w_110_0, w_116_0, w_120_0, -, -, h1_0, -, -, h2_0, h4_0, -, -, h5_0, -, -, -, -, -, -, h12_0, -, -, -, -, -, -, h17_0, -, -, -, -, -, -, h23_0, -, -, -, -, -, -, h28_0, -, -, -, -, -, -, h35_0, -, -, -, -, -, -, h40_0, -, -, -, -, -, -, h46_0, -, -, -, -, -, -, h51_0, -, -, -, -, -, -, h59_0, -, -, -, -, -, -, h64_0, -, -, -, -, -, -, h70_0, -, -, -, -, -, -, h75_0, -, -, -, -, -, -, h82_0, -, -, -, -, -, -, h87_0, -, -, -, -, -, -, h93_0, -, -, -, -, -, -, h98_0, h110_0, h116_0, h120_0, hout⟩ := h6_3 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ3 hN h5_0
-  have hw4 := modulusReduce_poly hQ7 hQ3 h4_0
+  have hw4 := modulusReduce_poly hQ7 hQ3 hN h4_0
   obtain ⟨e0', he0, hb0⟩ := gaussian_bound h110_0
   obtain ⟨e1', he1, hb1⟩ := gaussian_bound h120_0
-  have hw116 := modulusReduce_one hQ7 hQ3 h116_0
+  have hw116 := modulusReduce_one hQ7 hQ3 hN h116_0
   obtain ⟨_, a0⟩ := ringAutomorphismRuns_eq hQ3 hN h12_0
   obtain ⟨_, a1⟩ := ringAutomorphismRuns_eq hQ3 hN h17_0
   obtain ⟨_, a2⟩ := ringAutomorphismRuns_eq hQ3 hN h23_0

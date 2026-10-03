@@ -373,9 +373,9 @@ theorem round0 {model : HashModel} {key : ByteArray}
           ![f0c i, f0d i] j =
         (lutCoefficient Q6 inverse6 (MxxExponentLutNand.table 0) (sigma i).toNat *
           reducePoly Q6 N (1 * unitPair sp j)) • g' + reduceMatrix Q6 N 1 12 (e j))
-    {arg : Fin 16} (harg : μ * ν = Xe arg) :
+    {arg : Fin 16} (harg : μ * ν = Xe (n := N) arg) :
     Rel sm ![![w.w_111_0, w.w_135_0], ![w.w_114_0, w.w_138_0]]
-      (fun j ↦ reducePoly Q6 N (1 * Xe (MxxExponentLutNand.table 0 arg) * unitPair sp j) • g')
+      (fun j ↦ reducePoly Q6 N (1 * Xe (n := N) (MxxExponentLutNand.table 0 arg) * unitPair sp j) • g')
       ![w.w_108_0, w.w_132_0] roundBound0 := by
   unfold Stage_online.generatedRoot.body at hb
   extract_lets at hb
@@ -489,7 +489,7 @@ theorem round0 {model : HashModel} {key : ByteArray}
     (fun j ↦ by fin_cases j; exacts [h60_0, h69_0]) (fun j ↦ by fin_cases j; exacts [h61_0, h70_0])
     (fun j ↦ by fin_cases j; exacts [h62_0, h71_0])
   have hmul' : Rel sm ![![w.w_61_0, w.w_70_0], ![w.w_62_0, w.w_71_0]]
-      (fun j ↦ reducePoly Q7 N (((P7 : Nat) : Int) * Xe arg * unitPair sp j) • g)
+      (fun j ↦ reducePoly Q7 N (((P7 : Nat) : Int) * Xe (n := N) arg * unitPair sp j) • g)
       ![w.w_60_0, w.w_69_0] mulBound0 := by
     convert hmul using 2 with j
     rw [smul_smul, ← map_mul, ← harg]
@@ -544,7 +544,7 @@ theorem round0 {model : HashModel} {key : ByteArray}
   have hsum := hloop.add hbranch
   -- The sum of the sixteen branches, moved down to level `2`.
   have hsum' := hsum.target_eq (t' := fun j ↦ ∑ i : Fin 16, scaleUpMatrix Q7 P7
-      (reducePoly Q6 N (substitution (sigma i).toNat (sigma_odd i) (Xe arg)) •
+      (reducePoly Q6 N (substitution (sigma i).toNat (sigma_odd i) (Xe (n := N) arg)) •
         (reducePoly Q6 N (substitution (sigma i).toNat (sigma_odd i) sp) •
           ![![f0a, f0b], ![f0c, f0d]] 0 j i + ![![f0a, f0b], ![f0c, f0d]] 1 j i))) (by
     funext j
@@ -555,15 +555,15 @@ theorem round0 {model : HashModel} {key : ByteArray}
     · rw [show (Fin.last 15 : Fin 16) = 15 from rfl]
       rfl)
   choose eS heS hS using hswitch
-  have hwalsh : ∑ i : Fin 16, reducePoly Q6 N (substitution (sigma i).toNat (sigma_odd i) (Xe arg)) *
+  have hwalsh : ∑ i : Fin 16, reducePoly Q6 N (substitution (sigma i).toNat (sigma_odd i) (Xe (n := N) arg)) *
       lutCoefficient Q6 inverse6 (MxxExponentLutNand.table 0) (sigma i).toNat =
-      reducePoly Q6 N (Xe (MxxExponentLutNand.table 0 arg)) := by
+      reducePoly Q6 N (Xe (n := N) (MxxExponentLutNand.table 0 arg)) := by
     rw [reducePoly_Xe, ← lut_walsh inverse6_mul (MxxExponentLutNand.table 0) arg]
     apply Finset.sum_congr rfl
     intro i _
     rw [substitution_root_pow, reducePoly_Xe, Nat.mul_comm]
   have hfin := lut_finish (W := 16) (q := Q7) (q' := Q6) (p := P7) (m' := 12) hN q7_eq hQ7 hQ6
-    (by norm_num) (sp := sp) (μ := Xe arg) (ν := Xe (MxxExponentLutNand.table 0 arg)) (Δ' := 1)
+    (by norm_num) (sp := sp) (μ := Xe (n := N) arg) (ν := Xe (n := N) (MxxExponentLutNand.table 0 arg)) (Δ' := 1)
     hsm (fun i ↦ substitution (sigma i).toNat (sigma_odd i))
     (fun i ↦ polyNorm_substitution_Xe i arg)
     (bsw := fun i k j ↦ ![![f0a, f0b], ![f0c, f0d]] k j i) hsum' (g' := g')

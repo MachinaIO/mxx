@@ -35,7 +35,7 @@ theorem encrypt_input {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1} 
     {g' g : ExactMatrix Q7 N 1 14} (hg' : gadgetMatrixRuns Backend.backend 1048576 14 g')
     (hg : centeredRebaseRuns g' g) :
     Rel sm (inputKey model key)
-      (fun j ↦ reducePoly Q7 N (((1 : Nat) : Int) * message coefficient exponent * unitPair sp j) • g)
+      (fun j ↦ reducePoly Q7 N (((1 : Nat) : Int) * message (n := N) coefficient exponent * unitPair sp j) • g)
       ![outputs.1, outputs.2.1] 26 := by
   obtain ⟨w, h2, h5, h9, h10, h20, h22, h24, h31, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
     hout⟩ := h
@@ -43,8 +43,8 @@ theorem encrypt_input {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1} 
   subst hgg'
   have hgg := centeredRebaseRuns_unique h10 hg
   subst hgg
-  obtain ⟨e0, he0, hb0⟩ := gaussian_bound h20
-  obtain ⟨e1, he1, hb1⟩ := gaussian_bound h31
+  obtain ⟨e0, he0, hb0⟩ := gaussian_bound_at hN h20
+  obtain ⟨e1, he1, hb1⟩ := gaussian_bound_at hN h31
   subst hout hmask hpayload
   refine ⟨![e0, e1], fun j ↦ by fin_cases j <;> assumption, fun j ↦ ?_⟩
   have hkey : ∀ k j, inputKey model key k j = ![![w.w_2_0, w.w_22_0], ![w.w_5_0, w.w_24_0]] k j := by
@@ -80,8 +80,8 @@ theorem encrypt_helper1 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   subst hgg'
   have hgg := centeredRebaseRuns_unique h13 hg
   subst hgg
-  obtain ⟨e0, he0, hb0⟩ := gaussian_bound h16
-  obtain ⟨e1, he1, hb1⟩ := gaussian_bound h27
+  obtain ⟨e0, he0, hb0⟩ := gaussian_bound_at hN h16
+  obtain ⟨e1, he1, hb1⟩ := gaussian_bound_at hN h27
   obtain ⟨_, hw10⟩ := ringAutomorphismRuns_eq hQ7 hN h10
   obtain ⟨_, hw23⟩ := ringAutomorphismRuns_eq hQ7 hN h23
   simp only [Prod.mk.injEq] at hout
@@ -116,15 +116,15 @@ theorem encrypt_helper3 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   subst hout hmask
   obtain ⟨w1, w4, w7, w8, w12, w14, w15, w18, w20, w22, w25, w29, h1, -, -, h4, h7, h8, -, -, h12,
     h14, h15, h18, h20, h22, -, -, h25, h29, hout⟩ := hloop i
-  have hw1 := modulusReduce_poly hQ7 hQ6 h1
-  have hw7 := modulusReduce_one hQ7 hQ6 h7
+  have hw1 := modulusReduce_poly hQ7 hQ6 hN h1
+  have hw7 := modulusReduce_one hQ7 hQ6 hN h7
   subst hw1 hw7
   have hgg' := gadgetMatrixRuns_unique h14 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h15 hg
   subst hgg
-  obtain ⟨e0, he0, hb0⟩ := gaussian_bound h18
-  obtain ⟨e1, he1, hb1⟩ := gaussian_bound h29
+  obtain ⟨e0, he0, hb0⟩ := gaussian_bound_at hN h18
+  obtain ⟨e1, he1, hb1⟩ := gaussian_bound_at hN h29
   obtain ⟨_, hw12⟩ := ringAutomorphismRuns_eq hQ6 hN h12
   obtain ⟨_, hw25⟩ := ringAutomorphismRuns_eq hQ6 hN h25
   simp only [Prod.mk.injEq] at hout
@@ -159,15 +159,15 @@ theorem encrypt_helper5 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   subst hout hmask
   obtain ⟨w1, w4, w7, w8, w12, w14, w15, w18, w20, w22, w25, w29, h1, -, -, h4, h7, h8, -, -, h12,
     h14, h15, h18, h20, h22, -, -, h25, h29, hout⟩ := hloop i
-  have hw1 := modulusReduce_poly hQ7 hQ5 h1
-  have hw7 := modulusReduce_one hQ7 hQ5 h7
+  have hw1 := modulusReduce_poly hQ7 hQ5 hN h1
+  have hw7 := modulusReduce_one hQ7 hQ5 hN h7
   subst hw1 hw7
   have hgg' := gadgetMatrixRuns_unique h14 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h15 hg
   subst hgg
-  obtain ⟨e0, he0, hb0⟩ := gaussian_bound h18
-  obtain ⟨e1, he1, hb1⟩ := gaussian_bound h29
+  obtain ⟨e0, he0, hb0⟩ := gaussian_bound_at hN h18
+  obtain ⟨e1, he1, hb1⟩ := gaussian_bound_at hN h29
   obtain ⟨_, hw12⟩ := ringAutomorphismRuns_eq hQ5 hN h12
   obtain ⟨_, hw25⟩ := ringAutomorphismRuns_eq hQ5 hN h25
   simp only [Prod.mk.injEq] at hout
@@ -202,15 +202,15 @@ theorem encrypt_helper7 {model : HashModel} {mask payload : ExactMatrix Q7 N 1 1
   subst hout hmask
   obtain ⟨w1, w4, w7, w8, w12, w14, w15, w18, w20, w22, w25, w29, h1, -, -, h4, h7, h8, -, -, h12,
     h14, h15, h18, h20, h22, -, -, h25, h29, hout⟩ := hloop i
-  have hw1 := modulusReduce_poly hQ7 hQ4 h1
-  have hw7 := modulusReduce_one hQ7 hQ4 h7
+  have hw1 := modulusReduce_poly hQ7 hQ4 hN h1
+  have hw7 := modulusReduce_one hQ7 hQ4 hN h7
   subst hw1 hw7
   have hgg' := gadgetMatrixRuns_unique h14 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h15 hg
   subst hgg
-  obtain ⟨e0, he0, hb0⟩ := gaussian_bound h18
-  obtain ⟨e1, he1, hb1⟩ := gaussian_bound h29
+  obtain ⟨e0, he0, hb0⟩ := gaussian_bound_at hN h18
+  obtain ⟨e1, he1, hb1⟩ := gaussian_bound_at hN h29
   obtain ⟨_, hw12⟩ := ringAutomorphismRuns_eq hQ4 hN h12
   obtain ⟨_, hw25⟩ := ringAutomorphismRuns_eq hQ4 hN h25
   simp only [Prod.mk.injEq] at hout

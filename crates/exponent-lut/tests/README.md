@@ -120,3 +120,20 @@ security. None of them has run on a GPU. The columns are:
 | `prf_min_estimator_bits` | Minimum over the eight attacks of `sparse_lwr_estimator.sage.py` |
 | `prf_mitm_bits`, `prf_binding_attack` | Estimator `LWE.mitm` with the split dimension rounded to an integer (it raises `TypeError` on sparse secrets otherwise), and the cheapest attack overall |
 | `level0_matrix_gb`, `stored_artifacts_tb` | One level-0 `(1, columns)` matrix, and the RHS, input-encoding, and public-key artifacts the implementation at `git_commit` stores, estimated from matrix sizes |
+
+## Parameter IDs for the Lean correctness proofs
+
+With `MXX_EXPONENT_LUT_NAND_PARAMETER_ID` or `MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID` set to a
+parameter ID, `nand_circuit.rs` and `lwr_prf.rs` run without searching at the parameters of that row
+of `lean/<test>/parameters.csv` (the noise model, the RNS-BGG parameters, the error width, and for
+the PRF the LWR profile and the key seed). They check that the recorded lattice security is
+reproduced, verify the round trip and the decrypted output, and export the graphs of the executed
+stages as a closed protocol to `lean/<test>/<parameter id>/generated`. See `lean/README.md` for the
+meaning of each column and the proofs of the exported claims.
+
+```sh
+MXX_EXPONENT_LUT_NAND_PARAMETER_ID=worst-n32-crt7x40 \
+  cargo test -p mxx-exponent-lut --features gpu --test nand_circuit -- --nocapture
+MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=average-n32-crt7x40 \
+  cargo test -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
+```

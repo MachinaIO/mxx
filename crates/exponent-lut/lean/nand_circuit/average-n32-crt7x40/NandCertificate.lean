@@ -18,20 +18,6 @@ open Mxx.Primitives MxxRuntime MxxExponentLut MxxExponentLutNand
 
 variable {tape : SampleTape} {path loopPath : List Nat}
 
-/-- The gadget matrix of a regular layout with base `2^20`. -/
-theorem gadget_exists {q m : Nat} {layout : RegularLayout q}
-    (hlayout : Backend.backend.regularLayout q N = some layout)
-    (hbase : (1048576 : Int) = layout.base) (hdigits : (m : Int) = layout.digitCount)
-    (hwidth : m = 1 * layout.digitCount) :
-    ∃ g : ExactMatrix q N 1 m, gadgetMatrixRuns Backend.backend 1048576 m g :=
-  ⟨_, layout, hlayout, hbase, hdigits, hwidth, rfl⟩
-
-/-- A plaintext `1 · X^e` with `0 ≤ e < 64` is the monomial `X^e`. -/
-theorem message_one {c e : Int} {k : Nat} (hc : c = 1) (he : e = k) (hk : k < 64) :
-    message c e = Xe k := by
-  subst hc he
-  rw [message, Int.cast_one, one_mul, Int.emod_eq_of_lt (by omega) (by omega), Int.toNat_natCast]
-
 /-- The requirement stage accepts exactly the exponents `8 b`. -/
 theorem requirement_holds {a b c d : Int} {out : Bool}
     (h : Requirement_0.generatedRoot tape path GeneratedClaim.requirement_0_params (a, b, c, d, ()) out)
@@ -54,14 +40,14 @@ theorem secret_ternary {out : ExactMatrix Q7 N 1 1}
     (h : Stage_payload.generatedRoot tape path GeneratedClaim.stage_0_params () out) :
     ∃ s : ErrorPoly N, out = (fun _ _ ↦ reducePoly Q7 N s) ∧ polyNorm s ≤ 1 := by
   obtain ⟨w, hw, hout⟩ := h
-  obtain ⟨s, hs, hn⟩ := ternary_poly hw
+  obtain ⟨s, hs, hn⟩ := ternary_poly_at hN hw
   exact ⟨s, hout.trans hs, hn⟩
 
 theorem mask_ternary {out : ExactMatrix Q7 N 1 1}
     (h : Stage_mask.generatedRoot tape path GeneratedClaim.stage_1_params () out) :
     ∃ s : ErrorPoly N, out = (fun _ _ ↦ reducePoly Q7 N s) ∧ polyNorm s ≤ 1 := by
   obtain ⟨w, hw, hout⟩ := h
-  obtain ⟨s, hs, hn⟩ := ternary_poly hw
+  obtain ⟨s, hs, hn⟩ := ternary_poly_at hN hw
   exact ⟨s, hout.trans hs, hn⟩
 
 set_option maxHeartbeats 64000000 in
@@ -80,12 +66,12 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   obtain ⟨n1, hn1⟩ : ∃ n : Nat, external.input_5 = n := ⟨external.input_5.toNat, by omega⟩
   have hn0' : n0 ≤ 1 := by omega
   have hn1' : n1 ≤ 1 := by omega
-  have hmsg0 : message external.input_1 external.input_2 = Xe 2 :=
-    message_one (by omega) (by omega) (by norm_num)
-  have hmsg4 : message external.input_1 external.input_4 = Xe (8 * n0) :=
-    message_one (by omega) (by omega) (by omega)
-  have hmsg6 : message external.input_1 external.input_6 = Xe (8 * n1) :=
-    message_one (by omega) (by omega) (by omega)
+  have hmsg0 : message (n := N) external.input_1 external.input_2 = Xe (n := N) 2 :=
+    message_one (by omega) (by omega) (by simp only [N]; omega)
+  have hmsg4 : message (n := N) external.input_1 external.input_4 = Xe (n := N) (8 * n0) :=
+    message_one (by omega) (by omega) (by simp only [N]; omega)
+  have hmsg6 : message (n := N) external.input_1 external.input_6 = Xe (n := N) (8 * n1) :=
+    message_one (by omega) (by omega) (by simp only [N]; omega)
   -- The gadget matrices of levels `0` through `7`.
   obtain ⟨g14, hg14⟩ := gadget_exists (m := 14) layout7 rfl rfl rfl
   obtain ⟨g12, hg12⟩ := gadget_exists (m := 12) layout6 rfl rfl rfl
@@ -116,28 +102,28 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   -- The four online rounds on the arguments `roundArgument b r`.
   have hrounds := rounds_nand ![n0, n1] (fun i ↦ by fin_cases i <;> simpa)
   obtain ⟨w, hb⟩ := honline
-  have hr0 := round0 hb hsmn (polyNorm_Xe 2) hg14 (centeredRebaseRuns_self hQ7 hN g14) hg12 hg12up
+  have hr0 := round0 hb hsmn (polyNorm_Xe hN1 2) hg14 (centeredRebaseRuns_self hQ7 hN g14) hg12 hg12up
     hinput hrhs0 hhelp1 hsw0 (arg := ⟨roundArgument ![n0, n1] 0, hrounds.1 0⟩) (by
       rw [Xe, Xe, Xe, ← pow_add]
       congr 1
       have e : roundArgument ![n0, n1] 0 = 2 + 8 * n0 := by
         simp [roundArgument, roundInput, initialExponent]
       exact e.symm)
-  have hr1 := round1 hb hsmn (polyNorm_Xe _) hg12 hg10 hg10up hr0 hrhs1 hhelp3 hsw1
+  have hr1 := round1 hb hsmn (polyNorm_Xe hN1 _) hg12 hg10 hg10up hr0 hrhs1 hhelp3 hsw1
     (arg := ⟨roundArgument ![n0, n1] 1, hrounds.1 1⟩) (by
       rw [Xe, Xe, Xe, ← pow_add]
       congr 1
       have e : roundArgument ![n0, n1] 1 = lookup 0 (roundArgument ![n0, n1] 0) + 8 * n1 := by
         simp [roundArgument, roundInput]
       simp only [e, lookup, dif_pos (hrounds.1 0)])
-  have hr2 := round2 hb hsmn (polyNorm_Xe _) hg10 hg8 hg8up hr1 hrhs2 hhelp5 hsw2
+  have hr2 := round2 hb hsmn (polyNorm_Xe hN1 _) hg10 hg8 hg8up hr1 hrhs2 hhelp5 hsw2
     (arg := ⟨roundArgument ![n0, n1] 2, hrounds.1 2⟩) (by
       rw [Xe, Xe, Xe, ← pow_add]
       congr 1
       have e : roundArgument ![n0, n1] 2 = lookup 1 (roundArgument ![n0, n1] 1) + 8 * n0 := by
         simp [roundArgument, roundInput]
       simp only [e, lookup, dif_pos (hrounds.1 1)])
-  have hr3 := round3 hb hsmn (polyNorm_Xe _) hg8 hg6 hg6up hr2 hrhs3 hhelp7 hsw3
+  have hr3 := round3 hb hsmn (polyNorm_Xe hN1 _) hg8 hg6 hg6up hr2 hrhs3 hhelp7 hsw3
     (arg := ⟨roundArgument ![n0, n1] 3, hrounds.1 3⟩) (by
       rw [Xe, Xe, Xe, ← pow_add]
       congr 1
@@ -155,8 +141,8 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   dsimp only at hd
   obtain ⟨hm1, hm2, -, -, hdec1, hout⟩ := hd
   rw [hsm] at hm1
-  have hw2 := modulusReduce_poly hQ7 hQ3 hm1
-  have hw6 := modulusReduce_one hQ7 hQ3 hm2
+  have hw2 := modulusReduce_poly hQ7 hQ3 hN hm1
+  have hw6 := modulusReduce_one hQ7 hQ3 hN hm2
   have hbound : 4 * roundBound3 + 4 < Q3 := by decide
   have ht : table 3 ⟨roundArgument ![n0, n1] 3, hrounds.1 3⟩ = 1 - n0 * n1 := by
     have h := hrounds.2
@@ -165,7 +151,7 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   have ht1 : table 3 ⟨roundArgument ![n0, n1] 3, hrounds.1 3⟩ < N := by
     rw [ht]
     exact lt_of_le_of_lt (Nat.sub_le 1 _) (by decide)
-  have hcoeff : (Xe (table 3 ⟨roundArgument ![n0, n1] 3, hrounds.1 3⟩)).coeff ⟨1, by decide⟩ =
+  have hcoeff : (Xe (n := N) (table 3 ⟨roundArgument ![n0, n1] 3, hrounds.1 3⟩)).coeff ⟨1, by decide⟩ =
       if 1 - n0 * n1 = 1 then 1 else 0 := by
     have h := Negacyclic.coeff_root_pow (R := Int) (n := N) hN
       ⟨table 3 ⟨roundArgument ![n0, n1] 3, hrounds.1 3⟩, ht1⟩ ⟨1, by decide⟩

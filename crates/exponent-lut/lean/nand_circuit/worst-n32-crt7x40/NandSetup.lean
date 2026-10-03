@@ -2,6 +2,7 @@ import Claim
 import ExponentLut
 import ExponentDecode
 import ExponentWalsh
+import ExponentRuntime
 import NandProgram
 
 /-!
@@ -28,6 +29,7 @@ abbrev P5 : Nat := 1099511622529
 abbrev P4 : Nat := 1099511622593
 
 theorem hN : 0 < N := by decide
+theorem hN1 : 1 < N := by decide
 theorem hpow : N = 2 ^ 5 := rfl
 theorem q7_eq : Q7 = P7 * Q6 := by norm_num
 theorem q6_eq : Q6 = P6 * Q5 := by norm_num
@@ -49,74 +51,6 @@ theorem layout4 : Backend.backend.regularLayout Q4 N = some Backend.layout1 := b
   simp [Backend.backend]
 theorem layout3 : Backend.backend.regularLayout Q3 N = some Backend.layout0 := by
   simp [Backend.backend]
-
-/-! ## Relations of the generated graphs as equations -/
-
-theorem hashSample_eq {q rows columns : Nat} {model : HashModel} {tagPrefix : Blob}
-    {components : List HashTagComponent} {key : ByteArray}
-    {output : ExactMatrix q N rows columns} (h : hashSample model tagPrefix components key output) :
-    output = model.sample q N rows columns key (completeHashTag tagPrefix components) := h.2.2
-
-theorem matrixMulScalarLeft_eq {q rows columns : Nat} (a : ExactMatrix q N 1 1)
-    (x : ExactMatrix q N rows columns) : matrixMulScalarLeft a x = a 0 0 • x := rfl
-
-theorem matrixMulScalarRight_eq {q rows columns : Nat} (x : ExactMatrix q N rows columns)
-    (a : ExactMatrix q N 1 1) : matrixMulScalarRight x a = a 0 0 • x := by
-  funext i j
-  simp [matrixMulScalarRight, mul_comm]
-
-/-- Reduction of a reduced integer polynomial to a divisor modulus. -/
-theorem modulusReduce_poly {q p : Nat} (hq : 1 < q) (hp : 1 < p) {s : ErrorPoly N}
-    {out : ExactMatrix p N 1 1} (h : modulusReduceRuns (fun _ _ ↦ reducePoly q N s : ExactMatrix q N 1 1) out) :
-    out = fun _ _ ↦ reducePoly p N s :=
-  modulusReduceRuns_reduce hq hp hN h (fun _ _ ↦ s) rfl
-
-theorem modulusReduce_one {q p : Nat} (hq : 1 < q) (hp : 1 < p) {out : ExactMatrix p N 1 1}
-    (h : modulusReduceRuns (1 : ExactMatrix q N 1 1) out) : out = 1 := by
-  have hone : (1 : ExactMatrix q N 1 1) = fun _ _ ↦ reducePoly q N 1 := by
-    funext i j
-    rw [Subsingleton.elim i 0, Subsingleton.elim j 0]
-    simp
-  rw [hone] at h
-  rw [modulusReduce_poly hq hp h]
-  funext i j
-  rw [Subsingleton.elim i 0, Subsingleton.elim j 0]
-  simp
-
-/-- A family read at a natural-number index. -/
-theorem familyGet_eq {α : Type} {count k : Nat} {f : Fin count → α} {out : α}
-    (h : familyGetDynamic f (Int.ofNat k) out) : ∃ hk : k < count, out = f ⟨k, hk⟩ := by
-  obtain ⟨position, hposition, hout⟩ := h
-  have hk : position.val = k := Int.ofNat.inj hposition
-  subst hk
-  exact ⟨position.isLt, hout⟩
-
-/-- A ternary sample as one integer polynomial. -/
-theorem ternary_poly {q : Nat} {output : ExactMatrix q N 1 1}
-    (h : uniformIntervalSample (-1) 1 output) :
-    ∃ s : ErrorPoly N, output = (fun _ _ ↦ reducePoly q N s) ∧ polyNorm s ≤ 1 := by
-  obtain ⟨w, hw, hb⟩ := uniformIntervalSample_ternary h
-  refine ⟨w 0 0, ?_, hb 0 0⟩
-  funext i j
-  rw [hw, Subsingleton.elim i 0, Subsingleton.elim j 0]
-  rfl
-
-/-- A Gaussian sample as an integer matrix with a coefficient bound. -/
-theorem gaussian_bound {q rows columns : Nat} {output : ExactMatrix q N rows columns}
-    (h : gaussianSample (4 / 1) 26 output) :
-    ∃ e : ErrorMatrix N rows columns, output = reduceMatrix q N rows columns e ∧ CoeffBound e 26 := by
-  obtain ⟨w, hw, hb⟩ := gaussianSample_bounded h
-  exact ⟨w, hw, fun i j k ↦ (coeff_natAbs_le_polyNorm _ k).trans (by simpa using hb i j)⟩
-
-/-- The message `c X^e` of a plaintext with coefficient `c` and exponent `e`. -/
-noncomputable def message (coefficient exponent : Int) : ErrorPoly N :=
-  (coefficient : ErrorPoly N) * AdjoinRoot.root (negacyclicModulus N Int) ^ (exponent % 64).toNat
-
-theorem multiplyMonomial_liftInteger {q : Nat} (coefficient exponent : Int) :
-    multiplyMonomial (liftInteger coefficient : ExactMatrix q N 1 1) exponent =
-      fun _ _ ↦ reducePoly q N (message coefficient exponent) := by
-  funext i j
-  simp [multiplyMonomial, liftInteger, message, reducePoly]
 
 /-! ## Hash tags -/
 
@@ -147,46 +81,26 @@ theorem sigma_mod (i : Fin 16) : (sigma i).toNat % 64 = 1 + 2 * 2 * i.val := by
 
 /-! ## LUT coefficients -/
 
-/-- The negacyclic root `X`. -/
-noncomputable abbrev X (q : Nat) : ExactPoly q N := AdjoinRoot.root (negacyclicModulus N (ZMod q))
-
-/-- The monomial `X^k` with integer coefficients. -/
-noncomputable abbrev Xe (k : Nat) : ErrorPoly N := AdjoinRoot.root (negacyclicModulus N Int) ^ k
-
-theorem polyNorm_Xe (k : Nat) : polyNorm (Xe k) ≤ 1 := by
-  have h := polyNorm_root_pow_mul_le (n := N) (by decide) k 1
-  rw [mul_one] at h
-  refine h.trans (polyNorm_le_of_coeff fun i ↦ ?_)
-  have h1 := Negacyclic.coeff_root_pow (R := Int) (n := N) (by decide) ⟨0, by decide⟩ i
-  rw [show ((⟨0, by decide⟩ : Fin N) : Nat) = 0 from rfl, pow_zero] at h1
-  rw [h1]
-  split <;> simp
-
-theorem reducePoly_Xe {q : Nat} (k : Nat) : reducePoly q N (Xe k) = X q ^ k := by
-  rw [map_pow]
-  congr 1
-  simp [reducePoly]
-
 theorem polyNorm_substitution_Xe (i : Fin 16) (k : Nat) :
-    polyNorm (substitution (sigma i).toNat (sigma_odd i) (Xe k)) ≤ 1 := by
+    polyNorm (substitution (sigma i).toNat (sigma_odd i) (Xe (n := N) k)) ≤ 1 := by
   rw [substitution_root_pow]
-  exact polyNorm_Xe _
+  exact polyNorm_Xe hN1 _
 
 /-- The coefficient `C_σ = W⁻¹ Σ_k X^(T k) σ(X^(-k))` of a width-16 LUT with table `T`. -/
 noncomputable def lutCoefficient (q inverse : Nat) (table : Fin 16 → Nat) (σ : Nat) : ExactPoly q N :=
   lutFourierCoefficient 32 (X q) (inverse : ExactPoly q N) (fun k ↦ X q ^ table k) σ
 
-theorem X_pow_period {q : Nat} (k : Nat) : X q ^ (64 * k) = 1 := by
-  have hroot : X q ^ 32 = -1 := Negacyclic.root_pow_n
-  rw [pow_mul, show X q ^ 64 = (X q ^ 32) ^ 2 by rw [← pow_mul], hroot]
+theorem X_pow_period {q : Nat} (k : Nat) : X (n := N) q ^ (64 * k) = 1 := by
+  have hroot : X (n := N) q ^ 32 = -1 := Negacyclic.root_pow_n
+  rw [pow_mul, show X (n := N) q ^ 64 = (X q ^ 32) ^ 2 by rw [← pow_mul], hroot]
   simp
 
 /-- `σ(X^(-k)) = X^(σ (64 - k))` is `-X^(σ (32 - k))` for an odd `σ`. -/
 theorem X_pow_neg_odd {q σ : Nat} (hσ : Odd σ) (k : Nat) (hk : k ≤ 32) :
-    X q ^ (σ * (64 - k)) = -X q ^ (σ * (32 - k)) := by
+    X (n := N) q ^ (σ * (64 - k)) = -X q ^ (σ * (32 - k)) := by
   have hsplit : σ * (64 - k) = σ * (32 - k) + 32 * σ := by
     rw [show 64 - k = (32 - k) + 32 by omega, Nat.mul_add, Nat.mul_comm σ 32]
-  have hroot : X q ^ 32 = -1 := Negacyclic.root_pow_n
+  have hroot : X (n := N) q ^ 32 = -1 := Negacyclic.root_pow_n
   rw [hsplit, pow_add, pow_mul (X q) 32 σ, hroot, hσ.neg_one_pow]
   ring
 
@@ -225,14 +139,6 @@ abbrev inverse6 : Nat := 1656419084768677916369117227758191167904054695734225248
 abbrev inverse5 : Nat := 1506504390455695168269303022545438576397038817847440089317221
 abbrev inverse4 : Nat := 1370157767855665020950234418224971312905348255901
 abbrev inverse3 : Nat := 1246151236331995168128710588131142041
-
-theorem natCast_self_poly (q : Nat) : (q : ExactPoly q N) = 0 := by
-  rw [← map_natCast (algebraMap (ZMod q) (ExactPoly q N)), ZMod.natCast_self, map_zero]
-
-theorem inverse_mul {q inverse k : Nat} (h : inverse * 16 = 1 + q * k) :
-    (inverse : ExactPoly q N) * ((16 : Nat) : ExactPoly q N) = 1 := by
-  rw [← Nat.cast_mul, h, Nat.cast_add, Nat.cast_mul, natCast_self_poly, zero_mul, add_zero,
-    Nat.cast_one]
 
 theorem inverse6_mul : (inverse6 : ExactPoly Q6 N) * ((16 : Nat) : ExactPoly Q6 N) = 1 :=
   inverse_mul (k := 15) (by norm_num)

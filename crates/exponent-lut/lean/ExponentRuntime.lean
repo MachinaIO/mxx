@@ -26,6 +26,11 @@ theorem hashSample_eq {q rows columns : Nat} {model : HashModel} {tagPrefix : Bl
 theorem matrixMulScalarLeft_eq {q rows columns : Nat} (a : ExactMatrix q n 1 1)
     (x : ExactMatrix q n rows columns) : matrixMulScalarLeft a x = a 0 0 • x := rfl
 
+theorem matrixMulScalarRight_eq {q rows columns : Nat} (x : ExactMatrix q n rows columns)
+    (a : ExactMatrix q n 1 1) : matrixMulScalarRight x a = a 0 0 • x := by
+  funext i j
+  simp [matrixMulScalarRight, mul_comm]
+
 /-- Reduction of a reduced integer polynomial to a divisor modulus. -/
 theorem modulusReduce_poly {q p : Nat} (hq : 1 < q) (hp : 1 < p) (hn : 0 < n) {s : ErrorPoly n}
     {out : ExactMatrix p n 1 1}

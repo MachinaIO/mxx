@@ -32,6 +32,21 @@ use std::{
 };
 use thiserror::Error;
 
+/// Constant polynomials with more coefficients are exported as one packed natural number.
+const PACKED_POLYNOMIAL_MIN: usize = 64;
+
+/// Packs nonnegative `values` into `width`-bit little-endian fields of one natural number, the
+/// encoding of `MxxRuntime.packedPolynomial`; `width` is the widest value's bit length, at least
+/// one.
+pub fn packed_table(values: &[num_bigint::BigUint]) -> (u64, num_bigint::BigUint) {
+    let width = values.iter().map(num_bigint::BigUint::bits).max().unwrap_or(0).max(1);
+    let table = values
+        .iter()
+        .rev()
+        .fold(num_bigint::BigUint::default(), |table, value| (table << width) | value);
+    (width, table)
+}
+
 /// Names of relations/functions supplied by the concrete primitive Lean package.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimitiveNames {
@@ -1335,6 +1350,30 @@ impl<'a> Emitter<'a> {
                             matrix.ring.ring_dimension()
                         ));
                         format!("(MxxRuntime.rotationPolynomial ({}) : {ty})", env.expr(exponent))
+                    }
+                    ConstantMatrix::Polynomial { coefficients }
+                        if matrix.rows == 1 &&
+                            matrix.columns == 1 &&
+                            coefficients.len() > PACKED_POLYNOMIAL_MIN &&
+                            coefficients.len() <= matrix.ring.ring_dimension() as usize &&
+                            coefficients.iter().all(|coefficient| {
+                                matches!(coefficient, IntExpr::Const(value) if value.sign() != num_bigint::Sign::Minus)
+                            }) =>
+                    {
+                        // A long literal list overflows Lean's elaborator; one packed natural
+                        // number keeps the constant a single kernel-sized term.
+                        let values = coefficients
+                            .iter()
+                            .map(|coefficient| match coefficient {
+                                IntExpr::Const(value) => value.magnitude().clone(),
+                                _ => unreachable!("guarded constant coefficient"),
+                            })
+                            .collect::<Vec<_>>();
+                        let (width, table) = packed_table(&values);
+                        format!(
+                            "(MxxRuntime.packedPolynomial {width} {} {table} : {ty})",
+                            values.len()
+                        )
                     }
                     ConstantMatrix::Polynomial { coefficients }
                         if matrix.rows == 1 && matrix.columns == 1 =>
@@ -3155,6 +3194,51 @@ mod tests {
         assert!(artifact.source.contains("ringAutomorphismRuns"));
         assert_eq!(artifact.source.matches("crtRecomposeLevel").count(), 2);
         assert!(artifact.source.contains("abbrev generatedRoot.constraints"));
+    }
+
+    #[test]
+    fn test_export_packs_long_constant_polynomial() {
+        let matrix = MatrixType {
+            ring: crate::ring::test_ring(257, 128),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let values = (0..128u32).map(|i| num_bigint::BigUint::from(i * 5 % 97)).collect::<Vec<_>>();
+        let value = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: matrix.clone(),
+                value: ConstantMatrix::Polynomial {
+                    coefficients: values
+                        .iter()
+                        .map(|value| IntExpr::constant(BigInt::from(value.clone())))
+                        .collect(),
+                },
+            },
+            vec![],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "packed_constant",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        let (width, table) = packed_table(&values);
+        assert_eq!(width, 7);
+        let mask = (num_bigint::BigUint::from(1u8) << width) - 1u8;
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(&((&table >> (width as usize * index)) & &mask), value);
+        }
+        assert!(
+            artifact.source.contains(&format!("MxxRuntime.packedPolynomial {width} 128 {table}"))
+        );
     }
 
     #[test]

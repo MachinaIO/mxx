@@ -215,23 +215,42 @@ pub fn bgv_params() -> BgvParams {
     .expect("valid BGV parameters")
 }
 
-/// The TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (the original TFHE
-/// library set): n = 630, N = 1024, k = 1, LWE noise 2^-15 and ring noise
-/// 2^-25 of their moduli, and a base 2^2, 8-digit key switch of the leading
-/// 16 bits of q = 2^32. The ring torus 2^32 is replaced by the double-CRT
-/// modulus Q = 65537 * 79873 (about 2^32.3) with the same relative noise; its
-/// exact per-limb gadget uses two base 2^9 digits per 17-bit limb in place of
-/// the profile's three approximate base 2^7 torus digits. `FHE_TEST_TFHE_*`
-/// variables override each value.
+/// The TFHE test profile, selected by `FHE_TEST_TFHE_PROFILE`; `FHE_TEST_TFHE_*` variables
+/// override each value.
+///
+/// `boolean` (the default) is the TFHE-rs `TFHE_LIB_PARAMETERS` Boolean profile (the original
+/// TFHE library set): n = 630, N = 1024, k = 1, LWE noise 2^-15 and ring noise 2^-25 of their
+/// moduli, and a base 2^2, 8-digit key switch of the leading 16 bits of q = 2^32. The ring torus
+/// 2^32 is replaced by the double-CRT modulus Q = 65537 * 79873 (about 2^32.3) with the same
+/// relative noise; its exact per-limb gadget uses two base 2^9 digits per 17-bit limb in place of
+/// the profile's three approximate base 2^7 torus digits. Its correctness is probabilistic.
+///
+/// `worst-case` makes one NAND gate correct for every sampled value within the Gaussian cutoffs,
+/// which the generated Lean claim states: N = 2048 keeps the blind-rotation rounding drift of
+/// n = 630 binary coordinates inside the sign lookup table, Q is two 31-bit primes so blind
+/// rotation noise vanishes in the Q-to-q switch, the ring gadget uses four base 2^8 digits per
+/// limb, and the LWE noise sigma is 128 so the key-switching noise stays below q/8. These
+/// parameters establish correctness only; they are not chosen for security.
 #[cfg(feature = "gpu")]
 pub fn tfhe_params() -> TfheParams {
-    let n = integer("FHE_TEST_TFHE_RING_DIMENSION", 1024);
-    let base = integer("FHE_TEST_TFHE_BASE_BITS", 9);
-    let q = primes("FHE_TEST_TFHE_Q_PRIMES", vec![65_537, 79_873]);
+    let worst_case = match env::var("FHE_TEST_TFHE_PROFILE").as_deref() {
+        Ok("worst-case") => true,
+        Ok("boolean") | Err(_) => false,
+        _ => panic!("FHE_TEST_TFHE_PROFILE must be boolean or worst-case"),
+    };
+    let (n, base, primes_default, lwe_sigma_default) = if worst_case {
+        (2048, 8, vec![2_147_389_441, 2_147_377_153], "128")
+    } else {
+        (1024, 9, vec![65_537, 79_873], "131072")
+    };
+    let n = integer("FHE_TEST_TFHE_RING_DIMENSION", n);
+    let base = integer("FHE_TEST_TFHE_BASE_BITS", base);
+    let q = primes("FHE_TEST_TFHE_Q_PRIMES", primes_default);
     let ring_sigma = env::var("FHE_TEST_TFHE_RING_SIGMA").unwrap_or_else(|_| "156".into());
     let mut common = common_params(n, q, base, &ring_sigma, true);
     common.error_cutoff = common.error_cutoff.max(ceil_sigma_multiple(&ring_sigma, 16));
-    let lwe_sigma = env::var("FHE_TEST_TFHE_LWE_SIGMA").unwrap_or_else(|_| "131072".into());
+    let lwe_sigma =
+        env::var("FHE_TEST_TFHE_LWE_SIGMA").unwrap_or_else(|_| lwe_sigma_default.into());
     let lwe_error_sigma: f64 = lwe_sigma.parse().expect("finite positive LWE sigma");
     assert!(lwe_error_sigma.is_finite() && lwe_error_sigma > 0.0);
     let lwe_error_cutoff = env::var("FHE_TEST_TFHE_LWE_ERROR_CUTOFF")

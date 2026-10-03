@@ -30,6 +30,7 @@
 
 mod bgv;
 mod params;
+pub mod protocol;
 #[cfg(all(test, feature = "gpu"))]
 mod tests_gpu;
 mod tfhe;
@@ -61,6 +62,10 @@ pub enum FheError {
     MissingEvaluationKey,
     #[error(transparent)]
     Dsl(#[from] DslError),
+    #[error(transparent)]
+    Protocol(#[from] mxx_ir_core::protocol::ProtocolError),
+    #[error(transparent)]
+    Specification(#[from] mxx_ir_core::protocol::SpecificationError),
 }
 
 /// Shared matrix-plaintext graph operations. TFHE uses its dedicated integer

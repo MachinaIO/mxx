@@ -1,0 +1,33 @@
+name = "MxxFheTfhe"
+version = "0.1.0"
+defaultTargets = ["TfheGenerated", "MxxFheTfhe"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../../backends/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "MxxBackends"
+path = "../../../backends/lean"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../../ir-core/lean"
+
+# Modules written by `test_export_tfhe_gate_claim` from the worst-case TFHE profile.
+[[lean_lib]]
+name = "TfheGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "TfheSemantics", "Claim", "Ideal", "Stage_keygen", "Stage_encrypt_left",
+  "Stage_encrypt_right", "Stage_nand", "Stage_decrypt", "Certificate"
+]
+
+# Handwritten proofs of the generated claim.
+[[lean_lib]]
+name = "MxxFheTfhe"
+roots = ["TfheStages", "TfheNand", "TfheProof"]

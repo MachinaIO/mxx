@@ -172,4 +172,63 @@ theorem decode_terminal_parity {q : Nat} (hq : 1 < q) (hodd : q % 2 = 1) (hn : 0
     omega
   exact threshold_decode_parity hq hodd hμ heabs
 
+
+/-- Threshold decoding of one coefficient `-⌊q/2⌋ b + e` with `|b| ≤ T` and `4 |e| + 2 T + 12 < q`
+returns the parity of `b`: with `b = 2 t + p`, the phase is `-⌊q/2⌋ p + (t + e)` modulo `q`. -/
+theorem threshold_decode_parity_bounded {q : Nat} (hq : 1 < q) (hodd : q % 2 = 1) {b e : Int}
+    {T : Nat} (hb : |b| ≤ T) (he : 4 * |e| + 2 * T + 12 < q) :
+    ((2 * ((((-(((q / 2 : Nat) : Int) * b) + e : Int) : ZMod q).val : Nat) : Int) +
+      (q : Int) / 2) / (q : Int)) % 2 = b % 2 := by
+  obtain ⟨t, p, hbtp, hp0, hp1⟩ : ∃ t p : Int, b = 2 * t + p ∧ 0 ≤ p ∧ p < 2 :=
+    ⟨b / 2, b % 2, (Int.mul_ediv_add_emod b 2).symm, Int.emod_nonneg _ (by norm_num),
+      Int.emod_lt_of_pos _ (by norm_num)⟩
+  have hq2 : ((q / 2 : Nat) : Int) = (q : Int) / 2 := by omega
+  have hqodd : (q : Int) = 2 * ((q : Int) / 2) + 1 := by omega
+  have hcast : (((-(((q / 2 : Nat) : Int) * b) + e : Int) : ZMod q)) =
+      (((-(((q / 2 : Nat) : Int) * p) + (t + e) : Int) : ZMod q)) := by
+    rw [ZMod.intCast_eq_intCast_iff_dvd_sub]
+    refine ⟨t, ?_⟩
+    rw [hq2, hbtp]
+    generalize (q : Int) / 2 = h at hqodd ⊢
+    rw [hqodd]
+    ring
+  have hbp : b % 2 = p % 2 := by omega
+  rw [hcast, threshold_decode_parity hq hodd (by omega) ?_, hbp]
+  rw [abs_le] at hb
+  have habs : |t + e| ≤ |t| + |e| := abs_add_le _ _
+  have ht : 2 * |t| ≤ (T : Int) + 1 := by
+    rcases abs_cases t with ⟨h1, _⟩ | ⟨h1, _⟩ <;> omega
+  omega
+
+/-- Decryption of a terminal encoding whose coefficient `k` lies in `[-T, T]`: threshold decoding
+returns its parity when `4 B + 2 T + 12 < q`. -/
+theorem decode_terminal_parity_bounded {q : Nat} (hq : 1 < q) (hodd : q % 2 = 1) (hn : 0 < n)
+    {sm sp μ : ErrorPoly n} {A : Fin 2 → Fin 2 → ExactMatrix q n 1 1}
+    {c : Fin 2 → ExactMatrix q n 1 1} {B T : Nat}
+    (hrel : Rel sm A (fun j ↦ reducePoly q n ((((q / 2 : Nat) : Int) : ErrorPoly n) * μ *
+      unitPair sp j) • (1 : ExactMatrix q n 1 1)) c B)
+    (hB : 4 * B + 2 * T + 12 < q) {k : Fin n} (hμ : |μ.coeff k| ≤ T)
+    {phase : ExactMatrix q n 1 1}
+    (hphase : phase = c 1 - (reducePoly q n sm • A 0 1 + A 1 1)) {length : Int} {out : Int}
+    (hdecode : thresholdDecode 2 length k.val phase out) : out = μ.coeff k % 2 := by
+  obtain ⟨e, he, hc⟩ := hrel
+  obtain ⟨_, _, _, _, index, hindex, _, hout⟩ := hdecode
+  have hk : index = k := Fin.ext (by exact_mod_cast hindex)
+  subst hk
+  rw [hout]
+  have hentry : (phase 0 0).coeff index =
+      ((-(((q / 2 : Nat) : Int) * μ.coeff index) + (e 1 0 0).coeff index : Int) : ZMod q) := by
+    rw [hphase, hc 1]
+    simp only [unitPair, Matrix.cons_val_one, Matrix.sub_apply, Matrix.add_apply,
+      Matrix.smul_apply, smul_eq_mul, reduceMatrix, mul_one, Matrix.one_apply_eq]
+    rw [show ∀ x y z w : ExactPoly q n, x + y - z + w - (x + y) = -z + w from fun x y z w ↦ by ring,
+      ← map_neg, ← map_add, reducePoly_coeff_eq hq hn]
+    simp [intCast_mul_coeff]
+  rw [hentry]
+  have heabs : 4 * |(e 1 0 0).coeff index| + 2 * T + 12 < q := by
+    have := he 1 0 0 index
+    rw [Int.abs_eq_natAbs]
+    omega
+  exact threshold_decode_parity_bounded hq hodd hμ heabs
+
 end MxxExponentLut

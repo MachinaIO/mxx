@@ -14,13 +14,6 @@ namespace LwrProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
 
-theorem familyGetDynamic_ofNat {α : Type} {count i : Nat} {f : Fin count → α} {out : α}
-    (h : familyGetDynamic f (Int.ofNat i) out) : ∃ hi : i < count, out = f ⟨i, hi⟩ := by
-  obtain ⟨p, hp, rfl⟩ := h
-  have : p.val = i := Int.ofNat.inj hp
-  subst this
-  exact ⟨p.isLt, rfl⟩
-
 theorem ite_add_ite_eq_two (p q : Prop) [Decidable p] [Decidable q] :
     ((if p then (1 : Int) else 0) + (if q then 1 else 0) = 2) ↔ p ∧ q := by
   by_cases hp : p <;> by_cases hq : q <;> simp [hp, hq]
@@ -34,9 +27,9 @@ theorem member_step {ac ae a : Fin 17 → Int} {i : Nat} {current next : Bool}
   unfold Requirement_0.sequential_generatedRoot_6 at h
   dsimp only at h
   obtain ⟨w4, w14, w23, -, -, h4, -, -, h14, -, -, h23, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h4
-  obtain ⟨hi14, rfl⟩ := familyGetDynamic_ofNat h14
-  obtain ⟨hi23, rfl⟩ := familyGetDynamic_ofNat h23
+  obtain ⟨hi, rfl⟩ := familyGet_eq h4
+  obtain ⟨hi14, rfl⟩ := familyGet_eq h14
+  obtain ⟨hi23, rfl⟩ := familyGet_eq h23
   subst hnext
   replace hout := hout.symm
   simp only [decide_eq_true_eq, ite_add_ite_eq_two] at hout
@@ -52,7 +45,7 @@ theorem selector_step0 {s : Fin 14 → Int} {i : Nat} {current next : Int}
   unfold Requirement_0.sequential_generatedRoot_10 at h
   dsimp only at h
   obtain ⟨w3, -, -, h3, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-0 sum of the ideal adds `s(i) a(coords 0 i)`. -/
@@ -63,11 +56,11 @@ theorem ideal_step0 {s : Fin 14 → Int} {a : Fin 17 → Int} {i : Nat} {current
   unfold Ideal.sequential_generatedRoot_4 at h
   dsimp only at h
   obtain ⟨w3, w47, w48, -, -, h3, -, -, -, hsel, -, -, h48, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   have hc : w47 = Int.ofNat (coords 0 ⟨i, hi⟩) :=
     (select_eq_selectInt hsel).trans (selectInt_map_ofNat (coordsTable 0) i)
   subst hc
-  obtain ⟨hi', rfl⟩ := familyGetDynamic_ofNat h48
+  obtain ⟨hi', rfl⟩ := familyGet_eq h48
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-1 selector loop adds the selector of cell `i`. -/
@@ -78,7 +71,7 @@ theorem selector_step1 {s : Fin 14 → Int} {i : Nat} {current next : Int}
   unfold Requirement_0.sequential_generatedRoot_20 at h
   dsimp only at h
   obtain ⟨w3, -, -, h3, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-2 selector loop adds the selector of cell `i`. -/
@@ -89,7 +82,7 @@ theorem selector_step2 {s : Fin 14 → Int} {i : Nat} {current next : Int}
   unfold Requirement_0.sequential_generatedRoot_30 at h
   dsimp only at h
   obtain ⟨w3, -, -, h3, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-3 selector loop adds the selector of cell `i`. -/
@@ -100,7 +93,7 @@ theorem selector_step3 {s : Fin 14 → Int} {i : Nat} {current next : Int}
   unfold Requirement_0.sequential_generatedRoot_40 at h
   dsimp only at h
   obtain ⟨w3, -, -, h3, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-4 selector loop adds the selector of cell `i`. -/
@@ -111,7 +104,7 @@ theorem selector_step4 {s : Fin 14 → Int} {i : Nat} {current next : Int}
   unfold Requirement_0.sequential_generatedRoot_50 at h
   dsimp only at h
   obtain ⟨w3, -, -, h3, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-1 sum of the ideal adds `s(i) a(coords 1 i)`. -/
@@ -122,11 +115,11 @@ theorem ideal_step1 {s : Fin 14 → Int} {a : Fin 17 → Int} {i : Nat} {current
   unfold Ideal.sequential_generatedRoot_8 at h
   dsimp only at h
   obtain ⟨w3, w47, w48, -, -, h3, -, -, -, hsel, -, -, h48, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   have hc : w47 = Int.ofNat (coords 1 ⟨i, hi⟩) :=
     (select_eq_selectInt hsel).trans (selectInt_map_ofNat (coordsTable 1) i)
   subst hc
-  obtain ⟨hi', rfl⟩ := familyGetDynamic_ofNat h48
+  obtain ⟨hi', rfl⟩ := familyGet_eq h48
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-2 sum of the ideal adds `s(i) a(coords 2 i)`. -/
@@ -137,11 +130,11 @@ theorem ideal_step2 {s : Fin 14 → Int} {a : Fin 17 → Int} {i : Nat} {current
   unfold Ideal.sequential_generatedRoot_12 at h
   dsimp only at h
   obtain ⟨w3, w47, w48, -, -, h3, -, -, -, hsel, -, -, h48, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   have hc : w47 = Int.ofNat (coords 2 ⟨i, hi⟩) :=
     (select_eq_selectInt hsel).trans (selectInt_map_ofNat (coordsTable 2) i)
   subst hc
-  obtain ⟨hi', rfl⟩ := familyGetDynamic_ofNat h48
+  obtain ⟨hi', rfl⟩ := familyGet_eq h48
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-3 sum of the ideal adds `s(i) a(coords 3 i)`. -/
@@ -152,11 +145,11 @@ theorem ideal_step3 {s : Fin 14 → Int} {a : Fin 17 → Int} {i : Nat} {current
   unfold Ideal.sequential_generatedRoot_16 at h
   dsimp only at h
   obtain ⟨w3, w47, w48, -, -, h3, -, -, -, hsel, -, -, h48, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   have hc : w47 = Int.ofNat (coords 3 ⟨i, hi⟩) :=
     (select_eq_selectInt hsel).trans (selectInt_map_ofNat (coordsTable 3) i)
   subst hc
-  obtain ⟨hi', rfl⟩ := familyGetDynamic_ofNat h48
+  obtain ⟨hi', rfl⟩ := familyGet_eq h48
   exact ⟨hi, hout⟩
 
 /-- One iteration of the block-4 sum of the ideal adds `s(i) a(coords 4 i)`. -/
@@ -167,11 +160,11 @@ theorem ideal_step4 {s : Fin 14 → Int} {a : Fin 17 → Int} {i : Nat} {current
   unfold Ideal.sequential_generatedRoot_20 at h
   dsimp only at h
   obtain ⟨w3, w47, w48, -, -, h3, -, -, -, hsel, -, -, h48, hout⟩ := h
-  obtain ⟨hi, rfl⟩ := familyGetDynamic_ofNat h3
+  obtain ⟨hi, rfl⟩ := familyGet_eq h3
   have hc : w47 = Int.ofNat (coords 4 ⟨i, hi⟩) :=
     (select_eq_selectInt hsel).trans (selectInt_map_ofNat (coordsTable 4) i)
   subst hc
-  obtain ⟨hi', rfl⟩ := familyGetDynamic_ofNat h48
+  obtain ⟨hi', rfl⟩ := familyGet_eq h48
   exact ⟨hi, hout⟩
 
 /-- A selector loop sums its family. -/

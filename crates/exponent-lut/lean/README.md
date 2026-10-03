@@ -24,15 +24,16 @@ package requires the package one directory up, and Mathlib and the ir-core Lean 
 | --- | --- |
 | `ExponentAutomorphism.lean` | The odd substitution `X ↦ X^σ` and its norm bound |
 | `ExponentScale.lean` | `scaleUp`, the runtime ModDown (`blockModSwitchRuns`) and its remainder |
-| `ExponentEncoding.lean` | The encoding relation `Rel` (`c_j = s₀ A_{0j} + A_{1j} - t_j + e_j`): sums, actions, substitution, ModDown |
+| `ExponentEncoding.lean` | The encoding relation `Rel` (`c_j = s₀ A_{0j} + A_{1j} - t_j + e_j`): sums, actions, substitution, ModDown; multiplication gains (`SmulGain`), which are `1` for monomials |
 | `ExponentGadget.lean` | Gadget reconstruction from decompositions, uniqueness of gadgets and rebases |
 | `ExponentStacking.lean` | Row and column concatenation and slicing |
 | `ExponentWalsh.lean` | Walsh (Fourier) interpolation of a LUT |
-| `ExponentLut.lean` | Private multiplication with and without ModDown, one LUT branch, and the LUT ModDown |
-| `ExponentPublic.lean` | Public multiplication and the public alignment of a public encoding to a lower modulus |
-| `ExponentDecode.lean` | Terminal threshold decryption of binary coefficients and of the parity of coefficients in `[-2, 2]` |
+| `ExponentLut.lean` | Private multiplication with and without ModDown (for any payload gain), one LUT branch, and the LUT ModDown |
+| `ExponentPublic.lean` | Public multiplication (for any plaintext gain) and the public alignment of a public encoding to a lower modulus |
+| `ExponentDecode.lean` | Terminal threshold decryption of binary coefficients and of the parity of coefficients in `[-T, T]` |
 | `ExponentSampling.lean` | Tape samplers (`…SampleAt`) as deterministic samplers |
 | `ExponentRuntime.lean` | Runtime relations as equations: hashes, family reads, ternary and Gaussian samples, plaintext monomials |
+| `ExponentIterate.lean` | Sums and conjunctions computed by generated `iterate` loops, and constant tables read by `select` |
 
 ### Program-dependent lemmas
 
@@ -65,6 +66,7 @@ and the key.
 | --- | --- | --- |
 | `nand_circuit` | `worst-n32-crt7x40`, `average-n32-crt7x40` | Depth-one NAND, `n = 32`, seven 40-bit primes, 11-bit security |
 | `lwr_prf` | `worst-n32-crt7x40`, `average-n32-crt7x40` | `Q = 32`, `P = 4`, `ν = 16`, `h = 2`, `n = 32`, seven 40-bit primes, 11-bit security |
+| `lwr_prf` | `average-n65536-crt36x40` | The recommended row of `tests/lwr_prf_parameters.csv`: `Q = 256`, `P = 32`, `ν = 1024`, `h = 31`, `n = 2^16`, thirty-six 40-bit primes with 10-bit digits, 124-bit security |
 
 ## Claims and proofs
 
@@ -92,14 +94,23 @@ the final plaintext `X^(outputExponent b)` is the NAND of the inputs.
 
 ### Sparse-LWR PRF (`lwr_prf`)
 
-`LwrSetup`, `LwrEncrypt` (the state `X^0`, every member of the public vector `a`, and the readout
-LUT helpers), `LwrPreprocess` (the selector RHS of every block and the readout switching
-ciphertexts), `LwrBlock0` to `LwrBlock4` (the public alignment, public multiplication, and private
-multiplication with ModDown of every cell, and the sum of the fourteen cells), `LwrLut` (the
-coefficient LUT from `Q2` to `Q1`), and `LwrCertificate`. The requirement makes the plaintext of
-member `k` of `a` the monomial `X^(2 a_k)` and every block's selectors one-hot, so after the five
-blocks the state is `X^(2z)` for the sum `z` of the selected coordinates; the readout LUT gives
-`(-1)^⌊z/16⌋ τ(z mod 16)`, and decryption returns its parity, the ideal output.
+`LwrSetup`, `LwrInputs` (the requirement and the ideal output, which check the members of `a` and
+sum every block's selectors in loops), `LwrEncrypt` (the state `X^0`, every member of the public
+vector `a`, and the readout LUT helpers), `LwrPreprocess` (the selector RHS of every block and the
+readout switching ciphertexts), `LwrBlock0` to `LwrBlock<B-1>` (the public alignment, public
+multiplication, and private multiplication with ModDown of every cell, and the sum of the cells),
+`LwrLut` (the coefficient LUT from `Q2` to `Q1`), and `LwrCertificate`. The requirement makes the
+plaintext of member `k` of `a` the monomial `X^(stride a_k)` and every block's selectors one-hot, so
+after the blocks the state is `X^(stride z)` for the sum `z` of the selected coordinates; the readout
+LUT gives `(-1)^⌊z/w⌋ τ(z mod w)` for `w = Q/2`, and decryption returns its parity, the ideal output.
+
+At `average-n65536-crt36x40` (34 blocks of 113 cells, a readout LUT of 128 branches) the error
+analysis keeps the bound of an error multiplied by a monomial plaintext (`SmulGain _ 1`), as the
+noise audit of the crate does; the coarser bound `n ‖e‖` of the small parameter sets would not fit
+the terminal modulus at `n = 2^16`. The worst-case cutoffs of the tape samplers then bound the
+terminal error by about `2^35.6` against `Q1 ≈ 2^40`. Its cells live in `LwrCells`, and its proof
+library passes `--tstack` to Lean, since the kernel check of the certificate, which chains the 34
+blocks, needs a larger thread stack than the default.
 
 ## Reproduction
 
@@ -113,7 +124,14 @@ MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=worst-n32-crt7x40 \
   cargo test -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
 ```
 
-The export is deterministic: rerunning an ID writes identical `generated` files.
+The export is deterministic: rerunning an ID writes identical `generated` files. The round trip of
+`average-n65536-crt36x40` does not fit a local GPU; `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1` exports
+its claim from the same stage graphs without executing them:
+
+```sh
+MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1 MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=average-n65536-crt36x40 \
+  cargo test -r -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
+```
 
 Check a proof in its parameter directory:
 

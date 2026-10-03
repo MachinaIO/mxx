@@ -12,11 +12,11 @@ set_option maxRecDepth 8192
 
 theorem initial_registered_gadget (params : Stage_encrypt.Params)
     {decoder key one digits half publicInputs publicCircuit}
-    (w : FinalPublicWitness DiamondBackend.backend params decoder key one digits half
+    (w : FinalPublicWitness Backend.backend params decoder key one digits half
       publicInputs publicCircuit) : w.gadget = gadget := by
   obtain ⟨layout, hlookup, _, _, hwidth, heq⟩ := w.gadgetRun
-  have hl : layout = DiamondBackend.layout0 := by
-    simpa [DiamondBackend.backend] using hlookup.symm
+  have hl : layout = Backend.layout0 := by
+    simpa [Backend.backend] using hlookup.symm
   subst layout
   simpa only [castMatrixColumns, gadget] using heq
 
@@ -24,7 +24,7 @@ theorem initial_registered_gadget (params : Stage_encrypt.Params)
     its target has a zero second row. Its error comes from the same state and preimage. -/
 theorem initial_one_encoding (params : Stage_encrypt.Params)
     {decoder key one digits half publicInputs publicCircuit}
-    (w : FinalPublicWitness DiamondBackend.backend params decoder key one digits half
+    (w : FinalPublicWitness Backend.backend params decoder key one digits half
       publicInputs publicCircuit)
     (secret : ExactMatrix q n 1 1) (selector : ExactMatrix q n 1 2)
     (state : ExactMatrix q n 1 inner) (B P : Nat)

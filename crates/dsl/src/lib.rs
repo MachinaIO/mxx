@@ -71,7 +71,40 @@ mod bundle_tests;
 #[cfg(test)]
 mod protocol_tests;
 #[cfg(test)]
+mod test_lwe_protocol;
+#[cfg(test)]
 mod test_protocol;
+
+/// The graph names of a value's leaves: `name` for a single leaf, otherwise `name.0`, `name.1`,
+/// ... in schema order. Inputs, outputs, and artifact bindings share this convention.
+fn leaf_names(name: &str, count: usize) -> Result<Vec<String>, DslError> {
+    match count {
+        0 => Err(DslError::Schema),
+        1 => Ok(vec![name.to_owned()]),
+        _ => Ok((0..count).map(|port| format!("{name}.{port}")).collect()),
+    }
+}
+
+/// One artifact binding per leaf of `schema`, connecting the producer output `producer_output`
+/// to the consumer artifact input `consumer_input` declared by [`DslContext::artifact_input`].
+pub fn artifact_bindings<S: GraphValueSchema>(
+    schema: &S,
+    consumer_input: &str,
+    producer_stage: &mxx_ir_core::protocol::StageId,
+    producer_output: &str,
+) -> Result<Vec<mxx_ir_core::protocol::ArtifactBinding>, DslError> {
+    use mxx_ir_core::protocol::{ArtifactBinding, ArtifactName, StageInputName};
+    let count = schema.wire_types().len();
+    Ok(leaf_names(consumer_input, count)?
+        .into_iter()
+        .zip(leaf_names(producer_output, count)?)
+        .map(|(consumer, producer)| ArtifactBinding {
+            consumer_input: StageInputName(consumer),
+            producer_stage: producer_stage.clone(),
+            producer_output: ArtifactName(producer),
+        })
+        .collect())
+}
 
 thread_local! {
     /// Lexical loop depth while closure bodies are constructed. Using the depth as the binder
@@ -1934,19 +1967,39 @@ impl DslContext {
         name: impl Into<String>,
         schema: V::Schema,
     ) -> Result<V, DslError> {
-        let name = name.into();
+        Self::source_inputs(name.into(), &schema, None)
+    }
+
+    /// Declares a value of any schema, such as an integer family or a record of them, as the
+    /// artifact inputs produced by another stage. Each leaf is the artifact named like the
+    /// producer's output leaf: `name` alone, or `name.0`, `name.1`, ... in schema order, so the
+    /// same name and schema match [`Self::transferred_output`] or [`Self::cached_output`].
+    pub fn artifact_input<V: GraphValue>(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        schema: V::Schema,
+        availability: ArtifactAvailability,
+    ) -> Result<V, DslError> {
+        Self::source_inputs(artifact_name.into(), &schema, Some((production_id, availability)))
+    }
+
+    fn source_inputs<V: GraphValue>(
+        name: String,
+        schema: &V::Schema,
+        artifact: Option<(ProductionId, ArtifactAvailability)>,
+    ) -> Result<V, DslError> {
         let types = schema.wire_types();
-        let count = types.len();
-        if count == 0 {
-            return Err(DslError::Schema);
-        }
-        let values = types
+        let names = leaf_names(&name, types.len())?;
+        let values = names
             .into_iter()
-            .enumerate()
-            .map(|(port, wire_type)| {
-                let name = if count == 1 { name.clone() } else { format!("{name}.{port}") };
+            .zip(types)
+            .map(|(name, wire_type)| {
+                let artifact = artifact.clone().map(|(production_id, availability)| {
+                    ArtifactInput { production_id, artifact_name: name.clone(), availability }
+                });
                 NodeHandle::new(
-                    NodeKind::Input { name, wire_type: wire_type.clone(), artifact: None },
+                    NodeKind::Input { name, wire_type: wire_type.clone(), artifact },
                     vec![],
                     vec![wire_type],
                 )
@@ -1954,7 +2007,7 @@ impl DslContext {
                 .expect("input field")
             })
             .collect::<Vec<_>>();
-        V::from_values(&schema, &values)
+        V::from_values(schema, &values)
     }
 
     pub fn int_parameter(mut self, name: impl Into<String>) -> Self {
@@ -2078,12 +2131,7 @@ impl DslContext {
         availability: Option<ArtifactAvailability>,
     ) -> Result<(), DslError> {
         let values = value.flatten();
-        if values.is_empty() {
-            return Err(DslError::Schema);
-        }
-        let names = (0..values.len())
-            .map(|port| if values.len() == 1 { name.clone() } else { format!("{name}.{port}") })
-            .collect::<Vec<_>>();
+        let names = leaf_names(&name, values.len())?;
         if let Some(name) = names.iter().find(|name| self.outputs.contains_key(*name)) {
             return Err(DslError::DuplicateOutput(name.clone()));
         }
@@ -2293,6 +2341,60 @@ pub use mxx_ir_core::node::ConcatAxis;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_record_artifact_inputs_match_transferred_output_leaves_and_bindings() {
+        use crate::{Family, GraphValue, Int, IntType};
+        use mxx_ir_core::{
+            ParamEnv,
+            artifact::{ArtifactAvailability, ProductionId, SpecHash, export_validated_manifest},
+            protocol::StageId,
+        };
+        let producer = super::DslContext::new("record-artifact-producer");
+        let record =
+            (producer.int_family_input("mask", 3), producer.input::<Int>("body", IntType).unwrap());
+        let schema = record.schema();
+        let producer = producer.transferred_output("ciphertext", record).unwrap().build().unwrap();
+        assert!(producer.graph.outputs().contains_key("ciphertext.0"));
+        assert!(producer.graph.outputs().contains_key("ciphertext.1"));
+
+        let production = ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] };
+        let consumer = super::DslContext::new("record-artifact-consumer");
+        let (mask, body): (Family<Int>, Int) = consumer
+            .artifact_input(
+                production.clone(),
+                "ciphertext",
+                schema.clone(),
+                ArtifactAvailability::Transferred,
+            )
+            .unwrap();
+        let consumer = consumer.output("sum", body.add(mask.at(2))).unwrap().build().unwrap();
+        let manifest = export_validated_manifest(
+            production.clone(),
+            &producer.validate(&ParamEnv::default()).unwrap(),
+        )
+        .unwrap();
+        consumer
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &std::collections::BTreeMap::from([(production, manifest)]),
+            )
+            .expect("record leaves resolve against the producer manifest");
+
+        let bindings = super::artifact_bindings(
+            &schema,
+            "ciphertext",
+            &StageId("encrypt".into()),
+            "ciphertext",
+        )
+        .unwrap();
+        let names = bindings
+            .iter()
+            .map(|binding| (binding.consumer_input.0.as_str(), binding.producer_output.0.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, [("ciphertext.0", "ciphertext.0"), ("ciphertext.1", "ciphertext.1")]);
+        assert!(bindings.iter().all(|binding| binding.producer_stage.0 == "encrypt"));
+    }
+
     #[test]
     fn test_polynomial_values_validate_family_shape_and_preserve_runtime_nodes() {
         let context = super::DslContext::new("native-ntt");

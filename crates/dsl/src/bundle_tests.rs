@@ -361,13 +361,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_operational_decoder_target_registry_is_rejected() {
+    fn operational_decoder_targets_are_optional() {
         let mut bundle = valid_bundle();
         bundle.operational_decoder_targets.clear();
-        assert_eq!(
-            bundle.validate(),
-            Err(BundleValidationError::EmptyOperationalDecoderTargetRegistry)
-        );
+        assert_eq!(bundle.validate(), Ok(()));
     }
 
     #[test]

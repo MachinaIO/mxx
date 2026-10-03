@@ -193,7 +193,7 @@ pub fn check_generated_modules(directory: &Path, timeout: Duration) -> Result<()
     let directory = fs::canonicalize(directory).map_err(io_error("resolve generated directory"))?;
     let modules = local_imports(&directory)?;
     let crate_path = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let runtime = crate_path.join("../runtime/lean");
+    let runtime = crate_path.join("../ir-core/lean");
     let extra_paths = [
         crate_path.join("../ir-core/lean/.lake/build/lib/lean"),
         crate_path.join("lean/.lake/build/lib/lean"),

@@ -139,6 +139,11 @@ Artifact inputs, imported from a program run identified by a `ProductionId`: `ar
 `trapdoor_family_artifact_input`. Each takes the production id, the artifact name, the same
 shape and bound arguments as the runtime form, and an `ArtifactAvailability` (`Transferred` or
 `Cached`, as in section 2). A family artifact is loaded member by member as the program reads it.
+`context.artifact_input::<V>(production_id, name, schema, availability)` imports a value of any
+type from its schema, for example an integer family or a record of them: each leaf is the
+artifact `name`, or `name.0`, `name.1`, ... in schema order, exactly as `.transferred_output(name,
+value)` exports it. `artifact_bindings(&schema, consumer_input, &producer_stage, producer_output)`
+returns the matching per-leaf `ArtifactBinding`s for a `ProtocolStage`.
 
 ## 6. Constants
 

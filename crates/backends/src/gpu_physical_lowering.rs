@@ -5903,18 +5903,21 @@ pub(super) fn lower_preimage_sample_node(
 /// A trapdoor import keeps the anchor of its eager leaf transforms.
 fn activate_import(
     wire: WireRef,
-    pending: &mut BTreeMap<WireRef, ImportTemplate>,
+    pending: &mut BTreeMap<WireRef, Vec<ImportTemplate>>,
     operations: &[CompiledGpuOp],
     templates: &mut Vec<ImportTemplate>,
 ) -> Result<(), String> {
-    let Some(mut import) = pending.remove(&wire) else {
+    let Some(imports) = pending.remove(&wire) else {
         return Ok(());
     };
-    if !matches!(import.upload_owner, ImportDestination::Trapdoor { .. }) {
-        import.before_operation =
-            u32::try_from(operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
+    let before_operation =
+        u32::try_from(operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
+    for mut import in imports {
+        if !matches!(import.upload_owner, ImportDestination::Trapdoor { .. }) {
+            import.before_operation = before_operation;
+        }
+        templates.push(import);
     }
-    templates.push(import);
     Ok(())
 }
 
@@ -6324,7 +6327,8 @@ pub(crate) fn plan_physical_graph(
     let mut bytes_input_owners = BTreeMap::new();
     let mut output_ids = BTreeMap::new();
     let mut wire_ids = BTreeMap::<WireRef, PhysicalValueId>::new();
-    let mut pending_imports = BTreeMap::<WireRef, ImportTemplate>::new();
+    // One template per artifact payload: a whole integer family has one per member.
+    let mut pending_imports = BTreeMap::<WireRef, Vec<ImportTemplate>>::new();
     let mut deferred_trapdoor_imports =
         Vec::<(WireRef, ArtifactKey, ManifestArtifact, ConcreteWireType)>::new();
     for (index, node) in scope.nodes().iter().enumerate() {
@@ -6344,9 +6348,81 @@ pub(crate) fn plan_physical_graph(
                 .get(&wire)
                 .ok_or_else(|| "GPU artifact import lacks validated descriptor".to_owned())?
                 .clone();
+            if let Some(ty @ ConcreteWireType::IndexedFamily { element, count }) =
+                checked.wire_types.get(&wire) &&
+                element.as_ref() == &ConcreteWireType::Int &&
+                *count > 0 &&
+                (validated.source.outputs().values().any(|output| output.value == wire) ||
+                    scope.nodes().iter().any(|consumer| {
+                        scope.arguments(consumer).is_some_and(|arguments| {
+                            arguments.contains(&wire)
+                        }) && !matches!(
+                            consumer.kind(),
+                            NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic
+                        )
+                    }))
+            {
+                // An integer family read other than by member selection is one
+                // device value: every member is imported into its slot before
+                // the first consumer. Selections alone keep importing only the
+                // selected member.
+                let keys = (0..*count)
+                    .map(|index| ArtifactKey {
+                        production: artifact.production_id.clone(),
+                        name: artifact.artifact_name.clone(),
+                        index: Some(index),
+                    })
+                    .collect::<Vec<_>>();
+                let mut payload_size = 1usize;
+                for key in &keys {
+                    let size = *artifact_payload_sizes.get(key).ok_or_else(|| {
+                        "GPU Int artifact requires plan_with_store for payload size".to_owned()
+                    })?;
+                    payload_size = payload_size.max(size);
+                }
+                let bits = payload_size.checked_mul(8).ok_or("GPU Int artifact width overflows")?;
+                let limit = BigInt::from(1u8) << (bits - 1);
+                let range = -&limit..=limit - 1;
+                let storage = StorageRef::Input(
+                    u32::try_from(values.len()).map_err(|_| "too many GPU Int import storages")?,
+                );
+                let (physical, resident, native) = planned_integer_input(
+                    backend,
+                    device,
+                    ty,
+                    &vec![BigInt::from(0u8); *count],
+                    &range,
+                    storage,
+                )?;
+                let destination = value_id(values.len())?;
+                values.push(physical);
+                owners.insert(destination, resident);
+                wire_ids.insert(wire, destination);
+                pending_imports.insert(
+                    wire,
+                    keys.into_iter()
+                        .enumerate()
+                        .map(|(index, key)| ImportTemplate {
+                            before_operation: 0,
+                            key,
+                            descriptor: descriptor.clone(),
+                            expected_type: ArtifactType::Int,
+                            staged: false,
+                            destination,
+                            upload_owner: ImportDestination::Signed {
+                                owner: Arc::new(native.member(index)),
+                                ty: ConcreteWireType::Int,
+                            },
+                            member: None,
+                            read_ahead: false,
+                        })
+                        .collect(),
+                );
+                continue;
+            }
             if descriptor.family_count.is_some() {
-                // A family is only a descriptor here. Parallel Zip lowering
-                // requests individual members as its waves reach them.
+                // A matrix family is only a descriptor here. Parallel Zip
+                // lowering requests individual members as its waves reach them.
                 continue;
             }
             if let Some(ty @ ConcreteWireType::Trapdoor { .. }) = checked.wire_types.get(&wire) {
@@ -6406,7 +6482,7 @@ pub(crate) fn plan_physical_graph(
                 wire_ids.insert(wire, destination);
                 pending_imports.insert(
                     wire,
-                    ImportTemplate {
+                    vec![ImportTemplate {
                         before_operation: 0,
                         key: ArtifactKey {
                             production: artifact.production_id.clone(),
@@ -6420,7 +6496,7 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Bytes { owner: native, length: *length },
                         member: None,
                         read_ahead: false,
-                    },
+                    }],
                 );
                 continue;
             }
@@ -6476,7 +6552,7 @@ pub(crate) fn plan_physical_graph(
                 wire_ids.insert(wire, destination);
                 pending_imports.insert(
                     wire,
-                    ImportTemplate {
+                    vec![ImportTemplate {
                         before_operation: 0,
                         key,
                         descriptor,
@@ -6487,7 +6563,7 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Bytes { owner: native, length: capacity },
                         member: None,
                         read_ahead: false,
-                    },
+                    }],
                 );
                 continue;
             }
@@ -6507,7 +6583,7 @@ pub(crate) fn plan_physical_graph(
                 wire_ids.insert(wire, destination);
                 pending_imports.insert(
                     wire,
-                    ImportTemplate {
+                    vec![ImportTemplate {
                         before_operation: 0,
                         key: ArtifactKey {
                             production: artifact.production_id.clone(),
@@ -6522,7 +6598,7 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Bounded { owner: native, ty: ty.clone() },
                         member: None,
                         read_ahead: false,
-                    },
+                    }],
                 );
                 continue;
             }
@@ -6558,7 +6634,7 @@ pub(crate) fn plan_physical_graph(
                 wire_ids.insert(wire, destination);
                 pending_imports.insert(
                     wire,
-                    ImportTemplate {
+                    vec![ImportTemplate {
                         before_operation: 0,
                         key,
                         descriptor,
@@ -6568,7 +6644,7 @@ pub(crate) fn plan_physical_graph(
                         upload_owner: ImportDestination::Signed { owner: native, ty: ty.clone() },
                         member: None,
                         read_ahead: false,
-                    },
+                    }],
                 );
                 continue;
             }
@@ -6598,7 +6674,7 @@ pub(crate) fn plan_physical_graph(
             wire_ids.insert(wire, evaluation);
             pending_imports.insert(
                 wire,
-                ImportTemplate {
+                vec![ImportTemplate {
                     before_operation: 0,
                     key: ArtifactKey {
                         production: artifact.production_id.clone(),
@@ -6615,7 +6691,7 @@ pub(crate) fn plan_physical_graph(
                     upload_owner: ImportDestination::Placed { ty },
                     member: None,
                     read_ahead: false,
-                },
+                }],
             );
             continue;
         }
@@ -6810,7 +6886,7 @@ pub(crate) fn plan_physical_graph(
         ctx.wire_ids.insert(wire, graph_value);
         pending_imports.insert(
             wire,
-            ImportTemplate {
+            vec![ImportTemplate {
                 before_operation,
                 key,
                 descriptor,
@@ -6821,7 +6897,7 @@ pub(crate) fn plan_physical_graph(
                 upload_owner,
                 member: None,
                 read_ahead: false,
-            },
+            }],
         );
     }
     for (index, node) in scope.nodes().iter().enumerate() {
@@ -6876,14 +6952,24 @@ pub(crate) fn plan_physical_graph(
                 }
                 arguments[..spec.carried_count].to_vec()
             } else if let NodeKind::ParallelLoop(spec) = node.kind() {
-                // A broadcast input is read by every lane, so the artifact is
-                // loaded once before the loop. A zipped family artifact would
-                // need per-lane selection, which is not planned here.
+                // A broadcast input is read by every lane, and a whole integer
+                // family is one device value, so either is loaded once before the
+                // loop. A zipped matrix family artifact would need per-lane
+                // selection, which is not planned here.
                 if spec.input_modes.len() != arguments.len() {
                     return Err("GPU parallel loop input modes disagree with its arguments".into());
                 }
+                let whole_integer_family = |wire: &WireRef| {
+                    matches!(
+                        checked.wire_types.get(wire),
+                        Some(ConcreteWireType::IndexedFamily { element, .. })
+                            if element.as_ref() == &ConcreteWireType::Int
+                    )
+                };
                 if arguments.iter().zip(&spec.input_modes).any(|(wire, mode)| {
-                    pending_imports.contains_key(wire) && *mode != LoopInputMode::Broadcast
+                    pending_imports.contains_key(wire) &&
+                        *mode != LoopInputMode::Broadcast &&
+                        !whole_integer_family(wire)
                 }) {
                     return Err(
                         "GPU parallel loop zips an artifact input without a planned import boundary"
@@ -6919,7 +7005,15 @@ pub(crate) fn plan_physical_graph(
                     NodeKind::CrtRecompose { .. } |
                     NodeKind::CenteredRebase { .. } |
                     NodeKind::HashSample { .. } |
-                    NodeKind::FamilyPack { .. }
+                    NodeKind::FamilyPack { .. } |
+                    NodeKind::IntBinary(_) |
+                    NodeKind::IntCompare(_) |
+                    NodeKind::BitExtract { .. } |
+                    NodeKind::IntMatrixVectorProduct { .. } |
+                    NodeKind::MultiplyMonomial |
+                    NodeKind::Select { .. } |
+                    NodeKind::FamilyGetStatic { .. } |
+                    NodeKind::FamilyGetDynamic
             ) {
                 arguments.to_vec()
             } else {
@@ -9293,6 +9387,107 @@ mod tests {
         };
         let stored = load(&mut store, &production, "stored");
         assert_eq!(load(&mut store, &second, "sum"), stored);
+    }
+
+    /// A record of an integer family and an integer, exported by a CPU run as
+    /// per-leaf artifacts, is imported by a GPU consumer.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_integer_record_artifacts_import_on_gpu() {
+        use mxx_dsl::{Family, GraphValue, IntType};
+        let device = detected_gpu_device_ids()[0];
+        let parameters = DCRTPolyParams::new(32, 1, 28, 8, None, None);
+        let modulus = parameters.to_crt().0[0];
+        let gpu_parameters = GpuDCRTPolyParams::new(32, vec![modulus], 8, None);
+        let producer = DslContext::new("integer-record-producer");
+        let record =
+            (producer.int_family_input("mask", 3), producer.input::<Int>("body", IntType).unwrap());
+        let schema = record.schema();
+        let producer = producer
+            .transferred_output("ciphertext", record)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let mask = (0..3).map(|_| BigInt::from(rand::random::<i32>())).collect::<Vec<_>>();
+        let body = BigInt::from(rand::random::<i32>());
+        let produced = execute_in_session(
+            &producer,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([
+                ("mask".to_owned(), RuntimeValue::integer_values(mask.clone())),
+                ("body".to_owned(), RuntimeValue::Int(body.clone())),
+            ]),
+            &mut store,
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let production = produced.production_id.expect("producer identity");
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+
+        let consumer = DslContext::new("integer-record-consumer");
+        let (imported_mask, imported_body): (Family<Int>, Int) = consumer
+            .artifact_input(
+                production.clone(),
+                "ciphertext",
+                schema,
+                ArtifactAvailability::Transferred,
+            )
+            .unwrap();
+        let secret = consumer.int_family_input("secret", 3);
+        let dot = imported_mask.matrix_vector_product(&secret).at(0);
+        // LWE coordinates are updated lane by lane, as TFHE ciphertext arithmetic does.
+        let negated = mxx_dsl::parallel(3, |index| {
+            Ok(Int::constant(0).sub(imported_mask.at(index)).rem(Int::constant(1 << 20)))
+        })
+        .unwrap();
+        let consumer = consumer
+            .output("sum", imported_body.add(imported_mask.at(1)).add(imported_mask.at(2)))
+            .unwrap()
+            .output("phase", dot)
+            .unwrap()
+            .output("negated", negated)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([gpu_parameters], [device])).unwrap();
+        // Integer artifacts have variable-length payloads, so planning reads their sizes.
+        let secret = (0..3).map(|_| BigInt::from(rand::random::<i16>())).collect::<Vec<_>>();
+        // Declared like a key coordinate, so the product's planned range fits int64.
+        runtime
+            .options_mut()
+            .integer_input_ranges
+            .insert("secret".into(), BigInt::from(i16::MIN)..=BigInt::from(i16::MAX));
+        let inputs = || {
+            BTreeMap::from([("secret".to_owned(), RuntimeValue::integer_values(secret.clone()))])
+        };
+        let mut plan = runtime.plan_with_store(consumer, &inputs(), &mut store).unwrap();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, inputs(), &mut store, rand::random())
+            .unwrap();
+        assert_eq!(
+            runtime.download_integer_family(&result["sum"]).unwrap(),
+            vec![&body + &mask[1] + &mask[2]]
+        );
+        let dot = mask.iter().zip(&secret).map(|(a, s)| a * s).sum::<BigInt>();
+        assert_eq!(runtime.download_integer_family(&result["phase"]).unwrap(), vec![dot]);
+        let negated = mask
+            .iter()
+            .map(|a| {
+                let modulus = BigInt::from(1 << 20);
+                ((-a % &modulus) + &modulus) % &modulus
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runtime.download_integer_family(&result["negated"]).unwrap(), negated);
     }
 
     /// The plan is store-free; the selected matrix is read at its first

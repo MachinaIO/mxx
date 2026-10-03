@@ -28,8 +28,10 @@ pub struct ProtocolStage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactBinding {
-    /// Consumer input whose executable graph carries a concrete runtime
-    /// `ProductionId`. Runtime production identity is not protocol identity.
+    /// Consumer input fed by the producer output. An artifact input carries a concrete runtime
+    /// `ProductionId` (runtime production identity is not protocol identity) and must name the
+    /// producer output with matching availability; a plain input receives the value directly,
+    /// as when the caller passes one execution's output to the next.
     pub consumer_input: StageInputName,
     /// Stage-relative producer identity used by the protocol declaration.
     pub producer_stage: StageId,
@@ -54,12 +56,18 @@ pub type ParamDecls = Vec<ParameterDecl>;
 
 /// The single canonical Rust protocol declaration.
 ///
-/// Rust stores compile parameters and the closed protocol bundle, and validates their wiring.
-/// Noise bounds and correctness proofs belong to the application, not this declaration layer.
+/// Rust stores compile parameters, the closed protocol bundle, and the correctness claim to state
+/// about it, and validates their wiring. Correctness proofs belong to the application, not this
+/// declaration layer; [`crate::lean::protocol::export`] writes the claim they prove.
 #[derive(Clone)]
 pub struct ProtocolDecl {
     pub params: ParamDecls,
     pub bundle: ClosedProtocolBundle,
+    /// The values of `params` at which the correctness claim is stated.
+    pub bindings: crate::ParamEnv,
+    /// `None` claims that every execution is correct. `Some(k)` claims that, over ideally sampled
+    /// values, an execution fails with probability at most `2^-k`.
+    pub failure_probability_log2: Option<u32>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -207,7 +215,7 @@ pub fn validate_stage_artifact_bindings(stages: &[ProtocolStage]) -> Result<(), 
         if !artifact_inputs.is_subset(&bound) {
             return Err(ProtocolError::MissingArtifactBinding);
         }
-        if !bound.is_subset(&artifact_inputs) {
+        if !bound.iter().all(|name| inputs.contains_key(*name)) {
             return Err(ProtocolError::InvalidArtifactConsumer);
         }
         for binding in &stage.bindings {
@@ -228,16 +236,16 @@ pub fn validate_stage_artifact_bindings(stages: &[ProtocolStage]) -> Result<(), 
             let (consumer_type, consumer_artifact) = inputs
                 .get(&binding.consumer_input.0)
                 .ok_or(ProtocolError::InvalidArtifactConsumer)?;
-            let consumer_artifact =
-                consumer_artifact.ok_or(ProtocolError::InvalidArtifactConsumer)?;
-            if consumer_artifact.artifact_name != binding.producer_output.0 {
-                return Err(ProtocolError::ArtifactNameMismatch);
-            }
             if producer_type != *consumer_type {
                 return Err(ProtocolError::ArtifactTypeMismatch);
             }
-            if output.availability != Some(consumer_artifact.availability) {
-                return Err(ProtocolError::ArtifactAvailabilityMismatch);
+            if let Some(consumer_artifact) = consumer_artifact {
+                if consumer_artifact.artifact_name != binding.producer_output.0 {
+                    return Err(ProtocolError::ArtifactNameMismatch);
+                }
+                if output.availability != Some(consumer_artifact.availability) {
+                    return Err(ProtocolError::ArtifactAvailabilityMismatch);
+                }
             }
         }
     }

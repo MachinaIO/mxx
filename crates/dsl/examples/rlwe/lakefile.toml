@@ -1,0 +1,26 @@
+name = "MxxRlweExample"
+version = "0.1.0"
+defaultTargets = ["RlweGenerated", "MxxRlweExample"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../../ir-core/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../../ir-core/lean"
+
+# Modules written by the `rlwe_encrypt` example.
+[[lean_lib]]
+name = "RlweGenerated"
+srcDir = "generated"
+roots = ["Backend", "Claim", "Ideal", "Stage_rlwe"]
+
+# The handwritten proof of the generated claim, and its certificate.
+[[lean_lib]]
+name = "MxxRlweExample"
+roots = ["RlweProof", "Certificate"]

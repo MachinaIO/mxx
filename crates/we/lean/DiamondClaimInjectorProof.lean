@@ -15,18 +15,18 @@ structure ClaimInjectorWitness (hashModel : HashModel) (external : ExternalInput
     (execution : Execution) where
   encryptRoot : Stage_encrypt.generatedRoot.Witness
   decryptRoot : Stage_decrypt.generatedRoot.Witness
-  encryptRun : Stage_encrypt.generatedRoot.body DiamondBackend.backend hashModel stage_0_params
+  encryptRun : Stage_encrypt.generatedRoot.body Backend.backend hashModel stage_0_params
     (external.input_8, external.input_5, external.input_0, external.input_1, external.input_2,
       external.input_3, external.input_4, external.input_7, ()) execution.stage_0 encryptRoot
-  decryptRun : Stage_decrypt.generatedRoot.body DiamondBackend.backend stage_1_params
+  decryptRun : Stage_decrypt.generatedRoot.body Backend.backend stage_1_params
     (execution.stage_0.2.1, execution.stage_0.2.2.2.2.2.2.1, external.input_6,
       execution.stage_0.1, execution.stage_0.2.2.1, execution.stage_0.2.2.2.1,
       execution.stage_0.2.2.2.2.2.2.2.1, execution.stage_0.2.2.2.2.1,
       external.input_5, external.input_0, external.input_1, external.input_2, external.input_3,
       external.input_4, execution.stage_0.2.2.2.2.2.1, ()) execution.stage_1 decryptRoot
-  producer : InjectorRootWitness DiamondBackend.backend hashModel stage_0_params external.input_7
+  producer : InjectorRootWitness Backend.backend hashModel stage_0_params external.input_7
     execution.stage_0.2.1 execution.stage_0.2.2.2.2.2.2.1
-  finalPublic : FinalPublicWitness DiamondBackend.backend stage_0_params execution.stage_0.1
+  finalPublic : FinalPublicWitness Backend.backend stage_0_params execution.stage_0.1
     execution.stage_0.2.2.1 execution.stage_0.2.2.2.1 execution.stage_0.2.2.2.2.2.1
     (matrixPolynomial [MxxIR.roundDiv stage_0_params.diamond_modulus 2]) execution.stage_0.2.2.2.2.1
     encryptRoot.w_30_0
@@ -68,10 +68,10 @@ theorem generated_claim_injector
   obtain ⟨encryptRoot, hencrypt⟩ := hrun.2.1
   obtain ⟨decryptRoot, hdecrypt⟩ := hrun.2.2.1
   obtain ⟨producer, finalPublic, terminal, hterminal, hbase, hwitnesses⟩ :=
-    generated_injector_root DiamondBackend.backend hashModel stage_0_params _ _ encryptRoot hencrypt
+    generated_injector_root Backend.backend hashModel stage_0_params _ _ encryptRoot hencrypt
   have hraw : ∀ position : Fin circuitWidth, 0 ≤ external.input_6 position ∧ external.input_6 position ≤ 1 :=
     hrun.1.2.2.2.2.2.2.1
-  obtain ⟨secret, hstates⟩ := generated_decrypt_bounded_states DiamondBackend.backend hashModel
+  obtain ⟨secret, hstates⟩ := generated_decrypt_bounded_states Backend.backend hashModel
     stage_0_params stage_1_params _ _ decryptRoot hdecrypt external.input_7 producer digitBase (by decide)
     rfl rfl rfl (by decide) hraw
   refine ⟨{

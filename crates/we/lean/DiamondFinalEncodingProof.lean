@@ -78,7 +78,7 @@ theorem final_state_project {q n inner columns B P : Nat} (hn : 0 < n)
 
 theorem final_actual_encodings (params : Stage_encrypt.Params)
     {decoder key one digits half publicInputs publicCircuit}
-    (w : FinalPublicWitness DiamondBackend.backend params decoder key one digits half
+    (w : FinalPublicWitness Backend.backend params decoder key one digits half
       publicInputs publicCircuit) (selector : ExactMatrix q n 1 2)
     (state : ExactMatrix q n 1 inner) {B P : Nat}
     (hstate : Approx state (selector * w.base) B)
@@ -100,7 +100,7 @@ final cancellation bound. Root linkage and acceptance induction supply these two
 premises; the output encoding equations and final residual are derived here. -/
 theorem final_residual_from_state (params : Stage_encrypt.Params)
     {decoder key one digits half publicInputs publicCircuit}
-    (w : FinalPublicWitness DiamondBackend.backend params decoder key one digits half
+    (w : FinalPublicWitness Backend.backend params decoder key one digits half
       publicInputs publicCircuit) (hq : params.diamond_modulus = (q : Int))
     (selector : ExactMatrix q n 1 2) (message : Bool)
     (hmessage : selector 0 1 = if message then 1 else 0)
@@ -137,7 +137,7 @@ theorem final_residual_from_state (params : Stage_encrypt.Params)
         ((selector * w.base) * one - (secret * publicCircuit - secret * w.gadget)) *
           reduceMatrix q n ell 1 dlift := by
     simpa only [← hdlift, Matrix.mul_assoc] using final_public_cancellation
-      DiamondBackend.backend params w selector
+      Backend.backend params w selector
   have hresult := final_encoding_approx (by decide : 0 < n)
     (state * decoder) (state * key) (-(msg * half))
     ((selector * w.base) * decoder + msg * half) ((selector * w.base) * key)
@@ -150,9 +150,9 @@ theorem final_residual_from_state (params : Stage_encrypt.Params)
 derived from its sampled trapdoor cutoff. Only local injector/circuit induction remains. -/
 theorem final_residual_from_encrypt_run
     (hashModel : HashModel) (params : Stage_encrypt.Params) {inputs outputs}
-    (hrun : Stage_encrypt.generatedRoot DiamondBackend.backend hashModel params inputs outputs)
+    (hrun : Stage_encrypt.generatedRoot Backend.backend hashModel params inputs outputs)
     {publicCircuit : ExactMatrix q n 1 ell}
-    (w : FinalPublicWitness DiamondBackend.backend params outputs.1 outputs.2.2.1
+    (w : FinalPublicWitness Backend.backend params outputs.1 outputs.2.2.1
       outputs.2.2.2.1 outputs.2.2.2.2.2.1
       (matrixPolynomial [MxxIR.roundDiv params.diamond_modulus 2])
       outputs.2.2.2.2.1 publicCircuit)
@@ -170,7 +170,7 @@ theorem final_residual_from_encrypt_run
       (state * outputs.2.2.2.1 - circuit) * outputs.2.2.2.2.2.1))
       (matrixPolynomial [(MxxWe.messageCenter q message : Int)])
       (2 * B0 + a * (B0 + BH)) := by
-  obtain ⟨hd, hk, ho⟩ := generated_final_preimages_bounded DiamondBackend.backend
+  obtain ⟨hd, hk, ho⟩ := generated_final_preimages_bounded Backend.backend
     hashModel params hrun
   exact final_residual_from_state params w hq selector message hmessage state circuit
     hstate hd hk ho hcircuit

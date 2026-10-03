@@ -220,13 +220,14 @@ pub fn bgv_params() -> BgvParams {
 /// 2^-25 of their moduli, and a base 2^2, 8-digit key switch of the leading
 /// 16 bits of q = 2^32. The ring torus 2^32 is replaced by the double-CRT
 /// modulus Q = 65537 * 79873 (about 2^32.3) with the same relative noise; its
-/// exact per-limb gadget uses two base 2^9 digits per 17-bit limb in place of
-/// the profile's three approximate base 2^7 torus digits. `FHE_TEST_TFHE_*`
-/// variables override each value.
+/// exact per-limb gadget uses three base 2^6 digits per 17-bit limb in place of
+/// the profile's three approximate base 2^7 torus digits. The generated Lean
+/// claim states that one NAND gate fails with probability at most 2^-128 at
+/// these values. `FHE_TEST_TFHE_*` variables override each value.
 #[cfg(feature = "gpu")]
 pub fn tfhe_params() -> TfheParams {
     let n = integer("FHE_TEST_TFHE_RING_DIMENSION", 1024);
-    let base = integer("FHE_TEST_TFHE_BASE_BITS", 9);
+    let base = integer("FHE_TEST_TFHE_BASE_BITS", 6);
     let q = primes("FHE_TEST_TFHE_Q_PRIMES", vec![65_537, 79_873]);
     let ring_sigma = env::var("FHE_TEST_TFHE_RING_SIGMA").unwrap_or_else(|_| "156".into());
     let mut common = common_params(n, q, base, &ring_sigma, true);

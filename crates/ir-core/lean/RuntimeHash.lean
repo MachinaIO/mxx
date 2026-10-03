@@ -9,6 +9,9 @@ algorithm is an explicit abstract boundary; key, complete encoded tag and geomet
 structure HashModel where
   sample : (q n rows columns : Nat) → ByteArray → Blob →
     Mxx.Primitives.ExactMatrix q n rows columns
+  /-- Integer families keyed like `sample`: the runtime truncates the digest stream of each
+  coefficient to `log2 modulus` bits, so the result need not relate to `sample`'s residues. -/
+  integers : (count modulus : Nat) → ByteArray → Blob → Fin count → Nat
 
 def u64LittleEndian (value : Nat) : Blob :=
   (List.range 8).map (fun index ↦ UInt8.ofNat (value / 256 ^ index))
@@ -46,5 +49,16 @@ noncomputable def hashSample {q n rows columns : Nat} (model : HashModel)
     (output : Mxx.Primitives.ExactMatrix q n rows columns) : Prop :=
   key.size = 32 ∧ (∀ value, .u64Le value ∈ components → 0 ≤ value ∧ value < 2 ^ 64) ∧
   output = model.sample q n rows columns key (completeHashTag tagPrefix components)
+
+/-- `count` integers on `[0, modulus)` for a power-of-two modulus above one. The reduction is the
+identity on the runtime's truncated values and keeps every model inhabited. -/
+def hashIntFamily {count : Nat} (model : HashModel) (modulus : Int)
+    (tagPrefix : Blob) (components : List HashTagComponent) (key : ByteArray)
+    (output : Fin count → Int) : Prop :=
+  key.size = 32 ∧ (∀ value, .u64Le value ∈ components → 0 ≤ value ∧ value < 2 ^ 64) ∧
+  (∃ bits : Nat, 0 < bits ∧ modulus = 2 ^ bits) ∧
+  output = fun index ↦
+    ((model.integers count modulus.toNat key (completeHashTag tagPrefix components) index %
+      modulus.toNat : Nat) : Int)
 
 end MxxRuntime

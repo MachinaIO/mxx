@@ -4,14 +4,27 @@
 //! Diamond roles, or provide semantic fallbacks for an operation it cannot translate. Primitive
 //! names are supplied by the package owning those primitive relations.
 //!
-//! [`export`] emits one Lean relation per frozen scope, referencing backend-owned primitive
-//! relations ([`PrimitiveNames`]) and concrete CRT layouts ([`BackendLayout`]). Loops are not
-//! unrolled; families remain functions on `Fin N`. [`claim::assemble_claim`] renders an
-//! application-independent linked claim, and [`protocol::export_claim`] exports every stage,
-//! requirement, and ideal graph of a protocol declaration and writes the final `Claim.lean`. No
-//! noise bound is inferred; applications supply decoder semantics and proofs. The handwritten Lean
-//! package `crates/ir-core/lean/` supplies shared definitions such as `IterRuns`.
+//! [`export`] emits one Lean relation per frozen scope, referencing the primitive relations
+//! ([`PrimitiveNames`]) of the handwritten Lean package `crates/ir-core/lean/` (`MxxIR`,
+//! `MxxPrimitives`, `MxxRuntime`). Loops are not unrolled; families remain functions on `Fin N`.
+//! Long constant polynomials become packed tables, named top-level definitions
+//! `<scope>.table_<node>` that proofs can refer to. Each ring a gadget node uses gets the layout
+//! ([`BackendLayout`]) its base and digit count declare, derived as the runtime backend derives
+//! it: enough digits per tower for the widest CRT modulus, and a regular decomposition with fewer
+//! digits than every tower needs drops the trailing towers (an approximate gadget).
+//!
+//! [`protocol::export`] is the one entry point for a protocol: given a declaration and a
+//! directory, it writes every stage, requirement, and ideal module, the `Backend` module of their
+//! gadget layouts, and the linked `Claim.lean`, which [`claim::assemble_claim`] renders. The claim
+//! states only that the workflow endpoint equals the ideal one; noise bounds are proof obligations,
+//! not part of the statement. Applications supply the proofs.
+//!
+//! By default a sampler relation admits any value within the sampler's support, so a claim holds
+//! for every execution. With [`ExportOptions::sampling_tape`], each sampled coefficient is instead
+//! a sampling-tape entry keyed by its occurrence, which a claim with a failure probability
+//! (`ProtocolDecl::failure_probability_log2`) measures under the ideal sampler laws.
 
+mod backend;
 pub mod claim;
 #[cfg(test)]
 mod fixtures;
@@ -31,6 +44,21 @@ use std::{
     rc::Rc,
 };
 use thiserror::Error;
+
+/// Constant polynomials with more coefficients are exported as one packed natural number.
+const PACKED_POLYNOMIAL_MIN: usize = 64;
+
+/// Packs nonnegative `values` into `width`-bit little-endian fields of one natural number, the
+/// encoding of `MxxRuntime.packedPolynomial`; `width` is the widest value's bit length, at least
+/// one.
+pub fn packed_table(values: &[num_bigint::BigUint]) -> (u64, num_bigint::BigUint) {
+    let width = values.iter().map(num_bigint::BigUint::bits).max().unwrap_or(0).max(1);
+    let table = values
+        .iter()
+        .rev()
+        .fold(num_bigint::BigUint::default(), |table, value| (table << width) | value);
+    (width, table)
+}
 
 /// Names of relations/functions supplied by the concrete primitive Lean package.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +86,11 @@ pub struct PrimitiveNames {
     pub uniform_residue_sample: String,
     pub uniform_interval_sample: String,
     pub gaussian_sample: String,
+    /// Tape-reading forms of the three samplers, used when [`ExportOptions::sampling_tape`] is
+    /// set: each takes the sampling tape and the occurrence's site before its usual arguments.
+    pub uniform_residue_sample_at: String,
+    pub uniform_interval_sample_at: String,
+    pub gaussian_sample_at: String,
     pub hash_sample: String,
     pub gadget_trapdoor: String,
     pub gadget_decompose: String,
@@ -76,6 +109,9 @@ pub struct PrimitiveNames {
     pub rns_mod_down: String,
     pub block_mod_switch: String,
     pub ring_automorphism: String,
+    pub multiply_monomial: String,
+    pub int_matrix_vector_product: String,
+    pub hash_int_family: String,
     pub pack_polynomial: String,
     pub polynomial_from_values: String,
     pub polynomial_values: String,
@@ -113,6 +149,9 @@ impl Default for PrimitiveNames {
             uniform_residue_sample: "MxxRuntime.uniformResidueSample".into(),
             uniform_interval_sample: "MxxRuntime.uniformIntervalSample".into(),
             gaussian_sample: "MxxRuntime.gaussianSample".into(),
+            uniform_residue_sample_at: "MxxRuntime.uniformResidueSampleAt".into(),
+            uniform_interval_sample_at: "MxxRuntime.uniformIntervalSampleAt".into(),
+            gaussian_sample_at: "MxxRuntime.gaussianSampleAt".into(),
             hash_sample: "MxxRuntime.hashSample".into(),
             gadget_trapdoor: "MxxRuntime.gadgetTrapdoorRuns".into(),
             gadget_decompose: "MxxRuntime.gadgetDecomposeRuns".into(),
@@ -131,6 +170,9 @@ impl Default for PrimitiveNames {
             rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
             block_mod_switch: "MxxRuntime.blockModSwitchRuns".into(),
             ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
+            multiply_monomial: "MxxRuntime.multiplyMonomial".into(),
+            int_matrix_vector_product: "MxxRuntime.intMatrixVectorProduct".into(),
+            hash_int_family: "MxxRuntime.hashIntFamily".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
             polynomial_from_values: "MxxRuntime.polynomialFromValues".into(),
             polynomial_values: "MxxRuntime.polynomialValues".into(),
@@ -144,12 +186,42 @@ impl Default for PrimitiveNames {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The gadget layout of one ring, derived from the gadget nodes that use it exactly as the runtime
+/// backend derives it from the same declarations: every CRT tower has `digits_per_tower` balanced
+/// base-`base` digits, enough for the widest tower, and a regular decomposition with `D` digits
+/// keeps the first `D / digits_per_tower` towers, dropping the trailing `dropped_towers`
+/// (an approximate gadget). Lean checks that the digits cover every tower.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct BackendLayout {
     pub modulus: num_bigint::BigInt,
     pub ring_dimension: usize,
+    pub crt_moduli: Vec<u64>,
     pub base: num_bigint::BigInt,
-    pub regular_digits: usize,
+    pub digits_per_tower: usize,
+    /// `None` when only small decompositions, which read every tower, use the ring.
+    pub dropped_towers: Option<usize>,
+}
+
+impl BackendLayout {
+    /// Combines the facts two graphs establish about one ring, or `None` when they disagree.
+    pub fn merge(&self, other: &Self) -> Option<Self> {
+        let dropped_towers = match (self.dropped_towers, other.dropped_towers) {
+            (Some(left), Some(right)) if left != right => return None,
+            (left, right) => left.or(right),
+        };
+        let merged = Self { dropped_towers, ..self.clone() };
+        (merged == Self { dropped_towers, ..other.clone() }).then_some(merged)
+    }
+}
+
+/// The digit count a gadget node declares for its ring's layout.
+enum LayoutDigits<'e> {
+    /// The regular digit count, across the towers it keeps.
+    Regular(&'e IntExpr),
+    /// The digit count of one tower (a small decomposition), which must cover the widest tower.
+    PerTower(&'e IntExpr),
+    /// A concrete regular digit count.
+    Count(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,8 +231,12 @@ pub struct ExportOptions {
     /// Import containing the concrete primitive relations.
     pub runtime_import: String,
     pub primitives: PrimitiveNames,
-    /// Layout metadata from the same concrete backend setup used by the Lean context.
-    pub backend_layouts: Vec<BackendLayout>,
+    /// Read every sampled coefficient from a sampling tape instead of leaving it unconstrained
+    /// within the sampler's support. Each relation then takes `tape` and its call `path`; a
+    /// sampler at node `k` reads site `path ++ [k]`, a subgraph call extends the path with its
+    /// node, and a loop body with its node and iteration, so distinct occurrences read disjoint
+    /// tape keys. Trapdoor and preimage samplers have no tape semantics and are rejected.
+    pub sampling_tape: bool,
 }
 
 impl Default for ExportOptions {
@@ -170,7 +246,7 @@ impl Default for ExportOptions {
             namespace: "Generated".into(),
             runtime_import: "MxxRuntime".into(),
             primitives: Default::default(),
-            backend_layouts: Vec::new(),
+            sampling_tape: false,
         }
     }
 }
@@ -220,6 +296,8 @@ pub struct RootBoundary {
     pub outputs: BTreeMap<String, BoundaryValue>,
     pub requires_backend: bool,
     pub requires_hash_model: bool,
+    /// The relation takes a sampling tape and a site path; see [`ExportOptions::sampling_tape`].
+    pub requires_sampling_tape: bool,
     pub parameter_type: String,
     pub parameters: BTreeMap<String, ParameterField>,
 }
@@ -615,6 +693,10 @@ struct Emitter<'a> {
     validated: &'a ValidatedGraph,
     options: &'a ExportOptions,
     source: String,
+    /// The gadget layout of each ring, keyed by modulus and ring dimension.
+    layouts: BTreeMap<(num_bigint::BigInt, usize), BackendLayout>,
+    /// Top-level definitions of the packed constant tables, inserted before the first scope.
+    tables: String,
     source_map: SourceMap,
     scopes: BTreeMap<FrozenGraphScopeId, String>,
     params: BTreeSet<String>,
@@ -622,12 +704,14 @@ struct Emitter<'a> {
     indent: usize,
     requires_backend: bool,
     requires_hash_model: bool,
+    requires_tape: bool,
     layout_environments: BTreeMap<FrozenGraphScopeId, Vec<crate::expr::ParamEnv>>,
     current_wire_types: BTreeMap<String, String>,
     current_scope_values: Vec<(String, String)>,
     current_referenced_wires: BTreeSet<String>,
     current_anonymous_lets: BTreeSet<String>,
     current_uses_hash_model: bool,
+    current_uses_tape: bool,
     current_witnesses: Vec<(String, String)>,
     current_record: bool,
     current_value_expressions: BTreeMap<String, String>,
@@ -655,6 +739,8 @@ impl<'a> Emitter<'a> {
             validated,
             options,
             source: String::new(),
+            layouts: BTreeMap::new(),
+            tables: String::new(),
             source_map: Default::default(),
             scopes,
             params,
@@ -678,12 +764,19 @@ impl<'a> Emitter<'a> {
             current_referenced_wires: BTreeSet::new(),
             current_anonymous_lets: BTreeSet::new(),
             current_uses_hash_model: false,
+            current_uses_tape: false,
+            requires_tape: options.sampling_tape,
             current_witnesses: Vec::new(),
             current_record: false,
             current_value_expressions: BTreeMap::new(),
             scope_proofs: BTreeMap::new(),
             requires_hash_model: graph.scopes().values().any(|scope| {
-                scope.nodes().iter().any(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+                scope.nodes().iter().any(|node| {
+                    matches!(
+                        node.kind(),
+                        NodeKind::HashSample { .. } | NodeKind::HashIntFamily { .. }
+                    )
+                })
             }),
         }
     }
@@ -698,20 +791,12 @@ impl<'a> Emitter<'a> {
         let mut root_env = self.validated.bindings.clone();
         root_env.loop_indices.clear();
         self.collect_layout_environments(&FrozenGraphScopeId::Root, root_env);
-        for (index, layout) in self.options.backend_layouts.iter().enumerate() {
-            if self.options.backend_layouts[..index].iter().any(|other| {
-                other.modulus == layout.modulus &&
-                    other.ring_dimension == layout.ring_dimension &&
-                    other != layout
-            }) {
-                return Err(ExportError::BackendLayout("conflicting backend ring layouts".into()));
-            }
-        }
         self.source.push_str(&format!(
             "import MxxIR\nimport {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace {}\n\n",
             self.options.runtime_import, self.options.namespace
         ));
         self.emit_params()?;
+        let tables_at = self.source.len();
         // Lean declarations are not mutually recursive.  Emit every structural/named child
         // before the scope that calls it, using the frozen child links rather than relying on
         // lexical ordering of scope names.
@@ -720,6 +805,8 @@ impl<'a> Emitter<'a> {
         for scope_id in scope_ids {
             self.emit_scope_postorder(&scope_id, &mut emitted)?;
         }
+        let tables = std::mem::take(&mut self.tables);
+        self.source.insert_str(tables_at, &tables);
         self.source.push_str("\nend ");
         self.source.push_str(&self.options.namespace);
         self.source.push('\n');
@@ -794,6 +881,7 @@ impl<'a> Emitter<'a> {
             outputs,
             requires_backend: self.requires_backend,
             requires_hash_model: self.requires_hash_model,
+            requires_sampling_tape: self.requires_tape,
             parameter_type: format!("{}.Params", self.options.namespace),
             parameters: if self.params.is_empty() {
                 BTreeMap::from([(
@@ -831,7 +919,7 @@ impl<'a> Emitter<'a> {
             },
         };
         Ok(LeanArtifact {
-            backend_layouts: self.options.backend_layouts.clone(),
+            backend_layouts: std::mem::take(&mut self.layouts).into_values().collect(),
             module_name: self.options.module_name.clone(),
             source: self.source,
             source_map: self.source_map,
@@ -975,6 +1063,7 @@ impl<'a> Emitter<'a> {
         self.current_anonymous_lets.clear();
         self.current_scope_values.clear();
         self.current_uses_hash_model = false;
+        self.current_uses_tape = false;
         let declaration_start = self.source.len();
         // Keep the configuration argument part of the generated relation even for a closed graph;
         // the underscore binding suppresses Lean's unused-binder warning without changing its
@@ -1078,7 +1167,7 @@ impl<'a> Emitter<'a> {
             loop_parameters(self.graph, scope_id, &env.referenced_loop_names.borrow());
         // Scope arity and positional arguments are unchanged; only truly unused names disappear.
         let final_header = format!(
-            "def {} {}{}(params : Params){} ({} : {}) (outputs : {}) : Prop :=\n",
+            "def {} {}{}{}(params : Params){} ({} : {}) (outputs : {}) : Prop :=\n",
             self.scopes[scope_id],
             if self.requires_backend { "(backend : MxxRuntime.BackendContext) " } else { "" },
             if !self.requires_hash_model {
@@ -1087,6 +1176,13 @@ impl<'a> Emitter<'a> {
                 "(hashModel : MxxRuntime.HashModel) "
             } else {
                 "(_ : MxxRuntime.HashModel) "
+            },
+            if !self.requires_tape {
+                ""
+            } else if self.current_uses_tape {
+                "(tape : MxxRuntime.SampleTape) (path : List Nat) "
+            } else {
+                "(_ : MxxRuntime.SampleTape) (_ : List Nat) "
             },
             loop_binders,
             if inputs.is_empty() { "_" } else { "inputs" },
@@ -1121,9 +1217,14 @@ impl<'a> Emitter<'a> {
             self.source
                 .insert_str(declaration_start, &(record + &constraint_definition + &body_header));
             let mut wrapper_header = final_header
-                .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)");
+                .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)")
+                .replace(
+                    "(_ : MxxRuntime.SampleTape) (_ : List Nat)",
+                    "(tape : MxxRuntime.SampleTape) (path : List Nat)",
+                );
             let backend = if self.requires_backend { "backend " } else { "" };
             let hash = if self.requires_hash_model { "hashModel " } else { "" };
+            let hash = if self.requires_tape { format!("{hash}tape path ") } else { hash.into() };
             let input = if inputs.is_empty() { "()" } else { "inputs" };
             let loop_names = scope_loop_slots(self.graph, scope_id)
                 .into_iter()
@@ -1184,6 +1285,12 @@ impl<'a> Emitter<'a> {
         }
         if referenced.contains("hashModel") {
             constraint_arguments.push(("hashModel".to_owned(), "MxxRuntime.HashModel".to_owned()));
+        }
+        if referenced.contains("tape") {
+            constraint_arguments.push(("tape".to_owned(), "MxxRuntime.SampleTape".to_owned()));
+        }
+        if referenced.contains("path") {
+            constraint_arguments.push(("path".to_owned(), "List Nat".to_owned()));
         }
         if referenced.contains("params") {
             constraint_arguments.push(("params".to_owned(), "Params".to_owned()));
@@ -1248,24 +1355,25 @@ impl<'a> Emitter<'a> {
                 ..
             } => {
                 let wire = WireRef { node: node_id, port: crate::types::Port(0) };
-                let layout = self.require_layout(scope_id, wire, Some(base), None)?;
                 let crate::types::ConcreteWireType::Matrix(matrix) =
                     &self.validated.scopes[scope_id].wire_types[&wire]
                 else {
                     unreachable!()
                 };
-                if matrix.rows.checked_mul(layout.regular_digits) != Some(matrix.columns) {
+                if matrix.rows == 0 || matrix.columns % matrix.rows != 0 {
                     return Err(ExportError::BackendLayout(
-                        "public gadget width disagrees with backend layout".into(),
+                        "public gadget width is not a multiple of its rows".into(),
                     ));
                 }
+                let digits = matrix.columns / matrix.rows;
+                self.require_layout(scope_id, wire, Some(base), Some(LayoutDigits::Count(digits)))?;
                 let ty = self.output_type(scope, node_id, 0);
                 append_expression_guards(base, env, relations);
                 self.bind_existential(&output(0), &ty);
                 relations.push(format!(
                     "MxxRuntime.gadgetMatrixRuns backend {} {} {}",
                     env.expr(base),
-                    layout.regular_digits,
+                    digits,
                     output(0)
                 ));
             }
@@ -1324,6 +1432,37 @@ impl<'a> Emitter<'a> {
                             matrix.ring.ring_dimension()
                         ));
                         format!("(MxxRuntime.rotationPolynomial ({}) : {ty})", env.expr(exponent))
+                    }
+                    ConstantMatrix::Polynomial { coefficients }
+                        if matrix.rows == 1 &&
+                            matrix.columns == 1 &&
+                            coefficients.len() > PACKED_POLYNOMIAL_MIN &&
+                            coefficients.len() <= matrix.ring.ring_dimension() as usize &&
+                            coefficients.iter().all(|coefficient| {
+                                matches!(coefficient, IntExpr::Const(value) if value.sign() != num_bigint::Sign::Minus)
+                            }) =>
+                    {
+                        // A long literal list overflows Lean's elaborator; one packed natural
+                        // number keeps the constant a single kernel-sized term. The number is a
+                        // named top-level definition, `<scope>.table_<node>`, so proofs can refer
+                        // to the table without restating it.
+                        let values = coefficients
+                            .iter()
+                            .map(|coefficient| match coefficient {
+                                IntExpr::Const(value) => value.magnitude().clone(),
+                                _ => unreachable!("guarded constant coefficient"),
+                            })
+                            .collect::<Vec<_>>();
+                        let (width, table) = packed_table(&values);
+                        let name = format!("{}.table_{}", self.scopes[scope_id], node_id.0);
+                        self.tables.push_str(&format!(
+                            "/-- The packed coefficients of node {} in `{}`. -/\ndef {name} : Nat := {table}\n\n",
+                            node_id.0, self.scopes[scope_id]
+                        ));
+                        format!(
+                            "(MxxRuntime.packedPolynomial {width} {} {name} : {ty})",
+                            values.len()
+                        )
                     }
                     ConstantMatrix::Polynomial { coefficients }
                         if matrix.rows == 1 && matrix.columns == 1 =>
@@ -1449,17 +1588,18 @@ impl<'a> Emitter<'a> {
             }
             NodeKind::GadgetTrapdoor { base, .. } => {
                 let wire = WireRef { node: node_id, port: crate::types::Port(0) };
-                let layout = self.require_layout(scope_id, wire, Some(base), None)?;
+                self.require_layout(scope_id, wire, Some(base), None)?;
                 let crate::types::ConcreteWireType::Trapdoor {
                     matrix,
                     sigma,
+                    digit_count,
                     preimage_max_coefficient_bound,
                     ..
                 } = &self.validated.scopes[scope_id].wire_types[&wire]
                 else {
                     unreachable!()
                 };
-                if matrix.rows.checked_mul(layout.regular_digits) != Some(matrix.columns) {
+                if matrix.rows.checked_mul(*digit_count) != Some(matrix.columns) {
                     return Err(ExportError::BackendLayout(
                         "public gadget trapdoor width disagrees with backend layout".into(),
                     ));
@@ -1473,7 +1613,7 @@ impl<'a> Emitter<'a> {
                     self.options.primitives.gadget_trapdoor,
                     sigma,
                     env.expr(base),
-                    layout.regular_digits,
+                    digit_count,
                     cutoff,
                     output(0)
                 ));
@@ -1484,7 +1624,11 @@ impl<'a> Emitter<'a> {
                     scope_id,
                     args[0],
                     Some(base),
-                    if *small { None } else { Some(digit_count) },
+                    Some(if *small {
+                        LayoutDigits::PerTower(digit_count)
+                    } else {
+                        LayoutDigits::Regular(digit_count)
+                    }),
                 )?;
                 append_expression_guards(base, env, relations);
                 append_expression_guards(digit_count, env, relations);
@@ -1519,11 +1663,14 @@ impl<'a> Emitter<'a> {
                 preimage_max_coefficient_bound,
                 ..
             } => {
+                if self.requires_tape {
+                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
+                }
                 self.require_layout(
                     scope_id,
                     WireRef { node: node_id, port: crate::types::Port(1) },
                     Some(gadget_base),
-                    Some(digit_count),
+                    Some(LayoutDigits::Regular(digit_count)),
                 )?;
                 append_expression_guards(gadget_base, env, relations);
                 append_expression_guards(digit_count, env, relations);
@@ -1548,6 +1695,9 @@ impl<'a> Emitter<'a> {
                 ));
             }
             NodeKind::PreimageSample { max_coefficient_bound, .. } => {
+                if self.requires_tape {
+                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
+                }
                 self.require_layout(scope_id, args[1], None, None)?;
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let k = output(0);
@@ -1568,63 +1718,88 @@ impl<'a> Emitter<'a> {
                     k
                 ));
             }
-            NodeKind::UniformResidueSample { .. } => self.sample_one(
+            NodeKind::UniformResidueSample { .. } => self.sample_one_at(
                 scope,
                 node_id,
                 existentials,
                 relations,
-                &self.options.primitives.uniform_residue_sample,
+                if self.requires_tape {
+                    &self.options.primitives.uniform_residue_sample_at
+                } else {
+                    &self.options.primitives.uniform_residue_sample
+                },
                 &[],
+                true,
             ),
             NodeKind::UniformIntervalSample { range, .. } => {
                 append_expression_guards(&range.minimum, env, relations);
                 append_expression_guards(&range.maximum, env, relations);
                 let lo = env.expr(&range.minimum);
                 let hi = env.expr(&range.maximum);
-                self.sample_one(
+                self.sample_one_at(
                     scope,
                     node_id,
                     existentials,
                     relations,
-                    &self.options.primitives.uniform_interval_sample,
+                    if self.requires_tape {
+                        &self.options.primitives.uniform_interval_sample_at
+                    } else {
+                        &self.options.primitives.uniform_interval_sample
+                    },
                     &[lo, hi],
+                    true,
                 );
             }
             NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let sigma = env.real_expr(sigma);
                 let bound = env.expr(max_coefficient_bound);
+                self.sample_one_at(
+                    scope,
+                    node_id,
+                    existentials,
+                    relations,
+                    if self.requires_tape {
+                        &self.options.primitives.gaussian_sample_at
+                    } else {
+                        &self.options.primitives.gaussian_sample
+                    },
+                    &[sigma, bound],
+                    true,
+                );
+            }
+            NodeKind::MultiplyMonomial => {
+                let a = arg(0)?;
+                let exponent = arg(1)?;
+                self.let_output(
+                    &output(0),
+                    &format!("{} {a} {exponent}", self.options.primitives.multiply_monomial),
+                );
+            }
+            NodeKind::IntMatrixVectorProduct { transpose } => {
+                let matrix = arg(0)?;
+                let vector = arg(1)?;
+                self.let_output(
+                    &output(0),
+                    &format!(
+                        "{} {transpose} {matrix} {vector}",
+                        self.options.primitives.int_matrix_vector_product
+                    ),
+                );
+            }
+            NodeKind::HashIntFamily { modulus, tag_prefix, tag_components, .. } => {
+                append_expression_guards(modulus, env, relations);
+                let key = arg(0)?;
+                self.current_uses_hash_model = true;
+                let (prefix, components) =
+                    hash_tag_terms(tag_prefix, tag_components, args, env, relations);
                 self.sample_one(
                     scope,
                     node_id,
                     existentials,
                     relations,
-                    &self.options.primitives.gaussian_sample,
-                    &[sigma, bound],
-                );
-            }
-            NodeKind::MultiplyMonomial => {
-                return self.unsupported(
-                    scope_id,
-                    node_id,
-                    kind,
-                    "runtime monomial multiplication has no Lean ring relation",
-                );
-            }
-            NodeKind::IntMatrixVectorProduct { .. } => {
-                return self.unsupported(
-                    scope_id,
-                    node_id,
-                    kind,
-                    "integer matrix-vector products have no Lean relation",
-                );
-            }
-            NodeKind::HashIntFamily { .. } => {
-                return self.unsupported(
-                    scope_id,
-                    node_id,
-                    kind,
-                    "integer hash families have no Lean sampler relation",
+                    &self.options.primitives.hash_int_family,
+                    &["hashModel".into(), env.expr(modulus), prefix, components, key],
                 );
             }
             NodeKind::HashSample { variant, tag_prefix, tag_components, .. } => {
@@ -1638,44 +1813,15 @@ impl<'a> Emitter<'a> {
                 }
                 let key = arg(0)?;
                 self.current_uses_hash_model = true;
-                let components = tag_components
-                    .iter()
-                    .map(|component| {
-                        use crate::node::HashTagComponent;
-                        match component {
-                            HashTagComponent::Bytes(bytes) => format!(
-                                ".bytes [{}]",
-                                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
-                            ),
-                            HashTagComponent::Integer(expression) |
-                            HashTagComponent::Decimal(expression) |
-                            HashTagComponent::U64Le(expression) => {
-                                append_expression_guards(expression, env, relations);
-                                let constructor = match component {
-                                    HashTagComponent::Integer(_) => "integer",
-                                    HashTagComponent::Decimal(_) => "decimal",
-                                    _ => "u64Le",
-                                };
-                                format!(".{constructor} ({})", env.expr(expression))
-                            }
-                            HashTagComponent::Operand(index) => {
-                                format!(".integer {}", wire_name(args[*index]))
-                            }
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = format!(
-                    "[{}]",
-                    tag_prefix.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
-                );
+                let (prefix, components) =
+                    hash_tag_terms(tag_prefix, tag_components, args, env, relations);
                 self.sample_one(
                     scope,
                     node_id,
                     existentials,
                     relations,
                     &self.options.primitives.hash_sample,
-                    &["hashModel".into(), prefix, format!("[{components}]"), key],
+                    &["hashModel".into(), prefix, components, key],
                 );
             }
             NodeKind::ModulusSwitch { .. } |
@@ -2224,62 +2370,114 @@ impl<'a> Emitter<'a> {
             self.collect_layout_environments(&child_id, child);
         }
     }
+    /// The gadget layout of the ring of `wire`. The first gadget node of a ring fixes its layout
+    /// from its base and digit count (or, for a trapdoor, from its type); every later node must
+    /// agree with it, under every loop environment of `scope`.
     fn require_layout(
-        &self,
+        &mut self,
         scope: &FrozenGraphScopeId,
         wire: WireRef,
         base: Option<&IntExpr>,
-        digits: Option<&IntExpr>,
-    ) -> Result<BackendLayout, ExportError> {
+        digits: Option<LayoutDigits<'_>>,
+    ) -> Result<(), ExportError> {
         use crate::types::ConcreteWireType;
+        let error = |message: &str| ExportError::BackendLayout(message.into());
         let ty = &self.validated.scopes[scope].wire_types[&wire];
         let matrix = match ty {
             ConcreteWireType::Matrix(m) |
             ConcreteWireType::SmallMatrix { matrix: m, .. } |
             ConcreteWireType::Preimage { matrix: m, .. } |
             ConcreteWireType::Trapdoor { matrix: m, .. } => m,
-            _ => {
-                return Err(ExportError::BackendLayout("layout operand is not a ring value".into()))
-            }
+            _ => return Err(error("layout operand is not a ring value")),
         };
-        let layout = self
-            .options
-            .backend_layouts
-            .iter()
-            .find(|layout| {
-                layout.modulus == matrix.ring.modulus() &&
-                    layout.ring_dimension == matrix.ring.ring_dimension() as usize
-            })
-            .ok_or_else(|| {
-                ExportError::BackendLayout(format!(
-                    "missing ring ({}, {})",
-                    matrix.ring.modulus(),
-                    matrix.ring.ring_dimension()
-                ))
-            })?;
+        let towers = matrix.ring.crt_moduli().len();
+        // The base and regular digit count this node declares, uniform over loop environments.
+        let mut declared: Option<(num_bigint::BigInt, Option<num_bigint::BigInt>)> = None;
+        // The per-tower digit count of a small decomposition, uniform over loop environments.
+        let mut small_digits = None;
+        if let ConcreteWireType::Trapdoor { gadget_base, digit_count, .. } = ty {
+            declared = Some((gadget_base.clone(), Some((*digit_count).into())));
+        }
         for env in &self.layout_environments[scope] {
             let evaluate = |expression: &IntExpr| {
-                expression.evaluate(env).map_err(|error| {
-                    ExportError::BackendLayout(format!("nonuniform layout payload: {error}"))
+                expression.evaluate(env).map_err(|e| {
+                    ExportError::BackendLayout(format!("nonuniform layout payload: {e}"))
                 })
             };
-            if let Some(base) = base {
-                if evaluate(base)? != layout.base {
-                    return Err(ExportError::BackendLayout("gadget base mismatch".into()));
+            let Some(base) = base else { break };
+            if let Some(LayoutDigits::PerTower(count)) = &digits {
+                let count = evaluate(count)?;
+                if small_digits.replace(count.clone()).is_some_and(|previous| previous != count) {
+                    return Err(error("gadget digit count mismatch"));
                 }
             }
-            if let Some(digits) = digits {
-                if evaluate(digits)? != num_bigint::BigInt::from(layout.regular_digits) {
-                    return Err(ExportError::BackendLayout("gadget digit count mismatch".into()));
+            let observed = (
+                evaluate(base)?,
+                match &digits {
+                    Some(LayoutDigits::Regular(count)) => Some(evaluate(count)?),
+                    Some(LayoutDigits::PerTower(_)) => None,
+                    Some(LayoutDigits::Count(count)) => Some((*count).into()),
+                    None => None,
+                },
+            );
+            match &declared {
+                Some(previous) if previous.0 != observed.0 => {
+                    return Err(error("gadget base mismatch"));
                 }
+                Some(previous)
+                    if previous.1.is_some() && observed.1.is_some() && previous.1 != observed.1 =>
+                {
+                    return Err(error("gadget digit count mismatch"));
+                }
+                Some(_) => {}
+                None => declared = Some(observed),
             }
         }
-        if let ConcreteWireType::Trapdoor { gadget_base, digit_count, .. } = ty {
-            if gadget_base != &layout.base || *digit_count != layout.regular_digits {
-                return Err(ExportError::BackendLayout("trapdoor layout mismatch".into()));
-            }
+        let Some((base, digits)) = declared else {
+            // A preimage sampler reads the layout its trapdoor's type declares.
+            return Ok(());
+        };
+        let base_bits = base.bits();
+        if base < 2.into() || base != num_bigint::BigInt::from(1u8) << (base_bits - 1) {
+            return Err(error("gadget base must be a power of two greater than one"));
         }
-        Ok(layout.clone())
+        // The runtime gives every tower enough digits for the widest one, and a regular
+        // decomposition keeps the leading `digits / digits_per_tower` towers.
+        let crt_moduli = matrix.ring.crt_moduli().to_vec();
+        let widest = crt_moduli.iter().map(|modulus| u64::BITS - modulus.leading_zeros()).max();
+        let digits_per_tower = (widest.unwrap_or(0) as usize).div_ceil(base_bits as usize - 1);
+        if small_digits.is_some_and(|count| count != digits_per_tower.into()) {
+            return Err(error("small gadget digit count must cover the widest tower"));
+        }
+        let dropped_towers = match digits {
+            None => None,
+            Some(digits) => {
+                let kept = usize::try_from(digits)
+                    .ok()
+                    .filter(|digits| *digits != 0 && digits % digits_per_tower == 0)
+                    .map(|digits| digits / digits_per_tower)
+                    .filter(|kept| *kept <= towers)
+                    .ok_or_else(|| error("gadget digit count does not keep whole towers"))?;
+                Some(towers - kept)
+            }
+        };
+        let layout = BackendLayout {
+            modulus: matrix.ring.modulus(),
+            ring_dimension: matrix.ring.ring_dimension() as usize,
+            crt_moduli,
+            base,
+            digits_per_tower,
+            dropped_towers,
+        };
+        let key = (layout.modulus.clone(), layout.ring_dimension);
+        let merged = match self.layouts.get(&key) {
+            Some(previous) => previous
+                .merge(&layout)
+                .ok_or_else(|| error("gadget nodes of one ring declare different layouts"))?,
+            None => layout,
+        };
+        self.layouts.insert(key, merged);
+        Ok(())
     }
     fn bind_existential(&mut self, name: &str, ty: &str) {
         self.current_value_expressions.insert(
@@ -2331,11 +2529,30 @@ impl<'a> Emitter<'a> {
         relation: &str,
         args: &[String],
     ) {
+        self.sample_one_at(scope, node, existentials, relations, relation, args, false);
+    }
+    /// `sample_one`, reading the tape at this node's site when `reads_tape` and the export
+    /// threads a sampling tape.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_one_at(
+        &mut self,
+        scope: &GraphScope,
+        node: NodeId,
+        existentials: &mut Vec<(String, String)>,
+        relations: &mut Vec<String>,
+        relation: &str,
+        args: &[String],
+        reads_tape: bool,
+    ) {
         let name = wire_name(WireRef { node, port: crate::types::Port(0) });
         let ty = self.output_type(scope, node, 0);
         self.bind_existential(&name, &ty);
         existentials.push((name.clone(), ty));
         let mut terms = vec![relation.to_owned()];
+        if reads_tape && self.requires_tape {
+            self.current_uses_tape = true;
+            terms.push(format!("tape (path ++ [{}])", node.0));
+        }
         terms.extend(args.iter().map(|arg| format!("({arg})")));
         terms.push(name);
         relations.push(terms.join(" "));
@@ -2356,11 +2573,19 @@ impl<'a> Emitter<'a> {
             .child_scope_id(scope_id, node)
             .ok_or(ExportError::MissingChildScope { scope: scope_id.clone(), node })?;
         self.current_uses_hash_model |= self.requires_hash_model;
+        self.current_uses_tape |= self.requires_tape;
         let child_name = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             self.scopes[&child],
             if self.requires_backend { " backend" } else { "" },
-            if self.requires_hash_model { " hashModel" } else { "" }
+            if self.requires_hash_model { " hashModel" } else { "" },
+            if !self.requires_tape {
+                String::new()
+            } else if parallel {
+                format!(" tape (path ++ [{}, i.val])", node.0)
+            } else {
+                format!(" tape (path ++ [{}])", node.0)
+            }
         );
         let node_ref = scope.node(node).expect("node");
         let outputs = (0..node_ref.output_types().len())
@@ -2530,11 +2755,17 @@ impl<'a> Emitter<'a> {
             .child_scope_id(scope_id, node)
             .ok_or(ExportError::MissingChildScope { scope: scope_id.clone(), node })?;
         self.current_uses_hash_model |= self.requires_hash_model;
+        self.current_uses_tape |= self.requires_tape;
         let child_name = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             self.scopes[&child],
             if self.requires_backend { " backend" } else { "" },
-            if self.requires_hash_model { " hashModel" } else { "" }
+            if self.requires_hash_model { " hashModel" } else { "" },
+            if self.requires_tape {
+                format!(" tape (path ++ [{}, i])", node.0)
+            } else {
+                String::new()
+            }
         );
         let kind = scope.node(node).expect("node").kind();
         let NodeKind::SequentialLoop(spec) = kind else { unreachable!() };
@@ -2662,6 +2893,44 @@ impl<'a> Emitter<'a> {
             matrix.columns
         )
     }
+}
+
+/// Render a hash tag prefix and its typed components as `MxxRuntime` terms, recording the guards
+/// of every compile-time component.
+fn hash_tag_terms(
+    tag_prefix: &[u8],
+    tag_components: &[crate::node::HashTagComponent],
+    args: &[WireRef],
+    env: &LexicalEnv,
+    relations: &mut Vec<String>,
+) -> (String, String) {
+    use crate::node::HashTagComponent;
+    let components = tag_components
+        .iter()
+        .map(|component| match component {
+            HashTagComponent::Bytes(bytes) => format!(
+                ".bytes [{}]",
+                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
+            ),
+            HashTagComponent::Integer(expression) |
+            HashTagComponent::Decimal(expression) |
+            HashTagComponent::U64Le(expression) => {
+                append_expression_guards(expression, env, relations);
+                let constructor = match component {
+                    HashTagComponent::Integer(_) => "integer",
+                    HashTagComponent::Decimal(_) => "decimal",
+                    _ => "u64Le",
+                };
+                format!(".{constructor} ({})", env.expr(expression))
+            }
+            HashTagComponent::Operand(index) => format!(".integer {}", wire_name(args[*index])),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        format!("[{}]", tag_prefix.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")),
+        format!("[{components}]"),
+    )
 }
 
 fn valid_identifier(name: &str) -> Result<(), ExportError> {
@@ -3125,6 +3394,94 @@ mod tests {
         assert!(artifact.source.contains("ringAutomorphismRuns"));
         assert_eq!(artifact.source.matches("crtRecomposeLevel").count(), 2);
         assert!(artifact.source.contains("abbrev generatedRoot.constraints"));
+    }
+
+    #[test]
+    fn test_export_packs_long_constant_polynomial() {
+        let matrix = MatrixType {
+            ring: crate::ring::test_ring(257, 128),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let values = (0..128u32).map(|i| num_bigint::BigUint::from(i * 5 % 97)).collect::<Vec<_>>();
+        let value = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: matrix.clone(),
+                value: ConstantMatrix::Polynomial {
+                    coefficients: values
+                        .iter()
+                        .map(|value| IntExpr::constant(BigInt::from(value.clone())))
+                        .collect(),
+                },
+            },
+            vec![],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "packed_constant",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        let (width, table) = packed_table(&values);
+        assert_eq!(width, 7);
+        let mask = (num_bigint::BigUint::from(1u8) << width) - 1u8;
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(&((&table >> (width as usize * index)) & &mask), value);
+        }
+        assert!(artifact.source.contains(&format!("def generatedRoot.table_0 : Nat := {table}")));
+        assert!(
+            artifact.source.contains(&format!(
+                "MxxRuntime.packedPolynomial {width} 128 generatedRoot.table_0"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_export_sampling_tape_reads_each_occurrence_site() {
+        let matrix = MatrixType {
+            ring: crate::ring::test_ring(257, 8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let value = NodeHandle::new(
+            NodeKind::GaussianSample {
+                matrix_type: matrix.clone(),
+                sigma: crate::expr::RealExpr::from_f64_exact(3.0).unwrap(),
+                max_coefficient_bound: IntExpr::constant(48),
+            },
+            vec![],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "sampled",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let taped =
+            export(&validated, &ExportOptions { sampling_tape: true, ..Default::default() })
+                .unwrap();
+        assert!(taped.root.requires_sampling_tape);
+        assert!(taped.source.contains("MxxRuntime.gaussianSampleAt tape (path ++ [0])"));
+        assert!(taped.source.contains("(tape : MxxRuntime.SampleTape) (path : List Nat)"));
+        let plain = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(!plain.root.requires_sampling_tape);
+        assert!(plain.source.contains("MxxRuntime.gaussianSample ("));
+        assert!(!plain.source.contains("SampleTape"));
     }
 
     #[test]
@@ -3853,19 +4210,13 @@ mod tests {
                 ..ParamEnv::default()
             };
             let validated = crate::ring::test_validate(&graph, &env).unwrap();
-            let options = ExportOptions {
-                backend_layouts: vec![BackendLayout {
-                    modulus: 17.into(),
-                    ring_dimension: 2,
-                    base: 16.into(),
-                    regular_digits: 2,
-                }],
-                ..ExportOptions::default()
-            };
-            let result = export(&validated, &options);
+            // The first call's base is the caller's `c` and the second call's is 16; one ring
+            // has one layout, so they must agree.
+            let result = export(&validated, &ExportOptions::default());
             assert_eq!(result.is_ok(), accepted, "{result:?}");
             if let Ok(artifact) = result {
                 assert!(artifact.root.requires_backend);
+                assert_eq!(artifact.backend_layouts[0].base, 16.into());
                 assert!(
                     artifact
                         .source
@@ -4187,6 +4538,78 @@ mod tests {
     }
 
     #[test]
+    fn regular_decomposition_drops_the_trailing_towers_it_omits() {
+        // Towers 17, 97, 113: the widest has 7 bits, so base 2 needs 7 digits per tower, and
+        // 14 regular digits keep the first two towers, as the runtime backend derives it.
+        let decomposition = |digits: i64| {
+            let matrix = MatrixType {
+                ring: crate::ring::test_ring(17 * 97 * 113, 2),
+                rows: 1.into(),
+                columns: 1.into(),
+            };
+            let input = NodeHandle::new(
+                NodeKind::Input {
+                    name: "target".into(),
+                    wire_type: WireType::Matrix(matrix.clone()),
+                    artifact: None,
+                },
+                vec![],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            let value = NodeHandle::new(
+                NodeKind::GadgetDecompose {
+                    base: 2.into(),
+                    small: false,
+                    digit_count: digits.into(),
+                },
+                vec![input],
+                vec![WireType::Preimage {
+                    matrix: MatrixType { rows: digits.into(), ..matrix },
+                    max_coefficient_bound: 1.into(),
+                    bound_domain: CoefficientBoundDomain::Global,
+                }],
+            )
+            .output(0)
+            .unwrap();
+            let (graph, _) = Graph::freeze(
+                "approximate-gadget",
+                vec![],
+                BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+            export(&validated, &ExportOptions::default())
+        };
+        let artifact = decomposition(14).unwrap();
+        assert_eq!(
+            artifact.backend_layouts,
+            vec![BackendLayout {
+                modulus: (17 * 97 * 113).into(),
+                ring_dimension: 2,
+                crt_moduli: vec![17, 97, 113],
+                base: 2.into(),
+                digits_per_tower: 7,
+                dropped_towers: Some(1),
+            }]
+        );
+        let backend = backend::render_backend(&artifact.backend_layouts);
+        assert!(backend.contains("droppedModuli := 1"));
+        assert!(backend.contains("digitsPerTower := 7"));
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_ir_fixtures/approximate_gadget");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("Backend.lean"), &backend).unwrap();
+        std::fs::write(directory.join("Generated.lean"), &artifact.source).unwrap();
+        // Ten digits do not keep whole towers, so no backend executes this decomposition.
+        assert!(matches!(decomposition(10), Err(ExportError::BackendLayout(_))));
+    }
+
+    #[test]
     fn export_preserves_trapdoor_pair_and_three_preimage_operands() {
         let trapdoor_matrix = MatrixType {
             ring: crate::ring::test_ring(17, 2),
@@ -4207,7 +4630,7 @@ mod tests {
             NodeKind::TrapdoorSample {
                 matrix_type: trapdoor_matrix.clone(),
                 sigma: crate::expr::RealExpr::from(1),
-                gadget_base: IntExpr::constant(2),
+                gadget_base: IntExpr::constant(32),
                 digit_count: IntExpr::constant(1),
                 preimage_max_coefficient_bound: IntExpr::constant(4),
             },
@@ -4217,7 +4640,7 @@ mod tests {
                 WireType::Trapdoor {
                     matrix: trapdoor_matrix.clone(),
                     sigma: crate::expr::RealExpr::from(1),
-                    gadget_base: IntExpr::constant(2),
+                    gadget_base: IntExpr::constant(32),
                     digit_count: IntExpr::constant(1),
                     preimage_max_coefficient_bound: IntExpr::constant(4),
                 },
@@ -4260,27 +4683,20 @@ mod tests {
         )
         .unwrap();
         let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
-        assert!(matches!(
-            export(&validated, &ExportOptions::default()),
-            Err(ExportError::BackendLayout(_))
-        ));
-        let options = ExportOptions {
-            backend_layouts: vec![BackendLayout {
+        // The trapdoor sampler fixes the layout that the preimage sampler then reads.
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.root.requires_backend);
+        assert_eq!(
+            artifact.backend_layouts,
+            vec![BackendLayout {
                 modulus: 17.into(),
                 ring_dimension: 2,
-                base: 2.into(),
-                regular_digits: 1,
-            }],
-            ..ExportOptions::default()
-        };
-        let artifact = export(&validated, &options).unwrap();
-        assert!(artifact.root.requires_backend);
-        let mut incompatible = options.clone();
-        incompatible.backend_layouts[0].base = 32.into();
-        assert!(matches!(export(&validated, &incompatible), Err(ExportError::BackendLayout(_))));
-        let mut conflicting = options.clone();
-        conflicting.backend_layouts.push(incompatible.backend_layouts[0].clone());
-        assert!(matches!(export(&validated, &conflicting), Err(ExportError::BackendLayout(_))));
+                crt_moduli: vec![17],
+                base: 32.into(),
+                digits_per_tower: 1,
+                dropped_towers: Some(0),
+            }]
+        );
         assert!(artifact.source.contains("trapdoorSample backend"));
         assert!(
             artifact

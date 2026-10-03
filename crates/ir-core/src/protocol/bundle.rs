@@ -82,6 +82,8 @@ pub struct TrapdoorContractMismatch {
 pub enum EndpointSpecId {
     ToyThresholdDecode,
     DiamondBooleanInterval,
+    /// An exactly compared decoder output (a Boolean, an integer, or a family of either).
+    Exact,
 }
 
 /// A symbolic upper bound explicitly assumed by an external-input contract.
@@ -221,7 +223,11 @@ impl ComparatorSpec {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EndpointSemanticBinding {
     ThresholdDecode,
-    DiamondBoolean { message: ProtocolInputId },
+    DiamondBoolean {
+        message: ProtocolInputId,
+    },
+    /// The decoder output must equal the ideal output exactly; no message input is named.
+    Exact,
 }
 
 /// The executable decoder family selected by an operational target.  This is
@@ -317,8 +323,6 @@ pub enum BundleValidationError {
     MissingEndpointBinding,
     #[error("an endpoint has semantic identities that do not match its closed endpoint spec")]
     InvalidEndpointSemantics,
-    #[error("the operational decoder target registry must be nonempty")]
-    EmptyOperationalDecoderTargetRegistry,
     #[error("operational decoder target ids must be nonempty and unique")]
     DuplicateOperationalDecoderTarget,
     #[error("an operational decoder target does not name a closed residual output or decoder node")]
@@ -499,7 +503,8 @@ impl ClosedProtocolBundle {
     fn all_input_destinations(&self) -> BTreeSet<ProtocolInputDestination> {
         let workflow = self.workflow.stages.iter().flat_map(|stage| {
             root_inputs(&stage.graph).filter_map(move |(name, _, artifact)| {
-                artifact.is_none().then_some(ProtocolInputDestination::WorkflowStage {
+                let linked = stage.bindings.iter().any(|binding| binding.consumer_input.0 == name);
+                (artifact.is_none() && !linked).then_some(ProtocolInputDestination::WorkflowStage {
                     stage: stage.id.clone(),
                     input: StageInputName(name.to_owned()),
                 })
@@ -545,7 +550,8 @@ impl ClosedProtocolBundle {
                 return Err(BundleValidationError::MissingEndpointBinding);
             }
             match (&endpoint.spec, &endpoint.semantics) {
-                (EndpointSpecId::ToyThresholdDecode, EndpointSemanticBinding::ThresholdDecode) => {}
+                (EndpointSpecId::ToyThresholdDecode, EndpointSemanticBinding::ThresholdDecode) |
+                (EndpointSpecId::Exact, EndpointSemanticBinding::Exact) => {}
                 (
                     EndpointSpecId::DiamondBooleanInterval,
                     EndpointSemanticBinding::DiamondBoolean { message },
@@ -608,9 +614,6 @@ impl ClosedProtocolBundle {
         &self,
         stages: &BTreeMap<StageId, &ProtocolStage>,
     ) -> Result<(), BundleValidationError> {
-        if self.operational_decoder_targets.is_empty() {
-            return Err(BundleValidationError::EmptyOperationalDecoderTargetRegistry);
-        }
         let target_ids = self
             .operational_decoder_targets
             .iter()

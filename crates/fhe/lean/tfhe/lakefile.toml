@@ -1,0 +1,32 @@
+name = "MxxFheTfhe"
+version = "0.1.0"
+defaultTargets = ["TfheGenerated", "MxxFheTfhe"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../../ir-core/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../../ir-core/lean"
+
+# Modules written by `test_gpu_tfhe_round_trip` (`crates/fhe/tests/gpu_tfhe.rs`).
+[[lean_lib]]
+name = "TfheGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "Ideal", "Stage_keygen", "Stage_encrypt_left", "Stage_encrypt_right",
+  "Stage_nand", "Stage_decrypt"
+]
+
+# Handwritten proofs of the generated claim.
+[[lean_lib]]
+name = "MxxFheTfhe"
+roots = [
+  "TfheStages", "TfheRotation", "TfheNand", "TfheDependence", "TfheBound", "TfheProof",
+  "Certificate"
+]

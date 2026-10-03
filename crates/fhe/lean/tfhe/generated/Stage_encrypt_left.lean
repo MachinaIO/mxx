@@ -14,14 +14,14 @@ set_option genSizeOf false in
 structure generatedRoot.Witness where
   w_1_0 : Fin 630 → Int
   w_4_0 : Int
-  w_13_0 : Mxx.Primitives.ExactMatrix 4611255024196841473 2048 1 1
+  w_13_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1
   w_14_0 : Int
   w_22_0 : Int
 
-abbrev generatedRoot.constraints_0 (hashModel : MxxRuntime.HashModel) (w_0_0 : ByteArray) (w_1_0 : Fin 630 → Int) (w_3_0 : Fin 1 → Int) (w_4_0 : Int) (w_13_0 : Mxx.Primitives.ExactMatrix 4611255024196841473 2048 1 1) (w_14_0 : Int) (w_19_0 : Int) (w_21_0 : Int) (w_22_0 : Int) (w_24_0 : Int) (w_25_0 : Int) (outputs : (Fin 630 → Int) × Int × Unit) : Prop :=
+abbrev generatedRoot.constraints_0 (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (w_0_0 : ByteArray) (w_1_0 : Fin 630 → Int) (w_3_0 : Fin 1 → Int) (w_4_0 : Int) (w_13_0 : Mxx.Primitives.ExactMatrix 5234636801 1024 1 1) (w_14_0 : Int) (w_19_0 : Int) (w_21_0 : Int) (w_22_0 : Int) (w_24_0 : Int) (w_25_0 : Int) (outputs : (Fin 630 → Int) × Int × Unit) : Prop :=
   MxxRuntime.hashIntFamily (hashModel) (4294967296) ([109, 120, 120, 47, 104, 97, 115, 104, 45, 105, 110, 116, 45, 102, 97, 109, 105, 108, 121, 47, 118, 49, 0, 116, 102, 104, 101, 47, 108, 119, 101, 45, 101, 110, 99, 114, 121, 112, 116, 47, 97, 47, 118, 49]) ([]) (w_0_0) w_1_0 ∧
   MxxRuntime.familyGetStatic w_3_0 (0) w_4_0 ∧
-  MxxRuntime.gaussianSample ((128/1)) (2048) w_13_0 ∧
+  MxxRuntime.gaussianSampleAt tape (path ++ [13]) ((131072/1)) (2097152) w_13_0 ∧
   MxxRuntime.extractCoefficient 0 w_13_0 w_14_0 ∧
   0 ≤ w_19_0 ∧
   w_19_0 < 2 ∧
@@ -30,7 +30,7 @@ abbrev generatedRoot.constraints_0 (hashModel : MxxRuntime.HashModel) (w_0_0 : B
   w_24_0 ≠ 0 ∧
   outputs = (w_1_0, (w_25_0, ()))
 
-abbrev generatedRoot.body (hashModel : MxxRuntime.HashModel) (params : Params) (inputs : ByteArray × (Fin 630 → Int) × Int × Unit) (outputs : (Fin 630 → Int) × Int × Unit) (witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : ByteArray × (Fin 630 → Int) × Int × Unit) (outputs : (Fin 630 → Int) × Int × Unit) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let w_0_0 : ByteArray := inputs.1
   let w_2_0 : Fin 630 → Int := inputs.2.1
@@ -49,20 +49,20 @@ abbrev generatedRoot.body (hashModel : MxxRuntime.HashModel) (params : Params) (
   let w_14_0 := witness.w_14_0
   let w_15_0 : Int := 2
   let w_16_0 : Int := (w_14_0 * w_15_0)
-  let w_17_0 : Int := 4611255024196841473
+  let w_17_0 : Int := 5234636801
   let w_18_0 : Bool := decide (w_16_0 ≤ w_17_0)
   let w_19_0 : Int := if w_18_0 then 1 else 0
-  let w_20_0 : Int := 4611255024196841473
+  let w_20_0 : Int := 5234636801
   let w_21_0 : Int := (w_14_0 - w_20_0)
   let w_22_0 := witness.w_22_0
   let w_23_0 : Int := (w_12_0 + w_22_0)
   let w_24_0 : Int := 4294967296
   let w_25_0 : Int := (w_23_0 % w_24_0)
-  generatedRoot.constraints_0 hashModel w_0_0 w_1_0 w_3_0 w_4_0 w_13_0 w_14_0 w_19_0 w_21_0 w_22_0 w_24_0 w_25_0 outputs
+  generatedRoot.constraints_0 hashModel tape path w_0_0 w_1_0 w_3_0 w_4_0 w_13_0 w_14_0 w_19_0 w_21_0 w_22_0 w_24_0 w_25_0 outputs
 
-def generatedRoot (hashModel : MxxRuntime.HashModel) (params : Params) (inputs : ByteArray × (Fin 630 → Int) × Int × Unit) (outputs : (Fin 630 → Int) × Int × Unit) : Prop :=
+def generatedRoot (hashModel : MxxRuntime.HashModel) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : ByteArray × (Fin 630 → Int) × Int × Unit) (outputs : (Fin 630 → Int) × Int × Unit) : Prop :=
   ∃ witness : generatedRoot.Witness,
-    generatedRoot.body hashModel params inputs outputs witness
+    generatedRoot.body hashModel tape path params inputs outputs witness
 
 
 end Stage_encrypt_left

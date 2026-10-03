@@ -27,7 +27,7 @@ def ValidExternals (external : ExternalInputs) : Prop :=
   (external.input_4).size = 32
 
 structure Execution where
-  «stage_0» : (Fin 630 → Mxx.Primitives.ExactMatrix 4611255024196841473 2048 1 16) × (Fin 630 → Mxx.Primitives.ExactMatrix 4611255024196841473 2048 1 16) × (Fin 10321920 → Int) × (Fin 16384 → Int) × (Fin 630 → Int) × Unit
+  «stage_0» : (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 630 → Mxx.Primitives.ExactMatrix 5234636801 1024 1 12) × (Fin 5160960 → Int) × (Fin 8192 → Int) × (Fin 630 → Int) × Unit
   «stage_1» : (Fin 630 → Int) × Int × Unit
   «stage_2» : (Fin 630 → Int) × Int × Unit
   «stage_3» : (Fin 630 → Int) × Int × Unit
@@ -46,15 +46,15 @@ def stage_4_params : Stage_decrypt.Params := { «unit» := () }
 
 def ideal_params : Ideal.Params := { «unit» := () }
 
-def Runs (hashModel : MxxRuntime.HashModel) (external : ExternalInputs)
+def Runs (hashModel : MxxRuntime.HashModel) (external : ExternalInputs) (tape : MxxRuntime.SampleTape)
     (execution : Execution) : Prop :=
   ValidExternals external ∧
-  Stage_keygen.generatedRoot FheBackend.backend hashModel stage_0_params (external.input_0) execution.«stage_0» ∧
-  Stage_encrypt_left.generatedRoot hashModel stage_1_params ((external.input_2, execution.«stage_0».2.2.2.2.1, external.input_1, ())) execution.«stage_1» ∧
-  Stage_encrypt_right.generatedRoot hashModel stage_2_params ((external.input_4, execution.«stage_0».2.2.2.2.1, external.input_3, ())) execution.«stage_2» ∧
-  Stage_nand.generatedRoot FheBackend.backend stage_3_params ((execution.«stage_0».2.2.1, execution.«stage_1».2.1, execution.«stage_2».2.1, execution.«stage_1».1, execution.«stage_2».1, execution.«stage_0».1, execution.«stage_0».2.1, execution.«stage_0».2.2.2.1, ())) execution.«stage_3» ∧
-  Stage_decrypt.generatedRoot stage_4_params ((execution.«stage_3».2.1, execution.«stage_3».1, execution.«stage_0».2.2.2.2.1, ())) execution.«stage_4» ∧
-  Ideal.generatedRoot ideal_params ((external.input_1, external.input_3, ())) execution.«ideal»
+  Stage_keygen.generatedRoot FheBackend.backend hashModel tape [0] stage_0_params (external.input_0) execution.«stage_0» ∧
+  Stage_encrypt_left.generatedRoot hashModel tape [1] stage_1_params ((external.input_2, execution.«stage_0».2.2.2.2.1, external.input_1, ())) execution.«stage_1» ∧
+  Stage_encrypt_right.generatedRoot hashModel tape [2] stage_2_params ((external.input_4, execution.«stage_0».2.2.2.2.1, external.input_3, ())) execution.«stage_2» ∧
+  Stage_nand.generatedRoot FheBackend.backend tape [3] stage_3_params ((execution.«stage_0».2.2.1, execution.«stage_1».2.1, execution.«stage_2».2.1, execution.«stage_1».1, execution.«stage_2».1, execution.«stage_0».1, execution.«stage_0».2.1, execution.«stage_0».2.2.2.1, ())) execution.«stage_3» ∧
+  Stage_decrypt.generatedRoot tape [4] stage_4_params ((execution.«stage_3».2.1, execution.«stage_3».1, execution.«stage_0».2.2.2.2.1, ())) execution.«stage_4» ∧
+  Ideal.generatedRoot tape [5] ideal_params ((external.input_1, external.input_3, ())) execution.«ideal»
 
 noncomputable def observedResidual (execution : Execution) (index : Fin 1) : Int :=
   Mxx.Primitives.centeredLift 4294967296
@@ -63,8 +63,9 @@ noncomputable def observedResidual (execution : Execution) (index : Fin 1) : Int
 
 /-- The application proof must establish this proposition; no noise premise is assumed. -/
 def CorrectnessClaim : Prop :=
-  ∀ hashModel external execution, Runs hashModel external execution →
-    (∀ index, (observedResidual execution index).natAbs < TfheSemantics.decoderRadius 4294967296) ∧
-    execution.«stage_4».1 = execution.«ideal»
+  ∀ hashModel external,
+    MxxRuntime.tapeMeasure {tape | ∃ execution, Runs hashModel external tape execution ∧
+      ¬ ((∀ index, (observedResidual execution index).natAbs < TfheSemantics.decoderRadius 4294967296) ∧
+    execution.«stage_4».1 = execution.«ideal»)} ≤ (2 : ENNReal)⁻¹ ^ 128
 
 end GeneratedClaim

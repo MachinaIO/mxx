@@ -32,6 +32,7 @@ pub fn export_claim(
             centered_lift: "Mxx.Primitives.centeredLift",
             message_center: "MxxWe.messageCenter",
             decoder_radius: "MxxWe.decoderRadius",
+            failure_probability_log2: None,
         },
         manifests,
         directory)

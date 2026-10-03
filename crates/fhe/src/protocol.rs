@@ -430,12 +430,15 @@ fn closed_protocol(
 }
 
 /// Writes every stage, ideal, and backend module of `protocol`, its linked `Claim.lean`, and the
-/// semantics module `semantics` (named `semantics_module`) into `directory`.
+/// semantics module `semantics` (named `semantics_module`) into `directory`. With
+/// `failure_probability_log2 = Some(k)` the claim bounds the failure probability over the sampled
+/// values by `2^-k`; with `None` it states correctness of every execution.
 pub fn export_claim(
     protocol: &ProtocolDecl,
     runtime_parameters: &[mxx_backends::poly::dcrt::params::DCRTPolyParams],
     semantics_module: &str,
     semantics: &str,
+    failure_probability_log2: Option<u32>,
     directory: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use mxx_ir_core::{
@@ -471,6 +474,7 @@ pub fn export_claim(
             centered_lift: "Mxx.Primitives.centeredLift",
             message_center: &format!("{semantics_module}.messageCenter"),
             decoder_radius: &format!("{semantics_module}.decoderRadius"),
+            failure_probability_log2,
         },
         &manifests,
         directory,
@@ -522,11 +526,10 @@ pub fn bgv_tables(bgv: &BgvParams) -> Result<String, FheError> {
 mod tests {
     use super::*;
 
-    /// Exports the claim of the worst-case TFHE profile, which `FHE_TEST_TFHE_PROFILE` selects.
+    /// Exports the claim of the default TFHE profile: one gate fails with probability at most
+    /// `2^-128` over the sampled keys and errors.
     #[test]
     fn test_export_tfhe_gate_claim() {
-        // SAFETY: tests in this binary that read the TFHE profile run in this thread only.
-        unsafe { std::env::set_var("FHE_TEST_TFHE_PROFILE", "worst-case") };
         let tfhe = utils::tfhe_params();
         let protocol = tfhe_nand_protocol(&tfhe).unwrap();
         let directory =
@@ -536,6 +539,7 @@ mod tests {
             &tfhe.runtime_parameters(),
             "TfheSemantics",
             &tfhe_semantics(&tfhe),
+            Some(128),
             &directory,
         )
         .unwrap();
@@ -560,6 +564,7 @@ mod tests {
             &bgv.runtime_parameters().unwrap(),
             "BgvSemantics",
             &bgv_semantics(bgv.common.ring.ring_dimension() as usize, &phase_bound),
+            None,
             &directory,
         )
         .unwrap();

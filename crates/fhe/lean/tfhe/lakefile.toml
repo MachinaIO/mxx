@@ -24,10 +24,10 @@ name = "TfheGenerated"
 srcDir = "generated"
 roots = [
   "Backend", "TfheSemantics", "Claim", "Ideal", "Stage_keygen", "Stage_encrypt_left",
-  "Stage_encrypt_right", "Stage_nand", "Stage_decrypt", "Certificate"
+  "Stage_encrypt_right", "Stage_nand", "Stage_decrypt"
 ]
 
 # Handwritten proofs of the generated claim.
 [[lean_lib]]
 name = "MxxFheTfhe"
-roots = ["TfheStages", "TfheNand", "TfheProof"]
+roots = ["TfheStages", "TfheRotation"]

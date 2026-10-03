@@ -16,7 +16,7 @@ structure generatedRoot.Witness where
 abbrev generatedRoot.constraints_0 (w_4_0 : Int) (outputs : Int) : Prop :=
   outputs = w_4_0
 
-abbrev generatedRoot.body (params : Params) (inputs : Int × Int × Unit) (outputs : Int) (_witness : generatedRoot.Witness) : Prop :=
+abbrev generatedRoot.body (_ : MxxRuntime.SampleTape) (_ : List Nat) (params : Params) (inputs : Int × Int × Unit) (outputs : Int) (_witness : generatedRoot.Witness) : Prop :=
   let _params := params
   let w_1_0 : Int := inputs.1
   let w_2_0 : Int := inputs.2.1
@@ -25,9 +25,9 @@ abbrev generatedRoot.body (params : Params) (inputs : Int × Int × Unit) (outpu
   let w_4_0 : Int := (w_0_0 - w_3_0)
   generatedRoot.constraints_0 w_4_0 outputs
 
-def generatedRoot (params : Params) (inputs : Int × Int × Unit) (outputs : Int) : Prop :=
+def generatedRoot (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (inputs : Int × Int × Unit) (outputs : Int) : Prop :=
   ∃ witness : generatedRoot.Witness,
-    generatedRoot.body params inputs outputs witness
+    generatedRoot.body tape path params inputs outputs witness
 
 
 end Ideal

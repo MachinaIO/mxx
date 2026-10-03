@@ -73,6 +73,11 @@ pub struct PrimitiveNames {
     pub uniform_residue_sample: String,
     pub uniform_interval_sample: String,
     pub gaussian_sample: String,
+    /// Tape-reading forms of the three samplers, used when [`ExportOptions::sampling_tape`] is
+    /// set: each takes the sampling tape and the occurrence's site before its usual arguments.
+    pub uniform_residue_sample_at: String,
+    pub uniform_interval_sample_at: String,
+    pub gaussian_sample_at: String,
     pub hash_sample: String,
     pub gadget_trapdoor: String,
     pub gadget_decompose: String,
@@ -131,6 +136,9 @@ impl Default for PrimitiveNames {
             uniform_residue_sample: "MxxRuntime.uniformResidueSample".into(),
             uniform_interval_sample: "MxxRuntime.uniformIntervalSample".into(),
             gaussian_sample: "MxxRuntime.gaussianSample".into(),
+            uniform_residue_sample_at: "MxxRuntime.uniformResidueSampleAt".into(),
+            uniform_interval_sample_at: "MxxRuntime.uniformIntervalSampleAt".into(),
+            gaussian_sample_at: "MxxRuntime.gaussianSampleAt".into(),
             hash_sample: "MxxRuntime.hashSample".into(),
             gadget_trapdoor: "MxxRuntime.gadgetTrapdoorRuns".into(),
             gadget_decompose: "MxxRuntime.gadgetDecomposeRuns".into(),
@@ -182,6 +190,12 @@ pub struct ExportOptions {
     pub primitives: PrimitiveNames,
     /// Layout metadata from the same concrete backend setup used by the Lean context.
     pub backend_layouts: Vec<BackendLayout>,
+    /// Read every sampled coefficient from a sampling tape instead of leaving it unconstrained
+    /// within the sampler's support. Each relation then takes `tape` and its call `path`; a
+    /// sampler at node `k` reads site `path ++ [k]`, a subgraph call extends the path with its
+    /// node, and a loop body with its node and iteration, so distinct occurrences read disjoint
+    /// tape keys. Trapdoor and preimage samplers have no tape semantics and are rejected.
+    pub sampling_tape: bool,
 }
 
 impl Default for ExportOptions {
@@ -192,6 +206,7 @@ impl Default for ExportOptions {
             runtime_import: "MxxRuntime".into(),
             primitives: Default::default(),
             backend_layouts: Vec::new(),
+            sampling_tape: false,
         }
     }
 }
@@ -241,6 +256,8 @@ pub struct RootBoundary {
     pub outputs: BTreeMap<String, BoundaryValue>,
     pub requires_backend: bool,
     pub requires_hash_model: bool,
+    /// The relation takes a sampling tape and a site path; see [`ExportOptions::sampling_tape`].
+    pub requires_sampling_tape: bool,
     pub parameter_type: String,
     pub parameters: BTreeMap<String, ParameterField>,
 }
@@ -643,12 +660,14 @@ struct Emitter<'a> {
     indent: usize,
     requires_backend: bool,
     requires_hash_model: bool,
+    requires_tape: bool,
     layout_environments: BTreeMap<FrozenGraphScopeId, Vec<crate::expr::ParamEnv>>,
     current_wire_types: BTreeMap<String, String>,
     current_scope_values: Vec<(String, String)>,
     current_referenced_wires: BTreeSet<String>,
     current_anonymous_lets: BTreeSet<String>,
     current_uses_hash_model: bool,
+    current_uses_tape: bool,
     current_witnesses: Vec<(String, String)>,
     current_record: bool,
     current_value_expressions: BTreeMap<String, String>,
@@ -699,6 +718,8 @@ impl<'a> Emitter<'a> {
             current_referenced_wires: BTreeSet::new(),
             current_anonymous_lets: BTreeSet::new(),
             current_uses_hash_model: false,
+            current_uses_tape: false,
+            requires_tape: options.sampling_tape,
             current_witnesses: Vec::new(),
             current_record: false,
             current_value_expressions: BTreeMap::new(),
@@ -820,6 +841,7 @@ impl<'a> Emitter<'a> {
             outputs,
             requires_backend: self.requires_backend,
             requires_hash_model: self.requires_hash_model,
+            requires_sampling_tape: self.requires_tape,
             parameter_type: format!("{}.Params", self.options.namespace),
             parameters: if self.params.is_empty() {
                 BTreeMap::from([(
@@ -1001,6 +1023,7 @@ impl<'a> Emitter<'a> {
         self.current_anonymous_lets.clear();
         self.current_scope_values.clear();
         self.current_uses_hash_model = false;
+        self.current_uses_tape = false;
         let declaration_start = self.source.len();
         // Keep the configuration argument part of the generated relation even for a closed graph;
         // the underscore binding suppresses Lean's unused-binder warning without changing its
@@ -1104,7 +1127,7 @@ impl<'a> Emitter<'a> {
             loop_parameters(self.graph, scope_id, &env.referenced_loop_names.borrow());
         // Scope arity and positional arguments are unchanged; only truly unused names disappear.
         let final_header = format!(
-            "def {} {}{}(params : Params){} ({} : {}) (outputs : {}) : Prop :=\n",
+            "def {} {}{}{}(params : Params){} ({} : {}) (outputs : {}) : Prop :=\n",
             self.scopes[scope_id],
             if self.requires_backend { "(backend : MxxRuntime.BackendContext) " } else { "" },
             if !self.requires_hash_model {
@@ -1113,6 +1136,13 @@ impl<'a> Emitter<'a> {
                 "(hashModel : MxxRuntime.HashModel) "
             } else {
                 "(_ : MxxRuntime.HashModel) "
+            },
+            if !self.requires_tape {
+                ""
+            } else if self.current_uses_tape {
+                "(tape : MxxRuntime.SampleTape) (path : List Nat) "
+            } else {
+                "(_ : MxxRuntime.SampleTape) (_ : List Nat) "
             },
             loop_binders,
             if inputs.is_empty() { "_" } else { "inputs" },
@@ -1147,9 +1177,14 @@ impl<'a> Emitter<'a> {
             self.source
                 .insert_str(declaration_start, &(record + &constraint_definition + &body_header));
             let mut wrapper_header = final_header
-                .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)");
+                .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)")
+                .replace(
+                    "(_ : MxxRuntime.SampleTape) (_ : List Nat)",
+                    "(tape : MxxRuntime.SampleTape) (path : List Nat)",
+                );
             let backend = if self.requires_backend { "backend " } else { "" };
             let hash = if self.requires_hash_model { "hashModel " } else { "" };
+            let hash = if self.requires_tape { format!("{hash}tape path ") } else { hash.into() };
             let input = if inputs.is_empty() { "()" } else { "inputs" };
             let loop_names = scope_loop_slots(self.graph, scope_id)
                 .into_iter()
@@ -1210,6 +1245,12 @@ impl<'a> Emitter<'a> {
         }
         if referenced.contains("hashModel") {
             constraint_arguments.push(("hashModel".to_owned(), "MxxRuntime.HashModel".to_owned()));
+        }
+        if referenced.contains("tape") {
+            constraint_arguments.push(("tape".to_owned(), "MxxRuntime.SampleTape".to_owned()));
+        }
+        if referenced.contains("path") {
+            constraint_arguments.push(("path".to_owned(), "List Nat".to_owned()));
         }
         if referenced.contains("params") {
             constraint_arguments.push(("params".to_owned(), "Params".to_owned()));
@@ -1569,6 +1610,9 @@ impl<'a> Emitter<'a> {
                 preimage_max_coefficient_bound,
                 ..
             } => {
+                if self.requires_tape {
+                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
+                }
                 self.require_layout(
                     scope_id,
                     WireRef { node: node_id, port: crate::types::Port(1) },
@@ -1598,6 +1642,9 @@ impl<'a> Emitter<'a> {
                 ));
             }
             NodeKind::PreimageSample { max_coefficient_bound, .. } => {
+                if self.requires_tape {
+                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
+                }
                 self.require_layout(scope_id, args[1], None, None)?;
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let k = output(0);
@@ -1618,39 +1665,54 @@ impl<'a> Emitter<'a> {
                     k
                 ));
             }
-            NodeKind::UniformResidueSample { .. } => self.sample_one(
+            NodeKind::UniformResidueSample { .. } => self.sample_one_at(
                 scope,
                 node_id,
                 existentials,
                 relations,
-                &self.options.primitives.uniform_residue_sample,
+                if self.requires_tape {
+                    &self.options.primitives.uniform_residue_sample_at
+                } else {
+                    &self.options.primitives.uniform_residue_sample
+                },
                 &[],
+                true,
             ),
             NodeKind::UniformIntervalSample { range, .. } => {
                 append_expression_guards(&range.minimum, env, relations);
                 append_expression_guards(&range.maximum, env, relations);
                 let lo = env.expr(&range.minimum);
                 let hi = env.expr(&range.maximum);
-                self.sample_one(
+                self.sample_one_at(
                     scope,
                     node_id,
                     existentials,
                     relations,
-                    &self.options.primitives.uniform_interval_sample,
+                    if self.requires_tape {
+                        &self.options.primitives.uniform_interval_sample_at
+                    } else {
+                        &self.options.primitives.uniform_interval_sample
+                    },
                     &[lo, hi],
+                    true,
                 );
             }
             NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let sigma = env.real_expr(sigma);
                 let bound = env.expr(max_coefficient_bound);
-                self.sample_one(
+                self.sample_one_at(
                     scope,
                     node_id,
                     existentials,
                     relations,
-                    &self.options.primitives.gaussian_sample,
+                    if self.requires_tape {
+                        &self.options.primitives.gaussian_sample_at
+                    } else {
+                        &self.options.primitives.gaussian_sample
+                    },
                     &[sigma, bound],
+                    true,
                 );
             }
             NodeKind::MultiplyMonomial => {
@@ -2362,11 +2424,30 @@ impl<'a> Emitter<'a> {
         relation: &str,
         args: &[String],
     ) {
+        self.sample_one_at(scope, node, existentials, relations, relation, args, false);
+    }
+    /// `sample_one`, reading the tape at this node's site when `reads_tape` and the export
+    /// threads a sampling tape.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_one_at(
+        &mut self,
+        scope: &GraphScope,
+        node: NodeId,
+        existentials: &mut Vec<(String, String)>,
+        relations: &mut Vec<String>,
+        relation: &str,
+        args: &[String],
+        reads_tape: bool,
+    ) {
         let name = wire_name(WireRef { node, port: crate::types::Port(0) });
         let ty = self.output_type(scope, node, 0);
         self.bind_existential(&name, &ty);
         existentials.push((name.clone(), ty));
         let mut terms = vec![relation.to_owned()];
+        if reads_tape && self.requires_tape {
+            self.current_uses_tape = true;
+            terms.push(format!("tape (path ++ [{}])", node.0));
+        }
         terms.extend(args.iter().map(|arg| format!("({arg})")));
         terms.push(name);
         relations.push(terms.join(" "));
@@ -2387,11 +2468,19 @@ impl<'a> Emitter<'a> {
             .child_scope_id(scope_id, node)
             .ok_or(ExportError::MissingChildScope { scope: scope_id.clone(), node })?;
         self.current_uses_hash_model |= self.requires_hash_model;
+        self.current_uses_tape |= self.requires_tape;
         let child_name = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             self.scopes[&child],
             if self.requires_backend { " backend" } else { "" },
-            if self.requires_hash_model { " hashModel" } else { "" }
+            if self.requires_hash_model { " hashModel" } else { "" },
+            if !self.requires_tape {
+                String::new()
+            } else if parallel {
+                format!(" tape (path ++ [{}, i.val])", node.0)
+            } else {
+                format!(" tape (path ++ [{}])", node.0)
+            }
         );
         let node_ref = scope.node(node).expect("node");
         let outputs = (0..node_ref.output_types().len())
@@ -2561,11 +2650,17 @@ impl<'a> Emitter<'a> {
             .child_scope_id(scope_id, node)
             .ok_or(ExportError::MissingChildScope { scope: scope_id.clone(), node })?;
         self.current_uses_hash_model |= self.requires_hash_model;
+        self.current_uses_tape |= self.requires_tape;
         let child_name = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             self.scopes[&child],
             if self.requires_backend { " backend" } else { "" },
-            if self.requires_hash_model { " hashModel" } else { "" }
+            if self.requires_hash_model { " hashModel" } else { "" },
+            if self.requires_tape {
+                format!(" tape (path ++ [{}, i])", node.0)
+            } else {
+                String::new()
+            }
         );
         let kind = scope.node(node).expect("node").kind();
         let NodeKind::SequentialLoop(spec) = kind else { unreachable!() };

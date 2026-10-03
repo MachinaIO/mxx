@@ -188,6 +188,7 @@ mod tests {
                 centered_lift: "Mxx.Primitives.centeredLift",
                 message_center: "LweFixture.messageCenter",
                 decoder_radius: "LweFixture.decoderRadius",
+                failure_probability_log2: None,
             },
             &manifests,
             &directory,

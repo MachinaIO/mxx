@@ -192,6 +192,7 @@ mod tests {
             centered_lift: "Mxx.Primitives.centeredLift",
             message_center: "ThresholdFixture.zeroCenter",
             decoder_radius: "ThresholdFixture.decoderRadius",
+            failure_probability_log2: None,
         };
         export_claim(
             &declaration,

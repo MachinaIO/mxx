@@ -69,6 +69,12 @@ pub struct ClaimSemantics<'a> {
     /// Lean function `Nat → Nat` giving the strict error radius for the declared decoder.
     /// This is part of the conclusion to prove, not an assumed bound on executions.
     pub decoder_radius: &'a str,
+    /// `None` states correctness of every execution. `Some(k)` reads every sampled coefficient
+    /// from a sampling tape, stage `i` at site prefix `[i]`, and states that for every hash model
+    /// and external input the tapes with a failing execution have `MxxRuntime.tapeMeasure` at
+    /// most `2^-k`. The stages must then be exported with
+    /// [`super::ExportOptions::sampling_tape`].
+    pub failure_probability_log2: Option<u32>,
 }
 
 pub struct ClaimBackend<'a> {
@@ -423,10 +429,14 @@ pub fn assemble_claim(
             })
             .collect::<Vec<_>>()
             .join(", ");
+        if root.requires_sampling_tape != semantics.failure_probability_log2.is_some() {
+            return Err("root sampling tape does not match the claim semantics".into());
+        }
         let context = format!(
-            "{}{}",
+            "{}{}{}",
             if root.requires_backend { format!(" {backend}") } else { String::new() },
-            if root.requires_hash_model { " hashModel" } else { "" }
+            if root.requires_hash_model { " hashModel" } else { "" },
+            if root.requires_sampling_tape { format!(" tape [{position}]") } else { String::new() }
         );
         source.push_str(&format!(
             "\ndef {field}_params : {} := {{ {params} }}\n",
@@ -456,7 +466,22 @@ pub fn assemble_claim(
     } else {
         "_"
     };
-    source.push_str(&format!("\ndef Runs ({hash_binder} : {}) (external : ExternalInputs)\n    (execution : Execution) : Prop :=\n  {}\n", semantics.hash_model_type, conditions.join(" ∧\n  ")));
+    let tape_binder = if semantics.failure_probability_log2.is_some() {
+        " (tape : MxxRuntime.SampleTape)"
+    } else {
+        ""
+    };
+    source.push_str(&format!("\ndef Runs ({hash_binder} : {}) (external : ExternalInputs){tape_binder}\n    (execution : Execution) : Prop :=\n  {}\n", semantics.hash_model_type, conditions.join(" ∧\n  ")));
+    // The success condition of one execution, quantified over every execution or bounded in
+    // probability over sampling tapes.
+    let correctness = |success: String| match semantics.failure_probability_log2 {
+        None => format!(
+            "def CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    {success}\n\nend GeneratedClaim\n"
+        ),
+        Some(bits) => format!(
+            "def CorrectnessClaim : Prop :=\n  ∀ hashModel external,\n    MxxRuntime.tapeMeasure {{tape | ∃ execution, Runs hashModel external tape execution ∧\n      ¬ ({success})}} ≤ (2 : ENNReal)⁻¹ ^ {bits}\n\nend GeneratedClaim\n"
+        ),
+    };
     let actual = output(claim, &claim.actual)?;
     let ideal = output(claim, &claim.ideal)?;
     if let Endpoint::MatrixApprox { bound } = &claim.endpoint {
@@ -472,7 +497,12 @@ pub fn assemble_claim(
         let actual_value =
             project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
         let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
-        source.push_str(&format!("\n/-- The error witness and its bound are conclusions, never execution premises. -/\ndef CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    Mxx.Primitives.Approx ({actual_value}) ({ideal_value}) {bound}\n\nend GeneratedClaim\n"));
+        source.push_str(
+            "\n/-- The error witness and its bound are conclusions, never execution premises. -/\n",
+        );
+        source.push_str(&correctness(format!(
+            "Mxx.Primitives.Approx ({actual_value}) ({ideal_value}) {bound}"
+        )));
         return Ok(source);
     }
     if let Endpoint::CenteredResidual { residual: residual_port } = &claim.endpoint {
@@ -524,7 +554,10 @@ pub fn assemble_claim(
         let message_center = semantics.message_center;
         let decoder_radius = semantics.decoder_radius;
         source.push_str(&format!("\nnoncomputable def observedResidual (execution : Execution) (index : Fin {count}) : Int :=\n  {centered_lift} {q}\n    ({coefficient} -\n      ({message_center} {q} ({ideal_value}) index : ZMod {q}))\n\n"));
-        source.push_str(&format!("/-- The application proof must establish this proposition; no noise premise is assumed. -/\ndef CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    (∀ index, (observedResidual execution index).natAbs < {decoder_radius} {q}) ∧\n    {actual_value} = {ideal_value}\n\nend GeneratedClaim\n"));
+        source.push_str("/-- The application proof must establish this proposition; no noise premise is assumed. -/\n");
+        source.push_str(&correctness(format!(
+            "(∀ index, (observedResidual execution index).natAbs < {decoder_radius} {q}) ∧\n    {actual_value} = {ideal_value}"
+        )));
         return Ok(source);
     }
     if actual.wire_type != ConcreteWireType::Bool ||
@@ -553,7 +586,10 @@ pub fn assemble_claim(
     let message_center = semantics.message_center;
     let decoder_radius = semantics.decoder_radius;
     source.push_str(&format!("\nnoncomputable def observedResidual (execution : Execution) : Int :=\n  {centered_lift} {q}\n    ((({residual_value}) 0 0).coeff ⟨0, by decide⟩ -\n      ({message_center} {q} {ideal_value} : ZMod {q}))\n\n"));
-    source.push_str(&format!("/-- The application proof must establish this proposition; no noise premise is assumed. -/\ndef CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    (observedResidual execution).natAbs < {decoder_radius} {q} ∧\n    {actual_value} = {ideal_value}\n\nend GeneratedClaim\n"));
+    source.push_str("/-- The application proof must establish this proposition; no noise premise is assumed. -/\n");
+    source.push_str(&correctness(format!(
+        "(observedResidual execution).natAbs < {decoder_radius} {q} ∧\n    {actual_value} = {ideal_value}"
+    )));
     Ok(source)
 }
 
@@ -658,6 +694,7 @@ mod tests {
                 centered_lift: "OtherApplication.centeredLift",
                 message_center: "OtherApplication.messageCenter",
                 decoder_radius: "OtherApplication.decoderRadius",
+                failure_probability_log2: None,
             },
         )
     }
@@ -715,6 +752,7 @@ mod tests {
                 centered_lift: "Mxx.Primitives.centeredLift",
                 message_center: "CenteredResidualFixture.messageCenter",
                 decoder_radius: "CenteredResidualFixture.decoderRadius",
+                failure_probability_log2: None,
             },
         )
         .unwrap();
@@ -850,6 +888,7 @@ mod tests {
                 centered_lift: "Mxx.Primitives.centeredLift",
                 message_center: "MxxWe.messageCenter",
                 decoder_radius: "MxxWe.decoderRadius",
+                failure_probability_log2: None,
             },
         )
         .unwrap();

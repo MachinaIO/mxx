@@ -30,9 +30,12 @@ roots = [
 name = "MxxRuntime"
 roots = [
   "MxxRuntime",
+  "RuntimeGaussian",
   "RuntimeHash",
   "RuntimeLemmas",
   "RuntimeMatrixOps",
   "RuntimeModulusSwitch",
   "RuntimePrimitives",
+  "RuntimeProbability",
+  "RuntimeSampling",
 ]

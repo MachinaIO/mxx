@@ -4,8 +4,8 @@ namespace FheBackend
 
 noncomputable section
 
-def moduli0 : List Nat := [2147377153]
-def layout0 : MxxRuntime.RegularLayout 2147377153 :=
+def moduli0 : List Nat := [65537]
+def layout0 : MxxRuntime.RegularLayout 65537 :=
   { crtModuli := moduli0
     droppedModuli := 0
     dropped_lt := by decide
@@ -13,17 +13,17 @@ def layout0 : MxxRuntime.RegularLayout 2147377153 :=
     modulus_pos := by decide
     pairwise_coprime := by unfold Pairwise; decide
     product_eq := by decide
-    baseBits := 8
-    base := 256
+    baseBits := 6
+    base := 64
     base_eq := by norm_num
     base_gt_one := by norm_num
     base_even := by decide
-    digitsPerTower := 4
+    digitsPerTower := 3
     digits_pos := by norm_num
     capacity := by decide }
 
-def moduli1 : List Nat := [2147389441]
-def layout1 : MxxRuntime.RegularLayout 2147389441 :=
+def moduli1 : List Nat := [79873]
+def layout1 : MxxRuntime.RegularLayout 79873 :=
   { crtModuli := moduli1
     droppedModuli := 0
     dropped_lt := by decide
@@ -31,17 +31,17 @@ def layout1 : MxxRuntime.RegularLayout 2147389441 :=
     modulus_pos := by decide
     pairwise_coprime := by unfold Pairwise; decide
     product_eq := by decide
-    baseBits := 8
-    base := 256
+    baseBits := 6
+    base := 64
     base_eq := by norm_num
     base_gt_one := by norm_num
     base_even := by decide
-    digitsPerTower := 4
+    digitsPerTower := 3
     digits_pos := by norm_num
     capacity := by decide }
 
-def moduli2 : List Nat := [2147389441, 2147377153]
-def layout2 : MxxRuntime.RegularLayout 4611255024196841473 :=
+def moduli2 : List Nat := [65537, 79873]
+def layout2 : MxxRuntime.RegularLayout 5234636801 :=
   { crtModuli := moduli2
     droppedModuli := 0
     dropped_lt := by decide
@@ -49,24 +49,24 @@ def layout2 : MxxRuntime.RegularLayout 4611255024196841473 :=
     modulus_pos := by decide
     pairwise_coprime := by unfold Pairwise; decide
     product_eq := by decide
-    baseBits := 8
-    base := 256
+    baseBits := 6
+    base := 64
     base_eq := by norm_num
     base_gt_one := by norm_num
     base_even := by decide
-    digitsPerTower := 4
+    digitsPerTower := 3
     digits_pos := by norm_num
     capacity := by decide }
 
 def backend : MxxRuntime.BackendContext where
   regularLayout q n :=
-    if h : q = 2147377153 ∧ n = 2048 then
+    if h : q = 65537 ∧ n = 1024 then
       some (h.1.symm ▸ layout0)
     else
-    if h : q = 2147389441 ∧ n = 2048 then
+    if h : q = 79873 ∧ n = 1024 then
       some (h.1.symm ▸ layout1)
     else
-    if h : q = 4611255024196841473 ∧ n = 2048 then
+    if h : q = 5234636801 ∧ n = 1024 then
       some (h.1.symm ▸ layout2)
     else
     none

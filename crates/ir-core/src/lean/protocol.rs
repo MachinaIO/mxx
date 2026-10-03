@@ -72,6 +72,7 @@ pub fn export_claim(
                 namespace: name.clone(),
                 module_name: name.clone(),
                 backend_layouts: backend.layouts.to_vec(),
+                sampling_tape: semantics.failure_probability_log2.is_some(),
                 ..ExportOptions::default()
             },
         )?;

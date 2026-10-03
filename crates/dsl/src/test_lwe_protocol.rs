@@ -1,5 +1,5 @@
-//! Small integer-LWE reference protocol used to test the centered-residual endpoint, integer hash
-//! families, and integer matrix-vector products in the shared correctness machinery.
+//! Small integer-LWE reference protocol used to test exact endpoints, integer hash families, and
+//! integer matrix-vector products in the shared correctness machinery.
 
 use crate::{DslContext, Family, GraphValue, IdealSpec, Int, Ring, artifact_bindings};
 use mxx_ir_core::{
@@ -7,9 +7,9 @@ use mxx_ir_core::{
     protocol::{
         ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec, EndpointBinding,
         EndpointBindings, EndpointSemanticBinding, EndpointSpecId, InputContract,
-        InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
-        OutputRef, ProtocolDecl, ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId,
-        ProtocolPreconditionSpec, ProtocolStage, StageId, StageInputName, Workflow,
+        InputContractEntry, InputValueContract, OutputRef, ProtocolDecl, ProtocolInputBinding,
+        ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage,
+        StageId, StageInputName, Workflow,
     },
 };
 
@@ -23,7 +23,7 @@ pub fn lwe_production() -> ProductionId {
 /// Encryption transfers the ciphertext `(a, b = <a, s> + 32 m - 16 mod 64)` under a hash-derived
 /// mask `a` as a record of an integer family and an integer; decryption decodes the phase `b -
 /// <a, s> mod 64` as `phase < 32`.
-pub fn lwe_protocol(decoder_uses_phase: bool) -> Result<ProtocolDecl, Box<dyn std::error::Error>> {
+pub fn lwe_protocol() -> Result<ProtocolDecl, Box<dyn std::error::Error>> {
     let encryption = DslContext::new("toy-lwe-encrypt");
     let key = Ring::from_crt_moduli(vec![257.into()], 1).bytes_input("hash_key", 32);
     let secret = encryption.int_family_input("secret", 2);
@@ -44,10 +44,8 @@ pub fn lwe_protocol(decoder_uses_phase: bool) -> Result<ProtocolDecl, Box<dyn st
         ArtifactAvailability::Transferred,
     )?;
     let phase = body.sub(mask.matrix_vector_product(&secret).at(0)).rem(MODULUS);
-    let decoded = if decoder_uses_phase { phase.clone() } else { secret.at(0) }
-        .less(Int::constant(MODULUS / 2))
-        .to_int();
-    let decryption = decryption.output("decoded", decoded)?.output("phase", phase)?.build()?;
+    let decoded = phase.less(Int::constant(MODULUS / 2)).to_int();
+    let decryption = decryption.output("decoded", decoded)?.build()?;
 
     let ideal = DslContext::new("toy-lwe-ideal");
     let ideal_message: Int = ideal.input("message", crate::IntType)?;
@@ -56,7 +54,7 @@ pub fn lwe_protocol(decoder_uses_phase: bool) -> Result<ProtocolDecl, Box<dyn st
     let encrypt = StageId("encrypt".to_owned());
     let decrypt = StageId("decrypt".to_owned());
     let stage_id = decrypt.clone();
-    let endpoint = EndpointSpecId::CenteredResidual;
+    let endpoint = EndpointSpecId::Exact;
     let bit = || InputValueContract::IntegerRange { lower: 0.into(), upper: 1.into() };
     let inputs = [
         ("hash_key", InputValueContract::Bytes { length: 32.into() }),
@@ -83,6 +81,8 @@ pub fn lwe_protocol(decoder_uses_phase: bool) -> Result<ProtocolDecl, Box<dyn st
         .collect();
     Ok(ProtocolDecl::new(ProtocolDecl {
         params: Vec::new(),
+        bindings: Default::default(),
+        failure_probability_log2: None,
         bundle: ClosedProtocolBundle {
             workflow: Workflow {
                 stages: vec![
@@ -114,19 +114,11 @@ pub fn lwe_protocol(decoder_uses_phase: bool) -> Result<ProtocolDecl, Box<dyn st
                 entries: vec![EndpointBinding {
                     spec: endpoint,
                     semantics: EndpointSemanticBinding::Exact,
-                    workflow_output: OutputRef {
-                        stage: stage_id.clone(),
-                        output: "decoded".to_owned(),
-                    },
+                    workflow_output: OutputRef { stage: stage_id, output: "decoded".to_owned() },
                     ideal_output: "result".to_owned(),
                 }],
             },
-            operational_decoder_targets: vec![OperationalDecoderTarget {
-                target_id: "toy-lwe-phase".to_owned(),
-                residual: OutputRef { stage: stage_id, output: "phase".to_owned() },
-                endpoint,
-                kind: OperationalDecoderKind::CenteredResidual,
-            }],
+            operational_decoder_targets: Vec::new(),
             endpoint_specs: vec![endpoint],
             input_contract: InputContract {
                 inputs: inputs
@@ -147,70 +139,23 @@ pub fn lwe_protocol(decoder_uses_phase: bool) -> Result<ProtocolDecl, Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_ir_core::{
-        ParamEnv,
-        artifact::export_validated_manifest,
-        lean::{
-            claim::{ClaimBackend, ClaimSemantics},
-            protocol::export_claim,
-        },
-        protocol::BundleValidationError,
-        validate,
-    };
-    use std::{collections::BTreeMap, fs, path::Path};
+    use mxx_ir_core::protocol::BundleValidationError;
+    use std::{fs, path::Path};
 
     #[test]
-    fn test_centered_residual_lwe_protocol_export() {
+    fn test_exact_lwe_protocol_export() {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_data/lean_ir_fixtures/lwe_protocol");
         // The stage layout is part of the fixture; drop modules of an earlier layout.
         let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        let declaration = lwe_protocol(true).unwrap();
-        let producer = validate(&declaration.stages()[0].graph, &ParamEnv::default()).unwrap();
-        let manifests = BTreeMap::from([(
-            lwe_production(),
-            export_validated_manifest(lwe_production(), &producer).unwrap(),
-        )]);
-        fs::write(directory.join("LweFixture.lean"), LWE_SEMANTICS).unwrap();
+        mxx_ir_core::lean::protocol::export(&lwe_protocol().unwrap(), &directory)
+            .expect("generic export accepts the exact endpoint");
         fs::write(directory.join("LweProof.lean"), LWE_PROOF).unwrap();
-        export_claim(
-            &declaration,
-            &ParamEnv::default(),
-            &ClaimBackend {
-                module_name: "LweFixture",
-                context_name: "LweFixture.backend",
-                layouts: &[],
-            },
-            &ClaimSemantics {
-                imports: &["LweFixture"],
-                hash_model_type: "MxxRuntime.HashModel",
-                centered_lift: "Mxx.Primitives.centeredLift",
-                message_center: "LweFixture.messageCenter",
-                decoder_radius: "LweFixture.decoderRadius",
-                failure_probability_log2: None,
-            },
-            &manifests,
-            &directory,
-        )
-        .expect("generic export accepts the centered-residual decoder");
-        fs::write(
-            directory.join("Certificate.lean"),
-            mxx_ir_core::lean::claim::assemble_certificate("LweProof", "LweProof.correctness")
-                .unwrap(),
-        )
-        .unwrap();
+        fs::write(directory.join("Certificate.lean"), LWE_CERTIFICATE).unwrap();
 
         let source = fs::read_to_string(directory.join("Claim.lean")).unwrap();
         let (premises, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
-        assert!(premises.contains("(index : Fin 1)"));
-        assert!(premises.contains(": Int) : ZMod 64)"));
-        assert!(premises.contains("LweFixture.messageCenter 64"));
-        assert!(!premises.contains(".natAbs <"));
-        assert!(conclusion.contains(
-            "(∀ index, (observedResidual execution index).natAbs < LweFixture.decoderRadius 64)"
-        ));
-        assert!(conclusion.contains(" = execution.«ideal»"));
+        assert!(conclusion.contains("execution.«stage_1» = execution.«ideal»"));
         assert!(
             premises.contains("(execution.«stage_0».2.1, execution.«stage_0».1, external.input_1")
         );
@@ -221,46 +166,19 @@ mod tests {
     }
 
     #[test]
-    fn centered_residual_decoder_must_depend_on_the_residual() {
-        let Err(error) = lwe_protocol(false) else { panic!("an unrelated decoder was accepted") };
-        assert!(matches!(
-            error.downcast_ref::<mxx_ir_core::protocol::ProtocolError>(),
-            Some(mxx_ir_core::protocol::ProtocolError::InvalidBundle(
-                BundleValidationError::InvalidOperationalDecoderTarget
-            ))
-        ));
+    fn exact_endpoint_requires_exact_semantics() {
+        let mut bundle = lwe_protocol().unwrap().bundle;
+        bundle.endpoints.entries[0].semantics = EndpointSemanticBinding::ThresholdDecode;
+        assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidEndpointSemantics));
     }
 
-    #[test]
-    fn centered_residual_target_requires_a_reduced_residual_and_matching_kind() {
-        let protocol = lwe_protocol(true).unwrap();
-        let mut unreduced = protocol.bundle.clone();
-        unreduced.operational_decoder_targets[0].residual.output = "decoded".to_owned();
-        assert_eq!(
-            unreduced.validate(),
-            Err(BundleValidationError::InvalidOperationalDecoderTarget)
-        );
-        let mut mismatched = protocol.bundle.clone();
-        mismatched.operational_decoder_targets[0].kind = OperationalDecoderKind::BooleanInterval;
-        assert_eq!(
-            mismatched.validate(),
-            Err(BundleValidationError::OperationalDecoderTargetKindMismatch)
-        );
-        let mut wrong_semantics = protocol.bundle;
-        wrong_semantics.endpoints.entries[0].semantics = EndpointSemanticBinding::ThresholdDecode;
-        assert_eq!(
-            wrong_semantics.validate(),
-            Err(BundleValidationError::InvalidEndpointSemantics)
-        );
-    }
+    /// Checks that the proof's theorem has exactly the generated statement.
+    const LWE_CERTIFICATE: &str = "import Claim
+import LweProof
 
-    const LWE_SEMANTICS: &str = "import MxxRuntime
-namespace LweFixture
-/-- The encoded bit `32 m - 16 mod 64`, subtracted from the phase. -/
-def messageCenter (_ : Nat) (message : Int) (_ : Fin 1) : Int := if message = 1 then 16 else 48
-/-- Phases strictly within 16 of their center decode correctly and keep the gate margin. -/
-def decoderRadius (_ : Nat) : Nat := 16
-end LweFixture
+theorem certificate : GeneratedClaim.CorrectnessClaim := LweProof.correctness
+
+#print axioms certificate
 ";
 
     const LWE_PROOF: &str = r#"import Claim
@@ -289,14 +207,9 @@ theorem correctness : CorrectnessClaim := by
       omega
     · rw [hm, if_pos rfl]
       omega
-  refine ⟨fun index ↦ ?_, ?_⟩
-  · unfold observedResidual
-    rw [hdecoded, hideal]
-    simp only [hphase, LweFixture.messageCenter, LweFixture.decoderRadius, sub_self]
-    simp [Mxx.Primitives.centeredLift]
-  · rw [hdecoded, hideal]
-    simp only [hphase]
-    rcases hm with hm | hm <;> simp [hm]
+  rw [hdecoded, hideal]
+  simp only [hphase]
+  rcases hm with hm | hm <;> simp [hm]
 
 end LweProof
 "#;

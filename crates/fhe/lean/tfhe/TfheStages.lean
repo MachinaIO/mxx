@@ -142,19 +142,18 @@ theorem encrypt_right_spec {hashModel : HashModel} {tape : SampleTape} {key : By
   rw [h22, hcentered, dot_entry hdot]
   rfl
 
-/-- Decryption: the canonical phase and its sign decoding. -/
-theorem decrypt_spec {tape : SampleTape} {b : Int} {mask secret : Fin lweN → Int} {outputs}
-    (h : Stage_decrypt.generatedRoot tape [4] { unit := () } (b, mask, secret, ()) outputs) :
-    outputs.2.1 = (b - ∑ j : Fin lweN, mask j * secret j) % q ∧
-    outputs.1 = 1 - (if (if 2 * outputs.2.1 ≤ q then outputs.2.1 else outputs.2.1 - q) < 0
-      then 1 else 0) := by
+/-- Decryption: the sign decoding of the canonical phase. -/
+theorem decrypt_spec {tape : SampleTape} {b : Int} {mask secret : Fin lweN → Int} {bit : Int}
+    (h : Stage_decrypt.generatedRoot tape [4] { unit := () } (b, mask, secret, ()) bit) :
+    ∃ phase, phase = (b - ∑ j : Fin lweN, mask j * secret j) % q ∧
+      bit = 1 - (if (if 2 * phase ≤ q then phase else phase - q) < 0 then 1 else 0) := by
   obtain ⟨witness, hdot, _, _, _, _, hsel, hout⟩ := h
   subst hout
   have h16 := select_two hsel
   rw [mul_comm] at h16
+  refine ⟨_, rfl, ?_⟩
   simp only [q, Nat.cast_ofNat]
-  rw [dot_entry hdot] at h16 ⊢
-  refine ⟨rfl, ?_⟩
+  rw [dot_entry hdot] at h16
   rw [h16]
   simp only [decide_eq_true_eq]
 
@@ -166,19 +165,19 @@ theorem ideal_spec {tape : SampleTape} {left right out : Int}
 
 /-! ## Key generation -/
 
-theorem backend_layout : FheBackend.backend.regularLayout Q N = some FheBackend.layout2 := by
-  simp [FheBackend.backend]
+theorem backend_layout : Backend.backend.regularLayout Q N = some Backend.layout0 := by
+  simp [Backend.backend]
 
-theorem layout2_exact : FheBackend.layout2.droppedModuli = 0 := rfl
+theorem layout_exact : Backend.layout0.droppedModuli = 0 := rfl
 
-theorem layout2_digitCount : FheBackend.layout2.digitCount = 6 := by decide
+theorem layout_digitCount : Backend.layout0.digitCount = 6 := by decide
 
 /-- The gadget row of the bootstrapping keys. -/
 noncomputable def gadgetRow : ExactMatrix Q N 1 6 :=
-  castMatrixColumns (by rw [layout2_digitCount]) (regularGadgetMatrix (rows := 1) FheBackend.layout2)
+  castMatrixColumns (by rw [layout_digitCount]) (regularGadgetMatrix (rows := 1) Backend.layout0)
 
 theorem gadgetMatrixRuns_eq {g : ExactMatrix Q N 1 6}
-    (hg : gadgetMatrixRuns FheBackend.backend 64 6 g) : g = gadgetRow := by
+    (hg : gadgetMatrixRuns Backend.backend 64 6 g) : g = gadgetRow := by
   obtain ⟨layout, hl, _, _, _, hgeq⟩ := hg
   rw [backend_layout] at hl
   cases hl
@@ -233,7 +232,7 @@ theorem split_twelve (c : Fin 12) :
 
 /-- What key generation establishes, in terms of the sampling tape. -/
 theorem keygen_spec {hashModel : HashModel} {tape : SampleTape} {key : ByteArray} {outputs}
-    (h : Stage_keygen.generatedRoot FheBackend.backend hashModel tape [0] { unit := () } key
+    (h : Stage_keygen.generatedRoot Backend.backend hashModel tape [0] { unit := () } key
       outputs) :
     outputs.2.2.2.2.1 = lweSecret tape ∧
     (∀ j, lweSecret tape j = 0 ∨ lweSecret tape j = 1) ∧

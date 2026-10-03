@@ -41,8 +41,7 @@ theorem run_correct {hashModel : HashModel} {external : ExternalInputs} {t : Sam
     (hWL : x.«stage_1».1 = W.maskL) (hWR : x.«stage_2».1 = W.maskR)
     (hmL : W.messageL = external.input_1) (hmR : W.messageR = external.input_3)
     (hW : ∑ j, lweSecret t j ≤ 506) (hY : |noiseY W t| < Δ - allowance) :
-    (∀ index, (observedResidual x index).natAbs < TfheSemantics.decoderRadius 4294967296) ∧
-      x.«stage_4».1 = x.«ideal» := by
+    x.«stage_4» = x.«ideal» := by
   obtain ⟨hvalid, hk, hl, hr, hn, hd, hi⟩ := hruns
   obtain ⟨hsec, hs, hZ, hA, hB, _, _, hks⟩ := keygen_spec hk
   obtain ⟨_, ⟨hm1a, hm1b⟩, _, ⟨hm2a, hm2b⟩, _⟩ := hvalid
@@ -66,17 +65,17 @@ theorem run_correct {hashModel : HashModel} {external : ExternalInputs} {t : Sam
     rw [show (-536870912 : ℝ) = ((-536870912 : ℤ) : ℝ) by norm_num] at h1
     rw [show (536870912 : ℝ) = ((536870912 : ℤ) : ℝ) by norm_num] at h2
     exact ⟨Int.cast_lt.mp h1, Int.cast_lt.mp h2⟩
-  obtain ⟨hdec, hbit⟩ := decrypt_spec hd
+  obtain ⟨phase, hdec, hbit⟩ := decrypt_spec hd
   rw [hsec] at hdec
   have hideal := ideal_spec hi
   rw [hmL, hmR] at hphase
   -- The decryption phase is the NAND output phase.
-  have hv : ((x.«stage_4».2.1 : Int) : ZMod q) =
+  have hv : ((phase : Int) : ZMod q) =
       (((1 - external.input_1 * external.input_3) * 2 - 1) * Δ + η : Int) := by
     rw [hdec, ZMod.intCast_mod]
     exact hphase
   have hvq := (ZMod.intCast_eq_intCast_iff' _ _ _).mp hv
-  have hrange : 0 ≤ x.«stage_4».2.1 ∧ x.«stage_4».2.1 < 4294967296 := by
+  have hrange : 0 ≤ phase ∧ phase < 4294967296 := by
     rw [hdec]
     simp only [q, Nat.cast_ofNat]
     omega
@@ -84,27 +83,9 @@ theorem run_correct {hashModel : HashModel} {external : ExternalInputs} {t : Sam
   rw [Int.emod_eq_of_lt hrange.1 hrange.2] at hvq
   have hm1' : external.input_1 = 0 ∨ external.input_1 = 1 := by omega
   have hm2' : external.input_3 = 0 ∨ external.input_3 = 1 := by omega
-  constructor
-  · intro index
-    unfold observedResidual TfheSemantics.messageCenter TfheSemantics.decoderRadius
-    have hres : ((x.«stage_4».2.1 : Int) : ZMod 4294967296) -
-        (((if x.«ideal» = 1 then 536870912 else (4294967296 : Nat) - 536870912 : Int) :
-          Int) : ZMod 4294967296) = (η : ZMod 4294967296) := by
-      have hq0 : ((4294967296 : Int) : ZMod 4294967296) = 0 := by
-        exact_mod_cast ZMod.natCast_self 4294967296
-      have hq0' : (4294967296 : ZMod 4294967296) = 0 := by simpa using hq0
-      rw [show (x.«stage_4».2.1 : ZMod 4294967296) = ((x.«stage_4».2.1 : Int) :
-        ZMod q) from rfl, hv, hideal]
-      simp only [Δ]
-      rcases hm1' with h1 | h1 <;> rcases hm2' with h2 | h2 <;>
-        · simp only [h1, h2]
-          norm_num
-          try (ring_nf; simp [hq0'])
-    rw [hres, centeredLift_intCast (by decide) (by omega)]
-    omega
-  · rw [hbit, hideal]
-    rcases hm1' with h1 | h1 <;> rcases hm2' with h2 | h2 <;> simp only [h1, h2] at hvq ⊢ <;>
-      split_ifs <;> omega
+  rw [hbit, hideal]
+  rcases hm1' with h1 | h1 <;> rcases hm2' with h2 | h2 <;> simp only [h1, h2] at hvq ⊢ <;>
+    split_ifs <;> omega
 
 /-- `exp (-x) ≤ 2^-k` when `x ≥ k · 0.6931471808`, which exceeds `k log 2`. -/
 theorem exp_neg_le_half_pow {x : ℝ} {k : ℕ} (h : (k : ℝ) * 0.6931471808 ≤ x) :
@@ -152,8 +133,7 @@ theorem correctness : CorrectnessClaim := by
   · obtain ⟨t0, x0, h0⟩ := hex
     let W : World := ⟨x0.«stage_1».1, x0.«stage_2».1, external.input_1, external.input_3⟩
     have hsub : {tape | ∃ execution, Runs hashModel external tape execution ∧
-        ¬((∀ index, (observedResidual execution index).natAbs <
-          TfheSemantics.decoderRadius 4294967296) ∧ execution.«stage_4».1 = execution.«ideal»)} ⊆
+        ¬(execution.«stage_4» = execution.«ideal»)} ⊆
         {t | (507 : ℤ) ≤ ∑ j : Fin lweN, lweSecret t j} ∪
           {t | (Δ : ℝ) - allowance ≤ |noiseY W t|} := by
       rintro t ⟨x, hx, hfail⟩
@@ -171,9 +151,7 @@ theorem correctness : CorrectnessClaim := by
         add_le_add hamming_tail (noiseY_tail W (by simp only [allowance, Δ]; norm_num))
       _ ≤ (2 : ENNReal)⁻¹ ^ 128 := final_numeric
   · have hempty : {tape | ∃ execution, Runs hashModel external tape execution ∧
-        ¬((∀ index, (observedResidual execution index).natAbs <
-          TfheSemantics.decoderRadius 4294967296) ∧ execution.«stage_4».1 = execution.«ideal»)} =
-        ∅ := by
+        ¬(execution.«stage_4» = execution.«ideal»)} = ∅ := by
       ext t
       simp only [Set.mem_setOf_eq, Set.mem_empty_iff_false, iff_false, not_exists, not_and]
       intro x hx

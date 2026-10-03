@@ -15,10 +15,10 @@ open Mxx.Primitives MxxRuntime
 
 /-- The digits of a two-row column under the ring gadget. -/
 noncomputable def decompose (diff : ExactMatrix Q N 2 1) : ExactMatrix Q N 12 1 :=
-  castMatrixRows (by rw [layout2_digitCount]) (regularDecomposeMatrix FheBackend.layout2 diff)
+  castMatrixRows (by rw [layout_digitCount]) (regularDecomposeMatrix Backend.layout0 diff)
 
 theorem gadgetDecomposeRuns_eq {diff : ExactMatrix Q N 2 1} {D : ExactMatrix Q N 12 1}
-    (hD : gadgetDecomposeRuns FheBackend.backend 64 6 diff D) : D = decompose diff := by
+    (hD : gadgetDecomposeRuns Backend.backend 64 6 diff D) : D = decompose diff := by
   obtain ⟨layout, hl, _, _, _, hdeq, _⟩ := hD
   rw [backend_layout] at hl
   cases hl
@@ -29,26 +29,26 @@ theorem gadgetDecomposeRuns_eq {diff : ExactMatrix Q N 2 1} {D : ExactMatrix Q N
 theorem gadget_reconstruct (diff : ExactMatrix Q N 2 1) :
     (∑ c : Fin 6, gadgetRow 0 c * decompose diff (Fin.castAdd 6 c) 0) = diff 0 0 ∧
     (∑ c : Fin 6, gadgetRow 0 c * decompose diff (Fin.natAdd 6 c) 0) = diff 1 0 := by
-  have hrec := regularGadgetMatrix_reconstruct FheBackend.layout2 diff (by decide) (by decide)
-    layout2_exact
+  have hrec := regularGadgetMatrix_reconstruct Backend.layout0 diff (by decide) (by decide)
+    layout_exact
   refine ⟨?_, ?_⟩ <;>
   · rw [← congrFun (congrFun hrec _) 0, Matrix.mul_apply]
     simp only [gadgetRow, decompose, castMatrixColumns_apply, castMatrixRows_apply]
-    rw [← (finCongr (by rw [layout2_digitCount] : 6 + 6 = 2 * FheBackend.layout2.digitCount)).sum_comp]
+    rw [← (finCongr (by rw [layout_digitCount] : 6 + 6 = 2 * Backend.layout0.digitCount)).sum_comp]
     rw [Fin.sum_univ_add]
-    simp only [regularGadgetMatrix_two_rows FheBackend.layout2 layout2_exact, finCongr_apply,
+    simp only [regularGadgetMatrix_two_rows Backend.layout0 layout_exact, finCongr_apply,
       Fin.val_cast, Fin.val_castAdd, Fin.val_natAdd]
-    have hlow (x : Fin 6) : (x : Nat) / FheBackend.layout2.digitCount = 0 := by
-      rw [layout2_digitCount]; exact Nat.div_eq_of_lt x.isLt
-    have hhigh (x : Fin 6) : (6 + (x : Nat)) / FheBackend.layout2.digitCount = 1 := by
-      rw [layout2_digitCount]; omega
+    have hlow (x : Fin 6) : (x : Nat) / Backend.layout0.digitCount = 0 := by
+      rw [layout_digitCount]; exact Nat.div_eq_of_lt x.isLt
+    have hhigh (x : Fin 6) : (6 + (x : Nat)) / Backend.layout0.digitCount = 1 := by
+      rw [layout_digitCount]; omega
     simp only [hlow, hhigh, Fin.val_zero, Fin.val_one, if_true, if_false, zero_ne_one,
       one_ne_zero, zero_mul, Finset.sum_const_zero, add_zero, zero_add]
     apply Finset.sum_congr rfl
     intro x _
     congr 2
     apply Fin.ext
-    simp [layout2_digitCount, Nat.mod_eq_of_lt x.isLt]
+    simp [layout_digitCount, Nat.mod_eq_of_lt x.isLt]
 
 /-- The centered integer digits. -/
 noncomputable def digitInts (diff : ExactMatrix Q N 2 1) : ErrorMatrix N 12 1 :=
@@ -61,10 +61,10 @@ theorem decompose_eq_reduce (diff : ExactMatrix Q N 2 1) (r : Fin 12) (c : Fin 1
 /-- Every digit is within `32`. -/
 theorem digitInts_bound (diff : ExactMatrix Q N 2 1) (r : Fin 12) (c : Fin 1) (k : Fin N) :
     |(digitInts diff r c).coeff k| ≤ 32 := by
-  have hbound := regularDecomposeMatrix_bounded FheBackend.layout2 diff (by decide) (by decide)
-  obtain ⟨witness, hwitness, hb⟩ : PreimageWithin (decompose diff) (FheBackend.layout2.base / 2) :=
+  have hbound := regularDecomposeMatrix_bounded Backend.layout0 diff (by decide) (by decide)
+  obtain ⟨witness, hwitness, hb⟩ : PreimageWithin (decompose diff) (Backend.layout0.base / 2) :=
     preimageWithin_castMatrixRows _ hbound
-  have hbase : FheBackend.layout2.base / 2 = 32 := by decide
+  have hbase : Backend.layout0.base / 2 = 32 := by decide
   rw [hbase] at hb
   have hentry : decompose diff r c = reducePoly Q N (witness r c) := by
     rw [show decompose diff = _ from hwitness]
@@ -259,7 +259,7 @@ theorem blind_rotation_runs {W : World} {t : SampleTape} {tape : SampleTape} {pa
     {A B : Fin lweN → ExactMatrix Q N 1 12} (hA : A = gswA t) (hB : B = gswB t)
     {P : ExactMatrix Q N 1 1} (hP : P 0 0 = lutPoly) {e0 : Int} (he0 : e0 = initialExp W t)
     {masks : Fin lweN → Int} (hmasks : masks = combinedMask W) {outputs}
-    (h : Stage_nand.scope_tfhe_blind_rotation FheBackend.backend tape path { unit := () }
+    (h : Stage_nand.scope_tfhe_blind_rotation Backend.backend tape path { unit := () }
       (0, multiplyMonomial P e0, masks, A, B, ()) outputs) :
     outputs.1 0 0 = accSeq W t lweN 0 0 ∧ outputs.2.1 0 0 = accSeq W t lweN 1 0 := by
   obtain ⟨witness, hcat, _, hround, _, hiter, _, _, _, _, _, _, hs8, _, _, _, _, _, _, hs9, hout⟩ := h

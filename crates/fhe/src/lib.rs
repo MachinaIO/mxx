@@ -30,7 +30,6 @@
 
 mod bgv;
 mod params;
-pub mod protocol;
 #[cfg(all(test, feature = "gpu"))]
 mod tests_gpu;
 mod tfhe;

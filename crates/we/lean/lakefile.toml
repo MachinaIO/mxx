@@ -7,10 +7,6 @@ relaxedAutoImplicit = false
 pp.unicode.fun = true
 
 [[require]]
-name = "MxxBackends"
-path = "../../backends/lean"
-
-[[require]]
 name = "mxx-ir-core"
 path = "../../ir-core/lean"
 

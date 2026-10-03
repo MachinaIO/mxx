@@ -1,5 +1,4 @@
 import Backend
-import BgvSemantics
 import Stage_keygen
 import Stage_encrypt_x
 import Stage_encrypt_y
@@ -29,7 +28,7 @@ structure Execution where
   «stage_3» : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 3 1
   «stage_4» : Mxx.Primitives.ExactMatrix 5846006548020969210596774788483421161649837621249 8192 2 1
   «stage_5» : Mxx.Primitives.ExactMatrix 324518553605595287786984016396289 8192 2 1
-  «stage_6» : Mxx.Primitives.ExactMatrix 324518553605595287786984016396289 8192 1 1 × (Fin 8192 → Int) × Unit
+  «stage_6» : Fin 8192 → Int
   «ideal» : Fin 8192 → Int
 
 def stage_0_params : Stage_keygen.Params := { «unit» := () }
@@ -60,15 +59,9 @@ def Runs (_ : MxxRuntime.HashModel) (external : ExternalInputs)
   Stage_decrypt.generatedRoot stage_6_params ((execution.«stage_5», execution.«stage_0».2.2.1, ())) execution.«stage_6» ∧
   Ideal.generatedRoot ideal_params ((external.input_0, external.input_1, ())) execution.«ideal»
 
-noncomputable def observedResidual (execution : Execution) (index : Fin 8192) : Int :=
-  Mxx.Primitives.centeredLift 324518553605595287786984016396289
-    (((execution.«stage_6».1) 0 0).coeff index -
-      (BgvSemantics.messageCenter 324518553605595287786984016396289 (execution.«ideal») index : ZMod 324518553605595287786984016396289))
-
-/-- The application proof must establish this proposition; no noise premise is assumed. -/
+/-- Every execution's endpoint equals the ideal one. -/
 def CorrectnessClaim : Prop :=
   ∀ hashModel external execution, Runs hashModel external execution →
-    (∀ index, (observedResidual execution index).natAbs < BgvSemantics.decoderRadius 324518553605595287786984016396289) ∧
-    execution.«stage_6».2.1 = execution.«ideal»
+    execution.«stage_6» = execution.«ideal»
 
 end GeneratedClaim

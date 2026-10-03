@@ -124,7 +124,7 @@ theorem nand_spec {W : World} {t : SampleTape} (hs : ∀ j, lweSecret t j = 0 �
     (hl : EncryptionFacts t 1 (lweSecret t) W.messageL left) (hlm : left.1 = W.maskL)
     (hr : EncryptionFacts t 2 (lweSecret t) W.messageR right) (hrm : right.1 = W.maskR)
     {A B : Fin lweN → ExactMatrix Q N 1 12} (hA : A = gswA t) (hB : B = gswB t) {outputs}
-    (h : Stage_nand.generatedRoot FheBackend.backend t [3] { unit := () }
+    (h : Stage_nand.generatedRoot Backend.backend t [3] { unit := () }
       (kska, left.2.1, right.2.1, left.1, right.1, A, B, kskb, ()) outputs) :
     ∃ η : Int, ((outputs.2.1 - ∑ j : Fin lweN, outputs.1 j * lweSecret t j : Int) : ZMod q) =
         (((1 - W.messageL * W.messageR) * 2 - 1) * Δ + η : Int) ∧

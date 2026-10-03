@@ -48,7 +48,6 @@ pub mod gpu_subgraph_kernel;
 #[path = "gpu_runtime_metrics.rs"]
 pub mod gpu_warmup;
 pub mod host_control;
-pub mod lean;
 mod runtime_env;
 pub mod session;
 pub mod transcript;

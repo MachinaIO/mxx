@@ -227,10 +227,11 @@ another, and this has not succeeded so far.
 
 **In progress: correctness statements generated from the protocol.** Instead, we are developing a
 *statement compiler*. It reads the DSL description of a protocol and deterministically generates
-a correctness statement in Lean. The statement says that, at specific parameters, the noise left at
-the end of the protocol is below a specific threshold. Anyone who trusts the statement compiler
-and the Lean kernel can then delegate the noise growth simulation and the Lean proofs to an AI.
-A human does not have to audit all of that work, only check that a fixed Lean theorem passes.
+a correctness statement in Lean. The statement says that, at specific parameters, the protocol
+returns what its ideal functionality computes, for every execution or except with a stated
+failure probability. Anyone who trusts the statement compiler and the Lean kernel can then
+delegate the noise growth simulation and the Lean proofs to an AI. A human does not have to audit
+all of that work, only check that a fixed Lean theorem passes.
 The TFHE NAND gate and the BGV round trip of `mxx-fhe` already have generated statements
 with complete Lean proofs at their test parameters; the TFHE statement bounds the failure
 probability by `2^-128`, assuming ideal samplers. See the

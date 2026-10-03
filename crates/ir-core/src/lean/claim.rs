@@ -1,6 +1,9 @@
-//! Application-independent linking of exported graphs and threshold correctness claims.
-//! Claims are propositions to prove, never assumed conclusions.
-use super::{BackendLayout, BoundaryValue, LeanArtifact};
+//! Application-independent linking of exported graphs and their correctness claims.
+//! Claims are propositions to prove, never assumed conclusions. A claim states only what the
+//! protocol computes: the workflow endpoint equals the ideal one, for every execution or except
+//! with a bounded probability. Noise bounds and other margins are proof obligations, not part of
+//! the statement.
+use super::{BoundaryValue, LeanArtifact};
 use crate::{Graph, IntExpr, ParamEnv, types::ConcreteWireType};
 use std::collections::BTreeSet;
 
@@ -56,49 +59,17 @@ pub struct Link {
     pub consumer: Port,
 }
 
-/// Names supplied by the owning semantic Lean packages. No semantic premise is added.
-pub struct ClaimSemantics<'a> {
-    pub imports: &'a [&'a str],
-    pub hash_model_type: &'a str,
-    pub centered_lift: &'a str,
-    /// Lean function giving the center subtracted from the designated residual output: `Nat →
-    /// Bool → Nat` for [`Endpoint::BooleanInterval`], and `Nat → τ → Fin k → Int` for
-    /// [`Endpoint::CenteredResidual`], where `τ` is the ideal output type and `k` the residual's
-    /// coefficient count. Use zero when the graph has already subtracted the encoded message.
-    pub message_center: &'a str,
-    /// Lean function `Nat → Nat` giving the strict error radius for the declared decoder.
-    /// This is part of the conclusion to prove, not an assumed bound on executions.
-    pub decoder_radius: &'a str,
-    /// `None` states correctness of every execution. `Some(k)` reads every sampled coefficient
-    /// from a sampling tape, stage `i` at site prefix `[i]`, and states that for every hash model
-    /// and external input the tapes with a failing execution have `MxxRuntime.tapeMeasure` at
-    /// most `2^-k`. The stages must then be exported with
-    /// [`super::ExportOptions::sampling_tape`].
-    pub failure_probability_log2: Option<u32>,
-}
+/// The generated module holding the gadget layouts of every root, and its context.
+pub const BACKEND_MODULE: &str = "Backend";
+pub const BACKEND_CONTEXT: &str = "Backend.backend";
 
-pub struct ClaimBackend<'a> {
-    pub module_name: &'a str,
-    pub context_name: &'a str,
-    pub layouts: &'a [BackendLayout],
-}
-
-/// Application-independent endpoint semantics, with the bound in the conclusion only.
+/// Application-independent endpoint semantics, stated in the conclusion only.
 #[derive(Clone, Debug)]
 pub enum Endpoint {
-    BooleanInterval {
-        residual: Port,
-    },
-    MatrixApprox {
-        bound: num_bigint::BigUint,
-    },
-    /// Exact equality of Boolean, integer, or family endpoints, with every coefficient of the
-    /// residual within the decoder radius after centering. A scalar-polynomial residual uses its
-    /// ring modulus and all coefficients; an integer residual `value % modulus` uses that
-    /// compile-time modulus as its only coefficient.
-    CenteredResidual {
-        residual: Port,
-    },
+    /// Exact equality of Boolean, integer, or family endpoints.
+    Exact,
+    /// Matrix endpoints within `bound` of each other (`Mxx.Primitives.Approx`).
+    MatrixApprox { bound: num_bigint::BigUint },
 }
 
 /// Shared externals, acyclic graph connections and one typed endpoint.
@@ -110,6 +81,12 @@ pub struct LinkedClaim<'a> {
     pub actual: Port,
     pub ideal: Port,
     pub endpoint: Endpoint,
+    /// `None` states correctness of every execution. `Some(k)` reads every sampled coefficient
+    /// from a sampling tape, stage `i` at site prefix `[i]`, and states that for every hash model
+    /// and external input the tapes with a failing execution have `MxxRuntime.tapeMeasure` at
+    /// most `2^-k`. The roots must then be exported with
+    /// [`super::ExportOptions::sampling_tape`].
+    pub failure_probability_log2: Option<u32>,
 }
 
 fn tuple(values: &[String]) -> String {
@@ -227,15 +204,8 @@ fn input_contract_predicate(
     }
 }
 
-fn check_root(
-    root: &ClaimRoot<'_>,
-    bindings: &ParamEnv,
-    backend: &ClaimBackend<'_>,
-) -> Result<(), String> {
+fn check_root(root: &ClaimRoot<'_>, bindings: &ParamEnv) -> Result<(), String> {
     let artifact = root.artifact;
-    if artifact.backend_layouts.iter().any(|layout| !backend.layouts.contains(layout)) {
-        return Err("generated backend does not cover exported layouts".into());
-    }
     let expected = crate::encoding::spec_hash(root.graph, bindings).map_err(|e| e.to_string())?;
     if artifact.spec_hash != expected {
         return Err("generated graph or compile bindings mismatch".into());
@@ -307,19 +277,15 @@ fn output<'a>(claim: &'a LinkedClaim<'_>, port: &Port) -> Result<&'a BoundaryVal
         .ok_or_else(|| "missing output port".into())
 }
 
-/// Assemble a claim after checking graph identities, backend coverage and exact boundary wiring.
-pub fn assemble_claim(
-    claim: &LinkedClaim<'_>,
-    bindings: &ParamEnv,
-    backend: &ClaimBackend<'_>,
-    semantics: &ClaimSemantics<'_>,
-) -> Result<String, String> {
+/// Assemble a claim after checking graph identities and exact boundary wiring. Roots that use
+/// gadgets read their layouts from [`BACKEND_MODULE`], which must cover every root's layouts.
+pub fn assemble_claim(claim: &LinkedClaim<'_>, bindings: &ParamEnv) -> Result<String, String> {
     let mut fields = BTreeSet::new();
     for root in &claim.roots {
         if super::valid_identifier(&root.field).is_err() || !fields.insert(&root.field) {
             return Err("invalid or duplicate execution field".into());
         }
-        check_root(root, bindings, backend)?;
+        check_root(root, bindings)?;
     }
     let entries =
         claim.roots.iter().map(|root| (root.artifact, root.field.clone())).collect::<Vec<_>>();
@@ -382,12 +348,8 @@ pub fn assemble_claim(
             return Err("duplicate artifact/external binding".into());
         }
     }
-    let backend_module = backend.module_name;
-    let backend = backend.context_name;
-    let mut source = format!("import {backend_module}\n");
-    for import in semantics.imports {
-        source.push_str(&format!("import {import}\n"));
-    }
+    let backend = BACKEND_CONTEXT;
+    let mut source = format!("import {BACKEND_MODULE}\n");
     for (artifact, _) in &entries {
         source.push_str(&format!("import {}\n", artifact.module_name));
     }
@@ -429,8 +391,8 @@ pub fn assemble_claim(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        if root.requires_sampling_tape != semantics.failure_probability_log2.is_some() {
-            return Err("root sampling tape does not match the claim semantics".into());
+        if root.requires_sampling_tape != claim.failure_probability_log2.is_some() {
+            return Err("root sampling tape does not match the failure probability".into());
         }
         let context = format!(
             "{}{}{}",
@@ -466,15 +428,15 @@ pub fn assemble_claim(
     } else {
         "_"
     };
-    let tape_binder = if semantics.failure_probability_log2.is_some() {
+    let tape_binder = if claim.failure_probability_log2.is_some() {
         " (tape : MxxRuntime.SampleTape)"
     } else {
         ""
     };
-    source.push_str(&format!("\ndef Runs ({hash_binder} : {}) (external : ExternalInputs){tape_binder}\n    (execution : Execution) : Prop :=\n  {}\n", semantics.hash_model_type, conditions.join(" ∧\n  ")));
+    source.push_str(&format!("\ndef Runs ({hash_binder} : {}) (external : ExternalInputs){tape_binder}\n    (execution : Execution) : Prop :=\n  {}\n", "MxxRuntime.HashModel", conditions.join(" ∧\n  ")));
     // The success condition of one execution, quantified over every execution or bounded in
     // probability over sampling tapes.
-    let correctness = |success: String| match semantics.failure_probability_log2 {
+    let correctness = |success: String| match claim.failure_probability_log2 {
         None => format!(
             "def CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    {success}\n\nend GeneratedClaim\n"
         ),
@@ -484,134 +446,42 @@ pub fn assemble_claim(
     };
     let actual = output(claim, &claim.actual)?;
     let ideal = output(claim, &claim.ideal)?;
-    if let Endpoint::MatrixApprox { bound } = &claim.endpoint {
-        let ConcreteWireType::Matrix(matrix) = &actual.wire_type else {
-            return Err("approximation endpoint must be a matrix".into());
-        };
-        if actual.wire_type != ideal.wire_type || actual.lean_type != ideal.lean_type {
-            return Err("approximation endpoint type mismatch".into());
-        }
-        if matrix.ring.ring_dimension() as usize == 0 || matrix.rows == 0 || matrix.columns == 0 {
-            return Err("approximation endpoint must be nonempty".into());
-        }
-        let actual_value =
-            project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
-        let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
-        source.push_str(
-            "\n/-- The error witness and its bound are conclusions, never execution premises. -/\n",
-        );
-        source.push_str(&correctness(format!(
-            "Mxx.Primitives.Approx ({actual_value}) ({ideal_value}) {bound}"
-        )));
-        return Ok(source);
+    if actual.wire_type != ideal.wire_type || actual.lean_type != ideal.lean_type {
+        return Err("endpoint type mismatch".into());
     }
-    if let Endpoint::CenteredResidual { residual: residual_port } = &claim.endpoint {
-        let exact = |ty: &ConcreteWireType| match ty {
-            ConcreteWireType::IndexedFamily { element, .. } => {
-                matches!(element.as_ref(), ConcreteWireType::Bool | ConcreteWireType::Int)
-            }
-            ty => matches!(ty, ConcreteWireType::Bool | ConcreteWireType::Int),
-        };
-        if actual.wire_type != ideal.wire_type ||
-            actual.lean_type != ideal.lean_type ||
-            !exact(&actual.wire_type)
-        {
-            return Err("exact endpoint must be a matching Boolean, integer, or family".into());
-        }
-        let residual = output(claim, residual_port)?;
-        let residual_value =
-            project(residual, &format!("execution.«{}»", entries[residual_port.root].1));
-        let (q, count, coefficient) = match &residual.wire_type {
-            ConcreteWireType::Matrix(matrix)
-                if matrix.is_scalar() && matrix.ring.ring_dimension() as usize != 0 =>
-            {
-                (
-                    matrix.ring.modulus().to_string(),
-                    matrix.ring.ring_dimension() as usize,
-                    format!("(({residual_value}) 0 0).coeff index"),
-                )
-            }
-            ConcreteWireType::Int => {
-                let graph = claim.roots[residual_port.root].graph;
-                let modulus = match crate::protocol::integer_modulus(graph, residual.wire) {
-                    Some(crate::node::NodeKind::ConstantInt(value)) => value.clone(),
-                    Some(crate::node::NodeKind::EvaluateInt(expression)) => {
-                        expression.evaluate(bindings).map_err(|error| error.to_string())?
-                    }
-                    _ => return Err("integer residual must be `value % modulus`".into()),
-                };
-                if modulus <= num_bigint::BigInt::from(1) {
-                    return Err("integer residual modulus must exceed one".into());
-                }
-                (modulus.to_string(), 1, format!("(({residual_value} : Int) : ZMod {modulus})"))
-            }
-            _ => return Err("residual must be a scalar polynomial or an integer".into()),
-        };
-        let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
-        let actual_value =
-            project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
-        let centered_lift = semantics.centered_lift;
-        let message_center = semantics.message_center;
-        let decoder_radius = semantics.decoder_radius;
-        source.push_str(&format!("\nnoncomputable def observedResidual (execution : Execution) (index : Fin {count}) : Int :=\n  {centered_lift} {q}\n    ({coefficient} -\n      ({message_center} {q} ({ideal_value}) index : ZMod {q}))\n\n"));
-        source.push_str("/-- The application proof must establish this proposition; no noise premise is assumed. -/\n");
-        source.push_str(&correctness(format!(
-            "(∀ index, (observedResidual execution index).natAbs < {decoder_radius} {q}) ∧\n    {actual_value} = {ideal_value}"
-        )));
-        return Ok(source);
-    }
-    if actual.wire_type != ConcreteWireType::Bool ||
-        ideal.wire_type != ConcreteWireType::Bool ||
-        actual.lean_type != "Bool" ||
-        ideal.lean_type != "Bool"
-    {
-        return Err("claim endpoint must be Boolean".into());
-    }
-    let Endpoint::BooleanInterval { residual: residual_port } = &claim.endpoint else {
-        unreachable!()
-    };
-    let residual = output(claim, residual_port)?;
-    let ConcreteWireType::Matrix(matrix) = &residual.wire_type else {
-        return Err("residual must be a matrix".into());
-    };
-    if !matrix.is_scalar() || matrix.ring.ring_dimension() as usize == 0 {
-        return Err("residual must be a scalar polynomial".into());
-    }
-    let q = matrix.ring.modulus();
-    let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
     let actual_value = project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
-    let residual_value =
-        project(residual, &format!("execution.«{}»", entries[residual_port.root].1));
-    let centered_lift = semantics.centered_lift;
-    let message_center = semantics.message_center;
-    let decoder_radius = semantics.decoder_radius;
-    source.push_str(&format!("\nnoncomputable def observedResidual (execution : Execution) : Int :=\n  {centered_lift} {q}\n    ((({residual_value}) 0 0).coeff ⟨0, by decide⟩ -\n      ({message_center} {q} {ideal_value} : ZMod {q}))\n\n"));
-    source.push_str("/-- The application proof must establish this proposition; no noise premise is assumed. -/\n");
-    source.push_str(&correctness(format!(
-        "(observedResidual execution).natAbs < {decoder_radius} {q} ∧\n    {actual_value} = {ideal_value}"
-    )));
-    Ok(source)
-}
-
-/// Assemble the final theorem against the mechanically extracted proposition.
-/// The application supplies a declaration name, never the theorem statement or proof text.
-/// Lean must check that declaration at exactly `GeneratedClaim.CorrectnessClaim`.
-pub fn assemble_certificate(proof_module: &str, proof_declaration: &str) -> Result<String, String> {
-    let identifier = |name: &str| -> Result<String, String> {
-        name.split('.')
-            .map(|part| {
-                super::valid_identifier(part)
-                    .map_err(|_| "invalid certificate module or declaration name".to_owned())?;
-                Ok(format!("«{part}»"))
-            })
-            .collect::<Result<Vec<_>, String>>()
-            .map(|parts| parts.join("."))
+    let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
+    let success = match &claim.endpoint {
+        Endpoint::Exact => {
+            let exact = |ty: &ConcreteWireType| {
+                matches!(ty, ConcreteWireType::Bool | ConcreteWireType::Int)
+            };
+            let supported = match &actual.wire_type {
+                ConcreteWireType::IndexedFamily { element, .. } => exact(element),
+                ty => exact(ty),
+            };
+            if !supported {
+                return Err("exact endpoint must be a Boolean, integer, or family of either".into());
+            }
+            format!("{actual_value} = {ideal_value}")
+        }
+        Endpoint::MatrixApprox { bound } => {
+            let ConcreteWireType::Matrix(matrix) = &actual.wire_type else {
+                return Err("approximation endpoint must be a matrix".into());
+            };
+            if matrix.ring.ring_dimension() as usize == 0 || matrix.rows == 0 || matrix.columns == 0
+            {
+                return Err("approximation endpoint must be nonempty".into());
+            }
+            format!("Mxx.Primitives.Approx ({actual_value}) ({ideal_value}) {bound}")
+        }
     };
-    let module = identifier(proof_module)?;
-    let proof = identifier(proof_declaration)?;
-    Ok(format!(
-        "import Claim\nimport {module}\n\nnamespace GeneratedCertificate\n\ntheorem correctness : GeneratedClaim.CorrectnessClaim :=\n  {proof}\n\n#print axioms correctness\n\nend GeneratedCertificate\n"
-    ))
+    source.push_str(match claim.failure_probability_log2 {
+        None => "\n/-- Every execution's endpoint equals the ideal one. -/\n",
+        Some(_) => "\n/-- Executions whose endpoint differs from the ideal one are rare. -/\n",
+    });
+    source.push_str(&correctness(success));
+    Ok(source)
 }
 
 #[cfg(test)]
@@ -684,59 +554,34 @@ mod tests {
             requirements: vec![],
             actual: Port { root: 0, name: "bit".into() },
             ideal: Port { root: 1, name: "bit".into() },
-            endpoint: Endpoint::BooleanInterval {
-                residual: Port { root: 0, name: "residual".into() },
-            },
+            endpoint: Endpoint::Exact,
+            failure_probability_log2: None,
         }
     }
 
     fn render(claim: &LinkedClaim<'_>) -> Result<String, String> {
-        assemble_claim(
-            claim,
-            &ParamEnv::default(),
-            &ClaimBackend { module_name: "Backend", context_name: "Backend.context", layouts: &[] },
-            &ClaimSemantics {
-                imports: &["OtherApplication.Semantics"],
-                hash_model_type: "OtherApplication.HashModel",
-                centered_lift: "OtherApplication.centeredLift",
-                message_center: "OtherApplication.messageCenter",
-                decoder_radius: "OtherApplication.decoderRadius",
-                failure_probability_log2: None,
-            },
-        )
+        assemble_claim(claim, &ParamEnv::default())
     }
 
     #[test]
-    fn linked_claim_uses_configured_semantics_and_shared_externals() {
+    fn linked_claim_states_endpoint_equality_over_shared_externals() {
         let (graph, artifact) = exported_graph();
         let source = render(&linked(&graph, &artifact)).unwrap();
-        assert!(source.contains("OtherApplication.messageCenter 17"));
-        assert!(source.contains("OtherApplication.decoderRadius 17"));
-        assert!(!source.contains("MxxWe"));
+        assert!(source.contains("import Backend\n"));
+        assert!(source.contains("(_ : MxxRuntime.HashModel)"));
         assert_eq!(source.matches("(external.input_0)").count(), 2);
-        let (runs, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
-        assert!(!runs.contains(".natAbs <"));
-        assert!(conclusion.contains("(observedResidual execution).natAbs <"));
-        assert!(conclusion.contains("execution.«producer»"));
-        assert!(conclusion.contains("execution.«ideal»"));
+        let (_, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
+        assert!(conclusion.contains(
+            "Runs hashModel external execution →\n    execution.«producer».1 = execution.«ideal».1"
+        ));
     }
 
     #[test]
     fn failure_probability_bounds_the_tape_measure_of_failing_runs() {
         let (graph, artifact) = exported_graph_with(true);
-        let claim = linked(&graph, &artifact);
-        let semantics = |failure_probability_log2| ClaimSemantics {
-            imports: &["OtherApplication.Semantics"],
-            hash_model_type: "OtherApplication.HashModel",
-            centered_lift: "OtherApplication.centeredLift",
-            message_center: "OtherApplication.messageCenter",
-            decoder_radius: "OtherApplication.decoderRadius",
-            failure_probability_log2,
-        };
-        let backend =
-            ClaimBackend { module_name: "Backend", context_name: "Backend.context", layouts: &[] };
-        let source =
-            assemble_claim(&claim, &ParamEnv::default(), &backend, &semantics(Some(40))).unwrap();
+        let mut claim = linked(&graph, &artifact);
+        claim.failure_probability_log2 = Some(40);
+        let source = render(&claim).unwrap();
         let (runs, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
         assert!(runs.contains("(external : ExternalInputs) (tape : MxxRuntime.SampleTape)"));
         assert!(runs.contains("tape [0] producer_params"));
@@ -744,25 +589,15 @@ mod tests {
         assert!(conclusion.contains(
             "MxxRuntime.tapeMeasure {tape | ∃ execution, Runs hashModel external tape execution ∧"
         ));
-        assert!(conclusion.contains("¬ ((observedResidual execution).natAbs <"));
+        assert!(conclusion.contains("¬ (execution.«producer».1 = execution.«ideal».1)"));
         assert!(conclusion.contains("≤ (2 : ENNReal)⁻¹ ^ 40"));
         // Tape-reading roots and a deterministic claim do not mix, in either direction.
-        assert!(
-            assemble_claim(&claim, &ParamEnv::default(), &backend, &semantics(None))
-                .unwrap_err()
-                .contains("sampling tape")
-        );
+        claim.failure_probability_log2 = None;
+        assert!(render(&claim).unwrap_err().contains("sampling tape"));
         let (graph, artifact) = exported_graph();
-        assert!(
-            assemble_claim(
-                &linked(&graph, &artifact),
-                &ParamEnv::default(),
-                &backend,
-                &semantics(Some(40))
-            )
-            .unwrap_err()
-            .contains("sampling tape")
-        );
+        let mut claim = linked(&graph, &artifact);
+        claim.failure_probability_log2 = Some(40);
+        assert!(render(&claim).unwrap_err().contains("sampling tape"));
     }
 
     #[test]
@@ -784,71 +619,13 @@ mod tests {
     }
 
     #[test]
-    fn centered_residual_bounds_every_polynomial_coefficient_in_the_conclusion() {
+    fn exact_endpoints_are_boolean_integer_or_family_values() {
         let (graph, artifact) = exported_graph();
         let mut claim = linked(&graph, &artifact);
-        claim.endpoint =
-            Endpoint::CenteredResidual { residual: Port { root: 0, name: "residual".into() } };
-        let source = assemble_claim(
-            &claim,
-            &ParamEnv::default(),
-            &ClaimBackend {
-                module_name: "MxxRuntime",
-                context_name: "unusedBackend",
-                layouts: &[],
-            },
-            &ClaimSemantics {
-                imports: &["CenteredResidualFixture"],
-                hash_model_type: "MxxRuntime.HashModel",
-                centered_lift: "Mxx.Primitives.centeredLift",
-                message_center: "CenteredResidualFixture.messageCenter",
-                decoder_radius: "CenteredResidualFixture.decoderRadius",
-                failure_probability_log2: None,
-            },
-        )
-        .unwrap();
-        let (runs, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
-        assert!(runs.contains("(index : Fin 2)"));
-        assert!(runs.contains("((execution.«producer».2.1) 0 0).coeff index"));
-        assert!(
-            runs.contains("CenteredResidualFixture.messageCenter 17 (execution.«ideal».1) index")
-        );
-        assert!(!runs.contains(".natAbs <"));
-        assert!(conclusion.contains(
-            "(∀ index, (observedResidual execution index).natAbs < CenteredResidualFixture.decoderRadius 17)"
-        ));
-        assert!(conclusion.contains("execution.«producer».1 = execution.«ideal».1"));
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test_data/lean_ir_fixtures/centered_residual_claim");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join(format!("{}.lean", artifact.module_name)), &artifact.source)
-            .unwrap();
-        std::fs::write(
-            directory.join("CenteredResidualFixture.lean"),
-            "import MxxRuntime\nnamespace CenteredResidualFixture\ndef messageCenter (_ : Nat) (_ : Bool) (_ : Fin 2) : Int := 0\ndef decoderRadius (q : Nat) : Nat := q / 4\nend CenteredResidualFixture\n",
-        )
-        .unwrap();
-        std::fs::write(directory.join("Claim.lean"), source).unwrap();
-
-        claim.endpoint =
-            Endpoint::CenteredResidual { residual: Port { root: 0, name: "bit".into() } };
-        assert!(render(&claim).unwrap_err().contains("scalar polynomial or an integer"));
-        claim.endpoint =
-            Endpoint::CenteredResidual { residual: Port { root: 0, name: "residual".into() } };
         claim.actual = Port { root: 0, name: "residual".into() };
+        assert!(render(&claim).unwrap_err().contains("type mismatch"));
         claim.ideal = Port { root: 1, name: "residual".into() };
         assert!(render(&claim).unwrap_err().contains("exact endpoint"));
-    }
-
-    #[test]
-    fn certificate_fixes_the_proposition_and_rejects_source_injection() {
-        let source = assemble_certificate("Application.Proof", "Application.correctness").unwrap();
-        assert!(source.contains("theorem correctness : GeneratedClaim.CorrectnessClaim"));
-        assert!(source.contains("«Application».«correctness»"));
-        for invalid in ["", "A..B", "A\naxiom bad : False", "A; B"] {
-            assert!(assemble_certificate(invalid, "Proof.correctness").is_err());
-            assert!(assemble_certificate("Proof", invalid).is_err());
-        }
     }
 
     #[test]
@@ -925,30 +702,12 @@ mod tests {
             consumer: Port { root: 1, name: "bit".into() },
         });
         claim.requirements.push(claim.actual.clone());
-        let source = assemble_claim(
-            &claim,
-            &ParamEnv::default(),
-            &ClaimBackend {
-                module_name: "MxxRuntime",
-                context_name: "unusedBackend",
-                layouts: &[],
-            },
-            &ClaimSemantics {
-                imports: &["Decoder"],
-                hash_model_type: "MxxRuntime.HashModel",
-                centered_lift: "Mxx.Primitives.centeredLift",
-                message_center: "MxxWe.messageCenter",
-                decoder_radius: "MxxWe.decoderRadius",
-                failure_probability_log2: None,
-            },
-        )
-        .unwrap();
+        let source = render(&claim).unwrap();
         assert!(source.contains("  «match» :"));
         assert!(source.contains("  «namespace» :"));
         assert!(source.contains("namespace_params (execution.«match».1) execution.«namespace»"));
         assert!(source.contains("execution.«match».1 = true"));
         assert!(source.contains("execution.«match».1 = execution.«namespace».1"));
-        assert!(source.contains("execution.«match».2.1"));
         assert!(!source.contains("execution.match"));
         assert!(!source.contains("execution.namespace"));
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -956,6 +715,11 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join(format!("{}.lean", artifact.module_name)), &artifact.source)
             .unwrap();
+        std::fs::write(
+            directory.join(format!("{BACKEND_MODULE}.lean")),
+            super::super::backend::render_backend(&[]),
+        )
+        .unwrap();
         std::fs::write(directory.join("Claim.lean"), source).unwrap();
     }
 
@@ -986,23 +750,15 @@ mod tests {
         assert!(render(&claim).unwrap_err().contains("not Boolean"));
         claim.requirements.clear();
         claim.actual = Port { root: 0, name: "residual".into() };
-        assert!(render(&claim).unwrap_err().contains("must be Boolean"));
+        assert!(render(&claim).unwrap_err().contains("type mismatch"));
     }
 
     #[test]
-    fn linked_claim_rejects_mismatched_graph_layout_and_boundary_metadata() {
+    fn linked_claim_rejects_mismatched_graph_and_boundary_metadata() {
         let (graph, artifact) = exported_graph();
         let mut wrong = artifact.clone();
         wrong.spec_hash.0[0] ^= 1;
         assert!(render(&linked(&graph, &wrong)).unwrap_err().contains("bindings mismatch"));
-        wrong = artifact.clone();
-        wrong.backend_layouts.push(BackendLayout {
-            modulus: 17.into(),
-            ring_dimension: 2,
-            base: 2.into(),
-            regular_digits: 1,
-        });
-        assert!(render(&linked(&graph, &wrong)).unwrap_err().contains("cover exported layouts"));
         wrong = artifact.clone();
         wrong.root.outputs.get_mut("bit").unwrap().projection = "outputs.2.2.1".into();
         assert!(render(&linked(&graph, &wrong)).unwrap_err().contains("projection mismatch"));

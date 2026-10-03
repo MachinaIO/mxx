@@ -1,7 +1,6 @@
 import Stage_keygen
 import Stage_encrypt_x
 import Stage_encrypt_y
-import BgvTables
 import Stage_multiply
 import Stage_relinearize
 import Stage_modswitch
@@ -28,6 +27,12 @@ abbrev P : Nat := 72057594037616641
 abbrev Q : Nat := 5846006548020969210596774788483421161649837621249
 abbrev QP : Nat := 421249166578543632464236954685046510773404157767471124412817604609
 abbrev QL : Nat := 324518553605595287786984016396289
+
+/-- The slot permutations, as the packed tables the generated stages embed: encoding reads logical
+slot `encodeTable[j]` into native evaluation `j`, and decoding reads native evaluation
+`decodeTable[i]` into logical slot `i`. -/
+abbrev encodeTable : Nat := Stage_encrypt_x.generatedRoot.table_14
+abbrev decodeTable : Nat := Stage_decrypt.generatedRoot.table_12
 
 /-- The hybrid key-switching gadget `P * Q / q_j` of each digit. -/
 def gadget : Fin 3 → Int :=
@@ -129,7 +134,7 @@ def EncryptionFacts (pk : ExactMatrix Q n 2 1) (x : Fin n → Int) (ct : ExactMa
   ∃ (U E1 E2 : ErrorPoly n) (m : ExactMatrix t n 1 1) (native : Fin n → Int),
     polyNorm U ≤ 1 ∧ polyNorm E1 ≤ 20 ∧ polyNorm E2 ≤ 20 ∧
     polynomialFromValues true native m ∧
-    (∀ j : Fin n, ∃ k : Fin n, k.val = packedEntry 13 BgvTables.encode j.val ∧ native j = x k) ∧
+    (∀ j : Fin n, ∃ k : Fin n, k.val = packedEntry 13 encodeTable j.val ∧ native j = x k) ∧
     ct 0 0 = pk 0 0 * reducePoly Q n U + ((t : Int) : ExactPoly Q n) * reducePoly Q n E1 ∧
     ct 1 0 = pk 1 0 * reducePoly Q n U + ((t : Int) : ExactPoly Q n) * reducePoly Q n E2 +
       reducePoly Q n (centeredIntLift (m 0 0))
@@ -145,8 +150,8 @@ theorem encrypt_x_spec {pk : ExactMatrix Q n 2 1} {x : Fin n → Int} {ct : Exac
   have ha : witness.w_1_0 0 0 = pk 0 0 := sliceMatrix_entry hs0 (by decide) (by decide)
   have hb : witness.w_8_0 0 0 = pk 1 0 := sliceMatrix_entry hs1 (by decide) (by decide)
   have htable : polynomialValues false
-      (packedPolynomial (q := t) (n := n) 13 n BgvTables.encode) witness.w_15_0 := hvals
-  have hentry (i : Fin n) : witness.w_15_0 i = packedEntry 13 BgvTables.encode i.val :=
+      (packedPolynomial (q := t) (n := n) 13 n encodeTable) witness.w_15_0 := hvals
+  have hentry (i : Fin n) : witness.w_15_0 i = packedEntry 13 encodeTable i.val :=
     polynomialValues_packed (by decide) hn htable
       (fun j ↦ (Nat.mod_lt _ (by decide)).trans_le (by decide)) i
   have hrebase : witness.w_18_0 0 0 = reducePoly Q n (centeredIntLift (witness.w_17_0 0 0)) := by
@@ -181,8 +186,8 @@ theorem encrypt_y_spec {pk : ExactMatrix Q n 2 1} {x : Fin n → Int} {ct : Exac
   have ha : witness.w_1_0 0 0 = pk 0 0 := sliceMatrix_entry hs0 (by decide) (by decide)
   have hb : witness.w_8_0 0 0 = pk 1 0 := sliceMatrix_entry hs1 (by decide) (by decide)
   have htable : polynomialValues false
-      (packedPolynomial (q := t) (n := n) 13 n BgvTables.encode) witness.w_15_0 := hvals
-  have hentry (i : Fin n) : witness.w_15_0 i = packedEntry 13 BgvTables.encode i.val :=
+      (packedPolynomial (q := t) (n := n) 13 n encodeTable) witness.w_15_0 := hvals
+  have hentry (i : Fin n) : witness.w_15_0 i = packedEntry 13 encodeTable i.val :=
     polynomialValues_packed (by decide) hn htable
       (fun j ↦ (Nat.mod_lt _ (by decide)).trans_le (by decide)) i
   have hrebase : witness.w_18_0 0 0 = reducePoly Q n (centeredIntLift (witness.w_17_0 0 0)) := by
@@ -308,13 +313,12 @@ theorem modswitch_spec {ct : ExactMatrix Q n 2 1} {out : ExactMatrix QL n 2 1}
 
 /-- Decryption: the phase `c1 - s c0`, its centered plaintext scaled by the inverse correction
 factor, and the decoded slots read through the decoding table. -/
-def DecryptionFacts (ct : ExactMatrix QL n 2 1) (S : ErrorPoly n)
-    (outputs : ExactMatrix QL n 1 1 × (Fin n → Int) × Unit) : Prop :=
-  outputs.1 0 0 = ct 1 0 - reducePoly QL n S * ct 0 0 ∧
+def DecryptionFacts (ct : ExactMatrix QL n 2 1) (S : ErrorPoly n) (slots : Fin n → Int) : Prop :=
+  ∃ phase : ExactMatrix QL n 1 1, phase 0 0 = ct 1 0 - reducePoly QL n S * ct 0 0 ∧
   ∃ (plain : ExactMatrix t n 1 1) (native : Fin n → Int),
-    plain 0 0 = reducePoly t n (centeredIntLift (outputs.1 0 0)) * ((998911 : Int) : ExactPoly t n) ∧
+    plain 0 0 = reducePoly t n (centeredIntLift (phase 0 0)) * ((998911 : Int) : ExactPoly t n) ∧
     polynomialValues true plain native ∧
-    ∀ i : Fin n, ∃ k : Fin n, k.val = packedEntry 13 BgvTables.decode i.val ∧ outputs.2.1 i = native k
+    ∀ i : Fin n, ∃ k : Fin n, k.val = packedEntry 13 decodeTable i.val ∧ slots i = native k
 
 theorem decrypt_spec {ct : ExactMatrix QL n 2 1} {sk : ExactMatrix Q n 1 1} {S : ErrorPoly n}
     {outputs} (hsk : sk 0 0 = reducePoly Q n S)
@@ -331,11 +335,12 @@ theorem decrypt_spec {ct : ExactMatrix QL n 2 1} {sk : ExactMatrix Q n 1 1} {S :
     simp only [modulusReduce, hsk]
     exact modulusReduce_reducePoly (by decide) (by decide) (by decide) hn _
   have hdecode : polynomialValues false
-      (packedPolynomial (q := t) (n := n) 13 n BgvTables.decode) witness.w_13_0 := htable
-  have hentry (i : Fin n) : witness.w_13_0 i = packedEntry 13 BgvTables.decode i.val :=
+      (packedPolynomial (q := t) (n := n) 13 n decodeTable) witness.w_13_0 := htable
+  have hentry (i : Fin n) : witness.w_13_0 i = packedEntry 13 decodeTable i.val :=
     polynomialValues_packed (by decide) hn hdecode
       (fun j ↦ (Nat.mod_lt _ (by decide)).trans_le (by decide)) i
-  refine ⟨?_, matrixMulScalarLeft witness.w_8_0 (matrixPolynomial [998911]), witness.w_11_0, ?_,
+  refine ⟨matrixAdd (matrixMulScalarLeft witness.w_1_0 (matrixNeg witness.w_3_0)) witness.w_6_0,
+    ?_, matrixMulScalarLeft witness.w_8_0 (matrixPolynomial [998911]), witness.w_11_0, ?_,
     hvals, fun i ↦ ?_⟩
   · simp only [matrixAdd, matrixMulScalarLeft, matrixNeg, Matrix.add_apply, Matrix.neg_apply,
       e0, e1, hs]

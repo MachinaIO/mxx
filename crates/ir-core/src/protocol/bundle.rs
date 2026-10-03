@@ -82,9 +82,8 @@ pub struct TrapdoorContractMismatch {
 pub enum EndpointSpecId {
     ToyThresholdDecode,
     DiamondBooleanInterval,
-    /// An exactly compared decoder output whose margin is a centered residual (see
-    /// [`OperationalDecoderKind::CenteredResidual`]).
-    CenteredResidual,
+    /// An exactly compared decoder output (a Boolean, an integer, or a family of either).
+    Exact,
 }
 
 /// A symbolic upper bound explicitly assumed by an external-input contract.
@@ -236,14 +235,8 @@ pub enum EndpointSemanticBinding {
 /// decoder threshold or interval.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OperationalDecoderKind {
-    ThresholdDecode {
-        plaintext_modulus: IntExpr,
-    },
+    ThresholdDecode { plaintext_modulus: IntExpr },
     BooleanInterval,
-    /// A decoder in the residual's stage whose output (a Boolean, an integer, or a family of
-    /// either) depends on the residual. The residual is either a scalar polynomial, all of whose
-    /// coefficients form the margin, or an integer reduced by `%` with a compile-time modulus.
-    CenteredResidual,
 }
 
 /// Names the residual and executable decoder whose acceptance margin an application proves.
@@ -330,8 +323,6 @@ pub enum BundleValidationError {
     MissingEndpointBinding,
     #[error("an endpoint has semantic identities that do not match its closed endpoint spec")]
     InvalidEndpointSemantics,
-    #[error("the operational decoder target registry must be nonempty")]
-    EmptyOperationalDecoderTargetRegistry,
     #[error("operational decoder target ids must be nonempty and unique")]
     DuplicateOperationalDecoderTarget,
     #[error("an operational decoder target does not name a closed residual output or decoder node")]
@@ -512,7 +503,8 @@ impl ClosedProtocolBundle {
     fn all_input_destinations(&self) -> BTreeSet<ProtocolInputDestination> {
         let workflow = self.workflow.stages.iter().flat_map(|stage| {
             root_inputs(&stage.graph).filter_map(move |(name, _, artifact)| {
-                artifact.is_none().then_some(ProtocolInputDestination::WorkflowStage {
+                let linked = stage.bindings.iter().any(|binding| binding.consumer_input.0 == name);
+                (artifact.is_none() && !linked).then_some(ProtocolInputDestination::WorkflowStage {
                     stage: stage.id.clone(),
                     input: StageInputName(name.to_owned()),
                 })
@@ -559,7 +551,7 @@ impl ClosedProtocolBundle {
             }
             match (&endpoint.spec, &endpoint.semantics) {
                 (EndpointSpecId::ToyThresholdDecode, EndpointSemanticBinding::ThresholdDecode) |
-                (EndpointSpecId::CenteredResidual, EndpointSemanticBinding::Exact) => {}
+                (EndpointSpecId::Exact, EndpointSemanticBinding::Exact) => {}
                 (
                     EndpointSpecId::DiamondBooleanInterval,
                     EndpointSemanticBinding::DiamondBoolean { message },
@@ -622,9 +614,6 @@ impl ClosedProtocolBundle {
         &self,
         stages: &BTreeMap<StageId, &ProtocolStage>,
     ) -> Result<(), BundleValidationError> {
-        if self.operational_decoder_targets.is_empty() {
-            return Err(BundleValidationError::EmptyOperationalDecoderTargetRegistry);
-        }
         let target_ids = self
             .operational_decoder_targets
             .iter()
@@ -644,12 +633,6 @@ impl ClosedProtocolBundle {
                 .outputs()
                 .get(&target.residual.output)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
-            if matches!(target.kind, OperationalDecoderKind::CenteredResidual) ||
-                target.endpoint == EndpointSpecId::CenteredResidual
-            {
-                self.validate_centered_residual_target(target, residual_stage, residual.value)?;
-                continue;
-            }
             let residual_matrix_type = match output_type(&residual_stage.graph, residual.value) {
                 Some(WireType::Matrix(matrix_type)) => matrix_type,
                 Some(WireType::IndexedFamily { element, .. }) => match element.as_ref() {
@@ -745,54 +728,6 @@ impl ClosedProtocolBundle {
         Ok(())
     }
 
-    /// Checks a centered-residual target: its decoder output shares the residual's stage and
-    /// depends on it, and an integer residual is a `%` reduction by a compile-time modulus.
-    fn validate_centered_residual_target(
-        &self,
-        target: &OperationalDecoderTarget,
-        residual_stage: &ProtocolStage,
-        residual: WireRef,
-    ) -> Result<(), BundleValidationError> {
-        if !matches!(target.kind, OperationalDecoderKind::CenteredResidual) ||
-            target.endpoint != EndpointSpecId::CenteredResidual
-        {
-            return Err(BundleValidationError::OperationalDecoderTargetKindMismatch);
-        }
-        let endpoint = self
-            .endpoints
-            .entries
-            .iter()
-            .find(|endpoint| endpoint.spec == target.endpoint)
-            .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
-        if endpoint.workflow_output.stage != target.residual.stage {
-            return Err(BundleValidationError::InvalidOperationalDecoderTarget);
-        }
-        let graph = &residual_stage.graph;
-        let decoder = graph
-            .outputs()
-            .get(&endpoint.workflow_output.output)
-            .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?
-            .value;
-        let scalar = |ty: Option<&WireType>| {
-            matches!(ty, Some(WireType::Bool | WireType::ConstantBool | WireType::Int))
-        };
-        let decoder_type_supported = match output_type(graph, decoder) {
-            Some(WireType::IndexedFamily { element, .. }) => scalar(Some(element)),
-            ty => scalar(ty),
-        };
-        let residual_supported = match output_type(graph, residual) {
-            Some(WireType::Matrix(matrix)) => {
-                matrix.rows == IntExpr::constant(1) && matrix.columns == IntExpr::constant(1)
-            }
-            Some(WireType::Int) => integer_modulus(graph, residual).is_some(),
-            _ => false,
-        };
-        if !decoder_type_supported || !residual_supported || !depends_on(graph, decoder, residual) {
-            return Err(BundleValidationError::InvalidOperationalDecoderTarget);
-        }
-        Ok(())
-    }
-
     fn validate_preconditions(&self) -> Result<(), BundleValidationError> {
         if self.precondition_spec.requirement_outputs.len() != self.requirements.len() {
             return Err(BundleValidationError::PreconditionCardinalityMismatch);
@@ -813,42 +748,6 @@ impl ClosedProtocolBundle {
         }
         Ok(())
     }
-}
-
-/// The compile-time modulus of an integer residual `value % modulus`, as the divisor's constant or
-/// symbolic node. Runtime remainders are Euclidean, so the residual is canonical for it.
-pub(crate) fn integer_modulus(graph: &Graph, residual: WireRef) -> Option<&NodeKind> {
-    let (NodeKind::IntBinary(IntBinaryOp::Remainder), [_, divisor]) =
-        node_kind_and_arguments(graph, residual)?
-    else {
-        return None;
-    };
-    let (kind @ (NodeKind::ConstantInt(_) | NodeKind::EvaluateInt(_)), []) =
-        node_kind_and_arguments::<0>(graph, divisor)?
-    else {
-        return None;
-    };
-    Some(kind)
-}
-
-/// Whether `output` is computed from `source` through root-scope node arguments. A loop or call
-/// node counts as depending on every argument it receives.
-fn depends_on(graph: &Graph, output: WireRef, source: WireRef) -> bool {
-    let scope = graph.root_scope();
-    let mut pending = vec![output];
-    let mut visited = BTreeSet::new();
-    while let Some(wire) = pending.pop() {
-        if wire == source {
-            return true;
-        }
-        if !visited.insert(wire.node) {
-            continue;
-        }
-        if let Some(arguments) = scope.node(wire.node).and_then(|node| scope.arguments(node)) {
-            pending.extend(arguments.iter().copied());
-        }
-    }
-    false
 }
 
 fn node_kind_and_arguments<const N: usize>(

@@ -7,7 +7,7 @@
 use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv, RealExpr, WireType,
     graph::CompileParameter,
-    lean::{BackendLayout, ExportOptions, PrimitiveNames, export},
+    lean::{ExportOptions, PrimitiveNames, export},
     node::{MatrixBinaryOp, NodeKind},
     types::MatrixType,
 };
@@ -152,12 +152,6 @@ fn render(selected: Geometry) -> String {
             namespace: namespace.clone(),
             module_name: namespace.clone(),
             primitives,
-            backend_layouts: vec![BackendLayout {
-                modulus: 17.into(),
-                ring_dimension: 2,
-                base: 32.into(),
-                regular_digits: 1,
-            }],
             ..ExportOptions::default()
         },
     )

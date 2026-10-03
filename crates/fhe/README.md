@@ -15,10 +15,9 @@ encryption, evaluation, and decryption run on the CPU or the GPU. It depends on 
 | `BgvParams`, `BgvCiphertext` | BGV parameters, SIMD encoding, arithmetic, rotations, and key switching. |
 | `FheScheme` | The shared matrix-plaintext interface, implemented by BGV. |
 | `utils` | Parameter helpers, including the standard TFHE Boolean profile used in tests. |
-| `protocol` | Closed protocol declarations of the TFHE NAND gate and the BGV round trip, and their Lean claim export. |
 | `lean/` | Lean packages that prove the generated correctness claims of both protocols. |
 | `cuda/` | The native TFHE blind-rotation kernel used on the GPU. |
-| `tests/` | GPU round trips for TFHE and BGV. |
+| `tests/` | GPU round trips for TFHE and BGV, which also declare the executed graphs as a closed protocol and export its Lean claim. |
 | `scripts/` | A GPU BGV comparison with PhantomFHE: building a pinned external checkout, the comparison driver, and validating and summarizing its measurements. |
 
 ## Design
@@ -34,20 +33,22 @@ encryption, evaluation, and decryption run on the CPU or the GPU. It depends on 
 
 ## Lean correctness proofs
 
-`lean/tfhe` and `lean/bgv` each hold the statement modules generated from a protocol
-declaration in `generated/`, and handwritten proofs of its `GeneratedClaim.CorrectnessClaim`.
-Both use the parameters of the GPU integration tests.
+Each GPU integration test declares the graphs it executes as a closed protocol and calls
+`mxx_ir_core::lean::protocol::export`, which writes the statement modules to `generated/` of
+`lean/tfhe` or `lean/bgv`. Each package holds handwritten proofs of the generated
+`GeneratedClaim.CorrectnessClaim` and a three-line `Certificate.lean` that checks the proof
+against it. The claim states only that decryption returns the ideal output; noise bounds are
+steps of the proofs, not part of the statement.
 
 - **TFHE** (`utils::tfhe_params`): keygen, two encryptions, one bootstrapped NAND gate, and
-  decryption should decode `1 - m1 m2`, with the decryption phase within `Δ` of the encoded bit.
-  These parameters are correct only with high probability, so the claim states that, for every
-  hash model and external input, the sampled values with a failing run have probability at most
-  `2^-128`. The probability assumes ideal samplers: every sampled coefficient is an independent
+  decryption should decode `1 - m1 m2`. These parameters are correct only with high probability,
+  so the claim states that, for every hash model and external input, the sampled values with a
+  failing run have probability at most `2^-128`. The probability assumes ideal samplers: every sampled coefficient is an independent
   draw from its sampler's law, the truncated discrete Gaussian or a uniform distribution. It
   needs no assumption on hash outputs and none of the usual noise heuristics (independence of
   noise terms, uniform digits, Gaussian tails).
 - **BGV** (`utils::bgv_params`): the multiply, relinearize, and modulus-switch round trip
-  decrypts the slotwise product, with the phase within the exported bound, for every execution.
+  decrypts the slotwise product for every execution.
 
 The TFHE proof (`TfheStages`, `TfheRotation`, `TfheNand`, `TfheDependence`, `TfheBound`,
 `TfheProof`) restates each stage against the sampling tape and models the blind rotation as
@@ -57,13 +58,14 @@ exceeds `Δ` less a deterministic rounding allowance. That linear form is sub-Ga
 blind-rotation step multiplies fresh key errors by digits of at most 32 that read only earlier
 keys, and key switching multiplies its fresh errors by digits of at most 3, giving a tail below
 `2^-129`. The BGV proof follows each stage through integer witnesses, including hybrid key
-switching and modulus switching.
+switching and modulus switching, and bounds the final phase so that decoding is exact. It reads
+the slot permutations from the packed tables the generated stages define.
 
-Regenerate the statements with the GPU-gated export tests, then check both proofs inside each
+Regenerate the statements with the GPU integration tests, then check both proofs inside each
 package directory:
 
 ```bash
-cargo test -r -p mxx-fhe --features gpu --lib protocol::tests
+cargo test -r -p mxx-fhe --features gpu --test gpu_tfhe --test gpu_bgv
 ```
 
 ```bash
@@ -74,5 +76,5 @@ cd crates/fhe/lean/tfhe && lake build
 cd crates/fhe/lean/bgv && lake build
 ```
 
-Each package's `generated/Certificate.lean` prints the axioms of the checked theorem, which are
-only `propext`, `Classical.choice`, and `Quot.sound`.
+Each package's `Certificate.lean` prints the axioms of the checked theorem, which are only
+`propext`, `Classical.choice`, and `Quot.sound`.

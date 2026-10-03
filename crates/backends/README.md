@@ -20,11 +20,9 @@ CPU and GPU backends, inputs, planning, execution, outputs, and artifact stores.
 | `gpu_runtime` (`gpu` feature) | The GPU runtime: planning, execution, options, and limitations. |
 | `artifact`, `session`, `transcript`, `authority` | Artifact stores, durable sessions, sampling transcripts, and the prepare-then-run boundary. |
 | `host_control` | Structural node dispatch shared by execution and measurement. |
-| `lean` | Concrete CRT layouts for the Lean export. |
 | `env` | Environment variables read by native primitives and backends. |
 | `cuda/` | Native CUDA sources; `poly::dcrt::gpu` describes them. |
 | `native/` | C++ adapters to OpenFHE, bridged with `cxx`. |
-| `lean/` | Handwritten Lean packages for primitive and runtime relations. |
 | `benches/` | Matrix-product and preimage-sampling benchmarks for the CPU and the GPU. |
 
 ## Design

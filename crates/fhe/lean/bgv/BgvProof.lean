@@ -177,9 +177,9 @@ theorem modswitch_phase {S W : ErrorPoly n} {c : ExactMatrix Q n 2 1}
 
 set_option maxRecDepth 100000 in
 theorem tables_consistent (k : Nat) (hk : k < n) :
-    packedEntry 13 BgvTables.encode (packedEntry 13 BgvTables.decode k) = k := by
+    packedEntry 13 encodeTable (packedEntry 13 decodeTable k) = k := by
   have := checkBelow_spec (test := fun k ↦
-    packedEntry 13 BgvTables.encode (packedEntry 13 BgvTables.decode k) == k)
+    packedEntry 13 encodeTable (packedEntry 13 decodeTable k) == k)
     (bound := 8192) (by decide +kernel) k hk
   simpa using this
 
@@ -206,11 +206,11 @@ theorem zmod_val_cast {x : ZMod t} : (((x.val : Nat) : Int) : ZMod t) = x := by
 theorem slots_correct {x y : Fin n → Int} {mx my plain : ExactMatrix t n 1 1}
     {nx ny nout out ideal : Fin n → Int}
     (hfx : polynomialFromValues true nx mx)
-    (htx : ∀ j : Fin n, ∃ k : Fin n, k.val = packedEntry 13 BgvTables.encode j.val ∧ nx j = x k)
+    (htx : ∀ j : Fin n, ∃ k : Fin n, k.val = packedEntry 13 encodeTable j.val ∧ nx j = x k)
     (hfy : polynomialFromValues true ny my)
-    (hty : ∀ j : Fin n, ∃ k : Fin n, k.val = packedEntry 13 BgvTables.encode j.val ∧ ny j = y k)
+    (hty : ∀ j : Fin n, ∃ k : Fin n, k.val = packedEntry 13 encodeTable j.val ∧ ny j = y k)
     (hplain : plain 0 0 = mx 0 0 * my 0 0) (hvals : polynomialValues true plain nout)
-    (hslots : ∀ i : Fin n, ∃ k : Fin n, k.val = packedEntry 13 BgvTables.decode i.val ∧
+    (hslots : ∀ i : Fin n, ∃ k : Fin n, k.val = packedEntry 13 decodeTable i.val ∧
       out i = nout k)
     (hideal : ∀ i, ideal i = x i * y i % t) : out = ideal := by
   haveI : Fact (Nat.Prime t) := ⟨by norm_num⟩
@@ -241,7 +241,7 @@ theorem slots_correct {x y : Fin n → Int} {mx my plain : ExactMatrix t n 1 1}
   rw [hplain, oddPowerSum_mul hn hroot, ← hv1, ← hv2] at hv0
   obtain ⟨kx, hkx, hnx⟩ := htx k
   obtain ⟨ky, hky, hny⟩ := hty k
-  have hidx : packedEntry 13 BgvTables.encode k.val = i.val := by
+  have hidx : packedEntry 13 encodeTable k.val = i.val := by
     rw [hk]; exact tables_consistent i.val i.isLt
   have hkxi : kx = i := Fin.ext (hkx.trans hidx)
   have hkyi : ky = i := Fin.ext (hky.trans hidx)
@@ -262,7 +262,7 @@ theorem correctness : CorrectnessClaim := by
   obtain ⟨hd0, hd1, hd2⟩ := multiply_spec hm
   obtain ⟨digits, C, K, hδ0, hδ1, hδ2, hcrt, hC, hK, hr0, hr1⟩ := relinearize_spec hr
   obtain ⟨C', K', hC', hK', hms⟩ := modswitch_spec hs
-  obtain ⟨hphase, plain, nout, hplain, hvals, hslots⟩ := decrypt_spec hsk hd
+  obtain ⟨phase, hphase, plain, nout, hplain, hvals, hslots⟩ := decrypt_spec hsk hd
   have hideal := ideal_spec hi
   -- Fresh phases over the integers.
   set Mx := centeredIntLift (mx 0 0)
@@ -284,9 +284,9 @@ theorem correctness : CorrectnessClaim := by
     linear_combination hrel + (execution.«stage_2» 1 0 - reducePoly Q n S * execution.«stage_2» 0 0) *
       phx + reducePoly Q n Vx * phy
   obtain ⟨W', hW', hphaseL⟩ := modswitch_phase phrel hK'
-  have hfinal : execution.«stage_6».1 0 0 = reducePoly QL n W' := by
+  have hfinal : phase 0 0 = reducePoly QL n W' := by
     rw [hphase, hms 0, hms 1, hphaseL]
-  -- The static bound on the final phase.
+  -- The final phase is small enough that its centered lift is exact.
   have hVx := fresh_phase_norm hS hE hUx hE1x hE2x (polyNorm_centeredIntLift (by decide) (mx 0 0))
   have hVy := fresh_phase_norm hS hE hUy hE1y hE2y (polyNorm_centeredIntLift (by decide) (my 0 0))
   have hXn := relin_error_norm hS hErk hδ0 hδ1 hδ2 hC hX
@@ -307,33 +307,27 @@ theorem correctness : CorrectnessClaim := by
     have := natAbs_coeff_le_of_polyNorm hbound.le i
     unfold QL
     omega
-  refine ⟨fun index ↦ ?_, ?_⟩
-  · unfold observedResidual
-    simp only [BgvSemantics.messageCenter, Int.cast_zero, sub_zero, hfinal,
-      reducePoly_coeff (by decide : 1 < QL) hn]
-    rw [centeredLift_intCast (by decide) (hsmall index)]
-    exact (natAbs_coeff_le_of_polyNorm le_rfl index).trans_lt hbound
-  · -- The decrypted plaintext is the product of the two encoded plaintexts.
-    have ht0 : ((t : Int) : ExactPoly t n) = 0 := by
-      have := reducePoly_modulus_mul (n := n) t 1
-      rwa [mul_one, reducePoly_intCast] at this
-    have hfactor : ((998911 : Int) : ExactPoly t n) = ((q3 : Int) : ExactPoly t n) := by
-      rw [intCast_eq_algebraMap, intCast_eq_algebraMap (value := (q3 : Int))]
-      congr 1
-    have hred_t := congrArg (reducePoly t n) hW'
-    rw [map_mul, map_add, map_mul, reducePoly_intCast, reducePoly_intCast, ht0, zero_mul,
-      add_zero] at hred_t
-    have hVt (V : ErrorPoly n) (m : ExactMatrix t n 1 1) (A : ErrorPoly n)
-        (hV : V = ((t : Int) : ErrorPoly n) * A + centeredIntLift (m 0 0)) :
-        reducePoly t n V = m 0 0 := by
-      rw [hV, map_add, map_mul, reducePoly_intCast, ht0, zero_mul, zero_add,
-        reducePoly_centeredIntLift (q := t) (by decide) hn]
-    have hplain' : plain 0 0 = mx 0 0 * my 0 0 := by
-      rw [hplain, hfinal, centeredIntLift_reducePoly (q := QL) (by decide) hn _ hsmall, hfactor,
-        mul_comm, hred_t]
-      change reducePoly t n (Vx * Vy + ((t : Int) : ErrorPoly n) * X) = _
-      rw [map_add, map_mul, map_mul (reducePoly t n) ((t : Int) : ErrorPoly n), reducePoly_intCast,
-        ht0, zero_mul, add_zero, hVt Vx mx _ rfl, hVt Vy my _ rfl]
-    exact slots_correct hfx htx hfy hty hplain' hvals hslots hideal
+  -- The decrypted plaintext is the product of the two encoded plaintexts.
+  have ht0 : ((t : Int) : ExactPoly t n) = 0 := by
+    have := reducePoly_modulus_mul (n := n) t 1
+    rwa [mul_one, reducePoly_intCast] at this
+  have hfactor : ((998911 : Int) : ExactPoly t n) = ((q3 : Int) : ExactPoly t n) := by
+    rw [intCast_eq_algebraMap, intCast_eq_algebraMap (value := (q3 : Int))]
+    congr 1
+  have hred_t := congrArg (reducePoly t n) hW'
+  rw [map_mul, map_add, map_mul, reducePoly_intCast, reducePoly_intCast, ht0, zero_mul,
+    add_zero] at hred_t
+  have hVt (V : ErrorPoly n) (m : ExactMatrix t n 1 1) (A : ErrorPoly n)
+      (hV : V = ((t : Int) : ErrorPoly n) * A + centeredIntLift (m 0 0)) :
+      reducePoly t n V = m 0 0 := by
+    rw [hV, map_add, map_mul, reducePoly_intCast, ht0, zero_mul, zero_add,
+      reducePoly_centeredIntLift (q := t) (by decide) hn]
+  have hplain' : plain 0 0 = mx 0 0 * my 0 0 := by
+    rw [hplain, hfinal, centeredIntLift_reducePoly (q := QL) (by decide) hn _ hsmall, hfactor,
+      mul_comm, hred_t]
+    change reducePoly t n (Vx * Vy + ((t : Int) : ErrorPoly n) * X) = _
+    rw [map_add, map_mul, map_mul (reducePoly t n) ((t : Int) : ErrorPoly n), reducePoly_intCast,
+      ht0, zero_mul, add_zero, hVt Vx mx _ rfl, hVt Vy my _ rfl]
+  exact slots_correct hfx htx hfy hty hplain' hvals hslots hideal
 
 end MxxFheBgv

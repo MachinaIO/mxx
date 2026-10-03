@@ -3,17 +3,9 @@ use crate::{
     diamond::DiamondWeCompiler,
     lean::numeric::{NumericCertificateInputs, render_numeric_certificate},
 };
-use mxx_backends::{
-    lean::{export_dcrt_layouts, render_backend_context},
-    poly::dcrt::params::DCRTPolyParams,
-};
-use mxx_ir_core::{
-    artifact::{ProductionId, SpecHash, export_validated_manifest},
-    validate,
-};
+use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
 use std::{
-    collections::BTreeMap,
     error::Error,
     fs,
     path::{Path, PathBuf},
@@ -106,13 +98,12 @@ pub fn export_diamond_certificate(
     {
         return Err("unsupported Diamond proof topology: requires positive input_count, batch_bits, depth and width, digit_base>=2^batch_bits, and witness_width=input_count*batch_bits".into());
     }
-    let layouts = export_dcrt_layouts([parameters])?;
-    let layout = &layouts[0];
-    if layout.modulus != compiler.config.modulus() ||
-        layout.crt_moduli != compiler.config.crt_moduli ||
-        layout.ring_dimension != compiler.config.ring_dimension ||
-        layout.regular_digit_count != compiler.config.digit_count ||
-        (BigInt::from(1u32) << layout.base_bits) != compiler.config.gadget_base
+    let modulus = BigInt::from_biguint(num_bigint::Sign::Plus, parameters.modulus().as_ref().clone());
+    if modulus != compiler.config.modulus() ||
+        parameters.to_crt().0 != compiler.config.crt_moduli ||
+        parameters.ring_dimension() != compiler.config.ring_dimension ||
+        parameters.modulus_digits() != compiler.config.digit_count ||
+        (BigInt::from(1u32) << parameters.base_bits()) != compiler.config.gadget_base
     {
         return Err("Diamond compiler and registered DCRT layout disagree".into());
     }
@@ -121,21 +112,7 @@ pub fn export_diamond_certificate(
         return Err("Diamond certificate export requires an empty output directory".into());
     }
     let protocol = compiler.protocol_decl()?;
-    let declaration = protocol.protocol();
     let bindings = compiler.circuit_bindings()?;
-    let encryption = declaration
-        .stages()
-        .iter()
-        .find(|stage| stage.id.0 == "encrypt")
-        .ok_or("encrypt stage missing")?;
-    let producer = validate(
-        &encryption.graph,
-        &bindings)?;
-    let placeholder = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-    let manifests =
-        BTreeMap::from([(placeholder.clone(), export_validated_manifest(placeholder, &producer)?)]);
-    let backend = render_backend_context(&layouts, "Backend", "DiamondBackend")?;
-    fs::write(directory.join("Backend.lean"), backend.source())?;
     fs::write(
         directory.join("DiamondProofParameters.lean"),
         format!(
@@ -161,10 +138,10 @@ pub fn export_diamond_certificate(
              abbrev transitionCount : Nat := inputCount * digitBase * stateCount\n\
              abbrev sampleCount : Nat := inputCount * digitBase\n\n\
              end DiamondProofParameters\n",
-            layout.modulus,
-            layout.ring_dimension,
-            layout.regular_digit_count,
-            layout.base_bits,
+            modulus,
+            parameters.ring_dimension(),
+            parameters.modulus_digits(),
+            parameters.base_bits(),
             compiler.config.input_count,
             compiler.config.batch_bits,
             compiler.config.digit_base,
@@ -173,7 +150,7 @@ pub fn export_diamond_certificate(
             compiler.shape.instance_width,
         ),
     )?;
-    crate::lean::export_claim(&protocol, &bindings, &backend, &manifests, directory)?;
+    crate::lean::export_claim(&protocol, &bindings, directory)?;
     fs::write(
         directory.join("DiamondGateProof.lean"),
         include_str!("../../lean/DiamondGateProof.lean"),
@@ -306,7 +283,7 @@ pub fn export_diamond_certificate(
         directory.join("DiamondClaimCorrectnessProof.lean"),
         include_str!("../../lean/DiamondClaimCorrectnessProof.lean"),
     )?;
-    let q = layout.modulus.to_biguint().ok_or("negative modulus")?;
+    let q = modulus.to_biguint().ok_or("negative modulus")?;
     if q < BigUint::from(4u32) {
         return Err("decoder modulus must be at least four".into());
     }
@@ -323,9 +300,9 @@ pub fn export_diamond_certificate(
     .ok_or("empty decoder radius")?;
     let numeric_inputs = NumericCertificateInputs {
         cap,
-        n: layout.ring_dimension.into(),
+        n: parameters.ring_dimension().into(),
         inner: compiler.config.input_config().state_columns()?.into(),
-        ell: layout.regular_digit_count.into(),
+        ell: parameters.modulus_digits().into(),
         error_bound: compiler
             .config
             .error_max_coefficient_bound
@@ -336,7 +313,7 @@ pub fn export_diamond_certificate(
             .preimage_max_coefficient_bound
             .to_biguint()
             .ok_or("negative K")?,
-        digit_bound: (BigUint::from(1u32) << layout.base_bits) / 2u32,
+        digit_bound: (BigUint::from(1u32) << parameters.base_bits()) / 2u32,
         injector_layers: compiler.config.input_count.into(),
         circuit_layers: compiler.shape.depth.into(),
     };

@@ -857,6 +857,8 @@ impl DiamondWeProtocolFamily {
                     .map(move |name| ParameterDecl { name: (*name).to_owned(), kind: kind.clone() })
             })
             .collect(),
+            bindings: Default::default(),
+            failure_probability_log2: None,
             bundle: ClosedProtocolBundle {
                 workflow: Workflow {
                     stages: vec![

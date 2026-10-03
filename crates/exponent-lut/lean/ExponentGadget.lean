@@ -21,6 +21,21 @@ def rowOf {α : Type} {rows columns : Nat} (x : Matrix (Fin rows) (Fin columns) 
     Matrix (Fin 1) (Fin columns) α :=
   fun _ column ↦ x k column
 
+/-- A runtime gadget matrix is determined by its backend. -/
+theorem gadgetMatrixRuns_unique {q rows columns : Nat} {backend : BackendContext}
+    {base digits : Int} {g h : ExactMatrix q n rows columns}
+    (hg : gadgetMatrixRuns backend base digits g) (hh : gadgetMatrixRuns backend base digits h) :
+    g = h := by
+  obtain ⟨layout, hl, _, _, hw, hg⟩ := hg
+  obtain ⟨layout', hl', _, _, hw', hh⟩ := hh
+  rw [hl] at hl'
+  cases hl'
+  rw [hg, hh]
+
+theorem centeredRebaseRuns_unique {q p rows columns : Nat} {x : ExactMatrix q n rows columns}
+    {y z : ExactMatrix p n rows columns} (hy : centeredRebaseRuns x y)
+    (hz : centeredRebaseRuns x z) : y = z := hy.2.trans hz.2.symm
+
 /-! ## Reconstruction at the decomposition modulus -/
 
 /-- The one-row gadget times the digits of a two-row target, scaled per row. -/

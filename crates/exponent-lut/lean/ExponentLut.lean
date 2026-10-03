@@ -72,6 +72,18 @@ theorem substituteMatrix_rebasedGadget {q q' m : Nat} (hn : 0 < n) {backend : Ba
   obtain ⟨c, hc⟩ := centeredIntLift_algebraMap (n := n) hn x
   simp only [substituteMatrix, hx, hc, map_intCast]
 
+/-- `blockModSwitchRuns_scaleUp` with the dropped factor named. -/
+theorem blockModSwitchRuns_scaleUp' {q q' p rows columns : Nat} (hn : 0 < n) (hq : q = p * q')
+    {basis : List Nat} {input : ExactMatrix q n rows columns} {output : ExactMatrix q' n rows columns}
+    (h : blockModSwitchRuns basis 1 input output) :
+    ∃ remainder : ErrorMatrix n rows columns, CoeffBound remainder (p / 2) ∧
+      scaleUpMatrix q p output = input - reduceMatrix q n rows columns remainder := by
+  have hpq : q / q' = p := by
+    obtain ⟨_, _, _, _, hq'1, _⟩ := h
+    rw [hq, Nat.mul_div_cancel _ (by omega)]
+  have := blockModSwitchRuns_scaleUp hn h
+  rwa [hpq] at this
+
 /-! ## Routed targets -/
 
 theorem substituteMatrix_smul {q rows columns : Nat} {index : Nat} (hodd : Odd index)
@@ -258,6 +270,73 @@ theorem lut_branch {q q' p m m' log bound : Nat} (hn : 0 < n) (hpow : n = 2 ^ lo
     exact hKe k j
   rw [hYX, hKfun]
   exact hbranch.mono (le_of_eq (by ring))
+
+/-! ## Finishing a LUT -/
+
+set_option maxHeartbeats 1000000 in
+/-- The branches of a LUT summed and moved down one level. Every branch target is `scaleUp` of
+`σ_i(μ) (σ_i(r₀) B^i_{0j} + B^i_{1j})`, where the switching ciphertexts satisfy
+`σ_i(r₀) B^i_{0j} + B^i_{1j} = (C_i Δ' r_j) g' + e^i_j`; when `Σ_i σ_i(μ) C_i = ν`, the result is
+an encoding of `ν` at the next level with scale `Δ'` and gadget `g'`. -/
+theorem lut_finish {q q' p m' W : Nat} (hn : 0 < n) (hq : q = p * q') (hq1 : 1 < q)
+    (hq' : 1 < q') (hp : 0 < p) {sm sp μ ν Δ' : ErrorPoly n} (hsm : polyNorm sm ≤ 1)
+    (σ : Fin W → ErrorPoly n → ErrorPoly n) (hσμ : ∀ i, polyNorm (σ i μ) ≤ 1)
+    {K : Fin W → Fin 2 → Fin 2 → ExactMatrix q n 1 m'} {Rw : Fin W → Fin 2 → ExactMatrix q n 1 m'}
+    {bsw : Fin W → Fin 2 → Fin 2 → ExactMatrix q' n 1 m'} {Bb : Nat}
+    (hbranch : ∀ i, Rel sm (K i) (fun j ↦ scaleUpMatrix q p (reducePoly q' n (σ i μ) •
+      (reducePoly q' n (σ i sp) • bsw i 0 j + bsw i 1 j))) (Rw i) Bb)
+    {g' : ExactMatrix q' n 1 m'} {C : Fin W → ExactPoly q' n} {eB : Fin W → Fin 2 → ErrorMatrix n 1 m'}
+    {BB : Nat} (hswitch : ∀ i j, reducePoly q' n (σ i sp) • bsw i 0 j + bsw i 1 j =
+      (C i * reducePoly q' n (Δ' * unitPair sp j)) • g' + reduceMatrix q' n 1 m' (eB i j))
+    (heB : ∀ i j, CoeffBound (eB i j) BB)
+    (hwalsh : ∑ i, reducePoly q' n (σ i μ) * C i = reducePoly q' n ν)
+    {Ksum : Fin 2 → Fin 2 → ExactMatrix q n 1 m'} {Rsum : Fin 2 → ExactMatrix q n 1 m'}
+    (hKsum : Ksum = ∑ i, K i) (hRsum : Rsum = ∑ i, Rw i) {basis : List Nat}
+    {K' : Fin 2 → Fin 2 → ExactMatrix q' n 1 m'} {R' : Fin 2 → ExactMatrix q' n 1 m'}
+    (hK' : ∀ k j, blockModSwitchRuns basis 1 (Ksum k j) (K' k j))
+    (hR' : ∀ j, blockModSwitchRuns basis 1 (Rsum j) (R' j)) :
+    Rel sm K' (fun j ↦ reducePoly q' n (Δ' * ν * unitPair sp j) • g') R'
+      ((W * Bb + (n + 2) * (p / 2)) / p + W * (n * 1 * BB)) := by
+  have hsum := Rel.sum Finset.univ (fun i _ ↦ hbranch i)
+  rw [← hKsum, ← hRsum] at hsum
+  -- The summed target.
+  let f : Fin 2 → ErrorMatrix n 1 m' := fun j ↦ ∑ i, σ i μ • eB i j
+  have htarget : ∀ j, (∑ i, fun j ↦ scaleUpMatrix q p (reducePoly q' n (σ i μ) •
+      (reducePoly q' n (σ i sp) • bsw i 0 j + bsw i 1 j))) j =
+      scaleUpMatrix q p (reducePoly q' n (Δ' * ν * unitPair sp j) • g' + reduceMatrix q' n 1 m' (f j)) := by
+    intro j
+    simp only [Finset.sum_apply, hswitch]
+    funext row column
+    simp only [scaleUpMatrix, Matrix.sum_apply, Matrix.add_apply, Matrix.smul_apply, smul_eq_mul,
+      reduceMatrix, f]
+    rw [← scaleUp_sum hq hq' hn]
+    congr 1
+    have hterm : ∀ i ∈ (Finset.univ : Finset (Fin W)), reducePoly q' n (σ i μ) *
+        (C i * reducePoly q' n (Δ' * unitPair sp j) * g' row column +
+          reducePoly q' n (eB i j row column)) =
+        (reducePoly q' n (σ i μ) * C i) * (reducePoly q' n (Δ' * unitPair sp j) * g' row column) +
+          reducePoly q' n (σ i μ * eB i j row column) := by
+      intro i _
+      simp only [map_mul]
+      ring
+    rw [Finset.sum_congr rfl hterm, Finset.sum_add_distrib, ← Finset.sum_mul, hwalsh,
+      map_sum]
+    simp only [map_mul]
+    ring
+  have hsum' : Rel sm Ksum (fun j ↦ scaleUpMatrix q p
+      (reducePoly q' n (Δ' * ν * unitPair sp j) • g' + reduceMatrix q' n 1 m' (f j))) Rsum
+      (∑ _i : Fin W, Bb) := by
+    obtain ⟨e, he, hc⟩ := hsum
+    exact ⟨e, he, fun j ↦ by rw [hc j, htarget j]⟩
+  have hdown := hsum'.modDown hn hq hq1 hq' hp hsm (fun j ↦ rfl)
+    (fun k j ↦ blockModSwitchRuns_scaleUp' hn hq (hK' k j))
+    (fun j ↦ blockModSwitchRuns_scaleUp' hn hq (hR' j))
+  have hf : ∀ j, CoeffBound (f j) (W * (n * 1 * BB)) := by
+    intro j
+    have := coeffBound_sum Finset.univ (fun i _ ↦ coeffBound_smul hn (hσμ i) (heB i j))
+    simpa [Finset.sum_const, Finset.card_univ, Fintype.card_fin] using this
+  have habs := hdown.absorb hf
+  simpa [Finset.sum_const, Finset.card_univ, Fintype.card_fin] using habs
 
 /-! ## Private multiplication -/
 

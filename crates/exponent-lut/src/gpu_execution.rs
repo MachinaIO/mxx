@@ -145,6 +145,10 @@ impl<S: SessionStore + Send> StageExecution<S> for GpuRuntime {
     fn download_matrix(&self, value: &RuntimeValue) -> Result<DCRTPolyMatrix, ApiError> {
         GpuRuntime::download_matrix(self, value).map_err(gpu_error)
     }
+
+    fn download_integers(&self, value: &RuntimeValue) -> Result<Vec<num_bigint::BigInt>, ApiError> {
+        self.download_integer_family(value).map_err(gpu_error)
+    }
 }
 
 #[cfg(test)]

@@ -28,13 +28,13 @@ use crate::{
         refresh::{RefreshDeclaration, RefreshError},
         simulation::{RefreshNoiseParameters, RefreshRouteNoiseGains, RefreshTranscriptTopology},
     },
-    program::{ExponentLUTProgramLowering, ExponentLutProgramId, WireId},
+    program::{ExponentLUTProgramLowering, ExponentLutProgramId, InputBinding, WireId},
 };
 
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineBuild, checkpoint_refreshed_output, resume_refreshed_output, verify_output,
-    verify_refreshed_output,
+    RnsOnlineBuild, checkpoint_refreshed_output, decode_output, resume_refreshed_output,
+    verify_output, verify_refreshed_output,
 };
 pub use noise::{
     RnsBggDerivedWorkload, RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound,
@@ -1282,52 +1282,94 @@ pub(crate) fn plaintext_constant<P: mxx_backends::poly::Poly>(ring: &Ring, value
     constant_from_terms(ring, dimension, &terms)
 }
 
-/// A caller's plaintext family as one `(c, k)` pair per member, the member
-/// being `c * X^k`. Members are read in parallel. A family member with more
-/// than one nonzero coefficient is refused: a family is read member by member
-/// inside loop bodies (see `plaintext_member`), so it is never a resident
-/// family of full matrices.
-pub(crate) fn plaintext_terms<P: mxx_backends::poly::Poly>(
-    values: &[P],
-) -> Result<Vec<(BigInt, usize)>, String> {
-    use rayon::prelude::*;
-    values
-        .par_iter()
-        .map(|value| match centered_terms(value).1.as_slice() {
-            [] => Ok((BigInt::zero(), 0)),
-            [(exponent, coefficient)] => Ok((coefficient.clone(), *exponent)),
-            _ => Err("a plaintext family member must have at most one nonzero coefficient".into()),
-        })
-        .collect()
+/// The signed monomial `c * X^k` of a caller's plaintext, as `(c, k)` with
+/// `c` centered and `0 <= k < n`; zero is `(0, 0)`. A plaintext with more
+/// than one nonzero coefficient is refused.
+fn plaintext_monomial<P: mxx_backends::poly::Poly>(value: &P) -> Result<(BigInt, usize), String> {
+    match centered_terms(value).1.as_slice() {
+        [] => Ok((BigInt::zero(), 0)),
+        [(exponent, coefficient)] => Ok((coefficient.clone(), *exponent)),
+        _ => Err("a plaintext must have at most one nonzero coefficient".into()),
+    }
 }
 
-/// Member `index` of a plaintext family given by `plaintext_terms`, built
-/// where it is read from compile-time tables of its coefficient and exponent.
-pub(crate) fn plaintext_member(
+/// A plaintext family read member by member inside loop bodies, so it is
+/// never a resident family of full matrices: member `i` is
+/// `coefficients[i] * X^(exponents[i])`.
+#[derive(Clone)]
+pub(crate) struct PlaintextFamily {
+    coefficients: Family<mxx_dsl::Int>,
+    exponents: Family<mxx_dsl::Int>,
+}
+
+impl PlaintextFamily {
+    pub(crate) fn count(&self) -> &IntExpr {
+        self.coefficients.count()
+    }
+
+    /// Member `index`, built where it is read in the ring `ring`.
+    pub(crate) fn member(&self, ring: &Ring, index: mxx_dsl::Int) -> Mat {
+        signed_monomial(ring, self.coefficients.at(index.clone()), self.exponents.at(index))
+    }
+}
+
+fn signed_monomial(ring: &Ring, coefficient: mxx_dsl::Int, exponent: mxx_dsl::Int) -> Mat {
+    coefficient.lift_to_constant_polynomial(ring.matrix_type((1, 1))).multiply_monomial(exponent)
+}
+
+/// Bind a caller's plaintext, or plaintext family, as graph integer inputs:
+/// the plaintext `c * X^k` is read from the inputs `{name}.coefficient` and
+/// `{name}.exponent`, whose values are inserted into `runtime`. A stage graph
+/// therefore does not depend on its plaintexts, and an exported claim
+/// quantifies over them. Callers make `name` unique per binding, as they do
+/// for secrets, so stages with different plaintexts have distinct
+/// specifications.
+pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
     ring: &Ring,
-    terms: &[(BigInt, usize)],
-    index: mxx_dsl::Int,
-) -> Result<Mat, mxx_dsl::DslError> {
-    let index = index.expression()?;
-    let table = |values: Vec<IntExpr>| {
-        mxx_dsl::Int::evaluate(IntExpr::Select {
-            selector: Box::new(index.clone()),
-            branches: values,
-        })
-    };
-    let member = if terms.iter().all(|(coefficient, _)| coefficient.is_one()) {
-        ring.polynomial([IntExpr::constant(1)])
-    } else {
-        table(terms.iter().map(|(coefficient, _)| IntExpr::constant(coefficient.clone())).collect())
-            .lift_to_constant_polynomial(ring.matrix_type((1, 1)))
-    };
-    Ok(if terms.iter().all(|(_, exponent)| *exponent == 0) {
-        member
-    } else {
-        member.multiply_monomial(table(
-            terms.iter().map(|(_, exponent)| IntExpr::constant(*exponent)).collect(),
-        ))
+    name: &str,
+    value: &InputBinding<P, Vec<P>>,
+    runtime: &mut BTreeMap<String, mxx_backends::RuntimeValue>,
+) -> Result<InputBinding<Mat, PlaintextFamily>, String> {
+    use mxx_backends::RuntimeValue;
+    use rayon::prelude::*;
+    let (coefficient_name, exponent_name) =
+        (format!("{name}.coefficient"), format!("{name}.exponent"));
+    let context = mxx_dsl::DslContext::new("plaintext");
+    Ok(match value {
+        InputBinding::Scalar(value) => {
+            let (coefficient, exponent) = plaintext_monomial(value)?;
+            runtime.insert(coefficient_name.clone(), RuntimeValue::Int(coefficient));
+            runtime.insert(exponent_name.clone(), RuntimeValue::Int(BigInt::from(exponent)));
+            let input = |name: String| {
+                context.input::<mxx_dsl::Int>(name, mxx_dsl::IntType).map_err(|e| e.to_string())
+            };
+            InputBinding::Scalar(signed_monomial(
+                ring,
+                input(coefficient_name)?,
+                input(exponent_name)?,
+            ))
+        }
+        InputBinding::Family(values) => {
+            let (coefficients, exponents): (Vec<_>, Vec<_>) = values
+                .par_iter()
+                .map(plaintext_monomial)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(coefficient, exponent)| (coefficient, BigInt::from(exponent)))
+                .unzip();
+            runtime.insert(coefficient_name.clone(), RuntimeValue::integer_values(coefficients));
+            runtime.insert(exponent_name.clone(), RuntimeValue::integer_values(exponents));
+            InputBinding::Family(PlaintextFamily {
+                coefficients: context.int_family_input(coefficient_name, values.len()),
+                exponents: context.int_family_input(exponent_name, values.len()),
+            })
+        }
     })
+}
+
+/// A random name prefix for one binding's plaintext inputs.
+pub(crate) fn plaintext_input_prefix() -> String {
+    format!("rns-bgg/plaintext/{:032x}", rand::random::<u128>())
 }
 
 pub(crate) fn concrete_ring(value: &Mat) -> Result<ConcreteRing, RnsBggError> {

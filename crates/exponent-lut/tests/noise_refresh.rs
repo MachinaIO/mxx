@@ -612,10 +612,10 @@ fn noise_refresh_end_to_end() {
     let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
     // The secrets are sampled on the stage runtime and stay resident there.
     let payload = RnsEncryptBuild::new(&parameters, [0x51; 32])
-        .sample_payload_secret(&mut runtime, &mut store)
+        .sample_payload_secret(&mut runtime, &mut store, |_| Ok(()))
         .expect("payload secret");
     let mask = RnsEncryptBuild::new(&parameters, [0x51; 32])
-        .sample_mask_secret(&mut runtime, &mut store)
+        .sample_mask_secret(&mut runtime, &mut store, |_| Ok(()))
         .expect("mask secret");
     // The PRF schedule has a source-q carrier distinct from the outer
     // schedule's level zero.  Import the already sampled outer secrets into

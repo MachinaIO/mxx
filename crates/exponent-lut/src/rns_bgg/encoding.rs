@@ -144,6 +144,28 @@ where
     S: SessionStore,
     P: Poly,
 {
+    let (wire, output_level) = output_wire_level(program, output_index)?;
+    verify_output_at_level(
+        program,
+        result,
+        output_index,
+        wire,
+        output_level,
+        expected,
+        parameters,
+        payload,
+        mask,
+        execution,
+        store,
+    )
+}
+
+/// The wire of scalar output `output_index` and the level of its finalized
+/// carrier: a coefficient output is moved down once more by `finish_outputs`.
+fn output_wire_level(
+    program: &ExponentLutProgram,
+    output_index: usize,
+) -> Result<(WireId, usize), ApiError> {
     let wire = match program
         .outputs()
         .get(output_index)
@@ -162,19 +184,100 @@ where
     let output_level = source_level
         .checked_add(usize::from(coefficient_output))
         .ok_or_else(|| ApiError::input("verification output level overflow"))?;
-    verify_output_at_level(
-        program,
-        result,
-        output_index,
-        wire,
-        output_level,
-        expected,
-        parameters,
-        payload,
-        mask,
+    Ok((wire, output_level))
+}
+
+/// Decrypt private output `output_index` of [`crate::api::online_eval`] with
+/// the caller's mask and return its plaintext coefficients at `positions`,
+/// modulo two.
+///
+/// A private output is a terminal-level carrier: the terminal state gadget
+/// is the identity, its message scale is `floor(q / 2)`, and the second
+/// component of the payload secret is one. Its second row component is
+/// therefore `s * A_01 + A_11 - floor(q / 2) * mu + e` for the mask
+/// `s = (s_0, 1)` and the paired public key `A`, so the phase
+/// `row_1 - (s_0 * A_01 + A_11)` is `-floor(q / 2) * mu + e`. Threshold
+/// decoding modulo two returns every coefficient of `mu` modulo two whenever
+/// the error is below `q / 4`; the payload secret is not needed. The graph is
+/// the one decryption step of the workflow: its inputs are the online
+/// outputs `output-{output_index}.1`, `.3`, and `.5`, named
+/// `decode-key-01`, `decode-key-11`, and `decode-row-1`, and the mask, and
+/// its outputs are `decoded-{position}`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_output<E, S>(
+    program: &ExponentLutProgram,
+    result: &StageOutputs,
+    output_index: usize,
+    parameters: &RnsBggParameters,
+    mask: &RnsBggMaskSecret,
+    positions: &[usize],
+    execution: &mut E,
+    store: &mut S,
+    before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
+) -> Result<Vec<BigInt>, ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+{
+    let (wire, output_level) = output_wire_level(program, output_index)?;
+    if output_level + 1 != parameters.levels().len() {
+        return Err(ApiError::input("only a terminal-level output can be decoded"));
+    }
+    if !matches!(
+        program.wire_knowledge(wire).map_err(ApiError::scheme)?,
+        AttributeKnowledge::PrivatePayload
+    ) {
+        return Err(ApiError::input("only a private output is decoded"));
+    }
+    let ring = parameters.ring(output_level).map_err(ApiError::scheme)?;
+    let dimension = parameters.level(output_level).map_err(ApiError::scheme)?.ring_dimension();
+    let length = positions.iter().max().map_or(0, |position| position + 1);
+    if length > dimension as usize {
+        return Err(ApiError::input("decoded position is outside the ring"));
+    }
+    let mut runtime = BTreeMap::new();
+    for (port, input) in [(1, "decode-key-01"), (3, "decode-key-11"), (5, "decode-row-1")] {
+        let value = result
+            .outputs
+            .get(&format!("output-{output_index}.{port}"))
+            .ok_or_else(|| ApiError::input("decoded output port is missing"))?;
+        runtime.insert(input.to_owned(), value.clone());
+    }
+    let mask_row = reduce_secret(parameters, &mask.row, output_level).map_err(ApiError::scheme)?;
+    let phase = ring.input("decode-row-1", (1, 1)) -
+        (mask_row.0 * ring.input("decode-key-01", (1, 1)) +
+            mask_row.1 * ring.input("decode-key-11", (1, 1)));
+    let mut graph = DslContext::new("rns-bgg-output-decode");
+    let decoded = phase.threshold_decode_ints(2u8, length);
+    for position in positions {
+        graph = graph
+            .output(format!("decoded-{position}"), decoded[*position].clone())
+            .map_err(ApiError::scheme)?;
+    }
+    let graph = graph.build().map_err(ApiError::scheme)?;
+    if let Some(binding) = &mask.binding {
+        binding.bind(&mut runtime);
+    }
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
         execution,
         store,
-    )
+        before_execute,
+    )?;
+    positions
+        .iter()
+        .map(|position| {
+            let value = outputs
+                .outputs
+                .get(&format!("decoded-{position}"))
+                .ok_or_else(|| ApiError::input("decoded coefficient is missing"))?;
+            let [value] = <[BigInt; 1]>::try_from(execution.download_integers(value)?)
+                .map_err(|_| ApiError::input("decoded coefficient is not one integer"))?;
+            Ok(value)
+        })
+        .collect()
 }
 
 /// Verify one output after a declared RNS-BGG refresh.
@@ -703,6 +806,12 @@ impl SecretBinding {
 }
 
 impl RnsBggPayloadSecret {
+    /// The graph input through which every stage reads this sampled secret,
+    /// or `None` for a secret given as a graph expression.
+    pub fn input_name(&self) -> Option<&str> {
+        self.binding.as_ref().map(|binding| binding.name.as_str())
+    }
+
     /// Re-express the same sampled coefficients in a requested RNS level.
     ///
     /// This preserves the secret relation across stage-local parameter
@@ -720,6 +829,12 @@ impl RnsBggPayloadSecret {
 }
 
 impl RnsBggMaskSecret {
+    /// The graph input through which every stage reads this sampled secret,
+    /// or `None` for a secret given as a graph expression.
+    pub fn input_name(&self) -> Option<&str> {
+        self.binding.as_ref().map(|binding| binding.name.as_str())
+    }
+
     /// Re-express the same sampled coefficients in a requested RNS level.
     ///
     /// This preserves the secret relation across stage-local parameter
@@ -772,6 +887,7 @@ fn sample_secret_row<E, S>(
     parameters: &RnsBggParameters,
     execution: &mut E,
     store: &mut S,
+    before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
 ) -> Result<(RnsBggRow, SecretBinding), ApiError>
 where
     E: StageExecution<S>,
@@ -788,7 +904,7 @@ where
         &ParamEnv::default(),
         execution,
         store,
-        |_| Ok(()),
+        before_execute,
     )?;
     let value = sampled
         .outputs
@@ -1663,7 +1779,7 @@ pub struct RnsEncryptBuild<'a> {
     payload_secret: Option<RnsBggPayloadSecret>,
     mask_secret: Option<RnsBggMaskSecret>,
     /// Input plaintexts; a family keeps `plaintext_terms`, read member by member.
-    plaintexts: BTreeMap<WireId, InputBinding<Mat, Vec<(BigInt, usize)>>>,
+    plaintexts: BTreeMap<WireId, InputBinding<Mat, super::PlaintextFamily>>,
     preprocess: Option<ProductionId>,
     binding: Option<RnsBggArtifactBinding>,
     refresh_declaration: Option<RefreshDeclaration>,
@@ -2007,21 +2123,21 @@ impl<'a> RnsEncryptBuild<'a> {
                         encode(key, value.clone()).map_err(ApiError::scheme)?,
                     )
                     .map_err(ApiError::scheme)?,
-                InputBinding::Family(terms) => {
+                InputBinding::Family(plaintexts) => {
                     let key_parts = (0..4)
                         .map(|port| {
                             ring.family_artifact_input(
                                 production.clone(),
                                 refresh_prf_input_key_artifact_name(commitment, slot, *wire, port),
-                                IntExpr::constant(terms.len()),
+                                plaintexts.count().clone(),
                                 (1, columns),
                                 ArtifactAvailability::Cached,
                             )
                         })
                         .collect::<Vec<_>>();
                     let plaintext_ring = child.parameters.ring(0).map_err(ApiError::scheme)?;
-                    let family = mxx_dsl::parallel(IntExpr::constant(terms.len()), |index| {
-                        let plaintext = plaintext_member(&plaintext_ring, terms, index.clone())?;
+                    let family = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
+                        let plaintext = plaintexts.member(&plaintext_ring, index.clone());
                         let member_key = RnsBggPublicKey::new(
                             *wire,
                             (
@@ -2044,30 +2160,36 @@ impl<'a> RnsEncryptBuild<'a> {
         Ok(graph)
     }
 
-    /// Samples a payload secret.
+    /// Samples a payload secret on `execution`; it stays resident there.
+    /// `before_execute` observes the sampling graph, whose output `secret`
+    /// later stages read through [`RnsBggPayloadSecret::input_name`].
     pub fn sample_payload_secret<E, S>(
         &self,
         execution: &mut E,
         store: &mut S,
+        before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
     ) -> Result<RnsBggPayloadSecret, ApiError>
     where
         E: StageExecution<S>,
         S: SessionStore,
     {
-        let (row, binding) = sample_secret_row(self.parameters, execution, store)?;
+        let (row, binding) = sample_secret_row(self.parameters, execution, store, before_execute)?;
         Ok(RnsBggPayloadSecret { row, binding: Some(binding) })
     }
     /// Samples a mask secret on `execution`; it stays resident there.
+    /// `before_execute` observes the sampling graph, whose output `secret`
+    /// later stages read through [`RnsBggMaskSecret::input_name`].
     pub fn sample_mask_secret<E, S>(
         &self,
         execution: &mut E,
         store: &mut S,
+        before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
     ) -> Result<RnsBggMaskSecret, ApiError>
     where
         E: StageExecution<S>,
         S: SessionStore,
     {
-        let (row, binding) = sample_secret_row(self.parameters, execution, store)?;
+        let (row, binding) = sample_secret_row(self.parameters, execution, store, before_execute)?;
         Ok(RnsBggMaskSecret { row, binding: Some(binding) })
     }
 
@@ -2389,37 +2511,35 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             return Err(ApiError::input("encryption inputs do not exactly match Program inputs"));
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let prefix = super::plaintext_input_prefix();
         for (wire, declaration) in inputs.inputs() {
             let value = lhs.get(wire).ok_or_else(|| ApiError::input("missing encryption input"))?;
-            let converted = match value {
-                InputBinding::Scalar(value)
-                    if matches!(declaration.shape(), InputBinding::Scalar(())) =>
-                {
-                    InputBinding::Scalar(plaintext_constant(&ring, value))
-                }
-                InputBinding::Family(values)
-                    if matches!(declaration.shape(), InputBinding::Family(_)) =>
-                {
-                    let expected = match declaration.shape() {
-                        InputBinding::Family(count) => count
-                            .evaluate(parameters)
-                            .ok()
-                            .and_then(|value| value.to_usize())
-                            .ok_or_else(|| {
-                                ApiError::input("encryption input family count is not concrete")
-                            })?,
-                        InputBinding::Scalar(()) => unreachable!(),
-                    };
+            match (declaration.shape(), value) {
+                (InputBinding::Scalar(()), InputBinding::Scalar(_)) => {}
+                (InputBinding::Family(count), InputBinding::Family(values)) => {
+                    let expected = count
+                        .evaluate(parameters)
+                        .ok()
+                        .and_then(|value| value.to_usize())
+                        .ok_or_else(|| {
+                            ApiError::input("encryption input family count is not concrete")
+                        })?;
                     if values.len() != expected {
                         return Err(ApiError::input(
                             "encryption input family count does not match Program",
                         ));
                     }
-                    InputBinding::Family(plaintext_terms(values).map_err(ApiError::input)?)
                 }
                 _ => return Err(ApiError::input("encryption input shape does not match Program")),
-            };
-            self.plaintexts.insert(*wire, converted);
+            }
+            let plaintext = super::plaintext_inputs(
+                &ring,
+                &format!("{prefix}/input/{wire:?}"),
+                value,
+                &mut self.runtime,
+            )
+            .map_err(ApiError::input)?;
+            self.plaintexts.insert(*wire, plaintext);
         }
         self.inputs = Some(inputs.clone());
         self.projection_identity = Some(
@@ -2545,9 +2665,9 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                     let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
                     graph.transferred_output(name, encoding.row)
                 }
-                (InputBinding::Family(terms), true) => {
-                    let stored = mxx_dsl::parallel(IntExpr::constant(terms.len()), |index| {
-                        let plaintext = plaintext_member(&plaintext_ring, terms, index.clone())?;
+                (InputBinding::Family(plaintexts), true) => {
+                    let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
+                        let plaintext = plaintexts.member(&plaintext_ring, index.clone());
                         let encoding = encode(Some(index.expression()?), plaintext)
                             .map_err(|_| DslError::Schema)?;
                         let payload = encoding.public_payload.ok_or(DslError::Schema)?;
@@ -2556,9 +2676,9 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                     .map_err(ApiError::scheme)?;
                     graph.transferred_output(name, stored)
                 }
-                (InputBinding::Family(terms), false) => {
-                    let stored = mxx_dsl::parallel(IntExpr::constant(terms.len()), |index| {
-                        let plaintext = plaintext_member(&plaintext_ring, terms, index.clone())?;
+                (InputBinding::Family(plaintexts), false) => {
+                    let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
+                        let plaintext = plaintexts.member(&plaintext_ring, index.clone());
                         encode(Some(index.expression()?), plaintext)
                             .map(|encoding| encoding.row)
                             .map_err(|_| DslError::Schema)

@@ -414,10 +414,10 @@ fn fixture(
 ) -> Fixture {
     // The secrets are sampled on the stage runtime and stay resident there.
     let payload = RnsEncryptBuild::new(&parameters, [7; 32])
-        .sample_payload_secret(runtime, store)
+        .sample_payload_secret(runtime, store, |_| Ok(()))
         .expect("payload secret");
     let mask = RnsEncryptBuild::new(&parameters, [7; 32])
-        .sample_mask_secret(runtime, store)
+        .sample_mask_secret(runtime, store, |_| Ok(()))
         .expect("mask secret");
     let zero = DCRTPoly::const_zero(&poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&poly_parameters, 0);

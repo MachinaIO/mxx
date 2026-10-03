@@ -38,7 +38,7 @@ parameters of the GPU integration tests. The statements are not written by hand:
 integration test declares the graphs it executes as a protocol and calls
 `mxx_ir_core::lean::protocol::export`, which deterministically writes the statement
 `GeneratedClaim.CorrectnessClaim` to `generated/` of `lean/tfhe` or `lean/bgv`.
-[`crates/ir-core/SPEC.md`](../ir-core/SPEC.md) specifies the generated modules and statement.
+[`crates/ir-core/LEAN-SPEC.md`](../ir-core/LEAN-SPEC.md) specifies the generated modules and statement.
 
 ### What is proved
 
@@ -63,37 +63,7 @@ In Lean, the two statements read:
 ```
 
 `Runs` links the generated stage relations exactly as the test passes outputs from one execution
-to the next, and requires the input contracts. The statements say only that decryption returns
-the ideal output; noise bounds are steps of the proofs, not part of the statements.
-
-### Assumptions
-
-- **Ideal samplers (TFHE).** The TFHE parameters are correct only with high probability. Every
-  sampled coefficient is read from a sampling tape whose entries are independent draws from
-  their sampler's law: the truncated discrete Gaussian, or a uniform interval or residue. The
-  proof needs none of the usual noise heuristics, such as independent noise terms, uniform
-  digits, or Gaussian tails.
-- **Truncated samplers (BGV).** Every sample lies within its cutoff, so the BGV statement holds
-  for every execution, with no probability.
-- **No assumption on hashes.** Both statements hold for every hash model, that is, for every
-  function from hash inputs to outputs.
-- **Trusted base.** The statement compiler in `mxx-ir-core`, the relations of the `MxxRuntime`
-  Lean library, which describe what each runtime primitive computes, and the Lean kernel.
-
-### How the proofs work
-
-The TFHE proof (`TfheStages`, `TfheRotation`, `TfheNand`, `TfheDependence`, `TfheBound`,
-`TfheProof`) restates each stage against the sampling tape and models the blind rotation as
-explicit functions of it. A run fails only if the LWE secret has more than 506 ones, which
-Hoeffding's bound makes rarer than `2^-168`, or if a linear form of the sampled key errors
-exceeds `Δ` less a deterministic rounding allowance. That linear form is sub-Gaussian: each
-blind-rotation step multiplies fresh key errors by digits of at most 32 that read only earlier
-keys, and key switching multiplies its fresh errors by digits of at most 3, giving a tail below
-`2^-129`.
-
-The BGV proof (`BgvStages`, `BgvProof`) follows each stage through integer witnesses, including
-hybrid key switching and modulus switching, and bounds the final phase so that decoding is exact.
-It reads the slot permutations from the packed tables the generated stages define.
+to the next, and requires the input contracts.
 
 ### Package layout
 

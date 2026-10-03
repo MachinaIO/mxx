@@ -26,12 +26,12 @@ use mxx_exponent_lut::{
     },
     program::{AttributeKnowledge, FamilyRange, InputBinding, WireId},
     rns_bgg::{
-        RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
+        RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
         RnsNoiseBuild, RnsOnlineBuild, RnsPreprocessBuild, verify_output,
     },
     utils::{
-        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model,
+        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
         ring_dimension_candidates,
     },
 };
@@ -47,8 +47,10 @@ struct Fixture {
     parameters: RnsBggParameters,
     profile: SparseLwrPrfProfile,
     program: SparseLwrPrfProgram,
-    payload: mxx_exponent_lut::rns_bgg::RnsBggPayloadSecret,
-    mask: mxx_exponent_lut::rns_bgg::RnsBggMaskSecret,
+    /// The Static secrets, sampled before preprocessing. The single Dynamic
+    /// secret is sampled only after preprocessing.
+    payload: Option<mxx_exponent_lut::rns_bgg::RnsBggPayloadSecret>,
+    mask: Option<mxx_exponent_lut::rns_bgg::RnsBggMaskSecret>,
     rhs: BTreeMap<mxx_exponent_lut::program::RhsId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
     lhs: BTreeMap<WireId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
     trace: RnsBggNoiseTrace,
@@ -263,6 +265,9 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
         "MXX_EXPONENT_LUT_LWR_PRF_OPERATIONS_PER_DROP must be positive"
     );
     let average = noise_model("MXX_EXPONENT_LUT_LWR_PRF_").expect("noise-model configuration");
+    // `MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic` binds the selectors only at
+    // encryption.
+    let rhs_mode = rhs_mode("MXX_EXPONENT_LUT_LWR_PRF_").expect("RHS mode configuration");
     // `n,crt_depth,primes_per_drop` of a candidate already selected by a
     // full search. It replaces the search, and its lattice security estimate
     // is not repeated; the noise audit still builds its parameter chain.
@@ -330,6 +335,7 @@ fn search_fixture(sigma: &BigDecimal) -> SearchedFixture {
                     .expect("terminal bounds are nonempty"),
                 operations_per_drop,
                 primes_per_drop,
+                rhs_mode,
             };
             let (parameters, audit_trace) = match audit_program_at_crt_depth(
                 &request,
@@ -412,13 +418,19 @@ fn fixture(
     runtime: &mut impl api::StageExecution<api::StageStore>,
     store: &mut api::StageStore,
 ) -> Fixture {
-    // The secrets are sampled on the stage runtime and stay resident there.
-    let payload = RnsEncryptBuild::new(&parameters, [7; 32])
-        .sample_payload_secret(runtime, store)
-        .expect("payload secret");
-    let mask = RnsEncryptBuild::new(&parameters, [7; 32])
-        .sample_mask_secret(runtime, store)
-        .expect("mask secret");
+    // The Static secrets are sampled on the stage runtime and stay resident
+    // there.
+    let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
+    let payload = (!dynamic).then(|| {
+        RnsEncryptBuild::new(&parameters, [7; 32])
+            .sample_payload_secret(runtime, store)
+            .expect("payload secret")
+    });
+    let mask = (!dynamic).then(|| {
+        RnsEncryptBuild::new(&parameters, [7; 32])
+            .sample_mask_secret(runtime, store)
+            .expect("mask secret")
+    });
     let zero = DCRTPoly::const_zero(&poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&poly_parameters, 0);
     let q = profile.q().expect("Q exponent") as u64;
@@ -591,11 +603,13 @@ fn round_trip(
     // while encrypt receives public D attributes, a fresh mask, and only the
     // preparation artifacts.  Online receives artifacts/configuration only;
     // RHS plaintexts never cross this boundary.
+    let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
+    let no_rhs = BTreeMap::new();
     let (preprocess, online) = api::preprocess(
         program.program(),
         &ParamEnv::default(),
-        &rhs,
-        &payload,
+        if dynamic { &no_rhs } else { &rhs },
+        payload.as_ref(),
         HASH_KEY,
         RnsPreprocessBuild::new(&parameters, [7; 32]),
         runtime,
@@ -607,18 +621,30 @@ fn round_trip(
         },
     )
     .expect("RNS preprocessing");
+    // The single Dynamic secret is chosen only after preprocessing, and the
+    // selectors are bound with a fresh batch at encryption.
+    let payload = payload.unwrap_or_else(|| {
+        RnsEncryptBuild::new(&parameters, [7; 32])
+            .sample_payload_secret(runtime, &mut store)
+            .expect("payload secret")
+    });
     let encrypted = api::encrypt(
         &program.program().encryption_inputs(),
         &ParamEnv::default(),
         &lhs,
         &preprocess,
         &payload,
-        &mask,
+        mask.as_ref(),
         HASH_KEY,
         RnsEncryptBuild::new(&parameters, [7; 32]),
         runtime,
         &mut store,
-        |_| Ok(()),
+        |build| {
+            if dynamic {
+                build.bind_rhs_inputs(&ParamEnv::default(), &rhs, rand::random())?;
+            }
+            Ok(())
+        },
         |_| {
             observe("encrypt");
             Ok(())
@@ -678,7 +704,7 @@ fn round_trip(
             &expected,
             &parameters,
             &payload,
-            &mask,
+            mask.as_ref(),
             runtime,
             &mut store,
         )

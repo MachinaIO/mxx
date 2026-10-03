@@ -42,6 +42,14 @@ model. In average-case mode, the matching namespaced
 part of the accepted noise report and are not silently changed by the
 round-trip stage.
 
+The NAND and Sparse-LWR targets run the Static RHS lifecycle by default.
+Setting `MXX_EXPONENT_LUT_NAND_RHS_MODE=dynamic`,
+`MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic`, or
+`MXX_EXPONENT_LUT_NOISE_REFRESH_RHS_MODE=dynamic` selects the Dynamic lifecycle:
+preprocessing receives no secret and no RHS plaintexts, the single secret is
+sampled afterwards, and encryption binds the RHS plaintexts with a fresh batch
+identifier. The noise model applies to both modes.
+
 Compile all three targets without running them:
 
 ```sh

@@ -100,7 +100,7 @@ fn public_lut_branch<D: super::RightAction>(
     multiply_public_action(public_data, switched_key_decomposition)
 }
 
-fn matrix_from_hash(
+pub(super) fn matrix_from_hash(
     ring: &mxx_dsl::Ring,
     key: Bytes,
     tag: impl Into<mxx_dsl::HashTag>,
@@ -235,30 +235,154 @@ fn decompose_refresh_matrix(
     Ok(super::centered_rebase_compact(value, &evaluation_ring))
 }
 
-fn refresh_payload_action(
+/// A refresh action `[top; desired - r0 top + eta]` at the slot's `p` level
+/// under payload row `payload = (r0, 1)`.
+pub(super) fn refresh_payload_action(
     parameters: &RnsBggParameters,
     decomposition_level: usize,
-    payload: &RnsBggPayloadSecret,
+    payload: &RnsBggRow,
     desired: RnsBggRow,
-    hash_key: Bytes,
-    tag: impl Into<mxx_dsl::HashTag>,
+    top: RnsBggRow,
     target_columns: usize,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let p_ring = parameters.ring(decomposition_level)?;
+    let r0 = checked_modulus_convert(payload.0.clone(), &p_ring)?;
+    super::ciphertext_matrix(parameters, decomposition_level, target_columns, r0, top, desired)
+}
+
+/// The hash-sampled top row of a setup-fixed (Static) refresh action.
+fn refresh_action_top(
+    parameters: &RnsBggParameters,
+    decomposition_level: usize,
+    hash_key: Bytes,
+    tag: impl Into<mxx_dsl::HashTag>,
+    target_columns: usize,
+) -> Result<RnsBggRow, RnsBggError> {
+    let p_ring = parameters.ring(decomposition_level)?;
     let top_matrix = matrix_from_hash(&p_ring, hash_key, tag, target_columns);
-    let r0 = checked_modulus_convert(payload.row.0.clone(), &p_ring)?;
-    let eta =
-        crate::rns_bgg::encoding::fresh_error(parameters, decomposition_level, target_columns)?;
-    let bottom = (
-        desired.0 - r0.clone() * top_matrix.0.0.clone() + eta.0,
-        desired.1 - r0 * top_matrix.0.1.clone() + eta.1,
+    Ok(top_matrix.0)
+}
+
+/// The negated positional target `-W_label` of one refresh label action at
+/// the slot's `p` level. The encoding carries the private payload with a
+/// minus sign, so applying the action to the PRF value contributes
+/// `+z W_label`; a fresh-error label is additionally weighted by `H = p/q_t`.
+pub(super) fn refresh_label_action_target(
+    parameters: &RnsBggParameters,
+    declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+    slot: usize,
+    label: RefreshPrfLabel,
+    evaluation_level: usize,
+    decomposition_level: usize,
+) -> Result<RnsBggRow, RnsBggError> {
+    let metadata =
+        declaration.slots().get(slot).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+    let h =
+        matches!(label, RefreshPrfLabel::FreshError { .. }).then(|| &metadata.p / &metadata.q_t);
+    let target_q = refresh_label_target_with_columns(
+        parameters,
+        evaluation_level,
+        parameters.component_columns(declaration.target_level())?,
+        declaration.digits().base,
+        label,
+        h,
+    )?;
+    let target_p =
+        checked_modulus_convert_matrix(target_q, &parameters.ring(decomposition_level)?)?;
+    Ok(map_matrix(target_p, |entry| -entry).0)
+}
+
+/// The data action target `H lift_p(Delta_* t H_*)` of one refresh slot, the
+/// target-level payload row under payload row `payload` lifted to the slot's
+/// `p` level and scaled by `H = p/q_t`.
+pub(super) fn refresh_data_action_target(
+    parameters: &RnsBggParameters,
+    declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+    slot: usize,
+    payload: &RnsBggRow,
+    decomposition_level: usize,
+) -> Result<RnsBggRow, RnsBggError> {
+    let metadata =
+        declaration.slots().get(slot).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+    let target_level = declaration.target_level();
+    let p_ring = parameters.ring(decomposition_level)?;
+    let h_p = p_ring.polynomial([IntExpr::constant(&metadata.p / &metadata.q_t)]);
+    let output_ring = parameters.ring(target_level)?;
+    let output_gadget = parameters.state_gadget(target_level)?;
+    let output_scale = parameters.scalar(target_level, parameters.message_scale(target_level)?)?;
+    let output_payload = checked_modulus_convert_row(payload.clone(), &output_ring)?;
+    let desired_output = (
+        output_scale.clone() * output_payload.0 * output_gadget.clone(),
+        output_scale * output_payload.1 * output_gadget,
     );
-    Ok(((top_matrix.0.0, top_matrix.0.1), bottom))
+    Ok(lift_output_target_to_p(desired_output, &p_ring, h_p))
 }
 
 fn lift_output_target_to_p(value: RnsBggRow, p_ring: &Ring, h_p: Mat) -> RnsBggRow {
     let h_p = h_p.centered_rebase(p_ring);
     super::map_row(value, |entry| h_p.clone() * entry.centered_rebase(p_ring))
+}
+
+/// The RHS ciphertext `C` of `plaintext` consumed at `level`, sampled at
+/// `q_(level+1)` with top row `top` under payload row `payload`:
+/// `(t_bar, 1) C = Delta_(level+1) y t H_(level+1) + e_C`.
+pub(super) fn rhs_ciphertext(
+    parameters: &RnsBggParameters,
+    level: usize,
+    payload: &RnsBggRow,
+    plaintext: Mat,
+    top: RnsBggRow,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let next_level =
+        level.checked_add(1).ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
+    let next_ring = parameters.ring(next_level)?;
+    let target_columns = parameters.component_columns(next_level)?;
+    // Plaintext handles are canonicalized in the caller's natural input
+    // ring (currently level zero).  Do not require them to already carry
+    // the RHS consumer's logical level: the ciphertext is intentionally
+    // sampled at q_(level + 1), and this conversion is the boundary where
+    // the plaintext is represented in that ring.
+    let nu = checked_modulus_convert(plaintext, &next_ring)?;
+    let payload = checked_modulus_convert_row(payload.clone(), &next_ring)?;
+    let gadget = parameters.state_gadget(next_level)?;
+    let scale = parameters.scalar(next_level, parameters.message_scale(next_level)?)?;
+    let target = (payload.0.clone() * gadget.clone(), payload.1.clone() * gadget);
+    let desired = (target.0 * scale.clone() * nu.clone(), target.1 * scale * nu);
+    super::ciphertext_matrix(parameters, next_level, target_columns, payload.0, top, desired)
+}
+
+/// The LUT switching ciphertext `C_sigma` of branch `sigma` of `table` for
+/// a LUT evaluated at `level`, sampled at `q_(level+1)` with top row `top`
+/// under payload row `payload = (t_bar, 1)`:
+/// `(sigma(t_bar), 1) C_sigma = Delta_(level+1) a_sigma t H_(level+1) + e`.
+pub(super) fn lut_switching_ciphertext(
+    parameters: &RnsBggParameters,
+    level: usize,
+    table: &LutTable,
+    payload: &RnsBggRow,
+    sigma: IntExpr,
+    top: RnsBggRow,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let next_level = level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
+    let coefficient = super::EncodingLowering::lut_coefficient(
+        parameters,
+        next_level,
+        table.input_layout(),
+        table.output_representation(),
+        sigma.clone(),
+        table.values(),
+    )?;
+    // C_sigma is sampled in the next ring and constrained by the payload
+    // secret. Its signed switching decomposition has each compact digit
+    // centered-rebased to the source ring; the full matrix is never rebased
+    // as a dense matrix.
+    let payload = checked_modulus_convert_row(payload.clone(), &parameters.ring(next_level)?)?;
+    let gadget = parameters.state_gadget(next_level)?;
+    let scale = parameters.scalar(next_level, parameters.message_scale(next_level)?)?;
+    let target = lut_payload_target(scale, coefficient, payload.clone(), gadget);
+    let prefix = payload.0.ring_automorphism(sigma);
+    let columns = parameters.component_columns(next_level)?;
+    super::ciphertext_matrix(parameters, next_level, columns, prefix, top, target)
 }
 
 fn lut_payload_target(scale: Mat, coefficient: Mat, payload: RnsBggRow, gadget: Mat) -> RnsBggRow {
@@ -466,8 +590,13 @@ pub struct PublicKeyLowering<'a> {
     pub(crate) parameters: &'a RnsBggParameters,
     pub(crate) program: Arc<ExponentLutProgram>,
     pub(crate) workload: Arc<RnsBggDerivedWorkload>,
-    pub(crate) payload_secret: RnsBggPayloadSecret,
+    /// The Static payload secret; Dynamic preprocessing has none.
+    pub(crate) payload_secret: Option<RnsBggPayloadSecret>,
     pub(crate) hash_key: Bytes,
+    /// Setup context and, for a prepared PRF child, its refresh declaration
+    /// and slot: the public namespace of Dynamic digit-companion keys.
+    pub(crate) context: [u8; 32],
+    pub(crate) refresh_prf_namespace: Option<([u8; 32], usize)>,
     /// RHS plaintexts; a family keeps `plaintext_terms`, read member by member.
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, Vec<(BigInt, usize)>>>,
     /// Setup-fixed RHS ciphertexts.  These are compact matrices; their signed
@@ -484,6 +613,10 @@ pub struct PublicKeyLowering<'a> {
     pub(crate) refresh_stars: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
     pub(crate) refresh_targets: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
     pub(crate) refresh_label_targets: BTreeMap<([u8; 32], usize, usize), RnsBggMatrix>,
+    /// Dynamic refresh keys encryption consumes to form `A_sum`, keyed by
+    /// declaration commitment, slot, and label: the source key (`None`) and
+    /// each label's child-PRF output key.
+    pub(crate) refresh_keys: BTreeMap<([u8; 32], usize, Option<usize>), RnsBggMatrix>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Open parallel bodies, outermost first: each one's instance count and
     /// member index, and the RHS family members it prepared.
@@ -503,8 +636,9 @@ impl<'a> PublicKeyLowering<'a> {
         parameters: &'a RnsBggParameters,
         program: Arc<ExponentLutProgram>,
         workload: Arc<RnsBggDerivedWorkload>,
-        payload_secret: RnsBggPayloadSecret,
+        payload_secret: Option<RnsBggPayloadSecret>,
         hash_key: Bytes,
+        context: [u8; 32],
     ) -> Self {
         Self {
             parameters,
@@ -512,6 +646,8 @@ impl<'a> PublicKeyLowering<'a> {
             workload,
             payload_secret,
             hash_key,
+            context,
+            refresh_prf_namespace: None,
             rhs: BTreeMap::new(),
             rhs_material: BTreeMap::new(),
             lut_material: BTreeMap::new(),
@@ -519,6 +655,7 @@ impl<'a> PublicKeyLowering<'a> {
             refresh_stars: BTreeMap::new(),
             refresh_targets: BTreeMap::new(),
             refresh_label_targets: BTreeMap::new(),
+            refresh_keys: BTreeMap::new(),
             current_site: None,
             parallel_bodies: Vec::new(),
             finished_bodies: Vec::new(),
@@ -598,6 +735,45 @@ impl<'a> PublicKeyLowering<'a> {
         Ok(self.site()?.output)
     }
 
+    /// The Static payload secret, which only Static material reads.
+    fn payload(&self) -> Result<&RnsBggPayloadSecret, RnsBggError> {
+        self.payload_secret
+            .as_ref()
+            .ok_or(RnsBggError::Binding("Static preprocessing requires the payload secret"))
+    }
+
+    /// The pre-rounding Dynamic product key `T = sum_a B_{a,j} Dec(A)_{:,a}`
+    /// of state key `key` at `level`, with companion keys from `material`'s
+    /// tag (see [`super::companion_columns`]). A LUT branch passes its
+    /// automorphism `sigma`, which maps each stored key `B^0` to
+    /// `sigma(B^0)`, the key of the automorphed companion encoding.
+    fn companion_product_key(
+        &self,
+        level: usize,
+        key: &RnsBggMatrix,
+        material: String,
+        member: Option<IntExpr>,
+        sigma: Option<IntExpr>,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let tag = super::companion_tag(
+            self.parameters,
+            &self.context,
+            self.program.id(),
+            self.refresh_prf_namespace,
+            material,
+            member,
+            level,
+        );
+        let companion_key = |j| {
+            let key = super::companion_key(self.parameters, level, self.hash_key.clone(), &tag, j)?;
+            Ok(match &sigma {
+                Some(sigma) => map_matrix(key, |entry| entry.ring_automorphism(sigma.clone())),
+                None => key,
+            })
+        };
+        Ok(super::companion_columns(self.parameters, level, key, &companion_key, None, false)?.0)
+    }
+
     /// Sample an input key with shape selected from Program knowledge.
     pub(crate) fn sample_input_public_key(
         &self,
@@ -633,10 +809,6 @@ impl<'a> PublicKeyLowering<'a> {
     /// consuming operation.
     fn prepare_rhs_material(&mut self, rhs: &RhsRef<Int>) -> Result<RnsBggMatrix, RnsBggError> {
         let level = self.workload.rhs_level(rhs.id)?;
-        let next_level =
-            level.checked_add(1).ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
-        let next_ring = self.parameters.ring(next_level)?;
-        let target_columns = self.parameters.component_columns(next_level)?;
         // Bind the sampled RHS to the caller's plaintext through the same
         // payload-constrained ciphertext relation used by private input
         // encryption. The plaintext is a graph handle; it is never copied
@@ -651,18 +823,6 @@ impl<'a> PublicKeyLowering<'a> {
             .map_err(|error| RnsBggError::Graph(error.to_string()))?,
             None => return Err(RnsBggError::Binding("RHS plaintext was not bound")),
         };
-        // Plaintext handles are canonicalized in the caller's natural input
-        // ring (currently level zero).  Do not require them to already carry
-        // the RHS consumer's logical level: the setup-fixed ciphertext is
-        // intentionally sampled at q_(level + 1), and this conversion is the
-        // boundary where the plaintext is represented in that ring.
-        let nu = checked_modulus_convert(plaintext, &next_ring)?;
-        let payload = checked_modulus_convert_row(self.payload_secret.row.clone(), &next_ring)?;
-        let gadget = self.parameters.state_gadget(next_level)?;
-        let scale =
-            self.parameters.scalar(next_level, self.parameters.message_scale(next_level)?)?;
-        let target = (payload.0.clone() * gadget.clone(), payload.1.clone() * gadget);
-        let desired = (target.0 * scale.clone() * nu.clone(), target.1 * scale * nu);
         // The member enters the tag as an index expression, as it does where
         // online evaluation reads the member.
         let member = rhs
@@ -679,13 +839,7 @@ impl<'a> PublicKeyLowering<'a> {
             level,
             member,
         )?;
-        let error =
-            crate::rns_bgg::encoding::fresh_error(self.parameters, next_level, target_columns)?;
-        let bottom = (
-            desired.0 - payload.0.clone() * top.0.clone() + error.0,
-            desired.1 - payload.0 * top.1.clone() + error.1,
-        );
-        Ok((top, bottom))
+        rhs_ciphertext(self.parameters, level, &self.payload()?.row, plaintext, top)
     }
     /// Materialize setup-fixed compact `B_sigma` switching ciphertexts for a
     /// complete LUT/layout identity.  Gadget decomposition is deferred until
@@ -712,39 +866,13 @@ impl<'a> PublicKeyLowering<'a> {
         let sigmas = layout
             .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
+        let payload = &self.payload()?.row;
+        let columns = self.parameters.component_columns(next_level)?;
         let switching_ciphertexts = mxx_dsl::parallel(count, |index| {
             let sigma = IntExpr::Select {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            let coefficient = super::EncodingLowering::lut_coefficient(
-                self.parameters,
-                next_level,
-                layout,
-                table.output_representation(),
-                sigma.clone(),
-                table.values(),
-            )
-            .map_err(|_| DslError::Schema)?;
-            // B_sigma is sampled in the next ring and constrained by the
-            // payload secret. Its signed switching decomposition has
-            // each compact digit centered-rebased to the source ring; the
-            // full B matrix is never rebased as a dense matrix.
-            let payload =
-                checked_modulus_convert_row(self.payload_secret.row.clone(), &target_ring)
-                    .map_err(|_| DslError::Schema)?;
-            let gadget = self.parameters.state_gadget(next_level).map_err(|_| DslError::Schema)?;
-            let scale = self
-                .parameters
-                .scalar(
-                    next_level,
-                    self.parameters.message_scale(next_level).map_err(|_| DslError::Schema)?,
-                )
-                .map_err(|_| DslError::Schema)?;
-            let target = lut_payload_target(scale, coefficient, payload.clone(), gadget);
-            let ring_next = self.parameters.ring(next_level).map_err(|_| DslError::Schema)?;
-            let columns =
-                self.parameters.component_columns(next_level).map_err(|_| DslError::Schema)?;
             let mut tag = mxx_dsl::HashTag::from(
                 format!("rns-bgg/lut-b/{:?}/{level}/{next_level}", lut_id).into_bytes(),
             );
@@ -752,19 +880,9 @@ impl<'a> PublicKeyLowering<'a> {
             tag.push(sigma.clone());
             tag.push("branch");
             tag.push(index.expression()?);
-            let top_matrix = matrix_from_hash(&ring_next, self.hash_key.clone(), tag, columns);
-            let top = (top_matrix.0.0, top_matrix.0.1);
-            let prefix = payload.0.ring_automorphism(sigma.clone());
-            let error = crate::rns_bgg::encoding::fresh_error(self.parameters, next_level, columns)
-                .map_err(|_| DslError::Schema)?;
-            let b_sigma = (
-                top.clone(),
-                (
-                    -prefix.clone() * top.0 + target.0 + error.0,
-                    -prefix * top.1 + target.1 + error.1,
-                ),
-            );
-            Ok(b_sigma)
+            let top = matrix_from_hash(&target_ring, self.hash_key.clone(), tag, columns).0;
+            lut_switching_ciphertext(self.parameters, level, table, payload, sigma, top)
+                .map_err(|_| DslError::Schema)
         })
         .map_err(graph)?;
         self.lut_material.insert(key, switching_ciphertexts.clone());
@@ -883,6 +1001,35 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         {
             return Err(RnsBggError::Binding("RNS-BGG MulPrivate requires a private input"));
         }
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            // The key is fixed from public companion keys alone; the RHS
+            // ciphertext and its digits exist only after encryption.
+            let level = self.workload.level(input.wire)?;
+            let rhs_level = self.workload.rhs_level(rhs.id)?;
+            if rhs_level != level {
+                return Err(RnsBggError::RhsLevelMismatch {
+                    rhs: rhs.id,
+                    expected: level,
+                    actual: rhs_level,
+                });
+            }
+            let member =
+                rhs.index.as_ref().map(Int::expression).transpose().map_err(|_| {
+                    RnsBggError::Binding("RHS member index is not an index expression")
+                })?;
+            let key = self.companion_product_key(
+                level,
+                &input.matrix,
+                format!("rhs/{:?}", rhs.id),
+                member,
+                None,
+            )?;
+            let target_ring = self.parameters.ring(self.workload.level(self.output()?)?)?;
+            return Ok(RnsBggPublicKey::new(
+                self.output()?,
+                super::mod_down_public(key, &target_ring),
+            ));
+        }
         let streamed = self.streamed_rhs_member(rhs)?;
         let compact = match (streamed, self.rhs_material.get(&rhs.id)) {
             (Some(material), _) => material,
@@ -933,7 +1080,12 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         }
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let source_level = self.workload.level(input.wire)?;
-        let switching_ciphertexts = self.prepare_lut_switching_ciphertexts(input, lut_id, table)?;
+        let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
+        // Dynamic switching ciphertexts are generated by encryption; the key
+        // uses their public companion keys only.
+        let switching_ciphertexts = (!dynamic)
+            .then(|| self.prepare_lut_switching_ciphertexts(input, lut_id, table))
+            .transpose()?;
         let next_level =
             source_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let source_ring = self.parameters.ring(source_level)?;
@@ -955,22 +1107,33 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                     selector: Box::new(index.expression()?),
                     branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
                 };
-                let switching_decomposition = super::centered_rebase_compact(
-                    decompose_matrix(
-                        self.parameters,
-                        next_level,
-                        switching_ciphertexts.at(index.clone()),
-                    )
-                    .map_err(|_| DslError::Schema)?,
-                    &source_ring,
-                );
                 let routed = super::map_matrix(input.matrix.clone(), |entry| {
                     entry.ring_automorphism(sigma.clone())
                 });
-                let switched_public_key = super::mod_down_public(
-                    super::multiply_public_action(routed, switching_decomposition),
-                    &target_ring,
-                );
+                let switched = match &switching_ciphertexts {
+                    Some(switching_ciphertexts) => {
+                        let switching_decomposition = super::centered_rebase_compact(
+                            decompose_matrix(
+                                self.parameters,
+                                next_level,
+                                switching_ciphertexts.at(index.clone()),
+                            )
+                            .map_err(|_| DslError::Schema)?,
+                            &source_ring,
+                        );
+                        super::multiply_public_action(routed, switching_decomposition)
+                    }
+                    None => self
+                        .companion_product_key(
+                            source_level,
+                            &routed,
+                            format!("lut/{lut_id:?}"),
+                            Some(index.expression()?),
+                            Some(sigma.clone()),
+                        )
+                        .map_err(|_| DslError::Schema)?,
+                };
+                let switched_public_key = super::mod_down_public(switched, &target_ring);
                 let switched_key_decomposition = super::centered_rebase_compact(
                     decompose_matrix(self.parameters, next_level, switched_public_key)
                         .map_err(|_| DslError::Schema)?,
@@ -1374,6 +1537,9 @@ impl PublicKeyLowering<'_> {
         // A_sum is built independently in each intermediate ring.  Mask
         // labels may contribute only to their owning slot; fresh labels must
         // be present in every slot and therefore preserve their shared source.
+        // Dynamic actions depend on the secret, so encryption builds A_sum
+        // from the source and label keys recorded here.
+        let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
         let mut sums = vec![None::<RnsBggMatrix>; slot_count];
         let expected_wires = declaration
             .prepared()
@@ -1392,22 +1558,18 @@ impl PublicKeyLowering<'_> {
             let channels = outputs
                 .get(expected_label)
                 .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
-            let fresh = match label {
+            let valid_digit = match label {
                 RefreshPrfLabel::Mask { slot, digit, .. } => {
-                    if slot >= declaration.digits().mask_counts.len() ||
-                        digit >= declaration.digits().mask_counts[slot]
-                    {
-                        return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-                    }
-                    false
+                    slot < declaration.digits().mask_counts.len() &&
+                        digit < declaration.digits().mask_counts[slot]
                 }
                 RefreshPrfLabel::FreshError { digit, .. } => {
-                    if digit >= declaration.digits().fresh_count {
-                        return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-                    }
-                    true
+                    digit < declaration.digits().fresh_count
                 }
             };
+            if !valid_digit {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+            }
             let expected_slots = label.slots(slot_count).map_err(RnsBggError::Refresh)?;
             if channels.len() != expected_slots.len() ||
                 channels.keys().copied().ne(expected_slots.iter().copied())
@@ -1435,30 +1597,22 @@ impl PublicKeyLowering<'_> {
                 {
                     return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
                 }
-                let h = fresh.then(|| &slot_metadata.p / &slot_metadata.q_t);
                 let evaluation_level = anchor_levels[slot];
                 let decomposition_level = decomposition_levels[slot];
+                if dynamic {
+                    // Encryption forms this label's action, and its share
+                    // of `A_sum`, from the child-PRF output key.
+                    self.refresh_keys.insert(
+                        (*declaration.commitment(), slot, Some(index)),
+                        value.matrix.clone(),
+                    );
+                    continue;
+                }
                 let target_columns =
                     self.parameters.component_columns(declaration.target_level())?;
-                let target_q = refresh_label_target_with_columns(
-                    self.parameters,
-                    evaluation_level,
-                    target_columns,
-                    declaration.digits().base,
-                    label,
-                    h.clone(),
-                )?;
-                let p_ring = self.parameters.ring(decomposition_level)?;
-                // Encoding carries the private payload with a minus sign.
-                // The preprocessing action therefore stores -W_label so
-                // that applying it to the PRF value contributes +z*W_label.
-                let target_p = checked_modulus_convert_matrix(target_q, &p_ring)
-                    .map(|target| map_matrix(target, |entry| -entry))?;
-                let label_action = refresh_payload_action(
+                let top = refresh_action_top(
                     self.parameters,
                     decomposition_level,
-                    &self.payload_secret,
-                    (target_p.0.0, target_p.0.1),
                     self.hash_key.clone(),
                     mxx_dsl::HashTag::from(
                         format!(
@@ -1467,6 +1621,21 @@ impl PublicKeyLowering<'_> {
                         )
                         .into_bytes(),
                     ),
+                    target_columns,
+                )?;
+                let label_action = refresh_payload_action(
+                    self.parameters,
+                    decomposition_level,
+                    &self.payload()?.row,
+                    refresh_label_action_target(
+                        self.parameters,
+                        declaration,
+                        slot,
+                        label,
+                        evaluation_level,
+                        decomposition_level,
+                    )?,
+                    top,
                     target_columns,
                 )?;
                 let label_action_decomposition = decompose_refresh_matrix(
@@ -1494,51 +1663,14 @@ impl PublicKeyLowering<'_> {
             let aout = output_anchors
                 .get(slot)
                 .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
-            let a_sum =
-                sums[slot].take().ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
-            let h = &declaration.slots()[slot].p / &declaration.slots()[slot].q_t;
             let slot_modulus = declaration.slots()[slot]
                 .q
                 .to_biguint()
                 .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
             let evaluation_level = anchor_levels[slot];
             let decomposition_level = decomposition_levels[slot];
-            let target_level = declaration.target_level();
-            let target_columns = self.parameters.component_columns(target_level)?;
             let p_ring = self.parameters.ring(decomposition_level)?;
-            let h_p = p_ring.polynomial([IntExpr::constant(h.clone())]);
-            let output_ring = self.parameters.ring(target_level)?;
-            let output_gadget = self.parameters.state_gadget(target_level)?;
-            let output_scale = self
-                .parameters
-                .scalar(target_level, self.parameters.message_scale(target_level)?)?;
-            let output_payload =
-                checked_modulus_convert_row(self.payload_secret.row.clone(), &output_ring)?;
-            let desired_output = (
-                output_scale.clone() * output_payload.0 * output_gadget.clone(),
-                output_scale * output_payload.1 * output_gadget,
-            );
-            let desired_data = lift_output_target_to_p(desired_output, &p_ring, h_p);
-            let action = refresh_payload_action(
-                self.parameters,
-                decomposition_level,
-                &self.payload_secret,
-                desired_data,
-                self.hash_key.clone(),
-                mxx_dsl::HashTag::from(
-                    format!("rns-bgg/refresh-data/{:?}/{slot}", declaration.commitment())
-                        .into_bytes(),
-                ),
-                target_columns,
-            )?;
-            let action_decomposition = decompose_refresh_matrix(
-                self.parameters,
-                evaluation_level,
-                decomposition_level,
-                action.clone(),
-            )?;
-            let data_public =
-                super::multiply_public_action(ain.matrix.clone(), action_decomposition);
+            let output_ring = self.parameters.ring(declaration.target_level())?;
             if &slot_modulus % &target_modulus != BigUint::zero() {
                 return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
             }
@@ -1556,11 +1688,55 @@ impl PublicKeyLowering<'_> {
             {
                 return Err(RnsBggError::Binding("refresh CRT channel schemas differ"));
             }
-            let a_sum = add_public_matrices(a_sum, data_public);
-            let a_sum = mod_down_public(a_sum, &p_ring);
-            self.refresh_sums.insert((*declaration.commitment(), slot), a_sum);
+            if dynamic {
+                // Encryption forms the data action and `A_sum` from the
+                // source key.
+                self.refresh_keys
+                    .insert((*declaration.commitment(), slot, None), ain.matrix.clone());
+            } else {
+                let a_sum = sums[slot]
+                    .take()
+                    .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
+                let target_columns =
+                    self.parameters.component_columns(declaration.target_level())?;
+                let top = refresh_action_top(
+                    self.parameters,
+                    decomposition_level,
+                    self.hash_key.clone(),
+                    mxx_dsl::HashTag::from(
+                        format!("rns-bgg/refresh-data/{:?}/{slot}", declaration.commitment())
+                            .into_bytes(),
+                    ),
+                    target_columns,
+                )?;
+                let payload = &self.payload()?.row;
+                let action = refresh_payload_action(
+                    self.parameters,
+                    decomposition_level,
+                    payload,
+                    refresh_data_action_target(
+                        self.parameters,
+                        declaration,
+                        slot,
+                        payload,
+                        decomposition_level,
+                    )?,
+                    top,
+                    target_columns,
+                )?;
+                let action_decomposition = decompose_refresh_matrix(
+                    self.parameters,
+                    evaluation_level,
+                    decomposition_level,
+                    action.clone(),
+                )?;
+                let data_public =
+                    super::multiply_public_action(ain.matrix.clone(), action_decomposition);
+                let a_sum = mod_down_public(add_public_matrices(a_sum, data_public), &p_ring);
+                self.refresh_sums.insert((*declaration.commitment(), slot), a_sum);
+                self.refresh_targets.insert((*declaration.commitment(), slot), action);
+            }
             self.refresh_stars.insert((*declaration.commitment(), slot), aout_p);
-            self.refresh_targets.insert((*declaration.commitment(), slot), action);
             values.push(target_at_output);
             coefficients.push(self.parameters.scalar(
                 declaration.target_level(),
@@ -1612,13 +1788,14 @@ impl<'a> RnsPreprocessBuild<'a> {
     }
 
     /// Bind RHS plaintexts for a prepared PRF child without exposing the
-    /// generic stage trait at application call sites.
+    /// generic stage trait at application call sites. Dynamic children bind
+    /// no RHS plaintexts and no secret.
     pub fn bind_rhs_inputs<P: Poly>(
         &mut self,
         program: &ExponentLutProgram,
         parameters: &mxx_ir_core::ParamEnv,
         rhs: &PlaintextInputs<RhsId, P>,
-        payload: &RnsBggPayloadSecret,
+        payload: Option<&RnsBggPayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
         <Self as PreprocessBuild<P>>::bind_inputs(self, program, parameters, rhs, payload, hash_key)
@@ -1698,6 +1875,9 @@ impl<'a> RnsPreprocessBuild<'a> {
         }
         if self.refresh_prf_binding.is_some() {
             return Err(ApiError::input("refresh PRF is already bound"));
+        }
+        if let Some(evaluator) = self.evaluator.as_mut() {
+            evaluator.refresh_prf_namespace = Some((*declaration.commitment(), slot));
         }
         self.refresh_prf_binding = Some((
             *declaration.commitment(),
@@ -1926,11 +2106,27 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         program: &ExponentLutProgram,
         parameters: &mxx_ir_core::ParamEnv,
         rhs: &PlaintextInputs<RhsId, P>,
-        payload: &Self::PayloadSecret,
+        payload: Option<&Self::PayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        if rhs.len() != program.rhs_inputs().len() ||
-            rhs.keys().any(|id| !program.rhs_inputs().contains_key(id))
+        let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
+        match (dynamic, payload) {
+            (false, Some(_)) | (true, None) => {}
+            (false, None) => {
+                return Err(ApiError::input("Static preprocessing requires the payload secret"));
+            }
+            (true, Some(_)) => {
+                return Err(ApiError::input("Dynamic preprocessing takes no secret"));
+            }
+        }
+        if dynamic && !rhs.is_empty() {
+            return Err(ApiError::input(
+                "Dynamic preprocessing takes no RHS plaintexts; encryption binds them",
+            ));
+        }
+        if !dynamic &&
+            (rhs.len() != program.rhs_inputs().len() ||
+                rhs.keys().any(|id| !program.rhs_inputs().contains_key(id)))
         {
             return Err(ApiError::input("RHS bindings do not exactly match Program inputs"));
         }
@@ -1943,8 +2139,9 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             self.parameters,
             program.clone(),
             workload,
-            payload.clone(),
+            payload.cloned(),
             bytes,
+            self.context,
         );
         for (wire, declaration) in program.inputs() {
             let binding = match declaration.shape() {
@@ -1968,6 +2165,33 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 .map_err(|e| ApiError::input(e.to_string()))?;
         }
         for (id, declaration) in program.rhs_inputs() {
+            if dynamic {
+                // Only references: every key derives from public companion
+                // keys, and encryption binds the plaintexts.
+                evaluator.workload.rhs_level(*id).map_err(ApiError::scheme)?;
+                let binding = match declaration {
+                    InputBinding::Scalar(()) => {
+                        InputBinding::Scalar(RhsRef { id: *id, index: None::<Int> })
+                    }
+                    InputBinding::Family(count) => {
+                        let count = count
+                            .evaluate(parameters)
+                            .ok()
+                            .and_then(|value| value.to_usize())
+                            .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
+                        InputBinding::Family(
+                            mxx_dsl::parallel(IntExpr::constant(count), |index| {
+                                Ok(RhsRef { id: *id, index: Some(index) })
+                            })
+                            .map_err(ApiError::scheme)?,
+                        )
+                    }
+                };
+                self.environment
+                    .bind_rhs(*id, binding)
+                    .map_err(|e| ApiError::input(e.to_string()))?;
+                continue;
+            }
             let value = rhs.get(id).ok_or_else(|| ApiError::input("missing RHS plaintext"))?;
             match (declaration, value) {
                 (InputBinding::Scalar(()), InputBinding::Scalar(poly)) => {
@@ -2014,7 +2238,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         // Plaintext RHS graph handles stay for lowering: a loop that reads an
         // RHS family member prepares its compact ciphertext there.
         self.runtime.insert(HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.into()));
-        if let Some(binding) = &payload.binding {
+        if let Some(binding) = payload.and_then(|payload| payload.binding.as_ref()) {
             binding.bind(&mut self.runtime);
         }
         self.hash_key_commitment = hash_key_commitment(hash_key);
@@ -2241,6 +2465,13 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 )
                 .map_err(ApiError::scheme)?;
         }
+        // Dynamic refresh keys are public; encryption forms the secret-
+        // dependent actions and A_sum from them.
+        for ((commitment, slot, label), key) in &evaluator.refresh_keys {
+            graph = graph
+                .cached_output(refresh_key_artifact_name(*commitment, *slot, *label), key.clone())
+                .map_err(ApiError::scheme)?;
+        }
         let graph = graph.build().map_err(ApiError::scheme)?;
         let input_levels = evaluator
             .program
@@ -2255,9 +2486,20 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             self.parameters.parameter_identity(),
             self.hash_key_commitment,
             Vec::<ProductionId>::new(),
+            self.parameters.rhs_mode(),
         )
         .map_err(ApiError::scheme)?
         .with_input_levels(input_levels);
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            let rhs = evaluator
+                .program
+                .rhs_inputs()
+                .iter()
+                .map(|(id, shape)| Ok((*id, (shape.clone(), evaluator.workload.rhs_level(*id)?))))
+                .collect::<Result<BTreeMap<_, _>, RnsBggError>>()
+                .map_err(ApiError::scheme)?;
+            binding = binding.with_dynamic_schema(rhs, evaluator.workload.luts().clone());
+        }
         if let Some(declaration) = &self.refresh_declaration {
             binding = binding.with_refresh_declaration(declaration);
         }
@@ -2331,8 +2573,9 @@ mod test {
             &parameters,
             owned_program.clone(),
             workload.clone(),
-            RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None },
+            Some(RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None }),
             hash_key.clone(),
+            [0; 32],
         );
         let input_key = public.sample_input_public_key(input).unwrap();
         let mut public_environment = Environment::new();
@@ -2359,6 +2602,8 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: None,
             hash_key,
         };
@@ -2428,11 +2673,12 @@ mod test {
             &parameters,
             program,
             workload,
-            RnsBggPayloadSecret {
+            Some(RnsBggPayloadSecret {
                 row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)),
                 binding: None,
-            },
+            }),
             ring.bytes_input("sampled-key-schema", 32),
+            [0; 32],
         );
         let private_key = lowering.sample_input_public_key(private).unwrap();
         let public_key = lowering.sample_input_public_key(public).unwrap();
@@ -2617,11 +2863,12 @@ mod test {
             &parameters,
             program,
             workload,
-            RnsBggPayloadSecret {
+            Some(RnsBggPayloadSecret {
                 row: (high_ring.uniform_interval((1, 1), -1, 1), high_ring.identity(1)),
                 binding: None,
-            },
+            }),
             high_ring.bytes_input("mul-public-private-level", 32),
+            [0; 32],
         );
         lowering.current_site =
             Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() });
@@ -2708,8 +2955,9 @@ mod test {
             &parameters,
             program,
             workload,
-            RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None },
+            Some(RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None }),
             ring.bytes_input("mul-public-numeric-key", 32),
+            [0; 32],
         );
         lowering.current_site =
             Some(LoweringSite { output: private_output, indices: Vec::new(), ranges: Vec::new() });
@@ -3111,10 +3359,16 @@ mod test {
         let action = refresh_payload_action(
             &parameters,
             decomposition_level,
-            &payload,
+            &payload.row,
             desired,
-            hash_key,
-            mxx_dsl::HashTag::from(b"refresh-width-test".to_vec()),
+            refresh_action_top(
+                &parameters,
+                decomposition_level,
+                hash_key,
+                mxx_dsl::HashTag::from(b"refresh-width-test".to_vec()),
+                target_columns,
+            )
+            .unwrap(),
             target_columns,
         )
         .unwrap();
@@ -3165,8 +3419,9 @@ mod test {
             &parameters,
             program,
             workload,
-            payload,
+            Some(payload),
             ring.bytes_input("rhs-schema-key", 32),
+            [0; 32],
         );
         lowering.rhs.insert(
             rhs,
@@ -3261,7 +3516,7 @@ mod test {
             &program,
             &ParamEnv::default(),
             &rhs,
-            &payload,
+            Some(&payload),
             b"later-rhs-levels",
         )
         .unwrap();
@@ -3338,8 +3593,9 @@ mod test {
             &parameters,
             program,
             workload,
-            payload,
+            Some(payload),
             ring.bytes_input("rhs-family-schema-key", 32),
+            [0; 32],
         );
         lowering.rhs.insert(
             rhs,

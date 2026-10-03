@@ -18,8 +18,8 @@ use crate::{
     },
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
-        ExponentLutProgramBuilder, GraphParallelLowering, InputBinding, LoweringSite, LutTable,
-        Operand, ProgramLoweringContext, RhsId, WireId, family_of_fields,
+        ExponentLutProgramBuilder, GraphParallelLowering, InputBinding, InputShape, LoweringSite,
+        LutId, LutTable, Operand, ProgramLoweringContext, RhsId, RhsRef, WireId, family_of_fields,
     },
 };
 use mxx_backends::{
@@ -127,7 +127,8 @@ impl RnsBggEncoding<RnsBggRow, Mat> {
 /// ordinary runtime result owner. The residual graph and its final decode are
 /// concrete RNS-BGG application operations; no generic runtime decoder or
 /// verification artifact is exposed. `payload` and `mask` remain
-/// caller-owned, and neither is passed to online evaluation.
+/// caller-owned, and neither is passed to online evaluation. Dynamic
+/// parameters take no mask: their single secret `payload` is also the mask.
 pub fn verify_output<E, S, P>(
     program: &ExponentLutProgram,
     result: &StageOutputs,
@@ -135,7 +136,7 @@ pub fn verify_output<E, S, P>(
     expected: &P,
     parameters: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
-    mask: &RnsBggMaskSecret,
+    mask: Option<&RnsBggMaskSecret>,
     execution: &mut E,
     store: &mut S,
 ) -> Result<(), ApiError>
@@ -192,7 +193,7 @@ pub fn verify_refreshed_output<E, S, P>(
     expected: &P,
     parameters: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
-    mask: &RnsBggMaskSecret,
+    mask: Option<&RnsBggMaskSecret>,
     execution: &mut E,
     store: &mut S,
 ) -> Result<(), ApiError>
@@ -233,7 +234,7 @@ fn verify_output_at_level<E, S, P>(
     expected: &P,
     parameters: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
-    mask: &RnsBggMaskSecret,
+    mask: Option<&RnsBggMaskSecret>,
     execution: &mut E,
     store: &mut S,
 ) -> Result<(), ApiError>
@@ -242,6 +243,7 @@ where
     S: SessionStore,
     P: Poly,
 {
+    let mask = &stage_mask(parameters, payload, mask)?;
     // Only the terminal relation (identity state gadget, public scale
     // floor(q / 2)) separates plaintexts by more than the q / 4 decoding
     // threshold; an intermediate carrier's gadget powers can be smaller than
@@ -437,14 +439,16 @@ pub enum OnlineWireFamily {
 }
 
 /// A family RHS bound for online evaluation: the stored bottom row of each
-/// member's compact ciphertext. A member read samples its top row from the
-/// hash key in place (`rhs_top`).
+/// member's compact ciphertext. A Static member read samples its top row
+/// from the hash key in place (`rhs_top`); Dynamic encryption stores the top
+/// rows too, since they are sampled per encryption.
 #[derive(Clone)]
 pub struct OnlineRhsFamily {
     rhs: RhsId,
     program: crate::program::ExponentLutProgramId,
     level: usize,
     hash_key: Bytes,
+    tops: Option<Family<RnsBggRow>>,
     bottoms: Family<RnsBggRow>,
 }
 
@@ -503,17 +507,24 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineFam
         &mut self,
         family: &Self::RhsFamily,
         index: &IntExpr,
-    ) -> Result<RnsBggMatrix, crate::program::ProgramLowerError<RnsBggError>> {
-        let top = super::public_key::rhs_top(
-            self.parameters,
-            family.program,
-            family.hash_key.clone(),
-            family.rhs,
-            family.level,
-            Some(index.clone()),
-        )
-        .map_err(crate::program::ProgramLowerError::Backend)?;
-        Ok((top, family.bottoms.at(Int::evaluate(index.clone()))))
+    ) -> Result<(RnsBggMatrix, RhsRef<Int>), crate::program::ProgramLowerError<RnsBggError>> {
+        let member = Int::evaluate(index.clone());
+        let top = match &family.tops {
+            Some(tops) => tops.at(member.clone()),
+            None => super::public_key::rhs_top(
+                self.parameters,
+                family.program,
+                family.hash_key.clone(),
+                family.rhs,
+                family.level,
+                Some(index.clone()),
+            )
+            .map_err(crate::program::ProgramLowerError::Backend)?,
+        };
+        Ok((
+            (top, family.bottoms.at(member.clone())),
+            RhsRef { id: family.rhs, index: Some(member) },
+        ))
     }
 
     fn parallel(
@@ -543,20 +554,22 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineFam
     }
 }
 
-/// Import every RHS of `program` from `preprocess`, for binding before the
-/// Program is lowered. Preprocessing publishes the bottom row of each compact
-/// RHS at the level after its consumer's, so it is imported once at that
-/// level; a family RHS is one family per row port, and each member's top row
-/// is sampled where the member is read. `name` maps a role to its artifact
-/// name.
+/// Import every RHS of `program`, for binding before the Program is
+/// lowered, each paired with its reference. Static preprocessing publishes
+/// the bottom row of each compact RHS at the level after its consumer's, and
+/// each member's top row is sampled where the member is read; Dynamic
+/// encryption publishes both rows. A family RHS is one family per row port.
+/// `name` maps a role to its artifact name.
 fn import_rhs_bindings(
     parameters: &RnsBggParameters,
     program: &ExponentLutProgram,
     workload: &RnsBggDerivedWorkload,
     preprocess: &ProductionId,
+    encryption: &ProductionId,
     hash_key: &Bytes,
     name: impl Fn(String) -> String,
-) -> Result<Vec<(RhsId, InputBinding<RnsBggMatrix, OnlineRhsFamily>)>, ApiError> {
+) -> Result<Vec<(RhsId, InputBinding<(RnsBggMatrix, RhsRef<Int>), OnlineRhsFamily>)>, ApiError> {
+    let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
     let mut bindings = Vec::with_capacity(program.rhs_inputs().len());
     for (rhs, shape) in program.rhs_inputs() {
         let consumer_level = workload.rhs_level(*rhs).map_err(ApiError::scheme)?;
@@ -568,47 +581,64 @@ fn import_rhs_bindings(
         let binding = match shape {
             InputBinding::Scalar(()) => {
                 let port = |port: usize| {
+                    let (production, role) = if dynamic {
+                        (encryption, format!("rhs/{rhs:?}/ciphertext.{port}"))
+                    } else {
+                        (preprocess, format!("rhs/{rhs:?}.{}", port - 2))
+                    };
                     ring.artifact_input(
-                        preprocess.clone(),
-                        name(format!("rhs/{rhs:?}.{port}")),
+                        production.clone(),
+                        name(role),
                         (1, columns),
                         ArtifactAvailability::Transferred,
                     )
                 };
-                let top = super::public_key::rhs_top(
-                    parameters,
-                    program.id(),
-                    hash_key.clone(),
-                    *rhs,
-                    consumer_level,
-                    None,
-                )
-                .map_err(ApiError::scheme)?;
-                InputBinding::Scalar((top, (port(0), port(1))))
+                let top = if dynamic {
+                    (port(0), port(1))
+                } else {
+                    super::public_key::rhs_top(
+                        parameters,
+                        program.id(),
+                        hash_key.clone(),
+                        *rhs,
+                        consumer_level,
+                        None,
+                    )
+                    .map_err(ApiError::scheme)?
+                };
+                InputBinding::Scalar(((top, (port(2), port(3))), RhsRef { id: *rhs, index: None }))
             }
             InputBinding::Family(count) => {
-                let ports = (0..2)
-                    .map(|port| {
+                let row = |ports: [usize; 2]| {
+                    let families = ports.map(|port| {
+                        let (production, role) = if dynamic {
+                            (encryption, format!("rhs/{rhs:?}/family/ciphertext.{port}"))
+                        } else {
+                            (preprocess, format!("rhs/{rhs:?}/family.{}", port - 2))
+                        };
                         ring.family_artifact_input(
-                            preprocess.clone(),
-                            name(format!("rhs/{rhs:?}/family.{port}")),
+                            production.clone(),
+                            name(role),
                             count.clone(),
                             (1, columns),
                             ArtifactAvailability::Transferred,
                         )
-                    })
-                    .collect::<Vec<_>>();
-                let element: RnsBggRow =
-                    (ports[0].at(Int::constant(0)), ports[1].at(Int::constant(0)));
-                let fields =
-                    ports.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
+                    });
+                    let element: RnsBggRow =
+                        (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
+                    let fields = families
+                        .iter()
+                        .map(|family| family.value_handle().clone())
+                        .collect::<Vec<_>>();
+                    family_of_fields(&element, count.clone(), &fields).map_err(ApiError::scheme)
+                };
                 InputBinding::Family(OnlineRhsFamily {
                     rhs: *rhs,
                     program: program.id(),
                     level: consumer_level,
                     hash_key: hash_key.clone(),
-                    bottoms: family_of_fields(&element, count.clone(), &fields)
-                        .map_err(ApiError::scheme)?,
+                    tops: dynamic.then(|| row([0, 1])).transpose()?,
+                    bottoms: row([2, 3])?,
                 })
             }
         };
@@ -733,6 +763,26 @@ impl RnsBggMaskSecret {
             row: reduce_secret(parameters, &self.row, level)?,
             binding: self.binding.clone(),
         })
+    }
+}
+
+/// The mask secret of a stage: the supplied Static mask, or in Dynamic
+/// mode the single secret `s` itself, aliasing the payload's sampled rows
+/// and runtime binding so no second secret exists.
+fn stage_mask(
+    parameters: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    mask: Option<&RnsBggMaskSecret>,
+) -> Result<RnsBggMaskSecret, ApiError> {
+    match (parameters.rhs_mode(), mask) {
+        (RhsMode::Static, Some(mask)) => Ok(mask.clone()),
+        (RhsMode::Dynamic, None) => {
+            Ok(RnsBggMaskSecret { row: payload.row.clone(), binding: payload.binding.clone() })
+        }
+        (RhsMode::Static, None) => Err(ApiError::input("Static stages require a mask secret")),
+        (RhsMode::Dynamic, Some(_)) => {
+            Err(ApiError::input("Dynamic stages take no mask: the payload secret is the mask"))
+        }
     }
 }
 
@@ -886,20 +936,40 @@ fn encode_public_inner(
     if *plaintext.matrix_type() != ring.matrix_type((1, 1)) {
         return Err(RnsBggError::Binding("public plaintext ring"));
     }
-    let s = reduce_secret(parameters, &mask.row, level)?;
-    let gadget = parameters.public_gadget(level)?;
-    let matrix = key.matrix.clone();
+    let row = public_encoding_row(
+        parameters,
+        key.matrix.clone(),
+        &mask.row,
+        plaintext.clone() * parameters.public_gadget(level)?,
+        parameters.level(level)?.modulus_digits(),
+        level,
+    )?;
+    Ok(RnsBggEncoding::new(key.clone(), row, Some(plaintext)))
+}
+
+/// The row `s A - s (d G) + e` encoding a public attribute `d` under key `A`
+/// at `level`, with `public_scale = d G` for the full (unscaled)
+/// current-level public gadget `G` and a fresh error row of `columns`
+/// columns. Ordinary public inputs and Dynamic digit companions share this
+/// equation.
+fn public_encoding_row(
+    parameters: &RnsBggParameters,
+    matrix: RnsBggMatrix,
+    mask: &RnsBggRow,
+    public_scale: Mat,
+    columns: usize,
+    level: usize,
+) -> Result<RnsBggRow, RnsBggError> {
+    let s = reduce_secret(parameters, mask, level)?;
     let mask_matrix = (
         s.0.clone() * matrix.0.0 + s.1.clone() * matrix.1.0,
         s.0.clone() * matrix.0.1 + s.1.clone() * matrix.1.1,
     );
-    let public_scale = plaintext.clone() * gadget;
-    let error = fresh_error(parameters, level, parameters.level(level)?.modulus_digits())?;
-    let row = (
+    let error = fresh_error(parameters, level, columns)?;
+    Ok((
         mask_matrix.0 - s.0 * public_scale.clone() + error.0,
         mask_matrix.1 - s.1 * public_scale + error.1,
-    );
-    Ok(RnsBggEncoding::new(key.clone(), row, Some(plaintext)))
+    ))
 }
 
 /// Online lowering state.  Its artifact fields are metadata and lazy handles,
@@ -915,6 +985,11 @@ pub struct EncodingLowering<'a> {
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
+    /// Setup context, part of the Dynamic digit-companion key namespace.
+    pub(crate) context: [u8; 32],
+    /// Dynamic: each RHS's digit-companion family, imported where the
+    /// Program is bound so a Program family body reads its members in place.
+    pub(crate) rhs_companions: BTreeMap<RhsId, Family<RnsBggRow>>,
 }
 
 impl EncodingLowering<'_> {
@@ -928,6 +1003,117 @@ impl EncodingLowering<'_> {
         self.refresh_prf_namespace.map_or(role.clone(), |(commitment, slot)| {
             refresh_prf_artifact_name(commitment, slot, &role)
         })
+    }
+
+    /// Import the digit-companion family of every Dynamic RHS of the Program
+    /// (see [`Self::companion_family`]); Static RHS have none.
+    fn import_rhs_companions(&mut self) -> Result<(), RnsBggError> {
+        if self.parameters.rhs_mode() == RhsMode::Static {
+            return Ok(());
+        }
+        for (rhs, shape) in self.program.rhs_inputs() {
+            let members = match shape {
+                InputBinding::Scalar(()) => IntExpr::constant(1),
+                InputBinding::Family(count) => count.clone(),
+            };
+            let family = self.companion_family(
+                self.workload.rhs_level(*rhs)?,
+                format!("rhs/{rhs:?}/digit-encoding"),
+                members,
+            )?;
+            self.rhs_companions.insert(*rhs, family);
+        }
+        Ok(())
+    }
+
+    /// The production of the RHS, LUT-switching, and refresh-action
+    /// ciphertexts: preprocessing for Static, encryption for Dynamic.
+    fn ciphertext_production(&self) -> &ProductionId {
+        match self.parameters.rhs_mode() {
+            RhsMode::Static => &self.preprocess,
+            RhsMode::Dynamic => &self.encryption,
+        }
+    }
+
+    /// The encryption's family of digit-companion encodings of `members`
+    /// ciphertexts consumed at `level`, stored under `role`: the encodings of
+    /// member `t`'s output column `j`, flattened over the digit rows (see
+    /// [`super::companion_key`]), at `t m_(i+1) + j`.
+    fn companion_family(
+        &self,
+        level: usize,
+        role: String,
+        members: IntExpr,
+    ) -> Result<Family<RnsBggRow>, RnsBggError> {
+        let ring = self.parameters.ring(level)?;
+        let columns = companion_width(self.parameters, level)?;
+        let count = (members * IntExpr::constant(companion_columns_count(self.parameters, level)?))
+            .canonicalize();
+        let families = [0, 1].map(|port| {
+            ring.family_artifact_input(
+                self.encryption.clone(),
+                self.encryption_artifact_name(format!("{role}.{port}")),
+                count.clone(),
+                (1, columns),
+                ArtifactAvailability::Transferred,
+            )
+        });
+        let element: RnsBggRow =
+            (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
+        let fields =
+            families.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
+        family_of_fields(&element, count, &fields).map_err(graph)
+    }
+
+    /// The pre-rounding Dynamic product key `T` and companion row `E` of
+    /// state key `key` at `level` (see [`super::companion_columns`]), with
+    /// member `member`'s companions `z_{a,j}` read from `companions`. A LUT
+    /// branch passes its automorphism `sigma`: the stored `z^0` encodes the
+    /// inverse-automorphed digit under `B^0`, so `sigma(z^0)` encodes the
+    /// digit under `sigma(B^0)` and the transformed secret.
+    fn companion_product(
+        &self,
+        level: usize,
+        key: &RnsBggMatrix,
+        material: String,
+        member: Option<IntExpr>,
+        sigma: Option<IntExpr>,
+        companions: &Family<RnsBggRow>,
+    ) -> Result<(RnsBggMatrix, RnsBggRow), RnsBggError> {
+        let tag = super::companion_tag(
+            self.parameters,
+            &self.context,
+            self.program.id(),
+            self.refresh_prf_namespace,
+            material,
+            member.clone(),
+            level,
+        );
+        let automorphism = |entry: Mat| match &sigma {
+            Some(sigma) => entry.ring_automorphism(sigma.clone()),
+            None => entry,
+        };
+        let offset = member.unwrap_or(IntExpr::constant(0)) *
+            IntExpr::constant(companion_columns_count(self.parameters, level)?);
+        let companion_key = |j| {
+            let key = super::companion_key(self.parameters, level, self.hash_key.clone(), &tag, j)?;
+            Ok(map_matrix(key, automorphism))
+        };
+        let companion = |j: IntExpr| {
+            let index = (offset.clone() + j).canonicalize();
+            Ok(map_row(companions.at(Int::evaluate(index)), automorphism))
+        };
+        // Inside a Program family body the columns are unrolled.
+        let unroll = !self.site()?.indices.is_empty();
+        let (key, row) = super::companion_columns(
+            self.parameters,
+            level,
+            key,
+            &companion_key,
+            Some(&companion),
+            unroll,
+        )?;
+        Ok((key, row.ok_or(RnsBggError::Binding("companion row"))?))
     }
 
     /// Compute the native Walsh/automorphism branch polynomial for one unary
@@ -1111,9 +1297,12 @@ impl EncodingLowering<'_> {
         let families = (0..4)
             .map(|port| {
                 decomposition_ring.family_artifact_input(
-                    self.preprocess.clone(),
-                    self.preprocess_artifact_name(format!(
-                        "lut-switching/{evaluation_level}/{decomposition_level}/{lut_id:?}/{input_layout:?}.{port}"
+                    self.ciphertext_production().clone(),
+                    self.preprocess_artifact_name(lut_switching_role(
+                        evaluation_level,
+                        lut_id,
+                        input_layout,
+                        &format!(".{port}"),
                     )),
                     count.clone(),
                     (1, target_columns),
@@ -1133,6 +1322,7 @@ impl EncodingLowering<'_> {
         input: &RnsBggEncoding,
         b_sigma: RnsBggMatrix,
         sigma: IntExpr,
+        companions: Option<(&Family<RnsBggRow>, crate::program::LutId, IntExpr)>,
     ) -> Result<(RnsBggRow, (SmallMatrix, SmallMatrix)), DslError> {
         let evaluation_level = self.workload.level(input.wire()).map_err(|_| DslError::Schema)?;
         let decomposition_level = evaluation_level.checked_add(1).ok_or(DslError::Schema)?;
@@ -1152,8 +1342,27 @@ impl EncodingLowering<'_> {
             input.row.0.clone().ring_automorphism(sigma.clone()),
             input.row.1.clone().ring_automorphism(sigma.clone()),
         );
-        let (switched_row, switched_matrix) =
-            multiply_row_and_public_by_columns(routed_row, routed, switching_decomposition);
+        let (switched_row, switched_matrix) = match companions {
+            None => multiply_row_and_public_by_columns(routed_row, routed, switching_decomposition),
+            // Dynamic: the digits of the actual ciphertext act on the routed
+            // row; the key and the companion row replace its key product.
+            Some((companions, lut, branch)) => {
+                let row = multiply_rows_by_columns(vec![routed_row], switching_decomposition)
+                    .pop()
+                    .ok_or(DslError::Schema)?;
+                let (key, companion_row) = self
+                    .companion_product(
+                        evaluation_level,
+                        &routed,
+                        format!("lut/{lut:?}"),
+                        Some(branch),
+                        Some(sigma.clone()),
+                        companions,
+                    )
+                    .map_err(|_| DslError::Schema)?;
+                (add_encoding_rows(row, companion_row), key)
+            }
+        };
         let switched_public_key = mod_down_public(switched_matrix, &target_ring);
         let switched_key_decomposition = compact_decompose_columns(
             self.parameters,
@@ -1193,7 +1402,7 @@ impl EncodingLowering<'_> {
         };
         let matrix = |port: usize| {
             ring.artifact_input(
-                self.preprocess.clone(),
+                self.ciphertext_production().clone(),
                 format!("{prefix}.{port}"),
                 (1, columns),
                 ArtifactAvailability::Transferred,
@@ -1391,7 +1600,9 @@ impl EncodingLowering<'_> {
 
 impl ExponentLUTProgramLowering for EncodingLowering<'_> {
     type Wire = RnsBggEncoding;
-    type Rhs = RnsBggMatrix;
+    /// The RHS ciphertext with its reference, which names a Dynamic RHS's
+    /// companion keys and encodings.
+    type Rhs = (RnsBggMatrix, RhsRef<Int>);
     type Error = RnsBggError;
     fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
         if self.workload.level(lhs.wire())? != self.workload.level(rhs.wire())? {
@@ -1499,15 +1710,44 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             return Err(RnsBggError::Binding("RNS-BGG MulPrivate requires a private input"));
         }
         let evaluation_level = self.workload.level(input.wire())?;
-        let action = self.rhs_decomposition(rhs, evaluation_level)?;
+        let (ciphertext, reference) = rhs;
+        let action = self.rhs_decomposition(ciphertext, evaluation_level)?;
         let output = self.site()?.output;
         let target_level = self.workload.level(output)?;
         let target_ring = self.parameters.ring(target_level)?;
-        let (row, matrix) = multiply_row_and_public_by_columns(
-            input.row.clone(),
-            input.public_key.matrix.clone(),
-            action,
-        );
+        let (row, matrix) = match self.parameters.rhs_mode() {
+            RhsMode::Static => multiply_row_and_public_by_columns(
+                input.row.clone(),
+                input.public_key.matrix.clone(),
+                action,
+            ),
+            // Dynamic: `c Dec(C)` plus the companion row, with the key
+            // fixed in preprocessing from public companion keys (Eq. 049).
+            RhsMode::Dynamic => {
+                let companions = self
+                    .rhs_companions
+                    .get(&reference.id)
+                    .ok_or(RnsBggError::Binding("Dynamic RHS companions are not imported"))?;
+                let member = reference
+                    .index
+                    .as_ref()
+                    .map(Int::expression)
+                    .transpose()
+                    .map_err(|_| RnsBggError::Binding("RHS member index"))?;
+                let row = multiply_rows_by_columns(vec![input.row.clone()], action)
+                    .pop()
+                    .ok_or(RnsBggError::Binding("RHS product row"))?;
+                let (key, companion_row) = self.companion_product(
+                    evaluation_level,
+                    &input.public_key.matrix,
+                    format!("rhs/{:?}", reference.id),
+                    member,
+                    None,
+                    companions,
+                )?;
+                (add_encoding_rows(row, companion_row), key)
+            }
+        };
         let public_key = RnsBggPublicKey::new(output, mod_down_public(matrix, &target_ring));
         Ok(RnsBggEncoding::new(
             public_key,
@@ -1529,6 +1769,17 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         let (switching, sigmas) = self.lut_switching(input, lut_id, table)?;
         let output = self.site()?.output;
         let helper = self.lut_helpers(level, table, sigmas.len())?;
+        // Dynamic: the switching ciphertexts' digit companions, one block
+        // per branch.
+        let companions = (self.parameters.rhs_mode() == RhsMode::Dynamic)
+            .then(|| {
+                self.companion_family(
+                    level,
+                    lut_switching_role(level, lut_id, table.input_layout(), "/digit-encoding"),
+                    IntExpr::constant(sigmas.len()),
+                )
+            })
+            .transpose()?;
         // Accumulate the branches sequentially, as preprocessing does: the sum
         // and its noise bound equal the balanced tree, while only one branch,
         // including its sampled A_sigma, is resident at a time.
@@ -1551,8 +1802,13 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            let (switched_row, switched_key_decomposition) =
-                this.lut_branch_action(input, b_sigma, sigma.clone())?;
+            let branch = index.expression()?;
+            let (switched_row, switched_key_decomposition) = this.lut_branch_action(
+                input,
+                b_sigma,
+                sigma.clone(),
+                companions.as_ref().map(|companions| (companions, lut_id, branch)),
+            )?;
             let mask = (helper.0.at(index.clone()), helper.1.at(index));
             let public_data =
                 this.lut_public_data(level, Int::from(sigma)).map_err(|_| DslError::Schema)?;
@@ -1566,16 +1822,26 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         // and carries it to the next iteration, so that load overlaps this
         // branch's work; the last branch runs after the loop.
         let last = table.values().len().checked_sub(1).ok_or(RnsBggError::Lut)?;
-        let (sums, b_last) = mxx_dsl::iterate(
-            IntExpr::constant(last),
-            (initial, b_at(Int::constant(0))),
-            |index, (sums, b_sigma)| {
-                let next = b_at(index.clone().add(1usize));
-                Ok((branch(index, sums, b_sigma)?, next))
-            },
-        )
-        .map_err(graph)?;
-        let (row, public_key) = branch(Int::constant(last), sums, b_last).map_err(graph)?;
+        let (row, public_key) = if companions.is_some() {
+            // Dynamic branches are unrolled, so each branch's companion loop
+            // reads the stored companions in a loop of its own.
+            (0..=last)
+                .try_fold(initial, |sums, index| {
+                    branch(Int::constant(index), sums, b_at(Int::constant(index)))
+                })
+                .map_err(graph)?
+        } else {
+            let (sums, b_last) = mxx_dsl::iterate(
+                IntExpr::constant(last),
+                (initial, b_at(Int::constant(0))),
+                |index, (sums, b_sigma)| {
+                    let next = b_at(index.clone().add(1usize));
+                    Ok((branch(index, sums, b_sigma)?, next))
+                },
+            )
+            .map_err(graph)?;
+            branch(Int::constant(last), sums, b_last).map_err(graph)?
+        };
         let mut public_key = RnsBggPublicKey::new(output, public_key);
         let mut row = row;
         if !self
@@ -1671,6 +1937,13 @@ pub struct RnsEncryptBuild<'a> {
     runtime: BTreeMap<String, RuntimeValue>,
     refresh_prf_children: BTreeMap<usize, Box<RnsEncryptBuild<'a>>>,
     refresh_prf_binding: Option<([u8; 32], usize, crate::program::ExponentLutProgramId, [u8; 32])>,
+    /// Dynamic: the shape and consuming level of each declared RHS and each
+    /// evaluated `(level, LUT)`, known once preprocessing (or, for a PRF
+    /// child, its Program) is bound.
+    dynamic_schema: Option<(BTreeMap<RhsId, (InputShape, usize)>, BTreeSet<(usize, LutId)>)>,
+    /// Dynamic: the encryption batch identifier and the RHS plaintexts; a
+    /// family keeps `plaintext_terms`, read member by member.
+    dynamic_rhs: Option<([u8; 32], BTreeMap<RhsId, InputBinding<Mat, Vec<(BigInt, usize)>>>)>,
 }
 
 fn validate_refresh_prf_input_key_artifacts(
@@ -1733,19 +2006,21 @@ impl<'a> RnsEncryptBuild<'a> {
             runtime: BTreeMap::new(),
             refresh_prf_children: BTreeMap::new(),
             refresh_prf_binding: None,
+            dynamic_schema: None,
+            dynamic_rhs: None,
         }
     }
 
     /// Bind public LHS plaintexts and secrets for a prepared PRF child.
     /// This application-facing method keeps the generic stage trait out of
-    /// refresh child setup code.
+    /// refresh child setup code. Dynamic children take no mask.
     pub fn bind_lhs_inputs<P: Poly>(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
         parameters: &mxx_ir_core::ParamEnv,
         lhs: &PlaintextInputs<WireId, P>,
         payload: &RnsBggPayloadSecret,
-        mask: &RnsBggMaskSecret,
+        mask: Option<&RnsBggMaskSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
         <Self as EncryptBuild<P>>::bind_inputs(
@@ -1761,6 +2036,7 @@ impl<'a> RnsEncryptBuild<'a> {
         if binding.context() != &self.context ||
             (self.refresh_prf_binding.is_none() &&
                 binding.parameters() != &self.parameters.parameter_identity()) ||
+            binding.rhs_mode() != self.parameters.rhs_mode() ||
             binding.hash_key_commitment() != &self.hash_key_commitment
         {
             return Err(ApiError::compatibility(
@@ -1778,7 +2054,65 @@ impl<'a> RnsEncryptBuild<'a> {
         if self.inputs.is_none() {
             return Err(ApiError::input("encryption inputs are not bound"));
         }
+        // A PRF child's schema is its own Program's, bound with it.
+        if self.parameters.rhs_mode() == RhsMode::Dynamic && self.refresh_prf_binding.is_none() {
+            self.dynamic_schema =
+                Some((binding.dynamic_rhs().clone(), binding.dynamic_luts().clone()));
+        }
         self.binding = Some(binding);
+        Ok(())
+    }
+
+    /// Bind the RHS plaintexts of a Dynamic encryption and its batch
+    /// identifier, after the preprocessing artifacts (or, for a PRF child,
+    /// its refresh binding) are bound, e.g. in the `api::encrypt` compose
+    /// callback.
+    ///
+    /// `batch_id` is a fresh public identifier of this encryption request,
+    /// retained only to resume the same request. It selects the sampling
+    /// session, so every encryption batch under one setup draws its own
+    /// ciphertexts, digit companions, and helpers; it never enters a
+    /// preprocessing key. An empty map is valid when no RHS is declared.
+    pub fn bind_rhs_inputs<P: Poly>(
+        &mut self,
+        parameters: &ParamEnv,
+        rhs: &PlaintextInputs<RhsId, P>,
+        batch_id: [u8; 32],
+    ) -> Result<(), ApiError> {
+        if self.parameters.rhs_mode() != RhsMode::Dynamic {
+            return Err(ApiError::input("Static RHS plaintexts are bound by preprocessing"));
+        }
+        if self.dynamic_rhs.is_some() {
+            return Err(ApiError::input("Dynamic RHS inputs are already bound"));
+        }
+        let (schema, _) = self.dynamic_schema.as_ref().ok_or_else(|| {
+            ApiError::input("bind the preprocessing artifacts before the Dynamic RHS inputs")
+        })?;
+        if rhs.len() != schema.len() || rhs.keys().any(|id| !schema.contains_key(id)) {
+            return Err(ApiError::input("RHS bindings do not exactly match Program inputs"));
+        }
+        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let mut plaintexts = BTreeMap::new();
+        for (id, (shape, _)) in schema {
+            let plaintext = match (shape, &rhs[id]) {
+                (InputBinding::Scalar(()), InputBinding::Scalar(value)) => {
+                    InputBinding::Scalar(plaintext_constant(&ring, value))
+                }
+                (InputBinding::Family(count), InputBinding::Family(values)) => {
+                    if resolved_input_cardinality(shape, parameters).map_err(ApiError::scheme)? !=
+                        Some(values.len())
+                    {
+                        return Err(ApiError::input(format!(
+                            "RHS family count {count:?} does not match Program"
+                        )));
+                    }
+                    InputBinding::Family(plaintext_terms(values).map_err(ApiError::input)?)
+                }
+                _ => return Err(ApiError::input("RHS plaintext shape does not match Program")),
+            };
+            plaintexts.insert(*id, plaintext);
+        }
+        self.dynamic_rhs = Some((batch_id, plaintexts));
         Ok(())
     }
 
@@ -1830,6 +2164,15 @@ impl<'a> RnsEncryptBuild<'a> {
         }
         if self.refresh_prf_binding.is_some() {
             return Err(RnsBggError::Binding("refresh PRF child is already bound"));
+        }
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            let workload = RnsBggDerivedWorkload::from_program(program)?;
+            let rhs = program
+                .rhs_inputs()
+                .iter()
+                .map(|(id, shape)| Ok((*id, (shape.clone(), workload.rhs_level(*id)?))))
+                .collect::<Result<BTreeMap<_, _>, RnsBggError>>()?;
+            self.dynamic_schema = Some((rhs, workload.luts().clone()));
         }
         self.refresh_prf_binding = Some((
             *declaration.commitment(),
@@ -1906,6 +2249,25 @@ impl<'a> RnsEncryptBuild<'a> {
             }
             if declaration.slots().get(*slot).is_none() {
                 return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+            }
+            // A Dynamic child encrypts under the parent's single secret, in
+            // the parent's batch.
+            let secret = |build: &RnsEncryptBuild<'a>| {
+                build
+                    .payload_secret
+                    .as_ref()
+                    .and_then(|secret| secret.binding.as_ref())
+                    .map(|binding| binding.name.clone())
+            };
+            let batch = |build: &RnsEncryptBuild<'a>| build.dynamic_rhs.as_ref().map(|(id, _)| *id);
+            if self.parameters.rhs_mode() == RhsMode::Dynamic &&
+                (secret(child) != secret(self) ||
+                    batch(child).is_none() ||
+                    batch(child) != batch(self))
+            {
+                return Err(RnsBggError::Binding(
+                    "Dynamic refresh children must share the parent's secret and batch",
+                ));
             }
         }
         self.refresh_prf_children =
@@ -2041,6 +2403,15 @@ impl<'a> RnsEncryptBuild<'a> {
                 }
             };
         }
+        if child.parameters.rhs_mode() == RhsMode::Dynamic {
+            graph = child.dynamic_material(
+                graph,
+                hash_key,
+                declaration.prepared().program().id(),
+                Some((commitment, slot)),
+                |role| refresh_prf_artifact_name(commitment, slot, &role),
+            )?;
+        }
         Ok(graph)
     }
 
@@ -2058,6 +2429,8 @@ impl<'a> RnsEncryptBuild<'a> {
         Ok(RnsBggPayloadSecret { row, binding: Some(binding) })
     }
     /// Samples a mask secret on `execution`; it stays resident there.
+    /// Dynamic parameters reject it: their single payload secret is also the
+    /// mask.
     pub fn sample_mask_secret<E, S>(
         &self,
         execution: &mut E,
@@ -2067,6 +2440,9 @@ impl<'a> RnsEncryptBuild<'a> {
         E: StageExecution<S>,
         S: SessionStore,
     {
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            return Err(ApiError::input("Dynamic encryption samples no separate mask"));
+        }
         let (row, binding) = sample_secret_row(self.parameters, execution, store)?;
         Ok(RnsBggMaskSecret { row, binding: Some(binding) })
     }
@@ -2170,11 +2546,47 @@ impl<'a> RnsEncryptBuild<'a> {
         ))
     }
 
+    /// The public refresh matrix `role` of `slot` (`a-sum` or `a-star`)
+    /// published by preprocessing, at the slot's `p` ring.
+    fn preprocess_refresh_matrix(
+        &self,
+        declaration: &RefreshDeclaration,
+        slot: usize,
+        role: &str,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let metadata = declaration
+            .slots()
+            .get(slot)
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+        let p_ring = self.parameters.ring_for_modulus(&metadata.p)?;
+        let columns = self.parameters.component_columns(declaration.target_level())?;
+        let production =
+            self.preprocess.clone().ok_or(RnsBggError::Binding("missing preprocess"))?;
+        let availability = match role {
+            "a-sum" => ArtifactAvailability::Transferred,
+            "a-star" => ArtifactAvailability::Cached,
+            _ => return Err(RnsBggError::Binding("unknown refresh decoder matrix")),
+        };
+        let name = refresh_artifact_name(*declaration.commitment(), slot, role);
+        let port = |port: usize| {
+            p_ring.artifact_input(
+                production.clone(),
+                format!("{name}.{port}"),
+                (1, columns),
+                availability,
+            )
+        };
+        Ok(((port(0), port(1)), (port(2), port(3))))
+    }
+
+    /// The refresh decoder `s (A_sum - H A_star) - o + e` of `slot`, for the
+    /// slot's action sum `sum`.
     fn refresh_decoder(
         &self,
         declaration: &RefreshDeclaration,
         mask: &RnsBggMaskSecret,
         slot: usize,
+        sum: RnsBggMatrix,
     ) -> Result<RnsBggRow, RnsBggError> {
         let p_level = refresh_slot_level(self.parameters, declaration, slot)?;
         let metadata = declaration
@@ -2183,48 +2595,7 @@ impl<'a> RnsEncryptBuild<'a> {
             .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
         let p_ring = self.parameters.ring_for_modulus(&metadata.p)?;
         let columns = self.parameters.component_columns(declaration.target_level())?;
-        let commitment = *declaration.commitment();
-        let production =
-            self.preprocess.clone().ok_or(RnsBggError::Binding("missing preprocess"))?;
-        let matrix = |role: &str| -> Result<RnsBggMatrix, RnsBggError> {
-            let availability = match role {
-                "a-sum" => ArtifactAvailability::Transferred,
-                "a-star" => ArtifactAvailability::Cached,
-                _ => return Err(RnsBggError::Binding("unknown refresh decoder matrix")),
-            };
-            Ok((
-                (
-                    p_ring.artifact_input(
-                        production.clone(),
-                        format!("{}.0", refresh_artifact_name(commitment, slot, role)),
-                        (1, columns),
-                        availability,
-                    ),
-                    p_ring.artifact_input(
-                        production.clone(),
-                        format!("{}.1", refresh_artifact_name(commitment, slot, role)),
-                        (1, columns),
-                        availability,
-                    ),
-                ),
-                (
-                    p_ring.artifact_input(
-                        production.clone(),
-                        format!("{}.2", refresh_artifact_name(commitment, slot, role)),
-                        (1, columns),
-                        availability,
-                    ),
-                    p_ring.artifact_input(
-                        production.clone(),
-                        format!("{}.3", refresh_artifact_name(commitment, slot, role)),
-                        (1, columns),
-                        availability,
-                    ),
-                ),
-            ))
-        };
-        let sum = matrix("a-sum")?;
-        let anchor = matrix("a-star")?;
+        let anchor = self.preprocess_refresh_matrix(declaration, slot, "a-star")?;
         let h = p_ring.polynomial([IntExpr::constant(&metadata.p / &metadata.q_t)]);
         let delta = (
             (sum.0.0 - h.clone() * anchor.0.0, sum.0.1 - h.clone() * anchor.0.1),
@@ -2239,6 +2610,365 @@ impl<'a> RnsEncryptBuild<'a> {
         let error = encoding_error_row(self.parameters, &p_ring, columns)?;
         Ok((decoder.0 + error.0, decoder.1 + error.1))
     }
+
+    /// Dynamic encryption material under the single secret `s`: every RHS
+    /// ciphertext and LUT switching ciphertext of the bound schema, with top
+    /// rows sampled in this encryption, and the digit-companion encodings of
+    /// every digit of each stored ciphertext (spec Eq. 043-045, 083-084).
+    /// `program` and `namespace` name the companion keys, as preprocessing
+    /// does; `name` maps a role to its artifact name.
+    fn dynamic_material(
+        &self,
+        mut graph: DslContext,
+        hash_key: &Bytes,
+        program: crate::program::ExponentLutProgramId,
+        namespace: Option<([u8; 32], usize)>,
+        name: impl Fn(String) -> String,
+    ) -> Result<DslContext, ApiError> {
+        let (rhs_schema, luts) = self
+            .dynamic_schema
+            .as_ref()
+            .ok_or_else(|| ApiError::input("Dynamic encryption schema is not bound"))?;
+        let (_, plaintexts) = self.dynamic_rhs.as_ref().ok_or_else(|| {
+            ApiError::input("Dynamic encryption requires bind_rhs_inputs with a batch identifier")
+        })?;
+        let payload = &self
+            .payload_secret
+            .as_ref()
+            .ok_or_else(|| ApiError::input("secret is not bound"))?
+            .row;
+        let inputs = self
+            .inputs
+            .as_ref()
+            .ok_or_else(|| ApiError::input("encryption inputs are not bound"))?;
+        let tag = |material: String, member: Option<IntExpr>, level: usize| {
+            super::companion_tag(
+                self.parameters,
+                &self.context,
+                program,
+                namespace,
+                material,
+                member,
+                level,
+            )
+        };
+        let top = |level: usize| -> Result<RnsBggRow, RnsBggError> {
+            let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
+            Ok(uniform_row(&self.parameters.ring(next)?, self.parameters.component_columns(next)?))
+        };
+        let plaintext_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        for (rhs, (_, level)) in rhs_schema {
+            let level = *level;
+            let material = format!("rhs/{rhs:?}");
+            match plaintexts.get(rhs) {
+                Some(InputBinding::Scalar(plaintext)) => {
+                    let ciphertext = super::public_key::rhs_ciphertext(
+                        self.parameters,
+                        level,
+                        payload,
+                        plaintext.clone(),
+                        top(level).map_err(ApiError::scheme)?,
+                    )
+                    .map_err(ApiError::scheme)?;
+                    let companions = self
+                        .companion_encodings(
+                            level,
+                            1,
+                            &|_| ciphertext.clone(),
+                            &|_| tag(material.clone(), None, level),
+                            None,
+                            hash_key,
+                        )
+                        .map_err(ApiError::scheme)?;
+                    graph = graph
+                        .transferred_output(name(format!("{material}/ciphertext")), ciphertext)
+                        .map_err(ApiError::scheme)?;
+                    graph = graph
+                        .transferred_output(name(format!("{material}/digit-encoding")), companions)
+                        .map_err(ApiError::scheme)?;
+                }
+                Some(InputBinding::Family(terms)) => {
+                    let ciphertexts = mxx_dsl::parallel(IntExpr::constant(terms.len()), |member| {
+                        let plaintext = plaintext_member(&plaintext_ring, terms, member)?;
+                        let top = top(level).map_err(|_| DslError::Schema)?;
+                        super::public_key::rhs_ciphertext(
+                            self.parameters,
+                            level,
+                            payload,
+                            plaintext,
+                            top,
+                        )
+                        .map_err(|_| DslError::Schema)
+                    })
+                    .map_err(ApiError::scheme)?;
+                    let companions = self
+                        .companion_encodings(
+                            level,
+                            terms.len(),
+                            &|member| ciphertexts.at(member),
+                            &|member| tag(material.clone(), Some(member), level),
+                            None,
+                            hash_key,
+                        )
+                        .map_err(ApiError::scheme)?;
+                    graph = graph
+                        .transferred_output(
+                            name(format!("{material}/family/ciphertext")),
+                            ciphertexts,
+                        )
+                        .map_err(ApiError::scheme)?;
+                    graph = graph
+                        .transferred_output(name(format!("{material}/digit-encoding")), companions)
+                        .map_err(ApiError::scheme)?;
+                }
+                None => return Err(ApiError::input("missing Dynamic RHS plaintext")),
+            }
+        }
+        for (level, lut) in luts {
+            let level = *level;
+            let table = inputs
+                .luts()
+                .get(lut.0 as usize)
+                .ok_or_else(|| ApiError::scheme(RnsBggError::Lut))?;
+            let layout = table.input_layout();
+            let dimension =
+                self.parameters.level(level).map_err(ApiError::scheme)?.ring_dimension() as usize;
+            let sigmas = layout
+                .automorphism_indices(dimension)
+                .map_err(|_| ApiError::scheme(RnsBggError::Lut))?;
+            let inverses = sigmas
+                .iter()
+                .map(|sigma| automorphism_inverse(*sigma, dimension))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ApiError::scheme)?;
+            let select = |indices: &[usize], branch: IntExpr| IntExpr::Select {
+                selector: Box::new(branch),
+                branches: indices.iter().map(|index| IntExpr::constant(*index)).collect(),
+            };
+            let ciphertexts = mxx_dsl::parallel(IntExpr::constant(sigmas.len()), |branch| {
+                let sigma = select(&sigmas, branch.expression()?);
+                let top = top(level).map_err(|_| DslError::Schema)?;
+                super::public_key::lut_switching_ciphertext(
+                    self.parameters,
+                    level,
+                    table,
+                    payload,
+                    sigma,
+                    top,
+                )
+                .map_err(|_| DslError::Schema)
+            })
+            .map_err(ApiError::scheme)?;
+            let material = format!("lut/{lut:?}");
+            let companions = self
+                .companion_encodings(
+                    level,
+                    sigmas.len(),
+                    &|branch| ciphertexts.at(branch),
+                    &|branch| tag(material.clone(), Some(branch), level),
+                    Some(&|branch| select(&inverses, branch)),
+                    hash_key,
+                )
+                .map_err(ApiError::scheme)?;
+            graph = graph
+                .transferred_output(name(lut_switching_role(level, *lut, layout, "")), ciphertexts)
+                .map_err(ApiError::scheme)?;
+            graph = graph
+                .transferred_output(
+                    name(lut_switching_role(level, *lut, layout, "/digit-encoding")),
+                    companions,
+                )
+                .map_err(ApiError::scheme)?;
+        }
+        Ok(graph)
+    }
+
+    /// The digit-companion encodings, under the single secret, of `members`
+    /// ciphertexts consumed at `level`, member `t`'s stored ciphertext being
+    /// `ciphertext(t)` and its companion-key tag `tag(t)`. Element
+    /// `t m_(i+1) + j` holds, flattened over the digit rows `a` (see
+    /// [`super::companion_key`]), `z_{a,j} = s B_{a,j} - d_{a,j} s G + eps`
+    /// for the digits `d_{a,j} = Dec_{q_(i+1)}(C)_{a,j}` of column `j` of the
+    /// stored ciphertext, rebased to `q_i`; a LUT branch encodes
+    /// `sigma^-1(d)`, with the inverse automorphism index `inverse_sigma(t)`
+    /// (spec Eq. 045, 084). Flattened, `d_{a,j} G` is `d_j^T (x) G`.
+    fn companion_encodings(
+        &self,
+        level: usize,
+        members: usize,
+        ciphertext: &dyn Fn(Int) -> RnsBggMatrix,
+        tag: &dyn Fn(IntExpr) -> mxx_dsl::HashTag,
+        inverse_sigma: Option<&dyn Fn(IntExpr) -> IntExpr>,
+        hash_key: &Bytes,
+    ) -> Result<Family<RnsBggRow>, RnsBggError> {
+        let ring = self.parameters.ring(level)?;
+        let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
+        let next_parameters = self.parameters.level(next)?;
+        let base = 1u64
+            .checked_shl(next_parameters.base_bits())
+            .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
+        let digits = next_parameters.modulus_digits();
+        let digit_rows = 2 * self.parameters.component_columns(level)?;
+        let columns = companion_columns_count(self.parameters, level)?;
+        let width = companion_width(self.parameters, level)?;
+        let gadget = self.parameters.public_gadget(level)?;
+        let mask = &self.payload_secret.as_ref().ok_or(RnsBggError::Binding("secret"))?.row;
+        let entry_range = |start: usize| mxx_ir_core::node::IndexRange {
+            start: IntExpr::constant(start),
+            end: IntExpr::constant(start + 1),
+        };
+        mxx_dsl::parallel(IntExpr::constant(members * columns), |index| {
+            let index = Box::new(index.expression()?);
+            let count = Box::new(IntExpr::constant(columns));
+            let member = IntExpr::FloorDiv(index.clone(), count.clone()).canonicalize();
+            let column = IntExpr::Rem(index, count).canonicalize();
+            // Column `j` of the ciphertext, read from its entries in
+            // row-major order.
+            let ((c00, c01), (c10, c11)) = ciphertext(Int::evaluate(member.clone()));
+            let entries = Family::pack(
+                [c00, c01, c10, c11]
+                    .into_iter()
+                    .flat_map(|block| {
+                        (0..columns / 2)
+                            .map(move |entry| block.clone().slice(None, Some(entry_range(entry))))
+                    })
+                    .collect(),
+            )?;
+            let column_entries = [IntExpr::constant(0), IntExpr::constant(columns)]
+                .map(|row| entries.at(Int::evaluate((row + column.clone()).canonicalize())));
+            let column_digits =
+                Mat::concat(mxx_ir_core::node::ConcatAxis::Rows, column_entries.to_vec())
+                    .decompose(base, digits)
+                    .centered_rebase(&ring);
+            let mut row_digits = ring.identity(digit_rows).mul_small_rhs(column_digits).transpose();
+            if let Some(inverse_sigma) = inverse_sigma {
+                row_digits = row_digits.ring_automorphism(inverse_sigma(member.clone()));
+            }
+            let key = super::companion_key(
+                self.parameters,
+                level,
+                hash_key.clone(),
+                &tag(member),
+                column,
+            )
+            .map_err(|_| DslError::Schema)?;
+            public_encoding_row(
+                self.parameters,
+                key,
+                mask,
+                row_digits.tensor(gadget.clone()),
+                width,
+                level,
+            )
+            .map_err(|_| DslError::Schema)
+        })
+        .map_err(graph)
+    }
+
+    /// Dynamic refresh helpers under the single secret, for every slot: the
+    /// data and label actions, sampled in this encryption, and the decoder
+    /// of their key sum `A_sum = MS_(q->p)(A_0 D_0 + sum_l A_l D_l)`, formed
+    /// from the public source and label keys published by preprocessing.
+    fn dynamic_refresh(
+        &self,
+        mut graph: DslContext,
+        declaration: &RefreshDeclaration,
+        mask: &RnsBggMaskSecret,
+    ) -> Result<DslContext, RnsBggError> {
+        let payload = &self.payload_secret.as_ref().ok_or(RnsBggError::Binding("secret"))?.row;
+        let production =
+            self.preprocess.clone().ok_or(RnsBggError::Binding("missing preprocess"))?;
+        let commitment = *declaration.commitment();
+        let target_columns = self.parameters.component_columns(declaration.target_level())?;
+        for slot in 0..declaration.slots().len() {
+            let q_level = refresh_slot_q_level(self.parameters, declaration, slot)?;
+            let p_level = refresh_slot_level(self.parameters, declaration, slot)?;
+            let p_ring = self.parameters.ring(p_level)?;
+            let q_ring = self.parameters.ring(q_level)?;
+            let key_columns = self.parameters.component_columns(q_level)?;
+            let key = |label: Option<usize>| -> RnsBggMatrix {
+                let name = refresh_key_artifact_name(commitment, slot, label);
+                let port = |port: usize| {
+                    q_ring.artifact_input(
+                        production.clone(),
+                        format!("{name}.{port}"),
+                        (1, key_columns),
+                        ArtifactAvailability::Cached,
+                    )
+                };
+                ((port(0), port(1)), (port(2), port(3)))
+            };
+            let applied = |action: &RnsBggMatrix, key: RnsBggMatrix| {
+                compact_decompose_matrix(self.parameters, q_level, p_level, action.clone())
+                    .map(|decomposition| multiply_public_action(key, decomposition))
+            };
+            let action = |target: RnsBggRow| {
+                super::public_key::refresh_payload_action(
+                    self.parameters,
+                    p_level,
+                    payload,
+                    target,
+                    uniform_row(&p_ring, target_columns),
+                    target_columns,
+                )
+            };
+            let data = action(super::public_key::refresh_data_action_target(
+                self.parameters,
+                declaration,
+                slot,
+                payload,
+                p_level,
+            )?)?;
+            let mut sum = applied(&data, key(None))?;
+            graph = graph
+                .transferred_output(refresh_artifact_name(commitment, slot, "target"), data)?;
+            for index in 0..declaration.labels().len() {
+                let label = declaration
+                    .labels()
+                    .label(index)
+                    .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+                if !label
+                    .slots(declaration.slots().len())
+                    .map_err(RnsBggError::Refresh)?
+                    .contains(&slot)
+                {
+                    continue;
+                }
+                let label_action = action(super::public_key::refresh_label_action_target(
+                    self.parameters,
+                    declaration,
+                    slot,
+                    label,
+                    q_level,
+                    p_level,
+                )?)?;
+                sum = add_public_matrices(sum, applied(&label_action, key(Some(index)))?);
+                graph = graph.transferred_output(
+                    refresh_label_artifact_name(commitment, slot, index),
+                    label_action,
+                )?;
+            }
+            let decoder =
+                self.refresh_decoder(declaration, mask, slot, mod_down_public(sum, &p_ring))?;
+            graph = graph
+                .transferred_output(refresh_artifact_name(commitment, slot, "decoder"), decoder)?;
+        }
+        Ok(graph)
+    }
+}
+
+/// A row of two uniform blocks of `columns` columns over `ring`: the top row
+/// of a ciphertext sampled in the encryption that publishes it.
+fn uniform_row(ring: &Ring, columns: usize) -> RnsBggRow {
+    (ring.uniform_residue((1, columns)), ring.uniform_residue((1, columns)))
+}
+
+/// The automorphism index `sigma^-1 mod 2n` inverting `X -> X^sigma`.
+fn automorphism_inverse(sigma: usize, ring_dimension: usize) -> Result<usize, RnsBggError> {
+    let order = BigUint::from(2 * ring_dimension);
+    mxx_backends::utils::mod_inverse_biguints(&(BigUint::from(sigma) % &order), &order)
+        .and_then(|inverse| inverse.to_usize())
+        .ok_or(RnsBggError::Lut)
 }
 
 fn refresh_slot_level(
@@ -2380,9 +3110,10 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         parameters: &mxx_ir_core::ParamEnv,
         lhs: &PlaintextInputs<WireId, P>,
         payload: &Self::PayloadSecret,
-        mask: &Self::MaskSecret,
+        mask: Option<&Self::MaskSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
+        let mask = stage_mask(self.parameters, payload, mask)?;
         if lhs.len() != inputs.inputs().len() ||
             lhs.keys().any(|wire| !inputs.inputs().contains_key(wire))
         {
@@ -2426,11 +3157,11 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             encryption_projection_identity(inputs, parameters, self.parameters)
                 .map_err(ApiError::scheme)?,
         );
-        self.payload_secret = Some(payload.clone());
-        self.mask_secret = Some(mask.clone());
         for binding in [&payload.binding, &mask.binding].into_iter().flatten() {
             binding.bind(&mut self.runtime);
         }
+        self.payload_secret = Some(payload.clone());
+        self.mask_secret = Some(mask);
         self.hash_key_commitment = hash_key_commitment(hash_key);
         self.hash_key = hash_key.to_vec();
         Ok(())
@@ -2466,6 +3197,11 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                 digest.update(source.spec_hash.0);
                 digest.update(source.execution_nonce);
             }
+        }
+        // A Dynamic batch selects its own sampling session.
+        if let Some((batch, _)) = &self.dynamic_rhs {
+            digest.update(b"batch");
+            digest.update(batch);
         }
         digest.finalize().into()
     }
@@ -2569,17 +3305,30 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             }
             .map_err(ApiError::scheme)?;
         }
+        let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
+        if dynamic {
+            graph =
+                self.dynamic_material(graph, &hash_key, binding.program(), None, |role| role)?;
+        }
         if let Some(declaration) = self.refresh_declaration.clone() {
-            for slot in declaration.slots() {
-                let decoder = self
-                    .refresh_decoder(&declaration, &mask, slot.slot)
-                    .map_err(ApiError::scheme)?;
-                graph = graph
-                    .transferred_output(
-                        refresh_artifact_name(*declaration.commitment(), slot.slot, "decoder"),
-                        decoder.clone(),
-                    )
-                    .map_err(ApiError::scheme)?;
+            if dynamic {
+                graph =
+                    self.dynamic_refresh(graph, &declaration, &mask).map_err(ApiError::scheme)?;
+            } else {
+                for slot in declaration.slots() {
+                    let sum = self
+                        .preprocess_refresh_matrix(&declaration, slot.slot, "a-sum")
+                        .map_err(ApiError::scheme)?;
+                    let decoder = self
+                        .refresh_decoder(&declaration, &mask, slot.slot, sum)
+                        .map_err(ApiError::scheme)?;
+                    graph = graph
+                        .transferred_output(
+                            refresh_artifact_name(*declaration.commitment(), slot.slot, "decoder"),
+                            decoder.clone(),
+                        )
+                        .map_err(ApiError::scheme)?;
+                }
             }
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
@@ -2610,7 +3359,8 @@ pub struct RnsOnlineBuild<'a> {
     hash_key: Vec<u8>,
     evaluator: Option<EncodingLowering<'a>>,
     families: OnlineFamilies<'a>,
-    environment: Environment<RnsBggEncoding, RnsBggMatrix, OnlineWireFamily, OnlineRhsFamily>,
+    environment:
+        Environment<RnsBggEncoding, (RnsBggMatrix, RhsRef<Int>), OnlineWireFamily, OnlineRhsFamily>,
     pending_refresh: Option<(usize, RefreshDeclaration, BTreeMap<usize, RnsOnlineBuild<'a>>)>,
     refreshed_input: Option<(RefreshDeclaration, RnsBggEncoding)>,
     refresh_prf: Option<(usize, crate::program::ExponentLutProgramId, [u8; 32])>,
@@ -2857,6 +3607,7 @@ impl<'a> RnsOnlineBuild<'a> {
             prepared,
             &workload,
             &preprocess_production,
+            &encryption_production,
             &hash_key,
             |role: String| refresh_prf_artifact_name(commitment, slot, &role),
         )? {
@@ -2874,7 +3625,14 @@ impl<'a> RnsOnlineBuild<'a> {
             refresh_prf_namespace: Some((*declaration.commitment(), slot)),
             current_site: None,
             hash_key,
+            context: self.context,
+            rhs_companions: BTreeMap::new(),
         });
+        self.evaluator
+            .as_mut()
+            .ok_or_else(|| ApiError::input("online artifacts are not bound"))?
+            .import_rhs_companions()
+            .map_err(ApiError::scheme)?;
         Ok(())
     }
 
@@ -3140,11 +3898,13 @@ impl<'a> RnsOnlineBuild<'a> {
             .ring(0)
             .map_err(ApiError::scheme)?
             .bytes_input(super::HASH_KEY_INPUT, 32);
+        let encryption = sources.get(1).cloned().unwrap_or_else(|| preprocess.clone());
         for (rhs, binding) in import_rhs_bindings(
             self.parameters,
             program,
             &workload,
             &preprocess,
+            &encryption,
             &hash_key,
             |role| role,
         )? {
@@ -3152,7 +3912,6 @@ impl<'a> RnsOnlineBuild<'a> {
                 .bind_rhs(rhs, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
-        let encryption = sources.get(1).cloned().unwrap_or_else(|| preprocess.clone());
         let manifests = BTreeMap::from([(production.clone(), artifacts.manifest().clone())]);
         if !manifests.contains_key(&production) {
             return Err(ApiError::compatibility(
@@ -3169,7 +3928,14 @@ impl<'a> RnsOnlineBuild<'a> {
             refresh_prf_namespace: None,
             current_site: None,
             hash_key,
+            context: self.context,
+            rhs_companions: BTreeMap::new(),
         });
+        self.evaluator
+            .as_mut()
+            .ok_or_else(|| ApiError::input("online artifacts are not bound"))?
+            .import_rhs_companions()
+            .map_err(ApiError::scheme)?;
         self.environment = environment;
         self.refreshed_public_key = Some(public_key.clone());
         self.refreshed_input =
@@ -3428,7 +4194,12 @@ impl<'a> RnsOnlineBuild<'a> {
         (
             &mut EncodingLowering<'a>,
             &mut OnlineFamilies<'a>,
-            &mut Environment<RnsBggEncoding, RnsBggMatrix, OnlineWireFamily, OnlineRhsFamily>,
+            &mut Environment<
+                RnsBggEncoding,
+                (RnsBggMatrix, RhsRef<Int>),
+                OnlineWireFamily,
+                OnlineRhsFamily,
+            >,
         ),
         ApiError,
     > {
@@ -3692,6 +4463,7 @@ fn build_refresh_checkpoint_graph(
         expected_parameters,
         expected_hash_key,
         Vec::new(),
+        parameters.rhs_mode(),
     )
     .map_err(ApiError::scheme)?
     .with_refresh_declaration(declaration);
@@ -3732,7 +4504,12 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
         (
             &mut Self::Evaluator,
             &mut Self::Families,
-            &mut Environment<RnsBggEncoding, RnsBggMatrix, OnlineWireFamily, OnlineRhsFamily>,
+            &mut Environment<
+                RnsBggEncoding,
+                (RnsBggMatrix, RhsRef<Int>),
+                OnlineWireFamily,
+                OnlineRhsFamily,
+            >,
         ),
         ApiError,
     > {
@@ -3767,6 +4544,7 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
         for binding in [preprocess_binding, encryption_binding] {
             if binding.context() != &self.context ||
                 binding.parameters() != &expected_parameters ||
+                binding.rhs_mode() != self.parameters.rhs_mode() ||
                 binding.program() != program.id() ||
                 binding.hash_key_commitment() != &expected_hash_key
             {
@@ -3878,6 +4656,7 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
             program,
             &workload,
             &preprocess_production,
+            &encryption_production,
             &hash_key,
             |role| role,
         )? {
@@ -3895,7 +4674,14 @@ impl<'a> OnlineBuild for RnsOnlineBuild<'a> {
             refresh_prf_namespace: None,
             current_site: None,
             hash_key,
+            context: self.context,
+            rhs_companions: BTreeMap::new(),
         });
+        self.evaluator
+            .as_mut()
+            .ok_or_else(|| ApiError::input("online artifacts are not bound"))?
+            .import_rhs_companions()
+            .map_err(ApiError::scheme)?;
         Ok(())
     }
 
@@ -4233,6 +5019,8 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: None,
         };
         let source_ring = parameters.ring(0).unwrap();
@@ -4281,7 +5069,7 @@ mod test {
                 &DCRTPoly::from_usize_to_constant(output_level, bit),
                 parameters,
                 &payload,
-                &mask,
+                Some(&mask),
                 &mut execution,
                 &mut store,
             );
@@ -4298,9 +5086,9 @@ mod test {
                     &DCRTPoly::from_usize_to_constant(output_level, 1 - bit),
                     parameters,
                     &payload,
-                    &mask,
+                    Some(&mask),
                     &mut execution,
-                    &mut store,
+                    &mut store
                 )
                 .is_err(),
                 "wrong coefficient plaintext must be rejected"
@@ -4363,7 +5151,7 @@ mod test {
                 &expected_poly,
                 &parameters,
                 &payload,
-                &mask,
+                Some(&mask),
                 &mut execution,
                 &mut store,
             )
@@ -4506,6 +5294,8 @@ mod test {
                 encryption: production,
                 manifests: BTreeMap::new(),
                 refresh_prf_namespace: None,
+                context: [0; 32],
+                rhs_companions: BTreeMap::new(),
                 current_site: Some(LoweringSite {
                     output,
                     indices: Vec::new(),
@@ -4570,6 +5360,8 @@ mod test {
             encryption: production.clone(),
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let assert_compact = |matrix: &RnsBggMatrix| {
@@ -4593,11 +5385,12 @@ mod test {
             &scalar_program,
             &scalar_lowerer.workload,
             &production,
+            &production,
             &hash_key,
             |role| role,
         )
         .unwrap();
-        let [(id, InputBinding::Scalar(scalar_compact))] = bindings.as_slice() else {
+        let [(id, InputBinding::Scalar((scalar_compact, _)))] = bindings.as_slice() else {
             panic!("one scalar RHS binding expected");
         };
         assert_eq!(*id, scalar_rhs);
@@ -4638,6 +5431,7 @@ mod test {
             &family_program,
             &family_lowerer.workload,
             &production,
+            &production,
             &hash_key,
             |role| role,
         )
@@ -4661,6 +5455,7 @@ mod test {
                 &index,
             )
             .unwrap()
+            .0
         };
         let member = member_at(IntExpr::constant(1));
         assert_compact(&member);
@@ -4707,6 +5502,8 @@ mod test {
             encryption: production.clone(),
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let ring = parameters.ring(0).unwrap();
@@ -4774,6 +5571,8 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite {
                 output: public_output,
                 indices: Vec::new(),
@@ -4846,6 +5645,8 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let low_ring = parameters.ring(1).unwrap();
@@ -4992,6 +5793,8 @@ mod test {
             },
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite {
                 output: private_output,
                 indices: Vec::new(),
@@ -5180,6 +5983,8 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
+            context: [0; 32],
+            rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         assert!(lowerer.program.wire_is_coefficient_output(output).unwrap());
@@ -5331,5 +6136,390 @@ mod test {
         let decoder0 = secret0.clone() - offset.0.clone();
         let decoder1 = secret1.clone() - offset.0.clone();
         assert_ne!(decoder0.flatten(), decoder1.flatten());
+    }
+
+    /// A three-level Dynamic chain with a multiple-prime drop at every
+    /// level. Ring dimension, base bits, and sigma are overridable by
+    /// `MXX_EXPONENT_LUT_DYNAMIC_TEST_{RING_DIMENSION,BASE_BITS,SIGMA}`.
+    fn dynamic_test_parameters() -> RnsBggParameters {
+        let read = |name: &str, default: &str| {
+            std::env::var(format!("MXX_EXPONENT_LUT_DYNAMIC_TEST_{name}"))
+                .unwrap_or_else(|_| default.to_owned())
+        };
+        let ring_dimension = read("RING_DIMENSION", "16").parse().unwrap();
+        let base_bits = read("BASE_BITS", "6").parse().unwrap();
+        let sigma = read("SIGMA", "1").parse::<bigdecimal::BigDecimal>().unwrap();
+        let high = DCRTPolyParams::new(ring_dimension, 3, 17, base_bits, None, None);
+        let primes = high.to_crt().0;
+        let middle =
+            high.select_modulus(&(BigUint::from(primes[0]) * BigUint::from(primes[1]))).unwrap();
+        let low = high.select_modulus(&BigUint::from(primes[0])).unwrap();
+        RnsBggParameters::new(vec![high, middle, low], sigma, 1)
+            .unwrap()
+            .with_rhs_mode(RhsMode::Dynamic)
+    }
+
+    /// One plaintext assignment of a Dynamic batch: the LHS and RHS
+    /// plaintexts, the expected terminal output, and a wrong output.
+    type DynamicBatch =
+        (PlaintextInputs<WireId, DCRTPoly>, PlaintextInputs<RhsId, DCRTPoly>, DCRTPoly, DCRTPoly);
+
+    /// Preprocess `program` once with no secret and no RHS, then run two
+    /// encryption batches, each under a freshly sampled single secret with
+    /// RHS values chosen only then, verify each online output, and check that
+    /// every online output key equals the preprocessed one.
+    fn check_dynamic_batches(
+        parameters: &RnsBggParameters,
+        program: &ExponentLutProgram,
+        batch: impl Fn() -> DynamicBatch,
+    ) {
+        let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+            parameters.levels().iter().cloned(),
+        ));
+        let mut store = MemoryArtifactStore::default();
+        let hash_key: [u8; 32] = rand::random();
+        let context: [u8; 32] = rand::random();
+        let (preprocess, online) = crate::api::preprocess(
+            program,
+            &ParamEnv::default(),
+            &PlaintextInputs::<RhsId, DCRTPoly>::new(),
+            None,
+            &hash_key,
+            super::RnsPreprocessBuild::new(parameters, context),
+            &mut execution,
+            &mut store,
+            |_, outputs| Ok(outputs),
+            // Preprocessing reads only the hash key and samples nothing: no
+            // secret, ciphertext, or secret-dependent helper exists yet.
+            |validated| {
+                for (_, scope) in validated.source.scopes() {
+                    for node in scope.nodes() {
+                        assert!(!matches!(
+                            node.kind(),
+                            mxx_ir_core::node::NodeKind::UniformResidueSample { .. } |
+                                mxx_ir_core::node::NodeKind::UniformIntervalSample { .. } |
+                                mxx_ir_core::node::NodeKind::GaussianSample { .. }
+                        ));
+                    }
+                }
+                for node in validated.source.root_scope().nodes() {
+                    if let mxx_ir_core::node::NodeKind::Input { name, .. } = node.kind() {
+                        assert_eq!(name, super::HASH_KEY_INPUT);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let Operand::Scalar(output) = program.outputs()[0] else { panic!("scalar output") };
+        let level = RnsBggDerivedWorkload::from_program(program).unwrap().level(output).unwrap();
+        let ring = parameters.ring(level).unwrap();
+        let columns = parameters.component_columns(level).unwrap();
+        let mut graph = DslContext::new("dynamic-preprocessed-key");
+        for port in 0..4 {
+            graph = graph
+                .output(
+                    format!("key-{port}"),
+                    ring.artifact_input(
+                        online.production().clone(),
+                        format!("public-key/{output:?}.{port}"),
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    ),
+                )
+                .unwrap();
+        }
+        let preprocessed = execute_graph(
+            StageGraph::new(
+                graph.build().unwrap(),
+                BTreeMap::new(),
+                BTreeMap::from([(online.production().clone(), online.manifest().clone())]),
+            ),
+            &ParamEnv::default(),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let download = |execution: &mxx_backends::authority::CpuExecution,
+                        outputs: &StageOutputs,
+                        name: String| {
+            <mxx_backends::authority::CpuExecution as crate::api::StageExecution<
+                MemoryArtifactStore,
+            >>::download_matrix(execution, &outputs.outputs[&name])
+            .unwrap()
+        };
+        let preprocessed_key = (0..4)
+            .map(|port| download(&execution, &preprocessed, format!("key-{port}")))
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            let (lhs, rhs, expected, wrong) = batch();
+            let secret = RnsEncryptBuild::new(parameters, context)
+                .sample_payload_secret(&mut execution, &mut store)
+                .unwrap();
+            let encrypted = crate::api::encrypt(
+                &program.encryption_inputs(),
+                &ParamEnv::default(),
+                &lhs,
+                &preprocess,
+                &secret,
+                None,
+                &hash_key,
+                RnsEncryptBuild::new(parameters, context),
+                &mut execution,
+                &mut store,
+                |build| build.bind_rhs_inputs(&ParamEnv::default(), &rhs, rand::random()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let result = crate::api::online_eval(
+                program,
+                &ParamEnv::default(),
+                &online,
+                &encrypted,
+                &hash_key,
+                RnsOnlineBuild::new(parameters, context),
+                &mut execution,
+                &mut store,
+                |_, outputs| Ok(outputs),
+                |_| Ok(()),
+            )
+            .unwrap();
+            verify_output(
+                program,
+                &result,
+                0,
+                &expected,
+                parameters,
+                &secret,
+                None,
+                &mut execution,
+                &mut store,
+            )
+            .unwrap();
+            assert!(
+                verify_output(
+                    program,
+                    &result,
+                    0,
+                    &wrong,
+                    parameters,
+                    &secret,
+                    None,
+                    &mut execution,
+                    &mut store,
+                )
+                .is_err(),
+                "a wrong Dynamic output must be rejected"
+            );
+            for (port, key) in preprocessed_key.iter().enumerate() {
+                assert_eq!(
+                    &download(&execution, &result, format!("output-0.{port}")),
+                    key,
+                    "the online key must be the key fixed by preprocessing"
+                );
+            }
+        }
+    }
+
+    fn monomial(parameters: &RnsBggParameters, exponent: usize) -> DCRTPoly {
+        DCRTPoly::const_rotate_poly(parameters.levels().last().unwrap(), exponent)
+    }
+
+    /// Two successive private products by a scalar RHS and a family RHS
+    /// member, both chosen after preprocessing.
+    #[test]
+    fn dynamic_private_products_verify_late_rhs_under_one_setup() {
+        let parameters = dynamic_test_parameters();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let first = builder.rhs_input().unwrap();
+        let second = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let product = builder.mul_private(Operand::Scalar(input), Operand::Scalar(first)).unwrap();
+        let output = builder
+            .mul_private(
+                Operand::Scalar(product),
+                Operand::Member { family: second, index: IntExpr::constant(1) },
+            )
+            .unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let dimension = parameters.level(0).unwrap().ring_dimension() as usize;
+        check_dynamic_batches(&parameters, &program, || {
+            // Products past X^n are negated monomials.
+            let exponents = [0; 4].map(|_| rand::random::<u32>() as usize % dimension);
+            let [x, y, z0, z1] = exponents.map(|exponent| monomial(&parameters, exponent));
+            let expected = x.clone() * y.clone() * z1.clone();
+            let wrong = expected.clone() * monomial(&parameters, 1);
+            (
+                BTreeMap::from([(input, InputBinding::Scalar(x))]),
+                BTreeMap::from([
+                    (first, InputBinding::Scalar(y)),
+                    (second, InputBinding::Family(vec![z0, z1])),
+                ]),
+                expected,
+                wrong,
+            )
+        });
+    }
+
+    /// A Dynamic LUT, whose switching ciphertexts and digit companions
+    /// encryption generates, followed by a product by a late RHS.
+    #[test]
+    fn dynamic_lut_switching_verifies_through_a_late_rhs_product() {
+        let parameters = dynamic_test_parameters();
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let table = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    layout,
+                    2,
+                    vec![1, 0],
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let negated = builder.lut(Operand::Scalar(input), table).unwrap();
+        let output = builder.mul_private(Operand::Scalar(negated), Operand::Scalar(rhs)).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let dimension = parameters.level(0).unwrap().ring_dimension() as usize;
+        check_dynamic_batches(&parameters, &program, || {
+            let bit = rand::random::<u32>() as usize % 2;
+            let exponent = rand::random::<u32>() as usize % dimension;
+            let expected = monomial(&parameters, 1 - bit) * monomial(&parameters, exponent);
+            let wrong = monomial(&parameters, bit) * monomial(&parameters, exponent);
+            (
+                BTreeMap::from([(input, InputBinding::Scalar(monomial(&parameters, bit)))]),
+                BTreeMap::from([(rhs, InputBinding::Scalar(monomial(&parameters, exponent)))]),
+                expected,
+                wrong,
+            )
+        });
+    }
+
+    /// Dynamic stages take no preprocessing secret or RHS, no separate mask,
+    /// and require their RHS binding at encryption; Static stages reject the
+    /// Dynamic RHS binding.
+    #[test]
+    fn dynamic_stages_reject_preprocessing_secrets_and_separate_masks() {
+        let parameters = dynamic_test_parameters();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let output = builder.mul_private(Operand::Scalar(input), Operand::Scalar(rhs)).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+            parameters.levels().iter().cloned(),
+        ));
+        let mut store = MemoryArtifactStore::default();
+        let secret = RnsEncryptBuild::new(&parameters, [1; 32])
+            .sample_payload_secret(&mut execution, &mut store)
+            .unwrap();
+        assert!(
+            RnsEncryptBuild::new(&parameters, [1; 32])
+                .sample_mask_secret(&mut execution, &mut store)
+                .is_err()
+        );
+        let mut preprocess = super::RnsPreprocessBuild::new(&parameters, [1; 32]);
+        assert!(
+            <super::RnsPreprocessBuild<'_> as crate::api::PreprocessBuild<DCRTPoly>>::bind_inputs(
+                &mut preprocess,
+                &program,
+                &ParamEnv::default(),
+                &BTreeMap::new(),
+                Some(&secret),
+                &[0; 32],
+            )
+            .is_err(),
+            "Dynamic preprocessing takes no secret"
+        );
+        let rhs_values = BTreeMap::from([(rhs, InputBinding::Scalar(monomial(&parameters, 1)))]);
+        assert!(
+            <super::RnsPreprocessBuild<'_> as crate::api::PreprocessBuild<DCRTPoly>>::bind_inputs(
+                &mut super::RnsPreprocessBuild::new(&parameters, [1; 32]),
+                &program,
+                &ParamEnv::default(),
+                &rhs_values,
+                None,
+                &[0; 32],
+            )
+            .is_err(),
+            "Dynamic preprocessing takes no RHS plaintexts"
+        );
+        let lhs = BTreeMap::from([(input, InputBinding::Scalar(monomial(&parameters, 0)))]);
+        let mask = RnsBggMaskSecret { row: secret.row.clone(), binding: secret.binding.clone() };
+        assert!(
+            <RnsEncryptBuild<'_> as EncryptBuild<DCRTPoly>>::bind_inputs(
+                &mut RnsEncryptBuild::new(&parameters, [1; 32]),
+                &program.encryption_inputs(),
+                &ParamEnv::default(),
+                &lhs,
+                &secret,
+                Some(&mask),
+                &[0; 32],
+            )
+            .is_err(),
+            "Dynamic encryption takes no separate mask"
+        );
+        let (preprocess, _) = crate::api::preprocess(
+            &program,
+            &ParamEnv::default(),
+            &PlaintextInputs::<RhsId, DCRTPoly>::new(),
+            None,
+            &[0; 32],
+            super::RnsPreprocessBuild::new(&parameters, [1; 32]),
+            &mut execution,
+            &mut store,
+            |_, outputs| Ok(outputs),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let encrypt = |compose: &dyn Fn(&mut RnsEncryptBuild<'_>) -> Result<(), ApiError>,
+                       execution: &mut mxx_backends::authority::CpuExecution,
+                       store: &mut MemoryArtifactStore| {
+            crate::api::encrypt(
+                &program.encryption_inputs(),
+                &ParamEnv::default(),
+                &lhs,
+                &preprocess,
+                &secret,
+                None,
+                &[0; 32],
+                RnsEncryptBuild::new(&parameters, [1; 32]),
+                execution,
+                store,
+                compose,
+                |_| Ok(()),
+            )
+            .map(|_| ())
+        };
+        assert!(
+            encrypt(&|_| Ok(()), &mut execution, &mut store).is_err(),
+            "Dynamic encryption requires its RHS binding"
+        );
+        assert!(
+            encrypt(
+                &|build| build.bind_rhs_inputs(
+                    &ParamEnv::default(),
+                    &PlaintextInputs::<RhsId, DCRTPoly>::new(),
+                    [2; 32]
+                ),
+                &mut execution,
+                &mut store,
+            )
+            .is_err(),
+            "a missing RHS plaintext is rejected"
+        );
+        let static_parameters = RnsBggParameters::new(parameters.levels().to_vec(), 1, 1).unwrap();
+        assert!(
+            RnsEncryptBuild::new(&static_parameters, [1; 32])
+                .bind_rhs_inputs(&ParamEnv::default(), &rhs_values, [2; 32])
+                .is_err(),
+            "Static encryption rejects late RHS plaintexts"
+        );
     }
 }

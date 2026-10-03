@@ -19,7 +19,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::{
@@ -28,7 +28,7 @@ use crate::{
         refresh::{RefreshDeclaration, RefreshError},
         simulation::{RefreshNoiseParameters, RefreshRouteNoiseGains, RefreshTranscriptTopology},
     },
-    program::{ExponentLUTProgramLowering, ExponentLutProgramId, WireId},
+    program::{ExponentLUTProgramLowering, ExponentLutProgramId, InputShape, LutId, RhsId, WireId},
 };
 
 pub use encoding::{
@@ -100,6 +100,40 @@ pub(crate) fn refresh_label_artifact_name(
     refresh_artifact_name(commitment, slot, &format!("target/{label}"))
 }
 
+/// Build the canonical path of a Dynamic refresh key: the slot's source key
+/// (`label = None`) or a label's child-PRF output key.
+pub(crate) fn refresh_key_artifact_name(
+    commitment: [u8; 32],
+    slot: usize,
+    label: Option<usize>,
+) -> String {
+    match label {
+        None => refresh_artifact_name(commitment, slot, "source-key"),
+        Some(label) => refresh_artifact_name(commitment, slot, &format!("label-key/{label}")),
+    }
+}
+
+/// Build the canonical path of the switching ciphertexts of LUT `lut`
+/// evaluated at `level` with input layout `layout`, followed by `suffix`.
+pub(crate) fn lut_switching_role(
+    level: usize,
+    lut: LutId,
+    layout: crate::program::ExpLayout,
+    suffix: &str,
+) -> String {
+    format!("lut-switching/{level}/{}/{lut:?}/{layout:?}{suffix}", level + 1)
+}
+
+/// Number `m_(i+1)` of stored digit-companion elements, one per output
+/// column, of one Dynamic ciphertext consumed at `level`.
+pub(crate) fn companion_columns_count(
+    parameters: &RnsBggParameters,
+    level: usize,
+) -> Result<usize, RnsBggError> {
+    let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
+    Ok(2 * parameters.component_columns(next)?)
+}
+
 /// Build the canonical refresh-checkpoint artifact path.
 pub(crate) fn refresh_checkpoint_artifact_name(commitment: [u8; 32], role: &str) -> String {
     format!("refresh/{}/{role}", refresh_commitment_hex(commitment))
@@ -156,6 +190,24 @@ fn encoding_error_bound(sigma: &BigDecimal) -> Result<BigUint, RnsBggError> {
     Ok(bound)
 }
 
+/// When the RHS values of a Program, and every secret-dependent helper, are
+/// fixed. One execution of a Program has exactly one mode.
+///
+/// `Static` binds the RHS plaintexts during preprocessing under a payload
+/// secret distinct from the encryption mask, and multiplies by setup-fixed
+/// ciphertexts. `Dynamic` finishes preprocessing from public material only:
+/// encryption then binds one secret `s = (s_bar, 1)` as both mask and
+/// payload, and generates each RHS ciphertext `C` together with the public
+/// encodings `z = s B - d s G + e` of its gadget digits `d`. A private
+/// product then has the ciphertext-independent key `T = sum_a B_a U_a`,
+/// where `U = Dec(A)` is the gadget decomposition of the state key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RhsMode {
+    #[default]
+    Static,
+    Dynamic,
+}
+
 /// Validated modulus-chain and encoding-noise parameters.
 #[derive(Clone, Debug)]
 pub struct RnsBggParameters {
@@ -164,6 +216,7 @@ pub struct RnsBggParameters {
     encoding_error_sigma: BigDecimal,
     encoding_error_bound: BigUint,
     operations_per_drop: usize,
+    rhs_mode: RhsMode,
 }
 
 /// Validated source-to-target route for a public operand.
@@ -249,7 +302,20 @@ impl RnsBggParameters {
             encoding_error_sigma: sigma,
             encoding_error_bound,
             operations_per_drop,
+            rhs_mode: RhsMode::Static,
         })
+    }
+
+    /// RHS timing mode shared by preprocessing, encryption, online
+    /// evaluation, and noise analysis.
+    pub fn rhs_mode(&self) -> RhsMode {
+        self.rhs_mode
+    }
+
+    /// These parameters with RHS timing mode `mode`.
+    pub fn with_rhs_mode(mut self, mode: RhsMode) -> Self {
+        self.rhs_mode = mode;
+        self
     }
 
     pub fn levels(&self) -> &[DCRTPolyParams] {
@@ -756,6 +822,9 @@ impl RnsBggParameters {
         for drop in &self.drops {
             digest.update(drop.to_bytes_be());
         }
+        if self.rhs_mode == RhsMode::Dynamic {
+            digest.update(b"dynamic-rhs");
+        }
         digest.finalize().into()
     }
 
@@ -851,7 +920,8 @@ impl RnsBggParameters {
             std::iter::repeat_n(q_parameters, q_levels).chain([p_parameters]).collect(),
             self.encoding_error_sigma.clone(),
             self.operations_per_drop,
-        )?;
+        )?
+        .with_rhs_mode(self.rhs_mode);
         if expected.component_columns(q_levels - 1)? != self.component_columns(q_level)? {
             return Err(RnsBggError::Binding(
                 "refresh PRF coefficient output width does not match source q carrier",
@@ -1047,6 +1117,14 @@ pub(crate) struct RnsBggArtifactBinding {
     /// The logical level of each Program input, which encryption encodes it
     /// at.
     input_levels: BTreeMap<WireId, usize>,
+    /// RHS timing mode of the bound stages.
+    rhs_mode: RhsMode,
+    /// Dynamic only: the shape and consuming level of each declared RHS,
+    /// whose ciphertext and digit companions encryption generates.
+    dynamic_rhs: BTreeMap<RhsId, (InputShape, usize)>,
+    /// Dynamic only: each `(level, LUT)` the Program evaluates, whose
+    /// switching ciphertexts and digit companions encryption generates.
+    dynamic_luts: BTreeSet<(usize, LutId)>,
 }
 
 impl RnsBggArtifactBinding {
@@ -1056,6 +1134,7 @@ impl RnsBggArtifactBinding {
         parameters: [u8; 32],
         hash_key_commitment: [u8; 32],
         sources: Vec<mxx_ir_core::artifact::ProductionId>,
+        rhs_mode: RhsMode,
     ) -> Result<Self, RnsBggError> {
         if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(RnsBggError::Binding("artifact sources must be canonical and unique"));
@@ -1068,6 +1147,9 @@ impl RnsBggArtifactBinding {
             sources: Vec::new(),
             refresh_commitment: None,
             input_levels: BTreeMap::new(),
+            rhs_mode,
+            dynamic_rhs: BTreeMap::new(),
+            dynamic_luts: BTreeSet::new(),
         };
         for source in sources {
             binding = binding.with_source(source)?;
@@ -1084,6 +1166,29 @@ impl RnsBggArtifactBinding {
     /// The logical level of each Program input.
     pub(crate) fn input_levels(&self) -> &BTreeMap<WireId, usize> {
         &self.input_levels
+    }
+
+    /// Records the RHS and LUT schema encryption needs in Dynamic mode.
+    pub(crate) fn with_dynamic_schema(
+        mut self,
+        rhs: BTreeMap<RhsId, (InputShape, usize)>,
+        luts: BTreeSet<(usize, LutId)>,
+    ) -> Self {
+        self.dynamic_rhs = rhs;
+        self.dynamic_luts = luts;
+        self
+    }
+
+    pub(crate) fn rhs_mode(&self) -> RhsMode {
+        self.rhs_mode
+    }
+
+    pub(crate) fn dynamic_rhs(&self) -> &BTreeMap<RhsId, (InputShape, usize)> {
+        &self.dynamic_rhs
+    }
+
+    pub(crate) fn dynamic_luts(&self) -> &BTreeSet<(usize, LutId)> {
+        &self.dynamic_luts
     }
 
     /// Binds a refresh declaration to this stage's artifact identity.
@@ -1210,13 +1315,11 @@ fn map_matrix(matrix: RnsBggMatrix, mut operation: impl FnMut(Mat) -> Mat) -> Rn
     ((operation(matrix.0.0), operation(matrix.0.1)), (operation(matrix.1.0), operation(matrix.1.1)))
 }
 
-/// Resolve the concrete ordered CRT ring of a graph matrix.
-/// The nonzero coefficients of `value`, centered into `(-q/2, q/2]`, and its
-/// ring dimension.
-fn centered_terms<P: mxx_backends::poly::Poly>(value: &P) -> (usize, Vec<(usize, BigInt)>) {
+/// The nonzero coefficients of `value`, centered into `(-q/2, q/2]`.
+fn centered_terms<P: mxx_backends::poly::Poly>(value: &P) -> Vec<(usize, BigInt)> {
     use mxx_backends::element::PolyElem;
-    let coefficients = value.coeffs();
-    let terms = coefficients
+    value
+        .coeffs()
         .iter()
         .enumerate()
         .filter(|(_, coefficient)| !coefficient.value().is_zero())
@@ -1230,8 +1333,7 @@ fn centered_terms<P: mxx_backends::poly::Poly>(value: &P) -> (usize, Vec<(usize,
             };
             (index, centered)
         })
-        .collect();
-    (coefficients.len(), terms)
+        .collect()
 }
 
 /// The coefficient of a constant polynomial with these terms.
@@ -1243,29 +1345,30 @@ fn constant_term(terms: &[(usize, BigInt)]) -> Option<BigInt> {
     }
 }
 
-/// The exponent `k` in `[0, 2n)` of a signed monomial `X^k` with these terms,
-/// where `X^(j+n) = -X^j`.
-fn monomial_exponent(dimension: usize, terms: &[(usize, BigInt)]) -> Option<usize> {
+/// The position `k < n` and sign of a signed monomial `+-X^k` with these
+/// terms; `true` marks `-X^k`.
+fn signed_monomial(terms: &[(usize, BigInt)]) -> Option<(usize, bool)> {
     match terms {
-        [(position, coefficient)] if coefficient.is_one() => Some(*position),
-        [(position, coefficient)] if (-coefficient).is_one() => Some(position + dimension),
+        [(position, coefficient)] if coefficient.is_one() => Some((*position, false)),
+        [(position, coefficient)] if (-coefficient).is_one() => Some((*position, true)),
         _ => None,
     }
 }
 
 /// A graph constant with these terms, sized by them rather than by the ring
 /// dimension where it can be: a constant polynomial keeps one coefficient and a
-/// signed monomial is a rotation. Any other polynomial keeps its coefficients
-/// up to its last nonzero one.
-fn constant_from_terms(ring: &Ring, dimension: usize, terms: &[(usize, BigInt)]) -> Mat {
+/// signed monomial is a (negated) rotation. Any other polynomial keeps its
+/// coefficients up to its last nonzero one.
+fn constant_from_terms(ring: &Ring, terms: &[(usize, BigInt)]) -> Mat {
     if let Some(coefficient) = constant_term(terms) {
         return ring.polynomial([IntExpr::constant(coefficient)]);
     }
-    if let Some(exponent) = monomial_exponent(dimension, terms) {
-        return ring.constant(
+    if let Some((position, negated)) = signed_monomial(terms) {
+        let rotation = ring.constant(
             (1, 1),
-            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: IntExpr::constant(exponent) },
+            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: IntExpr::constant(position) },
         );
+        return if negated { -rotation } else { rotation };
     }
     let length = terms.last().map_or(0, |(position, _)| position + 1);
     let mut coefficients = vec![IntExpr::constant(0); length];
@@ -1278,8 +1381,7 @@ fn constant_from_terms(ring: &Ring, dimension: usize, terms: &[(usize, BigInt)])
 /// A caller's plaintext polynomial as a graph constant over `ring`, sized by
 /// its nonzero terms (see `constant_from_terms`).
 pub(crate) fn plaintext_constant<P: mxx_backends::poly::Poly>(ring: &Ring, value: &P) -> Mat {
-    let (dimension, terms) = centered_terms(value);
-    constant_from_terms(ring, dimension, &terms)
+    constant_from_terms(ring, &centered_terms(value))
 }
 
 /// A caller's plaintext family as one `(c, k)` pair per member, the member
@@ -1293,7 +1395,7 @@ pub(crate) fn plaintext_terms<P: mxx_backends::poly::Poly>(
     use rayon::prelude::*;
     values
         .par_iter()
-        .map(|value| match centered_terms(value).1.as_slice() {
+        .map(|value| match centered_terms(value).as_slice() {
             [] => Ok((BigInt::zero(), 0)),
             [(exponent, coefficient)] => Ok((coefficient.clone(), *exponent)),
             _ => Err("a plaintext family member must have at most one nonzero coefficient".into()),
@@ -1390,6 +1492,190 @@ pub(crate) fn add_public_matrices(lhs: RnsBggMatrix, rhs: RnsBggMatrix) -> RnsBg
 
 pub(crate) fn add_encoding_rows(lhs: RnsBggRow, rhs: RnsBggRow) -> RnsBggRow {
     (lhs.0 + rhs.0, lhs.1 + rhs.1)
+}
+
+/// The ciphertext `C = [top; target - prefix * top + e]` at `level`, with a
+/// fresh error row `e` of `columns` columns, so `(prefix, 1) C = target + e`.
+/// RHS, LUT-switching, and refresh-action ciphertexts all have this form.
+pub(crate) fn ciphertext_matrix(
+    parameters: &RnsBggParameters,
+    level: usize,
+    columns: usize,
+    prefix: Mat,
+    top: RnsBggRow,
+    target: RnsBggRow,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let error = encoding::fresh_error(parameters, level, columns)?;
+    let bottom = (
+        target.0 - prefix.clone() * top.0.clone() + error.0,
+        target.1 - prefix * top.1.clone() + error.1,
+    );
+    Ok((top, bottom))
+}
+
+/// Hash tag of the public digit-companion keys `B_{a,j}` of one Dynamic RHS
+/// member or LUT branch consumed at `level`.
+///
+/// It names public setup coordinates only: the parameter identity, setup
+/// context, Program, the refresh declaration and slot of an embedded PRF
+/// child, the material (`rhs/<id>` or `lut/<id>`), and its member or branch.
+/// No encryption batch, plaintext, ciphertext, or digit enters it, so every
+/// encryption under one setup shares these keys and the Program keys
+/// evaluated from them.
+pub(crate) fn companion_tag(
+    parameters: &RnsBggParameters,
+    context: &[u8; 32],
+    program: ExponentLutProgramId,
+    namespace: Option<([u8; 32], usize)>,
+    material: String,
+    member: Option<IntExpr>,
+    level: usize,
+) -> mxx_dsl::HashTag {
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/dynamic-rhs-digit-key".to_vec());
+    tag.push(hex(&parameters.parameter_identity()));
+    tag.push(hex(context));
+    tag.push(hex(program.as_bytes()));
+    if let Some((commitment, slot)) = namespace {
+        tag.push("refresh");
+        tag.push(hex(&commitment));
+        tag.push(IntExpr::constant(slot));
+    }
+    tag.push(material);
+    if let Some(member) = member {
+        tag.push("member");
+        tag.push(member);
+    }
+    tag.push("level");
+    tag.push(IntExpr::constant(level));
+    tag
+}
+
+/// The public keys `B_{:,j}` of output column `j` of the ciphertext named by
+/// `tag` (see [`companion_tag`]) at `level`: the `2 x M_i` keys `B_{a,j}` of
+/// all `m_i` digit rows, each of the four blocks flattened into one
+/// `1 x m_i D_i` row whose entries `a D_i .. (a+1) D_i` are block `B_{a,j}`.
+/// A digit is a public attribute encoded under the full current-level
+/// public gadget, so each block has `D_i` columns.
+pub(crate) fn companion_key(
+    parameters: &RnsBggParameters,
+    level: usize,
+    hash_key: mxx_dsl::Bytes,
+    tag: &mxx_dsl::HashTag,
+    j: IntExpr,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let mut tag = tag.clone();
+    tag.push("column");
+    tag.push(j);
+    Ok(public_key::matrix_from_hash(
+        &parameters.ring(level)?,
+        hash_key,
+        tag,
+        companion_width(parameters, level)?,
+    ))
+}
+
+/// Width `m_i D_i` of one flattened block of the digit-companion keys and
+/// encodings of an output column at `level`.
+pub(crate) fn companion_width(
+    parameters: &RnsBggParameters,
+    level: usize,
+) -> Result<usize, RnsBggError> {
+    Ok(2 * parameters.component_columns(level)? * parameters.level(level)?.modulus_digits())
+}
+
+/// The pre-rounding key `T` and companion row `E` of a Dynamic product by a
+/// ciphertext `C` at `level` (spec Eq. 049): for every output column `j`,
+///
+/// `T_j = sum_a B_{a,j} U_{:,a}` and `E_j = sum_a z_{a,j} U_{:,a}`,
+///
+/// where `U = Dec_{q_i}(A)` is the full current-level gadget decomposition
+/// of the state key `key = A`, `a` ranges over the `m_i` columns of `A`, and
+/// `j` over the `m_(i+1)` output columns. `companion_key(j)` is `B_{:,j}` and
+/// `companion(j)` the encodings `z_{a,j} = s B_{a,j} - d_{a,j} s G + eps` of
+/// the digits `d_{a,j} = Dec_{q_(i+1)}(C)_{a,j}`, both flattened over `a` as
+/// in [`companion_key`]. Then
+/// `E + c Dec(C) = s T - x (s H_i Dec(C)) + eps U + e Dec(C)`: the unit
+/// column `e_a` is a preimage of `H_i e_a` under the next-level gadget, so
+/// `s H_i Dec(C) = s C` up to multiples of `q_(i+1)`, which the scale `p_i`
+/// of the private payload annihilates. `T` depends only on public keys.
+///
+/// Flattened over `a`, both sums are one product per key row with
+/// `vec(U_r) = Dec(A_r^T)`, whose rows `a D_i .. (a+1) D_i` decompose entry
+/// `a` of key row `r`. Each output column reads only its own keys and
+/// companions; the columns are a loop, or unrolled when `unroll` is set
+/// because the product runs inside a Program family body, where a loop may
+/// not read stored companions. The caller adds the
+/// ciphertext row `c Dec(C)` and applies the single scale-and-round.
+pub(crate) fn companion_columns(
+    parameters: &RnsBggParameters,
+    level: usize,
+    key: &RnsBggMatrix,
+    companion_key: &dyn Fn(IntExpr) -> Result<RnsBggMatrix, RnsBggError>,
+    companion: Option<&dyn Fn(IntExpr) -> Result<RnsBggRow, RnsBggError>>,
+    unroll: bool,
+) -> Result<(RnsBggMatrix, Option<RnsBggRow>), RnsBggError> {
+    let ring = parameters.ring(level)?;
+    let current = parameters.level(level)?;
+    let base = public_gadget_base(current.base_bits())?;
+    let digits = current.modulus_digits();
+    let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
+    let output_columns = parameters.component_columns(next)?;
+    let width = 2 * output_columns;
+    let row = |left: &Mat, right: &Mat| {
+        Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![left.clone(), right.clone()])
+    };
+    let [u0, u1] = [row(&key.0.0, &key.0.1), row(&key.1.0, &key.1.1)]
+        .map(|row| row.transpose().decompose(base, digits));
+    let act =
+        |(left, right): RnsBggRow| left.mul_small_rhs(u0.clone()) + right.mul_small_rhs(u1.clone());
+    // Column `j`'s terms, added at column `j` by its unit row.
+    let terms = |j: IntExpr| -> Result<Vec<Mat>, RnsBggError> {
+        let (top, bottom) = companion_key(j.clone())?;
+        let mut terms = vec![act(top), act(bottom)];
+        if let Some(companion) = companion {
+            terms.push(act(companion(j)?));
+        }
+        Ok(terms)
+    };
+    let units = (0..width)
+        .map(|column| {
+            ring.constant(
+                (1, width),
+                mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(column) },
+            )
+        })
+        .collect::<Vec<_>>();
+    let add = |rows: Vec<Mat>, terms: Vec<Mat>, unit: Mat| -> Vec<Mat> {
+        rows.into_iter().zip(terms).map(|(row, term)| row + term * unit.clone()).collect()
+    };
+    let zero = vec![ring.zero((1, width)); if companion.is_some() { 3 } else { 2 }];
+    let rows = if unroll {
+        // Inside a Program family body a loop may not read stored
+        // companions, so the columns are unrolled.
+        units.into_iter().enumerate().try_fold(zero, |rows, (j, unit)| {
+            Ok::<_, RnsBggError>(add(rows, terms(IntExpr::constant(j))?, unit))
+        })?
+    } else {
+        // The unit rows are read from a family: a constant whose index
+        // depends on the loop would be fixed when the loop body is planned.
+        let units = Family::pack(units)?;
+        mxx_dsl::iterate(width, zero, |j, rows: Vec<Mat>| {
+            let unit = units.at(j.clone());
+            Ok(add(rows, terms(j.expression()?).map_err(|_| mxx_dsl::DslError::Schema)?, unit))
+        })?
+    };
+    let block = |row: &Mat, start: usize| {
+        row.clone().slice(
+            None,
+            Some(mxx_ir_core::node::IndexRange {
+                start: IntExpr::constant(start),
+                end: IntExpr::constant(start + output_columns),
+            }),
+        )
+    };
+    let split = |row: &Mat| (block(row, 0), block(row, output_columns));
+    Ok(((split(&rows[0]), split(&rows[1])), rows.get(2).map(split)))
 }
 
 /// Decompose a compact right-action matrix at its declared decomposition
@@ -2000,6 +2286,34 @@ mod tests {
             [&aligned_matrix.0.0, &aligned_matrix.0.1, &aligned_matrix.1.0, &aligned_matrix.1.1]
         {
             assert_eq!(entry.matrix_type(), &target_type);
+        }
+    }
+
+    /// A negated monomial plaintext `-X^k` is a valid negated rotation, and
+    /// evaluates to `-X^k` together with `X^k` and a general polynomial.
+    #[test]
+    fn plaintext_constants_keep_negated_monomials_valid() {
+        use mxx_backends::poly::{Poly, dcrt::poly::DCRTPoly};
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let ring = crate::test_support::ring_of(&level);
+        let monomial = DCRTPoly::const_rotate_poly(&level, 5);
+        let cases = [
+            ("negated", -monomial.clone()),
+            ("positive", monomial.clone()),
+            ("general", monomial.clone() + DCRTPoly::const_rotate_poly(&level, 2)),
+        ];
+        let mut context = mxx_dsl::DslContext::new("plaintext-constants");
+        for (name, value) in &cases {
+            context = context.output(*name, plaintext_constant(&ring, value)).unwrap();
+        }
+        let graph = crate::test_support::validate(&context.build().unwrap());
+        let result = crate::test_support::execute_cpu(&graph, [level], BTreeMap::new());
+        for (name, value) in cases {
+            assert_eq!(
+                crate::test_support::full(&result.outputs[name]).entry(0, 0),
+                value,
+                "{name}"
+            );
         }
     }
 

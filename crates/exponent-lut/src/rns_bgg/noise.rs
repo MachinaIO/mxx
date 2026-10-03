@@ -8,7 +8,7 @@
 //! remains the separate direct-decoder residual contract carried by the
 //! refresh noise parameters.
 #![warn(missing_docs)]
-use super::{RnsBggError, RnsBggParameters};
+use super::{RhsMode, RnsBggError, RnsBggParameters};
 use crate::{
     noise_refresh::{
         prf::PrfLabel,
@@ -32,7 +32,10 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::noise_utils::{NoiseBreakdown, ReductionCounts, SampleCoordinate};
 
@@ -327,10 +330,30 @@ impl RnsBggParameters {
         let fresh =
             &j * &input.payload_l1 * fresh_error_gain * self.encoding_error_bound() * p * 2u8;
         let rounding = &j * (&n + 1u8) * (p - 1u8);
+        let companion = &j * self.companion_noise_gain(level)? * self.encoding_error_bound() * 2u8;
         Ok(RnsBggNoiseBound {
-            error: (inherited + fresh + rounding + 1u8) / 2u8,
+            error: (inherited + fresh + rounding + companion + 1u8) / 2u8,
             payload_l1: output_payload_l1,
         })
+    }
+
+    /// Coefficient gain of the Dynamic digit-companion error
+    /// `max_j sum_a eps_{a,j} U_{:,a}` of one product or LUT branch at
+    /// `level` (spec Eq. 075): `m_i` digit rows, each acting through a column
+    /// of `M_i = 2 D_i` key-decomposition digits with `n` coefficients
+    /// bounded by `b/2`, so `m_i M_i n b / 2`. Static products have no
+    /// companions and a zero gain.
+    fn companion_noise_gain(&self, level: usize) -> Result<BigUint, RnsBggError> {
+        if self.rhs_mode() == RhsMode::Static {
+            return Ok(BigUint::zero());
+        }
+        let current = self.level(level)?;
+        let m = BigUint::from(self.component_columns(level)?) * 2u8;
+        let public_columns = BigUint::from(current.modulus_digits()) * 2u8;
+        Ok(
+            m * public_columns * current.ring_dimension() * (BigUint::one() << current.base_bits()) /
+                2u8,
+        )
     }
 
     /// Scale-and-round a level-`level` LUT noise bound once by `p`, adding the
@@ -612,12 +635,27 @@ impl RnsBggParameters {
         // Adding the online remainder gives (2N/3+2)*(p^2-1)/(12*p^2).
         let rounding = NonnegativeRational::new((&n + 3u8) * (&p_squared - 1u8), 18u8 * &p_squared)
             .expect("positive scale");
+        let companion =
+            self.companion_noise_variance(level)?.scaled_ratio(&BigUint::one(), &p_squared);
         Ok(PrivateMulNoiseTerms {
             inherited_variance_gain,
             inherited_mean_gain,
             rhs_error,
             rounding,
+            companion,
         })
+    }
+
+    /// Diagnostic variance of the Dynamic digit-companion error
+    /// `sum_a eps_{a,j} U_{:,a}` of one product or LUT branch at `level`,
+    /// before its scale-and-round: the `m_i` fresh companion errors act
+    /// through key-decomposition columns of energy at most `M_i n (b/2)^2`.
+    /// Acceptance of Dynamic parameters uses the deterministic bound only.
+    fn companion_noise_variance(&self, level: usize) -> Result<NonnegativeRational, RnsBggError> {
+        let base = BigUint::one() << self.level(level)?.base_bits();
+        Ok(self
+            .encoding_error_variance()
+            .scaled_ratio(&(self.companion_noise_gain(level)? * base), &BigUint::from(2u8)))
     }
 
     /// Total variance of the direct product when the input error, the RHS
@@ -631,7 +669,11 @@ impl RnsBggParameters {
         fresh_error_gain: &RightActionNoiseGain,
     ) -> Result<NonnegativeRational, RnsBggError> {
         let terms = self.private_mul_noise_terms(level, payload_gain, fresh_error_gain)?;
-        Ok(terms.inherited_variance(input_variance).add(&terms.rhs_error).add(&terms.rounding))
+        Ok(terms
+            .inherited_variance(input_variance)
+            .add(&terms.rhs_error)
+            .add(&terms.rounding)
+            .add(&terms.companion))
     }
 
     /// Separately identified components of the explicit LUT equation (6.6)
@@ -681,6 +723,7 @@ impl RnsBggParameters {
             input_mean_gain: &j * &branch_l1,
             helper: gaussian.scaled(&branch_energy),
             fresh: gaussian.scaled(&(fresh_gain * &p_squared)),
+            companion: self.companion_noise_variance(level)?,
             internal_rounding: branch_rounding.scaled(&(&j * &j)),
             scale: p,
             outer_rounding,
@@ -721,8 +764,10 @@ impl RnsBggParameters {
         let fresh = &input.payload_l1 * fresh_error_gain * &self.encoding_error_bound * &twice_p;
         // S = ||s_bar||_1 + 1 <= N + 1 for the ternary secret.
         let rounding = (n + 2u8) * (p - 1u8);
+        // Dynamic: the digit companions' error, divided once by p.
+        let companion = self.companion_noise_gain(level)? * &self.encoding_error_bound * 2u8;
         Ok(RnsBggNoiseBound {
-            error: (inherited + fresh + rounding + &twice_p - 1u8) / twice_p,
+            error: (inherited + fresh + rounding + companion + &twice_p - 1u8) / twice_p,
             payload_l1: output_payload_l1,
         })
     }
@@ -771,6 +816,8 @@ pub(crate) struct PrivateMulNoiseTerms {
     pub rhs_error: NonnegativeRational,
     /// Variance of both ModDown remainders.
     pub rounding: NonnegativeRational,
+    /// Variance of the Dynamic digit-companion error; zero when Static.
+    pub companion: NonnegativeRational,
 }
 
 impl PrivateMulNoiseTerms {
@@ -793,6 +840,9 @@ pub(crate) struct LutNoiseTerms {
     pub helper: NonnegativeRational,
     /// Variance of one branch's B-key error image.
     pub fresh: NonnegativeRational,
+    /// Variance of one branch's Dynamic digit-companion error image; zero
+    /// when Static.
+    pub companion: NonnegativeRational,
     /// Coherent variance of the branches' internal public remainders.
     pub internal_rounding: NonnegativeRational,
     /// The scale `p` of the scale-and-round.
@@ -1082,6 +1132,7 @@ pub(crate) struct WorkloadCollector<'a> {
     parameters: Option<&'a RnsBggParameters>,
     levels: BTreeMap<WireId, usize>,
     rhs_levels: BTreeMap<RhsId, usize>,
+    luts: BTreeSet<(usize, LutId)>,
     /// For each public Program input, the lowest level at which it is
     /// consumed, or `None` once any use needs it at its own level.
     public_input_uses: BTreeMap<WireId, Option<usize>>,
@@ -1115,6 +1166,8 @@ pub struct RnsBggDerivedWorkload {
     program: crate::program::ExponentLutProgramId,
     levels: BTreeMap<WireId, usize>,
     rhs_levels: BTreeMap<RhsId, usize>,
+    /// The input level and identity of every LUT the Program evaluates.
+    luts: BTreeSet<(usize, LutId)>,
 }
 
 impl RnsBggDerivedWorkload {
@@ -1164,6 +1217,7 @@ impl RnsBggDerivedWorkload {
             parameters,
             levels: program.inputs().keys().map(|id| (*id, input_level(id))).collect(),
             rhs_levels: BTreeMap::new(),
+            luts: BTreeSet::new(),
             public_input_uses: program
                 .inputs()
                 .iter()
@@ -1234,6 +1288,7 @@ impl RnsBggDerivedWorkload {
                 program: program.id(),
                 levels: collector.levels,
                 rhs_levels: collector.rhs_levels,
+                luts: collector.luts,
             },
             uses,
         ))
@@ -1255,6 +1310,10 @@ impl RnsBggDerivedWorkload {
     /// Program identity committed by this workload.
     pub fn program(&self) -> crate::program::ExponentLutProgramId {
         self.program
+    }
+    /// The input level and identity of every LUT the Program evaluates.
+    pub fn luts(&self) -> &BTreeSet<(usize, LutId)> {
+        &self.luts
     }
 }
 
@@ -1340,6 +1399,7 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         }
         self.note_use(input.0, None);
         let output = self.site()?.output;
+        self.luts.insert((input.1, self.program.lut_id_at(output).map_err(|_| RnsBggError::Lut)?));
         let next = if matches!(
             table.output_representation(),
             crate::program::LutOutputRepresentation::Coefficient
@@ -2969,6 +3029,14 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             "lut-rounding",
             units(&terms.internal_rounding),
         ));
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            contributions = contributions.merge(&NoiseBreakdown::sampled(
+                stable_source_id(&(b"rns-bgg/lut/companion".as_slice(), level, lut)),
+                "lut-companion-error",
+                zero_mean_moments(units(&terms.companion.scaled(&branch_squares))),
+                false,
+            ));
+        }
         if !coefficient_output {
             contributions = contributions.merge(&residual(
                 b"rns-bgg/lut/outer-rounding",
@@ -3392,6 +3460,27 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 ),
                 None => NoiseBreakdown::sampled(rhs_source, "rhs-error", rhs_moments, rhs_bounded),
             };
+            // Dynamic: the RHS package's digit-companion errors, shared by
+            // every gate reading the same RHS member at this level.
+            let companion_source =
+                stable_source_id(&(b"rns-bgg/rhs-companion-error".as_slice(), rhs.id, level));
+            let companion_moments = zero_mean_moments(terms.companion.clone());
+            let companion = match rhs.index.as_ref() {
+                Some(index) => NoiseBreakdown::sampled_member(
+                    companion_source,
+                    "rhs-companion-error",
+                    self.lane_indices.len(),
+                    index.clone(),
+                    companion_moments,
+                    false,
+                ),
+                None => NoiseBreakdown::sampled(
+                    companion_source,
+                    "rhs-companion-error",
+                    companion_moments,
+                    false,
+                ),
+            };
             // Under H2 both remainders are centered uniforms independent per
             // coefficient and of the independent secret, so their images
             // are coefficient-uncorrelated. The remainders are determined by
@@ -3425,7 +3514,12 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                     zero_mean_moments(terms.rounding.clone()),
                 ),
             };
-            inherited.merge(&rhs_error).merge(&rounding)
+            let terms = inherited.merge(&rhs_error).merge(&rounding);
+            if self.parameters.rhs_mode() == RhsMode::Dynamic {
+                terms.merge(&companion)
+            } else {
+                terms
+            }
         });
         tracing::trace!(
             wire = wire.0,
@@ -3440,7 +3534,11 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         let mut heuristics = input.1.heuristics.clone();
         heuristics.insert(NoiseHeuristicId::H1StateUncorrelated);
         heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
-        heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
+        // Dynamic ciphertext digits depend on the secret and the ciphertext
+        // error, so RHS independence is not assumed there.
+        if self.parameters.rhs_mode() == RhsMode::Static {
+            heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
+        }
         let value = self.carry_provenance(
             RnsBggNoiseValue {
                 bound,
@@ -3704,6 +3802,9 @@ pub struct RnsBggPlanRequest {
     pub operations_per_drop: usize,
     /// CRT primes removed by each physical drop.
     pub primes_per_drop: usize,
+    /// RHS timing mode of the planned parameters.
+    #[serde(default)]
+    pub rhs_mode: RhsMode,
 }
 
 /// Serialized parameter-search evidence.
@@ -3731,15 +3832,50 @@ pub struct RnsBggParameterManifest {
     pub trace_commitment: [u8; 32],
 }
 
-fn parameter_artifact_bytes(parameters: &RnsBggParameters) -> BigUint {
-    parameters
-        .levels()
-        .iter()
-        .map(|level| {
-            let modulus_bytes = BigUint::from(level.modulus().bits().div_ceil(8));
-            BigUint::from(level.ring_dimension()) * modulus_bytes * 16u8
-        })
-        .sum()
+fn parameter_artifact_bytes(
+    parameters: &RnsBggParameters,
+    program: &ExponentLutProgram,
+) -> Result<BigUint, RnsBggError> {
+    let polynomial_bytes = |level: usize| -> Result<BigUint, RnsBggError> {
+        let level = parameters.level(level)?;
+        Ok(BigUint::from(level.ring_dimension()) * level.modulus().bits().div_ceil(8))
+    };
+    let mut bytes = (0..parameters.levels().len())
+        .map(|level| Ok(polynomial_bytes(level)? * 16u8))
+        .sum::<Result<BigUint, RnsBggError>>()?;
+    if parameters.rhs_mode() == RhsMode::Static {
+        return Ok(bytes);
+    }
+    // Dynamic encryption publishes, per RHS member and LUT branch consumed at
+    // level i, the full ciphertext (2 m_(i+1) polynomials at q_(i+1)) and its
+    // N_i = m_i m_(i+1) digit companions of M_i polynomials at q_i (spec
+    // Eq. 066).
+    let workload = RnsBggDerivedWorkload::from_program(program)?;
+    let material = |level: usize, count: usize| -> Result<BigUint, RnsBggError> {
+        let m = parameters.component_columns(level)? * 2;
+        let m_next = parameters.component_columns(level + 1)? * 2;
+        let public_columns = parameters.level(level)?.modulus_digits() * 2;
+        let ciphertext = polynomial_bytes(level + 1)? * m_next * 2u8;
+        let companions = polynomial_bytes(level)? * m * m_next * public_columns;
+        Ok((ciphertext + companions) * count)
+    };
+    for (rhs, shape) in program.rhs_inputs() {
+        let count = match shape {
+            InputBinding::Scalar(()) => 1,
+            InputBinding::Family(count) => count
+                .evaluate(&ParamEnv::default())
+                .ok()
+                .and_then(|count| count.to_usize())
+                .ok_or(RnsBggError::Binding("RHS family count is not concrete"))?,
+        };
+        bytes += material(workload.rhs_level(*rhs)?, count)?;
+    }
+    let tables = program.encryption_inputs();
+    for (level, lut) in workload.luts() {
+        let table = tables.luts().get(lut.0 as usize).ok_or(RnsBggError::Lut)?;
+        bytes += material(*level, table.values().len())?;
+    }
+    Ok(bytes)
 }
 
 fn noise_contract_commitment(
@@ -3834,11 +3970,12 @@ impl RnsBggParameters {
                     .ok_or(RnsBggError::Parameters("invalid prime basis"))?,
             );
         }
-        RnsBggParameters::new(
+        Ok(RnsBggParameters::new(
             levels,
             request.encoding_error_sigma.clone(),
             request.operations_per_drop,
-        )
+        )?
+        .with_rhs_mode(request.rhs_mode))
     }
 
     /// Evaluate the selected Program noise contract and terminal envelopes.
@@ -3869,6 +4006,11 @@ impl RnsBggParameters {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "noise audit workload derived"
         );
+        // Average-case acceptance is the caller's explicit choice. For
+        // Dynamic parameters it is a heuristic: the digit companions' moments
+        // assume the uncorrelated-error model (H1/H2) of the Static terms,
+        // without RHS independence (H4); the deterministic bound remains the
+        // conservative check.
         let average = average.filter(|config| config.allow_average_acceptance);
         let z_squared = average
             .map(|config| {
@@ -4022,7 +4164,7 @@ impl RnsBggParameters {
             noise_contract_commitment(program, bindings, &terminal_value_bounds, None);
         let parameter_commitment =
             parameter_commitment(request, &parameters, program, noise_contract_commitment);
-        let estimated_artifact_bytes = parameter_artifact_bytes(&parameters);
+        let estimated_artifact_bytes = parameter_artifact_bytes(&parameters, program)?;
         let trace_digest = trace_commitment(&trace);
         let manifest = RnsBggParameterManifest {
             request: request.clone(),
@@ -4086,7 +4228,7 @@ impl RnsBggParameters {
                         trace_commitment: trace_commitment(&trace),
                         trace,
                         average: average.cloned(),
-                        estimated_artifact_bytes: parameter_artifact_bytes(&parameters),
+                        estimated_artifact_bytes: parameter_artifact_bytes(&parameters, program)?,
                     };
                     return Ok((parameters, manifest));
                 }
@@ -4148,7 +4290,8 @@ impl RnsBggParameterManifest {
             levels,
             self.request.encoding_error_sigma.clone(),
             self.request.operations_per_drop,
-        )?;
+        )?
+        .with_rhs_mode(self.request.rhs_mode);
         let expected_parameter_commitment = parameter_commitment(
             &self.request,
             &parameters,
@@ -4158,7 +4301,7 @@ impl RnsBggParameterManifest {
         if expected_parameter_commitment != self.parameter_commitment {
             return Err(RnsBggError::Binding("parameter commitment mismatch"));
         }
-        if parameter_artifact_bytes(&parameters) != self.estimated_artifact_bytes {
+        if parameter_artifact_bytes(&parameters, program)? != self.estimated_artifact_bytes {
             return Err(RnsBggError::Binding("artifact size estimate mismatch"));
         }
         let trace = parameters.audit_program(
@@ -5518,6 +5661,76 @@ mod test {
         let trace =
             parameters.audit_program(&program, &bindings, &terminal, Some(&average)).unwrap();
         assert_eq!(trace.acceptance, Some(NoiseModelKind::AverageCase));
+    }
+
+    /// Dynamic parameters may be accepted by the average case when the
+    /// caller asks for it, as Static ones can.
+    #[test]
+    fn dynamic_audit_accepts_the_average_case_on_request() {
+        let (program, parameters) = identity_program();
+        let parameters = parameters.with_rhs_mode(RhsMode::Dynamic);
+        let mut input =
+            RnsBggNoiseValue::sampled_encoding(&parameters, b"average-input", &[1.into()]);
+        input.bound.error = parameters.level(0).unwrap().modulus().as_ref().clone() * 2u8;
+        let bindings = RnsBggNoiseBindings::from_inputs(&program, &[input], &[]).unwrap();
+        let terminal = [BigUint::one()];
+        assert!(parameters.audit_program(&program, &bindings, &terminal, None).is_err());
+        let average = crate::noise_refresh::simulation::AverageCaseConfig {
+            failure_exponent: 1,
+            tail_correction_bits: 0,
+            allow_average_acceptance: true,
+        };
+        let trace =
+            parameters.audit_program(&program, &bindings, &terminal, Some(&average)).unwrap();
+        assert_eq!(trace.acceptance, Some(NoiseModelKind::AverageCase));
+    }
+
+    /// The Dynamic product and LUT bounds are the Static recurrences plus the
+    /// digit-companion term `m_i M_i n b E / 2` per product or branch before
+    /// the single division by `p` (spec Eq. 075, 094-095).
+    #[test]
+    fn dynamic_bounds_add_the_companion_term_to_the_static_recurrence() {
+        let parameters = nested_alignment_parameters();
+        let dynamic = parameters.clone().with_rhs_mode(RhsMode::Dynamic);
+        let input = RnsBggNoiseBound { error: BigUint::from(1000u16), payload_l1: BigUint::one() };
+        let gain = BigUint::from(3u8);
+        let level = 0;
+        let current = parameters.level(level).unwrap();
+        let n = BigUint::from(current.ring_dimension());
+        let b = BigUint::one() << current.base_bits();
+        let m = BigUint::from(2 * parameters.component_columns(level).unwrap());
+        let public_columns = BigUint::from(2 * current.modulus_digits());
+        let p = parameters.scale(level).unwrap().clone();
+        let e = parameters.encoding_error_bound().clone();
+        let numerator = &m * &n * &b * &input.error +
+            &m * &public_columns * &n * &b * &e +
+            &p * 2u8 * &input.payload_l1 * &gain * &e +
+            (&n + 2u8) * (&p - 1u8);
+        let twice_p = &p * 2u8;
+        assert_eq!(
+            dynamic.private_mul_noise_bound(level, &input, &gain, BigUint::one()).unwrap().error,
+            (numerator + &twice_p - 1u8) / twice_p
+        );
+        assert!(
+            parameters.private_mul_noise_bound(level, &input, &gain, BigUint::one()).unwrap().error <
+                dynamic
+                    .private_mul_noise_bound(level, &input, &gain, BigUint::one())
+                    .unwrap()
+                    .error
+        );
+        let branches = 4;
+        let static_lut = parameters
+            .lut_noise_bound_before_mod_down(level, &input, branches, &gain, BigUint::one())
+            .unwrap()
+            .error;
+        let dynamic_lut = dynamic
+            .lut_noise_bound_before_mod_down(level, &input, branches, &gain, BigUint::one())
+            .unwrap()
+            .error;
+        assert_eq!(
+            dynamic_lut - static_lut,
+            BigUint::from(branches) * &m * &public_columns * &n * &b * &e / 2u8
+        );
     }
 
     #[test]

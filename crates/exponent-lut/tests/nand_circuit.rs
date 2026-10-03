@@ -17,19 +17,19 @@ use mxx_exponent_lut::{
     noise_refresh::simulation::NoiseModelKind,
     program::Operand,
     rns_bgg::{
-        RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,
+        RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,
         RnsBggParameters, RnsBggPayloadSecret, RnsBggPlanRequest, RnsEncryptBuild, RnsNoiseBuild,
         RnsOnlineBuild, RnsPreprocessBuild, verify_output,
     },
     utils::{
-        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model,
+        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
         ring_dimension_candidates,
     },
 };
 use mxx_ir_core::ParamEnv;
 use num_bigint::{BigInt, BigUint};
 use serial_test::serial as sequential;
-use std::env;
+use std::{collections::BTreeMap, env};
 
 const HASH_KEY: &[u8; 32] = b"nand-rns-public-api-hash-key-v01";
 const NAND_DEPTH_ENV: &str = "MXX_EXPONENT_LUT_NAND_DEPTH";
@@ -155,6 +155,10 @@ fn select_candidate(
     let expected_base_bits = expected_base_bits as u32;
     let average = noise_model("MXX_EXPONENT_LUT_NAND_")
         .unwrap_or_else(|error| panic!("invalid NAND noise model: {error}"));
+    // `MXX_EXPONENT_LUT_NAND_RHS_MODE=dynamic` chooses the RHS values only at
+    // encryption.
+    let rhs_mode = rhs_mode("MXX_EXPONENT_LUT_NAND_")
+        .unwrap_or_else(|error| panic!("invalid NAND RHS mode: {error}"));
     let expected_acceptance = match average.as_ref() {
         Some(_) => NoiseModelKind::AverageCase,
         None => NoiseModelKind::WorstCase,
@@ -214,6 +218,7 @@ fn select_candidate(
                 terminal_value_bound: BigUint::from(1u8),
                 operations_per_drop,
                 primes_per_drop,
+                rhs_mode,
             };
             let Ok((parameters, audit_trace)) = audit_program_at_crt_depth(
                 &request,
@@ -344,29 +349,31 @@ fn nand_circuit_end_to_end() {
     // resident there for every stage that binds them.
     let mut runtime = GpuRuntime::new(gpu_backend_on(gpu_parameters(&parameters), devices.clone()))
         .expect("GPU runtime");
-    let payload: RnsBggPayloadSecret = RnsEncryptBuild::new(&parameters, [0x4e; 32])
-        .sample_payload_secret(&mut runtime, &mut MemoryArtifactStore::default())
-        .expect("payload secret");
+    let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
+    let sample_payload = |runtime: &mut GpuRuntime| -> RnsBggPayloadSecret {
+        RnsEncryptBuild::new(&parameters, [0x4e; 32])
+            .sample_payload_secret(runtime, &mut MemoryArtifactStore::default())
+            .expect("payload secret")
+    };
+    // A Static payload secret exists before preprocessing; the single
+    // Dynamic secret is sampled only after it.
+    let static_payload = (!dynamic).then(|| sample_payload(&mut runtime));
     let mut store = nand_storage().open().expect("stage storage");
-    // Convert natural Boolean inputs into the declared LHS and fixed-RHS
-    // plaintext maps.  The RHS plaintexts remain preprocessing inputs and
-    // are never supplied to online evaluation.
+    // Convert natural Boolean inputs into the declared LHS and RHS plaintext
+    // maps.  Static RHS plaintexts are preprocessing inputs, Dynamic ones
+    // encryption inputs; neither is supplied to online evaluation.
     let (lhs, rhs) = compiled
         .plaintext_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(&poly_parameters, &assignment)
         .expect("NAND plaintext bindings");
-    // Encryption owns a fresh caller-supplied mask for each invocation;
-    // the mask is retained locally for the final public verification only.
-    let mask = RnsEncryptBuild::new(&parameters, rand::random())
-        .sample_mask_secret(&mut runtime, &mut store)
-        .expect("fresh mask secret");
-    // Preprocess receives the private RHS plaintexts and caller payload,
-    // then returns two typed named-session artifacts consumed by later
-    // stages.
+    let no_rhs = BTreeMap::new();
+    // Static preprocessing receives the private RHS plaintexts and caller
+    // payload; Dynamic preprocessing receives neither. It returns two typed
+    // named-session artifacts consumed by later stages.
     let (preprocess, online) = api::preprocess(
         compiled.program(),
         &ParamEnv::default(),
-        &rhs,
-        &payload,
+        if dynamic { &no_rhs } else { &rhs },
+        static_payload.as_ref(),
         HASH_KEY,
         RnsPreprocessBuild::new(&parameters, [0x4e; 32]),
         &mut runtime,
@@ -375,21 +382,35 @@ fn nand_circuit_end_to_end() {
         |_| Ok(()),
     )
     .expect("public preprocessing");
-    // Encrypt receives public LHS plaintexts, the fresh private mask, and
-    // the preprocess artifact.  Its estimate and execution share one
-    // graph construction path.
+    let payload = static_payload.unwrap_or_else(|| sample_payload(&mut runtime));
+    // Static encryption owns a fresh caller-supplied mask for each
+    // invocation, retained locally for the final public verification only;
+    // the Dynamic secret is also the mask.
+    let mask = (!dynamic).then(|| {
+        RnsEncryptBuild::new(&parameters, rand::random())
+            .sample_mask_secret(&mut runtime, &mut store)
+            .expect("fresh mask secret")
+    });
+    // Encrypt receives public LHS plaintexts, the secrets, the preprocess
+    // artifact, and in Dynamic mode the RHS plaintexts of a fresh batch.  Its
+    // estimate and execution share one graph construction path.
     let encrypted = api::encrypt(
         &compiled.program().encryption_inputs(),
         &ParamEnv::default(),
         &lhs,
         &preprocess,
         &payload,
-        &mask,
+        mask.as_ref(),
         HASH_KEY,
         RnsEncryptBuild::new(&parameters, [0x4e; 32]),
         &mut runtime,
         &mut store,
-        |_| Ok(()),
+        |build| {
+            if dynamic {
+                build.bind_rhs_inputs(&ParamEnv::default(), &rhs, rand::random())?;
+            }
+            Ok(())
+        },
         |_| Ok(()),
     )
     .expect("public encryption");
@@ -423,7 +444,7 @@ fn nand_circuit_end_to_end() {
         &expected,
         &parameters,
         &payload,
-        &mask,
+        mask.as_ref(),
         &mut runtime,
         &mut store,
     )
@@ -438,9 +459,9 @@ fn nand_circuit_end_to_end() {
             &wrong,
             &parameters,
             &payload,
-            &mask,
+            mask.as_ref(),
             &mut runtime,
-            &mut store,
+            &mut store
         )
         .is_err(),
         "NAND output must not verify as the wrong bit"

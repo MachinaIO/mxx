@@ -21,14 +21,14 @@ use mxx_exponent_lut::{
     noise_utils::{NoiseMomentPolicy, NonnegativeRational},
     program::{FamilyRange, InputBinding},
     rns_bgg::{
-        RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
+        RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
         RnsNoiseBuild, RnsOnlineBuild, RnsPreprocessBuild, checkpoint_refreshed_output,
         resume_refreshed_output, verify_refreshed_output,
     },
     utils::{
         audit_program_at_crt_depth, env_positive_decimal, env_usize, lattice_security_bits,
-        noise_model, ring_dimension_candidates, ring_dimension_stride_log2,
+        noise_model, rhs_mode, ring_dimension_candidates, ring_dimension_stride_log2,
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv};
@@ -83,6 +83,9 @@ fn select_rns_candidate() -> SelectedCandidate {
     assert!(operations_per_drop > 0);
     let average =
         noise_model(NOISE_REFRESH_PREFIX).expect("valid noise-refresh noise-model setting");
+    // `MXX_EXPONENT_LUT_NOISE_REFRESH_RHS_MODE=dynamic` chooses the source and
+    // PRF RHS values only at encryption.
+    let rhs_mode = rhs_mode(NOISE_REFRESH_PREFIX).expect("valid noise-refresh RHS mode");
     let encoding_error_sigma =
         env_positive_decimal("MXX_EXPONENT_LUT_NOISE_REFRESH_ERROR_SIGMA", "4")
             .expect("valid noise-refresh encoding sigma");
@@ -112,6 +115,7 @@ fn select_rns_candidate() -> SelectedCandidate {
                 terminal_value_bound: BigUint::one(),
                 operations_per_drop,
                 primes_per_drop,
+                rhs_mode,
             };
             let source_program = source.program();
             let source_bindings = RnsBggNoiseBindings::from_inputs(
@@ -287,7 +291,8 @@ fn build_candidate(
         parameters.encoding_error_sigma().clone(),
         parameters.operations_per_drop(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .with_rhs_mode(parameters.rhs_mode());
     let prf_q = prf_parameters.level(prf_output_level + 1).map_err(|error| error.to_string())?;
     if prf_q.modulus() != source_q.modulus() ||
         prf_q.modulus_digits() != source_q.modulus_digits() ||
@@ -611,17 +616,29 @@ fn noise_refresh_end_to_end() {
     let directory = tempfile::tempdir().expect("artifact directory");
     let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
     // The secrets are sampled on the stage runtime and stay resident there.
-    let payload = RnsEncryptBuild::new(&parameters, [0x51; 32])
-        .sample_payload_secret(&mut runtime, &mut store)
-        .expect("payload secret");
-    let mask = RnsEncryptBuild::new(&parameters, [0x51; 32])
-        .sample_mask_secret(&mut runtime, &mut store)
-        .expect("mask secret");
+    // Static secrets exist before preprocessing; the single Dynamic secret
+    // is sampled only after it, and is also the mask.
+    let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
+    let sample_payload = |runtime: &mut GpuRuntime, store: &mut FileArtifactStore| {
+        RnsEncryptBuild::new(&parameters, [0x51; 32])
+            .sample_payload_secret(runtime, store)
+            .expect("payload secret")
+    };
+    let static_payload = (!dynamic).then(|| sample_payload(&mut runtime, &mut store));
+    let mask = (!dynamic).then(|| {
+        RnsEncryptBuild::new(&parameters, [0x51; 32])
+            .sample_mask_secret(&mut runtime, &mut store)
+            .expect("mask secret")
+    });
     // The PRF schedule has a source-q carrier distinct from the outer
     // schedule's level zero.  Import the already sampled outer secrets into
     // that ring; never create an unrelated child secret relation.
-    let prf_payload = payload.at_level(&prf_parameters, 0).expect("PRF payload import");
-    let prf_mask = mask.at_level(&prf_parameters, 0).expect("PRF mask import");
+    let static_prf_payload = static_payload
+        .as_ref()
+        .map(|payload| payload.at_level(&prf_parameters, 0).expect("PRF payload import"));
+    let prf_mask =
+        mask.as_ref().map(|mask| mask.at_level(&prf_parameters, 0).expect("PRF mask import"));
+    let no_rhs = BTreeMap::new();
     let source_lhs_rhs = source
         .plaintext_inputs::<DCRTPoly>(&poly_parameters, &[false, false])
         .expect("source plaintext bindings");
@@ -633,7 +650,13 @@ fn noise_refresh_end_to_end() {
     for slot in 0..declaration.slots().len() {
         let mut child = RnsPreprocessBuild::new(&prf_parameters, [0x51; 32]);
         child
-            .bind_rhs_inputs(prf_program, &ParamEnv::default(), &prf_rhs, &prf_payload, &hash_key)
+            .bind_rhs_inputs(
+                prf_program,
+                &ParamEnv::default(),
+                if dynamic { &no_rhs } else { &prf_rhs },
+                static_prf_payload.as_ref(),
+                &hash_key,
+            )
             .expect("PRF preprocess child inputs");
         child.bind_refresh_prf(&declaration, slot).expect("PRF preprocess child binding");
         preprocess_children.insert(slot, child);
@@ -645,8 +668,8 @@ fn noise_refresh_end_to_end() {
     let (preprocess, online) = api::preprocess(
         source_program,
         &ParamEnv::default(),
-        &source_rhs,
-        &payload,
+        if dynamic { &no_rhs } else { &source_rhs },
+        static_payload.as_ref(),
         &hash_key,
         RnsPreprocessBuild::new(&parameters, [0x51; 32]),
         &mut runtime,
@@ -670,6 +693,10 @@ fn noise_refresh_end_to_end() {
         |_| Ok(()),
     )
     .expect("source preprocess");
+    let payload = static_payload.unwrap_or_else(|| sample_payload(&mut runtime, &mut store));
+    let prf_payload = payload.at_level(&prf_parameters, 0).expect("PRF payload import");
+    // One Dynamic encryption batch covers the source and every PRF child.
+    let batch_id: [u8; 32] = rand::random();
 
     // Encryption consumes only the public LHS plaintext projection plus the
     // payload/mask secrets.  It imports the preprocess-encrypt stage record;
@@ -683,7 +710,7 @@ fn noise_refresh_end_to_end() {
                 &ParamEnv::default(),
                 &prf_lhs,
                 &prf_payload,
-                &prf_mask,
+                prf_mask.as_ref(),
                 &hash_key,
             )
             .expect("PRF encryption child inputs");
@@ -691,6 +718,11 @@ fn noise_refresh_end_to_end() {
             .bind_refresh_prf(&declaration, slot, prf_program)
             .expect("PRF encryption child binding");
         child.bind_preprocess_artifacts(&preprocess).expect("PRF encryption child artifacts");
+        if dynamic {
+            child
+                .bind_rhs_inputs(&ParamEnv::default(), &prf_rhs, batch_id)
+                .expect("PRF encryption child RHS");
+        }
         encrypt_children.insert(slot, child);
     }
     let encrypt_declaration = declaration.clone();
@@ -700,12 +732,15 @@ fn noise_refresh_end_to_end() {
         &source_lhs,
         &preprocess,
         &payload,
-        &mask,
+        mask.as_ref(),
         &hash_key,
         RnsEncryptBuild::new(&parameters, [0x51; 32]),
         &mut runtime,
         &mut store,
         move |build| {
+            if dynamic {
+                build.bind_rhs_inputs(&ParamEnv::default(), &source_rhs, batch_id)?;
+            }
             build
                 .bind_refresh_declaration(&encrypt_declaration)
                 .expect("source encryption declaration");
@@ -760,7 +795,7 @@ fn noise_refresh_end_to_end() {
         &expected,
         &parameters,
         &payload,
-        &mask,
+        mask.as_ref(),
         &mut runtime,
         &mut store,
     )
@@ -790,7 +825,8 @@ fn noise_refresh_end_to_end() {
         parameters.encoding_error_sigma().clone(),
         parameters.operations_per_drop(),
     )
-    .expect("resumed RNS parameters");
+    .expect("resumed RNS parameters")
+    .with_rhs_mode(parameters.rhs_mode());
     let resumed = resume_refreshed_output(
         &declaration,
         &checkpointed,

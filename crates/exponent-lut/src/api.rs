@@ -538,12 +538,15 @@ pub trait PreprocessBuild<P: Poly> {
         ApiError,
     >;
 
+    /// Bind the Program, its RHS plaintexts, and the payload secret. A scheme
+    /// whose RHS values are chosen only at encryption receives no RHS and no
+    /// secret here.
     fn bind_inputs(
         &mut self,
         program: &ExponentLutProgram,
         parameters: &ParamEnv,
         rhs: &PlaintextInputs<RhsId, P>,
-        payload: &Self::PayloadSecret,
+        payload: Option<&Self::PayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError>;
 
@@ -570,13 +573,15 @@ pub trait EncryptBuild<P: Poly> {
     type PreprocessDescriptor;
     type Descriptor;
 
+    /// Bind the input plaintexts and secrets. A scheme that encrypts under
+    /// one secret takes no separate mask.
     fn bind_inputs(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
         parameters: &ParamEnv,
         lhs: &PlaintextInputs<WireId, P>,
         payload: &Self::PayloadSecret,
-        mask: &Self::MaskSecret,
+        mask: Option<&Self::MaskSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError>;
 
@@ -850,12 +855,13 @@ fn fresh_execution_session<S: SessionStore>(
 
 /// Build and execute preprocessing once, then publish two typed stage records
 /// over that same finalized production: encryption preparation first and
-/// online preparation second.
+/// online preparation second. `rhs` and `payload` are absent when the scheme
+/// chooses RHS values and the secret only at encryption.
 pub fn preprocess<E, S, P, T>(
     program: &ExponentLutProgram,
     parameters: &ParamEnv,
     rhs: &PlaintextInputs<RhsId, P>,
-    payload: &T::PayloadSecret,
+    payload: Option<&T::PayloadSecret>,
     hash_key: &[u8],
     mut build: T,
     execution: &mut E,
@@ -922,14 +928,15 @@ where
     Ok((encrypt_stage, online_stage))
 }
 
-/// Build and execute the input-only encryption graph.
+/// Build and execute the input-only encryption graph. `mask` is absent when
+/// the scheme encrypts under the single secret `payload`.
 pub fn encrypt<E, S, P, T>(
     inputs: &crate::program::EncryptionInputs,
     parameters: &ParamEnv,
     lhs: &PlaintextInputs<WireId, P>,
     preprocess: &StageArtifacts<T::PreprocessDescriptor>,
     payload: &T::PayloadSecret,
-    mask: &T::MaskSecret,
+    mask: Option<&T::MaskSecret>,
     hash_key: &[u8],
     mut build: T,
     execution: &mut E,

@@ -2024,9 +2024,12 @@ fn lower_device_int_expr_mode(
                 .ok_or_else(|| "GPU device divisor has no finite bounds".to_owned())?;
             // The same SignedWords width is required for both native outputs.
             // An actual zero divisor reports status; a conservative interval
-            // crossing zero must not reject a valid runtime binding.
+            // crossing zero must not reject a valid runtime binding. An
+            // operand in another encoding (a CanonicalU64 loop index) is
+            // widened below to the width its range needs.
             let magnitude = (numerator_magnitude + BigInt::from(1)).max(divisor_magnitude);
-            let words = signed_words(ctx, lhs)?.max(signed_words(ctx, rhs)?).max(
+            let operand_words = |id| signed_words(ctx, id).unwrap_or(1);
+            let words = operand_words(lhs).max(operand_words(rhs)).max(
                 usize::try_from(magnitude.bits().div_ceil(64))
                     .map_err(|_| "GPU division width exceeds host address space".to_owned())?
                     .max(1),

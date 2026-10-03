@@ -6,7 +6,7 @@ use crate::{
     noise_refresh::simulation::AverageCaseConfig,
     program::{ExponentLutProgram, Operand},
     rns_bgg::{
-        RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseTrace, RnsBggParameters,
+        RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseTrace, RnsBggParameters,
         RnsBggPlanRequest,
     },
 };
@@ -76,6 +76,18 @@ pub fn noise_model(prefix: &str) -> Result<Option<AverageCaseConfig>, String> {
         }
         "worst" => Ok(None),
         value => Err(format!("{model_name} must be exactly `average` or `worst`, got `{value}`")),
+    }
+}
+
+/// Select the configured RHS timing mode from `{prefix}RHS_MODE`: `static`
+/// (the default) or `dynamic`.
+pub fn rhs_mode(prefix: &str) -> Result<RhsMode, String> {
+    let name = format!("{prefix}RHS_MODE");
+    match env::var(&name).as_deref() {
+        Err(env::VarError::NotPresent) | Ok("static") => Ok(RhsMode::Static),
+        Ok("dynamic") => Ok(RhsMode::Dynamic),
+        Ok(value) => Err(format!("{name} must be exactly `static` or `dynamic`, got `{value}`")),
+        Err(error) => Err(format!("{name} is not valid Unicode: {error}")),
     }
 }
 
@@ -234,7 +246,8 @@ pub fn audit_program_at_crt_depth(
         request.encoding_error_sigma.clone(),
         request.operations_per_drop,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .with_rhs_mode(request.rhs_mode);
     let started = std::time::Instant::now();
     tracing::info!(
         ring_dimension = request.ring_dimension,

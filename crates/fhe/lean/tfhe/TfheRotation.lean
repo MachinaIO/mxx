@@ -254,4 +254,64 @@ theorem accSeq_phase (W : World) (t : SampleTape) (hs : ∀ j, lweSecret t j = 0
       rw [hstep, herr, hexp]
       exact ih
 
+/-- Every execution of the blind-rotation scope computes `accSeq`. -/
+theorem blind_rotation_runs {W : World} {t : SampleTape} {tape : SampleTape} {path : List Nat}
+    {A B : Fin lweN → ExactMatrix Q N 1 12} (hA : A = gswA t) (hB : B = gswB t)
+    {P : ExactMatrix Q N 1 1} (hP : P 0 0 = lutPoly) {e0 : Int} (he0 : e0 = initialExp W t)
+    {masks : Fin lweN → Int} (hmasks : masks = combinedMask W) {outputs}
+    (h : Stage_nand.scope_tfhe_blind_rotation FheBackend.backend tape path { unit := () }
+      (0, multiplyMonomial P e0, masks, A, B, ()) outputs) :
+    outputs.1 0 0 = accSeq W t lweN 0 0 ∧ outputs.2.1 0 0 = accSeq W t lweN 1 0 := by
+  obtain ⟨witness, hcat, _, hround, _, hiter, _, _, _, _, _, _, hs8, _, _, _, _, _, _, hs9, hout⟩ := h
+  subst hout
+  have hr (i : Fin lweN) : witness.w_6_0 i = rotation W i := by
+    obtain ⟨_, _, hi⟩ := hround i
+    rw [hi, hmasks]
+    rfl
+  have hfinal := MxxIR.IterRuns.invariant
+    (Invariant := fun i (acc : ExactMatrix Q N 2 1) ↦ acc = accSeq W t i) ?_ ?_ hiter
+  · dsimp only at hfinal ⊢
+    rw [sliceMatrix_entry hs8 (by decide) (by decide), sliceMatrix_entry hs9 (by decide) (by decide),
+      hfinal]
+    exact ⟨rfl, rfl⟩
+  · obtain ⟨h0, h1⟩ := concatRows_one_one hcat 0
+    have he0' : (initialExp W t % (2 * (N : Int))).toNat = (initialExp W t).toNat := by
+      have := initialExp_range W t
+      rw [Int.emod_eq_of_lt this.1 (by simp only [N, Nat.cast_ofNat]; omega)]
+    funext r c
+    have hc : c = 0 := Subsingleton.elim _ _
+    subst hc
+    fin_cases r
+    · show witness.w_2_0 0 0 = _
+      rw [h0]
+      rfl
+    · show witness.w_2_0 1 0 = _
+      rw [h1]
+      show P 0 0 * rootQ ^ (e0 % (2 * (N : Int))).toNat = _
+      rw [he0, he0', hP]
+      rfl
+  · intro i current next hcurrent hstep
+    obtain ⟨w3, w5, w6, w8, w11, _, _, hAi, _, _, hBi, hC, _, _, he, hD, hnext⟩ := hstep
+    obtain ⟨pA, hpA, rfl⟩ := hAi
+    obtain ⟨pB, hpB, rfl⟩ := hBi
+    obtain ⟨pe, hpe, rfl⟩ := he
+    simp only [Int.ofNat_eq_natCast, Nat.cast_inj] at hpA hpB hpe
+    have hi : i < lweN := hpA ▸ pA.isLt
+    have hpA' : pA = ⟨i, hi⟩ := Fin.ext hpA
+    have hpB' : pB = ⟨i, hi⟩ := Fin.ext hpB
+    have hpe' : pe = ⟨i, hi⟩ := Fin.ext hpe
+    subst hpA' hpB' hpe' hnext hcurrent
+    have hCeq : w6 = bskRows t ⟨i, hi⟩ := by
+      funext r c
+      obtain ⟨h0, h1⟩ := concatRows_one_one hC c
+      fin_cases r
+      · show w6 0 c = _
+        rw [h0, hA]; rfl
+      · show w6 1 c = _
+        rw [h1, hB]; rfl
+    dsimp only at hD ⊢
+    rw [gadgetDecomposeRuns_eq hD, hCeq, hr]
+    simp only [accSeq, dif_pos hi]
+    rfl
+
 end MxxFheTfhe

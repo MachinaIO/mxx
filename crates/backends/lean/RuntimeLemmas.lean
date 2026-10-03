@@ -770,6 +770,14 @@ theorem hashIntFamily_range {count : Nat} {model : HashModel} {modulus : Int} {t
   have hm : (modulus.toNat : Int) = modulus := Int.toNat_of_nonneg (by rw [hmodulus]; positivity)
   omega
 
+/-- A hash family is a function of its model, modulus, tag and key. -/
+theorem hashIntFamily_functional {count : Nat} {model : HashModel} {modulus : Int}
+    {tagPrefix : Blob} {components : List HashTagComponent} {key : ByteArray}
+    {output output' : Fin count → Int}
+    (h : hashIntFamily model modulus tagPrefix components key output)
+    (h' : hashIntFamily model modulus tagPrefix components key output') : output = output' :=
+  h.2.2.2.trans h'.2.2.2.symm
+
 /-- The centered value that `select` computes from a canonical residue of a small integer. -/
 theorem centered_select_of_small {q : Nat} (hq : 1 < q) {value : Int}
     (hsmall : 2 * value.natAbs < q) :

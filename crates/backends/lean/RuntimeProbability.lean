@@ -148,6 +148,57 @@ theorem lintegral_mul_exp_sum_le (S B : Finset ι) (hdisjoint : Disjoint S B)
           rw [Finset.sum_insert hkB, Real.exp_add, ENNReal.ofReal_mul (Real.exp_pos _).le,
             mul_assoc]
 
+/-- `lintegral_mul_exp_sum_le` for a block indexed through an injective key map. -/
+theorem lintegral_mul_exp_sum_key_le {α : Type} [DecidableEq α] (key : α → ι) (S : Finset ι)
+    (B : Finset α) (hinj : Set.InjOn key B) (hdisjoint : ∀ x ∈ B, key x ∉ S)
+    {F : (ι → ℤ) → ENNReal} (hF : DependsOn F S) {c : α → (ι → ℤ) → ℝ}
+    (hc : ∀ x ∈ B, DependsOn (c x) S) {K : α → ℝ}
+    (hK : ∀ x ∈ B, ∀ ω, ∫⁻ y, ENNReal.ofReal (Real.exp (c x ω * y)) ∂μ (key x) ≤
+      ENNReal.ofReal (Real.exp (K x))) :
+    ∫⁻ ω, F ω * ENNReal.ofReal (Real.exp (∑ x ∈ B, c x ω * ω (key x))) ∂Measure.infinitePi μ ≤
+      ENNReal.ofReal (Real.exp (∑ x ∈ B, K x)) * ∫⁻ ω, F ω ∂Measure.infinitePi μ := by
+  induction B using Finset.induction_on with
+  | empty => simp
+  | @insert x B hxB ih =>
+    have hinj' : Set.InjOn key B := hinj.mono (by simp)
+    have hxS : key x ∉ S := hdisjoint x (Finset.mem_insert_self _ _)
+    have hxB' : key x ∉ B.image key := by
+      simp only [Finset.mem_image, not_exists, not_and]
+      intro y hy hyx
+      exact hxB (hinj (by simp [hy]) (by simp) hyx ▸ hy)
+    have hcB : ∀ y ∈ B, DependsOn (c y) S := fun y hy ↦ hc y (Finset.mem_insert_of_mem hy)
+    have hrest : DependsOn (fun ω ↦ F ω * ENNReal.ofReal (Real.exp (∑ y ∈ B, c y ω * ω (key y))))
+        ↑(S ∪ B.image key) := by
+      intro ω ω' h
+      have hS : ∀ i ∈ (S : Set ι), ω i = ω' i := fun i hi ↦ h i (by simp_all)
+      dsimp only
+      rw [hF hS]
+      congr 3
+      refine Finset.sum_congr rfl fun y hy ↦ ?_
+      rw [hcB y hy hS, h (key y) (by simp only [Finset.coe_union, Finset.coe_image, Set.mem_union, Set.mem_image, Finset.mem_coe]; exact Or.inr ⟨y, hy, rfl⟩)]
+    have hstep := lintegral_mul_exp_coordinate_le μ (S ∪ B.image key)
+      (by simp only [Finset.mem_union, not_or]; exact ⟨hxS, hxB'⟩) hrest
+      ((hc x (Finset.mem_insert_self _ _)).mono (by simp)) (hK x (Finset.mem_insert_self _ _))
+    calc ∫⁻ ω, F ω * ENNReal.ofReal (Real.exp (∑ y ∈ insert x B, c y ω * ω (key y)))
+          ∂Measure.infinitePi μ
+        = ∫⁻ ω, (F ω * ENNReal.ofReal (Real.exp (∑ y ∈ B, c y ω * ω (key y)))) *
+            ENNReal.ofReal (Real.exp (c x ω * ω (key x))) ∂Measure.infinitePi μ := by
+          refine lintegral_congr fun ω ↦ ?_
+          rw [Finset.sum_insert hxB, Real.exp_add, ENNReal.ofReal_mul (Real.exp_pos _).le]
+          ring
+      _ ≤ ENNReal.ofReal (Real.exp (K x)) *
+            ∫⁻ ω, F ω * ENNReal.ofReal (Real.exp (∑ y ∈ B, c y ω * ω (key y)))
+              ∂Measure.infinitePi μ := hstep
+      _ ≤ ENNReal.ofReal (Real.exp (K x)) *
+            (ENNReal.ofReal (Real.exp (∑ y ∈ B, K y)) * ∫⁻ ω, F ω ∂Measure.infinitePi μ) := by
+          gcongr
+          exact ih hinj' (fun y hy ↦ hdisjoint y (Finset.mem_insert_of_mem hy)) hcB
+            (fun y hy ↦ hK y (Finset.mem_insert_of_mem hy))
+      _ = ENNReal.ofReal (Real.exp (∑ y ∈ insert x B, K y)) *
+            ∫⁻ ω, F ω ∂Measure.infinitePi μ := by
+          rw [Finset.sum_insert hxB, Real.exp_add, ENNReal.ofReal_mul (Real.exp_pos _).le,
+            mul_assoc]
+
 /-- A sub-Gaussian exponential moment bound gives the two-sided Gaussian tail bound. -/
 theorem measure_le_abs_le {Ω : Type} [MeasurableSpace Ω] (ν : Measure Ω) {Y : Ω → ℝ}
     (hY : Measurable Y) {V : ℝ} (hV : 0 < V)

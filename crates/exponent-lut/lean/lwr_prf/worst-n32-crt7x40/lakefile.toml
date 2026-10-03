@@ -22,4 +22,4 @@ roots = [
 # The proof of the generated claim.
 [[lean_lib]]
 name = "LwrProof"
-roots = ["LwrSetup", "LwrEncrypt", "LwrPreprocess"]
+roots = ["LwrSetup", "LwrEncrypt", "LwrPreprocess", "LwrBlock0", "LwrBlock1", "LwrBlock2", "LwrBlock3", "LwrBlock4"]

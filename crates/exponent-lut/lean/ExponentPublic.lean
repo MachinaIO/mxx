@@ -39,6 +39,17 @@ theorem gadget_mul_decompose {q m m' : Nat} (hq : 1 < q) (hn : 0 < n)
   simp only [Matrix.mul_apply, hG, hD, castMatrixColumns_apply, castMatrixRows_apply]
   exact Fintype.sum_equiv (finCongr hw₁) _ _ (fun k ↦ rfl)
 
+/-- A gadget decomposition is a function of its target. -/
+theorem gadgetDecomposeRuns_unique {q rows columns inner : Nat} {backend : BackendContext}
+    {base digits : Int} {X : ExactMatrix q n rows columns} {D D' : ExactMatrix q n inner columns}
+    (hD : gadgetDecomposeRuns backend base digits X D)
+    (hD' : gadgetDecomposeRuns backend base digits X D') : D = D' := by
+  obtain ⟨layout, hl, _, _, hw, hD, _⟩ := hD
+  obtain ⟨layout', hl', _, _, hw', hD', _⟩ := hD'
+  rw [hl] at hl'
+  cases hl'
+  rw [hD, hD']
+
 /-- The digits of a gadget decomposition are small. -/
 theorem gadgetDecomposeRuns_small {q rows columns inner : Nat} (hq : 1 < q) (hn : 0 < n)
     {backend : BackendContext} {base digits : Int} {X : ExactMatrix q n rows columns}

@@ -45,6 +45,16 @@ theorem q5_eq : Q5 = P5 * Q4 := by norm_num
 theorem q4_eq : Q4 = P4 * Q3 := by norm_num
 theorem q3_eq : Q3 = P3 * Q2 := by norm_num
 theorem q2_eq : Q2 = P2 * Q1 := by norm_num
+/-- The factors `Q7 / Q_k` dropped by aligning `a` from `Q7` to `Q_k`. -/
+abbrev A6 : Nat := 1099511619841
+abbrev A5 : Nat := 1208925803713492065601409
+abbrev A4 : Nat := 1329227971958197034497972917778543361
+abbrev A3 : Nat := 1461501604243759924967666999996056787893117755073
+
+theorem q7_eq6 : Q7 = A6 * Q6 := by norm_num
+theorem q7_eq5 : Q7 = A5 * Q5 := by norm_num
+theorem q7_eq4 : Q7 = A4 * Q4 := by norm_num
+theorem q7_eq3 : Q7 = A3 * Q3 := by norm_num
 theorem hQ7 : 1 < Q7 := by norm_num
 theorem hQ6 : 1 < Q6 := by norm_num
 theorem hQ5 : 1 < Q5 := by norm_num
@@ -149,6 +159,40 @@ abbrev inverse1 : Nat := 1030792149421
 
 theorem inverse1_mul : (inverse1 : ExactPoly Q1 N) * ((16 : Nat) : ExactPoly Q1 N) = 1 :=
   inverse_mul (k := 15) (by norm_num)
+
+/-! ## The key layout of output 0 -/
+
+/-- The coordinate of `a` read by cell `i` of block `b`; dummy and padding cells read member
+`16`. -/
+def coords : Fin 5 → Fin 14 → Nat :=
+  ![![4, 5, 10, 11, 12, 14, 15, 16, 16, 16, 16, 16, 16, 16],
+    ![0, 1, 2, 4, 6, 7, 8, 9, 12, 13, 14, 15, 16, 16],
+    ![0, 1, 2, 3, 5, 8, 9, 10, 11, 12, 15, 16, 16, 16],
+    ![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16],
+    ![3, 6, 7, 13, 14, 16, 16, 16, 16, 16, 16, 16, 16, 16]]
+
+theorem coords_lt (b : Fin 5) (i : Fin 14) : coords b i < 17 := by
+  fin_cases b <;> fin_cases i <;> decide
+
+theorem selectInt_coords0 (i : Fin 14) :
+    MxxIR.selectInt (Int.ofNat i) [(4), (5), (10), (11), (12), (14), (15), (16), (16), (16), (16), (16), (16), (16)] = Int.ofNat (coords 0 i) := by
+  fin_cases i <;> rfl
+
+theorem selectInt_coords1 (i : Fin 14) :
+    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (4), (6), (7), (8), (9), (12), (13), (14), (15), (16), (16)] = Int.ofNat (coords 1 i) := by
+  fin_cases i <;> rfl
+
+theorem selectInt_coords2 (i : Fin 14) :
+    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (3), (5), (8), (9), (10), (11), (12), (15), (16), (16), (16)] = Int.ofNat (coords 2 i) := by
+  fin_cases i <;> rfl
+
+theorem selectInt_coords3 (i : Fin 14) :
+    MxxIR.selectInt (Int.ofNat i) [(0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (13), (16)] = Int.ofNat (coords 3 i) := by
+  fin_cases i <;> rfl
+
+theorem selectInt_coords4 (i : Fin 14) :
+    MxxIR.selectInt (Int.ofNat i) [(3), (6), (7), (13), (14), (16), (16), (16), (16), (16), (16), (16), (16), (16)] = Int.ofNat (coords 4 i) := by
+  fin_cases i <;> rfl
 
 /-! ## Hash tags -/
 

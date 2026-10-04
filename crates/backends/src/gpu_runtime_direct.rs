@@ -318,6 +318,9 @@ struct DirectGraph {
     bindings_of: BTreeMap<PhysicalValueId, Vec<usize>>,
     /// Values whose owners a wave replaced since the regions were bound.
     rebound: BTreeSet<PhysicalValueId>,
+    /// Regions bound before a binding value last changed, rebound before
+    /// their next launch.
+    stale: BTreeSet<usize>,
     /// Whether the sample seeds hold the root invocation's; a wave clears it
     /// when it uploads its own.
     root_seeds: bool,
@@ -770,6 +773,7 @@ impl DirectGraph {
                 values: Vec::new(),
                 bindings_of: BTreeMap::new(),
                 rebound: BTreeSet::new(),
+                stale: BTreeSet::new(),
                 root_seeds: false,
             });
         }
@@ -988,6 +992,7 @@ impl DirectGraph {
             values: Vec::new(),
             bindings_of: BTreeMap::new(),
             rebound: BTreeSet::new(),
+            stale: BTreeSet::new(),
             root_seeds: false,
         };
         wave_groups(frame, &graph).map_err(GpuPlanError::GraphCompile)?;
@@ -1009,14 +1014,16 @@ impl DirectGraph {
             }
         }
         self.rebound.clear();
+        self.stale.clear();
         for region in &mut self.regions {
             region.executable.bind(&self.values)?;
         }
         Ok(())
     }
 
-    /// Rebind only the bindings of the values a wave replaced, and the regions
-    /// only if one of their addresses changed.
+    /// Recompute only the bindings of the values a wave or a host-driven loop
+    /// replaced; if an address changed, every region is rebound before its
+    /// next launch.
     fn rebind(&mut self, frame: &PhysicalFrame) -> Result<(), GpuRuntimeError> {
         let mut checked = BTreeSet::new();
         let mut changed = false;
@@ -1027,9 +1034,7 @@ impl DirectGraph {
             }
         }
         if changed {
-            for region in &mut self.regions {
-                region.executable.bind(&self.values)?;
-            }
+            self.stale.extend(0..self.regions.len());
         }
         Ok(())
     }
@@ -1125,6 +1130,9 @@ impl DirectGraph {
         let region = self.regions.get_mut(index).ok_or_else(|| {
             GpuRuntimeError::Execution("Graph region index is out of range".into())
         })?;
+        if self.stale.remove(&index) {
+            region.executable.bind(&self.values)?;
+        }
         let stream = region.executable.launch_stream().clone();
         // Each device prepares its resources on its own stream, after the
         // previous launch and before this one.
@@ -3099,20 +3107,20 @@ impl GpuRuntime {
                 artifact_handles: BTreeMap::new(),
             });
         }
-        let requests =
-            plan.frame
-                .slots
-                .len()
-                .checked_add(plan.frame.import_templates.len())
-                .and_then(|count| count.checked_add(plan.frame.external_io_imports.len()))
-                .and_then(|count| {
-                    plan.frame.external_io_loops.iter().try_fold(count, |count, loop_body| {
-                        count.checked_add(loop_body.imports.len())
-                    })
+        let requests = plan
+            .frame
+            .slots
+            .len()
+            .checked_add(plan.frame.import_templates.len())
+            .and_then(|count| count.checked_add(plan.frame.external_io_imports.len()))
+            .and_then(|count| {
+                plan.frame.external_io_loops.iter().try_fold(count, |count, loop_body| {
+                    count.checked_add(loop_body.imports.len())?.checked_add(loop_body.ahead.len())
                 })
-                .ok_or_else(|| {
-                    GpuRuntimeError::Artifact("planned I/O request count overflows".into())
-                })?;
+            })
+            .ok_or_else(|| {
+                GpuRuntimeError::Artifact("planned I/O request count overflows".into())
+            })?;
         let window = NonZeroUsize::new(requests.max(1))
             .ok_or_else(|| GpuRuntimeError::Artifact("producer I/O window is zero".into()))?;
         // Only a graph that exports artifacts is a producer with a durable
@@ -3272,9 +3280,13 @@ impl GpuRuntime {
     /// boundary the host replays a nested wave, iterates a host-driven loop
     /// whose body starts there, loads the imports planned there, and reads
     /// the selected artifact member of each selected import there, whose
-    /// selector the preceding regions computed. A wave replays this range for
-    /// its body, and a host-driven loop for its body in each iteration, so
-    /// each of these nests in the other.
+    /// selector the preceding regions computed. A host-driven loop whose
+    /// selected member only its own index determines has it read by the host
+    /// one iteration ahead into a staging owner and copied into place before
+    /// the iteration (see
+    /// [`AheadImport`](crate::gpu_physical_control::AheadImport)). A
+    /// wave replays this range for its body, and a host-driven loop for its
+    /// body in each iteration, so each of these nests in the other.
     ///
     /// `host_loop` is the host-driven loop whose body this range is, not
     /// entered again at its own start. `static_imports` is false after its
@@ -3406,12 +3418,21 @@ impl GpuRuntime {
                 // An I/O trial runs a root loop's first iterations only.
                 let root = active_wave.is_none() && host_loop.is_none();
                 let limit = self.io_trial.as_ref().filter(|_| root).map(|trial| trial.waves);
-                for iteration in 0..limit.map_or(count, |limit| count.min(limit as u64)) {
+                let iterations = limit.map_or(count, |limit| count.min(limit as u64));
+                // Each host-selected member is read one iteration ahead.
+                if iterations > 0 {
+                    self.start_ahead_imports(plan, pump, loop_index, 0)?;
+                }
+                for iteration in 0..iterations {
                     let iteration_started = Instant::now();
                     index_owner
                         .upload_u64(&[iteration])
                         .and_then(|()| index_owner.wait_until_ready())
                         .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
+                    self.receive_ahead_imports(plan, pump, loop_index)?;
+                    if iteration + 1 < iterations {
+                        self.start_ahead_imports(plan, pump, loop_index, iteration + 1)?;
+                    }
                     self.run_region_range(
                         plan,
                         groups,
@@ -3761,6 +3782,98 @@ impl GpuRuntime {
             .filter(|&index| plan.frame.import_templates[index].read_ahead)
             .collect::<Vec<_>>();
         self.start_imports(plan, pump, templates, Some(wave), indices)
+    }
+
+    /// Start iteration `iteration`'s host-selected imports of host-driven loop
+    /// `loop_index`, each into its staging owner, which the previous
+    /// iteration's copy has released.
+    fn start_ahead_imports<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        plan: &GpuExecutionPlan,
+        pump: &mut Option<&mut ProducerIoPump<'_, E>>,
+        loop_index: usize,
+        iteration: u64,
+    ) -> Result<(), GpuRuntimeError> {
+        let frame = FrameGeneration::new(0, plan.completed_runs);
+        for import in &plan.frame.external_io_loops[loop_index].ahead {
+            let mut env = import.env.clone();
+            env.loop_indices.insert(import.slot, BigInt::from(iteration));
+            let count = import.template.descriptor.family_count.unwrap_or(0);
+            let index = import
+                .member
+                .evaluate(&env)
+                .ok()
+                .and_then(|index| num_traits::ToPrimitive::to_usize(&index))
+                .filter(|index| *index < count)
+                .ok_or_else(|| {
+                    GpuRuntimeError::Artifact(
+                        "host-selected artifact index is outside its family".into(),
+                    )
+                })?;
+            let template = &import.template;
+            let key = ArtifactKey { index: Some(index), ..template.key.clone() };
+            let pump = pump.as_deref_mut().ok_or_else(|| {
+                GpuRuntimeError::Artifact("host-selected import has no I/O pump".into())
+            })?;
+            let emulated_load =
+                self.io_trial.as_ref().and_then(|trial| trial.load(&template.descriptor));
+            // SAFETY: no launch reads the staging owner, and the host copies
+            // it only after this import finishes.
+            unsafe {
+                start_import(
+                    &self.backend,
+                    pump,
+                    frame,
+                    template,
+                    key,
+                    Some(Arc::clone(&import.staging)),
+                    emulated_load,
+                )
+            }
+            .map_err(GpuRuntimeError::Artifact)?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the current iteration's host-selected imports of host-driven
+    /// loop `loop_index` and copy each from its staging owner into its
+    /// destination. Every launch of the previous iteration has joined.
+    fn receive_ahead_imports<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        plan: &GpuExecutionPlan,
+        pump: &mut Option<&mut ProducerIoPump<'_, E>>,
+        loop_index: usize,
+    ) -> Result<(), GpuRuntimeError> {
+        let frame = FrameGeneration::new(0, plan.completed_runs);
+        for import in &plan.frame.external_io_loops[loop_index].ahead {
+            let pump = pump.as_deref_mut().ok_or_else(|| {
+                GpuRuntimeError::Artifact("host-selected import has no I/O pump".into())
+            })?;
+            finish_import(pump, frame, import.template.destination)
+                .map_err(GpuRuntimeError::Artifact)?;
+            let missing =
+                |what: &str| GpuRuntimeError::Execution(format!("host-selected import {what}"));
+            let destination = plan
+                .frame
+                .owners
+                .get(&import.template.destination)
+                .ok_or_else(|| missing("has no destination"))?;
+            // Every part of an import destination views one allocation.
+            let part =
+                destination.physical().parts.first().ok_or_else(|| missing("has no parts"))?;
+            let target =
+                destination.storage(part.storage).ok_or_else(|| missing("has no storage"))?;
+            let source =
+                import.staging.storage(part.storage).ok_or_else(|| missing("has no staging"))?;
+            crate::poly::dcrt::gpu::copy_device_memory(
+                target.device,
+                target.address,
+                source.address,
+                usize::try_from(target.bytes).map_err(|_| missing("exceeds usize"))?,
+            )
+            .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Wait for a selected import the observer started at its load site.

@@ -151,6 +151,20 @@ pub(super) struct ExternalIoImport {
     pub selector: PhysicalValueId,
 }
 
+/// A selected artifact read in a host-driven loop whose member the host
+/// computes from the loop index: `member` at loop index slot `slot` under
+/// `env`. The executor reads iteration `k + 1`'s member into `staging`, an
+/// owner with the destination's layout, while iteration `k` runs, and copies
+/// it into `template.destination` before iteration `k + 1`; the Graph
+/// publishes no selector and its bound addresses never change.
+pub(super) struct AheadImport {
+    pub template: ImportTemplate,
+    pub slot: u32,
+    pub member: IntExpr,
+    pub env: ParamEnv,
+    pub staging: Arc<GpuResidentValue>,
+}
+
 /// A finite one-iteration Graph body replayed around selected artifact loads.
 /// The body writes results back into stable carried owners with explicit
 /// device-copy operations; no host arithmetic or per-iteration allocation is
@@ -163,6 +177,7 @@ pub(super) struct ExternalIoLoop {
     pub carried_ids: Vec<PhysicalValueId>,
     pub carry_copy_ops: Vec<u32>,
     pub imports: Vec<ExternalIoImport>,
+    pub ahead: Vec<AheadImport>,
 }
 
 fn allocate_wave_occurrence(
@@ -1268,6 +1283,62 @@ pub(super) fn lower_control_node(
                     name: artifact.artifact_name.clone(),
                     index: None,
                 };
+                // A member index that only the enclosing host-driven loop's
+                // index determines, and that selects a member in every
+                // iteration, is computed by the host, which reads it one
+                // iteration ahead. Any other index, including one that fails
+                // in some iteration, is computed by the Graph.
+                let host_selected =
+                    match (scope.node(index_wire.node).map(NodeHandle::kind), &ctx.ahead_imports) {
+                        (Some(NodeKind::EvaluateInt(member)), Some((slot, iterations, _))) => {
+                            let mut env = ParamEnv { loop_indices: BTreeMap::new(), ..env.clone() };
+                            (0..*iterations)
+                                .all(|iteration| {
+                                    env.loop_indices.insert(*slot, BigInt::from(iteration));
+                                    member
+                                        .evaluate(&env)
+                                        .ok()
+                                        .and_then(|index| index.to_usize())
+                                        .is_some_and(|index| index < count)
+                                })
+                                .then(|| (*slot, member.clone(), env))
+                        }
+                        _ => None,
+                    };
+                if let Some((slot, member, member_env)) = host_selected {
+                    let (destination, graph_value, upload_owner, before_operation) =
+                        crate::gpu_physical_lowering::allocate_typed_import_destination(
+                            ctx, &expected, &key, capacity,
+                        )?;
+                    let (upload_owner, staging) =
+                        crate::gpu_physical_lowering::twin_import_destination(
+                            ctx,
+                            destination,
+                            &upload_owner,
+                        )?
+                        .ok_or("GPU host-selected import has no staging owner")?;
+                    let (_, _, imports) =
+                        ctx.ahead_imports.as_mut().ok_or("GPU host-selected import has no loop")?;
+                    imports.push(AheadImport {
+                        template: ImportTemplate {
+                            before_operation,
+                            key,
+                            descriptor,
+                            expected_type,
+                            staged: false,
+                            destination,
+                            upload_owner,
+                            member: None,
+                            read_ahead: true,
+                        },
+                        slot,
+                        member,
+                        env: member_env,
+                        staging,
+                    });
+                    ctx.wire_ids.insert(output, graph_value);
+                    return Ok(());
+                }
                 let request_operation = u32::try_from(ctx.operations.len())
                     .map_err(|_| "too many GPU operations".to_owned())?;
                 let request_slot = crate::gpu_physical_lowering::emit_import_request(ctx, index)?;
@@ -2354,6 +2425,10 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                ahead_imports: ctx
+                    .ahead_imports
+                    .as_mut()
+                    .map(|(slot, count, imports)| (*slot, *count, &mut **imports)),
                 slots: ctx.slots,
                 export_templates: ctx.export_templates,
                 fused_nodes: ctx.fused_nodes,
@@ -2418,6 +2493,10 @@ fn lower_lazy_int_expr_select(
                 import_templates: ctx.import_templates,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: ctx.external_io_imports,
+                ahead_imports: ctx
+                    .ahead_imports
+                    .as_mut()
+                    .map(|(slot, count, imports)| (*slot, *count, &mut **imports)),
                 slots: ctx.slots,
                 export_templates: ctx.export_templates,
                 fused_nodes: ctx.fused_nodes,
@@ -6694,6 +6773,7 @@ fn lower_sequential_loop(
         external_index_owner,
         body_operations,
         mut body_imports,
+        mut body_ahead,
         body_static_imports,
         outputs,
         carry_copy_ops,
@@ -6796,6 +6876,7 @@ fn lower_sequential_loop(
         let mut body_producers = BTreeMap::new();
         let mut body_family_producers = BTreeMap::new();
         let mut body_imports = Vec::new();
+        let mut body_ahead = Vec::new();
         let mut body_static_imports = Vec::new();
         let loop_site = GpuLoopSiteKey {
             site: node_id.0,
@@ -6835,6 +6916,7 @@ fn lower_sequential_loop(
                 import_templates: &mut body_static_imports,
                 external_io_loops: ctx.external_io_loops,
                 external_io_imports: &mut body_imports,
+                ahead_imports: Some((loop_node.index_slot, count, &mut body_ahead)),
                 slots: &mut *ctx.slots,
                 export_templates: &mut *ctx.export_templates,
                 fused_nodes: &mut *ctx.fused_nodes,
@@ -6893,6 +6975,10 @@ fn lower_sequential_loop(
                     // An external-I/O body keeps its carried-state copy tail,
                     // which the host relaunches around each selected import.
                     if body_ctx.external_io_imports.is_empty() &&
+                        body_ctx
+                            .ahead_imports
+                            .as_ref()
+                            .is_none_or(|(_, _, imports)| imports.is_empty()) &&
                         write_carry_in_place(&mut body_ctx, output, input_ids[position])?
                     {
                         continue;
@@ -6923,6 +7009,7 @@ fn lower_sequential_loop(
                 external_index_owner,
                 body_operations,
                 body_imports,
+                body_ahead,
                 body_static_imports,
                 outputs,
                 carry_copy_ops,
@@ -6953,10 +7040,14 @@ fn lower_sequential_loop(
     if outputs.len() != loop_node.carried_count || body_operations.is_empty() {
         return Err("GPU sequential body has no valid carried computation".into());
     }
-    if has_scoped_artifacts && body_imports.is_empty() && body_static_imports.is_empty() {
+    if has_scoped_artifacts &&
+        body_imports.is_empty() &&
+        body_ahead.is_empty() &&
+        body_static_imports.is_empty()
+    {
         return Err("GPU scoped artifact has no selected import boundary".into());
     }
-    let external_io = !body_imports.is_empty();
+    let external_io = !body_imports.is_empty() || !body_ahead.is_empty();
     if external_io {
         if carry_copy_ops.is_empty() {
             return Err("GPU external-I/O loop has no selected import or carry copy".into());
@@ -6999,6 +7090,14 @@ fn lower_sequential_loop(
                 return Err("GPU external-I/O import is outside its body".into());
             }
         }
+        for import in &mut body_ahead {
+            import.template.before_operation = import
+                .template
+                .before_operation
+                .checked_add(body_start)
+                .filter(|operation| *operation < body_end)
+                .ok_or_else(|| "GPU external-I/O import is outside its body".to_owned())?;
+        }
         let carry_copy_ops = carry_copy_ops
             .into_iter()
             .map(|index| {
@@ -7016,6 +7115,7 @@ fn lower_sequential_loop(
             carried_ids: carried_ids.clone(),
             carry_copy_ops: carry_copy_ops.clone(),
             imports: body_imports,
+            ahead: body_ahead,
         });
         for (position, carried) in carried_ids.into_iter().enumerate() {
             let declared =
@@ -7038,7 +7138,7 @@ fn lower_sequential_loop(
         }
         return Ok(());
     }
-    if !body_imports.is_empty() {
+    if !body_imports.is_empty() || !body_ahead.is_empty() {
         return Err("GPU native loop has an uncommitted artifact import".into());
     }
     let scalar_binding = |bindings: &mut Vec<GpuBindingSource>, id| -> Result<u32, String> {

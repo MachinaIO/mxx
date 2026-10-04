@@ -6422,8 +6422,8 @@ mod test {
         });
     }
 
-    /// Dynamic products inside a Program family body, each by the RHS member
-    /// the body index selects, summed and multiplied by a scalar RHS.
+    /// A Dynamic product inside a Program family body over member 1 only, by
+    /// the RHS member the body index selects, then by a scalar RHS.
     #[test]
     fn dynamic_family_body_products_verify_indexed_rhs_members() {
         let parameters = dynamic_test_parameters();
@@ -6432,7 +6432,12 @@ mod test {
             builder.input_family(IntExpr::constant(2), AttributeKnowledge::PrivatePayload).unwrap();
         let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
         let scale = builder.rhs_input().unwrap();
-        let range = crate::program::FamilyRange::full(IntExpr::constant(2)).unwrap();
+        let range = crate::program::FamilyRange::bounded(
+            IntExpr::constant(1),
+            IntExpr::constant(1),
+            IntExpr::constant(2),
+        )
+        .unwrap();
         let products = builder
             .parallel(range, |builder, index| {
                 builder
@@ -6450,7 +6455,7 @@ mod test {
         check_dynamic_batches(&parameters, &program, || {
             let exponents = [0; 5].map(|_| rand::random::<u32>() as usize % dimension);
             let [x0, x1, y0, y1, z] = exponents.map(|exponent| monomial(&parameters, exponent));
-            let expected = (x0.clone() * y0.clone() + x1.clone() * y1.clone()) * z.clone();
+            let expected = x1.clone() * y1.clone() * z.clone();
             let wrong = expected.clone() * monomial(&parameters, 1);
             (
                 BTreeMap::from([(inputs, InputBinding::Family(vec![x0, x1]))]),

@@ -1520,6 +1520,9 @@ pub(super) struct PhysicalLoweringContext<'a> {
     pub import_templates: &'a mut Vec<ImportTemplate>,
     pub external_io_loops: &'a mut Vec<ExternalIoLoop>,
     pub external_io_imports: &'a mut Vec<ExternalIoImport>,
+    /// The index slot and iteration count of the sequential loop whose body
+    /// is being lowered, and that body's host-selected imports.
+    pub ahead_imports: Option<(u32, u64, &'a mut Vec<crate::gpu_physical_control::AheadImport>)>,
     /// Mapped host slots: the import request slots of selected imports, in
     /// lowering order, then the export slots.
     pub slots: &'a mut Vec<Arc<GpuExportSlot>>,
@@ -5557,6 +5560,10 @@ pub(super) fn lower_preimage_sample_node(
                 import_templates: &mut *ctx.import_templates,
                 external_io_loops: &mut *ctx.external_io_loops,
                 external_io_imports: &mut *ctx.external_io_imports,
+                ahead_imports: ctx
+                    .ahead_imports
+                    .as_mut()
+                    .map(|(slot, count, imports)| (*slot, *count, &mut **imports)),
                 slots: &mut *ctx.slots,
                 export_templates: &mut *ctx.export_templates,
                 fused_nodes: &mut *ctx.fused_nodes,
@@ -6791,6 +6798,7 @@ pub(crate) fn plan_physical_graph(
                 import_templates: &mut import_templates,
                 external_io_loops: &mut external_io_loops,
                 external_io_imports: &mut external_io_imports,
+                ahead_imports: None,
                 slots: &mut slots,
                 export_templates: &mut export_templates,
                 fused_nodes: &mut fused_nodes,

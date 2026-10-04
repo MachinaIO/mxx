@@ -1,22 +1,18 @@
 //! Shared FHE helpers and coefficient-boundary graphs.
 //! RNS modulus switching must not call the coefficient-boundary helpers.
-use crate::FheError;
-#[cfg(feature = "gpu")]
-use crate::{BgvHybridParams, BgvParams, FheCommonParams, TfheParams};
+
+/// Host-only graph and protocol fixtures shared by GPU tests and Lean export.
+pub mod protocol;
+
+use crate::{BgvHybridParams, BgvParams, FheCommonParams, FheError, TfheParams};
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 #[cfg(test)]
 use mxx_dsl::{DslError, select};
 use mxx_dsl::{Family, Int, Mat, Ring};
-use mxx_ir_core::IntExpr;
-#[cfg(feature = "gpu")]
-use mxx_ir_core::node::SampleRange;
-use num_bigint::BigInt;
-#[cfg(any(test, feature = "gpu"))]
-use num_bigint::BigUint;
+use mxx_ir_core::{IntExpr, node::SampleRange};
+use num_bigint::{BigInt, BigUint};
 
-#[cfg(feature = "gpu")]
 use num_traits::One;
-#[cfg(feature = "gpu")]
 use std::env;
 
 // Public modular constants only: no plaintext or ciphertext values are inspected here.
@@ -115,14 +111,12 @@ pub(crate) fn extract(parameters: &DCRTPolyParams, value: &Mat) -> Result<Family
     Ok(value.coefficients())
 }
 
-#[cfg(feature = "gpu")]
 fn integer(name: &str, default: usize) -> usize {
     env::var(name)
         .map(|value| value.parse().unwrap_or_else(|_| panic!("invalid {name}: {value}")))
         .unwrap_or(default)
 }
 
-#[cfg(feature = "gpu")]
 fn primes(name: &str, defaults: Vec<u64>) -> Vec<u64> {
     env::var(name)
         .map(|value| {
@@ -134,7 +128,6 @@ fn primes(name: &str, defaults: Vec<u64>) -> Vec<u64> {
         .unwrap_or(defaults)
 }
 
-#[cfg(feature = "gpu")]
 fn common_params(
     n: usize,
     q: Vec<u64>,
@@ -176,7 +169,6 @@ fn common_params(
     params
 }
 
-#[cfg(feature = "gpu")]
 pub fn bgv_params() -> BgvParams {
     let profile = env::var("FHE_TEST_PROFILE").unwrap_or_else(|_| "bgv-54".into());
     let (q, p, n, t, digit_size, sigma) = match profile.as_str() {
@@ -224,7 +216,6 @@ pub fn bgv_params() -> BgvParams {
 /// the profile's three approximate base 2^7 torus digits. The generated Lean
 /// claim states that one NAND gate fails with probability at most 2^-128 at
 /// these values. `FHE_TEST_TFHE_*` variables override each value.
-#[cfg(feature = "gpu")]
 pub fn tfhe_params() -> TfheParams {
     let n = integer("FHE_TEST_TFHE_RING_DIMENSION", 1024);
     let base = integer("FHE_TEST_TFHE_BASE_BITS", 6);
@@ -256,7 +247,6 @@ pub fn tfhe_params() -> TfheParams {
     .expect("valid TFHE parameters")
 }
 
-#[cfg(feature = "gpu")]
 fn ceil_sigma_multiple(sigma: &str, multiple: u64) -> BigUint {
     let (mantissa, exponent) = sigma
         .find(['e', 'E'])
@@ -285,7 +275,6 @@ fn ceil_sigma_multiple(sigma: &str, multiple: u64) -> BigUint {
     }
 }
 
-#[cfg(feature = "gpu")]
 pub fn modswitch_steps() -> usize {
     let steps = integer("FHE_TEST_MODSWITCH_STEPS", 1);
     assert!(steps > 0, "the round trip must include modulus switching");
@@ -364,8 +353,6 @@ pub mod gpu {
     }
 }
 
-#[cfg(all(test, not(feature = "gpu")))]
-use crate::FheCommonParams;
 #[cfg(test)]
 use mxx_backends::{
     ExecutionConfig, ExecutionResult, MemoryArtifactStore, RuntimeValue,
@@ -375,8 +362,6 @@ use mxx_backends::{
 use mxx_dsl::BuiltGraph;
 #[cfg(test)]
 use mxx_ir_core::ParamEnv;
-#[cfg(all(test, not(feature = "gpu")))]
-use mxx_ir_core::node::SampleRange;
 #[cfg(test)]
 use std::collections::BTreeMap;
 

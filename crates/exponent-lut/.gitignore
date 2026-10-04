@@ -1,2 +1,2 @@
-# Lean's generated environment, compiled modules, and cache.
-/lean/.lake/
+# Lean's generated environment, compiled modules, and cache of every package under lean/.
+/lean/**/.lake/

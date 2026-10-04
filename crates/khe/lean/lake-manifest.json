@@ -5,10 +5,10 @@
     {
       "type": "path",
       "scope": "",
-      "name": "MxxBackends",
+      "name": "«mxx-ir-core»",
       "manifestFile": "lake-manifest.json",
       "inherited": false,
-      "dir": "../../backends/lean",
+      "dir": "../../ir-core/lean",
       "configFile": "lakefile.toml"
     },
     {
@@ -17,7 +17,7 @@
       "name": "mathlib",
       "manifestFile": "lake-manifest.json",
       "inherited": false,
-      "dir": "../../backends/lean/.lake/packages/mathlib",
+      "dir": "../../ir-core/lean/.lake/packages/mathlib",
       "configFile": "lakefile.lean"
     },
     {

@@ -8,23 +8,23 @@ open DiamondProofParameters
 
 namespace DiamondGeneratedProof
 
-noncomputable def gadget : ExactMatrix q n 1 ell := regularGadgetMatrix DiamondBackend.layout0
+noncomputable def gadget : ExactMatrix q n 1 ell := regularGadgetMatrix Backend.layout0
 
 theorem generated_decomposition_reconstruct
     (params : Stage_decrypt.Params)
     (target : ExactMatrix q n 1 ell) (digits : ExactMatrix q n ell ell)
-    (hrun : gadgetDecomposeRuns DiamondBackend.backend params.diamond_gadget_base params.diamond_digit_count target digits) :
+    (hrun : gadgetDecomposeRuns Backend.backend params.diamond_gadget_base params.diamond_digit_count target digits) :
     gadget * digits = target ∧ PreimageWithin digits D := by
   rcases hrun with ⟨layout, hlookup, _, _, hwidth, hdigits, _⟩
-  have hl : layout = DiamondBackend.layout0 := by
-    simpa [DiamondBackend.backend] using hlookup.symm
+  have hl : layout = Backend.layout0 := by
+    simpa [Backend.backend] using hlookup.symm
   subst layout
-  have hd : digits = regularDecomposeMatrix DiamondBackend.layout0 target := by
+  have hd : digits = regularDecomposeMatrix Backend.layout0 target := by
     simpa [castMatrixRows] using hdigits
   rw [hd]
   constructor
-  · exact regularGadgetMatrix_reconstruct DiamondBackend.layout0 target (by decide) (by decide) (by decide)
-  · exact regularDecomposeMatrix_bounded DiamondBackend.layout0 target (by decide) (by decide)
+  · exact regularGadgetMatrix_reconstruct Backend.layout0 target (by decide) (by decide) (by decide)
+  · exact regularDecomposeMatrix_bounded Backend.layout0 target (by decide) (by decide)
 
 theorem generated_encrypted_product
     (params : Stage_decrypt.Params)
@@ -36,7 +36,7 @@ theorem generated_encrypted_product
       messageMatrix 0 0 • (rightSecret * gadget) + leftError)
     (rightEquation : rightCiphertext = rightSecret * rightPublic -
       rightMessage • (rightPayload * gadget) + rightError)
-    (hdecompose : gadgetDecomposeRuns DiamondBackend.backend params.diamond_gadget_base params.diamond_digit_count rightPublic digits)
+    (hdecompose : gadgetDecomposeRuns Backend.backend params.diamond_gadget_base params.diamond_digit_count rightPublic digits)
     (hproduct : productTerm = matrixMul leftCiphertext digits)
     (hmessage : messageTerm = matrixMulScalarRight rightCiphertext messageMatrix)
     (hsum : output = matrixAdd productTerm messageTerm) :

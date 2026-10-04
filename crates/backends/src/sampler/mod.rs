@@ -11,10 +11,11 @@
 //! - `bounds` defines the authoritative cutoffs: `hard_cutoff_from_sigma_bound` is `floor(6.5 *
 //!   sigma)`, and `default_preimage_cutoff` gives the minimum preimage cutoff.
 //!
-//! Correctness uses these enforced cutoffs and deterministic worst-case bounds, while
-//! lattice-security estimation models the ordinary untruncated distributions. Hash tags are encoded
-//! as a fixed prefix followed by typed, length-framed components, so tags such as `(1, 23)` and
-//! `(12, 3)` differ; changing the encoding changes every hash-derived value.
+//! Deterministic correctness claims use these enforced cutoffs and worst-case bounds; probabilistic
+//! claims model each coefficient as an independent draw from the truncated distribution the
+//! sampler targets. Lattice-security estimation models the ordinary untruncated distributions. Hash
+//! tags are encoded as a fixed prefix followed by typed, length-framed components, so tags such as
+//! `(1, 23)` and `(12, 3)` differ; changing the encoding changes every hash-derived value.
 
 use crate::{
     matrix::{PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError},

@@ -1,0 +1,16 @@
+name = "MxxExponentLutLwr"
+version = "0.1.0"
+defaultTargets = ["MxxExponentLutLwr"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = ".."
+
+# Lemmas about the sparse-LWR PRF programs of `tests/lwr_prf.rs` that hold at every parameter set.
+[[lean_lib]]
+name = "MxxExponentLutLwr"
+roots = ["LwrProgram"]

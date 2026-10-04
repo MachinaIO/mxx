@@ -29,6 +29,7 @@ use mxx_ir_core::{
     artifact::{ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId},
     encoding::spec_hash,
 };
+use num_bigint::BigInt;
 use std::{collections::BTreeMap, error::Error, path::PathBuf};
 use thiserror::Error as ThisError;
 
@@ -356,6 +357,10 @@ pub trait StageExecution<S: SessionStore> {
 
     /// Download one matrix output to host memory.
     fn download_matrix(&self, value: &RuntimeValue) -> Result<DCRTPolyMatrix, ApiError>;
+
+    /// Download one integer output, or the members of an integer family, to
+    /// host memory.
+    fn download_integers(&self, value: &RuntimeValue) -> Result<Vec<BigInt>, ApiError>;
 }
 
 impl<S: SessionStore> StageExecution<S> for CpuExecution {
@@ -412,6 +417,17 @@ impl<S: SessionStore> StageExecution<S> for CpuExecution {
             .cpu_full_arc()
             .map(|matrix| matrix.as_ref().clone())
             .ok_or_else(|| ApiError::input("CPU stage output is not a full host matrix"))
+    }
+
+    fn download_integers(&self, value: &RuntimeValue) -> Result<Vec<BigInt>, ApiError> {
+        let integer = |value: &RuntimeValue| match value {
+            RuntimeValue::Int(value) => Ok(value.clone()),
+            _ => Err(ApiError::input("stage output is not an integer")),
+        };
+        match value {
+            RuntimeValue::IndexedFamily { values, .. } => values.iter().map(integer).collect(),
+            value => Ok(vec![integer(value)?]),
+        }
     }
 }
 

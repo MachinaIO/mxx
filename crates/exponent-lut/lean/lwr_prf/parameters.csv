@@ -1,0 +1,4 @@
+parameter_id,noise_model,failure_exponent,ring_dimension,crt_bits,base_bits,crt_depth,primes_per_drop,operations_per_drop,error_sigma,security_bits,input_modulus,output_modulus,lwr_dimension,support_weight,outputs,key_seed
+worst-n32-crt7x40,worst,,32,40,20,7,1,1,4,11,32,4,16,2,1,10187170744214484787
+average-n32-crt7x40,average,100,32,40,20,7,1,1,4,11,32,4,16,2,1,10187170744214484787
+average-n65536-crt36x40,average,100,65536,40,10,36,1,1,4,124,256,32,1024,31,1,10187170744214484787

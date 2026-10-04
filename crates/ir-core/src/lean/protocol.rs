@@ -1,13 +1,8 @@
-//! Export protocol graphs and assemble their linked correctness claim without application
-//! dependencies.
+//! Export a protocol declaration's correctness claim: [`export`] writes every Lean module of it.
 use crate::{
-    ParamEnv,
     lean::{
         LeanArtifact,
-        claim::{
-            self, ClaimBackend, ClaimRoot, ClaimSemantics, ExternalInput, InputContract, Link,
-            LinkedClaim, Port,
-        },
+        claim::{self, ClaimRoot, ExternalInput, InputContract, Link, LinkedClaim, Port},
     },
     protocol::{
         ComparatorSpec, InputValueContract, ProtocolDecl, ProtocolInputDestination, StageId,
@@ -32,51 +27,104 @@ pub enum ProtocolExportError {
     Invalid(String),
 }
 
-/// Export every graph and the linked claim for this exact declaration and backend.
-pub fn export_claim(
+/// Writes every Lean module of `protocol`'s correctness claim into `directory`: one module per
+/// stage (`Stage_<id>`), per requirement (`Requirement_<i>`), and for the ideal graph (`Ideal`),
+/// the gadget layouts they use (`Backend`), and the linked claim (`Claim`). The claim is stated at
+/// the declaration's parameter bindings and failure probability; a proof package imports `Claim`
+/// and proves `GeneratedClaim.CorrectnessClaim`.
+pub fn export(
     protocol: &ProtocolDecl,
-    bindings: &ParamEnv,
-    backend: &ClaimBackend<'_>,
-    semantics: &ClaimSemantics<'_>,
-    manifests: &BTreeMap<crate::artifact::ProductionId, crate::artifact::Manifest>,
     directory: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
-        lean::{ExportOptions, export},
+        artifact::export_validated_manifest,
+        lean::{BackendLayout, ExportOptions, export},
+        node::NodeKind,
         validate_with_manifests,
     };
     use std::fs;
     let declaration = protocol;
+    let bindings = &declaration.bindings;
+    declaration.validate()?;
+    // Validate each stage against the manifests of the productions its artifact inputs name,
+    // exported from the producer stages, which precede their consumers.
+    let mut validated = BTreeMap::new();
+    for stage in declaration.stages() {
+        let mut manifests = BTreeMap::new();
+        for binding in &stage.bindings {
+            let artifact =
+                stage.graph.root_scope().nodes().iter().find_map(|node| match node.kind() {
+                    NodeKind::Input { name, artifact: Some(artifact), .. }
+                        if *name == binding.consumer_input.0 =>
+                    {
+                        Some(artifact)
+                    }
+                    _ => None,
+                });
+            if let Some(artifact) = artifact {
+                let producer = validated
+                    .get(&binding.producer_stage)
+                    .ok_or("an artifact producer must precede its consumer")?;
+                manifests.insert(
+                    artifact.production_id.clone(),
+                    export_validated_manifest(artifact.production_id.clone(), producer)?,
+                );
+            }
+        }
+        validated
+            .insert(stage.id.clone(), validate_with_manifests(&stage.graph, bindings, &manifests)?);
+    }
     let mut graphs = declaration
         .stages()
         .iter()
-        .map(|stage| Ok((stage_module_name(&stage.id)?, &stage.graph)))
-        .collect::<Result<Vec<_>, String>>()?;
-    graphs.extend(
-        declaration
-            .bundle
-            .requirements
-            .iter()
-            .enumerate()
-            .map(|(index, requirement)| (format!("Requirement_{index}"), requirement.graph())),
-    );
-    graphs.push(("Ideal".into(), declaration.bundle.ideal.graph()));
-    declaration.validate()?;
+        .map(|stage| {
+            Ok((
+                stage_module_name(&stage.id)?,
+                validated.remove(&stage.id).expect("validated stage"),
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    for (index, requirement) in declaration.bundle.requirements.iter().enumerate() {
+        graphs.push((
+            format!("Requirement_{index}"),
+            crate::validate(requirement.graph(), bindings)?,
+        ));
+    }
+    graphs.push(("Ideal".into(), crate::validate(declaration.bundle.ideal.graph(), bindings)?));
+    fs::create_dir_all(directory)?;
     let mut generated = BTreeMap::new();
+    let mut layouts = BTreeMap::<_, BackendLayout>::new();
     for (name, graph) in graphs {
-        let validated = validate_with_manifests(graph, bindings, manifests)?;
         let artifact = export(
-            &validated,
+            &graph,
             &ExportOptions {
                 namespace: name.clone(),
                 module_name: name.clone(),
-                backend_layouts: backend.layouts.to_vec(),
+                sampling_tape: declaration.failure_probability_log2.is_some(),
                 ..ExportOptions::default()
             },
         )?;
+        for layout in &artifact.backend_layouts {
+            let key = (layout.modulus.clone(), layout.ring_dimension);
+            let merged = match layouts.get(&key) {
+                Some(previous) => previous.merge(layout).ok_or_else(|| {
+                    format!(
+                        "graphs disagree on the gadget layout of ring ({}, {})",
+                        layout.modulus, layout.ring_dimension
+                    )
+                })?,
+                None => layout.clone(),
+            };
+            layouts.insert(key, merged);
+        }
         fs::write(directory.join(format!("{name}.lean")), &artifact.source)?;
         generated.insert(name, artifact);
     }
+    let layouts = layouts.into_values().collect::<Vec<_>>();
+    fs::write(
+        directory.join(format!("{}.lean", claim::BACKEND_MODULE)),
+        super::backend::render_backend(&layouts),
+    )?;
     let roots = ExportedRoots {
         stages: declaration
             .stages()
@@ -95,8 +143,7 @@ pub fn export_claim(
             .collect(),
         ideal: generated.remove("Ideal").expect("exported ideal"),
     };
-    let claim = assemble_claim(protocol, &roots, bindings, backend, semantics)?;
-    fs::write(directory.join("Claim.lean"), claim)?;
+    fs::write(directory.join("Claim.lean"), assemble_claim(protocol, &roots)?)?;
     Ok(())
 }
 
@@ -178,9 +225,6 @@ fn input_contracts(
 pub fn assemble_claim(
     declaration: &ProtocolDecl,
     roots: &ExportedRoots,
-    bindings: &ParamEnv,
-    backend: &ClaimBackend<'_>,
-    semantics: &ClaimSemantics<'_>,
 ) -> Result<String, ProtocolExportError> {
     declaration.validate().map_err(|error| ProtocolExportError::Invalid(error.to_string()))?;
     let bundle = &declaration.bundle;
@@ -274,12 +318,9 @@ pub fn assemble_claim(
     let ComparatorSpec::Equality { endpoints } = &bundle.comparator else {
         return Err(ProtocolExportError::Invalid("unsupported comparator".into()));
     };
-    if endpoints.len() != 1 ||
-        bundle.endpoints.entries.len() != 1 ||
-        bundle.operational_decoder_targets.len() != 1
-    {
+    if endpoints.len() != 1 || bundle.endpoints.entries.len() != 1 {
         return Err(ProtocolExportError::Invalid(
-            "threshold claim currently requires one exact operational endpoint".into(),
+            "a claim currently requires exactly one compared endpoint".into(),
         ));
     }
     let endpoint = &bundle.endpoints.entries[0];
@@ -297,12 +338,6 @@ pub fn assemble_claim(
         .outputs
         .get(&endpoint.workflow_output.output)
         .ok_or_else(|| ProtocolExportError::Invalid("missing actual endpoint".into()))?;
-    let target = &bundle.operational_decoder_targets[0];
-    if target.endpoint != endpoint.spec {
-        return Err(ProtocolExportError::Invalid(
-            "operational decoder does not identify the actual endpoint".into(),
-        ));
-    }
     let claim = LinkedClaim {
         roots: entries,
         externals,
@@ -316,15 +351,10 @@ pub fn assemble_claim(
             .collect(),
         actual: Port { root: actual_position, name: endpoint.workflow_output.output.clone() },
         ideal: Port { root: ideal_position, name: endpoint.ideal_output.clone() },
-        endpoint: claim::Endpoint::BooleanInterval {
-            residual: Port {
-                root: position(&target.residual.stage)?,
-                name: target.residual.output.clone(),
-            },
-        },
+        endpoint: claim::Endpoint::Exact,
+        failure_probability_log2: declaration.failure_probability_log2,
     };
-    claim::assemble_claim(&claim, bindings, backend, semantics)
-        .map_err(ProtocolExportError::Invalid)
+    claim::assemble_claim(&claim, &declaration.bindings).map_err(ProtocolExportError::Invalid)
 }
 
 #[cfg(test)]

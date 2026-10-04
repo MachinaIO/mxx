@@ -20,7 +20,8 @@ it.
 | `parallel`, `iterate`, `select`, `Subgraph` | Independent loops, loops with carried state, runtime selection, and reusable named bodies. |
 | `HashTag`, `tag!` | Typed hash tags for hash-derived samples. |
 | `GraphValue`, `GraphValueSchema` | Flattening tuples, vectors, and records into graph wires. |
-| `examples/rlwe_encrypt.rs` | A Ring-LWE round trip on the GPU (`--features gpu`). |
+| `examples/rlwe_encrypt.rs` | A Ring-LWE round trip on the GPU (`--features gpu`), which also exports the Lean statement that every execution decrypts its message. |
+| `examples/rlwe/` | The Lean proof of that statement; run `lake build` there after running the example. |
 
 ## Design
 

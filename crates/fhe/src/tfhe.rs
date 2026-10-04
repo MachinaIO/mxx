@@ -718,7 +718,7 @@ impl TfheParams {
             self.lwe_dimension,
             IntExpr::constant(BigInt::from(self.lwe_modulus.clone())),
         );
-        let dot = inner_product(&a, secret, self.lwe_dimension);
+        let dot = self.inner_product(&a, secret);
         let signed_bit = message.clone().mul(2).sub(1);
         let encoded = signed_bit.mul(Int::constant(BigInt::from(self.delta())));
         let b = dot.add(encoded).add(self.lwe_error()?).rem(modulus);
@@ -737,14 +737,23 @@ impl TfheParams {
         secret: &Family<Int>,
         ciphertext: &LweCiphertext,
     ) -> Result<Int, FheError> {
+        self.decode_phase(self.decryption_phase(secret, ciphertext)?)
+    }
+
+    /// The canonical decryption phase `b - <a, s> mod q`, which is `±floor(q/8)` plus noise.
+    pub fn decryption_phase(
+        &self,
+        secret: &Family<Int>,
+        ciphertext: &LweCiphertext,
+    ) -> Result<Int, FheError> {
         self.validate_lwe(ciphertext, self.lwe_dimension, &self.lwe_modulus)?;
         check_family(secret, self.lwe_dimension)?;
         let q = Int::constant(BigInt::from(self.lwe_modulus.clone()));
-        let phase = ciphertext
-            .b
-            .clone()
-            .sub(inner_product(&ciphertext.a, secret, self.lwe_dimension))
-            .rem(q.clone());
+        Ok(ciphertext.b.clone().sub(self.inner_product(&ciphertext.a, secret)).rem(q))
+    }
+
+    /// Decodes a canonical decryption phase to 1 when its centered value is nonnegative.
+    pub fn decode_phase(&self, phase: Int) -> Result<Int, FheError> {
         let centered = center_residue(phase, &self.lwe_modulus)?;
         Ok(Int::constant(1).sub(centered.less(Int::constant(0)).to_int()))
     }
@@ -1198,29 +1207,31 @@ impl TfheParams {
     }
 }
 
-fn inner_product(lhs: &Family<Int>, rhs: &Family<Int>, dimension: usize) -> Int {
-    balanced_sum((0..dimension).map(|index| lhs.at(index).mul(rhs.at(index))).collect())
-}
-
-/// Builds a pairwise reduction tree so large dot products remain shallow when
-/// the DSL graph sealer recursively visits expression arguments.
-fn balanced_sum(mut terms: Vec<Int>) -> Int {
-    if terms.is_empty() {
-        return Int::constant(0);
-    }
-    while terms.len() > 1 {
-        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
-        let mut round = terms.into_iter();
-        while let Some(left) = round.next() {
-            if let Some(right) = round.next() {
-                next.push(left.add(right));
-            } else {
-                next.push(left);
-            }
+impl TfheParams {
+    /// `<a, s>` for a mask `a` in `[0, q)` and a binary secret `s`. When the sum fits one signed
+    /// word, one integer matrix-vector product keeps it a single graph node, which the GPU
+    /// accumulates in one word; wider moduli sum a shallow tree of multiword products.
+    fn inner_product(&self, mask: &Family<Int>, secret: &Family<Int>) -> Int {
+        let bound = BigUint::from(self.lwe_dimension) * (&self.lwe_modulus - 1u8);
+        if bound <= BigUint::from(i64::MAX as u64) {
+            return mask.matrix_vector_product(secret).at(0);
         }
-        terms = next;
+        let mut terms = (0..self.lwe_dimension)
+            .map(|index| mask.at(index).mul(secret.at(index)))
+            .collect::<Vec<_>>();
+        while terms.len() > 1 {
+            let mut pairs = terms.into_iter();
+            let mut next = Vec::new();
+            while let Some(left) = pairs.next() {
+                next.push(match pairs.next() {
+                    Some(right) => left.add(right),
+                    None => left,
+                });
+            }
+            terms = next;
+        }
+        terms.pop().unwrap_or_else(|| Int::constant(0))
     }
-    terms.pop().expect("nonempty reduction terms")
 }
 
 fn center_residue(value: Int, modulus: &BigUint) -> Result<Int, DslError> {

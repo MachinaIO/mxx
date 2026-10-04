@@ -621,13 +621,13 @@ fn noise_refresh_end_to_end() {
     let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
     let sample_payload = |runtime: &mut GpuRuntime, store: &mut FileArtifactStore| {
         RnsEncryptBuild::new(&parameters, [0x51; 32])
-            .sample_payload_secret(runtime, store)
+            .sample_payload_secret(runtime, store, |_| Ok(()))
             .expect("payload secret")
     };
     let static_payload = (!dynamic).then(|| sample_payload(&mut runtime, &mut store));
     let mask = (!dynamic).then(|| {
         RnsEncryptBuild::new(&parameters, [0x51; 32])
-            .sample_mask_secret(&mut runtime, &mut store)
+            .sample_mask_secret(&mut runtime, &mut store, |_| Ok(()))
             .expect("mask secret")
     });
     // The PRF schedule has a source-q carrier distinct from the outer

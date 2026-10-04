@@ -43,7 +43,7 @@ theorem generated_circuit_plaintext_equation
     (activeCounts : Fin circuitDepth → Int) (kinds leftSources rightSources : Fin metadataCount → Int)
     (oneCipher onePublic : ExactMatrix q n 1 ell) (oneMessage : ExactMatrix q n 1 1)
     (honeMessage : oneMessage 0 0 = 1)
-    (hrun : Stage_decrypt.sequential_generatedRoot_33 DiamondBackend.backend params layer
+    (hrun : Stage_decrypt.sequential_generatedRoot_33 Backend.backend params layer
       (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
         rightSources, onePublic, oneMessage, ()) next) :
     ∃ active : Int, familyGetDynamic activeCounts (layer : Int) active ∧
@@ -63,7 +63,7 @@ theorem generated_circuit_plaintext_equation
   refine ⟨active, hactive, ?_⟩
   intro lane
   obtain ⟨kind, left, right, digits, sc, sp, sm, hk, hl, hr, _, _, _, hm, _, _, hmm⟩ :=
-    generated_circuit_lane_facts DiamondBackend.backend params layer lane active current
+    generated_circuit_lane_facts Backend.backend params layer lane active current
       kinds leftSources rightSources oneCipher onePublic oneMessage _ _ _ (hlanes lane)
   refine ⟨kind, left, right, hk, hl, hr, ?_⟩
   rw [hout]
@@ -126,7 +126,7 @@ theorem generated_circuit_requirement_layer_agrees
     (oneCipher onePublic : ExactMatrix q n 1 ell) (oneMessage : ExactMatrix q n 1 1)
     (hwidth : params.max_layer_width = requirementParams.max_layer_width)
     (honeMessage : oneMessage 0 0 = 1) (hagrees : CircuitPlaintextAgrees current reference)
-    (hcircuit : Stage_decrypt.sequential_generatedRoot_33 DiamondBackend.backend params layer
+    (hcircuit : Stage_decrypt.sequential_generatedRoot_33 Backend.backend params layer
       (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
         rightSources, onePublic, oneMessage, ()) next)
     (hrequirement : Requirement_2.sequential_generatedRoot_22 requirementParams layer
@@ -166,7 +166,7 @@ theorem generated_circuit_requirement_iteration_agrees
     (hagrees : CircuitPlaintextAgrees initial referenceInitial)
     (hcircuit : MxxIR.IterRuns
       (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33
-        DiamondBackend.backend params layer
+        Backend.backend params layer
         (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources, rightSources,
           onePublic, oneMessage, ()) next) count initial output)
     (hrequirement : MxxIR.IterRuns
@@ -207,7 +207,7 @@ theorem generated_accepting_requirement_plaintext
         oneMessage 0 0 = 1 → CircuitPlaintextAgrees initial referenceInitial →
         MxxIR.IterRuns
           (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33
-            DiamondBackend.backend params layer
+            Backend.backend params layer
             (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
               rightSources, onePublic, oneMessage, ()) next)
           requirementParams.depth.toNat initial output →

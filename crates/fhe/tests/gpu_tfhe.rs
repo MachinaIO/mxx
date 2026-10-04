@@ -1,9 +1,24 @@
 //! A minimal TFHE round trip through the production GPU runtime: generate
 //! keys, encrypt bits, evaluate bootstrapped NAND gates, and decrypt.
+//!
+//! The executed graphs, linked as one gate, also form a closed protocol whose correctness claim
+//! the test exports to `crates/fhe/lean/tfhe/generated`: one gate decrypts to the NAND of its
+//! inputs except with probability at most `2^-128` over the sampled keys and errors. `lake build`
+//! in `crates/fhe/lean/tfhe` checks the handwritten proof of that claim.
 
 use mxx_backends::{GpuRuntime, RuntimeValue, backend::poly_gpu::gpu_backend, poly::PolyParams};
-use mxx_dsl::{DslContext, GraphValue, IntType, Ring};
+use mxx_dsl::{DslContext, GraphValue, GraphValueSchema, IdealSpec, Int, IntType, Ring};
 use mxx_fhe::utils::{self, gpu};
+use mxx_ir_core::{
+    Graph,
+    protocol::{
+        ArtifactBinding, ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec,
+        EndpointBinding, EndpointBindings, EndpointSemanticBinding, EndpointSpecId, InputContract,
+        InputContractEntry, InputValueContract, OutputRef, ProtocolDecl, ProtocolInputBinding,
+        ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage,
+        StageId, StageInputName, Workflow,
+    },
+};
 use num_bigint::BigInt;
 use rand::Rng;
 use std::{collections::BTreeMap, time::Instant};
@@ -62,6 +77,7 @@ fn test_gpu_tfhe_round_trip() {
         .build()
         .unwrap();
     tracing::info!(graph = "keygen", operations = ?keygen_graph.operation_counts().unwrap());
+    let keygen_stage = keygen_graph.graph.clone();
     let keygen_inputs = BTreeMap::from([("keygen_hash_key".into(), fresh_hash_key())]);
     let mut keygen_plan = runtime.plan(keygen_graph, &keygen_inputs).unwrap();
     let started = Instant::now();
@@ -81,6 +97,7 @@ fn test_gpu_tfhe_round_trip() {
     let ciphertext_schema = ciphertext.schema();
     let encryption_graph = encryption.output("ct", ciphertext).unwrap().build().unwrap();
     tracing::info!(graph = "encryption", operations = ?encryption_graph.operation_counts().unwrap());
+    let encryption_stage = encryption_graph.graph.clone();
     let encryption_inputs = |bit: bool| {
         BTreeMap::from([
             ("lwe_sk".into(), key_outputs["lwe_sk"].clone()),
@@ -145,11 +162,12 @@ fn test_gpu_tfhe_round_trip() {
     let bit = tfhe
         .decrypt(
             &decryption.int_family_input("lwe_sk", tfhe.lwe_dimension),
-            &decryption.input("ct", ciphertext_schema).unwrap(),
+            &decryption.input("ct", ciphertext_schema.clone()).unwrap(),
         )
         .unwrap();
     let decryption_graph = decryption.output("bit", bit).unwrap().build().unwrap();
     tracing::info!(graph = "decryption", operations = ?decryption_graph.operation_counts().unwrap());
+    let decryption_stage = decryption_graph.graph.clone();
     let decryption_inputs = |ciphertext: RuntimeValue| {
         BTreeMap::from([
             ("lwe_sk".into(), key_outputs["lwe_sk"].clone()),
@@ -199,6 +217,46 @@ fn test_gpu_tfhe_round_trip() {
         previous = Some((output["ct"].clone(), expected));
     }
 
+    // The executed graphs, linked as one gate, form the closed protocol of the claim. Each stage
+    // input fed by an earlier stage's output is linked to it, as the test passes it above.
+    let id = |name: &str| StageId(name.to_owned());
+    let (keygen, encrypt_left, encrypt_right, nand, decrypt) =
+        (id("keygen"), id("encrypt_left"), id("encrypt_right"), id("nand"), id("decrypt"));
+    let secret_schema = keys.lwe_secret.schema();
+    let stage = |id: &StageId, graph: Graph, bindings: Vec<Vec<ArtifactBinding>>| ProtocolStage {
+        id: id.clone(),
+        graph,
+        bindings: bindings.concat(),
+    };
+    let encryption_at = |id: &StageId| {
+        stage(id, encryption_stage.clone(), vec![link(&secret_schema, "lwe_sk", &keygen, "lwe_sk")])
+    };
+    let stages = vec![
+        stage(&keygen, keygen_stage, vec![]),
+        encryption_at(&encrypt_left),
+        encryption_at(&encrypt_right),
+        stage(
+            &nand,
+            nand_graph().graph,
+            vec![
+                link(&ciphertext_schema, "left", &encrypt_left, "ct"),
+                link(&ciphertext_schema, "right", &encrypt_right, "ct"),
+                link(&keys.bootstrapping_key.schema(), "bsk", &keygen, "bsk"),
+                link(&keys.key_switch_key.schema(), "ksk", &keygen, "ksk"),
+            ],
+        ),
+        stage(
+            &decrypt,
+            decryption_stage,
+            vec![
+                link(&secret_schema, "lwe_sk", &keygen, "lwe_sk"),
+                link(&ciphertext_schema, "ct", &nand, "ct"),
+            ],
+        ),
+    ];
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lean/tfhe/generated");
+    mxx_ir_core::lean::protocol::export(&gate_protocol(stages), &directory).unwrap();
+
     let gates = timings.iter().filter(|(stage, _)| stage == "nand").collect::<Vec<_>>();
     let mean_ms =
         gates.iter().map(|(_, milliseconds)| milliseconds).sum::<f64>() / gates.len() as f64;
@@ -231,4 +289,92 @@ fn test_gpu_tfhe_round_trip() {
     println!(
         "TFHE_TIMING_SUMMARY stage=eval warmups=1 repeats={repeats} nand_mean_ms={mean_ms:.3}"
     );
+}
+
+/// The bindings feeding every leaf of the consumer input `consumer` from the producer output.
+fn link<S: GraphValueSchema>(
+    schema: &S,
+    consumer: &str,
+    producer: &StageId,
+    output: &str,
+) -> Vec<ArtifactBinding> {
+    mxx_dsl::artifact_bindings(schema, consumer, producer, output).unwrap()
+}
+
+/// One gate as a closed protocol over the linked `stages`: keygen, the two encryptions, the gate,
+/// and decryption. The decrypted bit must equal the ideal `1 - left * right`, except with
+/// probability at most `2^-128` over the sampled values.
+fn gate_protocol(stages: Vec<ProtocolStage>) -> ProtocolDecl {
+    let id = |name: &str| StageId(name.to_owned());
+    let (keygen, encrypt_left, encrypt_right, decrypt) =
+        (id("keygen"), id("encrypt_left"), id("encrypt_right"), id("decrypt"));
+    let ideal = DslContext::new("tfhe-gate-ideal");
+    let (left, right): (Int, Int) =
+        (ideal.input("left", IntType).unwrap(), ideal.input("right", IntType).unwrap());
+    let ideal = IdealSpec::new(
+        ideal.output("bit", Int::constant(1).sub(left.mul(right))).unwrap().build().unwrap().graph,
+    )
+    .unwrap();
+    let bit = InputValueContract::IntegerRange { lower: 0.into(), upper: 1.into() };
+    let key = InputValueContract::Bytes { length: 32.into() };
+    let (contracts, bindings): (Vec<_>, Vec<_>) = [
+        ("keygen_hash_key", key.clone(), vec![(&keygen, "keygen_hash_key")], None),
+        ("left", bit.clone(), vec![(&encrypt_left, "message")], Some("left")),
+        ("left_hash_key", key.clone(), vec![(&encrypt_left, "encryption_hash_key")], None),
+        ("right", bit, vec![(&encrypt_right, "message")], Some("right")),
+        ("right_hash_key", key, vec![(&encrypt_right, "encryption_hash_key")], None),
+    ]
+    .into_iter()
+    .map(|(name, value, stages, ideal)| {
+        let mut destinations = stages
+            .into_iter()
+            .map(|(stage, input)| ProtocolInputDestination::WorkflowStage {
+                stage: stage.clone(),
+                input: StageInputName(input.to_owned()),
+            })
+            .collect::<Vec<_>>();
+        destinations
+            .extend(ideal.map(|input| ProtocolInputDestination::Ideal { input: input.to_owned() }));
+        (
+            InputContractEntry { id: ProtocolInputId::from(name), name: name.to_owned(), value },
+            ProtocolInputBinding { input: ProtocolInputId::from(name), destinations },
+        )
+    })
+    .unzip();
+    // The closed protocol: the workflow output `bit` of the `decrypt` stage is compared with the
+    // ideal output of the same name, except with probability at most `2^-128`.
+    let endpoint = EndpointSpecId::Exact;
+    ProtocolDecl::new(ProtocolDecl {
+        params: Vec::new(),
+        bindings: Default::default(),
+        failure_probability_log2: Some(128),
+        bundle: ClosedProtocolBundle {
+            workflow: Workflow { stages, entrypoint: decrypt.clone() },
+            ideal,
+            requirements: Vec::new(),
+            comparator: ComparatorSpec::Equality {
+                endpoints: vec![ComparatorEndpointBinding {
+                    endpoint,
+                    actual_input: "bit".to_owned(),
+                    ideal_input: "bit".to_owned(),
+                    result_output: "failure".to_owned(),
+                    failure_value: true,
+                }],
+            },
+            endpoints: EndpointBindings {
+                entries: vec![EndpointBinding {
+                    spec: endpoint,
+                    semantics: EndpointSemanticBinding::Exact,
+                    workflow_output: OutputRef { stage: decrypt, output: "bit".to_owned() },
+                    ideal_output: "bit".to_owned(),
+                }],
+            },
+            operational_decoder_targets: Vec::new(),
+            endpoint_specs: vec![endpoint],
+            input_contract: InputContract { inputs: contracts },
+            input_bindings: bindings,
+            precondition_spec: ProtocolPreconditionSpec::default(),
+        },
+    })
+    .unwrap()
 }

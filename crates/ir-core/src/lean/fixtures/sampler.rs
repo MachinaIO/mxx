@@ -3,7 +3,7 @@
 use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv, RealExpr, WireType,
     graph::CompileParameter,
-    lean::{BackendLayout, ExportOptions, export},
+    lean::{ExportOptions, export},
     node::NodeKind,
     types::MatrixType,
 };
@@ -92,19 +92,7 @@ fn export_sampler_fixture() {
     .unwrap()
     .0;
     let checked = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
-    let artifact = export(
-        &checked,
-        &ExportOptions {
-            backend_layouts: vec![BackendLayout {
-                modulus: 17.into(),
-                ring_dimension: 2,
-                base: 32.into(),
-                regular_digits: 1,
-            }],
-            ..ExportOptions::default()
-        },
-    )
-    .unwrap();
+    let artifact = export(&checked, &ExportOptions { ..ExportOptions::default() }).unwrap();
     let proof = r#"
 theorem generated_sampled_trapdoor_path
     {backend : MxxRuntime.BackendContext}

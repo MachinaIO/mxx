@@ -324,14 +324,16 @@ fn lift_output_target_to_p(value: RnsBggRow, p_ring: &Ring, h_p: Mat) -> RnsBggR
 }
 
 /// The RHS ciphertext `C` of `plaintext` consumed at `level`, sampled at
-/// `q_(level+1)` with top row `top` under payload row `payload`:
-/// `(t_bar, 1) C = Delta_(level+1) y t H_(level+1) + e_C`.
+/// `q_(level+1)` with top row `top()` under payload row `payload`:
+/// `(t_bar, 1) C = Delta_(level+1) y t H_(level+1) + e_C`. The top row is
+/// sampled after the target, so the Static preprocessing graph keeps the
+/// operation order its exported correctness claims state.
 pub(super) fn rhs_ciphertext(
     parameters: &RnsBggParameters,
     level: usize,
     payload: &RnsBggRow,
     plaintext: Mat,
-    top: RnsBggRow,
+    top: impl FnOnce() -> Result<RnsBggRow, RnsBggError>,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let next_level =
         level.checked_add(1).ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
@@ -348,20 +350,22 @@ pub(super) fn rhs_ciphertext(
     let scale = parameters.scalar(next_level, parameters.message_scale(next_level)?)?;
     let target = (payload.0.clone() * gadget.clone(), payload.1.clone() * gadget);
     let desired = (target.0 * scale.clone() * nu.clone(), target.1 * scale * nu);
-    super::ciphertext_matrix(parameters, next_level, target_columns, payload.0, top, desired)
+    super::ciphertext_matrix(parameters, next_level, target_columns, payload.0, top()?, desired)
 }
 
 /// The LUT switching ciphertext `C_sigma` of branch `sigma` of `table` for
-/// a LUT evaluated at `level`, sampled at `q_(level+1)` with top row `top`
+/// a LUT evaluated at `level`, sampled at `q_(level+1)` with top row `top()`
 /// under payload row `payload = (t_bar, 1)`:
 /// `(sigma(t_bar), 1) C_sigma = Delta_(level+1) a_sigma t H_(level+1) + e`.
+/// The operations keep the order the exported correctness claims of the
+/// Static preprocessing graph state.
 pub(super) fn lut_switching_ciphertext(
     parameters: &RnsBggParameters,
     level: usize,
     table: &LutTable,
     payload: &RnsBggRow,
     sigma: IntExpr,
-    top: RnsBggRow,
+    top: impl FnOnce() -> Result<RnsBggRow, RnsBggError>,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let next_level = level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
     let coefficient = super::EncodingLowering::lut_coefficient(
@@ -380,9 +384,14 @@ pub(super) fn lut_switching_ciphertext(
     let gadget = parameters.state_gadget(next_level)?;
     let scale = parameters.scalar(next_level, parameters.message_scale(next_level)?)?;
     let target = lut_payload_target(scale, coefficient, payload.clone(), gadget);
-    let prefix = payload.0.ring_automorphism(sigma);
     let columns = parameters.component_columns(next_level)?;
-    super::ciphertext_matrix(parameters, next_level, columns, prefix, top, target)
+    let top = top()?;
+    let prefix = payload.0.ring_automorphism(sigma);
+    let error = super::encoding::fresh_error(parameters, next_level, columns)?;
+    Ok((
+        top.clone(),
+        (-prefix.clone() * top.0 + target.0 + error.0, -prefix * top.1 + target.1 + error.1),
+    ))
 }
 
 fn lut_payload_target(scale: Mat, coefficient: Mat, payload: RnsBggRow, gadget: Mat) -> RnsBggRow {
@@ -597,8 +606,9 @@ pub struct PublicKeyLowering<'a> {
     /// and slot: the public namespace of Dynamic digit-companion keys.
     pub(crate) context: [u8; 32],
     pub(crate) refresh_prf_namespace: Option<([u8; 32], usize)>,
-    /// RHS plaintexts; a family keeps `plaintext_terms`, read member by member.
-    pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, Vec<(BigInt, usize)>>>,
+    /// RHS plaintexts, read from graph inputs; a family is read member by
+    /// member.
+    pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
     /// Setup-fixed RHS ciphertexts.  These are compact matrices; their signed
     /// decompositions are constructed at the consuming level only.
     pub(crate) rhs_material: BTreeMap<RhsId, InputBinding<RnsBggMatrix, Family<RnsBggMatrix>>>,
@@ -674,8 +684,10 @@ impl<'a> PublicKeyLowering<'a> {
         &mut self,
         rhs: &RhsRef<Int>,
     ) -> Result<Option<RnsBggMatrix>, RnsBggError> {
-        let Some(InputBinding::Family(terms)) = self.rhs.get(&rhs.id) else { return Ok(None) };
-        let members = terms.len();
+        let Some(InputBinding::Family(plaintexts)) = self.rhs.get(&rhs.id) else {
+            return Ok(None);
+        };
+        let members = plaintexts.count().clone();
         let index = rhs
             .index
             .as_ref()
@@ -685,10 +697,11 @@ impl<'a> PublicKeyLowering<'a> {
             .map(|index| index.canonicalize());
         let own_member = match (self.parallel_bodies.as_slice(), &index) {
             ([(count, member, _)], Some(index)) => {
+                let empty = mxx_ir_core::ParamEnv::default();
                 member == index &&
                     count
-                        .evaluate(&mxx_ir_core::ParamEnv::default())
-                        .is_ok_and(|count| count == BigInt::from(members))
+                        .evaluate(&empty)
+                        .is_ok_and(|count| members.evaluate(&empty) == Ok(count))
             }
             _ => false,
         };
@@ -821,12 +834,10 @@ impl<'a> PublicKeyLowering<'a> {
         // into the artifact identity or the online lowerer.
         let plaintext = match self.rhs.get(&rhs.id) {
             Some(InputBinding::Scalar(value)) => value.clone(),
-            Some(InputBinding::Family(terms)) => super::plaintext_member(
+            Some(InputBinding::Family(plaintexts)) => plaintexts.member(
                 &self.parameters.ring(0)?,
-                terms,
                 rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?,
-            )
-            .map_err(|error| RnsBggError::Graph(error.to_string()))?,
+            ),
             None => return Err(RnsBggError::Binding("RHS plaintext was not bound")),
         };
         // The member enters the tag as an index expression, as it does where
@@ -837,15 +848,16 @@ impl<'a> PublicKeyLowering<'a> {
             .map(Int::expression)
             .transpose()
             .map_err(|_| RnsBggError::Binding("RHS member index is not an index expression"))?;
-        let top = rhs_top(
-            self.parameters,
-            self.program.id(),
-            self.hash_key.clone(),
-            rhs.id,
-            level,
-            member,
-        )?;
-        rhs_ciphertext(self.parameters, level, &self.payload()?.row, plaintext, top)
+        rhs_ciphertext(self.parameters, level, &self.payload()?.row, plaintext, || {
+            rhs_top(
+                self.parameters,
+                self.program.id(),
+                self.hash_key.clone(),
+                rhs.id,
+                level,
+                member,
+            )
+        })
     }
     /// Materialize setup-fixed compact `B_sigma` switching ciphertexts for a
     /// complete LUT/layout identity.  Gadget decomposition is deferred until
@@ -886,9 +898,10 @@ impl<'a> PublicKeyLowering<'a> {
             tag.push(sigma.clone());
             tag.push("branch");
             tag.push(index.expression()?);
-            let top = matrix_from_hash(&target_ring, self.hash_key.clone(), tag, columns).0;
-            lut_switching_ciphertext(self.parameters, level, table, payload, sigma, top)
-                .map_err(|_| DslError::Schema)
+            lut_switching_ciphertext(self.parameters, level, table, payload, sigma, || {
+                Ok(matrix_from_hash(&target_ring, self.hash_key.clone(), tag, columns).0)
+            })
+            .map_err(|_| DslError::Schema)
         })
         .map_err(graph)?;
         self.lut_material.insert(key, switching_ciphertexts.clone());
@@ -2182,6 +2195,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 .bind_wire(*wire, binding)
                 .map_err(|e| ApiError::input(e.to_string()))?;
         }
+        let prefix = super::plaintext_input_prefix();
         for (id, declaration) in program.rhs_inputs() {
             if dynamic {
                 // Only references: every key derives from public companion
@@ -2211,9 +2225,15 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 continue;
             }
             let value = rhs.get(id).ok_or_else(|| ApiError::input("missing RHS plaintext"))?;
-            match (declaration, value) {
-                (InputBinding::Scalar(()), InputBinding::Scalar(poly)) => {
-                    let plaintext = super::plaintext_constant(&ring, poly);
+            let plaintext = super::plaintext_inputs(
+                &ring,
+                &format!("{prefix}/rhs/{id:?}"),
+                value,
+                &mut self.runtime,
+            )
+            .map_err(ApiError::input)?;
+            match (declaration, plaintext) {
+                (InputBinding::Scalar(()), InputBinding::Scalar(plaintext)) => {
                     evaluator.rhs.insert(*id, InputBinding::Scalar(plaintext));
                     let reference = RhsRef { id: *id, index: None::<Int> };
                     let material =
@@ -2223,26 +2243,26 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                         .bind_rhs(*id, InputBinding::Scalar(reference))
                         .map_err(|e| ApiError::input(e.to_string()))?;
                 }
-                (InputBinding::Family(count), InputBinding::Family(values)) => {
+                (InputBinding::Family(count), InputBinding::Family(plaintexts)) => {
                     let expected = count
                         .clone()
                         .evaluate(parameters)
                         .ok()
                         .and_then(|value| value.to_usize())
                         .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
-                    if expected != values.len() {
+                    let members = plaintexts.count().clone();
+                    if members != IntExpr::constant(expected) {
                         return Err(ApiError::input("RHS family count does not match Program"));
                     }
-                    let plaintexts = super::plaintext_terms(values).map_err(ApiError::input)?;
                     evaluator.rhs.insert(*id, InputBinding::Family(plaintexts));
-                    let prepared = mxx_dsl::parallel(IntExpr::constant(values.len()), |index| {
+                    let prepared = mxx_dsl::parallel(members.clone(), |index| {
                         evaluator
                             .prepare_rhs_material(&RhsRef { id: *id, index: Some(index) })
                             .map_err(|_| DslError::Schema)
                     })
                     .map_err(ApiError::scheme)?;
                     evaluator.rhs_material.insert(*id, InputBinding::Family(prepared));
-                    let references = mxx_dsl::parallel(IntExpr::constant(values.len()), |index| {
+                    let references = mxx_dsl::parallel(members, |index| {
                         Ok(RhsRef { id: *id, index: Some(index) })
                     })
                     .map_err(ApiError::scheme)?;
@@ -3521,9 +3541,8 @@ mod test {
             row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)),
             binding: None,
         };
-        let value = |constant| {
-            DCRTPoly::from_u32s(&source, &vec![constant; source.ring_dimension() as usize])
-        };
+        // Plaintexts are signed monomials, here constants.
+        let value = |constant| DCRTPoly::from_u32s(&source, &[constant]);
         let mut rhs = BTreeMap::new();
         rhs.insert(first_rhs, InputBinding::Scalar(value(3)));
         rhs.insert(second_rhs, InputBinding::Scalar(value(5)));
@@ -3581,7 +3600,7 @@ mod test {
     fn rhs_family_members_reuse_the_next_level_action_schema() {
         let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
         let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
-        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let parameters = RnsBggParameters::new(vec![high.clone(), low], 1, 1).unwrap();
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
@@ -3615,10 +3634,16 @@ mod test {
             ring.bytes_input("rhs-family-schema-key", 32),
             [0; 32],
         );
-        lowering.rhs.insert(
-            rhs,
-            InputBinding::Family(vec![(BigInt::from(2u8), 0), (BigInt::from(5u8), 0)]),
-        );
+        let constant =
+            |value: u32| mxx_backends::poly::dcrt::poly::DCRTPoly::from_u32s(&high, &[value]);
+        let plaintexts = super::super::plaintext_inputs(
+            &ring,
+            "rhs-family-schema-plaintext",
+            &InputBinding::Family(vec![constant(2), constant(5)]),
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        lowering.rhs.insert(rhs, plaintexts);
         let first = lowering
             .prepare_rhs_material(&RhsRef { id: rhs, index: Some(Int::constant(0usize)) })
             .unwrap();

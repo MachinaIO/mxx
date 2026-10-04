@@ -1,129 +1,155 @@
-# Exponent-LUT Lean certificates
+# Exponent-LUT Lean correctness proofs
 
-Generic integer matrix action bounds live in
-`crates/primitives/lean/PrimitivesBounds.lean`, and balanced radix bounds in
-`crates/primitives/lean/PrimitivesCrtRadix.lean`. Registered gadget witnesses and
-execution bridges live in `crates/runtime/lean/RuntimeDecomposition.lean`.
-Retained witnesses select digits of the corrected target; approximate execution
-retains its invocation-local residual premise. Exact reconstruction requires a
-registered layout with zero dropped moduli.
+This directory proves, in Lean, the worst-case and average-case correctness of the graphs that the
+exponent-LUT integration tests actually execute. Run with a recorded parameter set, an integration
+test exports the executed stages as a closed protocol with `mxx_ir_core::lean::protocol::export`;
+its claim is `GeneratedClaim.CorrectnessClaim`, and the package of that parameter set proves it.
 
-Application mathematics in `crates/exponent-lut/lean/*.lean` covers native program
-evaluation, readout, modulus switching, strict rounding, and CRT recomposition.
-The exact cache specializations carry explicit exact-layout premises; the
-residual-aware cache equation keeps the source-secret multiplication of the
-decomposition residual. Static package compilation alone does not certify an
-approximate application execution. Build with the pinned Lean toolchain:
+## Layout
+
+| Location | Contents |
+| --- | --- |
+| `lean/*.lean` | Lemmas independent of the program and the parameters (package `MxxExponentLut`) |
+| `lean/<test>/` | Lemmas about the program of integration test `<test>` that hold at every parameter set, and `parameters.csv` |
+| `lean/<test>/<parameter id>/` | The proof of one parameter set (a Lake package) |
+| `lean/<test>/<parameter id>/generated/` | The claim the integration test exported deterministically; never edited by hand |
+| `lean/lwr_prf/generator/` | The script that writes the proof modules and the Lake package of an average-case `lwr_prf` parameter set from its exported claim |
+
+`<test>` is `nand_circuit` (`tests/nand_circuit.rs`) or `lwr_prf` (`tests/lwr_prf.rs`). Each
+package requires the package one directory up, and Mathlib and the ir-core Lean library come from
+`crates/ir-core/lean`.
+
+### Program- and parameter-independent lemmas
+
+| File | Contents |
+| --- | --- |
+| `ExponentAutomorphism.lean` | The odd substitution `X ↦ X^σ` and its norm bound |
+| `ExponentScale.lean` | `scaleUp`, the runtime ModDown (`blockModSwitchRuns`) and its remainder |
+| `ExponentEncoding.lean` | The encoding relation `Rel` (`c_j = s₀ A_{0j} + A_{1j} - t_j + e_j`): sums, actions, substitution, ModDown; multiplication gains (`SmulGain`), which are `1` for monomials |
+| `ExponentGadget.lean` | Gadget reconstruction from decompositions, uniqueness of gadgets and rebases |
+| `ExponentStacking.lean` | Row and column concatenation and slicing |
+| `ExponentWalsh.lean` | Walsh (Fourier) interpolation of a LUT |
+| `ExponentLut.lean` | Private multiplication with and without ModDown (for any payload gain), one LUT branch, and the LUT ModDown |
+| `ExponentPublic.lean` | Public multiplication (for any plaintext gain) and the public alignment of a public encoding to a lower modulus |
+| `ExponentDecode.lean` | Terminal threshold decryption of binary coefficients and of the parity of coefficients in `[-T, T]` |
+| `ExponentSampling.lean` | Tape samplers (`…SampleAt`) as deterministic samplers |
+| `ExponentRuntime.lean` | Runtime relations as equations: hashes, family reads, ternary and Gaussian samples, plaintext monomials |
+| `ExponentIterate.lean` | Sums and conjunctions computed by generated `iterate` loops, and constant tables read by `select` |
+
+### Program-dependent lemmas
+
+- `nand_circuit/NandProgram.lean`: the four LUT tables of the depth-one NAND program and the
+  exponent of every round; `rounds_nand` shows that the output exponent is `1 - b₀ b₁`.
+- `lwr_prf/LwrProgram.lean`: the sparse-LWR readout table `τ(k) = ⌊p' k / w⌋ + 1`.
+
+## Parameter IDs
+
+`<test>/parameters.csv` records reproducible parameter sets under unique `parameter_id`s. With
+`MXX_EXPONENT_LUT_NAND_PARAMETER_ID` or `MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID` set to an ID, the
+integration test runs that row without searching, checks that the recorded lattice security
+(`security_bits`) is reproduced, and exports the claim to `<parameter id>/generated`.
+
+Common columns:
+
+| Column | Meaning |
+| --- | --- |
+| `noise_model` | `worst` or `average` |
+| `failure_exponent` | For `average`, the exponent `k` of the failure bound `2^-k`; empty for `worst` |
+| `ring_dimension`, `crt_bits`, `base_bits`, `crt_depth`, `primes_per_drop`, `operations_per_drop` | RNS-BGG parameters |
+| `error_sigma` | Width of the encoding error |
+| `security_bits` | Lattice security estimated by `lattice-estimator-cli` |
+
+`nand_circuit` adds `nand_depth`; `lwr_prf` adds `input_modulus` (`Q`), `output_modulus` (`P`),
+`lwr_dimension` (`ν`), `support_weight` (`h`), `outputs`, and `key_seed`, the seed of the PBC layout
+and the key.
+
+| Test | IDs | Parameters |
+| --- | --- | --- |
+| `nand_circuit` | `worst-n32-crt7x40`, `average-n32-crt7x40` | Depth-one NAND, `n = 32`, seven 40-bit primes, 11-bit security |
+| `lwr_prf` | `worst-n32-crt7x40`, `average-n32-crt7x40` | `Q = 32`, `P = 4`, `ν = 16`, `h = 2`, `n = 32`, seven 40-bit primes, 11-bit security |
+| `lwr_prf` | `average-n65536-crt36x40` | The recommended row of `tests/lwr_prf_parameters.csv`: `Q = 256`, `P = 32`, `ν = 1024`, `h = 31`, `n = 2^16`, thirty-six 40-bit primes with 10-bit digits, 124-bit security |
+
+## Claims and proofs
+
+`GeneratedClaim.CorrectnessClaim` in `generated/Claim.lean` states that every execution whose
+external inputs meet the input contract and the requirement decrypts to the ideal (cleartext)
+output.
+
+- Worst case: every execution, under every hash model, matches.
+- Average case: samplers read a sample tape (`MxxRuntime.SampleTape`), and the tapes with a
+  mismatching execution have measure at most `2^-failure_exponent`. Tape samplers record their
+  cutoffs, so the worst-case analysis holds on every tape and the failure set is empty.
+
+The `…Certificate.lean` module of a parameter set proves `certificate :
+GeneratedClaim.CorrectnessClaim`, and `#guard_msgs` checks that `#print axioms certificate`
+lists only `propext`, `Classical.choice`, and `Quot.sound`.
+
+### NAND (`nand_circuit`)
+
+`NandSetup` (moduli, layouts, LUT automorphisms, hash tags), `NandEncrypt` (the state input and
+the LUT helpers), `NandPreprocess` (the RHS and LUT switching ciphertexts), `NandOnline0` to
+`NandOnline3` (the private multiplication, the fifteen branches of the generated loop, the last
+branch, and the ModDown of each round), and `NandCertificate` (the requirement, the ideal, and
+decryption). The state exponent follows `roundArgument` of `rounds_nand`, and coefficient one of
+the final plaintext `X^(outputExponent b)` is the NAND of the inputs.
+
+### Sparse-LWR PRF (`lwr_prf`)
+
+`LwrSetup`, `LwrInputs` (the requirement and the ideal output, which check the members of `a` and
+sum every block's selectors in loops), `LwrEncrypt` (the state `X^0`, every member of the public
+vector `a`, and the readout LUT helpers), `LwrPreprocess` (the selector RHS of every block and the
+readout switching ciphertexts), `LwrBlock0` to `LwrBlock<B-1>` (the public alignment, public
+multiplication, and private multiplication with ModDown of every cell, and the sum of the cells),
+`LwrLut` (the coefficient LUT from `Q2` to `Q1`), and `LwrCertificate`. The requirement makes the
+plaintext of member `k` of `a` the monomial `X^(stride a_k)` and every block's selectors one-hot, so
+after the blocks the state is `X^(stride z)` for the sum `z` of the selected coordinates; the readout
+LUT gives `(-1)^⌊z/w⌋ τ(z mod w)` for `w = Q/2`, and decryption returns its parity, the ideal output.
+
+At `average-n65536-crt36x40` (34 blocks of 113 cells, a readout LUT of 128 branches) the error
+analysis keeps the bound of an error multiplied by a monomial plaintext (`SmulGain _ 1`), as the
+noise audit of the crate does; the coarser bound `n ‖e‖` of the small parameter sets would not fit
+the terminal modulus at `n = 2^16`. The worst-case cutoffs of the tape samplers then bound the
+terminal error by about `2^35.6` against `Q1 ≈ 2^40`. Its cells live in `LwrCells`, and its proof
+library passes `--tstack` to Lean, since the kernel check of the certificate, which chains the 34
+blocks, needs a larger thread stack than the default.
+
+## Reproduction
+
+Export a claim and run the integration test on a GPU (`lattice-estimator-cli` must be on the
+`PATH`):
 
 ```sh
-cd crates/exponent-lut/lean
+MXX_EXPONENT_LUT_NAND_PARAMETER_ID=worst-n32-crt7x40 \
+  cargo test -p mxx-exponent-lut --features gpu --test nand_circuit -- --nocapture
+MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=worst-n32-crt7x40 \
+  cargo test -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
+```
+
+The export is deterministic: rerunning an ID writes identical `generated` files. The round trip of
+`average-n65536-crt36x40` does not fit a local GPU; `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1` exports
+its claim from the same stage graphs without executing them:
+
+```sh
+MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1 MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=average-n65536-crt36x40 \
+  cargo test -r -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
+```
+
+The proof of an average-case `lwr_prf` parameter set is written by the generator from its row and its
+exported claim; it writes every proof module and the Lake package files, and regenerating
+`average-n65536-crt36x40` reproduces its proof byte for byte. The cells, the block sums, and the
+readout LUT of `average-n32-crt7x40` are its templates.
+
+```sh
+cd crates/exponent-lut/lean/lwr_prf
+python3 generator/gen.py average-n65536-crt36x40
+```
+
+Check a proof in its parameter directory:
+
+```sh
+cd crates/exponent-lut/lean/nand_circuit/worst-n32-crt7x40
 lake build
 ```
 
-The BGG identity LUT with an encrypted RHS uses
-`ProgramState.identityLutOutput` and `ProgramDerivation.identityLutStep`;
-these describe the optimized single branch action, not a separate Program
-opcode. `MxxExponentLut.lut_fused_message` and
-`ProgramState.fusedLut_message` identify the sum with branch coefficients
-`D_i * sigma_i(rhs)` as the linear LUT map on `message * rhs`. The existing
-`lutStep` and branch error theorem accept those fused coefficients directly.
-The switch-error term is multiplied by the input message only. These lemmas
-do not by themselves certify the new BFV backend or a particular exported
-binary-LUT execution.
-
-`ExponentBfv.lean` contains equal-level Add/public multiplication, BFV branch cancellation, aggregate relation,
-fresh-RHS wrap cancellation, scaled outer-switch relation, and coefficientwise error-numerator
-divisibility for ordinary ModDown, direct-decoder cancellation, and fresh-target
-affine readout from the BFV double-scale note. It also proves that strict
-low-order mask/error bounds give the exact centered remainder, that ordinary
-ModDown recovers the fresh coefficient, and that full-modulus lift changes
-leave its CRT residue unchanged. Its premises expose the internal/outer switch
-equations and the integer wrap witness. These are reusable algebraic lemmas;
-linking actual primitive executions to those premises, proving the full norm
-recurrence, and certifying an exported BFV Program remain separate work.
-
-Candidate-specific modules belong in ignored `test_data` directories. The
-exporters in `crates/exponent-lut/src/lean.rs` and
-`crates/exponent-lut/src/lean/` connect the reusable lemmas to the actual frozen
-preprocessing and verification graphs, backend layouts, public inputs, and noise
-report. Their proof chain follows the native program, readout, routed source
-bounds, paired switching, strict decoding, and final CRT residual. Graph-derived
-relations and shared execution witnesses keep internal samples, caches, and
-outputs tied to the same executions.
-
-The IR layer generates `Claim.lean`. The application proof contract is
-`RefreshCorrectness.lean`, with theorem
-`ExponentGeneratedRefreshCorrectness.correctness : GeneratedClaim.CorrectnessClaim`.
-The IR layer then assembles `Certificate.lean` and its
-`GeneratedCertificate.correctness` declaration against that claim. Application
-code supplies the proof, not a replacement claim.
-
-## Acceptance and checking
-
-Worst-case numerical acceptance is a prerequisite for certification. The gate in
-`crates/exponent-lut/src/lean/certify.rs` checks the selected candidate's complete
-source closure and core certificate before retaining worst-case acceptance.
-Average-case acceptance continues to use the Rust simulation; it does not produce
-a worst-case Lean certificate.
-
-The reusable checker lives in `crates/runtime/src/lean/check.rs`. The application
-supplies its Lake package directory and complete local Lean source roots; Lake
-builds the package's declared default targets.
-
-The checker builds the static dependency closure first, records its source and
-object fingerprints, and compiles candidate modules into a fresh check directory
-in dependency order, with up to three independent modules running concurrently
-and `Certificate` last. WE uses the same runtime process scheduler; its application
-adapter retains its own final theorem identity and axiom policy. It compares candidate bytes with the
-exporter's authoritative in-memory source map before and after checking. Missing
-proofs or dependencies, compiler failures, timeouts, source changes, and failed
-axiom audits reject certification. The certificate's allowed axioms are
-`propext`, `Classical.choice`, and `Quot.sound`.
-
-Only successful checks write `checked-record.json`, containing source and dependency
-hashes, module logs, and elapsed time. Export-only tests do not certify a candidate.
-
-The route exporter proves the actual per-slot/per-digit scalar table and its
-offset/index lookup. Readout helper lemmas are emitted from the graph producers
-required by their consumers; the complete execution graphs remain unchanged.
-
-`ExponentNativeFirstStage` and `ExponentNativeProgramProof` are generated for
-the current candidate, rather than retained as obsolete concrete snapshots in
-this directory. Coverage includes the first-stage derivation and its `Approx`
-soundness corollary, every native program stage, and the actual final program
-output bound. The positive certificate test requires both modules' kernel
-objects and logs in addition to `Certificate.olean` and `checked-record.json`.
-
-`MXX_EXPONENT_LUT_LEAN_TIMEOUT_SECONDS` sets a positive integer wall-clock budget
-for the entire checker invocation, including static builds, generated modules,
-and final identity checks. Its default is 21600 seconds (six hours), an operational
-allowance rather than a completion-time guarantee. Invalid values are errors.
-Library callers can supply an explicit `Duration` to `certify`. This wall-clock
-budget does not change the Lean limits: stack 131072, 2000000 heartbeats, and
-recursion depth 16384.
-
-## Actual-certificate tests
-
-Run these ignored library tests from the repository root with the pinned Lean
-package and complete candidate proof exporter available:
-
-```sh
-MXX_EXPONENT_LUT_LEAN_TIMEOUT_SECONDS=21600 cargo test -r -p mxx-exponent-lut --lib lean::certify::tests::test_actual_full_certificate -- --ignored --exact --nocapture
-MXX_EXPONENT_LUT_LEAN_TIMEOUT_SECONDS=21600 cargo test -r -p mxx-exponent-lut --lib lean::certify::tests::test_actual_certificate_rejects_wrong_theorem_type -- --ignored --exact --nocapture
-```
-
-The positive test searches for a numerically accepted worst-case candidate,
-materializes its actual graphs, and requires a checked core certificate. The
-optional negative test preserves the actual claim but replaces the application
-theorem with a proof of `True`. It requires a type mismatch specifically in
-`Certificate`; an earlier failure or timeout does not satisfy the test.
-
-Both tests share the accepted-worst-case fixture with the export-only test.
-Fixture overrides are `MXX_PRIMITIVE_TEST_RING_DIMENSION` (default 32),
-`MXX_PRIMITIVE_TEST_CRT_DEPTH` (maximum 8), `MXX_PRIMITIVE_TEST_CRT_BITS` (40), and
-`MXX_PRIMITIVE_TEST_BASE_BITS` (4). Positive artifacts go under
-`test_data/exponent_lut_actual_full_certificate`; negative artifacts go under
-`test_data/exponent_lut_actual_wrong_theorem`. Expected negative rejection writes
-`rejection-record.json` with the error kind, certificate log path, and source
-hashes. The negative test checks theorem-to-claim binding; ordinary tamper tests
-separately check source-integrity rejection.
+`lake build` builds both the exported claim (`NandGenerated` or `LwrGenerated`) and its proof
+(`NandProof` or `LwrProof`).

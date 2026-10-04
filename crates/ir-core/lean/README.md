@@ -79,3 +79,40 @@ provides the reusable initial/step invariant elimination rule.
 Production Diamond artifacts are generated and checked inside parameter search, not through
 these fixtures. Application proofs remain in their owning crate; the shared exporter and
 linked-claim renderer live in `crates/ir-core/src/lean`.
+
+## Reproducible proof CI
+
+CI installs Lean `leanprover/lean4:v4.28.0`, fetches mathlib's compiled cache in this package,
+and runs `lake build` here, then in `crates/fhe/lean/tfhe`, `crates/fhe/lean/bgv`, and
+`crates/dsl/examples/rlwe`. All four builds are required by the `ci success` job.
+The certificate targets are included in each package's default targets.
+
+After installing the normal Rust/OpenFHE dependencies, check that the committed claims
+still describe the current Rust graphs and protocol declarations from the repository root:
+
+```sh
+python3 scripts/check_lean_claims.py
+```
+
+This builds the exporters without GPU features, regenerates TFHE, BGV and RLWE into a temporary
+directory, and compares the full file sets and raw bytes with their committed `generated/`
+directories. It never overwrites the checkout. Changed bytes, newly generated modules, and
+committed modules no longer emitted all fail CI. Unset `FHE_TEST_*` overrides for this check;
+the committed proofs use the default fixtures.
+
+To intentionally update the claims after a graph or protocol change:
+
+```sh
+output=$(mktemp -d)
+cargo run --locked -p mxx-fhe --example export_claims -- "$output"
+# Review $output/tfhe and $output/bgv before replacing their generated directories.
+cargo run --locked -p mxx-dsl --example rlwe_encrypt -- --export-lean crates/dsl/examples/rlwe/generated
+```
+
+The FHE exporters and GPU tests use `mxx_fhe::utils::protocol` for the same graph templates,
+metadata and linked declarations. RLWE's export-only mode uses the same program and declaration
+as its GPU mode. Exporting constructs graphs and validates declarations; it executes no
+cryptographic computation and needs neither CUDA nor a GPU.
+
+`crates/we/lean` is excluded: its proofs need parameter-search-selected modules absent from a
+fresh checkout. Its parameter-search proof checks remain separate.

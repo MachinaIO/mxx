@@ -407,8 +407,8 @@ impl LexicalEnv {
             IntExpr::Div(a, b) => {
                 format!("MxxIR.exactDiv ({}) ({})", self.expr(a), self.expr(b))
             }
-            IntExpr::FloorDiv(a, b) => format!("Int.fdiv ({}) ({})", self.expr(a), self.expr(b)),
-            IntExpr::Rem(a, b) => format!("Int.fmod ({}) ({})", self.expr(a), self.expr(b)),
+            IntExpr::FloorDiv(a, b) => format!("(Int.fdiv ({}) ({}))", self.expr(a), self.expr(b)),
+            IntExpr::Rem(a, b) => format!("(Int.fmod ({}) ({}))", self.expr(a), self.expr(b)),
             IntExpr::Select { selector, branches } => format!(
                 "MxxIR.selectInt ({}) [{}]",
                 self.expr(selector),
@@ -3255,8 +3255,8 @@ mod tests {
     #[test]
     fn export_supports_integer_expression_semantics() {
         for (expression, expected) in [
-            (IntExpr::FloorDiv(Box::new(7.into()), Box::new(2.into())), "Int.fdiv (7) (2)"),
-            (IntExpr::Rem(Box::new(7.into()), Box::new(2.into())), "Int.fmod (7) (2)"),
+            (IntExpr::FloorDiv(Box::new(7.into()), Box::new(2.into())), "(Int.fdiv (7) (2))"),
+            (IntExpr::Rem(Box::new(7.into()), Box::new(2.into())), "(Int.fmod (7) (2))"),
             (
                 IntExpr::Select { selector: Box::new(0.into()), branches: vec![7.into()] },
                 "MxxIR.selectInt (0) [(7)]",
@@ -3986,7 +3986,7 @@ mod tests {
         let remainder =
             IntExpr::Rem(Box::new(IntExpr::constant(3)), Box::new(IntExpr::constant(-2)));
         assert_eq!(remainder.evaluate(&ParamEnv::default()).unwrap(), BigInt::from(-1));
-        assert_eq!(env.expr(&remainder), "Int.fmod (3) (-2)");
+        assert_eq!(env.expr(&remainder), "(Int.fmod (3) (-2))");
     }
 
     #[test]
@@ -4268,8 +4268,8 @@ mod tests {
                 .unwrap();
         let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
-        assert!(artifact.source.contains("MxxIR.exactDiv (Int.fdiv (8) (2)) (2)"));
-        assert!(artifact.source.contains("MxxIR.roundDiv (Int.fmod (7) (4)) (2)"));
+        assert!(artifact.source.contains("MxxIR.exactDiv ((Int.fdiv (8) (2))) (2)"));
+        assert!(artifact.source.contains("MxxIR.roundDiv ((Int.fmod (7) (4))) (2)"));
         assert!(artifact.source.contains("MxxIR.log2Ceil (MxxIR.selectInt"));
     }
 

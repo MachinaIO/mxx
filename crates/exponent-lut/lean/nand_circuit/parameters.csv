@@ -1,3 +1,4 @@
-parameter_id,noise_model,failure_exponent,nand_depth,ring_dimension,crt_bits,base_bits,crt_depth,primes_per_drop,operations_per_drop,error_sigma,security_bits
-worst-n32-crt7x40,worst,,1,32,40,20,7,1,2,4,11
-average-n32-crt7x40,average,100,1,32,40,20,7,1,2,4,11
+parameter_id,noise_model,failure_exponent,nand_depth,ring_dimension,crt_bits,base_bits,crt_depth,primes_per_drop,operations_per_drop,error_sigma,security_bits,rhs_mode
+worst-n32-crt7x40,worst,,1,32,40,20,7,1,2,4,11,static
+average-n32-crt7x40,average,100,1,32,40,20,7,1,2,4,11,static
+dynamic-worst-n32-crt7x40,worst,,1,32,40,20,7,1,2,4,11,dynamic

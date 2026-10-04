@@ -210,15 +210,17 @@ fn select_candidate(
     if let Some(row) = recorded {
         assert_eq!(common::column::<u32>(row, "base_bits"), expected_base_bits);
     }
-    // `MXX_EXPONENT_LUT_NAND_RHS_MODE=dynamic` chooses the RHS values only at
-    // encryption. Recorded parameter sets, whose claims are exported, are
-    // Static.
-    let rhs_mode = rhs_mode("MXX_EXPONENT_LUT_NAND_")
-        .unwrap_or_else(|error| panic!("invalid NAND RHS mode: {error}"));
-    assert!(
-        recorded.is_none() || rhs_mode == RhsMode::Static,
-        "recorded NAND parameter sets run the Static RHS lifecycle"
-    );
+    // `MXX_EXPONENT_LUT_NAND_RHS_MODE=dynamic`, or a recorded row's
+    // `rhs_mode`, chooses the RHS values only at encryption.
+    let rhs_mode = match recorded {
+        Some(row) => match row["rhs_mode"].as_str() {
+            "static" => RhsMode::Static,
+            "dynamic" => RhsMode::Dynamic,
+            mode => panic!("recorded RHS mode {mode} is neither static nor dynamic"),
+        },
+        None => rhs_mode("MXX_EXPONENT_LUT_NAND_")
+            .unwrap_or_else(|error| panic!("invalid NAND RHS mode: {error}")),
+    };
     let expected_acceptance = match average.as_ref() {
         Some(_) => NoiseModelKind::AverageCase,
         None => NoiseModelKind::WorstCase,
@@ -575,7 +577,7 @@ fn nand_circuit_end_to_end() {
             &compiled,
             graphs.into_inner(),
             &payload,
-            mask.as_ref().expect("recorded parameter sets are Static"),
+            mask.as_ref(),
             (preprocess.production().clone(), encrypted.production().clone()),
             &row,
         );
@@ -594,7 +596,7 @@ fn nand_protocol(
     compiled: &mxx_exponent_lut::CompiledNandCircuit,
     graphs: BTreeMap<&'static str, Graph>,
     payload: &RnsBggPayloadSecret,
-    mask: &mxx_exponent_lut::rns_bgg::RnsBggMaskSecret,
+    mask: Option<&mxx_exponent_lut::rns_bgg::RnsBggMaskSecret>,
     (preprocess, encrypt): (
         mxx_ir_core::artifact::ProductionId,
         mxx_ir_core::artifact::ProductionId,
@@ -603,17 +605,30 @@ fn nand_protocol(
 ) -> ProtocolDecl {
     let id = |name: &str| StageId(name.to_owned());
     let productions = BTreeMap::from([(preprocess, id("preprocess")), (encrypt, id("encrypt"))]);
-    let payload_name = payload.input_name().expect("sampled payload").to_owned();
-    let mask_name = mask.input_name().expect("sampled mask").to_owned();
     let secret = |stage: &str| (id(stage), "secret".to_owned());
-    let mut links =
-        BTreeMap::from([(payload_name, secret("payload")), (mask_name, secret("mask"))]);
+    let mut links = BTreeMap::from([(
+        payload.input_name().expect("sampled payload").to_owned(),
+        secret("payload"),
+    )]);
+    // A Dynamic workflow samples no separate mask: its payload secret, sampled after
+    // preprocessing, is also the mask, and encryption binds the RHS plaintexts. No stage the
+    // decryption depends on reads a preprocessing artifact, so its preprocessing is not part of
+    // the claim.
+    if let Some(mask) = mask {
+        links.insert(mask.input_name().expect("sampled mask").to_owned(), secret("mask"));
+    }
+    let (stage_names, rhs_stage): (&[&str], _) = match mask {
+        Some(_) => {
+            (&["payload", "mask", "preprocess", "encrypt", "online", "decode"], "preprocess")
+        }
+        None => (&["payload", "encrypt", "online", "decode"], "encrypt"),
+    };
     for (input, port) in [("decode-key-01", 1), ("decode-key-11", 3), ("decode-row-1", 5)] {
         links.insert(input.to_owned(), (id("online"), format!("output-0.{port}")));
     }
     let graph = |name: &str| &graphs[name];
-    let stages = ["payload", "mask", "preprocess", "encrypt", "online", "decode"]
-        .into_iter()
+    let stages = stage_names
+        .iter()
         .map(|name| common::stage(name, graph(name), &productions, &links))
         .collect::<Vec<_>>();
 
@@ -643,7 +658,8 @@ fn nand_protocol(
         PurePredicateSpec::new(requirement.output("valid", valid).unwrap().build().unwrap().graph)
             .unwrap();
 
-    // The plaintext inputs of preprocessing (RHS `X^(8 bit)`) and encryption (state `X^2`).
+    // The plaintext inputs of the RHS stage (RHS `X^(8 bit)`: preprocessing when Static,
+    // encryption when Dynamic) and of encryption (state `X^2`).
     let only = |stage: &str, suffix: String| -> String {
         let [name] = <[String; 1]>::try_from(common::inputs_ending_with(graph(stage), &suffix))
             .unwrap_or_else(|_| panic!("{stage} must declare one input ending with {suffix}"));
@@ -660,16 +676,15 @@ fn nand_protocol(
     let mut exponents = vec![Vec::new(); leaves];
     for (rhs, leaf) in compiled.rhs_ids().iter().zip(compiled.circuit_input_indices()) {
         unit.push(common::to_stage(
-            "preprocess",
-            &only("preprocess", format!("/rhs/{rhs:?}.coefficient")),
+            rhs_stage,
+            &only(rhs_stage, format!("/rhs/{rhs:?}.coefficient")),
         ));
-        exponents[*leaf].push(common::to_stage(
-            "preprocess",
-            &only("preprocess", format!("/rhs/{rhs:?}.exponent")),
-        ));
+        exponents[*leaf]
+            .push(common::to_stage(rhs_stage, &only(rhs_stage, format!("/rhs/{rhs:?}.exponent"))));
     }
-    let hash_key = ["preprocess", "encrypt", "online"]
-        .into_iter()
+    let hash_key = stage_names
+        .iter()
+        .copied()
         .filter(|stage| !common::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
         .map(|stage| common::to_stage(stage, "rns-bgg/hash-key"))
         .collect();

@@ -1,0 +1,25 @@
+name = "MxxExponentLutNandDynamicWorstN32Crt7x40"
+version = "0.1.0"
+defaultTargets = ["NandGenerated", "NandProof"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLutNand"
+path = ".."
+
+# Modules written by `nand_circuit_end_to_end` (`tests/nand_circuit.rs`) for this parameter set.
+[[lean_lib]]
+name = "NandGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "Ideal", "Requirement_0", "Stage_payload", "Stage_encrypt", "Stage_online",
+  "Stage_decode"
+]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "NandProof"
+roots = ["NandSetup", "NandEncrypt", "NandDigits", "NandRound0", "NandRound1", "NandRound2", "NandRound3", "NandCertificate"]

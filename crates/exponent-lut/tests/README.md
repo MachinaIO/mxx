@@ -150,8 +150,10 @@ of `lean/<test>/parameters.csv` (the noise model, the RNS-BGG parameters, the er
 the PRF the LWR profile and the key seed). They check that the recorded lattice security is
 reproduced, verify the round trip and the decrypted output, and export the graphs of the executed
 stages as a closed protocol to `lean/<test>/<parameter id>/generated`. See `lean/README.md` for the
-meaning of each column and the proofs of the exported claims. A parameter ID runs the Static RHS
-lifecycle; it cannot be combined with `*_RHS_MODE=dynamic`.
+meaning of each column and the proofs of the exported claims. A NAND parameter ID runs the RHS
+lifecycle of its row's `rhs_mode` and ignores `MXX_EXPONENT_LUT_NAND_RHS_MODE`; a Dynamic row exports
+the stages `payload`, `encrypt`, `online`, and `decode`. A Sparse-LWR parameter ID runs the Static
+lifecycle; it cannot be combined with `MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic`.
 
 `lwr_prf.rs` with `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1` as well builds and validates the same
 stage graphs without a round trip: only the secret sampling executes, on the CPU, and the claim is

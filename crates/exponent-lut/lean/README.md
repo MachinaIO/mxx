@@ -35,6 +35,7 @@ package requires the package one directory up, and Mathlib and the ir-core Lean 
 | `ExponentSampling.lean` | Tape samplers (`…SampleAt`) as deterministic samplers |
 | `ExponentRuntime.lean` | Runtime relations as equations: hashes, family reads, ternary and Gaussian samples, plaintext monomials |
 | `ExponentIterate.lean` | Sums and conjunctions computed by generated `iterate` loops, and constant tables read by `select` |
+| `ExponentDynamic.lean` | Dynamic RHS products: column-wise digits, digit companions, the companion row and keys, the Dynamic private multiplication and LUT branch, and the windows of loop-accumulated rows |
 
 ### Program-dependent lemmas
 
@@ -59,13 +60,15 @@ Common columns:
 | `error_sigma` | Width of the encoding error |
 | `security_bits` | Lattice security estimated by `lattice-estimator-cli` |
 
-`nand_circuit` adds `nand_depth`; `lwr_prf` adds `input_modulus` (`Q`), `output_modulus` (`P`),
+`nand_circuit` adds `nand_depth` and `rhs_mode` (`static` or `dynamic`, the RHS lifecycle the
+round trip runs); `lwr_prf` adds `input_modulus` (`Q`), `output_modulus` (`P`),
 `lwr_dimension` (`ν`), `support_weight` (`h`), `outputs`, and `key_seed`, the seed of the PBC layout
 and the key.
 
 | Test | IDs | Parameters |
 | --- | --- | --- |
 | `nand_circuit` | `worst-n32-crt7x40`, `average-n32-crt7x40` | Depth-one NAND, `n = 32`, seven 40-bit primes, 11-bit security |
+| `nand_circuit` | `dynamic-worst-n32-crt7x40` | The same NAND parameters with the Dynamic RHS lifecycle |
 | `lwr_prf` | `worst-n32-crt7x40`, `average-n32-crt7x40` | `Q = 32`, `P = 4`, `ν = 16`, `h = 2`, `n = 32`, seven 40-bit primes, 11-bit security |
 | `lwr_prf` | `average-n65536-crt36x40` | The recommended row of `tests/lwr_prf_parameters.csv`: `Q = 256`, `P = 32`, `ν = 1024`, `h = 31`, `n = 2^16`, thirty-six 40-bit primes with 10-bit digits, 124-bit security |
 
@@ -92,6 +95,15 @@ the LUT helpers), `NandPreprocess` (the RHS and LUT switching ciphertexts), `Nan
 branch, and the ModDown of each round), and `NandCertificate` (the requirement, the ideal, and
 decryption). The state exponent follows `roundArgument` of `rounds_nand`, and coefficient one of
 the final plaintext `X^(outputExponent b)` is the NAND of the inputs.
+
+The Dynamic set `dynamic-worst-n32-crt7x40` has no preprocess or mask stage: the payload stage
+samples the single secret, and encryption also produces the RHS ciphertexts, the switching
+ciphertexts, and the digit companions. `NandEncrypt` proves the encodings and ciphertexts,
+`NandDigits` the RHS and LUT digit companions, and `NandRound0` to `NandRound3` each round: the
+RHS companion loop (the companion keys and row), the column loop (`c Dec(C)`), the Dynamic private
+multiplication, which keeps its modulus, the LUT companion loop, the loop over the sixteen branches
+with its two nested column loops, and the LUT ModDown. `NandRound1` to `NandRound3` repeat the
+lemmas of `NandRound0` at their moduli and widths; the last LUT outputs one column.
 
 ### Sparse-LWR PRF (`lwr_prf`)
 

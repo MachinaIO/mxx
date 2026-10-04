@@ -26,7 +26,7 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,
         RnsBggParameters, RnsBggPayloadSecret, RnsBggPlanRequest, RnsEncryptBuild, RnsNoiseBuild,
-        RnsOnlineBuild, RnsPreprocessBuild, decode_output, verify_output,
+        RnsOnlineEvalBuild, RnsPreprocessBuild, decode_output, verify_output,
     },
     utils::{
         audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
@@ -455,7 +455,7 @@ fn nand_circuit_end_to_end() {
     // Static preprocessing receives the private RHS plaintexts and caller
     // payload; Dynamic preprocessing receives neither. It returns two typed
     // named-session artifacts consumed by later stages.
-    let (preprocess, online) = api::preprocess(
+    let (preprocess, online_eval) = api::preprocess(
         compiled.program(),
         &ParamEnv::default(),
         if dynamic { &no_rhs } else { &rhs },
@@ -506,14 +506,14 @@ fn nand_circuit_end_to_end() {
     let result = api::online_eval(
         compiled.program(),
         &ParamEnv::default(),
-        &online,
+        &online_eval,
         &encrypted,
         HASH_KEY,
-        RnsOnlineBuild::new(&parameters, [0x4e; 32]),
+        RnsOnlineEvalBuild::new(&parameters, [0x4e; 32]),
         &mut runtime,
         &mut store,
         |_, outputs| Ok(outputs),
-        record("online"),
+        record("online_eval"),
     )
     .expect("public online evaluation");
 
@@ -619,12 +619,12 @@ fn nand_protocol(
     }
     let (stage_names, rhs_stage): (&[&str], _) = match mask {
         Some(_) => {
-            (&["payload", "mask", "preprocess", "encrypt", "online", "decode"], "preprocess")
+            (&["payload", "mask", "preprocess", "encrypt", "online_eval", "decode"], "preprocess")
         }
-        None => (&["payload", "encrypt", "online", "decode"], "encrypt"),
+        None => (&["payload", "encrypt", "online_eval", "decode"], "encrypt"),
     };
     for (input, port) in [("decode-key-01", 1), ("decode-key-11", 3), ("decode-row-1", 5)] {
-        links.insert(input.to_owned(), (id("online"), format!("output-0.{port}")));
+        links.insert(input.to_owned(), (id("online_eval"), format!("output-0.{port}")));
     }
     let graph = |name: &str| &graphs[name];
     let stages = stage_names

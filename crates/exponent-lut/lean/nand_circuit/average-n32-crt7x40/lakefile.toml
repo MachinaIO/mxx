@@ -16,10 +16,10 @@ name = "NandGenerated"
 srcDir = "generated"
 roots = [
   "Backend", "Claim", "Ideal", "Requirement_0", "Stage_payload", "Stage_mask",
-  "Stage_preprocess", "Stage_encrypt", "Stage_online", "Stage_decode"
+  "Stage_preprocess", "Stage_encrypt", "Stage_online_eval", "Stage_decode"
 ]
 
 # The proof of the generated claim.
 [[lean_lib]]
 name = "NandProof"
-roots = ["NandSetup", "NandEncrypt", "NandPreprocess", "NandOnline0", "NandOnline1", "NandOnline2", "NandOnline3", "NandCertificate"]
+roots = ["NandSetup", "NandEncrypt", "NandPreprocess", "NandOnlineEval0", "NandOnlineEval1", "NandOnlineEval2", "NandOnlineEval3", "NandCertificate"]

@@ -130,7 +130,7 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
     {execution : GeneratedClaim.Execution}
     (hruns : GeneratedClaim.Runs model external tape execution) :
     execution.«stage_5» = execution.«ideal» := by
-  obtain ⟨hvalid, hpay, hmask, hpre, henc, honline, hdec, hreq, hideal, hreqtrue⟩ := hruns
+  obtain ⟨hvalid, hpay, hmask, hpre, henc, honlineEval, hdec, hreq, hideal, hreqtrue⟩ := hruns
   obtain ⟨sp, hsp, hspn⟩ := secret_ternary hpay
   obtain ⟨sm, hsm, hsmn⟩ := mask_ternary hmask
   obtain ⟨-, ⟨hc1, hc2⟩, ⟨he1, he2⟩, ha, hac, hae, hs0, hx0, hs1, hx1, hs2, hx2, hs3, hx3, hs4, hx4⟩ :=
@@ -201,7 +201,7 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   have hrhs4 := preprocess_selector4 hpre hsp hg2 hg2u
   have hsw := preprocess_switch hpre hsp
   -- The five blocks accumulate the monomial of the sum of the selected coordinates.
-  obtain ⟨w, hb⟩ := honline
+  obtain ⟨w, hb⟩ := honlineEval
   -- Block 0.
   have hb0 := block0 hb hsmn (μ := Xe 0) (α := α) (ν := fun i ↦ message (n := N) (s0 i) (x0 i))
     (fun i ↦ by rw [Xe_mul]; exact polyNorm_Xe hN1 _) (fun k ↦ polyNorm_Xe hN1 _) hG14 hg12 hg12u hmemα
@@ -250,9 +250,9 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   -- The readout LUT and the decryption.
   have hlut := lutRound hb hsmn hg2 hg2u hin5 hhelp hsw
   have hb2 := hb
-  unfold Stage_online.generatedRoot.body at hb2
+  unfold Stage_online_eval.generatedRoot.body at hb2
   extract_lets at hb2
-  have houtOnline := hb2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
+  have houtOnlineEval := hb2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
   obtain ⟨wd, hd⟩ := hdec
   unfold Stage_decode.generatedRoot.body at hd
   dsimp only at hd
@@ -266,7 +266,7 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
     decide
   have hval := decode_terminal_parity hQ1 (by norm_num) hN hlut hbound (k := ⟨0, hN⟩)
     (lutValue_coeff_bound z5) (by
-      rw [houtOnline, hw2, hw6]
+      rw [houtOnlineEval, hw2, hw6]
       funext r c
       obtain rfl : r = 0 := Subsingleton.elim _ _
       obtain rfl : c = 0 := Subsingleton.elim _ _

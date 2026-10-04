@@ -28,7 +28,7 @@ theorem cell3 {model : HashModel} {key : ByteArray} {ca0 ca1 : Fin 17 → ExactM
     {apay : Fin 17 → ExactMatrix Q7 N 1 1} {As : Fin 2 → Fin 2 → ExactMatrix Q4 N 1 6}
     {cs : Fin 2 → ExactMatrix Q4 N 1 6} {bot0 bot1 : Fin 14 → ExactMatrix Q3 N 1 4} {i : Fin 14}
     {outputs}
-    (hcell : Stage_online.parallel_generatedRoot_89 Backend.backend model tape cellPath
+    (hcell : Stage_online_eval.parallel_generatedRoot_89 Backend.backend model tape cellPath
       GeneratedClaim.stage_4_params i
       (ca0, key, ca1, As 0 0, As 1 0, cs 0, apay, As 0 1, As 1 1, cs 1, bot0 i, bot1 i, ()) outputs)
     {sm sp μ ν : ErrorPoly N} {α : Fin 17 → ErrorPoly N} (hsm : polyNorm sm ≤ 1)
@@ -51,7 +51,7 @@ theorem cell3 {model : HashModel} {key : ByteArray} {ca0 ca1 : Fin 17 → ExactM
       (fun j ↦ reducePoly Q3 N (((P3 : Nat) : Int) * (α ⟨coords 3 i, coords_lt 3 i⟩ * μ * ν) *
         unitPair sp j) • h)
       ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1] (cellBound3 Bs) := by
-  unfold Stage_online.parallel_generatedRoot_89 at hcell
+  unfold Stage_online_eval.parallel_generatedRoot_89 at hcell
   try extract_lets at hcell
   obtain ⟨w_2_0, hcell⟩ := hcell
   try extract_lets at hcell
@@ -324,14 +324,14 @@ set_option maxHeartbeats 4000000 in
 /-- One iteration of the block-3 sum adds cell `2 + i` to every block. -/
 theorem sum3_step {model : HashModel} {f0 f1 f2 f3 f4 f5 : Fin 14 → ExactMatrix Q3 N 1 4} {i : Nat}
     {current next : SumState Q3 4}
-    (hbody : Stage_online.sequential_generatedRoot_108 Backend.backend model tape loopPath
+    (hbody : Stage_online_eval.sequential_generatedRoot_108 Backend.backend model tape loopPath
       GeneratedClaim.stage_4_params i
       (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
         current.2.2.2.2.2.1, f0, f1, f2, f3, f4, f5, ()) next) :
     next = (current.1 + cellAt f0 (2 + i), current.2.1 + cellAt f1 (2 + i),
       current.2.2.1 + cellAt f2 (2 + i), current.2.2.2.1 + cellAt f3 (2 + i),
       current.2.2.2.2.1 + cellAt f4 (2 + i), current.2.2.2.2.2.1 + cellAt f5 (2 + i), ()) := by
-  unfold Stage_online.sequential_generatedRoot_108 at hbody
+  unfold Stage_online_eval.sequential_generatedRoot_108 at hbody
   try extract_lets at hbody
   obtain ⟨w_3_0, hbody⟩ := hbody
   try extract_lets at hbody
@@ -367,7 +367,7 @@ theorem sum3_step {model : HashModel} {f0 f1 f2 f3 f4 f5 : Fin 14 → ExactMatri
 theorem sum3 {model : HashModel} {f0 f1 f2 f3 f4 f5 : Fin 14 → ExactMatrix Q3 N 1 4} {count : Nat}
     {init final : SumState Q3 4}
     (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : SumState Q3 4) ↦
-      Stage_online.sequential_generatedRoot_108 Backend.backend model tape (loopPaths i) GeneratedClaim.stage_4_params i
+      Stage_online_eval.sequential_generatedRoot_108 Backend.backend model tape (loopPaths i) GeneratedClaim.stage_4_params i
         (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
           current.2.2.2.2.2.1, f0, f1, f2, f3, f4, f5, ()) next) count init final) :
     final = addCells init f0 f1 f2 f3 f4 f5 count := by
@@ -387,8 +387,8 @@ theorem block3 {model : HashModel} {key : ByteArray}
     {apay : Fin 17 → ExactMatrix Q7 N 1 1}
     {r00 r01 : Fin 14 → ExactMatrix Q6 N 1 10} {r10 r11 : Fin 14 → ExactMatrix Q5 N 1 8}
     {r20 r21 : Fin 14 → ExactMatrix Q4 N 1 6} {r30 r31 : Fin 14 → ExactMatrix Q3 N 1 4}
-    {r40 r41 : Fin 14 → ExactMatrix Q2 N 1 2} {outputs} {w : Stage_online.generatedRoot.Witness}
-    (hb : Stage_online.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
+    {r40 r41 : Fin 14 → ExactMatrix Q2 N 1 2} {outputs} {w : Stage_online_eval.generatedRoot.Witness}
+    (hb : Stage_online_eval.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
       (s0, s1, s2, s3, k0, key, k1, ca0, ca1, cs0, apay, cs1, r00, r01, r10, r11, r20, r21, r30, r31,
         r40, r41, ()) outputs w)
     {sm sp μ : ErrorPoly N} {α : Fin 17 → ErrorPoly N} {ν : Fin 14 → ErrorPoly N}
@@ -413,7 +413,7 @@ theorem block3 {model : HashModel} {key : ByteArray}
       (∑ i : Fin 14, fun j ↦ reducePoly Q3 N (((P3 : Nat) : Int) *
         (α ⟨coords 3 i, coords_lt 3 i⟩ * μ * ν i) * unitPair sp j) • h)
       ![w.w_108_4, w.w_108_5] (∑ _i : Fin 14, cellBound3 Bs) := by
-  unfold Stage_online.generatedRoot.body at hb
+  unfold Stage_online_eval.generatedRoot.body at hb
   extract_lets at hb
   have h89_5 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
   have h90_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1

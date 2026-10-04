@@ -130,7 +130,7 @@ def block_lemma(I, b):
     qb, qn = L - b, L - b - 1
     par, seq = 23 + 22 * b, 42 + 22 * b
     prev = 42 + 22 * (b - 1)
-    path = f'{I.d}/generated/Stage_online.lean'
+    path = f'{I.d}/generated/Stage_online_eval.lean'
     init = [(24 + 22 * b + 3 * k, 25 + 22 * b + 3 * k) for k in range(6)]
     names = [f'h{par}_5'] + [f'h{x}_0' for pr in init for x in pr] + [f'h{seq}_5']
     if b == 0:
@@ -183,8 +183,8 @@ theorem block{b} {{model : HashModel}} {{key : ByteArray}}
     {{ca0 ca1 : Fin {M} → ExactMatrix Q{L} N 1 {mL}}} {{cs0 cs1 : ExactMatrix Q{L} N 1 {mL1}}}
     {{apay : Fin {M} → ExactMatrix Q{L} N 1 1}}
     {rfams}
-    {{outputs}} {{w : Stage_online.generatedRoot.Witness}}
-    (hb : Stage_online.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
+    {{outputs}} {{w : Stage_online_eval.generatedRoot.Witness}}
+    (hb : Stage_online_eval.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
       (s0, s1, s2, s3, k0, key, k1, ca0, ca1, cs0, apay, cs1, {rins}, ()) outputs w)
     {{sm sp μ : ErrorPoly N}} {{α : Fin {M} → ErrorPoly N}} {{ν : Fin {C} → ErrorPoly N}}
     (hsm : polyNorm sm ≤ 1)
@@ -206,7 +206,7 @@ theorem block{b} {{model : HashModel}} {{key : ByteArray}}
       (∑ i : Fin {C}, fun j ↦ reducePoly Q{qn} N (((P{qn} : Nat) : Int) *
         (α ⟨coords {b} i, coords_lt {b} i⟩ * μ * ν i) * unitPair sp j) • h)
       ![w.w_{seq}_4, w.w_{seq}_5] (∑ _i : Fin {C}, {bound}) := by
-  unfold Stage_online.generatedRoot.body at hb
+  unfold Stage_online_eval.generatedRoot.body at hb
   extract_lets at hb
 {haves}{statekey}  -- Every cell, then their sum.
   have hcells : ∀ i : Fin {C}, Rel sm ![![{fam(0)} i, {fam(1)} i], ![{fam(2)} i, {fam(3)} i]]

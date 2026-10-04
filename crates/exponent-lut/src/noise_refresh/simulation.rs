@@ -943,7 +943,7 @@ pub struct ExponentLutStorageReport {
 impl ExponentLutStorageReport {
     /// Computes storage accounting from the producer manifests and validated
     /// graph metadata.  Manifest entries are deduplicated by production and
-    /// artifact name, so passing preprocessing and online manifests together
+    /// artifact name, so passing preprocessing and online evaluation manifests together
     /// does not double count the shared setup production.
     ///
     /// A family contributes its complete logical artifact bytes to persistent
@@ -978,7 +978,7 @@ impl ExponentLutStorageReport {
             }
         }
 
-        // Non-relation-bearing artifact inputs are online label/input material.
+        // Non-relation-bearing artifact inputs are online evaluation label/input material.
         // They are not manifest outputs and therefore must be collected from
         // the validated graph's artifact metadata.
         for graph in graphs {

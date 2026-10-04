@@ -10,6 +10,7 @@ mod encoding;
 pub(crate) mod gpu;
 mod noise;
 mod public_key;
+mod workload;
 
 use bigdecimal::BigDecimal;
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
@@ -36,15 +37,16 @@ use crate::{
 
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineBuild, checkpoint_refreshed_output, decode_output, resume_refreshed_output,
+    RnsOnlineEvalBuild, checkpoint_refreshed_output, decode_output, resume_refreshed_output,
     verify_output, verify_refreshed_output,
 };
 pub use noise::{
-    RnsBggDerivedWorkload, RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound,
-    RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue,
-    RnsBggParameterManifest, RnsBggPlanRequest, RnsNoiseBuild,
+    RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound, RnsBggNoiseEvaluator,
+    RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameterManifest,
+    RnsBggPlanRequest, RnsNoiseBuild,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
+pub use workload::RnsBggDerivedWorkload;
 
 /// Name of the graph input carrying the shared 32-byte hash key. A stage
 /// graph declares it only where it samples hash-derived public matrices.
@@ -1241,7 +1243,7 @@ impl RnsBggArtifactBinding {
 /// A stage descriptor is deliberately distinct at the type level even though
 /// all three RNS-BGG checkpoints carry the same binding metadata.  The
 /// transparent wrapper keeps the serialized representation owned by the
-/// binding while preventing a preprocess, encryption, or online checkpoint
+/// binding while preventing a preprocess, encryption, or online evaluation checkpoint
 /// from being passed to the wrong stage API by accident.
 macro_rules! rns_bgg_stage_descriptor {
     ($name:ident) => {
@@ -1264,7 +1266,7 @@ macro_rules! rns_bgg_stage_descriptor {
 
 rns_bgg_stage_descriptor!(RnsBggPreprocessEncryptDescriptor);
 
-rns_bgg_stage_descriptor!(RnsBggPreprocessOnlineDescriptor);
+rns_bgg_stage_descriptor!(RnsBggPreprocessOnlineEvalDescriptor);
 
 rns_bgg_stage_descriptor!(RnsBggEncryptionDescriptor);
 
@@ -2200,6 +2202,32 @@ mod tests {
     use mxx_ir_core::IntExpr;
     use num_traits::One;
 
+    /// A prepared toy refresh PRF child: parameters `[q; L] ++ [p]` over a
+    /// three-prime `q`, `p` its first two primes, and `q_t` the first prime,
+    /// with the matching one-slot declaration and its source Program.
+    pub(super) fn refresh_prf_child_fixture(
+        rhs_mode: RhsMode,
+    ) -> (RnsBggParameters, crate::program::ExponentLutProgram, RefreshDeclaration) {
+        let q = DCRTPolyParams::new(32, 3, 17, 4, None, None);
+        let primes = q.to_crt().0;
+        let p = q.select_modulus(&(BigUint::from(primes[0]) * primes[1])).unwrap();
+        let slot = crate::noise_refresh::refresh::RefreshSlot {
+            slot: 0,
+            q: BigInt::from(q.modulus().as_ref().clone()),
+            p: BigInt::from(p.modulus().as_ref().clone()),
+            q_t: BigInt::from(primes[0]),
+        };
+        let (source, _, declaration) =
+            crate::noise_refresh::refresh::tests::test_declaration_with_slots(vec![slot]);
+        let q_levels = RnsBggParameters::refresh_prf_q_levels(&declaration).unwrap();
+        let parameters =
+            RnsBggParameters::new(std::iter::repeat_n(q, q_levels).chain([p]).collect(), 1, 1)
+                .unwrap()
+                .with_rhs_mode(rhs_mode);
+        parameters.validate_refresh_prf_schedule(&declaration, 0).unwrap();
+        (parameters, source, declaration)
+    }
+
     #[test]
     fn parameter_drops_are_exact_and_terminal_is_one() {
         let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
@@ -2555,14 +2583,14 @@ mod tests {
 
         assert_ne!(
             TypeId::of::<RnsBggPreprocessEncryptDescriptor>(),
-            TypeId::of::<RnsBggPreprocessOnlineDescriptor>()
+            TypeId::of::<RnsBggPreprocessOnlineEvalDescriptor>()
         );
         assert_ne!(
             TypeId::of::<RnsBggPreprocessEncryptDescriptor>(),
             TypeId::of::<RnsBggEncryptionDescriptor>()
         );
         assert_ne!(
-            TypeId::of::<RnsBggPreprocessOnlineDescriptor>(),
+            TypeId::of::<RnsBggPreprocessOnlineEvalDescriptor>(),
             TypeId::of::<RnsBggEncryptionDescriptor>()
         );
     }

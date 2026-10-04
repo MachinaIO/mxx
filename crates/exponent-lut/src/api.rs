@@ -527,14 +527,14 @@ pub trait PreprocessBuild<P: Poly> {
     type Families: FamilyExecution<Self::Evaluator>;
     type PayloadSecret;
     type EncryptDescriptor;
-    type OnlineDescriptor;
+    type OnlineEvalDescriptor;
     type Encrypt: EncryptBuild<
             P,
             PayloadSecret = Self::PayloadSecret,
             PreprocessDescriptor = Self::EncryptDescriptor,
         >;
-    type Online: OnlineBuild<
-            PreprocessDescriptor = Self::OnlineDescriptor,
+    type OnlineEval: OnlineEvalBuild<
+            PreprocessDescriptor = Self::OnlineEvalDescriptor,
             EncryptDescriptor = <Self::Encrypt as EncryptBuild<P>>::Descriptor,
         >;
 
@@ -573,13 +573,13 @@ pub trait PreprocessBuild<P: Poly> {
     /// dependency edges that cannot be known during graph construction.
     fn finalize_descriptors(
         production: &mxx_ir_core::artifact::ProductionId,
-        descriptors: (Self::EncryptDescriptor, Self::OnlineDescriptor),
-    ) -> Result<(Self::EncryptDescriptor, Self::OnlineDescriptor), ApiError>;
+        descriptors: (Self::EncryptDescriptor, Self::OnlineEvalDescriptor),
+    ) -> Result<(Self::EncryptDescriptor, Self::OnlineEvalDescriptor), ApiError>;
 
     fn build_graph(
         self,
         outputs: Vec<<Self::Evaluator as ExponentLUTProgramLowering>::Wire>,
-    ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineDescriptor)), ApiError>;
+    ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineEvalDescriptor)), ApiError>;
 }
 
 /// Builder contract for the input-only encryption graph.
@@ -611,9 +611,9 @@ pub trait EncryptBuild<P: Poly> {
     fn build_graph(self) -> Result<(StageGraph, Self::Descriptor), ApiError>;
 }
 
-/// Builder contract for online Program lowering and scheme refresh graph
+/// Builder contract for online evaluation: Program lowering and scheme refresh graph
 /// construction.
-pub trait OnlineBuild {
+pub trait OnlineEvalBuild {
     type Evaluator: ExponentLUTProgramLowering + crate::program::ProgramLoweringContext;
     type Families: FamilyExecution<Self::Evaluator>;
     type PreprocessDescriptor;
@@ -871,7 +871,7 @@ fn fresh_execution_session<S: SessionStore>(
 
 /// Build and execute preprocessing once, then publish two typed stage records
 /// over that same finalized production: encryption preparation first and
-/// online preparation second. `rhs` and `payload` are absent when the scheme
+/// online evaluation preparation second. `rhs` and `payload` are absent when the scheme
 /// chooses RHS values and the secret only at encryption.
 pub fn preprocess<E, S, P, T>(
     program: &ExponentLutProgram,
@@ -888,7 +888,7 @@ pub fn preprocess<E, S, P, T>(
     )
         -> Result<Vec<<T::Evaluator as ExponentLUTProgramLowering>::Wire>, ApiError>,
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
-) -> Result<(StageArtifacts<T::EncryptDescriptor>, StageArtifacts<T::OnlineDescriptor>), ApiError>
+) -> Result<(StageArtifacts<T::EncryptDescriptor>, StageArtifacts<T::OnlineEvalDescriptor>), ApiError>
 where
     E: StageExecution<S>,
     S: SessionStore,
@@ -906,7 +906,7 @@ where
     };
     let outputs = compose(&mut build, outputs)?;
     let lowered_at = std::time::Instant::now();
-    let (graph, (encrypt_descriptor, online_descriptor)) = build.build_graph(outputs)?;
+    let (graph, (encrypt_descriptor, online_eval_descriptor)) = build.build_graph(outputs)?;
     let built_at = std::time::Instant::now();
 
     // Validate and execute once. Both stage records share the same finalized
@@ -923,8 +923,8 @@ where
     let produced = execution.produce(validated, graph.runtime_inputs, store, execution_nonce)?;
     check_production(&produced, &production)?;
     let produced_at = std::time::Instant::now();
-    let (encrypt_descriptor, online_descriptor) =
-        T::finalize_descriptors(&production, (encrypt_descriptor, online_descriptor))?;
+    let (encrypt_descriptor, online_eval_descriptor) =
+        T::finalize_descriptors(&production, (encrypt_descriptor, online_eval_descriptor))?;
     tracing::info!(
         bind_ms = (bound_at - started).as_millis() as u64,
         lower_ms = (lowered_at - bound_at).as_millis() as u64,
@@ -940,8 +940,9 @@ where
         encrypt_descriptor,
         session.clone(),
     );
-    let online_stage = StageArtifacts::new(production, manifest, online_descriptor, session);
-    Ok((encrypt_stage, online_stage))
+    let online_eval_stage =
+        StageArtifacts::new(production, manifest, online_eval_descriptor, session);
+    Ok((encrypt_stage, online_eval_stage))
 }
 
 /// Build and execute the input-only encryption graph. `mask` is absent when
@@ -976,7 +977,7 @@ where
 }
 
 /// Lower the Program, append scheme-owned refresh operations, and execute the
-/// resulting online graph. The returned outputs are owned copies.
+/// resulting online evaluation graph. The returned outputs are owned copies.
 pub fn online_eval<E, S, T>(
     program: &ExponentLutProgram,
     parameters: &ParamEnv,
@@ -996,7 +997,7 @@ pub fn online_eval<E, S, T>(
 where
     E: StageExecution<S>,
     S: SessionStore,
-    T: OnlineBuild,
+    T: OnlineEvalBuild,
 {
     validate_hash_key(hash_key)?;
     build.bind_artifacts(program, parameters, preprocess, encryption, hash_key)?;
@@ -1061,20 +1062,20 @@ mod tests {
         let base = [7; 32];
         assert_ne!(
             domain_identity(base, b"encrypt-preparation"),
-            domain_identity(base, b"online-preparation")
+            domain_identity(base, b"online-eval-preparation")
         );
     }
 
     #[test]
     fn stage_identity_is_sensitive_to_builder_identity() {
         assert_ne!(
-            domain_identity([1; 32], b"online-preparation"),
-            domain_identity([2; 32], b"online-preparation")
+            domain_identity([1; 32], b"online-eval-preparation"),
+            domain_identity([2; 32], b"online-eval-preparation")
         );
     }
 
     #[test]
-    fn online_observer_runs_once_before_execution() {
+    fn online_eval_observer_runs_once_before_execution() {
         let mut execution = execution();
         let mut store = MemoryArtifactStore::default();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1094,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn online_observer_error_prevents_execution() {
+    fn online_eval_observer_error_prevents_execution() {
         let mut execution = execution();
         let mut store = MemoryArtifactStore::default();
         let result = execute_graph(

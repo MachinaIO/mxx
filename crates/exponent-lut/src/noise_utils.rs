@@ -2,10 +2,12 @@
 //!
 //! These values have no implicit ciphertext coordinate units. Coordinate
 //! conventions belong to the scheme adapter that consumes them.
+use bigdecimal::BigDecimal;
 use mxx_ir_core::{IntExpr, ParamEnv};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 
@@ -702,7 +704,8 @@ pub enum NoiseCorrelation {
     Unknown,
 }
 
-fn gcd(left: &BigUint, right: &BigUint) -> BigUint {
+/// The greatest common divisor; `gcd(0, 0)` is 0.
+pub(crate) fn gcd(left: &BigUint, right: &BigUint) -> BigUint {
     let mut left = left.clone();
     let mut right = right.clone();
     while !right.is_zero() {
@@ -711,6 +714,77 @@ fn gcd(left: &BigUint, right: &BigUint) -> BigUint {
         right = remainder;
     }
     left
+}
+
+/// Serde adapter that stores a `BigDecimal` as its decimal string.
+pub(crate) mod bigdecimal_string {
+    use bigdecimal::BigDecimal;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::str::FromStr;
+
+    pub fn serialize<S>(value: &BigDecimal, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BigDecimal, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        BigDecimal::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Moments of a zero-mean distribution with `variance`.
+pub(crate) fn zero_mean_moments(variance: NonnegativeRational) -> NoiseMoments {
+    NoiseMoments {
+        mean_numerator: BigInt::zero(),
+        mean_denominator: BigUint::one(),
+        mean_radius: NonnegativeRational::zero(),
+        variance,
+    }
+}
+
+/// The variance `sigma^2` of a positive decimal Gaussian width, exactly.
+pub(crate) fn encoding_variance_from_sigma(sigma: &BigDecimal) -> NonnegativeRational {
+    let (mut numerator, exponent) = sigma.as_bigint_and_exponent();
+    let denominator = if exponent >= 0 {
+        BigUint::from(10u8).pow(exponent as u32)
+    } else {
+        numerator *= BigInt::from(10u8).pow((-exponent) as u32);
+        BigUint::one()
+    };
+    NonnegativeRational::new(
+        numerator.to_biguint().expect("positive encoding sigma").pow(2),
+        denominator.pow(2),
+    )
+    .expect("positive encoding sigma variance")
+}
+
+/// `ceil(numerator / denominator)` for a positive denominator.
+pub(crate) fn ceil_div_nonnegative(numerator: &BigUint, denominator: &BigUint) -> BigUint {
+    debug_assert!(!denominator.is_zero());
+    if numerator.is_zero() {
+        BigUint::zero()
+    } else {
+        (numerator + denominator - 1u8) / denominator
+    }
+}
+
+/// Approximate `log2` of a nonnegative rational variance.
+pub(crate) fn variance_log2(variance: &NonnegativeRational) -> i64 {
+    variance.numerator.bits() as i64 - variance.denominator.bits() as i64
+}
+
+/// Hash a serializable sampling-domain label into a stable source identity.
+///
+/// Callers must include every value that distinguishes independent sampling
+/// domains. Equal identities mean that the audit must conservatively combine
+/// the corresponding linear actions as correlated uses of one source.
+pub(crate) fn stable_source_id<T: Serialize>(value: &T) -> [u8; 32] {
+    Sha256::digest(serde_json::to_vec(value).expect("stable source identity serialization")).into()
 }
 
 /// An index into one trace's flat dependency arena.

@@ -13,7 +13,7 @@ class Info:
     def __init__(self, d):
         self.d = d
         g = lambda f: open(f'{d}/generated/{f}.lean').read()
-        self.online = g('Stage_online')
+        self.online_eval = g('Stage_online_eval')
         self.pre = g('Stage_preprocess')
         self.enc = g('Stage_encrypt')
         pid = os.path.basename(os.path.abspath(d))
@@ -26,7 +26,7 @@ class Info:
         self.dp = int(r['crt_bits']) // int(r['base_bits'])
         self.base = 1 << int(r['base_bits'])
         self.digit = self.base // 2
-        mods = sorted({int(m) for m in re.findall(rf'ExactMatrix (\d+) {self.n} ', self.online + self.pre)})
+        mods = sorted({int(m) for m in re.findall(rf'ExactMatrix (\d+) {self.n} ', self.online_eval + self.pre)})
         self.Q = [None] + mods
         self.L = len(mods)
         self.P = {k: self.Q[k] // self.Q[k - 1] for k in range(2, self.L + 1)}
@@ -56,7 +56,7 @@ class Info:
 
     def _cells(self):
         """The cell count: the width of the cell families summed by the block-0 loop."""
-        loop = self.online[self.online.index('def sequential_generatedRoot_42 '):]
+        loop = self.online_eval[self.online_eval.index('def sequential_generatedRoot_42 '):]
         return int(re.search(r'\(Fin (\d+) → Mxx\.Primitives\.ExactMatrix \d+ \d+ 1 \d+\) × Unit\) \(outputs',
                              loop).group(1))
 
@@ -64,9 +64,9 @@ class Info:
         out = []
         for b in range(self.B):
             name = f'parallel_generatedRoot_{23 + 22 * b}'
-            i = self.online.index(f'def {name} ')
-            j = self.online.index('\ndef ', i + 1)
-            lst = re.search(r'selectInt \(\(Int\.ofNat i_0\)\) \[([^\]]*)\]', self.online[i:j]).group(1)
+            i = self.online_eval.index(f'def {name} ')
+            j = self.online_eval.index('\ndef ', i + 1)
+            lst = re.search(r'selectInt \(\(Int\.ofNat i_0\)\) \[([^\]]*)\]', self.online_eval[i:j]).group(1)
             vals = [int(x) for x in lst.replace('(', '').replace(')', '').split(', ')]
             assert len(vals) == self.C
             out.append(vals)

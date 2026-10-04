@@ -1,4 +1,4 @@
-import NandOnline3
+import NandOnlineEval3
 
 /-!
 # The worst-case correctness certificate
@@ -6,7 +6,7 @@ import NandOnline3
 Every execution satisfying the generated claim's run relation decodes the NAND of its two input
 bits. The payload and mask stages give ternary secrets; the encryption and preprocessing stages
 give the encodings, helpers, RHS ciphertexts, and switching ciphertexts of `NandEncrypt` and
-`NandPreprocess`; the four online rounds carry the state monomial `X^(roundArgument b r)` through
+`NandPreprocess`; the four online evaluation rounds carry the state monomial `X^(roundArgument b r)` through
 the LUT tables; and the decode stage reads coefficient `1` of the terminal plaintext
 `X^(outputExponent b)`, which is `1 - b₀ b₁`.
 -/
@@ -51,7 +51,7 @@ set_option maxHeartbeats 64000000 in
 /-- The worst-case correctness claim of `worst-n32-crt7x40`. -/
 theorem certificate : GeneratedClaim.CorrectnessClaim := by
   intro model external execution hruns
-  obtain ⟨hvalid, hpay, hmask, hpre, henc, honline, hdec, hreq, hideal, hreqtrue⟩ := hruns
+  obtain ⟨hvalid, hpay, hmask, hpre, henc, honlineEval, hdec, hreq, hideal, hreqtrue⟩ := hruns
   obtain ⟨sp, hsp, hspn⟩ := secret_ternary hpay
   obtain ⟨sm, hsm, hsmn⟩ := mask_ternary hmask
   -- The external inputs: coefficient `1`, start exponent `2`, bits `b₀ b₁`, exponents `8 bᵢ`.
@@ -95,9 +95,9 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
   rw [hmsg0] at hinput
   rw [hmsg4] at hrhs0 hrhs2
   rw [hmsg6] at hrhs1 hrhs3
-  -- The four online rounds on the arguments `roundArgument b r`.
+  -- The four online evaluation rounds on the arguments `roundArgument b r`.
   have hrounds := rounds_nand ![n0, n1] (fun i ↦ by fin_cases i <;> simpa)
-  obtain ⟨w, hb⟩ := honline
+  obtain ⟨w, hb⟩ := honlineEval
   have hr0 := round0 hb hsmn (polyNorm_Xe hN1 2) hg14 (centeredRebaseRuns_self hQ7 hN g14) hg12 hg12up
     hinput hrhs0 hhelp1 hsw0 (arg := ⟨roundArgument ![n0, n1] 0, hrounds.1 0⟩) (by
       rw [Xe, Xe, Xe, ← pow_add]
@@ -126,11 +126,11 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
       have e : roundArgument ![n0, n1] 3 = lookup 2 (roundArgument ![n0, n1] 2) + 8 * n1 := by
         simp [roundArgument, roundInput]
       simp only [e, lookup, dif_pos (hrounds.1 2)])
-  -- The online outputs are the terminal encoding.
+  -- The online evaluation outputs are the terminal encoding.
   have hb2 := hb
-  unfold Stage_online.generatedRoot.body at hb2
+  unfold Stage_online_eval.generatedRoot.body at hb2
   extract_lets at hb2
-  have houtOnline := hb2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
+  have houtOnlineEval := hb2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
   -- Decryption reads coefficient `1` of `X^(outputExponent b)`.
   obtain ⟨wd, hd⟩ := hdec
   unfold Stage_decode.generatedRoot.body at hd
@@ -156,7 +156,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     simp [Fin.ext_iff, ht]
   have hval := decode_terminal hQ3 (by norm_num) hN hr3 hbound (k := ⟨1, by decide⟩)
     (by rw [hcoeff]; split <;> simp) (by
-      rw [houtOnline, hw2, hw6]
+      rw [houtOnlineEval, hw2, hw6]
       funext r c
       obtain rfl : r = 0 := Subsingleton.elim _ _
       obtain rfl : c = 0 := Subsingleton.elim _ _

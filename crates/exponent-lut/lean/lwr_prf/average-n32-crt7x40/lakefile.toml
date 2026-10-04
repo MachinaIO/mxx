@@ -16,7 +16,7 @@ name = "LwrGenerated"
 srcDir = "generated"
 roots = [
   "Backend", "Claim", "Ideal", "Requirement_0", "Stage_payload", "Stage_mask",
-  "Stage_preprocess", "Stage_encrypt", "Stage_online", "Stage_decode"
+  "Stage_preprocess", "Stage_encrypt", "Stage_online_eval", "Stage_decode"
 ]
 
 # The proof of the generated claim.

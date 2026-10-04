@@ -62,7 +62,7 @@ theorem lutLoop_step {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly
     {i : Nat} (hi : i < 127) {state next : LoopState Q2 Q1 1}
     (hswitch : state.switch = fun k j ↦ fam k j ⟨i, by omega⟩)
     {T : Fin 2 → ExactMatrix Q2 N 1 1} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
-    (hbody : Stage_online.sequential_generatedRoot_769 Backend.backend model tape loopPath
+    (hbody : Stage_online_eval.sequential_generatedRoot_769 Backend.backend model tape loopPath
       GeneratedClaim.stage_4_params i
       (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
         state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
@@ -71,7 +71,7 @@ theorem lutLoop_step {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly
     Rel sm next.key (T + branchTarget (q := Q2) (p := P2) μ sp fam ⟨i, by omega⟩) next.row
         (Bs + lutBranchBound B) ∧
       next.switch = fun k j ↦ fam k j ⟨i + 1, by omega⟩ := by
-  unfold Stage_online.sequential_generatedRoot_769 at hbody
+  unfold Stage_online_eval.sequential_generatedRoot_769 at hbody
   try extract_lets at hbody
   obtain ⟨w_3_0, hbody⟩ := hbody
   try extract_lets at hbody
@@ -303,7 +303,7 @@ theorem lutLoop {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
     {fam : Fin 2 → Fin 2 → Fin 128 → ExactMatrix Q1 N 1 1} {count : Nat} (hcount : count ≤ 127)
     {final : LoopState Q2 Q1 1}
     (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : LoopState Q2 Q1 1) ↦
-      Stage_online.sequential_generatedRoot_769 Backend.backend model tape (loopPaths i) GeneratedClaim.stage_4_params i
+      Stage_online_eval.sequential_generatedRoot_769 Backend.backend model tape (loopPaths i) GeneratedClaim.stage_4_params i
         (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
           current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
           current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0,
@@ -361,8 +361,8 @@ theorem lutRound {model : HashModel} {key : ByteArray}
     {r280 r281 : Fin 113 → ExactMatrix Q7 N 1 24} {r290 r291 : Fin 113 → ExactMatrix Q6 N 1 20}
     {r300 r301 : Fin 113 → ExactMatrix Q5 N 1 16} {r310 r311 : Fin 113 → ExactMatrix Q4 N 1 12}
     {r320 r321 : Fin 113 → ExactMatrix Q3 N 1 8} {r330 r331 : Fin 113 → ExactMatrix Q2 N 1 4}
-    {outputs} {w : Stage_online.generatedRoot.Witness}
-    (hb : Stage_online.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
+    {outputs} {w : Stage_online_eval.generatedRoot.Witness}
+    (hb : Stage_online_eval.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
       (s0, s1, s2, s3, k0, key, k1, ca0, ca1, cs0, apay, cs1, r00, r01, r10, r11, r20, r21, r30, r31,
         r40, r41, r50, r51, r60, r61, r70, r71,
         r80, r81, r90, r91, r100, r101, r110, r111,
@@ -392,7 +392,7 @@ theorem lutRound {model : HashModel} {key : ByteArray}
       (fun j ↦ reducePoly Q1 N ((((Q1 / 2 : Nat) : Int) : ErrorPoly N) * lutValue z * unitPair sp j) •
         (1 : ExactMatrix Q1 N 1 1))
       ![w.w_829_0, w.w_834_0] (lutBound B) := by
-  unfold Stage_online.generatedRoot.body at hb
+  unfold Stage_online_eval.generatedRoot.body at hb
   extract_lets at hb
   have h2_0 := hb.1
   have h4_0 := hb.2.1

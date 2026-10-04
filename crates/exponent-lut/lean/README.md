@@ -90,8 +90,8 @@ lists only `propext`, `Classical.choice`, and `Quot.sound`.
 ### NAND (`nand_circuit`)
 
 `NandSetup` (moduli, layouts, LUT automorphisms, hash tags), `NandEncrypt` (the state input and
-the LUT helpers), `NandPreprocess` (the RHS and LUT switching ciphertexts), `NandOnline0` to
-`NandOnline3` (the private multiplication, the fifteen branches of the generated loop, the last
+the LUT helpers), `NandPreprocess` (the RHS and LUT switching ciphertexts), `NandOnlineEval0` to
+`NandOnlineEval3` (the private multiplication, the fifteen branches of the generated loop, the last
 branch, and the ModDown of each round), and `NandCertificate` (the requirement, the ideal, and
 decryption). The state exponent follows `roundArgument` of `rounds_nand`, and coefficient one of
 the final plaintext `X^(outputExponent b)` is the NAND of the inputs.

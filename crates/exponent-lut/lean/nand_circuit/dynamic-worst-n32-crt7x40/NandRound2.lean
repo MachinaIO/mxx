@@ -27,7 +27,7 @@ theorem rhsLoop2_step {model : HashModel} {key : ByteArray}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {z0 z1 : Fin 320 → ExactMatrix Q5 N 1 10} {i : Nat} (hi : i < 320) {s t : RhsState2}
     (hs : s.2.2.2.1 = z0 ⟨i, hi⟩ ∧ s.2.2.2.2.1 = z1 ⟨i, hi⟩)
-    (h : Stage_online.sequential_generatedRoot_157 Backend.backend model
+    (h : Stage_online_eval.sequential_generatedRoot_157 Backend.backend model
       GeneratedClaim.stage_2_params i
       (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, key, A0, A1, z0, z1, ()) t) :
     let B := digitKey model key Q5 10 (rhsOwner 50 4) ((i / 20 : Nat) : Int) ((i % 20 : Nat) : Int)
@@ -116,7 +116,7 @@ theorem rhsLoop2 {model : HashModel} {key : ByteArray}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {z0 z1 : Fin 320 → ExactMatrix Q5 N 1 10} {final : RhsState2}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : RhsState2) ↦
-      Stage_online.sequential_generatedRoot_157 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_157 Backend.backend model GeneratedClaim.stage_2_params i
         (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (key, (A0,
           (A1, (z0, (z1, ())))))))))) next) (Int.toNat 320)
       (0, (0, (0, (z0 ⟨0, by norm_num⟩, (z1 ⟨0, by norm_num⟩, ()))))) final) (jj : Fin 16) :
@@ -130,7 +130,7 @@ theorem rhsLoop2 {model : HashModel} {key : ByteArray}
       s.2.2.2.2.1 = z1 ⟨i % 320, Nat.mod_lt _ (by norm_num)⟩
   have hQ0 : Q 0 (0, (0, (0, (z0 ⟨0, by norm_num⟩, (z1 ⟨0, by norm_num⟩, ()))))) := ⟨rfl, rfl⟩
   have hstep : ∀ i (s t : RhsState2), i < 16 * 20 → Q i s →
-      Stage_online.sequential_generatedRoot_157 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_157 Backend.backend model GeneratedClaim.stage_2_params i
         (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (key, (A0, (A1, (z0, (z1, ())))))))))) t →
       (t.1 = s.1 + (if h : i < 16 * 20 then
           rhsKeySum2 model key A 0 ⟨i / 20, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
@@ -185,7 +185,7 @@ every column decomposition runs. -/
 theorem colLoop2 {model : HashModel} {c : ExactMatrix Q5 N 1 20} {top bot : ExactMatrix Q5 N 1 16}
     {final : ExactMatrix Q5 N 1 16}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q5 N 1 16) ↦
-      Stage_online.sequential_generatedRoot_175 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_175 Backend.backend model GeneratedClaim.stage_2_params i
         (current, (c, (top, (bot, ())))) next) (Int.toNat 16) 0 final) (jj : Fin 16) :
     final 0 jj = (c * rhsDigits2 top bot jj) 0 0 ∧
       ∃ D' : ExactMatrix Q5 N (10 + 10) 1,
@@ -248,7 +248,7 @@ theorem lutLoop2_step {model : HashModel} {key : ByteArray}
     (hA0 : concatColumns (M 0 0) (M 0 1) A0) (hA1 : concatColumns (M 1 0) (M 1 1) A1)
     {z0 z1 : Fin 4096 → ExactMatrix Q5 N 1 10} {i : Nat} (hi : i < 4096) {s t : LutState2}
     (hs : s.2.2.2.1 = lutCarry2 z0 ⟨i, hi⟩ ∧ s.2.2.2.2.1 = lutCarry2 z1 ⟨i, hi⟩)
-    (h : Stage_online.sequential_generatedRoot_164 Backend.backend model
+    (h : Stage_online_eval.sequential_generatedRoot_164 Backend.backend model
       GeneratedClaim.stage_2_params i
       (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, key, A0, A1, z0, z1, ()) t) :
     let B := fun k r ↦ substituteMatrix (sigma (i / 16 / 16)).toNat (sigma_odd ⟨i / 16 / 16, by omega⟩) (digitKey model key Q5 10 (lutOwner 50 ((i / 16 / 16 : Nat) : Int) 5)
@@ -376,7 +376,7 @@ theorem lutLoop2 {model : HashModel} {key : ByteArray}
     (hA0 : concatColumns (M 0 0) (M 0 1) A0) (hA1 : concatColumns (M 1 0) (M 1 1) A1)
     {z0 z1 : Fin 4096 → ExactMatrix Q5 N 1 10} {final : LutState2}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : LutState2) ↦
-      Stage_online.sequential_generatedRoot_164 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_164 Backend.backend model GeneratedClaim.stage_2_params i
         (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (key, (A0,
           (A1, (z0, (z1, ())))))))))) next) (Int.toNat 4096)
       (0, (0, (0, (lutCarry2 z0 ⟨0, by norm_num⟩, (lutCarry2 z1 ⟨0, by norm_num⟩, ()))))) final)
@@ -392,7 +392,7 @@ theorem lutLoop2 {model : HashModel} {key : ByteArray}
   have hQ0 : Q 0 (0, (0, (0, (lutCarry2 z0 ⟨0, by norm_num⟩, (lutCarry2 z1 ⟨0, by norm_num⟩, ()))))) :=
     ⟨rfl, rfl⟩
   have hstep : ∀ i (s t : LutState2), i < 256 * 16 → Q i s →
-      Stage_online.sequential_generatedRoot_164 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_164 Backend.backend model GeneratedClaim.stage_2_params i
         (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (key, (A0, (A1, (z0, (z1, ())))))))))) t →
       (t.1 = s.1 + (if h : i < 256 * 16 then
           lutKeySum2 model key M 0 ⟨i / 16, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
@@ -448,7 +448,7 @@ switching ciphertext, column by column, and every column decomposition runs. -/
 theorem switchLoop2 {model : HashModel} {i0 : Nat} {c : ExactMatrix Q5 N 1 16}
     {top bot : ExactMatrix Q4 N 1 16} {final : ExactMatrix Q5 N 1 16}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q5 N 1 16) ↦
-      Stage_online.sequential_sequential_generatedRoot_179_44 Backend.backend model
+      Stage_online_eval.sequential_sequential_generatedRoot_179_44 Backend.backend model
         GeneratedClaim.stage_2_params i0 i (current, (c, (top, (bot, ())))) next) (Int.toNat 16) 0
       final) (jj : Fin 16) :
     final 0 jj = (c * switchDigits2 top bot jj) 0 0 ∧
@@ -503,7 +503,7 @@ runs. -/
 theorem helperLoop2 {model : HashModel} {i0 : Nat} {h0 k0 k1 : ExactMatrix Q5 N 1 16}
     {top bot : ExactMatrix Q4 N 1 16} {final : HelperState2}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : HelperState2) ↦
-      Stage_online.sequential_sequential_generatedRoot_179_30 Backend.backend model
+      Stage_online_eval.sequential_sequential_generatedRoot_179_30 Backend.backend model
         GeneratedClaim.stage_2_params i0 i
         (current.1, (current.2.1, (current.2.2.1, (h0, (top, (bot, (k0, (k1, ())))))))) next)
       (Int.toNat 16) (0, (0, (0, ()))) final) (jj : Fin 16) :
@@ -526,7 +526,7 @@ theorem helperLoop2 {model : HashModel} {i0 : Nat} {h0 k0 k1 : ExactMatrix Q5 N 
       gadgetDecomposeRuns Backend.backend 1048576 8 (pairColumn (top 0 jj) (bot 0 jj)) D' ∧
         compactCenteredRebaseRuns 524288 D' (switchDigits2 top bot jj)
   have hstep : ∀ i (s t : HelperState2), i < 16 * 1 → Q i s →
-      Stage_online.sequential_sequential_generatedRoot_179_30 Backend.backend model
+      Stage_online_eval.sequential_sequential_generatedRoot_179_30 Backend.backend model
         GeneratedClaim.stage_2_params i0 i
         (s.1, (s.2.1, (s.2.2.1, (h0, (top, (bot, (k0, (k1, ())))))))) t →
       (t.1 = s.1 + f h0 i ∧ t.2.1 = s.2.1 + f k0 i ∧ t.2.2.1 = s.2.2.1 + f k1 i) ∧ Q (i + 1) t := by
@@ -829,7 +829,7 @@ theorem branchLoop2_step {model : HashModel} {key : ByteArray} {sm μ : ErrorPol
     {i : Nat} (hi : i < 16) {state next : BranchState2}
     (hswitch : state.switch = fun k j ↦ fam k j ⟨i, hi⟩)
     {T : Fin 2 → ExactMatrix Q5 N 1 8} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
-    (hbody : Stage_online.sequential_generatedRoot_179 Backend.backend model
+    (hbody : Stage_online_eval.sequential_generatedRoot_179 Backend.backend model
       GeneratedClaim.stage_2_params i
       (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
         state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
@@ -1060,7 +1060,7 @@ theorem branchLoop2 {model : HashModel} {key : ByteArray} {sm μ : ErrorPoly N}
       L1 0 p = ∑ a, lutKeySum2 model key Ap 1 p a ∧ L2 0 p = ∑ a, lutCompanionSum2 Ap z0 z1 p a)
     {final : BranchState2}
     (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : BranchState2) ↦
-      Stage_online.sequential_generatedRoot_179 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_179 Backend.backend model GeneratedClaim.stage_2_params i
         (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
           current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
           current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, h1, L0, L1, key, c 0, c 1, L2,
@@ -1121,8 +1121,8 @@ theorem round2 {model : HashModel}
     {v89 v91 : Fin 672 → ExactMatrix Q7 N 1 14} {v108 v109 : ExactMatrix Q7 N 1 14}
     {v111 v112 v114 v115 : ExactMatrix Q7 N 1 12} {v140 v141 v143 v144 : ExactMatrix Q6 N 1 10}
     {v169 v170 v172 v173 : ExactMatrix Q5 N 1 8} {v198 v199 v201 v202 : ExactMatrix Q4 N 1 6}
-    {outputs} {w : Stage_online.generatedRoot.Witness}
-    (hb : Stage_online.generatedRoot.body Backend.backend model GeneratedClaim.stage_2_params
+    {outputs} {w : Stage_online_eval.generatedRoot.Witness}
+    (hb : Stage_online_eval.generatedRoot.body Backend.backend model GeneratedClaim.stage_2_params
       (v1, v3, v5, v7, v9, v10, v12, v15, v18, v20, v22, v25, v27, v29, v31, v33, v34, v36, v39,
         v43, v45, v48, v50, v52, v54, v56, v57, v59, v62, v66, v68, v71, v73, v75, v77, v79, v80,
         v82, v85, v89, v91, v108, v109, v111, v112, v114, v115, v140, v141, v143, v144, v169, v170,
@@ -1165,7 +1165,7 @@ theorem round2 {model : HashModel}
     Rel sm ![![w.w_180_0, w.w_181_0], ![w.w_183_0, w.w_184_0]]
       (fun j ↦ reducePoly Q4 N (1 * Xe (n := N) (MxxExponentLutNand.table 2 arg) * unitPair sm j) • g')
       ![w.w_195_0, w.w_196_0] roundBound2 := by
-  unfold Stage_online.generatedRoot.body at hb
+  unfold Stage_online_eval.generatedRoot.body at hb
   dsimp only at hb
   have h34 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
   have h35 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1

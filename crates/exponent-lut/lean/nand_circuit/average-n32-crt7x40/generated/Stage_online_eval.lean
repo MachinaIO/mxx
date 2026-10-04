@@ -4,7 +4,7 @@ import MxxRuntime
 set_option maxRecDepth 16384
 set_option maxHeartbeats 2000000
 
-namespace Stage_online
+namespace Stage_online_eval
 
 structure Params where
   unit : Unit
@@ -2796,4 +2796,4 @@ def generatedRoot (backend : MxxRuntime.BackendContext) (hashModel : MxxRuntime.
     generatedRoot.body backend hashModel tape path params inputs outputs witness
 
 
-end Stage_online
+end Stage_online_eval

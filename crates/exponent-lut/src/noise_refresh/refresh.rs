@@ -412,6 +412,128 @@ impl RefreshDeclaration {
     pub(crate) fn prf_labels(&self) -> &[PrfLabel] {
         &self.prf_labels
     }
+
+    /// Checks that `program` is the prepared PRF Program a refresh PRF child
+    /// must lower.
+    pub(crate) fn validate_prf_program(
+        &self,
+        program: ExponentLutProgramId,
+    ) -> Result<(), RefreshError> {
+        if program == self.prepared.program().id() {
+            Ok(())
+        } else {
+            Err(RefreshError::PrfOutputMismatch)
+        }
+    }
+
+    /// Checks that every declared PRF output is a scalar output of `program`
+    /// (`PrfOutputMismatch` otherwise) and a coefficient output
+    /// (`InvalidSourceOutput` otherwise).
+    pub(crate) fn validate_prf_outputs(
+        &self,
+        program: &ExponentLutProgram,
+    ) -> Result<(), RefreshError> {
+        let declared =
+            self.prepared.declaration().ordered_outputs().map(|(_, wire)| wire).collect::<Vec<_>>();
+        let scalar_outputs = program
+            .outputs()
+            .iter()
+            .filter_map(|output| match output {
+                Operand::Scalar(wire) => Some(*wire),
+                Operand::Member { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if declared.iter().any(|wire| !scalar_outputs.contains(wire)) {
+            return Err(RefreshError::PrfOutputMismatch);
+        }
+        if declared.iter().any(|wire| !program.wire_is_coefficient_output(*wire).unwrap_or(false)) {
+            return Err(RefreshError::InvalidSourceOutput);
+        }
+        Ok(())
+    }
+
+    /// Checks that the per-slot PRF children are keyed by exactly the
+    /// declared slots `0..slots().len()`.
+    pub(crate) fn validate_prf_slots<C>(
+        &self,
+        children: &BTreeMap<usize, C>,
+    ) -> Result<(), RefreshError> {
+        if children.keys().copied().eq(0..self.slots.len()) {
+            Ok(())
+        } else {
+            Err(RefreshError::InvalidLayout)
+        }
+    }
+
+    /// Collects the per-label, per-slot PRF outputs of the refresh.
+    ///
+    /// `lower_slot` is called once per slot in order and returns that slot's
+    /// PRF outputs as `(wire, value)` pairs in declared output order. Every
+    /// slot's PRF Program yields every label; a mask label is kept only from
+    /// its owning slot and the shared fresh-error label from every slot. A
+    /// wrong output count or wire, a duplicate `(label, slot)`, or a label
+    /// without exactly its expected slots is `PrfOutputMismatch`.
+    pub(crate) fn collect_prf_outputs<V, E: From<RefreshError>>(
+        &self,
+        mut lower_slot: impl FnMut(usize) -> Result<Vec<(WireId, V)>, E>,
+    ) -> Result<BTreeMap<PrfLabel, BTreeMap<usize, V>>, E> {
+        let ordered = self.prepared.declaration().ordered_outputs().collect::<Vec<_>>();
+        let slot_count = self.slots.len();
+        let owners = (0..ordered.len())
+            .map(|index| {
+                self.labels.label(index).ok_or(RefreshError::InvalidLayout)?.slots(slot_count)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut outputs = BTreeMap::<PrfLabel, BTreeMap<usize, V>>::new();
+        for slot in 0..slot_count {
+            let values = lower_slot(slot)?;
+            if values.len() != ordered.len() {
+                return Err(RefreshError::PrfOutputMismatch.into());
+            }
+            for (((label, expected), owners), (wire, value)) in
+                ordered.iter().zip(&owners).zip(values)
+            {
+                if wire != *expected {
+                    return Err(RefreshError::PrfOutputMismatch.into());
+                }
+                if owners.contains(&slot) &&
+                    outputs.entry((*label).clone()).or_default().insert(slot, value).is_some()
+                {
+                    return Err(RefreshError::PrfOutputMismatch.into());
+                }
+            }
+        }
+        for ((label, _), owners) in ordered.iter().zip(&owners) {
+            if !outputs.get(*label).is_some_and(|slots| slots.keys().eq(owners.iter())) {
+                return Err(RefreshError::PrfOutputMismatch.into());
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// The CRT weight `(Q/q_t)·((Q/q_t)^-1 mod q_t)` of `slot`, where `Q` is
+    /// the product of every slot's `q_t`.
+    pub(crate) fn crt_weight(&self, slot: usize) -> Result<BigUint, RefreshError> {
+        refresh_crt_weight(&self.slots, slot)
+    }
+}
+
+/// The CRT weight of `slot` among `slots`: an out-of-range slot is
+/// `InvalidLayout`, and a negative or non-invertible `q_t` is
+/// `InvalidModulusRelation`.
+pub(crate) fn refresh_crt_weight(
+    slots: &[RefreshSlot],
+    slot: usize,
+) -> Result<BigUint, RefreshError> {
+    let moduli = slots
+        .iter()
+        .map(|slot| slot.q_t.to_biguint().ok_or(RefreshError::InvalidModulusRelation))
+        .collect::<Result<Vec<_>, _>>()?;
+    let qt = moduli.get(slot).ok_or(RefreshError::InvalidLayout)?;
+    let base = moduli.iter().product::<BigUint>() / qt;
+    let inverse = mxx_backends::utils::mod_inverse_biguints(&(&base % qt), qt)
+        .ok_or(RefreshError::InvalidModulusRelation)?;
+    Ok(base * inverse)
 }
 
 fn validate_refresh_source(
@@ -582,7 +704,7 @@ fn validate_refresh_prf_binding(
 
 /// Resolve a canonical flat digit label into slot, digit, coefficient and
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn source_program() -> (ExponentLutProgram, WireId) {
@@ -690,11 +812,24 @@ mod tests {
     }
 
     fn test_declaration() -> (ExponentLutProgram, WireId, RefreshDeclaration) {
+        test_declaration_with_slots(vec![RefreshSlot {
+            slot: 0,
+            q: 20.into(),
+            p: 10.into(),
+            q_t: 2.into(),
+        }])
+    }
+
+    /// A toy base-2 refresh of a one-input source Program over `slots`, with
+    /// one mask digit per slot and one fresh-error digit, on ring dimension 32.
+    pub(crate) fn test_declaration_with_slots(
+        slots: Vec<RefreshSlot>,
+    ) -> (ExponentLutProgram, WireId, RefreshDeclaration) {
         let topology = RefreshTranscriptTopology {
-            crt_slot_count: 1,
+            crt_slot_count: slots.len(),
             component_columns: 1,
             coefficient_count: 1,
-            mask_digit_counts: vec![1],
+            mask_digit_counts: vec![1; slots.len()],
             fresh_digit_count: 1,
         };
         let labels = RefreshPrfLabelIndex::new([3; 32], &topology).unwrap();
@@ -725,12 +860,13 @@ mod tests {
         .unwrap();
         let prepared = PreparedSparseLwrPrf::new(sparse, [9; 32]).unwrap();
         let (source, source_output) = source_program();
+        let mask_counts = vec![1; slots.len()];
         let declaration = RefreshDeclaration::new(
             &source,
             source_output,
             vec![WireType::Int],
-            vec![RefreshSlot { slot: 0, q: 20.into(), p: 10.into(), q_t: 2.into() }],
-            RefreshDigitPlan { base: 2, mask_counts: vec![1], fresh_count: 1 },
+            slots,
+            RefreshDigitPlan { base: 2, mask_counts, fresh_count: 1 },
             labels,
             prepared,
             0,
@@ -738,6 +874,139 @@ mod tests {
         )
         .unwrap();
         (source, source_output, declaration)
+    }
+
+    /// Two slots with coprime plaintext moduli 3 and 5 under `q = 60`.
+    fn two_slot_declaration() -> (ExponentLutProgram, WireId, RefreshDeclaration) {
+        test_declaration_with_slots(vec![
+            RefreshSlot { slot: 0, q: 60.into(), p: 6.into(), q_t: 3.into() },
+            RefreshSlot { slot: 1, q: 60.into(), p: 10.into(), q_t: 5.into() },
+        ])
+    }
+
+    #[test]
+    fn prf_program_must_be_the_prepared_program() {
+        let (source, _, declaration) = test_declaration();
+        declaration.validate_prf_program(declaration.prepared().program().id()).unwrap();
+        assert_eq!(
+            declaration.validate_prf_program(source.id()).unwrap_err(),
+            RefreshError::PrfOutputMismatch
+        );
+    }
+
+    #[test]
+    fn prf_outputs_must_be_scalar_coefficient_outputs() {
+        let (source, _, declaration) = test_declaration();
+        declaration.validate_prf_outputs(declaration.prepared().program()).unwrap();
+        // The source Program does not output the declared PRF wires.
+        assert_eq!(
+            declaration.validate_prf_outputs(&source).unwrap_err(),
+            RefreshError::PrfOutputMismatch
+        );
+        // A Program that outputs every declared wire as a plain input
+        // exposes them as scalar outputs that are not coefficient outputs.
+        let declared = declaration
+            .prepared()
+            .declaration()
+            .ordered_outputs()
+            .map(|(_, wire)| wire)
+            .collect::<Vec<_>>();
+        let last = declared.iter().map(|wire| wire.0).max().unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        for _ in 0..=last {
+            builder.input(crate::program::AttributeKnowledge::PublicPayload).unwrap();
+        }
+        let inputs = builder.finish(declared.into_iter().map(Operand::Scalar).collect()).unwrap();
+        assert_eq!(
+            declaration.validate_prf_outputs(&inputs).unwrap_err(),
+            RefreshError::InvalidSourceOutput
+        );
+    }
+
+    #[test]
+    fn prf_children_must_cover_exactly_the_declared_slots() {
+        let (_, _, declaration) = two_slot_declaration();
+        declaration.validate_prf_slots(&BTreeMap::from([(0, ()), (1, ())])).unwrap();
+        for children in [
+            BTreeMap::from([(0, ())]),
+            BTreeMap::from([(1, ()), (2, ())]),
+            BTreeMap::from([(0, ()), (1, ()), (2, ())]),
+        ] {
+            assert_eq!(
+                declaration.validate_prf_slots(&children).unwrap_err(),
+                RefreshError::InvalidLayout
+            );
+        }
+    }
+
+    #[test]
+    fn prf_outputs_keep_masks_from_their_owner_and_fresh_errors_from_every_slot() {
+        let (_, _, declaration) = two_slot_declaration();
+        let ordered = declaration.prepared().declaration().ordered_outputs().collect::<Vec<_>>();
+        let lower = |slot: usize| -> Result<Vec<(WireId, (usize, usize))>, RefreshError> {
+            Ok(ordered
+                .iter()
+                .enumerate()
+                .map(|(index, (_, wire))| (*wire, (slot, index)))
+                .collect())
+        };
+        let mut calls = Vec::new();
+        let outputs = declaration
+            .collect_prf_outputs(|slot| {
+                calls.push(slot);
+                lower(slot)
+            })
+            .unwrap();
+        assert_eq!(calls, vec![0, 1]);
+        assert_eq!(outputs.len(), ordered.len());
+        let mut kinds = (0, 0);
+        for (index, (label, _)) in ordered.iter().enumerate() {
+            let expected = match declaration.labels().label(index).unwrap() {
+                RefreshPrfLabel::Mask { slot, .. } => {
+                    kinds.0 += 1;
+                    BTreeMap::from([(slot, (slot, index))])
+                }
+                RefreshPrfLabel::FreshError { .. } => {
+                    kinds.1 += 1;
+                    BTreeMap::from([(0, (0, index)), (1, (1, index))])
+                }
+            };
+            assert_eq!(outputs[*label], expected);
+        }
+        assert!(kinds.0 > 0 && kinds.1 > 0);
+    }
+
+    #[test]
+    fn prf_outputs_reject_a_wrong_count_or_wire() {
+        let (_, _, declaration) = two_slot_declaration();
+        let ordered = declaration
+            .prepared()
+            .declaration()
+            .ordered_outputs()
+            .map(|(_, wire)| wire)
+            .collect::<Vec<_>>();
+        let short = declaration.collect_prf_outputs(|_| {
+            Ok::<_, RefreshError>(ordered.iter().skip(1).map(|wire| (*wire, ())).collect())
+        });
+        assert_eq!(short.unwrap_err(), RefreshError::PrfOutputMismatch);
+        let shifted = declaration.collect_prf_outputs(|slot| {
+            Ok::<_, RefreshError>(
+                ordered
+                    .iter()
+                    .map(|wire| (if slot == 1 { WireId(wire.0 + 1) } else { *wire }, ()))
+                    .collect(),
+            )
+        });
+        assert_eq!(shifted.unwrap_err(), RefreshError::PrfOutputMismatch);
+    }
+
+    #[test]
+    fn crt_weights_are_the_crt_idempotents() {
+        let (_, _, declaration) = two_slot_declaration();
+        // Q = 15: 5 * (5^-1 mod 3) = 10 and 3 * (3^-1 mod 5) = 6.
+        assert_eq!(declaration.crt_weight(0).unwrap(), BigUint::from(10u8));
+        assert_eq!(declaration.crt_weight(1).unwrap(), BigUint::from(6u8));
+        assert_eq!(declaration.crt_weight(2).unwrap_err(), RefreshError::InvalidLayout);
     }
 
     #[test]

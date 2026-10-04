@@ -41,7 +41,7 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
-        RnsNoiseBuild, RnsOnlineBuild, RnsPreprocessBuild, decode_output, verify_output,
+        RnsNoiseBuild, RnsOnlineEvalBuild, RnsPreprocessBuild, decode_output, verify_output,
     },
     utils::{
         audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
@@ -593,7 +593,7 @@ fn fixture(
 
     // The accumulator starts at mono(0) = 1 and the family is `a` followed by
     // the encoding of zero read by dummy and padding cells. No private
-    // plaintext is copied into the online call.
+    // plaintext is copied into the online evaluation call.
     let mut lhs = BTreeMap::new();
     for (wire, declaration) in program.program().encryption_inputs().inputs() {
         let value = match (declaration.knowledge(), declaration.shape()) {
@@ -754,7 +754,7 @@ fn lwr_prf_end_to_end() {
     }
 }
 
-/// Preprocess, encrypt, and evaluate online on `runtime`, then verify every
+/// Preprocess, encrypt, and run online evaluation on `runtime`, then verify every
 /// output against the clear PRF.
 #[allow(clippy::too_many_arguments)]
 fn round_trip(
@@ -786,11 +786,11 @@ fn round_trip(
     let observe = |name: &'static str| observed.borrow_mut().push(name);
     // Preprocess receives the private payload secret and fixed RHS selectors,
     // while encrypt receives public D attributes, a fresh mask, and only the
-    // preparation artifacts.  Online receives artifacts/configuration only;
+    // preparation artifacts.  Online evaluation receives artifacts/configuration only;
     // RHS plaintexts never cross this boundary.
     let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
     let no_rhs = BTreeMap::new();
-    let (preprocess, online) = api::preprocess(
+    let (preprocess, online_eval) = api::preprocess(
         program.program(),
         &ParamEnv::default(),
         if dynamic { &no_rhs } else { &rhs },
@@ -839,22 +839,22 @@ fn round_trip(
     let result = api::online_eval(
         program.program(),
         &ParamEnv::default(),
-        &online,
+        &online_eval,
         &encrypted,
         HASH_KEY,
-        RnsOnlineBuild::new(&parameters, [7; 32]),
+        RnsOnlineEvalBuild::new(&parameters, [7; 32]),
         runtime,
         &mut store,
         |_, outputs| Ok(outputs),
         |validated| {
             observe("online_eval");
-            record(&graphs, "online")(validated)
+            record(&graphs, "online_eval")(validated)
         },
     )
     .expect("RNS online evaluation");
     // Each of the three actual production graphs was planned (and its
     // candidates measured) by the GPU runtime immediately before execution,
-    // so the workflow remains simulation -> preprocess -> encrypt -> online
+    // so the workflow remains simulation -> preprocess -> encrypt -> online evaluation
     // evaluation rather than a test-only reconstruction.
     assert_eq!(
         observed.borrow().as_slice(),
@@ -868,8 +868,8 @@ fn round_trip(
         return;
     }
     if export_only() {
-        // No stage was evaluated: build the decryption graph on placeholder online outputs,
-        // record it, and export the claim.
+        // No stage was evaluated: build the decryption graph on placeholder online evaluation
+        // outputs, record it, and export the claim.
         let placeholder = api::StageOutputs {
             outputs: [1, 3, 5]
                 .into_iter()
@@ -1011,10 +1011,10 @@ fn lwr_protocol(
     let mut links =
         BTreeMap::from([(payload_name, secret("payload")), (mask_name, secret("mask"))]);
     for (input, port) in [("decode-key-01", 1), ("decode-key-11", 3), ("decode-row-1", 5)] {
-        links.insert(input.to_owned(), (id("online"), format!("output-0.{port}")));
+        links.insert(input.to_owned(), (id("online_eval"), format!("output-0.{port}")));
     }
     let graph = |name: &str| &graphs[name];
-    let stages = ["payload", "mask", "preprocess", "encrypt", "online", "decode"]
+    let stages = ["payload", "mask", "preprocess", "encrypt", "online_eval", "decode"]
         .into_iter()
         .map(|name| common::stage(name, graph(name), &productions, &links))
         .collect::<Vec<_>>();
@@ -1120,7 +1120,7 @@ fn lwr_protocol(
     };
     let requirement_input =
         |input: &str| ProtocolInputDestination::Requirement { requirement: 0, input: input.into() };
-    let hash_key = ["preprocess", "encrypt", "online"]
+    let hash_key = ["preprocess", "encrypt", "online_eval"]
         .into_iter()
         .filter(|stage| !common::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
         .map(|stage| common::to_stage(stage, "rns-bgg/hash-key"))

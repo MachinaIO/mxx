@@ -18,11 +18,11 @@ def lut(I):
     lines = rnd.split('\n')
     names = [re.match(r'  have (h\d+_\d+(?:_\d+)?) := hb\.', l).group(1) for l in lines
              if re.match(r'  have h\d+_\d+(?:_\d+)? := hb\.', l)]
-    haves = proj(f'{I.d}/generated/Stage_online.lean', 'generatedRoot', names)
+    haves = proj(f'{I.d}/generated/Stage_online_eval.lean', 'generatedRoot', names)
     first = next(i for i, l in enumerate(lines) if re.match(r'  have h\d+_\d+(?:_\d+)? := hb\.', l))
     last = max(i for i, l in enumerate(lines) if re.match(r'  have h\d+_\d+(?:_\d+)? := hb\.', l))
     rnd = '\n'.join(lines[:first]) + '\n' + haves.rstrip('\n') + '\n' + '\n'.join(lines[last + 1:])
-    # The inputs of the online root.
+    # The inputs of the online evaluation root.
     old_bind = rnd[rnd.index('    {r00 r01'):rnd.index('{outputs}')]
     fams_ = [f'{{r{j}0 r{j}1 : Fin {C} → ExactMatrix Q{L - 1 - j} N 1 {I.m(L - 2 - j)}}}' for j in range(B)]
     rfams = '\n    '.join(' '.join(fams_[k:k + 2]) for k in range(0, B, 2))

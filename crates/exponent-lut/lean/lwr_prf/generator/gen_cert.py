@@ -175,7 +175,7 @@ theorem mask_ternary {{out : ExactMatrix Q{L} N 1 1}}
   rw [show {s} * (a ⟨coords {b} sel{b}, coords_lt {b} sel{b}⟩).toNat + {prev} = {s} * z{b + 1} by
     rw [hz{b + 1}]; ring] at hin{b + 1}
 ''')
-    hout = proj(f'{I.d}/generated/Stage_online.lean', 'generatedRoot', ['hout'], 'hb2').replace('have hout', 'have houtOnline')
+    hout = proj(f'{I.d}/generated/Stage_online_eval.lean', 'generatedRoot', ['hout'], 'hb2').replace('have hout', 'have houtOnlineEval')
     bound = f'cellBound0 {cut}'
     for b in range(1, B):
         bound = f'cellBound{b} (∑ _i : Fin {C}, {bound})'
@@ -192,7 +192,7 @@ theorem correct {{model : HashModel}} {{external : GeneratedClaim.ExternalInputs
     {{execution : GeneratedClaim.Execution}}
     (hruns : GeneratedClaim.Runs model external tape execution) :
     execution.«stage_5» = execution.«ideal» := by
-  obtain ⟨hvalid, hpay, hmask, hpre, henc, honline, hdec, hreq, hideal, hreqtrue⟩ := hruns
+  obtain ⟨hvalid, hpay, hmask, hpre, henc, honlineEval, hdec, hreq, hideal, hreqtrue⟩ := hruns
   obtain ⟨sp, hsp, hspn⟩ := secret_ternary hpay
   obtain ⟨sm, hsm, hsmn⟩ := mask_ternary hmask
   obtain ⟨{valid}⟩ := hvalid
@@ -225,11 +225,11 @@ theorem correct {{model : HashModel}} {{external : GeneratedClaim.ExternalInputs
 {rhs}
   have hsw := preprocess_switch hpre hsp
   -- The {B} blocks accumulate the monomial of the sum of the selected coordinates.
-  obtain ⟨w, hb⟩ := honline
+  obtain ⟨w, hb⟩ := honlineEval
 {''.join(blocks)}  -- The readout LUT and the decryption.
   have hlut := lutRound hb hsmn hg{m(1)} hg{m(1)}u hin{B} hhelp hsw
   have hb2 := hb
-  unfold Stage_online.generatedRoot.body at hb2
+  unfold Stage_online_eval.generatedRoot.body at hb2
   extract_lets at hb2
 {hout}  obtain ⟨wd, hd⟩ := hdec
   unfold Stage_decode.generatedRoot.body at hd
@@ -243,7 +243,7 @@ theorem correct {{model : HashModel}} {{external : GeneratedClaim.ExternalInputs
     decide
   have hval := decode_terminal_parity_bounded hQ1 (by norm_num) hN hlut hbound (k := ⟨0, hN⟩)
     (lutValue_coeff_bound z{B}) (by
-      rw [houtOnline, hw2, hw6]
+      rw [houtOnlineEval, hw2, hw6]
       funext r c
       obtain rfl : r = 0 := Subsingleton.elim _ _
       obtain rfl : c = 0 := Subsingleton.elim _ _

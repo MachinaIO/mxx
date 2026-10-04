@@ -1,4 +1,4 @@
-import NandOnline1
+import NandOnlineEval1
 
 /-!
 # Online evaluation, round 2
@@ -33,7 +33,7 @@ theorem loop2_step {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N
     {i : Nat} (hi : i < 15) {state next : LoopState Q5 Q4 8}
     (hswitch : state.switch = fun k j ↦ fam k j ⟨i, by omega⟩)
     {T : Fin 2 → ExactMatrix Q5 N 1 8} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
-    (hbody : Stage_online.sequential_generatedRoot_246 Backend.backend model
+    (hbody : Stage_online_eval.sequential_generatedRoot_246 Backend.backend model
       GeneratedClaim.stage_4_params i
       (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
         state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
@@ -42,7 +42,7 @@ theorem loop2_step {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N
     Rel sm next.key (T + branchTarget (q := Q5) (p := P5) μ sp fam ⟨i, by omega⟩) next.row
         (Bs + branchBound2 B) ∧
       next.switch = fun k j ↦ fam k j ⟨i + 1, by omega⟩ := by
-  unfold Stage_online.sequential_generatedRoot_246 at hbody
+  unfold Stage_online_eval.sequential_generatedRoot_246 at hbody
   try extract_lets at hbody
   obtain ⟨w_3_0, hbody⟩ := hbody
   try extract_lets at hbody
@@ -274,7 +274,7 @@ theorem loop2 {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
     {fam : Fin 2 → Fin 2 → Fin 16 → ExactMatrix Q4 N 1 8} {count : Nat} (hcount : count ≤ 15)
     {final : LoopState Q5 Q4 8}
     (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : LoopState Q5 Q4 8) ↦
-      Stage_online.sequential_generatedRoot_246 Backend.backend model GeneratedClaim.stage_4_params i
+      Stage_online_eval.sequential_generatedRoot_246 Backend.backend model GeneratedClaim.stage_4_params i
         (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
           current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
           current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0,
@@ -322,8 +322,8 @@ theorem round2 {model : HashModel} {key : ByteArray}
     {f0a f0b f0c f0d : Fin 16 → ExactMatrix Q6 N 1 12} {h0a h0b : Fin 16 → ExactMatrix Q7 N 1 12}
     {c0 c1 : ExactMatrix Q7 N 1 14} {b0a b0b : ExactMatrix Q7 N 1 12}
     {b1a b1b : ExactMatrix Q6 N 1 10} {b2a b2b : ExactMatrix Q5 N 1 8}
-    {b3a b3b : ExactMatrix Q4 N 1 6} {outputs} {w : Stage_online.generatedRoot.Witness}
-    (hb : Stage_online.generatedRoot.body Backend.backend model GeneratedClaim.stage_4_params
+    {b3a b3b : ExactMatrix Q4 N 1 6} {outputs} {w : Stage_online_eval.generatedRoot.Witness}
+    (hb : Stage_online_eval.generatedRoot.body Backend.backend model GeneratedClaim.stage_4_params
       (f3a, f3b, f3c, f3d, h3a, key, h3b, f2a, f2b, f2c, f2d, h2a, h2b, f1a, f1b, f1c, f1d, h1a,
         h1b, f0a, f0b, f0c, f0d, h0a, h0b, c0, c1, b0a, b0b, b1a, b1b, b2a, b2b, b3a, b3b, ())
       outputs w)
@@ -348,7 +348,7 @@ theorem round2 {model : HashModel} {key : ByteArray}
     Rel sm ![![w.w_285_0, w.w_309_0], ![w.w_288_0, w.w_312_0]]
       (fun j ↦ reducePoly Q4 N (1 * Xe (n := N) (MxxExponentLutNand.table 2 arg) * unitPair sp j) • g')
       ![w.w_282_0, w.w_306_0] roundBound2 := by
-  unfold Stage_online.generatedRoot.body at hb
+  unfold Stage_online_eval.generatedRoot.body at hb
   extract_lets at hb
   have h198_0_1 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
   have h202_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1

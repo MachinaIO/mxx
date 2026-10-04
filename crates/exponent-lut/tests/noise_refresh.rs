@@ -23,7 +23,7 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
-        RnsNoiseBuild, RnsOnlineBuild, RnsPreprocessBuild, checkpoint_refreshed_output,
+        RnsNoiseBuild, RnsOnlineEvalBuild, RnsPreprocessBuild, checkpoint_refreshed_output,
         resume_refreshed_output, verify_refreshed_output,
     },
     utils::{
@@ -552,7 +552,7 @@ fn noise_refresh_end_to_end() {
     let source_program = source.program();
 
     // Construct stage-local PRF bindings and secrets.  RHS values are used
-    // only while preparing the PRF; the online stage receives no RHS
+    // only while preparing the PRF; the online evaluation stage receives no RHS
     // plaintexts, while the LHS plaintext projection remains public to the
     // encryption stage as required by MulPublic.
     let hash_key = [0x43; 32];
@@ -665,7 +665,7 @@ fn noise_refresh_end_to_end() {
     let preprocess_declaration = declaration.clone();
     // Preprocess executes once and publishes two typed stage records from the
     // same named session: one for encryption and one for online evaluation.
-    let (preprocess, online) = api::preprocess(
+    let (preprocess, online_eval) = api::preprocess(
         source_program,
         &ParamEnv::default(),
         if dynamic { &no_rhs } else { &source_rhs },
@@ -700,7 +700,7 @@ fn noise_refresh_end_to_end() {
 
     // Encryption consumes only the public LHS plaintext projection plus the
     // payload/mask secrets.  It imports the preprocess-encrypt stage record;
-    // no RHS plaintext enters this stage or the later online stage.
+    // no RHS plaintext enters this stage or the later online evaluation stage.
     let mut encrypt_children = BTreeMap::new();
     for slot in 0..declaration.slots().len() {
         let mut child = RnsEncryptBuild::new(&prf_parameters, [0x51; 32]);
@@ -753,32 +753,33 @@ fn noise_refresh_end_to_end() {
     )
     .expect("source encryption");
 
-    // Online children use only the online preprocess stage record and the
+    // Online evaluation children use only the online evaluation preprocess
+    // stage record and the
     // encryption stage record.  Refresh is bound as a graph operation here;
     // it is not materialized as a caller-owned carrier or rerun by resume.
-    let mut online_children = BTreeMap::new();
+    let mut online_eval_children = BTreeMap::new();
     for slot in 0..declaration.slots().len() {
-        let mut child = RnsOnlineBuild::new(&prf_parameters, [0x51; 32]);
+        let mut child = RnsOnlineEvalBuild::new(&prf_parameters, [0x51; 32]);
         child
-            .bind_refresh_artifacts(&declaration, slot, &online, &encrypted, &hash_key)
-            .expect("PRF online child artifacts");
-        child.bind_refresh_prf(&declaration, slot).expect("PRF online child binding");
-        online_children.insert(slot, child);
+            .bind_refresh_artifacts(&declaration, slot, &online_eval, &encrypted, &hash_key)
+            .expect("PRF online evaluation child artifacts");
+        child.bind_refresh_prf(&declaration, slot).expect("PRF online evaluation child binding");
+        online_eval_children.insert(slot, child);
     }
-    let online_declaration = declaration.clone();
-    let online_result = api::online_eval(
+    let online_eval_declaration = declaration.clone();
+    let online_eval_result = api::online_eval(
         source_program,
         &ParamEnv::default(),
-        &online,
+        &online_eval,
         &encrypted,
         &hash_key,
-        RnsOnlineBuild::new(&parameters, [0x51; 32]),
+        RnsOnlineEvalBuild::new(&parameters, [0x51; 32]),
         &mut runtime,
         &mut store,
         move |build, outputs| {
             build
-                .apply_refresh(0, &online_declaration, online_children)
-                .expect("source online refresh");
+                .apply_refresh(0, &online_eval_declaration, online_eval_children)
+                .expect("source online evaluation refresh");
             Ok(outputs)
         },
         |_| Ok(()),
@@ -790,7 +791,7 @@ fn noise_refresh_end_to_end() {
     verify_refreshed_output(
         source_program,
         &declaration,
-        &online_result,
+        &online_eval_result,
         0,
         &expected,
         &parameters,
@@ -800,19 +801,19 @@ fn noise_refresh_end_to_end() {
         &mut store,
     )
     .expect("RNS-BGG refresh application verification");
-    assert!(!online_result.outputs.is_empty(), "refresh online evaluation has no outputs");
+    assert!(!online_eval_result.outputs.is_empty(), "refresh online evaluation has no outputs");
     assert!(refreshed_bound > 0u8.into(), "refresh simulation must produce a bound");
 
-    // The refresh result is already materialized by online execution.
+    // The refresh result is already materialized by online evaluation.
     // Checkpointing imports only its key/row ports and optional public payload;
     // it does not lower or execute refresh again.  Resumption then runs the
     // built-in single-input identity continuation over that checkpoint.
     let checkpointed = checkpoint_refreshed_output(
         source_program,
         &declaration,
-        &online_result,
+        &online_eval_result,
         0,
-        &online,
+        &online_eval,
         &encrypted,
         &parameters,
         &hash_key,

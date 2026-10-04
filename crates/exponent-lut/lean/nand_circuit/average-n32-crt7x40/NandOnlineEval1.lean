@@ -1,4 +1,4 @@
-import NandOnline0
+import NandOnlineEval0
 
 /-!
 # Online evaluation, round 1
@@ -11,6 +11,8 @@ Round `1` multiplies the round-0 output encoding by the RHS of circuit input
 namespace NandProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
+
+variable {tape : SampleTape} {path loopPath : List Nat} {loopPaths : Nat → List Nat}
 
 /-- The error bound added by one branch of the round-1 LUT. -/
 abbrev branchBound1 (B : Nat) : Nat :=
@@ -33,7 +35,7 @@ theorem loop1_step {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N
     {i : Nat} (hi : i < 15) {state next : LoopState Q6 Q5 10}
     (hswitch : state.switch = fun k j ↦ fam k j ⟨i, by omega⟩)
     {T : Fin 2 → ExactMatrix Q6 N 1 10} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
-    (hbody : Stage_online.sequential_generatedRoot_159 Backend.backend model
+    (hbody : Stage_online_eval.sequential_generatedRoot_159 Backend.backend model tape loopPath
       GeneratedClaim.stage_4_params i
       (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
         state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
@@ -42,7 +44,7 @@ theorem loop1_step {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N
     Rel sm next.key (T + branchTarget (q := Q6) (p := P6) μ sp fam ⟨i, by omega⟩) next.row
         (Bs + branchBound1 B) ∧
       next.switch = fun k j ↦ fam k j ⟨i + 1, by omega⟩ := by
-  unfold Stage_online.sequential_generatedRoot_159 at hbody
+  unfold Stage_online_eval.sequential_generatedRoot_159 at hbody
   try extract_lets at hbody
   obtain ⟨w_3_0, hbody⟩ := hbody
   try extract_lets at hbody
@@ -274,7 +276,7 @@ theorem loop1 {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
     {fam : Fin 2 → Fin 2 → Fin 16 → ExactMatrix Q5 N 1 10} {count : Nat} (hcount : count ≤ 15)
     {final : LoopState Q6 Q5 10}
     (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : LoopState Q6 Q5 10) ↦
-      Stage_online.sequential_generatedRoot_159 Backend.backend model GeneratedClaim.stage_4_params i
+      Stage_online_eval.sequential_generatedRoot_159 Backend.backend model tape (loopPaths i) GeneratedClaim.stage_4_params i
         (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
           current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
           current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0,
@@ -322,8 +324,8 @@ theorem round1 {model : HashModel} {key : ByteArray}
     {f0a f0b f0c f0d : Fin 16 → ExactMatrix Q6 N 1 12} {h0a h0b : Fin 16 → ExactMatrix Q7 N 1 12}
     {c0 c1 : ExactMatrix Q7 N 1 14} {b0a b0b : ExactMatrix Q7 N 1 12}
     {b1a b1b : ExactMatrix Q6 N 1 10} {b2a b2b : ExactMatrix Q5 N 1 8}
-    {b3a b3b : ExactMatrix Q4 N 1 6} {outputs} {w : Stage_online.generatedRoot.Witness}
-    (hb : Stage_online.generatedRoot.body Backend.backend model GeneratedClaim.stage_4_params
+    {b3a b3b : ExactMatrix Q4 N 1 6} {outputs} {w : Stage_online_eval.generatedRoot.Witness}
+    (hb : Stage_online_eval.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
       (f3a, f3b, f3c, f3d, h3a, key, h3b, f2a, f2b, f2c, f2d, h2a, h2b, f1a, f1b, f1c, f1d, h1a,
         h1b, f0a, f0b, f0c, f0d, h0a, h0b, c0, c1, b0a, b0b, b1a, b1b, b2a, b2b, b3a, b3b, ())
       outputs w)
@@ -348,7 +350,7 @@ theorem round1 {model : HashModel} {key : ByteArray}
     Rel sm ![![w.w_198_0, w.w_222_0], ![w.w_201_0, w.w_225_0]]
       (fun j ↦ reducePoly Q5 N (1 * Xe (n := N) (MxxExponentLutNand.table 1 arg) * unitPair sp j) • g')
       ![w.w_195_0, w.w_219_0] roundBound1 := by
-  unfold Stage_online.generatedRoot.body at hb
+  unfold Stage_online_eval.generatedRoot.body at hb
   extract_lets at hb
   have h111_0_1 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
   have h115_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1

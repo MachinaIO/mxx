@@ -3,7 +3,7 @@
 The integration suite contains exactly three GPU-gated targets. Each target
 contains exactly one sequential test and runs the complete production flow:
 noise simulation, benchmark estimation, then an artifact-backed preprocess,
-encrypt, and online round trip. Benchmark estimation is the GPU runtime's
+encrypt, and online-evaluation round trip. Benchmark estimation is the GPU runtime's
 planning step: every stage graph is planned with `GpuRuntime` immediately
 before it executes, the planner measures its wave-width and column-tile
 candidates on that exact graph, and the selected `GpuWarmupReport` is logged
@@ -152,7 +152,7 @@ reproduced, verify the round trip and the decrypted output, and export the graph
 stages as a closed protocol to `lean/<test>/<parameter id>/generated`. See `lean/README.md` for the
 meaning of each column and the proofs of the exported claims. A NAND parameter ID runs the RHS
 lifecycle of its row's `rhs_mode` and ignores `MXX_EXPONENT_LUT_NAND_RHS_MODE`; a Dynamic row exports
-the stages `payload`, `encrypt`, `online`, and `decode`. A Sparse-LWR parameter ID runs the Static
+the stages `payload`, `encrypt`, `online_eval`, and `decode`. A Sparse-LWR parameter ID runs the Static
 lifecycle; it cannot be combined with `MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic`.
 
 `lwr_prf.rs` with `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1` as well builds and validates the same

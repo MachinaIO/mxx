@@ -15,7 +15,7 @@ path = ".."
 name = "NandGenerated"
 srcDir = "generated"
 roots = [
-  "Backend", "Claim", "Ideal", "Requirement_0", "Stage_payload", "Stage_encrypt", "Stage_online",
+  "Backend", "Claim", "Ideal", "Requirement_0", "Stage_payload", "Stage_encrypt", "Stage_online_eval",
   "Stage_decode"
 ]
 

@@ -11,7 +11,6 @@
 use super::{RhsMode, RnsBggError, RnsBggParameters, workload::RnsBggDerivedWorkload};
 use crate::{
     noise_refresh::{
-        prf::PrfLabel,
         refresh::{NoiseRefresh, RefreshDeclaration, RefreshError, RefreshPrfLabel},
         simulation::{NoiseModelKind, RefreshNoiseParameters},
     },
@@ -25,6 +24,7 @@ use crate::{
         InputBinding, LutId, LutTable, ProgramLowerError, ProgramLoweringContext, RhsId, RhsRef,
         WireId,
     },
+    program_gadgets::prf::PrfLabel,
 };
 use bigdecimal::BigDecimal;
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};

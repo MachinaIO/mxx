@@ -1,11 +1,9 @@
 //! Native exponent refresh: CRT routing and noise-model utilities.
 use crate::{
-    noise_refresh::{
-        prf::{PreparedSparseLwrPrf, PrfError, PrfLabel},
-        simulation::RefreshTranscriptTopology,
-    },
+    noise_refresh::simulation::RefreshTranscriptTopology,
     noise_utils::{NoiseMomentPolicy, NoiseMoments},
     program::{ExponentLutProgram, ExponentLutProgramId, Operand, WireId},
+    program_gadgets::prf::{PreparedSparseLwrPrf, PrfError, PrfLabel},
 };
 use mxx_ir_core::types::WireType;
 use num_bigint::{BigInt, BigUint};
@@ -698,7 +696,7 @@ fn validate_refresh_prf_binding(
     if profile.p().map_err(|_| RefreshError::InvalidLayout)? != digits.base {
         return Err(RefreshError::InvalidLayout);
     }
-    crate::noise_refresh::prf::validate_profile_program(profile, program)
+    crate::program_gadgets::prf::validate_profile_program(profile, program)
         .map_err(|_| RefreshError::PrfOutputMismatch)
 }
 
@@ -834,25 +832,25 @@ pub(crate) mod tests {
         };
         let labels = RefreshPrfLabelIndex::new([3; 32], &topology).unwrap();
         let prf_labels = labels.prf_labels().unwrap();
-        let parameters = crate::noise_refresh::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
+        let parameters = crate::program_gadgets::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
         let generated = (0..32_u8)
             .find_map(|seed| {
-                crate::noise_refresh::pbc::generate_key_layout(
+                crate::program_gadgets::pbc::generate_key_layout(
                     &parameters,
-                    crate::noise_refresh::pbc::PbcRootSeed([seed; 32]),
+                    crate::program_gadgets::pbc::PbcRootSeed([seed; 32]),
                     &[0, 1],
                 )
                 .ok()
             })
             .expect("toy setup must find a PBC schedule");
-        let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
+        let profile = crate::program_gadgets::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
             3,
         )
         .unwrap();
         let prf_labels = prf_labels.to_vec();
-        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new(
+        let sparse = crate::program_gadgets::prf::SparseLwrPrfProgram::new(
             profile,
             vec![generated.public_layout.clone(); prf_labels.len()],
             prf_labels,
@@ -1077,25 +1075,25 @@ pub(crate) mod tests {
             }]),
             Err(RefreshError::InvalidModulusRelation)
         );
-        let parameters = crate::noise_refresh::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
+        let parameters = crate::program_gadgets::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
         let generated = (0..32_u8)
             .find_map(|seed| {
-                crate::noise_refresh::pbc::generate_key_layout(
+                crate::program_gadgets::pbc::generate_key_layout(
                     &parameters,
-                    crate::noise_refresh::pbc::PbcRootSeed([seed; 32]),
+                    crate::program_gadgets::pbc::PbcRootSeed([seed; 32]),
                     &[0, 1],
                 )
                 .ok()
             })
             .expect("toy setup must find a PBC schedule");
-        let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
+        let profile = crate::program_gadgets::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
             3,
         )
         .unwrap();
         let prf_labels = labels.prf_labels().unwrap().to_vec();
-        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new(
+        let sparse = crate::program_gadgets::prf::SparseLwrPrfProgram::new(
             profile,
             vec![generated.public_layout.clone(); prf_labels.len()],
             prf_labels,
@@ -1132,25 +1130,25 @@ pub(crate) mod tests {
             fresh_digit_count: 1,
         };
         let labels = RefreshPrfLabelIndex::new([4; 32], &topology).unwrap();
-        let parameters = crate::noise_refresh::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
+        let parameters = crate::program_gadgets::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
         let generated = (0..32_u8)
             .find_map(|seed| {
-                crate::noise_refresh::pbc::generate_key_layout(
+                crate::program_gadgets::pbc::generate_key_layout(
                     &parameters,
-                    crate::noise_refresh::pbc::PbcRootSeed([seed; 32]),
+                    crate::program_gadgets::pbc::PbcRootSeed([seed; 32]),
                     &[0, 1],
                 )
                 .ok()
             })
             .expect("toy setup must find a PBC schedule");
-        let profile = crate::noise_refresh::prf::SparseLwrPrfProfile::new(
+        let profile = crate::program_gadgets::prf::SparseLwrPrfProfile::new(
             crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
             1,
             3,
         )
         .unwrap();
         let prf_labels = [PrfLabel::from_components(&[b"foreign"]).unwrap()].to_vec();
-        let sparse = crate::noise_refresh::prf::SparseLwrPrfProgram::new(
+        let sparse = crate::program_gadgets::prf::SparseLwrPrfProgram::new(
             profile,
             vec![generated.public_layout.clone(); prf_labels.len()],
             prf_labels,

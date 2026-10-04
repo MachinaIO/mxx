@@ -19,7 +19,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::PbcEncodedPublicVector;
-use crate::noise_refresh::pbc::{
+use crate::program_gadgets::pbc::{
     PbcError, PbcGeneratedKeyLayout, PbcLayoutId, PbcLocation, PbcPrivateSchedule, PbcPublicLayout,
 };
 use mxx_backends::RuntimeValue;
@@ -71,7 +71,7 @@ impl<M> PbcSelectorFamilyMetadata<M> {
         element_type: ConcreteMatrixType,
     ) -> Result<Self, PbcError> {
         layout.validate()?;
-        let canonical_order = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)?
+        let canonical_order = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)?
             .iter()
             .map(|(bucket, slot, _)| PbcLocation { bucket, slot })
             .collect::<Vec<_>>();
@@ -95,7 +95,7 @@ impl<M> PbcSelectorFamilyMetadata<M> {
         // sufficient here because callers may deserialize a metadata value
         // before importing it.  Recompute the order from the trusted layout
         // and reject a forged list even when its length is unchanged.
-        let expected_order = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)?
+        let expected_order = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)?
             .iter()
             .map(|(bucket, slot, _)| PbcLocation { bucket, slot })
             .collect::<Vec<_>>();
@@ -143,7 +143,7 @@ impl PbcSelectorArtifactNames {
         key_instance_id: [u8; 32],
     ) -> Result<Self, PbcError> {
         layout.validate()?;
-        let selector_packages = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)?
+        let selector_packages = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)?
             .iter()
             .map(|(bucket, slot, _)| PbcSelectorPackageArtifactNames {
                 bucket,
@@ -166,7 +166,7 @@ impl PbcSelectorArtifactNames {
         selector_packages: Vec<PbcSelectorPackageArtifactNames>,
     ) -> Result<Self, PbcError> {
         layout.validate()?;
-        let expected = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)?
+        let expected = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)?
             .iter()
             .map(|(bucket, slot, _)| (bucket, slot))
             .collect::<Vec<_>>();
@@ -457,7 +457,7 @@ impl PbcTrustedSelectorBits {
         let layout = &generated.public_layout;
         layout.validate()?;
         generated.private_schedule().validate(layout)?;
-        let active = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)?;
+        let active = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)?;
         let expected = layout
             .parameters
             .universe_size
@@ -509,7 +509,7 @@ impl PbcTrustedSelectorBits {
     ) -> Result<Self, PbcError> {
         layout.validate()?;
         schedule.validate(layout)?;
-        let active = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)?;
+        let active = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)?;
         let expected = active.len();
         if bits.len() != expected || bits.iter().any(|bit| *bit > 1) {
             return Err(PbcError::InvalidSchedule(

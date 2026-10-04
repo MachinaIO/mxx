@@ -4,7 +4,7 @@
 //! This module only owns errors, manifest validation, and the generic
 //! verification boundary shared by those adapters.
 
-use crate::noise_refresh::{prf::PrfError, refresh::RefreshError};
+use crate::{noise_refresh::refresh::RefreshError, program_gadgets::prf::PrfError};
 use mxx_dsl::{Bool, BuiltGraph, DslContext, GraphValue, Mat};
 use mxx_ir_core::{
     IntExpr, ParamEnv, ScopedWireRef,

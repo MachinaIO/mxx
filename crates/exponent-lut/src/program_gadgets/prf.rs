@@ -1,11 +1,11 @@
 //! Scheme-independent sparse-LWR PRF declarations and Program interpretation.
 use crate::{
-    noise_refresh::pbc::{PbcCell, PbcGeneratedKeyLayout, PbcLayoutId, PbcPublicLayout},
     program::{
         AttributeKnowledge, ExpLayout, ExponentLutProgram, ExponentLutProgramBuilder,
         ExponentLutProgramId, FamilyRange, LutOutputRepresentation, LutTable, Operand,
         ProgramValidationError, RhsId, WireId,
     },
+    program_gadgets::pbc::{PbcCell, PbcGeneratedKeyLayout, PbcLayoutId, PbcPublicLayout},
 };
 use mxx_ir_core::IntExpr;
 use serde::{Deserialize, Serialize};
@@ -672,12 +672,12 @@ mod tests {
     /// The layout depends only on the root seed, so distinct keys search
     /// distinct seed ranges starting at `seed_base`.
     fn toy_key(support: &[usize], seed_base: u8) -> PbcGeneratedKeyLayout {
-        let parameters = crate::noise_refresh::pbc::PbcParameters::paper_evaluation(10, 4);
+        let parameters = crate::program_gadgets::pbc::PbcParameters::paper_evaluation(10, 4);
         (seed_base..seed_base.saturating_add(32))
             .find_map(|seed| {
-                crate::noise_refresh::pbc::generate_key_layout(
+                crate::program_gadgets::pbc::generate_key_layout(
                     &parameters,
-                    crate::noise_refresh::pbc::PbcRootSeed([seed; 32]),
+                    crate::program_gadgets::pbc::PbcRootSeed([seed; 32]),
                     support,
                 )
                 .ok()
@@ -746,7 +746,7 @@ mod tests {
             }
             assert_eq!(
                 accumulator,
-                crate::noise_refresh::pbc::clear_pbc_inner_product(
+                crate::program_gadgets::pbc::clear_pbc_inner_product(
                     &key.public_layout,
                     key.private_schedule(),
                     &a,

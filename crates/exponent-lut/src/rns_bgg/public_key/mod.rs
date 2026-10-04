@@ -7,15 +7,13 @@ use crate::{
         ApiError, PlaintextInputs, PreprocessBuild, RefreshApplicationError, StageGraph,
         apply_refresh,
     },
-    noise_refresh::{
-        prf::PrfLabel,
-        refresh::{NoiseRefresh, RefreshError, RefreshPrfLabel},
-    },
+    noise_refresh::refresh::{NoiseRefresh, RefreshError, RefreshPrfLabel},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
         GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, ProgramLoweringContext,
         RhsId, RhsRef, WireId, lower_program,
     },
+    program_gadgets::prf::PrfLabel,
 };
 use mxx_backends::{RuntimeValue, poly::Poly};
 use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};

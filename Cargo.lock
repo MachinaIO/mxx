@@ -494,6 +494,7 @@ name = "mxx-exponent-lut"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "keccak-asm",
  "mxx-backends",
  "mxx-dsl",
  "mxx-ir-core",

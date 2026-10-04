@@ -620,9 +620,8 @@ mod tests {
         }
         // The caller's state binding mono_m(2) is exactly the packed register
         // state (R0,R1,R2)=(0,1,0), and each RHS mono_m(8*x) selects bit 3.
-        assert_eq!(2usize & 1, 0);
-        assert_eq!((2usize >> 1) & 1, 1);
-        assert_eq!((2usize >> 2) & 1, 0);
+        let registers = (0..3).map(|register| (2usize >> register) & 1).collect::<Vec<_>>();
+        assert_eq!(registers, [0, 1, 0]);
         assert!(compiled.circuit_input_indices().iter().all(|index| *index < 2));
     }
 

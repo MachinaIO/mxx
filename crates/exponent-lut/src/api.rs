@@ -6,11 +6,12 @@
 //! input-only and never receives a whole Program.
 
 use crate::{
-    noise_refresh::{NoiseRefresh, RefreshDeclaration, prf::PrfLabel},
+    noise_refresh::{NoiseRefresh, RefreshDeclaration},
     program::{
         Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution,
         ProgramLowerError, RhsId, WireId, lower_program,
     },
+    program_gadgets::prf::PrfLabel,
 };
 use mxx_backends::{
     ArtifactHandle, ArtifactKey, ArtifactPayload, ArtifactStore, ExecutionConfig, ExecutionError,

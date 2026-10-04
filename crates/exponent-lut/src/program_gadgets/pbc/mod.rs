@@ -1,9 +1,9 @@
 //! Private-bucket cuckoo (PBC) support for sparse-LWR evaluation.
 //!
 //! PBC separates data that may be public from the secret sparse support. A
-//! [`crate::noise_refresh::pbc::PbcPublicLayout`] deterministically hashes every universe
+//! [`crate::program_gadgets::pbc::PbcPublicLayout`] deterministically hashes every universe
 //! coordinate into candidate buckets and rectangularizes those buckets with dummy and padding
-//! cells. A [`crate::noise_refresh::pbc::PbcPrivateSchedule`] then records which slot is
+//! cells. A [`crate::program_gadgets::pbc::PbcPrivateSchedule`] then records which slot is
 //! selected for each bucket to realize the secret support assignment. The
 //! compiler consumes the public layout and
 //! selector artifacts, while the private schedule is never serialized
@@ -2192,7 +2192,7 @@ impl PbcEncodedPublicVector {
 ///
 /// The host binding stores one public residue and its active row-major order
 /// for every real or dummy cell, as defined by
-/// [`crate::noise_refresh::pbc::PbcActiveCellIndex`]. Padding has no family element. At the
+/// [`crate::program_gadgets::pbc::PbcActiveCellIndex`]. Padding has no family element. At the
 /// DSL runtime boundary, each residue `a` is materialized as the public
 /// monomial factor `X^a` consumed by the native selector binding; the declared `(1, 1)` describes
 /// the matrix shape only, not a scalar-output encoding. This is a declaration
@@ -2425,7 +2425,7 @@ pub(crate) mod routing_tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::noise_refresh::pbc::{PbcActiveCellIndex, PbcLayoutSeed, PbcParameters};
+    use crate::program_gadgets::pbc::{PbcActiveCellIndex, PbcLayoutSeed, PbcParameters};
 
     pub(crate) fn layout_with_padding() -> PbcPublicLayout {
         let parameters = PbcParameters::custom(4, 2, 2, 3, 1, None);
@@ -2575,7 +2575,7 @@ pub(crate) mod routing_tests {
 /// the artifact model has no first-class integer family artifacts. The other
 /// two families provide the public rotation and active-cell mask.
 pub struct PbcLayoutFamilies {
-    layout_id: crate::noise_refresh::pbc::PbcLayoutId,
+    layout_id: crate::program_gadgets::pbc::PbcLayoutId,
     encoded_vector_id: [u8; 32],
     rectangular_count: usize,
     package_indices: Family<Mat>,
@@ -2595,7 +2595,7 @@ impl PbcLayoutFamilies {
         layout.validate().map_err(|_| PbcError::ArtifactIdentityMismatch)?;
         encoded.validate(layout).map_err(|_| PbcError::ArtifactIdentityMismatch)?;
         let rectangular_count = layout.parameters.bucket_count * layout.bucket_width;
-        let package_count = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)
+        let package_count = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)
             .map_err(|_| PbcError::ArtifactIdentityMismatch)?
             .len();
         Ok(Self {
@@ -2634,7 +2634,7 @@ impl PbcLayoutFamilies {
         let mut families = Self::from_layout(ring, layout, encoded)?;
         artifacts::validate_manifest_identity(manifest, &production_id)?;
         let rectangular_count = families.rectangular_count;
-        let package_count = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)
+        let package_count = crate::program_gadgets::pbc::PbcActiveCellIndex::build(layout)
             .map_err(|_| PbcError::ArtifactIdentityMismatch)?
             .len();
         let mask_name = artifacts::public_family_artifact_name(encoded, "active-masks");
@@ -2703,7 +2703,7 @@ impl PbcLayoutFamilies {
     }
 
     /// Returns the layout identity committed by these family handles.
-    pub fn layout_id(&self) -> crate::noise_refresh::pbc::PbcLayoutId {
+    pub fn layout_id(&self) -> crate::program_gadgets::pbc::PbcLayoutId {
         self.layout_id
     }
 

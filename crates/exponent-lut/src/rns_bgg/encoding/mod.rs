@@ -12,17 +12,15 @@ use crate::{
         StageArtifacts, StageExecution, StageGraph, StageOutputs, apply_refresh, domain_identity,
         execute_artifacts, execute_graph,
     },
-    noise_refresh::{
-        prf::PrfLabel,
-        refresh::{
-            NoiseRefresh, RefreshDeclaration, RefreshError, RefreshPrfLabel, canonical_digit_offset,
-        },
+    noise_refresh::refresh::{
+        NoiseRefresh, RefreshDeclaration, RefreshError, RefreshPrfLabel, canonical_digit_offset,
     },
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
         ExponentLutProgramBuilder, GraphParallelLowering, InputBinding, InputShape, LoweringSite,
         LutId, LutTable, Operand, ProgramLoweringContext, RhsId, RhsRef, WireId, family_of_fields,
     },
+    program_gadgets::prf::PrfLabel,
 };
 use mxx_backends::{
     RuntimeValue, SessionStore, backend::poly::threshold_decode_coefficients,

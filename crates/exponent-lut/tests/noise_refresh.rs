@@ -13,13 +13,15 @@ use mxx_dsl::{GraphValue, GraphValueSchema};
 use mxx_exponent_lut::{
     CompiledNandCircuit, ExpLayout, NandCircuit, api,
     noise_refresh::{
-        pbc::{PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, generate_key_layout},
-        prf::{PreparedSparseLwrPrf, SparseLwrPrfProgram},
         refresh::{RefreshDeclaration, RefreshDigitPlan, RefreshPrfLabelIndex, RefreshSlot},
         simulation::RefreshTranscriptTopology,
     },
     noise_utils::{NoiseMomentPolicy, NonnegativeRational},
     program::{FamilyRange, InputBinding},
+    program_gadgets::{
+        pbc::{PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, generate_key_layout},
+        prf::{PreparedSparseLwrPrf, SparseLwrPrfProgram},
+    },
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
@@ -257,7 +259,7 @@ fn build_candidate(
                 .map_err(|error| format!("PBC layout generation failed: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let profile = mxx_exponent_lut::noise_refresh::prf::SparseLwrPrfProfile::new(
+    let profile = mxx_exponent_lut::program_gadgets::prf::SparseLwrPrfProfile::new(
         ExpLayout {
             stride_log2: ring_dimension_stride_log2(poly_parameters.ring_dimension(), 4)
                 .ok_or_else(|| "ring dimension must be a power of two with log2 >= 4".to_owned())?,

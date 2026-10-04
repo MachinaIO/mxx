@@ -29,15 +29,15 @@ use mxx_backends::{
 use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
     ExpLayout, api,
-    noise_refresh::{
+    noise_refresh::simulation::AverageCaseConfig,
+    program::{AttributeKnowledge, FamilyRange, InputBinding, WireId},
+    program_gadgets::{
         pbc::{
             PbcCell, PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, clear_pbc_inner_product,
             generate_key_layout,
         },
         prf::{PrfLabel, SparseLwrPrfProfile, SparseLwrPrfProgram},
-        simulation::AverageCaseConfig,
     },
-    program::{AttributeKnowledge, FamilyRange, InputBinding, WireId},
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,

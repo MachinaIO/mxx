@@ -25,7 +25,6 @@ use thiserror::Error;
 
 use crate::{
     noise_refresh::{
-        prf::PrfError,
         refresh::{RefreshDeclaration, RefreshError},
         simulation::{RefreshNoiseParameters, RefreshRouteNoiseGains, RefreshTranscriptTopology},
     },
@@ -33,6 +32,7 @@ use crate::{
         ExponentLUTProgramLowering, ExponentLutProgramId, InputBinding, InputShape, LutId, RhsId,
         WireId,
     },
+    program_gadgets::prf::PrfError,
 };
 
 pub use encoding::{

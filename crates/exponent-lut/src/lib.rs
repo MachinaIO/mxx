@@ -11,6 +11,7 @@ pub mod nand_circuit;
 pub mod noise_refresh;
 pub mod noise_utils;
 pub mod program;
+pub mod program_gadgets;
 pub mod rns_bgg;
 pub mod utils;
 
@@ -18,8 +19,8 @@ pub mod utils;
 mod test_support;
 
 pub use nand_circuit::{CompiledNandCircuit, NandCircuit, NandCircuitError};
-pub use noise_refresh::prf::SparseLwrPrfProfile;
 pub use program::{ExpLayout, ExponentLutProgram, ExponentLutProgramId, LayoutError};
+pub use program_gadgets::prf::SparseLwrPrfProfile;
 use thiserror::Error;
 
 /// Shared declaration and graph-construction errors, independent of a backend.

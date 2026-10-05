@@ -1,4 +1,4 @@
-//! Pointer-stable real scalars and direct CUDA Graph arithmetic.
+//! Pointer-stable real scalars and direct GPU graph arithmetic.
 
 use std::{ffi::c_void, ptr};
 
@@ -34,6 +34,11 @@ pub struct GpuDeviceReal {
 }
 
 impl GpuDeviceReal {
+    /// Allocation protocol shared with compiled physical storage views.
+    pub(crate) fn compiled_buffer(&self) -> &GpuDeviceBuffer {
+        &self.buffer
+    }
+
     pub fn new(
         params: &GpuDCRTPolyParams,
         physical_device: i32,
@@ -203,11 +208,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[serial]
     fn real_graph_replays_arithmetic_and_rejects_invalid_domain() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(8, vec![97], 3, None);
         let stream = params.native_launch_stream(device).unwrap();
         let left = GpuDeviceReal::new(&params, device).unwrap();

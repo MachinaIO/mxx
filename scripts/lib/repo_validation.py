@@ -3,15 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import tomllib
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Sequence, TextIO
 
-DEFAULT_GPU_REPEAT_COUNT = 150
+DEFAULT_GPU_REPEAT_COUNT = 300
 EDITED_DIFF_FILTER = "ACDMR"
-GPU_REPEAT_SOURCE_DIRS = frozenset({"element", "poly", "matrix", "sampler"})
 
 
 @dataclass(frozen=True)
@@ -58,14 +59,40 @@ def is_gpu_rust_path(path: str) -> bool:
 
 def is_gpu_repeat_validation_trigger(path: str) -> bool:
     normalized = PurePosixPath(path)
-    if normalized.parts[:3] == ("crates", "backends", "cuda"):
+    if normalized.parts[:3] in {("crates", "backends", "gpu"), ("crates", "backends", "cuda"), ("crates", "fhe", "cuda")}:
         return True
-    return (
-        is_gpu_rust_path(path)
-        and len(normalized.parts) >= 5
-        and normalized.parts[:3] == ("crates", "backends", "src")
-        and normalized.parts[3] in GPU_REPEAT_SOURCE_DIRS
-    )
+    if path in {"crates/backends/build.rs", "crates/fhe/build.rs", "crates/backends/Cargo.toml", "crates/fhe/Cargo.toml"}:
+        return True
+    return is_gpu_rust_path(path) and normalized.parts[:3] == ("crates", "backends", "src")
+
+
+def warning_free_rustflags(environment: dict[str, str], repo_root: Path | None = None) -> str:
+    """Keep Cargo's effective flags, including the repository OpenFHE rpath."""
+    if "CARGO_ENCODED_RUSTFLAGS" in environment:
+        flags = environment["CARGO_ENCODED_RUSTFLAGS"].split("\x1f") if environment["CARGO_ENCODED_RUSTFLAGS"] else []
+    elif "RUSTFLAGS" in environment:
+        flags = shlex.split(environment["RUSTFLAGS"])
+    else:
+        repo_root = repo_root or Path(__file__).resolve().parents[2]
+        with (repo_root / ".cargo/config.toml").open("rb") as config_file:
+            config = tomllib.load(config_file)
+        # This is the repository's configured host target rule, not a generic
+        # reimplementation of Cargo's target/cfg resolution.
+        flags = config.get("target", {}).get('cfg(target_os = "linux")', {}).get("rustflags", []) if sys.platform.startswith("linux") else []
+    return "\x1f".join([*flags, "-D", "warnings"])
+
+
+def gpu_validation_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Select one native backend without requiring an SDK for CPU validation."""
+    env = environment.copy()
+    backend = env.get("MXX_GPU_BACKEND", "cuda")
+    if backend not in {"cuda", "hip"}:
+        raise ValueError(f"Unsupported MXX_GPU_BACKEND: {backend!r}; expected cuda or hip")
+    env["MXX_GPU_BACKEND"] = backend
+    env.setdefault("CARGO_TARGET_DIR", f"target/gpu-{backend}")
+    env.setdefault("RUST_LOG", "debug")
+    env["CARGO_ENCODED_RUSTFLAGS"] = warning_free_rustflags(env)
+    return env
 
 
 def is_gpu_single_run_validation_trigger(path: str) -> bool:
@@ -133,7 +160,20 @@ def compile_gpu_test_binaries(
     executables = parse_cargo_test_executables(completed.stdout)
     if not executables:
         raise RuntimeError("Cargo did not report any GPU test executables.")
-    return executables
+    selected: list[Path] = []
+    test_filter = env.get("GPU_TEST_FILTER", "gpu")
+    for executable in executables:
+        listed = runner(
+            (str(executable), test_filter, "--ignored", "--list"),
+            cwd=repo_root, env=env, check=False, capture_output=True, text=True,
+        )
+        if listed.returncode != 0:
+            raise RuntimeError(f"Failed to list GPU unit tests in {executable}")
+        if any(line.endswith(": test") for line in listed.stdout.splitlines()):
+            selected.append(executable)
+    if not selected:
+        raise RuntimeError(f"No ignored GPU unit tests match {test_filter!r}; refusing an empty device gate")
+    return selected
 
 
 def run_gpu_repeat_suite(
@@ -162,7 +202,7 @@ def run_gpu_repeat_suite(
 
 def run_gpu_binary(binary: Path, repo_root: Path, env: dict[str, str]) -> int:
     completed = subprocess.run(
-        (str(binary), "gpu"),
+        (str(binary), env.get("GPU_TEST_FILTER", "gpu"), "--ignored"),
         cwd=repo_root,
         env=env,
         check=False,
@@ -170,18 +210,22 @@ def run_gpu_binary(binary: Path, repo_root: Path, env: dict[str, str]) -> int:
     return completed.returncode
 
 
-def maybe_run_gpu_repeat_validation(repo_root: Path, repeat_count: int, log: TextIO) -> int:
+def maybe_run_gpu_repeat_validation(repo_root: Path, repeat_count: int, log: TextIO, force: bool = False) -> int:
     edited_paths = edited_paths_from_git(repo_root)
     repeat_trigger_paths = gpu_repeat_validation_trigger_paths(edited_paths)
     single_run_trigger_paths = gpu_single_run_validation_trigger_paths(edited_paths)
+    if force:
+        repeat_trigger_paths.append("explicit full GPU unit validation")
     if not repeat_trigger_paths and not single_run_trigger_paths:
         log.write(
-            "[gpu-repeat] skipped: no edited files under crates/backends/cuda/ or matching *gpu*.rs in configured crate source paths\n"
+            "[gpu-repeat] skipped: no edited files under native GPU, GPU build, or matching *gpu*.rs in configured crate source paths\n"
         )
         return 0
 
-    env = os.environ.copy()
-    env.setdefault("RUST_LOG", "debug")
+    if repeat_count < 1:
+        raise ValueError("GPU repeat count must be positive")
+    env = gpu_validation_environment(dict(os.environ))
+    log.write(f"[gpu-repeat] backend={env['MXX_GPU_BACKEND']} filter={env.get('GPU_TEST_FILTER', 'gpu')} (ignored device unit tests)\n")
     binaries = compile_gpu_test_binaries(repo_root, env)
     if repeat_trigger_paths:
         log.write("[gpu-repeat] repeat mode triggered by edited files:\n")
@@ -230,7 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Repository validation helpers")
     parser.add_argument(
         "command",
-        choices=("maybe-run-gpu-repeat",),
+        choices=("maybe-run-gpu-repeat", "warning-free-rustflags"),
         help="Run conditional repository validation routines.",
     )
     parser.add_argument(
@@ -239,10 +283,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=int(os.environ.get("GPU_REPEAT_COUNT", DEFAULT_GPU_REPEAT_COUNT)),
         help="How many sequential GPU iterations to run when GPU-triggering files were edited.",
     )
+    parser.add_argument("--force", action="store_true", help="Run the GPU unit suite even with a clean checkout.")
     args = parser.parse_args(argv)
     repo_root = Path.cwd()
+    if args.command == "warning-free-rustflags":
+        sys.stdout.write(warning_free_rustflags(dict(os.environ), repo_root))
+        return 0
     if args.command == "maybe-run-gpu-repeat":
-        return maybe_run_gpu_repeat_validation(repo_root, args.repeat_count, sys.stdout)
+        return maybe_run_gpu_repeat_validation(repo_root, args.repeat_count, sys.stdout, force=args.force)
     raise ValueError(f"Unsupported command: {args.command}")
 
 

@@ -74,6 +74,7 @@ fn gpu_input(params: &GpuDCRTPolyParams, value: &DCRTPolyMatrix) -> RuntimeValue
 }
 
 #[test]
+#[ignore = "requires a supported GPU"]
 #[serial_test::serial]
 fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
     let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
@@ -110,6 +111,7 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
 }
 
 #[test]
+#[ignore = "requires a supported GPU"]
 #[serial_test::serial]
 fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
     let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
@@ -148,6 +150,7 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
 }
 
 #[test]
+#[ignore = "requires a supported GPU"]
 #[serial_test::serial]
 fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
     let parameters = DCRTPolyParams::new(2, 2, 12, 6, None, None);
@@ -212,7 +215,7 @@ fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
 }
 
 #[test]
-#[ignore = "full nested-RNS Ring-GSW GPU runtime round trip takes more than six minutes"]
+#[ignore = "requires a supported GPU; full nested-RNS Ring-GSW round trip takes more than six minutes"]
 #[serial_test::serial]
 fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
     let ring_dimension = 2u32;

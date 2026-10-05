@@ -3,7 +3,7 @@
 `mxx-fhe` builds fully homomorphic encryption with the mxx DSL: TFHE with NAND bootstrapping over
 integer LWE, and leveled BGV with SIMD slots, rotations, relinearization, and hybrid RNS key
 switching. Its methods build graphs rather than encrypting eagerly, so the same key generation,
-encryption, evaluation, and decryption run on the CPU or the GPU. It depends on `mxx-dsl`,
+encryption, evaluation, and decryption can run on the CPU or a supported GPU backend. It depends on `mxx-dsl`,
 `mxx-ir-core`, and `mxx-backends`.
 
 ## Contents
@@ -16,7 +16,7 @@ encryption, evaluation, and decryption run on the CPU or the GPU. It depends on 
 | `FheScheme` | The shared matrix-plaintext interface, implemented by BGV. |
 | `utils` | Parameter helpers, including the standard TFHE Boolean profile used in tests. |
 | `lean/` | Lean packages that prove the generated correctness claims of both protocols. |
-| `cuda/` | The native TFHE blind-rotation kernel used on the GPU. |
+| `cuda/` | The CUDA-only native TFHE blind-rotation kernel. |
 | `tests/` | GPU round trips for TFHE and BGV, which also declare the executed graphs as a closed protocol and export its Lean claim. |
 | `scripts/` | A GPU BGV comparison with PhantomFHE: building a pinned external checkout, the comparison driver, and validating and summarizing its measurements. |
 
@@ -76,10 +76,10 @@ to the next, and requires the input contracts.
 ### Regenerating and checking
 
 Regenerate the statements with the GPU integration tests, then check both proofs inside each
-package directory:
+package directory (integration tests require explicit authorization):
 
 ```bash
-cargo test -r -p mxx-fhe --features gpu --test gpu_tfhe --test gpu_bgv
+MXX_GPU_BACKEND=cuda cargo test -r -p mxx-fhe --features gpu --test gpu_tfhe --test gpu_bgv
 ```
 
 ```bash
@@ -93,3 +93,17 @@ cd crates/fhe/lean/bgv && lake build
 Regenerating at unchanged parameters writes byte-identical modules. Each package's
 `Certificate.lean` prints the axioms of the checked theorem, which are only `propext`,
 `Classical.choice`, and `Quot.sound`.
+
+## GPU backend scope
+
+`MXX_GPU_BACKEND=cuda|hip` is selected by `mxx-backends` and propagated through Cargo metadata;
+FHE does not choose a separate native compiler. BGV uses the common backend on either build.
+The TFHE blind-rotation kernel remains CUDA-only: HIP builds skip its native compilation and
+`TfheParams::gpu_blind_rotation_kernel` returns `None`. AMD TFHE execution is deferred and is
+not a supported or validated path in this change; CPU TFHE APIs remain available.
+
+HIP workspace/FHE compilation passed for gfx1100 and gfx942 with ROCm 7.0.0; AMD BGV device
+execution remains unverified. Five CUDA FHE device cases passed in each of three smoke repetitions; the whole device
+gate still has a pending long KHE probe after the compiled planner/lowering correction. See [`AMD_GPU_VALIDATION.md`](../../AMD_GPU_VALIDATION.md). The external PhantomFHE comparison tools
+under `crates/fhe/scripts/` target CUDA; they do not validate HIP or establish cross-vendor
+performance equivalence. See the [backend support evidence](../backends/README.md#gpu-backend-selection).

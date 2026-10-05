@@ -76,6 +76,15 @@ class RepoValidationTests(unittest.TestCase):
             self.assertEqual(run_gpu_binary(Path("/tmp/bin"), Path("/tmp/repo"), {"GPU_TEST_FILTER": "test_gpu_case"}), 0)
         self.assertEqual(runner.call_args.args[0], ("/tmp/bin", "test_gpu_case", "--ignored"))
 
+    def test_default_gpu_selection_skips_long_unit_tests(self) -> None:
+        with patch("repo_validation.subprocess.run") as runner:
+            runner.return_value.returncode = 0
+            self.assertEqual(run_gpu_binary(Path("/tmp/bin"), Path("/tmp/repo"), {}), 0)
+        self.assertEqual(
+            runner.call_args.args[0],
+            ("/tmp/bin", "gpu", "--ignored", "--skip", "test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts"),
+        )
+
     def test_force_runs_on_clean_checkout(self) -> None:
         with (patch("repo_validation.edited_paths_from_git", return_value=[]),
               patch("repo_validation.compile_gpu_test_binaries", return_value=[Path("/tmp/bin")]),

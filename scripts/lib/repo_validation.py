@@ -13,6 +13,10 @@ from typing import Callable, Iterable, Sequence, TextIO
 
 DEFAULT_GPU_REPEAT_COUNT = 300
 EDITED_DIFF_FILTER = "ACDMR"
+# Ignored GPU unit tests too long for the repeated default gate: the Ring-GSW
+# round trip takes more than six minutes per run. An explicit GPU_TEST_FILTER
+# still selects them.
+LONG_GPU_UNIT_TESTS = ("test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts",)
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,13 @@ def parse_cargo_test_executables(stdout_text: str) -> list[Path]:
     return executables
 
 
+def gpu_test_selection(env: dict[str, str]) -> tuple[str, ...]:
+    """Libtest arguments selecting the ignored device unit tests of the gate."""
+    if "GPU_TEST_FILTER" in env:
+        return (env["GPU_TEST_FILTER"], "--ignored")
+    return ("gpu", "--ignored", *(argument for name in LONG_GPU_UNIT_TESTS for argument in ("--skip", name)))
+
+
 def compile_gpu_test_binaries(
     repo_root: Path,
     env: dict[str, str],
@@ -161,10 +172,10 @@ def compile_gpu_test_binaries(
     if not executables:
         raise RuntimeError("Cargo did not report any GPU test executables.")
     selected: list[Path] = []
-    test_filter = env.get("GPU_TEST_FILTER", "gpu")
+    selection = gpu_test_selection(env)
     for executable in executables:
         listed = runner(
-            (str(executable), test_filter, "--ignored", "--list"),
+            (str(executable), *selection, "--list"),
             cwd=repo_root, env=env, check=False, capture_output=True, text=True,
         )
         if listed.returncode != 0:
@@ -172,7 +183,7 @@ def compile_gpu_test_binaries(
         if any(line.endswith(": test") for line in listed.stdout.splitlines()):
             selected.append(executable)
     if not selected:
-        raise RuntimeError(f"No ignored GPU unit tests match {test_filter!r}; refusing an empty device gate")
+        raise RuntimeError(f"No ignored GPU unit tests match {' '.join(selection)!r}; refusing an empty device gate")
     return selected
 
 
@@ -202,7 +213,7 @@ def run_gpu_repeat_suite(
 
 def run_gpu_binary(binary: Path, repo_root: Path, env: dict[str, str]) -> int:
     completed = subprocess.run(
-        (str(binary), env.get("GPU_TEST_FILTER", "gpu"), "--ignored"),
+        (str(binary), *gpu_test_selection(env)),
         cwd=repo_root,
         env=env,
         check=False,
@@ -225,7 +236,7 @@ def maybe_run_gpu_repeat_validation(repo_root: Path, repeat_count: int, log: Tex
     if repeat_count < 1:
         raise ValueError("GPU repeat count must be positive")
     env = gpu_validation_environment(dict(os.environ))
-    log.write(f"[gpu-repeat] backend={env['MXX_GPU_BACKEND']} filter={env.get('GPU_TEST_FILTER', 'gpu')} (ignored device unit tests)\n")
+    log.write(f"[gpu-repeat] backend={env['MXX_GPU_BACKEND']} selection={' '.join(gpu_test_selection(env))} (ignored device unit tests)\n")
     binaries = compile_gpu_test_binaries(repo_root, env)
     if repeat_trigger_paths:
         log.write("[gpu-repeat] repeat mode triggered by edited files:\n")

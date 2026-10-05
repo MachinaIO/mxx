@@ -2019,7 +2019,31 @@ fn available_gpu_ids() -> Vec<i32> {
 
 #[cfg(feature = "gpu")]
 pub fn detected_gpu_device_ids() -> Vec<i32> {
-    available_gpu_ids()
+    let devices = available_gpu_ids();
+    // A HIP build carries code objects for its single `HIP_ARCH` target only,
+    // and a device of another target fails at its first kernel launch. Reject
+    // such a device before fleet planning assigns work to it.
+    #[cfg(mxx_gpu_backend = "hip")]
+    {
+        static CHECKED: OnceLock<()> = OnceLock::new();
+        CHECKED.get_or_init(|| {
+            for &device in &devices {
+                let identity = gpu_device_identity(device)
+                    .unwrap_or_else(|error| panic!("GPU {device} identity query failed: {error}"));
+                // HIP reports target features after the base architecture.
+                let architecture = identity.architecture.split(':').next().unwrap_or_default();
+                if architecture != env!("MXX_GPU_ARCH") {
+                    panic!(
+                        "GPU {device} is {architecture}, but this HIP build targets {}; rebuild \
+                         with HIP_ARCH={architecture} or select devices of the built target with \
+                         MXX_GPU_LOGICAL_DEVICES",
+                        env!("MXX_GPU_ARCH")
+                    );
+                }
+            }
+        });
+    }
+    devices
 }
 
 fn pinned_alloc<T>(len: usize) -> NonNull<T> {

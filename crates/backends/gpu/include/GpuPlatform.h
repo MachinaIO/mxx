@@ -249,16 +249,14 @@
 #define gpuGraphDestroyNode cudaGraphDestroyNode
 #endif
 
-// A logical 32-lane tile remains independent on both halves of a wave64.
-template <typename T>
-__device__ __forceinline__ T gpu_shfl_xor(T value, unsigned offset, int width = 32)
-{
+// Lane exchange within a `width`-lane tile. A 32-lane tile remains
+// independent on both halves of a wave64.
 #if defined(MXX_GPU_BACKEND_HIP)
-    return __shfl_xor(value, offset, width);
+#define gpu_shfl_xor(value, offset, width) __shfl_xor(value, offset, width)
 #else
-    return __shfl_xor_sync(__activemask(), value, offset, width);
+#define gpu_shfl_xor(value, offset, width) \
+    __shfl_xor_sync(__activemask(), value, offset, width)
 #endif
-}
 
 #if defined(MXX_GPU_BACKEND_HIP)
 #define gpuMemPoolGetAccess hipMemPoolGetAccess

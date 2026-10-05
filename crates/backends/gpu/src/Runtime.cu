@@ -2477,6 +2477,16 @@ extern "C++" {
         std::vector<void *> host_staging;
     };
 
+    // Whether `exec` holds an executable to upload, bind or launch.
+    static bool graph_exec_ready(const MxxGpuGraphExec *exec)
+    {
+        if (!exec) return false;
+#if defined(MXX_GPU_BACKEND_HIP)
+        if (exec->schedule) return true;
+#endif
+        return exec->exec != nullptr;
+    }
+
     struct MxxGpuGraphBuilder
     {
         GpuContext *context = nullptr;
@@ -3547,21 +3557,25 @@ extern "C++" {
         result->device = builder->device;
         result->execution = builder->context->execution;
         result->default_stream = builder->stream;
-        const gpuError_t error = gpuGraphInstantiateWithFlags(&result->exec,
-            builder->root_graph, gpuGraphInstantiateFlagAutoFreeOnLaunch);
-        if (error != gpuSuccess) { delete result; return set_error(error); }
 #if defined(MXX_GPU_BACKEND_HIP)
+        // A Graph with control nodes runs only as the schedule's region
+        // executables, so no root executable is instantiated for it.
         if (!builder->hip_controls.empty())
         {
             result->schedule.reset(new HipGraphSchedule());
             if (result->schedule->compile(builder) != 0)
             {
-                (void)gpuGraphExecDestroy(result->exec);
                 delete result;
                 return 1;
             }
         }
+        else
 #endif
+        {
+            const gpuError_t error = gpuGraphInstantiateWithFlags(&result->exec,
+                builder->root_graph, gpuGraphInstantiateFlagAutoFreeOnLaunch);
+            if (error != gpuSuccess) { delete result; return set_error(error); }
+        }
         result->graph = builder->root_graph;
         builder->root_graph = nullptr;
         builder->graph = nullptr;
@@ -3683,7 +3697,7 @@ extern "C++" {
 
     int mxx_gpu_graph_upload(MxxGpuGraphExec *exec, void *launch_stream)
     {
-        if (!exec || !exec->exec || !launch_stream)
+        if (!graph_exec_ready(exec) || !launch_stream)
         {
             return set_error("invalid mxx_gpu_graph_upload arguments");
         }
@@ -3749,7 +3763,7 @@ extern "C++" {
         const MxxGraphBindingValue *values,
         size_t count)
     {
-        if (!exec || !exec->exec || (count != 0 && !values))
+        if (!graph_exec_ready(exec) || (count != 0 && !values))
         {
             return set_error("invalid mxx_gpu_graph_bind arguments");
         }
@@ -3957,7 +3971,7 @@ extern "C++" {
         void *launch_stream,
         MxxGpuNativeEvent **out_event)
     {
-        if (!exec || !exec->exec || !launch_stream || !out_event)
+        if (!graph_exec_ready(exec) || !launch_stream || !out_event)
         {
             return set_error("invalid mxx_gpu_graph_launch arguments");
         }

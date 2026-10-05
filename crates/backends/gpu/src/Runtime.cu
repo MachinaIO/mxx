@@ -1592,14 +1592,15 @@ extern "C"
             streams.push_back(owner.release_streams_by_partition[partition]);
         const int physical = mxx_physical_device(device);
         gpuError_t err = mxx_set_device(device);
+        // Synchronize the streams, not events recorded on them. Both wait
+        // for the same work, including queued stream-ordered frees. Compute
+        // Sanitizer, however, treats only a stream synchronization as
+        // completing those frees. After an event wait, the whole-device
+        // probe below makes the driver release destroyed Graph executables.
+        // The sanitizer then reports each of their kernels as using the
+        // freed buffers after the free.
         for (gpuStream_t stream : streams)
-        {
-            gpuEvent_t done = nullptr;
-            if (err == gpuSuccess) err = gpuEventCreateWithFlags(&done, gpuEventDisableTiming);
-            if (err == gpuSuccess) err = gpuEventRecord(done, stream);
-            if (err == gpuSuccess) err = gpuEventSynchronize(done);
-            if (done) (void)gpuEventDestroy(done);
-        }
+            if (err == gpuSuccess) err = gpuStreamSynchronize(stream);
         if (err == gpuSuccess) err = gpuDeviceGraphMemTrim(physical);
         gpuMemPool_t pool = nullptr;
         if (err == gpuSuccess) err = gpuDeviceGetDefaultMemPool(&pool, physical);

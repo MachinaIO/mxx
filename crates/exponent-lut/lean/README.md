@@ -14,8 +14,10 @@ its claim is `GeneratedClaim.CorrectnessClaim`, and the package of that paramete
 | `lean/<test>/<parameter id>/` | The proof of one parameter set (a Lake package) |
 | `lean/<test>/<parameter id>/generated/` | The claim the integration test exported deterministically; never edited by hand |
 | `lean/lwr_prf/generator/` | The script that writes the proof modules and the Lake package of an average-case `lwr_prf` parameter set from its exported claim |
+| `lean/public_ip/generator/` | The destructuring patterns of generated stages, and the script that writes the decode-stage proof of a `public_ip` parameter set |
 
-`<test>` is `nand_circuit` (`tests/nand_circuit.rs`) or `lwr_prf` (`tests/lwr_prf.rs`). Each
+`<test>` is `nand_circuit` (`tests/nand_circuit.rs`), `lwr_prf` (`tests/lwr_prf.rs`), or
+`public_ip` (`tests/public_ip.rs`). Each
 package requires the package one directory up, and Mathlib and the ir-core Lean library come from
 `crates/ir-core/lean`.
 
@@ -42,11 +44,14 @@ package requires the package one directory up, and Mathlib and the ir-core Lean 
 - `nand_circuit/NandProgram.lean`: the four LUT tables of the depth-one NAND program and the
   exponent of every round; `rounds_nand` shows that the output exponent is `1 - b₀ b₁`.
 - `lwr_prf/LwrProgram.lean`: the sparse-LWR readout table `τ(k) = ⌊p' k / w⌋ + 1`.
+- `public_ip/PublicIpProgram.lean`: an accepted plaintext `c X^e` (`c² = 1`, `0 ≤ e < n`,
+  `2e + n (1 - c) = 2x`) is the monomial `X^x`, products of monomials, and `X^(2n) = 1`.
 
 ## Parameter IDs
 
 `<test>/parameters.csv` records reproducible parameter sets under unique `parameter_id`s. With
-`MXX_EXPONENT_LUT_NAND_PARAMETER_ID` or `MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID` set to an ID, the
+`MXX_EXPONENT_LUT_NAND_PARAMETER_ID`, `MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID`, or
+`MXX_EXPONENT_LUT_PUBLIC_IP_PARAMETER_ID` set to an ID, the
 integration test runs that row without searching, checks that the recorded lattice security
 (`security_bits`) is reproduced, and exports the claim to `<parameter id>/generated`.
 
@@ -63,13 +68,15 @@ Common columns:
 `nand_circuit` adds `nand_depth` and `rhs_mode` (`static` or `dynamic`, the RHS lifecycle the
 round trip runs); `lwr_prf` adds `input_modulus` (`Q`), `output_modulus` (`P`),
 `lwr_dimension` (`ν`), `support_weight` (`h`), `outputs`, and `key_seed`, the seed of the PBC layout
-and the key.
+and the key; `public_ip` adds `input_modulus` (`Q`), `dimension` (`m`), and `seed`, the seed of `a`
+and of the hash seed of `t`.
 
 | Test | IDs | Parameters |
 | --- | --- | --- |
 | `nand_circuit` | `worst-n32-crt7x40`, `average-n32-crt7x40` | Depth-one NAND, `n = 32`, seven 40-bit primes, 11-bit security |
 | `nand_circuit` | `dynamic-worst-n32-crt7x40` | The same NAND parameters with the Dynamic RHS lifecycle |
 | `lwr_prf` | `worst-n32-crt7x40`, `average-n32-crt7x40` | `Q = 32`, `P = 4`, `ν = 16`, `h = 2`, `n = 32`, seven 40-bit primes, 11-bit security |
+| `public_ip` | `average-n32-crt2x40` | `Q = 32`, `m = 4`, `t = (1, 1, 0, 1)`, `n = 32`, two 40-bit primes (one level), 11-bit security |
 | `lwr_prf` | `average-n65536-crt36x40` | The recommended row of `tests/lwr_prf_parameters.csv`: `Q = 256`, `P = 32`, `ν = 1024`, `h = 31`, `n = 2^16`, thirty-six 40-bit primes with 10-bit digits, 124-bit security |
 
 ## Claims and proofs
@@ -125,6 +132,27 @@ terminal error by about `2^35.6` against `Q1 ≈ 2^40`. Its cells live in `LwrCe
 library passes `--tstack` to Lean, since the kernel check of the certificate, which chains the 34
 blocks, needs a larger thread stack than the default.
 
+### Public inner product (`public_ip`)
+
+The Program of `PublicInnerProductProgram` has public inputs only, so its output is a public
+encoding, which has no coefficient scaled by `⌊q/2⌋` to decrypt. Its workflow instead checks the
+output against a claimed plaintext `c X^e` with `decode_public_output`: the decode stage subtracts the
+mask part `s₀ A₀ⱼ + A₁ⱼ` from each row component, adds back `c X^e` times `sⱼ G`, threshold-decodes
+every coefficient of every column of both residuals, and outputs their sum. The requirement makes the
+plaintext of member `k` the monomial `X^(stride a_k)`, the last member (the encoding of zero) zero,
+and the claimed plaintext `X^(stride (<a, t> mod Q))`; the ideal residual count is zero. The claim
+therefore states that the output is a public encoding of `X^(stride <a, t>)` with error below
+`q / 4`. With public inputs only, online evaluation derives every public key from the hash key, so
+the workflow has no preprocessing or payload stage.
+
+`PublicIpSetup`, `PublicIpInputs` (the requirement, which checks the members in a loop, and the
+ideal), `PublicIpEncrypt` (every member of the input family), `PublicIpOnlineEval` (the first-level
+pair inside its one-member parallel family and the root, which multiplies it by the carried odd
+member; both are public multiplications at the native gadget), `PublicIpDecode` (both residuals are
+the output error, and every decoded coefficient of a column is zero), and `PublicIpCertificate`.
+`generator/gen_decode.py` writes `PublicIpDecode` from the exported decode stage, one decoded
+coefficient per line; regenerating `average-n32-crt2x40` reproduces it byte for byte.
+
 ## Reproduction
 
 Export a claim and run the integration test on a GPU (`lattice-estimator-cli` must be on the
@@ -135,6 +163,8 @@ MXX_EXPONENT_LUT_NAND_PARAMETER_ID=worst-n32-crt7x40 \
   cargo test -p mxx-exponent-lut --features gpu --test nand_circuit -- --nocapture
 MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=worst-n32-crt7x40 \
   cargo test -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
+MXX_EXPONENT_LUT_PUBLIC_IP_PARAMETER_ID=average-n32-crt2x40 \
+  cargo test -r -p mxx-exponent-lut --features gpu --test public_ip -- --nocapture
 ```
 
 The export is deterministic: rerunning an ID writes identical `generated` files. The round trip of
@@ -154,6 +184,8 @@ readout LUT of `average-n32-crt7x40` are its templates.
 ```sh
 cd crates/exponent-lut/lean/lwr_prf
 python3 generator/gen.py average-n65536-crt36x40
+cd ../public_ip
+python3 generator/gen_decode.py average-n32-crt2x40
 ```
 
 Check a proof in its parameter directory:
@@ -163,5 +195,5 @@ cd crates/exponent-lut/lean/nand_circuit/worst-n32-crt7x40
 lake build
 ```
 
-`lake build` builds both the exported claim (`NandGenerated` or `LwrGenerated`) and its proof
-(`NandProof` or `LwrProof`).
+`lake build` builds both the exported claim (`NandGenerated`, `LwrGenerated`, or
+`PublicIpGenerated`) and its proof (`NandProof`, `LwrProof`, or `PublicIpProof`).

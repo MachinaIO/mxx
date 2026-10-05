@@ -1,0 +1,17 @@
+name = "MxxExponentLutPublicIp"
+version = "0.1.0"
+defaultTargets = ["MxxExponentLutPublicIp"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = ".."
+
+# Lemmas about the public inner-product programs of `tests/public_ip.rs` that hold at every
+# parameter set.
+[[lean_lib]]
+name = "MxxExponentLutPublicIp"
+roots = ["PublicIpProgram"]

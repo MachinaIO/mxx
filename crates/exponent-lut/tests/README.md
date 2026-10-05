@@ -1,6 +1,6 @@
 # Exponent-LUT integration tests
 
-The integration suite contains exactly three GPU-gated targets. Each target
+The integration suite contains exactly four GPU-gated targets. Each target
 contains exactly one sequential test and runs the complete production flow:
 noise simulation, benchmark estimation, then an artifact-backed preprocess,
 encrypt, and online-evaluation round trip. Benchmark estimation is the GPU runtime's
@@ -14,8 +14,9 @@ at `info` level (run with `RUST_LOG=info` to see it).
 | `nand_circuit.rs` | `nand_circuit_end_to_end` | NAND circuit |
 | `lwr_prf.rs` | `lwr_prf_end_to_end` | Sparse-LWR PRF |
 | `noise_refresh.rs` | `noise_refresh_end_to_end` | Noise refreshing |
+| `public_ip.rs` | `public_ip_end_to_end` | Public inner product |
 
-All three workflows use the public RNS-BGG application API and the
+All four workflows use the public RNS-BGG application API and the
 `dcrt_runtime` sequential lock. They require the `gpu` feature and a
 GPU-visible environment. Before execution, the NAND and Sparse-LWR targets
 search their configured CRT-depth and ring-dimension candidates, validate the
@@ -28,8 +29,9 @@ described below, which makes no security claim.
 
 Parameter controls are namespaced per target rather than shared globally:
 `MXX_EXPONENT_LUT_NAND_*` controls the NAND workflow and
-`MXX_EXPONENT_LUT_LWR_PRF_*` controls Sparse-LWR, while
-`MXX_EXPONENT_LUT_NOISE_REFRESH_*` controls noise refreshing. Their
+`MXX_EXPONENT_LUT_LWR_PRF_*` controls Sparse-LWR,
+`MXX_EXPONENT_LUT_NOISE_REFRESH_*` controls noise refreshing, and
+`MXX_EXPONENT_LUT_PUBLIC_IP_*` controls the public inner product. Their
 ring-dimension settings specify inclusive logarithmic bounds and their
 security settings specify the required target. Search uses 40 CRT bits by
 default and derives the gadget base as `ceil(CRT_BITS/2)`, subject to the
@@ -63,11 +65,11 @@ cargo test -r -p mxx-exponent-lut --features gpu \
   --test lwr_prf lwr_prf_end_to_end -- --nocapture
 ```
 
-Compile all three targets without running them:
+Compile all four targets without running them:
 
 ```sh
 cargo test -r -p mxx-exponent-lut --features gpu \
-  --test nand_circuit --test lwr_prf --test noise_refresh --no-run
+  --test nand_circuit --test lwr_prf --test noise_refresh --test public_ip --no-run
 ```
 
 Run one target when GPU execution is explicitly authorized:
@@ -79,6 +81,8 @@ cargo test -r -p mxx-exponent-lut --features gpu \
   --test lwr_prf lwr_prf_end_to_end -- --nocapture
 cargo test -r -p mxx-exponent-lut --features gpu \
   --test noise_refresh noise_refresh_end_to_end -- --nocapture
+cargo test -r -p mxx-exponent-lut --features gpu \
+  --test public_ip public_ip_end_to_end -- --nocapture
 ```
 
 The NAND target builds a complete binary NAND tree whose depth is controlled
@@ -116,8 +120,13 @@ The PRF target uses a fixed canonical label and independently computes the
 sequential `D*T` exponent and readout before verifying the caller-owned
 output. The refresh target independently computes
 the clear PRF state/readout, checks the three production graphs in order, and
-verifies the refreshed output with caller-owned secrets. Correctness-oracle
-calculations remain outside the production graphs.
+verifies the refreshed output with caller-owned secrets. The public
+inner-product target draws `a` and the hash seed of `t` from
+`MXX_EXPONENT_LUT_PUBLIC_IP_SEED` (reported when fresh), computes `<a, t> mod Q`
+in the clear, verifies the public output against it and rejects its successor,
+and checks the output with `decode_public_output`, whose decoded residual count
+must be zero. Correctness-oracle calculations remain outside the production
+graphs.
 
 There is no alternate scheme selector or stage-skip switch. Internal
 structural regressions belong to the crate's unit tests; these external
@@ -144,16 +153,20 @@ security. None of them has run on a GPU. The columns are:
 
 ## Parameter IDs for the Lean correctness proofs
 
-With `MXX_EXPONENT_LUT_NAND_PARAMETER_ID` or `MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID` set to a
-parameter ID, `nand_circuit.rs` and `lwr_prf.rs` run without searching at the parameters of that row
-of `lean/<test>/parameters.csv` (the noise model, the RNS-BGG parameters, the error width, and for
-the PRF the LWR profile and the key seed). They check that the recorded lattice security is
+With `MXX_EXPONENT_LUT_NAND_PARAMETER_ID`, `MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID`, or
+`MXX_EXPONENT_LUT_PUBLIC_IP_PARAMETER_ID` set to a parameter ID, `nand_circuit.rs`, `lwr_prf.rs`, and
+`public_ip.rs` run without searching at the parameters of that row of `lean/<test>/parameters.csv`
+(the noise model, the RNS-BGG parameters, the error width, for the PRF the LWR profile and the key
+seed, and for the public inner product the input modulus, the dimension, and the seed). They check that the recorded lattice security is
 reproduced, verify the round trip and the decrypted output, and export the graphs of the executed
 stages as a closed protocol to `lean/<test>/<parameter id>/generated`. See `lean/README.md` for the
 meaning of each column and the proofs of the exported claims. A NAND parameter ID runs the RHS
 lifecycle of its row's `rhs_mode` and ignores `MXX_EXPONENT_LUT_NAND_RHS_MODE`; a Dynamic row exports
 the stages `payload`, `encrypt`, `online_eval`, and `decode`. A Sparse-LWR parameter ID runs the Static
-lifecycle; it cannot be combined with `MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic`.
+lifecycle; it cannot be combined with `MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic`. A public
+inner-product parameter ID exports the stages `mask`, `encrypt`, `online_eval`, and `decode`: with
+public inputs only, online evaluation derives every public key from the hash key, so no stage reads
+the preprocessing artifacts or the payload secret.
 
 `lwr_prf.rs` with `MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1` as well builds and validates the same
 stage graphs without a round trip: only the secret sampling executes, on the CPU, and the claim is
@@ -165,4 +178,6 @@ MXX_EXPONENT_LUT_NAND_PARAMETER_ID=worst-n32-crt7x40 \
   cargo test -p mxx-exponent-lut --features gpu --test nand_circuit -- --nocapture
 MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=average-n32-crt7x40 \
   cargo test -p mxx-exponent-lut --features gpu --test lwr_prf -- --nocapture
+MXX_EXPONENT_LUT_PUBLIC_IP_PARAMETER_ID=average-n32-crt2x40 \
+  cargo test -r -p mxx-exponent-lut --features gpu --test public_ip -- --nocapture
 ```

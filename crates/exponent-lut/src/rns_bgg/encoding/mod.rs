@@ -52,7 +52,7 @@ use self::dynamic::*;
 pub(super) use self::lowering::*;
 pub use self::{
     online_eval::{checkpoint_refreshed_output, resume_refreshed_output},
-    verify::{decode_output, verify_output, verify_refreshed_output},
+    verify::{decode_output, decode_public_output, verify_output, verify_refreshed_output},
 };
 
 /// Encoded row paired with the public key for its Program wire and, for

@@ -165,6 +165,131 @@ where
         .collect()
 }
 
+/// Check public output `output_index` of [`crate::api::online_eval`]
+/// against the plaintext `expected` with the caller's mask (for Dynamic
+/// parameters, the payload secret), and return the number of residual
+/// coefficients that do not decode to zero.
+///
+/// A public output is a terminal-level carrier whose payload is the mask
+/// `s = (s_0, 1)`: its row components are `c_j = s_0 A_0j + A_1j - mu s_j G
+/// + e_j` for the paired public key `A`, its public plaintext `mu`, and the
+/// native gadget `G` of the level. Unlike a private output it has no
+/// coefficient scaled by `floor(q / 2)`, so it is not decrypted; instead the
+/// residual `c_j - (s_0 A_0j + A_1j) + expected s_j G` is `e_j` exactly when
+/// `expected = mu`, and every coefficient of every column of both components
+/// threshold-decodes to zero modulo two whenever the error is below `q / 4`.
+/// The graph is the one check of the workflow: its inputs are the online
+/// evaluation outputs `output-{output_index}.0` to `.5`, named
+/// `decode-key-{port}` and `decode-row-{component}`, the mask, and the
+/// plaintext `decode-expected.coefficient` and `decode-expected.exponent`
+/// (a signed monomial `c X^k`); its output `decoded-residual`
+/// is the sum of the decoded coefficients.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_public_output<E, S, P>(
+    program: &ExponentLutProgram,
+    result: &StageOutputs,
+    output_index: usize,
+    parameters: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    mask: Option<&RnsBggMaskSecret>,
+    expected: &P,
+    execution: &mut E,
+    store: &mut S,
+    before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
+) -> Result<BigInt, ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+    P: Poly,
+{
+    let (wire, output_level) = output_wire_level(program, output_index)?;
+    if output_level + 1 != parameters.levels().len() {
+        return Err(ApiError::input("only a terminal-level output can be decoded"));
+    }
+    if !matches!(
+        program.wire_knowledge(wire).map_err(ApiError::scheme)?,
+        AttributeKnowledge::PublicPayload
+    ) {
+        return Err(ApiError::input("only a public output is checked against its plaintext"));
+    }
+    let ring = parameters.ring(output_level).map_err(ApiError::scheme)?;
+    let level = parameters.level(output_level).map_err(ApiError::scheme)?;
+    let dimension = level.ring_dimension() as usize;
+    let columns = parameters
+        .key_component_columns(output_level, AttributeKnowledge::PublicPayload)
+        .map_err(ApiError::scheme)?;
+    let mut runtime = BTreeMap::new();
+    for port in 0..6 {
+        let value = result
+            .outputs
+            .get(&format!("output-{output_index}.{port}"))
+            .ok_or_else(|| ApiError::input("decoded output port is missing"))?;
+        let name = if port < 4 {
+            format!("decode-key-{port}")
+        } else {
+            format!("decode-row-{}", port - 4)
+        };
+        runtime.insert(name, value.clone());
+    }
+    let expected = match super::plaintext_inputs(
+        &ring,
+        "decode-expected",
+        &InputBinding::Scalar(expected.clone()),
+        &mut runtime,
+    )
+    .map_err(ApiError::input)?
+    {
+        InputBinding::Scalar(expected) => expected,
+        InputBinding::Family(_) => unreachable!("a scalar plaintext binds a scalar"),
+    };
+    let mask = &stage_mask(parameters, payload, mask)?;
+    let mask_row = reduce_secret(parameters, &mask.row, output_level).map_err(ApiError::scheme)?;
+    let mask_row = [mask_row.0, mask_row.1];
+    let key = |port: usize| ring.input(format!("decode-key-{port}"), (1, columns));
+    let scaled = expected * parameters.public_gadget(output_level).map_err(ApiError::scheme)?;
+    let mut total = Int::constant(0);
+    for (component, mask_component) in mask_row.iter().enumerate() {
+        let residual = ring.input(format!("decode-row-{component}"), (1, columns)) -
+            (mask_row[0].clone() * key(component) + mask_row[1].clone() * key(2 + component)) +
+            mask_component.clone() * scaled.clone();
+        for column in 0..columns {
+            let entry = residual.clone().slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(column),
+                    end: IntExpr::constant(column + 1),
+                }),
+            );
+            for decoded in entry.threshold_decode_ints(2u8, dimension) {
+                total = total.add(decoded);
+            }
+        }
+    }
+    let graph = DslContext::new("rns-bgg-public-output-decode")
+        .output("decoded-residual", total)
+        .map_err(ApiError::scheme)?
+        .build()
+        .map_err(ApiError::scheme)?;
+    if let Some(binding) = &mask.binding {
+        binding.bind(&mut runtime);
+    }
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
+        execution,
+        store,
+        before_execute,
+    )?;
+    let value = outputs
+        .outputs
+        .get("decoded-residual")
+        .ok_or_else(|| ApiError::input("decoded residual is missing"))?;
+    let [value] = <[BigInt; 1]>::try_from(execution.download_integers(value)?)
+        .map_err(|_| ApiError::input("decoded residual is not one integer"))?;
+    Ok(value)
+}
+
 /// Verify one output after a declared RNS-BGG refresh.
 ///
 /// A refresh changes the carrier modulus and public key, so the ordinary

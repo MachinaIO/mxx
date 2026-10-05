@@ -37,8 +37,8 @@ use crate::{
 
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineEvalBuild, checkpoint_refreshed_output, decode_output, resume_refreshed_output,
-    verify_output, verify_refreshed_output,
+    RnsOnlineEvalBuild, checkpoint_refreshed_output, decode_output, decode_public_output,
+    resume_refreshed_output, verify_output, verify_refreshed_output,
 };
 pub use noise::{
     RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound, RnsBggNoiseEvaluator,

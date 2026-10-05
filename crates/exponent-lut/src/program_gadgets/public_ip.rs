@@ -13,7 +13,7 @@
 //! `O(log m)` bodies instead of one gate per product. Only the first level
 //! lists the selected coordinates, as a `Select` index expression.
 //!
-//! The gadget only assembles the Program and prepares its plaintext inputs;
+//! This module only assembles the Program and prepares its plaintext inputs;
 //! public keys and encodings are computed by the generic backend evaluators.
 
 use crate::{
@@ -256,7 +256,7 @@ mod tests {
         },
         rns_bgg::{
             RnsBggParameters, RnsEncryptBuild, RnsOnlineEvalBuild, RnsPreprocessBuild,
-            verify_output,
+            decode_public_output, verify_output,
         },
     };
     use mxx_backends::{
@@ -347,12 +347,12 @@ mod tests {
 
     /// The multiplication depth of the output and the number of Program
     /// family bodies.
-    fn depth_and_bodies(gadget: &PublicInnerProductProgram) -> (usize, usize) {
+    fn depth_and_bodies(public_ip: &PublicInnerProductProgram) -> (usize, usize) {
         let mut environment = Environment::new();
-        environment.bind_wire(gadget.input_vector(), InputBinding::Family(0)).unwrap();
+        environment.bind_wire(public_ip.input_vector(), InputBinding::Family(0)).unwrap();
         let mut depth = Depth::default();
         let outputs =
-            lower_program(gadget.program(), &mut depth, &mut DepthFamilies, &mut environment)
+            lower_program(public_ip.program(), &mut depth, &mut DepthFamilies, &mut environment)
                 .unwrap();
         (outputs[0], depth.bodies)
     }
@@ -394,8 +394,8 @@ mod tests {
     /// verifies that the output encodes `<a, t> mod Q` and not its successor.
     fn check_encoding_inner_product(dimension: usize, seed: [u8; 32]) {
         let vector = (0..dimension).map(|i| (5 * i + 3) % 16).collect::<Vec<_>>();
-        let gadget = PublicInnerProductProgram::new(LAYOUT, vector, seed, b"public-ip").unwrap();
-        let program = gadget.program();
+        let public_ip = PublicInnerProductProgram::new(LAYOUT, vector, seed, b"public-ip").unwrap();
+        let program = public_ip.program();
         let level = DCRTPolyParams::new(16, 4, 17, 4, None, None);
         let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
         let mut execution = CpuExecution::new(cpu_backend([level.clone()]));
@@ -421,7 +421,7 @@ mod tests {
         let mask = RnsEncryptBuild::new(&parameters, rand::random())
             .sample_mask_secret(&mut execution, &mut store, |_| Ok(()))
             .unwrap();
-        let lhs = gadget.plaintext_inputs::<DCRTPoly>(&level).unwrap();
+        let lhs = public_ip.plaintext_inputs::<DCRTPoly>(&level).unwrap();
         let encrypted = crate::api::encrypt(
             &program.encryption_inputs(),
             &ParamEnv::default(),
@@ -450,8 +450,8 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap();
-        let inner_product = gadget.inner_product();
-        let expected = gadget.encode::<DCRTPoly>(&level, inner_product).unwrap();
+        let inner_product = public_ip.inner_product();
+        let expected = public_ip.encode::<DCRTPoly>(&level, inner_product).unwrap();
         verify_output(
             program,
             &result,
@@ -464,7 +464,7 @@ mod tests {
             &mut store,
         )
         .unwrap();
-        let wrong = gadget.encode::<DCRTPoly>(&level, inner_product + 1).unwrap();
+        let wrong = public_ip.encode::<DCRTPoly>(&level, inner_product + 1).unwrap();
         assert!(
             verify_output(
                 program,
@@ -480,6 +480,24 @@ mod tests {
             .is_err(),
             "a wrong inner product must be rejected"
         );
+        let decode =
+            |expected: &DCRTPoly, execution: &mut CpuExecution, store: &mut MemoryArtifactStore| {
+                decode_public_output(
+                    program,
+                    &result,
+                    0,
+                    &parameters,
+                    &payload,
+                    Some(&mask),
+                    expected,
+                    execution,
+                    store,
+                    |_| Ok(()),
+                )
+                .unwrap()
+            };
+        assert_eq!(decode(&expected, &mut execution, &mut store), 0.into());
+        assert_ne!(decode(&wrong, &mut execution, &mut store), 0.into());
     }
 
     #[test]

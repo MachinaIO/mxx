@@ -231,19 +231,28 @@ fn rebind(
     replacements: &BTreeMap<*const (), BoundStorage>,
 ) -> Result<(), String> {
     for owner in owners.values_mut() {
-        let replaced = owner
-            .storages()
-            .filter_map(|(_, bound)| {
-                let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
-                replacements.get(&pointer).map(|new| (pointer, new.clone()))
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        if replaced.is_empty() {
-            continue;
-        }
-        if let Some(rebound) = owner.rebound(&replaced, owner.ready_events())? {
-            *owner = Arc::new(rebound);
-        }
+        rebind_owner(owner, replacements)?;
+    }
+    Ok(())
+}
+
+/// Materialize a replay destination using the same allocation spans as its views.
+fn rebind_owner(
+    owner: &mut Arc<GpuResidentValue>,
+    replacements: &BTreeMap<*const (), BoundStorage>,
+) -> Result<(), String> {
+    let replaced = owner
+        .storages()
+        .filter_map(|(_, bound)| {
+            let pointer = Arc::as_ptr(&bound.owner).cast::<()>();
+            replacements.get(&pointer).map(|new| (pointer, new.clone()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if replaced.is_empty() {
+        return Ok(());
+    }
+    if let Some(rebound) = owner.rebound(&replaced, owner.ready_events())? {
+        *owner = Arc::new(rebound);
     }
     Ok(())
 }
@@ -315,6 +324,11 @@ pub(crate) fn plan_graph_scratch(
     for wave in &frame.waves {
         for (&id, owner) in &wave.owner_bindings {
             collect(id, owner, false, false);
+        }
+        // Parent destinations installed into a nested occurrence are host-bound
+        // replay owners too. Their allocations must remain live for the plan.
+        for (_, id, owner) in &wave.nested_owner_bindings {
+            collect(*id, owner, false, false);
         }
     }
     for (index, op) in frame.program.operations.iter().enumerate() {
@@ -540,6 +554,9 @@ pub(crate) fn plan_graph_scratch(
     rebind(&mut frame.owners, &persistent)?;
     for wave in &mut frame.waves {
         rebind(&mut wave.owner_bindings, &persistent)?;
+        for (_, _, owner) in &mut wave.nested_owner_bindings {
+            rebind_owner(owner, &persistent)?;
+        }
     }
     Ok(plan)
 }

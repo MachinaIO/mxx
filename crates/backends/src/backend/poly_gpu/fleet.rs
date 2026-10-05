@@ -5600,6 +5600,17 @@ pub(crate) fn emit_compiled_subgraph_kernel(
     let kernel = kernels
         .get(*kernel_index as usize)
         .ok_or_else(|| invalid("compiled subgraph kernel is not registered"))?;
+    kernel.build_identity.validate_current().map_err(GpuNativeGraphError::Native)?;
+    let identity = gpu_device_identity(op.device).map_err(GpuNativeGraphError::Native)?;
+    // HIP feature suffixes describe runtime device capabilities; the compiled
+    // offload target is the base gfx architecture.
+    let architecture = identity.architecture.split(':').next().unwrap_or_default();
+    if kernel.build_identity.backend != identity.backend ||
+        kernel.build_identity.architecture != architecture
+    {
+        return Err(invalid("compiled subgraph kernel differs from its physical GPU target"));
+    }
+
     let owner = |id: &PhysicalValueId| {
         owners.get(id).ok_or_else(|| invalid("compiled subgraph kernel operand owner is missing"))
     };
@@ -7101,15 +7112,21 @@ impl GpuDcrtBackend {
             .map(|(physical, _)| {
                 let identity = gpu_device_identity(*physical)?;
                 Ok(format!(
-                    "{}:{}.{}/{}",
+                    "{}:{}:wave{}:{}:{}:{}:{}:{}:{}:{}",
+                    identity.backend,
+                    identity.architecture,
+                    identity.wave_size,
+                    identity.uuid,
                     identity.name,
-                    identity.compute_major,
-                    identity.compute_minor,
-                    identity.total_global_memory
+                    identity.total_global_memory,
+                    identity.driver_version,
+                    identity.runtime_version,
+                    identity.native_revision,
+                    identity.context_generation,
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(format!("cuda-fleet:{}:{}", self.execution_identity, identities.join(",")))
+        Ok(format!("gpu-fleet:{}:{}", self.execution_identity, identities.join(",")))
     }
 
     pub(super) fn runtime_device_budgets(&self) -> Result<Vec<GpuDeviceBudget>, String> {

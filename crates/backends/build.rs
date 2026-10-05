@@ -5,12 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn native_kernel_build_revision(cuda_dir: &Path, cuda_arch: &str, debug_build: bool) -> String {
-    let mut paths = Vec::new();
+fn native_kernel_build_revision(gpu_dir: &Path, identity: &[String]) -> String {
     fn collect(path: &Path, paths: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(path) else { return };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for entry in fs::read_dir(path).expect("read GPU source directory") {
+            let path = entry.expect("GPU source entry").path();
             if path.is_dir() {
                 collect(&path, paths);
             } else {
@@ -18,18 +16,26 @@ fn native_kernel_build_revision(cuda_dir: &Path, cuda_arch: &str, debug_build: b
             }
         }
     }
-    collect(cuda_dir, &mut paths);
+    let mut paths = Vec::new();
+    collect(gpu_dir, &mut paths);
     paths.sort();
     let mut hasher = DefaultHasher::new();
-    cuda_arch.hash(&mut hasher);
-    debug_build.hash(&mut hasher);
+    identity.hash(&mut hasher);
+    fs::read("build.rs").expect("read build script").hash(&mut hasher);
     for path in paths {
-        path.strip_prefix(cuda_dir).unwrap_or(&path).to_string_lossy().hash(&mut hasher);
-        if let Ok(contents) = fs::read(&path) {
-            contents.hash(&mut hasher);
-        }
+        path.strip_prefix(gpu_dir).expect("GPU source prefix").hash(&mut hasher);
+        fs::read(&path).expect("read GPU source").hash(&mut hasher);
     }
-    format!("cuda-native-build-{:016x}", hasher.finish())
+    format!("gpu-native-build-{:016x}", hasher.finish())
+}
+
+fn compiler_version(compiler: &str) -> String {
+    let output = std::process::Command::new(compiler)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("GPU compiler {compiler} is unavailable: {error}"));
+    assert!(output.status.success(), "GPU compiler {compiler} --version failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 fn main() {
@@ -56,85 +62,176 @@ fn main() {
     println!("cargo::rustc-link-lib=dylib=OPENFHEcore");
     println!("cargo::rustc-link-lib=dylib=gomp");
 
-    if env::var("CARGO_FEATURE_GPU").is_ok() {
-        // Crates implementing subgraph kernels compile against
-        // cuda/include/SubgraphKernel.cuh.
-        let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
-        println!("cargo::metadata=cuda_include={}", manifest.join("cuda/include").display());
-        println!("cargo::rerun-if-env-changed=CUDA_ARCH");
-        println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
-        println!("cargo::rerun-if-changed=cuda/src/Primitive.cu");
-        println!("cargo::rerun-if-changed=cuda/src/Control.cu");
-        println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixPreimageRaw.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixPolynomialValues.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixRawRemaining.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixIndexed.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixPreimageSeed.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixRawRns.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixHash.cu");
-        println!("cargo::rerun-if-changed=cuda/src/Real.cu");
-        println!("cargo::rerun-if-changed=cuda/include/Real.cuh");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSmallRhs.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
-        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixCrt.cu");
-        println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/Primitive.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/Control.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/Matrix.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixUtils.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixData.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixNTT.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSerde.cuh");
-        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixCrt.cuh");
-
-        let cuda_arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "89".to_string());
-        let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
-        let cuda_lib_dir =
-            env::var("CUDA_LIB_DIR").unwrap_or_else(|_| format!("{cuda_home}/lib64"));
-        let debug_build = env::var("DEBUG").is_ok_and(|debug| debug == "true");
-        println!(
-            "cargo::rustc-env=MXX_NATIVE_KERNEL_BUILD_REVISION={}",
-            native_kernel_build_revision(Path::new("cuda"), &cuda_arch, debug_build)
+    println!("cargo::rustc-check-cfg=cfg(mxx_gpu_backend, values(\"cuda\", \"hip\"))");
+    for name in [
+        "MXX_GPU_BACKEND",
+        "CUDA_HOME",
+        "CUDA_LIB_DIR",
+        "NVCC",
+        "CUDA_ARCH",
+        "ROCM_PATH",
+        "HIPCC",
+        "HIP_ARCH",
+        "HIP_PLATFORM",
+        "HIP_PATH",
+        "HIP_CLANG_PATH",
+        "HIPCC_COMPILE_FLAGS_APPEND",
+        "HIPCC_LINK_FLAGS_APPEND",
+        "CXX",
+        "CXXFLAGS",
+        "CC",
+        "CFLAGS",
+        "AR",
+        "ARFLAGS",
+        "HOST",
+        "TARGET",
+        "DEBUG",
+        "OPT_LEVEL",
+        "PATH",
+    ] {
+        println!("cargo::rerun-if-env-changed={name}");
+    }
+    if env::var("CARGO_FEATURE_GPU").is_err() {
+        return;
+    }
+    let backend = env::var("MXX_GPU_BACKEND").unwrap_or_else(|_| "cuda".into());
+    assert!(backend == "cuda" || backend == "hip", "MXX_GPU_BACKEND must be cuda or hip");
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let gpu_dir = manifest.join("gpu");
+    let include = gpu_dir.join("include");
+    println!("cargo::rerun-if-changed={}", gpu_dir.display());
+    let debug = env::var("DEBUG").is_ok_and(|value| value == "true");
+    let (sdk, compiler, arch, lib_dir) = if backend == "cuda" {
+        let sdk = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+        let compiler = env::var("NVCC").unwrap_or_else(|_| format!("{sdk}/bin/nvcc"));
+        let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "89".into());
+        assert!(
+            !arch.is_empty() && arch.bytes().all(|byte| byte.is_ascii_digit()),
+            "CUDA_ARCH must be an SM number, e.g. 89"
         );
-        if env::var("NVCC").is_err() {
-            let nvcc_path = format!("{cuda_home}/bin/nvcc");
-            if PathBuf::from(&nvcc_path).exists() {
-                unsafe {
-                    env::set_var("NVCC", nvcc_path);
-                }
-            }
+        let lib_dir = env::var("CUDA_LIB_DIR").unwrap_or_else(|_| format!("{sdk}/lib64"));
+        (sdk, compiler, arch, lib_dir)
+    } else {
+        assert!(
+            env::var("HIP_PLATFORM").map_or(true, |value| value == "amd"),
+            "HIP_PLATFORM must be amd"
+        );
+        let sdk = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let compiler = env::var("HIPCC").unwrap_or_else(|_| format!("{sdk}/bin/hipcc"));
+        let arch = env::var("HIP_ARCH").expect("HIP_ARCH must explicitly name the target, e.g. gfx1100; device detection is not required");
+        assert!(
+            arch.starts_with("gfx") &&
+                arch.len() > 3 &&
+                arch[3..].bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "HIP_ARCH must be a gfx target, e.g. gfx1100"
+        );
+        let lib_dir = if Path::new(&format!("{sdk}/lib")).is_dir() {
+            format!("{sdk}/lib")
+        } else {
+            format!("{sdk}/lib64")
+        };
+        (sdk, compiler, arch, lib_dir)
+    };
+    let version = compiler_version(&compiler);
+    let sdk_version =
+        ["version.json", ".info/version", ".info/version-dev", "include/hip/hip_version.h"]
+            .iter()
+            .filter_map(|name| {
+                let path = Path::new(&sdk).join(name);
+                println!("cargo::rerun-if-changed={}", path.display());
+                fs::read_to_string(path).ok()
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+            .replace('\n', " | ");
+    let mut identity = vec![
+        backend.clone(),
+        sdk.clone(),
+        compiler.clone(),
+        version.clone(),
+        sdk_version.clone(),
+        arch.clone(),
+        include.display().to_string(),
+        lib_dir.clone(),
+        debug.to_string(),
+        "c++17,fPIC,no-rdc".into(),
+    ];
+    for (name, value) in env::vars().filter(|(name, _)| {
+        name.contains("FLAGS") ||
+            name.starts_with("CC_") ||
+            name.starts_with("CXX_") ||
+            name.starts_with("AR_") ||
+            ["HOST", "TARGET", "OPT_LEVEL", "HIP_PLATFORM", "HIP_PATH", "HIP_CLANG_PATH"]
+                .contains(&name.as_str())
+    }) {
+        println!("cargo::rerun-if-env-changed={name}");
+        identity.push(format!("{name}={value}"));
+    }
+    identity.sort();
+    let revision = native_kernel_build_revision(&gpu_dir, &identity);
+    println!("cargo::rustc-env=MXX_NATIVE_KERNEL_BUILD_REVISION={revision}");
+    println!("cargo::rustc-env=MXX_GPU_BACKEND={backend}");
+    let identity_arch = if backend == "cuda" { format!("sm_{arch}") } else { arch.clone() };
+    println!("cargo::rustc-env=MXX_GPU_ARCH={identity_arch}");
+    println!("cargo::rustc-cfg=mxx_gpu_backend=\"{backend}\"");
+    for (name, value) in [
+        ("gpu_include", include.display().to_string()),
+        ("gpu_backend", backend.clone()),
+        ("gpu_arch", arch.clone()),
+        ("gpu_compiler", compiler.clone()),
+        ("gpu_compiler_version", version.replace('\n', " | ")),
+        ("gpu_sdk", sdk.clone()),
+        ("gpu_sdk_version", sdk_version),
+        ("gpu_native_revision", revision),
+    ] {
+        println!("cargo::metadata={name}={value}");
+    }
+    let mut build = cc::Build::new();
+    build
+        .file("gpu/src/Runtime.cu")
+        .file("gpu/src/Primitive.cu")
+        .file("gpu/src/Control.cu")
+        .file("gpu/src/Real.cu")
+        .file("gpu/src/matrix/Matrix.cu")
+        .include(&include)
+        .flag("-std=c++17");
+    if backend == "cuda" {
+        // SAFETY: no worker threads have been started by this build script.
+        unsafe {
+            env::set_var("NVCC", &compiler);
         }
-
-        let mut build = cc::Build::new();
         build
             .cuda(true)
-            .file("cuda/src/Runtime.cu")
-            .file("cuda/src/Primitive.cu")
-            .file("cuda/src/Control.cu")
-            .file("cuda/src/Real.cu")
-            .file("cuda/src/matrix/Matrix.cu")
-            .include("cuda/include")
-            .flag("-std=c++17")
+            .define("MXX_GPU_BACKEND_CUDA", "1")
             .flag("-Xcompiler")
             .flag("-fPIC")
-            .flag(format!("-arch=sm_{cuda_arch}"));
-        if !debug_build {
+            .flag(format!("-arch=sm_{arch}"));
+        if !debug {
             build.flag("-lineinfo");
         }
-        build.compile("gpupoly");
-
-        println!("cargo::rustc-link-search=native={cuda_lib_dir}");
+    } else {
+        // hipcc generates a self-contained host/device object for each translation unit;
+        // no relocatable device code or separate device link is used.
+        unsafe {
+            env::set_var("HIP_PLATFORM", "amd");
+        }
+        build
+            .cpp(true)
+            .compiler(&compiler)
+            .define("MXX_GPU_BACKEND_HIP", "1")
+            .include(format!("{sdk}/include"))
+            .flag("-x")
+            .flag("hip")
+            .flag("-fPIC")
+            .flag("-fno-gpu-rdc")
+            .flag(format!("--offload-arch={arch}"));
+    }
+    build.compile("gpupoly");
+    println!("cargo::rustc-link-search=native={lib_dir}");
+    if backend == "cuda" {
         println!("cargo::rustc-link-lib=cudart");
         println!("cargo::rustc-link-lib=cudadevrt");
+    } else {
+        println!("cargo::rustc-link-lib=dylib=amdhip64");
     }
 }

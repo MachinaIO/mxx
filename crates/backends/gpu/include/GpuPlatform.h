@@ -1,0 +1,269 @@
+#pragma once
+
+// Vendor-neutral GPU runtime vocabulary. Shared kernels use these names;
+// SDK-specific types never cross the opaque Rust ABI.
+#if defined(MXX_GPU_BACKEND_HIP)
+#include <hip/hip_runtime.h>
+#else
+#include <cuda_runtime.h>
+#endif
+
+// Runtime types, constants and calls preserve the shared ownership contract.
+#if defined(MXX_GPU_BACKEND_HIP)
+#define gpuDeviceCanAccessPeer hipDeviceCanAccessPeer
+#define gpuDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define gpuDeviceGetDefaultMemPool hipDeviceGetDefaultMemPool
+#define gpuDeviceGetGraphMemAttribute hipDeviceGetGraphMemAttribute
+#define gpuDeviceGraphMemTrim hipDeviceGraphMemTrim
+#define gpuDeviceProp hipDeviceProp_t
+#define gpuDeviceSynchronize hipDeviceSynchronize
+#define gpuDriverGetVersion hipDriverGetVersion
+#define gpuErrorGraphExecUpdateFailure hipErrorGraphExecUpdateFailure
+#define gpuErrorInvalidDevice hipErrorInvalidDevice
+#define gpuErrorInvalidResourceHandle hipErrorInvalidResourceHandle
+#define gpuErrorInvalidValue hipErrorInvalidValue
+#define gpuErrorMemoryAllocation hipErrorMemoryAllocation
+#define gpuErrorNoDevice hipErrorNoDevice
+#define gpuErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+#define gpuError_t hipError_t
+#define gpuEventCreateWithFlags hipEventCreateWithFlags
+#define gpuEventDestroy hipEventDestroy
+#define gpuEventDisableTiming hipEventDisableTiming
+#define gpuEventRecord hipEventRecord
+#define gpuEventSynchronize hipEventSynchronize
+#define gpuEvent_t hipEvent_t
+#define gpuFree hipFree
+#define gpuFreeAsync hipFreeAsync
+#define gpuFreeHost hipFreeHost
+#define gpuFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define gpuFuncSetAttribute hipFuncSetAttribute
+#define gpuGetDevice hipGetDevice
+#define gpuGetDeviceCount hipGetDeviceCount
+#define gpuGetDeviceProperties hipGetDeviceProperties
+#define gpuGetErrorString hipGetErrorString
+#define gpuGetLastError hipGetLastError
+#define gpuGraphAddEmptyNode hipGraphAddEmptyNode
+#define gpuGraphAddKernelNode hipGraphAddKernelNode
+#define gpuGraphAddMemcpyNode1D hipGraphAddMemcpyNode1D
+#define gpuGraphAddMemsetNode hipGraphAddMemsetNode
+#define gpuGraphCreate hipGraphCreate
+#define gpuGraphDestroy hipGraphDestroy
+#define gpuGraphExecDestroy hipGraphExecDestroy
+#define gpuGraphExecKernelNodeSetParams hipGraphExecKernelNodeSetParams
+#define gpuGraphExecMemcpyNodeSetParams1D hipGraphExecMemcpyNodeSetParams1D
+#define gpuGraphExecMemsetNodeSetParams hipGraphExecMemsetNodeSetParams
+#define gpuGraphExecUpdate hipGraphExecUpdate
+#define gpuGraphExecUpdateError hipGraphExecUpdateError
+#define gpuGraphExecUpdateResult hipGraphExecUpdateResult
+#define gpuGraphExecUpdateResultInfo hipGraphExecUpdateResultInfo
+#define gpuGraphExecUpdateSuccess hipGraphExecUpdateSuccess
+#define gpuGraphExec_t hipGraphExec_t
+#define gpuGraphInstantiateFlagAutoFreeOnLaunch hipGraphInstantiateFlagAutoFreeOnLaunch
+#define gpuGraphInstantiateWithFlags hipGraphInstantiateWithFlags
+#define gpuGraphKernelNodeSetAttribute hipGraphKernelNodeSetAttribute
+#define gpuGraphKernelNodeSetParams hipGraphKernelNodeSetParams
+#define gpuGraphLaunch hipGraphLaunch
+#define gpuGraphMemAttrReservedMemCurrent hipGraphMemAttrReservedMemCurrent
+#define gpuGraphMemcpyNodeSetParams1D hipGraphMemcpyNodeSetParams1D
+#define gpuGraphMemsetNodeSetParams hipGraphMemsetNodeSetParams
+#define gpuGraphNode_t hipGraphNode_t
+#define gpuGraphUpload hipGraphUpload
+#define gpuGraph_t hipGraph_t
+#define gpuHostAlloc hipHostMalloc
+#define gpuHostAllocMapped (hipHostMallocMapped | hipHostMallocCoherent)
+#define gpuHostAllocPortable hipHostMallocPortable
+#define gpuHostGetDevicePointer hipHostGetDevicePointer
+#define gpuKernelNodeParams hipKernelNodeParams
+#define gpuLaunchAttributeCooperative hipLaunchAttributeCooperative
+#define gpuLaunchAttributeValue hipLaunchAttributeValue
+#define gpuLaunchCooperativeKernel hipLaunchCooperativeKernel
+#define gpuLaunchKernel hipLaunchKernel
+#define gpuMalloc hipMalloc
+#define gpuMallocAsync hipMallocAsync
+#define gpuMallocHost hipHostMalloc
+#define gpuMemAccessDesc hipMemAccessDesc
+#define gpuMemAccessFlagsProtReadWrite hipMemAccessFlagsProtReadWrite
+#define gpuMemGetInfo hipMemGetInfo
+#define gpuMemLocationTypeDevice hipMemLocationTypeDevice
+#define gpuMemPoolAttrReleaseThreshold hipMemPoolAttrReleaseThreshold
+#define gpuMemPoolAttrReservedMemCurrent hipMemPoolAttrReservedMemCurrent
+#define gpuMemPoolAttrUsedMemCurrent hipMemPoolAttrUsedMemCurrent
+#define gpuMemPoolAttrUsedMemHigh hipMemPoolAttrUsedMemHigh
+#define gpuMemPoolGetAttribute hipMemPoolGetAttribute
+#define gpuMemPoolSetAccess hipMemPoolSetAccess
+#define gpuMemPoolSetAttribute hipMemPoolSetAttribute
+#define gpuMemPoolTrimTo hipMemPoolTrimTo
+#define gpuMemPool_t hipMemPool_t
+#define gpuMemcpy hipMemcpy
+#define gpuMemcpy2DAsync hipMemcpy2DAsync
+#define gpuMemcpyAsync hipMemcpyAsync
+#define gpuMemcpyDefault hipMemcpyDefault
+#define gpuMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define gpuMemcpyHostToDevice hipMemcpyHostToDevice
+#define gpuMemcpyKind hipMemcpyKind
+#define gpuMemcpyPeerAsync hipMemcpyPeerAsync
+#define gpuMemoryTypeDevice hipMemoryTypeDevice
+#define gpuMemoryTypeHost hipMemoryTypeHost
+#define gpuMemoryTypeUnregistered hipMemoryTypeUnregistered
+#define gpuMemsetAsync hipMemsetAsync
+#define gpuMemsetParams hipMemsetParams
+#define gpuPointerAttributes hipPointerAttribute_t
+#define gpuPointerGetAttributes hipPointerGetAttributes
+#define gpuRuntimeGetVersion hipRuntimeGetVersion
+#define gpuSetDevice hipSetDevice
+#define gpuStreamCaptureStatus hipStreamCaptureStatus
+#define gpuStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define gpuStreamCreateWithFlags hipStreamCreateWithFlags
+#define gpuStreamDestroy hipStreamDestroy
+#define gpuStreamGetDevice hipStreamGetDevice
+#define gpuStreamIsCapturing hipStreamIsCapturing
+#define gpuStreamNonBlocking hipStreamNonBlocking
+#define gpuStreamSynchronize hipStreamSynchronize
+#define gpuStreamWaitEvent hipStreamWaitEvent
+#define gpuStream_t hipStream_t
+#define gpuSuccess hipSuccess
+#define gpuGraphClone hipGraphClone
+#define gpuGraphNodeFindInClone hipGraphNodeFindInClone
+#define gpuGraphGetNodes hipGraphGetNodes
+#define gpuGraphGetEdges hipGraphGetEdges
+#define gpuGraphDestroyNode hipGraphDestroyNode
+#else
+#define gpuDeviceCanAccessPeer cudaDeviceCanAccessPeer
+#define gpuDeviceEnablePeerAccess cudaDeviceEnablePeerAccess
+#define gpuDeviceGetDefaultMemPool cudaDeviceGetDefaultMemPool
+#define gpuDeviceGetGraphMemAttribute cudaDeviceGetGraphMemAttribute
+#define gpuDeviceGraphMemTrim cudaDeviceGraphMemTrim
+#define gpuDeviceProp cudaDeviceProp
+#define gpuDeviceSynchronize cudaDeviceSynchronize
+#define gpuDriverGetVersion cudaDriverGetVersion
+#define gpuErrorGraphExecUpdateFailure cudaErrorGraphExecUpdateFailure
+#define gpuErrorInvalidDevice cudaErrorInvalidDevice
+#define gpuErrorInvalidResourceHandle cudaErrorInvalidResourceHandle
+#define gpuErrorInvalidValue cudaErrorInvalidValue
+#define gpuErrorMemoryAllocation cudaErrorMemoryAllocation
+#define gpuErrorNoDevice cudaErrorNoDevice
+#define gpuErrorPeerAccessAlreadyEnabled cudaErrorPeerAccessAlreadyEnabled
+#define gpuError_t cudaError_t
+#define gpuEventCreateWithFlags cudaEventCreateWithFlags
+#define gpuEventDestroy cudaEventDestroy
+#define gpuEventDisableTiming cudaEventDisableTiming
+#define gpuEventRecord cudaEventRecord
+#define gpuEventSynchronize cudaEventSynchronize
+#define gpuEvent_t cudaEvent_t
+#define gpuFree cudaFree
+#define gpuFreeAsync cudaFreeAsync
+#define gpuFreeHost cudaFreeHost
+#define gpuFuncAttributeMaxDynamicSharedMemorySize cudaFuncAttributeMaxDynamicSharedMemorySize
+#define gpuFuncSetAttribute cudaFuncSetAttribute
+#define gpuGetDevice cudaGetDevice
+#define gpuGetDeviceCount cudaGetDeviceCount
+#define gpuGetDeviceProperties cudaGetDeviceProperties
+#define gpuGetErrorString cudaGetErrorString
+#define gpuGetLastError cudaGetLastError
+#define gpuGraphAddEmptyNode cudaGraphAddEmptyNode
+#define gpuGraphAddKernelNode cudaGraphAddKernelNode
+#define gpuGraphAddMemcpyNode1D cudaGraphAddMemcpyNode1D
+#define gpuGraphAddMemsetNode cudaGraphAddMemsetNode
+#define gpuGraphCreate cudaGraphCreate
+#define gpuGraphDestroy cudaGraphDestroy
+#define gpuGraphExecDestroy cudaGraphExecDestroy
+#define gpuGraphExecKernelNodeSetParams cudaGraphExecKernelNodeSetParams
+#define gpuGraphExecMemcpyNodeSetParams1D cudaGraphExecMemcpyNodeSetParams1D
+#define gpuGraphExecMemsetNodeSetParams cudaGraphExecMemsetNodeSetParams
+#define gpuGraphExecUpdate cudaGraphExecUpdate
+#define gpuGraphExecUpdateError cudaGraphExecUpdateError
+#define gpuGraphExecUpdateResult cudaGraphExecUpdateResult
+#define gpuGraphExecUpdateResultInfo cudaGraphExecUpdateResultInfo
+#define gpuGraphExecUpdateSuccess cudaGraphExecUpdateSuccess
+#define gpuGraphExec_t cudaGraphExec_t
+#define gpuGraphInstantiateFlagAutoFreeOnLaunch cudaGraphInstantiateFlagAutoFreeOnLaunch
+#define gpuGraphInstantiateWithFlags cudaGraphInstantiateWithFlags
+#define gpuGraphKernelNodeSetAttribute cudaGraphKernelNodeSetAttribute
+#define gpuGraphKernelNodeSetParams cudaGraphKernelNodeSetParams
+#define gpuGraphLaunch cudaGraphLaunch
+#define gpuGraphMemAttrReservedMemCurrent cudaGraphMemAttrReservedMemCurrent
+#define gpuGraphMemcpyNodeSetParams1D cudaGraphMemcpyNodeSetParams1D
+#define gpuGraphMemsetNodeSetParams cudaGraphMemsetNodeSetParams
+#define gpuGraphNode_t cudaGraphNode_t
+#define gpuGraphUpload cudaGraphUpload
+#define gpuGraph_t cudaGraph_t
+#define gpuHostAlloc cudaHostAlloc
+#define gpuHostAllocMapped cudaHostAllocMapped
+#define gpuHostAllocPortable cudaHostAllocPortable
+#define gpuHostGetDevicePointer cudaHostGetDevicePointer
+#define gpuKernelNodeParams cudaKernelNodeParams
+#define gpuLaunchAttributeCooperative cudaLaunchAttributeCooperative
+#define gpuLaunchAttributeValue cudaLaunchAttributeValue
+#define gpuLaunchCooperativeKernel cudaLaunchCooperativeKernel
+#define gpuLaunchKernel cudaLaunchKernel
+#define gpuMalloc cudaMalloc
+#define gpuMallocAsync cudaMallocAsync
+#define gpuMallocHost cudaMallocHost
+#define gpuMemAccessDesc cudaMemAccessDesc
+#define gpuMemAccessFlagsProtReadWrite cudaMemAccessFlagsProtReadWrite
+#define gpuMemGetInfo cudaMemGetInfo
+#define gpuMemLocationTypeDevice cudaMemLocationTypeDevice
+#define gpuMemPoolAttrReleaseThreshold cudaMemPoolAttrReleaseThreshold
+#define gpuMemPoolAttrReservedMemCurrent cudaMemPoolAttrReservedMemCurrent
+#define gpuMemPoolAttrUsedMemCurrent cudaMemPoolAttrUsedMemCurrent
+#define gpuMemPoolAttrUsedMemHigh cudaMemPoolAttrUsedMemHigh
+#define gpuMemPoolGetAttribute cudaMemPoolGetAttribute
+#define gpuMemPoolSetAccess cudaMemPoolSetAccess
+#define gpuMemPoolSetAttribute cudaMemPoolSetAttribute
+#define gpuMemPoolTrimTo cudaMemPoolTrimTo
+#define gpuMemPool_t cudaMemPool_t
+#define gpuMemcpy cudaMemcpy
+#define gpuMemcpy2DAsync cudaMemcpy2DAsync
+#define gpuMemcpyAsync cudaMemcpyAsync
+#define gpuMemcpyDefault cudaMemcpyDefault
+#define gpuMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
+#define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
+#define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
+#define gpuMemcpyKind cudaMemcpyKind
+#define gpuMemcpyPeerAsync cudaMemcpyPeerAsync
+#define gpuMemoryTypeDevice cudaMemoryTypeDevice
+#define gpuMemoryTypeHost cudaMemoryTypeHost
+#define gpuMemoryTypeUnregistered cudaMemoryTypeUnregistered
+#define gpuMemsetAsync cudaMemsetAsync
+#define gpuMemsetParams cudaMemsetParams
+#define gpuPointerAttributes cudaPointerAttributes
+#define gpuPointerGetAttributes cudaPointerGetAttributes
+#define gpuRuntimeGetVersion cudaRuntimeGetVersion
+#define gpuSetDevice cudaSetDevice
+#define gpuStreamCaptureStatus cudaStreamCaptureStatus
+#define gpuStreamCaptureStatusNone cudaStreamCaptureStatusNone
+#define gpuStreamCreateWithFlags cudaStreamCreateWithFlags
+#define gpuStreamDestroy cudaStreamDestroy
+#define gpuStreamGetDevice cudaStreamGetDevice
+#define gpuStreamIsCapturing cudaStreamIsCapturing
+#define gpuStreamNonBlocking cudaStreamNonBlocking
+#define gpuStreamSynchronize cudaStreamSynchronize
+#define gpuStreamWaitEvent cudaStreamWaitEvent
+#define gpuStream_t cudaStream_t
+#define gpuSuccess cudaSuccess
+#define gpuGraphClone cudaGraphClone
+#define gpuGraphNodeFindInClone cudaGraphNodeFindInClone
+#define gpuGraphGetNodes cudaGraphGetNodes
+#define gpuGraphGetEdges cudaGraphGetEdges
+#define gpuGraphDestroyNode cudaGraphDestroyNode
+#endif
+
+// Lane exchange within a `width`-lane tile. A 32-lane tile remains
+// independent on both halves of a wave64.
+#if defined(MXX_GPU_BACKEND_HIP)
+#define gpu_shfl_xor(value, offset, width) __shfl_xor(value, offset, width)
+#else
+#define gpu_shfl_xor(value, offset, width) \
+    __shfl_xor_sync(__activemask(), value, offset, width)
+#endif
+
+#if defined(MXX_GPU_BACKEND_HIP)
+#define gpuMemPoolGetAccess hipMemPoolGetAccess
+#define gpuMemLocation hipMemLocation
+#define gpuMemAccessFlags hipMemAccessFlags
+#else
+#define gpuMemPoolGetAccess cudaMemPoolGetAccess
+#define gpuMemLocation cudaMemLocation
+#define gpuMemAccessFlags cudaMemAccessFlags
+#endif

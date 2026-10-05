@@ -1,5 +1,16 @@
 name: CI runner
 on:
+  workflow_dispatch:
+    inputs:
+      gpu_backend:
+        description: Native GPU backend (runner must already have its SDK and OpenFHE)
+        type: choice
+        options: [cuda, hip]
+        default: cuda
+      gpu_device_tests:
+        description: Run ignored GPU unit tests on the configured device runner
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -79,6 +90,30 @@ jobs:
 
       - name: Run test
         run: RUST_TEST_NOCAPTURE=1 cargo test -r --workspace --lib -- --test-threads=1
+
+  gpu:
+    # Configure MXX_CUDA_RUNNER / MXX_HIP_RUNNER as JSON runner labels only
+    # after provisioning SDK, OpenFHE, Rust, and (for device tests) a GPU.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      ((inputs.gpu_backend == 'cuda' && vars.MXX_CUDA_RUNNER != '') ||
+       (inputs.gpu_backend == 'hip' && vars.MXX_HIP_RUNNER != ''))
+    runs-on: ${{ fromJSON(inputs.gpu_backend == 'cuda' && vars.MXX_CUDA_RUNNER || vars.MXX_HIP_RUNNER) }}
+    timeout-minutes: 120
+    env:
+      MXX_GPU_BACKEND: ${{ inputs.gpu_backend }}
+      HIP_ARCH: ${{ vars.MXX_HIP_ARCH }}
+      CUDA_ARCH: ${{ vars.MXX_CUDA_ARCH || '89' }}
+      CARGO_TARGET_DIR: target/gpu-${{ inputs.gpu_backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: GPU lib compile gate
+        run: scripts/run_tests.sh --gpu-compile
+      - name: GPU device unit gate (no integration tests)
+        if: inputs.gpu_device_tests
+        env:
+          PYTHONPATH: scripts/lib
+        run: python3 -m repo_validation maybe-run-gpu-repeat --force
 
   ci-success:
     name: ci success

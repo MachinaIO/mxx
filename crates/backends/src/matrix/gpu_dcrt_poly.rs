@@ -181,6 +181,55 @@ impl Debug for GpuSmallMatrix {
 }
 
 impl GpuSmallMatrix {
+    /// Stable compact allocation identity for compiled replay use.
+    pub(crate) fn compiled_storage_identity(&self) -> usize {
+        self.raw as usize
+    }
+
+    /// Join the compact allocation's producer on its actual consumer stream.
+    pub(crate) fn wait_compiled_inputs(
+        &self,
+        device: i32,
+        stream: &GpuNativeLaunchStream,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_small_matrix_wait_compiled_inputs(
+                self.raw,
+                device,
+                stream.raw_ptr(),
+                read_only,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Retire compact readers and publish only actual compiled writers.
+    pub(crate) fn record_compiled_use(
+        &self,
+        device: i32,
+        stream: &GpuNativeLaunchStream,
+        event: *mut std::ffi::c_void,
+        written: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_small_matrix_record_compiled_use(
+                self.raw,
+                device,
+                stream.raw_ptr(),
+                event,
+                written,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        Ok(())
+    }
+
     pub fn params(&self) -> &GpuDCRTPolyParams {
         &self.params
     }
@@ -507,6 +556,60 @@ unsafe impl Send for GpuDCRTPolyMatrix {}
 unsafe impl Sync for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    /// Stable identity of the shared native allocation behind matrix views.
+    pub(crate) fn compiled_storage_identity(&self) -> usize {
+        Arc::as_ptr(&self._owner) as usize
+    }
+
+    /// Join only this storage partition's producer on its actual consumer.
+    /// A read may be consumed by a peer device or another logical alias.
+    pub(crate) fn wait_compiled_storage(
+        &self,
+        storage_device: i32,
+        device: i32,
+        stream: &GpuNativeLaunchStream,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_wait_compiled_storage(
+                self.raw,
+                storage_device,
+                device,
+                stream.raw_ptr(),
+                read_only,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Retire only the used storage partition; reads preserve producer readiness.
+    pub(crate) fn record_compiled_storage_use(
+        &self,
+        storage_device: i32,
+        device: i32,
+        stream: &GpuNativeLaunchStream,
+        event: *mut std::ffi::c_void,
+        written: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_record_compiled_storage_use(
+                self.raw,
+                storage_device,
+                device,
+                stream.raw_ptr(),
+                event,
+                written,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        Ok(())
+    }
+
     pub fn params(&self) -> &GpuDCRTPolyParams {
         &self.params
     }

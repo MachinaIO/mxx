@@ -136,13 +136,13 @@
 //! - NTTs support ring dimensions up to 131072.
 
 #[cfg(test)]
-#[path = "gpu_runtime_direct/io_trial_tests.rs"]
+#[path = "gpu_runtime_direct/gpu_io_trial_tests.rs"]
 mod io_trial_tests;
 #[cfg(test)]
-#[path = "gpu_runtime_direct/node_profile_tests.rs"]
+#[path = "gpu_runtime_direct/gpu_node_profile_tests.rs"]
 mod node_profile_tests;
 #[cfg(test)]
-#[path = "gpu_runtime_direct/selected_artifact_tests.rs"]
+#[path = "gpu_runtime_direct/gpu_selected_artifact_tests.rs"]
 mod selected_artifact_tests;
 
 use crate::{
@@ -308,6 +308,32 @@ struct GraphRegion {
     /// Launch streams of the other devices this region's operations run on,
     /// which prepare their devices' resources before each launch.
     peer_streams: Vec<GpuNativeLaunchStream>,
+    /// Actual physical values used by this region, including nested bodies.
+    /// The bool marks a real writer on the consumer device, never a borrowed output.
+    owner_uses: Vec<(PhysicalValueId, i32, bool)>,
+}
+
+/// Freeze the region's operand-use index once; launches resolve only current
+/// bindings and deduplicate their underlying allocations after rebinding.
+fn region_owner_uses(operations: &[CompiledGpuOp]) -> Vec<(PhysicalValueId, i32, bool)> {
+    fn collect(operations: &[CompiledGpuOp], uses: &mut BTreeMap<(PhysicalValueId, i32), bool>) {
+        for operation in operations {
+            for argument in operation.arguments.iter() {
+                if let KernelArg::Value(id) | KernelArg::OptionalValue(Some(id)) = argument {
+                    uses.entry((*id, operation.device)).or_insert(false);
+                }
+            }
+            for id in operation.outputs.iter() {
+                uses.insert((*id, operation.device), true);
+            }
+            if let Some(body) = &operation.body {
+                collect(body, uses);
+            }
+        }
+    }
+    let mut uses = BTreeMap::new();
+    collect(operations, &mut uses);
+    uses.into_iter().map(|((value, device), written)| (value, device, written)).collect()
 }
 
 struct DirectGraph {
@@ -324,6 +350,8 @@ struct WaveGroup {
     body_start: u32,
     body_end: u32,
     waves: Vec<usize>,
+    depth: usize,
+    count: usize,
 }
 
 #[derive(Clone)]
@@ -376,24 +404,80 @@ fn wave_groups(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<WaveGro
             body_start: first.body_start,
             body_end: first.body_end,
             waves: indices,
+            depth: 0,
+            count: next,
         });
     }
-    let sites = groups.iter().map(|group| group.site).collect::<BTreeSet<_>>();
-    for group in &groups {
-        if let Some((parent, _)) = group.parent_template {
-            let enclosing = groups
-                .iter()
-                .find(|candidate| candidate.site == parent)
-                .ok_or("GPU child wave refers to an absent parent template")?;
-            if !sites.contains(&parent) ||
-                group.body_start < enclosing.body_start ||
-                group.body_end > enclosing.body_end ||
-                (group.body_start == enclosing.body_start &&
-                    group.body_end == enclosing.body_end)
-            {
-                return Err("GPU child wave body is not strictly inside its parent".into());
+    let by_site = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.site, index))
+        .collect::<BTreeMap<_, _>>();
+    for index in 0..groups.len() {
+        let mut current = index;
+        let mut visited = BTreeSet::new();
+        let mut depth = 0usize;
+        loop {
+            let group = &groups[current];
+            if !visited.insert(group.site) {
+                return Err("GPU wave parent templates form a cycle".into());
             }
+            let Some((parent, lane)) = group.parent_template else { break };
+            let parent_index = *by_site
+                .get(&parent)
+                .ok_or("GPU child wave refers to an absent parent template")?;
+            let enclosing = &groups[parent_index];
+            if group.body_start < enclosing.body_start || group.body_end > enclosing.body_end {
+                return Err("GPU child wave body is outside its parent".into());
+            }
+            let width = frame.waves[enclosing.waves[0]].active_lanes;
+            let count = enclosing.count;
+            if lane >= width ||
+                group
+                    .active_parent_occurrences
+                    .iter()
+                    .any(|&occurrence| occurrence >= count || occurrence % width != lane)
+            {
+                return Err("GPU child wave has an invalid parent lane or occurrence".into());
+            }
+            current = parent_index;
+            depth += 1;
         }
+        groups[index].depth = depth;
+    }
+    // Equal intervals are legal only along the explicit parent chain: a
+    // wrapper may emit no operations of its own. Unrelated overlaps remain
+    // invalid. The interval stack avoids comparing every pair of loop sites.
+    let mut ordered = (0..groups.len()).collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|&index| {
+        (
+            groups[index].body_start,
+            std::cmp::Reverse(groups[index].body_end),
+            groups[index].depth,
+            groups[index].site,
+        )
+    });
+    let mut enclosing = Vec::<usize>::new();
+    for index in ordered {
+        let group = &groups[index];
+        if group.body_start == group.body_end {
+            continue;
+        }
+        while enclosing.last().is_some_and(|&parent| groups[parent].body_end <= group.body_start) {
+            enclosing.pop();
+        }
+        if let Some(&parent) = enclosing.last() {
+            if group.parent_template.map(|(site, _)| site) != Some(groups[parent].site) ||
+                group.body_end > groups[parent].body_end
+            {
+                return Err(
+                    "GPU wave bodies overlap without an enclosing parent relationship".into()
+                );
+            }
+        } else if group.parent_template.is_some() {
+            return Err("GPU wave body is disconnected from its parent interval".into());
+        }
+        enclosing.push(index);
     }
     Ok(groups)
 }
@@ -549,6 +633,14 @@ fn region_key(frame: &PhysicalFrame, start: usize, end: usize) -> u64 {
         }
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", crate::gpu_execution_plan::GpuControlExecution::current()).hash(&mut hasher);
+    let native = crate::gpu_subgraph_kernel::GpuKernelBuildIdentity::current();
+    (&native.backend, &native.architecture, &native.native_revision).hash(&mut hasher);
+    for kernel in &frame.program.subgraph_kernels {
+        (&kernel.name, &kernel.parameters, kernel.scratch_bytes).hash(&mut hasher);
+        format!("{:?}{:?}{:?}", kernel.build_identity, kernel.inputs, kernel.outputs)
+            .hash(&mut hasher);
+    }
     for op in &frame.program.operations[start..end] {
         operation(frame, op, start, &mut hasher);
     }
@@ -671,6 +763,18 @@ fn per_launch_overhead(mut segments: Vec<f64>, measured: f64) -> f64 {
 /// group; other regions run once.
 fn region_replay_counts(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Vec<f64>, String> {
     let groups = wave_groups(frame, graph)?;
+    let mut ordered = groups.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|group| group.depth);
+    let mut invocations = BTreeMap::<GpuLoopSiteKey, f64>::new();
+    for group in ordered {
+        let count = match group.parent_template {
+            Some((parent, _)) => {
+                invocations[&parent] * group.active_parent_occurrences.len() as f64
+            }
+            None => 1.0,
+        };
+        invocations.insert(group.site, count);
+    }
     Ok(graph
         .regions
         .iter()
@@ -681,15 +785,8 @@ fn region_replay_counts(frame: &PhysicalFrame, graph: &DirectGraph) -> Result<Ve
                     group.body_start <= region.start_operation &&
                         region.start_operation < group.body_end
                 })
-                .min_by_key(|group| group.body_end - group.body_start)
-                .map_or(1.0, |group| {
-                    let invocations = if group.parent_template.is_some() {
-                        group.active_parent_occurrences.len()
-                    } else {
-                        1
-                    };
-                    (group.waves.len() * invocations) as f64
-                })
+                .max_by_key(|group| group.depth)
+                .map_or(1.0, |group| group.waves.len() as f64 * invocations[&group.site])
         })
         .collect())
 }
@@ -700,8 +797,21 @@ impl DirectGraph {
         start: u32,
         end: u32,
     ) -> Result<std::ops::Range<usize>, GpuRuntimeError> {
-        if start == end && self.regions.is_empty() {
-            return Ok(0..0);
+        if start == end {
+            let boundary = self
+                .regions
+                .iter()
+                .position(|region| region.start_operation == start)
+                .or_else(|| {
+                    (self.regions.last().map_or(start == 0, |region| region.end_operation == start))
+                        .then_some(self.regions.len())
+                })
+                .ok_or_else(|| {
+                    GpuRuntimeError::Execution(
+                        "empty scheduled range is not a Graph boundary".into(),
+                    )
+                })?;
+            return Ok(boundary..boundary);
         }
         let first =
             self.regions.iter().position(|region| region.start_operation == start).ok_or_else(
@@ -738,8 +848,7 @@ impl DirectGraph {
         .map_err(GpuPlanError::GraphCompile)?;
         let length = frame.program.operations.len();
         if length == 0 {
-            if !frame.waves.is_empty() ||
-                !frame.import_templates.is_empty() ||
+            if !frame.import_templates.is_empty() ||
                 !frame.export_templates.is_empty() ||
                 !frame.external_io_imports.is_empty() ||
                 !frame.external_io_loops.is_empty()
@@ -748,18 +857,22 @@ impl DirectGraph {
                     "empty physical Graph has scheduled work".into(),
                 ));
             }
-            return Ok(Self { regions: Vec::new(), first_launch: None });
+            let graph = Self { regions: Vec::new(), first_launch: None };
+            wave_groups(frame, &graph).map_err(GpuPlanError::GraphCompile)?;
+            return Ok(graph);
         }
         let mut starts = vec![0usize];
         for wave in &frame.waves {
             let start = wave.body_start as usize;
             let end = wave.body_end as usize;
-            if start >= end || end > length {
+            if start > end || end > length {
                 return Err(GpuPlanError::GraphCompile(
                     "parallel wave has an invalid operation interval".into(),
                 ));
             }
-            starts.push(start);
+            if start < length {
+                starts.push(start);
+            }
             if end < length {
                 starts.push(end);
             }
@@ -948,6 +1061,7 @@ impl DirectGraph {
                 resources,
                 device: frame.device,
                 peer_streams,
+                owner_uses: region_owner_uses(&program.operations),
             });
         }
         // Upload now, so the first production launch does not pay the
@@ -994,6 +1108,11 @@ impl DirectGraph {
                     let storage = owner.storage(part.storage).ok_or_else(|| {
                         GpuRuntimeError::Execution("physical graph storage is missing".into())
                     })?;
+                    if crate::gpu_graph_memory::is_graph_managed(storage) {
+                        return Err(GpuRuntimeError::Execution(
+                            "physical graph binding still has deferred scratch storage".into(),
+                        ));
+                    }
                     let offset = part.view.byte_offset;
                     if storage.device != part.device || offset >= storage.bytes {
                         return Err(GpuRuntimeError::Execution(
@@ -1077,6 +1196,34 @@ impl DirectGraph {
                     GpuRuntimeError::Execution("launch resource is on an unplanned GPU".into())
                 })
         };
+        // Resolve this region's current views, not whole-plan snapshots. Typed
+        // scalar aliases and multiple CRT slots may share one native allocation.
+        let mut storage_uses = BTreeMap::new();
+        for &(value, consumer, written) in &region.owner_uses {
+            let owner = frame.owners.get(&value).ok_or_else(|| {
+                GpuRuntimeError::Execution("compiled region operand owner is missing".into())
+            })?;
+            for (_, bound) in owner.storages() {
+                if crate::gpu_graph_memory::is_graph_managed(bound) {
+                    continue;
+                }
+                let allocation =
+                    crate::poly::dcrt::gpu::CompiledStorageOwner::from_owner(&*bound.owner)
+                        .ok_or_else(|| {
+                            GpuRuntimeError::Execution(
+                                "compiled storage has no allocation protocol".into(),
+                            )
+                        })?;
+                let actual_writer = written && bound.device == consumer;
+                storage_uses
+                    .entry((consumer, bound.device, allocation.identity()))
+                    .and_modify(|(_, write): &mut (_, bool)| *write |= actual_writer)
+                    .or_insert((allocation, actual_writer));
+            }
+        }
+        for (&(consumer, storage_device, _), &(allocation, written)) in &storage_uses {
+            allocation.prepare(storage_device, consumer, device_stream(consumer)?, written)?;
+        }
         for real in frame.real_owners.iter().chain(frame.real_output_owners.values()) {
             real.prepare_graph_launch(device_stream(real.physical_device())?)?;
         }
@@ -1118,6 +1265,27 @@ impl DirectGraph {
             peer.record_event()?.enqueue_wait(&stream)?;
         }
         let completion = region.executable.launch(&stream)?;
+        for (&(consumer, storage_device, _), &(allocation, written)) in &storage_uses {
+            allocation
+                .protect(storage_device, consumer, device_stream(consumer)?, &completion, written)
+                .map_err(|error| {
+                    GpuRuntimeError::LaunchUncertain(format!(
+                        "native graph launched but storage retirement failed: {error}"
+                    ))
+                })?;
+        }
+        if let Ok(schedule) = region.executable.schedule_metrics() {
+            if schedule.control_reads != 0 {
+                tracing::debug!(
+                    control_reads = schedule.control_reads,
+                    control_bytes = schedule.control_bytes,
+                    control_wait_seconds = schedule.control_wait_seconds,
+                    region_launches = schedule.region_launches,
+                    host_schedule_seconds = schedule.host_schedule_seconds,
+                    "GPU graph control schedule"
+                );
+            }
+        }
         for (device, stream) in std::iter::once((region.device, &stream))
             .chain(region.peer_streams.iter().map(|peer| (peer.physical_device(), peer)))
         {
@@ -1191,7 +1359,8 @@ fn contract_devices(
         .collect()
 }
 
-/// Check the plan's persistent allocations against each device budget.
+/// Check persistent frame, wave, and nested replay destination allocations
+/// against each device budget, counting shared allocation storage only once.
 fn validate_allocated_budget(
     frame: &PhysicalFrame,
     contract: &crate::gpu_execution_plan::GpuPlanContract,
@@ -1199,7 +1368,13 @@ fn validate_allocated_budget(
 ) -> Result<(), GpuPlanError> {
     let mut allocations = BTreeMap::<(i32, u64), u64>::new();
     for (id, owner) in
-        frame.owners.iter().chain(frame.waves.iter().flat_map(|wave| wave.owner_bindings.iter()))
+        frame
+            .owners
+            .iter()
+            .chain(frame.waves.iter().flat_map(|wave| wave.owner_bindings.iter()))
+            .chain(frame.waves.iter().flat_map(|wave| {
+                wave.nested_owner_bindings.iter().map(|(_, id, owner)| (id, owner))
+            }))
     {
         let physical = frame
             .program
@@ -1593,7 +1768,9 @@ fn fused_operations(
 }
 
 /// Emit operation `index` of the operation list being built, including its
-/// conditional body.
+/// reusable conditional body. HIP's native schedule partitions the same DAG
+/// into precompiled regions, so planning, profiling and execution share its
+/// control transfers, operand patches, scratch owners and retry semantics.
 fn emit_direct_operation(
     backend: &GpuDcrtBackend,
     builder: &mut GpuNativeGraphBuilder,
@@ -2686,7 +2863,7 @@ impl GpuRuntime {
         }
         let contract = self
             .backend
-            .physical_plan_contract(&validated, inputs)
+            .physical_plan_contract(&validated, inputs, &self.options.subgraph_kernels)
             .map_err(GpuPlanError::InvalidInput)?;
         // A candidate is feasible only after its full physical frame and
         // native Graph have actually been allocated and executed. The score
@@ -2782,7 +2959,8 @@ impl GpuRuntime {
                     graph
                         .bind(&frame)
                         .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
-                    self.measure_regions(&frame, &mut graph)
+                    let measured = self.measure_regions(&frame, &mut graph);
+                    measured
                 })();
                 // The candidate's owners and Graphs are gone; complete their
                 // frees and return the pools' retained memory so the next
@@ -3238,13 +3416,26 @@ impl GpuRuntime {
         let nested = |group: &WaveGroup, operation: u32| {
             group.body_start == operation &&
                 group.body_end <= end &&
-                active_site.is_none_or(|site| site != group.site)
+                match (group.parent_template, active_site) {
+                    (None, None) => true,
+                    (Some((parent, _)), Some(active)) => parent == active,
+                    _ => false,
+                }
         };
         let mut region = interval.start;
-        while region < interval.end {
-            let operation = plan.graph.regions[region].start_operation;
+        // Metadata-only bodies still publish each wave's borrowed owners. Visit
+        // each empty group once per enclosing invocation, including its end boundary.
+        let mut empty_groups = BTreeSet::new();
+        while region <= interval.end {
+            let operation = if region == interval.end {
+                end
+            } else {
+                plan.graph.regions[region].start_operation
+            };
             let candidate = groups.iter().enumerate().find(|(_, group)| {
                 nested(group, operation) &&
+                    !empty_groups.contains(&group.site) &&
+                    (region < interval.end || group.body_start == group.body_end) &&
                     match (group.parent_template, active_wave) {
                         (None, None) => true,
                         (Some((site, _)), Some(parent)) => {
@@ -3310,15 +3501,25 @@ impl GpuRuntime {
                             execution_nonce,
                             group_index,
                             parent_occurrence,
+                            active_wave.map(|wave| wave.wave_index),
                             &path,
                             pump,
                         )?;
                     }
                 }
+                if group.body_start == group.body_end {
+                    empty_groups.insert(group.site);
+                }
                 region = plan.graph.region_interval(group.body_start, group.body_end)?.end;
                 continue;
             }
-            if groups.iter().any(|group| nested(group, operation)) {
+            if region == interval.end {
+                break;
+            }
+            if groups
+                .iter()
+                .any(|group| nested(group, operation) && !empty_groups.contains(&group.site))
+            {
                 return Err(GpuRuntimeError::Execution(
                     "wave region has no reached parent invocation".into(),
                 ));
@@ -3431,6 +3632,7 @@ impl GpuRuntime {
         execution_nonce: [u8; 32],
         group_index: usize,
         parent_occurrence: Option<usize>,
+        parent_wave_index: Option<usize>,
         parent_path: &[u64],
         pump: &mut Option<&mut ProducerIoPump<'_, E>>,
     ) -> Result<(), GpuRuntimeError> {
@@ -3468,7 +3670,148 @@ impl GpuRuntime {
                     wave_family_member(family, member_index).map_err(GpuRuntimeError::Execution)?;
                 plan.frame.waves[wave_index].owner_bindings.insert(value_id, member);
             }
-            let bindings = plan.frame.waves[wave_index].owner_bindings.clone();
+            // Borrowed results retain the input's allocation, including a
+            // named body's returned view. Resolve after selecting this wave's
+            // Zip inputs and refresh family views without copying payloads.
+            let mut view_sources = BTreeSet::new();
+            for borrowed in plan.frame.waves[wave_index].borrowed_outputs.clone() {
+                let source = if plan.frame.waves[wave_index]
+                    .zip_sources
+                    .iter()
+                    .any(|(_, _, id)| *id == borrowed.source)
+                {
+                    plan.frame.waves[wave_index].owner_bindings.get(&borrowed.source)
+                } else {
+                    plan.frame.owners.get(&borrowed.source)
+                }
+                .ok_or_else(|| {
+                    GpuRuntimeError::Execution("borrowed wave input is absent".into())
+                })?;
+                // A borrowed output may expose only a tail of its input.
+                // Canonicalize the input's complete allocation spans before
+                // redirecting the current template's other views of them.
+                let mut source_allocations = std::collections::HashMap::new();
+                for (_, bound) in source.storages() {
+                    crate::gpu_physical_control::record_allocation_replacement(
+                        &mut source_allocations,
+                        bound,
+                        bound,
+                    )
+                    .map_err(GpuRuntimeError::Execution)?;
+                }
+                let actual = borrowed.resolve(source).map_err(GpuRuntimeError::Execution)?;
+                let mut replaced = std::collections::HashMap::<
+                    *const (),
+                    (crate::backend::BoundStorage, crate::backend::BoundStorage),
+                >::new();
+                if let Some(previous) =
+                    plan.frame.waves[wave_index].owner_bindings.get(&borrowed.value)
+                {
+                    let mut originals = std::collections::HashMap::new();
+                    for (_, bound) in previous.storages() {
+                        crate::gpu_physical_control::record_allocation_replacement(
+                            &mut originals,
+                            bound,
+                            bound,
+                        )
+                        .map_err(GpuRuntimeError::Execution)?;
+                    }
+                    for (slot, old) in previous.storages() {
+                        let new = actual.storage(*slot).ok_or_else(|| {
+                            GpuRuntimeError::Execution("borrowed output lost a storage slot".into())
+                        })?;
+                        if !Arc::ptr_eq(&old.owner, &new.owner) {
+                            let key = Arc::as_ptr(&old.owner).cast::<()>();
+                            let original = originals[&key].clone();
+                            let destination = source_allocations
+                                .get(&Arc::as_ptr(&new.owner).cast::<()>())
+                                .ok_or_else(|| {
+                                    GpuRuntimeError::Execution(
+                                        "borrowed replacement allocation is absent".into(),
+                                    )
+                                })?
+                                .clone();
+                            if let Some((_, previous_destination)) = replaced.get(&key) {
+                                if !Arc::ptr_eq(&previous_destination.owner, &destination.owner) ||
+                                    previous_destination.address != destination.address ||
+                                    previous_destination.bytes != destination.bytes
+                                {
+                                    return Err(GpuRuntimeError::Execution(
+                                        "borrowed allocation splits across replacement spans"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            replaced.insert(key, (original, destination));
+                        }
+                    }
+                }
+                for &(family_id, member_index) in &borrowed.family_members {
+                    plan.frame
+                        .bind_family_member(family_id, member_index, &actual)
+                        .map_err(GpuRuntimeError::Execution)?;
+                    view_sources.insert(family_id);
+                }
+                if !replaced.is_empty() {
+                    for owner in plan.frame.waves[wave_index].owner_bindings.values_mut() {
+                        if let Some(rebound) =
+                            crate::gpu_physical_control::rebind_allocation_origins(
+                                owner,
+                                &replaced,
+                                actual.ready_events(),
+                            )
+                            .map_err(GpuRuntimeError::Execution)?
+                        {
+                            *owner = Arc::new(rebound);
+                        }
+                    }
+                    let template_values = plan.frame.waves[wave_index].template_values.clone();
+                    for (id, owner) in plan
+                        .frame
+                        .owners
+                        .iter_mut()
+                        .filter(|(id, _)| template_values.contains(&(id.0 as usize)))
+                    {
+                        let _ = id;
+                        if let Some(rebound) =
+                            crate::gpu_physical_control::rebind_allocation_origins(
+                                owner,
+                                &replaced,
+                                actual.ready_events(),
+                            )
+                            .map_err(GpuRuntimeError::Execution)?
+                        {
+                            *owner = Arc::new(rebound);
+                        }
+                    }
+                }
+                plan.frame.waves[wave_index].owner_bindings.insert(borrowed.value, actual);
+            }
+            let mut bindings = plan.frame.waves[wave_index].owner_bindings.clone();
+            if let Some(parent) = parent_wave_index {
+                for (child, id, owner) in &plan.frame.waves[parent].nested_owner_bindings {
+                    if *child == wave_index {
+                        bindings.insert(*id, Arc::clone(owner));
+                    }
+                }
+            }
+            for &(family_id, member_index, value) in
+                &plan.frame.waves[wave_index].produced_family_members.clone()
+            {
+                let owner = bindings
+                    .get(&value)
+                    .or_else(|| plan.frame.owners.get(&value))
+                    .ok_or_else(|| {
+                        GpuRuntimeError::Execution(
+                            "produced family member has no bound owner".into(),
+                        )
+                    })?;
+                let owner = Arc::clone(owner);
+                plan.frame
+                    .bind_family_member(family_id, member_index, &owner)
+                    .map_err(GpuRuntimeError::Execution)?;
+                view_sources.insert(family_id);
+            }
             for (id, owner) in bindings {
                 if plan.frame.program.values.get(id.0 as usize) != Some(owner.physical().as_ref()) {
                     return Err(GpuRuntimeError::Execution(
@@ -3479,7 +3822,9 @@ impl GpuRuntime {
                     event.wait()?;
                 }
                 plan.frame.owners.insert(id, owner);
+                view_sources.insert(id);
             }
+            plan.frame.refresh_value_views(view_sources).map_err(GpuRuntimeError::Execution)?;
             for control in &plan.frame.control_resets {
                 control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
             }

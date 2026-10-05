@@ -1,4 +1,4 @@
-//! Rust bindings to the native CUDA layer in `crates/backends/cuda/`.
+//! Rust bindings to the native GPU layer in `crates/backends/gpu/`.
 //!
 //! Headers in `include/` declare only cross-file and Rust-facing functions, and bodies live in
 //! `src/`:
@@ -13,8 +13,10 @@
 //! | `src/matrix/Matrix.cu` | Unity build of the matrix layer: NTT, data movement, decomposition, sampling, trapdoors, serialization, CRT and RNS conversions, small right operands, preimages, and hashing. |
 //!
 //! `build.rs` compiles `Runtime.cu`, `Primitive.cu`, `Control.cu`, `Real.cu`, and
-//! `matrix/Matrix.cu` into the `gpupoly` library under the `gpu` feature (`CUDA_ARCH`, default
-//! `89`), and embeds a hash of the CUDA sources as `MXX_NATIVE_KERNEL_BUILD_REVISION`.
+//! `matrix/Matrix.cu` into the `gpupoly` library under the `gpu` feature.
+//! `MXX_GPU_BACKEND` selects CUDA (the default) or HIP; `CUDA_ARCH` or `HIP_ARCH` selects
+//! the architecture. The native source and toolchain identity is embedded as
+//! `MXX_NATIVE_KERNEL_BUILD_REVISION`.
 //!
 //! Raw matrix kernels batch up to 8 CRT limbs per launch. The fused NTT runs up to ten butterfly
 //! stages of a 1024-coefficient tile in shared memory, and the stages above one tile with warp
@@ -25,6 +27,144 @@
 //! four thread rows and sums in 128 bits with one reduction per batch. Decomposition peels every
 //! balanced digit of a coefficient in one pass, and integer division uses native 128-bit division
 //! when the magnitudes have at most two words.
+
+unsafe extern "C" {
+    pub(crate) fn gpu_matrix_wait_compiled_storage(
+        owner: *const GpuMatrixOpaque,
+        storage_device: i32,
+        device: i32,
+        stream: *mut c_void,
+        read_only: bool,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_record_compiled_storage_use(
+        owner: *mut GpuMatrixOpaque,
+        storage_device: i32,
+        device: i32,
+        stream: *mut c_void,
+        event: *mut c_void,
+        written: bool,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_wait_compiled_inputs(
+        owner: *const GpuSmallMatrixOpaque,
+        device: i32,
+        stream: *mut c_void,
+        read_only: bool,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_record_compiled_use(
+        owner: *mut GpuSmallMatrixOpaque,
+        device: i32,
+        stream: *mut c_void,
+        event: *mut c_void,
+        written: bool,
+    ) -> c_int;
+    fn gpu_device_buffer_record_compiled_use(
+        owner: *mut c_void,
+        device: i32,
+        stream: *mut c_void,
+        event: *mut c_void,
+        written: bool,
+    ) -> c_int;
+}
+
+/// Borrow a physical storage owner's producer and reclamation protocol.
+/// Typed integer and status views share the underlying buffer identity.
+#[derive(Clone, Copy)]
+pub(crate) enum CompiledStorageOwner<'a> {
+    Buffer(&'a GpuDeviceBuffer),
+    Matrix(&'a crate::matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix),
+    Small(&'a crate::matrix::gpu_dcrt_poly::GpuSmallMatrix),
+}
+impl<'a> CompiledStorageOwner<'a> {
+    pub(crate) fn from_owner(owner: &'a (dyn std::any::Any + Send + Sync)) -> Option<Self> {
+        if let Some(value) = owner.downcast_ref::<GpuDeviceBuffer>() {
+            return Some(Self::Buffer(value));
+        }
+        if let Some(value) = owner.downcast_ref::<crate::matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix>()
+        {
+            return Some(Self::Matrix(value));
+        }
+        if let Some(value) = owner.downcast_ref::<crate::matrix::gpu_dcrt_poly::GpuSmallMatrix>() {
+            return Some(Self::Small(value));
+        }
+        let buffer = if let Some(value) = owner.downcast_ref::<GpuSignedValues>() {
+            &*value.buffer
+        } else if let Some(value) = owner.downcast_ref::<GpuDeviceBytes>() {
+            &value.buffer
+        } else if let Some(value) = owner.downcast_ref::<GpuDeviceSeed>() {
+            &value.bytes.buffer
+        } else if let Some(value) = owner.downcast_ref::<GpuExportStatus>() {
+            &value.buffer
+        } else if let Some(value) = owner.downcast_ref::<GpuPreimageAttempt>() {
+            &value.buffer
+        } else if let Some(value) = owner.downcast_ref::<GpuPreimageStatus>() {
+            &value.buffer
+        } else if let Some(value) =
+            owner.downcast_ref::<crate::poly::dcrt::gpu_real::GpuDeviceReal>()
+        {
+            value.compiled_buffer()
+        } else {
+            return None;
+        };
+        Some(Self::Buffer(buffer))
+    }
+    pub(crate) fn identity(self) -> (u8, usize) {
+        match self {
+            Self::Buffer(owner) => (0, owner.owner.as_ptr() as usize),
+            Self::Matrix(owner) => (1, owner.compiled_storage_identity()),
+            Self::Small(owner) => (2, owner.compiled_storage_identity()),
+        }
+    }
+    pub(crate) fn prepare(
+        self,
+        storage_device: i32,
+        device: i32,
+        stream: &GpuNativeLaunchStream,
+        written: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        match self {
+            Self::Buffer(owner) => owner.wait_compiled_inputs(device, stream, !written),
+            Self::Matrix(owner) => {
+                owner.wait_compiled_storage(storage_device, device, stream, !written)
+            }
+            Self::Small(owner) => owner.wait_compiled_inputs(device, stream, !written),
+        }
+    }
+    pub(crate) fn protect(
+        self,
+        storage_device: i32,
+        device: i32,
+        stream: &GpuNativeLaunchStream,
+        event: &GpuNativeEvent,
+        written: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let raw = event.raw_event()?;
+        let status = match self {
+            Self::Buffer(owner) => unsafe {
+                gpu_device_buffer_record_compiled_use(
+                    owner.owner.as_ptr(),
+                    device,
+                    stream.raw_ptr(),
+                    raw,
+                    written,
+                )
+            },
+            Self::Matrix(owner) => {
+                return owner.record_compiled_storage_use(
+                    storage_device,
+                    device,
+                    stream,
+                    raw,
+                    written,
+                )
+            }
+            Self::Small(owner) => return owner.record_compiled_use(device, stream, raw, written),
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+}
 
 use crate::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
@@ -522,11 +662,11 @@ impl GpuGraphPatch {
 #[doc(hidden)]
 #[derive(Debug, thiserror::Error)]
 pub enum GpuNativeGraphError {
-    #[error("native CUDA graph operation failed: {0}")]
+    #[error("native GPU graph operation failed: {0}")]
     Native(String),
-    #[error("CUDA graph launch completion is uncertain; bound owners must be retained: {0}")]
+    #[error("GPU graph launch completion is uncertain; bound owners must be retained: {0}")]
     LaunchUncertain(String),
-    #[error("CUDA conditional retry graph unsupported: {0}")]
+    #[error("native conditional GPU graph unsupported: {0}")]
     ConditionalUnsupported(String),
 }
 
@@ -623,6 +763,11 @@ unsafe extern "C" {
         out_driver_version: *mut c_int,
         out_runtime_version: *mut c_int,
         out_context_generation: *mut u64,
+        out_backend: *mut c_char,
+        backend_capacity: usize,
+        out_architecture: *mut c_char,
+        architecture_capacity: usize,
+        out_wave_size: *mut c_int,
     ) -> c_int;
     fn gpu_context_fence_releases(ctx: *const GpuContextOpaque) -> c_int;
 
@@ -1589,6 +1734,14 @@ unsafe extern "C" {
         launch_stream: *mut c_void,
         out_event: *mut *mut MxxGpuNativeEventOpaque,
     ) -> c_int;
+    fn mxx_gpu_graph_schedule_metrics(
+        exec: *mut MxxGpuGraphExecOpaque,
+        out_control_reads: *mut u64,
+        out_control_bytes: *mut u64,
+        out_control_wait_seconds: *mut f64,
+        out_region_launches: *mut u64,
+        out_host_schedule_seconds: *mut f64,
+    ) -> c_int;
     fn mxx_gpu_graph_exec_destroy(exec: *mut MxxGpuGraphExecOpaque);
     fn mxx_gpu_stream_record_event(
         stream: *mut c_void,
@@ -1632,12 +1785,12 @@ const GPU_STATUS_OUT_OF_MEMORY: c_int = 2;
 const GPU_STATUS_CONDITIONAL_UNSUPPORTED: c_int = 3;
 const GPU_STATUS_LAUNCH_UNCERTAIN: c_int = 4;
 
-/// A device allocation failed with CUDA's typed memory-allocation status.
+/// A device allocation failed with the GPU runtime's typed memory-allocation status.
 ///
 /// Most legacy GPU owners expose infallible constructors and use
 /// `check_status` internally.  This payload lets setup-time callers catch
 /// that one expected resource failure and turn it into a normal `Result`
-/// without classifying arbitrary CUDA or host allocation errors as OOM.
+/// without classifying arbitrary GPU or host allocation errors as OOM.
 #[derive(Debug)]
 pub struct GpuOutOfMemory(String);
 
@@ -1702,19 +1855,34 @@ fn allocator_resident_bytes(physical: GpuMemoryInfo, pool: GpuMempoolUsage) -> u
         .min(physical.total)
 }
 
+/// Runtime and hardware identity scoped to a single compiled GPU backend.
+/// CUDA architectures use `sm_` names; HIP architectures use `gfx` names and
+/// never encode their identity as a CUDA compute capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GpuDeviceIdentity {
+    pub backend: String,
+    pub architecture: String,
+    pub wave_size: i32,
     pub name: String,
+    pub uuid: String,
+    /// CUDA compute capability; both fields are zero for HIP.
     pub compute_major: i32,
     pub compute_minor: i32,
     pub total_global_memory: usize,
+    pub driver_version: i32,
+    pub runtime_version: i32,
+    pub context_generation: u64,
+    pub native_revision: &'static str,
 }
 
-/// Returns stable hardware properties used to scope reusable calibration data.
-/// This CUDA runtime query does not synchronize device work.
+/// Returns hardware and runtime properties used to scope reusable plans and
+/// calibration data. This query does not synchronize device work.
 pub fn gpu_device_identity(device: i32) -> Result<GpuDeviceIdentity, String> {
     let mut name = [0 as c_char; 256];
     let mut uuid = [0 as c_char; 64];
+    let mut backend = [0 as c_char; 16];
+    let mut architecture = [0 as c_char; 256];
+    let mut wave_size = 0;
     let mut compute_major = 0;
     let mut compute_minor = 0;
     let mut total_global_memory = 0;
@@ -1734,16 +1902,40 @@ pub fn gpu_device_identity(device: i32) -> Result<GpuDeviceIdentity, String> {
             &mut driver_version,
             &mut runtime_version,
             &mut context_generation,
+            backend.as_mut_ptr(),
+            backend.len(),
+            architecture.as_mut_ptr(),
+            architecture.len(),
+            &mut wave_size,
         )
     };
     if status != 0 {
         return Err(last_error_string());
     }
-    let name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
-    Ok(GpuDeviceIdentity { name, compute_major, compute_minor, total_global_memory })
+    let decode = |buffer: &[c_char]| {
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy().into_owned()
+    };
+    let backend = decode(&backend);
+    if backend != env!("MXX_GPU_BACKEND") {
+        return Err(format!("native GPU backend {backend} differs from the Rust build"));
+    }
+    Ok(GpuDeviceIdentity {
+        backend,
+        architecture: decode(&architecture),
+        wave_size,
+        name: decode(&name),
+        uuid: decode(&uuid),
+        compute_major,
+        compute_minor,
+        total_global_memory,
+        driver_version,
+        runtime_version,
+        context_generation,
+        native_revision: env!("MXX_NATIVE_KERNEL_BUILD_REVISION"),
+    })
 }
 
-/// Returns the CUDA allocator-visible memory counters for one detected device.
+/// Returns the GPU allocator-visible memory counters for one detected device.
 pub fn gpu_memory_info(device: i32) -> Result<GpuMemoryInfo, String> {
     let mut free = 0;
     let mut total = 0;
@@ -1754,7 +1946,7 @@ pub fn gpu_memory_info(device: i32) -> Result<GpuMemoryInfo, String> {
     Ok(GpuMemoryInfo { free, total })
 }
 
-/// Returns the default CUDA memory pool's logical current usage and high-water
+/// Returns the default GPU memory pool's logical current usage and high-water
 /// mark for one device. This query does not synchronize device work.
 pub fn gpu_default_mempool_usage(device: i32) -> Result<GpuMempoolUsage, String> {
     let mut used_current = 0;
@@ -1775,7 +1967,7 @@ pub fn gpu_default_mempool_usage(device: i32) -> Result<GpuMempoolUsage, String>
 }
 
 /// Returns a conservative physical residency baseline and the number of live
-/// mxx CUDA contexts on one device. Unlike the pool's logical used counter,
+/// mxx GPU contexts on one device. Unlike the pool's logical used counter,
 /// this includes persistent `cudaMalloc` allocations such as NTT tables.
 pub fn gpu_device_memory_usage(device: i32) -> Result<GpuDeviceMemoryUsage, String> {
     let physical = gpu_memory_info(device)?;
@@ -1827,7 +2019,31 @@ fn available_gpu_ids() -> Vec<i32> {
 
 #[cfg(feature = "gpu")]
 pub fn detected_gpu_device_ids() -> Vec<i32> {
-    available_gpu_ids()
+    let devices = available_gpu_ids();
+    // A HIP build carries code objects for its single `HIP_ARCH` target only,
+    // and a device of another target fails at its first kernel launch. Reject
+    // such a device before fleet planning assigns work to it.
+    #[cfg(mxx_gpu_backend = "hip")]
+    {
+        static CHECKED: OnceLock<()> = OnceLock::new();
+        CHECKED.get_or_init(|| {
+            for &device in &devices {
+                let identity = gpu_device_identity(device)
+                    .unwrap_or_else(|error| panic!("GPU {device} identity query failed: {error}"));
+                // HIP reports target features after the base architecture.
+                let architecture = identity.architecture.split(':').next().unwrap_or_default();
+                if architecture != env!("MXX_GPU_ARCH") {
+                    panic!(
+                        "GPU {device} is {architecture}, but this HIP build targets {}; rebuild \
+                         with HIP_ARCH={architecture} or select devices of the built target with \
+                         MXX_GPU_LOGICAL_DEVICES",
+                        env!("MXX_GPU_ARCH")
+                    );
+                }
+            }
+        });
+    }
+    devices
 }
 
 fn pinned_alloc<T>(len: usize) -> NonNull<T> {
@@ -6753,9 +6969,10 @@ impl GpuNativeGraphBuilder {
         Ok(())
     }
 
-    /// Emit a device-predicate IF node with compiled operations written
-    /// directly into CUDA's child graph. The callback uses this builder's
-    /// ordinary begin/finish operation API with body-local predecessor tokens.
+    /// Emit a device-predicate IF body as a CUDA conditional child graph or
+    /// a reusable HIP region selected at a D2H control boundary. The callback
+    /// uses this builder's ordinary begin/finish operation API with body-local
+    /// predecessor tokens.
     pub fn add_if_with_body(
         &mut self,
         predicate_address: u64,
@@ -6796,7 +7013,8 @@ impl GpuNativeGraphBuilder {
     /// Emit a bounded device-indexed WHILE node. The caller resets `index` and
     /// `status_word` after the previous execute has joined; the body reads the
     /// current index without modifying it; the tail advances it before the
-    /// next predicate check.
+    /// next predicate check. CUDA uses a conditional child graph; HIP reuses
+    /// the body region after each targeted D2H predicate read.
     pub fn add_while_with_body(
         &mut self,
         index_address: u64,
@@ -6868,7 +7086,41 @@ impl Drop for GpuNativeGraphBuilder {
     }
 }
 
+/// Host scheduling costs of the latest graph launch. Native CUDA conditional
+/// graphs report zero; HIP reports control D2H, event waits and region submits.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuGraphScheduleMetrics {
+    pub control_reads: u64,
+    pub control_bytes: u64,
+    pub control_wait_seconds: f64,
+    pub region_launches: u64,
+    pub host_schedule_seconds: f64,
+}
+
 impl GpuNativeGraphExec {
+    /// Reads counters recorded by the latest launch without waiting for device
+    /// completion or transferring device data.
+    pub fn schedule_metrics(&self) -> Result<GpuGraphScheduleMetrics, GpuNativeGraphError> {
+        let mut metrics = GpuGraphScheduleMetrics::default();
+        let status = unsafe {
+            mxx_gpu_graph_schedule_metrics(
+                self.raw,
+                &mut metrics.control_reads,
+                &mut metrics.control_bytes,
+                &mut metrics.control_wait_seconds,
+                &mut metrics.region_launches,
+                &mut metrics.host_schedule_seconds,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "mxx_gpu_graph_schedule_metrics failed: {}",
+                last_error_string()
+            )));
+        }
+        Ok(metrics)
+    }
+
     /// Return the fixed stream selected when capture began.
     #[doc(hidden)]
     pub fn launch_stream(&self) -> &GpuNativeLaunchStream {
@@ -6906,8 +7158,12 @@ impl GpuNativeGraphExec {
         Ok(())
     }
 
-    /// Launch the bound graph asynchronously and return its native completion
-    /// event. The caller owns the event and may attach it to runtime owners.
+    /// Launch the bound graph and return a fresh native completion event.
+    /// CUDA joins private top-level branch records into that event without
+    /// serializing independent operations or waiting on the host. HIP
+    /// control boundaries read small D2H records before submitting the next
+    /// region; the final region remains asynchronous. The caller owns the
+    /// event and may attach it to runtime owners.
     #[doc(hidden)]
     pub fn launch(
         &mut self,
@@ -7146,11 +7402,11 @@ mod tests {
         let out_of_memory = std::panic::catch_unwind(|| {
             check_status(GPU_STATUS_OUT_OF_MEMORY, "matrix allocation")
         })
-        .expect_err("typed CUDA OOM must be reported through the panic payload");
+        .expect_err("typed GPU OOM must be reported through the panic payload");
         assert!(out_of_memory.downcast_ref::<GpuOutOfMemory>().is_some());
 
         let other_error = std::panic::catch_unwind(|| check_status(1, "kernel launch"))
-            .expect_err("non-OOM CUDA errors must still fail");
+            .expect_err("non-OOM GPU errors must still fail");
         assert!(other_error.downcast_ref::<GpuOutOfMemory>().is_none());
     }
 
@@ -7200,11 +7456,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn preimage_attempt_and_status_keep_addresses_across_replay_reset() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = gpu_params_from_cpu(&gpu_test_params());
         let stream = params.native_launch_stream(device).unwrap();
         let attempt = GpuPreimageAttempt::new(&params, device).unwrap();
@@ -7234,11 +7490,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_polynomial_from_signed_words_replays_and_checks_status() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let modulus = 1_152_921_504_606_830_593u64;
         let params = GpuDCRTPolyParams::new(2048, vec![modulus], 8, None);
         let q = BigInt::from(modulus);
@@ -7341,11 +7597,11 @@ mod tests {
     /// A new device buffer reads zero even when the pool hands it the memory
     /// a buffer filled with other bytes freed on the same stream just before.
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn device_buffer_starts_zeroed_after_the_pool_reuses_memory() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
         let stream = params.native_launch_stream(device).unwrap();
         let bytes = 1 << 20;
@@ -7361,11 +7617,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_threshold_decode_replays_modulus_and_checks_length() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
         let mut values = vec![BigInt::from(0); 32];
         values[1] = BigInt::from(100);
@@ -7524,11 +7780,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn device_bytes_keep_address_across_exact_length_imports() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
         let owner = GpuDeviceBytes::new(&params, device, 5).unwrap();
         let address = owner.device_address();
@@ -7551,11 +7807,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_dynamic_slice_replays_window_and_checks_bounds() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
         let source = GpuDCRTPolyMatrix::zero_with_state(&params, 3, 3).unwrap();
         let destination = GpuDCRTPolyMatrix::zero_with_state(&params, 1, 1).unwrap();
@@ -7672,11 +7928,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_pack_values_and_extract_preserve_two_prime_coefficients() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193, 257], 3, None);
         let mut coefficients = vec![0u64; 32];
         coefficients[..3].copy_from_slice(&[7, 13, 49_300]);
@@ -7856,11 +8112,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_integer_lift_replays_multiword_signed_value_per_prime() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193, 257], 3, None);
         let q = BigInt::from(193u64 * 257);
         let first = -((&q << 80usize) + BigInt::from(7));
@@ -7961,11 +8217,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn indexed_matrix_table_replays_live_members_and_rejects_bad_index() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
         let source_zero = GpuDCRTPolyMatrix::zero_with_state(&params, 1, 1).unwrap();
         let source_one = GpuDCRTPolyMatrix::zero_with_state(&params, 1, 1).unwrap();
@@ -8080,11 +8336,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn preimage_graph_derives_distinct_deterministic_attempt_seeds() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let params = GpuDCRTPolyParams::new(32, vec![193], 3, None);
         let stream = params.native_launch_stream(device).unwrap();
         let base = GpuDeviceSeed::new(&params, device).unwrap();
@@ -8143,11 +8399,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_rns_and_block_graph_match_cpu_oracles() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let run = |source_moduli: Vec<u64>, target_moduli: Vec<u64>, mode: u32| {
             let source_cpu_params = DCRTPolyParams::new(
                 32,
@@ -8324,11 +8580,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_dynamic_centered_round_divide_replays_and_rejects_zero() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let cpu_params = DCRTPolyParams::new(32, 1, 10, 3, Some(vec![577]), None);
         let gpu_params = GpuDCRTPolyParams::new(32, vec![577], 3, None);
         let mut coefficients = vec![BigUint::from(0u8); 32];
@@ -8438,14 +8694,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_hash_sample_matches_cpu_tag_framing_and_column_subrange() {
         use crate::sampler::{PolyHashSampler, hash::DCRTPolyHashSampler};
         use keccak_asm::Keccak256;
 
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let moduli = [577u64, 641u64];
         let cpu_params = DCRTPolyParams::new(32, 2, 10, 3, Some(moduli.to_vec()), None);
         let gpu_params = GpuDCRTPolyParams::new_with_gpu(
@@ -8633,14 +8889,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_hash_sample_rejects_against_multi_block_crt_product() {
         use crate::sampler::{PolyHashSampler, hash::DCRTPolyHashSampler};
         use keccak_asm::Keccak256;
 
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         // More than 256 product bits forces multiple Keccak digest blocks for
         // each rejection candidate, unlike a single-limb residue sampler.
         let moduli = vec![
@@ -8747,11 +9003,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_dynamic_matrix_scale_reduces_signed_device_scalars() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let moduli = [577u64, 641u64];
         let params = GpuDCRTPolyParams::new(32, moduli.to_vec(), 3, None);
         let stream = params.native_launch_stream(device).unwrap();
@@ -8871,11 +9127,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn raw_ring_automorphism_replays_device_index_and_rejects_even_index() {
-        let Some(&device) = detected_gpu_device_ids().first() else {
-            return;
-        };
+        let device =
+            *detected_gpu_device_ids().first().expect("explicit GPU test requires a supported GPU");
         let modulus = 577u64;
         let params = GpuDCRTPolyParams::new(32, vec![modulus], 3, None);
         let stream = params.native_launch_stream(device).unwrap();
@@ -9017,12 +9273,11 @@ mod tests {
     /// metadata, and the graph must not retain the exemplar Rust owners.
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn test_gpu_graph_binding_descriptors_cover_imported_and_compact_owners() {
         let devices = detected_gpu_device_ids();
-        if devices.is_empty() {
-            return;
-        }
+        assert!(!devices.is_empty(), "explicit GPU test requires a supported GPU");
         let cpu_params = DCRTPolyParams::new(128, 1, 17, 1, None, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let imported_cpu = DCRTPolyMatrix::identity(&cpu_params, 1, None);
@@ -9064,6 +9319,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn test_gpu_select_modulus_rejects_base_too_wide_for_selected_basis() {
         let (n, _, bits, _) = crate::env::modulus_conversion_test_parameters();
@@ -9088,6 +9344,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn test_gpu_related_rings_share_execution_and_preserve_async_lifetimes() {
         let devices = available_gpu_ids();
@@ -9171,6 +9428,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn test_gpu_matrix_allocation_query_is_stable_and_checked() {
         gpu_device_sync();
@@ -9216,12 +9474,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a supported GPU"]
     #[sequential(gpu_context)]
     fn test_gpu_matrix_allocation_query_uses_partition_decomposition_metadata() {
         let devices = detected_gpu_device_ids();
-        if devices.len() < 2 {
-            return;
-        }
+        assert!(
+            devices.len() >= 2,
+            "partition test requires two logical devices; use MXX_GPU_LOGICAL_DEVICES=0,0 on one GPU"
+        );
         let cpu = DCRTPolyParams::new(128, 4, 17, 1, None, None);
         let (moduli, _, _) = cpu.to_crt();
         let params = GpuDCRTPolyParams::new_with_gpu(

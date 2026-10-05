@@ -1,7 +1,7 @@
 # mxx
 
 **Write a lattice-based cryptographic protocol in a Rust-based DSL, much as you would write it on paper, and
-run it on GPUs, with no CUDA and no hand-tuning of GPU memory or parallelism.**
+run it on GPUs, with no handwritten GPU kernels and no hand-tuning of GPU memory or parallelism.**
 
 > **Status:** research code under active development. It has not been audited.
 
@@ -11,7 +11,7 @@ Lattice-based schemes spend most of their time on polynomial matrix arithmetic, 
 decomposition, and preimage sampling, which is work that GPUs do well. Running such a scheme on a
 GPU usually requires three kinds of work:
 
-- hand-writing CUDA kernels for each operation,
+- hand-writing GPU kernels for each operation,
 - splitting the work into batches small enough to fit in GPU memory, and
 - retuning those batch sizes whenever the parameters, the protocol, or the GPU changes.
 
@@ -209,7 +209,7 @@ The API for running programs on the CPU and GPUs is described in
 - **Multiple GPUs.** A single plan can spread work over multiple GPUs. At present only large
   matrix products, preimage sampling, and independent loop iterations are spread; other steps
   run on one GPU.
-- **(Advanced) Your own CUDA kernel when it matters.** If part of a protocol needs a specialized
+- **(Advanced) Your own GPU kernel when it matters.** If part of a protocol needs a specialized
   kernel for better performance, you write only that kernel. The rest of the protocol stays in the
   DSL, and the automatic tuning of parallelism and memory scheduling still applies around your
   kernel, so you do not reimplement it. TFHE blind rotation uses this option: see
@@ -267,7 +267,7 @@ make autoresearch in lattice cryptography, research carried out by AI systems, f
 | --- | --- |
 | [`mxx-ir-core`](crates/ir-core/README.md) | The executable graph IR: rings, compile expressions, validation, artifact manifests, protocol declarations, and Lean export. |
 | [`mxx-dsl`](crates/dsl/README.md) | The Rust-based DSL that builds graphs. |
-| [`mxx-backends`](crates/backends/README.md) | Polynomial and matrix arithmetic, samplers, the CPU executor, the GPU runtime and native CUDA, and artifacts. |
+| [`mxx-backends`](crates/backends/README.md) | Polynomial and matrix arithmetic, samplers, the CPU executor, the GPU runtime and native CUDA/HIP, and artifacts. |
 | [`mxx-khe`](crates/khe/README.md) | Key-homomorphic encodings: BGG+ keys, encodings, circuit evaluation, lookups, and slot transfer, with the circuits and gadgets they evaluate, and WEE25 commitments. |
 | [`mxx-fhe`](crates/fhe/README.md) | TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and noise tracking. |
 | `mxx-we` | Diamond witness encryption. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
@@ -304,9 +304,22 @@ reference for details such as the GPU runtime's options and current limitations.
 
 - Rust with edition 2024 support.
 - OpenFHE and OpenMP.
-- CUDA toolkit for the optional `gpu` feature (`CUDA_ARCH` defaults to `89`).
+- No GPU SDK is required for a build without the optional `gpu` feature.
+- With `gpu`, `MXX_GPU_BACKEND=cuda` (the default) selects the CUDA toolkit;
+  `CUDA_ARCH` defaults to `89`.
+- `MXX_GPU_BACKEND=hip` selects ROCm/HIP. Set `HIP_ARCH` to the target AMD `gfx` architecture;
+  `HIPCC` and `ROCM_PATH` select the compiler and SDK. See the
+  [backend build and validation notes](crates/backends/README.md#gpu-backend-selection).
 
 ```sh
-cargo test -r --workspace --lib
-cargo test -r --workspace --lib --features gpu
+scripts/run_tests.sh --python --rust
+MXX_GPU_BACKEND=cuda scripts/run_tests.sh --gpu-compile
+MXX_GPU_BACKEND=hip HIP_ARCH=gfx942 scripts/run_tests.sh --gpu-compile
 ```
+
+The architecture above is an example, not a verified support claim. GPU compilation and
+device execution are separate gates; TFHE on AMD is deferred, while BGV uses the common
+backend. Integration tests require explicit authorization; the default script runs lib tests.
+
+Recorded CPU, CUDA, and HIP compilation results and the remaining AMD hardware gates are in
+[`AMD_GPU_VALIDATION.md`](AMD_GPU_VALIDATION.md). AMD device execution is currently unverified.

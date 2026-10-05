@@ -25,7 +25,7 @@ passed to the next GPU program without copying them to the host.
 
 **Plan (GPU only).** Before a program first runs on a GPU, the runtime builds a *plan*. The plan
 fixes how much parallelism to use (how many loop iterations and matrix columns are processed at
-once) and when GPU memory is allocated and freed, and compiles the program into CUDA Graphs.
+once) and when GPU memory is allocated and freed, and compiles the program into GPU graph regions.
 Planning tries several degrees of parallelism, discards those that do not fit in GPU memory, and
 keeps the fastest. After that, the plan runs any number of times on new inputs without being
 planned again.
@@ -100,6 +100,15 @@ session run, and `artifact_handles`. A matrix output is `RuntimeValue::Matrix(m)
 store)` removes the staged members afterwards.
 
 ## 4. Running on GPUs (`gpu` feature)
+
+The native backend is selected at build time by `MXX_GPU_BACKEND=cuda|hip`; CUDA is the
+default. This leaves the `gpu` feature and Rust calls below unchanged. HIP requires ROCm/HIP
+and an explicit `HIP_ARCH`; `HIPCC` and `ROCM_PATH` select its toolchain. CPU builds do not
+require a GPU SDK. See [backend selection and validation evidence](README.md#gpu-backend-selection).
+CUDA uses native conditional graphs. HIP schedules reusable graph regions after reading
+GPU-produced control records at D2H boundaries, and measurements must include that cost.
+Native subgraph callers use `crates/backends/gpu/include/SubgraphKernel.h`; backend-specific
+plan identity must not be reused across CUDA/HIP builds, while canonical artifacts are portable.
 
 ### 4.1 Backend and runtime
 

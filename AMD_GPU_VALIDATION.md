@@ -1,6 +1,16 @@
 # AMD GPU implementation validation
 
-Current checkpoint: diagnostic owner-trace scaffolding has been removed from seven code files,
+Current checkpoint: source `03c5c0719` (see "Cache-release synchronization and final-source
+gates" below). `gpu_device_release_cached_memory` now synchronizes the context streams before
+its whole-device allocation probe. With that change, the native library reproduction, the root
+addition, the parallel-wave, and the named/borrowed rebind tests report zero use-after-free.
+The nested control-region test still reports use-after-free, matching a Compute Sanitizer
+behavior that standalone CUDA programs reproduce without mxx. The final source passed
+warning-free CUDA and HIP gfx1100 workspace GPU compile gates. It also passed the 300-iteration
+GPU unit gate in identity, `0,0`, and `0,0,0` modes with zero failures. AMD runtime remains
+unverified because no AMD GPU is available.
+
+Previous checkpoint: diagnostic owner-trace scaffolding has been removed from seven code files,
 with ownership/event protections retained. Root applied `owner-trace-cleanup.patch`, ran nightly
 formatting and whitespace checks, and verified that owner-trace and temporary diagnostic
 references are absent from code. `source-manifest.traceclean-v17.json` identifies the cleaned
@@ -440,6 +450,8 @@ investigation checkpoint; memory acceptance and AMD hardware validation remain o
   the memory gate still fails.
 - Resolve memory acceptance. Standalone tool/runtime reproduction does not prove every
   production report is a false positive, and no blanket waiver or suppression is established.
+  At `03c5c0719`, only the nested control-region test still reports use-after-free. Accepting
+  that remaining case on the standalone evidence below is a pending review decision.
 - Establish successful original unchanged long Ring-GSW admission/execution/decryption;
   CPU provenance and smaller regressions do not supply that result.
 - Complete required 3–5 round-trip cases beyond demonstrated smoke scope, canonical artifact
@@ -649,3 +661,54 @@ translation units. Results are in `exact-stride-cache-debug-result.json` and
 `cross-module-diagnostic-result.json`. A direct mxx comparison with release
 debug information disabled is being compiled; no result from that comparison
 has yet established a cause or a complete memory fix.
+
+## Cache-release synchronization and final-source gates
+
+Evidence for source `03c5c0719` is in `final-03c5c0719/`. Its `source-manifest.json` records
+the clean commit, nvcc 13.1.80, driver 580.178.04, the RTX 4080 SUPER, Compute Sanitizer
+2026.3.0, and the build command. `binaries.sha256` and `libgpupoly.sha256` identify the tested
+binaries and the static native library. The bisection reproducers and their logs are in
+`cache-release-fix-2026-10-06/`.
+
+Cause. Removing the `gpu_device_release_cached_memory` call from the native reproduction
+removed all 12 reports and all eight API errors. Bisection inside it isolated the trigger:
+the failing whole-device `cudaMalloc` probe alone reproduced the 12 reports, while graph-memory
+trims, default-pool trims, and synchronization produced none. Before the probe, a
+`cudaStreamSynchronize` of the stream removed the reports. An event record and synchronize on
+the same stream, which the function used, did not. Both waits cover the same work. The
+sanitizer, however, treats only the stream synchronization as completing the queued
+stream-ordered frees. The function was already host-blocking and is planning-only, called
+between candidate trials. The change therefore keeps one wait per context stream, does not
+synchronize the device, and leaves production launch, retirement, and free paths unchanged.
+
+| Gate | Evidence | Result |
+| --- | --- | --- |
+| Native library reproduction (12 launches, nonzero inputs) | `memcheck-native.txt/log` | Numerical pass; 0 use-after-free (12 before); 8 expected probe OOM API errors |
+| `test_gpu_diagnostic_root_matrix_addition_pool_owners` | `memcheck-*.log` | Pass; 0 use-after-free; 4 expected probe API errors |
+| `test_gpu_direct_parallel_waves_return_all_resident_matrix_members` | `memcheck-*.log` | Pass; 0 use-after-free (3 before); 6 expected probe API errors |
+| `test_gpu_parallel_named_borrowed_matrix_outputs_rebind_and_hold` | `memcheck-*.log` | Pass; 0 use-after-free (93 before); 4 expected probe API errors |
+| `test_gpu_nested_control_regions_match_cpu_and_hold_replayed_outputs` | `memcheck-*.log` | Pass; 475 use-after-free (420–482 before); 2 expected probe API errors; no invalid global accesses |
+| CUDA sm_89 and HIP gfx1100 workspace GPU lib compilation | build logs of this session | Passed without warnings |
+| 300-iteration GPU unit gate | `repeat-*/summary.txt`, `repeat-*/command.txt` | Identity, `0,0`, and `0,0,0`: 300 iterations each, 900 total, zero failed iterations |
+
+Each gate iteration ran the `mxx-fhe` (5), `mxx-backends` (74), and `mxx-khe` (3) GPU test
+binaries. The command was `<binary> gpu --ignored --skip
+test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts`. Identity mode also
+skipped `test_gpu_matrix_allocation_query_uses_partition_decomposition_metadata`, which asserts
+two logical devices and fails identically without this change.
+
+Remaining nested control-region reports. Standalone CUDA programs in
+`cache-release-fix-2026-10-06/` reproduce the same report class without mxx (`pw4.cu`,
+`cg.cu`). A Graph with two or more conditional nodes at one level reports use-after-free when:
+
+- all work runs on one stream,
+- the host synchronizes that stream after every launch,
+- and the executable is never destroyed.
+
+Serializing the conditionals, a final join kernel, event-record nodes, and separate executables
+did not remove the reports. Compute Sanitizer 2025.4 behaves the same. Inside mxx, a
+launch-stream synchronization after each launch left 450 reports. Host waits on every
+per-branch completion event left 482. Only a device-wide synchronization after each launch or
+before each free removed them, and `GPU.md` forbids that in production. No ordering defect has
+been identified for this case, and no report was suppressed. HIP device execution, including
+the review fixes in `2efe36f75` and `03c5c0719`, is unverified without AMD hardware.

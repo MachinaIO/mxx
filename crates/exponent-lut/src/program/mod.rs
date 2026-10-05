@@ -381,10 +381,24 @@ impl FamilyRange {
 
 /// Explicit output semantics for a LUT.  Every table must carry this value;
 /// no program layout is consulted as a fallback.
+///
+/// `Coefficient` outputs carry their value scaled for decoding at their
+/// finalized level. `UnscaledCoefficient` outputs carry the value itself
+/// (scale 1), so they have no decoding margin: they are mask carriers whose
+/// weighted sums a noise refresh adds before decoding, and are never decoded
+/// on their own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LutOutputRepresentation {
     Exponent(ExpLayout),
     Coefficient,
+    UnscaledCoefficient,
+}
+
+impl LutOutputRepresentation {
+    /// Whether the output is a coefficient value, scaled or not.
+    pub const fn is_coefficient(&self) -> bool {
+        matches!(self, Self::Coefficient | Self::UnscaledCoefficient)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -580,6 +594,19 @@ impl ExponentLutProgram {
             .ok_or(ProgramValidationError::UndefinedWire(wire))
     }
 
+    /// Return whether a validated wire is the raw output of an unscaled
+    /// coefficient LUT lineage (see [`LutOutputRepresentation`]).
+    pub fn wire_is_unscaled_coefficient_output(
+        &self,
+        wire: WireId,
+    ) -> Result<bool, ProgramValidationError> {
+        let metadata = self.metadata()?;
+        metadata
+            .get(&wire)
+            .map(|metadata| metadata.unscaled)
+            .ok_or(ProgramValidationError::UndefinedWire(wire))
+    }
+
     /// Wire metadata of the immutable program. The structure is validated
     /// once, when the metadata is first derived; later lookups read the cache
     /// without walking the program again.
@@ -597,6 +624,8 @@ impl ExponentLutProgram {
 struct WireMetadata {
     knowledge: AttributeKnowledge,
     coefficient: bool,
+    /// Set only together with `coefficient`.
+    unscaled: bool,
 }
 
 pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationError> {
@@ -608,7 +637,7 @@ pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationEr
             layout.stride_log2.checked_add(layout.width_log2).is_some() &&
                 1usize.checked_shl(layout.width_log2).is_some()
         }
-        LutOutputRepresentation::Coefficient => true,
+        LutOutputRepresentation::Coefficient | LutOutputRepresentation::UnscaledCoefficient => true,
     };
     if table.input_width == 0 ||
         table.output_width == 0 ||
@@ -684,7 +713,14 @@ fn derive_wire_metadata(
         .inputs
         .iter()
         .map(|(wire, declaration)| {
-            (*wire, WireMetadata { knowledge: declaration.knowledge, coefficient: false })
+            (
+                *wire,
+                WireMetadata {
+                    knowledge: declaration.knowledge,
+                    coefficient: false,
+                    unscaled: false,
+                },
+            )
         })
         .collect::<BTreeMap<_, _>>();
     derive_body_metadata(&program.body, &program.luts, &mut metadata)?;
@@ -719,7 +755,7 @@ fn derive_body_metadata(
                         "MulPublic requires a public exponent LHS and exponent operands".into(),
                     ));
                 }
-                WireMetadata { knowledge: rhs.knowledge, coefficient: false }
+                WireMetadata { knowledge: rhs.knowledge, coefficient: false, unscaled: false }
             }
             Step::MulPrivate { input, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
@@ -728,7 +764,11 @@ fn derive_body_metadata(
                         "MulPrivate cannot consume a coefficient output".into(),
                     ));
                 }
-                WireMetadata { knowledge: AttributeKnowledge::PrivatePayload, coefficient: false }
+                WireMetadata {
+                    knowledge: AttributeKnowledge::PrivatePayload,
+                    coefficient: false,
+                    unscaled: false,
+                }
             }
             Step::Lut { input, table, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
@@ -742,9 +782,10 @@ fn derive_body_metadata(
                     .ok_or(ProgramValidationError::InvalidLutId(*table))?;
                 WireMetadata {
                     knowledge: input.knowledge,
-                    coefficient: matches!(
+                    coefficient: table.output_representation.is_coefficient(),
+                    unscaled: matches!(
                         table.output_representation,
-                        LutOutputRepresentation::Coefficient
+                        LutOutputRepresentation::UnscaledCoefficient
                     ),
                 }
             }

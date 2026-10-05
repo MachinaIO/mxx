@@ -77,139 +77,82 @@ impl<'a> RnsNoiseBuild<'a> {
             evaluator: Some(evaluator),
             families: RnsBggNoiseFamilies::default(),
             environment,
-            refresh_prf: None,
             pending_refresh: None,
         })
     }
 
-    /// Configure this builder for the prepared PRF Program belonging to one
-    /// refresh CRT channel.  This binding is intentionally separate from the
-    /// source Program validation: the prepared declaration is the authority
-    /// for the PRF output wires and labels.
-    pub fn bind_refresh_prf(
+    /// Configure this builder to lower `declaration`'s mask Program: its
+    /// mask LUT members are finalized and transformed in their root bodies,
+    /// as the encoding does.
+    pub fn bind_refresh_mask(
         &mut self,
         declaration: &RefreshDeclaration,
-        slot: usize,
     ) -> Result<(), RnsBggError> {
         let evaluator =
-            self.evaluator.as_ref().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        evaluator.parameters.validate_refresh_prf_schedule(declaration, slot)?;
-        declaration.validate_prf_program(evaluator.program.id())?;
-        if self.refresh_prf.is_some() {
-            return Err(RnsBggError::Binding("refresh PRF is already bound"));
+            self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        declaration.validate_mask_program(evaluator.program.id())?;
+        if evaluator.refresh_mask.is_some() {
+            return Err(RnsBggError::Binding("refresh mask is already bound"));
         }
-        self.refresh_prf =
-            Some((slot, *declaration.commitment(), evaluator.parameters.parameter_identity()));
+        evaluator.refresh_mask = Some(Arc::new(declaration.clone()));
         Ok(())
     }
 
-    /// Lower the prepared PRF Program once and return its outputs as
-    /// `(wire, (wire, value))` pairs in declared output order.  No ordinary
-    /// output finalization is applied to these wires.
-    fn lower_refresh_prf(
-        &mut self,
-        declaration: &RefreshDeclaration,
-    ) -> Result<Vec<(WireId, (WireId, RnsBggNoiseValue))>, RnsBggError> {
-        let (slot, commitment, parameter_identity) =
-            self.refresh_prf.ok_or(RnsBggError::Binding("refresh PRF is not bound"))?;
-        let evaluator =
-            self.evaluator.as_ref().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        if parameter_identity != evaluator.parameters.parameter_identity() {
-            return Err(RnsBggError::Binding("refresh PRF parameter identity changed"));
-        }
-        if commitment != *declaration.commitment() || slot >= declaration.slots().len() {
-            return Err(RnsBggError::Refresh(RefreshError::Commitment));
-        }
-        let evaluator =
-            self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        let mut families = RnsBggNoiseFamilies::default();
-        let outputs = crate::program::lower_program(
-            evaluator.program,
-            evaluator,
-            &mut families,
-            &mut self.environment,
-        )
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        Ok(outputs.into_iter().map(|(wire, value)| (wire, (wire, value))).collect())
-    }
-
-    /// Apply one declared refresh using one separately configured PRF builder
-    /// per CRT slot. The common refresh trait is invoked exactly once; the
-    /// channel Programs are lowered once each by its callback.
+    /// Compose the noise of `declaration`'s refresh of output `output_index`,
+    /// whose lowered source value is `source`, with the bound mask child
+    /// `mask` (on [`RnsBggParameters::refresh_mask_parameters`]) and the
+    /// decoder trapdoor sigma `trapdoor_sigma`. The report is returned in
+    /// the trace as [`RnsBggNoiseTrace::refresh`].
     pub fn apply_refresh(
         &mut self,
         output_index: usize,
         declaration: &RefreshDeclaration,
-        inputs: BTreeMap<usize, (WireId, RnsBggNoiseValue)>,
-        mut channels: BTreeMap<usize, RnsNoiseBuild<'a>>,
+        source: (WireId, RnsBggNoiseValue),
+        mut mask: RnsNoiseBuild<'a>,
+        trapdoor_sigma: f64,
     ) -> Result<(), RnsBggError> {
         if self.pending_refresh.is_some() {
             return Err(RnsBggError::Binding("refresh output was already selected"));
         }
-        declaration.validate_prf_slots(&channels)?;
-        let mut channel_traces = Vec::with_capacity(channels.len());
         let evaluator =
             self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        let source_level = evaluator.workload.level(declaration.source_output())?;
-        evaluator.parameters.validate_refresh_level_contract(declaration, source_level)?;
-        for (slot, channel) in &channels {
-            let expected_child_parameters =
-                evaluator.parameters.expected_refresh_prf_parameter_identity(declaration, *slot)?;
-            if channel.evaluator.as_ref().is_none_or(|child| {
-                child.parameters.parameter_identity() != expected_child_parameters
-            }) || channel.refresh_prf.map(|(_, _, identity)| identity) !=
-                Some(expected_child_parameters)
-            {
-                return Err(RnsBggError::Binding("refresh PRF child parameter identity mismatch"));
-            }
+        let expected =
+            evaluator.parameters.refresh_mask_parameters(declaration, evaluator.program)?;
+        let child =
+            mask.evaluator.as_ref().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        if child.parameters.parameter_identity() != expected.parameter_identity() ||
+            child.refresh_mask.as_ref().map(|bound| *bound.commitment()) !=
+                Some(*declaration.commitment()) ||
+            evaluator.program.outputs().get(output_index) !=
+                Some(&crate::program::Operand::Scalar(declaration.source_output()))
+        {
+            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
         }
-        let output = {
-            let mut refresh = super::super::RnsBggRefresh::new(evaluator, inputs);
-            crate::api::apply_refresh(declaration, &mut refresh, |callback_declaration, _| {
-                callback_declaration.collect_prf_outputs(|slot| {
-                    let mut channel = channels
-                        .remove(&slot)
-                        .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
-                    let outputs = channel.lower_refresh_prf(callback_declaration)?;
-                    channel_traces.push(
-                        channel
-                            .evaluator
-                            .as_ref()
-                            .ok_or(RnsBggError::Binding("noise evaluator consumed"))?
-                            .trace
-                            .clone(),
-                    );
-                    Ok(outputs)
-                })
-            })
-            .map_err(|error| match error {
-                crate::api::RefreshApplicationError::Refresh(error) => error,
-                crate::api::RefreshApplicationError::OutputMismatch => {
-                    RnsBggError::Refresh(RefreshError::PrfOutputMismatch)
-                }
-            })?
-        };
-        let evaluator =
-            self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        for channel_trace in &channel_traces {
-            evaluator.merge_refresh_trace(channel_trace);
-        }
-        self.pending_refresh = Some((output_index, output));
-        Ok(())
-    }
-
-    /// Compose refresh noise on this builder using the existing evaluator.
-    /// The same method is used by simulation and by checked resumption paths;
-    /// refresh metadata is retained in the evaluator and never wrapped in a
-    /// second carrier.
-    pub fn with_refresh_noise_parameters(
-        &mut self,
-        parameters: RefreshNoiseParameters,
-    ) -> Result<(), RnsBggError> {
-        self.evaluator
-            .as_mut()
+        evaluator.refresh_trapdoor_sigma = Some(trapdoor_sigma);
+        let mut refresh = super::super::RnsBggRefresh { lowerer: evaluator, source };
+        let report = crate::api::apply_refresh(declaration, &mut refresh, |_| {
+            let child =
+                mask.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+            let outputs = crate::program::lower_program(
+                child.program,
+                child,
+                &mut mask.families,
+                &mut mask.environment,
+            )
+            .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+            Ok(outputs.into_iter().map(|(_, value)| value).collect())
+        })?;
+        let child_trace = mask
+            .evaluator
+            .as_ref()
             .ok_or(RnsBggError::Binding("noise evaluator consumed"))?
-            .with_refresh_noise_parameters(parameters)
+            .trace
+            .clone();
+        let evaluator =
+            self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        evaluator.merge_refresh_trace(&child_trace);
+        self.pending_refresh = Some(report);
+        Ok(())
     }
 }
 
@@ -252,41 +195,8 @@ impl<'a> crate::api::NoiseBuild for RnsNoiseBuild<'a> {
             .finish_outputs(outputs)
             .map_err(|error| crate::api::ApiError::scheme(error))?;
         let mut trace = evaluator.trace;
-        let mut finalized = finalized;
-        if let Some((index, refreshed)) = self.pending_refresh {
-            if index >= finalized.len() {
-                return Err(crate::api::ApiError::input("refresh output index is out of range"));
-            }
-            finalized[index] = refreshed.1;
-        }
         trace.outputs = finalized;
+        trace.refresh = self.pending_refresh;
         Ok(trace)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn refresh_prf_binding_checks_the_schedule_before_the_program() {
-        let (parameters, source, declaration) =
-            super::super::super::tests::refresh_prf_child_fixture(RhsMode::Static);
-        let workload = RnsBggDerivedWorkload::from_program(&source).unwrap();
-        let bindings = RnsBggNoiseBindings::from_inputs(
-            &source,
-            &[RnsBggNoiseValue::sampled_encoding(&parameters, b"source", &[BigInt::from(1u8)])],
-            &[],
-        )
-        .unwrap();
-        let mut build = RnsNoiseBuild::new(&parameters, &source, &workload, &bindings).unwrap();
-        assert!(matches!(
-            build.bind_refresh_prf(&declaration, 1),
-            Err(RnsBggError::Binding("refresh PRF parameter schedule is not [q, ..., q, p]"))
-        ));
-        assert!(matches!(
-            build.bind_refresh_prf(&declaration, 0),
-            Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))
-        ));
     }
 }

@@ -1,370 +1,437 @@
-//! Native exponent refresh: CRT routing and noise-model utilities.
+//! Masked trapdoor-decoder noise refresh.
+//!
+//! The refreshed source is an encoding `c` whose payload is `(q/p) mu`. The
+//! refresh adds the mask encoding `m_enc` with a small payload `m`, removes
+//! `s A` from the sum with the [`super::decoder`], and rounds:
+//!
+//! `x = d - c - m_enc = (q/p) mu + m + E`, output `round((p/q) x) mod p = mu`
+//! whenever `|m + E| < q/(2p)`.
+//!
+//! The output is a plaintext modulo `p`; no encoding at the source modulus is
+//! recovered. The decoder's preimage `K` is sampled for the summed key of `c`
+//! and `m_enc` only, so the evaluator cannot decode `c` or `m_enc` alone.
+//!
+//! # Mask
+//!
+//! The mask is evaluated by the [`RefreshMaskProgram`], a sparse-LWR weak PRF
+//! whose terminal LUTs are [`LutOutputRepresentation::UnscaledCoefficient`]:
+//! their outputs carry the PRF value itself, not a decoding-scaled one. The
+//! negacyclic coefficient LUT returns `-T[z - n']` for inputs `z >= n'`, so a
+//! table over `f(k) = floor(p' k / n') + 1` alone yields the digit set
+//! `+-[1, p']`, which is not an interval. Two tables fix that:
+//!
+//! - the digit table `2 f - 1` gives a digit `delta = 2u - (P - 1)` uniform over the `P = 2 p'` odd
+//!   values of `[-(P-1), P-1]`;
+//! - the parity table `(f - 1) mod 2` gives `beta in {-1, 0, 0, 1}` for even `p'`.
+//!
+//! Per coefficient, `m = beta + sum_(i<d) P^i delta_i = beta + 2U - (P^d - 1)`
+//! with `U` uniform on `[0, P^d)`: centered, with mass `1/(2 P^d)` on every
+//! integer of `[-P^d, P^d]` except the two endpoints, which have half that
+//! mass. Both tables read only the rounded LWR value, never the low bits of
+//! the inner product.
+//!
+//! The digit family has one member per coefficient and digit, member
+//! `o = coefficient d + digit`, weighted by `P^digit`; the parity family has
+//! one member per coefficient, member `o = coefficient`, weighted by 1. The
+//! scheme adapter places member `o` at `X^coefficient` with its weight; see
+//! [`RefreshDeclaration::member_placement`] and
+//! [`RefreshDeclaration::member_weights`].
+//!
+//! # Hiding criterion
+//!
+//! As in `references/diamond_io.pdf` (§5, Key-Homomorphic PRF via
+//! Specialized Noise Refreshing, and §5.4), the mask is sized by the concrete
+//! criterion only: its range makes brute-force recovery of the masked value
+//! cost more than `2^lambda`, and the accumulated noise fits the decoding
+//! margin left after reserving that range ([`fit_mask_digits`]). The
+//! proof-level noise-flooding requirement, statistical closeness to uniform
+//! of the mask plus its error under their joint distribution, is a documented
+//! limitation: the mask carriers' errors are not independent of the mask,
+//! since LUT switching material is shared across members and unselected
+//! selector branches still contribute their errors.
+
 use crate::{
-    noise_refresh::simulation::RefreshTranscriptTopology,
-    noise_utils::{NoiseMomentPolicy, NoiseMoments},
-    program::{ExponentLutProgram, ExponentLutProgramId, Operand, WireId},
-    program_gadgets::prf::{PreparedSparseLwrPrf, PrfError, PrfLabel},
+    api::PlaintextInputs,
+    program::{
+        AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, ExponentLutProgramId,
+        FamilyRange, InputBinding, LutId, LutOutputRepresentation, LutTable, Operand,
+        ProgramValidationError, RhsId, WireId,
+    },
+    program_gadgets::{
+        pbc::{PbcCell, PbcGeneratedKeyLayout, PbcPublicLayout},
+        prf::SparseLwrPrfProfile,
+    },
 };
-use mxx_ir_core::types::WireType;
-use num_bigint::{BigInt, BigUint};
-use num_traits::{One, Zero};
-use serde::{Deserialize, Serialize};
+use mxx_backends::poly::{Poly, PolyParams};
+use mxx_ir_core::IntExpr;
+use num_bigint::BigUint;
+use num_traits::Zero;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-/// Finish one concrete refresh stage from already validated PRF outputs.
+/// Finish one concrete refresh stage from the aggregated mask.
 ///
-/// [`RefreshDeclaration`] is the sole immutable owner of refresh metadata and
-/// canonical PRF labels. The common `api::apply_refresh` orchestration invokes
-/// the PRF exactly once and validates its output key set before calling this
-/// stage-specific operation.
+/// The common `api::apply_refresh` orchestration validates the declaration,
+/// evaluates the mask Program exactly once, and passes its aggregated,
+/// member-weighted carrier to this stage-specific operation.
 pub trait NoiseRefresh {
-    type PrfOutput;
+    type Mask;
     type Output;
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn finish_noise_refresh(
         &mut self,
         declaration: &RefreshDeclaration,
-        outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
+        mask: Self::Mask,
     ) -> Result<Self::Output, Self::Error>;
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
 /// Validation and graph-linkage failures in the refresh protocol.
 pub enum RefreshError {
-    #[error("refresh CRT layout is empty or inconsistent")]
-    /// CRT slots or reconstruction coefficients are empty or inconsistent.
-    InvalidLayout,
-    #[error("refresh decoder is not bound to the supplied anchor")]
-    /// A decoder package is bound to a different anchor or target.
-    AnchorMismatch,
-    #[error("refresh PRF output is not bound to its canonical program label or output wire")]
-    /// A mask or fresh-error result came from the wrong PRF program or label.
-    PrfOutputMismatch,
-    #[error("refresh target public matrix does not match its setup binding")]
-    /// The setup target does not match the supplied public matrix.
-    TargetMismatch,
-    #[error("refresh graph linkage failed at {0}")]
-    /// A required graph attachment or handle relationship is absent.
-    GraphLink(&'static str),
-    #[error("refresh source output is not a declared exponent output")]
+    #[error("refresh source output is not a private, scalar, non-coefficient Program output")]
     InvalidSourceOutput,
-    #[error("refresh output schema is empty or inconsistent")]
-    InvalidOutputSchema,
-    #[error("refresh modulus relations are inconsistent")]
+    #[error("refresh mask Program or its layouts are inconsistent")]
+    InvalidMaskProgram,
+    #[error("refresh source and mask carriers do not share the decoding ring")]
     InvalidModulusRelation,
+    #[error("the mask range and the accumulated noise do not fit the decoding margin")]
+    MaskRange,
+    #[error("refresh target does not match its declaration")]
+    TargetMismatch,
     #[error("refresh metadata commitment failed")]
     Commitment,
+    #[error(transparent)]
+    Program(#[from] ProgramValidationError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-/// One CRT slot's source, switched, and plaintext moduli.
-pub struct RefreshSlot {
-    /// Zero-based CRT slot index.
-    pub slot: usize,
-    /// Full ciphertext modulus for this slot.
-    pub q: BigInt,
-    /// Exact intermediate ciphertext modulus selected for this slot.
-    pub p: BigInt,
-    /// Plaintext modulus represented by this slot.
-    pub q_t: BigInt,
+/// The two member families of the mask Program.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum MaskFamily {
+    /// `d` digits per coefficient, read through the digit table `2 f - 1`.
+    Digit,
+    /// One parity digit per coefficient, read through `(f - 1) mod 2`.
+    Parity,
 }
 
-/// Canonical public label attached to a sparse-LWR PRF result used by refresh.
-///
-/// The label contains only refresh instance and coefficient coordinates. It
-/// never contains sparse support, selected buckets, or selector material.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RefreshPrfLabel {
-    /// A per-CRT-slot mask digit.
-    Mask {
-        /// Refresh instance identity chosen by the caller.
-        refresh_id: [u8; 32],
-        /// Zero-based CRT slot.
-        slot: usize,
-        /// Vector component.
-        component: usize,
-        /// Polynomial coefficient.
-        coefficient: usize,
-        /// Base-`p` digit.
-        digit: usize,
-    },
-    /// The one fresh-error digit shared by all CRT slots.
-    FreshError {
-        /// Refresh instance identity chosen by the caller.
-        refresh_id: [u8; 32],
-        /// Vector component.
-        component: usize,
-        /// Polynomial coefficient.
-        coefficient: usize,
-        /// Base-`p` digit.
-        digit: usize,
-    },
-}
+impl MaskFamily {
+    pub const ALL: [Self; 2] = [Self::Digit, Self::Parity];
 
-impl RefreshPrfLabel {
-    /// The CRT slots whose PRF outputs carry this label: a mask belongs to
-    /// its own slot, and the shared fresh error to every slot.  Every slot's
-    /// PRF Program yields every label, so a stage keeps a label only from
-    /// these slots.
-    pub(crate) fn slots(&self, slot_count: usize) -> Result<Vec<usize>, RefreshError> {
+    fn index(self) -> usize {
         match self {
-            Self::Mask { slot, .. } if *slot < slot_count => Ok(vec![*slot]),
-            Self::FreshError { .. } if slot_count > 0 => Ok((0..slot_count).collect()),
-            _ => Err(RefreshError::InvalidLayout),
+            Self::Digit => 0,
+            Self::Parity => 1,
         }
     }
-
-    /// Returns the canonical bytes used for the sparse-LWR PRF output identity.
-    pub(crate) fn canonical_bytes(self) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(1 + 32 + 4 * std::mem::size_of::<u64>());
-        match self {
-            Self::Mask { refresh_id, slot, component, coefficient, digit } => {
-                raw.push(0);
-                raw.extend_from_slice(&refresh_id);
-                raw.extend((slot as u64).to_le_bytes());
-                raw.extend((component as u64).to_le_bytes());
-                raw.extend((coefficient as u64).to_le_bytes());
-                raw.extend((digit as u64).to_le_bytes());
-            }
-            Self::FreshError { refresh_id, component, coefficient, digit } => {
-                raw.push(1);
-                raw.extend_from_slice(&refresh_id);
-                raw.extend((component as u64).to_le_bytes());
-                raw.extend((coefficient as u64).to_le_bytes());
-                raw.extend((digit as u64).to_le_bytes());
-            }
-        }
-        raw
-    }
 }
 
-/// Canonical flat index for all PRF labels consumed by one refresh.
+/// The unscaled readout table of `family` over the canonical sparse-LWR
+/// value `f(k) = floor(p' k / n') + 1`.
+pub fn mask_table(
+    profile: &SparseLwrPrfProfile,
+    family: MaskFamily,
+) -> Result<LutTable, RefreshError> {
+    let readout = profile.canonical_readout().map_err(|_| RefreshError::InvalidMaskProgram)?;
+    let (output_width, values) = match family {
+        MaskFamily::Digit => (
+            profile.p().map_err(|_| RefreshError::InvalidMaskProgram)?,
+            readout.iter().map(|f| 2 * f - 1).collect(),
+        ),
+        MaskFamily::Parity => (2, readout.iter().map(|f| (f - 1) % 2).collect()),
+    };
+    Ok(LutTable::unary(
+        profile.native_width(),
+        profile.layout,
+        output_width,
+        values,
+        LutOutputRepresentation::UnscaledCoefficient,
+    )?)
+}
+
+/// The per-family part of a [`RefreshMaskProgram`].
+#[derive(Clone, Debug)]
+struct MaskFamilyProgram {
+    /// The public key layout of each member, in member order.
+    layouts: Vec<PbcPublicLayout>,
+    /// One selector RHS family per bucket and slot, of one member each.
+    selectors: Vec<Vec<RhsId>>,
+    lut: LutId,
+    output: WireId,
+}
+
+/// The sparse-LWR weak PRF evaluating every mask member, built so that each
+/// member is read by the root loop index alone.
 ///
-/// The order is mask slots first, followed by the shared fresh-error group;
-/// inside each group it is component-major, coefficient-major, then
-/// base-`p`-digit-major. Mask and fresh-error groups intentionally have
-/// independent digit cardinalities: `d_m` is used for every mask group and
-/// `d_e` for the shared fresh-error group. The component count is the selected
-/// scheme's encoding polynomial count, taken from the same topology used for
-/// noise accounting. This is public metadata only and contains no
-/// selector, support, schedule, or plaintext material.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RefreshPrfLabelIndex {
-    refresh_id: [u8; 32],
-    topology: RefreshTranscriptTopology,
-    mask_offsets: Vec<usize>,
+/// Inputs: the accumulator start `mono(0)` (private, shared by every member)
+/// and the public vector `a` of `nu + 1` members, member `nu` being the
+/// encoding of zero read by dummy and padding cells. Each family is one root
+/// `parallel` over its members. Its body runs the member's buckets in order;
+/// for bucket `b` it unrolls the common width `W` of the layouts, multiplying
+/// the accumulator by the cell's `a` coordinate (a `Select` over the member
+/// index) and weighting it by member `o` of the cell's selector family, then
+/// sums the cells. A slot beyond a layout's own width is padding. The body
+/// ends with the family's unscaled LUT, and the Program outputs are the two
+/// family `Sum`s. No body is nested, so selector members are read at the bare
+/// root binder.
+#[derive(Clone, Debug)]
+pub struct RefreshMaskProgram {
+    program: ExponentLutProgram,
+    initial_input: WireId,
+    input_vector: WireId,
+    families: Vec<MaskFamilyProgram>,
 }
 
-impl RefreshPrfLabelIndex {
-    /// Creates a canonical label index for a refresh instance.
+impl RefreshMaskProgram {
+    /// Build the mask Program for `layouts` (`[digit, parity]`, one layout per
+    /// member). Every layout must cover the profile's LWR dimension and all
+    /// must share one bucket count.
     pub fn new(
-        refresh_id: [u8; 32],
-        topology: &RefreshTranscriptTopology,
+        profile: &SparseLwrPrfProfile,
+        layouts: [Vec<PbcPublicLayout>; 2],
     ) -> Result<Self, RefreshError> {
-        // The topology checks the complete cardinality once; its positive
-        // group sizes make every prefix operation below fit as well.
-        topology.joint_event_count().map_err(|_| RefreshError::InvalidLayout)?;
-        let coordinates = topology.component_columns * topology.coefficient_count;
-        let mut mask_offsets = Vec::with_capacity(topology.crt_slot_count + 1);
-        mask_offsets.push(0);
-        for digits in &topology.mask_digit_counts {
-            mask_offsets.push(mask_offsets.last().unwrap() + coordinates * digits);
-        }
-        Ok(Self { refresh_id, topology: topology.clone(), mask_offsets })
-    }
-
-    /// Returns the total number of mask and fresh-error labels.
-    pub fn len(&self) -> usize {
-        self.mask_offsets[self.topology.crt_slot_count] + self.fresh_group_size()
-    }
-
-    /// Returns whether the index contains no labels.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Public slice of the canonical label-major output family. `None` is the
-    /// single fresh-error group, shared unchanged by every CRT channel.
-    pub fn group_range(&self, slot: Option<usize>) -> (usize, usize) {
-        match slot {
-            Some(slot) => {
-                (self.mask_offsets[slot], self.mask_offsets[slot + 1] - self.mask_offsets[slot])
-            }
-            None => (self.mask_offsets[self.topology.crt_slot_count], self.fresh_group_size()),
-        }
-    }
-
-    /// Returns the canonical label at `index`.
-    pub(crate) fn label(&self, index: usize) -> Option<RefreshPrfLabel> {
-        if index >= self.len() {
-            return None;
-        }
-        let mask_total = self.mask_offsets[self.topology.crt_slot_count];
-        if index < mask_total {
-            let group = self.mask_offsets.partition_point(|offset| *offset <= index) - 1;
-            let within = index - self.mask_offsets[group];
-            let digits = self.topology.mask_digit_counts[group];
-            let digit = within % digits;
-            let coefficient = (within / digits) % self.topology.coefficient_count;
-            let component = within / (digits * self.topology.coefficient_count);
-            Some(RefreshPrfLabel::Mask {
-                refresh_id: self.refresh_id,
-                slot: group,
-                component,
-                coefficient,
-                digit,
-            })
-        } else {
-            let within = index - mask_total;
-            let digit = within % self.topology.fresh_digit_count;
-            let coefficient =
-                (within / self.topology.fresh_digit_count) % self.topology.coefficient_count;
-            let component =
-                within / (self.topology.fresh_digit_count * self.topology.coefficient_count);
-            Some(RefreshPrfLabel::FreshError {
-                refresh_id: self.refresh_id,
-                component,
-                coefficient,
-                digit,
-            })
-        }
-    }
-
-    /// Returns the canonical flat index of `label`, rejecting a label from a
-    /// different refresh instance or outside this index's dimensions.
-    pub(crate) fn index_of(&self, label: RefreshPrfLabel) -> Option<usize> {
-        let (group_offset, component, coefficient, digit, is_mask) = match label {
-            RefreshPrfLabel::Mask { refresh_id, slot, component, coefficient, digit }
-                if refresh_id == self.refresh_id && slot < self.topology.crt_slot_count =>
+        profile.validate().map_err(|_| RefreshError::InvalidMaskProgram)?;
+        let bucket_count =
+            layouts.iter().flatten().next().ok_or(RefreshError::InvalidMaskProgram)?.cells.len();
+        for layout in layouts.iter().flatten() {
+            layout.validate().map_err(|_| RefreshError::InvalidMaskProgram)?;
+            if layout.parameters.universe_size != profile.lwr_dimension ||
+                layout.cells.len() != bucket_count
             {
-                (slot, component, coefficient, digit, true)
+                return Err(RefreshError::InvalidMaskProgram);
             }
-            RefreshPrfLabel::FreshError { refresh_id, component, coefficient, digit }
-                if refresh_id == self.refresh_id =>
-            {
-                (0, component, coefficient, digit, false)
+        }
+        let zero_member = profile.lwr_dimension;
+        let mut builder = ExponentLutProgramBuilder::new();
+        let initial_input = builder.input(AttributeKnowledge::PrivatePayload)?;
+        let input_vector = builder.input_family(
+            IntExpr::constant(profile.lwr_dimension + 1),
+            AttributeKnowledge::PublicPayload,
+        )?;
+        let mut families = Vec::with_capacity(2);
+        for (family, layouts) in MaskFamily::ALL.into_iter().zip(layouts) {
+            let members = layouts.len();
+            if members == 0 {
+                return Err(RefreshError::InvalidMaskProgram);
             }
-            _ => return None,
-        };
-        let digit_count = if is_mask {
-            self.topology.mask_digit_counts[group_offset]
-        } else {
-            self.topology.fresh_digit_count
-        };
-        if component >= self.topology.component_columns ||
-            coefficient >= self.topology.coefficient_count ||
-            digit >= digit_count
+            let width = layouts
+                .iter()
+                .flat_map(|layout| layout.cells.iter().map(Vec::len))
+                .max()
+                .ok_or(RefreshError::InvalidMaskProgram)?;
+            let selectors = (0..bucket_count)
+                .map(|_| {
+                    (0..width)
+                        .map(|_| builder.rhs_family(IntExpr::constant(members)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let lut = builder.register_lut(mask_table(profile, family)?)?;
+            let range = FamilyRange::full(IntExpr::constant(members))?;
+            let family_wire = builder.parallel(range, |builder, member| {
+                let mut state = initial_input;
+                for (bucket, selectors) in selectors.iter().enumerate() {
+                    let mut cells = Vec::with_capacity(width);
+                    for (slot, selector) in selectors.iter().enumerate() {
+                        // A real cell reads its `a` coordinate; dummy,
+                        // padding and missing slots read the zero member.
+                        let coordinate = IntExpr::Select {
+                            selector: Box::new(member.clone()),
+                            branches: layouts
+                                .iter()
+                                .map(|layout| {
+                                    IntExpr::constant(match layout.cells[bucket].get(slot) {
+                                        Some(PbcCell::Real { coordinate, .. }) => *coordinate,
+                                        _ => zero_member,
+                                    })
+                                })
+                                .collect(),
+                        };
+                        let shifted = builder.mul_public(
+                            Operand::Member { family: input_vector, index: coordinate },
+                            Operand::Scalar(state),
+                        )?;
+                        cells.push(builder.mul_private(
+                            Operand::Scalar(shifted),
+                            Operand::Member { family: *selector, index: member.clone() },
+                        )?);
+                    }
+                    let mut cells = cells.into_iter();
+                    let first = cells.next().ok_or(ProgramValidationError::InvalidLut)?;
+                    state = cells.try_fold(first, |sum, cell| {
+                        builder.add(Operand::Scalar(sum), Operand::Scalar(cell))
+                    })?;
+                }
+                builder.lut(Operand::Scalar(state), lut).map(Operand::Scalar)
+            })?;
+            let output = builder.sum(family_wire)?;
+            families.push(MaskFamilyProgram { layouts, selectors, lut, output });
+        }
+        let program = builder
+            .finish(families.iter().map(|family| Operand::Scalar(family.output)).collect())?;
+        Ok(Self { program, initial_input, input_vector, families })
+    }
+
+    pub fn program(&self) -> &ExponentLutProgram {
+        &self.program
+    }
+
+    pub fn id(&self) -> ExponentLutProgramId {
+        self.program.id()
+    }
+
+    /// The private accumulator start, bound to `mono(0)`.
+    pub const fn initial_input(&self) -> WireId {
+        self.initial_input
+    }
+
+    /// The public vector `a` followed by the encoding of zero.
+    pub const fn input_vector(&self) -> WireId {
+        self.input_vector
+    }
+
+    /// The number of members of `family`.
+    pub fn members(&self, family: MaskFamily) -> usize {
+        self.families[family.index()].layouts.len()
+    }
+
+    /// The terminal LUT of `family`.
+    pub fn lut(&self, family: MaskFamily) -> LutId {
+        self.families[family.index()].lut
+    }
+
+    /// The family whose terminal LUT is `lut`, if any.
+    pub fn family_of_lut(&self, lut: LutId) -> Option<MaskFamily> {
+        MaskFamily::ALL.into_iter().find(|family| self.families[family.index()].lut == lut)
+    }
+
+    /// The Program output of `family`: the `Sum` of its members.
+    pub fn output(&self, family: MaskFamily) -> WireId {
+        self.families[family.index()].output
+    }
+
+    /// The LHS plaintexts: `mono(0)` for the accumulator start, then
+    /// `mono(a_i)` for every coordinate of the public vector `a` in `Z_Q` and
+    /// `mono(0)` for the zero member, in the profile's exponent layout.
+    pub fn plaintext_inputs<P: Poly>(
+        &self,
+        profile: &SparseLwrPrfProfile,
+        parameters: &P::Params,
+        a: &[usize],
+    ) -> Result<PlaintextInputs<WireId, P>, RefreshError> {
+        let dimension = parameters.ring_dimension() as usize;
+        if a.len() != profile.lwr_dimension ||
+            profile.ring_dimension().ok() != Some(dimension) ||
+            a.iter().any(|value| Some(*value) >= profile.q().ok())
         {
-            return None;
+            return Err(RefreshError::InvalidMaskProgram);
         }
-        let offset = component * self.topology.coefficient_count * digit_count +
-            coefficient * digit_count +
-            digit;
-        Some(if is_mask {
-            self.mask_offsets[group_offset] + offset
-        } else {
-            self.mask_offsets[self.topology.crt_slot_count] + offset
-        })
+        let monomial = |exponent: usize| {
+            let rotation = (exponent * profile.layout.stride()) % (2 * dimension);
+            let value = P::const_rotate_poly(parameters, rotation % dimension);
+            if rotation >= dimension { -value } else { value }
+        };
+        let members = a.iter().copied().chain([0]).map(monomial).collect();
+        Ok(BTreeMap::from([
+            (self.initial_input, InputBinding::Scalar(monomial(0))),
+            (self.input_vector, InputBinding::Family(members)),
+        ]))
     }
 
-    /// Returns the PRF labels corresponding to this index in canonical
-    /// label-major order.  The application-owned coordinates are encoded as
-    /// one opaque component so that the sparse-LWR declaration never needs to
-    /// parse refresh semantics.
-    pub fn prf_labels(&self) -> Result<Vec<PrfLabel>, PrfError> {
-        (0..self.len())
-            .map(|index| {
-                let label =
-                    self.label(index).ok_or(PrfError::InvalidSparseLwrBlock)?.canonical_bytes();
-                PrfLabel::from_components(&[label.as_slice()])
-            })
-            .collect()
-    }
-
-    fn fresh_group_size(&self) -> usize {
-        self.topology.component_columns *
-            self.topology.coefficient_count *
-            self.topology.fresh_digit_count
+    /// The private selector plaintexts of the generated `keys`
+    /// (`[digit, parity]`, one key per member, each on its member's layout):
+    /// member `o` of the selector of bucket `b` and slot `j` is 1 exactly
+    /// when key `o` selects slot `j` of bucket `b`.
+    pub fn selector_plaintexts<P: Poly>(
+        &self,
+        parameters: &P::Params,
+        keys: [&[PbcGeneratedKeyLayout]; 2],
+    ) -> Result<PlaintextInputs<RhsId, P>, RefreshError> {
+        let mut plaintexts = BTreeMap::new();
+        for (family, keys) in self.families.iter().zip(keys) {
+            if keys.len() != family.layouts.len() {
+                return Err(RefreshError::InvalidMaskProgram);
+            }
+            for (key, layout) in keys.iter().zip(&family.layouts) {
+                if key.public_layout.layout_id != layout.layout_id ||
+                    key.private_schedule().validate(layout).is_err()
+                {
+                    return Err(RefreshError::InvalidMaskProgram);
+                }
+            }
+            for (bucket, selectors) in family.selectors.iter().enumerate() {
+                for (slot, selector) in selectors.iter().enumerate() {
+                    let bits = keys
+                        .iter()
+                        .map(|key| {
+                            if key.private_schedule().selected_slot(bucket) == slot {
+                                P::const_one(parameters)
+                            } else {
+                                P::const_zero(parameters)
+                            }
+                        })
+                        .collect();
+                    plaintexts.insert(*selector, InputBinding::Family(bits));
+                }
+            }
+        }
+        Ok(plaintexts)
     }
 }
 
-/// Immutable, checked declaration shared by preparation, online evaluation,
-/// and noise simulation for one refresh operation.
+/// Immutable, checked declaration shared by preprocessing, encryption,
+/// online evaluation and noise simulation for one refresh.
 ///
-/// The declaration owns only protocol metadata and the structural PRF
-/// preparation.  It does not contain a scheme carrier, plaintext, sampled
-/// matrix, or runtime graph handle.  Concrete stages bind those values through
-/// their `NoiseRefresh` implementation when the common refresh dispatch is
-/// called.
+/// It owns protocol metadata only: the source output, the mask Program and
+/// its digit plan. Scheme carriers, plaintexts, the decoder trapdoor and
+/// sampled matrices are bound by the concrete stages.
 #[derive(Clone, Debug)]
 pub struct RefreshDeclaration {
     source_program: ExponentLutProgramId,
     source_output: WireId,
-    output_schema: Vec<WireType>,
-    slots: Vec<RefreshSlot>,
-    digits: RefreshDigitPlan,
-    labels: RefreshPrfLabelIndex,
-    prepared: PreparedSparseLwrPrf,
-    target_level: usize,
-    moment_policy: NoiseMomentPolicy,
-    prf_labels: Vec<PrfLabel>,
+    profile: SparseLwrPrfProfile,
+    coefficients: usize,
+    digits: usize,
+    mask: RefreshMaskProgram,
     commitment: [u8; 32],
 }
 
 impl RefreshDeclaration {
-    /// Checks and freezes one refresh declaration.
+    /// Check and freeze one refresh of `source_output`, masked over
+    /// `coefficients` coefficients with `digits` mask digits each. `layouts`
+    /// are `[digit, parity]`: `coefficients * digits` digit layouts, member
+    /// `coefficient * digits + digit`, then `coefficients` parity layouts.
     pub fn new(
         source_program: &ExponentLutProgram,
         source_output: WireId,
-        output_schema: Vec<WireType>,
-        slots: Vec<RefreshSlot>,
-        digits: RefreshDigitPlan,
-        labels: RefreshPrfLabelIndex,
-        prepared: PreparedSparseLwrPrf,
-        target_level: usize,
-        moment_policy: NoiseMomentPolicy,
+        profile: SparseLwrPrfProfile,
+        coefficients: usize,
+        digits: usize,
+        layouts: [Vec<PbcPublicLayout>; 2],
     ) -> Result<Self, RefreshError> {
-        validate_refresh_source(source_program, source_output, &output_schema)?;
-        validate_refresh_layout(&slots, &digits, &labels)?;
-        validate_modulus_relations(&slots)?;
-        validate_refresh_prf_binding(&digits, &prepared)?;
-        let prf_labels = labels.prf_labels().map_err(|_| RefreshError::PrfOutputMismatch)?;
-        let declared_outputs = prepared
-            .declaration()
-            .ordered_outputs()
-            .map(|(label, _)| label.clone())
-            .collect::<Vec<_>>();
-        if declared_outputs != prf_labels {
-            return Err(RefreshError::PrfOutputMismatch);
+        validate_refresh_source(source_program, source_output)?;
+        if coefficients == 0 ||
+            digits == 0 ||
+            profile.p_prime % 2 != 0 ||
+            layouts[0].len() !=
+                coefficients.checked_mul(digits).ok_or(RefreshError::InvalidMaskProgram)? ||
+            layouts[1].len() != coefficients
+        {
+            return Err(RefreshError::InvalidMaskProgram);
         }
-        let source_program_id = source_program.id();
-        let commitment = refresh_commitment(
-            source_program_id,
+        let mask = RefreshMaskProgram::new(&profile, layouts)?;
+        let source_program = source_program.id();
+        let commitment = commitment(&(
+            b"mxx-exponent-lut/refresh/v2".as_slice(),
+            source_program,
             source_output,
-            &output_schema,
-            &slots,
-            &digits,
-            &labels,
-            &prepared,
-            target_level,
-            &moment_policy,
-        )?;
-        Ok(Self {
-            source_program: source_program_id,
-            source_output,
-            output_schema,
-            slots,
+            &profile,
+            coefficients,
             digits,
-            labels,
-            prepared,
-            target_level,
-            moment_policy,
-            prf_labels,
-            commitment,
-        })
+            mask.id(),
+        ))?;
+        Ok(Self { source_program, source_output, profile, coefficients, digits, mask, commitment })
     }
 
     pub const fn source_program(&self) -> ExponentLutProgramId {
@@ -375,1208 +442,519 @@ impl RefreshDeclaration {
         self.source_output
     }
 
-    pub fn output_schema(&self) -> &[WireType] {
-        &self.output_schema
+    pub const fn profile(&self) -> &SparseLwrPrfProfile {
+        &self.profile
     }
 
-    pub fn slots(&self) -> &[RefreshSlot] {
-        &self.slots
+    /// The number `N` of masked coefficients.
+    pub const fn coefficients(&self) -> usize {
+        self.coefficients
     }
 
-    pub fn digits(&self) -> &RefreshDigitPlan {
-        &self.digits
+    /// The number `d` of mask digits per coefficient.
+    pub const fn digits(&self) -> usize {
+        self.digits
     }
 
-    pub fn labels(&self) -> &RefreshPrfLabelIndex {
-        &self.labels
-    }
-
-    pub fn prepared(&self) -> &PreparedSparseLwrPrf {
-        &self.prepared
-    }
-
-    pub const fn target_level(&self) -> usize {
-        self.target_level
-    }
-
-    pub fn moment_policy(&self) -> &NoiseMomentPolicy {
-        &self.moment_policy
+    pub const fn mask(&self) -> &RefreshMaskProgram {
+        &self.mask
     }
 
     pub const fn commitment(&self) -> &[u8; 32] {
         &self.commitment
     }
 
-    pub(crate) fn prf_labels(&self) -> &[PrfLabel] {
-        &self.prf_labels
+    /// The digit base `P = 2 p'`.
+    pub fn digit_base(&self) -> BigUint {
+        BigUint::from(self.profile.p_prime) * 2u8
     }
 
-    /// Checks that `program` is the prepared PRF Program a refresh PRF child
-    /// must lower.
-    pub(crate) fn validate_prf_program(
-        &self,
-        program: ExponentLutProgramId,
-    ) -> Result<(), RefreshError> {
-        if program == self.prepared.program().id() {
-            Ok(())
-        } else {
-            Err(RefreshError::PrfOutputMismatch)
-        }
+    /// The bound `P^d` on the mask magnitude.
+    pub fn mask_bound(&self) -> BigUint {
+        self.digit_base().pow(self.digits as u32)
     }
 
-    /// Checks that every declared PRF output is a scalar output of `program`
-    /// (`PrfOutputMismatch` otherwise) and a coefficient output
-    /// (`InvalidSourceOutput` otherwise).
-    pub(crate) fn validate_prf_outputs(
-        &self,
-        program: &ExponentLutProgram,
-    ) -> Result<(), RefreshError> {
-        let declared =
-            self.prepared.declaration().ordered_outputs().map(|(_, wire)| wire).collect::<Vec<_>>();
-        let scalar_outputs = program
-            .outputs()
-            .iter()
-            .filter_map(|output| match output {
-                Operand::Scalar(wire) => Some(*wire),
-                Operand::Member { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        if declared.iter().any(|wire| !scalar_outputs.contains(wire)) {
-            return Err(RefreshError::PrfOutputMismatch);
-        }
-        if declared.iter().any(|wire| !program.wire_is_coefficient_output(*wire).unwrap_or(false)) {
-            return Err(RefreshError::InvalidSourceOutput);
-        }
-        Ok(())
-    }
-
-    /// Checks that the per-slot PRF children are keyed by exactly the
-    /// declared slots `0..slots().len()`.
-    pub(crate) fn validate_prf_slots<C>(
-        &self,
-        children: &BTreeMap<usize, C>,
-    ) -> Result<(), RefreshError> {
-        if children.keys().copied().eq(0..self.slots.len()) {
-            Ok(())
-        } else {
-            Err(RefreshError::InvalidLayout)
-        }
-    }
-
-    /// Collects the per-label, per-slot PRF outputs of the refresh.
-    ///
-    /// `lower_slot` is called once per slot in order and returns that slot's
-    /// PRF outputs as `(wire, value)` pairs in declared output order. Every
-    /// slot's PRF Program yields every label; a mask label is kept only from
-    /// its owning slot and the shared fresh-error label from every slot. A
-    /// wrong output count or wire, a duplicate `(label, slot)`, or a label
-    /// without exactly its expected slots is `PrfOutputMismatch`.
-    pub(crate) fn collect_prf_outputs<V, E: From<RefreshError>>(
-        &self,
-        mut lower_slot: impl FnMut(usize) -> Result<Vec<(WireId, V)>, E>,
-    ) -> Result<BTreeMap<PrfLabel, BTreeMap<usize, V>>, E> {
-        let ordered = self.prepared.declaration().ordered_outputs().collect::<Vec<_>>();
-        let slot_count = self.slots.len();
-        let owners = (0..ordered.len())
-            .map(|index| {
-                self.labels.label(index).ok_or(RefreshError::InvalidLayout)?.slots(slot_count)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut outputs = BTreeMap::<PrfLabel, BTreeMap<usize, V>>::new();
-        for slot in 0..slot_count {
-            let values = lower_slot(slot)?;
-            if values.len() != ordered.len() {
-                return Err(RefreshError::PrfOutputMismatch.into());
+    /// The member weights of `family`: `[P^0, ..., P^(d-1)]` for digits and
+    /// `[1]` for parity.
+    pub fn member_weights(&self, family: MaskFamily) -> Vec<BigUint> {
+        match family {
+            MaskFamily::Digit => {
+                let base = self.digit_base();
+                (0..self.digits as u32).map(|power| base.pow(power)).collect()
             }
-            for (((label, expected), owners), (wire, value)) in
-                ordered.iter().zip(&owners).zip(values)
-            {
-                if wire != *expected {
-                    return Err(RefreshError::PrfOutputMismatch.into());
-                }
-                if owners.contains(&slot) &&
-                    outputs.entry((*label).clone()).or_default().insert(slot, value).is_some()
-                {
-                    return Err(RefreshError::PrfOutputMismatch.into());
-                }
-            }
+            MaskFamily::Parity => vec![BigUint::from(1u8)],
         }
-        for ((label, _), owners) in ordered.iter().zip(&owners) {
-            if !outputs.get(*label).is_some_and(|slots| slots.keys().eq(owners.iter())) {
-                return Err(RefreshError::PrfOutputMismatch.into());
-            }
-        }
-        Ok(outputs)
     }
 
-    /// The CRT weight `(Q/q_t)·((Q/q_t)^-1 mod q_t)` of `slot`, where `Q` is
-    /// the product of every slot's `q_t`.
-    pub(crate) fn crt_weight(&self, slot: usize) -> Result<BigUint, RefreshError> {
-        refresh_crt_weight(&self.slots, slot)
+    /// Where member `member` of `family` lands, as expressions of the member
+    /// index: `(coefficient, weight index)` into [`Self::member_weights`]. A
+    /// digit member `coefficient d + digit` has weight index `digit`; a
+    /// parity member `coefficient` has weight index 0.
+    pub fn member_placement(&self, family: MaskFamily, member: IntExpr) -> (IntExpr, IntExpr) {
+        match family {
+            MaskFamily::Digit => {
+                let digits = Box::new(IntExpr::constant(self.digits));
+                let coefficient =
+                    IntExpr::FloorDiv(Box::new(member.clone()), digits.clone()).canonicalize();
+                (coefficient, IntExpr::Rem(Box::new(member), digits).canonicalize())
+            }
+            MaskFamily::Parity => (member, IntExpr::constant(0)),
+        }
+    }
+
+    /// Check that `program` is this declaration's mask Program.
+    pub fn validate_mask_program(&self, program: ExponentLutProgramId) -> Result<(), RefreshError> {
+        if program == self.mask.id() { Ok(()) } else { Err(RefreshError::InvalidMaskProgram) }
     }
 }
 
-/// The CRT weight of `slot` among `slots`: an out-of-range slot is
-/// `InvalidLayout`, and a negative or non-invertible `q_t` is
-/// `InvalidModulusRelation`.
-pub(crate) fn refresh_crt_weight(
-    slots: &[RefreshSlot],
-    slot: usize,
-) -> Result<BigUint, RefreshError> {
-    let moduli = slots
-        .iter()
-        .map(|slot| slot.q_t.to_biguint().ok_or(RefreshError::InvalidModulusRelation))
-        .collect::<Result<Vec<_>, _>>()?;
-    let qt = moduli.get(slot).ok_or(RefreshError::InvalidLayout)?;
-    let base = moduli.iter().product::<BigUint>() / qt;
-    let inverse = mxx_backends::utils::mod_inverse_biguints(&(&base % qt), qt)
-        .ok_or(RefreshError::InvalidModulusRelation)?;
-    Ok(base * inverse)
-}
-
+/// The source must be a private, scalar, non-coefficient output of
+/// `program`: its raw encoding is already final and carries `(q/p) mu`.
 fn validate_refresh_source(
     program: &ExponentLutProgram,
     source_output: WireId,
-    output_schema: &[WireType],
 ) -> Result<(), RefreshError> {
-    if output_schema.is_empty() {
-        return Err(RefreshError::InvalidOutputSchema);
-    }
-    let is_declared_output = program
+    let is_output = program
         .outputs()
         .iter()
-        .any(|operand| matches!(operand, Operand::Scalar(output) if *output == source_output));
-    if !is_declared_output ||
-        program
-            .wire_is_coefficient_output(source_output)
-            .map_err(|_| RefreshError::InvalidSourceOutput)?
+        .any(|output| matches!(output, Operand::Scalar(wire) if *wire == source_output));
+    if !is_output ||
+        program.wire_knowledge(source_output)? != AttributeKnowledge::PrivatePayload ||
+        program.wire_is_coefficient_output(source_output)?
     {
         return Err(RefreshError::InvalidSourceOutput);
     }
     Ok(())
 }
 
-fn validate_modulus_relations(slots: &[RefreshSlot]) -> Result<(), RefreshError> {
-    for slot in slots {
-        // q is the preterminal modulus.  p is the exact intermediate
-        // modulus M_t and q_t is the plaintext prime pi_t.
-        if slot.q <= slot.p ||
-            (&slot.q % &slot.p) != BigInt::zero() ||
-            (&slot.p % &slot.q_t) != BigInt::zero()
-        {
-            return Err(RefreshError::InvalidModulusRelation);
-        }
-        // The slot's intermediate modulus is M_t.  With p=M_t, the
-        // state-switch factor is H_t = M_t/q_t and must be invertible modulo
-        // the plaintext modulus; otherwise CRT recomposition cannot recover
-        // this channel.
-        let h_t = &slot.p / &slot.q_t;
-        if positive_gcd(&h_t, &slot.q_t) != BigInt::one() {
-            return Err(RefreshError::InvalidModulusRelation);
-        }
-    }
-    for (index, left) in slots.iter().enumerate() {
-        for right in slots.iter().skip(index + 1) {
-            if positive_gcd(&left.q_t, &right.q_t) != BigInt::one() {
-                return Err(RefreshError::InvalidModulusRelation);
-            }
-        }
-    }
-    Ok(())
+fn commitment(value: &impl Serialize) -> Result<[u8; 32], RefreshError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| RefreshError::Commitment)?;
+    Ok(Sha256::digest(bytes).into())
 }
 
-fn positive_gcd(left: &BigInt, right: &BigInt) -> BigInt {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    while !right.is_zero() {
-        let remainder = &left % &right;
-        left = right;
-        right = remainder;
+/// Choose the smallest digit count `d` for digit base `base` such that the
+/// mask range `base^d` is at least `2 observations error(d) 2^statistical_bits`,
+/// and check that `base^d + error(d) < spacing / 2`, i.e. that the masked
+/// value stays inside the decoding margin of `spacing = q / p`. `error(d)` is
+/// the accumulated noise bound with `d` digits; it may grow with `d`. Returns
+/// `d` and its error bound.
+pub fn fit_mask_digits(
+    base: &BigUint,
+    observations: &BigUint,
+    statistical_bits: usize,
+    spacing: &BigUint,
+    error: impl Fn(usize) -> Result<BigUint, RefreshError>,
+) -> Result<(usize, BigUint), RefreshError> {
+    if base < &BigUint::from(2u8) || observations.is_zero() {
+        return Err(RefreshError::MaskRange);
     }
-    left
-}
-
-fn refresh_commitment(
-    source_program: ExponentLutProgramId,
-    source_output: WireId,
-    output_schema: &[WireType],
-    slots: &[RefreshSlot],
-    digits: &RefreshDigitPlan,
-    labels: &RefreshPrfLabelIndex,
-    prepared: &PreparedSparseLwrPrf,
-    target_level: usize,
-    moment_policy: &NoiseMomentPolicy,
-) -> Result<[u8; 32], RefreshError> {
-    let metadata = (
-        source_program,
-        source_output,
-        output_schema,
-        slots,
-        digits,
-        labels,
-        prepared.descriptor(),
-        target_level,
-        moment_policy,
-    );
-    let bytes = serde_json::to_vec(&metadata).map_err(|_| RefreshError::Commitment)?;
-    let mut digest = Sha256::new();
-    digest.update(b"mxx-exponent-lut/refresh-declaration");
-    digest.update(bytes);
-    Ok(digest.finalize().into())
-}
-
-fn validate_refresh_layout(
-    slots: &[RefreshSlot],
-    digits: &RefreshDigitPlan,
-    labels: &RefreshPrfLabelIndex,
-) -> Result<(), RefreshError> {
-    if slots.is_empty() ||
-        slots.iter().enumerate().any(|(index, slot)| {
-            slot.slot != index || slot.q <= 0.into() || slot.p <= 0.into() || slot.q_t <= 0.into()
-        })
-    {
-        return Err(RefreshError::InvalidLayout);
-    }
-    if digits.base < 2 ||
-        !digits.base.is_power_of_two() ||
-        digits.mask_counts.len() != slots.len() ||
-        digits.mask_counts.iter().any(|count| *count == 0) ||
-        digits.fresh_count == 0 ||
-        labels.is_empty()
-    {
-        return Err(RefreshError::InvalidLayout);
-    }
-
-    let mut coordinates = std::collections::BTreeSet::new();
-    let mut mask_coordinates = vec![std::collections::BTreeSet::new(); slots.len()];
-    let mut mask_digits = vec![std::collections::BTreeSet::new(); slots.len()];
-    let mut fresh_digits = std::collections::BTreeSet::new();
-    for index in 0..labels.len() {
-        let label = labels.label(index).ok_or(RefreshError::InvalidLayout)?;
-        if labels.index_of(label) != Some(index) {
-            return Err(RefreshError::InvalidLayout);
+    let mut digits = 1;
+    loop {
+        let bound = error(digits)?;
+        let required = (observations * &bound * 2u8) << statistical_bits;
+        let range = base.pow(digits as u32);
+        if range < required {
+            digits += 1;
+            continue;
         }
-        match label {
-            RefreshPrfLabel::Mask { slot, component, coefficient, digit, .. } => {
-                if slot >= slots.len() || digit >= digits.mask_counts[slot] {
-                    return Err(RefreshError::InvalidLayout);
-                }
-                let coordinate = (component, coefficient);
-                coordinates.insert(coordinate);
-                mask_coordinates[slot].insert(coordinate);
-                mask_digits[slot].insert(digit);
-            }
-            RefreshPrfLabel::FreshError { component, coefficient, digit, .. } => {
-                if digit >= digits.fresh_count {
-                    return Err(RefreshError::InvalidLayout);
-                }
-                coordinates.insert((component, coefficient));
-                fresh_digits.insert(digit);
-            }
+        if (range + &bound) * 2u8 >= *spacing {
+            return Err(RefreshError::MaskRange);
         }
+        return Ok((digits, bound));
     }
-    if coordinates.is_empty() ||
-        fresh_digits.len() != digits.fresh_count ||
-        (0..slots.len()).any(|slot| {
-            mask_coordinates[slot] != coordinates ||
-                mask_digits[slot].len() != digits.mask_counts[slot]
-        })
-    {
-        return Err(RefreshError::InvalidLayout);
-    }
-    Ok(())
 }
 
-fn validate_refresh_prf_binding(
-    digits: &RefreshDigitPlan,
-    prepared: &PreparedSparseLwrPrf,
-) -> Result<(), RefreshError> {
-    let program = prepared.declaration();
-    let profile = program.profile();
-    if profile.p().map_err(|_| RefreshError::InvalidLayout)? != digits.base {
-        return Err(RefreshError::InvalidLayout);
-    }
-    crate::program_gadgets::prf::validate_profile_program(profile, program)
-        .map_err(|_| RefreshError::PrfOutputMismatch)
-}
-
-/// Resolve a canonical flat digit label into slot, digit, coefficient and
+/// Small refresh declarations for scheme tests.
 #[cfg(test)]
-pub(crate) mod tests {
+pub(crate) mod fixture {
     use super::*;
+    use crate::{
+        ExpLayout,
+        program_gadgets::pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
+    };
 
-    fn source_program() -> (ExponentLutProgram, WireId) {
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let output = builder.input(crate::program::AttributeKnowledge::PublicPayload).unwrap();
-        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
-        (program, output)
+    /// `n' = 4`, `p' = 2` (`P = 4`, `Q = 8`) in the ring of dimension 8, over
+    /// an LWR dimension of four.
+    pub(crate) fn profile() -> SparseLwrPrfProfile {
+        SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 2 }, 2, 4).unwrap()
     }
 
-    #[derive(Debug)]
-    struct CallbackError(PrfError);
-
-    impl std::fmt::Display for CallbackError {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            self.0.fmt(formatter)
-        }
-    }
-
-    impl std::error::Error for CallbackError {}
-
-    impl From<PrfError> for CallbackError {
-        fn from(error: PrfError) -> Self {
-            Self(error)
-        }
-    }
-
-    struct CallbackRefresh {
-        finished: bool,
-    }
-
-    impl NoiseRefresh for CallbackRefresh {
-        type PrfOutput = usize;
-        type Output = usize;
-        type Error = CallbackError;
-
-        fn finish_noise_refresh(
-            &mut self,
-            _declaration: &RefreshDeclaration,
-            outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
-        ) -> Result<Self::Output, Self::Error> {
-            self.finished = true;
-            Ok(outputs.values().sum())
-        }
-    }
-
-    #[test]
-    fn refresh_routes_masks_to_owner_and_fresh_error_to_every_slot() {
-        let refresh_id = [0xabu8; 32];
-        let mask =
-            RefreshPrfLabel::Mask { refresh_id, slot: 1, component: 0, coefficient: 0, digit: 0 };
-        let fresh =
-            RefreshPrfLabel::FreshError { refresh_id, component: 0, coefficient: 0, digit: 0 };
-        assert_eq!(mask.slots(3).unwrap(), vec![1]);
-        assert_eq!(fresh.slots(3).unwrap(), vec![0, 1, 2]);
-        assert!(mask.slots(1).is_err());
-    }
-
-    #[test]
-    fn apply_refresh_invokes_the_prf_callback_once() {
-        let (_, _, declaration) = test_declaration();
-        let labels = declaration.prf_labels().to_vec();
-        let mut refresh = CallbackRefresh { finished: false };
-        let mut callbacks = 0;
-        let output = crate::api::apply_refresh(
-            &declaration,
-            &mut refresh,
-            |callback_declaration, callback_labels| {
-                callbacks += 1;
-                assert!(std::ptr::eq(callback_declaration, &declaration));
-                assert_eq!(callback_labels, labels.as_slice());
-                Ok(callback_labels.iter().cloned().map(|label| (label, 7)).collect())
-            },
-        )
-        .unwrap();
-        assert_eq!(callbacks, 1);
-        assert!(refresh.finished);
-        assert_eq!(output, labels.len() * 7);
-    }
-
-    #[test]
-    fn apply_refresh_rejects_inexact_prf_output_keys() {
-        let (_, _, declaration) = test_declaration();
-        let labels = declaration.prf_labels().to_vec();
-
-        let mut missing = CallbackRefresh { finished: false };
-        let result = crate::api::apply_refresh(&declaration, &mut missing, |_, _| {
-            Ok(labels.iter().take(1).cloned().map(|label| (label, 1)).collect())
-        });
-        assert!(matches!(result, Err(crate::api::RefreshApplicationError::OutputMismatch)));
-        assert!(!missing.finished);
-
-        let mut extra = CallbackRefresh { finished: false };
-        let undeclared = PrfLabel::from_components(&[b"undeclared"]).unwrap();
-        let result = crate::api::apply_refresh(&declaration, &mut extra, |_, _| {
-            Ok(BTreeMap::from([(labels[0].clone(), 1), (undeclared, 1)]))
-        });
-        assert!(matches!(result, Err(crate::api::RefreshApplicationError::OutputMismatch)));
-        assert!(!extra.finished);
-
-        let mut empty = CallbackRefresh { finished: false };
-        let result =
-            crate::api::apply_refresh(&declaration, &mut empty, |_, _| Ok(BTreeMap::new()));
-        assert!(matches!(result, Err(crate::api::RefreshApplicationError::OutputMismatch)));
-        assert!(!empty.finished);
-    }
-
-    fn test_declaration() -> (ExponentLutProgram, WireId, RefreshDeclaration) {
-        test_declaration_with_slots(vec![RefreshSlot {
-            slot: 0,
-            q: 20.into(),
-            p: 10.into(),
-            q_t: 2.into(),
-        }])
-    }
-
-    /// A toy base-2 refresh of a one-input source Program over `slots`, with
-    /// one mask digit per slot and one fresh-error digit, on ring dimension 32.
-    pub(crate) fn test_declaration_with_slots(
-        slots: Vec<RefreshSlot>,
-    ) -> (ExponentLutProgram, WireId, RefreshDeclaration) {
-        let topology = RefreshTranscriptTopology {
-            crt_slot_count: slots.len(),
-            component_columns: 1,
-            coefficient_count: 1,
-            mask_digit_counts: vec![1; slots.len()],
-            fresh_digit_count: 1,
-        };
-        let labels = RefreshPrfLabelIndex::new([3; 32], &topology).unwrap();
-        let prf_labels = labels.prf_labels().unwrap();
-        let parameters = crate::program_gadgets::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
-        let generated = (0..32_u8)
-            .find_map(|seed| {
-                crate::program_gadgets::pbc::generate_key_layout(
-                    &parameters,
-                    crate::program_gadgets::pbc::PbcRootSeed([seed; 32]),
-                    &[0, 1],
-                )
-                .ok()
+    /// `count` random weight-one keys over four coordinates in two buckets,
+    /// so each mask member is a two-level chain.
+    pub(crate) fn keys(count: usize) -> Vec<PbcGeneratedKeyLayout> {
+        let parameters = PbcParameters::custom(4, 1, 2, 2, 64, None);
+        (0..count)
+            .map(|_| {
+                let support = vec![rand::random::<u32>() as usize % 4];
+                (0..64)
+                    .find_map(|_| {
+                        generate_key_layout(&parameters, PbcRootSeed(rand::random()), &support).ok()
+                    })
+                    .expect("PBC layout")
             })
-            .expect("toy setup must find a PBC schedule");
-        let profile = crate::program_gadgets::prf::SparseLwrPrfProfile::new(
-            crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
-            1,
-            3,
-        )
-        .unwrap();
-        let prf_labels = prf_labels.to_vec();
-        let sparse = crate::program_gadgets::prf::SparseLwrPrfProgram::new(
-            profile,
-            vec![generated.public_layout.clone(); prf_labels.len()],
-            prf_labels,
-        )
-        .unwrap();
-        let prepared = PreparedSparseLwrPrf::new(sparse, [9; 32]).unwrap();
-        let (source, source_output) = source_program();
-        let mask_counts = vec![1; slots.len()];
+            .collect()
+    }
+
+    /// A refresh of `source_output` over `coefficients` coefficients with
+    /// `digits` digits each, and its keys.
+    pub(crate) fn declaration(
+        source: &ExponentLutProgram,
+        source_output: WireId,
+        coefficients: usize,
+        digits: usize,
+    ) -> (RefreshDeclaration, [Vec<PbcGeneratedKeyLayout>; 2]) {
+        let keys = [keys(coefficients * digits), keys(coefficients)];
+        let layouts =
+            keys.clone().map(|keys| keys.into_iter().map(|key| key.public_layout).collect());
         let declaration = RefreshDeclaration::new(
-            &source,
+            source,
             source_output,
-            vec![WireType::Int],
-            slots,
-            RefreshDigitPlan { base: 2, mask_counts, fresh_count: 1 },
-            labels,
-            prepared,
-            0,
-            NoiseMomentPolicy::Continuous,
+            profile(),
+            coefficients,
+            digits,
+            layouts,
         )
         .unwrap();
-        (source, source_output, declaration)
+        (declaration, keys)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ExpLayout,
+        program_gadgets::pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
+    };
+    use num_bigint::BigInt;
+    use num_traits::One;
+    use std::collections::BTreeMap as Map;
+
+    /// n' = 8, p' = 2 (P = 4), over an LWR dimension of eight.
+    fn profile() -> SparseLwrPrfProfile {
+        SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2, 8).unwrap()
     }
 
-    /// Two slots with coprime plaintext moduli 3 and 5 under `q = 60`.
-    fn two_slot_declaration() -> (ExponentLutProgram, WireId, RefreshDeclaration) {
-        test_declaration_with_slots(vec![
-            RefreshSlot { slot: 0, q: 60.into(), p: 6.into(), q_t: 3.into() },
-            RefreshSlot { slot: 1, q: 60.into(), p: 10.into(), q_t: 5.into() },
-        ])
+    /// The signed coefficient a negacyclic LUT returns for input `z in Z_Q`.
+    fn negacyclic(table: &LutTable, z: usize) -> i64 {
+        let width = table.values().len();
+        let value = table.values()[z % width] as i64;
+        if z < width { value } else { -value }
     }
 
     #[test]
-    fn prf_program_must_be_the_prepared_program() {
-        let (source, _, declaration) = test_declaration();
-        declaration.validate_prf_program(declaration.prepared().program().id()).unwrap();
-        assert_eq!(
-            declaration.validate_prf_program(source.id()).unwrap_err(),
-            RefreshError::PrfOutputMismatch
-        );
-    }
-
-    #[test]
-    fn prf_outputs_must_be_scalar_coefficient_outputs() {
-        let (source, _, declaration) = test_declaration();
-        declaration.validate_prf_outputs(declaration.prepared().program()).unwrap();
-        // The source Program does not output the declared PRF wires.
-        assert_eq!(
-            declaration.validate_prf_outputs(&source).unwrap_err(),
-            RefreshError::PrfOutputMismatch
-        );
-        // A Program that outputs every declared wire as a plain input
-        // exposes them as scalar outputs that are not coefficient outputs.
-        let declared = declaration
-            .prepared()
-            .declaration()
-            .ordered_outputs()
-            .map(|(_, wire)| wire)
-            .collect::<Vec<_>>();
-        let last = declared.iter().map(|wire| wire.0).max().unwrap();
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        for _ in 0..=last {
-            builder.input(crate::program::AttributeKnowledge::PublicPayload).unwrap();
+    fn mask_tables_give_uniform_odd_digits_and_balanced_parity() {
+        let profile = profile();
+        let q = profile.q().unwrap();
+        let p = profile.p().unwrap() as i64;
+        let digit = mask_table(&profile, MaskFamily::Digit).unwrap();
+        let parity = mask_table(&profile, MaskFamily::Parity).unwrap();
+        let mut digits = Map::new();
+        let mut parities = Map::new();
+        for z in 0..q {
+            *digits.entry(negacyclic(&digit, z)).or_insert(0usize) += 1;
+            *parities.entry(negacyclic(&parity, z)).or_insert(0usize) += 1;
         }
-        let inputs = builder.finish(declared.into_iter().map(Operand::Scalar).collect()).unwrap();
+        let expected = (0..p).map(|u| (2 * u - (p - 1), q / p as usize)).collect::<Map<_, _>>();
+        assert_eq!(digits, expected, "uniform over the P odd values");
+        assert_eq!(parities, Map::from([(-1, q / 4), (0, q / 2), (1, q / 4)]));
+    }
+
+    #[test]
+    fn digit_and_parity_sum_is_centered_and_uniform_on_an_interval() {
+        // Weights 1, 2, 1 for beta = -1, 0, 1, so every tuple contributes 4.
+        for (base, digits) in [(2i64, 1u32), (4, 1), (4, 2), (2, 3)] {
+            let odd = (0..base).map(|u| 2 * u - (base - 1)).collect::<Vec<_>>();
+            let support = base.pow(digits);
+            let mut counts = Map::<i64, i64>::new();
+            for tuple in 0..support {
+                let mut value = 0;
+                let mut rest = tuple;
+                for power in 0..digits {
+                    value += base.pow(power) * odd[(rest % base) as usize];
+                    rest /= base;
+                }
+                for (beta, weight) in [(-1, 1), (0, 2), (1, 1)] {
+                    *counts.entry(value + beta).or_default() += weight;
+                }
+            }
+            assert_eq!(
+                counts.keys().copied().collect::<Vec<_>>(),
+                (-support..=support).collect::<Vec<_>>()
+            );
+            for (value, count) in counts {
+                let expected = if value.abs() == support { 1 } else { 2 };
+                assert_eq!(count, expected, "base {base}, d {digits}, value {value}");
+            }
+        }
+    }
+
+    fn keys(count: usize, seed_base: u8) -> Vec<PbcGeneratedKeyLayout> {
+        let parameters = PbcParameters::paper_evaluation(8, 2);
+        (0..count)
+            .map(|index| {
+                let support = [index % 8, (index + 3) % 8];
+                (0..64u8)
+                    .find_map(|attempt| {
+                        generate_key_layout(
+                            &parameters,
+                            PbcRootSeed([seed_base.wrapping_add(attempt); 32]),
+                            &support,
+                        )
+                        .ok()
+                    })
+                    .expect("PBC layout")
+            })
+            .collect()
+    }
+
+    fn source() -> (ExponentLutProgram, WireId) {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let output = builder.mul_private(Operand::Scalar(input), Operand::Scalar(rhs)).unwrap();
+        (builder.finish(vec![Operand::Scalar(output)]).unwrap(), output)
+    }
+
+    fn declaration(
+        coefficients: usize,
+        digits: usize,
+    ) -> (RefreshDeclaration, [Vec<PbcGeneratedKeyLayout>; 2]) {
+        let keys = [keys(coefficients * digits, 0), keys(coefficients, 101)];
+        let layouts =
+            keys.clone().map(|keys| keys.into_iter().map(|key| key.public_layout).collect());
+        let (program, output) = source();
+        (
+            RefreshDeclaration::new(&program, output, profile(), coefficients, digits, layouts)
+                .unwrap(),
+            keys,
+        )
+    }
+
+    #[test]
+    fn mask_program_has_two_unscaled_family_sums() {
+        let (declaration, keys) = declaration(3, 2);
+        let mask = declaration.mask();
+        assert_eq!(mask.members(MaskFamily::Digit), 6);
+        assert_eq!(mask.members(MaskFamily::Parity), 3);
+        let program = mask.program();
         assert_eq!(
-            declaration.validate_prf_outputs(&inputs).unwrap_err(),
+            program.outputs(),
+            &[
+                Operand::Scalar(mask.output(MaskFamily::Digit)),
+                Operand::Scalar(mask.output(MaskFamily::Parity))
+            ]
+        );
+        for family in MaskFamily::ALL {
+            assert!(program.wire_is_unscaled_coefficient_output(mask.output(family)).unwrap());
+        }
+        // Every selector member is one bit of one key, one-hot per bucket.
+        let parameters =
+            mxx_backends::poly::dcrt::params::DCRTPolyParams::new(16, 1, 17, 4, None, None);
+        let selectors = mask
+            .selector_plaintexts::<mxx_backends::poly::dcrt::poly::DCRTPoly>(
+                &parameters,
+                [&keys[0], &keys[1]],
+            )
+            .unwrap();
+        assert_eq!(selectors.len(), program.rhs_inputs().len());
+        assert!(
+            mask.selector_plaintexts::<mxx_backends::poly::dcrt::poly::DCRTPoly>(
+                &parameters,
+                [&keys[1], &keys[0]],
+            )
+            .is_err(),
+            "keys of other layouts are rejected"
+        );
+    }
+
+    /// Counts the lowered operations of a Program symbolically: each body
+    /// is lowered once, so the counts are those of the graph, not of the
+    /// members.
+    #[derive(Default)]
+    struct Counter {
+        site: Option<crate::program::LoweringSite>,
+        bodies: usize,
+        products: usize,
+        luts: usize,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("counter")]
+    struct CounterError;
+
+    impl crate::program::ExponentLUTProgramLowering for Counter {
+        type Wire = ();
+        type Rhs = ();
+        type Error = CounterError;
+        fn add(&mut self, _: &(), _: &()) -> Result<(), CounterError> {
+            Ok(())
+        }
+        fn mul_public(&mut self, _: &(), _: &()) -> Result<(), CounterError> {
+            Ok(())
+        }
+        fn mul_private(&mut self, _: &(), _: &()) -> Result<(), CounterError> {
+            self.products += 1;
+            Ok(())
+        }
+        fn lut(&mut self, _: &(), _: &LutTable) -> Result<(), CounterError> {
+            self.luts += 1;
+            Ok(())
+        }
+    }
+
+    impl crate::program::ProgramLoweringContext for Counter {
+        fn replace_site(
+            &mut self,
+            site: Option<crate::program::LoweringSite>,
+        ) -> Option<crate::program::LoweringSite> {
+            std::mem::replace(&mut self.site, site)
+        }
+    }
+
+    struct Families;
+
+    impl crate::program::FamilyExecution<Counter> for Families {
+        type WireFamily = ();
+        type RhsFamily = ();
+        fn wire_at(
+            &mut self,
+            _: &(),
+            _: &IntExpr,
+        ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
+            Ok(())
+        }
+        fn rhs_at(
+            &mut self,
+            _: &(),
+            _: &IntExpr,
+        ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
+            Ok(())
+        }
+        fn parallel(
+            &mut self,
+            evaluator: &mut Counter,
+            _: &FamilyRange,
+            body: impl FnOnce(
+                &mut Self,
+                &mut Counter,
+                IntExpr,
+            )
+                -> Result<(), crate::program::ProgramLowerError<CounterError>>,
+        ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
+            evaluator.bodies += 1;
+            body(self, evaluator, IntExpr::LoopIndex(0))
+        }
+        fn sum(
+            &mut self,
+            _: &mut Counter,
+            _: &(),
+        ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
+            Ok(())
+        }
+    }
+
+    fn counts(program: &ExponentLutProgram) -> (usize, usize, usize) {
+        let mut environment = crate::program::Environment::new();
+        for (wire, declaration) in program.inputs() {
+            let binding = match declaration.shape() {
+                InputBinding::Scalar(()) => InputBinding::Scalar(()),
+                InputBinding::Family(_) => InputBinding::Family(()),
+            };
+            environment.bind_wire(*wire, binding).unwrap();
+        }
+        for (rhs, shape) in program.rhs_inputs() {
+            let binding = match shape {
+                InputBinding::Scalar(()) => InputBinding::Scalar(()),
+                InputBinding::Family(_) => InputBinding::Family(()),
+            };
+            environment.bind_rhs(*rhs, binding).unwrap();
+        }
+        let mut counter = Counter::default();
+        crate::program::lower_program(program, &mut counter, &mut Families, &mut environment)
+            .unwrap();
+        (counter.bodies, counter.products, counter.luts)
+    }
+
+    #[test]
+    fn mask_program_graph_does_not_grow_with_members() {
+        let small = counts(declaration(2, 1).0.mask().program());
+        let large = counts(declaration(5, 2).0.mask().program());
+        assert_eq!(small.0, 2, "one root body per family");
+        assert_eq!(small.2, 2, "one LUT per family");
+        assert_eq!(small, large, "only the index tables scale with the members");
+    }
+
+    #[test]
+    fn member_placement_maps_digit_members_to_weighted_coefficients() {
+        let (declaration, _) = declaration(3, 2);
+        let env = mxx_ir_core::ParamEnv::default();
+        let weights = declaration.member_weights(MaskFamily::Digit);
+        assert_eq!(weights, vec![BigUint::from(1u8), BigUint::from(4u8)]);
+        for member in 0..6 {
+            let (coefficient, index) =
+                declaration.member_placement(MaskFamily::Digit, IntExpr::constant(member));
+            assert_eq!(coefficient.evaluate(&env).unwrap(), BigInt::from(member / 2));
+            assert_eq!(index.evaluate(&env).unwrap(), BigInt::from(member % 2));
+        }
+        let (coefficient, index) =
+            declaration.member_placement(MaskFamily::Parity, IntExpr::constant(2));
+        assert_eq!(coefficient.evaluate(&env).unwrap(), BigInt::from(2));
+        assert_eq!(index.evaluate(&env).unwrap(), BigInt::from(0));
+        assert_eq!(declaration.member_weights(MaskFamily::Parity), vec![BigUint::from(1u8)]);
+        assert_eq!(declaration.mask_bound(), BigUint::from(16u8));
+    }
+
+    #[test]
+    fn declaration_rejects_coefficient_and_misshaped_inputs() {
+        let (program, output) = source();
+        let keys = [keys(2, 0), keys(2, 101)];
+        let layouts =
+            keys.map(|keys| keys.into_iter().map(|key| key.public_layout).collect::<Vec<_>>());
+        assert!(
+            RefreshDeclaration::new(&program, output, profile(), 2, 2, layouts.clone()).is_err(),
+            "digit layouts must cover coefficients * digits"
+        );
+        assert!(
+            RefreshDeclaration::new(&program, output, profile(), 2, 1, layouts.clone()).is_ok()
+        );
+        let odd =
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 1, 8).unwrap();
+        assert!(RefreshDeclaration::new(&program, output, odd, 2, 1, layouts.clone()).is_err());
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let table = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    2,
+                    vec![0, 1],
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let coefficient = builder.lut(Operand::Scalar(input), table).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(coefficient)]).unwrap();
+        assert_eq!(
+            RefreshDeclaration::new(&program, coefficient, profile(), 2, 1, layouts).unwrap_err(),
             RefreshError::InvalidSourceOutput
         );
     }
 
     #[test]
-    fn prf_children_must_cover_exactly_the_declared_slots() {
-        let (_, _, declaration) = two_slot_declaration();
-        declaration.validate_prf_slots(&BTreeMap::from([(0, ()), (1, ())])).unwrap();
-        for children in [
-            BTreeMap::from([(0, ())]),
-            BTreeMap::from([(1, ()), (2, ())]),
-            BTreeMap::from([(0, ()), (1, ()), (2, ())]),
-        ] {
-            assert_eq!(
-                declaration.validate_prf_slots(&children).unwrap_err(),
-                RefreshError::InvalidLayout
-            );
-        }
-    }
-
-    #[test]
-    fn prf_outputs_keep_masks_from_their_owner_and_fresh_errors_from_every_slot() {
-        let (_, _, declaration) = two_slot_declaration();
-        let ordered = declaration.prepared().declaration().ordered_outputs().collect::<Vec<_>>();
-        let lower = |slot: usize| -> Result<Vec<(WireId, (usize, usize))>, RefreshError> {
-            Ok(ordered
-                .iter()
-                .enumerate()
-                .map(|(index, (_, wire))| (*wire, (slot, index)))
-                .collect())
-        };
-        let mut calls = Vec::new();
-        let outputs = declaration
-            .collect_prf_outputs(|slot| {
-                calls.push(slot);
-                lower(slot)
-            })
-            .unwrap();
-        assert_eq!(calls, vec![0, 1]);
-        assert_eq!(outputs.len(), ordered.len());
-        let mut kinds = (0, 0);
-        for (index, (label, _)) in ordered.iter().enumerate() {
-            let expected = match declaration.labels().label(index).unwrap() {
-                RefreshPrfLabel::Mask { slot, .. } => {
-                    kinds.0 += 1;
-                    BTreeMap::from([(slot, (slot, index))])
-                }
-                RefreshPrfLabel::FreshError { .. } => {
-                    kinds.1 += 1;
-                    BTreeMap::from([(0, (0, index)), (1, (1, index))])
-                }
-            };
-            assert_eq!(outputs[*label], expected);
-        }
-        assert!(kinds.0 > 0 && kinds.1 > 0);
-    }
-
-    #[test]
-    fn prf_outputs_reject_a_wrong_count_or_wire() {
-        let (_, _, declaration) = two_slot_declaration();
-        let ordered = declaration
-            .prepared()
-            .declaration()
-            .ordered_outputs()
-            .map(|(_, wire)| wire)
-            .collect::<Vec<_>>();
-        let short = declaration.collect_prf_outputs(|_| {
-            Ok::<_, RefreshError>(ordered.iter().skip(1).map(|wire| (*wire, ())).collect())
-        });
-        assert_eq!(short.unwrap_err(), RefreshError::PrfOutputMismatch);
-        let shifted = declaration.collect_prf_outputs(|slot| {
-            Ok::<_, RefreshError>(
-                ordered
-                    .iter()
-                    .map(|wire| (if slot == 1 { WireId(wire.0 + 1) } else { *wire }, ()))
-                    .collect(),
-            )
-        });
-        assert_eq!(shifted.unwrap_err(), RefreshError::PrfOutputMismatch);
-    }
-
-    #[test]
-    fn crt_weights_are_the_crt_idempotents() {
-        let (_, _, declaration) = two_slot_declaration();
-        // Q = 15: 5 * (5^-1 mod 3) = 10 and 3 * (3^-1 mod 5) = 6.
-        assert_eq!(declaration.crt_weight(0).unwrap(), BigUint::from(10u8));
-        assert_eq!(declaration.crt_weight(1).unwrap(), BigUint::from(6u8));
-        assert_eq!(declaration.crt_weight(2).unwrap_err(), RefreshError::InvalidLayout);
-    }
-
-    #[test]
-    fn refresh_declaration_freezes_exact_prf_outputs() {
-        let (source, source_output, declaration) = test_declaration();
-        let prf_labels = declaration.prf_labels().to_vec();
-        assert_eq!(declaration.prf_labels(), prf_labels.as_slice());
-        assert_eq!(declaration.slots()[0].slot, 0);
-        assert_eq!(declaration.source_program(), source.id());
-        assert_eq!(declaration.source_output(), source_output);
-        assert_eq!(declaration.output_schema(), &[WireType::Int]);
-        assert_eq!(declaration.moment_policy(), &NoiseMomentPolicy::Continuous);
-        assert_ne!(declaration.commitment(), &[0; 32]);
-
+    fn fit_mask_digits_grows_until_the_range_hides_the_noise() {
+        let base = BigUint::from(4u8);
+        let error = |digits: usize| Ok(BigUint::from(3u8 + digits as u8));
+        // 2 * 1 * error * 2^2 = 32..: base^3 = 64 >= 2 * 6 * 4 = 48.
+        let (digits, bound) =
+            fit_mask_digits(&base, &BigUint::one(), 2, &BigUint::from(1000u32), error).unwrap();
+        assert_eq!((digits, bound), (3, BigUint::from(6u8)));
         assert_eq!(
-            RefreshDeclaration::new(
-                &source,
-                source_output,
-                vec![WireType::Int],
-                declaration.slots().to_vec(),
-                RefreshDigitPlan { base: 4, mask_counts: vec![1], fresh_count: 1 },
-                declaration.labels().clone(),
-                declaration.prepared().clone(),
-                declaration.target_level(),
-                declaration.moment_policy().clone(),
-            )
-            .unwrap_err(),
-            RefreshError::InvalidLayout
+            fit_mask_digits(&base, &BigUint::one(), 2, &BigUint::from(140u8), error).unwrap_err(),
+            RefreshError::MaskRange,
+            "64 + 6 = 70 does not fit below 140 / 2"
         );
-
-        let duplicate = RefreshDeclaration::new(
-            &source,
-            source_output,
-            vec![WireType::Int],
-            declaration.slots().to_vec(),
-            declaration.digits().clone(),
-            declaration.labels().clone(),
-            declaration.prepared().clone(),
-            declaration.target_level(),
-            declaration.moment_policy().clone(),
-        )
-        .unwrap();
-        assert_eq!(declaration.commitment(), duplicate.commitment());
-    }
-
-    #[test]
-    fn refresh_declaration_rejects_non_coprime_or_nondividing_moduli() {
-        let topology = RefreshTranscriptTopology {
-            crt_slot_count: 2,
-            component_columns: 1,
-            coefficient_count: 1,
-            mask_digit_counts: vec![1, 1],
-            fresh_digit_count: 1,
-        };
-        let labels = RefreshPrfLabelIndex::new([5; 32], &topology).unwrap();
-        let (source, source_output) = source_program();
-        let invalid = validate_modulus_relations(&[
-            RefreshSlot { slot: 0, q: 20.into(), p: 10.into(), q_t: 2.into() },
-            RefreshSlot { slot: 1, q: 30.into(), p: 10.into(), q_t: 4.into() },
-        ]);
-        assert_eq!(invalid, Err(RefreshError::InvalidModulusRelation));
-        assert_eq!(
-            validate_modulus_relations(&[RefreshSlot {
-                slot: 0,
-                q: 10.into(),
-                p: 10.into(),
-                q_t: 2.into(),
-            }]),
-            Err(RefreshError::InvalidModulusRelation)
-        );
-        let parameters = crate::program_gadgets::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
-        let generated = (0..32_u8)
-            .find_map(|seed| {
-                crate::program_gadgets::pbc::generate_key_layout(
-                    &parameters,
-                    crate::program_gadgets::pbc::PbcRootSeed([seed; 32]),
-                    &[0, 1],
-                )
-                .ok()
-            })
-            .expect("toy setup must find a PBC schedule");
-        let profile = crate::program_gadgets::prf::SparseLwrPrfProfile::new(
-            crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
-            1,
-            3,
-        )
-        .unwrap();
-        let prf_labels = labels.prf_labels().unwrap().to_vec();
-        let sparse = crate::program_gadgets::prf::SparseLwrPrfProgram::new(
-            profile,
-            vec![generated.public_layout.clone(); prf_labels.len()],
-            prf_labels,
-        )
-        .unwrap();
-        let prepared = PreparedSparseLwrPrf::new(sparse, [9; 32]).unwrap();
-        assert_eq!(
-            RefreshDeclaration::new(
-                &source,
-                source_output,
-                vec![WireType::Int],
-                vec![
-                    RefreshSlot { slot: 0, q: 20.into(), p: 10.into(), q_t: 2.into() },
-                    RefreshSlot { slot: 1, q: 30.into(), p: 10.into(), q_t: 4.into() },
-                ],
-                RefreshDigitPlan { base: 2, mask_counts: vec![1, 1], fresh_count: 1 },
-                labels,
-                prepared,
-                0,
-                NoiseMomentPolicy::Continuous,
-            )
-            .unwrap_err(),
-            RefreshError::InvalidModulusRelation
-        );
-    }
-
-    #[test]
-    fn refresh_declaration_rejects_incomplete_label_topology() {
-        let topology = RefreshTranscriptTopology {
-            crt_slot_count: 1,
-            component_columns: 1,
-            coefficient_count: 1,
-            mask_digit_counts: vec![1],
-            fresh_digit_count: 1,
-        };
-        let labels = RefreshPrfLabelIndex::new([4; 32], &topology).unwrap();
-        let parameters = crate::program_gadgets::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
-        let generated = (0..32_u8)
-            .find_map(|seed| {
-                crate::program_gadgets::pbc::generate_key_layout(
-                    &parameters,
-                    crate::program_gadgets::pbc::PbcRootSeed([seed; 32]),
-                    &[0, 1],
-                )
-                .ok()
-            })
-            .expect("toy setup must find a PBC schedule");
-        let profile = crate::program_gadgets::prf::SparseLwrPrfProfile::new(
-            crate::program::ExpLayout { stride_log2: 1, width_log2: 5 },
-            1,
-            3,
-        )
-        .unwrap();
-        let prf_labels = [PrfLabel::from_components(&[b"foreign"]).unwrap()].to_vec();
-        let sparse = crate::program_gadgets::prf::SparseLwrPrfProgram::new(
-            profile,
-            vec![generated.public_layout.clone(); prf_labels.len()],
-            prf_labels,
-        )
-        .unwrap();
-        let prepared = PreparedSparseLwrPrf::new(sparse, [9; 32]).unwrap();
-        let (source, source_output) = source_program();
-        assert!(
-            RefreshDeclaration::new(
-                &source,
-                source_output,
-                vec![WireType::Int],
-                vec![RefreshSlot { slot: 0, q: 20.into(), p: 10.into(), q_t: 2.into() }],
-                RefreshDigitPlan { base: 2, mask_counts: vec![1], fresh_count: 1 },
-                labels,
-                prepared,
-                0,
-                NoiseMomentPolicy::Continuous,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn prf_labels_cover_all_public_key_columns_with_separate_digit_groups() {
-        let index = RefreshPrfLabelIndex::new(
-            [7; 32],
-            &crate::noise_refresh::simulation::RefreshTranscriptTopology {
-                crt_slot_count: 2,
-                component_columns: 6,
-                coefficient_count: 2,
-                mask_digit_counts: vec![3; 2],
-                fresh_digit_count: 1,
-            },
-        )
-        .expect("label index");
-        let mask_group = 6 * 2 * 3;
-        let fresh_group = 6 * 2;
-        assert_eq!(index.len(), 2 * mask_group + fresh_group);
-        for flat in 0..index.len() {
-            let label = index.label(flat).expect("label");
-            assert_eq!(index.index_of(label), Some(flat));
-            match label {
-                RefreshPrfLabel::Mask { component, digit, .. } => {
-                    assert!(component < 6);
-                    assert!(digit < 3);
-                }
-                RefreshPrfLabel::FreshError { component, digit, .. } => {
-                    assert!(component < 6);
-                    assert!(digit < 1);
-                }
-            }
-        }
-        assert!(matches!(index.label(2 * mask_group), Some(RefreshPrfLabel::FreshError { .. })));
-        assert!(
-            index
-                .index_of(RefreshPrfLabel::Mask {
-                    refresh_id: [7; 32],
-                    slot: 0,
-                    component: 6,
-                    coefficient: 0,
-                    digit: 0,
-                })
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn prf_label_boundaries_are_mixed_radix_for_varying_family_shapes() {
-        for (slot_count, component_count, coefficient_count, dm, de) in
-            [(2, 2, 1, 3, 1), (3, 4, 2, 1, 3), (2, 6, 3, 2, 4)]
-        {
-            let index = RefreshPrfLabelIndex::new(
-                [0x31; 32],
-                &crate::noise_refresh::simulation::RefreshTranscriptTopology {
-                    crt_slot_count: slot_count,
-                    component_columns: component_count,
-                    coefficient_count,
-                    mask_digit_counts: vec![dm; slot_count],
-                    fresh_digit_count: de,
-                },
-            )
-            .expect("mixed-radix label index");
-            let mask_group = component_count * coefficient_count * dm;
-            let fresh_group = component_count * coefficient_count * de;
-            let fresh_start = slot_count * mask_group;
-            assert_eq!(index.len(), fresh_start + fresh_group);
-            for slot in 0..slot_count {
-                for component in 0..component_count {
-                    for coefficient in 0..coefficient_count {
-                        for digit in 0..dm {
-                            let flat = ((slot * component_count + component) * coefficient_count +
-                                coefficient) *
-                                dm +
-                                digit;
-                            assert!(
-                                matches!(index.label(flat), Some(RefreshPrfLabel::Mask { slot: s, component: c, coefficient: n, digit: d, .. }) if s == slot && c == component && n == coefficient && d == digit)
-                            );
-                            assert_eq!(index.index_of(index.label(flat).unwrap()), Some(flat));
-                        }
-                    }
-                }
-            }
-            for component in 0..component_count {
-                for coefficient in 0..coefficient_count {
-                    for digit in 0..de {
-                        let offset = (component * coefficient_count + coefficient) * de + digit;
-                        let flat = fresh_start + offset;
-                        assert!(
-                            matches!(index.label(flat), Some(RefreshPrfLabel::FreshError { component: c, coefficient: n, digit: d, .. }) if c == component && n == coefficient && d == digit)
-                        );
-                        assert_eq!(index.index_of(index.label(flat).unwrap()), Some(flat));
-                    }
-                }
-            }
-            assert!(index.label(fresh_start - 1).is_some());
-            assert!(matches!(index.label(fresh_start), Some(RefreshPrfLabel::FreshError { .. })));
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefreshDigitPlan {
-    pub base: usize,
-    pub mask_counts: Vec<usize>,
-    pub fresh_count: usize,
-}
-
-#[derive(Debug, Error)]
-pub enum DigitPlanError {
-    #[error("native LWR requires a power-of-two digit base and nonempty support requirements")]
-    Parameters,
-    #[error("the mask interval and exposed error do not fit the CRT spacing")]
-    MaskRange,
-    #[error("the requested fresh digit distribution exceeds the next-state error budget")]
-    FreshRange,
-}
-
-/// Return the affine offset for positive canonical digits `1..=base`.
-///
-/// For `count = d`, the unshifted positional sum is the interval
-/// `S_d..base*S_d`, where `S_d = (base^d - 1)/(base - 1)`.  Mask digits are
-/// centered with `-S_d - base^d/2`; fresh digits retain their native signed
-/// representatives with `-(base/2)*S_d`.  The scheme applies any channel
-/// factor such as `H` after this common offset; callers must not supply a
-/// pre-scaled offset.
-pub(crate) fn canonical_digit_offset(
-    base: &BigUint,
-    count: usize,
-    mask: bool,
-) -> Result<BigInt, DigitPlanError> {
-    if *base < BigUint::from(2u8) || base % 2u8 != BigUint::zero() || count == 0 {
-        return Err(DigitPlanError::Parameters);
-    }
-    let support = (0..count).fold(BigUint::one(), |value, _| value * base);
-    let digit_sum = (&support - 1u8) / (base - 1u8);
-    let offset = if mask {
-        -BigInt::from(digit_sum) - BigInt::from(&support / 2u8)
-    } else {
-        -BigInt::from(base / 2u8) * BigInt::from(digit_sum)
-    };
-    Ok(offset)
-}
-
-/// Physical payload moments conditional on independent uniform native digits.
-/// `mask` centers their consecutive support; fresh digits retain the native
-/// signed representatives. Parameters establish a positive count and even base.
-pub(crate) fn native_digit_uniform_moments(
-    base: &BigUint,
-    count: usize,
-    mask: bool,
-) -> NoiseMoments {
-    let support = (0..count).fold(BigUint::one(), |value, _| value * base);
-    let digit_sum = (&support - 1u8) / (base - 1u8);
-    let offset = canonical_digit_offset(base, count, mask)
-        .expect("native digit moment parameters must be a positive even base");
-    let lower = offset + BigInt::from(digit_sum);
-    NoiseMoments::uniform_interval(lower, support)
-}
-
-impl RefreshDigitPlan {
-    /// Smallest positive digit counts covering the requested support sizes.
-    /// Public parameter selection uses exact products rather than float logs.
-    pub fn new(
-        base: usize,
-        mask_supports: &[BigUint],
-        fresh_support: &BigUint,
-    ) -> Result<Self, DigitPlanError> {
-        if base < 2 ||
-            !base.is_power_of_two() ||
-            mask_supports.is_empty() ||
-            mask_supports.iter().any(BigUint::is_zero) ||
-            fresh_support.is_zero()
-        {
-            return Err(DigitPlanError::Parameters);
-        }
-        let count = |required: &BigUint| {
-            let mut support = BigUint::from(base);
-            let mut digits = 1;
-            while &support < required {
-                support *= base;
-                digits += 1;
-            }
-            digits
-        };
-        Ok(Self {
-            base,
-            mask_counts: mask_supports.iter().map(count).collect(),
-            fresh_count: count(fresh_support),
-        })
-    }
-
-    pub fn weights(&self, count: usize) -> Vec<BigUint> {
-        let mut weight = BigUint::one();
-        (0..count)
-            .map(|_| {
-                let value = weight.clone();
-                weight *= self.base;
-                value
-            })
-            .collect()
-    }
-
-    pub fn support(&self, count: usize) -> BigUint {
-        (0..count).fold(BigUint::one(), |value, _| value * self.base)
-    }
-
-    /// Native integer digit representatives are [1-p/2, p/2]. This preserves
-    /// their actual support and mean; it is not a centered-binomial sampler.
-    pub fn fresh_interval(&self) -> (BigInt, BigInt) {
-        let sum = (self.support(self.fresh_count) - 1u8) / (self.base - 1);
-        let upper = BigInt::from(&sum * (self.base / 2));
-        let lower = BigInt::from(sum) * (BigInt::one() - BigInt::from(self.base / 2));
-        (lower, upper)
-    }
-
-    /// Conditional on distinct native PRF digits being independent and uniform.
-    /// Positional digits enumerate one consecutive interval bijectively. This
-    /// describes one fresh source shared across CRT channels, not one per slot.
-    pub fn fresh_uniform_moments(&self) -> NoiseMoments {
-        native_digit_uniform_moments(&self.base.into(), self.fresh_count, false)
-    }
-
-    /// Conditional uniform centered mask model, with physical mean -1/2.
-    pub fn mask_uniform_moments(&self, slot: usize) -> NoiseMoments {
-        native_digit_uniform_moments(&self.base.into(), self.mask_counts[slot], true)
-    }
-
-    /// Solve the mask-width/error fixed point at a fixed output modulus.
-    /// The supplied error function includes all digit emissions and the
-    /// decoder; the arithmetic scheme supplies those bounds, not this planner.
-    pub fn fit_masks(
-        &mut self,
-        spacings: &[BigUint],
-        observations: &BigUint,
-        statistical_bits: usize,
-        fresh_bound: &BigUint,
-        exposed_errors: impl Fn(&Self) -> Result<Vec<BigUint>, DigitPlanError>,
-    ) -> Result<Vec<BigUint>, DigitPlanError> {
-        if spacings.len() != self.mask_counts.len() || observations.is_zero() {
-            return Err(DigitPlanError::Parameters);
-        }
-        let (lower, upper) = self.fresh_interval();
-        if lower.magnitude().max(upper.magnitude()) > fresh_bound {
-            return Err(DigitPlanError::FreshRange);
-        }
-        loop {
-            let errors = exposed_errors(self)?;
-            if errors.len() != spacings.len() {
-                return Err(DigitPlanError::Parameters);
-            }
-            let mut changed = false;
-            for index in 0..spacings.len() {
-                let required = (observations * &errors[index] * 2u8) << statistical_bits;
-                let mut support = self.support(self.mask_counts[index]);
-                while support < required {
-                    support *= self.base;
-                    self.mask_counts[index] += 1;
-                    changed = true;
-                }
-                if support + &errors[index] * 2u8 >= spacings[index] {
-                    return Err(DigitPlanError::MaskRange);
-                }
-            }
-            if !changed {
-                return Ok(errors);
-            }
-        }
-    }
-
-    pub fn topology(
-        &self,
-        component_columns: usize,
-        coefficient_count: usize,
-    ) -> Result<super::simulation::RefreshTranscriptTopology, super::simulation::NoiseSimulationError>
-    {
-        super::simulation::RefreshTranscriptTopology::new(
-            component_columns,
-            coefficient_count,
-            self.mask_counts.clone(),
-            self.fresh_count,
-        )
-    }
-}
-
-#[cfg(test)]
-mod digit_tests {
-    use super::*;
-
-    #[test]
-    fn test_digit_plan_nonbinary_support_offsets_and_counts() {
-        let plan = RefreshDigitPlan::new(4, &[16u8.into(), 17u8.into()], &5u8.into()).unwrap();
-        assert_eq!(plan.mask_counts, vec![2, 3]);
-        assert_eq!(plan.fresh_count, 2);
-        assert_eq!(plan.weights(3), vec![1u8.into(), 4u8.into(), 16u8.into()]);
-        assert_eq!(plan.fresh_interval(), ((-5).into(), 10.into()));
-        assert_eq!(
-            canonical_digit_offset(&BigUint::from(plan.base), 2, true).unwrap(),
-            (-13).into()
-        );
-        assert_eq!(
-            canonical_digit_offset(&BigUint::from(plan.base), 2, false).unwrap(),
-            (-10).into()
-        );
-        // Enumerate the actual independent digit distribution as an oracle.
-        let sums = (-1..=2)
-            .flat_map(|low| (-1..=2).map(move |high| low + 4 * high))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(sums, (-5..=10).collect());
-        let moments = plan.fresh_uniform_moments();
-        let count = BigInt::from(sums.len());
-        let sum: BigInt = sums.iter().copied().map(BigInt::from).sum();
-        let squares: BigInt = sums.iter().map(|value| BigInt::from(value * value)).sum();
-        assert_eq!(
-            &moments.mean_numerator * &count,
-            &sum * BigInt::from(moments.mean_denominator.clone()),
-        );
-        assert_eq!(
-            BigInt::from(moments.variance.numerator) * &count * &count,
-            (squares * count - &sum * &sum) * BigInt::from(moments.variance.denominator),
-        );
-        for slot in 0..plan.mask_counts.len() {
-            let mask = plan.mask_uniform_moments(slot);
-            assert_eq!(mask.mean_numerator, (-1).into());
-            assert_eq!(mask.mean_denominator, 2u8.into());
-            let support = plan.support(plan.mask_counts[slot]);
-            assert_eq!(
-                mask.variance.scaled(&12u8.into()),
-                crate::noise_utils::NonnegativeRational::new(
-                    &support * &support - 1u8, 1u8.into(),
-                ).unwrap(),
-            );
-        }
-    }
-
-    #[test]
-    fn canonical_offsets_match_exhaustive_positive_digit_moments() {
-        fn positive_digit_sums(base: usize, count: usize) -> std::collections::BTreeSet<BigInt> {
-            let mut sums = std::collections::BTreeSet::from([BigInt::zero()]);
-            let mut weight = BigInt::one();
-            for _ in 0..count {
-                let current_weight = weight.clone();
-                let mut next = std::collections::BTreeSet::new();
-                for sum in &sums {
-                    for digit in 1..=base {
-                        next.insert(sum + &current_weight * BigInt::from(digit));
-                    }
-                }
-                sums = next;
-                weight *= base;
-            }
-            sums
-        }
-
-        for base in [2usize, 4, 8] {
-            for count in [1usize, 2] {
-                let positive = positive_digit_sums(base, count);
-                let support = BigUint::from(base).pow(count as u32);
-                assert_eq!(BigUint::from(positive.len()), support);
-                for mask in [true, false] {
-                    let offset = canonical_digit_offset(&BigUint::from(base), count, mask).unwrap();
-                    let values = positive
-                        .iter()
-                        .map(|value| value + &offset)
-                        .collect::<std::collections::BTreeSet<_>>();
-                    let moments = native_digit_uniform_moments(&BigUint::from(base), count, mask);
-                    let cardinality = BigInt::from(values.len());
-                    let sum: BigInt = values.iter().cloned().sum();
-                    let squares: BigInt = values.iter().map(|value| value * value).sum();
-                    assert_eq!(
-                        &moments.mean_numerator * &cardinality,
-                        &sum * BigInt::from(moments.mean_denominator.clone()),
-                    );
-                    let centered = squares * &cardinality - &sum * &sum;
-                    assert_eq!(
-                        BigInt::from(moments.variance.numerator.clone()) *
-                            &cardinality *
-                            &cardinality,
-                        centered * BigInt::from(moments.variance.denominator.clone()),
-                    );
-                    let first = values.first().unwrap();
-                    let last = values.last().unwrap();
-                    assert_eq!(last - first + 1u8, cardinality);
-                    if base == 2 && count == 1 {
-                        assert_eq!(
-                            values,
-                            if mask {
-                                std::collections::BTreeSet::from([BigInt::from(-1), BigInt::zero()])
-                            } else {
-                                std::collections::BTreeSet::from([BigInt::zero(), BigInt::one()])
-                            }
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_digit_plan_recomputes_error_after_mask_count_growth() {
-        let mut plan = RefreshDigitPlan::new(16, &[1u8.into()], &17u8.into()).unwrap();
-        let result = plan
-            .fit_masks(&[BigUint::from(1u8) << 64], &16u8.into(), 8, &200u8.into(), |current| {
-                Ok(vec![BigUint::from(current.mask_counts[0] + current.fresh_count)])
-            })
-            .unwrap();
-        assert_eq!(result[0], BigUint::from(plan.mask_counts[0] + plan.fresh_count));
-        assert!(plan.support(plan.mask_counts[0]) >= (&result[0] * 32u8) << 8);
-        assert!(plan.support(plan.mask_counts[0] - 1) < (&result[0] * 32u8) << 8);
     }
 }

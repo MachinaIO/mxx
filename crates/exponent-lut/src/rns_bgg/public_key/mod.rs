@@ -3,28 +3,25 @@
 
 use super::*;
 use crate::{
-    api::{
-        ApiError, PlaintextInputs, PreprocessBuild, RefreshApplicationError, StageGraph,
-        apply_refresh,
-    },
-    noise_refresh::refresh::{NoiseRefresh, RefreshError, RefreshPrfLabel},
+    api::{ApiError, PlaintextInputs, PreprocessBuild, StageArtifacts, StageGraph, apply_refresh},
+    noise_refresh::refresh::{NoiseRefresh, RefreshError},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
-        GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, ProgramLoweringContext,
-        RhsId, RhsRef, WireId, lower_program,
+        GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, Operand,
+        ProgramLoweringContext, RhsId, RhsRef, WireId, lower_program,
     },
-    program_gadgets::prf::PrfLabel,
 };
 use mxx_backends::{RuntimeValue, poly::Poly};
-use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
+use mxx_dsl::{
+    Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat, Preimage, Trapdoor,
+};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
     artifact::{ArtifactAvailability, Manifest, ProductionId},
-    node::ConstantMatrix,
     types::WireType,
 };
 use num_bigint::BigInt;
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -37,7 +34,11 @@ mod preprocess;
 mod refresh;
 mod sampling;
 
-pub(super) use self::{lowering::*, refresh::*, sampling::*};
+use self::refresh::import_decoder_trapdoor;
+pub use self::refresh::sample_refresh_decoder;
+pub(super) use self::{lowering::*, sampling::*};
+#[cfg(test)]
+use mxx_ir_core::node::ConstantMatrix;
 
 /// Public-key carrier paired with its validated Program wire.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -108,10 +109,10 @@ pub struct PublicKeyLowering<'a> {
     /// The Static payload secret; Dynamic preprocessing has none.
     pub(crate) payload_secret: Option<RnsBggPayloadSecret>,
     pub(crate) hash_key: Bytes,
-    /// Setup context and, for a prepared PRF child, its refresh declaration
-    /// and slot: the public namespace of Dynamic digit-companion keys.
+    /// Setup context and, for a refresh mask child, its refresh declaration:
+    /// the public namespace of Dynamic digit-companion keys.
     pub(crate) context: [u8; 32],
-    pub(crate) refresh_prf_namespace: Option<([u8; 32], usize)>,
+    pub(crate) refresh_mask: Option<Arc<RefreshDeclaration>>,
     /// RHS plaintexts, read from graph inputs; a family is read member by
     /// member.
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
@@ -122,17 +123,10 @@ pub struct PublicKeyLowering<'a> {
     /// identity.  The family member is the concrete automorphism branch.
     pub(crate) lut_material:
         BTreeMap<(usize, usize, crate::program::LutId, ExpLayout), Family<RnsBggMatrix>>,
-    /// Refresh targets and compact actions, keyed by declaration commitment
-    /// and CRT slot.  Keeping the commitment in the key prevents material
-    /// from one refresh declaration being reused by another invocation.
-    pub(crate) refresh_sums: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
-    pub(crate) refresh_stars: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
-    pub(crate) refresh_targets: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
-    pub(crate) refresh_label_targets: BTreeMap<([u8; 32], usize, usize), RnsBggMatrix>,
-    /// Dynamic refresh keys encryption consumes to form `A_sum`, keyed by
-    /// declaration commitment, slot, and label: the source key (`None`) and
-    /// each label's child-PRF output key.
-    pub(crate) refresh_keys: BTreeMap<([u8; 32], usize, Option<usize>), RnsBggMatrix>,
+    /// The decoder of a composed refresh: its declaration commitment, the
+    /// preimage `K` of the summed key, and the public `B` it is a preimage
+    /// under.
+    pub(crate) refresh_decoder: Option<([u8; 32], Preimage, Mat)>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Open parallel bodies, outermost first: each one's instance count and
     /// member index, and the RHS family members it prepared.
@@ -157,9 +151,12 @@ pub struct RnsPreprocessBuild<'a> {
         Environment<RnsBggPublicKey, RhsRef<Int>, PreprocessWireFamily, Family<RhsRef<Int>>>,
     runtime: BTreeMap<String, RuntimeValue>,
     refresh_declaration: Option<crate::noise_refresh::refresh::RefreshDeclaration>,
-    pending_refresh: Option<(usize, RnsBggPublicKey)>,
-    refresh_prf_binding: Option<([u8; 32], usize, ExponentLutProgramId, [u8; 32])>,
-    refresh_prf_children: BTreeMap<usize, PublicKeyLowering<'a>>,
+    /// The lowered mask Program child of the applied refresh, whose public
+    /// material this stage publishes under the refresh namespace.
+    refresh_mask_child: Option<PublicKeyLowering<'a>>,
+    /// The trusted decoder setup production the applied refresh imports,
+    /// with its manifest and preimage coefficient bound.
+    refresh_setup: Option<(ProductionId, Manifest, BigUint)>,
 }
 
 #[cfg(test)]

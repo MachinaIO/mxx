@@ -214,10 +214,8 @@ pub fn audit_program_at_crt_depth(
     )
     .map_err(|_| "unsupported prime pool".to_owned())?;
     let primes = pool.to_crt().0;
-    // A refresh source keeps two successors beyond its last LUT level, used
-    // as `p` and the target q_t product; without both a source whose final
-    // LUT lands at the last logical level cannot follow the production
-    // q -> p -> q_t chain.
+    // A refresh source keeps successors beyond its last LUT level: the level
+    // below it supplies the plaintext modulus `p` of the refreshed output.
     let chain_last = logical_count
         .checked_add(successor_levels)
         .ok_or_else(|| "logical level chain overflows".to_owned())?

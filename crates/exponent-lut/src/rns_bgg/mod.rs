@@ -24,10 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::{
-    noise_refresh::{
-        refresh::{RefreshDeclaration, RefreshError},
-        simulation::{RefreshNoiseParameters, RefreshRouteNoiseGains, RefreshTranscriptTopology},
-    },
+    noise_refresh::refresh::{RefreshDeclaration, RefreshError},
     program::{
         ExponentLUTProgramLowering, ExponentLutProgramId, InputBinding, InputShape, LutId, RhsId,
         WireId,
@@ -37,15 +34,16 @@ use crate::{
 
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineEvalBuild, checkpoint_refreshed_output, decode_output, decode_public_output,
-    resume_refreshed_output, verify_output, verify_refreshed_output,
+    RnsOnlineEvalBuild, decode_output, decode_public_output, verify_output,
 };
 pub use noise::{
     RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound, RnsBggNoiseEvaluator,
     RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameterManifest,
-    RnsBggPlanRequest, RnsNoiseBuild,
+    RnsBggPlanRequest, RnsBggRefreshNoise, RnsNoiseBuild,
 };
-pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
+pub use public_key::{
+    PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild, sample_refresh_decoder,
+};
 pub use workload::RnsBggDerivedWorkload;
 
 /// Name of the graph input carrying the shared 32-byte hash key. A stage
@@ -73,49 +71,25 @@ fn refresh_commitment_hex(commitment: [u8; 32]) -> String {
     commitment.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Build the canonical per-slot refresh artifact path.
-pub(crate) fn refresh_artifact_name(commitment: [u8; 32], slot: usize, role: &str) -> String {
-    format!("refresh/{}/slot/{slot}/{role}", refresh_commitment_hex(commitment))
+/// `refresh/<commitment>/<role>`: the namespace of every artifact of one
+/// refresh declaration.
+pub(crate) fn refresh_artifact_name(commitment: [u8; 32], role: &str) -> String {
+    format!("refresh/{}/{role}", refresh_commitment_hex(commitment))
 }
 
-/// Build the canonical per-slot prepared-PRF artifact path.
-pub(crate) fn refresh_prf_artifact_name(commitment: [u8; 32], slot: usize, role: &str) -> String {
-    refresh_artifact_name(commitment, slot, &format!("prf/{role}"))
+/// `refresh/<commitment>/mask/<role>`: an artifact of the refresh's mask
+/// Program child.
+pub(crate) fn refresh_mask_artifact_name(commitment: [u8; 32], role: &str) -> String {
+    refresh_artifact_name(commitment, &format!("mask/{role}"))
 }
 
-/// Build the canonical prepared-PRF input public-key artifact path.
-pub(crate) fn refresh_prf_input_key_artifact_name(
+/// The public-key artifact `port` of mask Program input `wire`.
+pub(crate) fn refresh_mask_input_key_artifact_name(
     commitment: [u8; 32],
-    slot: usize,
     wire: WireId,
     port: usize,
 ) -> String {
-    refresh_prf_artifact_name(commitment, slot, &format!("input-key/{wire:?}.{port}"))
-}
-
-/// Build the canonical label-specific target-action artifact path.
-///
-/// Label actions are currently target actions; the fixed role is part of this
-/// helper so producer and consumer cannot accidentally diverge.
-pub(crate) fn refresh_label_artifact_name(
-    commitment: [u8; 32],
-    slot: usize,
-    label: usize,
-) -> String {
-    refresh_artifact_name(commitment, slot, &format!("target/{label}"))
-}
-
-/// Build the canonical path of a Dynamic refresh key: the slot's source key
-/// (`label = None`) or a label's child-PRF output key.
-pub(crate) fn refresh_key_artifact_name(
-    commitment: [u8; 32],
-    slot: usize,
-    label: Option<usize>,
-) -> String {
-    match label {
-        None => refresh_artifact_name(commitment, slot, "source-key"),
-        Some(label) => refresh_artifact_name(commitment, slot, &format!("label-key/{label}")),
-    }
+    refresh_mask_artifact_name(commitment, &format!("input-key/{wire:?}.{port}"))
 }
 
 /// Build the canonical path of the switching ciphertexts of LUT `lut`
@@ -130,18 +104,16 @@ pub(crate) fn lut_switching_role(
 }
 
 /// Number `N_i = m_i m_(i+1)` of digit-companion encodings of one Dynamic
-/// ciphertext consumed at `level`: one per digit row and output column.
+/// ciphertext consumed at `level` whose two components have `output_columns`
+/// columns each: one per digit row and output column. An RHS ciphertext has
+/// `component_columns(level + 1)` output columns; a LUT switching
+/// ciphertext has [`RnsBggParameters::lut_output_columns`].
 pub(crate) fn companion_count(
     parameters: &RnsBggParameters,
     level: usize,
+    output_columns: usize,
 ) -> Result<usize, RnsBggError> {
-    let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
-    Ok(4 * parameters.component_columns(level)? * parameters.component_columns(next)?)
-}
-
-/// Build the canonical refresh-checkpoint artifact path.
-pub(crate) fn refresh_checkpoint_artifact_name(commitment: [u8; 32], role: &str) -> String {
-    format!("refresh/{}/{role}", refresh_commitment_hex(commitment))
+    Ok(4 * parameters.component_columns(level)? * output_columns)
 }
 
 /// Errors raised by the retained RNS-BGG contracts.
@@ -367,6 +339,48 @@ impl RnsBggParameters {
         Ok(self.levels.get(level + 1).map_or(1, PolyParams::modulus_digits))
     }
 
+    /// Columns per component of the switching target of a LUT whose switching
+    /// ciphertexts live at `next_level`, and so of its raw output carrier.
+    ///
+    /// A scaled output (`Exponent` or `Coefficient`) uses the state gadget of
+    /// `next_level`, i.e. `component_columns(next_level)`. An
+    /// `UnscaledCoefficient` output uses the full public gadget of
+    /// `next_level`, i.e. its `modulus_digits`: its payload carries no scale
+    /// that could annihilate the multiples of a smaller gadget modulus, so the
+    /// gadget modulus must be the finalized carrier's own (see
+    /// [`Self::lut_switching_target`]).
+    pub fn lut_output_columns(
+        &self,
+        next_level: usize,
+        representation: crate::program::LutOutputRepresentation,
+    ) -> Result<usize, RnsBggError> {
+        match representation {
+            crate::program::LutOutputRepresentation::UnscaledCoefficient => {
+                Ok(self.level(next_level)?.modulus_digits())
+            }
+            _ => self.component_columns(next_level),
+        }
+    }
+
+    /// The scale and gadget of the switching target of a LUT whose switching
+    /// ciphertexts live at `next_level`. A scaled output uses
+    /// `message_scale(next_level)` and `state_gadget(next_level)`; an
+    /// `UnscaledCoefficient` output uses scale 1 and `public_gadget(next_level)`,
+    /// so that after the source-level action (`Delta_l`) and the one
+    /// finalizing ModDown its payload is exactly `v r G_(next_level)`.
+    pub(crate) fn lut_switching_target(
+        &self,
+        next_level: usize,
+        representation: crate::program::LutOutputRepresentation,
+    ) -> Result<(BigUint, Mat), RnsBggError> {
+        match representation {
+            crate::program::LutOutputRepresentation::UnscaledCoefficient => {
+                Ok((BigUint::from(1u8), self.public_gadget(next_level)?))
+            }
+            _ => Ok((self.message_scale(next_level)?, self.state_gadget(next_level)?)),
+        }
+    }
+
     /// Return the number of key columns for a wire with the supplied
     /// attribute knowledge.  Public attributes use the full gadget at their
     /// current modulus; private payloads use the next-level state gadget.
@@ -497,311 +511,11 @@ impl RnsBggParameters {
         self.operations_per_drop
     }
 
-    pub fn refresh_residue_parameters(
-        &self,
-        level: usize,
-    ) -> Result<Vec<DCRTPolyParams>, RnsBggError> {
-        let parameters = self.level(level)?;
-        parameters
-            .to_crt()
-            .0
-            .into_iter()
-            .map(|prime| {
-                parameters
-                    .select_modulus(&BigUint::from(prime))
-                    .ok_or(RnsBggError::Parameters("refresh residue is outside the CRT basis"))
-            })
-            .collect()
-    }
-
-    /// Validate the workload-owned refresh level contract.  The source wire
-    /// determines the physical route: its level is `q`, the immediate next
-    /// level is `p`, and the following level is the CRT-recomposed target.
-    /// This check belongs at production refresh dispatch because deriving a
-    /// noise snapshot alone has no workload from which to resolve the source.
-    pub(crate) fn validate_refresh_level_contract(
-        &self,
-        declaration: &RefreshDeclaration,
-        source_level: usize,
-    ) -> Result<(), RnsBggError> {
-        let p_level = source_level
-            .checked_add(1)
-            .ok_or(RnsBggError::Binding("refresh source level has no q/p/target chain"))?;
-        let target_level = source_level
-            .checked_add(2)
-            .ok_or(RnsBggError::Binding("refresh source level has no q/p/target chain"))?;
-        let source_parameters = self
-            .level(source_level)
-            .map_err(|_| RnsBggError::Binding("refresh source level is not configured"))?;
-        let p_parameters = self
-            .level(p_level)
-            .map_err(|_| RnsBggError::Binding("refresh p level is not configured"))?;
-        let target_parameters = self
-            .level(target_level)
-            .map_err(|_| RnsBggError::Binding("refresh target level is not configured"))?;
-        if declaration.target_level() != target_level {
-            return Err(RnsBggError::Binding("refresh target level is not source+2"));
-        }
-
-        let q = source_parameters.modulus().as_ref().clone();
-        let p = p_parameters.modulus().as_ref().clone();
-        let target_modulus = target_parameters.modulus().as_ref().clone();
-        let mut target_modulus_product = BigUint::one();
-        for slot in declaration.slots() {
-            let declared_q = slot
-                .q
-                .to_biguint()
-                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            let declared_p = slot
-                .p
-                .to_biguint()
-                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            let qt = slot
-                .q_t
-                .to_biguint()
-                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            if declared_q != q || declared_p != p {
-                return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
-            }
-            if declared_q <= declared_p ||
-                &declared_q % &declared_p != BigUint::zero() ||
-                declared_p < qt ||
-                &declared_p % &qt != BigUint::zero()
-            {
-                return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
-            }
-            target_modulus_product *= qt;
-        }
-        if target_modulus_product != target_modulus {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
-        }
-        Ok(())
-    }
-
-    /// Derive the refresh noise contract from the actual RNS-BGG setup.
-    ///
-    /// Every prepared refresh action is decomposed in its slot's `p` ring.
-    /// For an evaluation row with `N` ring coordinates, `D_qp` input/decomposition
-    /// columns, and radix `B`, the conservative coefficient gain is
-    /// `K1 = N*D_qp*B`; the squared-L2 envelope is `K1²`. Label weights are
-    /// split using their canonical positional sums, so the evaluator can apply
-    /// each label's digit/`H` weight exactly once. The decoder gain separately
-    /// envelopes the two `N`-coefficient mask-secret convolutions. The returned
-    /// bias also includes the bounded fresh `eta` sampled by every prepared
-    /// label/data action and the canonical positive-digit offsets.
-    pub fn refresh_noise_parameters(
-        &self,
-        declaration: &RefreshDeclaration,
-    ) -> Result<RefreshNoiseParameters, RnsBggError> {
-        if declaration.slots().is_empty() {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-        }
-        let target_level = declaration.target_level();
-        let target_columns = self.component_columns(target_level)?;
-        let coefficient_count = self.level(target_level)?.ring_dimension() as usize;
-        let target_modulus = self.level(target_level)?.modulus().as_ref().clone();
-        let base = BigUint::from(declaration.digits().base);
-        let mask_counts = declaration.digits().mask_counts.clone();
-        let fresh_count = declaration.digits().fresh_count;
-        if mask_counts.len() != declaration.slots().len() || target_columns == 0 {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-        }
-
-        let mut global_modulus = None;
-        let mut plaintext_moduli = Vec::with_capacity(declaration.slots().len());
-        let mut switch_moduli = Vec::with_capacity(declaration.slots().len());
-        let mut state_scaling = Vec::with_capacity(declaration.slots().len());
-        let mut mask = Vec::with_capacity(declaration.slots().len());
-        let mut fresh = Vec::with_capacity(declaration.slots().len());
-        let mut decoder = Vec::with_capacity(declaration.slots().len());
-        let mut route_bias_bounds = Vec::with_capacity(declaration.slots().len());
-        let coordinate_count = BigUint::from(target_columns) * BigUint::from(coefficient_count);
-        let mut target_modulus_product = BigUint::one();
-
-        for (slot, metadata) in declaration.slots().iter().enumerate() {
-            let q = metadata
-                .q
-                .to_biguint()
-                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            let p = metadata
-                .p
-                .to_biguint()
-                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            let qt = metadata
-                .q_t
-                .to_biguint()
-                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            if q <= p || &q % &p != BigUint::zero() || p < qt || &p % &qt != BigUint::zero() {
-                return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
-            }
-            if let Some(expected) = &global_modulus {
-                if expected != &q {
-                    return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
-                }
-            } else {
-                global_modulus = Some(q.clone());
-            }
-            let q_level = self
-                .levels
-                .iter()
-                .position(|level| level.modulus().as_ref() == &q)
-                .ok_or(RnsBggError::Binding("refresh q modulus is not configured"))?;
-            let p_level = q_level
-                .checked_add(1)
-                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            let p_parameters = self.level(p_level).map_err(|_| {
-                RnsBggError::Binding("refresh p modulus is not the immediate q state level")
-            })?;
-            if p_parameters.modulus().as_ref() != &p {
-                return Err(RnsBggError::Binding(
-                    "refresh p modulus is not the immediate q state level",
-                ));
-            }
-            let decomposition_width = p_parameters.modulus_digits();
-            if self.component_columns(q_level)? != decomposition_width {
-                return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-            }
-            let decomposition_base = BigUint::one() << p_parameters.base_bits();
-            let k1 = BigUint::from(p_parameters.ring_dimension()) *
-                BigUint::from(decomposition_width) *
-                &decomposition_base;
-            let k2_squared = k1.pow(2u32);
-            let single_action_gain = crate::noise_utils::RightActionNoiseGain {
-                l1: k1.clone(),
-                l2_squared: k2_squared.clone(),
-            };
-            state_scaling.push(single_action_gain);
-            let decoder_l1 = BigUint::from(p_parameters.ring_dimension()) * 2u8;
-            decoder.push(crate::noise_utils::RightActionNoiseGain {
-                l2_squared: decoder_l1.pow(2u32),
-                l1: decoder_l1,
-            });
-
-            let mask_weights = refresh_noise_weight_sums(
-                &base,
-                mask_counts[slot],
-                &coordinate_count,
-                &BigUint::one(),
-            );
-            let fresh_weights = refresh_noise_weight_sums(
-                &base,
-                fresh_count,
-                &coordinate_count,
-                &(p.clone() / &qt),
-            );
-            // The evaluator splits each aggregate route gain by these exact
-            // sums before applying the individual label's positional
-            // weight. Every independently prepared dense action must retain
-            // the full single-action K1 envelope, so persist the weighted
-            // aggregate rather than K1 itself.
-            let mask_aggregate_l1 = &k1 * &mask_weights.0;
-            let fresh_aggregate_l1 = &k1 * &fresh_weights.0;
-            mask.push(crate::noise_utils::RightActionNoiseGain {
-                l1: mask_aggregate_l1.clone(),
-                l2_squared: &k2_squared * &mask_weights.1,
-            });
-            fresh.push(crate::noise_utils::RightActionNoiseGain {
-                l1: fresh_aggregate_l1.clone(),
-                l2_squared: &k2_squared * &fresh_weights.1,
-            });
-            let mask_unit_gain = refresh_noise_ceil_div(&mask_aggregate_l1, &mask_weights.0);
-            let fresh_unit_gain = refresh_noise_ceil_div(&fresh_aggregate_l1, &fresh_weights.0);
-            let eta_bound = self.encoding_error_bound();
-            let label_eta = eta_bound *
-                (&mask_weights.0 * &mask_unit_gain + &fresh_weights.0 * &fresh_unit_gain);
-            let data_eta = eta_bound * &k1;
-            let q_to_p = &q / &p;
-            let q_to_qt = &q / &qt;
-            let mask_offset = crate::noise_refresh::refresh::canonical_digit_offset(
-                &base,
-                mask_counts[slot],
-                true,
-            )
-            .map_err(|_| RnsBggError::Refresh(RefreshError::InvalidLayout))?
-            .magnitude() *
-                &q_to_p *
-                &coordinate_count *
-                mask_unit_gain;
-            let fresh_offset =
-                crate::noise_refresh::refresh::canonical_digit_offset(&base, fresh_count, false)
-                    .map_err(|_| RnsBggError::Refresh(RefreshError::InvalidLayout))?
-                    .magnitude() *
-                    &q_to_qt *
-                    &coordinate_count *
-                    fresh_unit_gain;
-            plaintext_moduli.push(qt);
-            switch_moduli.push(p);
-            target_modulus_product *= &plaintext_moduli[slot];
-            route_bias_bounds.push(label_eta + data_eta + mask_offset + fresh_offset);
-        }
-
-        if target_modulus_product != target_modulus {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
-        }
-
-        let topology = RefreshTranscriptTopology::new(
-            target_columns,
-            coefficient_count,
-            mask_counts.clone(),
-            fresh_count,
-        )
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        let mut parameters = RefreshNoiseParameters::new(
-            plaintext_moduli,
-            switch_moduli,
-            base,
-            mask_counts,
-            fresh_count,
-        )
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?
-        .with_global_modulus(
-            global_modulus.ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?,
-        )
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?
-        .with_transcript_topology(topology)
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?
-        .with_route_gains(RefreshRouteNoiseGains { state_scaling, mask, fresh, decoder })
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        parameters.route_bias_bounds = route_bias_bounds;
-        parameters.validate().map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        Ok(parameters)
-    }
-
     pub fn ring(&self, level: usize) -> Result<Ring, RnsBggError> {
         let parameters = self.level(level)?;
         Ok(Ring::from_crt_moduli(
             parameters.to_crt().0.into_iter().map(IntExpr::from).collect(),
             parameters.ring_dimension(),
-        ))
-    }
-
-    /// Ring whose ordered CRT basis has product `modulus`.
-    ///
-    /// A level with exactly this modulus keeps its own ordered basis. Other
-    /// moduli, such as per-slot refresh channels, are CRT sub-bases of the
-    /// parameter prime pool; their primes keep the pool's first-appearance
-    /// order so equal moduli always resolve to the same ring.
-    pub(crate) fn ring_for_modulus(&self, modulus: &BigInt) -> Result<Ring, RnsBggError> {
-        if let Some(level) = self
-            .levels
-            .iter()
-            .position(|level| &BigInt::from(level.modulus().as_ref().clone()) == modulus)
-        {
-            return self.ring(level);
-        }
-        let mut primes = Vec::<u64>::new();
-        for prime in self.levels.iter().flat_map(|level| level.to_crt().0) {
-            if !primes.contains(&prime) && (modulus % BigInt::from(prime)).is_zero() {
-                primes.push(prime);
-            }
-        }
-        let product = primes.iter().fold(BigInt::one(), |product, prime| product * prime);
-        if primes.is_empty() || &product != modulus {
-            return Err(RnsBggError::Parameters("modulus is not a CRT sub-basis of the parameters"));
-        }
-        Ok(Ring::from_crt_moduli(
-            primes.into_iter().map(IntExpr::from).collect(),
-            self.level(0)?.ring_dimension(),
         ))
     }
 
@@ -833,108 +547,6 @@ impl RnsBggParameters {
         digest.finalize().into()
     }
 
-    /// The number of `q` levels in a prepared PRF child's schedule
-    /// `[q, ..., q, p]`. The PRF outputs are coefficient LUT outputs, which
-    /// stay at their LUT's input level with the key width of the next level,
-    /// so `q` runs through the level after the outputs and `p` follows,
-    /// supplying that width.
-    fn refresh_prf_q_levels(declaration: &RefreshDeclaration) -> Result<usize, RnsBggError> {
-        let workload = RnsBggDerivedWorkload::from_program(declaration.prepared().program())?;
-        let mut levels = declaration
-            .prepared()
-            .declaration()
-            .ordered_outputs()
-            .map(|(_, wire)| workload.level(wire));
-        let level =
-            levels.next().ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))??;
-        if levels.any(|other| other.ok() != Some(level)) {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
-        level.checked_add(2).ok_or(RnsBggError::Parameters("refresh PRF level overflow"))
-    }
-
-    /// Validate the schedule required by a prepared PRF child: `q` at every
-    /// level through the PRF outputs, then `p`.
-    pub(crate) fn validate_refresh_prf_schedule(
-        &self,
-        declaration: &RefreshDeclaration,
-        slot: usize,
-    ) -> Result<(), RnsBggError> {
-        const MISMATCH: RnsBggError =
-            RnsBggError::Binding("refresh PRF parameter schedule is not [q, ..., q, p]");
-        let q_levels = Self::refresh_prf_q_levels(declaration)?;
-        if self.levels.len() != q_levels + 1 || slot >= declaration.slots().len() {
-            return Err(MISMATCH);
-        }
-        let declared_slot = declaration
-            .slots()
-            .get(slot)
-            .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
-        let q = declared_slot
-            .q
-            .to_biguint()
-            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-        let p = declared_slot
-            .p
-            .to_biguint()
-            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-        let first = self.level(0)?;
-        if first.modulus().as_ref() != &q ||
-            self.levels[..q_levels].iter().any(|level| level != first) ||
-            self.level(q_levels)?.modulus().as_ref() != &p
-        {
-            return Err(MISMATCH);
-        }
-        if self.component_columns(q_levels - 1)? != self.level(q_levels)?.modulus_digits() {
-            return Err(RnsBggError::Binding(
-                "refresh PRF coefficient output width does not match successor level",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Derive the exact child schedule from the outer source chain and return
-    /// its full parameter identity for retained child/artifact validation.
-    pub(crate) fn expected_refresh_prf_parameter_identity(
-        &self,
-        declaration: &RefreshDeclaration,
-        slot: usize,
-    ) -> Result<[u8; 32], RnsBggError> {
-        let declared_slot = declaration
-            .slots()
-            .get(slot)
-            .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
-        let q = declared_slot
-            .q
-            .to_biguint()
-            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-        let p = declared_slot
-            .p
-            .to_biguint()
-            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-        let q_level = (0..self.levels.len().saturating_sub(1))
-            .find(|level| {
-                self.levels[*level].modulus().as_ref() == &q &&
-                    self.levels[*level + 1].modulus().as_ref() == &p
-            })
-            .ok_or(RnsBggError::Binding("refresh q/p successor is not configured"))?;
-        let q_levels = Self::refresh_prf_q_levels(declaration)?;
-        let q_parameters = self.level(q_level)?.clone();
-        let p_parameters = self.level(q_level + 1)?.clone();
-        let expected = Self::new(
-            std::iter::repeat_n(q_parameters, q_levels).chain([p_parameters]).collect(),
-            self.encoding_error_sigma.clone(),
-            self.operations_per_drop,
-        )?
-        .with_rhs_mode(self.rhs_mode);
-        if expected.component_columns(q_levels - 1)? != self.component_columns(q_level)? {
-            return Err(RnsBggError::Binding(
-                "refresh PRF coefficient output width does not match source q carrier",
-            ));
-        }
-        Ok(expected.parameter_identity())
-    }
-
     pub(crate) fn state_gadget(&self, level: usize) -> Result<Mat, RnsBggError> {
         self.level(level)?;
         match self.levels.get(level + 1) {
@@ -956,33 +568,142 @@ impl RnsBggParameters {
         let base = public_gadget_base(parameters.base_bits())?;
         Ok(self.ring(level)?.gadget(1, base, parameters.modulus_digits()))
     }
-}
 
-fn refresh_noise_ceil_div(numerator: &BigUint, denominator: &BigUint) -> BigUint {
-    if numerator.is_zero() {
-        BigUint::zero()
-    } else {
-        (numerator + denominator - BigUint::one()) / denominator
+    /// `G^-1(weight)`: the gadget decomposition of the `1 x 1` `weight` (in
+    /// the ring of `gadget_level`) under that level's full gadget, rebased to
+    /// `ring_level`.
+    ///
+    /// Right-multiplying a carrier whose payload is `v G` by it selects
+    /// `v weight`: per tower it selects the base digits of
+    /// `weight mod q_t`, and `G G^-1(weight) = weight` modulo the gadget
+    /// modulus. Its digits are bounded by the gadget base, so its noise gain
+    /// [`Self::gadget_inverse_l1`] does not grow with `weight`. `weight` is a
+    /// graph value, so a loop body may select it per member.
+    pub(crate) fn gadget_inverse(
+        &self,
+        gadget_level: usize,
+        ring_level: usize,
+        weight: Mat,
+    ) -> Result<SmallMatrix, RnsBggError> {
+        let parameters = self.level(gadget_level)?;
+        let base = public_gadget_base(parameters.base_bits())?;
+        Ok(weight
+            .decompose(base, parameters.modulus_digits())
+            .centered_rebase(&self.ring(ring_level)?))
     }
-}
 
-fn refresh_noise_weight_sums(
-    base: &BigUint,
-    count: usize,
-    coordinate_count: &BigUint,
-    scalar: &BigUint,
-) -> (BigUint, BigUint) {
-    let mut l1 = BigUint::zero();
-    let mut l2_squared = BigUint::zero();
-    let mut weight = scalar.clone();
-    for _ in 0..count {
-        l1 += &weight;
-        l2_squared += weight.pow(2u32);
-        weight *= base;
+    /// The constant `1 x n` row of `weights` in the ring of `level`.
+    pub(crate) fn weight_row(&self, level: usize, weights: &[BigUint]) -> Result<Mat, RnsBggError> {
+        let ring = self.ring(level)?;
+        let entries = weights
+            .iter()
+            .map(|weight| ring.polynomial([IntExpr::constant(weight.clone())]))
+            .collect::<Vec<_>>();
+        Ok(match entries.len() {
+            1 => entries.into_iter().next().expect("one weight"),
+            _ => Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, entries),
+        })
     }
-    l1 = &l1 * coordinate_count;
-    l2_squared = &l2_squared * coordinate_count;
-    (l1, l2_squared)
+
+    /// The largest `l1` norm of [`Self::gadget_inverse`] over `weights`: the
+    /// sum over towers of the base-`B` digits of `weight mod q_t`.
+    pub(crate) fn gadget_inverse_l1(
+        &self,
+        gadget_level: usize,
+        weights: &[BigUint],
+    ) -> Result<BigUint, RnsBggError> {
+        let parameters = self.level(gadget_level)?;
+        let base = BigUint::from(public_gadget_base(parameters.base_bits())?);
+        let primes = parameters.to_crt().0;
+        Ok(weights
+            .iter()
+            .map(|weight| {
+                primes
+                    .iter()
+                    .map(|prime| {
+                        let mut residue = weight % prime;
+                        let mut sum = BigUint::zero();
+                        while !residue.is_zero() {
+                            sum += &residue % &base;
+                            residue /= &base;
+                        }
+                        sum
+                    })
+                    .sum::<BigUint>()
+            })
+            .max()
+            .unwrap_or_default())
+    }
+
+    /// The decoder trapdoor of a refresh decoded at `level`: its gadget base
+    /// and digit count are the level's own, and the preimage coefficient
+    /// bound is the sampler's default cutoff for trapdoor sigma `sigma`.
+    pub fn refresh_decoder_gadget(
+        &self,
+        level: usize,
+        sigma: f64,
+    ) -> Result<(u64, usize, BigUint), RnsBggError> {
+        let parameters = self.level(level)?;
+        let base = public_gadget_base(parameters.base_bits())?;
+        let digits = parameters.modulus_digits();
+        let bound = mxx_backends::sampler::bounds::default_preimage_cutoff(
+            parameters.ring_dimension(),
+            crate::noise_refresh::decoder::DECODER_ROWS,
+            digits,
+            u32::try_from(base).map_err(|_| RnsBggError::Parameters("decoder gadget base"))?,
+            sigma,
+        )
+        .ok_or(RnsBggError::Parameters("invalid decoder trapdoor sigma"))?;
+        Ok((base, digits, bound))
+    }
+
+    /// The level of the source output of `declaration` in `source_program`.
+    pub(crate) fn refresh_source_level(
+        declaration: &RefreshDeclaration,
+        source_program: &crate::program::ExponentLutProgram,
+    ) -> Result<usize, RnsBggError> {
+        if source_program.id() != declaration.source_program() {
+            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+        }
+        RnsBggDerivedWorkload::from_program(source_program)?.level(declaration.source_output())
+    }
+
+    /// The parameter chain of `declaration`'s mask Program child: `m` copies
+    /// of the parameters of the source level `L` of `source_program`, where
+    /// `m - 2` is the level of the mask LUT inputs. Every scale of the chain
+    /// is 1, and an `UnscaledCoefficient` output finalized to level `m - 1`
+    /// carries `v r G` with `G` the full gadget of `q_L`: the source ring.
+    /// The source level must leave a level `L + 1` (the plaintext modulus
+    /// `p`), and the declaration must mask every coefficient of the source
+    /// ring.
+    pub fn refresh_mask_parameters(
+        &self,
+        declaration: &RefreshDeclaration,
+        source_program: &crate::program::ExponentLutProgram,
+    ) -> Result<Self, RnsBggError> {
+        let source_level = Self::refresh_source_level(declaration, source_program)?;
+        if source_level + 1 >= self.levels.len() {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+        }
+        // Every coefficient of the decoded row carries noise, so every
+        // coefficient is masked.
+        if declaration.coefficients() != self.level(source_level)?.ring_dimension() as usize {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidMaskProgram));
+        }
+        let workload = RnsBggDerivedWorkload::from_program(declaration.mask().program())?;
+        let [digit, parity] = crate::noise_refresh::refresh::MaskFamily::ALL
+            .map(|family| workload.level(declaration.mask().output(family)));
+        let mask_level = digit?;
+        if parity? != mask_level {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidMaskProgram));
+        }
+        Self::new(
+            vec![self.level(source_level)?.clone(); mask_level + 2],
+            self.encoding_error_sigma.clone(),
+            self.operations_per_drop,
+        )
+        .map(|parameters| parameters.with_rhs_mode(self.rhs_mode))
+    }
 }
 
 fn public_gadget_base(base_bits: u32) -> Result<u64, RnsBggError> {
@@ -1118,7 +839,9 @@ pub(crate) struct RnsBggArtifactBinding {
     parameters: [u8; 32],
     hash_key_commitment: [u8; 32],
     sources: Vec<mxx_ir_core::artifact::ProductionId>,
-    refresh_commitment: Option<[u8; 32]>,
+    /// The applied refresh: its declaration commitment and the coefficient
+    /// bound of its decoder preimage `K`.
+    refresh: Option<([u8; 32], BigUint)>,
     /// The logical level of each Program input, which encryption encodes it
     /// at.
     input_levels: BTreeMap<WireId, usize>,
@@ -1130,6 +853,10 @@ pub(crate) struct RnsBggArtifactBinding {
     /// Dynamic only: each `(level, LUT)` the Program evaluates, whose
     /// switching ciphertexts and digit companions encryption generates.
     dynamic_luts: BTreeSet<(usize, LutId)>,
+    /// Dynamic encryption only: the prelude production holding every RHS
+    /// family's ciphertexts, and its manifest.
+    ciphertext_prelude:
+        Option<(mxx_ir_core::artifact::ProductionId, mxx_ir_core::artifact::Manifest)>,
 }
 
 impl RnsBggArtifactBinding {
@@ -1150,7 +877,8 @@ impl RnsBggArtifactBinding {
             parameters,
             hash_key_commitment,
             sources: Vec::new(),
-            refresh_commitment: None,
+            refresh: None,
+            ciphertext_prelude: None,
             input_levels: BTreeMap::new(),
             rhs_mode,
             dynamic_rhs: BTreeMap::new(),
@@ -1197,8 +925,12 @@ impl RnsBggArtifactBinding {
     }
 
     /// Binds a refresh declaration to this stage's artifact identity.
-    pub(crate) fn with_refresh_declaration(mut self, declaration: &RefreshDeclaration) -> Self {
-        self.refresh_commitment = Some(*declaration.commitment());
+    pub(crate) fn with_refresh(
+        mut self,
+        declaration: &RefreshDeclaration,
+        preimage_bound: BigUint,
+    ) -> Self {
+        self.refresh = Some((*declaration.commitment(), preimage_bound));
         self
     }
 
@@ -1235,8 +967,29 @@ impl RnsBggArtifactBinding {
         &self.sources
     }
 
+    pub(crate) fn with_ciphertext_prelude(
+        mut self,
+        production: mxx_ir_core::artifact::ProductionId,
+        manifest: mxx_ir_core::artifact::Manifest,
+    ) -> Self {
+        self.ciphertext_prelude = Some((production, manifest));
+        self
+    }
+
+    /// The Dynamic encryption prelude holding the RHS family ciphertexts.
+    pub(crate) fn ciphertext_prelude(
+        &self,
+    ) -> Option<&(mxx_ir_core::artifact::ProductionId, mxx_ir_core::artifact::Manifest)> {
+        self.ciphertext_prelude.as_ref()
+    }
+
     pub(crate) fn refresh_commitment(&self) -> Option<&[u8; 32]> {
-        self.refresh_commitment.as_ref()
+        self.refresh.as_ref().map(|(commitment, _)| commitment)
+    }
+
+    /// The coefficient bound of the applied refresh's decoder preimage.
+    pub(crate) fn refresh_preimage_bound(&self) -> Option<&BigUint> {
+        self.refresh.as_ref().map(|(_, bound)| bound)
     }
 }
 
@@ -1270,7 +1023,23 @@ rns_bgg_stage_descriptor!(RnsBggPreprocessOnlineEvalDescriptor);
 
 rns_bgg_stage_descriptor!(RnsBggEncryptionDescriptor);
 
-rns_bgg_stage_descriptor!(RnsBggRefreshCheckpointDescriptor);
+/// Descriptor of the trusted decoder setup of one refresh: the public `B`
+/// and its trapdoor at the refresh's decoding level, with the parameters
+/// needed to import the trapdoor. Only the trusted preprocessor reads this
+/// production; online evaluation and encryption see `B` through the
+/// preprocess republication only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RnsBggDecoderSetupDescriptor {
+    pub(crate) context: [u8; 32],
+    pub(crate) parameters: [u8; 32],
+    pub(crate) refresh_commitment: [u8; 32],
+    pub(crate) level: usize,
+    /// The trapdoor sigma, as a canonical decimal string.
+    pub(crate) sigma: String,
+    pub(crate) base: u64,
+    pub(crate) digits: usize,
+    pub(crate) bound: BigUint,
+}
 
 impl RnsBggPreprocessEncryptDescriptor {
     pub(crate) fn with_source(
@@ -1288,28 +1057,36 @@ pub(crate) fn hash_key_commitment(hash_key: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/// Small, one-shot refresh invocation shared by the three stage lowerers.
-pub struct RnsBggRefresh<'a, E: ExponentLUTProgramLowering> {
-    lowerer: &'a mut E,
-    inputs: BTreeMap<usize, E::Wire>,
+/// One-shot refresh invocation shared by the stage lowerers: the source
+/// carrier of the refreshed output, lowered by the outer stage.
+pub(crate) struct RnsBggRefresh<'a, E: ExponentLUTProgramLowering> {
+    pub(crate) lowerer: &'a mut E,
+    pub(crate) source: E::Wire,
 }
 
-impl<'a, E: ExponentLUTProgramLowering> RnsBggRefresh<'a, E> {
-    pub fn new(lowerer: &'a mut E, inputs: BTreeMap<usize, E::Wire>) -> Self {
-        // RefreshDeclaration owns and validates all immutable refresh
-        // metadata. Stage implementations receive it explicitly in
-        // `finish_noise_refresh`; this runtime carrier stores only lowering
-        // state and concrete inputs.
-        Self { lowerer, inputs }
-    }
+/// The member transform of the refresh mask: member `member` of `family`
+/// of the mask Program, whose finalized carrier at `level` has payload
+/// `v r G_level`, is right-multiplied by `G_level^-1(w)` for its weight `w`
+/// and then by `X^coefficient`. Returns that action and that monomial; both
+/// are graph values chosen per member, built without loop-dependent
+/// constants.
+pub(crate) fn refresh_member_action(
+    parameters: &RnsBggParameters,
+    declaration: &RefreshDeclaration,
+    family: crate::noise_refresh::refresh::MaskFamily,
+    member: IntExpr,
+    level: usize,
+) -> Result<(SmallMatrix, mxx_dsl::Int), RnsBggError> {
+    let weights = declaration.member_weights(family);
+    let (coefficient, index) = declaration.member_placement(family, member);
+    let row = parameters.weight_row(level, &weights)?;
+    let weight = if weights.len() == 1 { row } else { row_entry(&row, index) };
+    Ok((parameters.gadget_inverse(level, level, weight)?, mxx_dsl::Int::evaluate(coefficient)))
+}
 
-    pub(crate) fn lowerer(&mut self) -> &mut E {
-        self.lowerer
-    }
-
-    pub(crate) fn inputs(&self) -> &BTreeMap<usize, E::Wire> {
-        &self.inputs
-    }
+/// `X^coefficient * entry * action` for one carrier entry.
+pub(crate) fn act_on_entry(entry: Mat, action: &SmallMatrix, coefficient: &mxx_dsl::Int) -> Mat {
+    action.clone().right_multiply(entry).multiply_monomial(coefficient.clone())
 }
 
 fn map_row(row: RnsBggRow, mut operation: impl FnMut(Mat) -> Mat) -> RnsBggRow {
@@ -1543,7 +1320,7 @@ pub(crate) fn add_encoding_rows(lhs: RnsBggRow, rhs: RnsBggRow) -> RnsBggRow {
 
 /// The ciphertext `C = [top; target - prefix * top + e]` at `level`, with a
 /// fresh error row `e` of `columns` columns, so `(prefix, 1) C = target + e`.
-/// RHS, LUT-switching, and refresh-action ciphertexts all have this form.
+/// RHS and LUT-switching ciphertexts have this form.
 pub(crate) fn ciphertext_matrix(
     parameters: &RnsBggParameters,
     level: usize,
@@ -1564,7 +1341,7 @@ pub(crate) fn ciphertext_matrix(
 /// member or LUT branch consumed at `level`.
 ///
 /// It names public setup coordinates only: the parameter identity, setup
-/// context, Program, the refresh declaration and slot of an embedded PRF
+/// context, Program, the refresh declaration of an embedded mask Program
 /// child, the material (`rhs/<id>` or `lut/<id>`), and its member or branch.
 /// No encryption batch, plaintext, ciphertext, or digit enters it, so every
 /// encryption under one setup shares these keys and the Program keys
@@ -1573,7 +1350,7 @@ pub(crate) fn companion_tag(
     parameters: &RnsBggParameters,
     context: &[u8; 32],
     program: ExponentLutProgramId,
-    namespace: Option<([u8; 32], usize)>,
+    namespace: Option<[u8; 32]>,
     material: String,
     member: Option<IntExpr>,
     level: usize,
@@ -1583,10 +1360,9 @@ pub(crate) fn companion_tag(
     tag.push(hex(&parameters.parameter_identity()));
     tag.push(hex(context));
     tag.push(hex(program.as_bytes()));
-    if let Some((commitment, slot)) = namespace {
+    if let Some(commitment) = namespace {
         tag.push("refresh");
         tag.push(hex(&commitment));
-        tag.push(IntExpr::constant(slot));
     }
     tag.push(material);
     if let Some(member) = member {
@@ -1686,17 +1462,21 @@ pub(crate) fn join_row(row: &RnsBggRow) -> Mat {
 /// the scale `p_i` of the private payload annihilates. `T_s` depends only on
 /// public keys. The caller adds `c_s Dec(C_s)` (see [`column_action`]).
 ///
-/// One flat loop visits every `(s, j, a)` and holds only column `a` of
-/// `A_s`, its `M_i` digits, one key, and two companions (the current one and
-/// the next one, read ahead), so the graph and the working set are linear in
-/// `M_i + m_i + branches m_(i+1)`; a single loop also reads stored
-/// companions inside a Program family body. Returns
-/// the key rows and, given companions, the companion row, each
-/// `1 x branches m_(i+1)` with branch `s` at columns `s m_(i+1) ..`.
+/// The key rows read no artifact, so an outer loop visits every `(s, a)`
+/// and decomposes column `a` of `A_s` once, and its inner loop visits every
+/// `j`, holding one key and accumulating the `1 x m_(i+1)` block of branch
+/// `s`, which the outer body then places. A GPU loop that reads artifacts
+/// may not nest in another loop, so the companion row is one flat loop
+/// over every `(s, a, j)`, which holds column `a` of `A_s`, its digits, and
+/// two companions (the current one and the next one, read ahead). The
+/// graph and the working set are linear in `M_i + m_i + branches m_(i+1)`.
+/// Returns the key rows and, given companions, the companion row, each `1 x
+/// branches m_(i+1)` with branch `s` at columns `s m_(i+1) ..`.
 pub(crate) fn companion_columns(
     parameters: &RnsBggParameters,
     level: usize,
     branches: usize,
+    output_columns: usize,
     key_entry: &dyn Fn(IntExpr, usize, IntExpr) -> Result<Mat, RnsBggError>,
     companion_key: &dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>,
     companion: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggRow, RnsBggError>>,
@@ -1705,70 +1485,83 @@ pub(crate) fn companion_columns(
     let current = parameters.level(level)?;
     let base = public_gadget_base(current.base_bits())?;
     let digits = current.modulus_digits();
-    let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
     let digit_rows = 2 * parameters.component_columns(level)?;
-    let output_columns = 2 * parameters.component_columns(next)?;
-    let width = branches * output_columns;
+    let block = 2 * output_columns;
+    let width = branches * block;
     let schema = |_| mxx_dsl::DslError::Schema;
-    let total = width * digit_rows;
-    // `k = (s m_(i+1) + j) m_i + a`: its output column `k / m_i`, branch,
-    // column within the branch, and digit row.
-    let coordinates = |k: IntExpr| {
-        let k = Box::new(k);
-        let digit_rows = Box::new(IntExpr::constant(digit_rows));
-        let column = IntExpr::FloorDiv(k.clone(), digit_rows.clone()).canonicalize();
-        let output_columns = Box::new(IntExpr::constant(output_columns));
-        let branch =
-            IntExpr::FloorDiv(Box::new(column.clone()), output_columns.clone()).canonicalize();
-        let j = IntExpr::Rem(Box::new(column.clone()), output_columns).canonicalize();
-        (column, branch, j, IntExpr::Rem(k, digit_rows).canonicalize())
+    let quotient = |k: &IntExpr, divisor: usize| {
+        IntExpr::FloorDiv(Box::new(k.clone()), Box::new(IntExpr::constant(divisor))).canonicalize()
     };
-    let read = |k: IntExpr| {
-        let (_, branch, j, a) = coordinates(k);
-        companion.map(|companion| companion(branch, a, j)).transpose()
+    let remainder = |k: IntExpr, divisor: usize| {
+        IntExpr::Rem(Box::new(k), Box::new(IntExpr::constant(divisor))).canonicalize()
     };
-    // Each iteration reads the next companion (the first again after the
-    // last) and carries it, so that load overlaps this iteration's work.
-    let mut initial = vec![ring.zero((1, width)); if companion.is_some() { 3 } else { 2 }];
-    if let Some((left, right)) = read(IntExpr::constant(0))? {
-        initial.extend([left, right]);
-    }
-    Ok(mxx_dsl::iterate(total, initial, |k, mut carried: Vec<Mat>| {
-        let k = k.expression()?;
-        let next = IntExpr::Rem(
-            Box::new(k.clone() + IntExpr::constant(1)),
-            Box::new(IntExpr::constant(total)),
-        )
-        .canonicalize();
-        let (column, branch, j, a) = coordinates(k);
+    // `(u0, u1)`: the digits of column `a` of `A_s`.
+    let digits_of = |branch: &IntExpr, a: &IntExpr| {
         let [u0, u1] = [0, 1].map(|r| {
             key_entry(branch.clone(), r, a.clone()).map(|entry| entry.decompose(base, digits))
         });
-        let (u0, u1) = (u0.map_err(schema)?, u1.map_err(schema)?);
-        let act = |(left, right): RnsBggRow| {
-            left.mul_small_rhs(u0.clone()) + right.mul_small_rhs(u1.clone())
+        Ok::<_, RnsBggError>((u0?, u1?))
+    };
+    let act = |(u0, u1): &(Preimage, Preimage), (left, right): RnsBggRow| {
+        left.mul_small_rhs(u0.clone()) + right.mul_small_rhs(u1.clone())
+    };
+    let keys = vec![ring.zero((1, width)); 2];
+    let mut rows = mxx_dsl::iterate(branches * digit_rows, keys, |pair, rows: Vec<Mat>| {
+        let pair = pair.expression()?;
+        let (branch, a) = (quotient(&pair, digit_rows), remainder(pair, digit_rows));
+        let column = digits_of(&branch, &a).map_err(schema)?;
+        let blocks =
+            mxx_dsl::iterate(block, vec![ring.zero((1, block)); 2], |j, blocks: Vec<Mat>| {
+                let j = j.expression()?;
+                let (top, bottom) =
+                    companion_key(branch.clone(), a.clone(), j.clone()).map_err(schema)?;
+                let unit = unit_row(&ring, block, j);
+                Ok(blocks
+                    .into_iter()
+                    .zip([act(&column, top), act(&column, bottom)])
+                    .map(|(sum, term)| sum + term * unit.clone())
+                    .collect())
+            })?;
+        let place = unit_row(&ring, branches, branch);
+        Ok(rows
+            .into_iter()
+            .zip(blocks)
+            .map(|(row, block)| row + place.clone().tensor(block))
+            .collect())
+    })?;
+    if let Some(companion) = companion {
+        let total = width * digit_rows;
+        let read = |k: &IntExpr| {
+            let (pair, j) = (quotient(k, block), remainder(k.clone(), block));
+            companion(quotient(&pair, digit_rows), remainder(pair, digit_rows), j)
         };
-        let (top, bottom) = companion_key(branch, a, j).map_err(schema)?;
-        let mut terms = vec![act(top), act(bottom)];
-        let prefetched = read(next).map_err(schema)?;
-        if let Some((left, right)) = prefetched {
-            let current = carried.split_off(3);
-            terms.push(act((current[0].clone(), current[1].clone())));
-            carried.extend([left, right]);
-        }
-        let unit = unit_row(&ring, width, column);
-        for (row, term) in carried.iter_mut().zip(terms) {
-            *row = row.clone() + term * unit.clone();
-        }
-        Ok(carried)
-    })?
-    .into_iter()
-    .take(if companion.is_some() { 3 } else { 2 })
-    .collect())
+        // Each iteration reads the next companion (the first again after the
+        // last) and carries it, so that load overlaps this iteration's work.
+        let (left, right) = read(&IntExpr::constant(0))?;
+        let initial = vec![ring.zero((1, width)), left, right];
+        let sum = mxx_dsl::iterate(total, initial, |k, carried: Vec<Mat>| {
+            let k = k.expression()?;
+            let next = remainder(k.clone() + IntExpr::constant(1), total);
+            let (pair, j) = (quotient(&k, block), remainder(k, block));
+            let branch = quotient(&pair, digit_rows);
+            let a = remainder(pair, digit_rows);
+            let column = digits_of(&branch, &a).map_err(schema)?;
+            let (left, right) = read(&next).map_err(schema)?;
+            let [sum, current_left, current_right]: [Mat; 3] =
+                carried.try_into().map_err(|_| mxx_dsl::DslError::Schema)?;
+            let term = act(&column, (current_left, current_right));
+            let unit =
+                unit_row(&ring, width, (branch * IntExpr::constant(block) + j).canonicalize());
+            Ok(vec![sum + term * unit, left, right])
+        })?;
+        rows.extend(sum.into_iter().take(1));
+    }
+    Ok(rows)
 }
 
 /// `row Dec(matrix)` for every row of `rows`, one column at a time: column
-/// `j` of `matrix` (a `2 x m_(i+1)` matrix at `decomposition_level`) is
+/// `j` of `matrix` (a `2 x m_(i+1)` matrix at `decomposition_level` whose
+/// components have `columns` columns each) is
 /// sliced before it is decomposed, so only its `m_i` digits are held, never
 /// the whole `m_i x m_(i+1)` decomposition. Each row is `1 x m_i` at
 /// `evaluation_level`; the results are `1 x m_(i+1)`.
@@ -1777,13 +1570,14 @@ pub(crate) fn column_action(
     evaluation_level: usize,
     decomposition_level: usize,
     matrix: &RnsBggMatrix,
+    columns: usize,
     rows: Vec<Mat>,
 ) -> Result<Vec<Mat>, RnsBggError> {
     let ring = parameters.ring(evaluation_level)?;
     let decomposition = parameters.level(decomposition_level)?;
     let base = public_gadget_base(decomposition.base_bits())?;
     let digits = decomposition.modulus_digits();
-    let width = 2 * parameters.component_columns(decomposition_level)?;
+    let width = 2 * columns;
     let [top, bottom] = [&matrix.0, &matrix.1].map(join_row);
     Ok(mxx_dsl::iterate(width, vec![ring.zero((1, width)); rows.len()], |j, sums: Vec<Mat>| {
         let j = j.expression()?;
@@ -1800,50 +1594,6 @@ pub(crate) fn column_action(
             .map(|(sum, row)| sum + row.clone().mul_small_rhs(column.clone()) * unit.clone())
             .collect())
     })?)
-}
-
-/// Decompose a compact right-action matrix at its declared decomposition
-/// level and transport only the resulting bounded digits to the evaluation
-/// ring.  The dense matrix is never extended to the evaluation modulus.
-pub(crate) fn compact_decompose_matrix(
-    parameters: &RnsBggParameters,
-    evaluation_level: usize,
-    decomposition_level: usize,
-    matrix: RnsBggMatrix,
-) -> Result<RnsBggDecomposition, RnsBggError> {
-    let evaluation_ring = parameters.ring(evaluation_level)?;
-    let evaluation = resolve_ring(evaluation_ring.as_ref())?;
-    let decomposition = parameters.level(decomposition_level)?;
-    let decomposition_ring = resolve_ring(parameters.ring(decomposition_level)?.as_ref())?;
-    for entry in [&matrix.0.0, &matrix.0.1, &matrix.1.0, &matrix.1.1] {
-        if concrete_ring(entry)? != decomposition_ring {
-            return Err(RnsBggError::Parameters(
-                "compact action matrix does not match its decomposition ring",
-            ));
-        }
-    }
-    if evaluation.modulus() < decomposition_ring.modulus() {
-        return Err(RnsBggError::Parameters(
-            "evaluation modulus must contain the decomposition modulus",
-        ));
-    }
-    let base = 1u64
-        .checked_shl(decomposition.base_bits())
-        .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
-    let decomposition_count = decomposition.modulus_digits();
-    let value = (
-        (
-            matrix.0.0.decompose(base, decomposition_count),
-            matrix.0.1.decompose(base, decomposition_count),
-        ),
-        (
-            matrix.1.0.decompose(base, decomposition_count),
-            matrix.1.1.decompose(base, decomposition_count),
-        ),
-    );
-    // Equal rings keep the digit values; the rebase only drops the preimage
-    // relation, which does not hold for a consuming right action.
-    Ok(centered_rebase_compact(value, &evaluation_ring))
 }
 
 /// The compact decomposition of each column of `matrix`, its two entries
@@ -2070,18 +1820,6 @@ pub(crate) fn multiply_public_action<D: RightAction>(
     (top, rows.next().expect("two rows"))
 }
 
-pub(crate) fn multiply_encoding_action<D: RightAction>(
-    lhs: RnsBggRow,
-    rhs: ((D, D), (D, D)),
-) -> RnsBggRow {
-    let (a, b) = lhs;
-    let ((u, v), (w, x)) = rhs;
-    (
-        u.right_multiply(a.clone()) + w.right_multiply(b.clone()),
-        v.right_multiply(a) + x.right_multiply(b),
-    )
-}
-
 /// Whether a ModDown of `entry` into `destination` is the identity. Upward
 /// switches and destinations outside the source basis are rejected.
 fn validate_mod_down_entry(entry: &Mat, destination: &ConcreteRing) -> Result<bool, RnsBggError> {
@@ -2164,69 +1902,12 @@ pub(crate) fn mod_down_encoding(value: RnsBggRow, destination: &Ring) -> RnsBggR
         .unwrap_or_else(|error| panic!("invalid encoding modulus switch: {error}"))
 }
 
-pub(crate) fn recompose_public(
-    values: Family<RnsBggMatrix>,
-    coefficients: Family<Mat>,
-) -> Result<RnsBggMatrix, RnsBggError> {
-    if values.count() != coefficients.count() {
-        return Err(RnsBggError::Binding("CRT value and coefficient families differ"));
-    }
-    let weighted = mxx_dsl::parallel(values.count().clone(), |index| {
-        let coefficient = coefficients.at(index.clone());
-        Ok(map_matrix(values.at(index), |entry| entry * coefficient.clone()))
-    })?;
-    crate::utils::balanced_sum_family(weighted, add_public_matrices)
-        .map_err(|error| RnsBggError::Graph(error.to_string()))
-}
-
-pub(crate) fn recompose_encoding(
-    values: Family<RnsBggRow>,
-    coefficients: Family<Mat>,
-) -> Result<RnsBggRow, RnsBggError> {
-    if values.count() != coefficients.count() {
-        return Err(RnsBggError::Binding("CRT value and coefficient families differ"));
-    }
-    let weighted = mxx_dsl::parallel(values.count().clone(), |index| {
-        let coefficient = coefficients.at(index.clone());
-        let row = values.at(index);
-        Ok((coefficient.clone() * row.0, coefficient * row.1))
-    })?;
-    crate::utils::balanced_sum_family(weighted, add_encoding_rows)
-        .map_err(|error| RnsBggError::Graph(error.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use mxx_dsl::GraphValue;
     use mxx_ir_core::IntExpr;
     use num_traits::One;
-
-    /// A prepared toy refresh PRF child: parameters `[q; L] ++ [p]` over a
-    /// three-prime `q`, `p` its first two primes, and `q_t` the first prime,
-    /// with the matching one-slot declaration and its source Program.
-    pub(super) fn refresh_prf_child_fixture(
-        rhs_mode: RhsMode,
-    ) -> (RnsBggParameters, crate::program::ExponentLutProgram, RefreshDeclaration) {
-        let q = DCRTPolyParams::new(32, 3, 17, 4, None, None);
-        let primes = q.to_crt().0;
-        let p = q.select_modulus(&(BigUint::from(primes[0]) * primes[1])).unwrap();
-        let slot = crate::noise_refresh::refresh::RefreshSlot {
-            slot: 0,
-            q: BigInt::from(q.modulus().as_ref().clone()),
-            p: BigInt::from(p.modulus().as_ref().clone()),
-            q_t: BigInt::from(primes[0]),
-        };
-        let (source, _, declaration) =
-            crate::noise_refresh::refresh::tests::test_declaration_with_slots(vec![slot]);
-        let q_levels = RnsBggParameters::refresh_prf_q_levels(&declaration).unwrap();
-        let parameters =
-            RnsBggParameters::new(std::iter::repeat_n(q, q_levels).chain([p]).collect(), 1, 1)
-                .unwrap()
-                .with_rhs_mode(rhs_mode);
-        parameters.validate_refresh_prf_schedule(&declaration, 0).unwrap();
-        (parameters, source, declaration)
-    }
 
     #[test]
     fn parameter_drops_are_exact_and_terminal_is_one() {
@@ -2367,53 +2048,47 @@ mod tests {
         ));
     }
 
+    /// The mask chain repeats the source level up to the mask LUT inputs
+    /// plus two levels; a source without a plaintext level below it, or a
+    /// declaration that does not mask every coefficient, is rejected.
+    #[test]
+    fn refresh_mask_parameters_repeat_the_source_level_and_check_the_contract() {
+        let level = DCRTPolyParams::new(8, 3, 30, 15, None, None);
+        let plaintext = level.select_modulus(&BigUint::from(level.to_crt().0[0])).unwrap();
+        let parameters =
+            RnsBggParameters::new(vec![level.clone(), plaintext.clone()], 1, 1).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let source = builder.finish(vec![crate::program::Operand::Scalar(input)]).unwrap();
+        let (declaration, _) =
+            crate::noise_refresh::refresh::fixture::declaration(&source, input, 8, 1);
+        let mask = parameters.refresh_mask_parameters(&declaration, &source).unwrap();
+        let mask_level = RnsBggDerivedWorkload::from_program(declaration.mask().program())
+            .unwrap()
+            .level(declaration.mask().output(crate::noise_refresh::refresh::MaskFamily::Digit))
+            .unwrap();
+        assert_eq!(mask.levels().len(), mask_level + 2);
+        assert!(mask.levels().iter().all(|entry| entry == &level));
+
+        let terminal = RnsBggParameters::new(vec![level], 1, 1).unwrap();
+        assert!(matches!(
+            terminal.refresh_mask_parameters(&declaration, &source),
+            Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))
+        ));
+        let (partial, _) =
+            crate::noise_refresh::refresh::fixture::declaration(&source, input, 4, 1);
+        assert!(matches!(
+            parameters.refresh_mask_parameters(&partial, &source),
+            Err(RnsBggError::Refresh(RefreshError::InvalidMaskProgram))
+        ));
+    }
+
     #[test]
     fn planned_crt_depth_keeps_three_operation_windows() {
         let depths =
             (0..=7).map(|level| planned_crt_depth(level, 3, 1, 6, 2).unwrap()).collect::<Vec<_>>();
         assert_eq!(depths, vec![6, 6, 6, 5, 5, 5, 4, 4]);
         assert!(planned_crt_depth(0, 0, 1, 6, 2).is_err());
-    }
-
-    #[test]
-    fn compact_right_action_extends_only_bounded_digits() {
-        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
-        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
-        let parameters = RnsBggParameters::new(vec![high.clone(), low.clone()], 1, 1).unwrap();
-        let low_ring = parameters.ring(1).unwrap();
-        let low_one = low_ring.polynomial([mxx_ir_core::IntExpr::constant(BigInt::from(1u8))]);
-        let action = ((low_one.clone(), low_one.clone()), (low_one.clone(), low_one.clone()));
-        let decomposition = compact_decompose_matrix(&parameters, 0, 1, action.clone()).unwrap();
-        assert_eq!(
-            crate::test_support::modulus_of(decomposition.0.0.matrix_type()),
-            BigInt::from(high.modulus().as_ref().clone())
-        );
-        let high_ring = parameters.ring(0).unwrap();
-        let high_one = high_ring.polynomial([mxx_ir_core::IntExpr::constant(BigInt::from(1u8))]);
-        let row = (high_one.clone(), high_one);
-        let result = multiply_encoding_action(
-            row.clone(),
-            compact_decompose_matrix(&parameters, 0, 1, action).unwrap(),
-        );
-        assert_eq!(result.0.matrix_type(), row.0.matrix_type());
-    }
-
-    #[test]
-    fn compact_decomposition_preserves_gadget_shape_for_negative_coefficients() {
-        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
-        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
-        let parameters = RnsBggParameters::new(vec![high.clone(), low.clone()], 1, 1).unwrap();
-        let gadget = parameters.public_gadget(1).unwrap();
-        assert_eq!(
-            gadget.matrix_type(),
-            &parameters.ring(1).unwrap().matrix_type((1, low.modulus_digits()))
-        );
-
-        let negative =
-            parameters.ring(1).unwrap().polynomial([IntExpr::constant(BigInt::from(-1i8))]);
-        let action = ((negative.clone(), negative.clone()), (negative.clone(), negative.clone()));
-        let decomposition = compact_decompose_matrix(&parameters, 0, 1, action).unwrap();
-        assert_eq!(decomposition.0.0.matrix_type().ring.ring_dimension(), 16);
     }
 
     #[test]
@@ -2593,26 +2268,5 @@ mod tests {
             TypeId::of::<RnsBggPreprocessOnlineEvalDescriptor>(),
             TypeId::of::<RnsBggEncryptionDescriptor>()
         );
-    }
-
-    #[test]
-    fn refresh_noise_weight_sums_include_coordinates_and_fresh_h() {
-        let base = BigUint::from(4u8);
-        let coordinates = BigUint::from(3u8);
-        assert_eq!(
-            refresh_noise_weight_sums(&base, 2, &coordinates, &BigUint::one()),
-            (BigUint::from(5u8) * &coordinates, BigUint::from(17u8) * &coordinates)
-        );
-        assert_eq!(
-            refresh_noise_weight_sums(&base, 2, &coordinates, &BigUint::from(2u8)),
-            (BigUint::from(10u8) * &coordinates, BigUint::from(68u8) * &coordinates)
-        );
-    }
-
-    #[test]
-    fn refresh_noise_ceil_div_rounds_outward() {
-        assert_eq!(refresh_noise_ceil_div(&BigUint::from(10u8), &BigUint::from(3u8)), 4u8.into());
-        assert_eq!(refresh_noise_ceil_div(&BigUint::from(9u8), &BigUint::from(3u8)), 3u8.into());
-        assert_eq!(refresh_noise_ceil_div(&BigUint::zero(), &BigUint::from(3u8)), BigUint::zero());
     }
 }

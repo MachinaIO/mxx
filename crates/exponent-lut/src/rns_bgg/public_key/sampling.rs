@@ -177,10 +177,11 @@ pub(in crate::rns_bgg) fn lut_switching_ciphertext(
     // centered-rebased to the source ring; the full matrix is never rebased
     // as a dense matrix.
     let payload = checked_modulus_convert_row(payload.clone(), &parameters.ring(next_level)?)?;
-    let gadget = parameters.state_gadget(next_level)?;
-    let scale = parameters.scalar(next_level, parameters.message_scale(next_level)?)?;
+    let representation = table.output_representation();
+    let (scale, gadget) = parameters.lut_switching_target(next_level, representation)?;
+    let scale = parameters.scalar(next_level, scale)?;
     let target = lut_payload_target(scale, coefficient, payload.clone(), gadget);
-    let columns = parameters.component_columns(next_level)?;
+    let columns = parameters.lut_output_columns(next_level, representation)?;
     let top = top()?;
     let prefix = payload.0.ring_automorphism(sigma);
     let error = super::encoding::fresh_error(parameters, next_level, columns)?;

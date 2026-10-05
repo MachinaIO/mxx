@@ -22,18 +22,8 @@ pub struct RnsBggNoiseTrace {
     pub node_event_counts: BTreeMap<usize, BigUint>,
     /// Finalized declared outputs in declaration order.
     pub outputs: Vec<RnsBggNoiseValue>,
-    /// Target logical level of the most recently composed refresh output.
-    pub refreshed_target_level: Option<usize>,
-    /// Commitment of the declaration that produced the refreshed envelope.
-    pub refreshed_declaration_commitment: Option<[u8; 32]>,
-    /// Target coefficient modulus of the refreshed envelope.
-    pub refreshed_target_modulus: Option<BigUint>,
-    /// Authoritative schema frozen by the refresh declaration.
-    pub refreshed_output_schema: Option<Vec<WireType>>,
-    /// Refreshed target envelope after CRT recomposition and one ModDown.
-    pub refreshed_output: Option<RnsBggNoiseValue>,
-    /// Explicit residue model used by the final refresh ModDown.
-    pub refreshed_moment_policy: Option<NoiseMomentPolicy>,
+    /// The noise of the composed refresh, if any.
+    pub refresh: Option<super::RnsBggRefreshNoise>,
 }
 
 /// Trace one Program using one workload and one evaluator path.
@@ -179,14 +169,17 @@ fn parameter_artifact_bytes(
     // N_i = m_i m_(i+1) digit companions of M_i polynomials at q_i (spec
     // Eq. 066).
     let workload = RnsBggDerivedWorkload::from_program(program)?;
-    let material = |level: usize, count: usize| -> Result<BigUint, RnsBggError> {
-        let m = parameters.component_columns(level)? * 2;
-        let m_next = parameters.component_columns(level + 1)? * 2;
-        let public_columns = parameters.level(level)?.modulus_digits() * 2;
-        let ciphertext = polynomial_bytes(level + 1)? * m_next * 2u8;
-        let companions = polynomial_bytes(level)? * m * m_next * public_columns;
-        Ok((ciphertext + companions) * count)
-    };
+    // `output_columns` is the ciphertext's per-component width: the RHS
+    // state width, or a LUT's switching-target width.
+    let material =
+        |level: usize, output_columns: usize, count: usize| -> Result<BigUint, RnsBggError> {
+            let m = parameters.component_columns(level)? * 2;
+            let m_next = output_columns * 2;
+            let public_columns = parameters.level(level)?.modulus_digits() * 2;
+            let ciphertext = polynomial_bytes(level + 1)? * m_next * 2u8;
+            let companions = polynomial_bytes(level)? * m * m_next * public_columns;
+            Ok((ciphertext + companions) * count)
+        };
     for (rhs, shape) in program.rhs_inputs() {
         let count = match shape {
             InputBinding::Scalar(()) => 1,
@@ -196,12 +189,14 @@ fn parameter_artifact_bytes(
                 .and_then(|count| count.to_usize())
                 .ok_or(RnsBggError::Binding("RHS family count is not concrete"))?,
         };
-        bytes += material(workload.rhs_level(*rhs)?, count)?;
+        let level = workload.rhs_level(*rhs)?;
+        bytes += material(level, parameters.component_columns(level + 1)?, count)?;
     }
     let tables = program.encryption_inputs();
     for (level, lut) in workload.luts() {
         let table = tables.luts().get(lut.0 as usize).ok_or(RnsBggError::Lut)?;
-        bytes += material(*level, table.values().len())?;
+        let columns = parameters.lut_output_columns(*level + 1, table.output_representation())?;
+        bytes += material(*level, columns, table.values().len())?;
     }
     Ok(bytes)
 }
@@ -245,12 +240,7 @@ fn trace_commitment(trace: &RnsBggNoiseTrace) -> [u8; 32] {
         &trace.node_event_counts,
         &trace.outputs,
         &trace.joint_event_count,
-        &trace.refreshed_target_level,
-        &trace.refreshed_declaration_commitment,
-        &trace.refreshed_target_modulus,
-        &trace.refreshed_output_schema,
-        &trace.refreshed_output,
-        &trace.refreshed_moment_policy,
+        &trace.refresh,
     ))
 }
 

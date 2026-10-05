@@ -11,7 +11,6 @@ use crate::{
         Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution,
         ProgramLowerError, RhsId, WireId, lower_program,
     },
-    program_gadgets::prf::PrfLabel,
 };
 use mxx_backends::{
     ArtifactHandle, ArtifactKey, ArtifactPayload, ArtifactStore, ExecutionConfig, ExecutionError,
@@ -278,19 +277,6 @@ impl SessionStore for StageStore {
     ) -> Result<Manifest, Self::Error> {
         delegate_store!(self, store => store.load_finalized_named_manifest(expected))
     }
-}
-
-/// Errors raised while composing the common refresh declaration with a
-/// concrete stage refresh implementation.
-#[derive(Debug, ThisError)]
-pub enum RefreshApplicationError<RE>
-where
-    RE: Error + Send + Sync + 'static,
-{
-    #[error("refresh implementation failed: {0}")]
-    Refresh(RE),
-    #[error("refresh declaration and lowered PRF outputs do not agree")]
-    OutputMismatch,
 }
 
 /// Plaintext values bound to declared Program inputs.
@@ -609,6 +595,24 @@ pub trait EncryptBuild<P: Poly> {
 
     fn artifact_identity(&self) -> [u8; 32];
 
+    /// An optional graph that runs before [`Self::build_graph`] as its own
+    /// production. A scheme uses it for material whose families must be
+    /// exported without an in-graph consumer, so that they stream; the main
+    /// graph then imports them from [`Self::bind_prelude`]'s production.
+    fn prelude_graph(&mut self) -> Result<Option<StageGraph>, ApiError> {
+        Ok(None)
+    }
+
+    /// Bind the executed prelude production and its manifest.
+    fn bind_prelude(
+        &mut self,
+        production: mxx_ir_core::artifact::ProductionId,
+        manifest: Manifest,
+    ) -> Result<(), ApiError> {
+        let _ = (production, manifest);
+        Err(ApiError::input("this encryption has no prelude"))
+    }
+
     fn build_graph(self) -> Result<(StageGraph, Self::Descriptor), ApiError>;
 }
 
@@ -800,35 +804,22 @@ where
     execution.evaluate(validated, graph.runtime_inputs, store, execution_nonce)
 }
 
-/// Dispatch one refresh PRF evaluation and finish the concrete stage.
+/// Evaluate the refresh mask exactly once and finish the concrete stage.
 ///
-/// The declaration supplies the canonical ordered labels. This function owns
-/// exactly-once callback dispatch and common exact-key-set validation; a
-/// [`NoiseRefresh`] implementation only consumes the validated outputs.
+/// `evaluate_mask` lowers the declaration's mask Program and returns its
+/// aggregated, member-transformed carrier; the stage-specific
+/// [`NoiseRefresh`] implementation then decodes it with the source.
 pub(crate) fn apply_refresh<R, F>(
     declaration: &RefreshDeclaration,
     refresh: &mut R,
-    evaluate_prf: F,
-) -> Result<R::Output, RefreshApplicationError<R::Error>>
+    evaluate_mask: F,
+) -> Result<R::Output, R::Error>
 where
     R: NoiseRefresh,
-    F: FnOnce(
-        &RefreshDeclaration,
-        &[PrfLabel],
-    ) -> Result<BTreeMap<PrfLabel, R::PrfOutput>, R::Error>,
+    F: FnOnce(&RefreshDeclaration) -> Result<R::Mask, R::Error>,
 {
-    let labels = declaration.prf_labels();
-    let mut unique = std::collections::BTreeSet::new();
-    if labels.is_empty() || labels.iter().any(|label| !unique.insert(label.clone())) {
-        return Err(RefreshApplicationError::OutputMismatch);
-    }
-
-    let outputs = evaluate_prf(declaration, labels).map_err(RefreshApplicationError::Refresh)?;
-    if outputs.len() != labels.len() || labels.iter().any(|label| !outputs.contains_key(label)) {
-        return Err(RefreshApplicationError::OutputMismatch);
-    }
-
-    refresh.finish_noise_refresh(declaration, outputs).map_err(RefreshApplicationError::Refresh)
+    let mask = evaluate_mask(declaration)?;
+    refresh.finish_noise_refresh(declaration, mask)
 }
 
 pub(crate) fn domain_identity(base: [u8; 32], domain: &[u8]) -> [u8; 32] {
@@ -973,6 +964,18 @@ where
     build.bind_artifacts(preprocess)?;
     compose(&mut build)?;
     let identity = build.artifact_identity();
+    if let Some(prelude) = build.prelude_graph()? {
+        let prelude = execute_artifacts(
+            prelude,
+            parameters,
+            (),
+            domain_identity(identity, b"encrypt-prelude"),
+            execution,
+            store,
+            |_| Ok(()),
+        )?;
+        build.bind_prelude(prelude.production().clone(), prelude.manifest().clone())?;
+    }
     let (graph, descriptor) = build.build_graph()?;
     execute_artifacts(graph, parameters, descriptor, identity, execution, store, before_execute)
 }

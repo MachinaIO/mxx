@@ -6,16 +6,12 @@ use super::*;
 /// Raw input keys are sampled only from the hash key, so they are cacheable
 /// regardless of the payload knowledge attached to the input declaration.
 /// Derived public-payload wires remain hash-key/public-only, while private
-/// payload wires (and refresh replacements) may depend on transferred secret
-/// or private-plaintext material.
+/// payload wires may depend on transferred secret or private-plaintext
+/// material.
 fn preprocess_output_availability(
     program: &ExponentLutProgram,
     wire: WireId,
-    refresh_wire: Option<WireId>,
 ) -> Result<ArtifactAvailability, RnsBggError> {
-    if refresh_wire == Some(wire) {
-        return Ok(ArtifactAvailability::Transferred);
-    }
     if program.inputs().contains_key(&wire) ||
         program
             .wire_knowledge(wire)
@@ -45,13 +41,12 @@ impl<'a> RnsPreprocessBuild<'a> {
             environment: Environment::new(),
             runtime: BTreeMap::new(),
             refresh_declaration: None,
-            pending_refresh: None,
-            refresh_prf_binding: None,
-            refresh_prf_children: BTreeMap::new(),
+            refresh_mask_child: None,
+            refresh_setup: None,
         }
     }
 
-    /// Bind RHS plaintexts for a prepared PRF child without exposing the
+    /// Bind RHS plaintexts for a refresh mask child without exposing the
     /// generic stage trait at application call sites. Dynamic children bind
     /// no RHS plaintexts and no secret.
     pub fn bind_rhs_inputs<P: Poly>(
@@ -65,163 +60,116 @@ impl<'a> RnsPreprocessBuild<'a> {
         <Self as PreprocessBuild<P>>::bind_inputs(self, program, parameters, rhs, payload, hash_key)
     }
 
-    /// Bind the common refresh declaration before the preprocessing graph is
-    /// built.  The declaration is copied as immutable metadata only; sampled
-    /// matrices remain graph/artifact values owned by this stage.
-    pub fn bind_refresh_declaration(
+    /// Bind this builder, on [`RnsBggParameters::refresh_mask_parameters`],
+    /// to lower `declaration`'s mask Program: its mask LUT members are
+    /// finalized and transformed in their root bodies.
+    pub fn bind_refresh_mask(
         &mut self,
         declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
     ) -> Result<(), ApiError> {
         let evaluator =
-            self.evaluator.as_ref().ok_or_else(|| ApiError::input("bind_inputs first"))?;
-        evaluator.validate_refresh_declaration(declaration).map_err(ApiError::scheme)?;
-        self.refresh_declaration = Some(declaration.clone());
-        Ok(())
-    }
-
-    /// Bind this builder to one channel of the declaration's prepared PRF.
-    ///
-    /// A channel builder is intentionally separate from the source-stage
-    /// declaration binding: it owns the prepared PRF Program and is lowered
-    /// only when [`Self::apply_refresh`] dispatches the common refresh
-    /// operation.  This check therefore validates the PRF output schema and
-    /// coefficient lineage, without accepting a source carrier as a
-    /// substitute for the prepared evaluator.
-    pub fn bind_refresh_prf(
-        &mut self,
-        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
-        slot: usize,
-    ) -> Result<(), ApiError> {
-        self.parameters
-            .validate_refresh_prf_schedule(declaration, slot)
-            .map_err(ApiError::scheme)?;
-        let evaluator =
-            self.evaluator.as_ref().ok_or_else(|| ApiError::input("bind_inputs first"))?;
-        let expected_program = evaluator.program.id();
+            self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
         declaration
-            .validate_prf_program(expected_program)
-            .and_then(|()| declaration.validate_prf_outputs(&evaluator.program))
+            .validate_mask_program(evaluator.program.id())
             .map_err(|error| ApiError::scheme(RnsBggError::Refresh(error)))?;
-        if self.refresh_prf_binding.is_some() {
-            return Err(ApiError::input("refresh PRF is already bound"));
+        if evaluator.refresh_mask.is_some() {
+            return Err(ApiError::input("refresh mask is already bound"));
         }
-        if let Some(evaluator) = self.evaluator.as_mut() {
-            evaluator.refresh_prf_namespace = Some((*declaration.commitment(), slot));
+        // Static LUT switching material is prepared here, at root scope, so
+        // that every mask member's root body only reads it.
+        if self.parameters.rhs_mode() == RhsMode::Static {
+            for family in crate::noise_refresh::refresh::MaskFamily::ALL {
+                let output = declaration.mask().output(family);
+                let level = evaluator.workload.level(output).map_err(ApiError::scheme)?;
+                let lut = declaration.mask().lut(family);
+                let table = evaluator
+                    .program
+                    .encryption_inputs()
+                    .luts()
+                    .get(lut.0 as usize)
+                    .cloned()
+                    .ok_or_else(|| ApiError::scheme(RnsBggError::Lut))?;
+                evaluator
+                    .prepare_lut_switching_ciphertexts(level, lut, &table)
+                    .map_err(ApiError::scheme)?;
+            }
         }
-        self.refresh_prf_binding = Some((
-            *declaration.commitment(),
-            slot,
-            expected_program,
-            self.parameters.parameter_identity(),
-        ));
+        evaluator.refresh_mask = Some(Arc::new(declaration.clone()));
         Ok(())
     }
 
-    /// Lower the prepared PRF Program once and return its outputs as
-    /// `(wire, value)` pairs in declared output order.
-    fn lower_refresh_prf(
-        &mut self,
-        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
-    ) -> Result<Vec<(WireId, RnsBggPublicKey)>, RnsBggError> {
-        let (commitment, slot, program, parameter_identity) =
-            self.refresh_prf_binding.ok_or(RnsBggError::Binding("refresh PRF is not bound"))?;
-        if parameter_identity != self.parameters.parameter_identity() {
-            return Err(RnsBggError::Binding("refresh PRF parameter identity changed"));
-        }
-        if commitment != *declaration.commitment() ||
-            slot >= declaration.slots().len() ||
-            program != declaration.prepared().program().id()
-        {
-            return Err(RnsBggError::Refresh(RefreshError::Commitment));
-        }
-        let evaluator = self
-            .evaluator
-            .as_mut()
-            .ok_or(RnsBggError::Binding("refresh PRF builder was not bound"))?;
-        let program = evaluator.program.clone();
-        let outputs = lower_program(&program, evaluator, &mut self.families, &mut self.environment)
-            .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        Ok(outputs.into_iter().map(|value| (value.wire, value)).collect())
-    }
-
-    /// Apply one declared channel-aware refresh through the common lifecycle.
-    /// The refreshed carrier replaces the selected preprocess output exactly
-    /// once before graph construction.
+    /// Prepare the decoder of `declaration`'s refresh of output
+    /// `output_index`, whose lowered source key is `source`: lower the bound
+    /// mask child `mask` once, form the summed component-1 key `A` of the
+    /// source column selection and the two mask sums, and sample its
+    /// preimage `K` under the trusted `setup` trapdoor. The graph publishes
+    /// `K`, `B`, and the mask child's public material under the refresh
+    /// namespace; the source output's public key is published unchanged.
     pub fn apply_refresh(
         &mut self,
         output_index: usize,
         declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
-        inputs: BTreeMap<usize, RnsBggPublicKey>,
-        mut channels: BTreeMap<usize, RnsPreprocessBuild<'a>>,
-    ) -> Result<(), RnsBggError> {
-        if self.pending_refresh.is_some() || output_index >= declaration.output_schema().len() {
-            return Err(RnsBggError::Binding(
-                "refresh output was already selected or is out of range",
+        source: RnsBggPublicKey,
+        mut mask: RnsPreprocessBuild<'a>,
+        setup: &StageArtifacts<RnsBggDecoderSetupDescriptor>,
+    ) -> Result<(), ApiError> {
+        if self.refresh_declaration.is_some() {
+            return Err(ApiError::input("refresh was already applied"));
+        }
+        let evaluator =
+            self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
+        let expected = self
+            .parameters
+            .refresh_mask_parameters(declaration, &evaluator.program)
+            .map_err(ApiError::scheme)?;
+        let level = RnsBggParameters::refresh_source_level(declaration, &evaluator.program)
+            .map_err(ApiError::scheme)?;
+        let descriptor = setup.descriptor();
+        if mask.parameters.parameter_identity() != expected.parameter_identity() ||
+            mask.evaluator
+                .as_ref()
+                .and_then(|child| child.refresh_mask.as_ref())
+                .map(|bound| *bound.commitment()) !=
+                Some(*declaration.commitment()) ||
+            evaluator.program.outputs().get(output_index) !=
+                Some(&Operand::Scalar(declaration.source_output())) ||
+            source.wire != declaration.source_output()
+        {
+            return Err(ApiError::scheme(RnsBggError::Refresh(RefreshError::TargetMismatch)));
+        }
+        if descriptor.context != self.context ||
+            descriptor.parameters != self.parameters.parameter_identity() ||
+            descriptor.refresh_commitment != *declaration.commitment() ||
+            descriptor.level != level
+        {
+            return Err(ApiError::compatibility(
+                "the decoder setup does not belong to this refresh",
             ));
         }
-        let program = self
-            .evaluator
-            .as_ref()
-            .ok_or(RnsBggError::Binding("preprocess builder was not bound"))?
-            .program
-            .as_ref();
-        validate_refresh_output_target(program, output_index)?;
-        if self
-            .refresh_declaration
-            .as_ref()
-            .is_some_and(|bound| bound.commitment() != declaration.commitment())
-        {
-            return Err(RnsBggError::Refresh(RefreshError::Commitment));
-        }
-        declaration.validate_prf_slots(&channels).map_err(RnsBggError::Refresh)?;
-        for (slot, child) in &channels {
-            let expected_child_parameters =
-                self.parameters.expected_refresh_prf_parameter_identity(declaration, *slot)?;
-            if child.parameters.parameter_identity() != expected_child_parameters ||
-                child.refresh_prf_binding.map(|(_, _, _, identity)| identity) !=
-                    Some(expected_child_parameters)
-            {
-                return Err(RnsBggError::Binding("refresh PRF child parameter identity mismatch"));
-            }
-        }
-        let (output, child_material) = {
-            let evaluator = self
+        let mut refresh = RnsBggRefresh { lowerer: evaluator, source };
+        let key = apply_refresh(declaration, &mut refresh, |_| {
+            let child = mask
                 .evaluator
                 .as_mut()
-                .ok_or(RnsBggError::Binding("preprocess builder was not bound"))?;
-            let mut refresh = RnsBggRefresh::new(evaluator, inputs);
-            let mut child_material = Vec::with_capacity(channels.len());
-            let output = apply_refresh(declaration, &mut refresh, |callback_declaration, _| {
-                let per_label = callback_declaration.collect_prf_outputs(|slot| {
-                    channels
-                        .get_mut(&slot)
-                        .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?
-                        .lower_refresh_prf(callback_declaration)
-                })?;
-                for (slot, mut child) in std::mem::take(&mut channels) {
-                    let evaluator = child
-                        .evaluator
-                        .take()
-                        .ok_or(RnsBggError::Binding("refresh PRF builder was not bound"))?;
-                    child_material.push((slot, evaluator, std::mem::take(&mut child.runtime)));
-                }
-                Ok(per_label)
-            })
-            .map_err(|error| match error {
-                RefreshApplicationError::Refresh(error) => error,
-                RefreshApplicationError::OutputMismatch => {
-                    RnsBggError::Refresh(RefreshError::PrfOutputMismatch)
-                }
-            })?;
-            (output, child_material)
-        };
-        for (slot, child, runtime) in child_material {
-            merge_runtime(&mut self.runtime, runtime)?;
-            if self.refresh_prf_children.insert(slot, child).is_some() {
-                return Err(RnsBggError::Binding("refresh PRF slot was already retained"));
-            }
-        }
-        self.pending_refresh = Some((output_index, output));
+                .ok_or(RnsBggError::Binding("refresh mask builder was not bound"))?;
+            let program = child.program.clone();
+            lower_program(&program, child, &mut mask.families, &mut mask.environment)
+                .map_err(|error| RnsBggError::Graph(error.to_string()))
+        })
+        .map_err(ApiError::scheme)?;
+        let trapdoor = import_decoder_trapdoor(self.parameters, setup).map_err(ApiError::scheme)?;
+        let preimage = crate::noise_refresh::decoder::preimage(&trapdoor, key);
+        let evaluator =
+            self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
+        evaluator.refresh_decoder =
+            Some((*declaration.commitment(), preimage, trapdoor.public_matrix()));
+        merge_runtime(&mut self.runtime, std::mem::take(&mut mask.runtime))
+            .map_err(ApiError::scheme)?;
+        self.refresh_mask_child = Some(
+            mask.evaluator.take().ok_or_else(|| ApiError::input("refresh mask was not bound"))?,
+        );
+        self.refresh_setup =
+            Some((setup.production().clone(), setup.manifest().clone(), descriptor.bound.clone()));
         self.refresh_declaration = Some(declaration.clone());
         Ok(())
     }
@@ -457,19 +405,11 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
     }
 
     fn build_graph(
-        mut self,
+        self,
         outputs: Vec<RnsBggPublicKey>,
     ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineEvalDescriptor)), ApiError> {
         let mut evaluator =
             self.evaluator.ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
-        let mut outputs = outputs;
-        let refresh_output_wire = self.pending_refresh.as_ref().map(|(_, output)| output.wire);
-        if let Some((index, output)) = self.pending_refresh.take() {
-            let target = outputs.get_mut(index).ok_or_else(|| {
-                ApiError::input("refresh output index is outside lowered outputs")
-            })?;
-            *target = output;
-        }
         let outputs =
             deduplicate_outputs(evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?);
         let mut graph = DslContext::new("rns-bgg-preprocess");
@@ -483,103 +423,78 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 continue;
             }
             let name = format!("public-key/{:?}", output.wire);
-            graph = match preprocess_output_availability(
-                &evaluator.program,
-                output.wire,
-                refresh_output_wire,
-            )
-            .map_err(ApiError::scheme)?
+            graph = match preprocess_output_availability(&evaluator.program, output.wire)
+                .map_err(ApiError::scheme)?
             {
                 ArtifactAvailability::Cached => graph.cached_output(name, output),
                 ArtifactAvailability::Transferred => graph.transferred_output(name, output),
             }
             .map_err(ApiError::scheme)?;
         }
-        // Prepared PRF children use their own source-q key schedule.  Publish
-        // their input keys under the declaration/slot namespace so encryption
-        // cannot resolve a same-named outer-program key or another slot's key.
-        if let Some(declaration) = self.refresh_declaration.as_ref() {
+        // The mask child uses its own source-ring key schedule. Publish its
+        // input keys and Static material under the refresh namespace so
+        // encryption cannot resolve a same-named outer-program artifact.
+        if let (Some(declaration), Some(child)) =
+            (self.refresh_declaration.as_ref(), self.refresh_mask_child.as_ref())
+        {
             let commitment = *declaration.commitment();
-            for (slot, child) in &self.refresh_prf_children {
-                for (wire, input) in child.program.inputs() {
-                    let names = (0..4)
-                        .map(|port| {
-                            refresh_prf_input_key_artifact_name(commitment, *slot, *wire, port)
-                        })
-                        .collect::<Vec<_>>();
-                    match input.shape() {
-                        InputBinding::Scalar(()) => {
-                            let key =
-                                child.sample_input_public_key(*wire).map_err(ApiError::scheme)?;
-                            for (name, entry) in names.into_iter().zip(matrix_entries(&key.matrix))
-                            {
-                                graph =
-                                    graph.cached_output(name, entry).map_err(ApiError::scheme)?;
-                            }
+            for (wire, input) in child.program.inputs() {
+                let names = (0..4)
+                    .map(|port| refresh_mask_input_key_artifact_name(commitment, *wire, port))
+                    .collect::<Vec<_>>();
+                match input.shape() {
+                    InputBinding::Scalar(()) => {
+                        let key = child.sample_input_public_key(*wire).map_err(ApiError::scheme)?;
+                        for (name, entry) in names.into_iter().zip(matrix_entries(&key.matrix)) {
+                            graph = graph.cached_output(name, entry).map_err(ApiError::scheme)?;
                         }
-                        InputBinding::Family(count) => {
-                            let key_parts = (0..4)
-                                .map(|port| {
-                                    mxx_dsl::parallel(count.clone(), |index| {
-                                        let key = child
-                                            .sample_input_public_key_member(*wire, Some(index))
-                                            .map_err(|_| DslError::Schema)?;
-                                        Ok(matrix_entries(&key.matrix)[port].clone())
-                                    })
+                    }
+                    InputBinding::Family(count) => {
+                        let key_parts = (0..4)
+                            .map(|port| {
+                                mxx_dsl::parallel(count.clone(), |index| {
+                                    let key = child
+                                        .sample_input_public_key_member(*wire, Some(index))
+                                        .map_err(|_| DslError::Schema)?;
+                                    Ok(matrix_entries(&key.matrix)[port].clone())
                                 })
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(ApiError::scheme)?;
-                            for (name, entry) in names.into_iter().zip(key_parts) {
-                                graph =
-                                    graph.cached_output(name, entry).map_err(ApiError::scheme)?;
-                            }
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(ApiError::scheme)?;
+                        for (name, entry) in names.into_iter().zip(key_parts) {
+                            graph = graph.cached_output(name, entry).map_err(ApiError::scheme)?;
                         }
                     }
                 }
-                for (rhs, prepared) in &child.rhs_material {
-                    match prepared {
-                        InputBinding::Scalar(value) => {
-                            graph = graph
-                                .transferred_output(
-                                    refresh_prf_artifact_name(
-                                        commitment,
-                                        *slot,
-                                        &format!("rhs/{rhs:?}"),
-                                    ),
-                                    value.1.clone(),
-                                )
-                                .map_err(ApiError::scheme)?;
-                        }
-                        InputBinding::Family(value) => {
-                            graph = graph
-                                .transferred_output(
-                                    refresh_prf_artifact_name(
-                                        commitment,
-                                        *slot,
-                                        &format!("rhs/{rhs:?}/family"),
-                                    ),
-                                    child
-                                        .published_rhs_family(rhs, value)?
-                                        .field(|matrix| matrix.1)
-                                        .map_err(ApiError::scheme)?,
-                                )
-                                .map_err(ApiError::scheme)?;
-                        }
-                    }
+            }
+            for (rhs, prepared) in &child.rhs_material {
+                graph = match prepared {
+                    InputBinding::Scalar(value) => graph.transferred_output(
+                        refresh_mask_artifact_name(commitment, &format!("rhs/{rhs:?}")),
+                        value.1.clone(),
+                    ),
+                    InputBinding::Family(value) => graph.transferred_output(
+                        refresh_mask_artifact_name(commitment, &format!("rhs/{rhs:?}/family")),
+                        child
+                            .published_rhs_family(rhs, value)?
+                            .field(|matrix| matrix.1)
+                            .map_err(ApiError::scheme)?,
+                    ),
                 }
-                for ((evaluation_level, decomposition_level, lut, layout), material) in
-                    &child.lut_material
-                {
-                    let role = format!(
-                        "lut-switching/{evaluation_level}/{decomposition_level}/{lut:?}/{layout:?}"
-                    );
-                    graph = graph
-                        .transferred_output(
-                            refresh_prf_artifact_name(commitment, *slot, &role),
-                            material.clone(),
-                        )
-                        .map_err(ApiError::scheme)?;
-                }
+                .map_err(ApiError::scheme)?;
+            }
+            for ((evaluation_level, decomposition_level, lut, layout), material) in
+                &child.lut_material
+            {
+                let role = format!(
+                    "lut-switching/{evaluation_level}/{decomposition_level}/{lut:?}/{layout:?}"
+                );
+                graph = graph
+                    .transferred_output(
+                        refresh_mask_artifact_name(commitment, &role),
+                        material.clone(),
+                    )
+                    .map_err(ApiError::scheme)?;
             }
         }
         // Only the bottom row of each RHS ciphertext is stored; its top row
@@ -616,47 +531,19 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 )
                 .map_err(ApiError::scheme)?;
         }
-        for ((commitment, slot), sum) in &evaluator.refresh_sums {
-            for (index, entry) in matrix_entries(sum).into_iter().enumerate() {
-                graph = graph
-                    .transferred_output(
-                        refresh_artifact_name(*commitment, *slot, &format!("a-sum.{index}")),
-                        entry,
-                    )
-                    .map_err(ApiError::scheme)?;
-            }
-        }
-        for ((commitment, slot), star) in &evaluator.refresh_stars {
-            for (index, entry) in matrix_entries(star).into_iter().enumerate() {
-                graph = graph
-                    .cached_output(
-                        refresh_artifact_name(*commitment, *slot, &format!("a-star.{index}")),
-                        entry,
-                    )
-                    .map_err(ApiError::scheme)?;
-            }
-        }
-        for ((commitment, slot), action) in &evaluator.refresh_targets {
+        // The decoder of the refresh: `K` for online evaluation and `B` for
+        // encryption. The trapdoor itself stays in the setup production.
+        if let Some((commitment, preimage, public)) = &evaluator.refresh_decoder {
             graph = graph
                 .transferred_output(
-                    refresh_artifact_name(*commitment, *slot, "target"),
-                    action.clone(),
+                    refresh_artifact_name(*commitment, "decoder-preimage"),
+                    preimage.clone(),
                 )
-                .map_err(ApiError::scheme)?;
-        }
-        for ((commitment, slot, label), action) in &evaluator.refresh_label_targets {
-            graph = graph
+                .map_err(ApiError::scheme)?
                 .transferred_output(
-                    refresh_label_artifact_name(*commitment, *slot, *label),
-                    action.clone(),
+                    refresh_artifact_name(*commitment, "decoder-public"),
+                    public.clone(),
                 )
-                .map_err(ApiError::scheme)?;
-        }
-        // Dynamic refresh keys are public; encryption forms the secret-
-        // dependent actions and A_sum from them.
-        for ((commitment, slot, label), key) in &evaluator.refresh_keys {
-            graph = graph
-                .cached_output(refresh_key_artifact_name(*commitment, *slot, *label), key.clone())
                 .map_err(ApiError::scheme)?;
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
@@ -687,14 +574,23 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 .map_err(ApiError::scheme)?;
             binding = binding.with_dynamic_schema(rhs, evaluator.workload.luts().clone());
         }
-        if let Some(declaration) = &self.refresh_declaration {
-            binding = binding.with_refresh_declaration(declaration);
+        if let (Some(declaration), Some((_, _, bound))) =
+            (&self.refresh_declaration, &self.refresh_setup)
+        {
+            binding = binding.with_refresh(declaration, bound.clone());
         }
         let encrypt_binding = RnsBggPreprocessEncryptDescriptor::from_binding(binding.clone());
         let online_eval_binding = RnsBggPreprocessOnlineEvalDescriptor::from_binding(binding);
         let runtime = super::encoding::declared_runtime_inputs(&graph, self.runtime);
         Ok((
-            StageGraph::new(graph, runtime, BTreeMap::<ProductionId, Manifest>::new()),
+            StageGraph::new(
+                graph,
+                runtime,
+                self.refresh_setup
+                    .into_iter()
+                    .map(|(production, manifest, _)| (production, manifest))
+                    .collect(),
+            ),
             (encrypt_binding, online_eval_binding),
         ))
     }
@@ -736,23 +632,19 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            preprocess_output_availability(&program, private, None).unwrap(),
+            preprocess_output_availability(&program, private).unwrap(),
             ArtifactAvailability::Cached
         );
         assert_eq!(
-            preprocess_output_availability(&program, public_output, None).unwrap(),
+            preprocess_output_availability(&program, public_output).unwrap(),
             ArtifactAvailability::Cached
         );
         assert_eq!(
-            preprocess_output_availability(&program, private_output, None).unwrap(),
+            preprocess_output_availability(&program, private_output).unwrap(),
             ArtifactAvailability::Transferred
         );
         assert_eq!(
-            preprocess_output_availability(&program, private_rhs_output, None).unwrap(),
-            ArtifactAvailability::Transferred
-        );
-        assert_eq!(
-            preprocess_output_availability(&program, public_output, Some(public_output)).unwrap(),
+            preprocess_output_availability(&program, private_rhs_output).unwrap(),
             ArtifactAvailability::Transferred
         );
     }
@@ -779,8 +671,13 @@ mod test {
 
     #[test]
     fn online_evaluation_identity_extends_the_encryption_identity_by_its_domain() {
-        let (parameters, source, _) =
-            super::super::tests::refresh_prf_child_fixture(RhsMode::Dynamic);
+        let parameters =
+            RnsBggParameters::new(vec![DCRTPolyParams::new(16, 2, 17, 4, None, None)], 1, 1)
+                .unwrap()
+                .with_rhs_mode(RhsMode::Dynamic);
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let source = builder.finish(vec![Operand::Scalar(input)]).unwrap();
         let mut build = RnsPreprocessBuild::new(&parameters, [1; 32]);
         build
             .bind_rhs_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(
@@ -803,27 +700,52 @@ mod test {
         assert_eq!(online_eval, <[u8; 32]>::from(digest.finalize()));
     }
 
+    /// Static preprocessing of a refresh mask child prepares every selector
+    /// member inside the root body that reads it at its own index and exports
+    /// the family from that loop: no selector family is read from the
+    /// material prepared at binding, so none stays resident.
     #[test]
-    fn refresh_prf_binding_reports_a_wrong_program_as_a_refresh_error() {
-        let (parameters, source, declaration) =
-            super::super::tests::refresh_prf_child_fixture(RhsMode::Dynamic);
-        let mut build = RnsPreprocessBuild::new(&parameters, [1; 32]);
-        build
-            .bind_rhs_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(
-                &source,
+    fn refresh_mask_selectors_stream_from_their_root_loops() {
+        use mxx_backends::poly::dcrt::poly::DCRTPoly;
+        let level = DCRTPolyParams::new(8, 3, 30, 15, None, None);
+        let plaintext = level.select_modulus(&BigUint::from(level.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![level.clone(), plaintext], 1, 1).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let source = builder.finish(vec![Operand::Scalar(input)]).unwrap();
+        let (declaration, keys) =
+            crate::noise_refresh::refresh::fixture::declaration(&source, input, 8, 1);
+        let mask_parameters = parameters.refresh_mask_parameters(&declaration, &source).unwrap();
+        let selectors = declaration
+            .mask()
+            .selector_plaintexts::<DCRTPoly>(&level, [&keys[0], &keys[1]])
+            .unwrap();
+        let payload = crate::rns_bgg::RnsBggPayloadSecret {
+            row: (
+                mask_parameters.ring(0).unwrap().identity(1),
+                mask_parameters.ring(0).unwrap().identity(1),
+            ),
+            binding: None,
+        };
+        let mut child = RnsPreprocessBuild::new(&mask_parameters, [1; 32]);
+        child
+            .bind_rhs_inputs(
+                declaration.mask().program(),
                 &mxx_ir_core::ParamEnv::default(),
-                &BTreeMap::new(),
-                None,
+                &selectors,
+                Some(&payload),
                 &[2; 32],
             )
             .unwrap();
-        let Err(ApiError::Scheme { source }) = build.bind_refresh_prf(&declaration, 0) else {
-            panic!("a wrong PRF Program must be a scheme error");
-        };
-        assert!(matches!(
-            source.downcast_ref::<RnsBggError>(),
-            Some(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))
-        ));
+        child.bind_refresh_mask(&declaration).unwrap();
+        let (evaluator, families, environment) =
+            <RnsPreprocessBuild as PreprocessBuild<DCRTPoly>>::lowering_state(&mut child).unwrap();
+        let program = evaluator.program.clone();
+        lower_program(&program, evaluator, families, environment).unwrap();
+        let evaluator = child.evaluator.as_ref().unwrap();
+        assert!(evaluator.prepared_rhs_reads.is_empty(), "{:?}", evaluator.prepared_rhs_reads);
+        assert_eq!(evaluator.streamed_rhs.len(), program.rhs_inputs().len());
+        assert!(evaluator.streamed_rhs.values().all(Option::is_some));
     }
 
     #[test]

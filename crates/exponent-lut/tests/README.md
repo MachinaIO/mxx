@@ -1,6 +1,6 @@
 # Exponent-LUT integration tests
 
-The integration suite contains exactly four GPU-gated targets. Each target
+The integration suite contains exactly three GPU-gated targets. Each target
 contains exactly one sequential test and runs the complete production flow:
 noise simulation, benchmark estimation, then an artifact-backed preprocess,
 encrypt, and online-evaluation round trip. Benchmark estimation is the GPU runtime's
@@ -13,24 +13,20 @@ at `info` level (run with `RUST_LOG=info` to see it).
 | --- | --- | --- |
 | `nand_circuit.rs` | `nand_circuit_end_to_end` | NAND circuit |
 | `lwr_prf.rs` | `lwr_prf_end_to_end` | Sparse-LWR PRF |
-| `noise_refresh.rs` | `noise_refresh_end_to_end` | Noise refreshing |
 | `public_ip.rs` | `public_ip_end_to_end` | Public inner product |
 
-All four workflows use the public RNS-BGG application API and the
+All three workflows use the public RNS-BGG application API and the
 `dcrt_runtime` sequential lock. They require the `gpu` feature and a
 GPU-visible environment. Before execution, the NAND and Sparse-LWR targets
 search their configured CRT-depth and ring-dimension candidates, validate the
 production noise report, and retain only a candidate that reaches its
 configured positive lattice-security target through `lattice-estimator-cli`.
-The refresh target likewise checks its production noise/transcript contracts
-before verifying the refreshed output. The estimator is required for these
-security gates; the only mode that skips it is the NAND noiseless diagnostic
+The estimator is required for these security gates; the only mode that skips it is the NAND noiseless diagnostic
 described below, which makes no security claim.
 
 Parameter controls are namespaced per target rather than shared globally:
 `MXX_EXPONENT_LUT_NAND_*` controls the NAND workflow and
-`MXX_EXPONENT_LUT_LWR_PRF_*` controls Sparse-LWR,
-`MXX_EXPONENT_LUT_NOISE_REFRESH_*` controls noise refreshing, and
+`MXX_EXPONENT_LUT_LWR_PRF_*` controls Sparse-LWR, and
 `MXX_EXPONENT_LUT_PUBLIC_IP_*` controls the public inner product. Their
 ring-dimension settings specify inclusive logarithmic bounds and their
 security settings specify the required target. Search uses 40 CRT bits by
@@ -45,9 +41,8 @@ part of the accepted noise report and are not silently changed by the
 round-trip stage.
 
 The NAND and Sparse-LWR targets run the Static RHS lifecycle by default.
-Setting `MXX_EXPONENT_LUT_NAND_RHS_MODE=dynamic`,
-`MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic`, or
-`MXX_EXPONENT_LUT_NOISE_REFRESH_RHS_MODE=dynamic` selects the Dynamic lifecycle:
+Setting `MXX_EXPONENT_LUT_NAND_RHS_MODE=dynamic` or
+`MXX_EXPONENT_LUT_LWR_PRF_RHS_MODE=dynamic` selects the Dynamic lifecycle:
 preprocessing receives no secret and no RHS plaintexts, the single secret is
 sampled afterwards, and encryption binds the RHS plaintexts with a fresh batch
 identifier. The noise model applies to both modes.
@@ -65,11 +60,11 @@ cargo test -r -p mxx-exponent-lut --features gpu \
   --test lwr_prf lwr_prf_end_to_end -- --nocapture
 ```
 
-Compile all four targets without running them:
+Compile all three targets without running them:
 
 ```sh
 cargo test -r -p mxx-exponent-lut --features gpu \
-  --test nand_circuit --test lwr_prf --test noise_refresh --test public_ip --no-run
+  --test nand_circuit --test lwr_prf --test public_ip --no-run
 ```
 
 Run one target when GPU execution is explicitly authorized:
@@ -79,8 +74,6 @@ cargo test -r -p mxx-exponent-lut --features gpu \
   --test nand_circuit nand_circuit_end_to_end -- --nocapture
 cargo test -r -p mxx-exponent-lut --features gpu \
   --test lwr_prf lwr_prf_end_to_end -- --nocapture
-cargo test -r -p mxx-exponent-lut --features gpu \
-  --test noise_refresh noise_refresh_end_to_end -- --nocapture
 cargo test -r -p mxx-exponent-lut --features gpu \
   --test public_ip public_ip_end_to_end -- --nocapture
 ```
@@ -118,9 +111,7 @@ default 16); see `docs/architecture.md` section 6.1.
 
 The PRF target uses a fixed canonical label and independently computes the
 sequential `D*T` exponent and readout before verifying the caller-owned
-output. The refresh target independently computes
-the clear PRF state/readout, checks the three production graphs in order, and
-verifies the refreshed output with caller-owned secrets. The public
+output. The public
 inner-product target draws `a` and the hash seed of `t` from
 `MXX_EXPONENT_LUT_PUBLIC_IP_SEED` (reported when fresh), computes `<a, t> mod Q`
 in the clear, verifies the public output against it and rejects its successor,

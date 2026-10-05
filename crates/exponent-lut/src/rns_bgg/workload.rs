@@ -284,10 +284,7 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         self.note_use(input.0, None);
         let output = self.site()?.output;
         self.luts.insert((input.1, self.program.lut_id_at(output).map_err(|_| RnsBggError::Lut)?));
-        let next = if matches!(
-            table.output_representation(),
-            crate::program::LutOutputRepresentation::Coefficient
-        ) {
+        let next = if table.output_representation().is_coefficient() {
             input.1
         } else {
             input.1.checked_add(1).ok_or(RnsBggError::Parameters("logical level overflow"))?

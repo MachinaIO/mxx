@@ -14,8 +14,10 @@ impl EncodingLowering<'_> {
                 InputBinding::Scalar(()) => IntExpr::constant(1),
                 InputBinding::Family(count) => count.clone(),
             };
+            let level = self.workload.rhs_level(*rhs)?;
             let family = self.companion_family(
-                self.workload.rhs_level(*rhs)?,
+                level,
+                self.parameters.component_columns(level + 1)?,
                 format!("rhs/{rhs:?}/digit-encoding"),
                 members,
             )?;
@@ -25,18 +27,22 @@ impl EncodingLowering<'_> {
     }
 
     /// The encryption's family of digit-companion encodings of `members`
-    /// ciphertexts consumed at `level`, stored under `role`: member `t`,
-    /// output column `j`, and digit row `a` at `(t m_(i+1) + j) m_i + a`.
+    /// ciphertexts consumed at `level`, with `output_columns` columns per
+    /// component, stored under `role`: member `t`, digit row `a`, and output
+    /// column `j` at `(t m_i + a) m_(i+1) + j`, the order in which
+    /// [`super::companion_columns`] reads them.
     pub(super) fn companion_family(
         &self,
         level: usize,
+        output_columns: usize,
         role: String,
         members: IntExpr,
     ) -> Result<Family<RnsBggRow>, RnsBggError> {
         let ring = self.parameters.ring(level)?;
         let columns = self.parameters.level(level)?.modulus_digits();
-        let count =
-            (members * IntExpr::constant(companion_count(self.parameters, level)?)).canonicalize();
+        let count = (members *
+            IntExpr::constant(companion_count(self.parameters, level, output_columns)?))
+        .canonicalize();
         let families = [0, 1].map(|port| {
             ring.family_artifact_input(
                 self.encryption.clone(),
@@ -64,13 +70,13 @@ impl EncodingLowering<'_> {
         &self,
         level: usize,
         key: &RnsBggMatrix,
+        output_columns: usize,
         material: String,
         member: Option<IntExpr>,
         sigmas: Option<&[usize]>,
         companions: &Family<RnsBggRow>,
     ) -> Result<Vec<Mat>, RnsBggError> {
-        let count = companion_count(self.parameters, level)?;
-        let digit_rows = 2 * self.parameters.component_columns(level)?;
+        let count = companion_count(self.parameters, level, output_columns)?;
         let automorphism = |branch: &IntExpr, entry: Mat| match sigmas {
             Some(sigmas) => entry.ring_automorphism(IntExpr::Select {
                 selector: Box::new(branch.clone()),
@@ -90,7 +96,7 @@ impl EncodingLowering<'_> {
                 self.parameters,
                 &self.context,
                 self.program.id(),
-                self.refresh_prf_namespace,
+                self.refresh_mask.as_ref().map(|declaration| *declaration.commitment()),
                 material.clone(),
                 member_of(&branch),
                 level,
@@ -102,8 +108,8 @@ impl EncodingLowering<'_> {
         let companion = |branch: IntExpr, a: IntExpr, j: IntExpr| {
             let index = member_of(&branch).unwrap_or(IntExpr::constant(0)) *
                 IntExpr::constant(count) +
-                j * IntExpr::constant(digit_rows) +
-                a;
+                a * IntExpr::constant(2 * output_columns) +
+                j;
             Ok(map_row(companions.at(Int::evaluate(index.canonicalize())), |entry| {
                 automorphism(&branch, entry)
             }))
@@ -112,6 +118,7 @@ impl EncodingLowering<'_> {
             self.parameters,
             level,
             sigmas.map_or(1, <[usize]>::len),
+            output_columns,
             &key_entry,
             &companion_key,
             Some(&companion),
@@ -120,9 +127,59 @@ impl EncodingLowering<'_> {
 }
 
 impl<'a> RnsEncryptBuild<'a> {
+    /// Export every Dynamic RHS family's ciphertexts from one root `parallel`
+    /// per family into `graph`, the encryption prelude, under `name`. With
+    /// no in-graph consumer, each family is an export-only streamed port.
+    /// Returns whether any family was exported.
+    pub(super) fn dynamic_family_ciphertexts(
+        &self,
+        mut graph: DslContext,
+        name: impl Fn(String) -> String,
+    ) -> Result<(DslContext, bool), ApiError> {
+        let (rhs_schema, _) = self
+            .dynamic_schema
+            .as_ref()
+            .ok_or_else(|| ApiError::input("Dynamic encryption schema is not bound"))?;
+        let (_, plaintexts) = self.dynamic_rhs.as_ref().ok_or_else(|| {
+            ApiError::input("Dynamic encryption requires bind_rhs_inputs with a batch identifier")
+        })?;
+        let payload = &self
+            .payload_secret
+            .as_ref()
+            .ok_or_else(|| ApiError::input("secret is not bound"))?
+            .row;
+        let plaintext_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let mut exported = false;
+        for (rhs, (_, level)) in rhs_schema {
+            let Some(InputBinding::Family(family)) = plaintexts.get(rhs) else {
+                continue;
+            };
+            let level = *level;
+            let columns = self.parameters.component_columns(level + 1).map_err(ApiError::scheme)?;
+            let next = self.parameters.ring(level + 1).map_err(ApiError::scheme)?;
+            let ciphertexts = mxx_dsl::parallel(family.count().clone(), |member| {
+                let plaintext = family.member(&plaintext_ring, member);
+                super::public_key::rhs_ciphertext(
+                    self.parameters,
+                    level,
+                    payload,
+                    plaintext,
+                    || Ok(uniform_row(&next, columns)),
+                )
+                .map_err(|_| DslError::Schema)
+            })
+            .map_err(ApiError::scheme)?;
+            graph = graph
+                .transferred_output(name(format!("rhs/{rhs:?}/family/ciphertext")), ciphertexts)
+                .map_err(ApiError::scheme)?;
+            exported = true;
+        }
+        Ok((graph, exported))
+    }
+
     /// Bind the RHS plaintexts of a Dynamic encryption and its batch
-    /// identifier, after the preprocessing artifacts (or, for a PRF child,
-    /// its refresh binding) are bound, e.g. in the `api::encrypt` compose
+    /// identifier, after the preprocessing artifacts (and, for a refresh mask
+    /// child, its mask binding) are bound, e.g. in the `api::encrypt` compose
     /// callback.
     ///
     /// `batch_id` is a fresh public identifier of this encryption request,
@@ -190,7 +247,7 @@ impl<'a> RnsEncryptBuild<'a> {
         mut graph: DslContext,
         hash_key: &Bytes,
         program: crate::program::ExponentLutProgramId,
-        namespace: Option<([u8; 32], usize)>,
+        namespace: Option<[u8; 32]>,
         name: impl Fn(String) -> String,
     ) -> Result<DslContext, ApiError> {
         let (rhs_schema, luts) = self
@@ -220,11 +277,11 @@ impl<'a> RnsEncryptBuild<'a> {
                 level,
             )
         };
-        let top = |level: usize| -> Result<RnsBggRow, RnsBggError> {
+        let top = |level: usize, columns: usize| -> Result<RnsBggRow, RnsBggError> {
             let next = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
-            Ok(uniform_row(&self.parameters.ring(next)?, self.parameters.component_columns(next)?))
+            Ok(uniform_row(&self.parameters.ring(next)?, columns))
         };
-        let plaintext_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let rhs_columns = |level: usize| self.parameters.component_columns(level + 1);
         for (rhs, (_, level)) in rhs_schema {
             let level = *level;
             let material = format!("rhs/{rhs:?}");
@@ -235,13 +292,14 @@ impl<'a> RnsEncryptBuild<'a> {
                         level,
                         payload,
                         plaintext.clone(),
-                        || top(level),
+                        || top(level, rhs_columns(level)?),
                     )
                     .map_err(ApiError::scheme)?;
                     let companions = self
                         .companion_encodings(
                             level,
                             1,
+                            rhs_columns(level).map_err(ApiError::scheme)?,
                             &|_| ciphertext.clone(),
                             &|_| tag(material.clone(), None, level),
                             None,
@@ -262,32 +320,44 @@ impl<'a> RnsEncryptBuild<'a> {
                         .ok()
                         .and_then(|count| count.to_usize())
                         .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
-                    let ciphertexts = mxx_dsl::parallel(IntExpr::constant(members), |member| {
-                        let plaintext = family.member(&plaintext_ring, member);
-                        super::public_key::rhs_ciphertext(
-                            self.parameters,
-                            level,
-                            payload,
-                            plaintext,
-                            || top(level),
-                        )
-                        .map_err(|_| DslError::Schema)
-                    })
-                    .map_err(ApiError::scheme)?;
+                    // The ciphertexts were exported by the prelude production
+                    // (see `Self::dynamic_family_ciphertexts`), so this graph
+                    // reads its members instead of keeping the family.
+                    let (prelude, _) = self.prelude.as_ref().ok_or_else(|| {
+                        ApiError::input("Dynamic RHS family ciphertexts need the prelude")
+                    })?;
+                    let ring = self.parameters.ring(level + 1).map_err(ApiError::scheme)?;
+                    let columns = rhs_columns(level).map_err(ApiError::scheme)?;
+                    let parts = (0..4)
+                        .map(|port| {
+                            ring.family_artifact_input(
+                                prelude.clone(),
+                                name(format!("{material}/family/ciphertext.{port}")),
+                                IntExpr::constant(members),
+                                (1, columns),
+                                ArtifactAvailability::Transferred,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let first = |part: &Family<Mat>| part.at(Int::constant(0));
+                    let element: RnsBggMatrix = (
+                        (first(&parts[0]), first(&parts[1])),
+                        (first(&parts[2]), first(&parts[3])),
+                    );
+                    let fields =
+                        parts.iter().map(|part| part.value_handle().clone()).collect::<Vec<_>>();
+                    let ciphertexts =
+                        family_of_fields(&element, IntExpr::constant(members), &fields)
+                            .map_err(ApiError::scheme)?;
                     let companions = self
                         .companion_encodings(
                             level,
                             members,
+                            rhs_columns(level).map_err(ApiError::scheme)?,
                             &|member| ciphertexts.at(member),
                             &|member| tag(material.clone(), Some(member), level),
                             None,
                             hash_key,
-                        )
-                        .map_err(ApiError::scheme)?;
-                    graph = graph
-                        .transferred_output(
-                            name(format!("{material}/family/ciphertext")),
-                            ciphertexts,
                         )
                         .map_err(ApiError::scheme)?;
                     graph = graph
@@ -318,6 +388,10 @@ impl<'a> RnsEncryptBuild<'a> {
                 selector: Box::new(branch),
                 branches: indices.iter().map(|index| IntExpr::constant(*index)).collect(),
             };
+            let columns = self
+                .parameters
+                .lut_output_columns(level + 1, table.output_representation())
+                .map_err(ApiError::scheme)?;
             let ciphertexts = mxx_dsl::parallel(IntExpr::constant(sigmas.len()), |branch| {
                 let sigma = select(&sigmas, branch.expression()?);
                 super::public_key::lut_switching_ciphertext(
@@ -326,7 +400,7 @@ impl<'a> RnsEncryptBuild<'a> {
                     table,
                     payload,
                     sigma,
-                    || top(level),
+                    || top(level, columns),
                 )
                 .map_err(|_| DslError::Schema)
             })
@@ -336,6 +410,7 @@ impl<'a> RnsEncryptBuild<'a> {
                 .companion_encodings(
                     level,
                     sigmas.len(),
+                    columns,
                     &|branch| ciphertexts.at(branch),
                     &|branch| tag(material.clone(), Some(branch), level),
                     Some(&|branch| select(&inverses, branch)),
@@ -358,16 +433,18 @@ impl<'a> RnsEncryptBuild<'a> {
     /// The digit-companion encodings, under the single secret, of `members`
     /// ciphertexts consumed at `level`, member `t`'s stored ciphertext being
     /// `ciphertext(t)` and its companion-key tag `tag(t)`. Element
-    /// `(t m_(i+1) + j) m_i + a` (see [`Self::companion_family`]) is
+    /// `(t m_i + a) m_(i+1) + j` (see [`Self::companion_family`]) is
     /// `z_{a,j} = s B_{a,j} - d_{a,j} s G_i + eps` under
     /// [`super::companion_key`] for digit `d_{a,j} = Dec_{q_(i+1)}(C)_{a,j}`
     /// of the stored ciphertext, rebased to `q_i`; a LUT branch encodes
     /// `sigma^-1(d)`, with the inverse automorphism index `inverse_sigma(t)`
-    /// (spec Eq. 045, 084). Each lane decomposes only column `j` of `C`.
+    /// (spec Eq. 045, 084). Each lane decomposes only the entry of column `j`
+    /// of `C` that holds digit row `a`.
     fn companion_encodings(
         &self,
         level: usize,
         members: usize,
+        output_columns: usize,
         ciphertext: &dyn Fn(Int) -> RnsBggMatrix,
         tag: &dyn Fn(IntExpr) -> mxx_dsl::HashTag,
         inverse_sigma: Option<&dyn Fn(IntExpr) -> IntExpr>,
@@ -381,32 +458,51 @@ impl<'a> RnsEncryptBuild<'a> {
             .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
         let digits = next_parameters.modulus_digits();
         let digit_rows = 2 * self.parameters.component_columns(level)?;
-        let output_columns = 2 * self.parameters.component_columns(next)?;
-        let count = companion_count(self.parameters, level)?;
+        let count = companion_count(self.parameters, level, output_columns)?;
+        let output_columns = 2 * output_columns;
         let gadget = self.parameters.public_gadget(level)?;
         let width = self.parameters.level(level)?.modulus_digits();
         let mask = &self.payload_secret.as_ref().ok_or(RnsBggError::Binding("secret"))?.row;
-        mxx_dsl::parallel(IntExpr::constant(members * count), |index| {
-            let index = Box::new(index.expression()?);
+        // Member `k / count` of the ciphertexts is read through this outer
+        // index family, the Gather form a wave importer reads ahead when the
+        // ciphertexts are an imported family.
+        let member_of = Family::pack(
+            (0..members * count).map(|k| Int::constant(k / count)).collect::<Vec<_>>(),
+        )
+        .map_err(graph)?;
+        mxx_dsl::parallel(IntExpr::constant(members * count), |lane| {
+            let member_index = member_of.at(lane.clone());
+            let index = Box::new(lane.expression()?);
             let quotient = |divisor: usize| {
                 IntExpr::FloorDiv(index.clone(), Box::new(IntExpr::constant(divisor)))
                     .canonicalize()
             };
             let member = quotient(count);
-            let column = quotient(digit_rows);
-            let j = IntExpr::Rem(Box::new(column), Box::new(IntExpr::constant(output_columns)))
-                .canonicalize();
-            let a = IntExpr::Rem(index, Box::new(IntExpr::constant(digit_rows))).canonicalize();
-            let ciphertext = ciphertext(Int::evaluate(member.clone()));
+            let a = IntExpr::Rem(
+                Box::new(quotient(output_columns)),
+                Box::new(IntExpr::constant(digit_rows)),
+            )
+            .canonicalize();
+            let j = IntExpr::Rem(index, Box::new(IntExpr::constant(output_columns))).canonicalize();
+            let ciphertext = ciphertext(member_index);
             let [top, bottom] = [&ciphertext.0, &ciphertext.1].map(super::join_row);
-            let column_digits = Mat::concat(
-                mxx_ir_core::node::ConcatAxis::Rows,
-                vec![super::row_entry(&top, j.clone()), super::row_entry(&bottom, j.clone())],
+            // Digit row `a` is digit `a mod D` of entry `a / D` of the stacked
+            // column `j`, so only that entry is decomposed.
+            let entry = IntExpr::FloorDiv(Box::new(a.clone()), Box::new(IntExpr::constant(digits)))
+                .canonicalize();
+            let entry_digits = super::row_entry(
+                &Mat::concat(
+                    mxx_ir_core::node::ConcatAxis::Columns,
+                    vec![super::row_entry(&top, j.clone()), super::row_entry(&bottom, j.clone())],
+                ),
+                entry,
             )
             .decompose(base, digits)
             .centered_rebase(&ring);
-            let mut digit =
-                super::unit_row(&ring, digit_rows, a.clone()).mul_small_rhs(column_digits);
+            let digit_index =
+                IntExpr::Rem(Box::new(a.clone()), Box::new(IntExpr::constant(digits)))
+                    .canonicalize();
+            let mut digit = super::unit_row(&ring, digits, digit_index).mul_small_rhs(entry_digits);
             if let Some(inverse_sigma) = inverse_sigma {
                 digit = digit.ring_automorphism(inverse_sigma(member.clone()));
             }

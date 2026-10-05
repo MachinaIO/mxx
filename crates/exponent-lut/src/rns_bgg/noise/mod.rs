@@ -4,31 +4,29 @@
 //! a symbolic graph from public setup contracts; it does not execute a GPU
 //! graph or inspect ciphertext samples. Deterministic bounds are kept separate
 //! from conditional average-case moments. Fresh encoding errors use the
-//! configured Gaussian sigma and runtime cutoff, while refresh decoder noise
-//! remains the separate direct-decoder residual contract carried by the
-//! refresh noise parameters.
+//! configured Gaussian sigma and runtime cutoff; a refresh adds the decoder
+//! error of its trapdoor preimage (see the `refresh` submodule).
 #![warn(missing_docs)]
 use super::{RhsMode, RnsBggError, RnsBggParameters, workload::RnsBggDerivedWorkload};
 use crate::{
     noise_refresh::{
-        refresh::{NoiseRefresh, RefreshDeclaration, RefreshError, RefreshPrfLabel},
-        simulation::{NoiseModelKind, RefreshNoiseParameters},
+        refresh::{NoiseRefresh, RefreshDeclaration, RefreshError},
+        simulation::NoiseModelKind,
     },
     noise_utils::{
         NoiseCorrelation, NoiseHeuristicId, NoiseHeuristicLedger, NoiseMomentPolicy, NoiseMoments,
         NoiseSourceProvenance, NonnegativeRational, RightActionNoiseGain, ceil_div_nonnegative,
-        encoding_variance_from_sigma, gcd, stable_source_id, variance_log2, zero_mean_moments,
+        encoding_variance_from_sigma, stable_source_id, variance_log2, zero_mean_moments,
     },
     program::{
         Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution, FamilyRange,
         InputBinding, LutId, LutTable, ProgramLowerError, ProgramLoweringContext, RhsId, RhsRef,
         WireId,
     },
-    program_gadgets::prf::PrfLabel,
 };
 use bigdecimal::BigDecimal;
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_ir_core::{IntExpr, ParamEnv, types::WireType};
+use mxx_ir_core::{IntExpr, ParamEnv};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
@@ -42,7 +40,10 @@ mod evaluator;
 mod refresh;
 mod rules;
 
-pub use self::audit::{RnsBggNoiseTrace, RnsBggParameterManifest, RnsBggPlanRequest};
+pub use self::{
+    audit::{RnsBggNoiseTrace, RnsBggParameterManifest, RnsBggPlanRequest},
+    refresh::RnsBggRefreshNoise,
+};
 
 /// Evaluator-owned noise contracts for one Program lowering.
 ///
@@ -147,48 +148,6 @@ impl RnsBggNoiseBindings {
         }
         Ok(bindings)
     }
-
-    /// Bind the checked envelope produced by a refresh as a scalar input for
-    /// a subsequent Program.  The declaration and trace are both required so
-    /// a stale trace, wrong target ring, or wrong output schema cannot be
-    /// reinterpreted as an ordinary level-zero input.
-    pub fn bind_refreshed_input(
-        &mut self,
-        program: &ExponentLutProgram,
-        parameters: &RnsBggParameters,
-        input_id: WireId,
-        declaration: &RefreshDeclaration,
-        trace: &RnsBggNoiseTrace,
-    ) -> Result<(), RnsBggError> {
-        if self.inputs.contains_key(&input_id) {
-            return Err(RnsBggError::Binding("refreshed input is already bound"));
-        }
-        let input = program
-            .inputs()
-            .get(&input_id)
-            .ok_or(RnsBggError::Binding("refreshed input is not declared"))?;
-        if !matches!(input.shape(), InputBinding::Scalar(())) ||
-            input.knowledge() != crate::program::AttributeKnowledge::PrivatePayload
-        {
-            return Err(RnsBggError::Binding("refreshed input has incompatible shape or knowledge"));
-        }
-        if trace.refreshed_declaration_commitment != Some(*declaration.commitment()) ||
-            trace.refreshed_output_schema.as_deref() != Some(declaration.output_schema()) ||
-            trace.refreshed_target_level != Some(declaration.target_level())
-        {
-            return Err(RnsBggError::Refresh(RefreshError::Commitment));
-        }
-        let target = parameters.level(declaration.target_level())?;
-        if trace.refreshed_target_modulus.as_ref() != Some(target.modulus().as_ref()) {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
-        }
-        let value = trace
-            .refreshed_output
-            .clone()
-            .ok_or(RnsBggError::Refresh(RefreshError::InvalidOutputSchema))?;
-        self.inputs.insert(input_id, InputBinding::Scalar(value));
-        Ok(())
-    }
 }
 
 /// Deterministic coefficient-error and payload envelope.
@@ -240,11 +199,10 @@ pub struct RnsBggNoiseValue {
     pub moments: Option<NoiseMoments>,
     /// Stable source/route identities for shared correlations.
     ///
-    /// A refresh may aggregate several independently sampled PRF labels.
-    /// Keeping the complete source set (rather than one representative
-    /// source) lets later CRT routes recognize that the same fresh-error
-    /// sample is shared by every slot while treating distinct labels as
-    /// independent.
+    /// A value may aggregate several sampled sources, such as the members of
+    /// a refresh mask. Keeping the complete source set (rather than one
+    /// representative source) lets a later combination recognize a shared
+    /// sample.
     pub provenance: BTreeMap<[u8; 32], NoiseSourceProvenance>,
     /// Conservative assumptions used while composing moments.
     pub heuristics: NoiseHeuristicLedger,
@@ -332,6 +290,26 @@ impl RnsBggNoiseValue {
             .breakdown
             .map(|breakdown| Arc::new(breakdown.as_ref().clone().independent_members()));
         self
+    }
+
+    /// The image under a right action by constant integer digits whose `l1`
+    /// norm is `l1`, such as a gadget inverse `G^-1(w)`, followed by a
+    /// monomial: the payload is scaled by `weight`. The digits combine the
+    /// same coefficient of several columns, so the image is coherent: mean
+    /// gain `l1` and variance gain `l1^2`, with no independence claim.
+    pub(crate) fn constant_digit_action(mut self, l1: &BigUint, weight: &BigUint) -> Self {
+        self.bound.error *= l1;
+        self.bound.payload_l1 *= weight;
+        self.payload_l2_squared *= weight.pow(2u32);
+        let mean_gain =
+            NonnegativeRational::new(l1.clone(), BigUint::one()).expect("unit denominator");
+        let variance_gain = l1.pow(2u32);
+        let breakdown = self.contributions("constant-digit-action").map(|terms| {
+            terms.transform(|term| {
+                (mean_gain.clone(), term.moments.variance.scaled(&variance_gain), false)
+            })
+        });
+        self.with_breakdown(breakdown)
     }
 
     /// Replace the moments by the total of `breakdown`, when one exists.
@@ -543,7 +521,10 @@ pub struct RnsBggNoiseEvaluator<'a> {
     current_site: Option<crate::program::LoweringSite>,
     event_multiplier: BigUint,
     finalized_coefficient_wires: BTreeMap<WireId, RnsBggNoiseValue>,
-    refresh_parameters: Option<RefreshNoiseParameters>,
+    /// The refresh declaration when this evaluator lowers its mask Program.
+    refresh_mask: Option<Arc<RefreshDeclaration>>,
+    /// The decoder trapdoor sigma when this evaluator composes a refresh.
+    refresh_trapdoor_sigma: Option<f64>,
     /// Lane index of each enclosing parallel family, innermost last.
     lane_indices: Vec<IntExpr>,
     /// Wires whose payload is nonzero in at most `count` lanes of the family
@@ -571,8 +552,7 @@ pub struct RnsNoiseBuild<'a> {
         (WireId, RnsBggNoiseFamily),
         (RhsId, FamilyRange),
     >,
-    refresh_prf: Option<(usize, [u8; 32], [u8; 32])>,
-    pending_refresh: Option<(usize, (WireId, RnsBggNoiseValue))>,
+    pending_refresh: Option<RnsBggRefreshNoise>,
 }
 
 #[cfg(test)]

@@ -150,6 +150,7 @@ pub(super) fn import_rhs_bindings(
     workload: &RnsBggDerivedWorkload,
     preprocess: &ProductionId,
     encryption: &ProductionId,
+    prelude: Option<&ProductionId>,
     hash_key: &Bytes,
     name: impl Fn(String) -> String,
 ) -> Result<Vec<(RhsId, InputBinding<(RnsBggMatrix, RhsRef<Int>), OnlineEvalRhsFamily>)>, ApiError>
@@ -194,12 +195,22 @@ pub(super) fn import_rhs_bindings(
                 InputBinding::Scalar(((top, (port(2), port(3))), RhsRef { id: *rhs, index: None }))
             }
             InputBinding::Family(count) => {
+                // Dynamic family ciphertexts are the encryption prelude's.
+                let production = if dynamic {
+                    prelude.ok_or_else(|| {
+                        ApiError::compatibility(
+                            "Dynamic RHS family ciphertexts need the encryption prelude",
+                        )
+                    })?
+                } else {
+                    preprocess
+                };
                 let row = |ports: [usize; 2]| {
                     let families = ports.map(|port| {
-                        let (production, role) = if dynamic {
-                            (encryption, format!("rhs/{rhs:?}/family/ciphertext.{port}"))
+                        let role = if dynamic {
+                            format!("rhs/{rhs:?}/family/ciphertext.{port}")
                         } else {
-                            (preprocess, format!("rhs/{rhs:?}/family.{}", port - 2))
+                            format!("rhs/{rhs:?}/family.{}", port - 2)
                         };
                         ring.family_artifact_input(
                             production.clone(),
@@ -234,19 +245,20 @@ pub(super) fn import_rhs_bindings(
 
 impl EncodingLowering<'_> {
     fn preprocess_artifact_name(&self, role: String) -> String {
-        self.refresh_prf_namespace.map_or(role.clone(), |(commitment, slot)| {
-            refresh_prf_artifact_name(commitment, slot, &role)
+        self.refresh_mask.as_ref().map_or(role.clone(), |declaration| {
+            refresh_mask_artifact_name(*declaration.commitment(), &role)
         })
     }
 
     pub(super) fn encryption_artifact_name(&self, role: String) -> String {
-        self.refresh_prf_namespace.map_or(role.clone(), |(commitment, slot)| {
-            refresh_prf_artifact_name(commitment, slot, &role)
+        self.refresh_mask.as_ref().map_or(role.clone(), |declaration| {
+            refresh_mask_artifact_name(*declaration.commitment(), &role)
         })
     }
 
-    /// The production of the RHS, LUT-switching, and refresh-action
-    /// ciphertexts: preprocessing for Static, encryption for Dynamic.
+    /// The production of the RHS and LUT-switching ciphertexts: preprocessing
+    /// for Static, encryption for Dynamic (whose RHS family ciphertexts are
+    /// in the encryption prelude instead).
     pub(super) fn ciphertext_production(&self) -> &ProductionId {
         match self.parameters.rhs_mode() {
             RhsMode::Static => &self.preprocess,
@@ -287,7 +299,8 @@ impl EncodingLowering<'_> {
             .enumerate()
             .map(|(index, output)| {
                 let left = match representation {
-                    crate::program::LutOutputRepresentation::Coefficient => {
+                    crate::program::LutOutputRepresentation::Coefficient |
+                    crate::program::LutOutputRepresentation::UnscaledCoefficient => {
                         ring.polynomial([IntExpr::constant(BigInt::from(output))])
                     }
                     crate::program::LutOutputRepresentation::Exponent(layout) => {
@@ -328,10 +341,7 @@ impl EncodingLowering<'_> {
         let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
         let input_layout = table.input_layout();
         input_layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-        let output_level = if matches!(
-            table.output_representation(),
-            crate::program::LutOutputRepresentation::Coefficient
-        ) {
+        let output_level = if table.output_representation().is_coefficient() {
             level
         } else {
             level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?
@@ -429,7 +439,9 @@ impl EncodingLowering<'_> {
         let input_layout = table.input_layout();
         let ring_dimension = self.parameters.level(evaluation_level)?.ring_dimension() as usize;
         input_layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-        let target_columns = self.parameters.component_columns(decomposition_level)?;
+        let target_columns = self
+            .parameters
+            .lut_output_columns(decomposition_level, table.output_representation())?;
         let sigma_indices =
             input_layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
         let families = (0..4)
@@ -683,6 +695,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 let rows = self.companion_rows(
                     evaluation_level,
                     &input.public_key.matrix,
+                    columns,
                     format!("rhs/{:?}", reference.id),
                     member,
                     None,
@@ -693,6 +706,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                     evaluation_level,
                     evaluation_level + 1,
                     ciphertext,
+                    columns,
                     vec![super::join_row(&input.row)],
                 )?;
                 let split = |row: &Mat| super::split_row(row, columns);
@@ -720,12 +734,17 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         let (switching, sigmas) = self.lut_switching(input, lut_id, table)?;
         let output = self.site()?.output;
         let helper = self.lut_helpers(level, table, sigmas.len())?;
+        let columns = self.parameters.lut_output_columns(
+            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
+            table.output_representation(),
+        )?;
         // Dynamic: the switching ciphertexts' digit companions, one block
         // per branch.
         let companions = (self.parameters.rhs_mode() == RhsMode::Dynamic)
             .then(|| {
                 self.companion_family(
                     level,
+                    columns,
                     lut_switching_role(level, lut_id, table.input_layout(), "/digit-encoding"),
                     IntExpr::constant(sigmas.len()),
                 )
@@ -735,9 +754,6 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         // and its noise bound equal the balanced tree, while only one branch,
         // including its sampled A_sigma, is resident at a time.
         let evaluation_ring = self.parameters.ring(level)?;
-        let columns = self.parameters.component_columns(
-            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
-        )?;
         let zero = evaluation_ring.zero((1, columns));
         let initial =
             ((zero.clone(), zero.clone()), ((zero.clone(), zero.clone()), (zero.clone(), zero)));
@@ -769,15 +785,16 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         // branch's work; the last branch runs after the loop.
         let last = table.values().len().checked_sub(1).ok_or(RnsBggError::Lut)?;
         let (row, public_key) = if let Some(companions) = companions {
-            // Dynamic: one flat loop first builds every branch's key rows
-            // `T_s` and companion row `E_s` (block `s` of each row), so the
-            // stored companions are read in a single loop; the branch loop
+            // Dynamic: one companion loop first builds every branch's key
+            // rows `T_s` and companion row `E_s` (block `s` of each row), so
+            // the stored companions are read in one loop nest; the branch loop
             // then adds `sigma(c) Dec(C_sigma) + E_s` and acts with the
             // rounded `T_s` on the helper and `A_sigma`, one column at a
             // time.
             let rows = self.companion_rows(
                 level,
                 &input.public_key.matrix,
+                columns,
                 format!("lut/{lut_id:?}"),
                 None,
                 Some(&sigmas),
@@ -823,6 +840,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                         level,
                         next,
                         &b_sigma,
+                        columns,
                         vec![super::join_row(&routed_row)],
                     )
                     .map_err(schema)?;
@@ -836,6 +854,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                         level,
                         next,
                         &switched_key,
+                        columns,
                         vec![
                             super::join_row(&mask),
                             super::join_row(&data.0),
@@ -866,6 +885,11 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             .map_err(graph)?;
             branch(Int::constant(last), sums, b_last).map_err(graph)?
         };
+        if let Some(declaration) = self.refresh_mask.clone() &&
+            let Some(family) = declaration.mask().family_of_lut(lut_id)
+        {
+            return self.refresh_member(&declaration, family, level, output, row, public_key);
+        }
         let mut public_key = RnsBggPublicKey::new(output, public_key);
         let mut row = row;
         if !self
@@ -895,6 +919,40 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             None
         };
         Ok(RnsBggEncoding::new(public_key, row, self.checked_payload(output, public_payload)?))
+    }
+}
+
+impl EncodingLowering<'_> {
+    /// Finalize the raw unscaled LUT carrier of one refresh mask member at
+    /// `level` once, to `level + 1`, and apply its member transform (see
+    /// [`super::refresh_member_action`]). The family `Sum` then adds the
+    /// transformed members inside the root loop.
+    fn refresh_member(
+        &self,
+        declaration: &RefreshDeclaration,
+        family: crate::noise_refresh::refresh::MaskFamily,
+        level: usize,
+        output: WireId,
+        row: RnsBggRow,
+        public_key: RnsBggMatrix,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
+        let finalized =
+            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
+        let ring = self.parameters.ring(finalized)?;
+        let member = self
+            .site()?
+            .indices
+            .first()
+            .cloned()
+            .ok_or(RnsBggError::Binding("a refresh mask LUT must be a root family member"))?;
+        let (action, coefficient) =
+            super::refresh_member_action(self.parameters, declaration, family, member, finalized)?;
+        let act = |entry| super::act_on_entry(entry, &action, &coefficient);
+        Ok(RnsBggEncoding::new(
+            RnsBggPublicKey::new(output, map_matrix(mod_down_public(public_key, &ring), act)),
+            map_row(mod_down_encoding(row, &ring), act),
+            None,
+        ))
     }
 }
 
@@ -952,7 +1010,8 @@ mod test {
                     actual = actual + coefficient * monomial.clone().ring_automorphism(sigma);
                 }
                 let expected = match representation {
-                    crate::program::LutOutputRepresentation::Coefficient => {
+                    crate::program::LutOutputRepresentation::Coefficient |
+                    crate::program::LutOutputRepresentation::UnscaledCoefficient => {
                         ring.polynomial([IntExpr::constant(expected)])
                     }
                     crate::program::LutOutputRepresentation::Exponent(layout) => {
@@ -1059,7 +1118,7 @@ mod test {
                 preprocess: production.clone(),
                 encryption: production,
                 manifests: BTreeMap::new(),
-                refresh_prf_namespace: None,
+                refresh_mask: None,
                 context: [0; 32],
                 rhs_companions: BTreeMap::new(),
                 current_site: Some(LoweringSite {
@@ -1125,7 +1184,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production.clone(),
             manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
+            refresh_mask: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
@@ -1152,6 +1211,7 @@ mod test {
             &scalar_lowerer.workload,
             &production,
             &production,
+            None,
             &hash_key,
             |role| role,
         )
@@ -1198,6 +1258,7 @@ mod test {
             &family_lowerer.workload,
             &production,
             &production,
+            None,
             &hash_key,
             |role| role,
         )
@@ -1267,7 +1328,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production.clone(),
             manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
+            refresh_mask: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
@@ -1336,7 +1397,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
+            refresh_mask: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite {
@@ -1410,7 +1471,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
+            refresh_mask: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
@@ -1558,7 +1619,7 @@ mod test {
                 execution_nonce: [129; 32],
             },
             manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
+            refresh_mask: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite {
@@ -1748,7 +1809,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_prf_namespace: None,
+            refresh_mask: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),

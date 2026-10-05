@@ -8,19 +8,15 @@
 use super::*;
 use crate::{
     api::{
-        ApiError, EncryptBuild, OnlineEvalBuild, PlaintextInputs, RefreshApplicationError,
-        StageArtifacts, StageExecution, StageGraph, StageOutputs, apply_refresh, domain_identity,
-        execute_artifacts, execute_graph,
+        ApiError, EncryptBuild, OnlineEvalBuild, PlaintextInputs, StageArtifacts, StageExecution,
+        StageGraph, StageOutputs, apply_refresh,
     },
-    noise_refresh::refresh::{
-        NoiseRefresh, RefreshDeclaration, RefreshError, RefreshPrfLabel, canonical_digit_offset,
-    },
+    noise_refresh::refresh::{NoiseRefresh, RefreshDeclaration, RefreshError},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
-        ExponentLutProgramBuilder, GraphParallelLowering, InputBinding, InputShape, LoweringSite,
-        LutId, LutTable, Operand, ProgramLoweringContext, RhsId, RhsRef, WireId, family_of_fields,
+        GraphParallelLowering, InputBinding, InputShape, LoweringSite, LutId, LutTable, Operand,
+        ProgramLoweringContext, RhsId, RhsRef, WireId, family_of_fields,
     },
-    program_gadgets::prf::PrfLabel,
 };
 use mxx_backends::{
     RuntimeValue, SessionStore, backend::poly::threshold_decode_coefficients,
@@ -30,7 +26,6 @@ use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema,
 use mxx_ir_core::{
     IntExpr, ParamEnv, ValueHandle,
     artifact::{ArtifactAvailability, ArtifactType, Manifest, ProductionId},
-    node::ConstantMatrix,
     types::{ConcreteMatrixType, WireType},
 };
 use num_bigint::{BigInt, BigUint};
@@ -48,12 +43,12 @@ mod online_eval;
 mod refresh;
 mod verify;
 
-use self::dynamic::*;
 pub(super) use self::lowering::*;
-pub use self::{
-    online_eval::{checkpoint_refreshed_output, resume_refreshed_output},
-    verify::{decode_output, decode_public_output, verify_output, verify_refreshed_output},
-};
+pub use self::verify::{decode_output, decode_public_output, verify_output};
+#[cfg(test)]
+use crate::{api::execute_graph, program::ExponentLutProgramBuilder};
+#[cfg(test)]
+use mxx_ir_core::node::ConstantMatrix;
 
 /// Encoded row paired with the public key for its Program wire and, for
 /// public wires, plaintext.
@@ -481,7 +476,7 @@ pub struct EncodingLowering<'a> {
     pub(crate) preprocess: ProductionId,
     pub(crate) encryption: ProductionId,
     pub(crate) manifests: BTreeMap<ProductionId, Manifest>,
-    pub(crate) refresh_prf_namespace: Option<([u8; 32], usize)>,
+    pub(crate) refresh_mask: Option<Arc<RefreshDeclaration>>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
@@ -510,15 +505,21 @@ pub struct RnsEncryptBuild<'a> {
     refresh_declaration: Option<RefreshDeclaration>,
     manifests: BTreeMap<ProductionId, Manifest>,
     runtime: BTreeMap<String, RuntimeValue>,
-    refresh_prf_children: BTreeMap<usize, Box<RnsEncryptBuild<'a>>>,
-    refresh_prf_binding: Option<([u8; 32], usize, crate::program::ExponentLutProgramId, [u8; 32])>,
+    /// The bound mask child of an applied refresh.
+    refresh_mask_child: Option<Box<RnsEncryptBuild<'a>>>,
+    /// For a mask child: the refresh declaration whose mask Program it
+    /// encrypts the inputs of.
+    refresh_mask: Option<RefreshDeclaration>,
     /// Dynamic: the shape and consuming level of each declared RHS and each
-    /// evaluated `(level, LUT)`, known once preprocessing (or, for a PRF
+    /// evaluated `(level, LUT)`, known once preprocessing (or, for a mask
     /// child, its Program) is bound.
     dynamic_schema: Option<(BTreeMap<RhsId, (InputShape, usize)>, BTreeSet<(usize, LutId)>)>,
     /// Dynamic: the encryption batch identifier and the RHS plaintexts, read
     /// from graph inputs; a family is read member by member.
     dynamic_rhs: Option<([u8; 32], BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>)>,
+    /// Dynamic: the executed prelude production holding the RHS family
+    /// ciphertexts, with its manifest.
+    prelude: Option<(ProductionId, Manifest)>,
 }
 
 /// Online evaluation builder with no backend, secrets, or plaintexts.
@@ -535,8 +536,9 @@ pub struct RnsOnlineEvalBuild<'a> {
         OnlineEvalWireFamily,
         OnlineEvalRhsFamily,
     >,
-    pending_refresh: Option<(usize, RefreshDeclaration, BTreeMap<usize, RnsOnlineEvalBuild<'a>>)>,
-    refreshed_input: Option<(RefreshDeclaration, RnsBggEncoding)>,
-    refresh_prf: Option<(usize, crate::program::ExponentLutProgramId, [u8; 32])>,
-    refreshed_public_key: Option<RnsBggPublicKey>,
+    /// The applied refresh: its output index, declaration and mask child.
+    pending_refresh: Option<(usize, RefreshDeclaration, Box<RnsOnlineEvalBuild<'a>>)>,
+    /// The coefficient bound of the refresh decoder preimage, from the
+    /// preprocess binding.
+    refresh_preimage_bound: Option<BigUint>,
 }

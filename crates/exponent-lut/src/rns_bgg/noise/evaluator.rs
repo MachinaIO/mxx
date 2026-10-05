@@ -61,7 +61,8 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             current_site: None,
             event_multiplier: BigUint::one(),
             finalized_coefficient_wires: BTreeMap::new(),
-            refresh_parameters: None,
+            refresh_mask: None,
+            refresh_trapdoor_sigma: None,
             lane_indices: Vec::new(),
             payload_support: BTreeMap::new(),
             reduction_counts: ReductionCounts::default(),
@@ -696,12 +697,91 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         Ok(contributions)
     }
 
+    /// Finalize one coefficient-output value: its one scale-and-round by
+    /// the source ratio, with the public-key and encoding roundings (or, at
+    /// the terminal level, the terminal encoding error).
+    fn finalize_coefficient(
+        &mut self,
+        wire: WireId,
+        mut value: RnsBggNoiseValue,
+    ) -> Result<RnsBggNoiseValue, RnsBggError> {
+        let level = self.level(wire)?;
+        let ratio = self.parameters.scale(level)?.clone();
+        if ratio == BigUint::one() {
+            // The terminal level has no scale-and-round.
+            value.bound.error += self.parameters.encoding_error_bound();
+            let breakdown = value.contributions("coefficient-output").map(|terms| {
+                terms.merge(&NoiseBreakdown::opaque(
+                    "terminal-encoding",
+                    zero_mean_moments(self.parameters.encoding_error_variance()),
+                ))
+            });
+            value = value.with_breakdown(breakdown);
+        } else {
+            // The aggregated noise is still before the flat LUT's one
+            // scale-and-round (spec §8.2); convert it exactly once,
+            // with the public-key and encoding roundings.
+            value.bound.error = self.parameters.lut_mod_down_bound(level, &value.bound.error)?;
+            let rounding = zero_mean_moments(self.parameters.lut_public_rounding_variance(level)?)
+                .add_with_covariance(
+                    &NoiseMoments::discrete_rounding_residue(&ratio)
+                        .map_err(|error| RnsBggError::Graph(error.to_string()))?,
+                    NoiseCorrelation::Independent,
+                );
+            let mean_gain = NonnegativeRational::new(BigUint::one(), ratio.clone())
+                .expect("positive coefficient modulus ratio");
+            let breakdown = value.contributions("coefficient-output").map(|terms| {
+                // The final rounding is determined by the value it
+                // rounds.
+                let rounding = match terms.operand() {
+                    Some((operand, sample)) => NoiseBreakdown::object_residual(
+                        stable_source_id(&(
+                            b"rns-bgg/coefficient-final-rounding".as_slice(),
+                            operand,
+                            level,
+                        )),
+                        "coefficient-final-rounding",
+                        sample,
+                        rounding.clone(),
+                        true,
+                    ),
+                    None => NoiseBreakdown::opaque("coefficient-final-rounding", rounding.clone()),
+                };
+                terms
+                    .transform(|term| {
+                        (
+                            mean_gain.clone(),
+                            term.moments.variance.scaled_ratio(&BigUint::one(), &ratio.pow(2u32)),
+                            false,
+                        )
+                    })
+                    .merge(&rounding)
+            });
+            value = value.with_breakdown(breakdown);
+        }
+        if ratio != BigUint::one() {
+            let source = stable_source_id(&(
+                b"rns-bgg/coefficient-final-mod-down".as_slice(),
+                self.program.id(),
+                wire,
+                level,
+            ));
+            value.provenance.insert(source, NoiseSourceProvenance { source, route: vec![level] });
+        }
+        self.add_events(&BigUint::one());
+        if let Some(node) = self.trace.dependencies.wires.get(&wire).copied() {
+            let coordinates = self.event_coordinates(wire)?;
+            *self.trace.node_event_counts.entry(node.0).or_default() += coordinates;
+        }
+        Ok(value)
+    }
+
     pub(super) fn finish_outputs(
         &mut self,
         outputs: Vec<(WireId, RnsBggNoiseValue)>,
     ) -> Result<Vec<RnsBggNoiseValue>, RnsBggError> {
         let mut finalized = Vec::with_capacity(outputs.len());
-        for (wire, mut value) in outputs {
+        for (wire, value) in outputs {
             // Coefficient LUT output is finalized once, after the complete
             // aggregation topology.  Exponent outputs already carry their
             // normal next-level result and must not be rounded again.
@@ -714,86 +794,12 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                     finalized.push(previous.clone());
                     continue;
                 }
-                let level = self.level(wire)?;
-                let ratio = self.parameters.scale(level)?.clone();
-                if ratio == BigUint::one() {
-                    // The terminal level has no scale-and-round.
-                    value.bound.error += self.parameters.encoding_error_bound();
-                    let breakdown = value.contributions("coefficient-output").map(|terms| {
-                        terms.merge(&NoiseBreakdown::opaque(
-                            "terminal-encoding",
-                            zero_mean_moments(self.parameters.encoding_error_variance()),
-                        ))
-                    });
-                    value = value.with_breakdown(breakdown);
-                } else {
-                    // The aggregated noise is still before the flat LUT's one
-                    // scale-and-round (spec §8.2); convert it exactly once,
-                    // with the public-key and encoding roundings.
-                    value.bound.error =
-                        self.parameters.lut_mod_down_bound(level, &value.bound.error)?;
-                    let rounding =
-                        zero_mean_moments(self.parameters.lut_public_rounding_variance(level)?)
-                            .add_with_covariance(
-                                &NoiseMoments::discrete_rounding_residue(&ratio)
-                                    .map_err(|error| RnsBggError::Graph(error.to_string()))?,
-                                NoiseCorrelation::Independent,
-                            );
-                    let mean_gain = NonnegativeRational::new(BigUint::one(), ratio.clone())
-                        .expect("positive coefficient modulus ratio");
-                    let breakdown = value.contributions("coefficient-output").map(|terms| {
-                        // The final rounding is determined by the value it
-                        // rounds.
-                        let rounding = match terms.operand() {
-                            Some((operand, sample)) => NoiseBreakdown::object_residual(
-                                stable_source_id(&(
-                                    b"rns-bgg/coefficient-final-rounding".as_slice(),
-                                    operand,
-                                    level,
-                                )),
-                                "coefficient-final-rounding",
-                                sample,
-                                rounding.clone(),
-                                true,
-                            ),
-                            None => NoiseBreakdown::opaque(
-                                "coefficient-final-rounding",
-                                rounding.clone(),
-                            ),
-                        };
-                        terms
-                            .transform(|term| {
-                                (
-                                    mean_gain.clone(),
-                                    term.moments
-                                        .variance
-                                        .scaled_ratio(&BigUint::one(), &ratio.pow(2u32)),
-                                    false,
-                                )
-                            })
-                            .merge(&rounding)
-                    });
-                    value = value.with_breakdown(breakdown);
-                }
-                if ratio != BigUint::one() {
-                    let source = stable_source_id(&(
-                        b"rns-bgg/coefficient-final-mod-down".as_slice(),
-                        self.program.id(),
-                        wire,
-                        level,
-                    ));
-                    value
-                        .provenance
-                        .insert(source, NoiseSourceProvenance { source, route: vec![level] });
-                }
-                self.add_events(&BigUint::one());
-                if let Some(node) = self.trace.dependencies.wires.get(&wire).copied() {
-                    let coordinates = self.event_coordinates(wire)?;
-                    *self.trace.node_event_counts.entry(node.0).or_default() += coordinates;
-                }
+                let value = self.finalize_coefficient(wire, value)?;
                 self.finalized_coefficient_wires.insert(wire, value.clone());
+                finalized.push(value);
+            } else {
+                finalized.push(value);
             }
-            finalized.push(value);
         }
         let counts = &self.reduction_counts;
         tracing::info!(
@@ -1233,7 +1239,8 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         // carry the table's integer coefficient bound.
         let output_payload_l1 = match table.output_representation() {
             crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
-            crate::program::LutOutputRepresentation::Coefficient => table
+            crate::program::LutOutputRepresentation::Coefficient |
+            crate::program::LutOutputRepresentation::UnscaledCoefficient => table
                 .values()
                 .iter()
                 .copied()
@@ -1242,10 +1249,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 .ok_or(RnsBggError::Parameters("LUT table has no output values"))?,
         };
         let output_payload_l2_squared = output_payload_l1.pow(2u32);
-        let coefficient_output = matches!(
-            table.output_representation(),
-            crate::program::LutOutputRepresentation::Coefficient
-        );
+        let coefficient_output = table.output_representation().is_coefficient();
         let terminal_coefficient =
             coefficient_output && level + 1 >= self.parameters.levels().len();
         // A coefficient output keeps its noise before the scale-and-round
@@ -1305,12 +1309,25 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             input: self.node_for_wire(input.0)?,
             helper: None,
         };
-        self.operation_node_with_multiplier(
+        let (wire, value) = self.operation_node_with_multiplier(
             wire,
             value,
             node,
             self.event_multiplier.clone() * BigUint::from(table.values().len()),
-        )
+        )?;
+        if let Some(declaration) = self.refresh_mask.clone() &&
+            let Some(family) = declaration.mask().family_of_lut(lut)
+        {
+            // A refresh mask member: finalized once in its root body, then
+            // weighted by `G^-1(w)` and placed by a monomial, as the
+            // encoding does. The worst weight bounds every member.
+            let value = self.finalize_coefficient(wire, value)?;
+            let weights = declaration.member_weights(family);
+            let l1 = self.parameters.gadget_inverse_l1(level + 1, &weights)?;
+            let weight = weights.iter().max().cloned().unwrap_or_default();
+            return Ok((wire, value.constant_digit_action(&l1, &weight)));
+        }
+        Ok((wire, value))
     }
 }
 

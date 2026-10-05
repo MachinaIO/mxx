@@ -169,10 +169,14 @@ pub(super) struct AheadImport {
 /// The body writes results back into stable carried owners with explicit
 /// device-copy operations; no host arithmetic or per-iteration allocation is
 /// required. `body_end` is exclusive.
+///
+/// Host-driven loops nest: a body may contain the whole body of another,
+/// whose host-selected members may depend on this loop's index `index_slot`.
 pub(super) struct ExternalIoLoop {
     pub body_start: u32,
     pub body_end: u32,
     pub count: u64,
+    pub index_slot: u32,
     pub index_owner: Arc<GpuSignedValues>,
     pub carried_ids: Vec<PhysicalValueId>,
     pub carry_copy_ops: Vec<u32>,
@@ -1283,25 +1287,45 @@ pub(super) fn lower_control_node(
                     name: artifact.artifact_name.clone(),
                     index: None,
                 };
-                // A member index that only the enclosing host-driven loop's
-                // index determines, and that selects a member in every
-                // iteration, is computed by the host, which reads it one
-                // iteration ahead. Any other index, including one that fails
-                // in some iteration, is computed by the Graph.
+                // A member index that only the indices of the enclosing
+                // host-driven loops determine, and that selects a member in
+                // every iteration of them, is computed by the host, which
+                // reads it one iteration of the innermost loop ahead. Any
+                // other index, including one that fails in some iteration, is
+                // computed by the Graph.
                 let host_selected =
                     match (scope.node(index_wire.node).map(NodeHandle::kind), &ctx.ahead_imports) {
                         (Some(NodeKind::EvaluateInt(member)), Some((slot, iterations, _))) => {
+                            let loops = match &ctx.host_loops {
+                                Some(loops) if loops.last() == Some(&(*slot, *iterations)) => {
+                                    loops.clone()
+                                }
+                                _ => vec![(*slot, *iterations)],
+                            };
                             let mut env = ParamEnv { loop_indices: BTreeMap::new(), ..env.clone() };
-                            (0..*iterations)
-                                .all(|iteration| {
-                                    env.loop_indices.insert(*slot, BigInt::from(iteration));
-                                    member
-                                        .evaluate(&env)
-                                        .ok()
-                                        .and_then(|index| index.to_usize())
-                                        .is_some_and(|index| index < count)
-                                })
-                                .then(|| (*slot, member.clone(), env))
+                            let mut indices = vec![0u64; loops.len()];
+                            let mut selects = loops.iter().all(|(_, count)| *count > 0);
+                            while selects {
+                                for ((loop_slot, _), index) in loops.iter().zip(&indices) {
+                                    env.loop_indices.insert(*loop_slot, BigInt::from(*index));
+                                }
+                                selects = member
+                                    .evaluate(&env)
+                                    .ok()
+                                    .and_then(|index| index.to_usize())
+                                    .is_some_and(|index| index < count);
+                                // The next index tuple, innermost fastest.
+                                let Some(position) = (0..loops.len())
+                                    .rev()
+                                    .find(|&position| indices[position] + 1 < loops[position].1)
+                                else {
+                                    break;
+                                };
+                                indices[position] += 1;
+                                indices[position + 1..].fill(0);
+                            }
+                            env.loop_indices.clear();
+                            selects.then(|| (*slot, member.clone(), env))
                         }
                         _ => None,
                     };
@@ -1783,7 +1807,14 @@ pub(super) fn lower_control_node(
             lower_int_matrix_vector_product(ctx, scope, scope_id, node_id, node, env, *transpose)
         }
         NodeKind::ParallelLoop(loop_node) => {
-            lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env)
+            // A parallel loop in a device body replays its lanes in that body:
+            // none of them is the top level of a host-driven loop body.
+            let host_loops = if ctx.device_body { ctx.host_loops.take() } else { None };
+            let lowered = lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env);
+            if host_loops.is_some() {
+                ctx.host_loops = host_loops;
+            }
+            lowered
         }
         NodeKind::SequentialLoop(loop_node) => {
             lower_sequential_loop(ctx, graph, scope_id, node_id, node, loop_node, env)
@@ -2419,6 +2450,7 @@ fn lower_lazy_int_expr_select(
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
                 device_body: true,
+                host_loops: None,
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
                 waves: ctx.waves,
@@ -2487,6 +2519,7 @@ fn lower_lazy_int_expr_select(
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
                 device_body: true,
+                host_loops: None,
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
                 waves: ctx.waves,
@@ -6697,10 +6730,19 @@ fn lower_sequential_loop(
         .child_scope_id(scope_id, node_id)
         .ok_or_else(|| "GPU sequential loop has no child scope".to_owned())?;
     let has_scoped_artifacts = contains_scoped_artifact_input(graph, &child_id)?;
-    if has_scoped_artifacts && ctx.device_body {
-        // Per-iteration artifact reads are host-driven region boundaries.
+    if has_scoped_artifacts && ctx.device_body && ctx.host_loops.is_none() {
+        // Per-iteration artifact reads are host-driven region boundaries,
+        // which only the host's replay of a host-driven loop body can nest.
         return Err("GPU artifact-reading sequential loop cannot run inside a device body".into());
     }
+    // A loop that reads artifacts, directly or in a nested loop, is
+    // host-driven: the host replays its body, and so drives the loops in it
+    // that read artifacts too.
+    let body_host_loops = has_scoped_artifacts.then(|| {
+        let mut loops = ctx.host_loops.clone().unwrap_or_default();
+        loops.push((loop_node.index_slot, count));
+        loops
+    });
     let child =
         graph.scope(&child_id).ok_or_else(|| "GPU sequential body is missing".to_owned())?;
     let scope =
@@ -6777,6 +6819,7 @@ fn lower_sequential_loop(
         body_static_imports,
         outputs,
         carry_copy_ops,
+        nested_loops,
     ) = loop {
         let mark = (
             ctx.values.len(),
@@ -6852,10 +6895,11 @@ fn lower_sequential_loop(
             }
         };
         ctx.control_resets.push(reset);
-        if ctx.device_body {
+        if ctx.device_body && !has_scoped_artifacts {
             // The host resets loop control only before a root region or wave
             // replay. An enclosing device body replays this loop without the
-            // host, so every invocation restarts its index on the device.
+            // host, so every invocation restarts its index on the device. A
+            // host-driven loop has its index written by the host.
             let (zero, _) = allocate_wave_occurrence(ctx, 0, 0)?;
             emit_integer_operation(
                 ctx,
@@ -6910,6 +6954,7 @@ fn lower_sequential_loop(
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
                 device_body: true,
+                host_loops: body_host_loops.clone(),
                 preimage_replays: ctx.preimage_replays,
                 trapdoor_public_ids: ctx.trapdoor_public_ids,
                 waves: ctx.waves,
@@ -7013,6 +7058,7 @@ fn lower_sequential_loop(
                 body_static_imports,
                 outputs,
                 carry_copy_ops,
+                mark.10,
             );
         }
         let first_new = mark.0;
@@ -7040,14 +7086,17 @@ fn lower_sequential_loop(
     if outputs.len() != loop_node.carried_count || body_operations.is_empty() {
         return Err("GPU sequential body has no valid carried computation".into());
     }
+    // Host-driven loops lowered in the body, in body-relative operations.
+    let nested = nested_loops..ctx.external_io_loops.len();
     if has_scoped_artifacts &&
         body_imports.is_empty() &&
         body_ahead.is_empty() &&
-        body_static_imports.is_empty()
+        body_static_imports.is_empty() &&
+        nested.is_empty()
     {
         return Err("GPU scoped artifact has no selected import boundary".into());
     }
-    let external_io = !body_imports.is_empty() || !body_ahead.is_empty();
+    let external_io = !body_imports.is_empty() || !body_ahead.is_empty() || !nested.is_empty();
     if external_io {
         if carry_copy_ops.is_empty() {
             return Err("GPU external-I/O loop has no selected import or carry copy".into());
@@ -7077,6 +7126,26 @@ fn lower_sequential_loop(
             // remain in the repeated body. It never reads the full family.
             import.before_operation = body_start;
             ctx.import_templates.push(import);
+        }
+        let rebase_nested = |operation: u32| {
+            operation
+                .checked_add(body_start)
+                .filter(|operation| *operation <= body_end)
+                .ok_or_else(|| "GPU nested host-driven loop is outside its body".to_owned())
+        };
+        for inner in &mut ctx.external_io_loops[nested] {
+            inner.body_start = rebase_nested(inner.body_start)?;
+            inner.body_end = rebase_nested(inner.body_end)?;
+            for copy in &mut inner.carry_copy_ops {
+                *copy = rebase_nested(*copy)?;
+            }
+            for import in &mut inner.imports {
+                import.before_operation = rebase_nested(import.before_operation)?;
+                import.request_operation = rebase_nested(import.request_operation)?;
+            }
+            for import in &mut inner.ahead {
+                import.template.before_operation = rebase_nested(import.template.before_operation)?;
+            }
         }
         for import in &mut body_imports {
             let rebase = |operation: u32| {
@@ -7111,6 +7180,7 @@ fn lower_sequential_loop(
             body_start,
             body_end,
             count,
+            index_slot: loop_node.index_slot,
             index_owner: external_index_owner,
             carried_ids: carried_ids.clone(),
             carry_copy_ops: carry_copy_ops.clone(),
@@ -10326,6 +10396,117 @@ mod tests {
             let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
             for (member, key) in keys.iter().enumerate() {
                 assert_eq!(after[member] - before[member], 1, "replay {replay}: {key:?}");
+            }
+        }
+    }
+
+    /// Nested host-driven loops: an outer loop over `o` whose body runs an
+    /// inner loop over `i` that reads member `o I + i`, a member index of
+    /// both loop indices, folding it into the order-sensitive state `2 x + m`.
+    /// The outer body doubles its state before the inner loop in one case and
+    /// after it in the other. Both loops are host-driven, the inner one read
+    /// ahead by the host; the result matches the CPU and every member is
+    /// loaded once per execution.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_nested_sequential_loops_read_members_of_both_indices() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute_in_session},
+        };
+        use mxx_dsl::{Int, iterate};
+        use mxx_ir_core::artifact::ArtifactAvailability;
+
+        let outer = test_count("MXX_TEST_NESTED_OUTER_COUNT", 3);
+        let inner = test_count("MXX_TEST_NESTED_INNER_COUNT", 4);
+        let count = outer * inner;
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        let keys = member_keys(&production, count);
+        for work_before_inner in [true, false] {
+            let members = ring.family_artifact_input(
+                production.clone(),
+                "members",
+                count,
+                (1, 1),
+                ArtifactAvailability::Cached,
+            );
+            let sum = iterate(outer, ring.zero((1, 1)), move |o, sum| {
+                let o = o.expression()?;
+                let sum = if work_before_inner { sum.clone() + sum } else { sum };
+                let members = members.clone();
+                let sum = iterate(inner, sum, move |i, sum| {
+                    let member = IntExpr::Add(
+                        Box::new(IntExpr::Mul(
+                            Box::new(o.clone()),
+                            Box::new(IntExpr::constant(inner)),
+                        )),
+                        Box::new(i.expression()?),
+                    );
+                    Ok(sum.clone() + sum + members.at(Int::evaluate(member.canonicalize())))
+                })?;
+                Ok(if work_before_inner { sum } else { sum.clone() + sum })
+            })
+            .unwrap();
+            let validated = DslContext::new("direct-nested-sequential-consumer")
+                .output("sum", sum)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production.clone(), manifest.clone())]),
+                )
+                .unwrap();
+            let expected = execute_in_session(
+                &validated,
+                &mut cpu_backend([cpu_params.clone()]),
+                BTreeMap::new(),
+                &mut store,
+                rand::random(),
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(expected) = &expected.outputs["sum"] else {
+                panic!("CPU sum is a matrix");
+            };
+            let expected = expected.as_cpu_full().expect("CPU matrix").clone();
+            let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+            // Both loops are host-driven, the inner body nested in the outer
+            // one, and the host reads the inner loop's members ahead.
+            let [outer_loop, inner_loop] = &plan.frame().external_io_loops[..] else {
+                panic!("two host-driven loops");
+            };
+            assert!(
+                outer_loop.body_start <= inner_loop.body_start &&
+                    inner_loop.body_end < outer_loop.body_end,
+                "work before inner {work_before_inner}"
+            );
+            assert!(outer_loop.ahead.is_empty() && inner_loop.ahead.len() == 1);
+            for replay in 0..2 {
+                let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+                let result = runtime
+                    .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                    .unwrap();
+                let actual =
+                    runtime.download_matrix_output(&result.output("sum").unwrap()).unwrap();
+                assert_eq!(
+                    actual.entry(0, 0).to_bytes(),
+                    expected.entry(0, 0).to_bytes(),
+                    "work before inner {work_before_inner}, replay {replay}"
+                );
+                let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+                for (member, key) in keys.iter().enumerate() {
+                    assert_eq!(
+                        after[member] - before[member],
+                        1,
+                        "work before inner {work_before_inner}, replay {replay}: {key:?}"
+                    );
+                }
             }
         }
     }

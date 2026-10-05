@@ -432,8 +432,9 @@ fn geometric_candidates(maximum: usize, value: impl Fn(usize) -> usize) -> Vec<u
 /// Run every region of `graph` once, and each body region of a host-driven
 /// loop once, returning each region's seconds and launch count. Every
 /// iteration replays the same body work, so the first iteration's time counts
-/// for each later one. A region with a `cached` launch time is not launched:
-/// that time counts for each of its launches instead.
+/// for each later one, and for each iteration of every loop enclosing it. A
+/// region with a `cached` launch time is not launched: that time counts for
+/// each of its launches instead.
 fn run_trial_regions(
     graph: &mut DirectGraph,
     frame: &PhysicalFrame,
@@ -441,73 +442,90 @@ fn run_trial_regions(
 ) -> Result<(Vec<f64>, Vec<usize>), GpuRuntimeError> {
     let mut seconds = vec![0.0; graph.regions.len()];
     let mut launches = vec![0usize; graph.regions.len()];
-    let mut timed = |graph: &mut DirectGraph, region: usize| -> Result<(), GpuRuntimeError> {
-        launches[region] += 1;
-        if let Some(Some(launch)) = cached.get(region) {
-            seconds[region] += launch;
-            return Ok(());
-        }
-        let started = Instant::now();
-        graph.launch_region(frame, region)?.wait()?;
-        seconds[region] += started.elapsed().as_secs_f64();
-        Ok(())
+    let mut timed = |graph: &mut DirectGraph, region: usize, repeats: u64| {
+        launches[region] =
+            launches[region].saturating_add(usize::try_from(repeats).unwrap_or(usize::MAX));
+        let launch = match cached.get(region) {
+            Some(Some(launch)) => *launch,
+            _ => {
+                let started = Instant::now();
+                graph.launch_region(frame, region)?.wait()?;
+                started.elapsed().as_secs_f64()
+            }
+        };
+        seconds[region] += launch * repeats as f64;
+        Ok::<_, GpuRuntimeError>(())
     };
-    let mut repeated = Vec::new();
-    let mut region = 0usize;
-    let mut next_loop = 0usize;
-    while region < graph.regions.len() {
-        let start = graph.regions[region].start_operation;
-        if let Some(loop_body) = frame.external_io_loops.get(next_loop) {
-            if start == loop_body.body_start {
-                let end = graph
-                    .regions
-                    .iter()
-                    .position(|candidate| candidate.start_operation == loop_body.body_end)
-                    .unwrap_or(graph.regions.len());
-                if end <= region ||
-                    (end == graph.regions.len() &&
-                        loop_body.body_end as usize != frame.program.operations.len())
-                {
-                    return Err(GpuRuntimeError::Execution(
-                        "trial external-I/O loop has no matching Graph body end".into(),
-                    ));
-                }
-                if loop_body.count > 0 {
-                    loop_body
-                        .index_owner
-                        .upload_u64(&[0])
-                        .and_then(|()| loop_body.index_owner.wait_until_ready())
-                        .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
-                    for body_region in region..end {
-                        timed(graph, body_region)?;
-                    }
-                    repeated.push((region..end, loop_body.count));
-                }
-                region = end;
-                next_loop += 1;
-                continue;
-            }
-            if start > loop_body.body_start {
-                return Err(GpuRuntimeError::Execution(
-                    "trial external-I/O loop body was skipped".into(),
-                ));
-            }
-        }
-        timed(graph, region)?;
-        region += 1;
-    }
-    if next_loop != frame.external_io_loops.len() {
+    let regions = graph.regions.len();
+    let operations = u32::try_from(frame.program.operations.len())
+        .map_err(|_| GpuRuntimeError::Execution("trial Graph has too many operations".into()))?;
+    let visited = trial_region_range(graph, frame, 0..regions, operations, None, 1, &mut timed)?;
+    if visited != frame.external_io_loops.len() {
         return Err(GpuRuntimeError::Execution(
             "trial external-I/O loop did not reach its Graph region".into(),
         ));
     }
-    for (body, count) in repeated {
-        for region in body {
-            seconds[region] *= count as f64;
-            launches[region] *= usize::try_from(count).unwrap_or(usize::MAX);
-        }
-    }
     Ok((seconds, launches))
+}
+
+/// Time the regions `regions`, which end at operation `end`, each launch
+/// standing for `repeats` launches, entering every host-driven loop whose
+/// body starts in them other than `host_loop`, the loop whose body they are.
+/// Returns the number of loops entered.
+fn trial_region_range(
+    graph: &mut DirectGraph,
+    frame: &PhysicalFrame,
+    regions: std::ops::Range<usize>,
+    end: u32,
+    host_loop: Option<usize>,
+    repeats: u64,
+    timed: &mut dyn FnMut(&mut DirectGraph, usize, u64) -> Result<(), GpuRuntimeError>,
+) -> Result<usize, GpuRuntimeError> {
+    let mut visited = 0usize;
+    let mut region = regions.start;
+    while region < regions.end {
+        let start = graph.regions[region].start_operation;
+        let entered = frame.external_io_loops.iter().enumerate().position(|(index, body)| {
+            body.body_start == start && host_loop != Some(index) && body.body_end <= end
+        });
+        let Some(loop_index) = entered else {
+            timed(graph, region, repeats)?;
+            region += 1;
+            continue;
+        };
+        let loop_body = &frame.external_io_loops[loop_index];
+        let body_end = graph
+            .regions
+            .iter()
+            .position(|candidate| candidate.start_operation == loop_body.body_end)
+            .unwrap_or(graph.regions.len());
+        if body_end <= region ||
+            body_end > regions.end ||
+            (body_end == graph.regions.len() &&
+                loop_body.body_end as usize != frame.program.operations.len())
+        {
+            return Err(GpuRuntimeError::Execution(
+                "trial external-I/O loop has no matching Graph body end".into(),
+            ));
+        }
+        loop_body
+            .index_owner
+            .upload_u64(&[0])
+            .and_then(|()| loop_body.index_owner.wait_until_ready())
+            .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?;
+        let repeats = repeats.saturating_mul(loop_body.count);
+        visited += 1 + trial_region_range(
+            graph,
+            frame,
+            region..body_end,
+            loop_body.body_end,
+            Some(loop_index),
+            repeats,
+            timed,
+        )?;
+        region = body_end;
+    }
+    Ok(visited)
 }
 
 /// A key for the work of the operations `start..end` of `frame`, equal for
@@ -826,11 +844,20 @@ impl DirectGraph {
             }
             starts.push(boundary);
         }
-        let mut previous_end = 0usize;
+        // The bodies containing the current one, as (end, carry tail start):
+        // a nested body lies before the carry tail of each of them.
+        let mut enclosing = Vec::<(usize, usize)>::new();
         for region in &frame.external_io_loops {
             let start = region.body_start as usize;
             let end = region.body_end as usize;
-            if region.count == 0 || start >= end || end > length || start < previous_end {
+            while enclosing.last().is_some_and(|&(parent_end, _)| parent_end <= start) {
+                enclosing.pop();
+            }
+            if region.count == 0 ||
+                start >= end ||
+                end > length ||
+                enclosing.last().is_some_and(|&(_, parent_tail)| end > parent_tail)
+            {
                 return Err(GpuPlanError::GraphCompile(
                     "external-I/O loop has an invalid or overlapping body range".into(),
                 ));
@@ -870,7 +897,7 @@ impl DirectGraph {
                 }
                 starts.push(boundary);
             }
-            previous_end = end;
+            enclosing.push((end, tail_start));
         }
         starts.extend(extra_starts.iter().copied().filter(|&start| start < length));
         starts.sort_unstable();
@@ -1842,6 +1869,12 @@ impl GpuExecutionPlan {
     pub fn compiled_launch_count(&self) -> usize {
         self.launches.load(Ordering::Acquire)
     }
+    /// The physical frame the plan executes.
+    #[cfg(test)]
+    pub(crate) fn frame(&self) -> &PhysicalFrame {
+        &self.frame
+    }
+
     /// Whether executing the plan reads or writes artifacts.
     pub fn has_artifact_io(&self) -> bool {
         !(self.frame.import_templates.is_empty() &&
@@ -1861,6 +1894,10 @@ pub struct GpuRuntime {
     /// Seconds one launch of a region took in a trial, keyed by its work
     /// (`region_key`), reused by every later trial of this runtime.
     region_launch_seconds: BTreeMap<u64, f64>,
+    /// The current iteration of every host-driven loop the executor is in,
+    /// by index slot: a nested loop's host-selected member may depend on the
+    /// indices of the loops enclosing it.
+    host_loop_indices: BTreeMap<u32, u64>,
 }
 
 /// The limit and measurements of one I/O trial execute.
@@ -1929,6 +1966,7 @@ impl GpuRuntime {
             options: GpuRuntimeOptions::from_env()?,
             measured_costs: GpuMeasuredCostCache::default(),
             io_trial: None,
+            host_loop_indices: BTreeMap::new(),
             region_launch_seconds: BTreeMap::new(),
         })
     }
@@ -3401,21 +3439,26 @@ impl GpuRuntime {
                 ));
             }
             let frame = FrameGeneration::new(0, plan.completed_runs);
-            if let Some(loop_index) = plan
-                .frame
-                .external_io_loops
-                .iter()
-                .position(|loop_body| loop_body.body_start == operation) &&
-                host_loop != Some(loop_index)
+            // The outermost host-driven loop starting here inside this range,
+            // other than the one whose body this range is. Loops are sorted
+            // with every enclosing loop before the loops nested in it, and an
+            // enclosing loop that starts here too ends after this range, so a
+            // loop starting with its body's first operation is entered from
+            // that body.
+            if let Some(loop_index) =
+                plan.frame.external_io_loops.iter().enumerate().position(|(index, loop_body)| {
+                    loop_body.body_start == operation &&
+                        host_loop != Some(index) &&
+                        loop_body.body_end <= end
+                })
             {
                 let loop_body = &plan.frame.external_io_loops[loop_index];
-                if loop_body.body_end > end {
-                    return Err(GpuRuntimeError::Execution(
-                        "host-driven loop body crosses its enclosing Graph range".into(),
-                    ));
-                }
-                let (body_start, body_end, count) =
-                    (loop_body.body_start, loop_body.body_end, loop_body.count);
+                let (body_start, body_end, count, slot) = (
+                    loop_body.body_start,
+                    loop_body.body_end,
+                    loop_body.count,
+                    loop_body.index_slot,
+                );
                 let index_owner = Arc::clone(&loop_body.index_owner);
                 // An I/O trial runs a root loop's first iterations only.
                 let root = active_wave.is_none() && host_loop.is_none();
@@ -3426,6 +3469,7 @@ impl GpuRuntime {
                     self.start_ahead_imports(plan, pump, loop_index, 0)?;
                 }
                 for iteration in 0..iterations {
+                    self.host_loop_indices.insert(slot, iteration);
                     let iteration_started = Instant::now();
                     index_owner
                         .upload_u64(&[iteration])
@@ -3456,6 +3500,7 @@ impl GpuRuntime {
                         );
                     }
                 }
+                self.host_loop_indices.remove(&slot);
                 region = plan.graph.region_interval(body_start, body_end)?.end;
                 continue;
             }
@@ -3799,6 +3844,9 @@ impl GpuRuntime {
         let frame = FrameGeneration::new(0, plan.completed_runs);
         for import in &plan.frame.external_io_loops[loop_index].ahead {
             let mut env = import.env.clone();
+            env.loop_indices.extend(
+                self.host_loop_indices.iter().map(|(slot, index)| (*slot, BigInt::from(*index))),
+            );
             env.loop_indices.insert(import.slot, BigInt::from(iteration));
             let count = import.template.descriptor.family_count.unwrap_or(0);
             let index = import

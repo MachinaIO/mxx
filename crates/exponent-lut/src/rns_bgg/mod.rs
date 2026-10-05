@@ -1462,16 +1462,15 @@ pub(crate) fn join_row(row: &RnsBggRow) -> Mat {
 /// the scale `p_i` of the private payload annihilates. `T_s` depends only on
 /// public keys. The caller adds `c_s Dec(C_s)` (see [`column_action`]).
 ///
-/// The key rows read no artifact, so an outer loop visits every `(s, a)`
-/// and decomposes column `a` of `A_s` once, and its inner loop visits every
-/// `j`, holding one key and accumulating the `1 x m_(i+1)` block of branch
-/// `s`, which the outer body then places. A GPU loop that reads artifacts
-/// may not nest in another loop, so the companion row is one flat loop
-/// over every `(s, a, j)`, which holds column `a` of `A_s`, its digits, and
-/// two companions (the current one and the next one, read ahead). The
-/// graph and the working set are linear in `M_i + m_i + branches m_(i+1)`.
-/// Returns the key rows and, given companions, the companion row, each `1 x
-/// branches m_(i+1)` with branch `s` at columns `s m_(i+1) ..`.
+/// An outer loop visits every `(s, a)` and decomposes column `a` of `A_s`
+/// once; its inner loop visits every `j`, holding one key and two
+/// companions (the current one and the next one, read ahead), and
+/// accumulates the `1 x m_(i+1)` block of branch `s`, which the outer body
+/// then places. Both loops read companions, so on a GPU both are host-driven
+/// and the inner one reads each companion one iteration ahead. The graph and
+/// the working set are linear in `M_i + m_i + branches m_(i+1)`. Returns the key rows and, given
+/// companions, the companion row, each `1 x branches m_(i+1)` with branch `s` at columns `s
+/// m_(i+1) ..`.
 pub(crate) fn companion_columns(
     parameters: &RnsBggParameters,
     level: usize,
@@ -1487,76 +1486,59 @@ pub(crate) fn companion_columns(
     let digits = current.modulus_digits();
     let digit_rows = 2 * parameters.component_columns(level)?;
     let block = 2 * output_columns;
-    let width = branches * block;
     let schema = |_| mxx_dsl::DslError::Schema;
-    let quotient = |k: &IntExpr, divisor: usize| {
-        IntExpr::FloorDiv(Box::new(k.clone()), Box::new(IntExpr::constant(divisor))).canonicalize()
-    };
-    let remainder = |k: IntExpr, divisor: usize| {
-        IntExpr::Rem(Box::new(k), Box::new(IntExpr::constant(divisor))).canonicalize()
-    };
-    // `(u0, u1)`: the digits of column `a` of `A_s`.
-    let digits_of = |branch: &IntExpr, a: &IntExpr| {
+    let sums = if companion.is_some() { 3 } else { 2 };
+    let rows = vec![ring.zero((1, branches * block)); sums];
+    Ok(mxx_dsl::iterate(branches * digit_rows, rows, |pair, rows: Vec<Mat>| {
+        let pair = Box::new(pair.expression()?);
+        let digit_rows = Box::new(IntExpr::constant(digit_rows));
+        let branch = IntExpr::FloorDiv(pair.clone(), digit_rows.clone()).canonicalize();
+        let a = IntExpr::Rem(pair, digit_rows).canonicalize();
         let [u0, u1] = [0, 1].map(|r| {
             key_entry(branch.clone(), r, a.clone()).map(|entry| entry.decompose(base, digits))
         });
-        Ok::<_, RnsBggError>((u0?, u1?))
-    };
-    let act = |(u0, u1): &(Preimage, Preimage), (left, right): RnsBggRow| {
-        left.mul_small_rhs(u0.clone()) + right.mul_small_rhs(u1.clone())
-    };
-    let keys = vec![ring.zero((1, width)); 2];
-    let mut rows = mxx_dsl::iterate(branches * digit_rows, keys, |pair, rows: Vec<Mat>| {
-        let pair = pair.expression()?;
-        let (branch, a) = (quotient(&pair, digit_rows), remainder(pair, digit_rows));
-        let column = digits_of(&branch, &a).map_err(schema)?;
-        let blocks =
-            mxx_dsl::iterate(block, vec![ring.zero((1, block)); 2], |j, blocks: Vec<Mat>| {
-                let j = j.expression()?;
-                let (top, bottom) =
-                    companion_key(branch.clone(), a.clone(), j.clone()).map_err(schema)?;
-                let unit = unit_row(&ring, block, j);
-                Ok(blocks
-                    .into_iter()
-                    .zip([act(&column, top), act(&column, bottom)])
-                    .map(|(sum, term)| sum + term * unit.clone())
-                    .collect())
-            })?;
+        let (u0, u1) = (u0.map_err(schema)?, u1.map_err(schema)?);
+        let act = |(left, right): RnsBggRow| {
+            left.mul_small_rhs(u0.clone()) + right.mul_small_rhs(u1.clone())
+        };
+        let read = |j: IntExpr| {
+            companion.map(|companion| companion(branch.clone(), a.clone(), j)).transpose()
+        };
+        // Each inner iteration reads the next companion (the first again
+        // after the last) and carries it, so that load overlaps this
+        // iteration's work.
+        let mut initial = vec![ring.zero((1, block)); sums];
+        if let Some((left, right)) = read(IntExpr::constant(0)).map_err(schema)? {
+            initial.extend([left, right]);
+        }
+        let blocks = mxx_dsl::iterate(block, initial, |j, mut carried: Vec<Mat>| {
+            let j = j.expression()?;
+            let next = IntExpr::Rem(
+                Box::new(j.clone() + IntExpr::constant(1)),
+                Box::new(IntExpr::constant(block)),
+            )
+            .canonicalize();
+            let (top, bottom) =
+                companion_key(branch.clone(), a.clone(), j.clone()).map_err(schema)?;
+            let mut terms = vec![act(top), act(bottom)];
+            if let Some((left, right)) = read(next).map_err(schema)? {
+                let current = carried.split_off(sums);
+                terms.push(act((current[0].clone(), current[1].clone())));
+                carried.extend([left, right]);
+            }
+            let unit = unit_row(&ring, block, j);
+            for (row, term) in carried.iter_mut().zip(terms) {
+                *row = row.clone() + term * unit.clone();
+            }
+            Ok(carried)
+        })?;
         let place = unit_row(&ring, branches, branch);
         Ok(rows
             .into_iter()
             .zip(blocks)
             .map(|(row, block)| row + place.clone().tensor(block))
             .collect())
-    })?;
-    if let Some(companion) = companion {
-        let total = width * digit_rows;
-        let read = |k: &IntExpr| {
-            let (pair, j) = (quotient(k, block), remainder(k.clone(), block));
-            companion(quotient(&pair, digit_rows), remainder(pair, digit_rows), j)
-        };
-        // Each iteration reads the next companion (the first again after the
-        // last) and carries it, so that load overlaps this iteration's work.
-        let (left, right) = read(&IntExpr::constant(0))?;
-        let initial = vec![ring.zero((1, width)), left, right];
-        let sum = mxx_dsl::iterate(total, initial, |k, carried: Vec<Mat>| {
-            let k = k.expression()?;
-            let next = remainder(k.clone() + IntExpr::constant(1), total);
-            let (pair, j) = (quotient(&k, block), remainder(k, block));
-            let branch = quotient(&pair, digit_rows);
-            let a = remainder(pair, digit_rows);
-            let column = digits_of(&branch, &a).map_err(schema)?;
-            let (left, right) = read(&next).map_err(schema)?;
-            let [sum, current_left, current_right]: [Mat; 3] =
-                carried.try_into().map_err(|_| mxx_dsl::DslError::Schema)?;
-            let term = act(&column, (current_left, current_right));
-            let unit =
-                unit_row(&ring, width, (branch * IntExpr::constant(block) + j).canonicalize());
-            Ok(vec![sum + term * unit, left, right])
-        })?;
-        rows.extend(sum.into_iter().take(1));
-    }
-    Ok(rows)
+    })?)
 }
 
 /// `row Dec(matrix)` for every row of `rows`, one column at a time: column

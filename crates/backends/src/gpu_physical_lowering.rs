@@ -1523,6 +1523,12 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// The index slot and iteration count of the sequential loop whose body
     /// is being lowered, and that body's host-selected imports.
     pub ahead_imports: Option<(u32, u64, &'a mut Vec<crate::gpu_physical_control::AheadImport>)>,
+    /// The index slots and counts of the host-driven loops whose body this
+    /// context lowers at its top level, outermost first. Such a body is a
+    /// device body the host replays per iteration, so a sequential loop in it
+    /// that reads artifacts runs as a nested host-driven loop. `None`
+    /// elsewhere, including in a device-resident body nested in it.
+    pub host_loops: Option<Vec<(u32, u64)>>,
     /// Mapped host slots: the import request slots of selected imports, in
     /// lowering order, then the export slots.
     pub slots: &'a mut Vec<Arc<GpuExportSlot>>,
@@ -5554,6 +5560,7 @@ pub(super) fn lower_preimage_sample_node(
                 active_parallel_template: ctx.active_parallel_template,
                 active_parallel_instances: ctx.active_parallel_instances.clone(),
                 device_body: true,
+                host_loops: None,
                 preimage_replays: &mut *ctx.preimage_replays,
                 trapdoor_public_ids: &mut *ctx.trapdoor_public_ids,
                 waves: &mut *ctx.waves,
@@ -6868,6 +6875,7 @@ pub(crate) fn plan_physical_graph(
                 active_parallel_template: None,
                 active_parallel_instances: Vec::new(),
                 device_body: false,
+                host_loops: None,
                 preimage_replays: &mut preimage_replays,
                 trapdoor_public_ids: &mut trapdoor_public_ids,
                 waves: &mut waves,
@@ -7670,6 +7678,9 @@ pub(crate) fn plan_physical_graph(
         let mut ctx = root_context!();
         record_node_operations(&mut ctx, &FrozenGraphScopeId::Root, node, first_operation)?;
     }
+    // A nested host-driven loop is lowered before the loop enclosing it; the
+    // runtime expects every enclosing loop before the loops nested in it.
+    external_io_loops.sort_by_key(|body| (body.body_start, std::cmp::Reverse(body.body_end)));
     relocate_import_boundaries(
         &operations,
         &values,

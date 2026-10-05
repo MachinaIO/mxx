@@ -3901,7 +3901,13 @@ extern "C++" {
                 continue;
             error = update_on_device(record.device, exec->device, [&] {
                 return gpuGraphExecMemcpyNodeSetParams1D(
-                    exec->exec, record.node, destination, source, record.bytes, record.kind);
+#if defined(MXX_GPU_BACKEND_HIP)
+                    exec->schedule ? exec->schedule->executable(record.node) : exec->exec,
+                    exec->schedule ? exec->schedule->node(record.node) : record.node,
+#else
+                    exec->exec, record.node,
+#endif
+                    destination, source, record.bytes, record.kind);
             });
             if (error != gpuSuccess)
             {

@@ -6834,6 +6834,8 @@ fn lower_sequential_loop(
             ctx.import_templates.len(),
             ctx.external_io_loops.len(),
             *ctx.crt_resource_next,
+            ctx.slots.len(),
+            ctx.export_templates.len(),
         );
         let resource_keys = ctx.hash_resources.keys().copied().collect::<BTreeSet<_>>();
         let mut input_ids = Vec::with_capacity(arguments.len());
@@ -6895,11 +6897,10 @@ fn lower_sequential_loop(
             }
         };
         ctx.control_resets.push(reset);
-        if ctx.device_body && !has_scoped_artifacts {
+        if ctx.device_body {
             // The host resets loop control only before a root region or wave
             // replay. An enclosing device body replays this loop without the
-            // host, so every invocation restarts its index on the device. A
-            // host-driven loop has its index written by the host.
+            // host, so every invocation restarts its index on the device.
             let (zero, _) = allocate_wave_occurrence(ctx, 0, 0)?;
             emit_integer_operation(
                 ctx,
@@ -7078,6 +7079,8 @@ fn lower_sequential_loop(
         ctx.import_templates.truncate(mark.9);
         ctx.external_io_loops.truncate(mark.10);
         *ctx.crt_resource_next = mark.11;
+        ctx.slots.truncate(mark.12);
+        ctx.export_templates.truncate(mark.13);
         ctx.hash_resources.retain(|id, _| resource_keys.contains(id));
         ctx.integer_status.retain(|_, id| (id.0 as usize) < first_new);
         carry_ranges = widened;
@@ -10508,6 +10511,95 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A host-driven loop whose body reads member `k` at a carried index `k`
+    /// (selected by the Graph), then runs a native loop whose only artifact
+    /// read is the fixed member 0, and then a host-driven loop that reads
+    /// member `o I + i` and the outer member `k`, whose load boundary is that
+    /// nested loop's start. Every outer iteration restarts the native loop,
+    /// and the outer member is waited for once per outer iteration; the
+    /// result matches the CPU.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_nested_loops_restart_native_loops_and_keep_outer_imports() {
+        use crate::{
+            backend::poly::cpu_backend,
+            executor::{ExecutionConfig, execute_in_session},
+        };
+        use mxx_dsl::{Int, iterate};
+        use mxx_ir_core::artifact::ArtifactAvailability;
+
+        let outer = test_count("MXX_TEST_NESTED_OUTER_COUNT", 3);
+        let inner = test_count("MXX_TEST_NESTED_INNER_COUNT", 4);
+        let count = outer * inner;
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let initial = (ring.zero((1, 1)), Int::constant(0));
+        let (sum, _) = iterate(outer, initial, move |o, (sum, k)| {
+            let o = o.expression()?;
+            let selected = members.at(k.clone());
+            let fixed = members.clone();
+            let sum = iterate(inner, sum, move |_, sum| {
+                Ok(sum.clone() + sum + fixed.at(Int::constant(0)))
+            })?;
+            let streamed = members.clone();
+            let sum = iterate(inner, sum, move |i, sum| {
+                let member = IntExpr::Add(
+                    Box::new(IntExpr::Mul(Box::new(o.clone()), Box::new(IntExpr::constant(inner)))),
+                    Box::new(i.expression()?),
+                );
+                Ok(sum.clone() +
+                    sum +
+                    streamed.at(Int::evaluate(member.canonicalize())) +
+                    selected.clone())
+            })?;
+            Ok((sum, k.add(1usize)))
+        })
+        .unwrap();
+        let validated = DslContext::new("direct-nested-native-and-outer-import")
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        let expected = execute_in_session(
+            &validated,
+            &mut cpu_backend([cpu_params]),
+            BTreeMap::new(),
+            &mut store,
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(expected) = &expected.outputs["sum"] else {
+            panic!("CPU sum is a matrix");
+        };
+        let expected = expected.as_cpu_full().expect("CPU matrix").clone();
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        assert_eq!(plan.frame().external_io_loops.len(), 2);
+        for replay in 0..2 {
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let actual = runtime.download_matrix_output(&result.output("sum").unwrap()).unwrap();
+            assert_eq!(actual.entry(0, 0).to_bytes(), expected.entry(0, 0).to_bytes(), "{replay}");
         }
     }
 

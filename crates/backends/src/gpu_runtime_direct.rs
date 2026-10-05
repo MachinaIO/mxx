@@ -3439,6 +3439,21 @@ impl GpuRuntime {
                 ));
             }
             let frame = FrameGeneration::new(0, plan.completed_runs);
+            // Every selected import of this range's scope planned at this
+            // boundary: of the root or a wave lane, or of the host-driven
+            // loop whose body this range is. Its request was issued once in
+            // this scope, so it finishes here, before a nested loop that
+            // starts here and consumes it.
+            let selected = match host_loop {
+                None => &plan.frame.external_io_imports,
+                Some(loop_index) => &plan.frame.external_io_loops[loop_index].imports,
+            };
+            for import in selected.iter().filter(|import| import.before_operation == operation) {
+                let pump = pump.as_deref_mut().ok_or_else(|| {
+                    GpuRuntimeError::Artifact("selected import has no I/O pump".into())
+                })?;
+                self.finish_selected_import(plan, pump, frame, import)?;
+            }
             // The outermost host-driven loop starting here inside this range,
             // other than the one whose body this range is. Loops are sorted
             // with every enclosing loop before the loops nested in it, and an
@@ -3506,36 +3521,6 @@ impl GpuRuntime {
             }
             if static_imports {
                 self.finish_boundary_imports(plan, pump, operation, active_imports)?;
-            }
-            // Every selected import planned at this boundary: at the root, in a
-            // host-driven loop body, or in one lane of a wave body.
-            let selected = plan
-                .frame
-                .external_io_imports
-                .iter()
-                .enumerate()
-                .filter(|(_, import)| import.before_operation == operation)
-                .map(|(index, _)| (None, index))
-                .chain(plan.frame.external_io_loops.iter().enumerate().flat_map(
-                    |(loop_index, loop_body)| {
-                        loop_body
-                            .imports
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, import)| import.before_operation == operation)
-                            .map(move |(index, _)| (Some(loop_index), index))
-                    },
-                ))
-                .collect::<Vec<_>>();
-            for (loop_index, index) in selected {
-                let pump = pump.as_deref_mut().ok_or_else(|| {
-                    GpuRuntimeError::Artifact("selected import has no I/O pump".into())
-                })?;
-                let import = match loop_index {
-                    None => &plan.frame.external_io_imports[index],
-                    Some(loop_index) => &plan.frame.external_io_loops[loop_index].imports[index],
-                };
-                self.finish_selected_import(plan, pump, frame, import)?;
             }
             // A plan without waves bound its owners and uploaded its seeds
             // once; after a wave rebound its lanes' owners and uploaded its

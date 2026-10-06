@@ -6,93 +6,24 @@ import NandRound0
 
 Round `0` multiplies the level-`0` state encoding by the Dynamic RHS of circuit input `0` and
 evaluates the first LUT. The generated loops compute, in order, the companion keys and row of the
-RHS (`sequential_generatedRoot_128`), the companion keys and rows of the sixteen LUT branches
-(`sequential_generatedRoot_135`), the ciphertext action `c Dec(C)` (`sequential_generatedRoot_146`),
-and the sixteen branches (`sequential_generatedRoot_150`); the root moves the sum down to `Q5`.
+RHS (`sequential_generatedRoot_104`), the companion keys and rows of the sixteen LUT branches
+(`sequential_generatedRoot_111`), the ciphertext action `c Dec(C)` (`sequential_generatedRoot_122`),
+and the sixteen branches (`sequential_generatedRoot_126`); the root moves the sum down to `Q5`.
+Both companion loops decompose one key column per iteration and accumulate its companion keys and
+row over the output columns in a nested loop, which reads each companion one iteration ahead.
 -/
 
 namespace NandProof
 
 open Mxx.Primitives MxxRuntime MxxExponentLut
 
-/-- The state of the RHS companion loop of round `1`. -/
-abbrev RhsState1 := ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 ×
-  ExactMatrix Q6 N 1 12 × ExactMatrix Q6 N 1 12 × Unit
+/-- The state of the RHS companion loop of round `1`: the companion keys and the companion row. -/
+abbrev RhsState1 := ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 × Unit
 
-set_option maxHeartbeats 8000000 in
-/-- One iteration of the RHS companion loop of round `1` adds, at column `i / 24`, the companion
-keys and the companion `i` paired with the digits of key entry `i % 24`. -/
-theorem rhsLoop1_step {model : HashModel} {key : ByteArray}
-    {A : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 12} {A0 A1 : ExactMatrix Q6 N 1 24}
-    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
-    {z0 z1 : Fin 480 → ExactMatrix Q6 N 1 12} {i : Nat} (hi : i < 480) {s t : RhsState1}
-    (hs : s.2.2.2.1 = z0 ⟨i, hi⟩ ∧ s.2.2.2.2.1 = z1 ⟨i, hi⟩)
-    (h : Stage_online_eval.sequential_generatedRoot_128 Backend.backend model
-      GeneratedClaim.stage_2_params i
-      (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, key, A0, A1, z0, z1, ()) t) :
-    let B := digitKey model key Q6 12 (rhsOwner 49 2) ((i / 24 : Nat) : Int) ((i % 24 : Nat) : Int)
-    let U := keyDigits 12 A ⟨i % 24, by omega⟩
-    t.1 = s.1 + (B 0 0 * U 0 + B 0 1 * U 1) 0 0 • unitRow ((i / 24 : Nat) : Int) ∧
-      t.2.1 = s.2.1 + (B 1 0 * U 0 + B 1 1 * U 1) 0 0 • unitRow ((i / 24 : Nat) : Int) ∧
-      t.2.2.1 = s.2.2.1 +
-        (z0 ⟨i, hi⟩ * U 0 + z1 ⟨i, hi⟩ * U 1) 0 0 • unitRow ((i / 24 : Nat) : Int) ∧
-      t.2.2.2.1 = z0 ⟨(i + 1) % 480, Nat.mod_lt _ (by norm_num)⟩ ∧
-      t.2.2.2.2.1 = z1 ⟨(i + 1) % 480, Nat.mod_lt _ (by norm_num)⟩ := by
-  intro B U
-  obtain ⟨w2, w4, w5, w7, w9, w10, w14, w18, w20, w35, w37, -, -, -, x2, -, -, -, -, -, -, -, -,
-    x4, x5, -, -, -, x7, -, -, -, -, -, -, -, -, x9, x10, -, -, -, -, -, -, -, -, -, -, x14, -, -, -,
-    x18, -, -, -, x20, -, -, -, -, -, -, -, x35, -, -, x37, xout⟩ := h
-  have hcol : Int.fmod (Int.fdiv (Int.ofNat i) 24) 20 = ((i / 24 : Nat) : Int) := by
-    rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega), Int.fmod_eq_emod_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
-    omega
-  have hdiv : Int.fdiv (Int.ofNat i) 24 = ((i / 24 : Nat) : Int) := by
-    rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
-    omega
-  have hrow : Int.fmod (Int.ofNat i) 24 = ((i % 24 : Nat) : Int) := by
-    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
-    omega
-  have hnext : 24 * Int.fmod (Int.fdiv (Int.fmod (1 + Int.ofNat i) 480) 24) 20 +
-      Int.fmod (Int.fmod (1 + Int.ofNat i) 480) 24 = Int.ofNat ((i + 1) % 480) := by
-    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ 24 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 24 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 480 by norm_num), Int.ofNat_eq_natCast]
-    omega
-  rw [hcol, hrow] at x2 x7 x18 x20
-  rw [hrow] at x4 x9
-  rw [hdiv] at x14
-  rw [hnext] at x35 x37
-  obtain ⟨_, hw35⟩ := familyGet_eq x35
-  obtain ⟨_, hw37⟩ := familyGet_eq x37
-  have hw14 := unitRow_window (c := ((i / 24 : Nat) : Int)) (by omega) x14
-  have hentry : ∀ {r : Fin 2} {Ar : ExactMatrix Q6 N 1 24} {x : ExactMatrix Q6 N 1 1}
-      {u : ExactMatrix Q6 N 12 1}, concatColumns (A r 0) (A r 1) Ar →
-      sliceMatrix Ar 0 1 ((i % 24 : Nat) : Int) (1 + ((i % 24 : Nat) : Int)) x →
-      gadgetDecomposeRuns Backend.backend 1048576 12 x u → u = U r := by
-    intro r Ar x u hAr hx hu
-    obtain ⟨_, hx0⟩ := sliceMatrix_column hx
-    rw [concatColumns_entry hAr, pair_eta] at hx0
-    have hxe : x = fun _ _ ↦ joinedEntry (A r) ⟨i % 24, by omega⟩ := by
-      funext a b
-      rw [Subsingleton.elim a 0, Subsingleton.elim b 0, hx0]
-      congr 1
-    rw [hxe] at hu
-    exact entryDigits_eq hu
-  have hw5 := hentry hA0 x4 x5
-  have hw10 := hentry hA1 x9 x10
-  have hB : B = ![![w2, w7], ![w18, w20]] := by
-    funext k j
-    fin_cases k <;> fin_cases j <;>
-      simp [B, digitKey, digitKeyPrefix, digitKeyHead, rhsOwner, componentBytes, hashSample_eq x2,
-        hashSample_eq x7, hashSample_eq x18, hashSample_eq x20]
-  subst xout hw5 hw10 hw14 hw35 hw37
-  obtain ⟨hs0, hs1⟩ := hs
-  refine ⟨?_, ?_, ?_, rfl, rfl⟩ <;>
-    simp only [hB, hs0, hs1, matrixAdd, matrixMul, matrixMulScalarLeft_eq, Matrix.cons_val_zero,
-      Matrix.cons_val_one]
+/-- The state of the inner RHS companion loop of round `1`: the blocks of the companion keys and
+the companion row, and the carried companion. -/
+abbrev RhsBlock1 := ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 ×
+  ExactMatrix Q6 N 1 12 × ExactMatrix Q6 N 1 12 × Unit
 
 /-- The digit-row sum of the RHS companion keys `B_k0 u_0 + B_k1 u_1` of round `1`. -/
 noncomputable def rhsKeySum1 (model : HashModel) (key : ByteArray)
@@ -106,7 +37,178 @@ noncomputable def rhsKeySum1 (model : HashModel) (key : ByteArray)
 /-- The digit-row sum of the RHS companions `z_0 u_0 + z_1 u_1` of round `1`. -/
 noncomputable def rhsCompanionSum1 (A : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 12)
     (z0 z1 : Fin 480 → ExactMatrix Q6 N 1 12) (jj : Fin 20) (a : Fin 24) : ExactPoly Q6 N :=
-  (z0 ⟨a + 24 * jj, by omega⟩ * keyDigits 12 A a 0 + z1 ⟨a + 24 * jj, by omega⟩ * keyDigits 12 A a 1) 0 0
+  (z0 ⟨jj + 20 * a, by omega⟩ * keyDigits 12 A a 0 + z1 ⟨jj + 20 * a, by omega⟩ * keyDigits 12 A a 1) 0 0
+
+set_option maxHeartbeats 8000000 in
+/-- One iteration `j` of the inner RHS companion loop of round `1` at digit row `a` adds, at column
+`j`, the companion keys and companion `j + 20 a` paired with the digits `U` of key entry `a`, and
+reads the next companion of that digit row. -/
+theorem rhsInner1_step {model : HashModel} {key : ByteArray} {U : Fin 2 → ExactMatrix Q6 N 12 1}
+    {z0 z1 : Fin 480 → ExactMatrix Q6 N 1 12} {a j : Nat} (ha : a < 24) (hj : j < 20)
+    {s t : RhsBlock1}
+    (hs : s.2.2.2.1 = z0 ⟨j + 20 * a, by omega⟩ ∧ s.2.2.2.2.1 = z1 ⟨j + 20 * a, by omega⟩)
+    (h : Stage_online_eval.sequential_sequential_generatedRoot_104_16 Backend.backend model
+      GeneratedClaim.stage_2_params a j
+      (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, key, U 0, U 1, z0, z1, ()) t) :
+    let B := digitKey model key Q6 12 (rhsOwner 49 2) ((j : Nat) : Int) ((a : Nat) : Int)
+    t.1 = s.1 + (B 0 0 * U 0 + B 0 1 * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
+      t.2.1 = s.2.1 + (B 1 0 * U 0 + B 1 1 * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
+      t.2.2.1 = s.2.2.1 + (z0 ⟨j + 20 * a, by omega⟩ * U 0 + z1 ⟨j + 20 * a, by omega⟩ * U 1) 0 0 •
+        unitRow ((j : Nat) : Int) ∧
+      t.2.2.2.1 = z0 ⟨(j + 1) % 20 + 20 * a, by omega⟩ ∧
+      t.2.2.2.2.1 = z1 ⟨(j + 1) % 20 + 20 * a, by omega⟩ := by
+  intro B
+  obtain ⟨w2, w5, w10, w14, w16, w31, w33, -, x2, -, x5, -, -, -, -, -, -, -, -, x10, -, x14, -,
+    x16, -, -, -, -, x31, -, -, x33, xout⟩ := h
+  have hrow : Int.fmod (Int.ofNat a) 24 = ((a : Nat) : Int) := by
+    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  have hnext : 20 * Int.fmod (Int.ofNat a) 24 + Int.fmod (1 + Int.ofNat j) 20 =
+      Int.ofNat ((j + 1) % 20 + 20 * a) := by
+    simp only [Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 24 by norm_num),
+      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num), Int.ofNat_eq_natCast]
+    omega
+  rw [hrow] at x2 x5 x14 x16
+  rw [hnext] at x31 x33
+  obtain ⟨_, hw31⟩ := familyGet_eq x31
+  obtain ⟨_, hw33⟩ := familyGet_eq x33
+  have hw10 := unitRow_window (c := ((j : Nat) : Int)) (by simp only [Int.ofNat_eq_natCast]; omega) x10
+  have hB : B = ![![w2, w5], ![w14, w16]] := by
+    funext k i
+    fin_cases k <;> fin_cases i <;>
+      simp [B, digitKey, digitKeyPrefix, digitKeyHead, rhsOwner, componentBytes, hashSample_eq x2,
+        hashSample_eq x5, hashSample_eq x14, hashSample_eq x16]
+  subst xout hw10 hw31 hw33
+  obtain ⟨hs0, hs1⟩ := hs
+  refine ⟨?_, ?_, ?_, rfl, rfl⟩ <;>
+    simp only [hB, hs0, hs1, matrixAdd, matrixMul, matrixMulScalarLeft_eq, Matrix.cons_val_zero,
+      Matrix.cons_val_one]
+
+set_option maxHeartbeats 8000000 in
+/-- The inner RHS companion loop of round `1` at digit row `a` ends with the companion keys and the
+companion row of that digit row, column by column. -/
+theorem rhsInner1 {model : HashModel} {key : ByteArray} (A : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 12)
+    {z0 z1 : Fin 480 → ExactMatrix Q6 N 1 12} (a : Fin 24) {final : RhsBlock1}
+    (h : MxxIR.IterRuns (fun (i : Nat) (current next : RhsBlock1) ↦
+      Stage_online_eval.sequential_sequential_generatedRoot_104_16 Backend.backend model
+        GeneratedClaim.stage_2_params a i
+        (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (key,
+          (keyDigits 12 A a 0, (keyDigits 12 A a 1, (z0, (z1, ())))))))))) next) (Int.toNat 20)
+      (0, (0, (0, (z0 ⟨20 * a, by omega⟩, (z1 ⟨20 * a, by omega⟩, ()))))) final) (jj : Fin 20) :
+    final.1 0 jj = rhsKeySum1 model key A 0 jj a ∧ final.2.1 0 jj = rhsKeySum1 model key A 1 jj a ∧
+      final.2.2.1 0 jj = rhsCompanionSum1 A z0 z1 jj a := by
+  let Q : Nat → RhsBlock1 → Prop := fun i s ↦
+    s.2.2.2.1 = z0 ⟨i % 20 + 20 * a, by omega⟩ ∧ s.2.2.2.2.1 = z1 ⟨i % 20 + 20 * a, by omega⟩
+  have hQ0 : Q 0 (0, (0, (0, (z0 ⟨20 * a, by omega⟩, (z1 ⟨20 * a, by omega⟩, ()))))) :=
+    ⟨congrArg z0 (Fin.ext (by simp)), congrArg z1 (Fin.ext (by simp))⟩
+  have hstep : ∀ i (s t : RhsBlock1) (hi : i < 20), Q i s →
+      Stage_online_eval.sequential_sequential_generatedRoot_104_16 Backend.backend model
+        GeneratedClaim.stage_2_params a i
+        (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (key, (keyDigits 12 A a 0,
+          (keyDigits 12 A a 1, (z0, (z1, ())))))))))) t →
+      (∀ w, t.1 0 w = s.1 0 w + rhsKeySum1 model key A 0 ⟨i, hi⟩ a *
+          (unitRow ((i : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) ∧
+        (∀ w, t.2.1 0 w = s.2.1 0 w + rhsKeySum1 model key A 1 ⟨i, hi⟩ a *
+          (unitRow ((i : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) ∧
+        (∀ w, t.2.2.1 0 w = s.2.2.1 0 w + rhsCompanionSum1 A z0 z1 ⟨i, hi⟩ a *
+          (unitRow ((i : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) ∧ Q (i + 1) t := by
+    intro i s t hi hq hb
+    have hq' : s.2.2.2.1 = z0 ⟨i + 20 * a, by omega⟩ ∧ s.2.2.2.2.1 = z1 ⟨i + 20 * a, by omega⟩ := by
+      obtain ⟨h0, h1⟩ := hq
+      exact ⟨h0.trans (congrArg z0 (Fin.ext (by simp [Nat.mod_eq_of_lt hi]))),
+        h1.trans (congrArg z1 (Fin.ext (by simp [Nat.mod_eq_of_lt hi])))⟩
+    obtain ⟨h0, h1, h2, h3, h4⟩ := rhsInner1_step (U := keyDigits 12 A a) a.isLt hi hq' hb
+    refine ⟨fun w ↦ ?_, fun w ↦ ?_, fun w ↦ ?_, h3, h4⟩
+    · rw [h0]
+      rfl
+    · rw [h1]
+      rfl
+    · rw [h2]
+      rfl
+  have hk0 := IterRuns.accumulate_entries (fun s : RhsBlock1 ↦ s.1)
+    (fun w (j : Fin 20) ↦ rhsKeySum1 model key A 0 j a * (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) Q hQ0
+    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).1, (hstep i s t hi hq hb).2.2.2⟩) h jj
+  have hk1 := IterRuns.accumulate_entries (fun s : RhsBlock1 ↦ s.2.1)
+    (fun w (j : Fin 20) ↦ rhsKeySum1 model key A 1 j a * (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) Q hQ0
+    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).2.1, (hstep i s t hi hq hb).2.2.2⟩) h jj
+  have hk2 := IterRuns.accumulate_entries (fun s : RhsBlock1 ↦ s.2.2.1)
+    (fun w (j : Fin 20) ↦ rhsCompanionSum1 A z0 z1 j a * (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) Q hQ0
+    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).2.2.1, (hstep i s t hi hq hb).2.2.2⟩) h jj
+  refine ⟨?_, ?_, ?_⟩
+  · rw [hk0, sum_unitRow_mul (fun j ↦ rhsKeySum1 model key A 0 j a) jj]
+    simp
+  · rw [hk1, sum_unitRow_mul (fun j ↦ rhsKeySum1 model key A 1 j a) jj]
+    simp
+  · rw [hk2, sum_unitRow_mul (fun j ↦ rhsCompanionSum1 A z0 z1 j a) jj]
+    simp
+
+set_option maxHeartbeats 16000000 in
+/-- One iteration `a` of the RHS companion loop of round `1` decomposes key column `a` once and
+adds the companion keys and the companion row of digit row `a`, column by column. -/
+theorem rhsLoop1_step {model : HashModel} {key : ByteArray}
+    {A : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 12} {A0 A1 : ExactMatrix Q6 N 1 24}
+    (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
+    {z0 z1 : Fin 480 → ExactMatrix Q6 N 1 12} {i : Nat} (hi : i < 24) {s t : RhsState1}
+    (h : Stage_online_eval.sequential_generatedRoot_104 Backend.backend model
+      GeneratedClaim.stage_2_params i (s.1, s.2.1, s.2.2.1, z0, z1, key, A0, A1, ()) t)
+    (jj : Fin 20) :
+    t.1 0 jj = s.1 0 jj + rhsKeySum1 model key A 0 jj ⟨i, hi⟩ ∧
+      t.2.1 0 jj = s.2.1 0 jj + rhsKeySum1 model key A 1 jj ⟨i, hi⟩ ∧
+      t.2.2.1 0 jj = s.2.2.1 0 jj + rhsCompanionSum1 A z0 z1 jj ⟨i, hi⟩ := by
+  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, x2, -, -, -, x6, -, -, x8, -, -, -, -, -, -, -, -, x11,
+    x12, -, -, -, -, -, -, -, -, x14, x15, -, hin, x17, x20, x23, xout⟩ := h
+  have hdiv : Int.fdiv (Int.ofNat i) 24 = 0 := by
+    rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  have hrow : Int.fmod (Int.ofNat i) 24 = ((i : Nat) : Int) := by
+    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  have hfirst : 20 * Int.fmod (Int.ofNat i) 24 = Int.ofNat (20 * i) := by
+    rw [hrow]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  rw [hdiv] at x2
+  rw [hrow] at x11 x14
+  rw [hfirst] at x6 x8
+  have hw2 := unitRow_window (c := 0) (by omega) x2
+  obtain ⟨_, hw6⟩ := familyGet_eq x6
+  obtain ⟨_, hw8⟩ := familyGet_eq x8
+  have hentry : ∀ {r : Fin 2} {Ar : ExactMatrix Q6 N 1 24} {x : ExactMatrix Q6 N 1 1}
+      {u : ExactMatrix Q6 N 12 1}, concatColumns (A r 0) (A r 1) Ar →
+      sliceMatrix Ar 0 1 ((i : Nat) : Int) (1 + ((i : Nat) : Int)) x →
+      gadgetDecomposeRuns Backend.backend 1048576 12 x u → u = keyDigits 12 A ⟨i, hi⟩ r := by
+    intro r Ar x u hAr hx hu
+    obtain ⟨_, hx0⟩ := sliceMatrix_column hx
+    rw [concatColumns_entry hAr, pair_eta] at hx0
+    have hxe : x = fun _ _ ↦ joinedEntry (A r) ⟨i, hi⟩ := by
+      funext a b
+      rw [Subsingleton.elim a 0, Subsingleton.elim b 0, hx0]
+      congr 1
+    rw [hxe] at hu
+    exact entryDigits_eq hu
+  have hw12 := hentry hA0 x11 x12
+  have hw15 := hentry hA1 x14 x15
+  rw [hw12, hw15, hw6, hw8] at hin
+  have hblock := rhsInner1 (key := key) A ⟨i, hi⟩ hin jj
+  have hone : w.w_2_0 0 0 = 1 := by rw [hw2]; simp [unitRow]
+  have ht : ∀ {x y : ExactMatrix Q6 N 1 20}, tensorRuns w.w_2_0 x y → y 0 jj = x 0 jj := by
+    intro x y hxy
+    calc y 0 jj = w.w_2_0 0 0 * x 0 jj := tensorRuns_scalar hxy jj.val jj.isLt
+      _ = x 0 jj := by rw [hone, one_mul]
+  subst xout
+  refine ⟨?_, ?_, ?_⟩
+  · simp only [matrixAdd, Matrix.add_apply]
+    rw [ht x17]
+    exact congrArg _ hblock.1
+  · simp only [matrixAdd, Matrix.add_apply]
+    rw [ht x20]
+    exact congrArg _ hblock.2.1
+  · simp only [matrixAdd, Matrix.add_apply]
+    rw [ht x23]
+    exact congrArg _ hblock.2.2
 
 set_option maxHeartbeats 8000000 in
 /-- The RHS companion loop of round `1` ends with the companion keys and the companion row, column by
@@ -116,63 +218,30 @@ theorem rhsLoop1 {model : HashModel} {key : ByteArray}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {z0 z1 : Fin 480 → ExactMatrix Q6 N 1 12} {final : RhsState1}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : RhsState1) ↦
-      Stage_online_eval.sequential_generatedRoot_128 Backend.backend model GeneratedClaim.stage_2_params i
-        (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (key, (A0,
-          (A1, (z0, (z1, ())))))))))) next) (Int.toNat 480)
-      (0, (0, (0, (z0 ⟨0, by norm_num⟩, (z1 ⟨0, by norm_num⟩, ()))))) final) (jj : Fin 20) :
+      Stage_online_eval.sequential_generatedRoot_104 Backend.backend model GeneratedClaim.stage_2_params i
+        (current.1, (current.2.1, (current.2.2.1, (z0, (z1, (key, (A0, (A1, ())))))))) next)
+      (Int.toNat 24) (0, (0, (0, ()))) final) (jj : Fin 20) :
     final.1 0 jj = ∑ a, rhsKeySum1 model key A 0 jj a ∧
       final.2.1 0 jj = ∑ a, rhsKeySum1 model key A 1 jj a ∧
       final.2.2.1 0 jj = ∑ a, rhsCompanionSum1 A z0 z1 jj a := by
-  have hcount : Int.toNat 480 = 20 * 24 := rfl
+  have hcount : Int.toNat 24 = 24 := rfl
   rw [hcount] at h
-  let Q : Nat → RhsState1 → Prop := fun i s ↦
-    s.2.2.2.1 = z0 ⟨i % 480, Nat.mod_lt _ (by norm_num)⟩ ∧
-      s.2.2.2.2.1 = z1 ⟨i % 480, Nat.mod_lt _ (by norm_num)⟩
-  have hQ0 : Q 0 (0, (0, (0, (z0 ⟨0, by norm_num⟩, (z1 ⟨0, by norm_num⟩, ()))))) := ⟨rfl, rfl⟩
-  have hstep : ∀ i (s t : RhsState1), i < 20 * 24 → Q i s →
-      Stage_online_eval.sequential_generatedRoot_128 Backend.backend model GeneratedClaim.stage_2_params i
-        (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (key, (A0, (A1, (z0, (z1, ())))))))))) t →
-      (t.1 = s.1 + (if h : i < 20 * 24 then
-          rhsKeySum1 model key A 0 ⟨i / 24, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
-            ⟨i % 24, Nat.mod_lt _ (Nat.pos_of_ne_zero fun h0 ↦ by simp [h0] at h)⟩ •
-          (unitRow (((i / 24 : Nat) : Int)) : ExactMatrix Q6 N 1 20) else 0) ∧
-        t.2.1 = s.2.1 + (if h : i < 20 * 24 then
-          rhsKeySum1 model key A 1 ⟨i / 24, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
-            ⟨i % 24, Nat.mod_lt _ (Nat.pos_of_ne_zero fun h0 ↦ by simp [h0] at h)⟩ •
-          (unitRow (((i / 24 : Nat) : Int)) : ExactMatrix Q6 N 1 20) else 0) ∧
-        t.2.2.1 = s.2.2.1 + (if h : i < 20 * 24 then
-          rhsCompanionSum1 A z0 z1 ⟨i / 24, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
-            ⟨i % 24, Nat.mod_lt _ (Nat.pos_of_ne_zero fun h0 ↦ by simp [h0] at h)⟩ •
-          (unitRow (((i / 24 : Nat) : Int)) : ExactMatrix Q6 N 1 20) else 0)) ∧ Q (i + 1) t := by
-    intro i s t hi hq hb
-    have hi' : i < 480 := hi
-    have hmod : i % 480 = i := Nat.mod_eq_of_lt hi'
-    have hq' : s.2.2.2.1 = z0 ⟨i, hi'⟩ ∧ s.2.2.2.2.1 = z1 ⟨i, hi'⟩ := by
-      obtain ⟨h0, h1⟩ := hq
-      exact ⟨h0.trans (congrArg z0 (Fin.ext hmod)), h1.trans (congrArg z1 (Fin.ext hmod))⟩
-    obtain ⟨h0, h1, h2, h3, h4⟩ := rhsLoop1_step hA0 hA1 hi' hq' hb
-    have hz : (⟨i % 24 + 24 * (i / 24), by omega⟩ : Fin 480) = ⟨i, hi'⟩ :=
-      Fin.ext (Nat.mod_add_div i 24)
-    refine ⟨⟨?_, ?_, ?_⟩, h3, h4⟩
-    · rw [h0, dif_pos hi]
-      rfl
-    · rw [h1, dif_pos hi]
-      rfl
-    · rw [h2, dif_pos hi]
-      simp only [rhsCompanionSum1, hz]
-  have hk0 := (IterRuns.accumulate (fun s : RhsState1 ↦ s.1) _ Q hQ0
-    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).1.1, (hstep i s t hi hq hb).2⟩) h).1
-  have hk1 := (IterRuns.accumulate (fun s : RhsState1 ↦ s.2.1) _ Q hQ0
-    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).1.2.1, (hstep i s t hi hq hb).2⟩) h).1
-  have hk2 := (IterRuns.accumulate (fun s : RhsState1 ↦ s.2.2.1) _ Q hQ0
-    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).1.2.2, (hstep i s t hi hq hb).2⟩) h).1
+  have hk0 := IterRuns.accumulate_entries (fun s : RhsState1 ↦ s.1)
+    (fun w a ↦ rhsKeySum1 model key A 0 w a) (fun _ _ ↦ True) trivial
+    (fun i s t hi _ hb ↦ ⟨fun w ↦ (rhsLoop1_step hA0 hA1 hi hb w).1, trivial⟩) h jj
+  have hk1 := IterRuns.accumulate_entries (fun s : RhsState1 ↦ s.2.1)
+    (fun w a ↦ rhsKeySum1 model key A 1 w a) (fun _ _ ↦ True) trivial
+    (fun i s t hi _ hb ↦ ⟨fun w ↦ (rhsLoop1_step hA0 hA1 hi hb w).2.1, trivial⟩) h jj
+  have hk2 := IterRuns.accumulate_entries (fun s : RhsState1 ↦ s.2.2.1)
+    (fun w a ↦ rhsCompanionSum1 A z0 z1 w a) (fun _ _ ↦ True) trivial
+    (fun i s t hi _ hb ↦ ⟨fun w ↦ (rhsLoop1_step hA0 hA1 hi hb w).2.2, trivial⟩) h jj
   refine ⟨?_, ?_, ?_⟩
-  · rw [hk0, zero_add]
-    exact sum_unitRow_entry (rhsKeySum1 model key A 0) jj
-  · rw [hk1, zero_add]
-    exact sum_unitRow_entry (rhsKeySum1 model key A 1) jj
-  · rw [hk2, zero_add]
-    exact sum_unitRow_entry (rhsCompanionSum1 A z0 z1) jj
+  · rw [hk0]
+    simp
+  · rw [hk1]
+    simp
+  · rw [hk2]
+    simp
 
 /-- The digits of column `jj` of the joined round-`0` RHS ciphertext `(top, bot)`. -/
 noncomputable abbrev rhsDigits1 (top bot : ExactMatrix Q6 N 1 20) (jj : Fin 20) :
@@ -185,7 +254,7 @@ every column decomposition runs. -/
 theorem colLoop1 {model : HashModel} {c : ExactMatrix Q6 N 1 24} {top bot : ExactMatrix Q6 N 1 20}
     {final : ExactMatrix Q6 N 1 20}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q6 N 1 20) ↦
-      Stage_online_eval.sequential_generatedRoot_146 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_122 Backend.backend model GeneratedClaim.stage_2_params i
         (current, (c, (top, (bot, ())))) next) (Int.toNat 20) 0 final) (jj : Fin 20) :
     final 0 jj = (c * rhsDigits1 top bot jj) 0 0 ∧
       ∃ D' : ExactMatrix Q6 N (12 + 12) 1,
@@ -230,117 +299,19 @@ theorem colLoop1 {model : HashModel} {c : ExactMatrix Q6 N 1 24} {top bot : Exac
   rw [sum_unitRow_entry F jj]
   simp [F]
 
-/-- The state of the LUT companion loop of round `1`. -/
-abbrev LutState1 := ExactMatrix Q6 N 1 320 × ExactMatrix Q6 N 1 320 × ExactMatrix Q6 N 1 320 ×
+/-- The state of the LUT companion loop of round `1`: the substituted companion keys and the
+companion rows of every branch. -/
+abbrev LutState1 := ExactMatrix Q6 N 1 320 × ExactMatrix Q6 N 1 320 × ExactMatrix Q6 N 1 320 × Unit
+
+/-- The state of the inner LUT companion loop of round `1`: the blocks of one branch and digit row,
+and the carried companion. -/
+abbrev LutBlock1 := ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 × ExactMatrix Q6 N 1 20 ×
   ExactMatrix Q6 N 1 12 × ExactMatrix Q6 N 1 12 × Unit
 
 /-- Companion `k` of the round-`0` LUT, substituted by the automorphism of its branch `k / 400`. -/
 noncomputable def lutCarry1 (z : Fin 6400 → ExactMatrix Q6 N 1 12) (k : Fin 6400) :
     ExactMatrix Q6 N 1 12 :=
   substituteMatrix (sigma (k / 20 / 20)).toNat (sigma_odd ⟨k / 20 / 20, by omega⟩) (z k)
-
-set_option maxHeartbeats 16000000 in
-/-- One iteration of the LUT companion loop of round `1` adds, at column `i / 20` (branch
-`i / 20 / 20`, column `i / 20 % 20`), the substituted companion keys and companion `i` paired with the
-digits of the substituted key entry `i % 20`. -/
-theorem lutLoop1_step {model : HashModel} {key : ByteArray}
-    {M : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10} {A0 A1 : ExactMatrix Q6 N 1 20}
-    (hA0 : concatColumns (M 0 0) (M 0 1) A0) (hA1 : concatColumns (M 1 0) (M 1 1) A1)
-    {z0 z1 : Fin 6400 → ExactMatrix Q6 N 1 12} {i : Nat} (hi : i < 6400) {s t : LutState1}
-    (hs : s.2.2.2.1 = lutCarry1 z0 ⟨i, hi⟩ ∧ s.2.2.2.2.1 = lutCarry1 z1 ⟨i, hi⟩)
-    (h : Stage_online_eval.sequential_generatedRoot_135 Backend.backend model
-      GeneratedClaim.stage_2_params i
-      (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, key, A0, A1, z0, z1, ()) t) :
-    let B := fun k r ↦ substituteMatrix (sigma (i / 20 / 20)).toNat (sigma_odd ⟨i / 20 / 20, by omega⟩) (digitKey model key Q6 12 (lutOwner 49 ((i / 20 / 20 : Nat) : Int) 3)
-      ((i / 20 % 20 : Nat) : Int) ((i % 20 : Nat) : Int) k r)
-    let U := keyDigits 12 (fun r j ↦ substituteMatrix (sigma (i / 20 / 20)).toNat (sigma_odd ⟨i / 20 / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩
-    t.1 = s.1 + (B 0 0 * U 0 + B 0 1 * U 1) 0 0 • unitRow ((i / 20 : Nat) : Int) ∧
-      t.2.1 = s.2.1 + (B 1 0 * U 0 + B 1 1 * U 1) 0 0 • unitRow ((i / 20 : Nat) : Int) ∧
-      t.2.2.1 = s.2.2.1 +
-        (lutCarry1 z0 ⟨i, hi⟩ * U 0 + lutCarry1 z1 ⟨i, hi⟩ * U 1) 0 0 • unitRow ((i / 20 : Nat) : Int) ∧
-      t.2.2.2.1 = lutCarry1 z0 ⟨(i + 1) % 6400, Nat.mod_lt _ (by norm_num)⟩ ∧
-      t.2.2.2.2.1 = lutCarry1 z1 ⟨(i + 1) % 6400, Nat.mod_lt _ (by norm_num)⟩ := by
-  intro B U
-  obtain ⟨w2, w3, w5, w6, w7, w9, w10, w12, w13, w14, w18, w22, w23, w25, w26, w41, w42, w44, w45,
-    -, -, -, -, -, x2, -, -, -, -, x3, -, -, -, -, -, -, -, -, x5, -, -, -, -, x6, x7, -, -, -, -, -,
-    x9, -, -, -, -, x10, -, -, -, -, -, -, -, -, x12, -, -, -, -, x13, x14, -, -, -, -, -, -, -, -,
-    -, -, x18, -, -, -, -, -, x22, -, -, -, -, x23, -, -, -, -, -, x25, -, -, -, -, x26, -, -, -, -,
-    -, -, -, -, -, -, x41, -, -, -, -, -, x42, -, -, x44, -, -, -, -, -, x45, xout⟩ := h
-  have hmem : Int.fdiv (Int.fdiv (Int.ofNat i) 20) 20 = Int.ofNat (i / 20 / 20) := by
-    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num), Int.ofNat_eq_natCast]
-    omega
-  have hmem' : Int.fdiv (Int.fdiv (Int.ofNat i) 20) 20 = ((i / 20 / 20 : Nat) : Int) := hmem
-  have hcol : Int.fmod (Int.fdiv (Int.ofNat i) 20) 20 = ((i / 20 % 20 : Nat) : Int) := by
-    rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega), Int.fmod_eq_emod_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
-    omega
-  have hdiv : Int.fdiv (Int.ofNat i) 20 = ((i / 20 : Nat) : Int) := by
-    rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
-    omega
-  have hrow : Int.fmod (Int.ofNat i) 20 = ((i % 20 : Nat) : Int) := by
-    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
-    simp only [Int.ofNat_eq_natCast]
-    omega
-  have hnext : 400 * Int.fdiv (Int.fdiv (Int.fmod (1 + Int.ofNat i) 6400) 20) 20 +
-      20 * Int.fmod (Int.fdiv (Int.fmod (1 + Int.ofNat i) 6400) 20) 20 +
-      Int.fmod (Int.fmod (1 + Int.ofNat i) 6400) 20 = Int.ofNat ((i + 1) % 6400) := by
-    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 6400 by norm_num), Int.ofNat_eq_natCast]
-    omega
-  have hsnext : Int.fdiv (Int.fdiv (Int.fmod (1 + Int.ofNat i) 6400) 20) 20 =
-      Int.ofNat ((i + 1) % 6400 / 20 / 20) := by
-    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num),
-      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 6400 by norm_num), Int.ofNat_eq_natCast]
-    omega
-  rw [hmem', hcol, hrow] at x2 x9 x22 x25
-  rw [hmem] at x3 x6 x10 x13 x23 x26
-  rw [hrow] at x5 x12
-  rw [hdiv] at x18
-  rw [hnext] at x41 x44
-  rw [hsnext] at x42 x45
-  obtain ⟨_, hw41⟩ := familyGet_eq x41
-  obtain ⟨_, hw44⟩ := familyGet_eq x44
-  have hw18 := unitRow_window (c := ((i / 20 : Nat) : Int)) (by omega) x18
-  obtain ⟨_, hw3⟩ := ringAutomorphismRuns_eq hQ6 hN x3
-  obtain ⟨_, hw10⟩ := ringAutomorphismRuns_eq hQ6 hN x10
-  obtain ⟨_, hw23⟩ := ringAutomorphismRuns_eq hQ6 hN x23
-  obtain ⟨_, hw26⟩ := ringAutomorphismRuns_eq hQ6 hN x26
-  obtain ⟨_, hw42⟩ := ringAutomorphismRuns_eq hQ6 hN x42
-  obtain ⟨_, hw45⟩ := ringAutomorphismRuns_eq hQ6 hN x45
-  have hentry : ∀ {r : Fin 2} {Ar : ExactMatrix Q6 N 1 20} {x y : ExactMatrix Q6 N 1 1}
-      {u : ExactMatrix Q6 N 12 1}, concatColumns (M r 0) (M r 1) Ar →
-      sliceMatrix Ar 0 1 ((i % 20 : Nat) : Int) (1 + ((i % 20 : Nat) : Int)) x →
-      ringAutomorphismRuns (sigma (i / 20 / 20)) x y →
-      gadgetDecomposeRuns Backend.backend 1048576 12 y u → u = U r := by
-    intro r Ar x y u hAr hx hy hu
-    obtain ⟨_, hx0⟩ := sliceMatrix_column hx
-    rw [concatColumns_entry hAr, pair_eta] at hx0
-    obtain ⟨_, hy0⟩ := ringAutomorphismRuns_eq hQ6 hN hy
-    have hye : y = fun _ _ ↦ joinedEntry (fun j ↦ substituteMatrix (sigma (i / 20 / 20)).toNat (sigma_odd ⟨i / 20 / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩ := by
-      funext a b
-      rw [hy0]
-      dsimp only
-      rw [Subsingleton.elim a 0, Subsingleton.elim b 0, hx0, joinedEntry_substitute]
-      rfl
-    rw [hye] at hu
-    exact entryDigits_eq hu
-  have hw7 := hentry hA0 x5 x6 x7
-  have hw14 := hentry hA1 x12 x13 x14
-  have hK : ∀ k r, digitKey model key Q6 12 (lutOwner 49 ((i / 20 / 20 : Nat) : Int) 3)
-      ((i / 20 % 20 : Nat) : Int) ((i % 20 : Nat) : Int) k r = ![![w2, w9], ![w22, w25]] k r := by
-    intro k r
-    fin_cases k <;> fin_cases r <;>
-      simp [digitKey, digitKeyPrefix, digitKeyHead, lutOwner, componentBytes, hashSample_eq x2,
-        hashSample_eq x9, hashSample_eq x22, hashSample_eq x25]
-  subst hw3 hw10 hw23 hw26
-  subst xout hw7 hw14 hw18 hw41 hw44 hw42 hw45
-  obtain ⟨hs0, hs1⟩ := hs
-  refine ⟨?_, ?_, ?_, rfl, rfl⟩ <;>
-    simp only [B, hK, hs0, hs1, matrixAdd, matrixMul, matrixMulScalarLeft_eq, Matrix.cons_val_zero,
-      Matrix.cons_val_one] <;>
-    rfl
 
 /-- The digit-row sum of the substituted LUT companion keys `σB_k0 u_0 + σB_k1 u_1` of round `1`
 at position `p` (branch `p / 20`, column `p % 20`). -/
@@ -358,84 +329,335 @@ noncomputable def lutKeySum1 (model : HashModel) (key : ByteArray)
       keyDigits 12 (fun r j ↦ substituteMatrix (sigma (p / 20)).toNat
         (sigma_odd ⟨p / 20, by omega⟩) (M r j)) a 1) 0 0
 
-/-- The digit-row sum of the substituted LUT companions `σz_0 u_0 + σz_1 u_1` of round `1`. -/
+/-- The digit-row sum of the substituted LUT companions `σz_0 u_0 + σz_1 u_1` of round `1`: the
+companion of branch `p / 20`, digit row `a`, and column `p % 20` is `20 (20 (p / 20) + a) + p % 20`. -/
 noncomputable def lutCompanionSum1 (M : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10)
     (z0 z1 : Fin 6400 → ExactMatrix Q6 N 1 12) (p : Fin 320) (a : Fin 20) : ExactPoly Q6 N :=
-  (lutCarry1 z0 ⟨a + 20 * p, by omega⟩ *
+  (lutCarry1 z0 ⟨20 * (20 * (p / 20) + a) + p % 20, by omega⟩ *
       keyDigits 12 (fun r j ↦ substituteMatrix (sigma (p / 20)).toNat
         (sigma_odd ⟨p / 20, by omega⟩) (M r j)) a 0 +
-    lutCarry1 z1 ⟨a + 20 * p, by omega⟩ *
+    lutCarry1 z1 ⟨20 * (20 * (p / 20) + a) + p % 20, by omega⟩ *
       keyDigits 12 (fun r j ↦ substituteMatrix (sigma (p / 20)).toNat
         (sigma_odd ⟨p / 20, by omega⟩) (M r j)) a 1) 0 0
 
 set_option maxHeartbeats 16000000 in
-/-- The LUT companion loop of round `1` ends with the substituted companion keys and companion rows of
-every branch, position by position. -/
+/-- One iteration `j` of the inner LUT companion loop of round `1` at pair `i` (branch `i / 20`,
+digit row `i % 20`) adds, at column `j`, the substituted companion keys and companion `20 i + j`
+paired with the digits `U`, and reads the next companion of that pair. -/
+theorem lutInner1_step {model : HashModel} {key : ByteArray} {U : Fin 2 → ExactMatrix Q6 N 12 1}
+    {z0 z1 : Fin 6400 → ExactMatrix Q6 N 1 12} {i j : Nat} (hi : i < 320) (hj : j < 20)
+    {s t : LutBlock1}
+    (hs : s.2.2.2.1 = lutCarry1 z0 ⟨20 * i + j, by omega⟩ ∧
+      s.2.2.2.2.1 = lutCarry1 z1 ⟨20 * i + j, by omega⟩)
+    (h : Stage_online_eval.sequential_sequential_generatedRoot_111_20 Backend.backend model
+      GeneratedClaim.stage_2_params i j
+      (s.1, s.2.1, s.2.2.1, s.2.2.2.1, s.2.2.2.2.1, key, U 0, U 1, z0, z1, ()) t) :
+    let B := fun k r ↦ substituteMatrix (sigma (i / 20)).toNat (sigma_odd ⟨i / 20, by omega⟩)
+      (digitKey model key Q6 12 (lutOwner 49 ((i / 20 : Nat) : Int) 3) ((j : Nat) : Int)
+        ((i % 20 : Nat) : Int) k r)
+    t.1 = s.1 + (B 0 0 * U 0 + B 0 1 * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
+      t.2.1 = s.2.1 + (B 1 0 * U 0 + B 1 1 * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
+      t.2.2.1 = s.2.2.1 + (lutCarry1 z0 ⟨20 * i + j, by omega⟩ * U 0 +
+        lutCarry1 z1 ⟨20 * i + j, by omega⟩ * U 1) 0 0 • unitRow ((j : Nat) : Int) ∧
+      t.2.2.2.1 = lutCarry1 z0 ⟨20 * i + (j + 1) % 20, by omega⟩ ∧
+      t.2.2.2.2.1 = lutCarry1 z1 ⟨20 * i + (j + 1) % 20, by omega⟩ := by
+  intro B
+  obtain ⟨w2, w3, w6, w7, w12, w16, w17, w19, w20, w35, w36, w38, w39, -, -, x2, -, -, -, x3, -, -,
+    x6, -, -, -, x7, -, -, -, -, -, -, -, -, x12, -, -, x16, -, -, -, x17, -, -, x19, -, -, -, x20,
+    -, -, -, -, -, x35, -, -, -, x36, -, -, x38, -, -, -, x39, xout⟩ := h
+  have hmem : Int.fdiv (Int.ofNat i) 20 = ((i / 20 : Nat) : Int) := by
+    rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  have hrow : Int.fmod (Int.ofNat i) 20 = ((i % 20 : Nat) : Int) := by
+    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  have hnext : 400 * Int.fdiv (Int.ofNat i) 20 + 20 * Int.fmod (Int.ofNat i) 20 +
+      Int.fmod (1 + Int.ofNat j) 20 = Int.ofNat (20 * i + (j + 1) % 20) := by
+    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num),
+      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num), Int.ofNat_eq_natCast]
+    omega
+  have hnmem : ((20 * i + (j + 1) % 20) / 20 / 20 : Nat) = i / 20 := by omega
+  rw [hnext] at x35 x38
+  rw [hmem, hrow] at x2 x6 x16 x19
+  rw [hmem] at x3 x7 x17 x20 x36 x39
+  obtain ⟨_, hw35⟩ := familyGet_eq x35
+  obtain ⟨_, hw38⟩ := familyGet_eq x38
+  have hw12 := unitRow_window (c := ((j : Nat) : Int)) (by simp only [Int.ofNat_eq_natCast]; omega) x12
+  obtain ⟨_, hw3⟩ := ringAutomorphismRuns_eq hQ6 hN x3
+  obtain ⟨_, hw7⟩ := ringAutomorphismRuns_eq hQ6 hN x7
+  obtain ⟨_, hw17⟩ := ringAutomorphismRuns_eq hQ6 hN x17
+  obtain ⟨_, hw20⟩ := ringAutomorphismRuns_eq hQ6 hN x20
+  obtain ⟨_, hw36⟩ := ringAutomorphismRuns_eq hQ6 hN x36
+  obtain ⟨_, hw39⟩ := ringAutomorphismRuns_eq hQ6 hN x39
+  have hK : ∀ k r, digitKey model key Q6 12 (lutOwner 49 ((i / 20 : Nat) : Int) 3)
+      ((j : Nat) : Int) ((i % 20 : Nat) : Int) k r = ![![w2, w6], ![w16, w19]] k r := by
+    intro k r
+    fin_cases k <;> fin_cases r <;>
+      simp [digitKey, digitKeyPrefix, digitKeyHead, lutOwner, componentBytes, hashSample_eq x2,
+        hashSample_eq x6, hashSample_eq x16, hashSample_eq x19]
+  subst hw3 hw7 hw17 hw20
+  subst xout hw12 hw35 hw38 hw36 hw39
+  obtain ⟨hs0, hs1⟩ := hs
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · simp only [B, hK, matrixAdd, matrixMul, matrixMulScalarLeft_eq, Matrix.cons_val_zero,
+      Matrix.cons_val_one]
+    rfl
+  · simp only [B, hK, matrixAdd, matrixMul, matrixMulScalarLeft_eq, Matrix.cons_val_zero,
+      Matrix.cons_val_one]
+    rfl
+  · simp only [hs0, hs1, matrixAdd, matrixMul, matrixMulScalarLeft_eq]
+  · simp only [lutCarry1, sigma_congr (by omega) (by omega) hnmem]
+    rfl
+  · simp only [lutCarry1, sigma_congr (by omega) (by omega) hnmem]
+    rfl
+
+set_option maxHeartbeats 16000000 in
+/-- The inner LUT companion loop of round `1` at pair `i` ends with the substituted companion keys
+and the companion row of branch `i / 20` and digit row `i % 20`, column by column. -/
+theorem lutInner1 {model : HashModel} {key : ByteArray} (M : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10)
+    {z0 z1 : Fin 6400 → ExactMatrix Q6 N 1 12} {i : Nat} (hi : i < 320) {final : LutBlock1}
+    (h : MxxIR.IterRuns (fun (j : Nat) (current next : LutBlock1) ↦
+      Stage_online_eval.sequential_sequential_generatedRoot_111_20 Backend.backend model
+        GeneratedClaim.stage_2_params i j
+        (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (key,
+          (keyDigits 12 (fun r j ↦ substituteMatrix (sigma (i / 20)).toNat
+            (sigma_odd ⟨i / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩ 0,
+          (keyDigits 12 (fun r j ↦ substituteMatrix (sigma (i / 20)).toNat
+            (sigma_odd ⟨i / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩ 1, (z0, (z1, ()))))))))))
+        next) (Int.toNat 20)
+      (0, (0, (0, (lutCarry1 z0 ⟨20 * i, by omega⟩, (lutCarry1 z1 ⟨20 * i, by omega⟩, ()))))) final)
+    (jj : Fin 20) :
+    final.1 0 jj = lutKeySum1 model key M 0 ⟨20 * (i / 20) + jj, by omega⟩ ⟨i % 20, by omega⟩ ∧
+      final.2.1 0 jj = lutKeySum1 model key M 1 ⟨20 * (i / 20) + jj, by omega⟩ ⟨i % 20, by omega⟩ ∧
+      final.2.2.1 0 jj =
+        lutCompanionSum1 M z0 z1 ⟨20 * (i / 20) + jj, by omega⟩ ⟨i % 20, by omega⟩ := by
+  have hp : ∀ j : Fin 20, (20 * (i / 20) + j) / 20 = i / 20 ∧ (20 * (i / 20) + j) % 20 = j :=
+    fun j ↦ ⟨by omega, by omega⟩
+  let Q : Nat → LutBlock1 → Prop := fun j s ↦
+    s.2.2.2.1 = lutCarry1 z0 ⟨20 * i + j % 20, by omega⟩ ∧
+      s.2.2.2.2.1 = lutCarry1 z1 ⟨20 * i + j % 20, by omega⟩
+  have hQ0 : Q 0 (0, (0, (0, (lutCarry1 z0 ⟨20 * i, by omega⟩, (lutCarry1 z1 ⟨20 * i, by omega⟩,
+      ()))))) :=
+    ⟨congrArg (lutCarry1 z0) (Fin.ext (by simp)), congrArg (lutCarry1 z1) (Fin.ext (by simp))⟩
+  have hstep : ∀ j (s t : LutBlock1) (hj : j < 20), Q j s →
+      Stage_online_eval.sequential_sequential_generatedRoot_111_20 Backend.backend model
+        GeneratedClaim.stage_2_params i j
+        (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (key,
+          (keyDigits 12 (fun r j ↦ substituteMatrix (sigma (i / 20)).toNat
+            (sigma_odd ⟨i / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩ 0,
+          (keyDigits 12 (fun r j ↦ substituteMatrix (sigma (i / 20)).toNat
+            (sigma_odd ⟨i / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩ 1, (z0, (z1, ()))))))))))
+        t →
+      (∀ w, t.1 0 w = s.1 0 w +
+          lutKeySum1 model key M 0 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩ *
+            (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) ∧
+        (∀ w, t.2.1 0 w = s.2.1 0 w +
+          lutKeySum1 model key M 1 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩ *
+            (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) ∧
+        (∀ w, t.2.2.1 0 w = s.2.2.1 0 w +
+          lutCompanionSum1 M z0 z1 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩ *
+            (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) ∧ Q (j + 1) t := by
+    intro j s t hj hq hb
+    have hq' : s.2.2.2.1 = lutCarry1 z0 ⟨20 * i + j, by omega⟩ ∧
+        s.2.2.2.2.1 = lutCarry1 z1 ⟨20 * i + j, by omega⟩ := by
+      obtain ⟨h0, h1⟩ := hq
+      exact ⟨h0.trans (congrArg (lutCarry1 z0) (Fin.ext (by simp [Nat.mod_eq_of_lt hj]))),
+        h1.trans (congrArg (lutCarry1 z1) (Fin.ext (by simp [Nat.mod_eq_of_lt hj])))⟩
+    obtain ⟨h0, h1, h2, h3, h4⟩ := lutInner1_step hi hj hq' hb
+    have e1 : (20 * (i / 20) + j) / 20 = i / 20 := by omega
+    have e2 : (20 * (i / 20) + j) % 20 = j := by omega
+    have e3 : (⟨20 * (20 * ((20 * (i / 20) + j) / 20) + i % 20) + (20 * (i / 20) + j) % 20,
+        by omega⟩ : Fin 6400) = ⟨20 * i + j, by omega⟩ := Fin.ext (by simp only; omega)
+    refine ⟨fun w ↦ ?_, fun w ↦ ?_, fun w ↦ ?_, h3, h4⟩
+    · rw [h0]
+      simp only [lutKeySum1, Matrix.add_apply, Matrix.smul_apply, smul_eq_mul,
+        sigma_congr (by omega) (by omega) e1, e1, e2]
+    · rw [h1]
+      simp only [lutKeySum1, Matrix.add_apply, Matrix.smul_apply, smul_eq_mul,
+        sigma_congr (by omega) (by omega) e1, e1, e2]
+    · rw [h2]
+      simp only [lutCompanionSum1, Matrix.add_apply, Matrix.smul_apply, smul_eq_mul,
+        sigma_congr (by omega) (by omega) e1, e3]
+  have hk0 := IterRuns.accumulate_entries (fun s : LutBlock1 ↦ s.1)
+    (fun w (j : Fin 20) ↦ lutKeySum1 model key M 0 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩ *
+      (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) Q hQ0
+    (fun j s t hj hq hb ↦ ⟨(hstep j s t hj hq hb).1, (hstep j s t hj hq hb).2.2.2⟩) h jj
+  have hk1 := IterRuns.accumulate_entries (fun s : LutBlock1 ↦ s.2.1)
+    (fun w (j : Fin 20) ↦ lutKeySum1 model key M 1 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩ *
+      (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) Q hQ0
+    (fun j s t hj hq hb ↦ ⟨(hstep j s t hj hq hb).2.1, (hstep j s t hj hq hb).2.2.2⟩) h jj
+  have hk2 := IterRuns.accumulate_entries (fun s : LutBlock1 ↦ s.2.2.1)
+    (fun w (j : Fin 20) ↦ lutCompanionSum1 M z0 z1 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩ *
+      (unitRow ((j : Nat) : Int) : ExactMatrix Q6 N 1 20) 0 w) Q hQ0
+    (fun j s t hj hq hb ↦ ⟨(hstep j s t hj hq hb).2.2.1, (hstep j s t hj hq hb).2.2.2⟩) h jj
+  refine ⟨?_, ?_, ?_⟩
+  · rw [hk0, sum_unitRow_mul (fun j : Fin 20 ↦
+      lutKeySum1 model key M 0 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩) jj]
+    simp
+  · rw [hk1, sum_unitRow_mul (fun j : Fin 20 ↦
+      lutKeySum1 model key M 1 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩) jj]
+    simp
+  · rw [hk2, sum_unitRow_mul (fun j : Fin 20 ↦
+      lutCompanionSum1 M z0 z1 ⟨20 * (i / 20) + j, by omega⟩ ⟨i % 20, by omega⟩) jj]
+    simp
+
+set_option maxHeartbeats 16000000 in
+/-- One iteration `i` of the LUT companion loop of round `1` decomposes the substituted key column
+`i % 20` of branch `i / 20` once and adds, at the columns of that branch, its substituted companion
+keys and companion row. -/
+theorem lutLoop1_step {model : HashModel} {key : ByteArray}
+    {M : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10} {A0 A1 : ExactMatrix Q6 N 1 20}
+    (hA0 : concatColumns (M 0 0) (M 0 1) A0) (hA1 : concatColumns (M 1 0) (M 1 1) A1)
+    {z0 z1 : Fin 6400 → ExactMatrix Q6 N 1 12} {i : Nat} (hi : i < 320) {s t : LutState1}
+    (h : Stage_online_eval.sequential_generatedRoot_111 Backend.backend model
+      GeneratedClaim.stage_2_params i (s.1, s.2.1, s.2.2.1, z0, z1, key, A0, A1, ()) t)
+    (p : Fin 320) :
+    t.1 0 p = s.1 0 p + (if (p : Nat) / 20 = i / 20 then
+        lutKeySum1 model key M 0 p ⟨i % 20, by omega⟩ else 0) ∧
+      t.2.1 0 p = s.2.1 0 p + (if (p : Nat) / 20 = i / 20 then
+        lutKeySum1 model key M 1 p ⟨i % 20, by omega⟩ else 0) ∧
+      t.2.2.1 0 p = s.2.2.1 0 p + (if (p : Nat) / 20 = i / 20 then
+        lutCompanionSum1 M z0 z1 p ⟨i % 20, by omega⟩ else 0) := by
+  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, x2, -, -, -, -, x6, -, -, -, x7, -, -, x9, -, -, -, x10,
+    -, -, -, -, -, -, -, -, x13, -, -, -, x14, x15, -, -, -, -, -, -, -, -, x17, -, -, -, x18, x19, -,
+    hin, x21, x24, x27, xout⟩ := h
+  have hmem : Int.fdiv (Int.ofNat i) 20 = ((i / 20 : Nat) : Int) := by
+    rw [Int.fdiv_eq_ediv_of_nonneg _ (by omega)]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  have hrow : Int.fmod (Int.ofNat i) 20 = ((i % 20 : Nat) : Int) := by
+    rw [Int.fmod_eq_emod_of_nonneg _ (by omega)]
+    simp only [Int.ofNat_eq_natCast]
+    omega
+  have hfirst : 400 * Int.fdiv (Int.ofNat i) 20 + 20 * Int.fmod (Int.ofNat i) 20 =
+      Int.ofNat (20 * i) := by
+    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num),
+      Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ 20 by norm_num), Int.ofNat_eq_natCast]
+    omega
+  rw [hfirst] at x6 x9
+  rw [hmem] at x2 x7 x10 x14 x18
+  rw [hrow] at x13 x17
+  have hw2 := unitRow_window (c := ((i / 20 : Nat) : Int)) (by omega) x2
+  obtain ⟨_, hw6⟩ := familyGet_eq x6
+  obtain ⟨_, hw9⟩ := familyGet_eq x9
+  obtain ⟨_, hw7⟩ := ringAutomorphismRuns_eq hQ6 hN x7
+  obtain ⟨_, hw10⟩ := ringAutomorphismRuns_eq hQ6 hN x10
+  have hentry : ∀ {r : Fin 2} {Ar : ExactMatrix Q6 N 1 20} {x y : ExactMatrix Q6 N 1 1}
+      {u : ExactMatrix Q6 N 12 1}, concatColumns (M r 0) (M r 1) Ar →
+      sliceMatrix Ar 0 1 ((i % 20 : Nat) : Int) (1 + ((i % 20 : Nat) : Int)) x →
+      ringAutomorphismRuns (sigma (i / 20)) x y →
+      gadgetDecomposeRuns Backend.backend 1048576 12 y u →
+      u = keyDigits 12 (fun r j ↦ substituteMatrix (sigma (i / 20)).toNat
+        (sigma_odd ⟨i / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩ r := by
+    intro r Ar x y u hAr hx hy hu
+    obtain ⟨_, hx0⟩ := sliceMatrix_column hx
+    rw [concatColumns_entry hAr, pair_eta] at hx0
+    obtain ⟨_, hy0⟩ := ringAutomorphismRuns_eq hQ6 hN hy
+    have hye : y = fun _ _ ↦ joinedEntry (fun j ↦ substituteMatrix (sigma (i / 20)).toNat
+        (sigma_odd ⟨i / 20, by omega⟩) (M r j)) ⟨i % 20, by omega⟩ := by
+      funext a b
+      rw [hy0]
+      dsimp only
+      rw [Subsingleton.elim a 0, Subsingleton.elim b 0, hx0, joinedEntry_substitute]
+      rfl
+    rw [hye] at hu
+    exact entryDigits_eq hu
+  have hw15 := hentry hA0 x13 x14 x15
+  have hw19 := hentry hA1 x17 x18 x19
+  have hc0 : w.w_7_0 = lutCarry1 z0 ⟨20 * i, by omega⟩ := by
+    rw [hw7, hw6]
+    simp only [lutCarry1, sigma_congr (by omega) (by omega)
+      (show (20 * i) / 20 / 20 = i / 20 by omega)]
+    rfl
+  have hc1 : w.w_10_0 = lutCarry1 z1 ⟨20 * i, by omega⟩ := by
+    rw [hw10, hw9]
+    simp only [lutCarry1, sigma_congr (by omega) (by omega)
+      (show (20 * i) / 20 / 20 = i / 20 by omega)]
+    rfl
+  rw [hw15, hw19, hc0, hc1] at hin
+  have hblock := lutInner1 (key := key) M hi hin
+  rw [hw2] at x21 x24 x27
+  have hp : (p : Nat) / 20 = i / 20 →
+      (⟨20 * (i / 20) + (p : Nat) % 20, by omega⟩ : Fin 320) = p := fun h ↦ Fin.ext (by
+    simp only
+    omega)
+  subst xout
+  refine ⟨?_, ?_, ?_⟩
+  · simp only [matrixAdd, Matrix.add_apply]
+    rw [tensorRuns_unitRow x21 p]
+    split_ifs with hpi
+    · have e := (hblock ⟨(p : Nat) % 20, by omega⟩).1
+      dsimp only at e
+      rw [e, hp hpi]
+    · rfl
+  · simp only [matrixAdd, Matrix.add_apply]
+    rw [tensorRuns_unitRow x24 p]
+    split_ifs with hpi
+    · have e := (hblock ⟨(p : Nat) % 20, by omega⟩).2.1
+      dsimp only at e
+      rw [e, hp hpi]
+    · rfl
+  · simp only [matrixAdd, Matrix.add_apply]
+    rw [tensorRuns_unitRow x27 p]
+    split_ifs with hpi
+    · have e := (hblock ⟨(p : Nat) % 20, by omega⟩).2.2
+      dsimp only at e
+      rw [e, hp hpi]
+    · rfl
+
+set_option maxHeartbeats 16000000 in
+/-- The LUT companion loop of round `1` ends with the substituted companion keys and companion rows
+of every branch, position by position. -/
 theorem lutLoop1 {model : HashModel} {key : ByteArray}
     {M : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10} {A0 A1 : ExactMatrix Q6 N 1 20}
     (hA0 : concatColumns (M 0 0) (M 0 1) A0) (hA1 : concatColumns (M 1 0) (M 1 1) A1)
     {z0 z1 : Fin 6400 → ExactMatrix Q6 N 1 12} {final : LutState1}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : LutState1) ↦
-      Stage_online_eval.sequential_generatedRoot_135 Backend.backend model GeneratedClaim.stage_2_params i
-        (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1, (current.2.2.2.2.1, (key, (A0,
-          (A1, (z0, (z1, ())))))))))) next) (Int.toNat 6400)
-      (0, (0, (0, (lutCarry1 z0 ⟨0, by norm_num⟩, (lutCarry1 z1 ⟨0, by norm_num⟩, ()))))) final)
+      Stage_online_eval.sequential_generatedRoot_111 Backend.backend model GeneratedClaim.stage_2_params i
+        (current.1, (current.2.1, (current.2.2.1, (z0, (z1, (key, (A0, (A1, ())))))))) next)
+      (Int.toNat 320) (0, (0, (0, ()))) final)
     (p : Fin 320) :
     final.1 0 p = ∑ a, lutKeySum1 model key M 0 p a ∧
       final.2.1 0 p = ∑ a, lutKeySum1 model key M 1 p a ∧
       final.2.2.1 0 p = ∑ a, lutCompanionSum1 M z0 z1 p a := by
-  have hcount : Int.toNat 6400 = 320 * 20 := rfl
+  have hcount : Int.toNat 320 = 16 * 20 := rfl
   rw [hcount] at h
-  let Q : Nat → LutState1 → Prop := fun i s ↦
-    s.2.2.2.1 = lutCarry1 z0 ⟨i % 6400, Nat.mod_lt _ (by norm_num)⟩ ∧
-      s.2.2.2.2.1 = lutCarry1 z1 ⟨i % 6400, Nat.mod_lt _ (by norm_num)⟩
-  have hQ0 : Q 0 (0, (0, (0, (lutCarry1 z0 ⟨0, by norm_num⟩, (lutCarry1 z1 ⟨0, by norm_num⟩, ()))))) :=
-    ⟨rfl, rfl⟩
-  have hstep : ∀ i (s t : LutState1), i < 320 * 20 → Q i s →
-      Stage_online_eval.sequential_generatedRoot_135 Backend.backend model GeneratedClaim.stage_2_params i
-        (s.1, (s.2.1, (s.2.2.1, (s.2.2.2.1, (s.2.2.2.2.1, (key, (A0, (A1, (z0, (z1, ())))))))))) t →
-      (t.1 = s.1 + (if h : i < 320 * 20 then
-          lutKeySum1 model key M 0 ⟨i / 20, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
-            ⟨i % 20, Nat.mod_lt _ (Nat.pos_of_ne_zero fun h0 ↦ by simp [h0] at h)⟩ •
-          (unitRow (((i / 20 : Nat) : Int)) : ExactMatrix Q6 N 1 320) else 0) ∧
-        t.2.1 = s.2.1 + (if h : i < 320 * 20 then
-          lutKeySum1 model key M 1 ⟨i / 20, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
-            ⟨i % 20, Nat.mod_lt _ (Nat.pos_of_ne_zero fun h0 ↦ by simp [h0] at h)⟩ •
-          (unitRow (((i / 20 : Nat) : Int)) : ExactMatrix Q6 N 1 320) else 0) ∧
-        t.2.2.1 = s.2.2.1 + (if h : i < 320 * 20 then
-          lutCompanionSum1 M z0 z1 ⟨i / 20, Nat.div_lt_of_lt_mul (by rwa [Nat.mul_comm] at h)⟩
-            ⟨i % 20, Nat.mod_lt _ (Nat.pos_of_ne_zero fun h0 ↦ by simp [h0] at h)⟩ •
-          (unitRow (((i / 20 : Nat) : Int)) : ExactMatrix Q6 N 1 320) else 0)) ∧ Q (i + 1) t := by
-    intro i s t hi hq hb
-    have hi' : i < 6400 := hi
-    have hmod : i % 6400 = i := Nat.mod_eq_of_lt hi'
-    have hq' : s.2.2.2.1 = lutCarry1 z0 ⟨i, hi'⟩ ∧ s.2.2.2.2.1 = lutCarry1 z1 ⟨i, hi'⟩ := by
-      obtain ⟨h0, h1⟩ := hq
-      exact ⟨h0.trans (congrArg (lutCarry1 z0) (Fin.ext hmod)),
-        h1.trans (congrArg (lutCarry1 z1) (Fin.ext hmod))⟩
-    obtain ⟨h0, h1, h2, h3, h4⟩ := lutLoop1_step hA0 hA1 hi' hq' hb
-    have hz : (⟨i % 20 + 20 * (i / 20), by omega⟩ : Fin 6400) = ⟨i, hi'⟩ :=
-      Fin.ext (Nat.mod_add_div i 20)
-    refine ⟨⟨?_, ?_, ?_⟩, h3, h4⟩
-    · rw [h0, dif_pos hi]
-      rfl
-    · rw [h1, dif_pos hi]
-      rfl
-    · rw [h2, dif_pos hi]
-      simp only [lutCompanionSum1, hz]
-  have hk0 := (IterRuns.accumulate (fun s : LutState1 ↦ s.1) _ Q hQ0
-    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).1.1, (hstep i s t hi hq hb).2⟩) h).1
-  have hk1 := (IterRuns.accumulate (fun s : LutState1 ↦ s.2.1) _ Q hQ0
-    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).1.2.1, (hstep i s t hi hq hb).2⟩) h).1
-  have hk2 := (IterRuns.accumulate (fun s : LutState1 ↦ s.2.2.1) _ Q hQ0
-    (fun i s t hi hq hb ↦ ⟨(hstep i s t hi hq hb).1.2.2, (hstep i s t hi hq hb).2⟩) h).1
+  have hk0 := IterRuns.accumulate_entries (fun s : LutState1 ↦ s.1)
+    (fun (w : Fin 320) (i : Fin (16 * 20)) ↦ if (i : Nat) / 20 = (w : Nat) / 20 then
+      lutKeySum1 model key M 0 w ⟨(i : Nat) % 20, by omega⟩ else 0) (fun _ _ ↦ True) trivial
+    (fun i s t hi _ hb ↦ ⟨fun w ↦ by
+      dsimp only
+      rw [(lutLoop1_step hA0 hA1 hi hb w).1]
+      congr 1
+      exact if_congr ⟨Eq.symm, Eq.symm⟩ rfl rfl, trivial⟩) h p
+  have hk1 := IterRuns.accumulate_entries (fun s : LutState1 ↦ s.2.1)
+    (fun (w : Fin 320) (i : Fin (16 * 20)) ↦ if (i : Nat) / 20 = (w : Nat) / 20 then
+      lutKeySum1 model key M 1 w ⟨(i : Nat) % 20, by omega⟩ else 0) (fun _ _ ↦ True) trivial
+    (fun i s t hi _ hb ↦ ⟨fun w ↦ by
+      dsimp only
+      rw [(lutLoop1_step hA0 hA1 hi hb w).2.1]
+      congr 1
+      exact if_congr ⟨Eq.symm, Eq.symm⟩ rfl rfl, trivial⟩) h p
+  have hk2 := IterRuns.accumulate_entries (fun s : LutState1 ↦ s.2.2.1)
+    (fun (w : Fin 320) (i : Fin (16 * 20)) ↦ if (i : Nat) / 20 = (w : Nat) / 20 then
+      lutCompanionSum1 M z0 z1 w ⟨(i : Nat) % 20, by omega⟩ else 0) (fun _ _ ↦ True) trivial
+    (fun i s t hi _ hb ↦ ⟨fun w ↦ by
+      dsimp only
+      rw [(lutLoop1_step hA0 hA1 hi hb w).2.2]
+      congr 1
+      exact if_congr ⟨Eq.symm, Eq.symm⟩ rfl rfl, trivial⟩) h p
   refine ⟨?_, ?_, ?_⟩
-  · rw [hk0, zero_add]
-    exact sum_unitRow_entry (lutKeySum1 model key M 0) p
-  · rw [hk1, zero_add]
-    exact sum_unitRow_entry (lutKeySum1 model key M 1) p
-  · rw [hk2, zero_add]
-    exact sum_unitRow_entry (lutCompanionSum1 M z0 z1) p
+  · rw [hk0]
+    simpa using sum_branch_entry (B := 16) (A := 20) (fun a ↦ lutKeySum1 model key M 0 p a)
+      ⟨(p : Nat) / 20, by omega⟩
+  · rw [hk1]
+    simpa using sum_branch_entry (B := 16) (A := 20) (fun a ↦ lutKeySum1 model key M 1 p a)
+      ⟨(p : Nat) / 20, by omega⟩
+  · rw [hk2]
+    simpa using sum_branch_entry (B := 16) (A := 20) (fun a ↦ lutCompanionSum1 M z0 z1 p a)
+      ⟨(p : Nat) / 20, by omega⟩
 
 /-- The digits, re-encoded at `Q6`, of column `jj` of the joined switching data `(top, bot)` at `Q5`. -/
 noncomputable abbrev switchDigits1 (top bot : ExactMatrix Q5 N 1 20) (jj : Fin 20) :
@@ -448,7 +670,7 @@ switching ciphertext, column by column, and every column decomposition runs. -/
 theorem switchLoop1 {model : HashModel} {i0 : Nat} {c : ExactMatrix Q6 N 1 20}
     {top bot : ExactMatrix Q5 N 1 20} {final : ExactMatrix Q6 N 1 20}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q6 N 1 20) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_150_44 Backend.backend model
+      Stage_online_eval.sequential_sequential_generatedRoot_126_44 Backend.backend model
         GeneratedClaim.stage_2_params i0 i (current, (c, (top, (bot, ())))) next) (Int.toNat 20) 0
       final) (jj : Fin 20) :
     final 0 jj = (c * switchDigits1 top bot jj) 0 0 ∧
@@ -503,7 +725,7 @@ runs. -/
 theorem helperLoop1 {model : HashModel} {i0 : Nat} {h0 k0 k1 : ExactMatrix Q6 N 1 20}
     {top bot : ExactMatrix Q5 N 1 20} {final : HelperState1}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : HelperState1) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_150_30 Backend.backend model
+      Stage_online_eval.sequential_sequential_generatedRoot_126_30 Backend.backend model
         GeneratedClaim.stage_2_params i0 i
         (current.1, (current.2.1, (current.2.2.1, (h0, (top, (bot, (k0, (k1, ())))))))) next)
       (Int.toNat 20) (0, (0, (0, ()))) final) (jj : Fin 20) :
@@ -526,7 +748,7 @@ theorem helperLoop1 {model : HashModel} {i0 : Nat} {h0 k0 k1 : ExactMatrix Q6 N 
       gadgetDecomposeRuns Backend.backend 1048576 10 (pairColumn (top 0 jj) (bot 0 jj)) D' ∧
         compactCenteredRebaseRuns 524288 D' (switchDigits1 top bot jj)
   have hstep : ∀ i (s t : HelperState1), i < 20 * 1 → Q i s →
-      Stage_online_eval.sequential_sequential_generatedRoot_150_30 Backend.backend model
+      Stage_online_eval.sequential_sequential_generatedRoot_126_30 Backend.backend model
         GeneratedClaim.stage_2_params i0 i
         (s.1, (s.2.1, (s.2.2.1, (h0, (top, (bot, (k0, (k1, ())))))))) t →
       (t.1 = s.1 + f h0 i ∧ t.2.1 = s.2.1 + f k0 i ∧ t.2.2.1 = s.2.2.1 + f k1 i) ∧ Q (i + 1) t := by
@@ -590,14 +812,20 @@ theorem lutKeySum1_eq {model : HashModel} {key : ByteArray}
 
 theorem lutCompanionSum1_eq (M : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10)
     (z0 z1 : Fin 6400 → ExactMatrix Q6 N 1 12) (σ : Fin 16) (p : Fin 320) (hp : (p : Nat) / 20 = σ)
-    (a : Fin 20) :
+    (c : Nat) (hc : (p : Nat) % 20 = c) (a : Fin 20) :
     lutCompanionSum1 M z0 z1 p a =
-      (substituteMatrix (sigma σ).toNat (sigma_odd σ) (z0 ⟨(a : Nat) + 20 * p, by omega⟩) *
+      (substituteMatrix (sigma σ).toNat (sigma_odd σ)
+          (z0 ⟨20 * (20 * (σ : Nat) + a) + c, by omega⟩) *
         keyDigits 12 (fun r i ↦ substituteMatrix (sigma σ).toNat (sigma_odd σ) (M r i)) a 0 +
-      substituteMatrix (sigma σ).toNat (sigma_odd σ) (z1 ⟨(a : Nat) + 20 * p, by omega⟩) *
+      substituteMatrix (sigma σ).toNat (sigma_odd σ)
+          (z1 ⟨20 * (20 * (σ : Nat) + a) + c, by omega⟩) *
         keyDigits 12 (fun r i ↦ substituteMatrix (sigma σ).toNat (sigma_odd σ) (M r i)) a 1) 0 0 := by
-  have e2 : ((a : Nat) + 20 * p) / 20 / 20 = σ := by omega
-  unfold lutCompanionSum1 lutCarry1
+  have e2 : (20 * (20 * (σ : Nat) + a) + c) / 20 / 20 = σ := by omega
+  have e3 : (⟨20 * (20 * ((p : Nat) / 20) + a) + (p : Nat) % 20, by omega⟩ : Fin 6400) =
+      ⟨20 * (20 * (σ : Nat) + a) + c, by omega⟩ := Fin.ext (by simp only; omega)
+  unfold lutCompanionSum1
+  rw [e3]
+  unfold lutCarry1
   simp only [sigma_congr (by omega) σ.isLt hp, sigma_congr (by omega) σ.isLt e2]
 
 set_option maxHeartbeats 16000000 in
@@ -615,8 +843,8 @@ theorem lutCompanionRows1 {model : HashModel} {key : ByteArray} {sm : ErrorPoly 
             (columnDigits Q6 (10 + 10) Backend.backend 1048576 10 524288
               (joinedEntry ![fam 0 0 s, fam 0 1 s] jj) (joinedEntry ![fam 1 0 s, fam 1 1 s] jj) a 0) *
           reducePoly Q6 N (unitPair sm r)) • g14)
-        ![z0 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩,
-          z1 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩] 26)
+        ![z0 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩,
+          z1 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩] 26)
     {L0 L1 L2 : ExactMatrix Q6 N 1 320}
     (hL : ∀ p, L0 0 p = ∑ a, lutKeySum1 model key M 0 p a ∧
       L1 0 p = ∑ a, lutKeySum1 model key M 1 p a ∧ L2 0 p = ∑ a, lutCompanionSum1 M z0 z1 p a)
@@ -651,23 +879,20 @@ theorem lutCompanionRows1 {model : HashModel} {key : ByteArray} {sm : ErrorPoly 
         (fun r ↦ (lutDigits1 fam σ j a l *
           reducePoly Q6 N (unitPair (substitution (sigma σ).toNat (sigma_odd σ) sm) r)) • g14)
         ![substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z0 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩),
+            (z0 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩),
           substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z1 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩)] 26 := by
+            (z1 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩)] 26 := by
     intro j l a
     have h := (hz σ ⟨10 * (j : Nat) + l, by omega⟩ a).substitute hN (sigma_odd σ) hcop
     have hc : (fun r ↦ substituteMatrix (sigma σ).toNat (sigma_odd σ)
-        (![z0 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + (10 * (j : Nat) + l)), by omega⟩,
-          z1 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + (10 * (j : Nat) + l)), by omega⟩] r)) =
+        (![z0 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩,
+          z1 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩] r)) =
         ![substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z0 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩),
+            (z0 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩),
           substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z1 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩)] := by
-      have e : (⟨(a : Nat) + 20 * (20 * (σ : Nat) + (10 * (j : Nat) + l)), by omega⟩ : Fin 6400) =
-          ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩ :=
-        Fin.ext (by dsimp only; omega)
+            (z1 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩)] := by
       funext r
-      fin_cases r <;> simp [e]
+      fin_cases r <;> rfl
     have ht : (fun r ↦ substituteMatrix (sigma σ).toNat (sigma_odd σ)
         ((substitution (sigmaInv σ).toNat (sigmaInv_odd σ)
             (columnDigits Q6 (10 + 10) Backend.backend 1048576 10 524288
@@ -687,20 +912,21 @@ theorem lutCompanionRows1 {model : HashModel} {key : ByteArray} {sm : ErrorPoly 
   have hErow : ∀ (j : Fin 2) (l : Fin 10),
       rowWindow 10 (20 * σ + 10 * j) (by omega) L2 0 l =
         (∑ a : Fin (10 + 10), (![substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z0 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩),
+            (z0 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩),
           substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z1 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩)] 0 *
+            (z1 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩)] 0 *
             keyDigits 12 (fun r i ↦ substituteMatrix (sigma σ).toNat (sigma_odd σ) (M r i)) a 0 +
           ![substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z0 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩),
+            (z0 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩),
           substituteMatrix (sigma σ).toNat (sigma_odd σ)
-            (z1 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩)] 1 *
+            (z1 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩)] 1 *
             keyDigits 12 (fun r i ↦ substituteMatrix (sigma σ).toNat (sigma_odd σ) (M r i)) a 1)) 0 0 := by
     intro j l
     simp only [rowWindow]
     rw [(hL _).2.2, Matrix.sum_apply]
     simp only [lutCompanionSum1_eq M z0 z1 σ ⟨20 * (σ : Nat) + 10 * (j : Nat) + l, by omega⟩
-      (show (20 * (σ : Nat) + 10 * (j : Nat) + l) / 20 = σ by omega)]
+      (show (20 * (σ : Nat) + 10 * (j : Nat) + l) / 20 = σ by omega) (10 * (j : Nat) + l)
+      (show (20 * (σ : Nat) + 10 * (j : Nat) + l) % 20 = 10 * (j : Nat) + l by omega)]
     simp only [Matrix.cons_val_zero, Matrix.cons_val_one]
   have hMrow0 : ∀ (j : Fin 2) (l : Fin 10),
       rowWindow 10 (20 * σ + 10 * j) (by omega) L0 0 l =
@@ -758,9 +984,9 @@ theorem lutCompanionRows1 {model : HashModel} {key : ByteArray} {sm : ErrorPoly 
       (digitKey model key Q6 12 (lutOwner 49 ((σ : Nat) : Int) 3) ((10 * (j : Nat) + l : Nat) : Int)
         ((a : Nat) : Int) k r))
     (z := fun j l a ↦ ![substituteMatrix (sigma σ).toNat (sigma_odd σ)
-        (z0 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩),
+        (z0 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩),
       substituteMatrix (sigma σ).toNat (sigma_odd σ)
-        (z1 ⟨(a : Nat) + 20 * (20 * (σ : Nat) + 10 * (j : Nat) + l), by omega⟩)])
+        (z1 ⟨20 * (20 * (σ : Nat) + a) + (10 * (j : Nat) + l), by omega⟩)])
     (bound := 26) hz'
     (u := fun a r ↦ keyDigits 12 (fun r i ↦ substituteMatrix (sigma σ).toNat (sigma_odd σ) (M r i)) a r)
     (fun a r ↦ (hdig a r).1) (u' := u') (β := 524288) hu' hβ
@@ -821,15 +1047,15 @@ theorem branchLoop1_step {model : HashModel} {key : ByteArray} {sm μ : ErrorPol
             (columnDigits Q6 (10 + 10) Backend.backend 1048576 10 524288
               (joinedEntry ![fam 0 0 s, fam 0 1 s] jj) (joinedEntry ![fam 1 0 s, fam 1 1 s] jj) a 0) *
           reducePoly Q6 N (unitPair sm r)) • g14)
-        ![z0 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩,
-          z1 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩] 26)
+        ![z0 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩,
+          z1 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩] 26)
     {L0 L1 L2 : ExactMatrix Q6 N 1 320}
     (hL : ∀ p, L0 0 p = ∑ a, lutKeySum1 model key Ap 0 p a ∧
       L1 0 p = ∑ a, lutKeySum1 model key Ap 1 p a ∧ L2 0 p = ∑ a, lutCompanionSum1 Ap z0 z1 p a)
     {i : Nat} (hi : i < 16) {state next : BranchState1}
     (hswitch : state.switch = fun k j ↦ fam k j ⟨i, hi⟩)
     {T : Fin 2 → ExactMatrix Q6 N 1 10} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
-    (hbody : Stage_online_eval.sequential_generatedRoot_150 Backend.backend model
+    (hbody : Stage_online_eval.sequential_generatedRoot_126 Backend.backend model
       GeneratedClaim.stage_2_params i
       (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
         state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
@@ -1053,14 +1279,14 @@ theorem branchLoop1 {model : HashModel} {key : ByteArray} {sm μ : ErrorPoly N}
             (columnDigits Q6 (10 + 10) Backend.backend 1048576 10 524288
               (joinedEntry ![fam 0 0 s, fam 0 1 s] jj) (joinedEntry ![fam 1 0 s, fam 1 1 s] jj) a 0) *
           reducePoly Q6 N (unitPair sm r)) • g14)
-        ![z0 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩,
-          z1 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩] 26)
+        ![z0 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩,
+          z1 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩] 26)
     {L0 L1 L2 : ExactMatrix Q6 N 1 320}
     (hL : ∀ p, L0 0 p = ∑ a, lutKeySum1 model key Ap 0 p a ∧
       L1 0 p = ∑ a, lutKeySum1 model key Ap 1 p a ∧ L2 0 p = ∑ a, lutCompanionSum1 Ap z0 z1 p a)
     {final : BranchState1}
     (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : BranchState1) ↦
-      Stage_online_eval.sequential_generatedRoot_150 Backend.backend model GeneratedClaim.stage_2_params i
+      Stage_online_eval.sequential_generatedRoot_126 Backend.backend model GeneratedClaim.stage_2_params i
         (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
           current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
           current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, h1, L0, L1, key, c 0, c 1, L2,
@@ -1133,8 +1359,8 @@ theorem round1 {model : HashModel}
     (hg14 : centeredRebaseRuns g14' g14)
     {g' : ExactMatrix Q5 N 1 10} {g : ExactMatrix Q6 N 1 10}
     (hg' : gadgetMatrixRuns Backend.backend 1048576 10 g') (hg : centeredRebaseRuns g' g)
-    (hinput : Rel sm ![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]
-      (fun j ↦ reducePoly Q6 N (1 * μ * unitPair sm j) • g14) ![w.w_137_0, w.w_138_0] roundBound0)
+    (hinput : Rel sm ![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]
+      (fun j ↦ reducePoly Q6 N (1 * μ * unitPair sm j) • g14) ![w.w_113_0, w.w_114_0] roundBound0)
     (hrhs : ∃ e : Fin 2 → ErrorMatrix N 1 10, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
       reducePoly Q6 N sm • ![v140, v141] j + ![v143, v144] j =
         reducePoly Q6 N (((P6 : Nat) : Int) * ν * unitPair sm j) • g + reduceMatrix Q6 N 1 10 (e j))
@@ -1143,7 +1369,7 @@ theorem round1 {model : HashModel}
         (fun r ↦ (columnDigits Q6 (12 + 12) Backend.backend 1048576 12 524288
             (joinedEntry ![v140, v141] jj) (joinedEntry ![v143, v144] jj) a 0 *
           reducePoly Q6 N (unitPair sm r)) • g14)
-        ![v66 ⟨(a : Nat) + 24 * jj, by omega⟩, v68 ⟨(a : Nat) + 24 * jj, by omega⟩] 26)
+        ![v66 ⟨jj + 20 * a, by omega⟩, v68 ⟨jj + 20 * a, by omega⟩] 26)
     (hhelp : ∀ i : Fin 16, Rel sm (lutA model v18 Q6 10 3 (sigma i))
       (fun j ↦ reducePoly Q6 N (((P6 : Nat) : Int) *
         unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g) ![v56 i, v57 i] 26)
@@ -1159,58 +1385,49 @@ theorem round1 {model : HashModel}
             (columnDigits Q6 (10 + 10) Backend.backend 1048576 10 524288
               (joinedEntry ![v48 s, v50 s] jj) (joinedEntry ![v52 s, v54 s] jj) a 0) *
           reducePoly Q6 N (unitPair sm r)) • g14)
-        ![v59 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩,
-          v62 ⟨(a : Nat) + 20 * (20 * (s : Nat) + jj), by omega⟩] 26)
+        ![v59 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩,
+          v62 ⟨20 * (20 * (s : Nat) + a) + jj, by omega⟩] 26)
     {arg : Fin 16} (harg : μ * ν = Xe (n := N) arg) :
-    Rel sm ![![w.w_151_0, w.w_152_0], ![w.w_154_0, w.w_155_0]]
+    Rel sm ![![w.w_127_0, w.w_128_0], ![w.w_130_0, w.w_131_0]]
       (fun j ↦ reducePoly Q5 N (1 * Xe (n := N) (MxxExponentLutNand.table 1 arg) * unitPair sm j) • g')
-      ![w.w_166_0, w.w_167_0] roundBound1 := by
+      ![w.w_142_0, w.w_143_0] roundBound1 := by
   unfold Stage_online_eval.generatedRoot.body at hb
   dsimp only at hb
-  have h68 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h69 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h70 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h71 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h77 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h82 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h88 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h93 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h97 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h101 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h199 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h202 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h204 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h211 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h218 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h219 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h226 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h233 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h234 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h236 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h239 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h240 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h241 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h243 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h250 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h257 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h259 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h260 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h261 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h263 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h264 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h300 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
-  have h301 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h68 := hb.2.2.2.2.2.2.2.2.1
+  have h69 := hb.2.2.2.2.2.2.2.2.2.1
+  have h70 := hb.2.2.2.2.2.2.2.2.2.2.1
+  have h71 := hb.2.2.2.2.2.2.2.2.2.2.2.1
+  have h199 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h202 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h204 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h211 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h218 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h219 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h226 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h233 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h234 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h236 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h239 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h240 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h241 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h243 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h250 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h257 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h259 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h260 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h261 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h263 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h264 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h300 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h301 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
   have hgg : g14 = g14' := centeredRebaseRuns_unique hg14 (centeredRebaseRuns_self hQ6 hN g14')
   subst hgg
   have hinput' := hinput.target_eq (t' := fun j ↦
     reducePoly Q6 N (((1 : Nat) : Int) * μ * unitPair sm j) • g14) (by funext j; simp)
   -- The key of the state input, moved down by the previous round.
-  have hA0 : concatColumns (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]] 0 0) (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]] 0 1) w.w_124_0 := h199
-  have hA1 : concatColumns (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]] 1 0) (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]] 1 1) w.w_127_0 := h202
+  have hA0 : concatColumns (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]] 0 0) (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]] 0 1) w.w_100_0 := h199
+  have hA1 : concatColumns (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]] 1 0) (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]] 1 1) w.w_103_0 := h202
   -- The RHS companion loop.
-  obtain ⟨_, hw90⟩ := familyGet_index (k := 0) h97 (by decide)
-  obtain ⟨_, hw92⟩ := familyGet_index (k := 0) h101 (by decide)
-  rw [hw90, hw92] at h204
   have hrl := rhsLoop1 hA0 hA1 h204
   dsimp only at hrl
   -- The column loop and the digits of the RHS columns.
@@ -1220,7 +1437,7 @@ theorem round1 {model : HashModel}
       (joinedEntry ![v140, v141] ⟨10 * (j : Nat) + l, by omega⟩)
       (joinedEntry ![v143, v144] ⟨10 * (j : Nat) + l, by omega⟩) a 0
   have hDcol : ∀ (j : Fin 2) (l : Fin 10),
-      rhsDigits1 w.w_142_0 w.w_145_0 ⟨10 * (j : Nat) + l, by omega⟩ = fun a _ ↦ D j a l := by
+      rhsDigits1 w.w_118_0 w.w_121_0 ⟨10 * (j : Nat) + l, by omega⟩ = fun a _ ↦ D j a l := by
     intro j l
     funext a b
     rw [Subsingleton.elim b 0]
@@ -1234,71 +1451,71 @@ theorem round1 {model : HashModel}
     rw [concatColumns_entry h240, concatColumns_entry h241, joinedEntry_pair, joinedEntry_pair] at h1
     rw [hDcol] at h2
     exact ⟨D', h1, h2⟩
-  have hcD : ∀ j : Fin 2, rowWindow 10 (10 * j) (by omega) w.w_146_0 = pairMul ![w.w_137_0, w.w_138_0] (D j) := by
+  have hcD : ∀ j : Fin 2, rowWindow 10 (10 * j) (by omega) w.w_122_0 = pairMul ![w.w_113_0, w.w_114_0] (D j) := by
     intro j
-    rw [window_mul_columns (m := 12) (k := 10) (row := ![w.w_137_0, w.w_138_0]) (acc := w.w_146_0) h239
+    rw [window_mul_columns (m := 12) (k := 10) (row := ![w.w_113_0, w.w_114_0]) (acc := w.w_122_0) h239
       (fun p ↦ (hcl p).1) j (by omega)]
-    refine congrArg (pairMul ![w.w_137_0, w.w_138_0]) ?_
+    refine congrArg (pairMul ![w.w_113_0, w.w_114_0]) ?_
     funext a l
     rw [hDcol]
   -- The companion row and keys of the RHS.
   have hdig := fun (a : Fin (12 + 12)) (r : Fin 2) ↦ decompose_entry hQ6 hN Backend.layout3 layout6 rfl
     hg14' (entryDigits_runs hQ6 hN hg14' Backend.layout3 layout6 rfl
-      (fun _ _ ↦ joinedEntry (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]] r) a))
+      (fun _ _ ↦ joinedEntry (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]] r) a))
   choose u' hu' hβ using fun (a : Fin (12 + 12)) (r : Fin 2) ↦ (hdig a r).2
   have hErow : ∀ (j : Fin 2) (l : Fin 10),
-      rowWindow 10 (10 * j) (by omega) w.w_128_2 0 l =
+      rowWindow 10 (10 * j) (by omega) w.w_104_2 0 l =
         (∑ a : Fin (12 + 12),
-          (![v66 ⟨(a : Nat) + 24 * (10 * (j : Nat) + l), by omega⟩,
-              v68 ⟨(a : Nat) + 24 * (10 * (j : Nat) + l), by omega⟩] 0 *
-            keyDigits 12 (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) a 0 +
-          ![v66 ⟨(a : Nat) + 24 * (10 * (j : Nat) + l), by omega⟩,
-              v68 ⟨(a : Nat) + 24 * (10 * (j : Nat) + l), by omega⟩] 1 *
-            keyDigits 12 (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) a 1)) 0 0 := by
+          (![v66 ⟨10 * (j : Nat) + l + 20 * a, by omega⟩,
+              v68 ⟨10 * (j : Nat) + l + 20 * a, by omega⟩] 0 *
+            keyDigits 12 (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) a 0 +
+          ![v66 ⟨10 * (j : Nat) + l + 20 * a, by omega⟩,
+              v68 ⟨10 * (j : Nat) + l + 20 * a, by omega⟩] 1 *
+            keyDigits 12 (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) a 1)) 0 0 := by
     intro j l
     simp only [rowWindow]
     rw [(hrl ⟨10 * (j : Nat) + l, by omega⟩).2.2, Matrix.sum_apply]
     simp only [rhsCompanionSum1, Matrix.cons_val_zero, Matrix.cons_val_one]
-  have hMw : ∀ j : Fin 2, ![w.w_129_0, w.w_130_0] j = rowWindow 10 (10 * j) (by omega) w.w_128_0 ∧
-      ![w.w_132_0, w.w_133_0] j = rowWindow 10 (10 * j) (by omega) w.w_128_1 := by
+  have hMw : ∀ j : Fin 2, ![w.w_105_0, w.w_106_0] j = rowWindow 10 (10 * j) (by omega) w.w_104_0 ∧
+      ![w.w_108_0, w.w_109_0] j = rowWindow 10 (10 * j) (by omega) w.w_104_1 := by
     intro j
     fin_cases j
     · exact ⟨sliceMatrix_window (10 * 0) h211 (by simp) (by omega),
         sliceMatrix_window (10 * 0) h226 (by simp) (by omega)⟩
     · exact ⟨sliceMatrix_window (10 * 1) h218 (by simp) (by omega),
         sliceMatrix_window (10 * 1) h233 (by simp) (by omega)⟩
-  have hMrow0 : ∀ (j : Fin 2) (l : Fin 10), ![w.w_129_0, w.w_130_0] j 0 l =
+  have hMrow0 : ∀ (j : Fin 2) (l : Fin 10), ![w.w_105_0, w.w_106_0] j 0 l =
       (∑ a : Fin (12 + 12),
         (digitKey model v18 Q6 12 (rhsOwner 49 2) ((10 * (j : Nat) + l : Nat) : Int) ((a : Nat) : Int)
-            0 0 * keyDigits 12 (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) a 0 +
+            0 0 * keyDigits 12 (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) a 0 +
           digitKey model v18 Q6 12 (rhsOwner 49 2) ((10 * (j : Nat) + l : Nat) : Int)
-            ((a : Nat) : Int) 0 1 * keyDigits 12 (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) a 1)) 0 0 := by
+            ((a : Nat) : Int) 0 1 * keyDigits 12 (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) a 1)) 0 0 := by
     intro j l
     rw [(hMw j).1]
     simp only [rowWindow]
     rw [(hrl ⟨10 * (j : Nat) + l, by omega⟩).1, Matrix.sum_apply]
     rfl
-  have hMrow1 : ∀ (j : Fin 2) (l : Fin 10), ![w.w_132_0, w.w_133_0] j 0 l =
+  have hMrow1 : ∀ (j : Fin 2) (l : Fin 10), ![w.w_108_0, w.w_109_0] j 0 l =
       (∑ a : Fin (12 + 12),
         (digitKey model v18 Q6 12 (rhsOwner 49 2) ((10 * (j : Nat) + l : Nat) : Int) ((a : Nat) : Int)
-            1 0 * keyDigits 12 (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) a 0 +
+            1 0 * keyDigits 12 (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) a 0 +
           digitKey model v18 Q6 12 (rhsOwner 49 2) ((10 * (j : Nat) + l : Nat) : Int)
-            ((a : Nat) : Int) 1 1 * keyDigits 12 (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) a 1)) 0 0 := by
+            ((a : Nat) : Int) 1 1 * keyDigits 12 (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) a 1)) 0 0 := by
     intro j l
     rw [(hMw j).2]
     simp only [rowWindow]
     rw [(hrl ⟨10 * (j : Nat) + l, by omega⟩).2.1, Matrix.sum_apply]
     rfl
   obtain ⟨f, hf, hE⟩ := companion_rows (q := Q6) (m := 12) (m' := 10) (Dg := 12) hN (sm := sm)
-    (g := g14) (A := ![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) (D := D)
+    (g := g14) (A := ![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) (D := D)
     (B := fun j l a ↦ digitKey model v18 Q6 12 (rhsOwner 49 2) ((10 * (j : Nat) + l : Nat) : Int)
       ((a : Nat) : Int))
-    (z := fun j l a ↦ ![v66 ⟨(a : Nat) + 24 * (10 * (j : Nat) + l), by omega⟩,
-      v68 ⟨(a : Nat) + 24 * (10 * (j : Nat) + l), by omega⟩])
+    (z := fun j l a ↦ ![v66 ⟨10 * (j : Nat) + l + 20 * a, by omega⟩,
+      v68 ⟨10 * (j : Nat) + l + 20 * a, by omega⟩])
     (bound := 26) (fun j l a ↦ hrhsz ⟨10 * (j : Nat) + l, by omega⟩ a)
-    (u := fun a r ↦ keyDigits 12 (![![w.w_122_0, w.w_123_0], ![w.w_125_0, w.w_126_0]]) a r) (fun a r ↦ (hdig a r).1) (u' := u')
-    (β := 524288) hu' hβ (E := fun j ↦ rowWindow 10 (10 * j) (by omega) w.w_128_2)
-    (M := ![![w.w_129_0, w.w_130_0], ![w.w_132_0, w.w_133_0]]) hErow
+    (u := fun a r ↦ keyDigits 12 (![![w.w_98_0, w.w_99_0], ![w.w_101_0, w.w_102_0]]) a r) (fun a r ↦ (hdig a r).1) (u' := u')
+    (β := 524288) hu' hβ (E := fun j ↦ rowWindow 10 (10 * j) (by omega) w.w_104_2)
+    (M := ![![w.w_105_0, w.w_106_0], ![w.w_108_0, w.w_109_0]]) hErow
     (fun k j l ↦ by fin_cases k; exacts [hMrow0 j l, hMrow1 j l])
   -- The product.
   obtain ⟨eB, heB, hrhs'⟩ := hrhs
@@ -1306,11 +1523,11 @@ theorem round1 {model : HashModel}
     Backend.layout3 layout6 rfl hg14' (centeredRebaseRuns_self hQ6 hN _) hinput'
     (top := ![v140, v141]) (bot := ![v143, v144]) (D := D) hD hrhs' heB
     (smulGain_of_polyNorm hN hμ) hE hf
-  have hprod : Rel sm ![![w.w_129_0, w.w_130_0], ![w.w_132_0, w.w_133_0]]
+  have hprod : Rel sm ![![w.w_105_0, w.w_106_0], ![w.w_108_0, w.w_109_0]]
       (fun j ↦ reducePoly Q6 N (((P6 : Nat) : Int) * Xe (n := N) arg * unitPair sm j) • g)
-      ![w.w_148_0, w.w_149_0] mulBound1 := by
-    have hrows : ![w.w_148_0, w.w_149_0] = fun j ↦ pairMul ![w.w_137_0, w.w_138_0] (D j) +
-        rowWindow 10 (10 * j) (by omega) w.w_128_2 := by
+      ![w.w_124_0, w.w_125_0] mulBound1 := by
+    have hrows : ![w.w_124_0, w.w_125_0] = fun j ↦ pairMul ![w.w_113_0, w.w_114_0] (D j) +
+        rowWindow 10 (10 * j) (by omega) w.w_104_2 := by
       funext j
       rw [← hcD j, ← rowWindow_add]
       fin_cases j
@@ -1322,18 +1539,7 @@ theorem round1 {model : HashModel}
     congr 2
     ring
   -- The LUT companion loop.
-  obtain ⟨_, hw83⟩ := familyGet_index (k := 0) h77 (by decide)
-  obtain ⟨_, hw86⟩ := familyGet_index (k := 0) h88 (by decide)
-  obtain ⟨_, hw84⟩ := ringAutomorphismRuns_eq hQ6 hN h82
-  obtain ⟨_, hw87⟩ := ringAutomorphismRuns_eq hQ6 hN h93
-  have hc0 : w.w_61_0 = lutCarry1 v59 ⟨0, by norm_num⟩ := by
-    rw [hw84, hw83]
-    rfl
-  have hc1 : w.w_64_0 = lutCarry1 v62 ⟨0, by norm_num⟩ := by
-    rw [hw87, hw86]
-    rfl
-  rw [hc0, hc1] at h236
-  have hll := lutLoop1 (M := ![![w.w_129_0, w.w_130_0], ![w.w_132_0, w.w_133_0]]) h219 h234 h236
+  have hll := lutLoop1 (M := ![![w.w_105_0, w.w_106_0], ![w.w_108_0, w.w_109_0]]) h219 h234 h236
   dsimp only at hll
   -- The sixteen branches.
   obtain ⟨_, hw72⟩ := familyGet_index (k := 0) h68 (by decide)
@@ -1341,7 +1547,7 @@ theorem round1 {model : HashModel}
   obtain ⟨_, hw76⟩ := familyGet_index (k := 0) h70 (by decide)
   obtain ⟨_, hw78⟩ := familyGet_index (k := 0) h71 (by decide)
   rw [hw72, hw74, hw76, hw78] at h259
-  have hbl := branchLoop1 (fam := ![![v48, v50], ![v52, v54]]) (c := ![w.w_148_0, w.w_149_0])
+  have hbl := branchLoop1 (fam := ![![v48, v50], ![v52, v54]]) (c := ![w.w_124_0, w.w_125_0])
     hsm hg' hg hg14' (centeredRebaseRuns_self hQ6 hN _) hprod hhelp hlutz hll h259
   -- The sum of the sixteen branches, moved down to level `4`.
   have hsum := hbl.target_eq (t' := fun j ↦ ∑ i : Fin 16, scaleUpMatrix Q6 P6
@@ -1368,8 +1574,8 @@ theorem round1 {model : HashModel}
     (bsw := fun i k j ↦ ![![v48, v50], ![v52, v54]] k j i) hsum (g' := g')
     (C := fun i ↦ lutCoefficient Q5 inverse5 (MxxExponentLutNand.table 1) (sigma i).toNat)
     (fun i j ↦ by fin_cases j; exacts [hS i 0, hS i 1]) (fun i j ↦ heS i j) hwalsh
-    (K' := ![![w.w_151_0, w.w_152_0], ![w.w_154_0, w.w_155_0]])
-    (R' := ![w.w_166_0, w.w_167_0])
+    (K' := ![![w.w_127_0, w.w_128_0], ![w.w_130_0, w.w_131_0]])
+    (R' := ![w.w_142_0, w.w_143_0])
     (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h260, h261, h263, h264])
     (fun j ↦ by fin_cases j; exacts [h300, h301])
 

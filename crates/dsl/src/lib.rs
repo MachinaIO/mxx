@@ -486,12 +486,14 @@ impl Ring {
         )
     }
 
+    /// Imports a sampled trapdoor artifact. Its payload carries the public
+    /// matrix, so the public matrix is the trapdoor's own projection and can
+    /// never disagree with the secret.
     #[track_caller]
     #[allow(clippy::too_many_arguments)]
     pub fn trapdoor_artifact_input(
         &self,
         production_id: ProductionId,
-        public_artifact_name: impl Into<String>,
         trapdoor_artifact_name: impl Into<String>,
         rows: impl Into<IntExpr>,
         sigma: impl Into<RealExpr>,
@@ -508,16 +510,6 @@ impl Ring {
             rows: rows.clone(),
             columns: (rows * (digit_count.clone() + IntExpr::constant(2))).canonicalize(),
         });
-        let public_artifact_name = public_artifact_name.into();
-        let public = Mat::source_input(
-            public_artifact_name.clone(),
-            matrix_type.clone(),
-            Some(ArtifactInput {
-                production_id: production_id.clone(),
-                artifact_name: public_artifact_name,
-                availability: ArtifactAvailability::Transferred,
-            }),
-        );
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
         let wire_type = WireType::Trapdoor {
             matrix: matrix_type.clone(),
@@ -539,8 +531,16 @@ impl Ring {
             Vec::new(),
             vec![wire_type],
         );
+        let public_node = NodeHandle::new(
+            NodeKind::TrapdoorPublic,
+            vec![node.output(0).expect("trapdoor artifact input")],
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
         Trapdoor {
-            public,
+            public: Mat {
+                value: public_node.output(0).expect("trapdoor artifact public output"),
+                matrix_type: matrix_type.clone(),
+            },
             value: node.output(0).expect("trapdoor artifact input"),
             matrix_type,
             preimage_max_coefficient_bound,

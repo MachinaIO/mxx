@@ -465,7 +465,7 @@ pub fn select_decoder_at_crt_depth(
 
 /// Errors raised while converting a finite decimal into an exact IR real.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DecimalExpressionError {
+pub enum DecimalExpressionError {
     ExponentOutOfRange,
     InvalidRational,
 }
@@ -483,7 +483,7 @@ impl Error for DecimalExpressionError {}
 
 /// Convert BigDecimal without floating-point rounding or unchecked exponent
 /// arithmetic. BigDecimal stores `integer * 10^(-exponent)`.
-pub(crate) fn decimal_to_real_expr(value: &BigDecimal) -> Result<RealExpr, DecimalExpressionError> {
+pub fn decimal_to_real_expr(value: &BigDecimal) -> Result<RealExpr, DecimalExpressionError> {
     let (integer, exponent) = value.as_bigint_and_exponent();
     let magnitude = if exponent < 0 {
         exponent.checked_neg().ok_or(DecimalExpressionError::ExponentOutOfRange)?

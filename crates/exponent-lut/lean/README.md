@@ -37,7 +37,7 @@ package requires the package one directory up, and Mathlib and the ir-core Lean 
 | `ExponentSampling.lean` | Tape samplers (`…SampleAt`) as deterministic samplers |
 | `ExponentRuntime.lean` | Runtime relations as equations: hashes, family reads, ternary and Gaussian samples, plaintext monomials |
 | `ExponentIterate.lean` | Sums and conjunctions computed by generated `iterate` loops, and constant tables read by `select` |
-| `ExponentDynamic.lean` | Dynamic RHS products: column-wise digits, digit companions, the companion row and keys, the Dynamic private multiplication and LUT branch, and the windows of loop-accumulated rows |
+| `ExponentDynamic.lean` | Dynamic RHS products: column-wise digits and the digits of one decomposed entry, digit companions, the companion row and keys, the Dynamic private multiplication and LUT branch, and the rows accumulated by flat and nested loops |
 | `ExponentErrorForm.lean` | The encoding relation with a named error (`RelE`) and the operations of `lwr_prf` with the error they produce: ModDown residues as functions of the input (`downResidue`), public alignment, public and private multiplication, LUT branch and finish, and the coefficient finalization |
 | `ExponentMaskForm.lean` | Negacyclic product coefficients (`coeff_mul_eq`) and mask-weighted terms `s₀ w` as linear forms in the mask coordinates, sub-Gaussian with the proxy of their coefficient energy when `w` reads no mask coordinate (`maskForm_csubG`) |
 | `ExponentFunctional.lean` | Uniqueness of the outputs of the runtime relations (ModDown, reductions, rebases, automorphisms, slices, concatenations, family reads, tape samples) |
@@ -116,9 +116,11 @@ the final plaintext `X^(outputExponent b)` is the NAND of the inputs.
 The Dynamic set `dynamic-worst-n32-crt7x40` has no preprocess or mask stage: the payload stage
 samples the single secret, and encryption also produces the RHS ciphertexts, the switching
 ciphertexts, and the digit companions. `NandEncrypt` proves the encodings and ciphertexts,
-`NandDigits` the RHS and LUT digit companions, and `NandRound0` to `NandRound3` each round: the
-RHS companion loop (the companion keys and row), the column loop (`c Dec(C)`), the Dynamic private
-multiplication, which keeps its modulus, the LUT companion loop, the loop over the sixteen branches
+`NandDigits` the RHS and LUT digit companions (each lane decomposes only the ciphertext entry of its
+digit row), and `NandRound0` to `NandRound3` each round: the RHS companion loop (one key column per
+iteration, with a nested loop over the output columns that builds the companion keys and row), the
+column loop (`c Dec(C)`), the Dynamic private multiplication, which keeps its modulus, the LUT
+companion loop (nested the same way per branch and key column), the loop over the sixteen branches
 with its two nested column loops, and the LUT ModDown. `NandRound1` to `NandRound3` repeat the
 lemmas of `NandRound0` at their moduli and widths; the last LUT outputs one column.
 

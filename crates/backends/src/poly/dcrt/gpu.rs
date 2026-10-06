@@ -5988,14 +5988,15 @@ impl GpuDCRTPolyParams {
         {
             return Err(GpuNativeGraphError::Native("invalid raw integer view".into()));
         }
+        // The kernel broadcasts a one-element divisor, as it does every
+        // one-element operand; the remainder has the quotient's shape.
         if matches!(
             operation,
             GpuIntegerOperation::FloorDivideRemainder | GpuIntegerOperation::ExactDivideRemainder
-        ) && (rhs
+        ) && (rhs.is_none_or(|value| {
+            value.encoding != output.encoding || (value.count != output.count && value.count != 1)
+        }) || aux
             .is_none_or(|value| value.encoding != output.encoding || value.count != output.count) ||
-            aux.is_none_or(|value| {
-                value.encoding != output.encoding || value.count != output.count
-            }) ||
             lhs.encoding != output.encoding ||
             !matches!(output.encoding, GpuSignedValuesEncoding::SignedWords(_)))
         {

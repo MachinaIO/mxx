@@ -697,6 +697,136 @@ fn root_dynamic_trapdoor_import_preserves_public_and_six_secret_leaves() {
     }
 }
 
+/// A root trapdoor import whose public matrix is its own projection: the
+/// imported trapdoor samples a preimage of a fresh target on the GPU, which
+/// publishes the compact preimage and the target, and both `B K - target`
+/// returned by the GPU and the one the CPU computes from the published
+/// artifacts are zero.
+#[test]
+#[serial_test::serial]
+fn root_trapdoor_import_samples_and_publishes_a_preimage() {
+    let cpu_params = DCRTPolyParams::new(32, 2, 40, 20, None, None);
+    let gpu_params = GpuDCRTPolyParams::new(
+        cpu_params.ring_dimension(),
+        cpu_params.moduli().to_vec(),
+        cpu_params.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        cpu_params.moduli().iter().copied().map(Into::into).collect(),
+        cpu_params.ring_dimension(),
+    );
+    let digits = cpu_params.modulus_digits();
+    let base = 1u32 << cpu_params.base_bits();
+    let bound = crate::sampler::bounds::default_preimage_cutoff(
+        cpu_params.ring_dimension(),
+        2,
+        digits,
+        base,
+        4.0,
+    )
+    .unwrap();
+    let bound = BigInt::from(bound);
+    let producer = DslContext::new("root-trapdoor-producer")
+        .transferred_output("trapdoor", ring.sample_trapdoor(2, 4, base, digits, bound.clone()))
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let mut store = MemoryArtifactStore::default();
+    let setup = execute_in_session(
+        &producer,
+        &mut cpu_backend([cpu_params.clone()]),
+        BTreeMap::new(),
+        &mut store,
+        rand::random(),
+        ExecutionConfig::default(),
+    )
+    .unwrap()
+    .production_id
+    .expect("setup identity");
+    let setup_manifest = store.load_finalized_manifest(&setup).unwrap();
+    let import = |ring: &Ring| {
+        ring.trapdoor_artifact_input(setup.clone(), "trapdoor.1", 2, 4, base, digits, bound.clone())
+    };
+    let columns = 2 * (digits + 2);
+
+    let trapdoor = import(&ring);
+    let target = ring.uniform_residue((2, 3));
+    let preimage = trapdoor.sample_preimage(target.clone(), (columns, 3));
+    let consumer = DslContext::new("root-trapdoor-consumer")
+        .transferred_output("target", target.clone())
+        .unwrap()
+        .transferred_output("preimage", preimage.clone())
+        .unwrap()
+        .output("residual", trapdoor.public_matrix().mul_small_rhs(preimage) - target)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate_with_manifests(
+            &ParamEnv::default(),
+            &BTreeMap::from([(setup.clone(), setup_manifest.clone())]),
+        )
+        .unwrap();
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+    let mut plan = runtime.plan(consumer, &BTreeMap::new()).unwrap();
+    let result = runtime
+        .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+        .unwrap();
+    let residual = runtime.download_matrix_output(&result.output("residual").unwrap()).unwrap();
+    let zero = |matrix: &DCRTPolyMatrix| {
+        (0..matrix.size().0).all(|row| {
+            (0..matrix.size().1)
+                .all(|column| matrix.entry(row, column).coeffs_biguints().iter().all(Zero::is_zero))
+        })
+    };
+    assert!(zero(&residual), "the GPU preimage must satisfy B K = target");
+    let published = result.production_id.clone().expect("consumer identity");
+    drop(result);
+    let published_manifest = store.load_finalized_manifest(&published).unwrap();
+
+    let trapdoor = import(&ring);
+    let preimage = ring.preimage_artifact_input(
+        published.clone(),
+        "preimage",
+        (columns, 3),
+        bound.clone(),
+        ArtifactAvailability::Transferred,
+    );
+    let target =
+        ring.artifact_input(published.clone(), "target", (2, 3), ArtifactAvailability::Transferred);
+    let check = DslContext::new("root-trapdoor-check")
+        .output("residual", trapdoor.public_matrix().mul_small_rhs(preimage) - target)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate_with_manifests(
+            &ParamEnv::default(),
+            &BTreeMap::from([(setup, setup_manifest), (published, published_manifest)]),
+        )
+        .unwrap();
+    let mut backend = cpu_backend([cpu_params.clone()]);
+    let mut checked = execute_in_session(
+        &check,
+        &mut backend,
+        BTreeMap::new(),
+        &mut store,
+        rand::random(),
+        ExecutionConfig::default(),
+    )
+    .unwrap();
+    let RuntimeValue::Matrix(residual) =
+        checked.materialize_output("residual", &backend, &mut store).unwrap().clone()
+    else {
+        panic!("the CPU residual is not a matrix");
+    };
+    assert!(
+        zero(residual.cpu_full_arc().expect("host residual").as_ref()),
+        "the published preimage must satisfy B K = target"
+    );
+}
+
 fn download_resident_trapdoor_leaf(
     runtime: &GpuRuntime,
     secret: &Arc<GpuResidentValue>,

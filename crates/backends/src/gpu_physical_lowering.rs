@@ -4437,6 +4437,17 @@ fn eval_matrix_for_export(
     source: PhysicalValueId,
 ) -> Result<PhysicalValueId, String> {
     let physical = &ctx.values[source.0 as usize];
+    // A bounded matrix is exported in its compact coefficients, as a
+    // streamed family member is.
+    if matches!(
+        physical.ty,
+        ConcreteWireType::Preimage { .. } | ConcreteWireType::SmallMatrix { .. }
+    ) && matches!(
+        physical.encodings.as_ref(),
+        [PhysicalEncoding::CompactCoeff { .. }] | [PhysicalEncoding::CompactCoeffPerCrtLimb { .. }]
+    ) {
+        return Ok(source);
+    }
     if physical.ty.matrix_type().is_none() ||
         !matches!(
             physical.encodings.as_ref(),
@@ -6172,10 +6183,16 @@ pub(super) fn emit_artifact_export(
         }
         let source_binding_base = if public_export_source.is_some() {
             register_all_parts(ctx.bindings, ctx.values, export_source)?
-        } else if ctx.values[export_source.0 as usize].ty.matrix_type().is_some() {
+        } else if ctx.values[export_source.0 as usize].ty.matrix_type().is_some() &&
+            !matches!(
+                ctx.values[export_source.0 as usize].encodings.as_ref(),
+                [PhysicalEncoding::CompactCoeff { .. }] |
+                    [PhysicalEncoding::CompactCoeffPerCrtLimb { .. }]
+            )
+        {
             register_bindings(ctx.bindings, ctx.values, export_source)?
         } else {
-            // A scalar leaf is one contiguous part.
+            // A scalar leaf or a compact bounded matrix is one contiguous part.
             let binding = u32::try_from(ctx.bindings.len())
                 .map_err(|_| "too many GPU graph bindings".to_owned())?;
             ctx.bindings.push(GpuBindingSource::PhysicalPart {
@@ -7029,7 +7046,12 @@ pub(crate) fn plan_physical_graph(
                     NodeKind::MultiplyMonomial |
                     NodeKind::Select { .. } |
                     NodeKind::FamilyGetStatic { .. } |
-                    NodeKind::FamilyGetDynamic
+                    NodeKind::FamilyGetDynamic |
+                    // An imported trapdoor and its public projection: the
+                    // import keeps the boundary of its load site, which
+                    // precedes the conversion of its leaves.
+                    NodeKind::TrapdoorPublic |
+                    NodeKind::PreimageSample { .. }
             ) {
                 arguments.to_vec()
             } else {
@@ -7307,8 +7329,23 @@ pub(crate) fn plan_physical_graph(
         if matches!(
             values[source.0 as usize].ty,
             ConcreteWireType::Preimage { .. } | ConcreteWireType::SmallMatrix { .. }
-        ) && output_root.availability.is_none()
-        {
+        ) {
+            // A published bounded matrix is exported in its compact
+            // coefficients and returned like any other bounded matrix.
+            if let Some(availability) = output_root.availability {
+                let artifact_type = ArtifactType::from_wire_type(&values[source.0 as usize].ty)
+                    .ok_or_else(|| "GPU bounded artifact output has no artifact type".to_owned())?;
+                let mut ctx = root_context!();
+                let export_source = eval_matrix_for_export(&mut ctx, source)?;
+                emit_artifact_export(
+                    &mut ctx,
+                    name,
+                    &[(None, export_source)],
+                    artifact_type,
+                    availability,
+                    None,
+                )?;
+            }
             let source_value = &values[source.0 as usize];
             let [source_part] = source_value.parts.as_ref() else {
                 return Err("GPU bounded return needs one compact physical part".into());

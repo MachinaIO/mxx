@@ -35,10 +35,10 @@ theorem encrypt_input {model : HashModel} {secret : ExactMatrix Q7 N 1 1} {key :
     Rel sm (inputKey model key)
       (fun j ↦ reducePoly Q7 N (((1 : Nat) : Int) * message (n := N) c e * unitPair sm j) • g)
       ![outputs.1, outputs.2.1] 26 := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, hrest⟩ := h
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc1⟩ := hrest
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc2⟩ := hc1
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hout⟩ := hc2
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, hout⟩ := h
   have hgg' := gadgetMatrixRuns_unique h8 hg'
   subst hgg'
   have hgg := centeredRebaseRuns_unique h9 hg
@@ -72,10 +72,10 @@ theorem encrypt_helper1 {model : HashModel} {secret : ExactMatrix Q7 N 1 1}
       (fun j ↦ reducePoly Q7 N (((P7 : Nat) : Int) *
         unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g)
       ![outputs.2.2.2.2.1 i, outputs.2.2.2.2.2.1 i] 26 := by
-  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, h34, hrest⟩ := h
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc1⟩ := hrest
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc2⟩ := hc1
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hout⟩ := hc2
+  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, h34, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, hout⟩ := h
   subst hout hsecret
   obtain ⟨w3, w6, w10, w12, w13, w16, w18, w20, w23, w27, -, -, h3, h6, -, -, h10, h12, h13, h16,
     h18, h20, -, -, h23, h27, hout⟩ := h34 i
@@ -115,10 +115,10 @@ theorem encrypt_helper3 {model : HashModel} {secret : ExactMatrix Q7 N 1 1}
       (fun j ↦ reducePoly Q6 N (((P6 : Nat) : Int) *
         unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g)
       ![outputs.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.1 i] 26 := by
-  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hloop, hrest⟩ := h
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc1⟩ := hrest
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc2⟩ := hc1
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hout⟩ := hc2
+  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hloop, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, hout⟩ := h
   subst hout hsecret
   obtain ⟨w1, w4, w7, w8, w12, w14, w15, w18, w20, w22, w25, w29, h1, -, -, h4, h7, h8, -, -, h12,
     h14, h15, h18, h20, h22, -, -, h25, h29, hout⟩ := hloop i
@@ -161,10 +161,10 @@ theorem encrypt_helper5 {model : HashModel} {secret : ExactMatrix Q7 N 1 1}
       (fun j ↦ reducePoly Q5 N (((P5 : Nat) : Int) *
         unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g)
       ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] 26 := by
-  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hloop, hrest⟩ := h
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, hc1⟩ := hrest
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc2⟩ := hc1
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hout⟩ := hc2
+  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hloop, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, hout⟩ := h
   subst hout hsecret
   obtain ⟨w1, w4, w7, w8, w12, w14, w15, w18, w20, w22, w25, w29, h1, -, -, h4, h7, h8, -, -, h12,
     h14, h15, h18, h20, h22, -, -, h25, h29, hout⟩ := hloop i
@@ -207,10 +207,10 @@ theorem encrypt_helper7 {model : HashModel} {secret : ExactMatrix Q7 N 1 1}
       (fun j ↦ reducePoly Q4 N (((P4 : Nat) : Int) *
         unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g)
       ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] 26 := by
-  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hloop, hrest⟩ := h
-  obtain ⟨-, -, -, -, -, -, -, -, hc1⟩ := hrest
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hc2⟩ := hc1
-  obtain ⟨-, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hout⟩ := hc2
+  obtain ⟨w, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hloop, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -,
+    -, -, -, -, -, hout⟩ := h
   subst hout hsecret
   obtain ⟨w1, w4, w7, w8, w12, w14, w15, w18, w20, w22, w25, w29, h1, -, -, h4, h7, h8, -, -, h12,
     h14, h15, h18, h20, h22, -, -, h25, h29, hout⟩ := hloop i
@@ -254,7 +254,12 @@ theorem encrypt_switch0 {model : HashModel} {key : ByteArray} {secret : ExactMat
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] j + ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] j =
         (lutCoefficient Q6 inverse6 (MxxExponentLutNand.table 0) (sigma i).toNat *
           reducePoly Q6 N (1 * unitPair sp j)) • g + reduceMatrix Q6 N 1 12 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hpayload
   obtain ⟨w0, w1, w3, w4, w11, w16, w22, w27, w34, w39, w45, w50, w58, w63, w69, w74, w81, w86, w92, w97, w106, w107, w110, w116, w120, h0, h1, h3, -, -, h4, -, -, -, -, -, -, h11, -, -, -, -, -, -, h16, -, -, -, -, -, -, h22, -, -, -, -, -, -, h27, -, -, -, -, -, -, h34, -, -, -, -, -, -, h39, -, -, -, -, -, -, h45, -, -, -, -, -, -, h50, -, -, -, -, -, -, h58, -, -, -, -, -, -, h63, -, -, -, -, -, -, h69, -, -, -, -, -, -, h74, -, -, -, -, -, -, h81, -, -, -, -, -, -, h86, -, -, -, -, -, -, h92, -, -, -, -, -, -, h97, h106, h107, h110, h116, h120, hout⟩ := hpar39 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ6 hN h4
@@ -308,7 +313,12 @@ theorem encrypt_switch1 {model : HashModel} {key : ByteArray} {secret : ExactMat
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] j + ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] j =
         (lutCoefficient Q5 inverse5 (MxxExponentLutNand.table 1) (sigma i).toNat *
           reducePoly Q5 N (1 * unitPair sp j)) • g + reduceMatrix Q5 N 1 10 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hpayload
   obtain ⟨w0, w1, w3, w4, w11, w16, w22, w27, w34, w39, w45, w50, w58, w63, w69, w74, w81, w86, w92, w97, w106, w107, w110, w116, w120, h0, h1, h3, -, -, h4, -, -, -, -, -, -, h11, -, -, -, -, -, -, h16, -, -, -, -, -, -, h22, -, -, -, -, -, -, h27, -, -, -, -, -, -, h34, -, -, -, -, -, -, h39, -, -, -, -, -, -, h45, -, -, -, -, -, -, h50, -, -, -, -, -, -, h58, -, -, -, -, -, -, h63, -, -, -, -, -, -, h69, -, -, -, -, -, -, h74, -, -, -, -, -, -, h81, -, -, -, -, -, -, h86, -, -, -, -, -, -, h92, -, -, -, -, -, -, h97, h106, h107, h110, h116, h120, hout⟩ := hpar42 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ5 hN h4
@@ -362,7 +372,12 @@ theorem encrypt_switch2 {model : HashModel} {key : ByteArray} {secret : ExactMat
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] j + ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 i] j =
         (lutCoefficient Q4 inverse4 (MxxExponentLutNand.table 2) (sigma i).toNat *
           reducePoly Q4 N (1 * unitPair sp j)) • g + reduceMatrix Q4 N 1 8 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hpayload
   obtain ⟨w0, w1, w3, w4, w11, w16, w22, w27, w34, w39, w45, w50, w58, w63, w69, w74, w81, w86, w92, w97, w106, w107, w110, w116, w120, h0, h1, h3, -, -, h4, -, -, -, -, -, -, h11, -, -, -, -, -, -, h16, -, -, -, -, -, -, h22, -, -, -, -, -, -, h27, -, -, -, -, -, -, h34, -, -, -, -, -, -, h39, -, -, -, -, -, -, h45, -, -, -, -, -, -, h50, -, -, -, -, -, -, h58, -, -, -, -, -, -, h63, -, -, -, -, -, -, h69, -, -, -, -, -, -, h74, -, -, -, -, -, -, h81, -, -, -, -, -, -, h86, -, -, -, -, -, -, h92, -, -, -, -, -, -, h97, h106, h107, h110, h116, h120, hout⟩ := hpar45 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ4 hN h4
@@ -415,7 +430,12 @@ theorem encrypt_switch3 {model : HashModel} {key : ByteArray} {secret : ExactMat
         (lutCoefficient Q3 inverse3 (MxxExponentLutNand.table 3) (sigma i).toNat *
           reducePoly Q3 N ((((Q3 / 2 : Nat) : Int) : ErrorPoly N) * unitPair sp j)) •
           (1 : ExactMatrix Q3 N 1 1) + reduceMatrix Q3 N 1 1 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hpayload
   obtain ⟨w0, w1, w3, w4, w11, w16, w22, w27, w34, w39, w45, w50, w58, w63, w69, w74, w81, w86, w92, w97, w109, w115, w119, h0, h1, h3, -, -, h4, -, -, -, -, -, -, h11, -, -, -, -, -, -, h16, -, -, -, -, -, -, h22, -, -, -, -, -, -, h27, -, -, -, -, -, -, h34, -, -, -, -, -, -, h39, -, -, -, -, -, -, h45, -, -, -, -, -, -, h50, -, -, -, -, -, -, h58, -, -, -, -, -, -, h63, -, -, -, -, -, -, h69, -, -, -, -, -, -, h74, -, -, -, -, -, -, h81, -, -, -, -, -, -, h86, -, -, -, -, -, -, h92, -, -, -, -, -, -, h97, h109, h115, h119, hout⟩ := hpar48 i
   obtain ⟨_, hw5⟩ := ringAutomorphismRuns_eq hQ3 hN h4
@@ -468,7 +488,12 @@ theorem encrypt_rhs0 {model : HashModel} {key : ByteArray} {secret : ExactMatrix
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
         reducePoly Q7 N (((P7 : Nat) : Int) * message (n := N) c0 e0 * unitPair sm j) • g +
           reduceMatrix Q7 N 1 12 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hsecret
   have hgg' := gadgetMatrixRuns_unique h53 hg'
   subst hgg'
@@ -498,7 +523,12 @@ theorem encrypt_rhs1 {model : HashModel} {key : ByteArray} {secret : ExactMatrix
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
         reducePoly Q6 N (((P6 : Nat) : Int) * message (n := N) c1 e1 * unitPair sm j) • g +
           reduceMatrix Q6 N 1 10 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hsecret
   dsimp (config := { zetaDelta := true }) only at h78 h94 h88
   have hpay := modulusReduce_poly hQ7 hQ6 hN h78
@@ -533,7 +563,12 @@ theorem encrypt_rhs2 {model : HashModel} {key : ByteArray} {secret : ExactMatrix
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
         reducePoly Q5 N (((P5 : Nat) : Int) * message (n := N) c2 e2 * unitPair sm j) • g +
           reduceMatrix Q5 N 1 8 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hsecret
   dsimp (config := { zetaDelta := true }) only at h106 h122 h116
   have hpay := modulusReduce_poly hQ7 hQ5 hN h106
@@ -568,7 +603,12 @@ theorem encrypt_rhs3 {model : HashModel} {key : ByteArray} {secret : ExactMatrix
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1] j =
         reducePoly Q4 N (((P4 : Nat) : Int) * message (n := N) c3 e3 * unitPair sm j) • g +
           reduceMatrix Q4 N 1 6 (e j) := by
-  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -, hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, h40, -, hpar41, -, hpar42, h43, -, hpar44, -, hpar45, h46, -, hpar47, -, hpar48, h49, -, hpar50, h51, h52, h53, h54, h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104, h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136, h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
+  obtain ⟨w, h2, h5, h8, h9, h19, h21, h23, h29, -, hpar31, -, hpar32, -, hpar33, -, hpar34, -,
+    hpar35, -, hpar36, -, hpar37, -, hpar38, -, hpar39, -, -, h40, -, hpar41, -, hpar42, -, -, h43,
+    -, hpar44, -, hpar45, -, -, h46, -, hpar47, -, hpar48, -, -, h49, -, hpar50, h51, h52, h53, h54,
+    h65, h72, h74, -, hpar75, h76, h77, h78, h79, h80, h88, h92, h94, h100, h102, -, hpar103, h104,
+    h105, h106, h107, h108, h116, h120, h122, h128, h130, -, hpar131, h132, h133, h134, h135, h136,
+    h144, h148, h150, h156, h158, -, hpar159, hout⟩ := h
   subst hout hsecret
   dsimp (config := { zetaDelta := true }) only at h134 h150 h144
   have hpay := modulusReduce_poly hQ7 hQ4 hN h134

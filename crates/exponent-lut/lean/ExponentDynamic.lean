@@ -14,9 +14,13 @@ under the companion key `B`. Online evaluation forms `T = Σ_a B Dec(A_{:,a})` a
 
 The runtime decomposes a ciphertext one column at a time, so the digits of a column are
 `columnDigits` and the digits of a key entry are `entryDigits`; `gadget_action_columns` assembles
-the columns into the action of the whole decomposition. The generated loops accumulate one term per
+the columns into the action of the whole decomposition. The decomposition is entry by entry
+(`regularDecomposeMatrix_congr`), so a digit of one decomposed entry is a row of the column digits
+(`columnDigits_entry`). The generated loops accumulate one term per
 iteration into a row through a window of a constant unit row; `unitRow_window`,
-`sum_unitRow_entry`, and `rowWindow` read those rows back entry by entry.
+`sum_unitRow_entry`, and `rowWindow` read those rows back entry by entry;
+`IterRuns.accumulate_entries`, `sum_unitRow_mul`, `tensorRuns_unitRow`, and `sum_branch_entry` read
+the rows of nested loops whose outer iterations place one block per branch.
 -/
 
 namespace MxxExponentLut
@@ -278,6 +282,95 @@ theorem sum_unitRow_entry {q W A : Nat} (F : Fin W → Fin A → ExactPoly q n) 
     rw [if_neg fun h ↦ hv (Fin.ext (by exact_mod_cast h)).symm, mul_zero]
   · simp
 
+/-- A loop whose iteration `i` adds `F w i` to entry `w` of the row `proj`, while a side condition
+`Q` is kept, ends with the sum over every iteration, entry by entry. -/
+theorem IterRuns.accumulate_entries {σ : Type} {q W C : Nat} {body : Nat → σ → σ → Prop}
+    {init final : σ} (proj : σ → ExactMatrix q n 1 W) (F : Fin W → Fin C → ExactPoly q n)
+    (Q : Nat → σ → Prop) (hQ : Q 0 init)
+    (hstep : ∀ i current next (hi : i < C), Q i current → body i current next →
+      (∀ w, proj next 0 w = proj current 0 w + F w ⟨i, hi⟩) ∧ Q (i + 1) next)
+    (h : MxxIR.IterRuns body C init final) (w : Fin W) :
+    proj final 0 w = proj init 0 w + ∑ i, F w i := by
+  have hacc := IterRuns.accumulate proj
+    (fun i ↦ if hi : i < C then (fun _ v ↦ F v ⟨i, hi⟩ : ExactMatrix q n 1 W) else 0) Q hQ
+    (fun i current next hi hq hb ↦ by
+      obtain ⟨he, hq'⟩ := hstep i current next hi hq hb
+      refine ⟨?_, hq'⟩
+      funext r v
+      rw [Subsingleton.elim r 0, Matrix.add_apply, he v]
+      simp only [dif_pos hi]) h
+  rw [hacc.1, Matrix.add_apply, Matrix.sum_apply,
+    Finset.sum_range (fun i ↦ (if hi : i < C then (fun _ v ↦ F v ⟨i, hi⟩ : ExactMatrix q n 1 W)
+      else 0) 0 w)]
+  congr 1
+  refine Finset.sum_congr rfl fun i _ ↦ ?_
+  rw [dif_pos i.isLt]
+
+/-- The values `X j` placed at columns `j` sum to `X w` at column `w`. -/
+theorem sum_unitRow_mul {q W : Nat} (X : Fin W → ExactPoly q n) (w : Fin W) :
+    ∑ j : Fin W, X j * (unitRow ((j : Nat) : Int) : ExactMatrix q n 1 W) 0 w = X w := by
+  rw [Finset.sum_eq_single w]
+  · simp [unitRow]
+  · intro v _ hv
+    have : ((w : Nat) : Int) ≠ ((v : Nat) : Int) := fun h ↦ hv (Fin.ext (by exact_mod_cast h.symm))
+    simp [unitRow, this]
+  · simp
+
+/-- The tensor of the unit row of branch `s` with a block places the block at the columns
+`s A ..` of branch `s`. -/
+theorem tensorRuns_unitRow {q B A : Nat} {s : Nat} {x : ExactMatrix q n 1 A}
+    {out : ExactMatrix q n (1 * 1) (B * A)}
+    (h : tensorRuns (unitRow (s : Int) : ExactMatrix q n 1 B) x out) (p : Fin (B * A)) :
+    out 0 p = if (p : Nat) / A = s then x 0 ⟨p % A, Nat.mod_lt _ (by
+      rcases Nat.eq_zero_or_pos A with h0 | h0
+      · subst h0; simp at p; exact p.elim0
+      · exact h0)⟩ else 0 := by
+  have hA : 0 < A := by
+    rcases Nat.eq_zero_or_pos A with h0 | h0
+    · subst h0; simp at p; exact p.elim0
+    · exact h0
+  have hb : (p : Nat) / A < B := Nat.div_lt_of_lt_mul (Nat.lt_of_lt_of_eq p.isLt (Nat.mul_comm B A))
+  have key : ∀ (i : Fin (1 * 1)) (j : Fin (B * A)), (i : Nat) = 0 → (j : Nat) = p →
+      out i j = out 0 p := by
+    intro i j hi hj
+    congr 1 <;> exact Fin.ext (by simp [hj])
+  have h' := (key _ _ (by simp) (by simp only; rw [Nat.mul_comm]; exact Nat.div_add_mod _ _)).symm.trans
+    (h 0 0 ⟨(p : Nat) / A, hb⟩ ⟨(p : Nat) % A, Nat.mod_lt _ hA⟩)
+  rw [h']
+  simp only [unitRow]
+  by_cases hp : (p : Nat) / A = s
+  · simp [hp]
+  · have : (((p : Nat) / A : Nat) : Int) ≠ (s : Int) := fun h ↦ hp (by exact_mod_cast h)
+    rw [if_neg this, if_neg hp, zero_mul]
+
+/-- Summing, over every pair `i` of `B` branches and `A` rows, the values of branch `s` picks the
+`A` values of branch `s`. -/
+theorem sum_branch_entry {M : Type} [AddCommMonoid M] {B A : Nat} (G : Fin A → M) (s : Fin B) :
+    ∑ i : Fin (B * A), (if (i : Nat) / A = s then G ⟨(i : Nat) % A, Nat.mod_lt _ (by
+      rcases Nat.eq_zero_or_pos A with h0 | h0
+      · subst h0; simp at i; exact i.elim0
+      · exact h0)⟩ else 0) = ∑ a, G a := by
+  rcases Nat.eq_zero_or_pos A with hA | hA
+  · subst hA; simp
+  rw [← finProdFinEquiv.sum_comp, Fintype.sum_prod_type]
+  have hdiv : ∀ (v : Fin B) (a : Fin A),
+      ((finProdFinEquiv (v, a) : Fin (B * A)) : Nat) / A = v ∧
+      ((finProdFinEquiv (v, a) : Fin (B * A)) : Nat) % A = a := by
+    intro v a
+    simp only [finProdFinEquiv_apply_val]
+    constructor
+    · rw [Nat.add_mul_div_left _ _ hA, Nat.div_eq_of_lt a.isLt, zero_add]
+    · rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt a.isLt]
+  rw [Finset.sum_eq_single s]
+  · refine Finset.sum_congr rfl fun a _ ↦ ?_
+    simp only [(hdiv s a).1, (hdiv s a).2, if_true, Fin.eta]
+  · intro v _ hv
+    refine Finset.sum_eq_zero fun a _ ↦ ?_
+    rw [if_neg]
+    rw [(hdiv v a).1]
+    exact fun h ↦ hv (Fin.ext h)
+  · simp
+
 /-! ## Digits of key entries -/
 
 /-- The digits of a `1 × 1` entry. -/
@@ -389,6 +482,11 @@ theorem concatColumns_entry {q m : Nat} {l r : ExactMatrix q n 1 m}
 def pairColumn {α : Type} (x y : α) : Matrix (Fin 2) (Fin 1) α :=
   fun r _ ↦ if r.val = 0 then x else y
 
+/-- Entry `k` of the row `[x₀ | x₁]` of two `1 × 1` blocks is entry `k` of their column. -/
+theorem joinedEntry_single {α : Type} (x : Fin 2 → Matrix (Fin 1) (Fin 1) α) (k : Fin (1 + 1)) :
+    joinedEntry x k = pairColumn (x 0 0 0) (x 1 0 0) k 0 := by
+  fin_cases k <;> rfl
+
 /-- Stacking two entries gives their column. -/
 theorem concatRows_pairColumn {q : Nat} {x y : ExactMatrix q n 1 1}
     {out : ExactMatrix q n (1 + 1) 1}
@@ -419,6 +517,132 @@ theorem columnDigits_eq {q q' k : Nat} {backend : BackendContext} {base digits :
       compactCenteredRebaseRuns bound D' D) ⟨D, D', hD', hD⟩
   obtain rfl := gadgetDecomposeRuns_unique hD' hE'
   exact centeredRebaseRuns_unique hD.2.2.1 hE.2.2.1
+
+/-- A modulus cast keeps equal entries equal. -/
+theorem castExactMatrix_congr {q r rows columns rows' columns' : Nat} (h : q = r)
+    {M : ExactMatrix q n rows columns} {M' : ExactMatrix q n rows' columns'}
+    {i : Fin rows} {j : Fin columns} {i' : Fin rows'} {j' : Fin columns'}
+    (he : M i j = M' i' j') : castExactMatrix h M i j = castExactMatrix h M' i' j' := by
+  subst h
+  exact he
+
+/-- The corrected target of the regular decomposition is formed entry by entry. -/
+theorem regularCorrectedTarget_congr {q rows columns rows' columns' : Nat}
+    (layout : RegularLayout q) {T : ExactMatrix q n rows columns}
+    {T' : ExactMatrix q n rows' columns'} {r : Fin rows} {c : Fin columns} {r' : Fin rows'}
+    {c' : Fin columns'} (hT : T r c = T' r' c') :
+    regularCorrectedTarget layout T r c = regularCorrectedTarget layout T' r' c' := by
+  unfold regularCorrectedTarget
+  split_ifs
+  · exact hT
+  · simp only [Matrix.sub_apply, reduceMatrix, regularLowResidual, hT]
+
+/-- Digit `d` of row `r` of the regular decomposition depends only on entry `r` of the target. -/
+theorem regularDecomposeMatrix_congr {q rows columns rows' columns' : Nat}
+    (layout : RegularLayout q) {T : ExactMatrix q n rows columns}
+    {T' : ExactMatrix q n rows' columns'} {r : Fin rows} {c : Fin columns} {r' : Fin rows'}
+    {c' : Fin columns'} (hT : T r c = T' r' c') (d : Fin layout.digitCount) :
+    regularDecomposeMatrix layout T (finProdFinEquiv (r, d)) c =
+      regularDecomposeMatrix layout T' (finProdFinEquiv (r', d)) c' := by
+  unfold regularDecomposeMatrix fullDecomposeMatrix regularColumnIndex
+  simp only [Equiv.symm_apply_apply]
+  apply castExactMatrix_congr
+  simp only [regularIndexEquiv, Equiv.symm_trans_apply, Equiv.symm_apply_apply,
+    Equiv.prodCongr_symm, Equiv.prodCongr_apply, Equiv.refl_symm, Equiv.coe_refl, Prod.map,
+    id, regularDigitsUnflattened]
+  congr 1
+  apply castExactMatrix_congr
+  exact regularCorrectedTarget_congr layout hT
+
+/-- Two decompositions that run agree on digit `k` of entries that agree: row `k + K r` of the
+first is row `k + K r'` of the second. -/
+theorem gadgetDecomposeRuns_congr {q rows columns rows' columns' D D' : Nat}
+    {backend : BackendContext} {base digits : Int} {T : ExactMatrix q n rows columns}
+    {T' : ExactMatrix q n rows' columns'} {u : ExactMatrix q n D columns}
+    {u' : ExactMatrix q n D' columns'} (hu : gadgetDecomposeRuns backend base digits T u)
+    (hu' : gadgetDecomposeRuns backend base digits T' u') {r : Fin rows} {c : Fin columns}
+    {r' : Fin rows'} {c' : Fin columns'} (hT : T r c = T' r' c') {K : Nat} (hK : digits = K)
+    {k : Nat} (hk : k < K) {i : Fin D} {i' : Fin D'} (hi : i.val = k + K * r)
+    (hi' : i'.val = k + K * r') : u i c = u' i' c' := by
+  obtain ⟨layout, hl, -, hd, hw, rfl, -⟩ := hu
+  obtain ⟨layout', hl', -, hd', hw', rfl, -⟩ := hu'
+  rw [hl] at hl'
+  cases hl'
+  have hKd : K = layout.digitCount := by omega
+  subst hKd
+  rw [castMatrixRows_apply, castMatrixRows_apply]
+  have e1 : Fin.cast hw i = finProdFinEquiv (r, ⟨k, hk⟩) :=
+    Fin.ext (by simp [finProdFinEquiv_apply_val, hi])
+  have e2 : Fin.cast hw' i' = finProdFinEquiv (r', ⟨k, hk⟩) :=
+    Fin.ext (by simp [finProdFinEquiv_apply_val, hi'])
+  rw [e1, e2]
+  exact regularDecomposeMatrix_congr layout hT _
+
+/-- A centered rebase keeps equal entries equal. -/
+theorem centeredRebase_congr {q p rows columns rows' columns' : Nat}
+    {M : ExactMatrix q n rows columns} {M' : ExactMatrix q n rows' columns'} {i : Fin rows}
+    {j : Fin columns} {i' : Fin rows'} {j' : Fin columns'} (he : M i j = M' i' j') :
+    (centeredRebase M : ExactMatrix p n rows columns) i j =
+      (centeredRebase M' : ExactMatrix p n rows' columns') i' j' := by
+  simp only [centeredRebase, he]
+
+/-- With an exact layout, the column `(x, y)` has digits rebased to `q`. -/
+theorem columnDigits_runs {q q' K : Nat} (hq : 1 < q) (hq' : 1 < q') (hn : 0 < n)
+    {backend : BackendContext} {base digits : Int} {g : ExactMatrix q' n 1 K}
+    (hg : gadgetMatrixRuns backend base digits g) (layout : RegularLayout q')
+    (hlayout : backend.regularLayout q' n = some layout) (hexact : layout.droppedModuli = 0)
+    {bound : Nat} (hbound : bound = layout.base / 2) (hsmall : 2 * bound < q')
+    (hbq : bound ≤ q / 2) (x y : ExactPoly q' n) :
+    ∃ D' : ExactMatrix q' n (K + K) 1,
+      gadgetDecomposeRuns backend base digits (pairColumn x y) D' ∧
+        compactCenteredRebaseRuns bound D'
+          (columnDigits q (K + K) backend base digits bound x y) := by
+  obtain ⟨layout', hl, hb, hd, hw, -⟩ := hg
+  rw [hlayout] at hl
+  cases hl
+  have hw2 : K + K = 2 * layout.digitCount := by simp at hw; omega
+  let D' : ExactMatrix q' n (K + K) 1 :=
+    castMatrixRows hw2.symm (regularDecomposeMatrix layout (pairColumn x y))
+  have hD' : gadgetDecomposeRuns backend base digits (pairColumn x y) D' :=
+    ⟨layout, hlayout, hb, hd, hw2, rfl,
+      regularGadgetMatrix_residual_exact layout (pairColumn x y) hq' hn hexact⟩
+  obtain ⟨wit, hwit, hwb⟩ := regularDecomposeMatrix_bounded layout (pairColumn x y) hq' hn
+  have hbD' : PreimageWithin D' bound := by
+    refine ⟨fun row column ↦ wit (Fin.cast hw2 row) column, ?_, fun row column ↦ ?_⟩
+    · funext row column
+      simp only [D', castMatrixRows_apply, hwit, reduceMatrix]
+    · rw [hbound]
+      exact hwb _ _
+  have hreb : compactCenteredRebaseRuns bound D' (centeredRebase D' : ExactMatrix q n (K + K) 1) := by
+    refine ⟨Or.inr hbq, hbD', ⟨hq, rfl⟩, ?_⟩
+    obtain ⟨wit', hwit', hwb'⟩ := hbD'
+    refine ⟨wit', ?_, hwb'⟩
+    funext row column
+    rw [hwit']
+    simp only [centeredRebase, reduceMatrix]
+    exact centeredRebase_reducePoly hq' hn _ fun i ↦ by
+      have := hwb' row column i
+      omega
+  exact ⟨D', hD', by rw [← columnDigits_eq hD' hreb]; exact hreb⟩
+
+/-- Digit `a % K` of entry `a / K` of the column `(x, y)`, decomposed alone and rebased, is row `a`
+of the column digits. -/
+theorem columnDigits_entry {q q' K : Nat} {backend : BackendContext} {base digits : Int}
+    {bound : Nat} (hK : digits = K) {x y : ExactPoly q' n} {e : ExactMatrix q' n 1 1}
+    (a : Fin (K + K))
+    (he : e 0 0 = pairColumn x y ⟨a / K, Nat.div_lt_of_lt_mul (by have := a.isLt; omega)⟩ 0)
+    {u' : ExactMatrix q' n K 1} {u : ExactMatrix q n K 1}
+    (hu' : gadgetDecomposeRuns backend base digits e u') (hu : compactCenteredRebaseRuns bound u' u)
+    (hcol : ∃ D' : ExactMatrix q' n (K + K) 1,
+      gadgetDecomposeRuns backend base digits (pairColumn x y) D' ∧
+        compactCenteredRebaseRuns bound D'
+          (columnDigits q (K + K) backend base digits bound x y)) :
+    u ⟨a % K, Nat.mod_lt _ (by have := a.isLt; omega)⟩ 0 = columnDigits q (K + K) backend base digits bound x y a 0 := by
+  obtain ⟨D', hD', hreb⟩ := hcol
+  rw [hu.2.2.1.2, hreb.2.2.1.2]
+  apply centeredRebase_congr
+  exact gadgetDecomposeRuns_congr hu' hD' he hK (k := a % K)
+    (Nat.mod_lt _ (by have := a.isLt; omega)) (by simp) (by simp [Nat.mod_add_div])
 
 /-- Digits decomposed column by column act like the decomposition of the whole matrix. -/
 theorem gadget_action_columns {q p q' m m' : Nat} (hq : q = p * q') (hq' : 1 < q') (hn : 0 < n)

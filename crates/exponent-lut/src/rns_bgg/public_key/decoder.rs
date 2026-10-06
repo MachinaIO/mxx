@@ -9,7 +9,8 @@
 use super::*;
 use crate::decoder::decoding::DecoderDeclaration;
 
-/// The setup's trapdoor artifact: `.0` is the public `B`, `.1` the trapdoor.
+/// The setup's trapdoor artifact: `.0` is the public `B`, `.1` the trapdoor, which also carries
+/// `B`.
 const UNMASK_TRAPDOOR: &str = "unmask/trapdoor";
 
 /// Run the trusted unmask setup of `declaration`'s decoder of
@@ -91,7 +92,6 @@ pub(super) fn import_unmask_trapdoor(
         .map_err(|_| RnsBggError::Binding("unmask setup sigma"))?;
     Ok(parameters.ring(descriptor.level)?.trapdoor_artifact_input(
         setup.production().clone(),
-        format!("{UNMASK_TRAPDOOR}.0"),
         format!("{UNMASK_TRAPDOOR}.1"),
         crate::decoder::unmask::UNMASK_ROWS,
         sigma,

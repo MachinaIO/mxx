@@ -580,12 +580,11 @@ mod artifact {
     use std::collections::BTreeMap;
     use thiserror::Error;
 
-    // A trapdoor output flattens into its public matrix (`.0`) and its trapdoor (`.1`).
+    // A trapdoor output flattens into its public matrix (`.0`) and its trapdoor (`.1`), whose
+    // payload also carries the public matrix.
     const B0: &str = "slot_transfer_b0";
-    const B0_PUBLIC: &str = "slot_transfer_b0.0";
     const B0_TRAPDOOR: &str = "slot_transfer_b0.1";
     const B1: &str = "slot_transfer_b1";
-    const B1_PUBLIC: &str = "slot_transfer_b1.0";
     const B1_TRAPDOOR: &str = "slot_transfer_b1.1";
     const SLOT_SECRET: &str = "slot_transfer_slot_secret";
     const SLOT_PUBLIC_KEY: &str = "slot_transfer_slot_a";
@@ -713,7 +712,6 @@ mod artifact {
             Ok(BggSlotTransferBaseWires {
                 b0: ring.trapdoor_artifact_input(
                     artifacts.production_id.clone(),
-                    B0_PUBLIC,
                     B0_TRAPDOOR,
                     self.secret_size,
                     self.trapdoor_sigma.clone(),
@@ -723,7 +721,6 @@ mod artifact {
                 ),
                 b1: ring.trapdoor_artifact_input(
                     artifacts.production_id.clone(),
-                    B1_PUBLIC,
                     B1_TRAPDOOR,
                     self.secret_size * 2,
                     self.trapdoor_sigma.clone(),

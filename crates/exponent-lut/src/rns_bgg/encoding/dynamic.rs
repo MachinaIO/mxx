@@ -465,10 +465,14 @@ impl<'a> RnsEncryptBuild<'a> {
         let mask = &self.payload_secret.as_ref().ok_or(RnsBggError::Binding("secret"))?.row;
         // Member `k / count` of the ciphertexts is read through this outer
         // index family, the Gather form a wave importer reads ahead when the
-        // ciphertexts are an imported family.
-        let member_of = Family::pack(
-            (0..members * count).map(|k| Int::constant(k / count)).collect::<Vec<_>>(),
-        )
+        // ciphertexts are an imported family. One scalar loop computes it,
+        // so the graph does not grow with the lane count.
+        let member_of = mxx_dsl::parallel(IntExpr::constant(members * count), |lane| {
+            Ok(Int::evaluate(
+                IntExpr::FloorDiv(Box::new(lane.expression()?), Box::new(IntExpr::constant(count)))
+                    .canonicalize(),
+            ))
+        })
         .map_err(graph)?;
         mxx_dsl::parallel(IntExpr::constant(members * count), |lane| {
             let member_index = member_of.at(lane.clone());

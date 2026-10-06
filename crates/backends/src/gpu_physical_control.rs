@@ -10328,6 +10328,94 @@ mod tests {
         }
     }
 
+    /// A parallel loop reads `members.at(x.at(i))`, where a scalar parallel
+    /// loop of the same graph computes `x_i = i / 2`, over several waves. The
+    /// computed index family is resident before the first wave's members are
+    /// read; each member is loaded once per read and the result matches.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_parallel_waves_gather_by_computed_index_family() {
+        use mxx_dsl::Int;
+        use mxx_ir_core::{artifact::ArtifactAvailability, node::LoopInputMode};
+
+        let count = test_count("MXX_TEST_GATHER_COUNT", 7);
+        let lanes = 2 * count;
+        let mut store = MemoryArtifactStore::default();
+        let (cpu_params, gpu_params, ring, production) = constant_member_family(&mut store, count);
+        let manifest = store.load_finalized_manifest(&production).unwrap();
+        let members = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (1, 1),
+            ArtifactAvailability::Cached,
+        );
+        let context = DslContext::new("direct-computed-gather-consumer");
+        let x = parallel(lanes, |i| {
+            Ok(Int::evaluate(
+                IntExpr::FloorDiv(Box::new(i.expression()?), Box::new(2.into())).canonicalize(),
+            ))
+        })
+        .unwrap();
+        let out = parallel(lanes, move |i| Ok(members.at(x.at(i)))).unwrap();
+        let validated = context
+            .output("out", out)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        let modes = validated
+            .source
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec.input_modes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(modes.iter().any(|mode| matches!(mode, LoopInputMode::Gather { .. })), "{modes:?}");
+
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params], [detected_gpu_device_ids()[0]])).unwrap();
+        runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let frame = plan.physical_frame_for_test();
+        assert!(frame.import_templates.iter().any(|template| template.member.is_some()));
+        let keys = member_keys(&production, count);
+        for replay in 0..2 {
+            let before = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let after = keys.iter().map(|key| store.load_count(key)).collect::<Vec<_>>();
+            for (member, key) in keys.iter().enumerate() {
+                assert_eq!(after[member] - before[member], 2, "replay {replay}: {key:?}");
+            }
+            // Member `j` is the constant `j + 1`.
+            for index in 0..lanes {
+                let expected = DCRTPoly::from_biguint_to_constant(
+                    &cpu_params,
+                    num_bigint::BigUint::from(index / 2 + 1),
+                );
+                let actual = runtime
+                    .download_matrix_member_output(&result.output("out").unwrap(), index)
+                    .unwrap();
+                assert_eq!(
+                    actual.entry(0, 0).to_bytes(),
+                    expected.to_bytes(),
+                    "replay {replay}, member {index}"
+                );
+            }
+        }
+    }
+
     /// A sequential loop whose iteration `k` loads member `k + 1` at the start
     /// of its body and carries it, adding the member loaded one iteration
     /// earlier: the multi-stage form of a streamed read. The load starts at

@@ -33,17 +33,25 @@ package requires the package one directory up, and Mathlib and the ir-core Lean 
 | `ExponentWalsh.lean` | Walsh (Fourier) interpolation of a LUT |
 | `ExponentLut.lean` | Private multiplication with and without ModDown (for any payload gain), one LUT branch, and the LUT ModDown |
 | `ExponentPublic.lean` | Public multiplication (for any plaintext gain) and the public alignment of a public encoding to a lower modulus |
-| `ExponentDecode.lean` | Terminal threshold decryption of binary coefficients and of the parity of coefficients in `[-T, T]` |
+| `ExponentDecode.lean` | Terminal threshold decryption of binary coefficients, of the parity of coefficients in `[-T, T]`, and of finalized coefficient outputs modulo `t` (`decode_terminal_scaled`) |
 | `ExponentSampling.lean` | Tape samplers (`…SampleAt`) as deterministic samplers |
 | `ExponentRuntime.lean` | Runtime relations as equations: hashes, family reads, ternary and Gaussian samples, plaintext monomials |
 | `ExponentIterate.lean` | Sums and conjunctions computed by generated `iterate` loops, and constant tables read by `select` |
 | `ExponentDynamic.lean` | Dynamic RHS products: column-wise digits, digit companions, the companion row and keys, the Dynamic private multiplication and LUT branch, and the windows of loop-accumulated rows |
+| `ExponentErrorForm.lean` | The encoding relation with a named error (`RelE`) and the operations of `lwr_prf` with the error they produce: ModDown residues as functions of the input (`downResidue`), public alignment, public and private multiplication, LUT branch and finish, and the coefficient finalization |
+| `ExponentMaskForm.lean` | Negacyclic product coefficients (`coeff_mul_eq`) and mask-weighted terms `s₀ w` as linear forms in the mask coordinates, sub-Gaussian with the proxy of their coefficient energy when `w` reads no mask coordinate (`maskForm_csubG`) |
+| `ExponentFunctional.lean` | Uniqueness of the outputs of the runtime relations (ModDown, reductions, rebases, automorphisms, slices, concatenations, family reads, tape samples) |
+| `ExponentPairing.lean` | Real weights on the coefficients of an error (`pairing`) and their pullbacks through right multiplications, polynomial multiplications and substitutions, with the `l1` norm and energy of the pulled-back weight |
+| `ExponentDecomp.lean` | The pairings with the cell, alignment and block numerators of `lwr_prf` as sums over their sources |
+| `ExponentCellStep.lean` | The pairing with the error leaving a block of cells and with the finalized LUT error, in site form: the next weight, the residue sites with their coefficients, and the remainder with its bound |
+| `ExponentH2.lean` | The tail of a noise form under H2 (`h2_tail`): Hoeffding on the clamped mask for the key sites, energies with tape-dependent bounds, the block bounds in terms of the `l1` norm of the weight, the one-tower gadget, and the numeric tails |
 
 ### Program-dependent lemmas
 
 - `nand_circuit/NandProgram.lean`: the four LUT tables of the depth-one NAND program and the
   exponent of every round; `rounds_nand` shows that the output exponent is `1 - b₀ b₁`.
-- `lwr_prf/LwrProgram.lean`: the sparse-LWR readout table `τ(k) = ⌊p' k / w⌋ + 1`.
+- `lwr_prf/LwrProgram.lean`: the sparse-LWR readout `τ(k) = ⌊p' k / w⌋ + 1` and the PRF table
+  `2 τ(k) - 1`, which is odd.
 - `public_ip/PublicIpProgram.lean`: an accepted plaintext `c X^e` (`c² = 1`, `0 ≤ e < n`,
   `2e + n (1 - c) = 2x`) is the monomial `X^x`, products of monomials, and `X^(2n) = 1`.
 
@@ -92,7 +100,9 @@ output.
 
 The `…Certificate.lean` module of a parameter set proves `certificate :
 GeneratedClaim.CorrectnessClaim`, and `#guard_msgs` checks that `#print axioms certificate`
-lists only `propext`, `Classical.choice`, and `Quot.sound`.
+lists only `propext`, `Classical.choice`, and `Quot.sound`. The exception is
+`lwr_prf/average-n65536-crt36x40`, whose `LwrH2Cert` proves the claim from the heuristic `LwrH2`
+(`certificateH2 : LwrH2 → GeneratedClaim.CorrectnessClaim`, with the same axioms).
 
 ### NAND (`nand_circuit`)
 
@@ -119,18 +129,44 @@ sum every block's selectors in loops), `LwrEncrypt` (the state `X^0`, every memb
 vector `a`, and the readout LUT helpers), `LwrPreprocess` (the selector RHS of every block and the
 readout switching ciphertexts), `LwrBlock0` to `LwrBlock<B-1>` (the public alignment, public
 multiplication, and private multiplication with ModDown of every cell, and the sum of the cells),
-`LwrLut` (the coefficient LUT from `Q2` to `Q1`), and `LwrCertificate`. The requirement makes the
+`LwrLut` (the coefficient LUT from `Q2` to `Q1` and the finalization `G⁻¹(k)`), and
+`LwrCertificate`. The requirement makes the
 plaintext of member `k` of `a` the monomial `X^(stride a_k)` and every block's selectors one-hot, so
 after the blocks the state is `X^(stride z)` for the sum `z` of the selected coordinates; the readout
-LUT gives `(-1)^⌊z/w⌋ τ(z mod w)` for `w = Q/2`, and decryption returns its parity, the ideal output.
+LUT gives `(-1)^⌊z/w⌋ (2 τ(z mod w) - 1)` for `w = Q/2` against the full gadget of `Q1`, the
+finalization `G⁻¹(k)` turns it into an encoding with scale `k` against the gadget `1`, and decryption
+modulo `t = 2P` returns `m + b (2P - 2m)` for `m = 2 τ - 1` and `b = ⌊z/w⌋ mod 2`, the ideal output.
 
-At `average-n65536-crt36x40` (34 blocks of 113 cells, a readout LUT of 128 branches) the error
-analysis keeps the bound of an error multiplied by a monomial plaintext (`SmulGain _ 1`), as the
-noise audit of the crate does; the coarser bound `n ‖e‖` of the small parameter sets would not fit
-the terminal modulus at `n = 2^16`. The worst-case cutoffs of the tape samplers then bound the
-terminal error by about `2^35.6` against `Q1 ≈ 2^40`. Its cells live in `LwrCells`, and its proof
-library passes `--tstack` to Lean, since the kernel check of the certificate, which chains the 34
-blocks, needs a larger thread stack than the default.
+At `average-n65536-crt36x40` (34 blocks of 113 cells, a readout LUT of 128 branches) the
+deterministic argument of the small sets does not fit: with the worst-case cutoffs the terminal
+error bound is about `2^39.9`, against the decoding budget `(Q1 - 2 r W) / (2 t) ≈ 2^33`. Its
+certificate goes through the residue-replacement heuristic H2 (`ResidueReplacement` of
+`RuntimeHeuristics`): `LwrH2Cert` proves `certificateH2 : LwrH2 → GeneratedClaim.CorrectnessClaim`,
+where `LwrH2` states that replacing the H2 sites by independent uniforms does not decrease the tail
+of the decoded coefficient at the threshold. The sites are the ModDown residues of the rows of the
+private multiplications, of the alignments of the members of `a`, and of the LUT finish, and the
+key residues of the alignments, which the mask multiplies. The remainder (the encryption, RHS and
+switching errors and the other key residues) is bounded on every tape; the row sites have a
+deterministic energy; the key sites are linear forms in the mask, below `τ` times their norm except
+on the union of their Hoeffding events. The modules of the library `LwrH2`:
+
+- `LwrEncryptE`, `LwrPreprocessE`, `LwrErrorCommon`, `LwrBlockE0` to `LwrBlockE<B-1>`, `LwrLutE`:
+  every operation with its error named (`RelE`);
+- `LwrModelBase`, `LwrModel0` to `LwrModel<B-1>`, `LwrModelLut`: the keys, rows, numerators and
+  errors of the model of a run as functions of the tape, with the samples clamped to their ranges;
+- `LwrChainAll`, `LwrChainFinal`: every run is its model, and every ModDown numerator of the model
+  is divisible by its dropped factor;
+- `LwrH2Model`: the weights pulled back from the decoded coefficient, the sites, and the
+  decomposition of the decoded coefficient into the remainder and the sum over the sites;
+- `LwrH2Bounds`: the `l1` norms of the weights, the remainder, and the energies of the sites, on
+  every tape; the finalization digits enter by their column `l1` norm (`FinalDigits`), which is
+  `20` here: the digits of `k` are `(0, 0, -4, 16)`;
+- `LwrH2Agree`: the site coefficients read only the payload, preprocessing and mask samples;
+- `LwrH2Cert`: the certificate under `LwrH2`.
+
+`generator/gen_h2.py` writes them after `generator/gen.py`. Its cells live in `LwrCells`, and its
+proof libraries pass `--tstack` to Lean, since the kernel checks of the chained blocks need a larger
+thread stack than the default.
 
 ### Public inner product (`public_ip`)
 
@@ -177,13 +213,13 @@ MXX_EXPONENT_LUT_LWR_PRF_EXPORT_ONLY=1 MXX_EXPONENT_LUT_LWR_PRF_PARAMETER_ID=ave
 ```
 
 The proof of an average-case `lwr_prf` parameter set is written by the generator from its row and its
-exported claim; it writes every proof module and the Lake package files, and regenerating
-`average-n65536-crt36x40` reproduces its proof byte for byte. The cells, the block sums, and the
+exported claim; it writes every proof module and the Lake package files. The cells, the block sums, and the
 readout LUT of `average-n32-crt7x40` are its templates.
 
 ```sh
 cd crates/exponent-lut/lean/lwr_prf
 python3 generator/gen.py average-n65536-crt36x40
+python3 generator/gen_h2.py average-n65536-crt36x40
 cd ../public_ip
 python3 generator/gen_decode.py average-n32-crt2x40
 ```

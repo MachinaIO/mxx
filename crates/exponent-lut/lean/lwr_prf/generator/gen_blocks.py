@@ -179,7 +179,7 @@ def block_lemma(I, b):
 set_option maxHeartbeats 64000000 in
 /-- Block `{b}`: the sum of its {C} cells, an encoding of `P{qn} Σ_i α_(c_i) μ ν_i` at `Q{qn}`. -/
 theorem block{b} {{model : HashModel}} {{key : ByteArray}}
-    {{s0 s1 s2 s3 : Fin {W} → ExactMatrix Q1 N 1 1}} {{k0 k1 : Fin {W} → ExactMatrix Q2 N 1 {m1}}}
+    {{s0 s1 s2 s3 : Fin {W} → ExactMatrix Q1 N 1 {m1}}} {{k0 k1 : Fin {W} → ExactMatrix Q2 N 1 {m1}}}
     {{ca0 ca1 : Fin {M} → ExactMatrix Q{L} N 1 {mL}}} {{cs0 cs1 : ExactMatrix Q{L} N 1 {mL1}}}
     {{apay : Fin {M} → ExactMatrix Q{L} N 1 1}}
     {rfams}

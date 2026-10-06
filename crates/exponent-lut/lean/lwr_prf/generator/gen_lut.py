@@ -5,11 +5,17 @@ from gen_blocks import small
 
 
 def lut(I):
+    return transform(I, 'LwrLut', 'set_option maxHeartbeats 64000000 in\n/-- The readout LUT and its finalization')
+
+
+def transform(I, name, anchor, extra=()):
+    """The template `name` of `average-n32-crt7x40` for the set: the names of the online
+    evaluation root after `anchor` are renumbered and reprojected, and the counts replaced."""
     L, B, C, M, N, W, s = I.L, I.B, I.C, I.M, I.n, I.W, I.stride
     m1 = I.m(1)
-    t = small('LwrLut')
+    t = small(name)
     shift = 22 * (B - 5)
-    a = t.index('set_option maxHeartbeats 64000000 in\n/-- The readout LUT: an encoding')
+    a = t.index(anchor)
     head, rnd = t[:a], t[a:]
     # Root-level names of the readout round.
     rnd = re.sub(r'\b(w\.w_|h)(\d+)(?=_)', lambda m: m.group(1) + str(int(m.group(2)) + shift)
@@ -23,21 +29,49 @@ def lut(I):
     last = max(i for i, l in enumerate(lines) if re.match(r'  have h\d+_\d+(?:_\d+)? := hb\.', l))
     rnd = '\n'.join(lines[:first]) + '\n' + haves.rstrip('\n') + '\n' + '\n'.join(lines[last + 1:])
     # The inputs of the online evaluation root.
-    old_bind = rnd[rnd.index('    {r00 r01'):rnd.index('{outputs}')]
-    fams_ = [f'{{r{j}0 r{j}1 : Fin {C} → ExactMatrix Q{L - 1 - j} N 1 {I.m(L - 2 - j)}}}' for j in range(B)]
-    rfams = '\n    '.join(' '.join(fams_[k:k + 2]) for k in range(0, B, 2))
-    rnd = rnd.replace(old_bind, '    ' + rfams + '\n    ')
+    if '    {r00 r01' in rnd:
+        old_bind = rnd[rnd.index('    {r00 r01'):rnd.index('{outputs}')]
+        fams_ = [f'{{r{j}0 r{j}1 : Fin {C} → ExactMatrix Q{L - 1 - j} N 1 {I.m(L - 2 - j)}}}' for j in range(B)]
+        rfams = '\n    '.join(' '.join(fams_[k:k + 2]) for k in range(0, B, 2))
+        rnd = rnd.replace(old_bind, '    ' + rfams + '\n    ')
+    else:
+        old = 'r00 r01 r10 r11 r20 r21 r30 r31 r40 r41}'
+        assert old in rnd
+        rnd = rnd.replace(old, ' '.join(f'r{j}0 r{j}1' for j in range(B)) + '}')
     ins_ = [f'r{j}0, r{j}1' for j in range(B)]
     rnd = rnd.replace('r00, r01, r10, r11, r20, r21, r30, r31,\n        r40, r41, ()',
                       ',\n        '.join(', '.join(ins_[k:k + 4]) for k in range(0, B, 4)) + ', ()')
     out = head + rnd
+    import re as _re
+    claim = open(f'{I.d}/generated/Stage_online_eval.lean').read()
+    scale = _re.findall(rf'matrixPolynomial \[\((\d+)\)\] : Mxx\.Primitives\.ExactMatrix {I.Q[1]} ', claim)
+    assert len(set(scale)) == 1, scale
+    reps0 = [
+        ('/-- The scale `k` of the finalized readout: `⌊Q1 / 8⌋` with its low `29` bits cleared. -/',
+         f'/-- The scale `k` of the finalized readout, near `Q1 / {4 * I.pprime}` with sparse digits. -/'),
+        ('abbrev outScale : Int := 137170518016', f'abbrev outScale : Int := {scale[0]}'),
+        ('the scale-up `G⁻¹(k)` has two digits of at most', f'the scale-up `G⁻¹(k)` has {m1} digits of at most'),
+        ('2 * lutBound B * 524288', f'{m1} * lutBound B * 524288'),
+        ('`2^19`', f'`2^{I.digit.bit_length() - 1}`'),
+    ]
+    for x, y in reps0:
+        if name == 'LwrLut':
+            assert x in out, x
+        out = out.replace(x, y)
+    for x, y in extra:
+        if x.startswith('re:'):
+            out = re.sub(x[3:], y, out)
+        else:
+            out = out.replace(x, y)
     reps = [
         ('Fin 17 → ExactMatrix Q7 N 1 14', f'Fin {M} → ExactMatrix Q{L} N 1 {I.m(L)}'),
         ('ExactMatrix Q7 N 1 12', f'ExactMatrix Q{L} N 1 {I.m(L - 1)}'),
         ('Fin 17 → ExactMatrix Q7 N 1 1', f'Fin {M} → ExactMatrix Q{L} N 1 1'),
         ('lutA model key Q2 2 5', f'lutA model key Q2 {m1} {B}'),
         ('ExactMatrix Q2 N 1 2', f'ExactMatrix Q2 N 1 {m1}'), ('ExactMatrix Q1 N 1 2', f'ExactMatrix Q1 N 1 {m1}'),
-        ('1048576 2 g', f'{I.base} {m1} g'), ('(m := 2)', f'(m := {m1})'), ('(log := 5)', f'(log := {I.log_n})'),
+        ('LoopState Q2 Q1 2', f'LoopState Q2 Q1 {m1}'), ('ErrorMatrix N 1 2', f'ErrorMatrix N 1 {m1}'),
+        ('reduceMatrix Q1 N 1 2', f'reduceMatrix Q1 N 1 {m1}'),
+        ('1048576 2 g', f'{I.base} {m1} g'), ('(m := 2)', f'(m := {m1})'), ("(m' := 2)", f"(m' := {m1})"), ('(log := 5)', f'(log := {I.log_n})'),
         ('(2 + 2) * N', f'({m1} + {m1}) * N'), ('524288', str(I.digit)), ('1048576', str(I.base)),
         ('Xe (2 * z)', f'Xe ({s} * z)'), ('polyNorm_substitution_Xe i (2 * z)', f'polyNorm_substitution_Xe i ({s} * z)'),
         ('moved down to level `8`', 'moved down to `Q1`'), ('Xe (n := N) (2 * z)', f'Xe (n := N) ({s} * z)'),

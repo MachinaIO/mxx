@@ -108,16 +108,17 @@ theorem Y_pow_{W} {{q : Nat}} : Y q ^ {W} = -1 := by
   rw [Y, ← pow_mul]
   exact Negacyclic.root_pow_n
 
-/-- The readout value `τ(k) = ⌊{I.pprime} k / {W}⌋ + 1` as a constant. -/
+/-- The half-integer readout value `2 τ(k) - 1`, `τ(k) = ⌊{I.pprime} k / {W}⌋ + 1`, as a constant. -/
 noncomputable def readoutPoly (q : Nat) (k : Fin {W}) : ExactPoly q N :=
-  ((MxxExponentLutLwr.readout {I.pprime} {W} k.val : Nat) : ExactPoly q N)
+  ((MxxExponentLutLwr.halfIntegerReadout {I.pprime} {W} k.val : Nat) : ExactPoly q N)
 
-/-- The coefficient `C_σ = W⁻¹ Σ_k τ(k) σ(Y^(-k))` of the readout LUT. -/
+/-- The coefficient `C_σ = W⁻¹ Σ_k (2 τ(k) - 1) σ(Y^(-k))` of the readout LUT. -/
 noncomputable def lutCoefficient (q inverse : Nat) (σ : Nat) : ExactPoly q N :=
   lutFourierCoefficient {W} (Y q) (inverse : ExactPoly q N) (readoutPoly q) σ
 
 set_option maxHeartbeats 4000000 in
-/-- The readout LUT on every exponent `z`: `Σ_i σ_i(Y^z) C_i = Y^(z - z mod {W}) τ(z mod {W})`. -/
+/-- The readout LUT on every exponent `z`:
+`Σ_i σ_i(Y^z) C_i = Y^(z - z mod {W}) (2 τ(z mod {W}) - 1)`. -/
 theorem lut_walsh {{q inverse : Nat}}
     (hinverse : (inverse : ExactPoly q N) * (({W} : Nat) : ExactPoly q N) = 1) (z : Nat) :
     ∑ i : Fin {W}, Y q ^ ((sigma i).toNat * z) * lutCoefficient q inverse (sigma i).toNat =
@@ -161,10 +162,10 @@ theorem lutCoefficient_eq {{q inverse σ : Nat}} (hσ : Odd σ) :
 expanded. -/
 theorem lutCoefficient_range {{q inverse σ : Nat}} (hσ : Odd σ) :
     lutCoefficient q inverse σ = (inverse : ExactPoly q N) *
-      ∑ k ∈ Finset.range {W}, ((MxxExponentLutLwr.readout {I.pprime} {W} k : Nat) : ExactPoly q N) *
+      ∑ k ∈ Finset.range {W}, ((MxxExponentLutLwr.halfIntegerReadout {I.pprime} {W} k : Nat) : ExactPoly q N) *
         (if k = 0 then 1 else -X q ^ (σ * ({N} - {s} * k))) := by
   rw [lutCoefficient_eq hσ, ← Fin.sum_univ_eq_sum_range (fun k ↦
-    ((MxxExponentLutLwr.readout {I.pprime} {W} k : Nat) : ExactPoly q N) *
+    ((MxxExponentLutLwr.halfIntegerReadout {I.pprime} {W} k : Nat) : ExactPoly q N) *
       (if k = 0 then 1 else -X q ^ (σ * ({N} - {s} * k)))) {W}]
   rfl
 
@@ -173,9 +174,10 @@ theorem polyNorm_substitution_Xe (i : Fin {W}) (k : Nat) :
   rw [substitution_root_pow]
   exact polyNorm_Xe hN1 _
 
-/-- The readout of the exponent `z`: `(-1)^⌊z / {W}⌋ τ(z mod {W})`. -/
+/-- The half-integer readout of the exponent `z`: `(-1)^⌊z / {W}⌋ (2 τ(z mod {W}) - 1)`. -/
 noncomputable def lutValue (z : Nat) : ErrorPoly N :=
-  (((-1 : Int) ^ (z / {W}) * (MxxExponentLutLwr.readout {I.pprime} {W} (z % {W}) : Int) : Int) : ErrorPoly N)
+  (((-1 : Int) ^ (z / {W}) * (MxxExponentLutLwr.halfIntegerReadout {I.pprime} {W} (z % {W}) : Int) : Int) :
+    ErrorPoly N)
 
 set_option maxHeartbeats 4000000 in
 /-- The readout LUT on the state `X^({s}z)`. -/

@@ -385,7 +385,7 @@ theorem sum1 {model : HashModel} {f0 f1 f2 f3 f4 f5 : Fin 113 → ExactMatrix Q3
 set_option maxHeartbeats 64000000 in
 /-- Block `1`: the sum of its 113 cells, an encoding of `P34 Σ_i α_(c_i) μ ν_i` at `Q34`. -/
 theorem block1 {model : HashModel} {key : ByteArray}
-    {s0 s1 s2 s3 : Fin 128 → ExactMatrix Q1 N 1 1} {k0 k1 : Fin 128 → ExactMatrix Q2 N 1 4}
+    {s0 s1 s2 s3 : Fin 128 → ExactMatrix Q1 N 1 4} {k0 k1 : Fin 128 → ExactMatrix Q2 N 1 4}
     {ca0 ca1 : Fin 1025 → ExactMatrix Q36 N 1 144} {cs0 cs1 : ExactMatrix Q36 N 1 140}
     {apay : Fin 1025 → ExactMatrix Q36 N 1 1}
     {r00 r01 : Fin 113 → ExactMatrix Q35 N 1 136} {r10 r11 : Fin 113 → ExactMatrix Q34 N 1 132}

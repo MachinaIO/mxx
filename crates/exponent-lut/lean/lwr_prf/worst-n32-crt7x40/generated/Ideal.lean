@@ -358,7 +358,7 @@ structure generatedRoot.Witness where
   w_16_0 : Int
   w_20_0 : Int
 
-abbrev generatedRoot.constraints_0 (params : Params) (w_2_0 : Fin 14 → Int) (w_3_0 : Fin 17 → Int) (w_7_0 : Fin 14 → Int) (w_11_0 : Fin 14 → Int) (w_15_0 : Fin 14 → Int) (w_19_0 : Fin 14 → Int) (w_1_0 : Int) (w_4_0 : Int) (w_6_0 : Int) (w_8_0 : Int) (w_10_0 : Int) (w_12_0 : Int) (w_14_0 : Int) (w_16_0 : Int) (w_18_0 : Int) (w_20_0 : Int) (w_22_0 : Int) (w_26_0 : Int) (w_30_0 : Int) (w_31_0 : Int) (outputs : Int) : Prop :=
+abbrev generatedRoot.constraints_0 (params : Params) (w_2_0 : Fin 14 → Int) (w_3_0 : Fin 17 → Int) (w_7_0 : Fin 14 → Int) (w_11_0 : Fin 14 → Int) (w_15_0 : Fin 14 → Int) (w_19_0 : Fin 14 → Int) (w_1_0 : Int) (w_4_0 : Int) (w_6_0 : Int) (w_8_0 : Int) (w_10_0 : Int) (w_12_0 : Int) (w_14_0 : Int) (w_16_0 : Int) (w_18_0 : Int) (w_20_0 : Int) (w_22_0 : Int) (w_26_0 : Int) (w_34_0 : Int) (w_36_0 : Int) (w_43_0 : Int) (outputs : Int) : Prop :=
   0 ≤ (14) ∧
   MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_generatedRoot_4 params i (current, (w_2_0, (w_3_0, ()))) next) (Int.toNat (14)) w_1_0 w_4_0 ∧
   0 ≤ (14) ∧
@@ -371,8 +371,9 @@ abbrev generatedRoot.constraints_0 (params : Params) (w_2_0 : Fin 14 → Int) (w
   MxxIR.IterRuns (fun (i : Nat) (current next : Int) => sequential_generatedRoot_20 params i (current, (w_19_0, (w_3_0, ()))) next) (Int.toNat (14)) w_18_0 w_20_0 ∧
   w_22_0 ≠ 0 ∧
   w_26_0 ≠ 0 ∧
-  w_30_0 ≠ 0 ∧
-  outputs = w_31_0
+  w_34_0 ≠ 0 ∧
+  w_36_0 ≠ 0 ∧
+  outputs = w_43_0
 
 abbrev generatedRoot.body (params : Params) (inputs : (Fin 14 → Int) × (Fin 17 → Int) × (Fin 14 → Int) × (Fin 14 → Int) × (Fin 14 → Int) × (Fin 14 → Int) × Unit) (outputs : Int) (witness : generatedRoot.Witness) : Prop :=
   let _params := params
@@ -407,8 +408,20 @@ abbrev generatedRoot.body (params : Params) (inputs : (Fin 14 → Int) × (Fin 1
   let w_28_0 : Int := 1
   let w_29_0 : Int := (w_27_0 + w_28_0)
   let w_30_0 : Int := 2
-  let w_31_0 : Int := (w_29_0 % w_30_0)
-  generatedRoot.constraints_0 params w_2_0 w_3_0 w_7_0 w_11_0 w_15_0 w_19_0 w_1_0 w_4_0 w_6_0 w_8_0 w_10_0 w_12_0 w_14_0 w_16_0 w_18_0 w_20_0 w_22_0 w_26_0 w_30_0 w_31_0 outputs
+  let w_31_0 : Int := (w_29_0 * w_30_0)
+  let w_32_0 : Int := 1
+  let w_33_0 : Int := (w_31_0 - w_32_0)
+  let w_34_0 : Int := 32
+  let w_35_0 : Int := (w_21_0 % w_34_0)
+  let w_36_0 : Int := 16
+  let w_37_0 : Int := (w_35_0 / w_36_0)
+  let w_38_0 : Int := 8
+  let w_39_0 : Int := 2
+  let w_40_0 : Int := (w_33_0 * w_39_0)
+  let w_41_0 : Int := (w_38_0 - w_40_0)
+  let w_42_0 : Int := (w_37_0 * w_41_0)
+  let w_43_0 : Int := (w_33_0 + w_42_0)
+  generatedRoot.constraints_0 params w_2_0 w_3_0 w_7_0 w_11_0 w_15_0 w_19_0 w_1_0 w_4_0 w_6_0 w_8_0 w_10_0 w_12_0 w_14_0 w_16_0 w_18_0 w_20_0 w_22_0 w_26_0 w_34_0 w_36_0 w_43_0 outputs
 
 def generatedRoot (params : Params) (inputs : (Fin 14 → Int) × (Fin 17 → Int) × (Fin 14 → Int) × (Fin 14 → Int) × (Fin 14 → Int) × (Fin 14 → Int) × Unit) (outputs : Int) : Prop :=
   ∃ witness : generatedRoot.Witness,

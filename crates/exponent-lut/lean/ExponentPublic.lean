@@ -94,6 +94,162 @@ theorem Rel.mulRight {q m m' : Nat} (hn : 0 < n) {sm : ErrorPoly n}
   beta_reduce
   rw [hc j, reduceMatrix_mul, Matrix.add_mul, Matrix.sub_mul, Matrix.add_mul, Matrix.smul_mul]
 
+/-- The balanced digits of zero are zero. -/
+theorem balancedDigitAt_zero {base : Nat} (hbase : 1 < base) (digit : Nat) :
+    balancedDigitAt base 0 digit = 0 := by
+  have hd : balancedDigit base 0 = 0 := by
+    unfold balancedDigit
+    have : (0 : Int) < (base : Int) / 2 := by omega
+    simp [this]
+  have hr : ∀ j, balancedResidual base 0 j = 0 := by
+    intro j
+    induction j with
+    | zero => rfl
+    | succ j ih => rw [balancedResidual_succ, hd]; simpa using ih
+  unfold balancedDigitAt
+  rw [hr, hd]
+
+/-- The digits of a constant polynomial are constant. -/
+theorem regularDigitPoly_isConstant (layout : OrderedCrtLayout) (hn : 0 < n)
+    {value : ExactPoly layout.modulusProduct n}
+    (hvalue : ∀ k : Fin n, k.val ≠ 0 → value.coeff k = 0) (limb : CrtDecomposition.RegularLimb layout) :
+    IsConstantPoly (CrtDecomposition.regularDigitPoly layout value limb) := by
+  intro k hk
+  rw [CrtDecomposition.regularDigitPoly_coeff layout value limb hn k]
+  unfold CrtDecomposition.regularDigitCoefficient
+  rw [hvalue k hk, map_zero]
+  simp [centeredLift, balancedDigitAt_zero layout.base_gt_one]
+
+/-- A preimage with constant witness survives a modulus cast. -/
+theorem castExactMatrix_constantPreimage {q q' rows columns : Nat} (h : q = q')
+    {value : ExactMatrix q n rows columns} {bound : Nat}
+    (hv : ∃ w : ErrorMatrix n rows columns, value = reduceMatrix q n rows columns w ∧
+      CoeffBound w bound ∧ IsConstantMatrix w) :
+    ∃ w : ErrorMatrix n rows columns, castExactMatrix h value = reduceMatrix q' n rows columns w ∧
+      CoeffBound w bound ∧ IsConstantMatrix w := by
+  cases h
+  exact hv
+
+/-- A modulus cast of a matrix of constant polynomials is constant. -/
+theorem castExactMatrix_coeff_zero {q q' rows columns : Nat} (h : q = q')
+    {value : ExactMatrix q n rows columns}
+    (hv : ∀ r c (k : Fin n), k.val ≠ 0 → (value r c).coeff k = 0) :
+    ∀ r c (k : Fin n), k.val ≠ 0 → (castExactMatrix h value r c).coeff k = 0 := by
+  cases h
+  exact hv
+
+/-- The full decomposition of a matrix of constant polynomials has a constant, small witness. -/
+theorem fullDecomposeMatrix_constant {q rows columns : Nat} (layout : RegularLayout q)
+    (target : ExactMatrix q n rows columns) (hq : 1 < q) (hn : 0 < n)
+    (htarget : ∀ r c (k : Fin n), k.val ≠ 0 → (target r c).coeff k = 0) :
+    ∃ w, fullDecomposeMatrix layout target = reduceMatrix q n _ columns w ∧
+      CoeffBound w (layout.base / 2) ∧ IsConstantMatrix w := by
+  unfold fullDecomposeMatrix
+  apply castExactMatrix_constantPreimage
+  let value := castExactMatrix layout.product_eq target
+  have hvalue := castExactMatrix_coeff_zero layout.product_eq htarget
+  let witness : ErrorMatrix n
+      (rows * (layout.crtModuli.length * layout.digitsPerTower)) columns :=
+    fun row column ↦ CrtDecomposition.regularDigitPoly layout.ordered
+      (value ((regularIndexEquiv layout rows).symm row).1 column)
+      ((regularIndexEquiv layout rows).symm row).2
+  refine ⟨witness, ?_, ?_, ?_⟩
+  · funext row column
+    exact CrtDecomposition.regularDigitExactPoly_eq_reduce layout.ordered _ _
+      (by rw [layout.ordered.modulusProduct_eq_q]; exact hq) hn
+  · intro row column coefficient
+    exact (coeff_natAbs_le_polyNorm _ coefficient).trans
+      (CrtDecomposition.regularDigitPoly_bound layout.ordered hn _ _)
+  · intro row column
+    exact regularDigitPoly_isConstant layout.ordered hn (fun k hk ↦ hvalue _ _ k hk) _
+
+/-- The gadget decomposition of a matrix of constant polynomials under an exact gadget has a
+constant witness of digits at most half the base. -/
+theorem gadgetDecomposeRuns_constant {q rows columns inner : Nat} (hq : 1 < q) (hn : 0 < n)
+    {backend : BackendContext} {base digits : Int} {X : ExactMatrix q n rows columns}
+    {D : ExactMatrix q n inner columns} (hD : gadgetDecomposeRuns backend base digits X D)
+    (hexact : ∀ layout, backend.regularLayout q n = some layout → layout.droppedModuli = 0)
+    (hX : ∀ r c (k : Fin n), k.val ≠ 0 → (X r c).coeff k = 0) :
+    ∃ d : ErrorMatrix n inner columns, D = reduceMatrix q n inner columns d ∧
+      CoeffBound d (base.toNat / 2) ∧ IsConstantMatrix d := by
+  obtain ⟨layout, hl, hbase, _, hw, hD, _⟩ := hD
+  have hcorrected : regularCorrectedTarget layout X = X := by
+    simp [regularCorrectedTarget, hexact layout hl]
+  obtain ⟨w, hwq, hwb, hwc⟩ := fullDecomposeMatrix_constant layout X hq hn hX
+  refine ⟨fun row column ↦ w (regularColumnIndex layout (Fin.cast hw row)) column, ?_,
+    fun row column ↦ ?_, fun row column ↦ hwc _ column⟩
+  · funext row column
+    rw [hD, castMatrixRows_apply]
+    simp only [regularDecomposeMatrix, hcorrected, hwq]
+    rfl
+  · rw [hbase, Int.toNat_natCast]
+    exact hwb _ column
+
+/-- A right action of one constant small matrix (the digits of a constant, such as the
+finalization `G⁻¹(k)` of a coefficient output) on every block: its gain is `m β`, without the
+ring dimension. -/
+theorem Rel.mulRightConstant {q m m' : Nat} (hn : 0 < n) {sm : ErrorPoly n}
+    {A : Fin 2 → Fin 2 → ExactMatrix q n 1 m} {t c : Fin 2 → ExactMatrix q n 1 m} {B β : Nat}
+    (h : Rel sm A t c B) (d : ErrorMatrix n m m') (hd : CoeffBound d β)
+    (hconstant : IsConstantMatrix d) :
+    Rel sm (fun k j ↦ A k j * reduceMatrix q n m m' d) (fun j ↦ t j * reduceMatrix q n m m' d)
+      (fun j ↦ c j * reduceMatrix q n m m' d) (m * B * β) := by
+  obtain ⟨e, he, hc⟩ := h
+  refine ⟨fun j ↦ e j * d, fun j ↦ ?_, fun j ↦ ?_⟩
+  · have hej := coeffBound_iff_matrixNorm_le.mp (he j)
+    have hdn := coeffBound_iff_matrixNorm_le.mp hd
+    exact coeffBound_iff_matrixNorm_le.mpr ((matrixNorm_mul_right_constant_le hn hconstant).trans
+      (Nat.mul_le_mul (Nat.mul_le_mul_left m hej) hdn))
+  · beta_reduce
+    rw [hc j, reduceMatrix_mul, Matrix.add_mul, Matrix.sub_mul, Matrix.add_mul, Matrix.smul_mul]
+
+/-- A constant polynomial has no coefficient past the first. -/
+theorem intCast_coeff_ne_zero (hn : 0 < n) (x : Int) {i : Fin n} (hi : i.val ≠ 0) :
+    ((x : ErrorPoly n)).coeff i = 0 := by
+  have h := intCast_mul_coeff x (1 : ErrorPoly n) i
+  rw [mul_one] at h
+  have h1 := Negacyclic.coeff_root_pow (R := Int) (n := n) hn ⟨0, hn⟩ i
+  rw [show ((⟨0, hn⟩ : Fin n) : Nat) = 0 from rfl, pow_zero,
+    if_neg (fun h ↦ hi (by rw [← h]))] at h1
+  rw [h, h1, mul_zero]
+
+set_option maxHeartbeats 1000000 in
+/-- The finalization of a coefficient output: an encoding of `ν` against the full gadget `G` of an
+exact layout, acted on by the decomposition `H'` of the constant `k` (rebased to its own modulus),
+is an encoding of `k ν` against the gadget `1`; its error grows by `m (base / 2)`. -/
+theorem Rel.finalizeCoefficient {q m : Nat} (hq1 : 1 < q) (hn : 0 < n)
+    {backend : BackendContext} {base digits : Int} (layout : RegularLayout q)
+    (hlayout : backend.regularLayout q n = some layout) (hexact : layout.droppedModuli = 0)
+    {G : ExactMatrix q n 1 m} (hG : gadgetMatrixRuns backend base digits G)
+    {sm sp ν : ErrorPoly n} {A : Fin 2 → Fin 2 → ExactMatrix q n 1 m}
+    {c : Fin 2 → ExactMatrix q n 1 m} {B : Nat}
+    (h : Rel sm A (fun j ↦ reducePoly q n (ν * unitPair sp j) • G) c B) (k : Int)
+    {K : ExactMatrix q n 1 1} (hK : K = matrixPolynomial [k])
+    {H : ExactMatrix q n m 1} (hH : gadgetDecomposeRuns backend base digits K H)
+    {bound : Nat} {H' : ExactMatrix q n m 1} (hH' : compactCenteredRebaseRuns bound H H') :
+    Rel sm (fun a j ↦ matrixMul (A a j) H')
+      (fun j ↦ reducePoly q n ((k : ErrorPoly n) * ν * unitPair sp j) • (1 : ExactMatrix q n 1 1))
+      (fun j ↦ matrixMul (c j) H') (m * B * (base.toNat / 2)) := by
+  have hHH' : H = H' := centeredRebaseRuns_unique (centeredRebaseRuns_self hq1 hn H) hH'.2.2.1
+  subst hHH'
+  have hconst : ∀ r c (i : Fin n), i.val ≠ 0 → (K r c).coeff i = 0 := by
+    intro r c i hi
+    rw [hK, matrixPolynomial_single, ← reducePoly_intCast, reducePoly_coeff_eq hq1 hn,
+      intCast_coeff_ne_zero hn k hi, Int.cast_zero]
+  obtain ⟨d, hd, hdb, hdc⟩ := gadgetDecomposeRuns_constant hq1 hn hH
+    (fun l hl ↦ by rw [hlayout] at hl; cases hl; exact hexact) hconst
+  have hact := h.mulRightConstant hn d hdb hdc
+  rw [← hd] at hact
+  have hrec := gadget_mul_decompose hq1 hn layout hlayout hexact hG hH
+  refine hact.target_eq (funext fun j ↦ ?_)
+  rw [Matrix.smul_mul, hrec, hK]
+  funext r c
+  obtain rfl : r = 0 := Subsingleton.elim _ _
+  obtain rfl : c = 0 := Subsingleton.elim _ _
+  simp only [Matrix.smul_apply, smul_eq_mul, matrixPolynomial_single, Matrix.one_apply_eq,
+    mul_one, map_mul, reducePoly_intCast]
+  ring
+
 set_option maxHeartbeats 1000000 in
 /-- Public alignment: the right action by the digits `H` of `p g` and the runtime ModDown move a
 public encoding of `α` with the native gadget `G` of `q = p q'` to one with the native gadget

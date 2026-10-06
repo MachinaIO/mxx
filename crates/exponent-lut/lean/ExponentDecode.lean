@@ -6,6 +6,10 @@ import ExponentEncoding
 At the terminal level the gadget is one and the message scale is `⌊q / 2⌋`, so the second row
 component minus the mask part is the phase `-⌊q / 2⌋ μ + e`. Threshold decoding modulo two returns
 every binary coefficient of `μ` when `4 |e| + 4 < q`.
+
+A coefficient output is finalized to the scale `k` with `t k = q - r` for its decryption modulus
+`t`, so its phase is `-k μ + e`; threshold decoding modulo `t` of the negated phase `k μ - e`
+returns `μ mod t` when `|μ| ≤ W` and `2 t |e| + 2 r W < q`.
 -/
 
 namespace MxxExponentLut
@@ -230,5 +234,79 @@ theorem decode_terminal_parity_bounded {q : Nat} (hq : 1 < q) (hodd : q % 2 = 1)
     rw [Int.abs_eq_natAbs]
     omega
   exact threshold_decode_parity_bounded hq hodd hμ heabs
+
+/-- Threshold decoding modulo `t` of one coefficient `k v - e` of the negated phase, with
+`t k = q - r`, `|v| ≤ W` and `2 t |e| + 2 r W < q`, returns `v mod t`: `t (k v - e)` is
+`q v - d` with `2 |d| < q`. -/
+theorem threshold_decode_scaled {q t k r : Nat} (hq : 1 < q) (ht : 0 < t) (hk : t * k + r = q)
+    {v e : Int} {W : Nat} (hv : |v| ≤ W) (he : 2 * t * |e| + 2 * r * W < q) :
+    (((t : Int) * ((((k * v - e : Int) : ZMod q).val : Nat) : Int) + (q : Int) / 2) / (q : Int)) %
+      (t : Int) = v % t := by
+  rw [val_intCast_emod hq]
+  set x : Int := k * v - e with hx
+  have hqpos : (0 : Int) < q := by omega
+  have hsplit := Int.emod_add_mul_ediv x q
+  set m := x / q
+  set d : Int := (r : Int) * v + t * e
+  have hkq : ((t : Int) * k + r) = q := by exact_mod_cast hk
+  have key : (t : Int) * (x % q) + (q : Int) / 2 = q * (v - t * m) + ((q : Int) / 2 - d) := by
+    have : (t : Int) * (x % q) = t * x - t * (q * m) := by linear_combination (t : Int) * hsplit
+    rw [this, hx]
+    simp only [d]
+    rw [← hkq]
+    ring
+  have hrv : |(r : Int) * v| ≤ r * W := by
+    rw [abs_mul, abs_of_nonneg (by positivity : (0 : Int) ≤ r)]
+    exact mul_le_mul_of_nonneg_left hv (by positivity)
+  have hte : |(t : Int) * e| = t * |e| := by
+    rw [abs_mul, abs_of_nonneg (by positivity : (0 : Int) ≤ t)]
+  have hd : 2 * |d| < q := by
+    have := abs_add_le ((r : Int) * v) ((t : Int) * e)
+    nlinarith
+  have hdabs := abs_le.mp (le_refl |d|)
+  have hquot : ((t : Int) * (x % q) + (q : Int) / 2) / q = v - t * m := by
+    rw [key, Int.add_comm, Int.add_mul_ediv_left _ _ (by omega),
+      Int.ediv_eq_zero_of_lt (by omega) (by omega)]
+    ring
+  rw [hquot]
+  simp [Int.sub_emod, Int.mul_emod_right]
+
+/-- Decryption of a finalized coefficient output: the encoding has scale `k` against the gadget
+`1`, and threshold decoding modulo `t` of coefficient `i` of the negated phase
+`-(c₁ - (s₀ A₀₁ + A₁₁))` returns `μ_i mod t` when `t k = q - r`, `|μ_i| ≤ W` and
+`2 t B + 2 r W < q`. -/
+theorem decode_terminal_scaled {q t k r W : Nat} (hq : 1 < q) (hn : 0 < n) (ht : 0 < t)
+    (hk : t * k + r = q) {sm sp μ : ErrorPoly n} {A : Fin 2 → Fin 2 → ExactMatrix q n 1 1}
+    {c : Fin 2 → ExactMatrix q n 1 1} {B : Nat}
+    (hrel : Rel sm A (fun j ↦ reducePoly q n (((k : Int) : ErrorPoly n) * μ * unitPair sp j) •
+      (1 : ExactMatrix q n 1 1)) c B)
+    (hB : 2 * t * B + 2 * r * W < q) {i : Fin n} (hμ : |μ.coeff i| ≤ W)
+    {phase : ExactMatrix q n 1 1}
+    (hphase : phase = -(c 1 - (reducePoly q n sm • A 0 1 + A 1 1))) {length : Int} {out : Int}
+    (hdecode : thresholdDecode t length i.val phase out) : out = μ.coeff i % t := by
+  obtain ⟨e, he, hc⟩ := hrel
+  obtain ⟨_, _, _, _, index, hindex, _, hout⟩ := hdecode
+  have hi : index = i := Fin.ext (by exact_mod_cast hindex)
+  subst hi
+  rw [hout]
+  have hentry : (phase 0 0).coeff index =
+      ((k * μ.coeff index - (e 1 0 0).coeff index : Int) : ZMod q) := by
+    rw [hphase, hc 1]
+    simp only [unitPair, Matrix.cons_val_one, Matrix.neg_apply, Matrix.sub_apply,
+      Matrix.add_apply, Matrix.smul_apply, smul_eq_mul, reduceMatrix, mul_one,
+      Matrix.one_apply_eq]
+    rw [show ∀ x y z w : ExactPoly q n, -(x + y - z + w - (x + y)) = z - w from fun x y z w ↦ by
+      ring, ← map_sub, reducePoly_coeff_eq hq hn]
+    have hkμ := intCast_mul_coeff (k : Int) μ index
+    push_cast at hkμ ⊢
+    simp [hkμ]
+  rw [hentry]
+  have hnat : 2 * t * ((e 1 0 0).coeff index).natAbs + 2 * r * W < q := by
+    have := Nat.mul_le_mul_left (2 * t) (he 1 0 0 index)
+    omega
+  have heabs : 2 * t * |(e 1 0 0).coeff index| + 2 * r * W < q := by
+    rw [Int.abs_eq_natAbs]
+    exact_mod_cast hnat
+  exact threshold_decode_scaled hq ht hk hμ heabs
 
 end MxxExponentLut

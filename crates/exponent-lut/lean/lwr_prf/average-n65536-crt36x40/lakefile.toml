@@ -1,6 +1,6 @@
 name = "MxxExponentLutLwrAverageN65536Crt36x40"
 version = "0.1.0"
-defaultTargets = ["LwrGenerated", "LwrProof"]
+defaultTargets = ["LwrGenerated", "LwrProof", "LwrH2"]
 
 [leanOptions]
 relaxedAutoImplicit = false
@@ -31,4 +31,25 @@ roots = [
   "LwrBlock16", "LwrBlock17", "LwrBlock18", "LwrBlock19", "LwrBlock20", "LwrBlock21", "LwrBlock22",
   "LwrBlock23", "LwrBlock24", "LwrBlock25", "LwrBlock26", "LwrBlock27", "LwrBlock28", "LwrBlock29",
   "LwrBlock30", "LwrBlock31", "LwrBlock32", "LwrBlock33", "LwrLut", "LwrCertificate"
+]
+
+# The certificate under H2: the errors named (`*E`), the model of a run (`LwrModel*`, `LwrChain*`),
+# and the decomposition of the decoded coefficient with its bounds (`LwrH2*`).
+[[lean_lib]]
+name = "LwrH2"
+moreLeanArgs = ["--tstack=4000000"]
+roots = [
+"LwrEncryptE", "LwrPreprocessE", "LwrErrorCommon", "LwrBlockE0", "LwrBlockE1", "LwrBlockE2",
+  "LwrBlockE3", "LwrBlockE4", "LwrBlockE5", "LwrBlockE6", "LwrBlockE7", "LwrBlockE8", "LwrBlockE9",
+  "LwrBlockE10", "LwrBlockE11", "LwrBlockE12", "LwrBlockE13", "LwrBlockE14", "LwrBlockE15",
+  "LwrBlockE16", "LwrBlockE17", "LwrBlockE18", "LwrBlockE19", "LwrBlockE20", "LwrBlockE21",
+  "LwrBlockE22", "LwrBlockE23", "LwrBlockE24", "LwrBlockE25", "LwrBlockE26", "LwrBlockE27",
+  "LwrBlockE28", "LwrBlockE29", "LwrBlockE30", "LwrBlockE31", "LwrBlockE32", "LwrBlockE33",
+  "LwrLutE", "LwrModelBase", "LwrModel0", "LwrModel1", "LwrModel2", "LwrModel3", "LwrModel4",
+  "LwrModel5", "LwrModel6", "LwrModel7", "LwrModel8", "LwrModel9", "LwrModel10", "LwrModel11",
+  "LwrModel12", "LwrModel13", "LwrModel14", "LwrModel15", "LwrModel16", "LwrModel17", "LwrModel18",
+  "LwrModel19", "LwrModel20", "LwrModel21", "LwrModel22", "LwrModel23", "LwrModel24", "LwrModel25",
+  "LwrModel26", "LwrModel27", "LwrModel28", "LwrModel29", "LwrModel30", "LwrModel31", "LwrModel32",
+  "LwrModel33", "LwrModelLut", "LwrChainAll", "LwrChainFinal", "LwrH2Model", "LwrH2Bounds",
+  "LwrH2Agree", "LwrH2Cert"
 ]

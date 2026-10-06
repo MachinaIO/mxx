@@ -1,0 +1,577 @@
+import LwrBlockE0
+import LwrBlock1
+
+/-!
+# Block 1 with explicit errors and keys
+
+Cell `i` of block `1` aligns its member, then multiplies as in block `0`; the alignment has its
+own error identity, and its digits `H` are a constant.
+-/
+
+namespace LwrProof
+
+open Mxx.Primitives MxxRuntime MxxExponentLut
+
+variable {tape : SampleTape} {path cellPath : List Nat}
+
+/-- The digits `H` of `p g'` for the alignment of the members of `a` from `Q7` to `Q6`. -/
+noncomputable def alignDigits1 : ExactMatrix Q7 N 14 12 :=
+  theOutput (gadgetDecomposeRuns Backend.backend 1048576 14)
+    (reducePoly Q7 N (((A6 : Nat) : Int) : ErrorPoly N) •
+      (theOutput centeredRebaseRuns (gadgetOf Q6 12) : ExactMatrix Q7 N 1 12))
+
+/-- A member key aligned from `Q7` to `Q6`. -/
+noncomputable abbrev alignKey1 (memKey : Fin 2 → Fin 2 → ExactMatrix Q7 N 1 14) (k j : Fin 2) :
+    ExactMatrix Q6 N 1 12 :=
+  theOutput (blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249, 1099511619841] 1) (memKey k j * alignDigits1)
+
+noncomputable abbrev pubDigits1 (As : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10) (j : Fin 2) :
+    ExactMatrix Q6 N (12 + 12) 10 :=
+  stackDigits Q6 12 524288 1048576 12 (As 0 j) (As 1 j)
+
+noncomputable abbrev rhsDigits1 (top bot : Fin 2 → ExactMatrix Q5 N 1 8) (j : Fin 2) :
+    ExactMatrix Q6 N (10 + 10) 8 :=
+  stackDigits Q6 10 524288 1048576 10 (top j) (bot j)
+
+noncomputable abbrev cellKeyUp1 (memKey : Fin 2 → Fin 2 → ExactMatrix Q7 N 1 14)
+    (As : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10) (top bot : Fin 2 → ExactMatrix Q5 N 1 8)
+    (k j : Fin 2) : ExactMatrix Q6 N 1 8 :=
+  pairMul (fun j' ↦ pairMul (alignKey1 memKey k) (pubDigits1 As j')) (rhsDigits1 top bot j)
+
+set_option maxHeartbeats 16000000 in
+set_option maxRecDepth 100000 in
+/-- Cell `i` of block `1` with its error and key named. -/
+theorem cell1E {model : HashModel} {key : ByteArray} {ca0 ca1 : Fin 17 → ExactMatrix Q7 N 1 14}
+    {apay : Fin 17 → ExactMatrix Q7 N 1 1} {As : Fin 2 → Fin 2 → ExactMatrix Q6 N 1 10}
+    {cs : Fin 2 → ExactMatrix Q6 N 1 10} {bot0 bot1 : Fin 14 → ExactMatrix Q5 N 1 8} {i : Fin 14}
+    {outputs}
+    (hcell : Stage_online_eval.parallel_generatedRoot_45 Backend.backend model tape cellPath
+      GeneratedClaim.stage_4_params i
+      (ca0, key, ca1, As 0 0, As 1 0, cs 0, apay, As 0 1, As 1 1, cs 1, bot0 i, bot1 i, ()) outputs)
+    {sm sp μ ν : ErrorPoly N} {α : Fin 17 → ErrorPoly N}
+    {G : ExactMatrix Q7 N 1 14} (hG : gadgetMatrixRuns Backend.backend 1048576 14 G)
+    {g' : ExactMatrix Q5 N 1 10} {g : ExactMatrix Q6 N 1 10}
+    (hg' : gadgetMatrixRuns Backend.backend 1048576 10 g') (hg : centeredRebaseRuns g' g)
+    {h : ExactMatrix Q5 N 1 8} {ea : Fin 17 → Fin 2 → ErrorMatrix N 1 14}
+    (ha : ∀ k : Fin 17, RelE sm (memberKey model key k)
+      (fun j ↦ reducePoly Q7 N (α k * unitPair sm j) • G) ![ca0 k, ca1 k] (ea k))
+    (hpay : ∀ k : Fin 17, apay k = fun _ _ ↦ reducePoly Q7 N (α k))
+    {es : Fin 2 → ErrorMatrix N 1 10}
+    (hs : RelE sm As (fun j ↦ reducePoly Q6 N (((P6 : Nat) : Int) * μ * unitPair sp j) • g) cs es)
+    {eB : Fin 2 → ErrorMatrix N 1 8}
+    (hrhs : ∀ j, reducePoly Q5 N sp • rhsTop model key Q5 8 rhsPrefix1 i j + ![bot0 i, bot1 i] j =
+      reducePoly Q5 N (((P5 : Nat) : Int) * ν * unitPair sp j) • h + reduceMatrix Q5 N 1 8 (eB j)) :
+    let c : Fin 17 := ⟨coords 1 i, coords_lt 1 i⟩
+    let top := rhsTop model key Q5 8 rhsPrefix1 i
+    let bot := ![bot0 i, bot1 i]
+    let mk := memberKey model key c
+    let crow : Fin 2 → ExactMatrix Q6 N 1 12 := fun j ↦
+      theOutput (blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249, 1099511619841] 1) (![ca0 c, ca1 c] j * alignDigits1)
+    (![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]] = fun k j ↦
+      theOutput (blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249] 1) (cellKeyUp1 mk As top bot k j)) ∧
+    ∃ va : Fin 2 → ErrorMatrix N 1 12,
+      (∀ j row column, (ea c j * liftMatrix alignDigits1) row column -
+          downResidue A6 (![ca0 c, ca1 c] j * alignDigits1) row column +
+          sm * downResidue A6 (mk 0 j * alignDigits1) row column +
+          downResidue A6 (mk 1 j * alignDigits1) row column =
+        ((A6 : Int) : ErrorPoly N) * va j row column) ∧
+    ∃ v : Fin 2 → ErrorMatrix N 1 8,
+      RelE sm ![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]]
+        (fun j ↦ reducePoly Q5 N (((P5 : Nat) : Int) * (α c * μ * ν) * unitPair sp j) • h)
+        ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1] (fun j ↦ v j - (α c * μ) • eB j) ∧
+      ∀ j row column,
+        pairMul (fun j' ↦ pairMul va (liftMatrix (pubDigits1 As j')) + α c • es j')
+            (liftMatrix (rhsDigits1 top bot j)) row column -
+          downResidue P6 (pairMul (fun j' ↦ pairMul crow (pubDigits1 As j') +
+            matrixMulScalarRight (cs j') (fun _ _ ↦ reducePoly Q6 N (α c)))
+            (rhsDigits1 top bot j)) row column +
+          sm * downResidue P6 (cellKeyUp1 mk As top bot 0 j) row column +
+          downResidue P6 (cellKeyUp1 mk As top bot 1 j) row column =
+        ((P6 : Int) : ErrorPoly N) * v j row column := by
+  intro c top bot mk crow
+  unfold Stage_online_eval.parallel_generatedRoot_45 at hcell
+  try extract_lets at hcell
+  obtain ⟨w_2_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_4_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_5_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_7_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_9_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_11_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_13_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_14_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_16_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_18_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_19_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_21_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_22_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_22_concat_1, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_24_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_26_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_27_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_29_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_30_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_32_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_33_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_33_concat_1, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_34_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_37_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_38_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_39_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_41_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_44_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_45_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_48_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_49_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_50_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_50_concat_1, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_53_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_54_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_55_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_57_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_61_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_62_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_63_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_63_concat_1, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_64_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_65_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_67_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_68_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_69_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_71_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_72_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_73_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_75_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_76_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_77_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_79_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_80_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_81_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_82_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_83_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_84_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_85_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_86_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_87_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  obtain ⟨w_88_0, hcell⟩ := hcell
+  try extract_lets at hcell
+  have h2_0 := hcell.2.2.2.2.1
+  have h4_0 := hcell.2.2.2.2.2.1
+  have h5_0 := hcell.2.2.2.2.2.2.1
+  have h7_0 := hcell.2.2.2.2.2.2.2.1
+  have h9_0 := hcell.2.2.2.2.2.2.2.2.1
+  have h11_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.1
+  have h13_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h14_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h16_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h18_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h19_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h21_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h18_0_1 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h22_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h24_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h26_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h27_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h29_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h30_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h32_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h29_0_1 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h33_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h34_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h37_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h38_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h39_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h41_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h44_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h45_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h48_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h49_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h48_0_1 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h50_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h53_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h54_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h55_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h57_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h61_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h62_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h61_0_1 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h63_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h64_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h65_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h67_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h68_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h69_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h71_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h72_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h73_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h75_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h76_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h77_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h79_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h80_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h81_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h82_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h83_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h84_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h85_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h86_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h87_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h88_0 := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have hout := hcell.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
+
+  -- The coordinate, the member of `a`, and its public key.
+  have hc := selectInt_coords1 i
+  rw [hc] at h11_0 h19_0 h27_0 h30_0
+  obtain ⟨_, hw2⟩ := familyGet_eq (k := coords 1 i) (by rw [← hc]; exact h2_0)
+  obtain ⟨_, hw24⟩ := familyGet_eq (k := coords 1 i) (by rw [← hc]; exact h24_0)
+  obtain ⟨_, hw44⟩ := familyGet_eq (k := coords 1 i) (by rw [← hc]; exact h44_0)
+  subst hw2 hw24 hw44
+  have hkey : memberKey model key (coords 1 i) = ![![w_11_0, w_27_0], ![w_19_0, w_30_0]] := by
+    funext k j
+    fin_cases k <;> fin_cases j
+    · exact (hashSample_eq h11_0).symm
+    · exact (hashSample_eq h27_0).symm
+    · exact (hashSample_eq h19_0).symm
+    · exact (hashSample_eq h30_0).symm
+  have ha' := ha ⟨coords 1 i, coords_lt 1 i⟩
+  rw [hkey] at ha'
+  -- The alignment of the member from `Q7` to `Q6`; the row and the key share one decomposition.
+  have hg13 := gadgetMatrixRuns_unique h13_0 h4_0
+  subst hg13
+  have hg14 := centeredRebaseRuns_unique h14_0 h5_0
+  subst hg14
+  have hH := gadgetDecomposeRuns_unique h16_0 h7_0
+  subst hH
+  obtain ⟨dH, hdH, hdHb, va, hal, hvap⟩ := align_downE (q := Q7) (q' := Q6) (p := A6) (m := 14) (m' := 12)
+    hN q7_eq6 hQ7 hQ6 Backend.layout6 layout7 rfl hG h5_0 ha'
+    (by
+      funext r c
+      obtain rfl : r = 0 := Subsingleton.elim _ _
+      simp (config := { zetaDelta := true }) [Matrix.mul_apply, matrixPolynomial_single, map_ofNat])
+    h7_0 (Y := fun j ↦ ![ca0 c, ca1 c] j * w_16_0)
+    (K := fun k j ↦ ![![w_11_0, w_27_0], ![w_19_0, w_30_0]] k j * w_16_0)
+    (fun j ↦ rfl) (fun k j ↦ rfl)
+    (c' := ![w_9_0, w_26_0]) (A' := ![![w_18_0, w_29_0], ![w_21_0, w_32_0]])
+    (fun j ↦ by fin_cases j; exacts [h9_0, h26_0])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h18_0, h29_0, h21_0, h32_0])
+  -- The public multiplication at `Q6`.
+  have h45' : modulusReduceRuns (apay ⟨coords 1 i, coords_lt 1 i⟩) w_45_0 := h45_0
+  rw [hpay] at h45'
+  have hpayb := modulusReduce_poly hQ7 hQ6 hN h45'
+  obtain ⟨ds, hDs, hdsb, hAe, hYe, hpub⟩ := mul_publicE (q := Q6) (m := 12) (m' := 10)
+    (bound := 524288) hN hQ6
+    Backend.layout5 layout6 rfl h4_0 hal hs h18_0_1 h22_0 h29_0_1 h33_0 h34_0
+    (Xs := ![w_37_0, w_53_0]) (fun j ↦ by fin_cases j; exacts [h37_0, h53_0])
+    (D' := ![w_38_0, w_54_0]) (fun j ↦ by fin_cases j; exacts [h38_0, h54_0])
+    (D := ![w_39_0, w_55_0]) (fun j ↦ by fin_cases j; exacts [h39_0, h55_0])
+    hpayb (Y := ![w_41_0, w_57_0]) (A' := ![![w_48_0, w_61_0], ![w_49_0, w_62_0]])
+    (fun j ↦ by fin_cases j; exacts [h41_0, h57_0]) (fun j ↦ by fin_cases j; exacts [h48_0, h61_0])
+    (fun j ↦ by fin_cases j; exacts [h49_0, h62_0])
+    (c' := ![_, _]) (fun j ↦ by fin_cases j <;> rfl)
+  have hpub' := hpub.target_eq (t' := fun j ↦ reducePoly Q6 N (((P6 : Nat) : Int) *
+      (α c * μ) * unitPair sp j) • g) (by
+    funext j
+    rw [smul_smul, ← map_mul]
+    congr 2
+    ring)
+  -- The private multiplication by the selector, dropping `P6`.
+  have htop : rhsTop model key Q5 8 rhsPrefix1 i = ![w_65_0, w_73_0] := by
+    funext j
+    fin_cases j
+    · exact (hashSample_eq h65_0).symm
+    · exact (hashSample_eq h73_0).symm
+  have hrhs' := hrhs
+  rw [htop] at hrhs'
+  obtain ⟨dr, hDr, hdrb, hMe, hXe, v, hv, hvp⟩ := mul_private_downE (q := Q6) (q' := Q5) (p := P6)
+    (m := 10) (m' := 8) (bound := 524288) hN q6_eq hQ6 hQ5 Backend.layout4 layout5 rfl hg' hg hpub'
+    h48_0_1 h50_0 h61_0_1 h63_0 h64_0 (top := ![w_65_0, w_73_0]) (bot := ![bot0 i, bot1 i])
+    (Xb := ![w_67_0, w_75_0]) (fun j ↦ by fin_cases j; exacts [h67_0, h75_0])
+    (D' := ![w_68_0, w_76_0]) (fun j ↦ by fin_cases j; exacts [h68_0, h76_0])
+    (D := ![w_69_0, w_77_0]) (fun j ↦ by fin_cases j; exacts [h69_0, h77_0])
+    hrhs' (X := ![w_85_0, w_87_0]) (M := ![![w_71_0, w_79_0], ![w_81_0, w_83_0]])
+    (fun j ↦ by fin_cases j; exacts [h85_0, h87_0]) (fun j ↦ by fin_cases j; exacts [h71_0, h79_0])
+    (fun j ↦ by fin_cases j; exacts [h81_0, h83_0])
+    (c' := ![w_86_0, w_88_0]) (A' := ![![w_72_0, w_80_0], ![w_82_0, w_84_0]])
+    (fun j ↦ by fin_cases j; exacts [h86_0, h88_0])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h72_0, h80_0, h82_0, h84_0])
+  -- The constants, digits and keys as functions of the input keys and the RHS.
+  have hg13 : gadgetOf Q6 12 = w_13_0 :=
+    theOutput_eq (R := fun (_ : Unit) (G : ExactMatrix Q6 N 1 12) ↦
+      gadgetMatrixRuns Backend.backend 1048576 12 G) (fun _ h ↦ gadgetMatrixRuns_unique h h4_0) h4_0
+  have hg14 : (theOutput centeredRebaseRuns (gadgetOf Q6 12) : ExactMatrix Q7 N 1 12) = w_14_0 := by
+    rw [hg13]
+    exact theOutput_eq (fun _ h ↦ centeredRebaseRuns_unique h h5_0) h5_0
+  have hHrel : gadgetDecomposeRuns Backend.backend 1048576 14
+      (reducePoly Q7 N (((A6 : Nat) : Int) : ErrorPoly N) •
+        (theOutput centeredRebaseRuns (gadgetOf Q6 12) : ExactMatrix Q7 N 1 12)) w_16_0 := by
+    rw [hg14]
+    convert h7_0 using 1
+    funext r c
+    obtain rfl : r = 0 := Subsingleton.elim _ _
+    simp (config := { zetaDelta := true }) [Matrix.mul_apply, matrixPolynomial_single, map_ofNat]
+  have hHeq : alignDigits1 = w_16_0 := theOutput_eq (fun _ h ↦ gadgetDecomposeRuns_unique h hHrel) hHrel
+  have hmk : mk = ![![w_11_0, w_27_0], ![w_19_0, w_30_0]] := hkey
+  have hAl : ∀ k j, blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249, 1099511619841] 1 (mk k j * alignDigits1)
+      (![![w_18_0, w_29_0], ![w_21_0, w_32_0]] k j) := by
+    intro k j
+    rw [hHeq, hmk]
+    fin_cases k <;> fin_cases j
+    exacts [h18_0, h29_0, h21_0, h32_0]
+  have hAlEq : ∀ k, alignKey1 mk k = ![![w_18_0, w_29_0], ![w_21_0, w_32_0]] k := fun k ↦ by
+    funext j
+    exact theOutput_eq (fun _ h ↦ blockModSwitchRuns_unique h (hAl k j)) (hAl k j)
+  have hcrowR : ∀ j, blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249, 1099511619841] 1 (![ca0 c, ca1 c] j * alignDigits1)
+      (![w_9_0, w_26_0] j) := by
+    intro j
+    rw [hHeq]
+    fin_cases j
+    exacts [h9_0, h26_0]
+  have hcrow : crow = ![w_9_0, w_26_0] := by
+    funext j
+    exact theOutput_eq (fun _ h ↦ blockModSwitchRuns_unique h (hcrowR j)) (hcrowR j)
+  have hDsEq : ∀ j, pubDigits1 As j = ![w_39_0, w_55_0] j := by
+    intro j
+    fin_cases j
+    · exact stackDigits_eq h37_0 h38_0 h39_0
+    · exact stackDigits_eq h53_0 h54_0 h55_0
+  have hDrEq : ∀ j, rhsDigits1 top bot j = ![w_69_0, w_77_0] j := by
+    intro j
+    simp only [top, bot, htop]
+    fin_cases j
+    · exact stackDigits_eq h67_0 h68_0 h69_0
+    · exact stackDigits_eq h75_0 h76_0 h77_0
+  have hKeyUp : ∀ k j, cellKeyUp1 mk As top bot k j =
+      ![![w_71_0, w_79_0], ![w_81_0, w_83_0]] k j := by
+    intro k j
+    rw [hMe k j, cellKeyUp1, hAlEq k]
+    congr 1
+    · funext j'
+      rw [hAe k j', hDsEq j']
+    · exact hDrEq j
+  have hK : ∀ k j, blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249] 1 (cellKeyUp1 mk As top bot k j)
+      (![![w_72_0, w_80_0], ![w_82_0, w_84_0]] k j) := by
+    intro k j
+    rw [hKeyUp]
+    fin_cases k <;> fin_cases j
+    exacts [h72_0, h80_0, h82_0, h84_0]
+  subst hout
+  refine ⟨?_, va, fun j row column ↦ ?_, v,
+    hv.target_eq (funext fun j ↦ by rw [smul_smul, ← map_mul]; congr 2; ring),
+    fun j row column ↦ ?_⟩
+  · funext k j
+    exact (theOutput_eq (fun _ h ↦ blockModSwitchRuns_unique h (hK k j)) (hK k j)).symm
+  · have hliftH : liftMatrix alignDigits1 = dH := by
+      rw [hHeq, hdH, liftMatrix_reduce hQ7 hN hdHb (by decide)]
+    rw [hliftH, hHeq, hmk]
+    exact hvap j row column
+  · have hlift : ∀ j', liftMatrix (pubDigits1 As j') = ds j' := fun j' ↦ by
+      rw [hDsEq j', hDs j', liftMatrix_reduce hQ6 hN (hdsb j') (by norm_num)]
+    have hliftr : liftMatrix (rhsDigits1 top bot j) = dr j := by
+      rw [hDrEq j, hDr j, liftMatrix_reduce hQ6 hN (hdrb j) (by norm_num)]
+    have hX : pairMul (fun j' ↦ pairMul crow (pubDigits1 As j') +
+        matrixMulScalarRight (cs j') (fun _ _ ↦ reducePoly Q6 N (α c))) (rhsDigits1 top bot j) =
+        ![w_85_0, w_87_0] j := by
+      rw [hXe j, hDrEq j, hcrow, ← hpayb]
+      congr 1
+      funext j'
+      rw [hDsEq j', ← hYe j']
+      fin_cases j' <;> rfl
+    simp only [hlift, hliftr, hX, hKeyUp]
+    exact hvp j row column
+
+set_option maxHeartbeats 64000000 in
+set_option maxRecDepth 100000 in
+/-- Block `1` with its error and key named: the sum of the cells of `cell1E`. -/
+theorem block1E {model : HashModel} {key : ByteArray}
+    {s0 s1 s2 s3 : Fin 16 → ExactMatrix Q1 N 1 2} {k0 k1 : Fin 16 → ExactMatrix Q2 N 1 2}
+    {ca0 ca1 : Fin 17 → ExactMatrix Q7 N 1 14} {cs0 cs1 : ExactMatrix Q7 N 1 12}
+    {apay : Fin 17 → ExactMatrix Q7 N 1 1}
+    {r00 r01 : Fin 14 → ExactMatrix Q6 N 1 10} {r10 r11 : Fin 14 → ExactMatrix Q5 N 1 8}
+    {r20 r21 : Fin 14 → ExactMatrix Q4 N 1 6} {r30 r31 : Fin 14 → ExactMatrix Q3 N 1 4}
+    {r40 r41 : Fin 14 → ExactMatrix Q2 N 1 2} {outputs} {w : Stage_online_eval.generatedRoot.Witness}
+    (hb : Stage_online_eval.generatedRoot.body Backend.backend model tape path GeneratedClaim.stage_4_params
+      (s0, s1, s2, s3, k0, key, k1, ca0, ca1, cs0, apay, cs1, r00, r01, r10, r11, r20, r21, r30, r31,
+        r40, r41, ()) outputs w)
+    {sm sp μ : ErrorPoly N} {α : Fin 17 → ErrorPoly N} {ν : Fin 14 → ErrorPoly N}
+    {G : ExactMatrix Q7 N 1 14} (hG : gadgetMatrixRuns Backend.backend 1048576 14 G)
+    {g' : ExactMatrix Q5 N 1 10} {g : ExactMatrix Q6 N 1 10}
+    (hg' : gadgetMatrixRuns Backend.backend 1048576 10 g') (hg : centeredRebaseRuns g' g)
+    {h : ExactMatrix Q5 N 1 8}
+    {ea : Fin 17 → Fin 2 → ErrorMatrix N 1 14}
+    (ha : ∀ k : Fin 17, RelE sm (memberKey model key k)
+      (fun j ↦ reducePoly Q7 N (α k * unitPair sm j) • G) ![ca0 k, ca1 k] (ea k))
+    (hpay : ∀ k : Fin 17, apay k = fun _ _ ↦ reducePoly Q7 N (α k))
+    {es : Fin 2 → ErrorMatrix N 1 10} (hs : RelE sm ![![w.w_42_0, w.w_42_1], ![w.w_42_2, w.w_42_3]]
+      (fun j ↦ reducePoly Q6 N (((P6 : Nat) : Int) * μ * unitPair sp j) • g)
+      ![w.w_42_4, w.w_42_5] es)
+    {eB : Fin 14 → Fin 2 → ErrorMatrix N 1 8}
+    (hrhs : ∀ i : Fin 14, ∀ j,
+      reducePoly Q5 N sp • rhsTop model key Q5 8 rhsPrefix1 i j + ![r10 i, r11 i] j =
+        reducePoly Q5 N (((P5 : Nat) : Int) * ν i * unitPair sp j) • h +
+          reduceMatrix Q5 N 1 8 (eB i j)) :
+    let As := ![![w.w_42_0, w.w_42_1], ![w.w_42_2, w.w_42_3]]
+    (![![w.w_64_0, w.w_64_1], ![w.w_64_2, w.w_64_3]] = ∑ i : Fin 14, fun k j ↦
+      theOutput (blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249] 1)
+        (cellKeyUp1 (memberKey model key ((coords 1 i : Nat) : Int)) As
+          (rhsTop model key Q5 8 rhsPrefix1 i) ![r10 i, r11 i] k j)) ∧
+    ∃ va : Fin 14 → Fin 2 → ErrorMatrix N 1 12,
+    (∀ i j row column,
+      let c : Fin 17 := ⟨coords 1 i, coords_lt 1 i⟩
+      let mk := memberKey model key c
+      (ea c j * liftMatrix alignDigits1) row column -
+          downResidue A6 (![ca0 c, ca1 c] j * alignDigits1) row column +
+          sm * downResidue A6 (mk 0 j * alignDigits1) row column +
+          downResidue A6 (mk 1 j * alignDigits1) row column =
+        ((A6 : Int) : ErrorPoly N) * va i j row column) ∧
+    ∃ v : Fin 14 → Fin 2 → ErrorMatrix N 1 8,
+      RelE sm ![![w.w_64_0, w.w_64_1], ![w.w_64_2, w.w_64_3]]
+        (∑ i : Fin 14, fun j ↦ reducePoly Q5 N (((P5 : Nat) : Int) *
+          (α ⟨coords 1 i, coords_lt 1 i⟩ * μ * ν i) * unitPair sp j) • h)
+        ![w.w_64_4, w.w_64_5]
+        (∑ i : Fin 14, fun j ↦ v i j - (α ⟨coords 1 i, coords_lt 1 i⟩ * μ) • eB i j) ∧
+      ∀ i j row column,
+        let c : Fin 17 := ⟨coords 1 i, coords_lt 1 i⟩
+        let top := rhsTop model key Q5 8 rhsPrefix1 i
+        let bot := ![r10 i, r11 i]
+        let mk := memberKey model key c
+        let crow : Fin 2 → ExactMatrix Q6 N 1 12 := fun j ↦
+          theOutput (blockModSwitchRuns [1099511626049, 1099511625409, 1099511623297, 1099511622593, 1099511622529, 1099511621249, 1099511619841] 1)
+            (![ca0 c, ca1 c] j * alignDigits1)
+        pairMul (fun j' ↦ pairMul (va i) (liftMatrix (pubDigits1 As j')) + α c • es j')
+            (liftMatrix (rhsDigits1 top bot j)) row column -
+          downResidue P6 (pairMul (fun j' ↦ pairMul crow (pubDigits1 As j') +
+            matrixMulScalarRight (![w.w_42_4, w.w_42_5] j') (fun _ _ ↦ reducePoly Q6 N (α c)))
+            (rhsDigits1 top bot j)) row column +
+          sm * downResidue P6 (cellKeyUp1 mk As top bot 0 j) row column +
+          downResidue P6 (cellKeyUp1 mk As top bot 1 j) row column =
+        ((P6 : Int) : ErrorPoly N) * v i j row column := by
+  intro As
+  unfold Stage_online_eval.generatedRoot.body at hb
+  extract_lets at hb
+  have h45_5 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h46_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h47_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h49_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h50_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h52_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h53_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h55_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h56_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h58_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h59_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h61_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h62_0 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  have h64_5 := hb.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1
+  -- Every cell, then their sum.
+  have hcells := fun i : Fin 14 ↦ cell1E (h45_5 i) hG hg' hg ha hpay hs (hrhs i)
+  choose hkeys va hva v hv hvp using hcells
+  have hsum := RelE.sum Finset.univ (fun i _ ↦ hv i)
+  -- The generated sum is the sum of the fourteen cells.
+  obtain ⟨_, e46⟩ := familyGetStatic_eq (k := 0) h46_0
+  replace e46 : w.w_46_0 = w.w_45_0 ⟨0, by decide⟩ := e46
+  obtain ⟨_, e47⟩ := familyGetStatic_eq (k := 1) h47_0
+  replace e47 : w.w_47_0 = w.w_45_0 ⟨1, by decide⟩ := e47
+  obtain ⟨_, e49⟩ := familyGetStatic_eq (k := 0) h49_0
+  replace e49 : w.w_49_0 = w.w_45_1 ⟨0, by decide⟩ := e49
+  obtain ⟨_, e50⟩ := familyGetStatic_eq (k := 1) h50_0
+  replace e50 : w.w_50_0 = w.w_45_1 ⟨1, by decide⟩ := e50
+  obtain ⟨_, e52⟩ := familyGetStatic_eq (k := 0) h52_0
+  replace e52 : w.w_52_0 = w.w_45_2 ⟨0, by decide⟩ := e52
+  obtain ⟨_, e53⟩ := familyGetStatic_eq (k := 1) h53_0
+  replace e53 : w.w_53_0 = w.w_45_2 ⟨1, by decide⟩ := e53
+  obtain ⟨_, e55⟩ := familyGetStatic_eq (k := 0) h55_0
+  replace e55 : w.w_55_0 = w.w_45_3 ⟨0, by decide⟩ := e55
+  obtain ⟨_, e56⟩ := familyGetStatic_eq (k := 1) h56_0
+  replace e56 : w.w_56_0 = w.w_45_3 ⟨1, by decide⟩ := e56
+  obtain ⟨_, e58⟩ := familyGetStatic_eq (k := 0) h58_0
+  replace e58 : w.w_58_0 = w.w_45_4 ⟨0, by decide⟩ := e58
+  obtain ⟨_, e59⟩ := familyGetStatic_eq (k := 1) h59_0
+  replace e59 : w.w_59_0 = w.w_45_4 ⟨1, by decide⟩ := e59
+  obtain ⟨_, e61⟩ := familyGetStatic_eq (k := 0) h61_0
+  replace e61 : w.w_61_0 = w.w_45_5 ⟨0, by decide⟩ := e61
+  obtain ⟨_, e62⟩ := familyGetStatic_eq (k := 1) h62_0
+  replace e62 : w.w_62_0 = w.w_45_5 ⟨1, by decide⟩ := e62
+  have hloop := sum1 (count := 12) (init := (w.w_46_0 + w.w_47_0, w.w_49_0 + w.w_50_0, w.w_52_0 + w.w_53_0, w.w_55_0 + w.w_56_0, w.w_58_0 + w.w_59_0, w.w_61_0 + w.w_62_0, ()))
+    (final := (w.w_64_0, w.w_64_1, w.w_64_2, w.w_64_3, w.w_64_4, w.w_64_5, ())) h64_5
+  simp only [addCells, Prod.mk.injEq] at hloop
+  obtain ⟨l0, l1, l2, l3, l4, l5, -⟩ := hloop
+  have m0 : w.w_64_0 = ∑ i : Fin 14, w.w_45_0 i := by rw [l0, e46, e47]; exact sum_cells _
+  have m1 : w.w_64_1 = ∑ i : Fin 14, w.w_45_1 i := by rw [l1, e49, e50]; exact sum_cells _
+  have m2 : w.w_64_2 = ∑ i : Fin 14, w.w_45_2 i := by rw [l2, e52, e53]; exact sum_cells _
+  have m3 : w.w_64_3 = ∑ i : Fin 14, w.w_45_3 i := by rw [l3, e55, e56]; exact sum_cells _
+  have m4 : w.w_64_4 = ∑ i : Fin 14, w.w_45_4 i := by rw [l4, e58, e59]; exact sum_cells _
+  have m5 : w.w_64_5 = ∑ i : Fin 14, w.w_45_5 i := by rw [l5, e61, e62]; exact sum_cells _
+  have hA : (∑ i : Fin 14, ![![w.w_45_0 i, w.w_45_1 i], ![w.w_45_2 i, w.w_45_3 i]]) =
+      ![![w.w_64_0, w.w_64_1], ![w.w_64_2, w.w_64_3]] := by
+    funext k j
+    fin_cases k <;> fin_cases j <;> simp [Finset.sum_apply, m0, m1, m2, m3]
+  have hc : (∑ i : Fin 14, ![w.w_45_4 i, w.w_45_5 i]) = ![w.w_64_4, w.w_64_5] := by
+    funext j
+    fin_cases j <;> simp [Finset.sum_apply, m4, m5]
+  rw [hA, hc] at hsum
+  refine ⟨?_, va, fun i j row column ↦ hva i j row column, v, hsum,
+    fun i j row column ↦ hvp i j row column⟩
+  rw [← hA]
+  exact Finset.sum_congr rfl fun i _ ↦ hkeys i
+
+end LwrProof

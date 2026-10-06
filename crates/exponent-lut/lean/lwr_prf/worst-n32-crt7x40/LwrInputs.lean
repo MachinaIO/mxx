@@ -220,14 +220,17 @@ theorem requirement_holds {ac ae a : Fin 17 → Int} {s0 s1 s2 s3 s4 : Fin 14 �
   · rw [← selector_sum (fun i c n hb ↦ selector_step4 hb) h50]; exact e50
 
 set_option maxHeartbeats 4000000 in
-/-- The ideal output: the parity of `τ(z mod 16) = ⌊2 (z mod 16) / 16⌋ + 1`. -/
+/-- The ideal output: `δ mod 8` for the half-integer readout `δ = (-1)^b m` of `z mod 32 = r + 16 b`,
+`m = 2 τ(r) - 1`, `τ(r) = ⌊2 r / 16⌋ + 1`: `m` for `b = 0` and `8 - m` for `b = 1`. -/
 theorem ideal_value {a : Fin 17 → Int} {s0 s1 s2 s3 s4 : Fin 14 → Int} {out : Int}
     (h : Ideal.generatedRoot GeneratedClaim.ideal_params (s0, a, s1, s2, s3, s4, ()) out) :
-    out = (selectedSum a ![s0, s1, s2, s3, s4] % 16 * 2 / 16 + 1) % 2 := by
+    out = ((selectedSum a ![s0, s1, s2, s3, s4] % 16 * 2 / 16 + 1) * 2 - 1) +
+      selectedSum a ![s0, s1, s2, s3, s4] % 32 / 16 *
+        (8 - ((selectedSum a ![s0, s1, s2, s3, s4] % 16 * 2 / 16 + 1) * 2 - 1) * 2) := by
   obtain ⟨w, hb⟩ := h
   unfold Ideal.generatedRoot.body at hb
   dsimp only at hb
-  obtain ⟨-, h4, -, h8, -, h12, -, h16, -, h20, -, -, -, hout⟩ := hb
+  obtain ⟨-, h4, -, h8, -, h12, -, h16, -, h20, -, -, -, -, hout⟩ := hb
   rw [hout, block_sum 0 (fun i c n hb ↦ ideal_step0 hb) h4, block_sum 1 (fun i c n hb ↦ ideal_step1 hb) h8,
     block_sum 2 (fun i c n hb ↦ ideal_step2 hb) h12, block_sum 3 (fun i c n hb ↦ ideal_step3 hb) h16,
     block_sum 4 (fun i c n hb ↦ ideal_step4 hb) h20]

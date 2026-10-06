@@ -97,14 +97,14 @@ theorem ringAutomorphismRuns_eq (hq : 1 < q) (hn : 0 < n) {rows columns : Nat} {
   exact ⟨hodd, hout.trans (ringAutomorphism_eq hq hn _ hodd input)⟩
 
 /-- Integer substitution permutes coefficients up to sign: the coefficient sum form. -/
-private theorem substitution_coeff_sum (index : Nat) (hodd : Odd index) (hn : 0 < n)
+theorem substitution_coeff_sum (index : Nat) (hodd : Odd index) (hn : 0 < n)
     (x : ErrorPoly n) :
     substitution index hodd x = ∑ i : Fin n, algebraMap Int (ErrorPoly n) (x.coeff i) *
       AdjoinRoot.root (negacyclicModulus n Int) ^ (i.val * index) := by
   conv_lhs => rw [Negacyclic.expansion hn x]
   simp only [map_sum, map_mul, substitution_algebraMap, substitution_root_pow]
 
-private theorem root_power_remainder {R : Type} [CommRing R] (exponent : Nat) :
+theorem root_power_remainder {R : Type} [CommRing R] (exponent : Nat) :
     AdjoinRoot.root (negacyclicModulus n R) ^ exponent =
       algebraMap Int (Negacyclic n R) ((-1 : Int) ^ (exponent / n)) *
         AdjoinRoot.root (negacyclicModulus n R) ^ (exponent % n) := by
@@ -112,7 +112,7 @@ private theorem root_power_remainder {R : Type} [CommRing R] (exponent : Nat) :
   rw [pow_add, pow_mul, Negacyclic.root_pow_n]
   simp
 
-private theorem substituted_term_coeff (hn : 0 < n) (a : Int) (exponent : Nat) (k : Fin n) :
+theorem substituted_term_coeff (hn : 0 < n) (a : Int) (exponent : Nat) (k : Fin n) :
     (algebraMap Int (ErrorPoly n) a *
       AdjoinRoot.root (negacyclicModulus n Int) ^ exponent).coeff k =
       if exponent % n = k.val then a * (-1 : Int) ^ (exponent / n) else 0 := by
@@ -123,7 +123,7 @@ private theorem substituted_term_coeff (hn : 0 < n) (a : Int) (exponent : Nat) (
   rw [hr]
   simp [Fin.ext_iff]
 
-private theorem multiply_index_injective {index : Nat} (hcoprime : n.Coprime index) :
+theorem multiply_index_injective {index : Nat} (hcoprime : n.Coprime index) :
     Function.Injective (fun i : Fin n => (i.val * index) % n) := by
   intro i j hij
   have h := Nat.ModEq.cancel_right_of_coprime hcoprime hij

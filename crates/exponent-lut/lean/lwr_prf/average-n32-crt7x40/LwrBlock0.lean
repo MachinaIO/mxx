@@ -366,7 +366,7 @@ theorem familyGetStatic_eq {α : Type} {count : Nat} {f : Fin count → α} {k :
 set_option maxHeartbeats 64000000 in
 /-- Block `0`: the sum of its fourteen cells, an encoding of `P6 Σ_i α_(c_i) μ ν_i` at `Q6`. -/
 theorem block0 {model : HashModel} {key : ByteArray}
-    {s0 s1 s2 s3 : Fin 16 → ExactMatrix Q1 N 1 1} {k0 k1 : Fin 16 → ExactMatrix Q2 N 1 2}
+    {s0 s1 s2 s3 : Fin 16 → ExactMatrix Q1 N 1 2} {k0 k1 : Fin 16 → ExactMatrix Q2 N 1 2}
     {ca0 ca1 : Fin 17 → ExactMatrix Q7 N 1 14} {cs0 cs1 : ExactMatrix Q7 N 1 12}
     {apay : Fin 17 → ExactMatrix Q7 N 1 1}
     {r00 r01 : Fin 14 → ExactMatrix Q6 N 1 10} {r10 r11 : Fin 14 → ExactMatrix Q5 N 1 8}

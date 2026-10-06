@@ -7,6 +7,7 @@ def cert(I):
     L, B, C, M, N, W, s = I.L, I.B, I.C, I.M, I.n, I.W, I.stride
     pp = I.pprime
     T = pp * (W - 1) // W + 1
+    TT = 4 * pp
     cut = I.cutoff
     m = I.m
     sels = ' '.join(f's{b}' for b in range(B))
@@ -20,11 +21,11 @@ import LwrInputs
 # The average-case correctness certificate
 
 Every execution on every sample tape satisfying the generated claim's run relation decodes the
-parity of the readout of its selected coordinates. The requirement makes the plaintext of member
+half-integer readout of its selected coordinates modulo `{TT}`. The requirement makes the plaintext of member
 `k` of `a` the monomial `X^({s} a_k)` and every block's selectors one-hot; the {B} blocks then
 accumulate `X^({s}z)` for the sum `z` of the selected coordinates, the readout LUT gives
-`(-1)^⌊z/{W}⌋ τ(z mod {W})` at the terminal modulus, and decryption returns its parity, which is the
-ideal output. The plaintexts of the members of `a` and of the state are monomials, so multiplying an
+`(-1)^⌊z/{W}⌋ (2 τ(z mod {W}) - 1)` at the terminal modulus, and decryption returns it modulo `{TT}`,
+which is the ideal output. The plaintexts of the members of `a` and of the state are monomials, so multiplying an
 error by them keeps its bound (`SmulGain _ 1`).
 -/
 
@@ -110,23 +111,32 @@ theorem intCast_coeff_zero (x : Int) : ((x : ErrorPoly N)).coeff ⟨0, hN⟩ = x
   rw [show ((⟨0, hN⟩ : Fin N) : Nat) = 0 from rfl, pow_zero, if_pos rfl] at h1
   rw [h, h1, mul_one]
 
-/-- The decrypted parity of the readout is the parity of `τ(z mod {W})`. -/
-theorem readout_parity (z : Nat) :
-    ((lutValue z).coeff ⟨0, hN⟩) % 2 = (((z : Int) % {W}) * {pp} / {W} + 1) % 2 := by
-  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.readout]
-  have hτ : (({pp} * (z % {W}) / {W} + 1 : Nat) : Int) = ((z : Int) % {W}) * {pp} / {W} + 1 := by omega
+/-- The half-integer readout modulo `{TT}` is the ideal value: `m` for an even `⌊z / {W}⌋` and
+`{TT} - m` for an odd one, with `m = 2 τ(z mod {W}) - 1`. -/
+theorem readout_mod{TT} (z : Nat) :
+    ((lutValue z).coeff ⟨0, hN⟩) % {TT} =
+      ((((z : Int) % {W}) * {pp} / {W} + 1) * 2 - 1) +
+        (z : Int) % {2 * W} / {W} * ({TT} - ((((z : Int) % {W}) * {pp} / {W} + 1) * 2 - 1) * 2) := by
+  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.halfIntegerReadout, MxxExponentLutLwr.readout]
+  have hτ : ((2 * ({pp} * (z % {W}) / {W} + 1) - 1 : Nat) : Int) =
+      (((z : Int) % {W}) * {pp} / {W} + 1) * 2 - 1 := by omega
   rw [hτ]
+  have hb : (z : Int) % {2 * W} / {W} = ((z / {W} : Nat) : Int) % 2 := by omega
+  rw [hb]
   rcases Nat.even_or_odd (z / {W}) with h | h
-  · rw [h.neg_one_pow, one_mul]
-  · rw [h.neg_one_pow, neg_one_mul, Int.neg_emod_two]
+  · rw [h.neg_one_pow, one_mul, show ((z / {W} : Nat) : Int) % 2 = 0 by
+      obtain ⟨k, hk⟩ := h; omega]
+    omega
+  · rw [h.neg_one_pow, neg_one_mul, show ((z / {W} : Nat) : Int) % 2 = 1 by
+      obtain ⟨k, hk⟩ := h; omega]
+    omega
 
-/-- The readout lies in `[-{T}, {T}]`. -/
-theorem lutValue_coeff_bound (z : Nat) : |(lutValue z).coeff ⟨0, hN⟩| ≤ ({T} : Nat) := by
-  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.readout]
-  have hτ : {pp} * (z % {W}) / {W} + 1 ≤ {T} := by omega
+theorem lutValue_coeff_bound (z : Nat) : |(lutValue z).coeff ⟨0, hN⟩| ≤ {2 * pp - 1} := by
+  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.halfIntegerReadout, MxxExponentLutLwr.readout]
+  have hτ : 2 * ({pp} * (z % {W}) / {W} + 1) - 1 ≤ {2 * pp - 1} := by omega
   rcases Nat.even_or_odd (z / {W}) with h | h
-  · rw [h.neg_one_pow, one_mul, abs_of_nonneg (by positivity)]; omega
-  · rw [h.neg_one_pow, neg_one_mul, abs_neg, abs_of_nonneg (by positivity)]; omega
+  · rw [h.neg_one_pow, one_mul, abs_le]; omega
+  · rw [h.neg_one_pow, neg_one_mul, abs_le]; omega
 
 theorem secret_ternary {{out : ExactMatrix Q{L} N 1 1}}
     (h : Stage_payload.generatedRoot tape path GeneratedClaim.stage_0_params () out) :
@@ -142,6 +152,10 @@ theorem mask_ternary {{out : ExactMatrix Q{L} N 1 1}}
   obtain ⟨s, hs, hn⟩ := ternary_poly_at hN hw
   exact ⟨s, hout.trans hs, hn⟩
 ''']
+    if I.h2:
+        # The certificate goes through H2 (`LwrH2Cert`); this module keeps the lemmas on the plaintexts.
+        o.append('\nend LwrProof\n')
+        return ''.join(o)
     # The correctness of every run.
     valid = wrap(['-', '⟨hc1, hc2⟩', '⟨he1, he2⟩', 'ha', 'hac', 'hae'] +
                  [f'hs{b}, hx{b}' for b in range(B)], ', ', 4, 10)

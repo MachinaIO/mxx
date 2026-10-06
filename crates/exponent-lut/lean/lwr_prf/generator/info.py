@@ -46,6 +46,8 @@ class Info:
         self.coords = self._coords()
         self.rhs_prefixes = self._rhs_prefixes()
         self.inverse, self.inverse_k = self._inverse()
+        # The sets whose certificate goes through H2 (`LwrH2Cert`) instead of a worst-case bound.
+        self.h2 = pid in ('average-n65536-crt36x40',)
         assert self.average, 'the generator proves average-case claims'
         self.cutoff = int(re.search(r'gaussianSampleAt tape \(path \+\+ \[\d+\]\) \(\(\d+/1\)\) \((\d+)\)',
                                     self.enc).group(1))

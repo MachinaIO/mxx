@@ -5,8 +5,8 @@ import LwrSetup
 
 The requirement checks every member of `a` in one loop and sums every block's selectors in a loop;
 it accepts plaintext monomials `c X^e` of `a` with `c X^e = X^(512a)` and one-hot selectors. The ideal
-output sums `s_b(i) a(coords b i)` over the cells of every block in a loop, and is the parity of the
-readout `τ(z mod 128)` of the total `z`.
+output sums `s_b(i) a(coords b i)` over the cells of every block in a loop, and is the half-integer
+readout of the total `z` modulo `64`.
 -/
 
 namespace LwrProof
@@ -1039,21 +1039,28 @@ def selectedSum (a : Fin 1025 → Int) (s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s1
 
 set_option maxHeartbeats 16000000 in
 set_option maxRecDepth 100000 in
-/-- The ideal output: the parity of `τ(z mod 128) = ⌊16 (z mod 128) / 128⌋ + 1`. -/
+/-- The ideal output: `δ mod 64` for the half-integer readout `δ = (-1)^b m` of
+`z mod 256 = r + 128 b`, `m = 2 τ(r) - 1`, `τ(r) = ⌊16 r / 128⌋ + 1`: `m` for `b = 0` and `64 - m` for
+`b = 1`. -/
 theorem ideal_value {a : Fin 1025 → Int} {s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19
       s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32 s33 : Fin 113 → Int} {out : Int}
     (h : Ideal.generatedRoot tape path GeneratedClaim.ideal_params (s0, a, s1, s2, s3, s4, s5, s6,
       s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, s21, s22, s23, s24, s25,
       s26, s27, s28, s29, s30, s31, s32, s33, ()) out) :
-    out = (selectedSum a s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19
-      s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32 s33 % 128 * 16 / 128 + 1) % 2 := by
+    out = ((selectedSum a s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19
+      s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32 s33 % 128 * 16 / 128 + 1) * 2 - 1) +
+      selectedSum a s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19
+      s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32 s33 % 256 / 128 *
+        (64 - ((selectedSum a s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19
+      s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31 s32 s33 % 128 * 16 / 128 + 1) * 2 - 1) * 2) := by
   obtain ⟨w, hb⟩ := h
   unfold Ideal.generatedRoot.body at hb
   dsimp only at hb
   obtain ⟨-, h4_0, -, h8_0, -, h12_0, -, h16_0, -, h20_0, -, h24_0, -, h28_0, -, h32_0, -, h36_0, -,
     h40_0, -, h44_0, -, h48_0, -, h52_0, -, h56_0, -, h60_0, -, h64_0, -, h68_0, -, h72_0, -, h76_0,
     -, h80_0, -, h84_0, -, h88_0, -, h92_0, -, h96_0, -, h100_0, -, h104_0, -, h108_0, -, h112_0, -,
-    h116_0, -, h120_0, -, h124_0, -, h128_0, -, h132_0, -, h136_0, h138_0, h142_0, h146_0, hout⟩ := hb
+    h116_0, -, h120_0, -, h124_0, -, h128_0, -, h132_0, -, h136_0, h138_0, h142_0, h150_0, h152_0,
+    hout⟩ := hb
   rw [hout, block_sum 0 (fun i c n hb ↦ ideal_step0 hb) h4_0,
     block_sum 1 (fun i c n hb ↦ ideal_step1 hb) h8_0,
     block_sum 2 (fun i c n hb ↦ ideal_step2 hb) h12_0,

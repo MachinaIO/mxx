@@ -92,23 +92,32 @@ theorem intCast_coeff_zero (x : Int) : ((x : ErrorPoly N)).coeff ⟨0, hN⟩ = x
   rw [show ((⟨0, hN⟩ : Fin N) : Nat) = 0 from rfl, pow_zero, if_pos rfl] at h1
   rw [h, h1, mul_one]
 
-/-- The decrypted parity of the readout is the parity of `τ(z mod 16)`. -/
-theorem readout_parity (z : Nat) :
-    ((lutValue z).coeff ⟨0, hN⟩) % 2 = (((z : Int) % 16) * 2 / 16 + 1) % 2 := by
-  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.readout]
-  have hτ : ((2 * (z % 16) / 16 + 1 : Nat) : Int) = ((z : Int) % 16) * 2 / 16 + 1 := by omega
+/-- The half-integer readout modulo `8` is the ideal value: `m` for an even `⌊z / 16⌋` and
+`8 - m` for an odd one, with `m = 2 τ(z mod 16) - 1`. -/
+theorem readout_mod8 (z : Nat) :
+    ((lutValue z).coeff ⟨0, hN⟩) % 8 =
+      ((((z : Int) % 16) * 2 / 16 + 1) * 2 - 1) +
+        (z : Int) % 32 / 16 * (8 - ((((z : Int) % 16) * 2 / 16 + 1) * 2 - 1) * 2) := by
+  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.halfIntegerReadout, MxxExponentLutLwr.readout]
+  have hτ : ((2 * (2 * (z % 16) / 16 + 1) - 1 : Nat) : Int) =
+      (((z : Int) % 16) * 2 / 16 + 1) * 2 - 1 := by omega
   rw [hτ]
+  have hb : (z : Int) % 32 / 16 = ((z / 16 : Nat) : Int) % 2 := by omega
+  rw [hb]
   rcases Nat.even_or_odd (z / 16) with h | h
-  · rw [h.neg_one_pow, one_mul]
-  · rw [h.neg_one_pow, neg_one_mul, Int.neg_emod_two]
+  · rw [h.neg_one_pow, one_mul, show ((z / 16 : Nat) : Int) % 2 = 0 by
+      obtain ⟨k, hk⟩ := h; omega]
+    omega
+  · rw [h.neg_one_pow, neg_one_mul, show ((z / 16 : Nat) : Int) % 2 = 1 by
+      obtain ⟨k, hk⟩ := h; omega]
+    omega
 
-theorem lutValue_coeff_bound (z : Nat) :
-    -2 ≤ (lutValue z).coeff ⟨0, hN⟩ ∧ (lutValue z).coeff ⟨0, hN⟩ ≤ 2 := by
-  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.readout]
-  have hτ : 2 * (z % 16) / 16 + 1 ≤ 2 := by omega
+theorem lutValue_coeff_bound (z : Nat) : |(lutValue z).coeff ⟨0, hN⟩| ≤ 3 := by
+  rw [lutValue, intCast_coeff_zero, MxxExponentLutLwr.halfIntegerReadout, MxxExponentLutLwr.readout]
+  have hτ : 2 * (2 * (z % 16) / 16 + 1) - 1 ≤ 3 := by omega
   rcases Nat.even_or_odd (z / 16) with h | h
-  · rw [h.neg_one_pow]; omega
-  · rw [h.neg_one_pow]; omega
+  · rw [h.neg_one_pow, one_mul, abs_le]; omega
+  · rw [h.neg_one_pow, neg_one_mul, abs_le]; omega
 
 theorem secret_ternary {out : ExactMatrix Q7 N 1 1}
     (h : Stage_payload.generatedRoot tape path GeneratedClaim.stage_0_params () out) :
@@ -124,8 +133,9 @@ theorem mask_ternary {out : ExactMatrix Q7 N 1 1}
   obtain ⟨s, hs, hn⟩ := ternary_poly_at hN hw
   exact ⟨s, hout.trans hs, hn⟩
 
+set_option maxRecDepth 100000 in
 set_option maxHeartbeats 64000000 in
-/-- Every run decodes the parity of the readout of its selected coordinates. -/
+/-- Every run decodes the half-integer readout of its selected coordinates modulo `8`. -/
 theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
     {execution : GeneratedClaim.Execution}
     (hruns : GeneratedClaim.Runs model external tape execution) :
@@ -199,7 +209,7 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   have hrhs2 := preprocess_selector2 hpre hsp hg6 hg6u
   have hrhs3 := preprocess_selector3 hpre hsp hg4 hg4u
   have hrhs4 := preprocess_selector4 hpre hsp hg2 hg2u
-  have hsw := preprocess_switch hpre hsp
+  have hsw := preprocess_switch hpre hsp hg2
   -- The five blocks accumulate the monomial of the sum of the selected coordinates.
   obtain ⟨w, hb⟩ := honlineEval
   -- Block 0.
@@ -252,7 +262,7 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   have hb2 := hb
   unfold Stage_online_eval.generatedRoot.body at hb2
   extract_lets at hb2
-  have houtOnlineEval := hb2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
+  have houtOnlineEval := hb2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2
   obtain ⟨wd, hd⟩ := hdec
   unfold Stage_decode.generatedRoot.body at hd
   dsimp only at hd
@@ -260,20 +270,22 @@ theorem correct {model : HashModel} {external : GeneratedClaim.ExternalInputs}
   rw [hsm] at hm1
   have hw2 := modulusReduce_poly hQ7 hQ1 hN hm1
   have hw6 := modulusReduce_one hQ7 hQ1 hN hm2
-  have hbound : 4 * lutBound (∑ _i : Fin 14, cellBound4 (∑ _i : Fin 14, cellBound3
-      (∑ _i : Fin 14, cellBound2 (∑ _i : Fin 14, cellBound1 (∑ _i : Fin 14, cellBound0 26))))) + 8 < Q1 := by
+  have hbound : 2 * 8 * outBound (∑ _i : Fin 14, cellBound4 (∑ _i : Fin 14, cellBound3
+      (∑ _i : Fin 14, cellBound2 (∑ _i : Fin 14, cellBound1 (∑ _i : Fin 14, cellBound0 26))))) +
+      2 * 2147481921 * 3 < Q1 := by
     simp only [Finset.sum_const, Finset.card_univ, Fintype.card_fin, smul_eq_mul]
     decide
-  have hval := decode_terminal_parity hQ1 (by norm_num) hN hlut hbound (k := ⟨0, hN⟩)
-    (lutValue_coeff_bound z5) (by
+  have hval := decode_terminal_scaled (t := 8) (k := 137170518016) (r := 2147481921) (W := 3)
+    hQ1 hN (by norm_num) (by norm_num) hlut hbound (i := ⟨0, hN⟩) (lutValue_coeff_bound z5) (by
       rw [houtOnlineEval, hw2, hw6]
       funext r c
       obtain rfl : r = 0 := Subsingleton.elim _ _
       obtain rfl : c = 0 := Subsingleton.elim _ _
-      simp only [matrixSub, matrixAdd, matrixMulScalarLeft_eq, Matrix.sub_apply, Matrix.add_apply,
-        Matrix.smul_apply, smul_eq_mul, Matrix.one_apply_eq, one_mul]
+      simp only [matrixNeg, matrixSub, matrixAdd, matrixMulScalarLeft_eq, Matrix.neg_apply,
+        Matrix.sub_apply, Matrix.add_apply, Matrix.smul_apply, smul_eq_mul, Matrix.one_apply_eq,
+        one_mul]
       rfl) hdec1
-  rw [hout, hval, readout_parity, hid]
+  rw [hout, hval, Nat.cast_ofNat, readout_mod8, hid]
   have hz : selectedSum a ![s0, s1, s2, s3, s4] = (z5 : Int) := by
     rw [selectedSum, Fin.sum_univ_five,
       show (![s0, s1, s2, s3, s4] : Fin 5 → Fin 14 → Int) 0 = s0 from rfl,

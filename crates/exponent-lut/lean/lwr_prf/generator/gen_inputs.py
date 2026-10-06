@@ -5,6 +5,7 @@ from lean_patterns import pattern
 
 def inputs(I):
     B, C, M, N, W, s = I.B, I.C, I.M, I.n, I.W, I.stride
+    T = 4 * I.pprime
     o = [f'''import LwrSetup
 
 /-!
@@ -12,8 +13,8 @@ def inputs(I):
 
 The requirement checks every member of `a` in one loop and sums every block's selectors in a loop;
 it accepts plaintext monomials `c X^e` of `a` with `c X^e = X^({s}a)` and one-hot selectors. The ideal
-output sums `s_b(i) a(coords b i)` over the cells of every block in a loop, and is the parity of the
-readout `τ(z mod {W})` of the total `z`.
+output sums `s_b(i) a(coords b i)` over the cells of every block in a loop, and is the half-integer
+readout of the total `z` modulo `{T}`.
 -/
 
 namespace LwrProof
@@ -144,7 +145,7 @@ theorem requirement_holds {{ac ae a : Fin {M} → Int}} {{{sels} : Fin {C} → I
     # The ideal root.
     ip = pattern(f'{I.d}/generated/Ideal.lean', 'generatedRoot')[1:-1].split(', ')
     loops = [x for x in ip if x not in ('-', 'hout')]
-    assert loops[:B] == [f'h{4 + 4 * b}_0' for b in range(B)] and len(loops) == B + 3, loops
+    assert loops[:B] == [f'h{4 + 4 * b}_0' for b in range(B)], loops
     ideal_tuple = wrap(['s0', 'a'] + [f's{b}' for b in range(1, B)], ', ', 6, 70)
     total = wrap(['0'] + [f'∑ i, s{b} i * a ⟨coords {b} i, coords_lt {b} i⟩' for b in range(B)], ' + ', 4, 2)
     rws = wrap([f'block_sum {b} (fun i c n hb ↦ ideal_step{b} hb) h{4 + 4 * b}_0' for b in range(B)], ', ', 4, 13)
@@ -155,10 +156,14 @@ def selectedSum (a : Fin {M} → Int) ({sels} : Fin {C} → Int) : Int :=
 
 set_option maxHeartbeats 16000000 in
 set_option maxRecDepth 100000 in
-/-- The ideal output: the parity of `τ(z mod {W}) = ⌊{I.pprime} (z mod {W}) / {W}⌋ + 1`. -/
+/-- The ideal output: `δ mod {T}` for the half-integer readout `δ = (-1)^b m` of
+`z mod {2 * W} = r + {W} b`, `m = 2 τ(r) - 1`, `τ(r) = ⌊{I.pprime} r / {W}⌋ + 1`: `m` for `b = 0` and `{T} - m` for
+`b = 1`. -/
 theorem ideal_value {{a : Fin {M} → Int}} {{{sels} : Fin {C} → Int}} {{out : Int}}
     (h : Ideal.generatedRoot tape path GeneratedClaim.ideal_params ({ideal_tuple}, ()) out) :
-    out = (selectedSum a {sels} % {W} * {I.pprime} / {W} + 1) % 2 := by
+    out = ((selectedSum a {sels} % {W} * {I.pprime} / {W} + 1) * 2 - 1) +
+      selectedSum a {sels} % {2 * W} / {W} *
+        ({T} - ((selectedSum a {sels} % {W} * {I.pprime} / {W} + 1) * 2 - 1) * 2) := by
   obtain ⟨w, hb⟩ := h
   unfold Ideal.generatedRoot.body at hb
   dsimp only at hb

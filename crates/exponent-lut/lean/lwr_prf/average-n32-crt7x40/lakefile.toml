@@ -23,3 +23,9 @@ roots = [
 [[lean_lib]]
 name = "LwrProof"
 roots = ["LwrSetup", "LwrInputs", "LwrEncrypt", "LwrPreprocess", "LwrBlock0", "LwrBlock1", "LwrBlock2", "LwrBlock3", "LwrBlock4", "LwrLut", "LwrCertificate"]
+
+# Phase 4 prototypes of the explicit-error proof (not a default target).
+[[lean_lib]]
+name = "LwrH2Scratch"
+roots = ["LwrEncryptE", "LwrPreprocessE", "LwrErrorCommon", "LwrBlockE0", "LwrBlockE1", "LwrBlockE2", "LwrBlockE3", "LwrBlockE4", "LwrLutE", "LwrModelBase", "LwrModel0", "LwrModel1", "LwrModel2", "LwrModel3", "LwrModel4", "LwrModelLut", "LwrChain", "LwrChainAll", "LwrChainFinal", "LwrH2Model", "LwrH2Bounds", "LwrH2Agree", "LwrH2Cert"]
+moreLeanArgs = ["--tstack=4000000"]

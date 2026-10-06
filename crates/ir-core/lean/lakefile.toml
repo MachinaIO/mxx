@@ -41,12 +41,14 @@ roots = [
   "MxxRuntime",
   "RuntimeGaussian",
   "RuntimeHash",
+  "RuntimeHeuristics",
   "RuntimeLemmas",
   "RuntimeMatrixOps",
   "RuntimeModulusSwitch",
   "RuntimePrimitives",
   "RuntimeProbability",
   "RuntimeSampling",
+  "RuntimeSubGaussian",
 ]
 
 # Concrete layouts checking the runtime facts generated relations rely on.

@@ -29,7 +29,7 @@ def preprocess(I):
 The selector of cell `i` of block `j` is preprocessed into the RHS ciphertext
 `s top_j + bot_j = (P ν r_j) g + e_j` at the modulus of the block's private multiplication, and
 the readout LUT's switching ciphertexts at `Q1` satisfy
-`σ_i(s) B_{{0j}} + B_{{1j}} = (C_i ⌊Q1/2⌋ r_j) · 1 + e_j`.
+`σ_i(s) B_{{0j}} + B_{{1j}} = (C_i r_j) G + e_j` against the full gadget `G` of `Q1`.
 -/
 
 namespace LwrProof
@@ -103,11 +103,13 @@ theorem preprocess_selector{j} {{model : HashModel}} {{key : ByteArray}} {{paylo
     autos = [n for n, k in kinds.items() if k == 'MxxRuntime.ringAutomorphismRuns']
     gauss = [n for n, k in kinds.items() if k == 'MxxRuntime.gaussianSampleAt']
     reds = [n for n, k in kinds.items() if k == 'MxxRuntime.modulusReduceRuns']
-    assert autos[0] == 'h5_0' and len(autos) == W + 1 and reds[0] == 'h4_0'
-    keep = ['h4_0', 'h5_0'] + gauss + [reds[1]] + autos[1:] + ['hout']
+    gads = [n for n, k in kinds.items() if k == 'MxxRuntime.gadgetMatrixRuns']
+    assert autos[0] == 'h5_0' and len(autos) == W + 1 and reds[0] == 'h4_0' and len(gads) == 1
+    keep = ['h4_0', 'h5_0'] + gauss + [reds[1]] + gads + autos[1:] + ['hout']
+    m1 = I.m(1)
     lines = destruct(path, 'parallel_generatedRoot_3', 'hcell', keep)
     haves = proj(path, 'generatedRoot', ['h3_3', 'hout'])
-    want = f'(Fin {W} → Mxx.Primitives.ExactMatrix {I.Q[1]} {N} 1 1)'
+    want = f'(Fin {W} → Mxx.Primitives.ExactMatrix {I.Q[1]} {N} 1 {I.m(1)})'
     pos = [i for i, x in enumerate(outs) if x.strip() == want]
     assert pos == [0, 1, 2, 3], pos
     aut_lines = '\n'.join(f'  obtain ⟨_, a{k}⟩ := ringAutomorphismRuns_eq hQ1 hN {n}'
@@ -118,19 +120,19 @@ theorem preprocess_selector{j} {{model : HashModel}} {{key : ByteArray}} {{paylo
     parts.append(f'''
 set_option maxHeartbeats 64000000 in
 set_option linter.unusedSimpArgs false in
-/-- The readout LUT's switching ciphertexts at `Q1`: `σ_i(s) B_{{0j}} + B_{{1j}} = (C_i ⌊Q1/2⌋ r_j) · 1 + e_j`. -/
+/-- The readout LUT's switching ciphertexts at `Q1`, whose target is unscaled against the full
+public gadget `G` of `Q1`: `σ_i(s) B_{{0j}} + B_{{1j}} = (C_i r_j) G + e_j`. -/
 theorem preprocess_switch {{model : HashModel}} {{key : ByteArray}} {{payload : ExactMatrix Q{L} N 1 1}}
     {{{binders} : Fin {C} → Int}} {{outputs}}
     (h : Stage_preprocess.generatedRoot Backend.backend model tape path GeneratedClaim.stage_2_params
       ({ins}, ()) outputs)
     {{sp : ErrorPoly N}} (hpayload : payload = fun _ _ ↦ reducePoly Q{L} N sp)
-    (i : Fin {W}) :
-    ∃ e : Fin 2 → ErrorMatrix N 1 1, (∀ j, CoeffBound (e j) {I.cutoff}) ∧ ∀ j,
+    {{G : ExactMatrix Q1 N 1 {m1}}} (hG : gadgetMatrixRuns Backend.backend {I.base} {m1} G) (i : Fin {W}) :
+    ∃ e : Fin 2 → ErrorMatrix N 1 {m1}, (∀ j, CoeffBound (e j) {I.cutoff}) ∧ ∀ j,
       reducePoly Q1 N (substitution (sigma i).toNat (sigma_odd i) sp) •
           ![outputs.1 i, outputs.2.1 i] j + ![outputs.2.2.1 i, outputs.2.2.2.1 i] j =
-        (lutCoefficient Q1 inverse1 (sigma i).toNat *
-          reducePoly Q1 N ((((Q1 / 2 : Nat) : Int) : ErrorPoly N) * unitPair sp j)) •
-          (1 : ExactMatrix Q1 N 1 1) + reduceMatrix Q1 N 1 1 (e j) := by
+        (lutCoefficient Q1 inverse1 (sigma i).toNat * reducePoly Q1 N (unitPair sp j)) • G +
+          reduceMatrix Q1 N 1 {m1} (e j) := by
   obtain ⟨w, hb⟩ := h
   unfold Stage_preprocess.generatedRoot.body at hb
   extract_lets at hb
@@ -142,6 +144,8 @@ theorem preprocess_switch {{model : HashModel}} {{key : ByteArray}} {{payload : 
   obtain ⟨e0', hb0, he0⟩ := gaussian_bound_at hN {gauss[0]}
   obtain ⟨e1', hb1, he1⟩ := gaussian_bound_at hN {gauss[1]}
   have hw{reds[1][1:-2]} := modulusReduce_one hQ{L} hQ1 hN {reds[1]}
+  have hGG := gadgetMatrixRuns_unique {gads[0]} hG
+  subst hGG
 {aut_lines}
   have hsig : MxxIR.selectInt (Int.ofNat ↑i) [{sig}] = sigma ↑i := rfl
   simp only [hsig] at hw5 {a_names_sp}
@@ -150,8 +154,7 @@ theorem preprocess_switch {{model : HashModel}} {{key : ByteArray}} {{payload : 
   refine ⟨![e0', e1'], fun j ↦ by fin_cases j <;> assumption, fun j ↦ ?_⟩
   rw [lutCoefficient_range (sigma_odd i)]
   fin_cases j <;> funext r c <;> obtain rfl : r = 0 := Subsingleton.elim _ _ <;>
-    obtain rfl : c = 0 := Subsingleton.elim _ _ <;>
-    simp (config := {{ zetaDelta := true }}) only [reducePoly_substitution, Nat.succ_eq_add_one,
+    simp (config := {{ zetaDelta := true }}) only [matrixMulScalarLeft, MxxExponentLutLwr.halfIntegerReadout, reducePoly_substitution, Nat.succ_eq_add_one,
       Nat.reduceAdd, ho0, ho1, Fin.zero_eta, Fin.mk_one, Fin.isValue, Matrix.cons_val_zero,
       Matrix.cons_val_one, Matrix.cons_val_fin_one, ho2, matrixAdd, matrixMulScalarLeft_one, matrixNeg, hw5,
       hw4, neg_mul, rotationPolynomial, Int.toNat_zero, pow_zero, map_one, Matrix.neg_apply,
@@ -162,8 +165,7 @@ theorem preprocess_switch {{model : HashModel}} {{key : ByteArray}} {{payload : 
       reduceMatrix, Nat.cast_ofNat, MxxExponentLutLwr.readout, Nat.cast_add, Nat.cast_one, mul_ite,
       Finset.sum_range_succ, Finset.range_one, ↓reduceIte, mul_zero, Nat.zero_div, Nat.cast_zero, zero_add,
       one_ne_zero, Nat.reduceDiv, Nat.reduceSub, OfNat.ofNat_ne_zero, Nat.reduceMul, Nat.ofNat_pos,
-      Nat.div_self, Int.natCast_ediv, Int.reduceDiv, unitPair, reducePoly_mul, map_ofNat,
-      Matrix.one_apply_eq] <;>
+      Nat.div_self, Int.natCast_ediv, Int.reduceDiv, unitPair, reducePoly_mul, map_ofNat] <;>
     ring
 
 end LwrProof

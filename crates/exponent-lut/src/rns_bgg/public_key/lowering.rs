@@ -119,11 +119,11 @@ impl<'a> PublicKeyLowering<'a> {
             payload_secret,
             hash_key,
             context,
-            refresh_mask: None,
+            decoder_smudge: None,
             rhs: BTreeMap::new(),
             rhs_material: BTreeMap::new(),
             lut_material: BTreeMap::new(),
-            refresh_decoder: None,
+            unmask: None,
             current_site: None,
             parallel_bodies: Vec::new(),
             finished_bodies: Vec::new(),
@@ -232,7 +232,7 @@ impl<'a> PublicKeyLowering<'a> {
             self.parameters,
             &self.context,
             self.program.id(),
-            self.refresh_mask.as_ref().map(|declaration| *declaration.commitment()),
+            self.decoder_smudge.as_ref().map(|declaration| *declaration.commitment()),
             material,
             member,
             level,
@@ -379,7 +379,9 @@ impl<'a> PublicKeyLowering<'a> {
         Ok(switching_ciphertexts)
     }
 
-    /// ModDown declared coefficient outputs once after graph aggregation.
+    /// Finalize declared coefficient outputs once after graph aggregation:
+    /// ModDown to the next level, then the scale-up action `G^-1(k)` (see
+    /// [`RnsBggParameters::coefficient_output_action`]).
     pub(crate) fn finish_outputs(
         &mut self,
         outputs: Vec<RnsBggPublicKey>,
@@ -397,9 +399,17 @@ impl<'a> PublicKeyLowering<'a> {
                         .checked_add(1)
                         .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
                     let q_ring = self.parameters.ring(target)?;
+                    let (_, k, _) = self.parameters.coefficient_output_decoding(
+                        &self.program,
+                        output.wire,
+                        target,
+                    )?;
+                    let action = self.parameters.coefficient_output_action(target, &k)?;
                     Ok(RnsBggPublicKey::new(
                         output.wire,
-                        super::mod_down_public(output.matrix, &q_ring),
+                        map_matrix(super::mod_down_public(output.matrix, &q_ring), |entry| {
+                            action.clone().right_multiply(entry)
+                        }),
                     ))
                 } else {
                     Ok(output)
@@ -660,23 +670,18 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             })
             .map_err(graph)?;
         let output = self.output()?;
-        if let Some(declaration) = self.refresh_mask.clone() &&
-            let Some(family) = declaration.mask().family_of_lut(lut_id)
+        if let Some(declaration) = self.decoder_smudge.clone() &&
+            declaration.smudge().lut() == lut_id
         {
-            // The refresh mask member is finalized once and transformed in
+            // The decoder smudge member is finalized once and transformed in
             // its root body, exactly as the encoding does.
             let finalized = next_level;
             let member =
                 self.site()?.indices.first().cloned().ok_or(RnsBggError::Binding(
-                    "a refresh mask LUT must be a root family member",
+                    "a decoder smudge LUT must be a root family member",
                 ))?;
-            let (action, coefficient) = super::refresh_member_action(
-                self.parameters,
-                &declaration,
-                family,
-                member,
-                finalized,
-            )?;
+            let (action, coefficient) =
+                super::smudge_member_action(self.parameters, &declaration, member, finalized)?;
             let finalized = super::mod_down_public(result, &self.parameters.ring(finalized)?);
             return Ok(RnsBggPublicKey::new(
                 output,
@@ -809,9 +814,10 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: None,
             hash_key,
         };

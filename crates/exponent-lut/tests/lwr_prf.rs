@@ -29,14 +29,17 @@ use mxx_backends::{
 use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
     ExpLayout, api,
-    noise_refresh::simulation::AverageCaseConfig,
-    program::{AttributeKnowledge, FamilyRange, InputBinding, WireId},
+    decoder::simulation::AverageCaseConfig,
+    program::{
+        AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, FamilyRange,
+        InputBinding, LutOutputRepresentation, Operand, WireId,
+    },
     program_gadgets::{
         pbc::{
             PbcCell, PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, clear_pbc_inner_product,
             generate_key_layout,
         },
-        prf::{PrfLabel, SparseLwrPrfProfile, SparseLwrPrfProgram},
+        prf::{PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
     },
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
@@ -142,10 +145,24 @@ fn record<'a>(
     }
 }
 
+/// The PRF Program: the sparse-LWR PRF gadget of every key and its outputs,
+/// one per key.
+#[derive(Clone)]
+struct LwrPrf {
+    program: ExponentLutProgram,
+    prf: SparseLwrPrf,
+}
+
+impl LwrPrf {
+    fn program(&self) -> &ExponentLutProgram {
+        &self.program
+    }
+}
+
 struct Fixture {
     parameters: RnsBggParameters,
     profile: SparseLwrPrfProfile,
-    program: SparseLwrPrfProgram,
+    program: LwrPrf,
     /// The Static secrets, sampled before preprocessing. The single Dynamic
     /// secret is sampled only after preprocessing.
     payload: Option<mxx_exponent_lut::rns_bgg::RnsBggPayloadSecret>,
@@ -172,11 +189,11 @@ fn error_sigma(recorded: Option<&ParameterRow>) -> BigDecimal {
 fn profile_and_program(
     ring_dimension: u32,
     recorded: Option<&ParameterRow>,
-) -> (SparseLwrPrfProfile, SparseLwrPrfProgram, Vec<PbcGeneratedKeyLayout>) {
+) -> (SparseLwrPrfProfile, LwrPrf, Vec<PbcGeneratedKeyLayout>) {
     // The LWR input modulus Q fixes the exponent layout inside the ring:
     // X^(2n / Q * z) adds exponents modulo Q natively, so width_log2 =
     // log2(Q) - 1 and stride_log2 = log2(n) - width_log2. The output modulus
-    // P = 2 * p_prime and the LWR dimension nu are independent of n.
+    // P and the LWR dimension nu are independent of n.
     let input_modulus =
         setting(recorded, "input_modulus", "MXX_EXPONENT_LUT_LWR_PRF_INPUT_MODULUS", 32);
     assert!(
@@ -207,7 +224,7 @@ fn profile_and_program(
     assert!(output_count > 0, "MXX_EXPONENT_LUT_LWR_PRF_OUTPUTS must be positive");
     let profile = SparseLwrPrfProfile::new(
         ExpLayout { stride_log2, width_log2 },
-        output_modulus / 2,
+        output_modulus,
         lwr_dimension,
     )
     .expect("valid sparse-LWR profile");
@@ -234,18 +251,21 @@ fn profile_and_program(
                 .expect("PBC layout for the sparse LWR key")
         })
         .collect::<Vec<_>>();
-    let labels = (0..output_count as u64)
-        .map(|index| {
-            PrfLabel::from_components(&[b"lwr-rns-output".as_slice(), &index.to_le_bytes()])
-                .expect("canonical label")
-        })
-        .collect();
-    let program = SparseLwrPrfProgram::new(
+    let mut builder = ExponentLutProgramBuilder::new();
+    let prf = SparseLwrPrf::build(
+        &mut builder,
         profile,
         keys.iter().map(|key| key.public_layout.clone()).collect(),
-        labels,
+        LutOutputRepresentation::Coefficient,
     )
-    .expect("sparse-LWR PRF program");
+    .expect("sparse-LWR PRF");
+    let outputs = match prf.output() {
+        PrfOutput::Scalar(output) => vec![Operand::Scalar(output)],
+        PrfOutput::Family(family) => (0..output_count)
+            .map(|index| Operand::Member { family, index: IntExpr::constant(index) })
+            .collect(),
+    };
+    let program = LwrPrf { program: builder.finish(outputs).expect("sparse-LWR PRF program"), prf };
     eprintln!(
         "LWR PRF program: n={ring_dimension} Q={input_modulus} P={output_modulus} nu={lwr_dimension} h={support_weight} outputs={output_count} blocks={} block_width={}",
         parameters.bucket_count, keys[0].public_layout.bucket_width
@@ -253,7 +273,7 @@ fn profile_and_program(
     (profile, program, keys)
 }
 
-fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNoiseBindings {
+fn noise_bindings(program: &LwrPrf, sigma: &BigDecimal) -> RnsBggNoiseBindings {
     let noise_inputs = program
         .program()
         .encryption_inputs()
@@ -292,21 +312,23 @@ fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNo
         };
         input_bindings.insert(*wire, binding);
     }
-    // Each bucket's one-hot selector family has exactly one nonzero member.
+    // A one-key bucket family is one-hot; a key-indexed family holds one
+    // bit of every key.
     let rhs_bindings = program
-        .selection_families()
-        .iter()
+        .prf
+        .selector_families()
+        .into_iter()
         .map(|family| {
             (
-                family.selector,
+                family.rhs,
                 InputBinding::Family(RnsBggNoiseFamily {
                     element: RnsBggNoiseRhs {
                         payload_l1: BigUint::from(1u8),
                         payload_l2_squared: BigUint::from(1u8),
                     },
-                    range: FamilyRange::full(IntExpr::constant(family.capacity))
+                    range: FamilyRange::full(IntExpr::constant(family.members))
                         .expect("valid selector family range"),
-                    max_nonzero_payloads: 1u8.into(),
+                    max_nonzero_payloads: family.max_nonzero.into(),
                 }),
             )
         })
@@ -315,16 +337,14 @@ fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNo
         .expect("declaration-order noise bindings")
 }
 
-fn terminal_value_bounds(
-    profile: &SparseLwrPrfProfile,
-    program: &SparseLwrPrfProgram,
-) -> Vec<BigUint> {
+fn terminal_value_bounds(profile: &SparseLwrPrfProfile, program: &LwrPrf) -> Vec<BigUint> {
+    // The half-integer readout `2 f - 1` is at most `P - 1`.
     let bound = profile
         .canonical_readout()
         .expect("canonical readout")
         .into_iter()
         .max()
-        .map(BigUint::from)
+        .map(|f| BigUint::from(2 * f - 1))
         .expect("nonempty canonical readout");
     vec![bound; program.program().outputs().len()]
 }
@@ -333,7 +353,7 @@ type SearchedFixture = (
     RnsBggParameters,
     DCRTPolyParams,
     SparseLwrPrfProfile,
-    SparseLwrPrfProgram,
+    LwrPrf,
     Vec<PbcGeneratedKeyLayout>,
     RnsBggNoiseTrace,
 );
@@ -549,7 +569,7 @@ fn fixture(
     parameters: RnsBggParameters,
     poly_parameters: DCRTPolyParams,
     profile: SparseLwrPrfProfile,
-    program: SparseLwrPrfProgram,
+    program: LwrPrf,
     keys: Vec<PbcGeneratedKeyLayout>,
     trace: RnsBggNoiseTrace,
     runtime: &mut impl api::StageExecution<api::StageStore>,
@@ -569,7 +589,6 @@ fn fixture(
             .sample_mask_secret(runtime, store, record(graphs, "mask"))
             .expect("mask secret")
     });
-    let zero = DCRTPoly::const_zero(&poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&poly_parameters, 0);
     let q = profile.q().expect("Q exponent") as u64;
     let a_exponents = (0..profile.lwr_dimension as u64)
@@ -611,18 +630,9 @@ fn fixture(
     // Selectors are fixed private RHS plaintexts: each output's key selects
     // one cell per block of its layout.
     let rhs = program
-        .selection_families()
-        .iter()
-        .map(|family| {
-            let bits =
-                program.selector_bits(family.output, &keys[family.output]).expect("key bits");
-            let values = bits[family.bucket]
-                .iter()
-                .map(|bit| if *bit == 1 { one.clone() } else { zero.clone() })
-                .collect();
-            (family.selector, InputBinding::Family(values))
-        })
-        .collect::<BTreeMap<_, _>>();
+        .prf
+        .selector_plaintexts::<DCRTPoly>(&poly_parameters, &keys)
+        .expect("selector plaintexts");
 
     Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, keys, a_exponents }
 }
@@ -640,19 +650,17 @@ fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBacke
 }
 
 /// Independent cleartext oracle for output `output`: `z = <a, k> mod Q`
-/// from the key's PBC schedule, then the signed readout `(-1)^b * tau_r` for
-/// `z = r + b * Q/2`. It never reads the production program graph.
-fn lwr_oracle(
-    profile: &SparseLwrPrfProfile,
-    key: &PbcGeneratedKeyLayout,
-    a: &[u64],
-) -> (bool, usize) {
+/// from the key's PBC schedule, then the signed half-integer readout
+/// `delta = (-1)^b (2 tau_r - 1)` for `z = r + b * Q/2`. It never reads the
+/// production program graph.
+fn lwr_oracle(profile: &SparseLwrPrfProfile, key: &PbcGeneratedKeyLayout, a: &[u64]) -> i64 {
     let q = profile.q().expect("Q exponent") as u64;
     let z = clear_pbc_inner_product(&key.public_layout, key.private_schedule(), a, q)
         .expect("clear PBC inner product") as usize;
     let half = q as usize / 2;
     let readout = profile.canonical_readout().expect("canonical readout");
-    if z < half { (false, readout[z]) } else { (true, readout[z - half]) }
+    let magnitude = 2 * readout[z % half] as i64 - 1;
+    if z < half { magnitude } else { -magnitude }
 }
 
 /// Stage storage selected by `MXX_EXPONENT_LUT_LWR_PRF_STORAGE`: `device`,
@@ -761,7 +769,7 @@ fn round_trip(
     parameters: RnsBggParameters,
     poly_parameters: DCRTPolyParams,
     profile: SparseLwrPrfProfile,
-    program: SparseLwrPrfProgram,
+    program: LwrPrf,
     keys: Vec<PbcGeneratedKeyLayout>,
     trace: RnsBggNoiseTrace,
     runtime: &mut impl api::StageExecution<api::StageStore>,
@@ -903,20 +911,19 @@ fn round_trip(
         return;
     }
     // Compute every output's expected readout independently from `a` and
-    // its key. The coefficient LUT returns the signed readout as the
-    // constant polynomial, so the expected plaintext is built in the source
-    // ring with the readout in coefficient 0 only; it is not decoded from the
-    // returned carrier. The terminal scale is floor(q / 2), so verification
-    // decides the readout modulo 2: only a key whose readout is odd tells a
-    // correct output from a zero one.
+    // its key. The coefficient LUT returns the signed half-integer readout
+    // `delta` as the constant polynomial, finalized to the scale `k` of its
+    // decryption modulus `2P`, so verification decides `delta` modulo `2P`;
+    // the expected plaintext is built in the source ring with `delta` in
+    // coefficient 0 only, not decoded from the returned carrier.
     let source_parameters = parameters.level(0).expect("LWR source parameters").clone();
     for (output, key) in keys.iter().enumerate() {
-        let (negative, readout) = lwr_oracle(&profile, key, &a_exponents);
-        let readout = u32::try_from(readout).expect("canonical readout fits DCRT coefficient");
+        let delta = lwr_oracle(&profile, key, &a_exponents);
+        let readout = u32::try_from(delta.unsigned_abs()).expect("readout fits a DCRT coefficient");
         let mut coefficients = vec![0; source_parameters.ring_dimension() as usize];
         coefficients[0] = readout;
         let expected = DCRTPoly::from_u32s(&source_parameters, &coefficients);
-        let expected = if negative { -expected } else { expected };
+        let expected = if delta < 0 { -expected } else { expected };
         verify_output(
             program.program(),
             &result,
@@ -933,9 +940,9 @@ fn round_trip(
     assert!(!trace.outputs.is_empty(), "noise trace must finalize declared output");
     assert!(!result.outputs.is_empty(), "online evaluation must produce output");
 
-    // Decryption of the first output: coefficient 0 of the terminal plaintext `±readout`,
-    // threshold-decoded modulo 2, is the readout's parity.
-    let (_, readout) = lwr_oracle(&profile, &keys[0], &a_exponents);
+    // Decryption of the first output: coefficient 0 of the terminal plaintext `delta`,
+    // threshold-decoded modulo 2P, is `delta mod 2P`.
+    let delta = lwr_oracle(&profile, &keys[0], &a_exponents);
     let decoded = decode_output(
         program.program(),
         &result,
@@ -949,7 +956,11 @@ fn round_trip(
         record(&graphs, "decode"),
     )
     .expect("LWR output decryption");
-    assert_eq!(decoded, vec![BigInt::from(readout % 2)], "decrypted LWR output parity");
+    assert_eq!(
+        decoded,
+        vec![BigInt::from(delta.rem_euclid(2 * profile.p() as i64))],
+        "decrypted LWR output modulo 2P"
+    );
 
     if let Some((id, row)) = recorded {
         export_claim(
@@ -971,7 +982,7 @@ fn export_claim(
     id: &str,
     row: &ParameterRow,
     profile: &SparseLwrPrfProfile,
-    program: &SparseLwrPrfProgram,
+    program: &LwrPrf,
     graphs: StageGraphs,
     payload: &mxx_exponent_lut::rns_bgg::RnsBggPayloadSecret,
     mask: &mxx_exponent_lut::rns_bgg::RnsBggMaskSecret,
@@ -986,14 +997,15 @@ fn export_claim(
 
 /// The executed LWR workflow of output 0 as a closed protocol: payload and mask sampling,
 /// preprocessing of the one-hot selectors, encryption of the state `X^0` and the public vector
-/// `a`, online evaluation, and decryption of coefficient 0 of the output, compared with the
-/// parity of the clear readout `rho(<a, k> mod Q)` of the selected cells. External inputs are the
+/// `a`, online evaluation, and decryption of coefficient 0 of the output modulo `2P`, compared
+/// with the clear half-integer readout `delta(<a, k> mod Q) mod 2P` of the selected cells.
+/// External inputs are the
 /// hash key, `a`, its plaintext monomials `±X^e` (a requirement ties `±X^e = X^(stride a)`), the
 /// selector bits of every block (a requirement makes each block one-hot), and the fixed unit
 /// coefficient and zero exponent of the state and of the selectors.
 fn lwr_protocol(
     profile: &SparseLwrPrfProfile,
-    program: &SparseLwrPrfProgram,
+    program: &LwrPrf,
     graphs: BTreeMap<&'static str, Graph>,
     payload: &mxx_exponent_lut::rns_bgg::RnsBggPayloadSecret,
     mask: &mxx_exponent_lut::rns_bgg::RnsBggMaskSecret,
@@ -1027,7 +1039,8 @@ fn lwr_protocol(
     let family = |count: usize| FamilyType { element: IntType, count: IntExpr::constant(count) };
     // Block `j` of output 0 reads coordinate `cells[j][c]` of `a`; dummy and padding cells read
     // the last member.
-    let blocks = program.layouts()[0]
+    assert_eq!(program.prf.members(), 1, "the exported claim covers one key");
+    let blocks = program.prf.layouts()[0]
         .cells
         .iter()
         .map(|cells| {
@@ -1040,13 +1053,14 @@ fn lwr_protocol(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let selector_families =
-        program.selection_families().iter().filter(|family| family.output == 0).collect::<Vec<_>>();
+    let selector_families = program.prf.selector_families();
     assert_eq!(selector_families.len(), blocks.len(), "one selector family per block");
 
-    // The ideal output: the parity of `rho(z) = floor(p' (z mod Q/2) / (Q/2)) + 1` for
-    // `z = sum_j a[cells[j][selected_j]]`. Block `j` adds `selector_j[c] a[cells[j][c]]` over its
-    // cells `c` in a loop; the cell coordinate is selected from the constant table of the block.
+    // The ideal output: `delta mod 2P` for the half-integer readout
+    // `delta = (-1)^b (2 tau(r) - 1)`, `tau(r) = floor(p' r / (Q/2)) + 1`, of
+    // `z mod Q = r + b Q/2` for `z = sum_j a[cells[j][selected_j]]`. Block `j` adds `selector_j[c]
+    // a[cells[j][c]]` over its cells `c` in a loop; the cell coordinate is selected from the
+    // constant table of the block.
     let block_sum = |selector: &Family<Int>, a: &Family<Int>, coordinates: &[usize]| {
         mxx_dsl::iterate(coordinates.len(), Int::constant(0), |cell, total| {
             let coordinate = mxx_dsl::select(
@@ -1066,9 +1080,15 @@ fn lwr_protocol(
             .expect("ideal selector");
         z = z.add(block_sum(&selector, &a, coordinates));
     }
-    let readout = z.rem(width).mul(profile.p_prime).div(width).add(1);
-    let ideal = IdealSpec::new(ideal.output("bit", readout.rem(2)).unwrap().build().unwrap().graph)
-        .unwrap();
+    // `delta mod 2P` is `m` for `b = 0` and `2P - m` for `b = 1`, with the
+    // magnitude `m = 2 tau(r) - 1` in `[1, P - 1]`.
+    let p = profile.p() as i64;
+    let magnitude =
+        z.clone().rem(width).mul(profile.p_prime() as i64).div(width).add(1).mul(2).sub(1);
+    let negative = z.rem(2 * width).div(width);
+    let value = magnitude.clone().add(negative.mul(Int::constant(2 * p).sub(magnitude.mul(2))));
+    let ideal =
+        IdealSpec::new(ideal.output("value", value).unwrap().build().unwrap().graph).unwrap();
 
     // The requirement: `±X^e = X^(stride a)` member by member, and one-hot selectors, each
     // checked in a loop.
@@ -1125,8 +1145,8 @@ fn lwr_protocol(
         .filter(|stage| !common::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
         .map(|stage| common::to_stage(stage, "rns-bgg/hash-key"))
         .collect();
-    let state = program.initial_input();
-    let vector = program.input_vector();
+    let state = program.prf.initial_input();
+    let vector = program.prf.input_vector();
     let mut externals = vec![
         common::external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
         common::external(
@@ -1155,13 +1175,13 @@ fn lwr_protocol(
         let rhs = |field: &str| {
             common::to_stage(
                 "preprocess",
-                &only("preprocess", format!("/rhs/{:?}.{field}", family.selector)),
+                &only("preprocess", format!("/rhs/{:?}.{field}", family.rhs)),
             )
         };
         let name = format!("selector_{block}");
         externals.push(common::external(
             &name,
-            family_range(family.capacity, 0, 1),
+            family_range(family.members, 0, 1),
             vec![
                 rhs("coefficient"),
                 ProtocolInputDestination::Ideal { input: name.clone() },
@@ -1170,13 +1190,13 @@ fn lwr_protocol(
         ));
         externals.push(common::external(
             &format!("selector_exponent_{block}"),
-            family_range(family.capacity, 0, 0),
+            family_range(family.members, 0, 0),
             vec![rhs("exponent")],
         ));
     }
     let (contracts, bindings): (Vec<_>, Vec<_>) = externals.into_iter().unzip();
 
-    // The decrypted coefficient 0 of the output, `decoded-0`, must equal the ideal parity.
+    // The decrypted coefficient 0 of the output, `decoded-0`, must equal the ideal value.
     let endpoint = EndpointSpecId::Exact;
     let failure_probability_log2 = match row["noise_model"].as_str() {
         "worst" => None,
@@ -1194,7 +1214,7 @@ fn lwr_protocol(
                 endpoints: vec![ComparatorEndpointBinding {
                     endpoint,
                     actual_input: "decoded-0".to_owned(),
-                    ideal_input: "bit".to_owned(),
+                    ideal_input: "value".to_owned(),
                     result_output: "failure".to_owned(),
                     failure_value: true,
                 }],
@@ -1207,7 +1227,7 @@ fn lwr_protocol(
                         stage: id("decode"),
                         output: "decoded-0".to_owned(),
                     },
-                    ideal_output: "bit".to_owned(),
+                    ideal_output: "value".to_owned(),
                 }],
             },
             operational_decoder_targets: Vec::new(),

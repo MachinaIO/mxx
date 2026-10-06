@@ -27,7 +27,7 @@ use mxx_backends::{
 use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
     ExpLayout, api,
-    noise_refresh::simulation::AverageCaseConfig,
+    decoder::simulation::AverageCaseConfig,
     program::{AttributeKnowledge, FamilyRange, InputBinding},
     program_gadgets::public_ip::PublicInnerProductProgram,
     rns_bgg::{

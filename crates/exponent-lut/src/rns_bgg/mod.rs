@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::{
-    noise_refresh::refresh::{RefreshDeclaration, RefreshError},
+    decoder::decoding::{DecoderDeclaration, DecoderError},
     program::{
         ExponentLUTProgramLowering, ExponentLutProgramId, InputBinding, InputShape, LutId, RhsId,
         WireId,
@@ -36,13 +36,14 @@ pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
     RnsOnlineEvalBuild, decode_output, decode_public_output, verify_output,
 };
+pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
-    RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound, RnsBggNoiseEvaluator,
-    RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameterManifest,
-    RnsBggPlanRequest, RnsBggRefreshNoise, RnsNoiseBuild,
+    RnsBggDecoderNoise, RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound,
+    RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue,
+    RnsBggParameterManifest, RnsBggPlanRequest, RnsNoiseBuild,
 };
 pub use public_key::{
-    PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild, sample_refresh_decoder,
+    PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild, sample_unmask_trapdoor,
 };
 pub use workload::RnsBggDerivedWorkload;
 
@@ -67,29 +68,29 @@ pub type RnsBggMatrix = ((Mat, Mat), (Mat, Mat));
 pub(crate) type RnsBggDigits = ((Preimage, Preimage), (Preimage, Preimage));
 /// Bounded digits of a right action, represented in the ring that consumes them.
 pub(crate) type RnsBggDecomposition = ((SmallMatrix, SmallMatrix), (SmallMatrix, SmallMatrix));
-fn refresh_commitment_hex(commitment: [u8; 32]) -> String {
+fn decoder_commitment_hex(commitment: [u8; 32]) -> String {
     commitment.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// `refresh/<commitment>/<role>`: the namespace of every artifact of one
-/// refresh declaration.
-pub(crate) fn refresh_artifact_name(commitment: [u8; 32], role: &str) -> String {
-    format!("refresh/{}/{role}", refresh_commitment_hex(commitment))
+/// `decoder/<commitment>/<role>`: the namespace of every artifact of one
+/// decoder declaration.
+pub(crate) fn decoder_artifact_name(commitment: [u8; 32], role: &str) -> String {
+    format!("decoder/{}/{role}", decoder_commitment_hex(commitment))
 }
 
-/// `refresh/<commitment>/mask/<role>`: an artifact of the refresh's mask
+/// `decoder/<commitment>/smudge/<role>`: an artifact of the decoder's smudge
 /// Program child.
-pub(crate) fn refresh_mask_artifact_name(commitment: [u8; 32], role: &str) -> String {
-    refresh_artifact_name(commitment, &format!("mask/{role}"))
+pub(crate) fn decoder_smudge_artifact_name(commitment: [u8; 32], role: &str) -> String {
+    decoder_artifact_name(commitment, &format!("smudge/{role}"))
 }
 
-/// The public-key artifact `port` of mask Program input `wire`.
-pub(crate) fn refresh_mask_input_key_artifact_name(
+/// The public-key artifact `port` of smudge Program input `wire`.
+pub(crate) fn decoder_smudge_input_key_artifact_name(
     commitment: [u8; 32],
     wire: WireId,
     port: usize,
 ) -> String {
-    refresh_mask_artifact_name(commitment, &format!("input-key/{wire:?}.{port}"))
+    decoder_smudge_artifact_name(commitment, &format!("input-key/{wire:?}.{port}"))
 }
 
 /// Build the canonical path of the switching ciphertexts of LUT `lut`
@@ -130,7 +131,7 @@ pub enum RnsBggError {
     #[error(transparent)]
     Prf(#[from] PrfError),
     #[error(transparent)]
-    Refresh(#[from] crate::noise_refresh::refresh::RefreshError),
+    Decoder(#[from] crate::decoder::decoding::DecoderError),
     #[error("invalid RNS-BGG LUT")]
     Lut,
     #[error("RNS-BGG graph construction failed: {0}")]
@@ -342,42 +343,45 @@ impl RnsBggParameters {
     /// Columns per component of the switching target of a LUT whose switching
     /// ciphertexts live at `next_level`, and so of its raw output carrier.
     ///
-    /// A scaled output (`Exponent` or `Coefficient`) uses the state gadget of
-    /// `next_level`, i.e. `component_columns(next_level)`. An
-    /// `UnscaledCoefficient` output uses the full public gadget of
-    /// `next_level`, i.e. its `modulus_digits`: its payload carries no scale
-    /// that could annihilate the multiples of a smaller gadget modulus, so the
-    /// gadget modulus must be the finalized carrier's own (see
-    /// [`Self::lut_switching_target`]).
+    /// An `Exponent` output uses the state gadget of `next_level`, i.e.
+    /// `component_columns(next_level)`. A `Coefficient` output uses the full
+    /// public gadget of `next_level`, i.e. its `modulus_digits`: its payload
+    /// carries no scale that could annihilate the multiples of a smaller
+    /// gadget modulus, so the gadget modulus must be the finalized carrier's
+    /// own (see `lut_switching_target`).
     pub fn lut_output_columns(
         &self,
         next_level: usize,
         representation: crate::program::LutOutputRepresentation,
     ) -> Result<usize, RnsBggError> {
         match representation {
-            crate::program::LutOutputRepresentation::UnscaledCoefficient => {
+            crate::program::LutOutputRepresentation::Coefficient => {
                 Ok(self.level(next_level)?.modulus_digits())
             }
-            _ => self.component_columns(next_level),
+            crate::program::LutOutputRepresentation::Exponent(_) => {
+                self.component_columns(next_level)
+            }
         }
     }
 
     /// The scale and gadget of the switching target of a LUT whose switching
-    /// ciphertexts live at `next_level`. A scaled output uses
-    /// `message_scale(next_level)` and `state_gadget(next_level)`; an
-    /// `UnscaledCoefficient` output uses scale 1 and `public_gadget(next_level)`,
-    /// so that after the source-level action (`Delta_l`) and the one
-    /// finalizing ModDown its payload is exactly `v r G_(next_level)`.
+    /// ciphertexts live at `next_level`. An `Exponent` output uses
+    /// `message_scale(next_level)` and `state_gadget(next_level)`; a
+    /// `Coefficient` output uses scale 1 and `public_gadget(next_level)`, so
+    /// that after the source-level action (`Delta_l`) and the one finalizing
+    /// ModDown its payload is exactly `v r G_(next_level)`.
     pub(crate) fn lut_switching_target(
         &self,
         next_level: usize,
         representation: crate::program::LutOutputRepresentation,
     ) -> Result<(BigUint, Mat), RnsBggError> {
         match representation {
-            crate::program::LutOutputRepresentation::UnscaledCoefficient => {
+            crate::program::LutOutputRepresentation::Coefficient => {
                 Ok((BigUint::from(1u8), self.public_gadget(next_level)?))
             }
-            _ => Ok((self.message_scale(next_level)?, self.state_gadget(next_level)?)),
+            crate::program::LutOutputRepresentation::Exponent(_) => {
+                Ok((self.message_scale(next_level)?, self.state_gadget(next_level)?))
+            }
         }
     }
 
@@ -635,10 +639,122 @@ impl RnsBggParameters {
             .unwrap_or_default())
     }
 
-    /// The decoder trapdoor of a refresh decoded at `level`: its gadget base
+    /// The decryption modulus `t = 2 (W + 1)` of a coefficient output with
+    /// payload bound `W` (see
+    /// [`crate::program::ExponentLutProgram::wire_coefficient_bound`]), so
+    /// that its payload lies in `(-t/2, t/2)`.
+    pub fn coefficient_decoding_modulus(bound: u64) -> Result<u64, RnsBggError> {
+        bound
+            .checked_add(1)
+            .and_then(|bound| bound.checked_mul(2))
+            .ok_or(RnsBggError::Parameters("coefficient decoding modulus overflow"))
+    }
+
+    /// The scale `k` of a coefficient output finalized at `level` and
+    /// decrypted modulo `t`, and the loss `r = q - t k`.
+    ///
+    /// `k = floor(floor(q/t) / 2^b) 2^b` for the largest `b >= 0` with
+    /// `t 2^b <= q/(32 t)` (`b = 0` if there is none), so `0 <= r < t 2^b`:
+    /// clearing the low bits of `k` keeps the balanced digits of `G^-1(k)`
+    /// small while the decoding loss `r W / t` stays below `q/(64 t)`.
+    pub fn coefficient_output_scale(
+        &self,
+        level: usize,
+        t: u64,
+    ) -> Result<(BigUint, BigUint), RnsBggError> {
+        if t < 2 {
+            return Err(RnsBggError::Parameters("coefficient decoding modulus below two"));
+        }
+        let q: BigUint = self.level(level)?.modulus().as_ref().clone();
+        let t = BigUint::from(t);
+        let limit = &q / (&t * &t * 32u8);
+        let low_bits = if limit.is_zero() { 0 } else { limit.bits() - 1 };
+        let k = ((&q / &t) >> low_bits) << low_bits;
+        if k.is_zero() {
+            return Err(RnsBggError::Parameters(
+                "coefficient output modulus below its decoding modulus",
+            ));
+        }
+        let loss = &q - &t * &k;
+        Ok((k, loss))
+    }
+
+    /// The decryption of the coefficient output `wire` of `program`, finalized
+    /// at `level`: its decryption modulus `t` (from the payload bound), its
+    /// scale `k` and the loss `r = q - t k` (see
+    /// [`Self::coefficient_output_scale`]).
+    pub(crate) fn coefficient_output_decoding(
+        &self,
+        program: &crate::program::ExponentLutProgram,
+        wire: WireId,
+        level: usize,
+    ) -> Result<(u64, BigUint, BigUint), RnsBggError> {
+        let bound = program
+            .wire_coefficient_bound(wire)
+            .map_err(|_| RnsBggError::Binding("coefficient output metadata"))?
+            .ok_or(RnsBggError::Binding("not a coefficient output"))?;
+        let t = Self::coefficient_decoding_modulus(bound)?;
+        let (k, loss) = self.coefficient_output_scale(level, t)?;
+        Ok((t, k, loss))
+    }
+
+    /// The finalization action `G^-1(k)` of a coefficient output finalized at
+    /// `level` with scale `k`: right-multiplying its carrier, whose payload
+    /// is `v G`, gives the payload `k v` against the identity gadget.
+    pub(crate) fn coefficient_output_action(
+        &self,
+        level: usize,
+        k: &BigUint,
+    ) -> Result<SmallMatrix, RnsBggError> {
+        self.gadget_inverse(level, level, self.weight_row(level, std::slice::from_ref(k))?)
+    }
+
+    /// The `l1` norm and the squared `l2` norm of `G^-1(k)` at `level`, the
+    /// finalization action of a coefficient output: per tower, the balanced
+    /// base-`B` digits of the centered residue of `k`, exactly as the runtime
+    /// decomposition computes them. The level's gadget must be exact (no
+    /// dropped moduli), so that `G G^-1(k) = k`.
+    pub(crate) fn gadget_inverse_norms(
+        &self,
+        level: usize,
+        k: &BigUint,
+    ) -> Result<(BigUint, BigUint), RnsBggError> {
+        let parameters = self.level(level)?;
+        if parameters.dropped_moduli() != 0 {
+            return Err(RnsBggError::Parameters("a coefficient output needs an exact gadget"));
+        }
+        let (moduli, _, _) = parameters.to_crt();
+        let digits = parameters.modulus_digits() / moduli.len();
+        let base = 1i128 << parameters.base_bits();
+        let (mut l1, mut l2_squared) = (BigUint::zero(), BigUint::zero());
+        for modulus in moduli {
+            let residue = (k % modulus).to_u64().expect("a residue fits its tower");
+            let mut value = if 2 * u128::from(residue) > u128::from(modulus) {
+                i128::from(residue) - i128::from(modulus)
+            } else {
+                i128::from(residue)
+            };
+            for _ in 0..digits {
+                let (quotient, remainder) = (value.div_euclid(base), value.rem_euclid(base));
+                let (digit, next) = if remainder < base / 2 {
+                    (remainder, quotient)
+                } else if remainder > base / 2 || quotient % 2 != 0 {
+                    (remainder - base, quotient + 1)
+                } else {
+                    (remainder, quotient)
+                };
+                l1 += digit.unsigned_abs();
+                l2_squared += digit.unsigned_abs() * digit.unsigned_abs();
+                value = next;
+            }
+        }
+        Ok((l1, l2_squared))
+    }
+
+    /// The unmask trapdoor of a decoder at `level`: its gadget base
     /// and digit count are the level's own, and the preimage coefficient
     /// bound is the sampler's default cutoff for trapdoor sigma `sigma`.
-    pub fn refresh_decoder_gadget(
+    pub fn unmask_gadget(
         &self,
         level: usize,
         sigma: f64,
@@ -648,61 +764,132 @@ impl RnsBggParameters {
         let digits = parameters.modulus_digits();
         let bound = mxx_backends::sampler::bounds::default_preimage_cutoff(
             parameters.ring_dimension(),
-            crate::noise_refresh::decoder::DECODER_ROWS,
+            crate::decoder::unmask::UNMASK_ROWS,
             digits,
-            u32::try_from(base).map_err(|_| RnsBggError::Parameters("decoder gadget base"))?,
+            u32::try_from(base).map_err(|_| RnsBggError::Parameters("unmask gadget base"))?,
             sigma,
         )
-        .ok_or(RnsBggError::Parameters("invalid decoder trapdoor sigma"))?;
+        .ok_or(RnsBggError::Parameters("invalid unmask trapdoor sigma"))?;
         Ok((base, digits, bound))
     }
 
     /// The level of the source output of `declaration` in `source_program`.
-    pub(crate) fn refresh_source_level(
-        declaration: &RefreshDeclaration,
+    pub(crate) fn decoder_source_level(
+        declaration: &DecoderDeclaration,
         source_program: &crate::program::ExponentLutProgram,
     ) -> Result<usize, RnsBggError> {
         if source_program.id() != declaration.source_program() {
-            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+            return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
         RnsBggDerivedWorkload::from_program(source_program)?.level(declaration.source_output())
     }
 
-    /// The parameter chain of `declaration`'s mask Program child: `m` copies
-    /// of the parameters of the source level `L` of `source_program`, where
-    /// `m - 2` is the level of the mask LUT inputs. Every scale of the chain
-    /// is 1, and an `UnscaledCoefficient` output finalized to level `m - 1`
-    /// carries `v r G` with `G` the full gadget of `q_L`: the source ring.
-    /// The source level must leave a level `L + 1` (the plaintext modulus
-    /// `p`), and the declaration must mask every coefficient of the source
-    /// ring.
-    pub fn refresh_mask_parameters(
+    /// The level `s` of the final smudge LUT input of `declaration`: its
+    /// smudge chain has `s + 2` levels, the last being the decoding level.
+    pub fn decoder_smudge_level(declaration: &DecoderDeclaration) -> Result<usize, RnsBggError> {
+        RnsBggDerivedWorkload::from_program(declaration.smudge().program())?
+            .level(declaration.smudge().output())
+    }
+
+    /// The smudge chain of `declaration`'s decoder of `source_program`: `s + 2`
+    /// levels `j` whose moduli are the first `depth(L) + primes_per_drop *
+    /// ceil((s + 1 - j) / operations_per_drop)` primes of `pool`, where
+    /// `depth(L)` is the CRT depth of the decoding level `L` and `pool` lists
+    /// the primes of `q_L` first. The last level is `q_L` itself and the step
+    /// into it is always a drop, so every smudge LUT, including the final
+    /// coefficient LUT, divides its noise at a cadence boundary.
+    pub fn decoder_smudge_parameters(
         &self,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
         source_program: &crate::program::ExponentLutProgram,
+        pool: &DCRTPolyParams,
+        primes_per_drop: usize,
     ) -> Result<Self, RnsBggError> {
-        let source_level = Self::refresh_source_level(declaration, source_program)?;
-        if source_level + 1 >= self.levels.len() {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+        let level = Self::decoder_source_level(declaration, source_program)?;
+        let decoding = self.level(level)?;
+        let decoding_primes = decoding.to_crt().0;
+        let primes = pool.to_crt().0;
+        let smudge_level = Self::decoder_smudge_level(declaration)?;
+        if primes_per_drop == 0 || !primes.starts_with(&decoding_primes) {
+            return Err(RnsBggError::Decoder(DecoderError::InvalidModulusRelation));
         }
+        let levels = (0..smudge_level + 2)
+            .map(|j| {
+                let drops = (smudge_level + 1 - j).div_ceil(self.operations_per_drop);
+                let depth = decoding_primes.len() + drops * primes_per_drop;
+                let modulus = primes
+                    .get(..depth)
+                    .ok_or(RnsBggError::Decoder(DecoderError::InvalidModulusRelation))?
+                    .iter()
+                    .copied()
+                    .map(BigUint::from)
+                    .product();
+                pool.select_modulus(&modulus)
+                    .ok_or(RnsBggError::Decoder(DecoderError::InvalidModulusRelation))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let smudge =
+            Self::new(levels, self.encoding_error_sigma.clone(), self.operations_per_drop)?
+                .with_rhs_mode(self.rhs_mode);
+        self.validate_decoder_smudge_parameters(&smudge, declaration, source_program)?;
+        Ok(smudge)
+    }
+
+    /// Check that `smudge` is a smudge chain of `declaration`'s decoder of
+    /// `source_program` at these parameters: `s + 2` levels of non-increasing
+    /// moduli, each a CRT sub-basis of the one before, with a strict drop into
+    /// the last level, which is the decoding level `L` with its CRT basis. The
+    /// level `L + 1` (the plaintext modulus `p`) must be a strict drop, and the
+    /// declaration must smudge every coefficient of the decoding ring.
+    pub(crate) fn validate_decoder_smudge_parameters(
+        &self,
+        smudge: &Self,
+        declaration: &DecoderDeclaration,
+        source_program: &crate::program::ExponentLutProgram,
+    ) -> Result<(), RnsBggError> {
+        let relation = RnsBggError::Decoder(DecoderError::InvalidModulusRelation);
+        let level = Self::decoder_source_level(declaration, source_program)?;
+        let decoding = self.level(level)?;
+        let plaintext = self
+            .level(level + 1)
+            .map_err(|_| RnsBggError::Decoder(DecoderError::InvalidModulusRelation))?;
         // Every coefficient of the decoded row carries noise, so every
-        // coefficient is masked.
-        if declaration.coefficients() != self.level(source_level)?.ring_dimension() as usize {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidMaskProgram));
+        // coefficient is smudged.
+        if declaration.coefficients() != decoding.ring_dimension() as usize {
+            return Err(RnsBggError::Decoder(DecoderError::InvalidSmudgeProgram));
         }
-        let workload = RnsBggDerivedWorkload::from_program(declaration.mask().program())?;
-        let [digit, parity] = crate::noise_refresh::refresh::MaskFamily::ALL
-            .map(|family| workload.level(declaration.mask().output(family)));
-        let mask_level = digit?;
-        if parity? != mask_level {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidMaskProgram));
+        let smudge_level = Self::decoder_smudge_level(declaration)?;
+        let levels = smudge.levels();
+        let depth = |params: &DCRTPolyParams| params.to_crt().0.len();
+        if plaintext.modulus() == decoding.modulus() ||
+            levels.len() != smudge_level + 2 ||
+            !compatible_level_parameters(&levels[smudge_level + 1], decoding) ||
+            depth(&levels[smudge_level]) <= depth(decoding) ||
+            smudge.encoding_error_sigma != self.encoding_error_sigma ||
+            smudge.rhs_mode != self.rhs_mode
+        {
+            return Err(relation);
         }
-        Self::new(
-            vec![self.level(source_level)?.clone(); mask_level + 2],
-            self.encoding_error_sigma.clone(),
-            self.operations_per_drop,
-        )
-        .map(|parameters| parameters.with_rhs_mode(self.rhs_mode))
+        for pair in levels.windows(2) {
+            if !compatible_level_parameters_except_basis(&pair[0], &pair[1]) ||
+                !pair[0].to_crt().0.starts_with(&pair[1].to_crt().0)
+            {
+                return Err(relation);
+            }
+        }
+        Ok(())
+    }
+
+    /// `2^-1 w mod q_level` for every weight numerator `w`: `q_level` is a
+    /// product of odd primes, so 2 is invertible.
+    pub(crate) fn halved_weights(
+        &self,
+        level: usize,
+        numerators: &[BigUint],
+    ) -> Result<Vec<BigUint>, RnsBggError> {
+        let modulus: BigUint = self.level(level)?.modulus().as_ref().clone();
+        let half = (&modulus + 1u8) / 2u8;
+        Ok(numerators.iter().map(|numerator| numerator * &half % &modulus).collect())
     }
 }
 
@@ -839,9 +1026,9 @@ pub(crate) struct RnsBggArtifactBinding {
     parameters: [u8; 32],
     hash_key_commitment: [u8; 32],
     sources: Vec<mxx_ir_core::artifact::ProductionId>,
-    /// The applied refresh: its declaration commitment and the coefficient
-    /// bound of its decoder preimage `K`.
-    refresh: Option<([u8; 32], BigUint)>,
+    /// The applied decoder: its declaration commitment and the coefficient
+    /// bound of its unmask preimage `K`.
+    decoder: Option<([u8; 32], BigUint)>,
     /// The logical level of each Program input, which encryption encodes it
     /// at.
     input_levels: BTreeMap<WireId, usize>,
@@ -877,7 +1064,7 @@ impl RnsBggArtifactBinding {
             parameters,
             hash_key_commitment,
             sources: Vec::new(),
-            refresh: None,
+            decoder: None,
             ciphertext_prelude: None,
             input_levels: BTreeMap::new(),
             rhs_mode,
@@ -924,13 +1111,13 @@ impl RnsBggArtifactBinding {
         &self.dynamic_luts
     }
 
-    /// Binds a refresh declaration to this stage's artifact identity.
-    pub(crate) fn with_refresh(
+    /// Binds a decoder declaration to this stage's artifact identity.
+    pub(crate) fn with_decoder(
         mut self,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
         preimage_bound: BigUint,
     ) -> Self {
-        self.refresh = Some((*declaration.commitment(), preimage_bound));
+        self.decoder = Some((*declaration.commitment(), preimage_bound));
         self
     }
 
@@ -983,13 +1170,13 @@ impl RnsBggArtifactBinding {
         self.ciphertext_prelude.as_ref()
     }
 
-    pub(crate) fn refresh_commitment(&self) -> Option<&[u8; 32]> {
-        self.refresh.as_ref().map(|(commitment, _)| commitment)
+    pub(crate) fn decoder_commitment(&self) -> Option<&[u8; 32]> {
+        self.decoder.as_ref().map(|(commitment, _)| commitment)
     }
 
-    /// The coefficient bound of the applied refresh's decoder preimage.
-    pub(crate) fn refresh_preimage_bound(&self) -> Option<&BigUint> {
-        self.refresh.as_ref().map(|(_, bound)| bound)
+    /// The coefficient bound of the applied decoder's unmask preimage.
+    pub(crate) fn unmask_preimage_bound(&self) -> Option<&BigUint> {
+        self.decoder.as_ref().map(|(_, bound)| bound)
     }
 }
 
@@ -1023,16 +1210,16 @@ rns_bgg_stage_descriptor!(RnsBggPreprocessOnlineEvalDescriptor);
 
 rns_bgg_stage_descriptor!(RnsBggEncryptionDescriptor);
 
-/// Descriptor of the trusted decoder setup of one refresh: the public `B`
-/// and its trapdoor at the refresh's decoding level, with the parameters
+/// Descriptor of the trusted unmask setup of one decoder: the public `B`
+/// and its trapdoor at the decoder's decoding level, with the parameters
 /// needed to import the trapdoor. Only the trusted preprocessor reads this
 /// production; online evaluation and encryption see `B` through the
 /// preprocess republication only.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RnsBggDecoderSetupDescriptor {
+pub struct RnsBggUnmaskSetupDescriptor {
     pub(crate) context: [u8; 32],
     pub(crate) parameters: [u8; 32],
-    pub(crate) refresh_commitment: [u8; 32],
+    pub(crate) decoder_commitment: [u8; 32],
     pub(crate) level: usize,
     /// The trapdoor sigma, as a canonical decimal string.
     pub(crate) sigma: String,
@@ -1057,28 +1244,27 @@ pub(crate) fn hash_key_commitment(hash_key: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/// One-shot refresh invocation shared by the stage lowerers: the source
-/// carrier of the refreshed output, lowered by the outer stage.
-pub(crate) struct RnsBggRefresh<'a, E: ExponentLUTProgramLowering> {
+/// One-shot decoder invocation shared by the stage lowerers: the source
+/// carrier of the decoded output, lowered by the outer stage.
+pub(crate) struct RnsBggDecoder<'a, E: ExponentLUTProgramLowering> {
     pub(crate) lowerer: &'a mut E,
     pub(crate) source: E::Wire,
 }
 
-/// The member transform of the refresh mask: member `member` of `family`
-/// of the mask Program, whose finalized carrier at `level` has payload
-/// `v r G_level`, is right-multiplied by `G_level^-1(w)` for its weight `w`
-/// and then by `X^coefficient`. Returns that action and that monomial; both
-/// are graph values chosen per member, built without loop-dependent
-/// constants.
-pub(crate) fn refresh_member_action(
+/// The member transform of the decoder smudge: member `member` of the smudge
+/// Program, whose finalized carrier at `level` has payload `v r G_level`, is
+/// right-multiplied by `G_level^-1(w)` for its halved weight `w = 2^-1 P^digit
+/// mod q_level` and then by `X^coefficient`. Returns that action and that
+/// monomial; both are graph values chosen per member, built without
+/// loop-dependent constants.
+pub(crate) fn smudge_member_action(
     parameters: &RnsBggParameters,
-    declaration: &RefreshDeclaration,
-    family: crate::noise_refresh::refresh::MaskFamily,
+    declaration: &DecoderDeclaration,
     member: IntExpr,
     level: usize,
 ) -> Result<(SmallMatrix, mxx_dsl::Int), RnsBggError> {
-    let weights = declaration.member_weights(family);
-    let (coefficient, index) = declaration.member_placement(family, member);
+    let weights = parameters.halved_weights(level, &declaration.member_weights())?;
+    let (coefficient, index) = declaration.member_placement(member);
     let row = parameters.weight_row(level, &weights)?;
     let weight = if weights.len() == 1 { row } else { row_entry(&row, index) };
     Ok((parameters.gadget_inverse(level, level, weight)?, mxx_dsl::Int::evaluate(coefficient)))
@@ -1341,7 +1527,7 @@ pub(crate) fn ciphertext_matrix(
 /// member or LUT branch consumed at `level`.
 ///
 /// It names public setup coordinates only: the parameter identity, setup
-/// context, Program, the refresh declaration of an embedded mask Program
+/// context, Program, the decoder declaration of an embedded smudge Program
 /// child, the material (`rhs/<id>` or `lut/<id>`), and its member or branch.
 /// No encryption batch, plaintext, ciphertext, or digit enters it, so every
 /// encryption under one setup shares these keys and the Program keys
@@ -1361,7 +1547,7 @@ pub(crate) fn companion_tag(
     tag.push(hex(context));
     tag.push(hex(program.as_bytes()));
     if let Some(commitment) = namespace {
-        tag.push("refresh");
+        tag.push("decoder");
         tag.push(hex(&commitment));
     }
     tag.push(material);
@@ -1891,6 +2077,94 @@ mod tests {
     use mxx_ir_core::IntExpr;
     use num_traits::One;
 
+    /// `k = floor(floor(q/t)/2^b) 2^b` with the largest admissible `b`
+    /// (`t 2^b <= q/(32 t)`), so `0 <= r = q - t k < t 2^b` and
+    /// `r <= q/(32 t)`; without an admissible `b`, `b = 0`; `t` above `q` is
+    /// rejected.
+    #[test]
+    fn coefficient_output_scale_clears_low_bits_within_the_loss() {
+        let wide = DCRTPolyParams::new(16, 3, 17, 4, None, None);
+        let narrow = wide.select_modulus(&BigUint::from(wide.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![wide, narrow], 1, 1).unwrap();
+        for (level, t) in [(0, 8u64), (0, 64), (1, 8), (1, 256)] {
+            let q: BigUint = parameters.level(level).unwrap().modulus().as_ref().clone();
+            let (k, r) = parameters.coefficient_output_scale(level, t).unwrap();
+            let t_big = BigUint::from(t);
+            assert_eq!(&t_big * &k + &r, q);
+            let limit = &q / (&t_big * &t_big * 32u8);
+            if limit.is_zero() {
+                assert_eq!(k, &q / &t_big, "no admissible b: k = floor(q/t)");
+                assert!(r < t_big);
+            } else {
+                let low_bits = limit.bits() - 1;
+                assert_eq!(k.trailing_zeros().unwrap_or(0) >= low_bits, true);
+                assert!(r < &t_big << low_bits);
+                assert!(&r * &t_big * 32u8 <= q);
+            }
+        }
+        let q = parameters.level(1).unwrap().modulus().as_ref().to_u64().unwrap();
+        assert!(parameters.coefficient_output_scale(1, q + 1).is_err());
+        assert!(parameters.coefficient_output_scale(1, 1).is_err());
+    }
+
+    /// The norms of `G^-1(k)` are those of the digits the runtime
+    /// decomposition computes, and the digits reconstruct `k`.
+    #[test]
+    fn gadget_inverse_norms_match_the_runtime_decomposition() {
+        use mxx_backends::{
+            MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend, poly::Poly,
+        };
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let q: BigUint = level.modulus().as_ref().clone();
+        let ring = parameters.ring(0).unwrap();
+        let columns = level.modulus_digits();
+        let (scaled, _) = parameters.coefficient_output_scale(0, 12).unwrap();
+        for k in [scaled, &q - 1u8, BigUint::from(12345u32)] {
+            let action = parameters.coefficient_output_action(0, &k).unwrap();
+            let digits = action.clone().right_multiply(ring.identity(columns));
+            let reconstruction = action.right_multiply(parameters.public_gadget(0).unwrap());
+            let graph = mxx_dsl::DslContext::new("gadget-inverse-norms")
+                .output("digits", digits)
+                .unwrap()
+                .output("reconstruction", reconstruction)
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut execution = CpuExecution::new(cpu_backend([level.clone()]));
+            let mut store = MemoryArtifactStore::default();
+            let result = crate::api::execute_graph(
+                crate::api::StageGraph::new(graph, BTreeMap::new(), BTreeMap::new()),
+                &mxx_ir_core::ParamEnv::default(),
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let download = |name: &str| {
+                <CpuExecution as crate::api::StageExecution<MemoryArtifactStore>>::download_matrix(
+                    &execution,
+                    &result.outputs[name],
+                )
+                .unwrap()
+            };
+            let centered = |value: BigUint| {
+                let value = BigInt::from(value);
+                let q = BigInt::from(q.clone());
+                if &value * 2u8 > q { value - q } else { value }
+            };
+            let digits = download("digits");
+            let (mut l1, mut l2_squared) = (BigUint::zero(), BigUint::zero());
+            for row in 0..columns {
+                let digit = centered(digits.entry(row, 0).coeffs_biguints()[0].clone());
+                l1 += digit.magnitude();
+                l2_squared += digit.magnitude() * digit.magnitude();
+            }
+            assert_eq!(parameters.gadget_inverse_norms(0, &k).unwrap(), (l1, l2_squared));
+            assert_eq!(download("reconstruction").entry(0, 0).coeffs_biguints()[0], k);
+        }
+    }
+
     #[test]
     fn parameter_drops_are_exact_and_terminal_is_one() {
         let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
@@ -2030,38 +2304,55 @@ mod tests {
         ));
     }
 
-    /// The mask chain repeats the source level up to the mask LUT inputs
-    /// plus two levels; a source without a plaintext level below it, or a
-    /// declaration that does not mask every coefficient, is rejected.
+    /// Pool-prefix parameters: a 12-prime pool, the decoding level `q_L` of
+    /// its first three primes and the plaintext level of its first prime.
+    pub(crate) fn decoder_test_chain() -> (DCRTPolyParams, RnsBggParameters) {
+        let pool = DCRTPolyParams::new(8, 12, 30, 15, None, None);
+        let prefix = |depth: usize| {
+            let modulus =
+                pool.to_crt().0[..depth].iter().map(|prime| BigUint::from(*prime)).product();
+            pool.select_modulus(&modulus).unwrap()
+        };
+        let parameters = RnsBggParameters::new(vec![prefix(3), prefix(1)], 1, 1).unwrap();
+        (pool, parameters)
+    }
+
+    /// The smudge chain descends by `primes_per_drop` primes per smudge level
+    /// to the decoding level; a repeated decoding level, a source without a
+    /// plaintext level below it, or a declaration that does not smudge every
+    /// coefficient, is rejected.
     #[test]
-    fn refresh_mask_parameters_repeat_the_source_level_and_check_the_contract() {
-        let level = DCRTPolyParams::new(8, 3, 30, 15, None, None);
-        let plaintext = level.select_modulus(&BigUint::from(level.to_crt().0[0])).unwrap();
-        let parameters =
-            RnsBggParameters::new(vec![level.clone(), plaintext.clone()], 1, 1).unwrap();
+    fn decoder_smudge_parameters_descend_to_the_decoding_level_and_check_the_contract() {
+        let (pool, parameters) = decoder_test_chain();
+        let level = parameters.level(0).unwrap().clone();
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
         let source = builder.finish(vec![crate::program::Operand::Scalar(input)]).unwrap();
-        let (declaration, _) =
-            crate::noise_refresh::refresh::fixture::declaration(&source, input, 8, 1);
-        let mask = parameters.refresh_mask_parameters(&declaration, &source).unwrap();
-        let mask_level = RnsBggDerivedWorkload::from_program(declaration.mask().program())
-            .unwrap()
-            .level(declaration.mask().output(crate::noise_refresh::refresh::MaskFamily::Digit))
-            .unwrap();
-        assert_eq!(mask.levels().len(), mask_level + 2);
-        assert!(mask.levels().iter().all(|entry| entry == &level));
+        let (declaration, _) = crate::decoder::decoding::fixture::declaration(&source, input, 8, 1);
+        let smudge = parameters.decoder_smudge_parameters(&declaration, &source, &pool, 1).unwrap();
+        let smudge_level = RnsBggParameters::decoder_smudge_level(&declaration).unwrap();
+        assert_eq!(smudge.levels().len(), smudge_level + 2);
+        let depths = smudge.levels().iter().map(|entry| entry.to_crt().0.len()).collect::<Vec<_>>();
+        assert_eq!(
+            depths,
+            (0..smudge_level + 2).map(|j| 3 + smudge_level + 1 - j).collect::<Vec<_>>()
+        );
+        assert_eq!(smudge.levels().last(), Some(&level));
 
+        let repeated = RnsBggParameters::new(vec![level.clone(); smudge_level + 2], 1, 1).unwrap();
+        assert!(matches!(
+            parameters.validate_decoder_smudge_parameters(&repeated, &declaration, &source),
+            Err(RnsBggError::Decoder(DecoderError::InvalidModulusRelation))
+        ));
         let terminal = RnsBggParameters::new(vec![level], 1, 1).unwrap();
         assert!(matches!(
-            terminal.refresh_mask_parameters(&declaration, &source),
-            Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))
+            terminal.decoder_smudge_parameters(&declaration, &source, &pool, 1),
+            Err(RnsBggError::Decoder(DecoderError::InvalidModulusRelation))
         ));
-        let (partial, _) =
-            crate::noise_refresh::refresh::fixture::declaration(&source, input, 4, 1);
+        let (partial, _) = crate::decoder::decoding::fixture::declaration(&source, input, 4, 1);
         assert!(matches!(
-            parameters.refresh_mask_parameters(&partial, &source),
-            Err(RnsBggError::Refresh(RefreshError::InvalidMaskProgram))
+            parameters.decoder_smudge_parameters(&partial, &source, &pool, 1),
+            Err(RnsBggError::Decoder(DecoderError::InvalidSmudgeProgram))
         ));
     }
 

@@ -2,20 +2,33 @@
 use super::*;
 
 impl RnsBggParameters {
-    /// Check the terminal coefficient representation after its single final
-    /// ModDown using the q/4 correctness threshold.
-    pub fn coefficient_output_noise_fits(
+    /// The decoding budget of the coefficient output `wire` of `program`,
+    /// whose source level is `level`: the finalized error `e` must satisfy
+    /// `|e| < (q - 2 r W) / (2 t)`, i.e. `2 t |e| + 2 r W < q`, for its
+    /// finalized modulus `q`, decryption modulus `t`, scale loss `r` (see
+    /// [`RnsBggParameters::coefficient_output_decoding`]) and payload bound
+    /// `W`.
+    pub fn coefficient_output_budget(
         &self,
+        program: &crate::program::ExponentLutProgram,
+        wire: WireId,
         level: usize,
-        noise: &RnsBggNoiseValue,
-    ) -> Result<bool, RnsBggError> {
-        let modulus = self
-            .levels
-            .get(level + 1)
-            .or_else(|| self.levels.get(level))
-            .ok_or(RnsBggError::Parameters("level outside modulus chain"))?
-            .modulus();
-        Ok(modulus.as_ref() > &(&noise.bound.error * 4u8))
+    ) -> Result<NonnegativeRational, RnsBggError> {
+        let finalized = level
+            .checked_add(1)
+            .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
+        let (t, _, loss) = self.coefficient_output_decoding(program, wire, finalized)?;
+        let bound = program
+            .wire_coefficient_bound(wire)
+            .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
+            .ok_or(RnsBggError::Graph("not a coefficient output".into()))?;
+        let modulus: BigUint = self.level(finalized)?.modulus().as_ref().clone();
+        let payload_loss = loss * BigUint::from(bound) * 2u8;
+        if modulus <= payload_loss {
+            return Err(RnsBggError::Budget("coefficient output scale loss"));
+        }
+        NonnegativeRational::new(modulus - payload_loss, BigUint::from(t) * 2u8)
+            .map_err(|_| RnsBggError::Parameters("invalid coefficient output budget"))
     }
 
     /// Flat-LUT noise after its single scale-and-round by `p = q_l/q_(l+1)`

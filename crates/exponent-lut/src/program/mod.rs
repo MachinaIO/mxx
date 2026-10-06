@@ -382,22 +382,24 @@ impl FamilyRange {
 /// Explicit output semantics for a LUT.  Every table must carry this value;
 /// no program layout is consulted as a fallback.
 ///
-/// `Coefficient` outputs carry their value scaled for decoding at their
-/// finalized level. `UnscaledCoefficient` outputs carry the value itself
-/// (scale 1), so they have no decoding margin: they are mask carriers whose
-/// weighted sums a noise refresh adds before decoding, and are never decoded
-/// on their own.
+/// A `Coefficient` output carries the table value itself (scale 1) as the
+/// constant coefficient. A root coefficient output is scaled for decryption
+/// only when it is finalized; a decoder adds unfinalized ones as its smudge.
+///
+/// A LUT reads one signed monomial `±X^(stride e)` of its input layout and
+/// returns `±T[e]`. The LUT is linear in its input, so any other input (for
+/// example `Add(x, x)`) is outside this contract; it is a plaintext property
+/// that Program validation cannot see, and callers guarantee it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LutOutputRepresentation {
     Exponent(ExpLayout),
     Coefficient,
-    UnscaledCoefficient,
 }
 
 impl LutOutputRepresentation {
-    /// Whether the output is a coefficient value, scaled or not.
+    /// Whether the output is a coefficient value.
     pub const fn is_coefficient(&self) -> bool {
-        matches!(self, Self::Coefficient | Self::UnscaledCoefficient)
+        matches!(self, Self::Coefficient)
     }
 }
 
@@ -562,10 +564,47 @@ impl ExponentLutProgram {
     /// Returns the declared scalar output operands in program order.
     ///
     /// The returned operands are part of the validated immutable Program and
-    /// can be used to bind a refresh declaration to a declared exponent
+    /// can be used to bind a decoder declaration to a declared exponent
     /// output. No new wire or operand can be constructed through this view.
     pub fn outputs(&self) -> &[Operand<WireId>] {
         &self.body.outputs
+    }
+
+    /// Every `parallel` family wire with the scalar wire its body returns,
+    /// nested bodies included.
+    pub(crate) fn family_body_outputs(&self) -> Vec<(WireId, WireId)> {
+        fn visit(body: &Body, pairs: &mut Vec<(WireId, WireId)>) {
+            for step in &body.steps {
+                if let Step::Parallel { body, output, .. } = step {
+                    if let Some(Operand::Scalar(inner)) = body.outputs.first() {
+                        pairs.push((*output, *inner));
+                    }
+                    visit(body, pairs);
+                }
+            }
+        }
+        let mut pairs = Vec::new();
+        visit(&self.body, &mut pairs);
+        pairs
+    }
+    /// The `(input, table)` of every LUT with a scalar input inside a
+    /// family body, in body order. Lowerings prepare their material at root
+    /// scope, where every member's body reads it.
+    pub(crate) fn family_body_luts(&self) -> Vec<(WireId, LutId)> {
+        fn visit(body: &Body, nested: bool, luts: &mut Vec<(WireId, LutId)>) {
+            for step in &body.steps {
+                match step {
+                    Step::Lut { input: Operand::Scalar(input), table, .. } if nested => {
+                        luts.push((*input, *table));
+                    }
+                    Step::Parallel { body, .. } => visit(body, true, luts),
+                    _ => {}
+                }
+            }
+        }
+        let mut luts = Vec::new();
+        visit(&self.body, false, &mut luts);
+        luts
     }
     pub fn encryption_inputs(&self) -> EncryptionInputs {
         EncryptionInputs { inputs: self.inputs.clone(), luts: self.luts.clone() }
@@ -587,23 +626,22 @@ impl ExponentLutProgram {
     /// Return whether a validated wire is the raw output of a coefficient LUT
     /// lineage.  Input declarations intentionally have no inferred layout.
     pub fn wire_is_coefficient_output(&self, wire: WireId) -> Result<bool, ProgramValidationError> {
-        let metadata = self.metadata()?;
-        metadata
-            .get(&wire)
-            .map(|metadata| metadata.coefficient)
-            .ok_or(ProgramValidationError::UndefinedWire(wire))
+        Ok(self.wire_coefficient_bound(wire)?.is_some())
     }
 
-    /// Return whether a validated wire is the raw output of an unscaled
-    /// coefficient LUT lineage (see [`LutOutputRepresentation`]).
-    pub fn wire_is_unscaled_coefficient_output(
+    /// The payload bound `W` of a coefficient wire (`|v| <= W` for every
+    /// coefficient of its payload under the LUT input contract of
+    /// [`LutOutputRepresentation`]), or `None` for an exponent wire: the
+    /// largest table value of a coefficient LUT, the sum of the bounds of an
+    /// `Add`, and `n W` for the `Sum` of `n` members.
+    pub fn wire_coefficient_bound(
         &self,
         wire: WireId,
-    ) -> Result<bool, ProgramValidationError> {
+    ) -> Result<Option<u64>, ProgramValidationError> {
         let metadata = self.metadata()?;
         metadata
             .get(&wire)
-            .map(|metadata| metadata.unscaled)
+            .map(|metadata| metadata.coefficient_bound)
             .ok_or(ProgramValidationError::UndefinedWire(wire))
     }
 
@@ -623,9 +661,14 @@ impl ExponentLutProgram {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WireMetadata {
     knowledge: AttributeKnowledge,
-    coefficient: bool,
-    /// Set only together with `coefficient`.
-    unscaled: bool,
+    /// The payload bound of a coefficient wire; `None` for an exponent wire.
+    coefficient_bound: Option<u64>,
+}
+
+impl WireMetadata {
+    const fn coefficient(&self) -> bool {
+        self.coefficient_bound.is_some()
+    }
 }
 
 pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationError> {
@@ -637,7 +680,7 @@ pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationEr
             layout.stride_log2.checked_add(layout.width_log2).is_some() &&
                 1usize.checked_shl(layout.width_log2).is_some()
         }
-        LutOutputRepresentation::Coefficient | LutOutputRepresentation::UnscaledCoefficient => true,
+        LutOutputRepresentation::Coefficient => true,
     };
     if table.input_width == 0 ||
         table.output_width == 0 ||
@@ -691,9 +734,19 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
         true,
         false,
     )?;
+    // A root output is a visible scalar, or a member of a visible family at a
+    // constant index inside it.
+    let empty = ParamEnv::default();
     if program.body.outputs.is_empty() ||
-        program.body.outputs.iter().any(|output| {
-            !matches!(output, Operand::Scalar(id) if matches!(visible.get(id), Some(VisibleKind::Scalar)))
+        program.body.outputs.iter().any(|output| match output {
+            Operand::Scalar(id) => !matches!(visible.get(id), Some(VisibleKind::Scalar)),
+            Operand::Member { family, index } => match visible.get(family) {
+                Some(VisibleKind::Family(count)) => !matches!(
+                    (index.evaluate(&empty), count.evaluate(&empty)),
+                    (Ok(index), Ok(count)) if index >= 0.into() && index < count
+                ),
+                _ => true,
+            },
         })
     {
         return Err(ProgramValidationError::InvalidOutputCount);
@@ -713,17 +766,18 @@ fn derive_wire_metadata(
         .inputs
         .iter()
         .map(|(wire, declaration)| {
-            (
-                *wire,
-                WireMetadata {
-                    knowledge: declaration.knowledge,
-                    coefficient: false,
-                    unscaled: false,
-                },
-            )
+            (*wire, WireMetadata { knowledge: declaration.knowledge, coefficient_bound: None })
         })
         .collect::<BTreeMap<_, _>>();
-    derive_body_metadata(&program.body, &program.luts, &mut metadata)?;
+    let mut counts = program
+        .inputs
+        .iter()
+        .filter_map(|(wire, declaration)| match declaration.shape() {
+            InputBinding::Family(count) => Some((*wire, count.clone())),
+            InputBinding::Scalar(()) => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    derive_body_metadata(&program.body, &program.luts, &mut metadata, &mut counts)?;
     Ok(metadata)
 }
 
@@ -731,48 +785,54 @@ fn derive_body_metadata(
     body: &Body,
     luts: &[LutTable],
     metadata: &mut BTreeMap<WireId, WireMetadata>,
+    counts: &mut BTreeMap<WireId, IntExpr>,
 ) -> Result<(), ProgramValidationError> {
+    let overflow =
+        || ProgramValidationError::InvalidStructure("coefficient payload bound overflow".into());
     for step in &body.steps {
         let output = match step {
             Step::Add { lhs, rhs, .. } => {
                 let lhs = metadata_for_operand(lhs, metadata)?;
                 let rhs = metadata_for_operand(rhs, metadata)?;
-                if lhs != rhs {
+                if lhs.knowledge != rhs.knowledge || lhs.coefficient() != rhs.coefficient() {
                     return Err(ProgramValidationError::InvalidStructure(
                         "Add operands must have matching knowledge and representation".into(),
                     ));
                 }
-                lhs
+                let coefficient_bound = match (lhs.coefficient_bound, rhs.coefficient_bound) {
+                    (Some(lhs), Some(rhs)) => Some(lhs.checked_add(rhs).ok_or_else(overflow)?),
+                    _ => None,
+                };
+                WireMetadata { knowledge: lhs.knowledge, coefficient_bound }
             }
             Step::MulPublic { lhs, rhs, .. } => {
                 let lhs = metadata_for_operand(lhs, metadata)?;
                 let rhs = metadata_for_operand(rhs, metadata)?;
                 if lhs.knowledge != AttributeKnowledge::PublicPayload ||
-                    lhs.coefficient ||
-                    rhs.coefficient
+                    lhs.coefficient() ||
+                    rhs.coefficient()
                 {
                     return Err(ProgramValidationError::InvalidStructure(
                         "MulPublic requires a public exponent LHS and exponent operands".into(),
                     ));
                 }
-                WireMetadata { knowledge: rhs.knowledge, coefficient: false, unscaled: false }
+                WireMetadata { knowledge: rhs.knowledge, coefficient_bound: None }
             }
             Step::MulPrivate { input, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
-                if input.coefficient {
+                if input.coefficient() {
                     return Err(ProgramValidationError::InvalidStructure(
                         "MulPrivate cannot consume a coefficient output".into(),
                     ));
                 }
                 WireMetadata {
                     knowledge: AttributeKnowledge::PrivatePayload,
-                    coefficient: false,
-                    unscaled: false,
+                    coefficient_bound: None,
                 }
             }
             Step::Lut { input, table, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
-                if input.coefficient {
+                if input.coefficient() {
                     return Err(ProgramValidationError::InvalidStructure(
                         "LUT input cannot be a coefficient output".into(),
                     ));
@@ -780,26 +840,42 @@ fn derive_body_metadata(
                 let table = luts
                     .get(table.0 as usize)
                     .ok_or(ProgramValidationError::InvalidLutId(*table))?;
-                WireMetadata {
-                    knowledge: input.knowledge,
-                    coefficient: table.output_representation.is_coefficient(),
-                    unscaled: matches!(
-                        table.output_representation,
-                        LutOutputRepresentation::UnscaledCoefficient
-                    ),
-                }
+                let coefficient_bound = table
+                    .output_representation
+                    .is_coefficient()
+                    .then(|| table.values.iter().copied().max().unwrap_or(0) as u64);
+                WireMetadata { knowledge: input.knowledge, coefficient_bound }
             }
-            Step::Parallel { body, .. } => {
-                derive_body_metadata(body, luts, metadata)?;
+            Step::Parallel { range, body, output } => {
+                derive_body_metadata(body, luts, metadata, counts)?;
+                counts.insert(*output, range.count().clone());
                 body.outputs
                     .first()
                     .ok_or(ProgramValidationError::InvalidOutputCount)
                     .and_then(|operand| metadata_for_operand(operand, metadata))?
             }
-            Step::Sum { family, .. } => metadata
-                .get(family)
-                .copied()
-                .ok_or(ProgramValidationError::UndefinedWire(*family))?,
+            Step::Sum { family, .. } => {
+                let member = metadata
+                    .get(family)
+                    .copied()
+                    .ok_or(ProgramValidationError::UndefinedWire(*family))?;
+                let coefficient_bound = match member.coefficient_bound {
+                    None => None,
+                    Some(bound) => {
+                        let count = match counts.get(family).map(IntExpr::canonicalize) {
+                            Some(IntExpr::Const(count)) => u64::try_from(count).ok(),
+                            _ => None,
+                        }
+                        .ok_or_else(|| {
+                            ProgramValidationError::InvalidStructure(
+                                "a coefficient Sum needs a constant member count".into(),
+                            )
+                        })?;
+                        Some(bound.checked_mul(count).ok_or_else(overflow)?)
+                    }
+                };
+                WireMetadata { knowledge: member.knowledge, coefficient_bound }
+            }
         };
         let wire = match step {
             Step::Add { output, .. } |
@@ -1227,6 +1303,85 @@ fn invalid_loop_slot(expression: &IntExpr, depth: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coefficient LUT of the table `values` on the private input.
+    fn coefficient_lut(
+        builder: &mut ExponentLutProgramBuilder,
+        input: WireId,
+        values: Vec<usize>,
+    ) -> WireId {
+        let table = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    8,
+                    values,
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        builder.lut(Operand::Scalar(input), table).unwrap()
+    }
+
+    /// The coefficient payload bound: the largest table value of a LUT, the
+    /// sum of an `Add`, `n W` for the `Sum` of `n` members; an exponent wire
+    /// has none. A LUT of `Add(x, x)` keeps the table bound: the input is a
+    /// signed monomial by the LUT contract, which validation cannot see.
+    #[test]
+    fn coefficient_bound_follows_luts_adds_and_sums() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let first = coefficient_lut(&mut builder, input, vec![3, 5]);
+        let second = coefficient_lut(&mut builder, input, vec![7, 1]);
+        let added = builder.add(Operand::Scalar(first), Operand::Scalar(second)).unwrap();
+        let doubled = builder.add(Operand::Scalar(input), Operand::Scalar(input)).unwrap();
+        let repeated = coefficient_lut(&mut builder, doubled, vec![3, 5]);
+        let family = builder
+            .parallel(FamilyRange::full(IntExpr::constant(3)).unwrap(), |builder, _| {
+                Ok(Operand::Scalar(coefficient_lut(builder, input, vec![2, 6])))
+            })
+            .unwrap();
+        let summed = builder.sum(family).unwrap();
+        let program = builder
+            .finish(vec![
+                Operand::Scalar(added),
+                Operand::Scalar(repeated),
+                Operand::Scalar(summed),
+                Operand::Member { family, index: IntExpr::constant(1) },
+            ])
+            .unwrap();
+        let bound = |wire| program.wire_coefficient_bound(wire).unwrap();
+        assert_eq!(bound(first), Some(5));
+        assert_eq!(bound(added), Some(12));
+        assert_eq!(bound(repeated), Some(5));
+        assert_eq!(bound(family), Some(6));
+        assert_eq!(bound(summed), Some(18));
+        assert_eq!(bound(input), None);
+        assert_eq!(bound(doubled), None);
+    }
+
+    /// A coefficient `Sum` needs a constant member count.
+    #[test]
+    fn coefficient_sum_over_a_symbolic_count_is_rejected() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let family = builder
+            .parallel(
+                FamilyRange::bounded(
+                    IntExpr::constant(0),
+                    IntExpr::Var("n".into()),
+                    IntExpr::constant(4),
+                )
+                .unwrap(),
+                |builder, _| Ok(Operand::Scalar(coefficient_lut(builder, input, vec![2, 6]))),
+            )
+            .unwrap();
+        let summed = builder.sum(family).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(summed)]);
+        assert!(program.and_then(|program| program.wire_coefficient_bound(summed)).is_err());
+    }
 
     #[test]
     fn layout_native_indices_are_deterministic() {

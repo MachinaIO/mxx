@@ -96,7 +96,7 @@ impl EncodingLowering<'_> {
                 self.parameters,
                 &self.context,
                 self.program.id(),
-                self.refresh_mask.as_ref().map(|declaration| *declaration.commitment()),
+                self.decoder_smudge.as_ref().map(|declaration| *declaration.commitment()),
                 material.clone(),
                 member_of(&branch),
                 level,
@@ -178,8 +178,8 @@ impl<'a> RnsEncryptBuild<'a> {
     }
 
     /// Bind the RHS plaintexts of a Dynamic encryption and its batch
-    /// identifier, after the preprocessing artifacts (and, for a refresh mask
-    /// child, its mask binding) are bound, e.g. in the `api::encrypt` compose
+    /// identifier, after the preprocessing artifacts (and, for a decoder smudge
+    /// child, its smudge binding) are bound, e.g. in the `api::encrypt` compose
     /// callback.
     ///
     /// `batch_id` is a fresh public identifier of this encryption request,

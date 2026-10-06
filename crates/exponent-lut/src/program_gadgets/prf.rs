@@ -1,15 +1,17 @@
-//! Scheme-independent sparse-LWR PRF declarations and Program interpretation.
+//! Scheme-independent sparse-LWR PRF: its profile and the one Program
+//! gadget that evaluates it.
 use crate::{
+    api::PlaintextInputs,
     program::{
-        AttributeKnowledge, ExpLayout, ExponentLutProgram, ExponentLutProgramBuilder,
-        ExponentLutProgramId, FamilyRange, LutOutputRepresentation, LutTable, Operand,
-        ProgramValidationError, RhsId, WireId,
+        AttributeKnowledge, ExpLayout, ExponentLutProgramBuilder, FamilyRange, InputBinding, LutId,
+        LutOutputRepresentation, LutTable, Operand, ProgramValidationError, RhsId, WireId,
     },
-    program_gadgets::pbc::{PbcCell, PbcGeneratedKeyLayout, PbcLayoutId, PbcPublicLayout},
+    program_gadgets::pbc::{PbcCell, PbcGeneratedKeyLayout, PbcPublicLayout},
 };
+use mxx_backends::poly::{Poly, PolyParams};
 use mxx_ir_core::IntExpr;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
+use std::collections::BTreeMap;
 
 /// Scheme-independent errors in native PRF declarations and bindings.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -18,113 +20,20 @@ pub enum PrfError {
     InvalidSparseLwrBlock,
     #[error(transparent)]
     Program(#[from] ProgramValidationError),
-    #[error("PRF artifact binding or transport failed: {0}")]
-    Artifact(String),
-}
-
-/// Stable identity of one value-readout declaration.
-///
-/// The digest is an opaque declaration identity; interpretation of the
-/// readout table remains owned by the concrete backend adapter.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct LutOutputIdentity([u8; 32]);
-
-impl LutOutputIdentity {
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-/// Opaque, canonically encoded public PRF label.
-///
-/// The refresh application owns the meaning of a label's fields.  The PRF
-/// only commits to their unambiguous byte encoding and never parses or
-/// derives semantics from them.  Length-prefixing each component keeps the
-/// encoding injective while allowing callers to use arbitrary binary tags.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize)]
-pub struct PrfLabel(Vec<u8>);
-
-impl PrfLabel {
-    /// Builds a label from an ordered set of application-owned components.
-    pub fn from_components(components: &[&[u8]]) -> Result<Self, PrfError> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"mxx-exponent-lut/prf-label/v1");
-        let count = u32::try_from(components.len()).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-        bytes.extend_from_slice(&count.to_le_bytes());
-        for component in components {
-            let length =
-                u64::try_from(component.len()).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-            bytes.extend_from_slice(&length.to_le_bytes());
-            bytes.extend_from_slice(component);
-        }
-        Ok(Self(bytes))
-    }
-
-    /// Wraps an already canonical label encoding after rejecting an empty
-    /// value. Callers that construct fields dynamically should prefer
-    /// [`Self::from_components`].
-    pub fn from_canonical_bytes(bytes: Vec<u8>) -> Result<Self, PrfError> {
-        const PREFIX: &[u8] = b"mxx-exponent-lut/prf-label/v1";
-        let prefix_len = PREFIX.len();
-        if bytes.len() < prefix_len + std::mem::size_of::<u32>() || !bytes.starts_with(PREFIX) {
-            return Err(PrfError::InvalidSparseLwrBlock);
-        }
-        let mut cursor = prefix_len;
-        let count = u32::from_le_bytes(
-            bytes[cursor..cursor + 4].try_into().map_err(|_| PrfError::InvalidSparseLwrBlock)?,
-        ) as usize;
-        cursor += 4;
-        for _ in 0..count {
-            let end = cursor.checked_add(8).ok_or(PrfError::InvalidSparseLwrBlock)?;
-            if end > bytes.len() {
-                return Err(PrfError::InvalidSparseLwrBlock);
-            }
-            let length = u64::from_le_bytes(
-                bytes[cursor..end].try_into().map_err(|_| PrfError::InvalidSparseLwrBlock)?,
-            );
-            cursor = end;
-            let length = usize::try_from(length).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-            cursor = cursor.checked_add(length).ok_or(PrfError::InvalidSparseLwrBlock)?;
-            if cursor > bytes.len() {
-                return Err(PrfError::InvalidSparseLwrBlock);
-            }
-        }
-        if cursor != bytes.len() {
-            return Err(PrfError::InvalidSparseLwrBlock);
-        }
-        Ok(Self(bytes))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for PrfLabel {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        Self::from_canonical_bytes(bytes).map_err(serde::de::Error::custom)
-    }
 }
 
 /// Native sparse-LWR profile.
 ///
 /// The exponent layout fixes the encoding ring dimension the layout lives in,
-/// `n = 2^(stride_log2 + width_log2)`, the exponent modulus
-/// `Q = 2^(width_log2 + 1) = 2n / 2^stride_log2`, and the balanced digit base
-/// `P = 2*p_prime`. The LWR dimension `lwr_dimension` (the length of the
+/// `n = 2^(stride_log2 + width_log2)` and the exponent modulus
+/// `Q = 2^(width_log2 + 1) = 2n / 2^stride_log2`. The LWR output modulus `p`
+/// (`P`) is even and divides `Q`; the negacyclic readout table covers half of
+/// it, `p' = P/2`. The LWR dimension `lwr_dimension` (the length of the
 /// public input `a` in `Z_Q^nu`) is independent of the ring dimension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct SparseLwrPrfProfile {
     pub layout: ExpLayout,
-    pub p_prime: usize,
+    pub p: usize,
     pub lwr_dimension: usize,
 }
 
@@ -133,7 +42,7 @@ impl SparseLwrPrfProfile {
     /// Public fields are intentional for declarative manifests, therefore all
     /// consuming boundaries must call this check instead of trusting them.
     pub fn validate(&self) -> Result<(), PrfError> {
-        if self.p_prime == 0 || self.lwr_dimension == 0 {
+        if self.lwr_dimension == 0 {
             return Err(PrfError::InvalidSparseLwrBlock);
         }
         let ring_log2 = self
@@ -147,16 +56,16 @@ impl SparseLwrPrfProfile {
         let exponent_bits =
             self.layout.width_log2.checked_add(1).ok_or(PrfError::InvalidSparseLwrBlock)?;
         let q = 1usize.checked_shl(exponent_bits).ok_or(PrfError::InvalidSparseLwrBlock)?;
-        let p = self.p_prime.checked_mul(2).ok_or(PrfError::InvalidSparseLwrBlock)?;
-        if p < 2 || p > q || q % p != 0 {
+        let p = self.p;
+        if p < 2 || p % 2 != 0 || p > q || q % p != 0 {
             return Err(PrfError::InvalidSparseLwrBlock);
         }
         Ok(())
     }
 
     /// Validates a native profile; its ring is derived from the full layout.
-    pub fn new(layout: ExpLayout, p_prime: usize, lwr_dimension: usize) -> Result<Self, PrfError> {
-        let profile = Self { layout, p_prime, lwr_dimension };
+    pub fn new(layout: ExpLayout, p: usize, lwr_dimension: usize) -> Result<Self, PrfError> {
+        let profile = Self { layout, p, lwr_dimension };
         profile.validate()?;
         Ok(profile)
     }
@@ -175,8 +84,14 @@ impl SparseLwrPrfProfile {
         1usize.checked_shl(exponent_bits).ok_or(PrfError::InvalidSparseLwrBlock)
     }
 
-    pub fn p(&self) -> Result<usize, PrfError> {
-        self.p_prime.checked_mul(2).ok_or(PrfError::InvalidSparseLwrBlock)
+    /// The LWR output modulus `P`.
+    pub const fn p(&self) -> usize {
+        self.p
+    }
+
+    /// Half the output modulus, `p' = P/2`: the values of the readout table.
+    pub const fn p_prime(&self) -> usize {
+        self.p / 2
     }
 
     pub const fn native_width(&self) -> usize {
@@ -188,7 +103,7 @@ impl SparseLwrPrfProfile {
     pub fn canonical_readout(&self) -> Result<Vec<usize>, PrfError> {
         let n_prime = self.native_width();
         let values = (0..n_prime)
-            .map(|k| self.p_prime.checked_mul(k).map(|value| value / n_prime + 1))
+            .map(|k| self.p_prime().checked_mul(k).map(|value| value / n_prime + 1))
             .collect::<Option<Vec<_>>>()
             .ok_or(PrfError::InvalidSparseLwrBlock)?;
         Ok(values)
@@ -203,149 +118,121 @@ impl<'de> Deserialize<'de> for SparseLwrPrfProfile {
         #[derive(Deserialize)]
         struct RawProfile {
             layout: ExpLayout,
-            p_prime: usize,
+            p: usize,
             lwr_dimension: usize,
         }
         let raw = RawProfile::deserialize(deserializer)?;
-        let profile =
-            Self { layout: raw.layout, p_prime: raw.p_prime, lwr_dimension: raw.lwr_dimension };
+        let profile = Self { layout: raw.layout, p: raw.p, lwr_dimension: raw.lwr_dimension };
         profile.validate().map_err(serde::de::Error::custom)?;
         Ok(profile)
     }
 }
 
-/// A sparse-key LWR weak PRF evaluated over encodings.
+/// The PRF output: one scalar for one member, else the family of members.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrfOutput {
+    Scalar(WireId),
+    Family(WireId),
+}
+
+/// One selector RHS family: `members` bits, at most `max_nonzero` of them one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrfSelectorFamily {
+    pub rhs: RhsId,
+    pub members: usize,
+    pub max_nonzero: usize,
+}
+
+/// A sparse-key LWR weak PRF added to a Program.
 ///
-/// Every output `o` computes `wPRF_{k_o}(a) = rho(<a, k_o> mod Q)` on the
-/// same public vector `a in Z_Q^nu`, supplied as one public-payload input
-/// family of `nu + 1` members (member `nu` is the encoding of zero, read by
-/// dummy and padding cells), with its own sparse key `k_o`. Key `k_o` is represented by its own
-/// probabilistic-batch-code layout: block `j` of that layout holds candidate
-/// coordinates of `a`, and a private one-hot selector family chooses the
-/// block's coordinate of the key support (or a dummy, contributing zero).
-/// Starting from the accumulator `mono(0)`, block `j` multiplies the
-/// accumulator by each candidate `a` coordinate (a public-by-private
-/// product), weights the branch by its selector bit (a private
-/// multiplication), and sums the branches; a terminal coefficient LUT reads
-/// out `rho`.
-#[derive(Clone)]
-pub struct SparseLwrPrfProgram {
-    pub accumulation: ExponentLutProgram,
-    pub readout: Vec<usize>,
-    pub(crate) initial_input: WireId,
-    pub(crate) output: WireId,
-    pub(crate) profile: SparseLwrPrfProfile,
-    /// Public input family `a`, one member per LWR coordinate plus the
-    /// encoding of zero for dummy and padding cells.
-    input_vector: WireId,
-    /// Public key layout of each output, in output order.
+/// Member `o` computes `rho(<a, k_o> mod Q)` on the public vector `a in
+/// Z_Q^nu`, one public-payload input family of `nu + 1` members (member `nu`
+/// is the encoding of zero, read by dummy and padding cells), under its own
+/// sparse key `k_o` placed by its probabilistic-batch-code layout: per
+/// bucket, each cell multiplies the accumulator (starting at the private
+/// input `mono(0)`) by its `a` coordinate (a public product) and weights it by
+/// its selector bit (a private product), the cells are summed, and a terminal
+/// LUT reads out `rho`.
+///
+/// The readout is the half-integer table `2 f(k) - 1` over the canonical
+/// `f(k) = floor(p' k / n') + 1` (output width `P`): through the negacyclic
+/// wrap the output `delta = (-1)^b (2 f(z mod n') - 1)` is uniform on the `P`
+/// odd values of `[-(P-1), P-1]` for a uniform `z = <a, k_o> mod Q`, twice the
+/// half-integer PRF of eprint 2024/665, Section 5.3.
+///
+/// The shape depends on the member count:
+///
+/// - One member: per bucket, one root `parallel` over the bucket's cells, selector family of one
+///   bit per cell (one-hot), and a `Sum`; the output is a scalar.
+/// - Several members: one root `parallel` over the members, so the graph does not grow with them. A
+///   cell's coordinate is a `Select` over the member index; the buckets share the largest cell
+///   count `W`, a slot beyond a layout's own cells being padding; the `W` cells of a bucket are
+///   unrolled in the body, each weighted by member `o` of its (bucket, slot) selector family of one
+///   bit per member. No body is nested, so selector members are read at the bare root binder. The
+///   output is the member family.
+#[derive(Clone, Debug)]
+pub struct SparseLwrPrf {
+    profile: SparseLwrPrfProfile,
+    /// The public key layout of each member, in member order.
     layouts: Vec<PbcPublicLayout>,
-    /// One selector family per output and block.
-    selection_families: Vec<PrfSelectionFamily>,
-    output_labels: Vec<PrfLabel>,
-    outputs: Vec<WireId>,
+    initial_input: WireId,
+    input_vector: WireId,
+    lut: LutId,
+    /// One member: the family of each bucket. Several: per bucket, the
+    /// family of each slot.
+    selectors: Vec<Vec<RhsId>>,
+    output: PrfOutput,
 }
 
-/// The one-hot selector family of one output's block.
-///
-/// The ID refers to a declaration in [`SparseLwrPrfProgram::accumulation`].
-/// Member `i` selects cell `i` of block `bucket` in the output's layout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrfSelectionFamily {
-    pub output: usize,
-    pub bucket: usize,
-    pub selector: RhsId,
-    pub capacity: usize,
-}
-
-/// Identity of the setup-owned PRF declaration.
-///
-/// It contains only public Program and layout facts plus the selector key
-/// namespace. It excludes the public vector `a` and all selector bits, so one
-/// setup serves every encryption of any `a`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SparseLwrPrfSetupIdentity {
-    pub program: ExponentLutProgramId,
-    /// Public key layout of each output, in output order.
-    pub layouts: Vec<PbcLayoutId>,
-    /// Public key-instance namespace of the selector families.
-    pub input_key_identity: [u8; 32],
-}
-
-impl std::fmt::Debug for SparseLwrPrfProgram {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SparseLwrPrfProgram")
-            .field("id", &self.id())
-            .field("profile", &self.profile)
-            .field("outputs", &self.outputs.len())
-            .field("readout", &self.readout)
-            .field("selection_families", &self.selection_families.len())
-            .finish()
-    }
-}
-
-impl SparseLwrPrfProgram {
-    /// Builds the PRF declaration for one key layout per output label.
-    ///
-    /// Each layout must be a valid PBC layout over the profile's LWR
-    /// dimension. The constructor contains no selector bits and no value of
-    /// `a`; both are runtime inputs.
-    pub fn new(
+impl SparseLwrPrf {
+    /// Add the PRF of the members `layouts` (one key layout per member, each
+    /// covering the profile's LWR dimension; several members share one bucket
+    /// count) to `builder`, its terminal LUT returning the readout in
+    /// `representation`.
+    pub fn build(
+        builder: &mut ExponentLutProgramBuilder,
         profile: SparseLwrPrfProfile,
         layouts: Vec<PbcPublicLayout>,
-        output_labels: Vec<PrfLabel>,
+        representation: LutOutputRepresentation,
     ) -> Result<Self, PrfError> {
         profile.validate()?;
-        if output_labels.is_empty() || layouts.len() != output_labels.len() {
-            return Err(PrfError::InvalidSparseLwrBlock);
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        if !output_labels.iter().all(|label| seen.insert(label.clone())) {
-            return Err(PrfError::InvalidSparseLwrBlock);
-        }
+        let bucket_count = layouts.first().ok_or(PrfError::InvalidSparseLwrBlock)?.cells.len();
         for layout in &layouts {
             layout.validate().map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-            if layout.parameters.universe_size != profile.lwr_dimension {
+            if layout.parameters.universe_size != profile.lwr_dimension ||
+                (layouts.len() > 1 && layout.cells.len() != bucket_count)
+            {
                 return Err(PrfError::InvalidSparseLwrBlock);
             }
         }
-        let readout = profile.canonical_readout()?;
-        let mut builder = ExponentLutProgramBuilder::new();
+        let values =
+            profile.canonical_readout()?.into_iter().map(|f| 2 * f - 1).collect::<Vec<_>>();
         let initial_input = builder.input(AttributeKnowledge::PrivatePayload)?;
         let input_vector = builder.input_family(
             IntExpr::constant(profile.lwr_dimension + 1),
             AttributeKnowledge::PublicPayload,
         )?;
-        // The accumulator stays in exponent representation; this terminal
-        // LUT performs the sole conversion to the coefficient-valued output.
         let lut = builder.register_lut(LutTable::unary(
             profile.native_width(),
             profile.layout,
-            profile.native_width(),
-            readout.clone(),
-            LutOutputRepresentation::Coefficient,
+            profile.p(),
+            values,
+            representation,
         )?)?;
-        let mut selection_families = Vec::new();
-        let mut outputs = Vec::with_capacity(layouts.len());
-        for (output, layout) in layouts.iter().enumerate() {
+        let zero_member = profile.lwr_dimension;
+        let coordinate = |cell: Option<&PbcCell>| match cell {
+            Some(PbcCell::Real { coordinate, .. }) => *coordinate,
+            _ => zero_member,
+        };
+        let (selectors, output) = if let [layout] = layouts.as_slice() {
+            let mut selectors = Vec::with_capacity(bucket_count);
             let mut state = initial_input;
-            for (bucket, cells) in layout.cells.iter().enumerate() {
-                // Block `bucket` of this output is consumed by the
-                // level-`bucket` private multiplication, so its selector is
-                // its own RHS family.
+            for cells in &layout.cells {
+                // The bucket's selector is consumed by its own private
+                // multiplication level, so it is its own RHS family.
                 let selector = builder.rhs_family(IntExpr::constant(cells.len()))?;
-                // One family body covers every cell of the block, so the
-                // one-hot selector bounds the whole block sum. A real cell
-                // reads its `a` coordinate; dummy and padding cells read the
-                // zero member `nu`.
-                let coordinates = cells
-                    .iter()
-                    .map(|cell| match cell {
-                        PbcCell::Real { coordinate, .. } => *coordinate,
-                        PbcCell::Dummy | PbcCell::Padding => profile.lwr_dimension,
-                    })
-                    .collect::<Vec<_>>();
+                let coordinates =
+                    cells.iter().map(|cell| coordinate(Some(cell))).collect::<Vec<_>>();
                 let range = FamilyRange::full(IntExpr::constant(cells.len()))?;
                 let family = builder.parallel(range, |builder, slot| {
                     let coordinate = IntExpr::Select {
@@ -364,243 +251,225 @@ impl SparseLwrPrfProgram {
                     Ok(Operand::Scalar(weighted))
                 })?;
                 state = builder.sum(family)?;
-                selection_families.push(PrfSelectionFamily {
-                    output,
-                    bucket,
-                    selector,
-                    capacity: cells.len(),
-                });
+                selectors.push(vec![selector]);
             }
-            outputs.push(builder.lut(Operand::Scalar(state), lut)?);
-        }
-        let output = *outputs.first().ok_or(PrfError::InvalidSparseLwrBlock)?;
-        let accumulation =
-            builder.finish(outputs.iter().copied().map(Operand::Scalar).collect())?;
-        Ok(Self {
-            accumulation,
-            readout,
-            initial_input,
-            output,
-            profile,
-            input_vector,
-            layouts,
-            selection_families,
-            output_labels,
-            outputs,
-        })
-    }
-
-    /// The selector families of every output's blocks, output-major and in
-    /// block order.
-    pub fn selection_families(&self) -> &[PrfSelectionFamily] {
-        &self.selection_families
-    }
-
-    /// The public input family `a`: one member per LWR coordinate, then the
-    /// encoding of zero read by dummy and padding cells.
-    pub fn input_vector(&self) -> WireId {
-        self.input_vector
-    }
-
-    /// The public key layout of each output, in output order.
-    pub fn layouts(&self) -> &[PbcPublicLayout] {
-        &self.layouts
-    }
-
-    /// Ordered scalar roots and their opaque application labels. The order is
-    /// the immutable Program root order.
-    pub fn ordered_outputs(&self) -> impl Iterator<Item = (&PrfLabel, WireId)> {
-        self.output_labels.iter().zip(self.outputs.iter().copied())
-    }
-
-    /// One-hot selector bits of `output`'s blocks for a generated key,
-    /// block-major; each block has one bit per cell of its layout row.
-    pub fn selector_bits(
-        &self,
-        output: usize,
-        key: &PbcGeneratedKeyLayout,
-    ) -> Result<Vec<Vec<u8>>, PrfError> {
-        let layout = self.layouts.get(output).ok_or(PrfError::InvalidSparseLwrBlock)?;
-        if key.public_layout.layout_id != layout.layout_id {
-            return Err(PrfError::InvalidSparseLwrBlock);
-        }
-        key.private_schedule().validate(layout).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-        Ok(layout
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(bucket, cells)| {
-                let selected = key.private_schedule().selected_slot(bucket);
-                (0..cells.len()).map(|slot| u8::from(slot == selected)).collect()
-            })
-            .collect())
-    }
-
-    /// Setup identity for a selector key namespace.
-    pub fn setup_identity(&self, selector_key_instance: [u8; 32]) -> SparseLwrPrfSetupIdentity {
-        SparseLwrPrfSetupIdentity {
-            program: self.id(),
-            layouts: self.layouts.iter().map(|layout| layout.layout_id).collect(),
-            input_key_identity: selector_key_instance,
-        }
+            (selectors, PrfOutput::Scalar(builder.lut(Operand::Scalar(state), lut)?))
+        } else {
+            let members = layouts.len();
+            let width = layouts
+                .iter()
+                .flat_map(|layout| layout.cells.iter().map(Vec::len))
+                .max()
+                .ok_or(PrfError::InvalidSparseLwrBlock)?;
+            let selectors = (0..bucket_count)
+                .map(|_| {
+                    (0..width)
+                        .map(|_| builder.rhs_family(IntExpr::constant(members)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let range = FamilyRange::full(IntExpr::constant(members))?;
+            let family = builder.parallel(range, |builder, member| {
+                let mut state = initial_input;
+                for (bucket, selectors) in selectors.iter().enumerate() {
+                    let mut cells = Vec::with_capacity(width);
+                    for (slot, selector) in selectors.iter().enumerate() {
+                        // A real cell reads its `a` coordinate; dummy,
+                        // padding and missing slots read the zero member.
+                        let coordinate = IntExpr::Select {
+                            selector: Box::new(member.clone()),
+                            branches: layouts
+                                .iter()
+                                .map(|layout| {
+                                    IntExpr::constant(coordinate(layout.cells[bucket].get(slot)))
+                                })
+                                .collect(),
+                        };
+                        let shifted = builder.mul_public(
+                            Operand::Member { family: input_vector, index: coordinate },
+                            Operand::Scalar(state),
+                        )?;
+                        cells.push(builder.mul_private(
+                            Operand::Scalar(shifted),
+                            Operand::Member { family: *selector, index: member.clone() },
+                        )?);
+                    }
+                    let mut cells = cells.into_iter();
+                    let first = cells.next().ok_or(ProgramValidationError::InvalidLut)?;
+                    state = cells.try_fold(first, |sum, cell| {
+                        builder.add(Operand::Scalar(sum), Operand::Scalar(cell))
+                    })?;
+                }
+                builder.lut(Operand::Scalar(state), lut).map(Operand::Scalar)
+            })?;
+            (selectors, PrfOutput::Family(family))
+        };
+        Ok(Self { profile, layouts, initial_input, input_vector, lut, selectors, output })
     }
 
     pub const fn profile(&self) -> SparseLwrPrfProfile {
         self.profile
     }
 
+    /// The public key layout of each member, in member order.
+    pub fn layouts(&self) -> &[PbcPublicLayout] {
+        &self.layouts
+    }
+
+    /// The number of members.
+    pub fn members(&self) -> usize {
+        self.layouts.len()
+    }
+
+    /// The private accumulator start, bound to `mono(0)`.
     pub const fn initial_input(&self) -> WireId {
         self.initial_input
     }
 
-    /// Returns the accumulator's initial native attribute `mono_m(0)`.
-    pub fn initial_attribute(&self, ring: &mxx_dsl::Ring) -> Result<mxx_dsl::Mat, PrfError> {
-        self.profile
-            .layout
-            .mono(ring, &num_bigint::BigInt::from(0))
-            .map_err(|_| PrfError::InvalidSparseLwrBlock)
+    /// The public vector `a` followed by the encoding of zero.
+    pub const fn input_vector(&self) -> WireId {
+        self.input_vector
     }
 
-    pub const fn output(&self) -> WireId {
+    /// The terminal readout LUT.
+    pub const fn lut(&self) -> LutId {
+        self.lut
+    }
+
+    pub const fn output(&self) -> PrfOutput {
         self.output
     }
 
-    pub fn id(&self) -> ExponentLutProgramId {
-        self.accumulation.id()
+    /// Every selector RHS family with its member count and how many of its
+    /// bits may be one: a one-member bucket family is one-hot, a
+    /// member-indexed family holds one bit of every member.
+    pub fn selector_families(&self) -> Vec<PrfSelectorFamily> {
+        let one_member = self.layouts.len() == 1;
+        self.selectors
+            .iter()
+            .enumerate()
+            .flat_map(|(bucket, families)| {
+                families.iter().map(move |rhs| {
+                    let members = if one_member {
+                        self.layouts[0].cells[bucket].len()
+                    } else {
+                        self.layouts.len()
+                    };
+                    PrfSelectorFamily {
+                        rhs: *rhs,
+                        members,
+                        max_nonzero: if one_member { 1 } else { members },
+                    }
+                })
+            })
+            .collect()
     }
 
-    /// Returns the complete immutable declaration, including the terminal
-    /// coefficient LUTs.
-    pub fn program(&self) -> &ExponentLutProgram {
-        &self.accumulation
-    }
-}
-
-pub fn validate_profile_program(
-    profile: SparseLwrPrfProfile,
-    program: &SparseLwrPrfProgram,
-) -> Result<(), PrfError> {
-    profile.validate()?;
-    program.profile.validate()?;
-    if program.profile != profile || program.readout != profile.canonical_readout()? {
-        return Err(PrfError::InvalidSparseLwrBlock);
-    }
-    Ok(())
-}
-
-/// PRF preparation descriptor. Cryptographic helper caches are owned by the
-/// concrete evaluator; this type records only the Program and the setup
-/// identity needed to reopen them.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PreparedSparseLwrPrfDescriptor {
-    pub program: ExponentLutProgramId,
-    pub setup: SparseLwrPrfSetupIdentity,
-}
-
-impl PreparedSparseLwrPrfDescriptor {
-    pub fn identity(&self) -> Result<[u8; 32], PrfError> {
-        let bytes =
-            serde_json::to_vec(self).map_err(|error| PrfError::Artifact(error.to_string()))?;
-        let mut digest = sha2::Sha256::new();
-        digest.update(b"mxx-exponent-lut/sparse-lwr/preparation");
-        digest.update(bytes);
-        Ok(digest.finalize().into())
-    }
-}
-
-/// PRF preparation state shared by preprocessing and online evaluation. It
-/// carries no value of `a` and no secret material.
-#[derive(Clone, Debug)]
-pub struct PreparedSparseLwrPrf {
-    program: SparseLwrPrfProgram,
-    setup: SparseLwrPrfSetupIdentity,
-}
-
-impl PartialEq for PreparedSparseLwrPrf {
-    fn eq(&self, other: &Self) -> bool {
-        // The declaration is compared through its canonical descriptor; the
-        // embedded graph handles are not value-comparable.
-        self.descriptor() == other.descriptor()
-    }
-}
-
-impl Eq for PreparedSparseLwrPrf {}
-
-impl PreparedSparseLwrPrf {
-    pub fn new(
-        program: SparseLwrPrfProgram,
-        selector_key_instance: [u8; 32],
-    ) -> Result<Self, PrfError> {
-        validate_profile_program(program.profile(), &program)?;
-        let setup = program.setup_identity(selector_key_instance);
-        Ok(Self { program, setup })
-    }
-
-    pub fn descriptor(&self) -> PreparedSparseLwrPrfDescriptor {
-        PreparedSparseLwrPrfDescriptor { program: self.program.id(), setup: self.setup.clone() }
-    }
-
-    pub fn import(
-        program: SparseLwrPrfProgram,
-        descriptor: &PreparedSparseLwrPrfDescriptor,
-        expected_identity: [u8; 32],
-    ) -> Result<Self, PrfError> {
-        validate_profile_program(program.profile(), &program)?;
-        if descriptor.identity()? != expected_identity || descriptor.program != program.id() {
-            return Err(PrfError::Artifact("PRF identity mismatch".into()));
+    /// The private selector plaintexts of the generated `keys`, one key per
+    /// member on its member's layout: with one member, bit `j` of bucket `b`'s
+    /// family is 1 exactly when the key selects slot `j` of bucket `b`; with
+    /// several, member `o` of the family of bucket `b` and slot `j` is.
+    pub fn selector_plaintexts<P: Poly>(
+        &self,
+        parameters: &P::Params,
+        keys: &[PbcGeneratedKeyLayout],
+    ) -> Result<PlaintextInputs<RhsId, P>, PrfError> {
+        if keys.len() != self.layouts.len() {
+            return Err(PrfError::InvalidSparseLwrBlock);
         }
-        if descriptor.setup != program.setup_identity(descriptor.setup.input_key_identity) {
-            return Err(PrfError::Artifact("PRF setup mismatch".into()));
+        for (key, layout) in keys.iter().zip(&self.layouts) {
+            if key.public_layout.layout_id != layout.layout_id ||
+                key.private_schedule().validate(layout).is_err()
+            {
+                return Err(PrfError::InvalidSparseLwrBlock);
+            }
         }
-        Ok(Self { program, setup: descriptor.setup.clone() })
+        let bit = |selected: bool| {
+            if selected { P::const_one(parameters) } else { P::const_zero(parameters) }
+        };
+        let mut plaintexts = BTreeMap::new();
+        for (bucket, families) in self.selectors.iter().enumerate() {
+            if let [key] = keys {
+                let selected = key.private_schedule().selected_slot(bucket);
+                let bits = (0..self.layouts[0].cells[bucket].len())
+                    .map(|slot| bit(slot == selected))
+                    .collect();
+                plaintexts.insert(families[0], InputBinding::Family(bits));
+                continue;
+            }
+            for (slot, family) in families.iter().enumerate() {
+                let bits = keys
+                    .iter()
+                    .map(|key| bit(key.private_schedule().selected_slot(bucket) == slot))
+                    .collect();
+                plaintexts.insert(*family, InputBinding::Family(bits));
+            }
+        }
+        Ok(plaintexts)
     }
 
-    pub fn program(&self) -> &ExponentLutProgram {
-        &self.program.accumulation
-    }
-
-    pub fn declaration(&self) -> &SparseLwrPrfProgram {
-        &self.program
-    }
-
-    pub fn setup_identity(&self) -> &SparseLwrPrfSetupIdentity {
-        &self.setup
+    /// The LHS plaintexts: `mono(0)` for the accumulator start, then
+    /// `mono(a_i)` for every coordinate of the public vector `a` in `Z_Q` and
+    /// `mono(0)` for the zero member, in the profile's exponent layout.
+    pub fn plaintext_inputs<P: Poly>(
+        &self,
+        parameters: &P::Params,
+        a: &[usize],
+    ) -> Result<PlaintextInputs<WireId, P>, PrfError> {
+        let profile = &self.profile;
+        let dimension = parameters.ring_dimension() as usize;
+        if a.len() != profile.lwr_dimension ||
+            profile.ring_dimension().ok() != Some(dimension) ||
+            a.iter().any(|value| Some(*value) >= profile.q().ok())
+        {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        let monomial = |exponent: usize| {
+            let rotation = (exponent * profile.layout.stride()) % (2 * dimension);
+            let value = P::const_rotate_poly(parameters, rotation % dimension);
+            if rotation >= dimension { -value } else { value }
+        };
+        let members = a.iter().copied().chain([0]).map(monomial).collect();
+        Ok(BTreeMap::from([
+            (self.initial_input, InputBinding::Scalar(monomial(0))),
+            (self.input_vector, InputBinding::Family(members)),
+        ]))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::InputBinding;
     use num_bigint::BigInt;
-    use std::collections::BTreeSet;
 
     #[test]
     fn profile_derives_q_and_p_for_nonbinary_digit_bases() {
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8, 64).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 16, 64).unwrap();
         assert_eq!(profile.native_width(), 32);
         assert_eq!(profile.q().unwrap(), 64);
-        assert_eq!(profile.p().unwrap(), 16);
+        assert_eq!((profile.p(), profile.p_prime()), (16, 8));
         let profile =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 6 }, 16, 128).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 6 }, 32, 128).unwrap();
         assert_eq!(profile.q().unwrap(), 128);
-        assert_eq!(profile.p().unwrap(), 32);
+        assert_eq!((profile.p(), profile.p_prime()), (32, 16));
     }
 
     #[test]
-    fn profile_rejects_nondividing_digit_base() {
-        assert!(
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 12, 64).is_err()
-        );
+    fn profile_rejects_odd_or_nondividing_output_modulus() {
+        let layout = ExpLayout { stride_log2: 1, width_log2: 5 };
+        for p in [0, 1, 3, 24, 128] {
+            assert!(SparseLwrPrfProfile::new(layout, p, 64).is_err(), "P = {p}");
+        }
+        assert!(SparseLwrPrfProfile::new(layout, 2, 64).is_ok());
     }
 
     #[test]
     fn profile_preserves_zero_and_nonzero_stride_input_layouts() {
         let zero_stride =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 0, width_log2: 4 }, 2, 16).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 0, width_log2: 4 }, 4, 16).unwrap();
         let nonzero_stride =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2, 16).unwrap();
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 4, 16).unwrap();
 
         assert_eq!(zero_stride.ring_dimension(), nonzero_stride.ring_dimension());
         assert_ne!(
@@ -613,20 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_labels_are_stable_and_injective() {
-        let first_slot = 7_u64.to_le_bytes();
-        let second_slot = 8_u64.to_le_bytes();
-        let first =
-            PrfLabel::from_components(&[b"mask".as_slice(), first_slot.as_slice()]).unwrap();
-        let second =
-            PrfLabel::from_components(&[b"mask".as_slice(), second_slot.as_slice()]).unwrap();
-        assert_ne!(first, second);
-        assert_eq!(PrfLabel::from_canonical_bytes(first.as_bytes().to_vec()).unwrap(), first);
-        assert!(PrfLabel::from_canonical_bytes(b"not-a-label".to_vec()).is_err());
-        assert!(serde_json::from_str::<PrfLabel>("[1, 2, 3]").is_err());
-    }
-
-    #[test]
     fn canonical_sparse_lwr_table_has_full_q_complement_and_uniform_p_values() {
         for (ring_dimension_log2, stride_log2) in
             [(3_u32, 0_u32), (3, 1), (3, 2), (4, 0), (4, 1), (4, 2)]
@@ -636,7 +491,7 @@ mod tests {
             let p_prime = n_prime / 2;
             let profile = SparseLwrPrfProfile::new(
                 ExpLayout { stride_log2, width_log2 },
-                p_prime,
+                2 * p_prime,
                 1 << ring_dimension_log2,
             )
             .unwrap();
@@ -658,14 +513,14 @@ mod tests {
     fn profile_deserialization_rechecks_derived_moduli() {
         let encoded = serde_json::json!({
             "layout": { "stride_log2": 1, "width_log2": 5 },
-            "p_prime": 12,
+            "p": 24,
         });
         assert!(serde_json::from_value::<SparseLwrPrfProfile>(encoded).is_err());
     }
 
-    /// n=32, Q=32, p'=2 over an LWR dimension of ten.
+    /// n=32, Q=32, P=4 over an LWR dimension of ten.
     fn toy_profile() -> SparseLwrPrfProfile {
-        SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 2, 10).unwrap()
+        SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 4, 10).unwrap()
     }
 
     /// A key of weight four with its own PBC layout over ten coordinates.
@@ -685,148 +540,135 @@ mod tests {
             .expect("toy key must find a PBC layout")
     }
 
-    fn toy_labels(count: usize) -> Vec<PrfLabel> {
-        (0..count as u64)
-            .map(|index| PrfLabel::from_components(&[index.to_le_bytes().as_slice()]).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn outputs_share_a_and_each_output_block_has_its_own_selector() {
-        let keys = [toy_key(&[0, 3, 5, 9], 0), toy_key(&[1, 2, 6, 7], 100)];
-        let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
-        let program =
-            SparseLwrPrfProgram::new(toy_profile(), layouts.clone(), toy_labels(2)).unwrap();
-        let workload =
-            crate::rns_bgg::RnsBggDerivedWorkload::from_program(program.program()).unwrap();
-        let families = program.selection_families();
-        assert_eq!(
-            families.len(),
-            layouts.iter().map(|layout| layout.parameters.bucket_count).sum::<usize>()
-        );
-        let selectors = families.iter().map(|family| family.selector).collect::<BTreeSet<_>>();
-        assert_eq!(selectors.len(), families.len(), "every block has its own selector");
-        for family in families {
-            let layout = &layouts[family.output];
-            assert_eq!(family.capacity, layout.cells[family.bucket].len());
-            // Block `b` is consumed by the level-`b` private multiplication.
-            assert_eq!(workload.rhs_level(family.selector).unwrap(), family.bucket);
-        }
-        let public_families = program
-            .program()
-            .inputs()
-            .iter()
-            .filter(|(_, declaration)| matches!(declaration.shape(), InputBinding::Family(_)))
-            .map(|(wire, _)| *wire)
-            .collect::<Vec<_>>();
-        assert_eq!(public_families, vec![program.input_vector()], "one shared `a` family");
-        assert_eq!(program.ordered_outputs().count(), 2);
-    }
-
-    #[test]
-    fn selector_bits_are_one_hot_and_select_the_key_inner_product() {
-        let keys = [toy_key(&[0, 3, 5, 9], 0), toy_key(&[1, 2, 6, 7], 100)];
-        let program = SparseLwrPrfProgram::new(
+    fn toy_prf(
+        keys: &[PbcGeneratedKeyLayout],
+    ) -> (crate::program::ExponentLutProgram, SparseLwrPrf) {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let prf = SparseLwrPrf::build(
+            &mut builder,
             toy_profile(),
             keys.iter().map(|key| key.public_layout.clone()).collect(),
-            toy_labels(2),
+            LutOutputRepresentation::Coefficient,
         )
         .unwrap();
-        let q = program.profile().q().unwrap() as u64;
-        let a = (0..10_u64).map(|coordinate| (7 * coordinate + 3) % q).collect::<Vec<_>>();
-        for (output, key) in keys.iter().enumerate() {
-            let bits = program.selector_bits(output, key).unwrap();
-            let mut accumulator = 0;
-            for (bucket, block) in bits.iter().enumerate() {
-                assert_eq!(block.iter().map(|bit| u64::from(*bit)).sum::<u64>(), 1);
-                let slot = block.iter().position(|bit| *bit == 1).unwrap();
-                if let PbcCell::Real { coordinate, .. } = key.public_layout.cells[bucket][slot] {
-                    accumulator = (accumulator + a[coordinate]) % q;
-                }
-            }
-            assert_eq!(
-                accumulator,
-                crate::program_gadgets::pbc::clear_pbc_inner_product(
-                    &key.public_layout,
-                    key.private_schedule(),
-                    &a,
-                    q
-                )
-                .unwrap()
-            );
-        }
-        assert!(program.selector_bits(0, &keys[1]).is_err(), "a key of another layout");
+        let output = match prf.output() {
+            PrfOutput::Scalar(wire) => vec![Operand::Scalar(wire)],
+            PrfOutput::Family(family) => (0..keys.len())
+                .map(|index| Operand::Member { family, index: IntExpr::constant(index) })
+                .collect(),
+        };
+        (builder.finish(output).unwrap(), prf)
     }
 
+    /// The bits of `family` in `plaintexts`, as integers.
+    fn bits(
+        parameters: &mxx_backends::poly::dcrt::params::DCRTPolyParams,
+        plaintexts: &PlaintextInputs<RhsId, mxx_backends::poly::dcrt::poly::DCRTPoly>,
+        family: RhsId,
+    ) -> Vec<u64> {
+        let InputBinding::Family(members) = &plaintexts[&family] else { panic!("a family") };
+        let one = <mxx_backends::poly::dcrt::poly::DCRTPoly as Poly>::const_one(parameters);
+        members.iter().map(|bit| u64::from(bit == &one)).collect()
+    }
+
+    /// One member: one one-hot selector family per bucket, consumed at the
+    /// bucket's level, whose selected coordinates sum to the key inner product.
     #[test]
-    fn layouts_must_cover_the_lwr_dimension_and_match_the_labels() {
+    fn one_member_prf_has_one_hot_bucket_selectors_of_the_key_inner_product() {
         let key = toy_key(&[0, 3, 5, 9], 0);
-        let layouts = vec![key.public_layout.clone()];
-        assert!(SparseLwrPrfProgram::new(toy_profile(), layouts.clone(), toy_labels(2)).is_err());
-        assert!(SparseLwrPrfProgram::new(toy_profile(), vec![], vec![]).is_err());
-        let duplicate = vec![toy_labels(1)[0].clone(), toy_labels(1)[0].clone()];
-        assert!(
-            SparseLwrPrfProgram::new(toy_profile(), vec![layouts[0].clone(); 2], duplicate)
-                .is_err()
+        let (program, prf) = toy_prf(std::slice::from_ref(&key));
+        assert!(matches!(prf.output(), PrfOutput::Scalar(_)));
+        let workload = crate::rns_bgg::RnsBggDerivedWorkload::from_program(&program).unwrap();
+        let families = prf.selector_families();
+        assert_eq!(families.len(), key.public_layout.parameters.bucket_count);
+        let parameters =
+            mxx_backends::poly::dcrt::params::DCRTPolyParams::new(32, 1, 17, 4, None, None);
+        let plaintexts = prf.selector_plaintexts(&parameters, std::slice::from_ref(&key)).unwrap();
+        let q = toy_profile().q().unwrap() as u64;
+        let a = (0..10_u64).map(|coordinate| (7 * coordinate + 3) % q).collect::<Vec<_>>();
+        let mut accumulator = 0;
+        for (bucket, family) in families.iter().enumerate() {
+            assert_eq!(family.members, key.public_layout.cells[bucket].len());
+            assert_eq!(family.max_nonzero, 1);
+            assert_eq!(workload.rhs_level(family.rhs).unwrap(), bucket);
+            let bits = bits(&parameters, &plaintexts, family.rhs);
+            assert_eq!(bits.iter().sum::<u64>(), 1);
+            let slot = bits.iter().position(|bit| *bit == 1).unwrap();
+            if let PbcCell::Real { coordinate, .. } = key.public_layout.cells[bucket][slot] {
+                accumulator = (accumulator + a[coordinate]) % q;
+            }
+        }
+        assert_eq!(
+            accumulator,
+            crate::program_gadgets::pbc::clear_pbc_inner_product(
+                &key.public_layout,
+                key.private_schedule(),
+                &a,
+                q
+            )
+            .unwrap()
         );
+        let other = toy_key(&[1, 2, 6, 7], 100);
+        assert!(
+            prf.selector_plaintexts::<mxx_backends::poly::dcrt::poly::DCRTPoly>(
+                &parameters,
+                &[other]
+            )
+            .is_err()
+        );
+    }
+
+    /// Several members: one member-indexed selector family per bucket and
+    /// slot, holding the slot bit of every member's key, and one root loop.
+    #[test]
+    fn member_prf_has_member_indexed_selectors_per_bucket_and_slot() {
+        let keys = [toy_key(&[0, 3, 5, 9], 0), toy_key(&[1, 2, 6, 7], 100)];
+        let (program, prf) = toy_prf(&keys);
+        assert!(matches!(prf.output(), PrfOutput::Family(_)));
+        let width =
+            keys.iter().flat_map(|key| key.public_layout.cells.iter().map(Vec::len)).max().unwrap();
+        let buckets = keys[0].public_layout.parameters.bucket_count;
+        let families = prf.selector_families();
+        assert_eq!(families.len(), buckets * width);
+        assert_eq!(program.rhs_inputs().len(), buckets * width);
+        assert!(families.iter().all(|family| family.members == 2 && family.max_nonzero == 2));
+        let parameters =
+            mxx_backends::poly::dcrt::params::DCRTPolyParams::new(32, 1, 17, 4, None, None);
+        let plaintexts = prf.selector_plaintexts(&parameters, &keys).unwrap();
+        for (index, family) in families.iter().enumerate() {
+            let (bucket, slot) = (index / width, index % width);
+            let expected = keys
+                .iter()
+                .map(|key| u64::from(key.private_schedule().selected_slot(bucket) == slot))
+                .collect::<Vec<_>>();
+            assert_eq!(bits(&parameters, &plaintexts, family.rhs), expected);
+        }
+    }
+
+    #[test]
+    fn layouts_must_exist_and_cover_the_lwr_dimension() {
+        let layout = toy_key(&[0, 3, 5, 9], 0).public_layout;
+        let build = |profile, layouts| {
+            SparseLwrPrf::build(
+                &mut ExponentLutProgramBuilder::new(),
+                profile,
+                layouts,
+                LutOutputRepresentation::Coefficient,
+            )
+        };
+        assert!(build(toy_profile(), vec![]).is_err());
         let wider =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 2, 11).unwrap();
-        assert!(SparseLwrPrfProgram::new(wider, layouts, toy_labels(1)).is_err());
-    }
-
-    #[test]
-    fn prepared_descriptor_requires_an_external_trusted_identity() {
-        let program = SparseLwrPrfProgram::new(
-            toy_profile(),
-            vec![toy_key(&[0, 3, 5, 9], 0).public_layout],
-            toy_labels(1),
-        )
-        .unwrap();
-        let prepared = PreparedSparseLwrPrf::new(program.clone(), [9; 32]).unwrap();
-        assert_eq!(prepared.setup_identity().input_key_identity, [9; 32]);
-        let descriptor = prepared.descriptor();
-        assert!(PreparedSparseLwrPrf::import(program.clone(), &descriptor, [0; 32]).is_err());
-        let other = SparseLwrPrfProgram::new(
-            toy_profile(),
-            vec![toy_key(&[1, 2, 6, 7], 100).public_layout],
-            toy_labels(1),
-        )
-        .unwrap();
-        assert!(
-            PreparedSparseLwrPrf::import(other, &descriptor, descriptor.identity().unwrap())
-                .is_err()
-        );
-        assert!(
-            PreparedSparseLwrPrf::import(program, &descriptor, descriptor.identity().unwrap())
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn profile_program_mismatch_is_rejected() {
-        let profile = toy_profile();
-        let program = SparseLwrPrfProgram::new(
-            profile,
-            vec![toy_key(&[0, 3, 5, 9], 0).public_layout],
-            toy_labels(1),
-        )
-        .unwrap();
-        let other =
-            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2, 10).unwrap();
-        assert!(validate_profile_program(other, &program).is_err());
-
-        let mut noncanonical = program.clone();
-        noncanonical.readout[0] += 1;
-        assert!(validate_profile_program(profile, &noncanonical).is_err());
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 4, 11).unwrap();
+        assert!(build(wider, vec![layout]).is_err());
     }
 
     #[test]
     fn tiny_native_reference_oracle_covers_every_z_mod_q() {
-        let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 2, 32)
-            .expect("n=32, Q=32, p'=2 profile");
+        let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 4, 32)
+            .expect("n=32, Q=32, P=4 profile");
         assert_eq!(profile.ring_dimension().unwrap(), 32);
         assert_eq!(profile.q().unwrap(), 32);
-        assert_eq!(profile.p_prime, 2);
+        assert_eq!(profile.p_prime(), 2);
         assert_eq!(profile.layout.stride_log2, 1);
         let coefficients = profile.canonical_readout().expect("canonical readout");
         assert_eq!(coefficients.len(), 16);

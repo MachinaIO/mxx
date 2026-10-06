@@ -40,13 +40,13 @@ impl<'a> RnsPreprocessBuild<'a> {
             families: super::encoding::OnlineEvalFamilies { parameters },
             environment: Environment::new(),
             runtime: BTreeMap::new(),
-            refresh_declaration: None,
-            refresh_mask_child: None,
-            refresh_setup: None,
+            decoder_declaration: None,
+            decoder_smudge_child: None,
+            unmask_setup: None,
         }
     }
 
-    /// Bind RHS plaintexts for a refresh mask child without exposing the
+    /// Bind RHS plaintexts for a decoder smudge child without exposing the
     /// generic stage trait at application call sites. Dynamic children bind
     /// no RHS plaintexts and no secret.
     pub fn bind_rhs_inputs<P: Poly>(
@@ -60,117 +60,97 @@ impl<'a> RnsPreprocessBuild<'a> {
         <Self as PreprocessBuild<P>>::bind_inputs(self, program, parameters, rhs, payload, hash_key)
     }
 
-    /// Bind this builder, on [`RnsBggParameters::refresh_mask_parameters`],
-    /// to lower `declaration`'s mask Program: its mask LUT members are
+    /// Bind this builder, on [`RnsBggParameters::decoder_smudge_parameters`],
+    /// to lower `declaration`'s smudge Program: its smudge LUT members are
     /// finalized and transformed in their root bodies.
-    pub fn bind_refresh_mask(
+    pub fn bind_decoder_smudge(
         &mut self,
-        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+        declaration: &crate::decoder::decoding::DecoderDeclaration,
     ) -> Result<(), ApiError> {
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
         declaration
-            .validate_mask_program(evaluator.program.id())
-            .map_err(|error| ApiError::scheme(RnsBggError::Refresh(error)))?;
-        if evaluator.refresh_mask.is_some() {
-            return Err(ApiError::input("refresh mask is already bound"));
+            .validate_smudge_program(evaluator.program.id())
+            .map_err(|error| ApiError::scheme(RnsBggError::Decoder(error)))?;
+        if evaluator.decoder_smudge.is_some() {
+            return Err(ApiError::input("decoder smudge is already bound"));
         }
-        // Static LUT switching material is prepared here, at root scope, so
-        // that every mask member's root body only reads it.
-        if self.parameters.rhs_mode() == RhsMode::Static {
-            for family in crate::noise_refresh::refresh::MaskFamily::ALL {
-                let output = declaration.mask().output(family);
-                let level = evaluator.workload.level(output).map_err(ApiError::scheme)?;
-                let lut = declaration.mask().lut(family);
-                let table = evaluator
-                    .program
-                    .encryption_inputs()
-                    .luts()
-                    .get(lut.0 as usize)
-                    .cloned()
-                    .ok_or_else(|| ApiError::scheme(RnsBggError::Lut))?;
-                evaluator
-                    .prepare_lut_switching_ciphertexts(level, lut, &table)
-                    .map_err(ApiError::scheme)?;
-            }
-        }
-        evaluator.refresh_mask = Some(Arc::new(declaration.clone()));
+        evaluator.decoder_smudge = Some(Arc::new(declaration.clone()));
         Ok(())
     }
 
-    /// Prepare the decoder of `declaration`'s refresh of output
+    /// Prepare the unmasking of `declaration`'s decoder of output
     /// `output_index`, whose lowered source key is `source`: lower the bound
-    /// mask child `mask` once, form the summed component-1 key `A` of the
-    /// source column selection and the two mask sums, and sample its
+    /// smudge child `smudge` once, form the summed component-1 key `A` of the
+    /// source column selection and the smudge sum, and sample its
     /// preimage `K` under the trusted `setup` trapdoor. The graph publishes
-    /// `K`, `B`, and the mask child's public material under the refresh
+    /// `K`, `B`, and the smudge child's public material under the decoder
     /// namespace; the source output's public key is published unchanged.
-    pub fn apply_refresh(
+    pub fn apply_decoder(
         &mut self,
         output_index: usize,
-        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+        declaration: &crate::decoder::decoding::DecoderDeclaration,
         source: RnsBggPublicKey,
-        mut mask: RnsPreprocessBuild<'a>,
-        setup: &StageArtifacts<RnsBggDecoderSetupDescriptor>,
+        mut smudge: RnsPreprocessBuild<'a>,
+        setup: &StageArtifacts<RnsBggUnmaskSetupDescriptor>,
     ) -> Result<(), ApiError> {
-        if self.refresh_declaration.is_some() {
-            return Err(ApiError::input("refresh was already applied"));
+        if self.decoder_declaration.is_some() {
+            return Err(ApiError::input("decoder was already applied"));
         }
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
-        let expected = self
-            .parameters
-            .refresh_mask_parameters(declaration, &evaluator.program)
+        self.parameters
+            .validate_decoder_smudge_parameters(smudge.parameters, declaration, &evaluator.program)
             .map_err(ApiError::scheme)?;
-        let level = RnsBggParameters::refresh_source_level(declaration, &evaluator.program)
+        let level = RnsBggParameters::decoder_source_level(declaration, &evaluator.program)
             .map_err(ApiError::scheme)?;
         let descriptor = setup.descriptor();
-        if mask.parameters.parameter_identity() != expected.parameter_identity() ||
-            mask.evaluator
-                .as_ref()
-                .and_then(|child| child.refresh_mask.as_ref())
-                .map(|bound| *bound.commitment()) !=
-                Some(*declaration.commitment()) ||
+        if smudge
+            .evaluator
+            .as_ref()
+            .and_then(|child| child.decoder_smudge.as_ref())
+            .map(|bound| *bound.commitment()) !=
+            Some(*declaration.commitment()) ||
             evaluator.program.outputs().get(output_index) !=
                 Some(&Operand::Scalar(declaration.source_output())) ||
             source.wire != declaration.source_output()
         {
-            return Err(ApiError::scheme(RnsBggError::Refresh(RefreshError::TargetMismatch)));
+            return Err(ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch)));
         }
         if descriptor.context != self.context ||
             descriptor.parameters != self.parameters.parameter_identity() ||
-            descriptor.refresh_commitment != *declaration.commitment() ||
+            descriptor.decoder_commitment != *declaration.commitment() ||
             descriptor.level != level
         {
-            return Err(ApiError::compatibility(
-                "the decoder setup does not belong to this refresh",
-            ));
+            return Err(ApiError::compatibility("the unmask setup does not belong to this decoder"));
         }
-        let mut refresh = RnsBggRefresh { lowerer: evaluator, source };
-        let key = apply_refresh(declaration, &mut refresh, |_| {
-            let child = mask
+        let mut decoder = RnsBggDecoder { lowerer: evaluator, source };
+        let key = apply_decoder(declaration, &mut decoder, |_| {
+            let child = smudge
                 .evaluator
                 .as_mut()
-                .ok_or(RnsBggError::Binding("refresh mask builder was not bound"))?;
+                .ok_or(RnsBggError::Binding("decoder smudge builder was not bound"))?;
             let program = child.program.clone();
-            lower_program(&program, child, &mut mask.families, &mut mask.environment)
+            lower_program(&program, child, &mut smudge.families, &mut smudge.environment)
                 .map_err(|error| RnsBggError::Graph(error.to_string()))
         })
         .map_err(ApiError::scheme)?;
-        let trapdoor = import_decoder_trapdoor(self.parameters, setup).map_err(ApiError::scheme)?;
-        let preimage = crate::noise_refresh::decoder::preimage(&trapdoor, key);
+        let trapdoor = import_unmask_trapdoor(self.parameters, setup).map_err(ApiError::scheme)?;
+        let preimage = crate::decoder::unmask::preimage(&trapdoor, key);
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
-        evaluator.refresh_decoder =
-            Some((*declaration.commitment(), preimage, trapdoor.public_matrix()));
-        merge_runtime(&mut self.runtime, std::mem::take(&mut mask.runtime))
+        evaluator.unmask = Some((*declaration.commitment(), preimage, trapdoor.public_matrix()));
+        merge_runtime(&mut self.runtime, std::mem::take(&mut smudge.runtime))
             .map_err(ApiError::scheme)?;
-        self.refresh_mask_child = Some(
-            mask.evaluator.take().ok_or_else(|| ApiError::input("refresh mask was not bound"))?,
+        self.decoder_smudge_child = Some(
+            smudge
+                .evaluator
+                .take()
+                .ok_or_else(|| ApiError::input("decoder smudge was not bound"))?,
         );
-        self.refresh_setup =
+        self.unmask_setup =
             Some((setup.production().clone(), setup.manifest().clone(), descriptor.bound.clone()));
-        self.refresh_declaration = Some(declaration.clone());
+        self.decoder_declaration = Some(declaration.clone());
         Ok(())
     }
 }
@@ -185,13 +165,13 @@ fn merge_runtime(
             Some(RuntimeValue::Bytes(existing)) => match &value {
                 RuntimeValue::Bytes(candidate) if existing == candidate => continue,
                 RuntimeValue::Bytes(_) => {
-                    return Err(RnsBggError::Binding("refresh child runtime input conflicts"));
+                    return Err(RnsBggError::Binding("decoder child runtime input conflicts"));
                 }
-                _ => return Err(RnsBggError::Binding("refresh child runtime input schema")),
+                _ => return Err(RnsBggError::Binding("decoder child runtime input schema")),
             },
             // A secret input name is unique to one sampled secret.
             Some(RuntimeValue::Matrix(_)) if matches!(value, RuntimeValue::Matrix(_)) => {}
-            Some(_) => return Err(RnsBggError::Binding("refresh child runtime input schema")),
+            Some(_) => return Err(RnsBggError::Binding("decoder child runtime input schema")),
             None => {
                 destination.insert(name, value);
             }
@@ -271,6 +251,19 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             bytes,
             self.context,
         );
+        // Static LUT switching material is prepared at root scope, so that
+        // a LUT in a family body only reads it in every member.
+        if !dynamic {
+            let luts = program.encryption_inputs().luts().to_vec();
+            for (input, lut) in program.family_body_luts() {
+                let level = evaluator.workload.level(input).map_err(ApiError::scheme)?;
+                let table =
+                    luts.get(lut.0 as usize).ok_or_else(|| ApiError::scheme(RnsBggError::Lut))?;
+                evaluator
+                    .prepare_lut_switching_ciphertexts(level, lut, table)
+                    .map_err(ApiError::scheme)?;
+            }
+        }
         for (wire, declaration) in program.inputs() {
             let binding = match declaration.shape() {
                 InputBinding::Scalar(()) => InputBinding::Scalar(
@@ -388,7 +381,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         digest.update(evaluator.program.id().as_bytes());
         digest.update(self.parameters.parameter_identity());
         digest.update(self.hash_key_commitment);
-        if let Some(declaration) = &self.refresh_declaration {
+        if let Some(declaration) = &self.decoder_declaration {
             digest.update(declaration.commitment());
         }
         let encryption = digest.clone().finalize().into();
@@ -431,16 +424,16 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             }
             .map_err(ApiError::scheme)?;
         }
-        // The mask child uses its own source-ring key schedule. Publish its
-        // input keys and Static material under the refresh namespace so
+        // The smudge child uses its own source-ring key schedule. Publish its
+        // input keys and Static material under the decoder namespace so
         // encryption cannot resolve a same-named outer-program artifact.
         if let (Some(declaration), Some(child)) =
-            (self.refresh_declaration.as_ref(), self.refresh_mask_child.as_ref())
+            (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
             let commitment = *declaration.commitment();
             for (wire, input) in child.program.inputs() {
                 let names = (0..4)
-                    .map(|port| refresh_mask_input_key_artifact_name(commitment, *wire, port))
+                    .map(|port| decoder_smudge_input_key_artifact_name(commitment, *wire, port))
                     .collect::<Vec<_>>();
                 match input.shape() {
                     InputBinding::Scalar(()) => {
@@ -470,11 +463,11 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             for (rhs, prepared) in &child.rhs_material {
                 graph = match prepared {
                     InputBinding::Scalar(value) => graph.transferred_output(
-                        refresh_mask_artifact_name(commitment, &format!("rhs/{rhs:?}")),
+                        decoder_smudge_artifact_name(commitment, &format!("rhs/{rhs:?}")),
                         value.1.clone(),
                     ),
                     InputBinding::Family(value) => graph.transferred_output(
-                        refresh_mask_artifact_name(commitment, &format!("rhs/{rhs:?}/family")),
+                        decoder_smudge_artifact_name(commitment, &format!("rhs/{rhs:?}/family")),
                         child
                             .published_rhs_family(rhs, value)?
                             .field(|matrix| matrix.1)
@@ -491,7 +484,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 );
                 graph = graph
                     .transferred_output(
-                        refresh_mask_artifact_name(commitment, &role),
+                        decoder_smudge_artifact_name(commitment, &role),
                         material.clone(),
                     )
                     .map_err(ApiError::scheme)?;
@@ -531,17 +524,17 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 )
                 .map_err(ApiError::scheme)?;
         }
-        // The decoder of the refresh: `K` for online evaluation and `B` for
+        // The unmasking of the decoder: `K` for online evaluation and `B` for
         // encryption. The trapdoor itself stays in the setup production.
-        if let Some((commitment, preimage, public)) = &evaluator.refresh_decoder {
+        if let Some((commitment, preimage, public)) = &evaluator.unmask {
             graph = graph
                 .transferred_output(
-                    refresh_artifact_name(*commitment, "decoder-preimage"),
+                    decoder_artifact_name(*commitment, "unmask-preimage"),
                     preimage.clone(),
                 )
                 .map_err(ApiError::scheme)?
                 .transferred_output(
-                    refresh_artifact_name(*commitment, "decoder-public"),
+                    decoder_artifact_name(*commitment, "unmask-public"),
                     public.clone(),
                 )
                 .map_err(ApiError::scheme)?;
@@ -575,9 +568,9 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             binding = binding.with_dynamic_schema(rhs, evaluator.workload.luts().clone());
         }
         if let (Some(declaration), Some((_, _, bound))) =
-            (&self.refresh_declaration, &self.refresh_setup)
+            (&self.decoder_declaration, &self.unmask_setup)
         {
-            binding = binding.with_refresh(declaration, bound.clone());
+            binding = binding.with_decoder(declaration, bound.clone());
         }
         let encrypt_binding = RnsBggPreprocessEncryptDescriptor::from_binding(binding.clone());
         let online_eval_binding = RnsBggPreprocessOnlineEvalDescriptor::from_binding(binding);
@@ -586,7 +579,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             StageGraph::new(
                 graph,
                 runtime,
-                self.refresh_setup
+                self.unmask_setup
                     .into_iter()
                     .map(|(production, manifest, _)| (production, manifest))
                     .collect(),
@@ -700,44 +693,42 @@ mod test {
         assert_eq!(online_eval, <[u8; 32]>::from(digest.finalize()));
     }
 
-    /// Static preprocessing of a refresh mask child prepares every selector
+    /// Static preprocessing of a decoder smudge child prepares every selector
     /// member inside the root body that reads it at its own index and exports
     /// the family from that loop: no selector family is read from the
     /// material prepared at binding, so none stays resident.
     #[test]
-    fn refresh_mask_selectors_stream_from_their_root_loops() {
+    fn decoder_smudge_selectors_stream_from_their_root_loops() {
         use mxx_backends::poly::dcrt::poly::DCRTPoly;
-        let level = DCRTPolyParams::new(8, 3, 30, 15, None, None);
-        let plaintext = level.select_modulus(&BigUint::from(level.to_crt().0[0])).unwrap();
-        let parameters = RnsBggParameters::new(vec![level.clone(), plaintext], 1, 1).unwrap();
+        let (pool, parameters) = crate::rns_bgg::tests::decoder_test_chain();
+        let level = parameters.level(0).unwrap().clone();
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let source = builder.finish(vec![Operand::Scalar(input)]).unwrap();
         let (declaration, keys) =
-            crate::noise_refresh::refresh::fixture::declaration(&source, input, 8, 1);
-        let mask_parameters = parameters.refresh_mask_parameters(&declaration, &source).unwrap();
-        let selectors = declaration
-            .mask()
-            .selector_plaintexts::<DCRTPoly>(&level, [&keys[0], &keys[1]])
-            .unwrap();
+            crate::decoder::decoding::fixture::declaration(&source, input, 8, 1);
+        let smudge_parameters =
+            parameters.decoder_smudge_parameters(&declaration, &source, &pool, 1).unwrap();
+        let selectors =
+            declaration.smudge().prf().selector_plaintexts::<DCRTPoly>(&level, &keys).unwrap();
         let payload = crate::rns_bgg::RnsBggPayloadSecret {
             row: (
-                mask_parameters.ring(0).unwrap().identity(1),
-                mask_parameters.ring(0).unwrap().identity(1),
+                smudge_parameters.ring(0).unwrap().identity(1),
+                smudge_parameters.ring(0).unwrap().identity(1),
             ),
             binding: None,
         };
-        let mut child = RnsPreprocessBuild::new(&mask_parameters, [1; 32]);
+        let mut child = RnsPreprocessBuild::new(&smudge_parameters, [1; 32]);
         child
             .bind_rhs_inputs(
-                declaration.mask().program(),
+                declaration.smudge().program(),
                 &mxx_ir_core::ParamEnv::default(),
                 &selectors,
                 Some(&payload),
                 &[2; 32],
             )
             .unwrap();
-        child.bind_refresh_mask(&declaration).unwrap();
+        child.bind_decoder_smudge(&declaration).unwrap();
         let (evaluator, families, environment) =
             <RnsPreprocessBuild as PreprocessBuild<DCRTPoly>>::lowering_state(&mut child).unwrap();
         let program = evaluator.program.clone();

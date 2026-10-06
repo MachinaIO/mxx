@@ -17,13 +17,13 @@ pub struct RnsBggNoiseTrace {
     pub wires: BTreeMap<WireId, RnsBggNoiseValue>,
     /// Physical event budget for each dependency node. A family body and LUT
     /// branch set are represented once in the symbolic trace, so their active
-    /// multiplicities are expanded before this map is recorded. Refresh
+    /// multiplicities are expanded before this map is recorded. Decoder
     /// transcript nodes store their already-expanded physical event count.
     pub node_event_counts: BTreeMap<usize, BigUint>,
     /// Finalized declared outputs in declaration order.
     pub outputs: Vec<RnsBggNoiseValue>,
-    /// The noise of the composed refresh, if any.
-    pub refresh: Option<super::RnsBggRefreshNoise>,
+    /// The noise of the composed decoder, if any.
+    pub decoder: Option<super::RnsBggDecoderNoise>,
 }
 
 /// Trace one Program using one workload and one evaluator path.
@@ -143,7 +143,7 @@ pub struct RnsBggParameterManifest {
     /// Accepted noise trace.
     pub trace: RnsBggNoiseTrace,
     /// Average-case policy used when this trace was accepted.
-    pub average: Option<crate::noise_refresh::simulation::AverageCaseConfig>,
+    pub average: Option<crate::decoder::simulation::AverageCaseConfig>,
     /// Estimated persistent artifact bytes.
     pub estimated_artifact_bytes: BigUint,
     /// Commitment to the complete accepted trace, including dependencies.
@@ -205,7 +205,7 @@ fn noise_contract_commitment(
     program: &ExponentLutProgram,
     bindings: &RnsBggNoiseBindings,
     terminal_value_bounds: &[BigUint],
-    average: Option<&crate::noise_refresh::simulation::AverageCaseConfig>,
+    average: Option<&crate::decoder::simulation::AverageCaseConfig>,
 ) -> [u8; 32] {
     stable_source_id(&(
         program.id(),
@@ -240,7 +240,7 @@ fn trace_commitment(trace: &RnsBggNoiseTrace) -> [u8; 32] {
         &trace.node_event_counts,
         &trace.outputs,
         &trace.joint_event_count,
-        &trace.refresh,
+        &trace.decoder,
     ))
 }
 
@@ -302,7 +302,7 @@ impl RnsBggParameters {
         program: &ExponentLutProgram,
         bindings: &RnsBggNoiseBindings,
         terminal_value_bounds: &[BigUint],
-        average: Option<&crate::noise_refresh::simulation::AverageCaseConfig>,
+        average: Option<&crate::decoder::simulation::AverageCaseConfig>,
     ) -> Result<RnsBggNoiseTrace, RnsBggError> {
         if terminal_value_bounds.len() != program.outputs().len() {
             return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
@@ -405,10 +405,10 @@ impl RnsBggParameters {
                     .as_ref()
                     .ok_or(RnsBggError::Parameters("average-case input moment model is missing"))?;
                 let level = workload.level(wire)?;
-                let modulus = if program
+                let coefficient = program
                     .wire_is_coefficient_output(wire)
-                    .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
-                {
+                    .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?;
+                let modulus = if coefficient {
                     self.levels
                         .get(level + 1)
                         .or_else(|| self.levels.get(level))
@@ -421,8 +421,13 @@ impl RnsBggParameters {
                 if modulus.as_ref() <= &payload {
                     return Err(RnsBggError::Budget("terminal range"));
                 }
-                let modulus_limit = NonnegativeRational::new(modulus.as_ref().clone(), 4u8.into())
-                    .map_err(|_| RnsBggError::Parameters("invalid average-case rational budget"))?;
+                let modulus_limit = if coefficient {
+                    self.coefficient_output_budget(program, wire, level)?
+                } else {
+                    NonnegativeRational::new(modulus.as_ref().clone(), 4u8.into()).map_err(
+                        |_| RnsBggError::Parameters("invalid average-case rational budget"),
+                    )?
+                };
                 if !moments.fits(&modulus_limit, z_squared) {
                     tracing::info!(
                         wire = wire.0,
@@ -440,7 +445,8 @@ impl RnsBggParameters {
                     .wire_is_coefficient_output(wire)
                     .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
                 {
-                    self.coefficient_output_noise_fits(level, value)?
+                    let budget = self.coefficient_output_budget(program, wire, level)?;
+                    &value.bound.error * &budget.denominator < budget.numerator
                 } else {
                     self.noise_fits(level, &value.bound)?
                 };
@@ -505,7 +511,7 @@ impl RnsBggParameters {
         program: &ExponentLutProgram,
         bindings: &RnsBggNoiseBindings,
         terminal_value_bounds: &[BigUint],
-        average: Option<&crate::noise_refresh::simulation::AverageCaseConfig>,
+        average: Option<&crate::decoder::simulation::AverageCaseConfig>,
     ) -> Result<(Self, RnsBggParameterManifest), RnsBggError> {
         if terminal_value_bounds.is_empty() {
             return Err(RnsBggError::Parameters("terminal bounds must not be empty"));
@@ -655,7 +661,7 @@ mod test {
         let bindings = RnsBggNoiseBindings::from_inputs(&program, &[input], &[]).unwrap();
         let terminal = [BigUint::one()];
         assert!(parameters.audit_program(&program, &bindings, &terminal, None).is_err());
-        let average = crate::noise_refresh::simulation::AverageCaseConfig {
+        let average = crate::decoder::simulation::AverageCaseConfig {
             failure_exponent: 1,
             tail_correction_bits: 0,
             allow_average_acceptance: true,
@@ -677,7 +683,7 @@ mod test {
         let bindings = RnsBggNoiseBindings::from_inputs(&program, &[input], &[]).unwrap();
         let terminal = [BigUint::one()];
         assert!(parameters.audit_program(&program, &bindings, &terminal, None).is_err());
-        let average = crate::noise_refresh::simulation::AverageCaseConfig {
+        let average = crate::decoder::simulation::AverageCaseConfig {
             failure_exponent: 1,
             tail_correction_bits: 0,
             allow_average_acceptance: true,
@@ -696,7 +702,7 @@ mod test {
             &[],
         )
         .unwrap();
-        let average = crate::noise_refresh::simulation::AverageCaseConfig {
+        let average = crate::decoder::simulation::AverageCaseConfig {
             failure_exponent: 1,
             tail_correction_bits: 0,
             allow_average_acceptance: true,
@@ -726,14 +732,14 @@ mod test {
             2u8 *
             BigUint::from(parameters.component_columns(0).unwrap());
         assert_eq!(events, expected);
-        let base = crate::noise_refresh::simulation::AverageCaseConfig {
+        let base = crate::decoder::simulation::AverageCaseConfig {
             failure_exponent: 1,
             tail_correction_bits: 0,
             allow_average_acceptance: true,
         }
         .z_squared_for_events(&events)
         .unwrap();
-        let corrected = crate::noise_refresh::simulation::AverageCaseConfig {
+        let corrected = crate::decoder::simulation::AverageCaseConfig {
             failure_exponent: 1,
             tail_correction_bits: 2,
             allow_average_acceptance: true,

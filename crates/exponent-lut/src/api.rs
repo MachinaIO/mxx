@@ -6,7 +6,7 @@
 //! input-only and never receives a whole Program.
 
 use crate::{
-    noise_refresh::{NoiseRefresh, RefreshDeclaration},
+    decoder::{Decoder, DecoderDeclaration},
     program::{
         Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution,
         ProgramLowerError, RhsId, WireId, lower_program,
@@ -616,7 +616,7 @@ pub trait EncryptBuild<P: Poly> {
     fn build_graph(self) -> Result<(StageGraph, Self::Descriptor), ApiError>;
 }
 
-/// Builder contract for online evaluation: Program lowering and scheme refresh graph
+/// Builder contract for online evaluation: Program lowering and scheme decoder graph
 /// construction.
 pub trait OnlineEvalBuild {
     type Evaluator: ExponentLUTProgramLowering + crate::program::ProgramLoweringContext;
@@ -686,7 +686,7 @@ pub trait NoiseBuild {
 /// Execute one artifact-producing graph and capture its finalized manifest.
 /// Validate, execute, and persist one already-built stage graph.
 ///
-/// This is the common persistence boundary used when a refreshed graph must
+/// This is the common persistence boundary used when a composed decoder graph must
 /// resume through the normal `StageArtifacts` lifecycle. It does not create a
 /// second executor or bypass graph validation or observers.
 pub(crate) fn execute_artifacts<E, S, D>(
@@ -804,22 +804,22 @@ where
     execution.evaluate(validated, graph.runtime_inputs, store, execution_nonce)
 }
 
-/// Evaluate the refresh mask exactly once and finish the concrete stage.
+/// Evaluate the decoder smudge exactly once and finish the concrete stage.
 ///
-/// `evaluate_mask` lowers the declaration's mask Program and returns its
+/// `evaluate_smudge` lowers the declaration's smudge Program and returns its
 /// aggregated, member-transformed carrier; the stage-specific
-/// [`NoiseRefresh`] implementation then decodes it with the source.
-pub(crate) fn apply_refresh<R, F>(
-    declaration: &RefreshDeclaration,
-    refresh: &mut R,
-    evaluate_mask: F,
+/// [`Decoder`] implementation then decodes it with the source.
+pub(crate) fn apply_decoder<R, F>(
+    declaration: &DecoderDeclaration,
+    decoder: &mut R,
+    evaluate_smudge: F,
 ) -> Result<R::Output, R::Error>
 where
-    R: NoiseRefresh,
-    F: FnOnce(&RefreshDeclaration) -> Result<R::Mask, R::Error>,
+    R: Decoder,
+    F: FnOnce(&DecoderDeclaration) -> Result<R::Smudge, R::Error>,
 {
-    let mask = evaluate_mask(declaration)?;
-    refresh.finish_noise_refresh(declaration, mask)
+    let smudge = evaluate_smudge(declaration)?;
+    decoder.finish_decoding(declaration, smudge)
 }
 
 pub(crate) fn domain_identity(base: [u8; 32], domain: &[u8]) -> [u8; 32] {
@@ -980,7 +980,7 @@ where
     execute_artifacts(graph, parameters, descriptor, identity, execution, store, before_execute)
 }
 
-/// Lower the Program, append scheme-owned refresh operations, and execute the
+/// Lower the Program, append scheme-owned decoder operations, and execute the
 /// resulting online evaluation graph. The returned outputs are owned copies.
 pub fn online_eval<E, S, T>(
     program: &ExponentLutProgram,

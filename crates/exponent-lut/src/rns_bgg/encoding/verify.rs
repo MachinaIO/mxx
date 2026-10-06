@@ -26,13 +26,14 @@ where
     S: SessionStore,
     P: Poly,
 {
-    let (wire, output_level) = output_wire_level(program, output_index)?;
+    let (wire, output_level, decoding) = output_wire_level(program, parameters, output_index)?;
     verify_output_at_level(
         program,
         result,
         output_index,
         wire,
         output_level,
+        decoding,
         expected,
         parameters,
         payload,
@@ -42,32 +43,29 @@ where
     )
 }
 
-/// The wire of scalar output `output_index` and the level of its finalized
-/// carrier: a coefficient output is moved down once more by `finish_outputs`.
+/// The wire of output `output_index`, the level of its finalized carrier (a
+/// coefficient output is moved down once more by `finish_outputs`), and, for
+/// a coefficient output, its decryption modulus `t` and scale `k` (see
+/// [`RnsBggParameters::coefficient_output_decoding`]). A member of a
+/// `parallel` family is described by its body's output wire, a member of an
+/// input family by the family's own wire.
 fn output_wire_level(
     program: &ExponentLutProgram,
+    parameters: &RnsBggParameters,
     output_index: usize,
-) -> Result<(WireId, usize), ApiError> {
+) -> Result<(WireId, usize, Option<(u64, BigUint)>), ApiError> {
     let wire = match program
         .outputs()
         .get(output_index)
         .ok_or_else(|| ApiError::input("verification output index is out of range"))?
     {
         Operand::Scalar(wire) => *wire,
-        Operand::Member { .. } => {
-            return Err(ApiError::input("verification output must be scalar"));
-        }
+        Operand::Member { family, .. } => program
+            .family_body_outputs()
+            .into_iter()
+            .find_map(|(output, inner)| (output == *family).then_some(inner))
+            .unwrap_or(*family),
     };
-    // An unscaled coefficient output carries its value at scale 1, so it has
-    // no decoding margin; it is read only through a noise refresh.
-    if program
-        .wire_is_unscaled_coefficient_output(wire)
-        .map_err(|_| ApiError::input("verification output metadata is invalid"))?
-    {
-        return Err(ApiError::input(
-            "an unscaled coefficient output has no decoding margin; read it through a noise refresh",
-        ));
-    }
     let workload = RnsBggDerivedWorkload::from_program(program).map_err(ApiError::scheme)?;
     let source_level = workload.level(wire).map_err(ApiError::scheme)?;
     let coefficient_output = program
@@ -76,22 +74,32 @@ fn output_wire_level(
     let output_level = source_level
         .checked_add(usize::from(coefficient_output))
         .ok_or_else(|| ApiError::input("verification output level overflow"))?;
-    Ok((wire, output_level))
+    let decoding = coefficient_output
+        .then(|| parameters.coefficient_output_decoding(program, wire, output_level))
+        .transpose()
+        .map_err(ApiError::scheme)?
+        .map(|(t, k, _)| (t, k));
+    Ok((wire, output_level, decoding))
 }
 
 /// Decrypt private output `output_index` of [`crate::api::online_eval`] with
 /// the caller's mask (for Dynamic parameters, the payload secret, which is
-/// also the mask) and return its plaintext coefficients at `positions`,
-/// modulo two.
+/// also the mask) and return its plaintext coefficients at `positions`:
+/// modulo two for an exponent output, modulo its decryption modulus `t` for
+/// a coefficient output.
 ///
 /// A private output is a terminal-level carrier: the terminal state gadget
-/// is the identity, its message scale is `floor(q / 2)`, and the second
-/// component of the payload secret is one. Its second row component is
-/// therefore `s * A_01 + A_11 - floor(q / 2) * mu + e` for the mask
-/// `s = (s_0, 1)` and the paired public key `A`, so the phase
-/// `row_1 - (s_0 * A_01 + A_11)` is `-floor(q / 2) * mu + e`. Threshold
-/// decoding modulo two returns every coefficient of `mu` modulo two whenever
-/// the error is below `q / 4`; the payload secret is not needed. The graph is
+/// is the identity, its message scale is `Delta` (`floor(q / 2)` for an
+/// exponent output, the scale `k` of [`RnsBggParameters::coefficient_output_scale`]
+/// for a coefficient output), and the second component of the payload
+/// secret is one. Its second row component is therefore
+/// `s * A_01 + A_11 - Delta * mu + e` for the mask `s = (s_0, 1)` and the
+/// paired public key `A`, so the phase `row_1 - (s_0 * A_01 + A_11)` is
+/// `-Delta * mu + e`. Threshold decoding modulo two of the phase returns
+/// every coefficient of an exponent output's `mu` modulo two whenever the
+/// error is below `q / 4`; threshold decoding modulo `t` of the negated phase
+/// `k mu - e` returns `mu mod t` whenever `2 t |e| + 2 r W < q` (`t k = q - r`,
+/// `|mu| <= W`). The payload secret is not needed. The graph is
 /// the one decryption step of the workflow: its inputs are the online
 /// evaluation outputs `output-{output_index}.1`, `.3`, and `.5`, named
 /// `decode-key-01`, `decode-key-11`, and `decode-row-1`, and the mask, and
@@ -113,7 +121,7 @@ where
     E: StageExecution<S>,
     S: SessionStore,
 {
-    let (wire, output_level) = output_wire_level(program, output_index)?;
+    let (wire, output_level, decoding) = output_wire_level(program, parameters, output_index)?;
     if output_level + 1 != parameters.levels().len() {
         return Err(ApiError::input("only a terminal-level output can be decoded"));
     }
@@ -143,7 +151,10 @@ where
         (mask_row.0 * ring.input("decode-key-01", (1, 1)) +
             mask_row.1 * ring.input("decode-key-11", (1, 1)));
     let mut graph = DslContext::new("rns-bgg-output-decode");
-    let decoded = phase.threshold_decode_ints(2u8, length);
+    let decoded = match &decoding {
+        Some((t, _)) => (-phase).threshold_decode_ints(*t, length),
+        None => phase.threshold_decode_ints(2u8, length),
+    };
     for position in positions {
         graph = graph
             .output(format!("decoded-{position}"), decoded[*position].clone())
@@ -212,7 +223,7 @@ where
     S: SessionStore,
     P: Poly,
 {
-    let (wire, output_level) = output_wire_level(program, output_index)?;
+    let (wire, output_level, _) = output_wire_level(program, parameters, output_index)?;
     if output_level + 1 != parameters.levels().len() {
         return Err(ApiError::input("only a terminal-level output can be decoded"));
     }
@@ -306,6 +317,7 @@ fn verify_output_at_level<E, S, P>(
     output_index: usize,
     wire: WireId,
     output_level: usize,
+    decoding: Option<(u64, BigUint)>,
     expected: &P,
     parameters: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
@@ -319,10 +331,10 @@ where
     P: Poly,
 {
     let mask = &stage_mask(parameters, payload, mask)?;
-    // Only the terminal relation (identity state gadget, public scale
-    // floor(q / 2)) separates plaintexts by more than the q / 4 decoding
-    // threshold; an intermediate carrier's gadget powers can be smaller than
-    // its noise, so it cannot be verified by decoding.
+    // Only the terminal relation (identity state gadget, scale floor(q / 2)
+    // or the coefficient scale k) separates plaintexts by more than the
+    // decoding threshold; an intermediate carrier's gadget powers can be
+    // smaller than its noise, so it cannot be verified by decoding.
     if output_level + 1 != parameters.levels().len() {
         return Err(ApiError::input(format!(
             "verification output is at level {output_level}, not the terminal level {}",
@@ -397,9 +409,14 @@ where
     let expected = plaintext_constant(&output_ring, expected);
     let public_payload_residual =
         public_payload.as_ref().map(|payload| payload.clone() - expected.clone());
+    let scale = match &decoding {
+        Some((_, k)) => k.clone(),
+        None => parameters.message_scale(output_level).map_err(ApiError::scheme)?,
+    };
+    let plaintext_modulus = BigInt::from(decoding.as_ref().map_or(2, |(t, _)| *t));
     let encoding = RnsBggEncoding::new(key, row, public_payload);
     let residual = encoding
-        .verification_residual(parameters, output_level, payload, mask, expected)
+        .verification_residual(parameters, output_level, payload, mask, expected, &scale)
         .map_err(ApiError::scheme)?;
     // The backend decoder consumes one polynomial (entry 0,0). Check every
     // gadget column, including the high powers which distinguish plaintexts.
@@ -451,7 +468,7 @@ where
         let decoded = threshold_decode_coefficients(
             residual.entry(0, 0).coeffs_biguints(),
             &modulus,
-            &BigInt::from(2u8),
+            &plaintext_modulus,
             output_parameters.ring_dimension() as usize,
         );
         if decoded.iter().any(|value| value != &BigInt::from(0u8)) {
@@ -531,9 +548,10 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: None,
         };
         let source_ring = parameters.ring(0).unwrap();
@@ -545,15 +563,19 @@ mod test {
             row: (source_ring.zero((1, 1)), source_ring.identity(1)),
             binding: None,
         };
-        let columns = parameters.component_columns(1).unwrap();
-        assert_ne!(columns, parameters.component_columns(0).unwrap());
+        // The raw carrier of a coefficient LUT at level 0: `Delta_0 v G_1`
+        // against the full level-1 public gadget, which the one ModDown
+        // turns into `v G_1` and the scale-up action into `k v`.
+        let columns = parameters
+            .lut_output_columns(1, crate::program::LutOutputRepresentation::Coefficient)
+            .unwrap();
         let zero = source_ring.zero((1, columns));
         let key =
             RnsBggPublicKey::new(output, ((zero.clone(), zero.clone()), (zero.clone(), zero)));
         let target_gadget =
-            parameters.state_gadget(1).unwrap().centered_rebase(&parameters.ring(0).unwrap());
-        let scale = parameters.message_scale(0).unwrap() * parameters.message_scale(1).unwrap();
-        let raw_signal = target_gadget * parameters.scalar(0, scale).unwrap();
+            parameters.public_gadget(1).unwrap().centered_rebase(&parameters.ring(0).unwrap());
+        let raw_signal =
+            target_gadget * parameters.scalar(0, parameters.scale(0).unwrap().clone()).unwrap();
         let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
             parameters.levels().iter().cloned(),
         ));
@@ -693,32 +715,43 @@ mod test {
         let mask = RnsBggMaskSecret { row: (ring.identity(1), ring.identity(1)), binding: None };
         let expected = ring.polynomial([IntExpr::constant(BigInt::from(1u8))]);
         let residual_a = RnsBggEncoding::new(key_a, row.clone(), None)
-            .verification_residual(&parameters, 0, &payload, &mask, expected.clone())
+            .verification_residual(
+                &parameters,
+                0,
+                &payload,
+                &mask,
+                expected.clone(),
+                &parameters.message_scale(0).unwrap(),
+            )
             .unwrap();
         let residual_b = RnsBggEncoding::new(key_b, row, None)
-            .verification_residual(&parameters, 0, &payload, &mask, expected)
+            .verification_residual(
+                &parameters,
+                0,
+                &payload,
+                &mask,
+                expected,
+                &parameters.message_scale(0).unwrap(),
+            )
             .unwrap();
         assert_ne!(residual_a.flatten(), residual_b.flatten());
     }
 
-    /// Three levels of three, two and one 17-bit primes, so the switching
-    /// target of a LUT at level 0 is wider for an unscaled coefficient table
-    /// (`modulus_digits(1)`) than for a scaled one (`component_columns(1)`).
-    /// Ring dimension and sigma are overridable by
-    /// `MXX_EXPONENT_LUT_UNSCALED_TEST_{RING_DIMENSION,SIGMA}`.
+    /// Two levels of two and one 17-bit primes, so the switching target of a
+    /// LUT at level 0 is wider for a coefficient table (`modulus_digits(1)`)
+    /// than for an exponent one (`component_columns(1)`, one column at the
+    /// terminal level). Ring dimension and sigma are overridable by
+    /// `MXX_EXPONENT_LUT_COEFFICIENT_TEST_{RING_DIMENSION,SIGMA}`.
     fn unequal_width_parameters(mode: RhsMode) -> RnsBggParameters {
         let read = |name: &str, default: &str| {
-            std::env::var(format!("MXX_EXPONENT_LUT_UNSCALED_TEST_{name}"))
+            std::env::var(format!("MXX_EXPONENT_LUT_COEFFICIENT_TEST_{name}"))
                 .unwrap_or_else(|_| default.to_owned())
         };
         let ring_dimension = read("RING_DIMENSION", "16").parse().unwrap();
         let sigma = read("SIGMA", "1").parse::<bigdecimal::BigDecimal>().unwrap();
-        let high = DCRTPolyParams::new(ring_dimension, 3, 17, 6, None, None);
-        let primes = high.to_crt().0;
-        let middle =
-            high.select_modulus(&(BigUint::from(primes[0]) * BigUint::from(primes[1]))).unwrap();
-        let low = high.select_modulus(&BigUint::from(primes[0])).unwrap();
-        RnsBggParameters::new(vec![high, middle, low], sigma, 1).unwrap().with_rhs_mode(mode)
+        let high = DCRTPolyParams::new(ring_dimension, 2, 17, 6, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        RnsBggParameters::new(vec![high, low], sigma, 1).unwrap().with_rhs_mode(mode)
     }
 
     /// Preprocess, encrypt and evaluate `program` with the private scalar
@@ -800,26 +833,27 @@ mod test {
         (result, payload, mask)
     }
 
-    /// An unscaled coefficient LUT at level 0 of a chain whose adjacent
-    /// widths differ: online evaluation finalizes it once to level 1, where
-    /// its rows have `modulus_digits(1)` columns and its residual
-    /// `row - s A + v r G_1` against the full level-1 public gadget is within
-    /// the noise evaluator's bound for that output, in Static and Dynamic
-    /// mode. Verification and decoding refuse it.
+    /// A coefficient LUT at level 0 of a chain whose adjacent widths differ:
+    /// online evaluation finalizes it once to the terminal level 1, scaling
+    /// its `v G_1` payload by `G^-1(k)` to `k v`. Its residual
+    /// `row - s A + r k v` is within the noise evaluator's bound for that
+    /// output, verification accepts `v` and rejects a wrong plaintext, and
+    /// decryption returns `v mod t`, in Static and Dynamic mode, for both
+    /// table entries (the larger one is the bound `W`) and both signs of the
+    /// input monomial.
     #[test]
-    fn unscaled_coefficient_lut_finalizes_to_the_public_gadget_relation() {
-        for mode in [RhsMode::Static, RhsMode::Dynamic] {
+    fn coefficient_lut_finalizes_scales_and_decodes() {
+        for (mode, bit, negative) in
+            [RhsMode::Static, RhsMode::Dynamic].into_iter().flat_map(|mode| {
+                [(0, false), (1, false), (0, true), (1, true)].map(|(b, n)| (mode, b, n))
+            })
+        {
             let parameters = unequal_width_parameters(mode);
             assert_ne!(
                 parameters
                     .lut_output_columns(1, crate::program::LutOutputRepresentation::Coefficient)
                     .unwrap(),
-                parameters
-                    .lut_output_columns(
-                        1,
-                        crate::program::LutOutputRepresentation::UnscaledCoefficient
-                    )
-                    .unwrap(),
+                parameters.component_columns(1).unwrap(),
                 "the test needs unequal adjacent widths"
             );
             let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
@@ -833,21 +867,23 @@ mod test {
                         layout,
                         8,
                         values.clone(),
-                        crate::program::LutOutputRepresentation::UnscaledCoefficient,
+                        crate::program::LutOutputRepresentation::Coefficient,
                     )
                     .unwrap(),
                 )
                 .unwrap();
             let output = builder.lut(Operand::Scalar(input), table).unwrap();
             let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
-            assert!(program.wire_is_unscaled_coefficient_output(output).unwrap());
+            assert_eq!(program.wire_coefficient_bound(output).unwrap(), Some(5));
+            let (t, k, _) = parameters.coefficient_output_decoding(&program, output, 1).unwrap();
+            assert_eq!(t, 12);
 
             let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
             let bindings = crate::rns_bgg::RnsBggNoiseBindings::from_inputs(
                 &program,
                 &[crate::rns_bgg::RnsBggNoiseValue::sampled_encoding(
                     &parameters,
-                    b"unscaled-lut-input",
+                    b"coefficient-lut-input",
                     &[BigInt::from(1u8)],
                 )],
                 &[],
@@ -862,12 +898,13 @@ mod test {
             .unwrap();
             let bound = report.outputs[0].bound.error.clone();
 
-            let bit = rand::random::<u32>() as usize % 2;
             let level = parameters.levels().first().unwrap();
+            let monomial = DCRTPoly::const_rotate_poly(level, bit);
             let lhs = BTreeMap::from([(
                 input,
-                InputBinding::Scalar(DCRTPoly::const_rotate_poly(level, bit)),
+                InputBinding::Scalar(if negative { -monomial } else { monomial }),
             )]);
+            let value = if negative { -(values[bit] as i64) } else { values[bit] as i64 };
             let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
                 parameters.levels().iter().cloned(),
             ));
@@ -877,7 +914,6 @@ mod test {
 
             let finalized = 1;
             let ring = parameters.ring(finalized).unwrap();
-            let columns = parameters.level(finalized).unwrap().modulus_digits();
             let mut runtime = BTreeMap::new();
             for port in 0..6 {
                 runtime.insert(
@@ -885,18 +921,17 @@ mod test {
                     result.outputs[&format!("output-0.{port}")].clone(),
                 );
             }
-            let port = |index: usize| ring.input(format!("port-{index}"), (1, columns));
+            let port = |index: usize| ring.input(format!("port-{index}"), (1, 1));
             let stage_mask = stage_mask(&parameters, &payload, mask.as_ref()).unwrap();
             let s = reduce_secret(&parameters, &stage_mask.row, finalized).unwrap();
             let r = reduce_secret(&parameters, &payload.row, finalized).unwrap();
-            let message = ring.polynomial([IntExpr::constant(BigInt::from(values[bit]))]) *
-                parameters.public_gadget(finalized).unwrap();
+            let message = ring.polynomial([IntExpr::constant(BigInt::from(k.clone()) * value)]);
             let residual = |component: usize, r_k: Mat| {
                 port(4 + component) -
                     (s.0.clone() * port(component) + s.1.clone() * port(2 + component)) +
                     r_k * message.clone()
             };
-            let graph = DslContext::new("unscaled-lut-residual")
+            let graph = DslContext::new("coefficient-lut-residual")
                 .output("residual-0", residual(0, r.0.clone()))
                 .unwrap()
                 .output("residual-1", residual(1, r.1.clone()))
@@ -923,48 +958,48 @@ mod test {
                         MemoryArtifactStore,
                     >>::download_matrix(&execution, &residuals.outputs[name])
                     .unwrap();
-                for column in 0..columns {
-                    for coefficient in matrix.entry(0, column).coeffs_biguints() {
-                        let value = BigInt::from(coefficient);
-                        let centered =
-                            if &value * 2u8 > modulus { value - &modulus } else { value };
-                        assert!(
-                            centered.magnitude() <= &bound,
-                            "{mode:?}: residual {centered} exceeds the simulated bound {bound}"
-                        );
-                    }
+                for coefficient in matrix.entry(0, 0).coeffs_biguints() {
+                    let value = BigInt::from(coefficient);
+                    let centered = if &value * 2u8 > modulus { value - &modulus } else { value };
+                    assert!(
+                        centered.magnitude() <= &bound,
+                        "{mode:?}: residual {centered} exceeds the simulated bound {bound}"
+                    );
                 }
             }
-            let expected = DCRTPoly::from_usize_to_constant(&parameters.levels()[1], values[bit]);
-            assert!(
+            let verify = |value: i64, execution: &mut _, store: &mut _| {
+                let plaintext = DCRTPoly::from_usize_to_constant(
+                    &parameters.levels()[1],
+                    value.unsigned_abs() as usize,
+                );
                 verify_output(
                     &program,
                     &result,
                     0,
-                    &expected,
+                    &if value < 0 { -plaintext } else { plaintext },
                     &parameters,
                     &payload,
                     mask.as_ref(),
-                    &mut execution,
-                    &mut store
+                    execution,
+                    store,
                 )
-                .is_err()
-            );
-            assert!(
-                decode_output(
-                    &program,
-                    &result,
-                    0,
-                    &parameters,
-                    &payload,
-                    mask.as_ref(),
-                    &[0],
-                    &mut execution,
-                    &mut store,
-                    |_| Ok(()),
-                )
-                .is_err()
-            );
+            };
+            verify(value, &mut execution, &mut store).unwrap();
+            assert!(verify(-value, &mut execution, &mut store).is_err());
+            let decoded = decode_output(
+                &program,
+                &result,
+                0,
+                &parameters,
+                &payload,
+                mask.as_ref(),
+                &[0],
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(decoded, vec![BigInt::from(value.rem_euclid(t as i64))], "{mode:?}");
         }
     }
 }

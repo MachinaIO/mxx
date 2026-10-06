@@ -21,7 +21,7 @@ use mxx_backends::{
 use mxx_dsl::{DslContext, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
     ExpLayout, NandCircuit, api,
-    noise_refresh::simulation::{AverageCaseConfig, NoiseModelKind},
+    decoder::simulation::{AverageCaseConfig, NoiseModelKind},
     program::Operand,
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,

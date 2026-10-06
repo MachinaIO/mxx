@@ -1,4 +1,4 @@
-//! The online evaluation stage adapter and its refresh decoding.
+//! The online evaluation stage adapter and its decoding.
 use super::*;
 
 /// The family of input encodings whose fields are the imported families:
@@ -39,24 +39,24 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             evaluator: None,
             families: OnlineEvalFamilies { parameters },
             environment: Environment::new(),
-            pending_refresh: None,
-            refresh_preimage_bound: None,
+            pending_decoder: None,
+            unmask_preimage_bound: None,
         }
     }
 
-    /// Bind this builder, on [`RnsBggParameters::refresh_mask_parameters`],
-    /// to `declaration`'s mask Program: its inputs and material are imported
+    /// Bind this builder, on [`RnsBggParameters::decoder_smudge_parameters`],
+    /// to `declaration`'s smudge Program: its inputs and material are imported
     /// from the source's preprocess and encryption productions under the
-    /// refresh namespace, and its mask LUT members are finalized and
+    /// decoder namespace, and its smudge LUT members are finalized and
     /// transformed in their root bodies.
-    pub fn bind_refresh_mask(
+    pub fn bind_decoder_smudge(
         &mut self,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
         preprocess: &StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
         encryption: &StageArtifacts<RnsBggEncryptionDescriptor>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        let prepared = declaration.mask().program();
+        let prepared = declaration.smudge().program();
         let preprocess_binding = preprocess.descriptor().binding();
         let encryption_binding = encryption.descriptor().binding();
         let expected_hash_key = hash_key_commitment(hash_key);
@@ -64,10 +64,10 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             if binding.context() != &self.context ||
                 binding.program() != declaration.source_program() ||
                 binding.hash_key_commitment() != &expected_hash_key ||
-                binding.refresh_commitment() != Some(declaration.commitment())
+                binding.decoder_commitment() != Some(declaration.commitment())
             {
                 return Err(ApiError::compatibility(
-                    "refresh mask artifacts do not match the source declaration",
+                    "decoder smudge artifacts do not match the source declaration",
                 ));
             }
         }
@@ -76,7 +76,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             !encryption_binding.sources().contains(preprocess.production())
         {
             return Err(ApiError::compatibility(
-                "RNS-BGG refresh encryption source is not the preprocess production",
+                "RNS-BGG decoder encryption source is not the preprocess production",
             ));
         }
         let preprocess_production = preprocess.production().clone();
@@ -92,8 +92,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             Arc::new(RnsBggDerivedWorkload::from_program(prepared).map_err(ApiError::scheme)?);
         self.hash_key_commitment = expected_hash_key;
         self.hash_key = hash_key.to_vec();
-        // The mask child's encryption publishes each input at its logical
-        // level with its public key, under the refresh namespace.
+        // The smudge child's encryption publishes each input at its logical
+        // level with its public key, under the decoder namespace.
         let commitment = *declaration.commitment();
         self.environment = Environment::new();
         for (wire, input) in prepared.inputs() {
@@ -112,7 +112,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                             (
                                 ring.artifact_input(
                                     encryption_production.clone(),
-                                    refresh_mask_artifact_name(
+                                    decoder_smudge_artifact_name(
                                         commitment,
                                         &format!("input-{wire:?}.0"),
                                     ),
@@ -121,7 +121,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                                 ),
                                 ring.artifact_input(
                                     encryption_production.clone(),
-                                    refresh_mask_artifact_name(
+                                    decoder_smudge_artifact_name(
                                         commitment,
                                         &format!("input-{wire:?}.1"),
                                     ),
@@ -132,7 +132,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                             (
                                 ring.artifact_input(
                                     encryption_production.clone(),
-                                    refresh_mask_artifact_name(
+                                    decoder_smudge_artifact_name(
                                         commitment,
                                         &format!("input-{wire:?}.2"),
                                     ),
@@ -141,7 +141,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                                 ),
                                 ring.artifact_input(
                                     encryption_production.clone(),
-                                    refresh_mask_artifact_name(
+                                    decoder_smudge_artifact_name(
                                         commitment,
                                         &format!("input-{wire:?}.3"),
                                     ),
@@ -154,13 +154,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                     (
                         ring.artifact_input(
                             encryption_production.clone(),
-                            refresh_mask_artifact_name(commitment, &format!("input-{wire:?}.4")),
+                            decoder_smudge_artifact_name(commitment, &format!("input-{wire:?}.4")),
                             (1, columns),
                             ArtifactAvailability::Transferred,
                         ),
                         ring.artifact_input(
                             encryption_production.clone(),
-                            refresh_mask_artifact_name(commitment, &format!("input-{wire:?}.5")),
+                            decoder_smudge_artifact_name(commitment, &format!("input-{wire:?}.5")),
                             (1, columns),
                             ArtifactAvailability::Transferred,
                         ),
@@ -168,7 +168,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                     public.then(|| {
                         ring.artifact_input(
                             encryption_production.clone(),
-                            refresh_mask_artifact_name(commitment, &format!("input-{wire:?}.6")),
+                            decoder_smudge_artifact_name(commitment, &format!("input-{wire:?}.6")),
                             (1, 1),
                             ArtifactAvailability::Transferred,
                         )
@@ -182,7 +182,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                         .map(|port| {
                             ring.family_artifact_input(
                                 encryption_production.clone(),
-                                refresh_mask_artifact_name(
+                                decoder_smudge_artifact_name(
                                     commitment,
                                     &format!("input-{wire:?}.{port}"),
                                 ),
@@ -196,7 +196,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                         .map(|port| {
                             ring.family_artifact_input(
                                 encryption_production.clone(),
-                                refresh_mask_artifact_name(
+                                decoder_smudge_artifact_name(
                                     commitment,
                                     &format!("input-{wire:?}.{}", port + 4),
                                 ),
@@ -209,7 +209,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                     let payload = public.then(|| {
                         ring.family_artifact_input(
                             encryption_production.clone(),
-                            refresh_mask_artifact_name(commitment, &format!("input-{wire:?}.6")),
+                            decoder_smudge_artifact_name(commitment, &format!("input-{wire:?}.6")),
                             count.clone(),
                             (1, 1),
                             ArtifactAvailability::Transferred,
@@ -242,7 +242,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             &encryption_production,
             prelude.as_ref(),
             &hash_key,
-            |role: String| refresh_mask_artifact_name(commitment, &role),
+            |role: String| decoder_smudge_artifact_name(commitment, &role),
         )? {
             self.environment
                 .bind_rhs(rhs, binding)
@@ -255,77 +255,82 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             preprocess: preprocess_production,
             encryption: encryption_production,
             manifests,
-            refresh_mask: Some(Arc::new(declaration.clone())),
+            decoder_smudge: Some(Arc::new(declaration.clone())),
             current_site: None,
             hash_key,
             context: self.context,
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
         });
         self.evaluator
             .as_mut()
             .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
             .import_rhs_companions()
             .map_err(ApiError::scheme)?;
+        self.evaluator
+            .as_mut()
+            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
+            .import_body_lut_material()
+            .map_err(ApiError::scheme)?;
         Ok(())
     }
 
-    /// Decode `declaration`'s refresh of output `output_index` when the
-    /// graph is built: the bound mask child `mask` is lowered once, and that
+    /// Apply `declaration`'s decoder to output `output_index` when the
+    /// graph is built: the bound smudge child `smudge` is lowered once, and that
     /// output becomes the plaintext `mu mod q_(L+1)` (see
-    /// [`crate::noise_refresh`]) instead of an encoding.
-    pub fn apply_refresh(
+    /// [`crate::decoder`]) instead of an encoding.
+    pub fn apply_decoder(
         &mut self,
         output_index: usize,
-        declaration: &RefreshDeclaration,
-        mask: RnsOnlineEvalBuild<'a>,
+        declaration: &DecoderDeclaration,
+        smudge: RnsOnlineEvalBuild<'a>,
     ) -> Result<(), ApiError> {
-        if self.pending_refresh.is_some() {
-            return Err(ApiError::input("refresh was already applied"));
+        if self.pending_decoder.is_some() {
+            return Err(ApiError::input("decoder was already applied"));
         }
         let evaluator = self
             .evaluator
             .as_ref()
             .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?;
-        let expected = self
-            .parameters
-            .refresh_mask_parameters(declaration, &evaluator.program)
+        self.parameters
+            .validate_decoder_smudge_parameters(smudge.parameters, declaration, &evaluator.program)
             .map_err(ApiError::scheme)?;
-        if mask.parameters.parameter_identity() != expected.parameter_identity() ||
-            mask.evaluator
-                .as_ref()
-                .and_then(|child| child.refresh_mask.as_ref())
-                .map(|bound| *bound.commitment()) !=
-                Some(*declaration.commitment()) ||
+        if smudge
+            .evaluator
+            .as_ref()
+            .and_then(|child| child.decoder_smudge.as_ref())
+            .map(|bound| *bound.commitment()) !=
+            Some(*declaration.commitment()) ||
             evaluator.program.outputs().get(output_index) !=
                 Some(&Operand::Scalar(declaration.source_output()))
         {
-            return Err(ApiError::scheme(RnsBggError::Refresh(RefreshError::TargetMismatch)));
+            return Err(ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch)));
         }
-        self.pending_refresh = Some((output_index, declaration.clone(), Box::new(mask)));
+        self.pending_decoder = Some((output_index, declaration.clone(), Box::new(smudge)));
         Ok(())
     }
 
-    /// The plaintext `round((p/q)(b K - c))` of the pending refresh, for the
-    /// summed decode row `c` of the source and the lowered mask.
-    fn decode_refresh(
+    /// The plaintext `round((p/q)(b K - c))` of the pending decoder, for the
+    /// summed decode row `c` of the source and the lowered smudge.
+    fn decode_output(
         &mut self,
         output_index: usize,
-        declaration: &RefreshDeclaration,
-        mut mask: RnsOnlineEvalBuild<'a>,
+        declaration: &DecoderDeclaration,
+        mut smudge: RnsOnlineEvalBuild<'a>,
         outputs: &[RnsBggEncoding],
     ) -> Result<Mat, RnsBggError> {
         let source = outputs
             .get(output_index)
-            .ok_or(RnsBggError::Refresh(RefreshError::TargetMismatch))?
+            .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?
             .clone();
         let evaluator = self
             .evaluator
             .as_mut()
             .ok_or(RnsBggError::Binding("online evaluation artifacts are not bound"))?;
         let level = evaluator.workload.level(source.wire())?;
-        let mut refresh = RnsBggRefresh { lowerer: evaluator, source };
-        let encoding = apply_refresh(declaration, &mut refresh, |_| {
-            let (child, families, environment) = mask
+        let mut decoder = RnsBggDecoder { lowerer: evaluator, source };
+        let encoding = apply_decoder(declaration, &mut decoder, |_| {
+            let (child, families, environment) = smudge
                 .lowering_state_inner()
                 .map_err(|error| RnsBggError::Graph(error.to_string()))?;
             let program = child.program.clone();
@@ -333,7 +338,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 .map_err(|error| RnsBggError::Graph(error.to_string()))
         })?;
         let child_manifests =
-            mask.evaluator.as_ref().map(|child| child.manifests.clone()).unwrap_or_default();
+            smudge.evaluator.as_ref().map(|child| child.manifests.clone()).unwrap_or_default();
         let evaluator = self
             .evaluator
             .as_mut()
@@ -341,26 +346,32 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         evaluator.manifests.extend(child_manifests);
         let commitment = *declaration.commitment();
         let ring = self.parameters.ring(level)?;
-        let columns = crate::noise_refresh::decoder::DECODER_ROWS *
+        let columns = crate::decoder::unmask::UNMASK_ROWS *
             (self.parameters.level(level)?.modulus_digits() + 2);
         let bound = self
-            .refresh_preimage_bound
+            .unmask_preimage_bound
             .clone()
-            .ok_or(RnsBggError::Binding("the refresh preimage bound is not bound"))?;
+            .ok_or(RnsBggError::Binding("the unmask preimage bound is not bound"))?;
         let preimage = ring.preimage_artifact_input(
             evaluator.preprocess.clone(),
-            refresh_artifact_name(commitment, "decoder-preimage"),
+            decoder_artifact_name(commitment, "unmask-preimage"),
             (columns, 1),
             BigInt::from(bound),
             ArtifactAvailability::Transferred,
         );
-        let row = ring.artifact_input(
+        let hint = ring.artifact_input(
             evaluator.encryption.clone(),
-            refresh_artifact_name(commitment, "decoder-row"),
+            decoder_artifact_name(commitment, "unmask-hint"),
             (1, columns),
             ArtifactAvailability::Transferred,
         );
-        let decoded = crate::noise_refresh::decoder::decode(row, preimage, encoding);
+        // The halved smudge weights leave `2^-1` in every coefficient (see
+        // `crate::decoder::decoding`); removing it centers the smudge.
+        let modulus: BigUint = self.parameters.level(level)?.modulus().as_ref().clone();
+        let half = IntExpr::constant((modulus + 1u8) / 2u8);
+        let dimension = self.parameters.level(level)?.ring_dimension() as usize;
+        let decoded = crate::decoder::unmask::unmask(hint, preimage, encoding) -
+            ring.polynomial(std::iter::repeat_n(half, dimension));
         Ok(decoded.modulus_switch(&self.parameters.ring(level + 1)?))
     }
 
@@ -462,12 +473,12 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 "RNS-BGG encryption source is not the preprocess production",
             ));
         }
-        if preprocess_binding.refresh_commitment() != encryption_binding.refresh_commitment() {
+        if preprocess_binding.decoder_commitment() != encryption_binding.decoder_commitment() {
             return Err(ApiError::compatibility(
-                "RNS-BGG refresh declaration commitment differs between stages",
+                "RNS-BGG decoder declaration commitment differs between stages",
             ));
         }
-        self.refresh_preimage_bound = preprocess_binding.refresh_preimage_bound().cloned();
+        self.unmask_preimage_bound = preprocess_binding.unmask_preimage_bound().cloned();
         let mut manifests = BTreeMap::new();
         manifests.insert(preprocess_production.clone(), preprocess.manifest().clone());
         manifests.insert(encryption_production.clone(), encryption.manifest().clone());
@@ -574,25 +585,31 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             preprocess: preprocess_production,
             encryption: encryption_production,
             manifests,
-            refresh_mask: None,
+            decoder_smudge: None,
             current_site: None,
             hash_key,
             context: self.context,
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
         });
         self.evaluator
             .as_mut()
             .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
             .import_rhs_companions()
             .map_err(ApiError::scheme)?;
+        self.evaluator
+            .as_mut()
+            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
+            .import_body_lut_material()
+            .map_err(ApiError::scheme)?;
         Ok(())
     }
 
     fn build_graph(mut self, outputs: Vec<RnsBggEncoding>) -> Result<StageGraph, ApiError> {
-        let refreshed = match self.pending_refresh.take() {
-            Some((index, declaration, mask)) => Some((
+        let decoded = match self.pending_decoder.take() {
+            Some((index, declaration, smudge)) => Some((
                 index,
-                self.decode_refresh(index, &declaration, *mask, &outputs)
+                self.decode_output(index, &declaration, *smudge, &outputs)
                     .map_err(ApiError::scheme)?,
             )),
             None => None,
@@ -604,10 +621,10 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
         let outputs = evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?;
         let mut graph = DslContext::new("rns-bgg-online-eval");
         for (index, output) in outputs.into_iter().enumerate() {
-            // A refreshed output is its plaintext modulo `q_(L+1)`, not an
+            // A decoded output is its plaintext modulo `q_(L+1)`, not an
             // encoding.
-            graph = match &refreshed {
-                Some((refreshed, plaintext)) if *refreshed == index => {
+            graph = match &decoded {
+                Some((decoded, plaintext)) if *decoded == index => {
                     graph.output(format!("output-{index}"), plaintext.clone())
                 }
                 _ => graph.output(format!("output-{index}"), output),

@@ -245,14 +245,14 @@ pub(super) fn import_rhs_bindings(
 
 impl EncodingLowering<'_> {
     fn preprocess_artifact_name(&self, role: String) -> String {
-        self.refresh_mask.as_ref().map_or(role.clone(), |declaration| {
-            refresh_mask_artifact_name(*declaration.commitment(), &role)
+        self.decoder_smudge.as_ref().map_or(role.clone(), |declaration| {
+            decoder_smudge_artifact_name(*declaration.commitment(), &role)
         })
     }
 
     pub(super) fn encryption_artifact_name(&self, role: String) -> String {
-        self.refresh_mask.as_ref().map_or(role.clone(), |declaration| {
-            refresh_mask_artifact_name(*declaration.commitment(), &role)
+        self.decoder_smudge.as_ref().map_or(role.clone(), |declaration| {
+            decoder_smudge_artifact_name(*declaration.commitment(), &role)
         })
     }
 
@@ -299,8 +299,7 @@ impl EncodingLowering<'_> {
             .enumerate()
             .map(|(index, output)| {
                 let left = match representation {
-                    crate::program::LutOutputRepresentation::Coefficient |
-                    crate::program::LutOutputRepresentation::UnscaledCoefficient => {
+                    crate::program::LutOutputRepresentation::Coefficient => {
                         ring.polynomial([IntExpr::constant(BigInt::from(output))])
                     }
                     crate::program::LutOutputRepresentation::Exponent(layout) => {
@@ -423,16 +422,62 @@ impl EncodingLowering<'_> {
         )
     }
 
-    /// The imported compact `B_sigma` switching ciphertexts of one LUT, one
-    /// family per matrix port, with its automorphism branch indices.
+    /// The material of LUT `lut_id` evaluated at `level`: the one imported
+    /// where the Program was bound for a LUT in a family body, otherwise
+    /// imported here.
+    fn lut_material(
+        &self,
+        level: usize,
+        lut_id: crate::program::LutId,
+        table: &LutTable,
+    ) -> Result<super::LutMaterial, RnsBggError> {
+        if let Some(material) = self.lut_material.get(&(level, lut_id)) {
+            return Ok(material.clone());
+        }
+        let (switching, sigmas) = self.lut_switching(level, lut_id, table)?;
+        let helper = self.lut_helpers(level, table, sigmas.len())?;
+        let columns = self.parameters.lut_output_columns(
+            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
+            table.output_representation(),
+        )?;
+        // Dynamic: the switching ciphertexts' digit companions, one block
+        // per branch.
+        let companions = (self.parameters.rhs_mode() == RhsMode::Dynamic)
+            .then(|| {
+                self.companion_family(
+                    level,
+                    columns,
+                    lut_switching_role(level, lut_id, table.input_layout(), "/digit-encoding"),
+                    IntExpr::constant(sigmas.len()),
+                )
+            })
+            .transpose()?;
+        Ok((switching, sigmas, helper, companions))
+    }
+
+    /// Import, at root scope, the material of every LUT in a family body
+    /// (see [`Self::lut_material`]).
+    pub(super) fn import_body_lut_material(&mut self) -> Result<(), RnsBggError> {
+        let luts = self.program.encryption_inputs().luts().to_vec();
+        for (input, lut_id) in self.program.family_body_luts() {
+            let level = self.workload.level(input)?;
+            let table = luts.get(lut_id.0 as usize).ok_or(RnsBggError::Lut)?;
+            let material = self.lut_material(level, lut_id, table)?;
+            self.lut_material.insert((level, lut_id), material);
+        }
+        Ok(())
+    }
+
+    /// The imported compact `B_sigma` switching ciphertexts of one LUT
+    /// evaluated at `evaluation_level`, one family per matrix port, with its
+    /// automorphism branch indices.
     fn lut_switching(
         &self,
-        input: &RnsBggEncoding,
+        evaluation_level: usize,
         lut_id: crate::program::LutId,
         table: &LutTable,
     ) -> Result<(Vec<Family<Mat>>, Vec<usize>), RnsBggError> {
         let count = IntExpr::constant(table.values().len());
-        let evaluation_level = self.workload.level(input.wire())?;
         let decomposition_level =
             evaluation_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let decomposition_ring = self.parameters.ring(decomposition_level)?;
@@ -504,6 +549,9 @@ impl EncodingLowering<'_> {
         Ok((switched_row, switched_key_decomposition))
     }
 
+    /// Finalize declared coefficient outputs once after graph aggregation:
+    /// ModDown to the next level, then the scale-up action `G^-1(k)` (see
+    /// [`RnsBggParameters::coefficient_output_action`]).
     pub(super) fn finish_outputs(
         &mut self,
         outputs: Vec<RnsBggEncoding>,
@@ -521,13 +569,20 @@ impl EncodingLowering<'_> {
                         .checked_add(1)
                         .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
                     let ring = self.parameters.ring(target)?;
+                    let (_, k, _) = self.parameters.coefficient_output_decoding(
+                        &self.program,
+                        output.wire(),
+                        target,
+                    )?;
+                    let action = self.parameters.coefficient_output_action(target, &k)?;
+                    let act = |entry: Mat| action.clone().right_multiply(entry);
                     let public_key = RnsBggPublicKey::new(
                         output.public_key.wire,
-                        mod_down_public(output.public_key.matrix, &ring),
+                        map_matrix(mod_down_public(output.public_key.matrix, &ring), act),
                     );
                     Ok(RnsBggEncoding::new(
                         public_key,
-                        mod_down_encoding(output.row, &ring),
+                        map_row(mod_down_encoding(output.row, &ring), act),
                         output
                             .public_payload
                             .map(|payload| checked_modulus_convert(payload, &ring))
@@ -731,25 +786,12 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         }
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let level = self.workload.level(input.wire())?;
-        let (switching, sigmas) = self.lut_switching(input, lut_id, table)?;
+        let (switching, sigmas, helper, companions) = self.lut_material(level, lut_id, table)?;
         let output = self.site()?.output;
-        let helper = self.lut_helpers(level, table, sigmas.len())?;
         let columns = self.parameters.lut_output_columns(
             level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
             table.output_representation(),
         )?;
-        // Dynamic: the switching ciphertexts' digit companions, one block
-        // per branch.
-        let companions = (self.parameters.rhs_mode() == RhsMode::Dynamic)
-            .then(|| {
-                self.companion_family(
-                    level,
-                    columns,
-                    lut_switching_role(level, lut_id, table.input_layout(), "/digit-encoding"),
-                    IntExpr::constant(sigmas.len()),
-                )
-            })
-            .transpose()?;
         // Accumulate the branches sequentially, as preprocessing does: the sum
         // and its noise bound equal the balanced tree, while only one branch,
         // including its sampled A_sigma, is resident at a time.
@@ -885,10 +927,10 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             .map_err(graph)?;
             branch(Int::constant(last), sums, b_last).map_err(graph)?
         };
-        if let Some(declaration) = self.refresh_mask.clone() &&
-            let Some(family) = declaration.mask().family_of_lut(lut_id)
+        if let Some(declaration) = self.decoder_smudge.clone() &&
+            declaration.smudge().lut() == lut_id
         {
-            return self.refresh_member(&declaration, family, level, output, row, public_key);
+            return self.smudge_member(&declaration, level, output, row, public_key);
         }
         let mut public_key = RnsBggPublicKey::new(output, public_key);
         let mut row = row;
@@ -923,14 +965,13 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
 }
 
 impl EncodingLowering<'_> {
-    /// Finalize the raw unscaled LUT carrier of one refresh mask member at
+    /// Finalize the raw (scale-1) coefficient LUT carrier of one decoder smudge member at
     /// `level` once, to `level + 1`, and apply its member transform (see
-    /// [`super::refresh_member_action`]). The family `Sum` then adds the
+    /// [`super::smudge_member_action`]). The smudge `Sum` then adds the
     /// transformed members inside the root loop.
-    fn refresh_member(
+    fn smudge_member(
         &self,
-        declaration: &RefreshDeclaration,
-        family: crate::noise_refresh::refresh::MaskFamily,
+        declaration: &DecoderDeclaration,
         level: usize,
         output: WireId,
         row: RnsBggRow,
@@ -944,9 +985,9 @@ impl EncodingLowering<'_> {
             .indices
             .first()
             .cloned()
-            .ok_or(RnsBggError::Binding("a refresh mask LUT must be a root family member"))?;
+            .ok_or(RnsBggError::Binding("a decoder smudge LUT must be a root family member"))?;
         let (action, coefficient) =
-            super::refresh_member_action(self.parameters, declaration, family, member, finalized)?;
+            super::smudge_member_action(self.parameters, declaration, member, finalized)?;
         let act = |entry| super::act_on_entry(entry, &action, &coefficient);
         Ok(RnsBggEncoding::new(
             RnsBggPublicKey::new(output, map_matrix(mod_down_public(public_key, &ring), act)),
@@ -1010,8 +1051,7 @@ mod test {
                     actual = actual + coefficient * monomial.clone().ring_automorphism(sigma);
                 }
                 let expected = match representation {
-                    crate::program::LutOutputRepresentation::Coefficient |
-                    crate::program::LutOutputRepresentation::UnscaledCoefficient => {
+                    crate::program::LutOutputRepresentation::Coefficient => {
                         ring.polynomial([IntExpr::constant(expected)])
                     }
                     crate::program::LutOutputRepresentation::Exponent(layout) => {
@@ -1118,9 +1158,10 @@ mod test {
                 preprocess: production.clone(),
                 encryption: production,
                 manifests: BTreeMap::new(),
-                refresh_mask: None,
+                decoder_smudge: None,
                 context: [0; 32],
                 rhs_companions: BTreeMap::new(),
+                lut_material: BTreeMap::new(),
                 current_site: Some(LoweringSite {
                     output,
                     indices: Vec::new(),
@@ -1184,9 +1225,10 @@ mod test {
             preprocess: production.clone(),
             encryption: production.clone(),
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let assert_compact = |matrix: &RnsBggMatrix| {
@@ -1328,9 +1370,10 @@ mod test {
             preprocess: production.clone(),
             encryption: production.clone(),
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let ring = parameters.ring(0).unwrap();
@@ -1397,9 +1440,10 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: Some(LoweringSite {
                 output: public_output,
                 indices: Vec::new(),
@@ -1471,9 +1515,10 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let low_ring = parameters.ring(1).unwrap();
@@ -1619,9 +1664,10 @@ mod test {
                 execution_nonce: [129; 32],
             },
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: Some(LoweringSite {
                 output: private_output,
                 indices: Vec::new(),
@@ -1809,9 +1855,10 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             manifests: BTreeMap::new(),
-            refresh_mask: None,
+            decoder_smudge: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
+            lut_material: BTreeMap::new(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         assert!(lowerer.program.wire_is_coefficient_output(output).unwrap());

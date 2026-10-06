@@ -1,4 +1,4 @@
-//! Noise-simulation settings shared by Program audits and the noise refresh.
+//! Noise-simulation settings shared by Program audits and the decoder.
 //!
 //! The concrete noise terms are owned by the backend noise evaluators; this
 //! module only selects the noise model and fixes the average-case tail
@@ -20,14 +20,14 @@ impl NoiseModelKind {
     /// Application-wide simulation selection. Average acceptance remains
     /// conditional on the explicitly selected coefficient and tail models.
     pub fn from_env() -> Result<Self, String> {
-        match std::env::var("MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL")
+        match std::env::var("MXX_EXPONENT_LUT_DECODER_NOISE_MODEL")
             .as_deref()
             .unwrap_or("average-case")
         {
             "worst-case" => Ok(Self::WorstCase),
             "average-case" => Ok(Self::AverageCase),
             _ => {
-                Err("MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL must be worst-case or average-case"
+                Err("MXX_EXPONENT_LUT_DECODER_NOISE_MODEL must be worst-case or average-case"
                     .into())
             }
         }

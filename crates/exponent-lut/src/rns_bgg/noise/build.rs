@@ -77,72 +77,76 @@ impl<'a> RnsNoiseBuild<'a> {
             evaluator: Some(evaluator),
             families: RnsBggNoiseFamilies::default(),
             environment,
-            pending_refresh: None,
+            pending_decoder: None,
         })
     }
 
-    /// Configure this builder to lower `declaration`'s mask Program: its
-    /// mask LUT members are finalized and transformed in their root bodies,
+    /// Configure this builder to lower `declaration`'s smudge Program: its
+    /// smudge LUT members are finalized and transformed in their root bodies,
     /// as the encoding does.
-    pub fn bind_refresh_mask(
+    pub fn bind_decoder_smudge(
         &mut self,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
     ) -> Result<(), RnsBggError> {
         let evaluator =
             self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        declaration.validate_mask_program(evaluator.program.id())?;
-        if evaluator.refresh_mask.is_some() {
-            return Err(RnsBggError::Binding("refresh mask is already bound"));
+        declaration.validate_smudge_program(evaluator.program.id())?;
+        if evaluator.decoder_smudge.is_some() {
+            return Err(RnsBggError::Binding("decoder smudge is already bound"));
         }
-        evaluator.refresh_mask = Some(Arc::new(declaration.clone()));
+        evaluator.decoder_smudge = Some(Arc::new(declaration.clone()));
         Ok(())
     }
 
-    /// Compose the noise of `declaration`'s refresh of output `output_index`,
-    /// whose lowered source value is `source`, with the bound mask child
-    /// `mask` (on [`RnsBggParameters::refresh_mask_parameters`]) and the
-    /// decoder trapdoor sigma `trapdoor_sigma`. The report is returned in
-    /// the trace as [`RnsBggNoiseTrace::refresh`].
-    pub fn apply_refresh(
+    /// Compose the noise of `declaration`'s decoder of output `output_index`,
+    /// whose lowered source value is `source`, with the bound smudge child
+    /// `smudge` (on [`RnsBggParameters::decoder_smudge_parameters`]) and the
+    /// unmask trapdoor sigma `trapdoor_sigma`. The report is returned in
+    /// the trace as [`RnsBggNoiseTrace::decoder`].
+    pub fn apply_decoder(
         &mut self,
         output_index: usize,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
         source: (WireId, RnsBggNoiseValue),
-        mut mask: RnsNoiseBuild<'a>,
+        mut smudge: RnsNoiseBuild<'a>,
         trapdoor_sigma: f64,
     ) -> Result<(), RnsBggError> {
-        if self.pending_refresh.is_some() {
-            return Err(RnsBggError::Binding("refresh output was already selected"));
+        if self.pending_decoder.is_some() {
+            return Err(RnsBggError::Binding("decoder output was already selected"));
         }
         let evaluator =
             self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        let expected =
-            evaluator.parameters.refresh_mask_parameters(declaration, evaluator.program)?;
         let child =
-            mask.evaluator.as_ref().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        if child.parameters.parameter_identity() != expected.parameter_identity() ||
-            child.refresh_mask.as_ref().map(|bound| *bound.commitment()) !=
-                Some(*declaration.commitment()) ||
+            smudge.evaluator.as_ref().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        evaluator.parameters.validate_decoder_smudge_parameters(
+            child.parameters,
+            declaration,
+            evaluator.program,
+        )?;
+        if child.decoder_smudge.as_ref().map(|bound| *bound.commitment()) !=
+            Some(*declaration.commitment()) ||
             evaluator.program.outputs().get(output_index) !=
                 Some(&crate::program::Operand::Scalar(declaration.source_output()))
         {
-            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+            return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
-        evaluator.refresh_trapdoor_sigma = Some(trapdoor_sigma);
-        let mut refresh = super::super::RnsBggRefresh { lowerer: evaluator, source };
-        let report = crate::api::apply_refresh(declaration, &mut refresh, |_| {
-            let child =
-                mask.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        evaluator.unmask_trapdoor_sigma = Some(trapdoor_sigma);
+        let mut decoder = super::super::RnsBggDecoder { lowerer: evaluator, source };
+        let report = crate::api::apply_decoder(declaration, &mut decoder, |_| {
+            let child = smudge
+                .evaluator
+                .as_mut()
+                .ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
             let outputs = crate::program::lower_program(
                 child.program,
                 child,
-                &mut mask.families,
-                &mut mask.environment,
+                &mut smudge.families,
+                &mut smudge.environment,
             )
             .map_err(|error| RnsBggError::Graph(error.to_string()))?;
             Ok(outputs.into_iter().map(|(_, value)| value).collect())
         })?;
-        let child_trace = mask
+        let child_trace = smudge
             .evaluator
             .as_ref()
             .ok_or(RnsBggError::Binding("noise evaluator consumed"))?
@@ -150,8 +154,8 @@ impl<'a> RnsNoiseBuild<'a> {
             .clone();
         let evaluator =
             self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
-        evaluator.merge_refresh_trace(&child_trace);
-        self.pending_refresh = Some(report);
+        evaluator.merge_decoder_trace(&child_trace);
+        self.pending_decoder = Some(report);
         Ok(())
     }
 }
@@ -196,7 +200,7 @@ impl<'a> crate::api::NoiseBuild for RnsNoiseBuild<'a> {
             .map_err(|error| crate::api::ApiError::scheme(error))?;
         let mut trace = evaluator.trace;
         trace.outputs = finalized;
-        trace.refresh = self.pending_refresh;
+        trace.decoder = self.pending_decoder;
         Ok(trace)
     }
 }

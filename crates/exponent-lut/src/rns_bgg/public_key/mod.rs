@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::{
-    api::{ApiError, PlaintextInputs, PreprocessBuild, StageArtifacts, StageGraph, apply_refresh},
-    noise_refresh::refresh::{NoiseRefresh, RefreshError},
+    api::{ApiError, PlaintextInputs, PreprocessBuild, StageArtifacts, StageGraph, apply_decoder},
+    decoder::decoding::{Decoder, DecoderError},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
         GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, Operand,
@@ -29,13 +29,13 @@ use std::{
     sync::Arc,
 };
 
+mod decoder;
 mod lowering;
 mod preprocess;
-mod refresh;
 mod sampling;
 
-use self::refresh::import_decoder_trapdoor;
-pub use self::refresh::sample_refresh_decoder;
+use self::decoder::import_unmask_trapdoor;
+pub use self::decoder::sample_unmask_trapdoor;
 pub(super) use self::{lowering::*, sampling::*};
 #[cfg(test)]
 use mxx_ir_core::node::ConstantMatrix;
@@ -109,10 +109,10 @@ pub struct PublicKeyLowering<'a> {
     /// The Static payload secret; Dynamic preprocessing has none.
     pub(crate) payload_secret: Option<RnsBggPayloadSecret>,
     pub(crate) hash_key: Bytes,
-    /// Setup context and, for a refresh mask child, its refresh declaration:
+    /// Setup context and, for a decoder smudge child, its decoder declaration:
     /// the public namespace of Dynamic digit-companion keys.
     pub(crate) context: [u8; 32],
-    pub(crate) refresh_mask: Option<Arc<RefreshDeclaration>>,
+    pub(crate) decoder_smudge: Option<Arc<DecoderDeclaration>>,
     /// RHS plaintexts, read from graph inputs; a family is read member by
     /// member.
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
@@ -123,10 +123,10 @@ pub struct PublicKeyLowering<'a> {
     /// identity.  The family member is the concrete automorphism branch.
     pub(crate) lut_material:
         BTreeMap<(usize, usize, crate::program::LutId, ExpLayout), Family<RnsBggMatrix>>,
-    /// The decoder of a composed refresh: its declaration commitment, the
+    /// The unmasking of the composed decoder: its declaration commitment, the
     /// preimage `K` of the summed key, and the public `B` it is a preimage
     /// under.
-    pub(crate) refresh_decoder: Option<([u8; 32], Preimage, Mat)>,
+    pub(crate) unmask: Option<([u8; 32], Preimage, Mat)>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Open parallel bodies, outermost first: each one's instance count and
     /// member index, and the RHS family members it prepared.
@@ -150,13 +150,13 @@ pub struct RnsPreprocessBuild<'a> {
     environment:
         Environment<RnsBggPublicKey, RhsRef<Int>, PreprocessWireFamily, Family<RhsRef<Int>>>,
     runtime: BTreeMap<String, RuntimeValue>,
-    refresh_declaration: Option<crate::noise_refresh::refresh::RefreshDeclaration>,
-    /// The lowered mask Program child of the applied refresh, whose public
-    /// material this stage publishes under the refresh namespace.
-    refresh_mask_child: Option<PublicKeyLowering<'a>>,
-    /// The trusted decoder setup production the applied refresh imports,
+    decoder_declaration: Option<crate::decoder::decoding::DecoderDeclaration>,
+    /// The lowered smudge Program child of the applied decoder, whose public
+    /// material this stage publishes under the decoder namespace.
+    decoder_smudge_child: Option<PublicKeyLowering<'a>>,
+    /// The trusted unmask setup production the applied decoder imports,
     /// with its manifest and preimage coefficient bound.
-    refresh_setup: Option<(ProductionId, Manifest, BigUint)>,
+    unmask_setup: Option<(ProductionId, Manifest, BigUint)>,
 }
 
 #[cfg(test)]

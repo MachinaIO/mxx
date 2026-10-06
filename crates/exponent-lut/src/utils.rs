@@ -3,11 +3,15 @@
 //! ciphertexts or add validation passes to their evaluation.
 use crate::{
     ExponentLutError,
-    noise_refresh::simulation::AverageCaseConfig,
-    program::{ExponentLutProgram, Operand},
+    decoder::{
+        decoding::{DecoderDeclaration, DecoderError, fit_smudge_digits},
+        simulation::AverageCaseConfig,
+    },
+    program::{ExponentLutProgram, Operand, WireId},
+    program_gadgets::{pbc::PbcPublicLayout, prf::SparseLwrPrfProfile},
     rns_bgg::{
-        RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseTrace, RnsBggParameters,
-        RnsBggPlanRequest,
+        RhsMode, RnsBggDecoderNoise, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseTrace,
+        RnsBggParameters, RnsBggPlanRequest, simulate_decoder_noise,
     },
 };
 use bigdecimal::{BigDecimal, Zero};
@@ -16,7 +20,7 @@ use mxx_dsl::{Family, GraphValue, Int};
 use mxx_ir_core::{ParamEnv, Rational, RealExpr};
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
-use std::{env, error::Error, fmt, process::Command};
+use std::{collections::BTreeMap, env, error::Error, fmt, process::Command};
 
 /// Read an optional unsigned environment setting without accepting malformed values.
 pub fn env_usize(name: &str, default: usize) -> Result<usize, String> {
@@ -166,8 +170,8 @@ pub fn lattice_security_bits(
 ///
 /// The chain ends at the program's last output level, after coefficient
 /// finalization, so a decrypted output carries the terminal relation. A
-/// program whose outputs continue, such as a refresh source, requests
-/// `successor_levels` further levels past its last LUT level.
+/// program whose outputs continue requests `successor_levels` further levels
+/// past its last LUT level.
 pub fn audit_program_at_crt_depth(
     request: &RnsBggPlanRequest,
     program: &ExponentLutProgram,
@@ -176,10 +180,30 @@ pub fn audit_program_at_crt_depth(
     average: Option<&AverageCaseConfig>,
     successor_levels: usize,
 ) -> Result<(RnsBggParameters, RnsBggNoiseTrace), String> {
+    let (_, parameters) =
+        plan_chain(request, program, successor_levels, request.max_crt_depth, None)?;
+    let trace =
+        audit_planned(request, &parameters, program, bindings, terminal_value_bounds, average)?;
+    Ok((parameters, trace))
+}
+
+/// The prime pool of `request` and the chain of `program` on it: logical
+/// level `l` keeps the first `planned_crt_depth(l)` primes below `top_depth`,
+/// through the program's last output level plus `successor_levels`. With
+/// `decoding = Some((level, cap))` every level after `level` keeps at most
+/// `cap` primes, so the step out of `level` is a drop.
+fn plan_chain(
+    request: &RnsBggPlanRequest,
+    program: &ExponentLutProgram,
+    successor_levels: usize,
+    top_depth: usize,
+    decoding: Option<(usize, usize)>,
+) -> Result<(DCRTPolyParams, RnsBggParameters), String> {
     if request.operations_per_drop == 0 ||
         request.primes_per_drop == 0 ||
         request.terminal_depth == 0 ||
-        request.max_crt_depth < request.terminal_depth
+        request.max_crt_depth < top_depth ||
+        top_depth < request.terminal_depth
     {
         return Err("invalid CRT-depth search request".to_owned());
     }
@@ -214,22 +238,27 @@ pub fn audit_program_at_crt_depth(
     )
     .map_err(|_| "unsupported prime pool".to_owned())?;
     let primes = pool.to_crt().0;
-    // A refresh source keeps successors beyond its last LUT level: the level
-    // below it supplies the plaintext modulus `p` of the refreshed output.
+    // A decoder source keeps successors beyond its last LUT level: the level
+    // below it supplies the plaintext modulus `p` of the decoded output.
     let chain_last = logical_count
         .checked_add(successor_levels)
         .ok_or_else(|| "logical level chain overflows".to_owned())?
         .max(output_last);
     let mut levels = Vec::with_capacity(chain_last + 1);
     for logical_level in 0..=chain_last {
-        let depth = crate::rns_bgg::planned_crt_depth(
+        let mut depth = crate::rns_bgg::planned_crt_depth(
             logical_level,
             request.operations_per_drop,
             request.primes_per_drop,
-            request.max_crt_depth,
+            top_depth,
             request.terminal_depth,
         )
         .map_err(|error| error.to_string())?;
+        if let Some((level, cap)) = decoding &&
+            logical_level > level
+        {
+            depth = depth.min(cap);
+        }
         let modulus = primes
             .get(..depth)
             .ok_or_else(|| "CRT-depth candidate exceeds the prime pool".to_owned())?
@@ -246,6 +275,18 @@ pub fn audit_program_at_crt_depth(
     )
     .map_err(|error| error.to_string())?
     .with_rhs_mode(request.rhs_mode);
+    Ok((pool, parameters))
+}
+
+/// Audit `program` on the planned `parameters`, logging the outcome.
+fn audit_planned(
+    request: &RnsBggPlanRequest,
+    parameters: &RnsBggParameters,
+    program: &ExponentLutProgram,
+    bindings: &RnsBggNoiseBindings,
+    terminal_value_bounds: &[BigUint],
+    average: Option<&AverageCaseConfig>,
+) -> Result<RnsBggNoiseTrace, String> {
     let started = std::time::Instant::now();
     tracing::info!(
         ring_dimension = request.ring_dimension,
@@ -272,7 +313,154 @@ pub fn audit_program_at_crt_depth(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "parameter candidate passed the noise audit"
     );
-    Ok((parameters, trace))
+    Ok(trace)
+}
+
+/// A decoder for [`select_decoder_at_crt_depth`]: the decoded scalar output,
+/// the smudge PRF profile, the public layouts of `n` smudge members (one
+/// layout per member, with one bucket count for every `n`), the hiding
+/// target `statistical_bits` (`P^d > E 2^bits`) and the unmask trapdoor
+/// sigma.
+pub struct DecoderRequest<'a> {
+    pub output: WireId,
+    pub profile: SparseLwrPrfProfile,
+    pub layouts: &'a dyn Fn(usize) -> Result<Vec<PbcPublicLayout>, String>,
+    pub statistical_bits: usize,
+    pub unmask_sigma: f64,
+}
+
+/// The parameters [`select_decoder_at_crt_depth`] chose for one candidate:
+/// the source chain, the smudge chain, the source audit, the declaration with
+/// its digit count, and its decoder noise.
+pub struct DecoderSelection {
+    pub parameters: RnsBggParameters,
+    pub smudge_parameters: RnsBggParameters,
+    pub trace: RnsBggNoiseTrace,
+    pub declaration: DecoderDeclaration,
+    pub noise: RnsBggDecoderNoise,
+}
+
+/// Plan one candidate `request` for `program` with the decoder `decoder` of
+/// one of its outputs, or fail so the caller tries its next candidate (a
+/// larger `max_crt_depth` or `primes_per_drop`).
+///
+/// The candidate's `max_crt_depth` primes are the whole chain, the smudge
+/// child's included. The smudge Program needs `H = primes_per_drop
+/// ceil((s + 1) / operations_per_drop)` primes above the decoding level `L`
+/// (`s` its final LUT input level), so the source chain is planned below a
+/// lower top when its own levels above `L` do not leave them. Every level
+/// after `L` keeps at most `depth(L) - primes_per_drop` primes, so the
+/// decoding spacing `q_L / q_(L+1)` is `primes_per_drop` primes. The smudge
+/// digit count is the smallest `d` whose range `P^d` hides the simulated
+/// decoder noise `E(d)` (`P^d > E(d) 2^bits`), and the
+/// candidate must fit `P^d/2 + E(d) < spacing/2`.
+pub fn select_decoder_at_crt_depth(
+    request: &RnsBggPlanRequest,
+    program: &ExponentLutProgram,
+    bindings: &RnsBggNoiseBindings,
+    terminal_value_bounds: &[BigUint],
+    average: Option<&AverageCaseConfig>,
+    decoder: &DecoderRequest<'_>,
+) -> Result<DecoderSelection, String> {
+    let to_string = |error: &dyn fmt::Display| error.to_string();
+    let workload =
+        RnsBggDerivedWorkload::from_program(program).map_err(|error| to_string(&error))?;
+    let level = workload.level(decoder.output).map_err(|error| to_string(&error))?;
+    let output_index = program
+        .outputs()
+        .iter()
+        .position(|output| matches!(output, Operand::Scalar(wire) if *wire == decoder.output))
+        .ok_or_else(|| "the decoded wire is not a scalar Program output".to_owned())?;
+    let coefficients = request.ring_dimension as usize;
+    let declaration_with = |digits: usize| {
+        let layouts = (decoder.layouts)(coefficients * digits)?;
+        DecoderDeclaration::new(
+            program,
+            decoder.output,
+            decoder.profile,
+            coefficients,
+            digits,
+            layouts,
+        )
+        .map_err(|error| to_string(&error))
+    };
+    let first = declaration_with(1)?;
+    let smudge_level =
+        RnsBggParameters::decoder_smudge_level(&first).map_err(|error| to_string(&error))?;
+    let (per_drop, primes_per_drop) = (request.operations_per_drop, request.primes_per_drop);
+    if per_drop == 0 || primes_per_drop == 0 {
+        return Err("invalid CRT-depth search request".to_owned());
+    }
+    let headroom = primes_per_drop * (smudge_level + 1).div_ceil(per_drop);
+    let above = (level / per_drop) * primes_per_drop;
+    let top_depth = request
+        .max_crt_depth
+        .checked_sub(headroom.saturating_sub(above))
+        .ok_or_else(|| "the smudge chain exceeds the candidate's primes".to_owned())?;
+    let decoding_depth = crate::rns_bgg::planned_crt_depth(
+        level,
+        per_drop,
+        primes_per_drop,
+        top_depth,
+        request.terminal_depth,
+    )
+    .map_err(|error| to_string(&error))?;
+    let cap = decoding_depth
+        .checked_sub(primes_per_drop)
+        .filter(|cap| *cap >= request.terminal_depth)
+        .ok_or_else(|| "the decoding drop goes below the terminal depth".to_owned())?;
+    if decoding_depth + headroom > request.max_crt_depth {
+        return Err("the smudge chain exceeds the candidate's primes".to_owned());
+    }
+    // One successor level past the last output supplies the decoded
+    // output's plaintext modulus `p`.
+    let (pool, parameters) = plan_chain(request, program, 1, top_depth, Some((level, cap)))?;
+    let trace =
+        audit_planned(request, &parameters, program, bindings, terminal_value_bounds, average)?;
+    let smudge_parameters = parameters
+        .decoder_smudge_parameters(&first, program, &pool, primes_per_drop)
+        .map_err(|error| to_string(&error))?;
+    let spacing = parameters.scale(level).map_err(|error| to_string(&error))?.clone();
+    let mut trials = BTreeMap::<usize, (DecoderDeclaration, RnsBggDecoderNoise)>::new();
+    let mut failure = None;
+    let fitted =
+        fit_smudge_digits(&first.digit_base(), decoder.statistical_bits, &spacing, |digits| {
+            let trial = declaration_with(digits).and_then(|declaration| {
+                if RnsBggParameters::decoder_smudge_level(&declaration)
+                    .map_err(|error| to_string(&error))? !=
+                    smudge_level
+                {
+                    return Err("smudge layouts change the smudge level".to_owned());
+                }
+                let noise = simulate_decoder_noise(
+                    &parameters,
+                    &smudge_parameters,
+                    program,
+                    bindings,
+                    &declaration,
+                    output_index,
+                    decoder.unmask_sigma,
+                )
+                .map_err(|error| to_string(&error))?;
+                Ok((declaration, noise))
+            });
+            match trial {
+                Ok((declaration, noise)) => {
+                    let error = noise.error.clone();
+                    trials.insert(digits, (declaration, noise));
+                    Ok(error)
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    Err(DecoderError::InvalidSmudgeProgram)
+                }
+            }
+        });
+    let (digits, _) =
+        fitted.map_err(|error| failure.take().unwrap_or_else(|| to_string(&error)))?;
+    let (declaration, noise) =
+        trials.remove(&digits).ok_or_else(|| "the fitted trial is missing".to_owned())?;
+    Ok(DecoderSelection { parameters, smudge_parameters, trace, declaration, noise })
 }
 
 /// Errors raised while converting a finite decimal into an exact IR real.
@@ -491,13 +679,13 @@ mod tests {
         }
     }
     #[test]
-    fn public_refresh_segments_preserve_slot_axis_without_implicit_family_capture() {
+    fn public_prf_segments_preserve_slot_axis_without_implicit_family_capture() {
         let ring = explicit_ring(&primes(4, 1, 17), 4);
         let routed = ring.input_family("routed-public-prf", 15, (2, 4));
         let reduced = reduce_family_segments(routed, 3, 5, |left, right| left + right).unwrap();
         assert_eq!(reduced.count(), &IntExpr::constant(3));
         assert_eq!(reduced.element_type(), &ring.matrix_type((2, 4)));
-        let graph = DslContext::new("public-refresh-segments")
+        let graph = DslContext::new("public-prf-segments")
             .output("slot-targets", reduced)
             .unwrap()
             .build()

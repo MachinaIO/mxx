@@ -5,10 +5,10 @@
 //! backend evaluator.
 
 pub mod api;
+pub mod decoder;
 #[cfg(feature = "gpu")]
 mod gpu_execution;
 pub mod nand_circuit;
-pub mod noise_refresh;
 pub mod noise_utils;
 pub mod program;
 pub mod program_gadgets;

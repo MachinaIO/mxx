@@ -1,7 +1,7 @@
 //! The encryption stage adapter.
 use super::*;
 
-fn validate_refresh_mask_input_key_artifacts(
+fn validate_decoder_smudge_input_key_artifacts(
     manifests: &BTreeMap<ProductionId, Manifest>,
     production: &ProductionId,
     parameters: &RnsBggParameters,
@@ -10,7 +10,7 @@ fn validate_refresh_mask_input_key_artifacts(
 ) -> Result<(), RnsBggError> {
     let manifest = manifests
         .get(production)
-        .ok_or(RnsBggError::Binding("refresh mask preprocess manifest is missing"))?;
+        .ok_or(RnsBggError::Binding("decoder smudge preprocess manifest is missing"))?;
     let ring = resolve_ring(parameters.ring(0)?.as_ref())?;
     for (wire, declaration) in inputs.inputs() {
         let columns = parameters.key_component_columns(0, declaration.knowledge())?;
@@ -23,17 +23,19 @@ fn validate_refresh_mask_input_key_artifacts(
                     .evaluate(&ParamEnv::default())
                     .ok()
                     .and_then(|value| value.to_usize())
-                    .ok_or(RnsBggError::Binding("refresh mask family count is not concrete"))?,
+                    .ok_or(RnsBggError::Binding("decoder smudge family count is not concrete"))?,
             ),
         };
         for port in 0..4 {
-            let name = refresh_mask_input_key_artifact_name(commitment, *wire, port);
+            let name = decoder_smudge_input_key_artifact_name(commitment, *wire, port);
             let artifact = manifest
                 .artifacts
                 .get(&name)
-                .ok_or(RnsBggError::Binding("refresh mask input-key artifact is missing"))?;
+                .ok_or(RnsBggError::Binding("decoder smudge input-key artifact is missing"))?;
             if artifact.artifact_type != artifact_type || artifact.family_count != family_count {
-                return Err(RnsBggError::Binding("refresh mask input-key artifact schema mismatch"));
+                return Err(RnsBggError::Binding(
+                    "decoder smudge input-key artifact schema mismatch",
+                ));
             }
         }
     }
@@ -55,20 +57,20 @@ impl<'a> RnsEncryptBuild<'a> {
             plaintexts: BTreeMap::new(),
             preprocess: None,
             binding: None,
-            refresh_declaration: None,
+            decoder_declaration: None,
             manifests: BTreeMap::new(),
             runtime: BTreeMap::new(),
-            refresh_mask_child: None,
-            refresh_mask: None,
+            decoder_smudge_child: None,
+            decoder_smudge: None,
             dynamic_schema: None,
             dynamic_rhs: None,
             prelude: None,
         }
     }
 
-    /// Bind public LHS plaintexts and secrets for a refresh mask child.
+    /// Bind public LHS plaintexts and secrets for a decoder smudge child.
     /// This application-facing method keeps the generic stage trait out of
-    /// refresh child setup code. Dynamic children take no mask.
+    /// decoder child setup code. Dynamic children take no mask.
     pub fn bind_lhs_inputs<P: Poly>(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
@@ -89,7 +91,7 @@ impl<'a> RnsEncryptBuild<'a> {
     ) -> Result<(), ApiError> {
         let binding = preprocess.descriptor().binding().clone();
         if binding.context() != &self.context ||
-            (self.refresh_mask.is_none() &&
+            (self.decoder_smudge.is_none() &&
                 binding.parameters() != &self.parameters.parameter_identity()) ||
             binding.rhs_mode() != self.parameters.rhs_mode() ||
             binding.hash_key_commitment() != &self.hash_key_commitment
@@ -109,8 +111,8 @@ impl<'a> RnsEncryptBuild<'a> {
         if self.inputs.is_none() {
             return Err(ApiError::input("encryption inputs are not bound"));
         }
-        // A refresh mask child's schema is its own Program's, bound with it.
-        if self.parameters.rhs_mode() == RhsMode::Dynamic && self.refresh_mask.is_none() {
+        // A decoder smudge child's schema is its own Program's, bound with it.
+        if self.parameters.rhs_mode() == RhsMode::Dynamic && self.decoder_smudge.is_none() {
             self.dynamic_schema =
                 Some((binding.dynamic_rhs().clone(), binding.dynamic_luts().clone()));
         }
@@ -118,7 +120,7 @@ impl<'a> RnsEncryptBuild<'a> {
         Ok(())
     }
 
-    /// Bind the preprocess artifacts used by a refresh mask child.
+    /// Bind the preprocess artifacts used by a decoder smudge child.
     pub fn bind_preprocess_artifacts(
         &mut self,
         preprocess: &StageArtifacts<RnsBggPreprocessEncryptDescriptor>,
@@ -127,24 +129,24 @@ impl<'a> RnsEncryptBuild<'a> {
     }
 
     /// Bind this encryption child, on
-    /// [`RnsBggParameters::refresh_mask_parameters`], to `declaration`'s mask
+    /// [`RnsBggParameters::decoder_smudge_parameters`], to `declaration`'s smudge
     /// Program, after its LHS inputs and the source's preprocess artifacts
     /// are bound. Its encodings are published into the parent's graph under
-    /// the refresh namespace; it is never executed on its own.
-    pub fn bind_refresh_mask(
+    /// the decoder namespace; it is never executed on its own.
+    pub fn bind_decoder_smudge(
         &mut self,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
     ) -> Result<(), RnsBggError> {
-        let program = declaration.mask().program();
+        let program = declaration.smudge().program();
         let inputs = self
             .inputs
             .as_ref()
-            .ok_or(RnsBggError::Binding("refresh mask child inputs are not bound"))?;
+            .ok_or(RnsBggError::Binding("decoder smudge child inputs are not bound"))?;
         if inputs.inputs() != program.inputs() {
-            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+            return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
-        if self.refresh_mask.is_some() {
-            return Err(RnsBggError::Binding("refresh mask child is already bound"));
+        if self.decoder_smudge.is_some() {
+            return Err(RnsBggError::Binding("decoder smudge child is already bound"));
         }
         if self.parameters.rhs_mode() == RhsMode::Dynamic {
             let workload = RnsBggDerivedWorkload::from_program(program)?;
@@ -155,48 +157,48 @@ impl<'a> RnsEncryptBuild<'a> {
                 .collect::<Result<BTreeMap<_, _>, RnsBggError>>()?;
             self.dynamic_schema = Some((rhs, workload.luts().clone()));
         }
-        self.refresh_mask = Some(declaration.clone());
+        self.decoder_smudge = Some(declaration.clone());
         Ok(())
     }
 
-    /// Attach the bound mask child of `declaration`'s refresh: its encodings
-    /// and the refresh decoder row are published into this encryption.
-    pub fn bind_refresh(
+    /// Attach the bound smudge child of `declaration`'s decoder: its encodings
+    /// and the unmask hint are published into this encryption.
+    pub fn bind_decoder(
         &mut self,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
         child: RnsEncryptBuild<'a>,
     ) -> Result<(), RnsBggError> {
-        if self.refresh_mask_child.is_some() {
-            return Err(RnsBggError::Binding("a refresh is already bound"));
+        if self.decoder_smudge_child.is_some() {
+            return Err(RnsBggError::Binding("a decoder is already bound"));
         }
         let binding = child
             .binding
             .as_ref()
-            .ok_or(RnsBggError::Binding("refresh mask child artifacts are not bound"))?;
+            .ok_or(RnsBggError::Binding("decoder smudge child artifacts are not bound"))?;
         if binding.context() != &self.context ||
             binding.parameters() != &self.parameters.parameter_identity() ||
             binding.hash_key_commitment() != &self.hash_key_commitment ||
             binding.program() != declaration.source_program() ||
-            binding.refresh_commitment() != Some(declaration.commitment()) ||
+            binding.decoder_commitment() != Some(declaration.commitment()) ||
             child.inputs.is_none() ||
             child.payload_secret.is_none() ||
             child.mask_secret.is_none() ||
-            child.refresh_mask.as_ref().map(|bound| *bound.commitment()) !=
+            child.decoder_smudge.as_ref().map(|bound| *bound.commitment()) !=
                 Some(*declaration.commitment())
         {
-            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+            return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
-        validate_refresh_mask_input_key_artifacts(
+        validate_decoder_smudge_input_key_artifacts(
             &child.manifests,
             child
                 .preprocess
                 .as_ref()
-                .ok_or(RnsBggError::Binding("refresh mask child preprocess is not bound"))?,
+                .ok_or(RnsBggError::Binding("decoder smudge child preprocess is not bound"))?,
             child.parameters,
             child
                 .inputs
                 .as_ref()
-                .ok_or(RnsBggError::Binding("refresh mask child inputs are not bound"))?,
+                .ok_or(RnsBggError::Binding("decoder smudge child inputs are not bound"))?,
             *declaration.commitment(),
         )?;
         // A Dynamic child encrypts under the parent's single secret, in the
@@ -215,45 +217,45 @@ impl<'a> RnsEncryptBuild<'a> {
                 batch(&child) != batch(self))
         {
             return Err(RnsBggError::Binding(
-                "a Dynamic refresh mask child must share the parent's secret and batch",
+                "a Dynamic decoder smudge child must share the parent's secret and batch",
             ));
         }
-        self.refresh_mask_child = Some(Box::new(child));
-        self.refresh_declaration = Some(declaration.clone());
+        self.decoder_smudge_child = Some(Box::new(child));
+        self.decoder_declaration = Some(declaration.clone());
         Ok(())
     }
 
-    fn append_refresh_mask_child(
+    fn append_decoder_smudge_child(
         child: &RnsEncryptBuild<'a>,
-        declaration: &RefreshDeclaration,
+        declaration: &DecoderDeclaration,
         mut graph: DslContext,
         hash_key: &Bytes,
     ) -> Result<DslContext, ApiError> {
         let inputs = child
             .inputs
             .as_ref()
-            .ok_or_else(|| ApiError::input("refresh mask child inputs are not bound"))?;
+            .ok_or_else(|| ApiError::input("decoder smudge child inputs are not bound"))?;
         let production = child
             .preprocess
             .as_ref()
-            .ok_or_else(|| ApiError::input("refresh mask child preprocess is not bound"))?;
+            .ok_or_else(|| ApiError::input("decoder smudge child preprocess is not bound"))?;
         let payload = child
             .payload_secret
             .as_ref()
-            .ok_or_else(|| ApiError::input("refresh mask child payload is not bound"))?;
+            .ok_or_else(|| ApiError::input("decoder smudge child payload is not bound"))?;
         let mask = child
             .mask_secret
             .as_ref()
-            .ok_or_else(|| ApiError::input("refresh mask child mask is not bound"))?;
+            .ok_or_else(|| ApiError::input("decoder smudge child mask secret is not bound"))?;
         let commitment = *declaration.commitment();
         for (name, family) in
             child.lut_helper_families(mask, hash_key, inputs).map_err(ApiError::scheme)?
         {
             graph = graph
-                .transferred_output(refresh_mask_artifact_name(commitment, &name), family)
+                .transferred_output(decoder_smudge_artifact_name(commitment, &name), family)
                 .map_err(ApiError::scheme)?;
         }
-        let workload = RnsBggDerivedWorkload::from_program(declaration.mask().program())
+        let workload = RnsBggDerivedWorkload::from_program(declaration.smudge().program())
             .map_err(ApiError::scheme)?;
         for (wire, declaration_input) in inputs.inputs() {
             // Each input is encoded at its logical level in the PRF Program.
@@ -269,13 +271,13 @@ impl<'a> RnsEncryptBuild<'a> {
                     (
                         ring.artifact_input(
                             production.clone(),
-                            refresh_mask_input_key_artifact_name(commitment, *wire, 0),
+                            decoder_smudge_input_key_artifact_name(commitment, *wire, 0),
                             (1, columns),
                             ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
-                            refresh_mask_input_key_artifact_name(commitment, *wire, 1),
+                            decoder_smudge_input_key_artifact_name(commitment, *wire, 1),
                             (1, columns),
                             ArtifactAvailability::Cached,
                         ),
@@ -283,13 +285,13 @@ impl<'a> RnsEncryptBuild<'a> {
                     (
                         ring.artifact_input(
                             production.clone(),
-                            refresh_mask_input_key_artifact_name(commitment, *wire, 2),
+                            decoder_smudge_input_key_artifact_name(commitment, *wire, 2),
                             (1, columns),
                             ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
-                            refresh_mask_input_key_artifact_name(commitment, *wire, 3),
+                            decoder_smudge_input_key_artifact_name(commitment, *wire, 3),
                             (1, columns),
                             ArtifactAvailability::Cached,
                         ),
@@ -299,7 +301,7 @@ impl<'a> RnsEncryptBuild<'a> {
             let value = child
                 .plaintexts
                 .get(wire)
-                .ok_or_else(|| ApiError::input("refresh mask child plaintext is not bound"))?;
+                .ok_or_else(|| ApiError::input("decoder smudge child plaintext is not bound"))?;
             let encode = |key: RnsBggPublicKey, plaintext: Mat| {
                 let plaintext = checked_modulus_convert(plaintext, &ring)?;
                 if matches!(declaration_input.knowledge(), AttributeKnowledge::PublicPayload) {
@@ -311,7 +313,7 @@ impl<'a> RnsEncryptBuild<'a> {
             graph = match value {
                 InputBinding::Scalar(value) => graph
                     .transferred_output(
-                        refresh_mask_artifact_name(commitment, &format!("input-{wire:?}")),
+                        decoder_smudge_artifact_name(commitment, &format!("input-{wire:?}")),
                         encode(key, value.clone()).map_err(ApiError::scheme)?,
                     )
                     .map_err(ApiError::scheme)?,
@@ -320,7 +322,7 @@ impl<'a> RnsEncryptBuild<'a> {
                         .map(|port| {
                             ring.family_artifact_input(
                                 production.clone(),
-                                refresh_mask_input_key_artifact_name(commitment, *wire, port),
+                                decoder_smudge_input_key_artifact_name(commitment, *wire, port),
                                 plaintexts.count().clone(),
                                 (1, columns),
                                 ArtifactAvailability::Cached,
@@ -342,7 +344,7 @@ impl<'a> RnsEncryptBuild<'a> {
                     .map_err(ApiError::scheme)?;
                     graph
                         .transferred_output(
-                            refresh_mask_artifact_name(commitment, &format!("input-{wire:?}")),
+                            decoder_smudge_artifact_name(commitment, &format!("input-{wire:?}")),
                             family,
                         )
                         .map_err(ApiError::scheme)?
@@ -353,9 +355,9 @@ impl<'a> RnsEncryptBuild<'a> {
             graph = child.dynamic_material(
                 graph,
                 hash_key,
-                declaration.mask().id(),
+                declaration.smudge().id(),
                 Some(commitment),
-                |role| refresh_mask_artifact_name(commitment, &role),
+                |role| decoder_smudge_artifact_name(commitment, &role),
             )?;
         }
         Ok(graph)
@@ -604,12 +606,12 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         let (mut graph, mut exported) = self.dynamic_family_ciphertexts(graph, |role| role)?;
         let mut runtime = self.runtime.clone();
         if let (Some(declaration), Some(child)) =
-            (self.refresh_declaration.as_ref(), self.refresh_mask_child.as_ref())
+            (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
             let commitment = *declaration.commitment();
             let (child_graph, child_exported) = child
                 .dynamic_family_ciphertexts(graph, |role| {
-                    refresh_mask_artifact_name(commitment, &role)
+                    decoder_smudge_artifact_name(commitment, &role)
                 })?;
             graph = child_graph;
             exported |= child_exported;
@@ -628,7 +630,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         production: ProductionId,
         manifest: Manifest,
     ) -> Result<(), ApiError> {
-        if let Some(child) = self.refresh_mask_child.as_mut() {
+        if let Some(child) = self.decoder_smudge_child.as_mut() {
             child.prelude = Some((production.clone(), manifest.clone()));
         }
         self.prelude = Some((production, manifest));
@@ -653,14 +655,17 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         let hash_key = ring.bytes_input(super::HASH_KEY_INPUT, self.hash_key.len());
         let mut graph = DslContext::new("rns-bgg-encrypt");
         if let (Some(declaration), Some(child)) =
-            (self.refresh_declaration.as_ref(), self.refresh_mask_child.as_ref())
+            (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
-            graph = Self::append_refresh_mask_child(child, declaration, graph, &hash_key)?;
-            let row = self.refresh_decoder_row(declaration, child.parameters)?;
+            graph = Self::append_decoder_smudge_child(child, declaration, graph, &hash_key)?;
+            // The child's last level is the decoding level `L`, with its CRT
+            // basis (checked when the child is bound).
+            let decoding = child.parameters.levels().len() - 1;
+            let hint = self.unmask_hint(declaration, child.parameters, decoding)?;
             graph = graph
                 .transferred_output(
-                    refresh_artifact_name(*declaration.commitment(), "decoder-row"),
-                    row,
+                    decoder_artifact_name(*declaration.commitment(), "unmask-hint"),
+                    hint,
                 )
                 .map_err(ApiError::scheme)?;
             merge_runtime_inputs(&mut self.runtime, &child.runtime)?;

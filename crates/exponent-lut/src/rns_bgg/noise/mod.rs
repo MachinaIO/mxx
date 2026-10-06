@@ -4,13 +4,13 @@
 //! a symbolic graph from public setup contracts; it does not execute a GPU
 //! graph or inspect ciphertext samples. Deterministic bounds are kept separate
 //! from conditional average-case moments. Fresh encoding errors use the
-//! configured Gaussian sigma and runtime cutoff; a refresh adds the decoder
-//! error of its trapdoor preimage (see the `refresh` submodule).
+//! configured Gaussian sigma and runtime cutoff; a decoder adds the unmask
+//! error of its trapdoor preimage (see the `decoder` submodule).
 #![warn(missing_docs)]
 use super::{RhsMode, RnsBggError, RnsBggParameters, workload::RnsBggDerivedWorkload};
 use crate::{
-    noise_refresh::{
-        refresh::{NoiseRefresh, RefreshDeclaration, RefreshError},
+    decoder::{
+        decoding::{Decoder, DecoderDeclaration, DecoderError},
         simulation::NoiseModelKind,
     },
     noise_utils::{
@@ -36,13 +36,14 @@ use crate::noise_utils::{NoiseBreakdown, ReductionCounts, SampleCoordinate};
 
 mod audit;
 mod build;
+mod decoder;
 mod evaluator;
-mod refresh;
 mod rules;
 
+pub(crate) use self::decoder::simulate_decoder_noise;
 pub use self::{
     audit::{RnsBggNoiseTrace, RnsBggParameterManifest, RnsBggPlanRequest},
-    refresh::RnsBggRefreshNoise,
+    decoder::RnsBggDecoderNoise,
 };
 
 /// Evaluator-owned noise contracts for one Program lowering.
@@ -200,7 +201,7 @@ pub struct RnsBggNoiseValue {
     /// Stable source/route identities for shared correlations.
     ///
     /// A value may aggregate several sampled sources, such as the members of
-    /// a refresh mask. Keeping the complete source set (rather than one
+    /// a decoder smudge. Keeping the complete source set (rather than one
     /// representative source) lets a later combination recognize a shared
     /// sample.
     pub provenance: BTreeMap<[u8; 32], NoiseSourceProvenance>,
@@ -521,10 +522,10 @@ pub struct RnsBggNoiseEvaluator<'a> {
     current_site: Option<crate::program::LoweringSite>,
     event_multiplier: BigUint,
     finalized_coefficient_wires: BTreeMap<WireId, RnsBggNoiseValue>,
-    /// The refresh declaration when this evaluator lowers its mask Program.
-    refresh_mask: Option<Arc<RefreshDeclaration>>,
-    /// The decoder trapdoor sigma when this evaluator composes a refresh.
-    refresh_trapdoor_sigma: Option<f64>,
+    /// The decoder declaration when this evaluator lowers its smudge Program.
+    decoder_smudge: Option<Arc<DecoderDeclaration>>,
+    /// The unmask trapdoor sigma when this evaluator composes a decoder.
+    unmask_trapdoor_sigma: Option<f64>,
     /// Lane index of each enclosing parallel family, innermost last.
     lane_indices: Vec<IntExpr>,
     /// Wires whose payload is nonzero in at most `count` lanes of the family
@@ -542,7 +543,7 @@ struct PayloadSupport {
 }
 
 /// Common API noise-stage adapter.  It owns only graph handles and the
-/// evaluator; sampled matrices and refresh artifacts stay at their stages.
+/// evaluator; sampled matrices and decoder artifacts stay at their stages.
 pub struct RnsNoiseBuild<'a> {
     evaluator: Option<RnsBggNoiseEvaluator<'a>>,
     families: RnsBggNoiseFamilies,
@@ -552,7 +553,7 @@ pub struct RnsNoiseBuild<'a> {
         (WireId, RnsBggNoiseFamily),
         (RhsId, FamilyRange),
     >,
-    pending_refresh: Option<RnsBggRefreshNoise>,
+    pending_decoder: Option<RnsBggDecoderNoise>,
 }
 
 #[cfg(test)]

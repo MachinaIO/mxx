@@ -161,6 +161,13 @@ impl RnsBggDerivedWorkload {
                 ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
                 ProgramLowerError::UnsupportedStructure { reason } => RnsBggError::Graph(reason),
             })?;
+        // A family wire has the level of the member its body returns, so a
+        // member output of a root family has a level.
+        for (family, inner) in program.family_body_outputs() {
+            if let Some(level) = collector.levels.get(&inner).copied() {
+                collector.levels.insert(family, level);
+            }
+        }
         let uses = collector
             .public_input_uses
             .iter()

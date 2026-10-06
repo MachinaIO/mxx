@@ -9,9 +9,9 @@ use super::*;
 use crate::{
     api::{
         ApiError, EncryptBuild, OnlineEvalBuild, PlaintextInputs, StageArtifacts, StageExecution,
-        StageGraph, StageOutputs, apply_refresh,
+        StageGraph, StageOutputs, apply_decoder,
     },
-    noise_refresh::refresh::{NoiseRefresh, RefreshDeclaration, RefreshError},
+    decoder::decoding::{Decoder, DecoderDeclaration, DecoderError},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
         GraphParallelLowering, InputBinding, InputShape, LoweringSite, LutId, LutTable, Operand,
@@ -36,11 +36,11 @@ use std::{
     sync::Arc,
 };
 
+mod decoder;
 mod dynamic;
 mod encrypt;
 mod lowering;
 mod online_eval;
-mod refresh;
 mod verify;
 
 pub(super) use self::lowering::*;
@@ -88,9 +88,10 @@ impl<R, A> RnsBggEncoding<R, A, RnsBggPublicKey> {
 }
 
 impl RnsBggEncoding<RnsBggRow, Mat> {
-    /// Returns the encryption residual against the deterministic BGG relation.
-    /// Fresh Gaussian error is therefore the returned value; no plaintext is
-    /// reconstructed and public payload pairing remains metadata-driven.
+    /// Returns the encryption residual against the deterministic BGG relation,
+    /// a private payload being scaled by `message_scale`. Fresh Gaussian
+    /// error is therefore the returned value; no plaintext is reconstructed
+    /// and public payload pairing remains metadata-driven.
     pub fn verification_residual(
         &self,
         parameters: &RnsBggParameters,
@@ -98,6 +99,7 @@ impl RnsBggEncoding<RnsBggRow, Mat> {
         payload: &RnsBggPayloadSecret,
         mask: &RnsBggMaskSecret,
         expected: Mat,
+        message_scale: &BigUint,
     ) -> Result<RnsBggRow, RnsBggError> {
         let ring = parameters.ring(level)?;
         if expected.matrix_type() != &ring.matrix_type((1, 1)) {
@@ -118,7 +120,7 @@ impl RnsBggEncoding<RnsBggRow, Mat> {
             let payload = reduce_secret(parameters, &payload.row, level)?;
             let gadget = parameters.state_gadget(level)?;
             let target = (payload.0 * gadget.clone(), payload.1 * gadget);
-            let delta = parameters.scalar(level, parameters.message_scale(level)?)?;
+            let delta = parameters.scalar(level, message_scale.clone())?;
             let scale = delta * expected;
             (target.0 * scale.clone(), target.1 * scale)
         };
@@ -293,13 +295,13 @@ fn merge_runtime_inputs(
             Some(RuntimeValue::Bytes(existing)) => match value {
                 RuntimeValue::Bytes(candidate) if existing == candidate => {}
                 RuntimeValue::Bytes(_) => {
-                    return Err(ApiError::input("refresh child runtime input conflicts"));
+                    return Err(ApiError::input("decoder child runtime input conflicts"));
                 }
-                _ => return Err(ApiError::input("refresh child runtime input schema")),
+                _ => return Err(ApiError::input("decoder child runtime input schema")),
             },
             // A secret input name is unique to one sampled secret.
             Some(RuntimeValue::Matrix(_)) if matches!(value, RuntimeValue::Matrix(_)) => {}
-            Some(_) => return Err(ApiError::input("refresh child runtime input schema")),
+            Some(_) => return Err(ApiError::input("decoder child runtime input schema")),
             None => {
                 destination.insert(name.clone(), value.clone());
             }
@@ -476,7 +478,7 @@ pub struct EncodingLowering<'a> {
     pub(crate) preprocess: ProductionId,
     pub(crate) encryption: ProductionId,
     pub(crate) manifests: BTreeMap<ProductionId, Manifest>,
-    pub(crate) refresh_mask: Option<Arc<RefreshDeclaration>>,
+    pub(crate) decoder_smudge: Option<Arc<DecoderDeclaration>>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
@@ -485,7 +487,15 @@ pub struct EncodingLowering<'a> {
     /// Dynamic: each RHS's digit-companion family, imported where the
     /// Program is bound so a Program family body reads its members in place.
     pub(crate) rhs_companions: BTreeMap<RhsId, Family<RnsBggRow>>,
+    /// The material of each `(level, LUT)` evaluated in a family body,
+    /// imported where the Program is bound so every member reads it in place.
+    pub(crate) lut_material: BTreeMap<(usize, LutId), LutMaterial>,
 }
+
+/// A LUT's imported switching ciphertexts (one family per matrix port), its
+/// automorphism indices, its helpers, and its Dynamic digit companions.
+pub(crate) type LutMaterial =
+    (Vec<Family<Mat>>, Vec<usize>, (Family<Mat>, Family<Mat>), Option<Family<RnsBggRow>>);
 
 /// Encryption builder; secrets and plaintexts are stage-local.
 pub struct RnsEncryptBuild<'a> {
@@ -502,16 +512,16 @@ pub struct RnsEncryptBuild<'a> {
     plaintexts: BTreeMap<WireId, InputBinding<Mat, super::PlaintextFamily>>,
     preprocess: Option<ProductionId>,
     binding: Option<RnsBggArtifactBinding>,
-    refresh_declaration: Option<RefreshDeclaration>,
+    decoder_declaration: Option<DecoderDeclaration>,
     manifests: BTreeMap<ProductionId, Manifest>,
     runtime: BTreeMap<String, RuntimeValue>,
-    /// The bound mask child of an applied refresh.
-    refresh_mask_child: Option<Box<RnsEncryptBuild<'a>>>,
-    /// For a mask child: the refresh declaration whose mask Program it
+    /// The bound smudge child of an applied decoder.
+    decoder_smudge_child: Option<Box<RnsEncryptBuild<'a>>>,
+    /// For a smudge child: the decoder declaration whose smudge Program it
     /// encrypts the inputs of.
-    refresh_mask: Option<RefreshDeclaration>,
+    decoder_smudge: Option<DecoderDeclaration>,
     /// Dynamic: the shape and consuming level of each declared RHS and each
-    /// evaluated `(level, LUT)`, known once preprocessing (or, for a mask
+    /// evaluated `(level, LUT)`, known once preprocessing (or, for a smudge
     /// child, its Program) is bound.
     dynamic_schema: Option<(BTreeMap<RhsId, (InputShape, usize)>, BTreeSet<(usize, LutId)>)>,
     /// Dynamic: the encryption batch identifier and the RHS plaintexts, read
@@ -536,9 +546,9 @@ pub struct RnsOnlineEvalBuild<'a> {
         OnlineEvalWireFamily,
         OnlineEvalRhsFamily,
     >,
-    /// The applied refresh: its output index, declaration and mask child.
-    pending_refresh: Option<(usize, RefreshDeclaration, Box<RnsOnlineEvalBuild<'a>>)>,
-    /// The coefficient bound of the refresh decoder preimage, from the
+    /// The applied decoder: its output index, declaration and smudge child.
+    pending_decoder: Option<(usize, DecoderDeclaration, Box<RnsOnlineEvalBuild<'a>>)>,
+    /// The coefficient bound of the unmask preimage, from the
     /// preprocess binding.
-    refresh_preimage_bound: Option<BigUint>,
+    unmask_preimage_bound: Option<BigUint>,
 }

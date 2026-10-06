@@ -61,8 +61,8 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             current_site: None,
             event_multiplier: BigUint::one(),
             finalized_coefficient_wires: BTreeMap::new(),
-            refresh_mask: None,
-            refresh_trapdoor_sigma: None,
+            decoder_smudge: None,
+            unmask_trapdoor_sigma: None,
             lane_indices: Vec::new(),
             payload_support: BTreeMap::new(),
             reduction_counts: ReductionCounts::default(),
@@ -442,7 +442,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         self.operation_node_with_multiplier(wire, value, node, self.event_multiplier.clone())
     }
 
-    pub(super) fn merge_refresh_trace(&mut self, other: &RnsBggNoiseTrace) {
+    pub(super) fn merge_decoder_trace(&mut self, other: &RnsBggNoiseTrace) {
         self.trace.joint_event_count += &other.joint_event_count;
         for (wire, value) in &other.wires {
             self.trace.wires.entry(*wire).or_insert_with(|| value.clone());
@@ -759,6 +759,27 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             });
             value = value.with_breakdown(breakdown);
         }
+        // The scale-up `G^-1(k)` of the finalized carrier (see
+        // `RnsBggParameters::coefficient_output_action`): a fixed right action
+        // with the balanced digits of `k`, whose energy applies only to a
+        // contribution with an established covariance bound.
+        let finalized_level = level
+            .checked_add(1)
+            .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
+        let (_, k, _) =
+            self.parameters.coefficient_output_decoding(&self.program, wire, finalized_level)?;
+        let (l1, l2_squared) = self.parameters.gadget_inverse_norms(finalized_level, &k)?;
+        value.bound.error *= &l1;
+        let mean_gain =
+            NonnegativeRational::new(l1.clone(), BigUint::one()).expect("positive scale-up action");
+        let l1_squared = &l1 * &l1;
+        let breakdown = value.contributions("coefficient-scale").map(|terms| {
+            terms.transform(|term| {
+                let gain = if term.covariance_bounded { &l2_squared } else { &l1_squared };
+                (mean_gain.clone(), term.moments.variance.scaled(gain), false)
+            })
+        });
+        value = value.with_breakdown(breakdown);
         if ratio != BigUint::one() {
             let source = stable_source_id(&(
                 b"rns-bgg/coefficient-final-mod-down".as_slice(),
@@ -1239,8 +1260,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         // carry the table's integer coefficient bound.
         let output_payload_l1 = match table.output_representation() {
             crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
-            crate::program::LutOutputRepresentation::Coefficient |
-            crate::program::LutOutputRepresentation::UnscaledCoefficient => table
+            crate::program::LutOutputRepresentation::Coefficient => table
                 .values()
                 .iter()
                 .copied()
@@ -1315,16 +1335,19 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             node,
             self.event_multiplier.clone() * BigUint::from(table.values().len()),
         )?;
-        if let Some(declaration) = self.refresh_mask.clone() &&
-            let Some(family) = declaration.mask().family_of_lut(lut)
+        if let Some(declaration) = self.decoder_smudge.clone() &&
+            declaration.smudge().lut() == lut
         {
-            // A refresh mask member: finalized once in its root body, then
-            // weighted by `G^-1(w)` and placed by a monomial, as the
-            // encoding does. The worst weight bounds every member.
+            // A decoder smudge member: finalized once in its root body, then
+            // weighted by `G^-1(w)` for its halved weight `w = 2^-1 P^digit mod
+            // q`, and placed by a monomial, as the encoding does. The error
+            // gain is the largest `l1(G^-1(w))` over the halved weights; the
+            // payload `P^digit delta / 2` is bounded by the largest numerator.
             let value = self.finalize_coefficient(wire, value)?;
-            let weights = declaration.member_weights(family);
+            let numerators = declaration.member_weights();
+            let weights = self.parameters.halved_weights(level + 1, &numerators)?;
             let l1 = self.parameters.gadget_inverse_l1(level + 1, &weights)?;
-            let weight = weights.iter().max().cloned().unwrap_or_default();
+            let weight = numerators.iter().max().cloned().unwrap_or_default();
             return Ok((wire, value.constant_digit_action(&l1, &weight)));
         }
         Ok((wire, value))
@@ -1814,8 +1837,11 @@ mod test {
         let mut evaluator = RnsBggNoiseEvaluator::new(&parameters, &program, &workload, &bindings);
         let outputs =
             evaluator.finish_outputs(vec![(output, value(&[1])), (output, value(&[1]))]).unwrap();
-        // The aggregated pre-rounding noise is scaled and rounded once.
-        let expected = parameters.lut_mod_down_bound(0, &value(&[1]).bound.error).unwrap();
+        // The aggregated pre-rounding noise is scaled and rounded once, then
+        // scaled up by the `G^-1(k)` action, whose gain is its digit l1 norm.
+        let (_, k, _) = parameters.coefficient_output_decoding(&program, output, 1).unwrap();
+        let (l1, _) = parameters.gadget_inverse_norms(1, &k).unwrap();
+        let expected = parameters.lut_mod_down_bound(0, &value(&[1]).bound.error).unwrap() * l1;
 
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].bound.error, expected);

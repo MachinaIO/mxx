@@ -594,7 +594,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         input_terms: NoiseBreakdown,
         coefficient_output: bool,
     ) -> Result<NoiseBreakdown, RnsBggError> {
-        let branches = table.values().len();
+        let branches = table.input_width();
         let payload_gain = RightActionNoiseGain {
             l1: input.bound.payload_l1.clone(),
             l2_squared: input.payload_l2_squared.clone(),
@@ -1260,13 +1260,9 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         // carry the table's integer coefficient bound.
         let output_payload_l1 = match table.output_representation() {
             crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
-            crate::program::LutOutputRepresentation::Coefficient => table
-                .values()
-                .iter()
-                .copied()
-                .max()
-                .map(BigUint::from)
-                .ok_or(RnsBggError::Parameters("LUT table has no output values"))?,
+            crate::program::LutOutputRepresentation::Coefficient => {
+                BigUint::from(table.max_output())
+            }
         };
         let output_payload_l2_squared = output_payload_l1.pow(2u32);
         let coefficient_output = table.output_representation().is_coefficient();
@@ -1283,7 +1279,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             self.parameters.lut_noise_bound_before_mod_down(
                 level,
                 &input.1.bound,
-                table.values().len(),
+                table.input_width(),
                 &fresh_error_gain.l1,
                 output_payload_l1,
             )?
@@ -1291,7 +1287,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             self.parameters.lut_noise_bound(
                 level,
                 &input.1.bound,
-                table.values().len(),
+                table.input_width(),
                 &fresh_error_gain.l1,
                 output_payload_l1,
             )?
@@ -1333,7 +1329,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             wire,
             value,
             node,
-            self.event_multiplier.clone() * BigUint::from(table.values().len()),
+            self.event_multiplier.clone() * BigUint::from(table.input_width()),
         )?;
         if let Some(declaration) = self.decoder_smudge.clone() &&
             declaration.smudge().lut() == lut

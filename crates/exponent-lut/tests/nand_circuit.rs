@@ -501,10 +501,10 @@ fn nand_circuit_end_to_end() {
     )
     .expect("public encryption");
     // Online evaluation receives only preparation artifacts and public
-    // configuration; preprocessing RHS plaintexts and the mask stay out
-    // of this stage.
+    // configuration; preprocessing RHS plaintexts, the mask and the LUT
+    // values stay out of this stage.
     let result = api::online_eval(
-        compiled.program(),
+        &compiled.program().without_lut_values(),
         &ParamEnv::default(),
         &online_eval,
         &encrypted,

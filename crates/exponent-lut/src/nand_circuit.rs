@@ -435,7 +435,7 @@ mod tests {
             input: &Self::Wire,
             table: &crate::program::LutTable,
         ) -> Result<Self::Wire, Self::Error> {
-            table.values().get(*input).copied().ok_or(LogicalError)
+            table.values().and_then(|values| values.get(*input)).copied().ok_or(LogicalError)
         }
     }
 
@@ -614,7 +614,7 @@ mod tests {
                     let expected = instruction.apply(packed, bit);
                     let expected =
                         if round + 1 == instructions.len() { expected & 1 } else { expected };
-                    assert_eq!(table.values()[packed + 8 * bit], expected);
+                    assert_eq!(table.values().unwrap()[packed + 8 * bit], expected);
                 }
             }
         }

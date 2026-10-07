@@ -330,7 +330,8 @@ impl EncodingLowering<'_> {
     /// Evaluate a public LUT payload with the same Walsh/automorphism
     /// coefficients used by the online evaluation encoding.  The payload is public, so
     /// the complete evaluation can remain a graph expression; private and
-    /// unknown payloads never enter this path.
+    /// unknown payloads never enter this path. It is the one step of the
+    /// online evaluation that reads the table's values.
     fn lut_public_payload(
         &self,
         level: usize,
@@ -349,6 +350,10 @@ impl EncodingLowering<'_> {
         let payload = checked_modulus_convert(payload, &output_ring)?;
         let sigmas =
             input_layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+        // The output payload is computed in the clear, from the values.
+        let values = table
+            .values()
+            .ok_or(RnsBggError::Binding("the values of a LUT on a public payload are withheld"))?;
         // One loop body over the automorphism indices, as preprocessing builds
         // its switching ciphertexts, so the graph does not grow with the
         // square of the table width.
@@ -363,7 +368,7 @@ impl EncodingLowering<'_> {
                 input_layout,
                 table.output_representation(),
                 sigma.clone(),
-                table.values(),
+                values,
             )
             .map_err(|_| DslError::Schema)?;
             Ok(coefficient * payload.clone().ring_automorphism(sigma))
@@ -477,7 +482,7 @@ impl EncodingLowering<'_> {
         lut_id: crate::program::LutId,
         table: &LutTable,
     ) -> Result<(Vec<Family<Mat>>, Vec<usize>), RnsBggError> {
-        let count = IntExpr::constant(table.values().len());
+        let count = IntExpr::constant(table.input_width());
         let decomposition_level =
             evaluation_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let decomposition_ring = self.parameters.ring(decomposition_level)?;
@@ -825,7 +830,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         // Each iteration first reads the next branch's switching ciphertext
         // and carries it to the next iteration, so that load overlaps this
         // branch's work; the last branch runs after the loop.
-        let last = table.values().len().checked_sub(1).ok_or(RnsBggError::Lut)?;
+        let last = table.input_width().checked_sub(1).ok_or(RnsBggError::Lut)?;
         let (row, public_key) = if let Some(companions) = companions {
             // Dynamic: one companion loop first builds every branch's key
             // rows `T_s` and companion row `E_s` (block `s` of each row), so

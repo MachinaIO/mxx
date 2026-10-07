@@ -196,7 +196,7 @@ fn parameter_artifact_bytes(
     for (level, lut) in workload.luts() {
         let table = tables.luts().get(lut.0 as usize).ok_or(RnsBggError::Lut)?;
         let columns = parameters.lut_output_columns(*level + 1, table.output_representation())?;
-        bytes += material(*level, columns, table.values().len())?;
+        bytes += material(*level, columns, table.input_width())?;
     }
     Ok(bytes)
 }

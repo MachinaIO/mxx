@@ -386,7 +386,7 @@ mod tests {
             input: &Self::Wire,
             table: &crate::program::LutTable,
         ) -> Result<Self::Wire, Self::Error> {
-            assert!(!table.values().is_empty());
+            assert!(table.input_width() > 0);
             Ok(input.clone())
         }
     }

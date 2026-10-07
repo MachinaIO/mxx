@@ -985,6 +985,10 @@ where
 
 /// Lower the Program, append scheme-owned decoder operations, and execute the
 /// resulting online evaluation graph. The returned outputs are owned copies.
+///
+/// The Program may withhold its LUT values
+/// ([`ExponentLutProgram::without_lut_values`]): its identity is unchanged, and
+/// only a LUT on a public payload reads them.
 pub fn online_eval<E, S, T>(
     program: &ExponentLutProgram,
     parameters: &ParamEnv,

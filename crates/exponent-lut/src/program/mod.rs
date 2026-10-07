@@ -403,12 +403,23 @@ impl LutOutputRepresentation {
     }
 }
 
+/// A LUT: its input and output shape and its output values.
+///
+/// The values enter the Program identity only through their digest, so a
+/// table whose values are withheld ([`LutTable::without_values`]) keeps the
+/// identity of the full table. Preprocessing embeds the values in the LUT
+/// switching ciphertexts and needs them; the online evaluation of a LUT on a
+/// private payload reads only the shape and the largest output value, which
+/// bounds a coefficient output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LutTable {
     input_width: usize,
     input_layout: ExpLayout,
     output_width: usize,
-    values: Vec<usize>,
+    #[serde(skip)]
+    values: Option<Vec<usize>>,
+    values_digest: [u8; 32],
+    max_output: usize,
     output_representation: LutOutputRepresentation,
 }
 
@@ -430,9 +441,25 @@ impl LutTable {
         values: Vec<usize>,
         output_representation: LutOutputRepresentation,
     ) -> Result<Self, ProgramValidationError> {
-        let table = Self { input_width, input_layout, output_width, values, output_representation };
+        let values_digest = lut_values_digest(&values);
+        let max_output = values.iter().copied().max().unwrap_or(0);
+        let table = Self {
+            input_width,
+            input_layout,
+            output_width,
+            values: Some(values),
+            values_digest,
+            max_output,
+            output_representation,
+        };
         validate_table(&table)?;
         Ok(table)
+    }
+
+    /// The same table with its values withheld; the Program identity is
+    /// unchanged.
+    pub fn without_values(&self) -> Self {
+        Self { values: None, ..self.clone() }
     }
 
     pub fn input_width(&self) -> usize {
@@ -444,8 +471,13 @@ impl LutTable {
     pub fn output_width(&self) -> usize {
         self.output_width
     }
-    pub fn values(&self) -> &[usize] {
-        &self.values
+    /// The output values, or `None` when they are withheld.
+    pub fn values(&self) -> Option<&[usize]> {
+        self.values.as_deref()
+    }
+    /// The largest output value, kept when the values are withheld.
+    pub fn max_output(&self) -> usize {
+        self.max_output
     }
     pub fn output_representation(&self) -> LutOutputRepresentation {
         self.output_representation
@@ -541,6 +573,17 @@ pub struct ExponentLutProgram {
 impl ExponentLutProgram {
     pub fn id(&self) -> ExponentLutProgramId {
         self.id
+    }
+    /// The same Program with the output values of every LUT withheld, for
+    /// the online evaluation: its identity is unchanged, since the identity
+    /// commits to each table's values by their digest. Preprocessing needs
+    /// the values; the online evaluation needs them only for a LUT on a
+    /// public payload, whose output it computes in the clear.
+    pub fn without_lut_values(&self) -> Self {
+        let program =
+            Self { luts: self.luts.iter().map(LutTable::without_values).collect(), ..self.clone() };
+        debug_assert_eq!(canonical_program_id(&program), self.id);
+        program
     }
     pub(crate) fn inputs(&self) -> &BTreeMap<WireId, ProgramInputDeclaration> {
         &self.inputs
@@ -690,14 +733,29 @@ pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationEr
     {
         return Err(ProgramValidationError::InvalidLut);
     }
-    if table.values.len() != table.input_width ||
-        table.values.iter().any(|value| *value >= table.output_width)
+    if let Some(values) = &table.values &&
+        (values.len() != table.input_width ||
+            values.iter().any(|value| *value >= table.output_width))
     {
         return Err(ProgramValidationError::InvalidLut);
     }
     Ok(())
 }
 
+/// The digest of a LUT's output values, which the Program identity commits to
+/// in place of the values.
+fn lut_values_digest(values: &[usize]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"mxx-exponent-lut/lut-values/v1");
+    digest.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        digest.update((*value as u64).to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// The Program identity: the digest of its inputs, RHS inputs, LUT tables
+/// (each with its values by their digest) and body.
 pub(crate) fn canonical_program_id(program: &ExponentLutProgram) -> ExponentLutProgramId {
     let bytes =
         serde_json::to_vec(&(&program.inputs, &program.rhs_inputs, &program.luts, &program.body))
@@ -840,10 +898,8 @@ fn derive_body_metadata(
                 let table = luts
                     .get(table.0 as usize)
                     .ok_or(ProgramValidationError::InvalidLutId(*table))?;
-                let coefficient_bound = table
-                    .output_representation
-                    .is_coefficient()
-                    .then(|| table.values.iter().copied().max().unwrap_or(0) as u64);
+                let coefficient_bound =
+                    table.output_representation.is_coefficient().then_some(table.max_output as u64);
                 WireMetadata { knowledge: input.knowledge, coefficient_bound }
             }
             Step::Parallel { range, body, output } => {
@@ -1884,7 +1940,7 @@ mod tests {
             .unwrap();
         assert_eq!(builder.luts[lut.0 as usize].input_width(), 4);
         assert_eq!(builder.luts[lut.0 as usize].input_layout().width(), 4);
-        assert_eq!(builder.luts[lut.0 as usize].values(), &[0, 1, 1, 0]);
+        assert_eq!(builder.luts[lut.0 as usize].values(), Some(&[0, 1, 1, 0][..]));
         assert!(
             builder
                 .register_binary_lut(
@@ -1953,6 +2009,16 @@ mod tests {
         assert_eq!(first.id(), same.id());
         assert_ne!(first.id(), changed.id());
         assert_eq!(first.body, same.body);
+
+        // Withholding the values keeps the identity, which is recomputed from
+        // the value digests, and the shape.
+        let withheld = first.without_lut_values();
+        assert_eq!(withheld.id(), first.id());
+        assert_eq!(canonical_program_id(&withheld), first.id());
+        assert_eq!(withheld.luts[0].values(), None);
+        assert_eq!(withheld.luts[0].input_width(), 2);
+        assert_eq!(withheld.luts[0].max_output(), 1);
+        assert_eq!(canonical_program_id(&changed.without_lut_values()), changed.id());
     }
 
     #[test]

@@ -518,8 +518,9 @@ mod tests {
             Ok(lhs * rhs)
         }
         fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
-            self.luts.push(table.values().to_vec());
-            Ok(*input + table.values().iter().sum::<usize>() as i32)
+            let values = table.values().expect("LUT values");
+            self.luts.push(values.to_vec());
+            Ok(*input + values.iter().sum::<usize>() as i32)
         }
     }
 

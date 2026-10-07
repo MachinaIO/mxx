@@ -170,7 +170,9 @@ pub(in crate::rns_bgg) fn lut_switching_ciphertext(
         table.input_layout(),
         table.output_representation(),
         sigma.clone(),
-        table.values(),
+        table.values().ok_or(RnsBggError::Binding(
+            "preprocessing needs the LUT values, which are withheld",
+        ))?,
     )?;
     // C_sigma is sampled in the next ring and constrained by the payload
     // secret. Its signed switching decomposition has each compact digit

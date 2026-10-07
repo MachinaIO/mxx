@@ -429,8 +429,9 @@ mod tests {
 
     /// The signed coefficient a negacyclic LUT returns for input `z in Z_Q`.
     fn negacyclic(table: &LutTable, z: usize) -> i64 {
-        let width = table.values().len();
-        let value = table.values()[z % width] as i64;
+        let values = table.values().expect("LUT values");
+        let width = values.len();
+        let value = values[z % width] as i64;
         if z < width { value } else { -value }
     }
 

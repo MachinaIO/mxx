@@ -350,7 +350,7 @@ impl<'a> PublicKeyLowering<'a> {
         if let Some(switching_ciphertexts) = self.lut_material.get(&key) {
             return Ok(switching_ciphertexts.clone());
         }
-        let count = IntExpr::constant(table.values().len());
+        let count = IntExpr::constant(table.input_width());
         let sigmas = layout
             .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
@@ -604,7 +604,7 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         let zero = source_ring.zero((1, columns));
         let initial = ((zero.clone(), zero.clone()), (zero.clone(), zero));
         let result =
-            mxx_dsl::iterate(IntExpr::constant(table.values().len()), initial, |index, sum| {
+            mxx_dsl::iterate(IntExpr::constant(table.input_width()), initial, |index, sum| {
                 let sigma = IntExpr::Select {
                     selector: Box::new(index.expression()?),
                     branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),

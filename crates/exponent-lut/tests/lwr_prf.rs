@@ -844,8 +844,9 @@ fn round_trip(
         },
     )
     .expect("RNS encryption");
+    // The online evaluation receives the Program without its LUT values.
     let result = api::online_eval(
-        program.program(),
+        &program.program().without_lut_values(),
         &ParamEnv::default(),
         &online_eval,
         &encrypted,

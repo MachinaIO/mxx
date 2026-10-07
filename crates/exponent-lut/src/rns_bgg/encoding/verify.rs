@@ -756,7 +756,8 @@ mod test {
 
     /// Preprocess, encrypt and evaluate `program` with the private scalar
     /// input bound to `input`, under `parameters`' RHS mode, and return the
-    /// online result with the payload secret and the stage mask.
+    /// online result with the payload secret and the stage mask. The online
+    /// evaluation receives the Program without its LUT values.
     fn run_without_rhs(
         parameters: &RnsBggParameters,
         program: &ExponentLutProgram,
@@ -818,7 +819,7 @@ mod test {
         )
         .unwrap();
         let result = crate::api::online_eval(
-            program,
+            &program.without_lut_values(),
             &ParamEnv::default(),
             &online_eval,
             &encrypted,

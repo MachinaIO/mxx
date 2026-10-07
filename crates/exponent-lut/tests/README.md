@@ -3,8 +3,7 @@
 The integration suite contains exactly four GPU-gated targets. Each target
 contains exactly one sequential test and runs the complete production flow:
 parameter search with noise simulation, benchmark estimation, then an
-artifact-backed round trip (preprocess, encrypt, and online evaluation; the
-decoder target runs its trusted setup, preprocess, encrypt, and decode stages). Benchmark estimation is the GPU runtime's
+artifact-backed round trip (preprocess, encrypt, and online evaluation). Benchmark estimation is the GPU runtime's
 planning step: every stage graph is planned with `GpuRuntime` immediately
 before it executes, the planner measures its wave-width and column-tile
 candidates on that exact graph, and the selected `GpuWarmupReport` is logged
@@ -15,11 +14,11 @@ at `info` level (run with `RUST_LOG=info` to see it).
 | `nand_circuit.rs` | `nand_circuit_end_to_end` | NAND circuit |
 | `lwr_prf.rs` | `lwr_prf_end_to_end` | Sparse-LWR PRF |
 | `public_ip.rs` | `public_ip_end_to_end` | Public inner product |
-| `decoder.rs` | `decoder_round_trip` | Trapdoor unmask of the decoder |
+| `decoder.rs` | `decoder_round_trip` | Smudged trapdoor decoder of a Program output |
 
-The application workflows use the public RNS-BGG application API, the decoder
-workflow builds its stages from `decoder::unmask` and runs them through
-`api::execute_artifacts`, and all four take the `dcrt_runtime` sequential lock. They require the `gpu` feature and a
+The workflows use the public RNS-BGG application API (the decoder target applies
+the PRF-smudged decoder to the output of an identity Program), and all four
+take the `dcrt_runtime` sequential lock. They require the `gpu` feature and a
 GPU-visible environment. Before execution, the NAND and Sparse-LWR targets
 search their configured CRT-depth and ring-dimension candidates, validate the
 production noise report, and retain only a candidate that reaches its
@@ -32,12 +31,12 @@ Parameter controls are namespaced per target rather than shared globally:
 `MXX_EXPONENT_LUT_LWR_PRF_*` controls Sparse-LWR,
 `MXX_EXPONENT_LUT_PUBLIC_IP_*` controls the public inner product, and
 `MXX_EXPONENT_LUT_DECODER_*` controls the decoder (its rustdoc lists the
-variables). The decoder search accepts the first candidate whose worst-case
-decoder error leaves the message rounding correct and whose lattice security
-reaches the target. Their
+variables). The decoder search accepts the first candidate whose smudge
+hides the simulated decoder noise and fits the decoding margin and whose
+two chains, the source and the smudge, reach the lattice-security target. Their
 ring-dimension settings specify inclusive logarithmic bounds and their
 security settings specify the required target. Search uses 40 CRT bits by
-default and derives the gadget base as `ceil(CRT_BITS/2)`, subject to the
+default (30 for the decoder) and derives the gadget base as `ceil(CRT_BITS/2)`, subject to the
 backend limits. Malformed, non-positive, or inconsistent values are rejected.
 
 Parameter search uses the average-case noise model by default. For each

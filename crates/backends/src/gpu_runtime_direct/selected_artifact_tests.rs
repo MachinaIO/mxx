@@ -954,3 +954,73 @@ fn exported_family_consumed_by_later_loop_commits_every_member() {
 fn family_consumed_by_later_loop_reads_every_member() {
     run_family_consumed_by_later_loop(false);
 }
+
+/// A root preimage retry next to a wave group: each wave resets and checks
+/// only the retries of its own body, so the root retry, which runs once
+/// outside the waves, keeps its status and the waves do not report it as
+/// never attempted.
+#[test]
+#[serial_test::serial]
+fn root_preimage_retry_is_not_checked_by_the_waves_of_another_loop() {
+    let cpu_params = DCRTPolyParams::new(32, 2, 40, 20, None, None);
+    let gpu_params = GpuDCRTPolyParams::new(
+        cpu_params.ring_dimension(),
+        cpu_params.moduli().to_vec(),
+        cpu_params.base_bits(),
+        None,
+    );
+    let ring = Ring::from_crt_moduli(
+        cpu_params.moduli().iter().copied().map(Into::into).collect(),
+        cpu_params.ring_dimension(),
+    );
+    let digits = cpu_params.modulus_digits();
+    let base = 1u32 << cpu_params.base_bits();
+    let bound = BigInt::from(
+        crate::sampler::bounds::default_preimage_cutoff(
+            cpu_params.ring_dimension(),
+            2,
+            digits,
+            base,
+            4.0,
+        )
+        .unwrap(),
+    );
+    let lanes = 6;
+    let members = {
+        let ring = ring.clone();
+        parallel(lanes, move |_| Ok(ring.uniform_residue((1, 1)))).unwrap()
+    };
+    let trapdoor = ring.sample_trapdoor(2, 4, base, digits, bound);
+    let target = ring.uniform_residue((2, 3));
+    let preimage = trapdoor.sample_preimage(target.clone(), (2 * (digits + 2), 3));
+    let validated = DslContext::new("root-preimage-beside-waves")
+        .output("members", members)
+        .unwrap()
+        .output("residual", trapdoor.public_matrix().mul_small_rhs(preimage) - target)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let mut runtime = GpuRuntime::new(gpu_backend([gpu_params])).unwrap();
+    runtime.options_mut().max_parallel_instances = std::num::NonZeroUsize::new(2).unwrap();
+    let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+    let frame = plan.physical_frame_for_test();
+    assert!(!frame.waves.is_empty(), "the member loop must run in waves");
+    assert_eq!(frame.preimage_replays.len(), 1);
+    let mut store = MemoryArtifactStore::default();
+    for replay in 0..2 {
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap_or_else(|error| panic!("replay {replay}: {error}"));
+        let residual = runtime.download_matrix_output(&result.output("residual").unwrap()).unwrap();
+        assert!(
+            (0..residual.size().0).all(|row| (0..residual.size().1).all(|column| residual
+                .entry(row, column)
+                .coeffs_biguints()
+                .iter()
+                .all(Zero::is_zero))),
+            "replay {replay}: the GPU preimage must satisfy B K = target"
+        );
+    }
+}

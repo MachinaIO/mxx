@@ -208,6 +208,9 @@ pub(crate) struct PreimageReplay {
     pub attempt: Arc<GpuPreimageAttempt>,
     pub status: Arc<GpuPreimageStatus>,
     pub planned_max: u32,
+    /// The operation index at which the retry loop is emitted: a wave group
+    /// whose body range contains it runs the retry once per wave.
+    pub operation: u32,
 }
 
 pub(crate) struct IndexedMatrixTableReplay {
@@ -3693,7 +3696,13 @@ fn compact_column_view(
     }
     let mut view = physical.clone();
     let part = &mut view.parts[0];
-    part.view.origin[1] = u64::try_from(column).map_err(|_| "GPU tile column exceeds u64")?;
+    let column = u64::try_from(column).map_err(|_| "GPU tile column exceeds u64")?;
+    // Compact consumers address a window by its byte offset alone.
+    part.view.byte_offset = column
+        .checked_mul(part.view.byte_strides[1])
+        .and_then(|bytes| part.view.byte_offset.checked_add(bytes))
+        .ok_or("GPU tile byte offset overflows")?;
+    part.view.origin[1] = column;
     part.view.extent[1] = u64::try_from(columns).map_err(|_| "GPU tile width exceeds u64")?;
     let owner = ctx.owners.get(&source).ok_or("GPU compact owner is absent")?;
     let resident = owner.with_physical_view(Arc::new(view.clone())).map_err(str::to_owned)?;
@@ -5524,7 +5533,14 @@ pub(super) fn lower_preimage_sample_node(
             ctx.owners.insert(id, Arc::new(resident));
             id
         };
-        ctx.preimage_replays.push(PreimageReplay { attempt, status, planned_max: max_attempts });
+        let operation = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU operations".to_owned())?;
+        ctx.preimage_replays.push(PreimageReplay {
+            attempt,
+            status,
+            planned_max: max_attempts,
+            operation,
+        });
         let gq_workspace = register_preimage_workspace(
             ctx.bindings,
             GpuPreparedWorkspaceKind::Gq,
@@ -5846,6 +5862,9 @@ pub(super) fn lower_preimage_sample_node(
         let mut predecessors = all_predecessors(ctx.producer, public).into_vec();
         predecessors.extend(all_predecessors(ctx.producer, secret));
         predecessors.extend(all_predecessors(ctx.producer, target));
+        // The retry body reads the tile-local copy of the target, not the
+        // source window: the loop must follow that copy.
+        predecessors.extend(all_predecessors(ctx.producer, target_local));
         predecessors.push(refresh);
         predecessors.sort_unstable();
         predecessors.dedup();
@@ -7817,6 +7836,9 @@ pub(crate) fn plan_physical_graph(
             body.carried_ids.iter().chain(body.imports.iter().map(|import| &import.destination))
         }))
         .chain(indexed_tables.iter().flat_map(|table| table.candidates.iter().map(|(id, _)| id)))
+        // A HashSample reads its tag operands through its plan's pointer table,
+        // not as kernel arguments, so scratch liveness never sees those reads.
+        .chain(hash_resources.values().flat_map(|spec| spec.operands.iter().map(|(id, _, _)| id)))
         .chain(trapdoor_public_ids.iter().flat_map(|(secret, public)| [secret, public]))
         .copied()
         .collect::<BTreeSet<_>>();
@@ -9075,9 +9097,14 @@ mod tests {
         let digits = parameters.modulus_digits();
         let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
         let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000);
-        let preimage = trapdoor.sample_preimage(ring.zero((1, 2)), (digits + 2, 2));
+        // A uniform target: a zero one is solved by a zero column, which hides
+        // a tile published at another tile's columns.
+        let target = ring.uniform_residue((1, 2));
+        let preimage = trapdoor.sample_preimage(target.clone(), (digits + 2, 2));
         let validated = DslContext::new("direct-preimage-tiled")
             .output("public", trapdoor.public_matrix())
+            .unwrap()
+            .output("target", target)
             .unwrap()
             .output("preimage", preimage)
             .unwrap()
@@ -9098,6 +9125,8 @@ mod tests {
             .unwrap();
         let public =
             runtime.download_matrix(first.output_value_for_test("public").unwrap()).unwrap();
+        let target =
+            runtime.download_matrix(first.output_value_for_test("target").unwrap()).unwrap();
         let RuntimeValue::Resident(first_owner) = first.output_value_for_test("preimage").unwrap()
         else {
             panic!("preimage output is not resident");
@@ -9142,11 +9171,11 @@ mod tests {
             }
             assert_eq!(
                 &public * &decoded.slice_columns(column, column + 1),
-                DCRTPolyMatrix::zero(&cpu, 1, 1),
+                target.slice_columns(column, column + 1),
                 "tile {column} publication must solve the public relation"
             );
         }
-        assert_eq!(&public * &decoded, DCRTPolyMatrix::zero(&cpu, 1, 2));
+        assert_eq!(&public * &decoded, target);
         let second = runtime
             .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
             .unwrap();
@@ -9170,7 +9199,9 @@ mod tests {
         // The replay samples a new trapdoor from its new nonce.
         let second_public =
             runtime.download_matrix(second.output_value_for_test("public").unwrap()).unwrap();
-        assert_eq!(&second_public * &second_decoded, DCRTPolyMatrix::zero(&cpu, 1, 2));
+        let second_target =
+            runtime.download_matrix(second.output_value_for_test("target").unwrap()).unwrap();
+        assert_eq!(&second_public * &second_decoded, second_target);
         assert_eq!(plan.compiled_launch_count(), 2);
     }
 

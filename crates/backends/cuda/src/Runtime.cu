@@ -2101,6 +2101,13 @@ extern "C"
     {
         if (!buffer)
             return 0;
+        if (buffer->release_blocked)
+        {
+            // A Graph may still read the allocation: keep it.
+            if (buffer->producer) cudaEventDestroy(buffer->producer);
+            delete buffer;
+            return 0;
+        }
         cudaError_t status = mxx_set_device(buffer->device);
         if (status == cudaSuccess && buffer->producer_valid)
             status = cudaStreamWaitEvent(buffer->allocation_stream, buffer->producer, 0);
@@ -2113,6 +2120,26 @@ extern "C"
         }
         delete buffer;
         return status == cudaSuccess ? 0 : set_error(status);
+    }
+
+    // Order the buffer's free after one compiled-Graph submission that reads
+    // or writes it: the free is queued on the allocation stream, which waits
+    // for the submission's completion event.
+    int gpu_device_buffer_protect_compiled_submission(
+        MxxGpuDeviceBuffer *buffer, void *completion_event)
+    {
+        if (!buffer || !completion_event)
+            return set_error("invalid device buffer protection arguments");
+        cudaError_t status = mxx_set_device(buffer->device);
+        if (status == cudaSuccess)
+            status = cudaStreamWaitEvent(buffer->allocation_stream,
+                reinterpret_cast<cudaEvent_t>(completion_event), 0);
+        if (status != cudaSuccess)
+        {
+            buffer->release_blocked = true;
+            return set_error(status);
+        }
+        return 0;
     }
 
     int gpu_device_buffer_upload(

@@ -5,9 +5,9 @@
 //! `s A` term without rounding, so the payload `P` keeps its error; removing
 //! that error is the job of the decoder built on top of it.
 //!
-//! - Trusted setup samples a public `B in R_q^(2 x m_B)` together with its trapdoor
-//!   ([`sample_trapdoor`]). The trapdoor never leaves the trusted preprocessor.
-//! - Preprocessing samples a short preimage `K in R_q^(m_B x w)` with `B K = A` ([`preimage`]).
+//! - Preprocessing samples a public `B in R_q^(2 x m_B)` together with its trapdoor
+//!   ([`sample_trapdoor`]) and a short preimage `K in R_q^(m_B x w)` with `B K = A` ([`preimage`]);
+//!   it publishes `B` and `K`, and the trapdoor never leaves it.
 //! - Encryption publishes `b = s B + e_b` ([`unmask_hint`]).
 //! - Online evaluation computes `d = b K = s A + e_b K` and returns `d - c = P + e_b K - e_c`
 //!   ([`unmask`]).

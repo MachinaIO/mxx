@@ -847,6 +847,31 @@ impl GpuPreparedNativeResources {
                 plan.protect_compiled_submission(physical_device, stream, completion)?;
             }
         }
+        for (device, plan, _) in self.hash_samples.values() {
+            if *device == physical_device {
+                plan.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, plan) in self.cutoff.values() {
+            if *device == physical_device {
+                plan.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, workspace) in self.p1.values() {
+            if *device == physical_device {
+                workspace.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, workspace) in self.gq.values() {
+            if *device == physical_device {
+                workspace.protect_compiled_submission(completion)?;
+            }
+        }
+        for table in self.indexed_matrices.values() {
+            if table.physical_device() == physical_device {
+                table.protect_compiled_submission(completion)?;
+            }
+        }
         Ok(())
     }
 }
@@ -5161,9 +5186,11 @@ pub(crate) fn emit_compiled_gpu_op(
                 .parts
                 .get(*destination_part as usize)
                 .ok_or_else(|| invalid("preimage publication part is absent"))?;
+            // The tile's window starts `origin[1]` columns into its owner.
             let owner_span = destination
                 .rows
                 .checked_mul(destination.storage_columns)
+                .and_then(|count| count.checked_sub(part.view.origin[1]))
                 .and_then(|count| count.checked_mul(u64::from(destination.degree)))
                 .and_then(|count| count.checked_mul(u64::from(destination.magnitude_bytes) + 1))
                 .ok_or_else(|| invalid("preimage publication owner span overflows"))?;
@@ -5177,7 +5204,6 @@ pub(crate) fn emit_compiled_gpu_op(
                 destination.physical_device != op.device ||
                 destination.bound_domain != 0 ||
                 destination.crt_depth != 1 ||
-                part.view.byte_offset != 0 ||
                 part.view.origin.first() != Some(&0) ||
                 destination
                     .column_offset

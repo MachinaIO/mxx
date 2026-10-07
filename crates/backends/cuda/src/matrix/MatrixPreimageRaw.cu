@@ -121,6 +121,8 @@ struct GpuRawPreimageCutoffPlan
     uint64_t *modulus_words = nullptr;
     uint64_t *half_words = nullptr;
     uint64_t *bound_words = nullptr;
+    // Set when a Graph submission could not be ordered before the frees.
+    bool release_blocked = false;
 };
 
 extern "C" int gpu_raw_preimage_cutoff_metadata_ranges(
@@ -152,6 +154,13 @@ extern "C" int gpu_raw_preimage_cutoff_metadata_ranges(
 extern "C" void gpu_raw_preimage_cutoff_destroy(GpuRawPreimageCutoffPlan *plan)
 {
     if (!plan) return;
+    if (plan->release_blocked)
+    {
+        // A Graph may still read the metadata: keep it.
+        if (plan->upload_ready) cudaEventDestroy(plan->upload_ready);
+        delete plan;
+        return;
+    }
     mxx_set_device(plan->physical_device);
     if (plan->moduli) cudaFreeAsync(plan->moduli, plan->stream);
     if (plan->garner_inverses) cudaFreeAsync(plan->garner_inverses, plan->stream);
@@ -161,6 +170,29 @@ extern "C" void gpu_raw_preimage_cutoff_destroy(GpuRawPreimageCutoffPlan *plan)
     if (plan->bound_words) cudaFreeAsync(plan->bound_words, plan->stream);
     if (plan->upload_ready) cudaEventDestroy(plan->upload_ready);
     delete plan;
+}
+
+// Order the plan's frees, queued on its stream, after one compiled-Graph
+// submission that reads its metadata.
+extern "C" int gpu_raw_preimage_cutoff_protect_compiled_submission(
+    GpuRawPreimageCutoffPlan *plan, int physical_device, void *completion_event)
+{
+    if (!plan || !completion_event)
+        return set_error("invalid raw preimage cutoff protection arguments");
+    if (physical_device != plan->physical_device)
+    {
+        plan->release_blocked = true;
+        return set_error("raw preimage cutoff protection device mismatch");
+    }
+    cudaError_t error = mxx_set_device(physical_device);
+    if (error == cudaSuccess)
+        error = cudaStreamWaitEvent(plan->stream, reinterpret_cast<cudaEvent_t>(completion_event), 0);
+    if (error != cudaSuccess)
+    {
+        plan->release_blocked = true;
+        return set_error(error);
+    }
+    return 0;
 }
 
 extern "C" int gpu_raw_preimage_cutoff_plan_wait(

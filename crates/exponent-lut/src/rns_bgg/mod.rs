@@ -42,9 +42,7 @@ pub use noise::{
     RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue,
     RnsBggParameterManifest, RnsBggPlanRequest, RnsNoiseBuild,
 };
-pub use public_key::{
-    PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild, sample_unmask_trapdoor,
-};
+pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
 pub use workload::RnsBggDerivedWorkload;
 
 /// Name of the graph input carrying the shared 32-byte hash key. A stage
@@ -1209,24 +1207,6 @@ rns_bgg_stage_descriptor!(RnsBggPreprocessEncryptDescriptor);
 rns_bgg_stage_descriptor!(RnsBggPreprocessOnlineEvalDescriptor);
 
 rns_bgg_stage_descriptor!(RnsBggEncryptionDescriptor);
-
-/// Descriptor of the trusted unmask setup of one decoder: the public `B`
-/// and its trapdoor at the decoder's decoding level, with the parameters
-/// needed to import the trapdoor. Only the trusted preprocessor reads this
-/// production; online evaluation and encryption see `B` through the
-/// preprocess republication only.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RnsBggUnmaskSetupDescriptor {
-    pub(crate) context: [u8; 32],
-    pub(crate) parameters: [u8; 32],
-    pub(crate) decoder_commitment: [u8; 32],
-    pub(crate) level: usize,
-    /// The trapdoor sigma, as a canonical decimal string.
-    pub(crate) sigma: String,
-    pub(crate) base: u64,
-    pub(crate) digits: usize,
-    pub(crate) bound: BigUint,
-}
 
 impl RnsBggPreprocessEncryptDescriptor {
     pub(crate) fn with_source(

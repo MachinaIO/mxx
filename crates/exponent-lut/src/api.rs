@@ -687,12 +687,10 @@ pub trait NoiseBuild {
 /// Validate, execute, and persist one already-built stage graph.
 ///
 /// This is the common persistence boundary used when a composed decoder graph must
-/// resume through the normal `StageArtifacts` lifecycle, and the one a caller
-/// that builds its own stage graphs (such as the decoder round trip) runs
-/// them through. It does not create a second executor or bypass graph
-/// validation or observers. `identity` selects the named session of the
-/// stage.
-pub fn execute_artifacts<E, S, D>(
+/// resume through the normal `StageArtifacts` lifecycle. It does not create a
+/// second executor or bypass graph validation or observers. `identity` selects
+/// the named session of the stage.
+pub(crate) fn execute_artifacts<E, S, D>(
     graph: StageGraph,
     parameters: &ParamEnv,
     descriptor: D,
@@ -790,7 +788,7 @@ where
 /// The graph is validated against its manifest map and the observer runs
 /// before execution. The returned outputs are owned copies, so callers can
 /// download verification residuals or bind them into a later graph.
-pub fn execute_graph<E, S>(
+pub(crate) fn execute_graph<E, S>(
     graph: StageGraph,
     parameters: &ParamEnv,
     execution: &mut E,

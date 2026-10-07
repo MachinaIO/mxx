@@ -449,7 +449,31 @@ fn run_trial_regions(
             Some(Some(launch)) => *launch,
             _ => {
                 let started = Instant::now();
-                graph.launch_region(frame, region)?.wait()?;
+                if let Err(error) = graph
+                    .launch_region(frame, region)
+                    .and_then(|done| done.wait().map_err(GpuRuntimeError::from))
+                {
+                    // Name the failed region's operations: a device fault surfaces
+                    // only at the region's completion.
+                    let (start, end) = (
+                        graph.regions[region].start_operation,
+                        graph.regions[region].end_operation,
+                    );
+                    let mut implementations = BTreeMap::<String, usize>::new();
+                    for operation in &frame.program.operations[start as usize..end as usize] {
+                        let name = frame
+                            .program
+                            .implementations
+                            .resolve(operation.implementation)
+                            .map_or_else(
+                                |_| format!("{:?}", operation.implementation),
+                                |entry| format!("{:?}", entry.primitive),
+                            );
+                        *implementations.entry(name).or_default() += 1;
+                    }
+                    tracing::error!(region, start, end, ?implementations, %error, "GPU trial region failed");
+                    return Err(error);
+                }
                 started.elapsed().as_secs_f64()
             }
         };
@@ -1296,7 +1320,19 @@ fn validate_allocated_budget(
     contract: &crate::gpu_execution_plan::GpuPlanContract,
     graph: Option<&DirectGraph>,
 ) -> Result<(), GpuPlanError> {
-    let mut allocations = BTreeMap::<(i32, u64), u64>::new();
+    // Each allocation's size with what holds it, so an over-budget plan names
+    // its largest holder.
+    let mut allocations = BTreeMap::<(i32, u64), (u64, String)>::new();
+    let mut record = |key: (i32, u64), bytes: u64, holder: &dyn Fn() -> String| {
+        allocations
+            .entry(key)
+            .and_modify(|existing| {
+                if bytes > existing.0 {
+                    *existing = (bytes, holder());
+                }
+            })
+            .or_insert_with(|| (bytes, holder()));
+    };
     for (id, owner) in
         frame.owners.iter().chain(frame.waves.iter().flat_map(|wave| wave.owner_bindings.iter()))
     {
@@ -1319,10 +1355,9 @@ fn validate_allocated_budget(
                     Some(buffer) => (buffer.as_ptr() as u64, buffer.len() as u64),
                     None => (storage.address, storage.bytes),
                 };
-            allocations
-                .entry((storage.device, address))
-                .and_modify(|existing| *existing = (*existing).max(bytes))
-                .or_insert(bytes);
+            record((storage.device, address), bytes, &|| {
+                format!("value {id:?}: {:?}", physical.ty)
+            });
         }
     }
     if let Some(graph) = graph {
@@ -1340,25 +1375,33 @@ fn validate_allocated_budget(
                 let bytes = u64::try_from(bytes).map_err(|_| {
                     GpuPlanError::Resource("native allocation size exceeds u64".into())
                 })?;
-                allocations
-                    .entry((device, address))
-                    .and_modify(|existing| *existing = (*existing).max(bytes))
-                    .or_insert(bytes);
+                record((device, address), bytes, &|| "a prepared native resource".to_owned());
             }
         }
     }
     for (logical, budget) in contract.device_budgets.iter().enumerate() {
         let device = i32::try_from(contract.logical_to_physical_devices[logical])
             .map_err(|_| GpuPlanError::Resource("physical device ID overflows".into()))?;
-        let used = allocations
+        let on_device = allocations
             .iter()
             .filter(|((owner_device, _), _)| *owner_device == device)
-            .try_fold(0u64, |total, (_, bytes)| total.checked_add(*bytes))
-            .ok_or_else(|| GpuPlanError::Resource("actual allocation size overflows".into()))?;
+            .map(|(_, allocation)| allocation)
+            .collect::<Vec<_>>();
+        let used =
+            on_device
+                .iter()
+                .try_fold(0u64, |total, (bytes, _)| total.checked_add(*bytes))
+                .ok_or_else(|| GpuPlanError::Resource("actual allocation size overflows".into()))?;
         tracing::debug!(device, used, budget = budget.device_bytes, "GPU plan allocation check");
         if used > budget.device_bytes {
+            let (largest, holder) = on_device
+                .iter()
+                .max_by_key(|(bytes, _)| *bytes)
+                .map(|(bytes, holder)| (*bytes, holder.as_str()))
+                .unwrap_or((0, "nothing"));
             return Err(GpuPlanError::Resource(format!(
-                "actual allocations use {used} bytes on GPU {device}, over {}-byte budget",
+                "actual allocations use {used} bytes on GPU {device}, over {}-byte budget; \
+                 the largest is {largest} bytes, held by {holder}",
                 budget.device_bytes
             )));
         }
@@ -1403,8 +1446,19 @@ fn upload_sample_seeds(
     Ok(())
 }
 
-fn reset_preimage_replays(frame: &PhysicalFrame) -> Result<(), String> {
-    for replay in &frame.preimage_replays {
+/// The preimage retries of `frame` inside the operation range `body` (all of
+/// them for `None`): a wave runs and checks only the retries of its body.
+fn preimage_replays_in(
+    frame: &PhysicalFrame,
+    body: Option<(u32, u32)>,
+) -> impl Iterator<Item = (usize, &crate::gpu_physical_lowering::PreimageReplay)> {
+    frame.preimage_replays.iter().enumerate().filter(move |(_, replay)| {
+        body.is_none_or(|(start, end)| (start..end).contains(&replay.operation))
+    })
+}
+
+fn reset_preimage_replays(frame: &PhysicalFrame, body: Option<(u32, u32)>) -> Result<(), String> {
+    for (_, replay) in preimage_replays_in(frame, body) {
         if replay.planned_max == 0 {
             return Err("GPU preimage retry bound is zero".into());
         }
@@ -1433,8 +1487,8 @@ fn upload_bytes_inputs(
     Ok(())
 }
 
-fn check_preimage_replays(frame: &PhysicalFrame) -> Result<(), String> {
-    for (index, replay) in frame.preimage_replays.iter().enumerate() {
+fn check_preimage_replays(frame: &PhysicalFrame, body: Option<(u32, u32)>) -> Result<(), String> {
+    for (index, replay) in preimage_replays_in(frame, body) {
         let status = replay.status.read().map_err(|error| error.to_string())?;
         if !status.succeeded() || status.attempts == 0 || status.attempts > replay.planned_max {
             return Err(format!(
@@ -2572,10 +2626,13 @@ impl GpuRuntime {
             for control in &frame.control_resets {
                 control.reset_for_replay().map_err(GpuPlanError::Measurement)?;
             }
-            reset_preimage_replays(frame).map_err(GpuPlanError::Measurement)?;
+            reset_preimage_replays(frame, None).map_err(GpuPlanError::Measurement)?;
             let (region_seconds, launches) = match run_trial_regions(graph, frame, &cached) {
                 Ok(measured) => measured,
                 Err(error) => {
+                    // The drain can abort on the device's sticky error, so the
+                    // trial's own error is reported first.
+                    tracing::error!(%error, "GPU region trial failed");
                     self.backend.drain_uncertain_launches().map_err(|drain| {
                         GpuPlanError::Measurement(format!(
                             "trial failed ({error}) and GPU drain failed ({drain})"
@@ -3097,7 +3154,7 @@ impl GpuRuntime {
         for control in &plan.frame.control_resets {
             control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
         }
-        if let Err(error) = reset_preimage_replays(&plan.frame) {
+        if let Err(error) = reset_preimage_replays(&plan.frame, None) {
             plan.poisoned = true;
             return Err(GpuRuntimeError::Execution(error));
         }
@@ -3139,7 +3196,7 @@ impl GpuRuntime {
             for control in &plan.frame.control_resets {
                 control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
             }
-            check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
+            check_preimage_replays(&plan.frame, None).map_err(GpuRuntimeError::DeviceStatus)?;
             plan.completed_runs += 1;
             return Ok(GpuExecutionPayload {
                 outputs: returned_values(&plan.frame).map_err(GpuRuntimeError::Execution)?,
@@ -3604,7 +3661,8 @@ impl GpuRuntime {
             for control in &plan.frame.control_resets {
                 control.reset_for_replay().map_err(GpuRuntimeError::Execution)?;
             }
-            reset_preimage_replays(&plan.frame).map_err(GpuRuntimeError::Execution)?;
+            reset_preimage_replays(&plan.frame, Some((group.body_start, group.body_end)))
+                .map_err(GpuRuntimeError::Execution)?;
             upload_sample_seeds(&plan.frame, execution_nonce, &logical_path)
                 .map_err(GpuRuntimeError::Execution)?;
             let wave = &plan.frame.waves[wave_index];
@@ -3642,7 +3700,8 @@ impl GpuRuntime {
             for control in &plan.frame.control_resets {
                 control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
             }
-            check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
+            check_preimage_replays(&plan.frame, Some((group.body_start, group.body_end)))
+                .map_err(GpuRuntimeError::DeviceStatus)?;
             // This wave has joined: write its streamed members before the next
             // wave reuses their slots.
             if let Some(pump) = pump.as_deref_mut() {
@@ -3704,7 +3763,7 @@ impl GpuRuntime {
         for control in &plan.frame.control_resets {
             control.check_completed().map_err(GpuRuntimeError::DeviceStatus)?;
         }
-        check_preimage_replays(&plan.frame).map_err(GpuRuntimeError::DeviceStatus)?;
+        check_preimage_replays(&plan.frame, None).map_err(GpuRuntimeError::DeviceStatus)?;
         if pump.is_none() {
             plan.completed_runs += 1;
         }

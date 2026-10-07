@@ -34,6 +34,8 @@ struct GpuRawHashPlan
     MxxRawHashTagSegment *device_segments = nullptr;
     uint8_t *device_static = nullptr;
     MxxRawHashTagOperand *device_operands = nullptr;
+    // Set when a Graph submission could not be ordered before the frees.
+    bool release_blocked = false;
     uint64_t *device_tag_length = nullptr;
     uint8_t *device_tag = nullptr;
     uint64_t *device_decimal_scratch = nullptr;
@@ -371,9 +373,38 @@ namespace
     }
 }
 
+// Order the plan's frees, queued on its stream, after one compiled-Graph
+// submission that reads its tables.
+extern "C" int gpu_raw_hash_plan_protect_compiled_submission(
+    GpuRawHashPlan *plan, int physical_device, void *completion_event)
+{
+    if (!plan || !completion_event)
+        return set_error("invalid raw hash plan protection arguments");
+    if (physical_device != plan->device)
+    {
+        plan->release_blocked = true;
+        return set_error("raw hash plan protection device mismatch");
+    }
+    cudaError_t error = mxx_set_device(physical_device);
+    if (error == cudaSuccess)
+        error = cudaStreamWaitEvent(plan->stream, reinterpret_cast<cudaEvent_t>(completion_event), 0);
+    if (error != cudaSuccess)
+    {
+        plan->release_blocked = true;
+        return set_error(error);
+    }
+    return 0;
+}
+
 extern "C" void gpu_raw_hash_plan_destroy(GpuRawHashPlan *plan)
 {
     if (!plan) return;
+    if (plan->release_blocked)
+    {
+        // A Graph may still read the tables: keep them.
+        delete plan;
+        return;
+    }
     if (plan->allocation)
     {
         mxx_set_device(plan->device);

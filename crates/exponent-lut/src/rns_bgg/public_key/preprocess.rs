@@ -42,7 +42,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             runtime: BTreeMap::new(),
             decoder_declaration: None,
             decoder_smudge_child: None,
-            unmask_setup: None,
+            unmask_bound: None,
         }
     }
 
@@ -82,17 +82,18 @@ impl<'a> RnsPreprocessBuild<'a> {
     /// Prepare the unmasking of `declaration`'s decoder of output
     /// `output_index`, whose lowered source key is `source`: lower the bound
     /// smudge child `smudge` once, form the summed component-1 key `A` of the
-    /// source column selection and the smudge sum, and sample its
-    /// preimage `K` under the trusted `setup` trapdoor. The graph publishes
-    /// `K`, `B`, and the smudge child's public material under the decoder
-    /// namespace; the source output's public key is published unchanged.
+    /// source column selection and the smudge sum, sample the public `B`
+    /// with its trapdoor (sigma `trapdoor_sigma`), and sample the preimage
+    /// `K` of `A`. The graph publishes `K`, `B`, and the smudge child's
+    /// public material under the decoder namespace, and the trapdoor never
+    /// leaves it; the source output's public key is published unchanged.
     pub fn apply_decoder(
         &mut self,
         output_index: usize,
         declaration: &crate::decoder::decoding::DecoderDeclaration,
         source: RnsBggPublicKey,
         mut smudge: RnsPreprocessBuild<'a>,
-        setup: &StageArtifacts<RnsBggUnmaskSetupDescriptor>,
+        trapdoor_sigma: &bigdecimal::BigDecimal,
     ) -> Result<(), ApiError> {
         if self.decoder_declaration.is_some() {
             return Err(ApiError::input("decoder was already applied"));
@@ -102,9 +103,6 @@ impl<'a> RnsPreprocessBuild<'a> {
         self.parameters
             .validate_decoder_smudge_parameters(smudge.parameters, declaration, &evaluator.program)
             .map_err(ApiError::scheme)?;
-        let level = RnsBggParameters::decoder_source_level(declaration, &evaluator.program)
-            .map_err(ApiError::scheme)?;
-        let descriptor = setup.descriptor();
         if smudge
             .evaluator
             .as_ref()
@@ -117,13 +115,6 @@ impl<'a> RnsPreprocessBuild<'a> {
         {
             return Err(ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch)));
         }
-        if descriptor.context != self.context ||
-            descriptor.parameters != self.parameters.parameter_identity() ||
-            descriptor.decoder_commitment != *declaration.commitment() ||
-            descriptor.level != level
-        {
-            return Err(ApiError::compatibility("the unmask setup does not belong to this decoder"));
-        }
         let mut decoder = RnsBggDecoder { lowerer: evaluator, source };
         let key = apply_decoder(declaration, &mut decoder, |_| {
             let child = smudge
@@ -135,7 +126,12 @@ impl<'a> RnsPreprocessBuild<'a> {
                 .map_err(|error| RnsBggError::Graph(error.to_string()))
         })
         .map_err(ApiError::scheme)?;
-        let trapdoor = import_unmask_trapdoor(self.parameters, setup).map_err(ApiError::scheme)?;
+        let (trapdoor, bound) = sample_unmask_trapdoor(
+            self.parameters,
+            declaration,
+            &evaluator.program,
+            trapdoor_sigma,
+        )?;
         let preimage = crate::decoder::unmask::preimage(&trapdoor, key);
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
@@ -148,8 +144,7 @@ impl<'a> RnsPreprocessBuild<'a> {
                 .take()
                 .ok_or_else(|| ApiError::input("decoder smudge was not bound"))?,
         );
-        self.unmask_setup =
-            Some((setup.production().clone(), setup.manifest().clone(), descriptor.bound.clone()));
+        self.unmask_bound = Some(bound);
         self.decoder_declaration = Some(declaration.clone());
         Ok(())
     }
@@ -567,23 +562,14 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 .map_err(ApiError::scheme)?;
             binding = binding.with_dynamic_schema(rhs, evaluator.workload.luts().clone());
         }
-        if let (Some(declaration), Some((_, _, bound))) =
-            (&self.decoder_declaration, &self.unmask_setup)
-        {
+        if let (Some(declaration), Some(bound)) = (&self.decoder_declaration, &self.unmask_bound) {
             binding = binding.with_decoder(declaration, bound.clone());
         }
         let encrypt_binding = RnsBggPreprocessEncryptDescriptor::from_binding(binding.clone());
         let online_eval_binding = RnsBggPreprocessOnlineEvalDescriptor::from_binding(binding);
         let runtime = super::encoding::declared_runtime_inputs(&graph, self.runtime);
         Ok((
-            StageGraph::new(
-                graph,
-                runtime,
-                self.unmask_setup
-                    .into_iter()
-                    .map(|(production, manifest, _)| (production, manifest))
-                    .collect(),
-            ),
+            StageGraph::new(graph, runtime, BTreeMap::new()),
             (encrypt_binding, online_eval_binding),
         ))
     }

@@ -1,37 +1,40 @@
 #![cfg(feature = "gpu")]
 
-//! The trapdoor decoder round trip on the GPU runtime.
+//! The smudged trapdoor decoder round trip on the GPU runtime.
 //!
-//! The four stages of the trapdoor unmask [`mxx_exponent_lut::decoder::unmask`] run as separate
-//! artifact stages, exchanging only published artifacts:
+//! The decoder ([`mxx_exponent_lut::decoder::decoding`]) of the identity Program's private output
+//! runs through the RNS-BGG application API in three artifact stages:
 //!
-//! - trusted setup samples the public `B` (`2 x 2 (digits + 2)`) and its trapdoor;
-//! - preprocessing samples a key `A in R_q^(2 x w)`, republishes `B`, and samples the short
-//!   preimage `K` with `B K = A` from the setup's trapdoor;
-//! - encryption samples the ternary secret `s = (s_bar, 1)` and publishes the decoder row `b = s B
-//!   + e_b` and the encoding `c = s A - Delta mu + e_c` of a message `mu in Z_p^w` (`Delta =
-//!   floor(q / p)`);
-//! - decoding computes `b K - c = Delta mu + e_b K - e_c`.
+//! - preprocessing prepares the source Program and the smudge Program (a sparse-LWR PRF per smudge
+//!   member), samples the public `B` with its trapdoor, and publishes `B` and the short preimage
+//!   `K` of the summed decoder key `A`; the trapdoor never leaves the stage;
+//! - encryption encrypts the source input `X^b`, the smudge PRF inputs, and the unmask hint `b = s
+//!   B + e_b`;
+//! - online evaluation evaluates the source and smudge Programs, adds the PRF smudge to the source
+//!   output, unmasks the sum with `K`, and rounds it to the plaintext modulus.
 //!
-//! The parameter search accepts the first ring dimension and CRT depth whose worst-case decoder
-//! error `N m_B B_e B_K + B_e` (`m_B = 2 (digits + 2)`, `B_e` the error cutoff, `B_K` the
-//! preimage cutoff) leaves `round(p x / q) = mu` with the margin of the reduction remainder, and
-//! whose lattice security reaches the target. Every stage is planned by the GPU runtime
-//! immediately before it executes; the plan's predicted time is logged as the benchmark estimate
-//! ("planned Exponent-LUT GPU stage"). The round trip then checks that every decoded coefficient
-//! rounds to the message and that its error stays within the simulated bound. The stages always
-//! execute: the plan's I/O trial of the trapdoor import reads the setup's artifact, which an
-//! estimate-only run (`MXX_EXPONENT_LUT_ESTIMATE_ONLY=1`) would not have produced.
+//! The parameter search tries the ring dimensions, primes per level drop, and CRT depths in order.
+//! [`mxx_exponent_lut::utils::select_decoder_at_crt_depth`] plans each candidate with the smudge
+//! chain, audits the source under the selected noise model, and picks the smallest smudge digit
+//! count whose range `P^d` hides the simulated decoder noise by `STATISTICAL_BITS` and fits the
+//! decoding margin. A selected candidate must also reach the lattice security target on both
+//! chains. Every stage is planned by the GPU runtime immediately before it executes; the plan's
+//! predicted time is logged as the benchmark estimate ("planned Exponent-LUT GPU stage"). The round
+//! trip checks that the decoded plaintext is the source input. The stages always execute; an
+//! estimate-only run (`MXX_EXPONENT_LUT_ESTIMATE_ONLY=1`) is rejected. The round trip runs the
+//! Static RHS lifecycle only.
 //!
 //! | Variable (`MXX_EXPONENT_LUT_DECODER_` prefix) | Default | Meaning |
 //! | --- | --- | --- |
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 5, 12 | Ring-dimension candidates |
-//! | `MAX_CRT_DEPTH` | 8 | CRT-depth candidates `1..=` |
-//! | `CRT_BITS`, `BASE_BITS` | 40, `ceil(CRT_BITS / 2)` | CRT prime and gadget base widths |
-//! | `PLAINTEXT_MODULUS` | 16 | `p` |
-//! | `WIDTH` | 2 | Key columns `w` |
-//! | `ERROR_SIGMA`, `TRAPDOOR_SIGMA` | 4, 4.578 | Error and trapdoor Gaussian widths |
+//! | `MAX_PRIMES_PER_DROP` | 4 | Primes-per-drop candidates `1..=` |
+//! | `MAX_CRT_DEPTH` | 40 | CRT-depth candidates `2..=` |
+//! | `CRT_BITS`, `BASE_BITS` | 30, `ceil(CRT_BITS / 2)` | CRT prime and gadget base widths |
+//! | `ERROR_SIGMA`, `TRAPDOOR_SIGMA` | 4, 4.578 | Encoding error and trapdoor Gaussian widths |
+//! | `SMUDGE_P` | 16 | Output modulus `P` of the smudge PRF |
+//! | `STATISTICAL_BITS` | 1 | Hiding margin of the smudge over the decoder noise |
 //! | `SECURITY_BITS` | 1 | Required lattice security |
+//! | `NOISE_MODEL`, `FAILURE_EXPONENT` | `average`, 100 | Noise model of the source audit |
 
 use bigdecimal::{BigDecimal, ToPrimitive};
 use mxx_backends::{
@@ -41,27 +44,42 @@ use mxx_backends::{
         Poly, PolyParams,
         dcrt::{
             gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
-            params::DCRTPolyParams,
+            poly::DCRTPoly,
         },
     },
-    sampler::bounds::{default_preimage_cutoff, hard_cutoff_from_sigma_bound},
 };
-use mxx_dsl::{DslContext, Mat, Ring};
 use mxx_exponent_lut::{
-    api::{self, StageArtifacts, StageExecution, StageGraph},
-    decoder::unmask::{UNMASK_ROWS, preimage, sample_trapdoor, unmask, unmask_hint},
-    utils::{decimal_to_real_expr, env_usize, lattice_security_bits, ring_dimension_candidates},
+    ExpLayout,
+    api::{self, PlaintextInputs, StageExecution},
+    decoder::simulation::AverageCaseConfig,
+    program::{
+        AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, InputBinding, Operand,
+        RhsId, WireId,
+    },
+    program_gadgets::{
+        pbc::{PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, generate_key_layout},
+        prf::SparseLwrPrfProfile,
+    },
+    rns_bgg::{
+        RhsMode, RnsBggNoiseBindings, RnsBggNoiseValue, RnsBggPlanRequest, RnsEncryptBuild,
+        RnsOnlineEvalBuild, RnsPreprocessBuild,
+    },
+    utils::{
+        DecoderRequest, DecoderSelection, env_usize, lattice_security_bits, noise_model,
+        ring_dimension_candidates, ring_dimension_stride_log2, select_decoder_at_crt_depth,
+    },
 };
-use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::ConcatAxis};
+use mxx_ir_core::ParamEnv;
 use num_bigint::{BigInt, BigUint};
-use num_traits::{Signed, Zero};
-use rand::Rng;
+use num_traits::Zero;
 use serial_test::serial as sequential;
-use std::{collections::BTreeMap, env};
+use std::{cell::RefCell, collections::BTreeMap, env};
 
 const PREFIX: &str = "MXX_EXPONENT_LUT_DECODER_";
-/// The setup's trapdoor artifact: `.0` is the public `B`, `.1` the trapdoor.
-const TRAPDOOR: &str = "decoder/trapdoor";
+/// The LWR dimension of the smudge PRF.
+const LWR_DIMENSION: usize = 4;
+/// The input width `n'` of the smudge PRF.
+const PRF_WIDTH_LOG2: u32 = 3;
 
 fn setting(name: &str, default: usize) -> usize {
     let name = format!("{PREFIX}{name}");
@@ -78,59 +96,59 @@ fn sigma(name: &str, default: &str) -> BigDecimal {
     value
 }
 
-/// The accepted parameters and the bounds the round trip checks against.
-struct Decoder {
-    parameters: DCRTPolyParams,
-    plaintext_modulus: u64,
-    width: usize,
-    error_sigma: BigDecimal,
+/// The identity Program on one private input, and that input.
+fn identity_source() -> (ExponentLutProgram, WireId) {
+    let mut builder = ExponentLutProgramBuilder::new();
+    let input = builder.input(AttributeKnowledge::PrivatePayload).expect("source input");
+    (builder.finish(vec![Operand::Scalar(input)]).expect("identity Program"), input)
+}
+
+/// `count` random weight-one PRF keys over the LWR coordinates, in two buckets.
+fn smudge_keys(count: usize) -> Vec<PbcGeneratedKeyLayout> {
+    let parameters = PbcParameters::custom(LWR_DIMENSION, 1, 2, 2, 64, None);
+    (0..count)
+        .map(|_| {
+            let support = vec![rand::random::<u32>() as usize % LWR_DIMENSION];
+            (0..64)
+                .find_map(|_| {
+                    generate_key_layout(&parameters, PbcRootSeed(rand::random()), &support).ok()
+                })
+                .expect("PBC key layout")
+        })
+        .collect()
+}
+
+/// The accepted candidate: the decoder selection, the smudge keys of its members, and the
+/// trapdoor sigma.
+struct Accepted {
+    selection: DecoderSelection,
+    keys: Vec<PbcGeneratedKeyLayout>,
     trapdoor_sigma: BigDecimal,
-    /// The error cutoff `B_e` of `e_b` and `e_c`.
-    error_bound: BigUint,
-    /// The preimage cutoff `B_K` of the trapdoor sampler.
-    preimage_bound: BigUint,
-    /// The worst-case decoder error `N m_B B_e B_K + B_e`.
-    decoding_error: BigUint,
 }
 
-impl Decoder {
-    fn modulus(&self) -> BigUint {
-        self.parameters.modulus().as_ref().clone()
-    }
-
-    /// `Delta = floor(q / p)`.
-    fn spacing(&self) -> BigUint {
-        self.modulus() / self.plaintext_modulus
-    }
-
-    fn gadget_base(&self) -> u32 {
-        1u32 << self.parameters.base_bits()
-    }
-
-    fn ring(&self) -> Ring {
-        Ring::from_crt_moduli(
-            self.parameters.to_crt().0.into_iter().map(Into::into).collect(),
-            self.parameters.ring_dimension(),
-        )
-    }
-}
-
-/// Search the configured candidates: the decoder error must leave a correct rounding and the
-/// lattice security must reach the target.
-fn search() -> Decoder {
-    let crt_bits = setting("CRT_BITS", 40);
+/// Search the configured candidates for the decoder of `source`'s output `input`.
+fn search(source: &ExponentLutProgram, input: WireId) -> Accepted {
+    let crt_bits = setting("CRT_BITS", 30);
     let base_bits = setting("BASE_BITS", crt_bits.div_ceil(2)) as u32;
     assert!((1..=31).contains(&base_bits), "the base bits must be in 1..=31");
-    let plaintext_modulus = setting("PLAINTEXT_MODULUS", 16) as u64;
-    assert!(plaintext_modulus >= 2, "the plaintext modulus must be at least 2");
-    let width = setting("WIDTH", 2);
-    assert!(width > 0, "the key width must be positive");
+    let max_primes_per_drop = setting("MAX_PRIMES_PER_DROP", 4);
+    let max_crt_depth = setting("MAX_CRT_DEPTH", 40);
+    let smudge_p = setting("SMUDGE_P", 16);
+    let statistical_bits = setting("STATISTICAL_BITS", 1);
     let required_security = setting("SECURITY_BITS", 1) as u64;
     assert!(required_security > 0, "the security target must be positive");
-    let max_crt_depth = setting("MAX_CRT_DEPTH", 8);
     let error_sigma = sigma("ERROR_SIGMA", "4");
     let trapdoor_sigma = sigma("TRAPDOOR_SIGMA", "4.578");
-    let error_bound = hard_cutoff_from_sigma_bound(&error_sigma);
+    let average: Option<AverageCaseConfig> =
+        noise_model(PREFIX).unwrap_or_else(|error| panic!("{error}"));
+    let one = [BigInt::from(1u8)];
+    let bindings = RnsBggNoiseBindings::from_inputs(
+        source,
+        &[RnsBggNoiseValue::sampled_encoding_sigma(&error_sigma, b"decoder-source", &one)
+            .expect("source noise binding")],
+        &[],
+    )
+    .expect("source noise bindings");
     let candidates = ring_dimension_candidates(
         &format!("{PREFIX}MIN_LOG_RING_DIMENSION"),
         &format!("{PREFIX}MAX_LOG_RING_DIMENSION"),
@@ -140,92 +158,98 @@ fn search() -> Decoder {
     .expect("ring-dimension configuration");
     let mut failures = Vec::new();
     for ring_dimension in candidates {
-        for crt_depth in 1..=max_crt_depth {
-            let parameters =
-                DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None, None);
-            let digits = parameters.modulus_digits();
-            let preimage_bound = default_preimage_cutoff(
-                ring_dimension,
-                UNMASK_ROWS,
-                digits,
-                1u32 << base_bits,
-                trapdoor_sigma.to_f64().expect("finite trapdoor sigma"),
-            )
-            .expect("valid trapdoor sigma");
-            let decoding_error = BigUint::from(ring_dimension) *
-                BigUint::from(UNMASK_ROWS * (digits + 2)) *
-                &error_bound *
-                &preimage_bound +
-                &error_bound;
-            let decoder = Decoder {
-                parameters,
-                plaintext_modulus,
-                width,
-                error_sigma: error_sigma.clone(),
-                trapdoor_sigma: trapdoor_sigma.clone(),
-                error_bound: error_bound.clone(),
-                preimage_bound,
-                decoding_error,
-            };
-            // `round(p x / q)` recovers `mu` when the error and the remainder `q - p Delta`
-            // stay within half the spacing.
-            let remainder = decoder.modulus() - decoder.spacing() * plaintext_modulus;
-            if (&decoder.decoding_error + remainder) * 2u8 >= decoder.spacing() {
-                failures.push(format!(
-                    "n={ring_dimension} crt_depth={crt_depth}: decoder error {} exceeds half of {}",
-                    decoder.decoding_error,
-                    decoder.spacing()
-                ));
-                continue;
+        let Some(stride_log2) = ring_dimension_stride_log2(ring_dimension, PRF_WIDTH_LOG2) else {
+            failures.push(format!("n={ring_dimension}: below the PRF input width"));
+            continue;
+        };
+        let profile = SparseLwrPrfProfile::new(
+            ExpLayout { stride_log2, width_log2: PRF_WIDTH_LOG2 },
+            smudge_p,
+            LWR_DIMENSION,
+        )
+        .expect("smudge PRF profile");
+        let generated = RefCell::new(BTreeMap::new());
+        let layouts = |members: usize| {
+            let keys = smudge_keys(members);
+            let layouts = keys.iter().map(|key| key.public_layout.clone()).collect();
+            generated.borrow_mut().insert(members, keys);
+            Ok(layouts)
+        };
+        let decoder = DecoderRequest {
+            output: input,
+            profile,
+            layouts: &layouts,
+            statistical_bits,
+            unmask_sigma: trapdoor_sigma.to_f64().expect("finite trapdoor sigma"),
+        };
+        'dimension: for primes_per_drop in 1..=max_primes_per_drop {
+            for crt_depth in 2..=max_crt_depth {
+                let request = RnsBggPlanRequest {
+                    ring_dimension,
+                    encoding_error_sigma: error_sigma.clone(),
+                    crt_bits,
+                    base_bits,
+                    terminal_depth: 1,
+                    max_crt_depth: crt_depth,
+                    terminal_value_bound: BigUint::from(1u8),
+                    operations_per_drop: 1,
+                    primes_per_drop,
+                    rhs_mode: RhsMode::Static,
+                };
+                let selection = match select_decoder_at_crt_depth(
+                    &request,
+                    source,
+                    &bindings,
+                    &[BigUint::from(1u8)],
+                    average.as_ref(),
+                    &decoder,
+                ) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        failures.push(format!(
+                            "n={ring_dimension} primes_per_drop={primes_per_drop} \
+                             crt_depth={crt_depth}: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                // The largest moduli of the two chains bound the security of every level.
+                let achieved = [&selection.parameters, &selection.smudge_parameters]
+                    .into_iter()
+                    .map(|parameters| {
+                        lattice_security_bits(&parameters.levels()[0], &error_sigma)
+                            .expect("lattice security estimator must be available")
+                    })
+                    .min()
+                    .expect("two chains");
+                if achieved < required_security {
+                    // More primes only lower the security of this ring dimension.
+                    failures.push(format!(
+                        "n={ring_dimension} primes_per_drop={primes_per_drop} \
+                         crt_depth={crt_depth}: security {achieved} < {required_security}"
+                    ));
+                    break 'dimension;
+                }
+                let noise = &selection.noise;
+                eprintln!(
+                    "decoder parameters accepted: ring_dimension={ring_dimension} \
+                     primes_per_drop={primes_per_drop} crt_depth={crt_depth} crt_bits={crt_bits} \
+                     base_bits={base_bits} digits={} members={} noise_model={} error_bits={} \
+                     smudge_bits={} spacing_bits={} security_bits={achieved}",
+                    selection.declaration.digits(),
+                    selection.declaration.smudge().members(),
+                    if average.is_some() { "average" } else { "worst" },
+                    noise.error.bits(),
+                    noise.smudge.bits(),
+                    noise.spacing.bits(),
+                );
+                let members = selection.declaration.smudge().members();
+                let keys = generated.borrow_mut().remove(&members).expect("smudge keys");
+                return Accepted { selection, keys, trapdoor_sigma };
             }
-            let achieved = lattice_security_bits(&decoder.parameters, &error_sigma)
-                .expect("lattice security estimator must be available");
-            if achieved < required_security {
-                failures.push(format!(
-                    "n={ring_dimension} crt_depth={crt_depth}: security {achieved} < {required_security}"
-                ));
-                continue;
-            }
-            eprintln!(
-                "decoder parameters accepted: ring_dimension={ring_dimension} crt_depth={crt_depth} \
-                 crt_bits={crt_bits} base_bits={base_bits} p={plaintext_modulus} w={width} \
-                 decoder_error={} spacing={} security_bits={achieved}",
-                decoder.decoding_error,
-                decoder.spacing()
-            );
-            return decoder;
         }
     }
     panic!("no decoder parameter candidate was accepted: {}", failures.join("; "));
-}
-
-/// Validate, plan, execute, and publish one stage on `runtime`.
-fn produce(
-    graph: DslContext,
-    stages: &[&StageArtifacts<&'static str>],
-    name: &'static str,
-    runtime: &mut GpuRuntime,
-    store: &mut api::StageStore,
-) -> StageArtifacts<&'static str> {
-    let manifests = stages
-        .iter()
-        .map(|stage| (stage.production().clone(), stage.manifest().clone()))
-        .collect::<BTreeMap<_, _>>();
-    api::execute_artifacts(
-        StageGraph::new(graph.build().expect("stage graph"), BTreeMap::new(), manifests),
-        &ParamEnv::default(),
-        name,
-        rand::random(),
-        runtime,
-        store,
-        |_| Ok(()),
-    )
-    .unwrap_or_else(|error| panic!("decoder {name} stage: {error}"))
-}
-
-/// The polynomial with coefficients `values` in `ring`.
-fn polynomial(ring: &Ring, values: &[BigUint]) -> Mat {
-    ring.polynomial(values.iter().map(|value| IntExpr::constant(BigInt::from(value.clone()))))
 }
 
 #[test]
@@ -246,197 +270,154 @@ fn decoder_round_trip() {
         eprintln!("skipping the decoder round trip: no CUDA device detected");
         return;
     }
-    let decoder = search();
-    let parameters = &decoder.parameters;
-    let ring = decoder.ring();
-    let ring_dimension = parameters.ring_dimension() as usize;
-    let digits = parameters.modulus_digits();
-    let columns = UNMASK_ROWS * (digits + 2);
-    let width = decoder.width;
-    let trapdoor_sigma = decimal_to_real_expr(&decoder.trapdoor_sigma).expect("trapdoor sigma");
-    let error_sigma = decimal_to_real_expr(&decoder.error_sigma).expect("error sigma");
-    let error_bound = BigInt::from(decoder.error_bound.clone());
-    let preimage_bound = BigInt::from(decoder.preimage_bound.clone());
-    let mut runtime = GpuRuntime::new(gpu_backend_on(
-        [GpuDCRTPolyParams::new(
-            parameters.ring_dimension(),
-            parameters.to_crt().0,
-            parameters.base_bits(),
-            None,
-        )],
-        devices,
-    ))
-    .expect("GPU runtime");
-    let directory = tempfile::tempdir().expect("artifact directory");
-    let mut store = api::StageStorage::File(directory.path().into()).open().expect("stage storage");
+    let (source, input) = identity_source();
+    let Accepted { selection, keys, trapdoor_sigma } = search(&source, input);
+    let DecoderSelection { parameters, smudge_parameters, declaration, noise, .. } = selection;
+    assert!(noise.fits(), "the decoder noise must fit the decoding margin: {noise:?}");
 
-    // Trusted setup: `B` and its trapdoor.
-    let trapdoor = sample_trapdoor(
-        &ring,
-        trapdoor_sigma.clone(),
-        decoder.gadget_base(),
-        digits,
-        preimage_bound.clone(),
-    );
-    let setup = produce(
-        DslContext::new("decoder-setup").transferred_output(TRAPDOOR, trapdoor).unwrap(),
-        &[],
-        "setup",
-        &mut runtime,
-        &mut store,
-    );
+    let smudge_program = declaration.smudge().program();
+    let level = parameters.levels()[0].clone();
+    let smudge_level = smudge_parameters.levels()[0].clone();
+    let selectors = declaration
+        .smudge()
+        .prf()
+        .selector_plaintexts::<DCRTPoly>(&smudge_level, &keys)
+        .expect("smudge selector plaintexts");
+    let a = (0..LWR_DIMENSION)
+        .map(|_| rand::random::<u32>() as usize % (1 << PRF_WIDTH_LOG2))
+        .collect::<Vec<_>>();
+    let smudge_lhs = declaration
+        .smudge()
+        .prf()
+        .plaintext_inputs::<DCRTPoly>(&smudge_level, &a)
+        .expect("smudge PRF inputs");
 
-    // Preprocessing: the key `A`, the republished `B`, and the preimage `K` of `A`.
-    let trapdoor = ring.trapdoor_artifact_input(
-        setup.production().clone(),
-        format!("{TRAPDOOR}.1"),
-        UNMASK_ROWS,
-        trapdoor_sigma,
-        decoder.gadget_base(),
-        digits,
-        preimage_bound.clone(),
-    );
-    let key = ring.uniform_residue((UNMASK_ROWS, width));
-    let preprocess = produce(
-        DslContext::new("decoder-preprocess")
-            .transferred_output("key", key.clone())
-            .unwrap()
-            .transferred_output("public", trapdoor.public_matrix())
-            .unwrap()
-            .transferred_output("preimage", preimage(&trapdoor, key))
-            .unwrap(),
-        &[&setup],
-        "preprocess",
-        &mut runtime,
-        &mut store,
-    );
-
-    // Encryption: the decoder row and the encoding of `Delta mu` under the secret `(s_bar, 1)`.
-    let mut rng = rand::rng();
-    let message = (0..width)
-        .map(|_| {
-            (0..ring_dimension)
-                .map(|_| rng.random_range(0..decoder.plaintext_modulus))
-                .collect::<Vec<_>>()
+    // The two chains share their rings; each ring is registered once.
+    let gpu_levels = parameters
+        .distinct_levels()
+        .into_iter()
+        .chain(smudge_parameters.distinct_levels())
+        .map(|level| (level.ring_dimension(), level.to_crt().0, level.base_bits()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|(ring_dimension, moduli, base_bits)| {
+            GpuDCRTPolyParams::new(ring_dimension, moduli, base_bits, None)
         })
         .collect::<Vec<_>>();
-    let spacing = decoder.spacing();
-    let payload = Mat::concat(
-        ConcatAxis::Columns,
-        message
-            .iter()
-            .map(|column| {
-                let scaled = column.iter().map(|&mu| &spacing * mu).collect::<Vec<_>>();
-                polynomial(&ring, &scaled)
-            })
-            .collect(),
-    );
-    let key = ring.artifact_input(
-        preprocess.production().clone(),
-        "key",
-        (UNMASK_ROWS, width),
-        ArtifactAvailability::Transferred,
-    );
-    let public = ring.artifact_input(
-        preprocess.production().clone(),
-        "public",
-        (UNMASK_ROWS, columns),
-        ArtifactAvailability::Transferred,
-    );
-    let secret = Mat::concat(
-        ConcatAxis::Columns,
-        vec![ring.uniform_interval((1, 1), -1, 1), ring.identity(1)],
-    );
-    let row = unmask_hint(
-        secret.clone(),
-        public,
-        ring.gaussian((1, columns), error_sigma.clone(), error_bound.clone()),
-    );
-    let encoding =
-        secret * key - payload + ring.gaussian((1, width), error_sigma, error_bound.clone());
-    let encryption = produce(
-        DslContext::new("decoder-encrypt")
-            .transferred_output("row", row)
-            .unwrap()
-            .transferred_output("encoding", encoding)
-            .unwrap(),
-        &[&preprocess],
-        "encrypt",
-        &mut runtime,
-        &mut store,
-    );
+    let mut runtime = GpuRuntime::new(gpu_backend_on(gpu_levels, devices)).expect("GPU runtime");
+    let directory = tempfile::tempdir().expect("artifact directory");
+    let mut store = api::StageStorage::File(directory.path().into()).open().expect("stage storage");
+    let hash_key: [u8; 32] = rand::random();
+    let context: [u8; 32] = rand::random();
+    let env = ParamEnv::default();
+    let no_rhs = PlaintextInputs::<RhsId, DCRTPoly>::new();
 
-    // Decoding: `b K - c`.
-    let preimage = ring.preimage_artifact_input(
-        preprocess.production().clone(),
-        "preimage",
-        (columns, width),
-        preimage_bound,
-        ArtifactAvailability::Transferred,
-    );
-    let row = ring.artifact_input(
-        encryption.production().clone(),
-        "row",
-        (1, columns),
-        ArtifactAvailability::Transferred,
-    );
-    let encoding = ring.artifact_input(
-        encryption.production().clone(),
-        "encoding",
-        (1, width),
-        ArtifactAvailability::Transferred,
-    );
-    let manifests = [&preprocess, &encryption]
-        .into_iter()
-        .map(|stage| (stage.production().clone(), stage.manifest().clone()))
-        .collect();
-    let graph = DslContext::new("decoder-decode")
-        .output("decoded", unmask(row, preimage, encoding))
-        .unwrap()
-        .build()
-        .expect("decoding graph");
-    let outputs = api::execute_graph(
-        StageGraph::new(graph, BTreeMap::new(), manifests),
-        &ParamEnv::default(),
+    // Preprocessing: the source and smudge public material, `B` with its trapdoor, and the
+    // preimage `K` of the decoder key.
+    let payload = RnsEncryptBuild::new(&parameters, context)
+        .sample_payload_secret(&mut runtime, &mut store, |_| Ok(()))
+        .expect("payload secret");
+    let mut smudge_preprocess = RnsPreprocessBuild::new(&smudge_parameters, context);
+    smudge_preprocess
+        .bind_rhs_inputs(
+            smudge_program,
+            &env,
+            &selectors,
+            Some(&payload.at_level(&smudge_parameters, 0).expect("smudge payload")),
+            &hash_key,
+        )
+        .expect("smudge preprocessing inputs");
+    smudge_preprocess.bind_decoder_smudge(&declaration).expect("smudge preprocessing decoder");
+    let (preprocess, online_eval) = api::preprocess(
+        &source,
+        &env,
+        &no_rhs,
+        Some(&payload),
+        &hash_key,
+        RnsPreprocessBuild::new(&parameters, context),
         &mut runtime,
         &mut store,
+        |build, outputs| {
+            build.apply_decoder(
+                0,
+                &declaration,
+                outputs[0].clone(),
+                smudge_preprocess,
+                &trapdoor_sigma,
+            )?;
+            Ok(outputs)
+        },
         |_| Ok(()),
     )
-    .expect("decoder decode stage");
-    let decoded =
-        StageExecution::<api::StageStore>::download_matrix(&runtime, &outputs.outputs["decoded"])
-            .expect("decoded payload");
+    .expect("decoder preprocessing");
 
-    // Every coefficient rounds to its message, with an error within the simulated bound.
-    let modulus = BigInt::from(decoder.modulus());
-    let spacing = BigInt::from(spacing);
-    let p = BigInt::from(decoder.plaintext_modulus);
-    let limit = BigInt::from(decoder.decoding_error.clone());
-    let mut largest = BigInt::zero();
-    for (column, expected) in message.iter().enumerate() {
-        let coefficients = decoded.entry(0, column).coeffs_biguints();
-        assert_eq!(coefficients.len(), ring_dimension);
-        for (index, (coefficient, &mu)) in coefficients.into_iter().zip(expected).enumerate() {
-            let value = BigInt::from(coefficient);
-            let rounded = ((&value * &p * 2 + &modulus) / (&modulus * 2)) % &p;
-            assert_eq!(
-                rounded,
-                BigInt::from(mu),
-                "column {column}, coefficient {index}: decoded {value} does not round to {mu}"
-            );
-            let mut error = (&value - &spacing * mu) % &modulus;
-            if &error * 2 > modulus {
-                error -= &modulus;
-            }
-            assert!(
-                error.abs() <= limit,
-                "column {column}, coefficient {index}: error {error} exceeds the bound {limit}"
-            );
-            largest = largest.max(error.abs());
-        }
-    }
+    // Encryption: the source input `X^b`, the smudge PRF inputs, and the unmask hint.
+    let mask = RnsEncryptBuild::new(&parameters, rand::random())
+        .sample_mask_secret(&mut runtime, &mut store, |_| Ok(()))
+        .expect("mask secret");
+    let mut smudge_encrypt = RnsEncryptBuild::new(&smudge_parameters, context);
+    smudge_encrypt
+        .bind_lhs_inputs(
+            &smudge_program.encryption_inputs(),
+            &env,
+            &smudge_lhs,
+            &payload.at_level(&smudge_parameters, 0).expect("smudge payload"),
+            Some(&mask.at_level(&smudge_parameters, 0).expect("smudge mask")),
+            &hash_key,
+        )
+        .expect("smudge encryption inputs");
+    smudge_encrypt.bind_decoder_smudge(&declaration).expect("smudge encryption decoder");
+    smudge_encrypt.bind_preprocess_artifacts(&preprocess).expect("smudge preprocess artifacts");
+    let bit = rand::random::<u32>() as usize % level.ring_dimension() as usize;
+    let lhs =
+        BTreeMap::from([(input, InputBinding::Scalar(DCRTPoly::const_rotate_poly(&level, bit)))]);
+    let encrypted = api::encrypt(
+        &source.encryption_inputs(),
+        &env,
+        &lhs,
+        &preprocess,
+        &payload,
+        Some(&mask),
+        &hash_key,
+        RnsEncryptBuild::new(&parameters, context),
+        &mut runtime,
+        &mut store,
+        |build| build.bind_decoder(&declaration, smudge_encrypt),
+        |_| Ok(()),
+    )
+    .expect("decoder encryption");
+
+    // Online evaluation: the smudged, unmasked, and rounded source output.
+    let mut smudge_online = RnsOnlineEvalBuild::new(&smudge_parameters, context);
+    smudge_online
+        .bind_decoder_smudge(&declaration, &online_eval, &encrypted, &hash_key)
+        .expect("smudge online evaluation");
+    let result = api::online_eval(
+        &source.without_lut_values(),
+        &env,
+        &online_eval,
+        &encrypted,
+        &hash_key,
+        RnsOnlineEvalBuild::new(&parameters, context),
+        &mut runtime,
+        &mut store,
+        |build, outputs| {
+            build.apply_decoder(0, &declaration, smudge_online)?;
+            Ok(outputs)
+        },
+        |_| Ok(()),
+    )
+    .expect("decoder online evaluation");
+    let plaintext =
+        StageExecution::<api::StageStore>::download_matrix(&runtime, &result.outputs["output-0"])
+            .expect("decoded plaintext");
+
+    // The decoded plaintext `round((p/q) x) mod p` is the source input.
+    let expected = DCRTPoly::const_rotate_poly(&parameters.levels()[1], bit);
+    assert_eq!(plaintext.entry(0, 0), expected, "decoded plaintext");
     eprintln!(
-        "decoder round trip: {} coefficients decoded; largest error {largest} of the bound {limit}",
-        width * ring_dimension
+        "decoder round trip: decoded X^{bit} with smudge 2^{} over noise 2^{}",
+        noise.smudge.bits(),
+        noise.error.bits()
     );
 }

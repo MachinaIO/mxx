@@ -873,6 +873,10 @@ unsafe extern "C" {
         out_address: *mut *mut c_void,
     ) -> c_int;
     fn gpu_device_buffer_free(buffer: *mut c_void) -> c_int;
+    fn gpu_device_buffer_protect_compiled_submission(
+        buffer: *mut c_void,
+        completion_event: *mut c_void,
+    ) -> c_int;
     fn gpu_device_buffer_upload(
         buffer: *mut c_void,
         offset: usize,
@@ -1062,6 +1066,10 @@ unsafe extern "C" {
     ) -> c_int;
     fn gpu_indexed_matrix_table_address(table: *const GpuIndexedMatrixTableOpaque) -> u64;
     fn gpu_indexed_matrix_table_destroy(table: *mut GpuIndexedMatrixTableOpaque);
+    fn gpu_indexed_matrix_table_protect_compiled_submission(
+        table: *mut GpuIndexedMatrixTableOpaque,
+        completion_event: *mut c_void,
+    ) -> c_int;
     fn gpu_raw_matrix_indexed_copy(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
@@ -1228,6 +1236,11 @@ unsafe extern "C" {
         out_count: *mut usize,
     ) -> c_int;
     fn gpu_raw_preimage_cutoff_destroy(plan: *mut GpuRawPreimageCutoffPlanOpaque);
+    fn gpu_raw_preimage_cutoff_protect_compiled_submission(
+        plan: *mut GpuRawPreimageCutoffPlanOpaque,
+        physical_device: c_int,
+        completion_event: *mut c_void,
+    ) -> c_int;
     fn gpu_raw_preimage_add_correction(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
@@ -2175,6 +2188,17 @@ pub struct GpuRawP1Bindings {
 }
 
 impl GpuRawP1Workspace {
+    /// Order the workspace's frees after one compiled-Graph submission.
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        for buffer in [&self.cov, &self.sqrt, &self.update, &self.sampled, &self.sample_workspace] {
+            buffer.protect_compiled_submission(completion)?;
+        }
+        Ok(())
+    }
+
     pub fn new(
         params: &GpuDCRTPolyParams,
         stream: &GpuNativeLaunchStream,
@@ -2255,6 +2279,14 @@ impl GpuRawP1Workspace {
 }
 
 impl GpuRawGqWorkspace {
+    /// Order the workspace's free after one compiled-Graph submission.
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.sampled.protect_compiled_submission(completion)
+    }
+
     pub fn new(
         params: &GpuDCRTPolyParams,
         stream: &GpuNativeLaunchStream,
@@ -2308,6 +2340,29 @@ impl GpuRawGqWorkspace {
 }
 
 impl GpuRawPreimageCutoffPlan {
+    /// Order the plan's metadata and staging frees after one compiled-Graph
+    /// submission.
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        let completion_event = completion.raw_event()?;
+        let status = unsafe {
+            gpu_raw_preimage_cutoff_protect_compiled_submission(
+                self.raw.as_ptr(),
+                self.physical_device,
+                completion_event,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_raw_preimage_cutoff_protect_compiled_submission failed: {}",
+                last_error_string()
+            )));
+        }
+        self.staging.protect_compiled_submission(completion)
+    }
+
     pub fn new(
         params: &GpuDCRTPolyParams,
         stream: &GpuNativeLaunchStream,
@@ -5843,6 +5898,27 @@ unsafe impl Send for GpuIndexedMatrixTable {}
 unsafe impl Sync for GpuIndexedMatrixTable {}
 
 impl GpuIndexedMatrixTable {
+    /// Order the table's free after one compiled-Graph submission that reads it.
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        let completion_event = completion.raw_event()?;
+        let status = unsafe {
+            gpu_indexed_matrix_table_protect_compiled_submission(
+                self.raw.as_ptr(),
+                completion_event,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_indexed_matrix_table_protect_compiled_submission failed: {}",
+                last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(
         params: &GpuDCRTPolyParams,
         stream: &GpuNativeLaunchStream,
@@ -6406,6 +6482,25 @@ impl GpuDeviceBuffer {
         if status != 0 {
             return Err(GpuNativeGraphError::Native(format!(
                 "gpu_device_buffer_wait failed: {}",
+                last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Order the buffer's free, queued on its allocation stream, after one
+    /// compiled-Graph submission that reads or writes it.
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        let completion_event = completion.raw_event()?;
+        let status = unsafe {
+            gpu_device_buffer_protect_compiled_submission(self.owner.as_ptr(), completion_event)
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_device_buffer_protect_compiled_submission failed: {}",
                 last_error_string()
             )));
         }

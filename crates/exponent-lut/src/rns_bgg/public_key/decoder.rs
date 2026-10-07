@@ -1,5 +1,5 @@
-//! The setup and preprocessing side of the smudged trapdoor decoder
-//! (see [`crate::decoder`]).
+//! The preprocessing side of the smudged trapdoor decoder (see
+//! [`crate::decoder`]).
 //!
 //! The decoded column is component 1 of the source output (its payload
 //! secret component is 1) under the selection `G_(L+1)^-1(1)`, whose payload
@@ -9,30 +9,17 @@
 use super::*;
 use crate::decoder::decoding::DecoderDeclaration;
 
-/// The setup's trapdoor artifact: `.0` is the public `B`, `.1` the trapdoor, which also carries
-/// `B`.
-const UNMASK_TRAPDOOR: &str = "unmask/trapdoor";
-
-/// Run the trusted unmask setup of `declaration`'s decoder of
-/// `source_program`: sample the public `B` and its trapdoor at the source
-/// level with trapdoor sigma `trapdoor_sigma`. Only the trusted preprocessor
-/// may read the returned production; it republishes `B` and the preimage of
-/// the decoder key.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_unmask_trapdoor<E, S>(
+/// Sample the public `B` and its trapdoor for `declaration`'s decoder of
+/// `source_program` at its decoding level, with trapdoor sigma
+/// `trapdoor_sigma`, in the preprocessing graph: the trapdoor never leaves
+/// the stage, which publishes only `B` and the preimage of the decoder key.
+/// Returns the trapdoor with the preimage coefficient bound.
+pub(super) fn sample_unmask_trapdoor(
     parameters: &RnsBggParameters,
     declaration: &DecoderDeclaration,
     source_program: &ExponentLutProgram,
-    context: [u8; 32],
     trapdoor_sigma: &bigdecimal::BigDecimal,
-    execution: &mut E,
-    store: &mut S,
-    before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
-) -> Result<StageArtifacts<RnsBggUnmaskSetupDescriptor>, ApiError>
-where
-    E: crate::api::StageExecution<S>,
-    S: mxx_backends::SessionStore,
-{
+) -> Result<(Trapdoor, BigUint), ApiError> {
     let level = RnsBggParameters::decoder_source_level(declaration, source_program)
         .map_err(ApiError::scheme)?;
     let sigma = trapdoor_sigma
@@ -40,65 +27,16 @@ where
         .ok_or_else(|| ApiError::input("the unmask trapdoor sigma is not finite"))?;
     let (base, digits, bound) = parameters.unmask_gadget(level, sigma).map_err(ApiError::scheme)?;
     let ring = parameters.ring(level).map_err(ApiError::scheme)?;
+    let sigma = crate::utils::decimal_to_real_expr(trapdoor_sigma)
+        .map_err(|_| ApiError::input("the unmask trapdoor sigma is not a decimal"))?;
     let trapdoor = crate::decoder::unmask::sample_trapdoor(
         &ring,
-        decimal_sigma(trapdoor_sigma)?,
+        sigma,
         base,
         digits,
         BigInt::from(bound.clone()),
     );
-    let graph = DslContext::new("rns-bgg-unmask-setup")
-        .transferred_output(UNMASK_TRAPDOOR, trapdoor)
-        .map_err(ApiError::scheme)?
-        .build()
-        .map_err(ApiError::scheme)?;
-    let descriptor = RnsBggUnmaskSetupDescriptor {
-        context,
-        parameters: parameters.parameter_identity(),
-        decoder_commitment: *declaration.commitment(),
-        level,
-        sigma: trapdoor_sigma.normalized().to_string(),
-        base,
-        digits,
-        bound,
-    };
-    crate::api::execute_artifacts(
-        StageGraph::new(graph, BTreeMap::new(), BTreeMap::new()),
-        &mxx_ir_core::ParamEnv::default(),
-        descriptor,
-        crate::api::domain_identity(*declaration.commitment(), b"unmask-setup"),
-        execution,
-        store,
-        before_execute,
-    )
-}
-
-fn decimal_sigma(sigma: &bigdecimal::BigDecimal) -> Result<mxx_ir_core::RealExpr, ApiError> {
-    crate::utils::decimal_to_real_expr(sigma)
-        .map_err(|_| ApiError::input("the unmask trapdoor sigma is not a decimal"))
-}
-
-/// Import the trapdoor of `setup` at its decoding level.
-pub(super) fn import_unmask_trapdoor(
-    parameters: &RnsBggParameters,
-    setup: &StageArtifacts<RnsBggUnmaskSetupDescriptor>,
-) -> Result<Trapdoor, RnsBggError> {
-    let descriptor = setup.descriptor();
-    let sigma = descriptor
-        .sigma
-        .parse::<bigdecimal::BigDecimal>()
-        .map_err(|_| RnsBggError::Binding("unmask setup sigma"))?;
-    let sigma = crate::utils::decimal_to_real_expr(&sigma)
-        .map_err(|_| RnsBggError::Binding("unmask setup sigma"))?;
-    Ok(parameters.ring(descriptor.level)?.trapdoor_artifact_input(
-        setup.production().clone(),
-        format!("{UNMASK_TRAPDOOR}.1"),
-        crate::decoder::unmask::UNMASK_ROWS,
-        sigma,
-        descriptor.base,
-        descriptor.digits,
-        BigInt::from(descriptor.bound.clone()),
-    ))
+    Ok((trapdoor, bound))
 }
 
 /// The component-1 key column `(A_01; A_11)` of `matrix`.

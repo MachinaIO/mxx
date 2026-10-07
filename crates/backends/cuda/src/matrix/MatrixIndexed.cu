@@ -11,6 +11,11 @@ struct GpuIndexedMatrixTable
     MxxRawMatrixLimb *pinned_limbs = nullptr;
     cudaStream_t allocation_stream = nullptr;
     cudaEvent_t allocation_ready = nullptr;
+    // Recorded after each upload's copy, which reads `pinned_limbs`.
+    cudaEvent_t copy_done = nullptr;
+    bool uploaded = false;
+    // Set when a Graph submission could not be ordered before the free.
+    bool release_blocked = false;
 };
 
 namespace
@@ -100,12 +105,15 @@ extern "C" int gpu_indexed_matrix_table_create(GpuContext *ctx, void *stream_raw
             cudaEventDisableTiming);
     if (error == cudaSuccess)
         error = cudaEventRecord(table->allocation_ready, table->allocation_stream);
+    if (error == cudaSuccess)
+        error = cudaEventCreateWithFlags(&table->copy_done, cudaEventDisableTiming);
     if (error != cudaSuccess)
     {
         if (table->device_limbs)
             cudaFreeAsync(table->device_limbs, table->allocation_stream);
         if (table->pinned_limbs) cudaFreeHost(table->pinned_limbs);
         if (table->allocation_ready) cudaEventDestroy(table->allocation_ready);
+        if (table->copy_done) cudaEventDestroy(table->copy_done);
         delete table;
         return set_error(error);
     }
@@ -122,13 +130,30 @@ extern "C" int gpu_indexed_matrix_table_upload(GpuIndexedMatrixTable *table,
     if (mxx_set_device(table->device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const size_t bytes = limb_count * sizeof(MxxRawMatrixLimb);
-    std::memcpy(table->pinned_limbs, limbs, bytes);
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
-    cudaError_t error = cudaStreamWaitEvent(stream, table->allocation_ready, 0);
+    // `pinned_limbs` holds the last uploaded members. An unchanged table is not
+    // rewritten: the consumer only waits for the copy that wrote it, so neither
+    // the pinned source of a pending copy nor a table another stream may still
+    // read is overwritten.
+    if (table->uploaded && std::memcmp(table->pinned_limbs, limbs, bytes) == 0)
+    {
+        const cudaError_t error = cudaStreamWaitEvent(stream, table->copy_done, 0);
+        return error == cudaSuccess ? 0 : set_error(error);
+    }
+    // The previous copy reads the pinned buffer asynchronously: it must have
+    // finished before the host rewrites it.
+    cudaError_t error = table->uploaded ? cudaEventSynchronize(table->copy_done) : cudaSuccess;
+    if (error != cudaSuccess) return set_error(error);
+    std::memcpy(table->pinned_limbs, limbs, bytes);
+    error = cudaStreamWaitEvent(stream, table->allocation_ready, 0);
     if (error == cudaSuccess)
         error = cudaMemcpyAsync(table->device_limbs, table->pinned_limbs,
             bytes, cudaMemcpyHostToDevice, stream);
-    return error == cudaSuccess ? 0 : set_error(error);
+    if (error == cudaSuccess)
+        error = cudaEventRecord(table->copy_done, stream);
+    if (error != cudaSuccess) return set_error(error);
+    table->uploaded = true;
+    return 0;
 }
 
 extern "C" uint64_t gpu_indexed_matrix_table_address(
@@ -137,13 +162,40 @@ extern "C" uint64_t gpu_indexed_matrix_table_address(
     return table ? reinterpret_cast<uint64_t>(table->device_limbs) : 0;
 }
 
+// Order the table's free, queued on its allocation stream, after one
+// compiled-Graph submission that reads it.
+extern "C" int gpu_indexed_matrix_table_protect_compiled_submission(
+    GpuIndexedMatrixTable *table, void *completion_event)
+{
+    if (!table || !completion_event)
+        return set_error("invalid indexed matrix table protection arguments");
+    cudaError_t error = mxx_set_device(table->device);
+    if (error == cudaSuccess)
+        error = cudaStreamWaitEvent(table->allocation_stream,
+            reinterpret_cast<cudaEvent_t>(completion_event), 0);
+    if (error != cudaSuccess)
+    {
+        table->release_blocked = true;
+        return set_error(error);
+    }
+    return 0;
+}
+
 extern "C" void gpu_indexed_matrix_table_destroy(GpuIndexedMatrixTable *table)
 {
     if (!table) return;
     mxx_set_device(table->device);
+    if (table->release_blocked)
+    {
+        // A Graph may still read the table: keep its allocations.
+        delete table;
+        return;
+    }
+    if (table->uploaded) cudaStreamWaitEvent(table->allocation_stream, table->copy_done, 0);
     if (table->device_limbs)
         cudaFreeAsync(table->device_limbs, table->allocation_stream);
     if (table->allocation_ready) cudaEventDestroy(table->allocation_ready);
+    if (table->copy_done) cudaEventDestroy(table->copy_done);
     if (table->pinned_limbs) cudaFreeHost(table->pinned_limbs);
     delete table;
 }

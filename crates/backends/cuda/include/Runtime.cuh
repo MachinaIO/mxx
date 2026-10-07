@@ -53,6 +53,9 @@ struct MxxGpuDeviceBuffer
     size_t bytes = 0;
     cudaEvent_t producer = nullptr;
     bool producer_valid = false;
+    // Set when a Graph submission reading the buffer could not be ordered
+    // before its free: the allocation is then kept rather than freed early.
+    bool release_blocked = false;
 };
 #endif
 
@@ -249,6 +252,8 @@ int gpu_device_buffer_address(
     size_t bytes,
     void **out_address);
 int gpu_device_buffer_free(MxxGpuDeviceBuffer *buffer);
+int gpu_device_buffer_protect_compiled_submission(
+    MxxGpuDeviceBuffer *buffer, void *completion_event);
 int gpu_device_buffer_upload(
     MxxGpuDeviceBuffer *buffer,
     size_t offset,
@@ -349,6 +354,8 @@ int gpu_indexed_matrix_table_upload(GpuIndexedMatrixTable *table, void *stream,
     const MxxRawMatrixLimb *limbs, size_t limb_count);
 uint64_t gpu_indexed_matrix_table_address(const GpuIndexedMatrixTable *table);
 void gpu_indexed_matrix_table_destroy(GpuIndexedMatrixTable *table);
+int gpu_indexed_matrix_table_protect_compiled_submission(
+    GpuIndexedMatrixTable *table, void *completion_event);
 int gpu_raw_matrix_indexed_copy(GpuContext *ctx, void *stream,
     const void *index_address, int index_encoding,
     const GpuIndexedMatrixTable *table, const MxxRawMatrixView *destination,
@@ -417,6 +424,8 @@ int gpu_raw_preimage_cutoff_metadata_ranges(
     const GpuRawPreimageCutoffPlan *plan, uint64_t *addresses,
     size_t *bytes, size_t capacity, size_t *out_count);
 void gpu_raw_preimage_cutoff_destroy(GpuRawPreimageCutoffPlan *plan);
+int gpu_raw_preimage_cutoff_protect_compiled_submission(
+    GpuRawPreimageCutoffPlan *plan, int physical_device, void *completion_event);
 int gpu_raw_preimage_add_correction(GpuContext *ctx, void *stream,
     const MxxRawMatrixView *candidate_eval,
     const MxxRawMatrixView *r_eval, const MxxRawMatrixView *e_eval,

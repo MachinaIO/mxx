@@ -167,6 +167,14 @@ impl<'a> RnsEncryptBuild<'a> {
         &mut self,
         declaration: &DecoderDeclaration,
         child: RnsEncryptBuild<'a>,
+    ) -> Result<(), ApiError> {
+        self.attach_decoder(declaration, child).map_err(ApiError::scheme)
+    }
+
+    fn attach_decoder(
+        &mut self,
+        declaration: &DecoderDeclaration,
+        child: RnsEncryptBuild<'a>,
     ) -> Result<(), RnsBggError> {
         if self.decoder_smudge_child.is_some() {
             return Err(RnsBggError::Binding("a decoder is already bound"));

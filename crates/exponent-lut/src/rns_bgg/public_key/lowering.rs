@@ -1115,7 +1115,11 @@ mod test {
         let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend([level]));
         let mut store = MemoryArtifactStore::default();
         let result = execute_graph(
-            StageGraph::new(graph, BTreeMap::new(), BTreeMap::<ProductionId, Manifest>::new()),
+            StageGraph::new(
+                graph,
+                BTreeMap::new(),
+                BTreeMap::<ProductionId, mxx_ir_core::artifact::Manifest>::new(),
+            ),
             &ParamEnv::default(),
             &mut execution,
             &mut store,

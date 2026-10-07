@@ -67,6 +67,11 @@ unsafe extern "C" {
         status_binding: u32,
     ) -> c_int;
     fn gpu_raw_hash_plan_destroy(plan: *mut GpuRawHashPlanOpaque);
+    fn gpu_raw_hash_plan_protect_compiled_submission(
+        plan: *mut GpuRawHashPlanOpaque,
+        physical_device: c_int,
+        completion_event: *mut c_void,
+    ) -> c_int;
 }
 
 /// Ordered tag pieces after CPU-equivalent framing of constant components.
@@ -143,6 +148,29 @@ unsafe impl Send for GpuHashSamplePlan {}
 unsafe impl Sync for GpuHashSamplePlan {}
 
 impl GpuHashSamplePlan {
+    /// Order the plan's frees, queued on its stream, after one compiled-Graph
+    /// submission that reads its tables.
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        let completion_event = completion.raw_event()?;
+        let status = unsafe {
+            gpu_raw_hash_plan_protect_compiled_submission(
+                self.raw,
+                self.physical_device,
+                completion_event,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_raw_hash_plan_protect_compiled_submission failed: {}",
+                last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(
         params: &GpuDCRTPolyParams,
         stream: &GpuNativeLaunchStream,

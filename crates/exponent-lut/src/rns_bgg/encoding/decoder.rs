@@ -45,8 +45,8 @@ impl Decoder for RnsBggDecoder<'_, EncodingLowering<'_>> {
 impl RnsEncryptBuild<'_> {
     /// The unmask hint `b = s B + e_b` of `declaration`'s decoder, for the
     /// stage mask `s` at level `level` of `parameters`, the decoding ring,
-    /// where `B` is the preprocess republication of the trusted setup's
-    /// public matrix.
+    /// where `B` is the public matrix preprocessing published with the
+    /// preimage.
     pub(super) fn unmask_hint(
         &self,
         declaration: &DecoderDeclaration,
@@ -83,10 +83,7 @@ mod tests {
     use super::*;
     use crate::{
         api::PlaintextInputs,
-        rns_bgg::{
-            RnsBggNoiseBindings, RnsBggNoiseValue, RnsOnlineEvalBuild, RnsPreprocessBuild,
-            sample_unmask_trapdoor,
-        },
+        rns_bgg::{RnsBggNoiseBindings, RnsBggNoiseValue, RnsOnlineEvalBuild, RnsPreprocessBuild},
     };
     use mxx_backends::{
         MemoryArtifactStore, authority::CpuExecution, backend::poly::cpu_backend,
@@ -225,7 +222,7 @@ mod tests {
         imports
     }
 
-    /// Setup, preprocessing, encryption and online evaluation of the decoder
+    /// Preprocessing, encryption and online evaluation of the decoder
     /// of the identity Program on a private input `X^b`, in Static and
     /// Dynamic mode. The simulated noise must fit the decoding margin, and
     /// `round((p/q) x) mod p` of the decoded `x = (q/p) X^b + m + E` must be
@@ -276,17 +273,6 @@ mod tests {
                     .unwrap()
             };
             let static_payload = (!dynamic).then(|| sample_payload(&mut execution, &mut store));
-            let setup = sample_unmask_trapdoor(
-                &parameters,
-                &declaration,
-                &source,
-                context,
-                &"4.578".parse().unwrap(),
-                &mut execution,
-                &mut store,
-                |_| Ok(()),
-            )
-            .unwrap();
 
             let no_rhs = PlaintextInputs::<RhsId, DCRTPoly>::new();
             let mut smudge_preprocess = RnsPreprocessBuild::new(&smudge_parameters, context);
@@ -318,7 +304,7 @@ mod tests {
                         &declaration,
                         outputs[0].clone(),
                         smudge_preprocess,
-                        &setup,
+                        &"4.578".parse().unwrap(),
                     )?;
                     Ok(outputs)
                 },
@@ -372,7 +358,7 @@ mod tests {
                     if dynamic {
                         build.bind_rhs_inputs(&env, &no_rhs, batch)?;
                     }
-                    build.bind_decoder(&declaration, smudge_encrypt).map_err(ApiError::scheme)
+                    build.bind_decoder(&declaration, smudge_encrypt)
                 },
                 |validated| {
                     // The Dynamic companion loop reads the prelude's family

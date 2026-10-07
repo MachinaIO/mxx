@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    api::{ApiError, PlaintextInputs, PreprocessBuild, StageArtifacts, StageGraph, apply_decoder},
+    api::{ApiError, PlaintextInputs, PreprocessBuild, StageGraph, apply_decoder},
     decoder::decoding::{Decoder, DecoderError},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
@@ -17,7 +17,7 @@ use mxx_dsl::{
 };
 use mxx_ir_core::{
     IntExpr, ValueHandle,
-    artifact::{ArtifactAvailability, Manifest, ProductionId},
+    artifact::{ArtifactAvailability, ProductionId},
     types::WireType,
 };
 use num_bigint::BigInt;
@@ -34,8 +34,7 @@ mod lowering;
 mod preprocess;
 mod sampling;
 
-use self::decoder::import_unmask_trapdoor;
-pub use self::decoder::sample_unmask_trapdoor;
+use self::decoder::sample_unmask_trapdoor;
 pub(super) use self::{lowering::*, sampling::*};
 #[cfg(test)]
 use mxx_ir_core::node::ConstantMatrix;
@@ -154,9 +153,8 @@ pub struct RnsPreprocessBuild<'a> {
     /// The lowered smudge Program child of the applied decoder, whose public
     /// material this stage publishes under the decoder namespace.
     decoder_smudge_child: Option<PublicKeyLowering<'a>>,
-    /// The trusted unmask setup production the applied decoder imports,
-    /// with its manifest and preimage coefficient bound.
-    unmask_setup: Option<(ProductionId, Manifest, BigUint)>,
+    /// The preimage coefficient bound of the applied decoder's unmask key.
+    unmask_bound: Option<BigUint>,
 }
 
 #[cfg(test)]

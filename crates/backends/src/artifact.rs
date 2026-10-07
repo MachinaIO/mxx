@@ -371,7 +371,7 @@ impl FileArtifactStore {
             .unwrap_or_else(|| "scalar.artifact".to_owned());
         self.production_dir(&key.production)
             .join("artifacts")
-            .join(hex_bytes(key.name.as_bytes()))
+            .join(name_component(&key.name))
             .join(member)
     }
 
@@ -388,7 +388,7 @@ impl FileArtifactStore {
     }
 
     fn alias_path(&self, name: &str) -> PathBuf {
-        self.root.join("session-aliases").join(hex_bytes(name.as_bytes()) + ".bin")
+        self.root.join("session-aliases").join(name_component(name) + ".bin")
     }
 
     fn read_encoded<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, FileArtifactError> {
@@ -1421,6 +1421,13 @@ impl SessionStore for FileArtifactStore {
 
 fn production_bytes(production: &ProductionId) -> Vec<u8> {
     production.spec_hash.0.iter().chain(production.execution_nonce.iter()).copied().collect()
+}
+
+/// The path component naming `name`: the hex digest of the name, so that any
+/// name fits within the file-name limit of the filesystem.
+fn name_component(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex_bytes(&Sha256::digest(name.as_bytes()))
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -3050,6 +3057,43 @@ mod tests {
         }
         assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(vec![])));
         assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::TypedBlob(vec![0])));
+    }
+
+    /// An artifact name longer than the file-name limit (a decoder smudge
+    /// LUT's switching material is named by its declaration commitment, its
+    /// level and its layout) still stores and loads: the path names it by its
+    /// digest.
+    #[test]
+    fn file_store_round_trips_an_artifact_name_beyond_the_file_name_limit() {
+        let directory = tempdir().expect("temporary artifact directory");
+        let production = production(31);
+        let name = format!("decoder/{}/smudge/lut-switching/2/3", "ab".repeat(200));
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        let key = ArtifactKey { production: production.clone(), name: name.clone(), index: None };
+        let mut store = FileArtifactStore::new(directory.path()).expect("create store");
+        store
+            .store(
+                key.clone(),
+                &artifact_type,
+                ArtifactAvailability::Transferred,
+                None,
+                ArtifactPayload::Bytes(vec![7]),
+            )
+            .expect("store a long-named artifact");
+        store
+            .store_manifest(Manifest {
+                ir_version: IR_VERSION,
+                production_id: production,
+                artifacts: BTreeMap::from([(name, descriptor.clone())]),
+            })
+            .expect("store manifest");
+        assert_eq!(store.load(&key, &descriptor).expect("load"), ArtifactPayload::Bytes(vec![7]));
     }
 
     #[test]

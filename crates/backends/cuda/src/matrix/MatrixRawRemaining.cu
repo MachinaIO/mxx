@@ -276,7 +276,8 @@ extern "C" int gpu_raw_ring_automorphism(GpuContext *ctx, void *stream_raw,
         const int result = mxx_gpu_launch_kernel(ctx, stream,
             raw_ring_automorphism_kernel, dim3(grid), dim3(256), 0,
             patches, std::size(patches), source->limbs[limb],
-            destination->limbs[limb], index_value, index_encoding, status,
+            destination->limbs[limb], static_cast<const uint64_t *>(index_value),
+            index_encoding, status,
             static_cast<size_t>(source->columns),
             static_cast<size_t>(source->degree),
             static_cast<size_t>(source->rows * source->columns));
@@ -352,7 +353,8 @@ extern "C" int gpu_raw_monomial_multiply(GpuContext *ctx, void *stream_raw,
         patches.push_back(raw_remaining_patch(3, 0, status_binding));
         const int result = mxx_gpu_launch_kernel(ctx, stream,
             raw_monomial_multiply_kernel, dim3(grid, static_cast<uint32_t>(limbs)), dim3(256), 0,
-            patches.data(), patches.size(), batch, exponent_value, exponent_encoding, status,
+            patches.data(), patches.size(), batch, static_cast<const uint64_t *>(exponent_value),
+            exponent_encoding, status,
             static_cast<size_t>(source->columns), degree, log_degree,
             static_cast<size_t>(source->rows * source->columns), subtract_source != 0);
         if (result != 0) return result;
@@ -390,7 +392,7 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
         };
         const int result = mxx_gpu_launch_kernel(ctx, stream,
             raw_lift_integer_kernel, dim3(grid), dim3(256), 0,
-            patches, std::size(patches), value, value_encoding,
+            patches, std::size(patches), static_cast<const uint64_t *>(value), value_encoding,
             destination->limbs[limb], status, destination->degree);
         if (result != 0) return result;
     }
@@ -458,9 +460,10 @@ extern "C" int gpu_raw_matrix_dynamic_slice(GpuContext *ctx, void *stream_raw,
         const int result = mxx_gpu_launch_kernel(ctx, stream,
             raw_dynamic_slice_kernel, dim3(grid), dim3(256), 0,
             patches, std::size(patches), source->limbs[limb],
-            destination->limbs[limb], row_start, row_start_encoding,
-            row_end, row_end_encoding, column_start, column_start_encoding,
-            column_end, column_end_encoding, status,
+            destination->limbs[limb], static_cast<const uint64_t *>(row_start),
+            row_start_encoding, static_cast<const uint64_t *>(row_end), row_end_encoding,
+            static_cast<const uint64_t *>(column_start), column_start_encoding,
+            static_cast<const uint64_t *>(column_end), column_end_encoding, status,
             static_cast<size_t>(source->rows),
             static_cast<size_t>(source->columns),
             static_cast<size_t>(destination->rows),

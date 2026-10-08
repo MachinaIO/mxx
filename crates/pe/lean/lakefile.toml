@@ -13,4 +13,4 @@ path = "../../exponent-lut/lean"
 # Lemmas that hold for every predicate encryption parameter set.
 [[lean_lib]]
 name = "MxxPe"
-roots = ["PeAutomorphism"]
+roots = ["PeDynamic", "PeTail"]

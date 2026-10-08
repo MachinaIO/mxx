@@ -85,3 +85,11 @@ cargo test -r -p mxx-pe --features gpu --test gpu_round_trip
 The integration test checks only correctness and these two estimates. It does not enforce the
 manuscript's leftover-hash, noise-flooding, and key-width conditions. The anchor's identity column
 from the existing TrapGen gives one sample with coefficient `1`, which the estimates do not model.
+
+## Lean proofs
+
+[`lean/`](lean/README.md) proves, in Lean, the correctness claim that the integration test exports
+for a recorded parameter set of `lean/parameters.csv`. For `average-w2-n8192-crt5x30`, the tapes
+on which a run meeting the input contract and the requirement decrypts a wrong message have
+measure at most `2^-100`. The proof reuses the exponent-LUT Lean library and depends only on the
+standard axioms.

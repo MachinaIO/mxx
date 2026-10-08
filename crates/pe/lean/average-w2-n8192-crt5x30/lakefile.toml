@@ -1,6 +1,6 @@
 name = "MxxPeAverageW2N8192Crt5x30"
 version = "0.1.0"
-defaultTargets = ["PeGenerated"]
+defaultTargets = ["PeGenerated", "PeProof"]
 
 [leanOptions]
 relaxedAutoImplicit = false
@@ -19,3 +19,8 @@ roots = [
   "Stage_payload", "Stage_prelude", "Stage_encrypt", "Stage_preprocess", "Stage_keygen",
   "Stage_online_eval", "Stage_decode"
 ]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "PeProof"
+roots = ["PeSetup", "PeOnline", "PeOnlineRel", "PePreprocess", "PeEncrypt", "PePrelude", "PeKeygen", "PeDecode", "PePhase", "PeModel", "PeLink", "PeIndep", "PeInteger", "PeCertificate"]

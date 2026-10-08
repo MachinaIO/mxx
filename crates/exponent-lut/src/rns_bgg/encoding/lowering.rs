@@ -245,15 +245,11 @@ pub(super) fn import_rhs_bindings(
 
 impl EncodingLowering<'_> {
     fn preprocess_artifact_name(&self, role: String) -> String {
-        self.decoder_smudge.as_ref().map_or(role.clone(), |declaration| {
-            decoder_smudge_artifact_name(*declaration.commitment(), &role)
-        })
+        self.encryption_artifact_name(role)
     }
 
     pub(super) fn encryption_artifact_name(&self, role: String) -> String {
-        self.decoder_smudge.as_ref().map_or(role.clone(), |declaration| {
-            decoder_smudge_artifact_name(*declaration.commitment(), &role)
-        })
+        self.artifact_prefix.as_ref().map_or(role.clone(), |prefix| format!("{prefix}/{role}"))
     }
 
     /// The production of the RHS and LUT-switching ciphertexts: preprocessing
@@ -1186,6 +1182,7 @@ mod test {
                 encryption: production,
                 manifests: BTreeMap::new(),
                 decoder_smudge: None,
+                artifact_prefix: None,
                 context: [0; 32],
                 rhs_companions: BTreeMap::new(),
                 lut_material: BTreeMap::new(),
@@ -1253,6 +1250,7 @@ mod test {
             encryption: production.clone(),
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
@@ -1398,6 +1396,7 @@ mod test {
             encryption: production.clone(),
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
@@ -1468,6 +1467,7 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
@@ -1543,6 +1543,7 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
@@ -1692,6 +1693,7 @@ mod test {
             },
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
@@ -1883,6 +1885,7 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),

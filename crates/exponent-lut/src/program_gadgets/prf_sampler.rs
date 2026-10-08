@@ -28,7 +28,7 @@
 use crate::{
     api::PlaintextInputs,
     program::{
-        ExpLayout, ExponentLutProgramBuilder, FamilyRange, InputBinding, LutId,
+        ExpLayout, ExponentLutProgram, ExponentLutProgramBuilder, FamilyRange, InputBinding, LutId,
         LutOutputRepresentation, LutTable, Operand, ProgramValidationError, RhsId, WireId,
     },
     program_gadgets::{
@@ -283,6 +283,30 @@ impl PrfSampler {
         self.output
     }
 
+    /// The sample of a member whose PRF inner product is `z in Z_Q`, read
+    /// through the readout and sampling tables `program` registered for this
+    /// sampler under the LUT contract `±X^(stride e) -> ±T[e]` (the sign is
+    /// negative past `n'`). The binary offset is not included.
+    pub fn sample_at(
+        &self,
+        program: &ExponentLutProgram,
+        z: usize,
+    ) -> Result<i64, PrfSamplerError> {
+        let invalid = || PrfSamplerError::InvalidDistribution;
+        let profile = self.prf.profile();
+        if Some(z) >= profile.q().ok() {
+            return Err(invalid());
+        }
+        let inputs = program.encryption_inputs();
+        let table = |lut: LutId| {
+            inputs.luts().get(lut.0 as usize).and_then(|table| table.values()).ok_or_else(invalid)
+        };
+        let n_prime = profile.native_width();
+        let exponent = *table(self.prf.lut())?.get(z % n_prime).ok_or_else(invalid)?;
+        let value = *table(self.lut)?.get(exponent).ok_or_else(invalid)? as i64;
+        Ok(if z < n_prime { value } else { -value })
+    }
+
     /// The RHS plaintexts: the PRF selectors of `keys` (see
     /// [`SparseLwrPrf::selector_plaintexts`]) and one for every offset RHS.
     pub fn rhs_plaintexts<P: Poly>(
@@ -383,16 +407,8 @@ mod tests {
     /// The sample at every `z in Z_Q`, through the registered readout and
     /// sampling tables under the LUT contract `±X^(stride e) -> ±T[e]`.
     fn samples(program: &ExponentLutProgram, sampler: &PrfSampler) -> Vec<i64> {
-        let inputs = program.encryption_inputs();
-        let readout = inputs.luts()[sampler.prf().lut().0 as usize].values().unwrap();
-        let table = inputs.luts()[sampler.lut().0 as usize].values().unwrap();
-        let profile = sampler.prf().profile();
-        let n_prime = profile.native_width();
-        (0..profile.q().unwrap())
-            .map(|z| {
-                let value = table[readout[z % n_prime]] as i64;
-                if z < n_prime { value } else { -value }
-            })
+        (0..sampler.prf().profile().q().unwrap())
+            .map(|z| sampler.sample_at(program, z).unwrap())
             .collect()
     }
 

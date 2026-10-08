@@ -381,6 +381,7 @@ pub fn select_decoder_at_crt_depth(
             coefficients,
             digits,
             layouts,
+            crate::decoder::decoding::DecoderTarget::Output,
         )
         .map_err(|error| to_string(&error))
     };

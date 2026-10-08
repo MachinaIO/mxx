@@ -10,7 +10,7 @@
 //! - `e_c`: the source output's level-`L` error, under the column selection `G_(L+1)^-1(1)`, whose
 //!   `l1` is the tower count of `q_(L+1)`;
 //! - the smudge members: the child evaluator lowers the smudge Program with the same member
-//!   transform as the encoding (one finalization, then
+//!   transform as the encoding (one ModDown, without the decryption scale-up, then
 //!   [`super::RnsBggNoiseValue::constant_digit_action`] with the `l1` of the halved weights `w`),
 //!   and its smudge sum aggregates them with their provenance;
 //! - `e_b K`: the unmask hint's fresh error against the unknown preimage, bounded by `N m_B B_e

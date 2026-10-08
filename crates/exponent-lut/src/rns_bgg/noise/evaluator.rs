@@ -706,7 +706,11 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     /// Finalize one coefficient-output value: its one scale-and-round by
     /// the source ratio, with the public-key and encoding roundings (or, at
     /// the terminal level, the terminal encoding error).
-    fn finalize_coefficient(
+    /// Move the raw (scale-1) coefficient carrier `value` of `wire` down
+    /// once to the next level (or add the terminal encoding error), as the
+    /// encoding's ModDown does: the step shared by a decryption finalization
+    /// and a decoder smudge member, which then applies its own weight action.
+    fn mod_down_coefficient(
         &mut self,
         wire: WireId,
         mut value: RnsBggNoiseValue,
@@ -765,6 +769,32 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             });
             value = value.with_breakdown(breakdown);
         }
+        if ratio != BigUint::one() {
+            let source = stable_source_id(&(
+                b"rns-bgg/coefficient-final-mod-down".as_slice(),
+                self.program.id(),
+                wire,
+                level,
+            ));
+            value.provenance.insert(source, NoiseSourceProvenance { source, route: vec![level] });
+        }
+        self.add_events(&BigUint::one());
+        if let Some(node) = self.trace.dependencies.wires.get(&wire).copied() {
+            let coordinates = self.event_coordinates(wire)?;
+            *self.trace.node_event_counts.entry(node.0).or_default() += coordinates;
+        }
+        Ok(value)
+    }
+
+    /// The decryption finalization of a coefficient output: its ModDown
+    /// ([`Self::mod_down_coefficient`]), then the scale-up `G^-1(k)`.
+    fn finalize_coefficient(
+        &mut self,
+        wire: WireId,
+        value: RnsBggNoiseValue,
+    ) -> Result<RnsBggNoiseValue, RnsBggError> {
+        let level = self.level(wire)?;
+        let mut value = self.mod_down_coefficient(wire, value)?;
         // The scale-up `G^-1(k)` of the finalized carrier (see
         // `RnsBggParameters::coefficient_output_action`): a fixed right action
         // with the balanced digits of `k`, whose energy applies only to a
@@ -786,20 +816,6 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             })
         });
         value = value.with_breakdown(breakdown);
-        if ratio != BigUint::one() {
-            let source = stable_source_id(&(
-                b"rns-bgg/coefficient-final-mod-down".as_slice(),
-                self.program.id(),
-                wire,
-                level,
-            ));
-            value.provenance.insert(source, NoiseSourceProvenance { source, route: vec![level] });
-        }
-        self.add_events(&BigUint::one());
-        if let Some(node) = self.trace.dependencies.wires.get(&wire).copied() {
-            let coordinates = self.event_coordinates(wire)?;
-            *self.trace.node_event_counts.entry(node.0).or_default() += coordinates;
-        }
         Ok(value)
     }
 
@@ -1392,12 +1408,12 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         if let Some(declaration) = self.decoder_smudge.clone() &&
             declaration.smudge().lut() == lut
         {
-            // A decoder smudge member: finalized once in its root body, then
+            // A decoder smudge member: moved down once in its root body, then
             // weighted by `G^-1(w)` for its halved weight `w = 2^-1 P^digit mod
             // q`, and placed by a monomial, as the encoding does. The error
             // gain is the largest `l1(G^-1(w))` over the halved weights; the
             // payload `P^digit delta / 2` is bounded by the largest numerator.
-            let value = self.finalize_coefficient(wire, value)?;
+            let value = self.mod_down_coefficient(wire, value)?;
             let numerators = declaration.member_weights();
             let weights = self.parameters.halved_weights(level + 1, &numerators)?;
             let l1 = self.parameters.gadget_inverse_l1(level + 1, &weights)?;

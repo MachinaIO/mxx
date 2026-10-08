@@ -7,8 +7,10 @@
 //! are scheme-agnostic; the RNS-BGG adapter binds them to concrete carriers.
 //! [`simulation`] holds the noise-model settings shared with Program audits.
 //!
-//! The decoder outputs a plaintext, not an encoding: it is not a noise
-//! refresh, which would replace the encoding by one with fresh noise.
+//! The decoder outputs a plaintext, not an encoding. A decoder targets either
+//! a Program output, rounded to the next level's modulus, or one column of a
+//! noise refresh, rounded to one CRT prime ([`decoding::DecoderTarget`]);
+//! [`crate::refresh`] combines the latter into an encoding with fresh noise.
 
 pub mod decoding;
 pub mod simulation;

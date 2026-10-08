@@ -44,7 +44,7 @@ mod online_eval;
 mod verify;
 
 pub(super) use self::lowering::*;
-pub use self::verify::{decode_output, decode_public_output, verify_output};
+pub use self::verify::{decode_output, decode_public_output, refresh_error, verify_output};
 #[cfg(test)]
 use crate::{api::execute_graph, program::ExponentLutProgramBuilder};
 #[cfg(test)]
@@ -479,6 +479,10 @@ pub struct EncodingLowering<'a> {
     pub(crate) encryption: ProductionId,
     pub(crate) manifests: BTreeMap<ProductionId, Manifest>,
     pub(crate) decoder_smudge: Option<Arc<DecoderDeclaration>>,
+    /// For a child Program: the namespace `<prefix>/<role>` its imported
+    /// artifacts are published under (see `decoder_smudge_artifact_name` and
+    /// `refresh_fresh_artifact_name`).
+    pub(crate) artifact_prefix: Option<String>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
@@ -530,6 +534,15 @@ pub struct RnsEncryptBuild<'a> {
     /// Dynamic: the executed prelude production holding the RHS family
     /// ciphertexts, with its manifest.
     prelude: Option<(ProductionId, Manifest)>,
+    /// For a refresh child: the namespace its hash key is derived under.
+    hash_namespace: Option<[u8; 32]>,
+    /// The bound noise refresh: its fresh-noise child and its decoders'
+    /// smudge children, in decoder order.
+    refresh: Option<(
+        crate::refresh::RefreshDeclaration,
+        Box<RnsEncryptBuild<'a>>,
+        Vec<RnsEncryptBuild<'a>>,
+    )>,
 }
 
 /// Online evaluation builder with no backend, secrets, or plaintexts.
@@ -551,4 +564,14 @@ pub struct RnsOnlineEvalBuild<'a> {
     /// The coefficient bound of the unmask preimage, from the
     /// preprocess binding.
     unmask_preimage_bound: Option<BigUint>,
+    /// For a refresh child: the namespace its hash key is derived under.
+    hash_namespace: Option<[u8; 32]>,
+    /// The applied noise refresh: its target output index, declaration, and
+    /// fresh-noise and smudge children (in decoder order).
+    pending_refresh: Option<(
+        usize,
+        crate::refresh::RefreshDeclaration,
+        Box<RnsOnlineEvalBuild<'a>>,
+        Vec<RnsOnlineEvalBuild<'a>>,
+    )>,
 }

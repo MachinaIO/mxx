@@ -155,6 +155,23 @@ pub struct RnsPreprocessBuild<'a> {
     decoder_smudge_child: Option<PublicKeyLowering<'a>>,
     /// The preimage coefficient bound of the applied decoder's unmask key.
     unmask_bound: Option<BigUint>,
+    /// For a refresh child: the namespace its hash key is derived under (see
+    /// `rns_bgg::refresh::child_hash_key`).
+    hash_namespace: Option<[u8; 32]>,
+    /// The applied noise refresh.
+    refresh: Option<PreparedRefresh<'a>>,
+}
+
+/// A noise refresh prepared by preprocessing: its lowered children, the
+/// public `B` of the shared unmask trapdoor, one preimage per decoder (in
+/// decoder order) and their coefficient bound.
+struct PreparedRefresh<'a> {
+    declaration: crate::refresh::RefreshDeclaration,
+    fresh: PublicKeyLowering<'a>,
+    smudges: Vec<PublicKeyLowering<'a>>,
+    preimages: Vec<Preimage>,
+    public: Mat,
+    bound: BigUint,
 }
 
 #[cfg(test)]

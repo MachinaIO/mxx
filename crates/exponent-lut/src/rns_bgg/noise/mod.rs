@@ -38,12 +38,14 @@ mod audit;
 mod build;
 mod decoder;
 mod evaluator;
+mod refresh;
 mod rules;
 
 pub(crate) use self::decoder::simulate_decoder_noise;
 pub use self::{
     audit::{RnsBggNoiseTrace, RnsBggParameterManifest, RnsBggPlanRequest},
     decoder::RnsBggDecoderNoise,
+    refresh::{RnsBggRefreshNoise, simulate_refresh_noise},
 };
 
 /// Evaluator-owned noise contracts for one Program lowering.

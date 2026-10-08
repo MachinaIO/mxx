@@ -1,6 +1,6 @@
 # Exponent-LUT integration tests
 
-The integration suite contains exactly four GPU-gated targets. Each target
+The integration suite contains exactly five GPU-gated targets. Each target
 contains exactly one sequential test and runs the complete production flow:
 parameter search with noise simulation, benchmark estimation, then an
 artifact-backed round trip (preprocess, encrypt, and online evaluation). Benchmark estimation is the GPU runtime's
@@ -15,9 +15,12 @@ at `info` level (run with `RUST_LOG=info` to see it).
 | `lwr_prf.rs` | `lwr_prf_end_to_end` | Sparse-LWR PRF |
 | `public_ip.rs` | `public_ip_end_to_end` | Public inner product |
 | `decoder.rs` | `decoder_round_trip` | Smudged trapdoor decoder of a Program output |
+| `refresh.rs` | `refresh_round_trip` | Noise refresh of a Program output's encoding row |
 
 The workflows use the public RNS-BGG application API (the decoder target applies
-the PRF-smudged decoder to the output of an identity Program), and all four
+the PRF-smudged decoder to the output of an identity Program, and the refresh
+target refreshes that output's encoding row, on fixed small chains without a
+lattice-security gate), and all five
 take the `dcrt_runtime` sequential lock. They require the `gpu` feature and a
 GPU-visible environment. Before execution, the NAND and Sparse-LWR targets
 search their configured CRT-depth and ring-dimension candidates, validate the
@@ -66,11 +69,11 @@ cargo test -r -p mxx-exponent-lut --features gpu \
   --test lwr_prf lwr_prf_end_to_end -- --nocapture
 ```
 
-Compile all four targets without running them:
+Compile all five targets without running them:
 
 ```sh
 cargo test -r -p mxx-exponent-lut --features gpu \
-  --test nand_circuit --test lwr_prf --test public_ip --test decoder --no-run
+  --test nand_circuit --test lwr_prf --test public_ip --test decoder --test refresh --no-run
 ```
 
 Run one target when GPU execution is explicitly authorized:

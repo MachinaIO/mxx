@@ -832,6 +832,7 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),

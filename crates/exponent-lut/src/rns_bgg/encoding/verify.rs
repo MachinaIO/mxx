@@ -311,6 +311,117 @@ where
     Ok(value)
 }
 
+/// The error `e' = y - (s A' - Delta mu G_Q)` of the refreshed row `y`
+/// (output `refresh` of an [`crate::api::online_eval`] with
+/// `declaration`'s refresh of `source`) for the target plaintext `expected`
+/// (a signed monomial `c X^k`), under the caller's mask (for Dynamic
+/// parameters, the payload secret): per gadget column of `G_Q`, the `n`
+/// coefficients centered modulo `Q`. `A'` is sampled from `hash_key`, and
+/// `Delta` and `G_Q` are those of the target's level. The graph is the one
+/// check of the workflow: its inputs are the row (`refresh-row`), the mask,
+/// the hash key and the plaintext `refresh-expected.coefficient` and
+/// `refresh-expected.exponent`; its output `refresh-error` is the row error.
+#[allow(clippy::too_many_arguments)]
+pub fn refresh_error<E, S, P>(
+    declaration: &crate::refresh::RefreshDeclaration,
+    source: &ExponentLutProgram,
+    result: &StageOutputs,
+    parameters: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    mask: Option<&RnsBggMaskSecret>,
+    expected: &P,
+    hash_key: &[u8],
+    execution: &mut E,
+    store: &mut S,
+) -> Result<Vec<Vec<BigInt>>, ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+    P: Poly,
+{
+    let level = parameters.refresh_level(declaration, source).map_err(ApiError::scheme)?;
+    let ring = parameters.ring(level).map_err(ApiError::scheme)?;
+    let columns = parameters.level(level).map_err(ApiError::scheme)?.modulus_digits();
+    let mut runtime = BTreeMap::new();
+    runtime.insert(
+        "refresh-row".to_owned(),
+        result
+            .outputs
+            .get("refresh")
+            .ok_or_else(|| ApiError::input("the refreshed row is missing"))?
+            .clone(),
+    );
+    runtime.insert(super::HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.into()));
+    let expected = match super::plaintext_inputs(
+        &ring,
+        "refresh-expected",
+        &InputBinding::Scalar(expected.clone()),
+        &mut runtime,
+    )
+    .map_err(ApiError::input)?
+    {
+        InputBinding::Scalar(expected) => expected,
+        InputBinding::Family(_) => unreachable!("a scalar plaintext binds a scalar"),
+    };
+    let mask = &stage_mask(parameters, payload, mask)?;
+    let s = reduce_secret(parameters, &mask.row, level).map_err(ApiError::scheme)?;
+    let a_prime = parameters
+        .refresh_matrix(level, ring.bytes_input(super::HASH_KEY_INPUT, hash_key.len()), declaration)
+        .map_err(ApiError::scheme)?;
+    let a_row = |row: usize| {
+        a_prime.clone().slice(
+            Some(mxx_ir_core::node::IndexRange {
+                start: IntExpr::constant(row),
+                end: IntExpr::constant(row + 1),
+            }),
+            None,
+        )
+    };
+    let delta = parameters
+        .scalar(level, parameters.message_scale(level).map_err(ApiError::scheme)?)
+        .map_err(ApiError::scheme)?;
+    let error = ring.input("refresh-row", (1, columns)) -
+        (s.0 * a_row(0) + s.1 * a_row(1) -
+            delta * expected * parameters.public_gadget(level).map_err(ApiError::scheme)?);
+    let graph = DslContext::new("rns-bgg-refresh-error")
+        .output("refresh-error", error)
+        .map_err(ApiError::scheme)?
+        .build()
+        .map_err(ApiError::scheme)?;
+    if let Some(binding) = &mask.binding {
+        binding.bind(&mut runtime);
+    }
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
+        execution,
+        store,
+        |_| Ok(()),
+    )?;
+    let error = execution.download_matrix(
+        outputs
+            .outputs
+            .get("refresh-error")
+            .ok_or_else(|| ApiError::input("the refresh error is missing"))?,
+    )?;
+    let modulus =
+        BigInt::from(parameters.level(level).map_err(ApiError::scheme)?.modulus().as_ref().clone());
+    Ok((0..columns)
+        .map(|column| {
+            error
+                .entry(0, column)
+                .coeffs_biguints()
+                .into_iter()
+                .map(|value| {
+                    let value = BigInt::from(value);
+                    if &value * 2u8 > modulus { value - &modulus } else { value }
+                })
+                .collect()
+        })
+        .collect())
+}
+
 fn verify_output_at_level<E, S, P>(
     program: &ExponentLutProgram,
     result: &StageOutputs,
@@ -549,6 +660,7 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),

@@ -20,6 +20,11 @@
 //!   `mono(0)`: one private multiplication by an RHS bound to one per PRF bucket keeps it at the
 //!   PRF's level, and the PRF's readout LUT and the sampling LUT read it at `z = 0` (`e = 1`, sign
 //!   `+`), giving `h` at the level of the samples.
+//!
+//! [`PrfSampler::binary_polynomial`] and [`PrfSampler::cbd_polynomial`] pack `N` samples, one per
+//! member, into one polynomial `sum_o s_o X^o`: each member is placed at `X^o` by a monomial
+//! [`ExponentLutProgramBuilder::mul_small_constant`], which leaves its noise unchanged, and the
+//! members are summed.
 use crate::{
     api::PlaintextInputs,
     program::{
@@ -187,6 +192,71 @@ impl PrfSampler {
             }
         };
         Ok(Self { prf, distribution, lut, offset_rhs, output })
+    }
+
+    /// The uniform binary polynomial `sum_o b_o X^o` over `Z_(q_min)` of the
+    /// first `count` coefficients (the ring dimension by default), one PRF
+    /// member and key layout per coefficient (see [`Self::polynomial`]).
+    pub fn binary_polynomial(
+        builder: &mut ExponentLutProgramBuilder,
+        profile: SparseLwrPrfProfile,
+        layouts: Vec<PbcPublicLayout>,
+        count: Option<usize>,
+        q_min: u64,
+    ) -> Result<(Self, WireId), PrfSamplerError> {
+        Self::polynomial(builder, profile, layouts, count, PrfDistribution::Binary { q_min })
+    }
+
+    /// The centered binomial polynomial `sum_o e_o X^o` with `e_o` from
+    /// `CBD_eta`, of the first `count` coefficients (the ring dimension by
+    /// default), one PRF member and key layout per coefficient (see
+    /// [`Self::polynomial`]).
+    pub fn cbd_polynomial(
+        builder: &mut ExponentLutProgramBuilder,
+        profile: SparseLwrPrfProfile,
+        layouts: Vec<PbcPublicLayout>,
+        count: Option<usize>,
+        eta: u32,
+    ) -> Result<(Self, WireId), PrfSamplerError> {
+        Self::polynomial(builder, profile, layouts, count, PrfDistribution::Cbd { eta })
+    }
+
+    /// The sampler of `count` members (the profile's ring dimension by
+    /// default, at most it; `layouts` holds one layout per member) and the
+    /// coefficient wire `sum_o s_o X^o` of its samples: member `o` is placed
+    /// at `X^o` and the members are summed. The wire's coefficient bound is
+    /// the sum of the members' bounds, although each coefficient holds one
+    /// sample.
+    fn polynomial(
+        builder: &mut ExponentLutProgramBuilder,
+        profile: SparseLwrPrfProfile,
+        layouts: Vec<PbcPublicLayout>,
+        count: Option<usize>,
+        distribution: PrfDistribution,
+    ) -> Result<(Self, WireId), PrfSamplerError> {
+        let ring_dimension = profile.ring_dimension()?;
+        let count = count.unwrap_or(ring_dimension);
+        if count == 0 || count > ring_dimension || layouts.len() != count {
+            return Err(PrfSamplerError::InvalidDistribution);
+        }
+        let sampler = Self::build(builder, profile, layouts, distribution)?;
+        let polynomial = match sampler.output {
+            PrfOutput::Scalar(sample) => sample,
+            PrfOutput::Family(family) => {
+                let range = FamilyRange::full(IntExpr::constant(count))?;
+                let placed = builder.parallel(range, |builder, member| {
+                    builder
+                        .mul_small_constant(
+                            Operand::Member { family, index: member.clone() },
+                            vec![1],
+                            member,
+                        )
+                        .map(Operand::Scalar)
+                })?;
+                builder.sum(placed)?
+            }
+        };
+        Ok((sampler, polynomial))
     }
 
     /// The PRF the samples are read from.
@@ -511,24 +581,41 @@ mod tests {
     /// (sigma 0) in a ring of dimension 16 with three 17-bit primes at every
     /// level; with it, the chain is the first the noise audit accepts (see
     /// [`planned_parameters`]).
+    ///
+    /// With `packed`, the Program instead outputs the polynomial of the
+    /// member samples (see [`PrfSampler::polynomial`]; sixteen members use
+    /// its default count), which decrypts to sample `o` at coefficient `o`.
     fn check_round_trip(
         distribution: PrfDistribution,
         members: usize,
+        packed: bool,
         sigma: Option<bigdecimal::BigDecimal>,
     ) {
         // n = 16, n' = 8, Q = 16, P = 16 over an LWR dimension of four.
         let profile =
             SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 16, 4).unwrap();
         let keys = crate::decoder::decoding::fixture::keys(members);
-        let (program, sampler) = sampler_on(profile, &keys, distribution).unwrap();
+        let (program, sampler) = if packed {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let layouts = keys.iter().map(|key| key.public_layout.clone()).collect();
+            let count = (members != profile.ring_dimension().unwrap()).then_some(members);
+            let (sampler, polynomial) =
+                PrfSampler::polynomial(&mut builder, profile, layouts, count, distribution)
+                    .unwrap();
+            (builder.finish(vec![Operand::Scalar(polynomial)]).unwrap(), sampler)
+        } else {
+            sampler_on(profile, &keys, distribution).unwrap()
+        };
         let samples = samples(&program, &sampler);
         // The binary offset is the sample at `z = 0`, added as an encoding.
         let offset = match distribution {
             PrfDistribution::Binary { .. } => samples[0],
             PrfDistribution::Cbd { .. } => 0,
         };
-        let bound = samples.iter().map(|sample| sample.unsigned_abs()).max().unwrap() +
+        let sample_bound = samples.iter().map(|sample| sample.unsigned_abs()).max().unwrap() +
             offset.unsigned_abs();
+        // A packed polynomial's bound sums its members' bounds.
+        let bound = if packed { sample_bound * members as u64 } else { sample_bound };
         let parameters = match &sigma {
             Some(sigma) => planned_parameters(&program, &sampler, sigma, bound),
             None => {
@@ -608,21 +695,32 @@ mod tests {
                 DCRTPoly::from_usize_to_constant(terminal, value.unsigned_abs() as usize);
             if value < 0 { -constant } else { constant }
         };
-        for (index, key) in keys.iter().enumerate() {
-            let z = crate::program_gadgets::pbc::clear_pbc_inner_product(
-                &key.public_layout,
-                key.private_schedule(),
-                &a,
-                q as u64,
-            )
-            .unwrap() as usize;
-            let expected = samples[z] + offset;
-            let verify = |value: i64, execution: &mut CpuExecution, store: &mut _| {
+        let expected = keys
+            .iter()
+            .map(|key| {
+                let z = crate::program_gadgets::pbc::clear_pbc_inner_product(
+                    &key.public_layout,
+                    key.private_schedule(),
+                    &a,
+                    q as u64,
+                )
+                .unwrap() as usize;
+                samples[z] + offset
+            })
+            .collect::<Vec<_>>();
+        if let PrfDistribution::Binary { q_min } = distribution {
+            for value in &expected {
+                let bit = value.rem_euclid(q_min as i64);
+                assert!(bit == 0 || bit == 1, "{value} mod {q_min}");
+            }
+        }
+        let verify =
+            |index: usize, value: &DCRTPoly, execution: &mut CpuExecution, store: &mut _| {
                 verify_output(
                     &program,
                     &result,
                     index,
-                    &plaintext(value),
+                    value,
                     &parameters,
                     &payload,
                     Some(&mask),
@@ -630,41 +728,64 @@ mod tests {
                     store,
                 )
             };
-            verify(expected, &mut execution, &mut store)
+        let decode =
+            |index: usize, positions: &[usize], execution: &mut CpuExecution, store: &mut _| {
+                decode_output(
+                    &program,
+                    &result,
+                    index,
+                    &parameters,
+                    &payload,
+                    Some(&mask),
+                    positions,
+                    execution,
+                    store,
+                    |_| Ok(()),
+                )
+                .unwrap()
+            };
+        if packed {
+            let polynomial = expected.iter().enumerate().fold(
+                DCRTPoly::const_zero(terminal),
+                |sum, (o, value)| {
+                    sum + plaintext(*value) * DCRTPoly::const_rotate_poly(terminal, o)
+                },
+            );
+            verify(0, &polynomial, &mut execution, &mut store)
+                .unwrap_or_else(|error| panic!("{distribution:?}: {error:?}"));
+            let wrong = polynomial + DCRTPoly::const_one(terminal);
+            assert!(verify(0, &wrong, &mut execution, &mut store).is_err());
+            let positions = (0..members).collect::<Vec<_>>();
+            assert_eq!(
+                decode(0, &positions, &mut execution, &mut store),
+                expected.iter().map(|value| BigInt::from(value.rem_euclid(t))).collect::<Vec<_>>(),
+                "{distribution:?}"
+            );
+            return;
+        }
+        for (index, value) in expected.iter().enumerate() {
+            verify(index, &plaintext(*value), &mut execution, &mut store)
                 .unwrap_or_else(|error| panic!("{distribution:?} output {index}: {error:?}"));
-            assert!(verify(expected + 1, &mut execution, &mut store).is_err());
-            let decoded = decode_output(
-                &program,
-                &result,
-                index,
-                &parameters,
-                &payload,
-                Some(&mask),
-                &[0],
-                &mut execution,
-                &mut store,
-                |_| Ok(()),
-            )
-            .unwrap();
-            assert_eq!(decoded, vec![BigInt::from(expected.rem_euclid(t))], "{distribution:?}");
-            if let PrfDistribution::Binary { q_min } = distribution {
-                let bit = expected.rem_euclid(q_min as i64);
-                assert!(bit == 0 || bit == 1, "z = {z}: {expected} mod {q_min}");
-            }
+            assert!(verify(index, &plaintext(value + 1), &mut execution, &mut store).is_err());
+            assert_eq!(
+                decode(index, &[0], &mut execution, &mut store),
+                vec![BigInt::from(value.rem_euclid(t))],
+                "{distribution:?}"
+            );
         }
     }
 
     #[test]
     fn cbd_round_trips_on_the_cpu() {
         for members in [1, 2] {
-            check_round_trip(PrfDistribution::Cbd { eta: 2 }, members, None);
+            check_round_trip(PrfDistribution::Cbd { eta: 2 }, members, false, None);
         }
     }
 
     #[test]
     fn binary_round_trips_on_the_cpu() {
         for members in [1, 2] {
-            check_round_trip(PrfDistribution::Binary { q_min: 7 }, members, None);
+            check_round_trip(PrfDistribution::Binary { q_min: 7 }, members, false, None);
         }
     }
 
@@ -675,8 +796,42 @@ mod tests {
         for distribution in [PrfDistribution::Cbd { eta: 2 }, PrfDistribution::Binary { q_min: 7 }]
         {
             for members in [1, 2] {
-                check_round_trip(distribution, members, Some(sigma.clone()));
+                check_round_trip(distribution, members, false, Some(sigma.clone()));
             }
         }
+    }
+
+    /// The packed binary and CBD polynomials with encoding noise of sigma
+    /// one: four coefficients, and the default count of the ring dimension.
+    #[test]
+    fn noisy_polynomial_round_trips_on_the_cpu() {
+        let sigma = bigdecimal::BigDecimal::from(1);
+        for distribution in [PrfDistribution::Cbd { eta: 2 }, PrfDistribution::Binary { q_min: 7 }]
+        {
+            for members in [4, 16] {
+                check_round_trip(distribution, members, true, Some(sigma.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn polynomial_count_is_at_most_the_ring_dimension_and_matches_the_layouts() {
+        let keys = keys(2);
+        let layouts = || keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
+        let build = |count| {
+            PrfSampler::cbd_polynomial(
+                &mut ExponentLutProgramBuilder::new(),
+                profile(),
+                layouts(),
+                count,
+                1,
+            )
+            .map(|_| ())
+        };
+        assert!(build(Some(2)).is_ok());
+        // The default count is the ring dimension, 32, not the two layouts.
+        assert_eq!(build(None), Err(PrfSamplerError::InvalidDistribution));
+        assert_eq!(build(Some(3)), Err(PrfSamplerError::InvalidDistribution));
+        assert_eq!(build(Some(0)), Err(PrfSamplerError::InvalidDistribution));
     }
 }

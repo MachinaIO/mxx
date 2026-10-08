@@ -43,6 +43,14 @@ pub trait ExponentLUTProgramLowering {
         rhs: &Self::Rhs,
     ) -> Result<Self::Wire, Self::Error>;
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error>;
+    /// Multiply by the fixed small polynomial `c(X) X^shift` (`c_i` at
+    /// `X^i`); `shift` has the enclosing loop indices substituted.
+    fn mul_small_constant(
+        &mut self,
+        input: &Self::Wire,
+        coefficients: &[i64],
+        shift: &IntExpr,
+    ) -> Result<Self::Wire, Self::Error>;
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +262,15 @@ where
                         evaluator.lut(&input, table).map_err(ProgramLowerError::Backend)
                     })?)
                 }
+                Step::MulSmallConstant { input, coefficients, shift, .. } => {
+                    let input = resolve_wire(input, families, environment, indices)?;
+                    let shift = substitute_indices(shift, indices)?;
+                    LoweredValue::Scalar(with_site(evaluator, site, |evaluator| {
+                        evaluator
+                            .mul_small_constant(&input, coefficients, &shift)
+                            .map_err(ProgramLowerError::Backend)
+                    })?)
+                }
                 Step::Parallel { range, body, .. } => {
                     let range = FamilyRange::bounded(
                         substitute_indices(range.start(), indices)?,
@@ -342,6 +359,7 @@ fn step_output(step: &Step) -> WireId {
         Step::MulPublic { output, .. } |
         Step::MulPrivate { output, .. } |
         Step::Lut { output, .. } |
+        Step::MulSmallConstant { output, .. } |
         Step::Parallel { output, .. } |
         Step::Sum { output, .. } => *output,
     }
@@ -521,6 +539,14 @@ mod tests {
             let values = table.values().expect("LUT values");
             self.luts.push(values.to_vec());
             Ok(*input + values.iter().sum::<usize>() as i32)
+        }
+        fn mul_small_constant(
+            &mut self,
+            input: &Self::Wire,
+            coefficients: &[i64],
+            _: &IntExpr,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(input * coefficients.iter().sum::<i64>() as i32)
         }
     }
 

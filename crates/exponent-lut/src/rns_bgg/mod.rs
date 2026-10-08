@@ -1259,6 +1259,34 @@ fn map_row(row: RnsBggRow, mut operation: impl FnMut(Mat) -> Mat) -> RnsBggRow {
     (operation(row.0), operation(row.1))
 }
 
+/// `entry * c(X) X^shift` in `ring` for the small constant of
+/// [`crate::program::ExponentLutProgramBuilder::mul_small_constant`]. A
+/// signed monomial is applied as one monomial product.
+fn mul_small_constant_entry(ring: &Ring, entry: Mat, coefficients: &[i64], shift: &IntExpr) -> Mat {
+    let terms = coefficients
+        .iter()
+        .enumerate()
+        .filter(|(_, coefficient)| **coefficient != 0)
+        .collect::<Vec<_>>();
+    let shifted = |entry: Mat, power: usize| {
+        let exponent = IntExpr::Add(Box::new(shift.clone()), Box::new(IntExpr::constant(power)))
+            .canonicalize();
+        if exponent == IntExpr::constant(0) {
+            entry
+        } else {
+            entry.multiply_monomial(mxx_dsl::Int::from(exponent))
+        }
+    };
+    match terms.as_slice() {
+        [(power, 1)] => shifted(entry, *power),
+        _ => shifted(
+            ring.polynomial(coefficients.iter().map(|coefficient| IntExpr::constant(*coefficient))) *
+                entry,
+            0,
+        ),
+    }
+}
+
 fn map_matrix(matrix: RnsBggMatrix, mut operation: impl FnMut(Mat) -> Mat) -> RnsBggMatrix {
     ((operation(matrix.0.0), operation(matrix.0.1)), (operation(matrix.1.0), operation(matrix.1.1)))
 }

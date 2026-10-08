@@ -196,6 +196,7 @@ impl ExponentLutProgramBuilder {
             Step::MulPublic { output, .. } |
             Step::MulPrivate { output, .. } |
             Step::Lut { output, .. } |
+            Step::MulSmallConstant { output, .. } |
             Step::Parallel { output, .. } |
             Step::Sum { output, .. } => *output,
         };
@@ -245,6 +246,28 @@ impl ExponentLutProgramBuilder {
         let rhs_knowledge = self.operand_knowledge(&rhs)?;
         let output = self.wire()?;
         self.output(false, rhs_knowledge, Step::MulPublic { lhs, rhs, output })
+    }
+
+    /// Append `input * c(X) X^shift` for the fixed small polynomial `c` with
+    /// coefficients `coefficients` (`c_i` at `X^i`, at least one nonzero).
+    /// `shift` may read the enclosing loop indices, so a family body can
+    /// place each member at its own power of `X`. The output keeps the
+    /// input's knowledge and representation; a coefficient bound grows by
+    /// `||c||_1`. An exponent input is a signed monomial only when `c` has a
+    /// single coefficient of magnitude one, which LUT consumers rely on.
+    pub fn mul_small_constant(
+        &mut self,
+        input: Operand<WireId>,
+        coefficients: Vec<i64>,
+        shift: IntExpr,
+    ) -> Result<WireId, ProgramValidationError> {
+        if self.operand_wire(&input)? {
+            return Err(ProgramValidationError::ExpectedScalarWire(WireId(0)));
+        }
+        super::check_small_constant(&coefficients, &shift, (self.bodies.len() - 1) as u32)?;
+        let knowledge = self.operand_knowledge(&input)?;
+        let output = self.wire()?;
+        self.output(false, knowledge, Step::MulSmallConstant { input, coefficients, shift, output })
     }
 
     pub fn mul_private(

@@ -496,6 +496,12 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                         range: range.clone(),
                     }
                 }
+                crate::noise_utils::NoiseDependencyNode::MulSmallConstant { gate, input } => {
+                    crate::noise_utils::NoiseDependencyNode::MulSmallConstant {
+                        gate: *gate,
+                        input: shift(*input),
+                    }
+                }
             };
             self.trace.dependencies.nodes.push(node);
         }
@@ -1060,6 +1066,58 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         };
         // A public factor keeps the zero payloads of the right operand.
         if let Some(count) = self.lane_support(rhs.0).cloned() {
+            self.set_lane_support(wire, count);
+        }
+        self.operation_node(wire, value, node)
+    }
+    fn mul_small_constant(
+        &mut self,
+        input: &Self::Wire,
+        coefficients: &[i64],
+        _: &IntExpr,
+    ) -> Result<Self::Wire, Self::Error> {
+        let wire = self.site()?.output;
+        let l1 = BigUint::from(
+            crate::program::small_constant_l1(coefficients)
+                .ok_or(RnsBggError::Parameters("small constant l1 overflow"))?,
+        );
+        // E_out = E c: every error coefficient is a signed sum of `||c||_1`
+        // weighted coefficients of E, so the bound and the mean gain scale
+        // by `||c||_1` and the variance by its square, as for a public
+        // plaintext multiplier. A single term `c X^k` permutes and scales the
+        // coefficients uniformly, so it keeps a contribution's covariance
+        // bound; a monomial (`|c| = 1`) leaves the noise unchanged.
+        let single_term = crate::program::small_constant_is_single_term(coefficients);
+        let gain = NonnegativeRational::new(l1.clone(), BigUint::one())
+            .expect("a nonzero small constant has a positive l1 norm");
+        let l1_squared = l1.pow(2);
+        let breakdown = input.1.contributions("mul-small-constant").map(|terms| {
+            terms.transform(|term| {
+                (
+                    gain.clone(),
+                    term.moments.variance.scaled(&l1_squared),
+                    term.covariance_bounded && single_term,
+                )
+            })
+        });
+        let value = self.carry_provenance(
+            RnsBggNoiseValue {
+                bound: input.1.bound.mul_public(&l1),
+                payload_l2_squared: &input.1.payload_l2_squared * &l1_squared,
+                moments: None,
+                provenance: BTreeMap::new(),
+                heuristics: input.1.heuristics.clone(),
+                breakdown: None,
+            }
+            .with_breakdown(breakdown),
+            [input.1.provenance.clone()],
+        );
+        let node = crate::noise_utils::NoiseDependencyNode::MulSmallConstant {
+            gate: Some(wire),
+            input: self.node_for_wire(input.0)?,
+        };
+        // A constant factor keeps the zero payloads of its operand.
+        if let Some(count) = self.lane_support(input.0).cloned() {
             self.set_lane_support(wire, count);
         }
         self.operation_node(wire, value, node)

@@ -389,6 +389,14 @@ mod tests {
             assert!(table.input_width() > 0);
             Ok(input.clone())
         }
+        fn mul_small_constant(
+            &mut self,
+            input: &Self::Wire,
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(input.clone())
+        }
     }
 
     impl ProgramLoweringContext for GraphEvaluator {

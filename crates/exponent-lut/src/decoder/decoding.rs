@@ -594,6 +594,14 @@ mod tests {
             self.luts += 1;
             Ok(())
         }
+        fn mul_small_constant(
+            &mut self,
+            _: &(),
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<(), CounterError> {
+            Ok(())
+        }
     }
 
     impl crate::program::ProgramLoweringContext for Counter {

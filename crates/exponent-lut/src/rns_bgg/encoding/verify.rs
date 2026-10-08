@@ -1003,4 +1003,204 @@ mod test {
             assert_eq!(decoded, vec![BigInt::from(value.rem_euclid(t as i64))], "{mode:?}");
         }
     }
+
+    /// `X^k` in the negacyclic ring of `level`.
+    fn monomial(level: &DCRTPolyParams, k: usize) -> DCRTPoly {
+        let n = level.ring_dimension() as usize;
+        let value = DCRTPoly::const_rotate_poly(level, k % n);
+        if (k / n) % 2 == 1 { -value } else { value }
+    }
+
+    /// The private member family `X^(e_o)`, `o < exponents.len()`, and its
+    /// plaintext binding.
+    fn monomial_family(
+        builder: &mut ExponentLutProgramBuilder,
+        level: &DCRTPolyParams,
+        exponents: &[usize],
+    ) -> (WireId, crate::api::PlaintextInputs<WireId, DCRTPoly>) {
+        let input = builder
+            .input_family(IntExpr::constant(exponents.len()), AttributeKnowledge::PrivatePayload)
+            .unwrap();
+        let members = exponents.iter().map(|e| monomial(level, *e)).collect();
+        (input, BTreeMap::from([(input, InputBinding::Family(members))]))
+    }
+
+    /// A family body multiplies member `X^(e_o)` by `c = 2 - X^2` shifted to
+    /// `X^o`, and the members are summed: verification accepts
+    /// `sum_o (2 - X^2) X^(e_o + o)`, including a negacyclic wrap, and
+    /// rejects its successor.
+    #[test]
+    fn small_constant_multiplies_exponent_members_in_place() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let exponents = [1, 5, 14];
+        let mut builder = ExponentLutProgramBuilder::new();
+        let (input, lhs) = monomial_family(&mut builder, &level, &exponents);
+        let placed = builder
+            .parallel(
+                crate::program::FamilyRange::full(IntExpr::constant(exponents.len())).unwrap(),
+                |b, o| {
+                    b.mul_small_constant(
+                        Operand::Member { family: input, index: o.clone() },
+                        vec![2, 0, -1],
+                        o,
+                    )
+                    .map(Operand::Scalar)
+                },
+            )
+            .unwrap();
+        let output = builder.sum(placed).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let expected =
+            exponents.iter().enumerate().fold(DCRTPoly::const_zero(&level), |sum, (o, e)| {
+                let two = DCRTPoly::from_usize_to_constant(&level, 2);
+                sum + two * monomial(&level, e + o) - monomial(&level, e + o + 2)
+            });
+        let mut execution =
+            mxx_backends::authority::CpuExecution::new(cpu_backend([level.clone()]));
+        let mut store = MemoryArtifactStore::default();
+        let (result, payload, mask) =
+            run_without_rhs(&parameters, &program, &lhs, &mut execution, &mut store);
+        let verify = |expected: &DCRTPoly, execution: &mut _, store: &mut _| {
+            verify_output(
+                &program,
+                &result,
+                0,
+                expected,
+                &parameters,
+                &payload,
+                mask.as_ref(),
+                execution,
+                store,
+            )
+        };
+        verify(&expected, &mut execution, &mut store).unwrap();
+        let wrong = expected + DCRTPoly::const_one(&level);
+        assert!(verify(&wrong, &mut execution, &mut store).is_err());
+    }
+
+    /// Coefficient LUT samples `T[e_o]` placed at `X^o` by a monomial small
+    /// constant and summed: the finalized output decrypts to `T[e_o]` at
+    /// coefficient `o`, under both RHS modes.
+    #[test]
+    fn small_constant_places_coefficient_samples() {
+        for mode in [RhsMode::Static, RhsMode::Dynamic] {
+            let parameters = unequal_width_parameters(mode);
+            let level = parameters.levels()[0].clone();
+            let exponents = [3, 9, 12];
+            let values = (0..16).map(|e| e % 7).collect::<Vec<_>>();
+            let mut builder = ExponentLutProgramBuilder::new();
+            let (input, lhs) = monomial_family(&mut builder, &level, &exponents);
+            let table = builder
+                .register_lut(
+                    LutTable::unary(
+                        16,
+                        ExpLayout { stride_log2: 0, width_log2: 4 },
+                        7,
+                        values.clone(),
+                        crate::program::LutOutputRepresentation::Coefficient,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let placed = builder
+                .parallel(
+                    crate::program::FamilyRange::full(IntExpr::constant(exponents.len())).unwrap(),
+                    |b, o| {
+                        let sample =
+                            b.lut(Operand::Member { family: input, index: o.clone() }, table)?;
+                        b.mul_small_constant(Operand::Scalar(sample), vec![1], o)
+                            .map(Operand::Scalar)
+                    },
+                )
+                .unwrap();
+            let output = builder.sum(placed).unwrap();
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            let terminal = parameters.levels()[1].clone();
+            let mut coefficients = vec![0; 16];
+            for (o, e) in exponents.iter().enumerate() {
+                coefficients[o] = values[*e] as u32;
+            }
+            let expected = DCRTPoly::from_u32s(&terminal, &coefficients);
+            let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+                parameters.levels().iter().cloned(),
+            ));
+            let mut store = MemoryArtifactStore::default();
+            let (result, payload, mask) =
+                run_without_rhs(&parameters, &program, &lhs, &mut execution, &mut store);
+            verify_output(
+                &program,
+                &result,
+                0,
+                &expected,
+                &parameters,
+                &payload,
+                mask.as_ref(),
+                &mut execution,
+                &mut store,
+            )
+            .unwrap_or_else(|error| panic!("{mode:?}: {error:?}"));
+            let decoded = decode_output(
+                &program,
+                &result,
+                0,
+                &parameters,
+                &payload,
+                mask.as_ref(),
+                &[0, 1, 2, 3],
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let mut expected =
+                exponents.iter().map(|e| BigInt::from(values[*e])).collect::<Vec<_>>();
+            expected.push(BigInt::from(0u8));
+            assert_eq!(decoded, expected, "{mode:?}");
+        }
+    }
+
+    /// The simulated noise of `input * c` against that of `input`: a monomial
+    /// leaves the bound unchanged and `3 - 2 X^2` multiplies it by five.
+    #[test]
+    fn small_constant_noise_is_exact_for_monomials() {
+        let parameters = unequal_width_parameters(RhsMode::Static);
+        let bound = |coefficients: Option<Vec<i64>>| {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+            let output = match coefficients {
+                Some(coefficients) => builder
+                    .mul_small_constant(Operand::Scalar(input), coefficients, IntExpr::constant(3))
+                    .unwrap(),
+                None => input,
+            };
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+            let bindings = crate::rns_bgg::RnsBggNoiseBindings::from_inputs(
+                &program,
+                &[crate::rns_bgg::RnsBggNoiseValue::sampled_encoding(
+                    &parameters,
+                    b"small-constant-input",
+                    &[BigInt::from(1u8)],
+                )],
+                &[],
+            )
+            .unwrap();
+            crate::api::noise_simulate(
+                &program,
+                crate::rns_bgg::RnsNoiseBuild::new(&parameters, &program, &workload, &bindings)
+                    .unwrap(),
+                |_, outputs| Ok(outputs),
+            )
+            .unwrap()
+            .outputs[0]
+                .bound
+                .clone()
+        };
+        let identity = bound(None);
+        assert_eq!(bound(Some(vec![0, -1])), identity);
+        let scaled = bound(Some(vec![3, 0, -2]));
+        assert_eq!(scaled.error, &identity.error * 5u8);
+        assert_eq!(scaled.payload_l1, &identity.payload_l1 * 5u8);
+    }
 }

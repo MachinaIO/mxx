@@ -299,6 +299,14 @@ mod tests {
         fn lut(&mut self, _: &usize, _: &crate::program::LutTable) -> Result<usize, DepthError> {
             Err(DepthError)
         }
+        fn mul_small_constant(
+            &mut self,
+            _: &usize,
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<usize, DepthError> {
+            Err(DepthError)
+        }
     }
 
     impl ProgramLoweringContext for Depth {

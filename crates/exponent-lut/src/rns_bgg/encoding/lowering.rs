@@ -622,6 +622,28 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
     /// companion keys and encodings.
     type Rhs = (RnsBggMatrix, RhsRef<Int>);
     type Error = RnsBggError;
+    /// The key, the rows and a public payload are each multiplied by the
+    /// plaintext `c` (see the public-key lowering).
+    fn mul_small_constant(
+        &mut self,
+        input: &Self::Wire,
+        coefficients: &[i64],
+        shift: &IntExpr,
+    ) -> Result<Self::Wire, Self::Error> {
+        let ring = self.parameters.ring(self.workload.level(input.wire())?)?;
+        let multiply =
+            |entry: Mat| super::mul_small_constant_entry(&ring, entry, coefficients, shift);
+        let output = self.site()?.output;
+        let public_key =
+            RnsBggPublicKey::new(output, map_matrix(input.public_key.matrix.clone(), multiply));
+        let public_payload = input.public_payload.clone().map(multiply);
+        let public_payload = self.checked_payload(output, public_payload)?;
+        Ok(RnsBggEncoding::new(
+            public_key,
+            (multiply(input.row.0.clone()), multiply(input.row.1.clone())),
+            public_payload,
+        ))
+    }
     fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
         if self.workload.level(lhs.wire())? != self.workload.level(rhs.wire())? {
             return Err(RnsBggError::Binding("Add key level mismatch"));

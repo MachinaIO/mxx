@@ -9,7 +9,8 @@
 //! probability at most `2^-FAILURE_EXPONENT`, see `mxx_pe::noise::simulate_average`) and both
 //! Ring-LWE instances of [`PeParameters::security_bits`] (the encryption secret and TrapGen) reach
 //! the target according to `lattice-estimator-cli`, which must be on `PATH` with its Sage
-//! environment. Every cutoff is derived from the tail budget of `STATISTICAL_BITS`.
+//! environment. Every cutoff is the sampler's default (`6.5 sigma`, and the default preimage
+//! cutoff for the key).
 //!
 //! On the accepted parameters, every stage runs on the GPU with file-backed artifacts: setup,
 //! one encryption of a random attribute and a random binary message, and keys for two random
@@ -36,7 +37,6 @@
 //! | `CRT_BITS`, `BASE_BITS` | 50, `ceil(CRT_BITS / 2)` | CRT prime and gadget base widths |
 //! | `ERROR_SIGMA`, `FLOODING_SIGMA`, `PROGRAMMING_SIGMA` | 3.19 | Sigmas of `chi`, `chi_fl`, `Z_t` |
 //! | `TRAPDOOR_SIGMA` | 4.578 | TrapGen sigma |
-//! | `STATISTICAL_BITS` | 40 | Tail budget of every cutoff |
 //! | `NOISE_MODEL`, `FAILURE_EXPONENT` | `worst`, 100 | Noise model of the correctness check |
 //! | `SECURITY_BITS` | 128 | Required lattice security of both instances |
 
@@ -171,7 +171,6 @@ fn recorded(row: &ParameterRow) -> (PeParameters, PeNoiseReport, BranchingProgra
         error_sigma: column(row, "error_sigma"),
         flooding_sigma: column(row, "flooding_sigma"),
         programming_sigma: column(row, "programming_sigma"),
-        statistical_bits: column(row, "statistical_bits"),
         failure_exponent,
         lattice_security_bits: None,
     };
@@ -218,7 +217,6 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
             error_sigma: decimal("ERROR_SIGMA", "3.19"),
             flooding_sigma: decimal("FLOODING_SIGMA", "3.19"),
             programming_sigma: decimal("PROGRAMMING_SIGMA", "3.19"),
-            statistical_bits: u32::try_from(count("STATISTICAL_BITS", 40)).unwrap(),
             failure_exponent,
             lattice_security_bits: Some(security),
         };

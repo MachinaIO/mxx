@@ -9,7 +9,7 @@ import PeDynamic
 /-!
 # The parameter set
 
-The ring `Z_Q[X]/(X^8192 + 1)` with five 30-bit CRT primes (`Q ≈ 2^150`), gadget base `2^15` with
+The ring `Z_Q[X]/(X^8192 + 1)` with 5 30-bit CRT primes (`Q ≈ 2^150`), gadget base `2^15` with
 two digits per prime, so a gadget row has `D = 10` columns and an encoding `m = 20`. The setup
 automorphism group is `H = {1, 8193}`, and `8193` is its own inverse modulo `2N`. Every Dynamic
 evaluation stays on this one ring.
@@ -50,13 +50,13 @@ def componentBytes : Blob := [99, 111, 109, 112, 111, 110, 101, 110, 116]
 def dynamicPrefix : Blob := [114, 110, 115, 45, 98, 103, 103, 47, 100, 121, 110, 97, 109, 105, 99]
 
 /-- The hex digest of the Dynamic setup schema. -/
-def schemaBytes : Blob := [54, 98, 53, 99, 56, 55, 50, 102, 98, 52, 56, 101, 102, 97, 57, 54, 54, 100, 57, 57, 57, 52, 101, 48, 55, 56, 57, 51, 53, 97, 55, 53, 57, 55, 101, 98, 55, 48, 55, 50, 55, 57, 98, 52, 51, 100, 54, 51, 99, 54, 101, 54, 51, 53, 102, 49, 54, 102, 55, 99, 100, 50, 99, 53]
+def schemaBytes : Blob := [48, 49, 56, 55, 99, 101, 49, 53, 57, 49, 53, 100, 54, 51, 53, 54, 56, 48, 102, 99, 52, 53, 49, 100, 54, 56, 102, 55, 55, 101, 101, 50, 99, 51, 57, 102, 50, 50, 50, 52, 55, 48, 51, 49, 52, 56, 54, 101, 54, 97, 102, 100, 53, 50, 97, 99, 53, 53, 52, 99, 102, 57, 98, 52]
 
 /-- `mxx-pe` -/
 def pePrefix : Blob := [109, 120, 120, 45, 112, 101]
 
 /-- The hex digest of the setup context, which names the parameters. -/
-def peContextBytes : Blob := [49, 50, 102, 48, 97, 97, 48, 101, 101, 97, 100, 56, 49, 53, 55, 100, 57, 101, 98, 57, 52, 54, 98, 100, 55, 99, 54, 98, 54, 49, 54, 49, 101, 102, 100, 52, 101, 50, 56, 100, 102, 100, 101, 54, 50, 51, 49, 98, 50, 99, 53, 100, 99, 99, 50, 51, 52, 53, 53, 54, 98, 98, 99, 99]
+def peContextBytes : Blob := [57, 100, 56, 97, 97, 51, 54, 55, 54, 51, 56, 57, 57, 97, 52, 49, 57, 97, 51, 49, 57, 100, 99, 99, 50, 99, 97, 52, 99, 48, 100, 101, 55, 99, 101, 48, 49, 100, 55, 53, 97, 97, 49, 99, 56, 99, 52, 53, 49, 101, 50, 52, 55, 53, 54, 54, 100, 49, 100, 49, 56, 54, 101, 54]
 
 /-- The public key `A_0` of the initial state. -/
 noncomputable def inputKey (model : HashModel) (key : ByteArray) : Fin 2 → Fin 2 → ExactMatrix Q N 1 10 :=

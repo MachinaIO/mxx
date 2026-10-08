@@ -16,7 +16,7 @@ structure generatedRoot.Witness where
   w_0_0 : Mxx.Primitives.ExactMatrix 1425702062627056211233337151529541201382227969 8192 1 12
 
 abbrev generatedRoot.constraints_0 (backend : MxxRuntime.BackendContext) (tape : MxxRuntime.SampleTape) (path : List Nat) (w_0_1 : MxxRuntime.TrapdoorValue (Mxx.Primitives.ExactMatrix 1425702062627056211233337151529541201382227969 8192 1 12) Unit) (w_0_0 : Mxx.Primitives.ExactMatrix 1425702062627056211233337151529541201382227969 8192 1 12) (outputs : Mxx.Primitives.ExactMatrix 1425702062627056211233337151529541201382227969 8192 1 12 × MxxRuntime.TrapdoorValue (Mxx.Primitives.ExactMatrix 1425702062627056211233337151529541201382227969 8192 1 12) Unit × Unit) : Prop :=
-  MxxRuntime.trapdoorSampleAt backend tape (path ++ [0]) (5154369773525533/1125899906842624) 32768 10 4762199564 w_0_0 w_0_1 ∧
+  MxxRuntime.trapdoorSampleAt backend tape (path ++ [0]) (5154369773525533/1125899906842624) 32768 10 3366109981 w_0_0 w_0_1 ∧
   outputs = (w_0_0, (w_0_1, ()))
 
 abbrev generatedRoot.body (backend : MxxRuntime.BackendContext) (tape : MxxRuntime.SampleTape) (path : List Nat) (params : Params) (_ : Unit) (outputs : Mxx.Primitives.ExactMatrix 1425702062627056211233337151529541201382227969 8192 1 12 × MxxRuntime.TrapdoorValue (Mxx.Primitives.ExactMatrix 1425702062627056211233337151529541201382227969 8192 1 12) Unit × Unit) (witness : generatedRoot.Witness) : Prop :=

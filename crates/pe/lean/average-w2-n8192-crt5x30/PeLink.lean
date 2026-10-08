@@ -50,7 +50,7 @@ theorem prelude_link {model : HashModel} {tape : SampleTape} {x : Fin 1 → Int}
       outputs.2.2.2.2.2.1 = reducePoly Q N (secOf tape) • messageRow model key 0 + messageRow model key 1 +
         reduceMatrix Q N 1 1 (emAt tape [3]) +
         ((halfQ : ExactPoly Q N) • (fun _ _ ↦ polynomialOfCoefficients m) : ExactMatrix Q N 1 1) ∧
-      CoeffBound (ebAt tape [3]) 30 ∧ CoeffBound (zAt tape [3]) 30 ∧ CoeffBound (emAt tape [3]) 30 := by
+      CoeffBound (ebAt tape [3]) 20 ∧ CoeffBound (zAt tape [3]) 20 ∧ CoeffBound (emAt tape [3]) 20 := by
   obtain ⟨hb, hcm, h00, h01, h10, h11, heb, hz, hem⟩ := prelude_explicit h hx rfl g0_runs
   have hb' : outputs.2.2.2.2.1 = bOf model key tape := hb.trans (bOf_eq model key tape).symm
   refine ⟨?_, ?_, hb', hcm, heb, hz, hem⟩
@@ -205,13 +205,13 @@ theorem lane_split (j : Fin 2) (l : Fin 10) (a : Fin 20) :
 
 set_option maxHeartbeats 64000000 in
 /-- The online output of the model is an encoding of `0` under `A_F`, with error at most
-`onlineBound 31 (12 N 30²) 31 30`, given the cutoffs of the samples and the digit runs. -/
+`onlineBound 20 (12 N 20²) 20 20`, given the cutoffs of the samples and the digit runs. -/
 theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
-    (hb0 : ∀ j, CoeffBound (![errAt ω [4, 25] encLaw, errAt ω [4, 35] encLaw] j) 31)
-    (hbh : ∀ j, CoeffBound (ehOf ω j) 30)
-    (hbz : ∀ (i : Fin 400) j, CoeffBound (![errAt ω [4, 43, i, 26] encLaw, errAt ω [4, 43, i, 35] encLaw] j) 31)
-    (hbza : ∀ (i : Fin 400) j, CoeffBound (![errAt ω [4, 8, i, 32] encLaw, errAt ω [4, 8, i, 41] encLaw] j) 31)
-    (heb : CoeffBound (ebAt ω [3]) 30) (hzb : CoeffBound (zAt ω [3]) 30)
+    (hb0 : ∀ j, CoeffBound (![errAt ω [4, 25] encLaw, errAt ω [4, 35] encLaw] j) 20)
+    (hbh : ∀ j, CoeffBound (ehOf ω j) 20)
+    (hbz : ∀ (i : Fin 400) j, CoeffBound (![errAt ω [4, 43, i, 26] encLaw, errAt ω [4, 43, i, 35] encLaw] j) 20)
+    (hbza : ∀ (i : Fin 400) j, CoeffBound (![errAt ω [4, 8, i, 32] encLaw, errAt ω [4, 8, i, 41] encLaw] j) 20)
+    (heb : CoeffBound (ebAt ω [3]) 20) (hzb : CoeffBound (zAt ω [3]) 20)
     (hD : ∀ (j : Fin 2) (l : Fin 10), ∃ D' : ExactMatrix Q N (10 + 10) 1,
         gadgetDecomposeRuns Backend.backend 32768 10
           (pairColumn (CtopOf ω j 0 l) (CbotOf model key ω j 0 l)) D' ∧
@@ -231,7 +231,7 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
     (hVK : gadgetDecomposeRuns Backend.backend 32768 10
       (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g0) VKc) :
     MxxExponentLut.Rel (secOf ω) (AFM model key) (fun _ ↦ 0) (cFOf model key ω)
-      (onlineBound 31 (12 * N * 30 * 30) 31 30) := by
+      (onlineBound 20 (12 * N * 20 * 20) 20 20) := by
   have hrhs := prelude_rhs (model := model) (key := key) (tape := ω) (path := [3]) (B := BOf ω)
     (sm := secOf ω) (g := g0) (b := bOf model key ω) (C00 := CtopOf ω 0) (C01 := CtopOf ω 1)
     (C10 := CbotOf model key ω 0) (C11 := CbotOf model key ω 1) (bOf_eq model key ω)
@@ -250,7 +250,7 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
       ![zOf model key ω (laneCol ⟨10 * (j : Nat) + l + 20 * a, by omega⟩)
           (laneRow ⟨10 * (j : Nat) + l + 20 * a, by omega⟩) 0,
         zOf model key ω (laneCol ⟨10 * (j : Nat) + l + 20 * a, by omega⟩)
-          (laneRow ⟨10 * (j : Nat) + l + 20 * a, by omega⟩) 1] 31 := by
+          (laneRow ⟨10 * (j : Nat) + l + 20 * a, by omega⟩) 1] 20 := by
     intro j l a
     obtain ⟨hc, hr⟩ := lane_split j l a
     rw [hc, hr]
@@ -269,7 +269,7 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
       ![zaOf model key ω (laneCol ⟨10 * (j : Nat) + l + 20 * a, by omega⟩)
           (laneRow ⟨10 * (j : Nat) + l + 20 * a, by omega⟩) 0,
         zaOf model key ω (laneCol ⟨10 * (j : Nat) + l + 20 * a, by omega⟩)
-          (laneRow ⟨10 * (j : Nat) + l + 20 * a, by omega⟩) 1] 31 := by
+          (laneRow ⟨10 * (j : Nat) + l + 20 * a, by omega⟩) 1] 20 := by
     intro j l a
     obtain ⟨hc, hr⟩ := lane_split j l a
     rw [hc, hr]
@@ -291,12 +291,12 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
     intro k j l
     fin_cases k <;> simp [halves, rowWindow, TM, keySum, Matrix.sum_apply]
   have hin : MxxExponentLut.Rel (secOf ω) (inputKey model key)
-      (fun j ↦ reducePoly Q N (((1 : Nat) : Int) * 1 * unitPair (secOf ω) j) • g0) (c0Of model key ω) 31 := by
+      (fun j ↦ reducePoly Q N (((1 : Nat) : Int) * 1 * unitPair (secOf ω) j) • g0) (c0Of model key ω) 20 := by
     rw [c0Of_eq]
     exact encRow_rel hb0
   have hh : MxxExponentLut.Rel (secOf ω) (helperKey model key)
       (fun j ↦ reducePoly Q N ((((1 : Nat) : Int) : ErrorPoly N) *
-        unitPair (substitution K hK (secOf ω)) j) • g0) (hrowOf model key ω) 30 := by
+        unitPair (substitution K hK (secOf ω)) j) • g0) (hrowOf model key ω) 20 := by
     rw [hrowOf_eq]
     exact encRow_rel hbh
   rw [cFOf_eq]

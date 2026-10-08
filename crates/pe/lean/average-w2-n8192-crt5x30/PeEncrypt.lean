@@ -15,10 +15,10 @@ namespace PeProof
 open Mxx.Primitives MxxRuntime MxxExponentLut
 
 /-- The law of the encryption errors. -/
-abbrev encLaw : SamplerLaw := .gaussian (319 / 100) 31
+abbrev encLaw : SamplerLaw := .gaussian (319 / 100) 20
 
 /-- The law of the helper errors. -/
-abbrev helperLaw : SamplerLaw := .gaussian (319 / 100) 30
+abbrev helperLaw : SamplerLaw := .gaussian (319 / 100) 20
 
 /-- An error component sampled at `site`. -/
 noncomputable abbrev errAt (tape : SampleTape) (site : List Nat) (law : SamplerLaw) : ErrorMatrix N 1 10 :=
@@ -410,13 +410,13 @@ theorem encrypt_err_bounds {model : HashModel} {tape : SampleTape} {path : List 
     {outputs : EncryptOutputs}
     (h : Stage_encrypt.generatedRoot Backend.backend model tape path GeneratedClaim.stage_4_params
       (secret, key, 1, 0, C00, C01, C10, C11, ()) outputs) :
-    (∀ j, CoeffBound (![errAt tape (path ++ [25]) encLaw, errAt tape (path ++ [35]) encLaw] j) 31) ∧
+    (∀ j, CoeffBound (![errAt tape (path ++ [25]) encLaw, errAt tape (path ++ [35]) encLaw] j) 20) ∧
     (∀ j, CoeffBound (![errAt tape (path ++ [4, 0, 12]) helperLaw,
-      errAt tape (path ++ [4, 0, 20]) helperLaw] j) 30) ∧
+      errAt tape (path ++ [4, 0, 20]) helperLaw] j) 20) ∧
     (∀ (i : Fin 400) j, CoeffBound (![errAt tape (path ++ [43, (i : Nat), 26]) encLaw,
-      errAt tape (path ++ [43, (i : Nat), 35]) encLaw] j) 31) ∧
+      errAt tape (path ++ [43, (i : Nat), 35]) encLaw] j) 20) ∧
     (∀ (i : Fin 400) j, CoeffBound (![errAt tape (path ++ [8, (i : Nat), 32]) encLaw,
-      errAt tape (path ++ [8, (i : Nat), 41]) encLaw] j) 31) := by
+      errAt tape (path ++ [8, (i : Nat), 41]) encLaw] j) 20) := by
   obtain ⟨w, -, -, h4, -, -, -, -, -, -, h8, -, -, -, -, h25, -, -, h35, -, -, -, -, hgather, -⟩ := h
   have hv0 : ∀ {a b : ErrorMatrix N 1 10}, (![a, b] : Fin 2 → ErrorMatrix N 1 10) 0 = a := fun {_ _} ↦ rfl
   have hv1 : ∀ {a b : ErrorMatrix N 1 10}, (![a, b] : Fin 2 → ErrorMatrix N 1 10) 1 = b := fun {_ _} ↦ rfl

@@ -15,13 +15,13 @@ namespace PeProof
 open Mxx.Primitives MxxRuntime MxxExponentLut MeasureTheory
 
 /-- The error bound of the online output. -/
-abbrev BF : Nat := onlineBound 31 (12 * N * 30 * 30) 31 30
+abbrev BF : Nat := onlineBound 20 (12 * N * 20 * 20) 20 20
 
 /-- The bound of one bias term `e_b k̃`. -/
-def biasB : Nat := 12 * N * 30 * keyCutoff
+def biasB : Nat := 12 * N * 20 * keyCutoff
 
 /-- The budget of the linear form. -/
-def mT : Nat := (Q - 8) / 4 - 32 - 2 * biasB
+def mT : Nat := (Q - 8) / 4 - 22 - 2 * biasB
 
 /-- The output error, clamped to its bound so that every tape has a bounded coefficient. -/
 noncomputable def eFcP (model : HashModel) (key : ByteArray) (P : Prims) : Fin 2 → ErrorMatrix N 1 10 := by
@@ -31,7 +31,7 @@ noncomputable def eFcP (model : HashModel) (key : ByteArray) (P : Prims) : Fin 2
 /-- The helper error, clamped to its cutoff. -/
 noncomputable def ehcP (P : Prims) : Fin 2 → ErrorMatrix N 1 10 := by
   classical
-  exact if ∀ j, CoeffBound (P.eh j) 30 then P.eh else 0
+  exact if ∀ j, CoeffBound (P.eh j) 20 then P.eh else 0
 
 /-- The rows that multiply the three extension blocks `v₀`, `v₁`, `v_F`. -/
 noncomputable def crowP (model : HashModel) (key : ByteArray) (P : Prims) : Fin 3 → Fin 20 → ErrorPoly N :=
@@ -154,7 +154,7 @@ set_option maxHeartbeats 64000000 in
 theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs} {ω : SampleTape}
     {exec : GeneratedClaim.Execution} (hruns : GeneratedClaim.Runs model external ω exec) :
     exec.«ideal» = external.input_2 ∧ (∀ k, external.input_2 k = 0 ∨ external.input_2 k = 1) ∧
-    ∀ i : Fin N, ∃ e : Int, |e| ≤ 31 + 2 * biasB + |lin model external.input_0 ω i| ∧
+    ∀ i : Fin N, ∃ e : Int, |e| ≤ 21 + 2 * biasB + |lin model external.input_0 ω i| ∧
       exec.«stage_8» i = ((2 * ((((-(((Q / 2 : Nat) : Int) * external.input_2 i) + e : Int) : ZMod Q).val :
         Nat) : Int) + (Q : Int) / 2) / (Q : Int)) % 2 := by
   obtain ⟨⟨B0, td, ⟨⟩⟩, s1, s2, ⟨C00, C01, C10, C11, b, cm, ⟨⟩⟩,
@@ -227,7 +227,7 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
     omega
   -- The clamped errors are the errors of the run.
   have heh : ehcP (prims ω) = ehOf ω := by
-    have hb : ∀ j, CoeffBound ((prims ω).eh j) 30 := fun j ↦ hbh j
+    have hb : ∀ j, CoeffBound ((prims ω).eh j) 20 := fun j ↦ hbh j
     simp only [ehcP, if_pos hb]
     rfl
   have heF : eFcP model external.input_0 (prims ω) = eFOf model external.input_0 ω := by
@@ -273,12 +273,12 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
   rw [hX] at hout
   have hmi := hm i
   refine ⟨emi - b0 - b1 - L - m i, ?_, ?_⟩
-  · have h1 : emi.natAbs ≤ 30 := hem 0 0 i
+  · have h1 : emi.natAbs ≤ 20 := hem 0 0 i
     have h2 : b0.natAbs ≤ biasB := coeffBound_mul hN heb hbk0 0 0 i
     have h3 : b1.natAbs ≤ biasB :=
       (coeff_natAbs_le_polyNorm _ i).trans ((polyNorm_substitution_le hN hK hKcoprime _).trans
         (coeffBound_polyNorm (coeffBound_mul hN heb hbk1) 0 0))
-    have a1 : |emi| ≤ 30 := by rw [Int.abs_eq_natAbs]; exact_mod_cast h1
+    have a1 : |emi| ≤ 20 := by rw [Int.abs_eq_natAbs]; exact_mod_cast h1
     have a2 : |b0| ≤ (biasB : Int) := by rw [Int.abs_eq_natAbs]; exact_mod_cast h2
     have a3 : |b1| ≤ (biasB : Int) := by rw [Int.abs_eq_natAbs]; exact_mod_cast h3
     obtain ⟨c1, c2⟩ := abs_le.mp a1
@@ -333,7 +333,7 @@ theorem jZ_bound {e : Fin 2 → ErrorMatrix N 1 10} {B : Nat} (he : ∀ j, Coeff
   · exact he 0 0 _ k
   · exact he 1 0 _ k
 
-theorem ehcP_bound (P : Prims) (j : Fin 2) : CoeffBound (ehcP P j) 30 := by
+theorem ehcP_bound (P : Prims) (j : Fin 2) : CoeffBound (ehcP P j) 20 := by
   unfold ehcP
   split
   · next h => exact h j
@@ -349,7 +349,7 @@ theorem eFcP_bound (model : HashModel) (key : ByteArray) (P : Prims) (j : Fin 2)
     simp
 
 /-- The bound of the rows of extension block `p`. -/
-def rowBound : Fin 3 → Nat := ![30, 30, BF]
+def rowBound : Fin 3 → Nat := ![20, 20, BF]
 
 theorem crowP_bound (model : HashModel) (key : ByteArray) (P : Prims) (p : Fin 3) (r : Fin 20)
     (k : Fin N) : ((crowP model key P p r).coeff k).natAbs ≤ rowBound p := by
@@ -363,14 +363,14 @@ theorem crowP_bound (model : HashModel) (key : ByteArray) (P : Prims) (p : Fin 3
 abbrev keySigma : Rat := (36955943884422039849686363886844743345501063507786308997710330263389608971746115995555182166571772460446609040073468199866370528568323731719438794004731564382523252973706112397296780774527489663820602174997088646797830840886459663010452528843218822143/71362384635297994052914298472474756819137331200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
 
 /-- The energy bound of a coefficient of the linear form. -/
-def energyB : Nat := 20 * N * (30 * 30 + 30 * 30 + BF * BF)
+def energyB : Nat := 20 * N * (20 * 20 + 20 * 20 + BF * BF)
 
-theorem numeric_margin : 400 * (520000000 * 520000000) * energyB ≤ mT * mT := by
+theorem numeric_margin : 240 * (524000000 * 524000000) * energyB ≤ mT * mT := by
   unfold energyB mT biasB BF onlineBound keyCutoff
   decide
 
-theorem keySigma_le : (keySigma : ℝ) ≤ 520000000 := by
-  have : keySigma ≤ 520000000 := by unfold keySigma; norm_num
+theorem keySigma_le : (keySigma : ℝ) ≤ 524000000 := by
+  have : keySigma ≤ 524000000 := by unfold keySigma; norm_num
   exact_mod_cast this
 
 theorem keySigma_pos : (0 : ℝ) < keySigma := by
@@ -384,31 +384,31 @@ theorem tail_numeric :
   have hE : (0 : ℝ) < energyB := by
     have : 0 < energyB := by unfold energyB; positivity
     exact_mod_cast this
-  have hσ2 : (keySigma : ℝ) ^ 2 ≤ 520000000 ^ 2 := pow_le_pow_left₀ keySigma_pos.le keySigma_le 2
-  have hm : (400 : ℝ) * (520000000 * 520000000) * energyB ≤ (mT : ℝ) * mT := by
+  have hσ2 : (keySigma : ℝ) ^ 2 ≤ 524000000 ^ 2 := pow_le_pow_left₀ keySigma_pos.le keySigma_le 2
+  have hm : (240 : ℝ) * (524000000 * 524000000) * energyB ≤ (mT : ℝ) * mT := by
     exact_mod_cast numeric_margin
-  have hx : 200 ≤ (mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB)) := by
+  have hx : 120 ≤ (mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB)) := by
     have hpos : 0 < 2 * ((keySigma : ℝ) ^ 2 * energyB) := by
       have := keySigma_pos
       positivity
     rw [le_div_iff₀ hpos]
     nlinarith
-  have hexp : Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB))) ≤ Real.exp (-200) := by
+  have hexp : Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB))) ≤ Real.exp (-120) := by
     apply Real.exp_le_exp.mpr
     rw [neg_div]
     linarith
-  have h200 : Real.exp (-200) ≤ ((2 : ℝ) ^ 200)⁻¹ := by
+  have h120 : Real.exp (-120) ≤ ((2 : ℝ) ^ 120)⁻¹ := by
     rw [Real.exp_neg]
     apply inv_anti₀ (by positivity)
     have h2 : (2 : ℝ) ≤ Real.exp 1 := by
       have := Real.add_one_le_exp (1 : ℝ)
       linarith
-    calc (2 : ℝ) ^ 200 ≤ Real.exp 1 ^ 200 := pow_le_pow_left₀ (by norm_num) h2 200
-      _ = Real.exp 200 := by rw [← Real.exp_nat_mul]; norm_num
+    calc (2 : ℝ) ^ 120 ≤ Real.exp 1 ^ 120 := pow_le_pow_left₀ (by norm_num) h2 120
+      _ = Real.exp 120 := by rw [← Real.exp_nat_mul]; norm_num
   have hreal : (N : ℝ) * (2 * Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB)))) ≤
       (2⁻¹ : ℝ) ^ 100 := by
     calc (N : ℝ) * (2 * Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB))))
-        ≤ (N : ℝ) * (2 * ((2 : ℝ) ^ 200)⁻¹) := by gcongr; exact hexp.trans h200
+        ≤ (N : ℝ) * (2 * ((2 : ℝ) ^ 120)⁻¹) := by gcongr; exact hexp.trans h120
       _ ≤ (2⁻¹ : ℝ) ^ 100 := by norm_num
   have hlhs : (N : ENNReal) * ENNReal.ofReal (2 * Real.exp (-(mT : ℝ) ^ 2 /
       (2 * ((keySigma : ℝ) ^ 2 * energyB)))) = ENNReal.ofReal ((N : ℝ) * (2 * Real.exp (-(mT : ℝ) ^ 2 /
@@ -435,7 +435,7 @@ theorem keyOf_not_mem (x : Fin 3 × Fin 20 × Fin N) : keyOf x ∉ preKeys := by
   apply not_mem_preKeys
   fin_cases p <;> rfl
 
-theorem margin_lt : 4 * (31 + 2 * biasB + mT) + 4 < Q := by
+theorem margin_lt : 4 * (21 + 2 * biasB + mT) + 4 < Q := by
   unfold mT biasB keyCutoff
   decide
 
@@ -462,7 +462,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
       simpa [c, lin, Int.cast_sum, Int.cast_mul] using this
     have hlinZ : |lin model external.input_0 ω i| < (mT : Int) := by exact_mod_cast hlin
     apply threshold_decode_value hQ hQodd (hbits i)
-    have hmt : (4 * (31 + 2 * biasB + mT) + 4 : Int) < Q := by exact_mod_cast margin_lt
+    have hmt : (4 * (21 + 2 * biasB + mT) + 4 : Int) < Q := by exact_mod_cast margin_lt
     have he' := he
     linarith only [he', hlinZ, hmt, abs_nonneg e]
   have hdep : ∀ i, DependsOn (fun ω ↦ c ω i) (preKeys : Set SampleKey) := by
@@ -498,7 +498,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     _ ≤ (N : ENNReal) * ENNReal.ofReal (2 * Real.exp (-(mT : ℝ) ^ 2 /
           (2 * ((keySigma : ℝ) ^ 2 * energyB)))) :=
         MxxPe.tapeMeasure_linear_tail keyOf keyOf_injective (sigma := keySigma)
-          (by unfold keySigma; norm_num) (cutoff := 4762199564) (fun _ ↦ rfl) c preKeys keyOf_not_mem
+          (by unfold keySigma; norm_num) (cutoff := 3366109981) (fun _ ↦ rfl) c preKeys keyOf_not_mem
           hdep hE henergy (by positivity)
     _ ≤ (2 : ENNReal)⁻¹ ^ 100 := tail_numeric
 

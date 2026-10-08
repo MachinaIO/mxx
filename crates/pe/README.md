@@ -89,7 +89,8 @@ from the existing TrapGen gives one sample with coefficient `1`, which the estim
 ## Lean proofs
 
 [`lean/`](lean/README.md) proves, in Lean, the correctness claim that the integration test exports
-for a recorded parameter set of `lean/parameters.csv`. For `average-w2-n8192-crt5x30`, the tapes
-on which a run meeting the input contract and the requirement decrypts a wrong message have
-measure at most `2^-100`. The proof reuses the exponent-LUT Lean library and depends only on the
-standard axioms.
+for a recorded parameter set of `lean/parameters.csv`. For the average-case rows
+`average-w2-n8192-crt5x30` and `average-w2-n8192-crt4x42`, the tapes on which a run meeting the
+input contract and the requirement decrypts a wrong message have measure at most `2^-100`.
+`lean/generator/gen.py` writes the proof of such a row from its exported claim; the proofs reuse the
+exponent-LUT Lean library and depend only on the standard axioms.

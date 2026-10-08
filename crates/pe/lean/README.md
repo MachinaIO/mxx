@@ -13,6 +13,7 @@ is `GeneratedClaim.CorrectnessClaim`, and the package of that parameter set prov
 | `lean/parameters.csv` | The recorded parameter sets |
 | `lean/<parameter id>/` | The proof of one parameter set (a Lake package that requires `MxxPe`) |
 | `lean/<parameter id>/generated/` | The claim the integration test exported deterministically; never edited by hand |
+| `lean/generator/` | `gen.py`, which writes the proof package of a parameter set from its row and its exported claim, and the templates it fills |
 
 `MxxPe` requires the exponent-LUT package `crates/exponent-lut/lean` (`MxxExponentLut`), whose
 encoding relation `Rel`, Dynamic products, digit companions, gadget lemmas, and runtime equations
@@ -41,13 +42,13 @@ exports the claim to `<parameter id>/generated`.
 | `reads`, `tables` | The predicate of the round trip: the attribute index read at every step and the LUT table of every step (`:`-separated entries) |
 | `ring_dimension`, `crt_bits`, `base_bits`, `crt_depth` | The equal-basis RNS chain and the gadget base |
 | `error_sigma`, `flooding_sigma`, `programming_sigma`, `trapdoor_sigma` | Widths of `chi`, `chi_fl`, `Z_t`, and TrapGen |
-| `statistical_bits` | Tail budget of every cutoff |
 | `encryption_security_bits`, `trapdoor_security_bits` | Lattice security of the encryption secret and of TrapGen, estimated by `lattice-estimator-cli` |
 
 | ID | Parameters | Proof |
 | --- | --- | --- |
 | `worst-w2-n16384-crt4x50` | One attribute bit, predicate `F(x) = x₀`, `n = 2^14`, four 50-bit primes, 276/283-bit security | None; its claim is not checked in |
 | `average-w2-n8192-crt5x30` | The same class and predicate, `n = 2^13`, five 30-bit primes (`Q ≈ 2^150`), 15-bit digits, 160/166-bit security, failure `2^-100` | `average-w2-n8192-crt5x30/PeCertificate.lean` |
+| `average-w2-n8192-crt4x42` | The same class and predicate, `n = 2^13`, four 42-bit primes (`Q ≈ 2^168`), 21-bit digits, 137/141-bit security, failure `2^-100` | `average-w2-n8192-crt4x42/PeCertificate.lean` |
 
 ## The claim
 
@@ -58,7 +59,7 @@ inputs are the hash key, the attribute exponents, the message bits, and the coef
 exponent of the initial state. The requirement accepts exactly the attributes that the predicate
 authorizes (`F(x) = 0`).
 
-## The proof of `average-w2-n8192-crt5x30`
+## The proof of an average-case parameter set
 
 The certificate `PeCertificate.certificate : GeneratedClaim.CorrectnessClaim` is checked by
 `#guard_msgs` to depend only on `propext`, `Classical.choice`, and `Quot.sound`. The argument has
@@ -71,9 +72,10 @@ every error named by its tape site. The phase of decryption is
 `e_m - e_b k̃` is bounded on every tape by the cutoffs of `e_m`, `e_b`, and the preimages, and the
 remainder is a linear form in the key extension `v = (v₀, v₁, v_F)`, whose coefficients are the
 helper error `e_h` and the error `e_F` of the online output. `e_F` is bounded by
-`onlineBound ≈ 2^102.3` (`PeOnlineRel`), from the Dynamic product, the identity branch, and the
+`onlineBound` (`PeOnlineRel`; `2^101.7` for `average-w2-n8192-crt5x30`, `2^118.4` for
+`average-w2-n8192-crt4x42`), from the Dynamic product, the identity branch, and the
 branch of `K` of the LUT of the table `(0, 1)`. Each coefficient whose linear form stays below
-`mT ≈ 2^148` decodes to its message bit (`run_decode`).
+`mT ≈ Q/4` decodes to its message bit (`run_decode`).
 
 **The coefficients read no key of the extension.** `e_h` and `e_F` are functions of `prims`, the
 samples of the secret, TrapGen, the prelude, and encryption, which read only the tape keys of
@@ -81,10 +83,11 @@ samples of the secret, TrapGen, the prelude, and encryption, which read only the
 `[6, 7]`, none of which is in `preKeys`.
 
 **The tail.** The coefficients are clamped to their bounds, so their energy is at most
-`E = 20 N (30² + 30² + onlineBound²)` on every tape. `tapeMeasure_linear_tail` bounds the
-probability that some coefficient of the linear form reaches `mT` by
-`N · 2 exp(-mT² / (2 σ² E))`, and `mT² / (2 σ² E) ≥ 200` for the key width `σ ≈ 5.18 · 10^8`, so
-the bound is at most `2^-186 ≤ 2^-100` (`tail_numeric`).
+`E = m N (c² + c² + onlineBound²)` on every tape, for the encoding width `m` and the cutoff `c` of
+`e_h`. `tapeMeasure_linear_tail` bounds the probability that some coefficient of the linear form
+reaches `mT` by `N · 2 exp(-mT² / (2 σ² E))` for the key width `σ`, and `mT² / (2 σ² E) ≥ 120`
+(`numeric_margin`, decided on the parameters), so the bound is at most `2^-106 ≤ 2^-100`
+(`tail_numeric`).
 
 | Module | Contents |
 | --- | --- |
@@ -106,6 +109,16 @@ the bound is at most `2^-186 ≤ 2^-100` (`tail_numeric`).
 The proof covers correctness only. The security estimates of the parameter set come from
 `lattice-estimator-cli` in the integration test and are not part of the Lean claim.
 
+## Generation
+
+The proof of every average-case row is written by `generator/gen.py` from the row and its exported
+claim. The templates are written for the class `(1, 2, 1, 1)` with the predicate `F(x) = x₀`, ring
+dimension `2^13`, two digits per CRT prime (`base_bits = crt_bits / 2`), and the average noise
+model; the script rejects other rows. It reads the modulus, the CRT basis, the gadget base, the
+cutoffs, the widths, and the hash tags from the exported claim, derives the digit count `D`, the
+encoding width `m = 2D`, the companion lanes `m²`, and the anchor width `D + 2`, and checks the
+numeric conditions the proof decides before writing the package.
+
 ## Reproduction
 
 Export the claim of a recorded parameter set (`lattice-estimator-cli` must be on the `PATH` with its
@@ -117,10 +130,11 @@ MXX_PE_ROUND_TRIP_PARAMETER_ID=average-w2-n8192-crt5x30 \
   cargo test -r -p mxx-pe --features gpu --test gpu_round_trip -- --nocapture
 ```
 
-Check the proof in its parameter directory:
+Write and check the proof of the exported claim:
 
 ```sh
-cd crates/pe/lean/average-w2-n8192-crt5x30
+python3 crates/pe/lean/generator/gen.py average-w2-n8192-crt4x42
+cd crates/pe/lean/average-w2-n8192-crt4x42
 lake build
 ```
 

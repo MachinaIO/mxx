@@ -13,7 +13,7 @@ namespace PeProof
 open Mxx.Primitives MxxRuntime MxxExponentLut
 
 /-- The law of the prelude samples. -/
-abbrev preludeLaw : SamplerLaw := .gaussian (319 / 100) 30
+abbrev preludeLaw : SamplerLaw := .gaussian (319 / 100) 20
 
 /-- The anchor error `e_b`. -/
 noncomputable def ebAt (tape : SampleTape) (path : List Nat) : ErrorMatrix N 1 12 :=
@@ -52,7 +52,7 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     outputs.2.1 0 = rowWindow 10 10 (by omega) (B * Z) ∧
     outputs.2.2.1 0 = rowWindow 10 0 (by omega) ((anchorSecond model key - b) * Z) ∧
     outputs.2.2.2.1 0 = rowWindow 10 10 (by omega) ((anchorSecond model key - b) * Z) + g ∧
-    CoeffBound (ebAt tape path) 30 ∧ CoeffBound (zAt tape path) 30 ∧ CoeffBound (emAt tape path) 30 := by
+    CoeffBound (ebAt tape path) 20 ∧ CoeffBound (zAt tape path) 20 ∧ CoeffBound (emAt tape path) 20 := by
   intro Z b
   obtain ⟨w, h2, h4, h8, -, h11, h12, h14, h16, h20, hout⟩ := h
   have hg2 : w.w_2_0 = g := gadgetMatrixRuns_unique h2 hg
@@ -72,15 +72,15 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     funext a c
     fin_cases a; fin_cases c
     simp [multiplyMonomial, hx]
-  have hb8' : CoeffBound (ebAt tape path) 30 := by
+  have hb8' : CoeffBound (ebAt tape path) 20 := by
     intro r c k
     have := hb8 r c k
     simpa [ebAt] using this
-  have hbz' : CoeffBound (zAt tape path) 30 := by
+  have hbz' : CoeffBound (zAt tape path) 20 := by
     intro r c k
     have := hbz r c k
     simpa [zAt] using this
-  have hb16' : CoeffBound (emAt tape path) 30 := by
+  have hb16' : CoeffBound (emAt tape path) 20 := by
     intro r c k
     have := hb16 r c k
     simpa [emAt] using this
@@ -118,9 +118,9 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
 noncomputable def rhsErr (tape : SampleTape) (path : List Nat) (j : Fin 2) : ErrorMatrix N 1 10 :=
   fun r c ↦ -((ebAt tape path * zAt tape path) r ⟨10 * (j : Nat) + c, by omega⟩)
 
-theorem rhsErr_bound {tape : SampleTape} {path : List Nat} (heb : CoeffBound (ebAt tape path) 30)
-    (hz : CoeffBound (zAt tape path) 30) (j : Fin 2) :
-    CoeffBound (rhsErr tape path j) (12 * N * 30 * 30) := by
+theorem rhsErr_bound {tape : SampleTape} {path : List Nat} (heb : CoeffBound (ebAt tape path) 20)
+    (hz : CoeffBound (zAt tape path) 20) (j : Fin 2) :
+    CoeffBound (rhsErr tape path j) (12 * N * 20 * 20) := by
   have hb := coeffBound_mul hN heb hz
   intro r c k
   have := hb r ⟨10 * (j : Nat) + c, by omega⟩ k

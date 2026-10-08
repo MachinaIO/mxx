@@ -12,13 +12,11 @@
 //! - `chi_fl` (the flooding contract) for the initial state `c_0` and every digit companion;
 //! - the programming contract for the entries of every `Z_t`.
 //!
-//! [`PeParameterRequest::tail_cutoff`] derives each cutoff from the total
-//! number of coefficients an encryption samples under it, so a rejection
-//! sampler's truncation and the union of its tail events stay below
-//! `2^-lambda`. The key is sampled at the width `s_key` the existing
-//! sampler realizes for the one-row trapdoor ([`PeParameters::key_width`]):
-//! both the anchor preimages and the extension coordinates use it, with one
-//! cutoff.
+//! Every cutoff is the sampler's default: `6.5 sigma` for the contracts
+//! ([`RnsBggGaussian::with_default_cutoff`]) and the default preimage cutoff
+//! for the key. The key is sampled at the width `s_key` the existing sampler
+//! realizes for the one-row trapdoor ([`PeParameters::key_width`]): both the
+//! anchor preimages and the extension coordinates use it, with one cutoff.
 use crate::{PeClass, PeError};
 use bigdecimal::{BigDecimal, ToPrimitive};
 use mxx_backends::{
@@ -58,8 +56,6 @@ pub struct PeParameterRequest {
     pub flooding_sigma: BigDecimal,
     /// Sigma of the entries of `Z_t`.
     pub programming_sigma: BigDecimal,
-    /// The statistical parameter `lambda` of the tail budget.
-    pub statistical_bits: u32,
     /// The noise model of the correctness check: `None` for the worst case,
     /// `Some(k)` for the average case with failure target `2^-k` (see
     /// [`crate::noise::simulate_average`]).
@@ -68,21 +64,6 @@ pub struct PeParameterRequest {
     /// [`PeParameters::security_bits`], estimated by `lattice-estimator-cli`;
     /// `None` estimates nothing (test parameters).
     pub lattice_security_bits: Option<u64>,
-}
-
-impl PeParameterRequest {
-    /// The smallest cutoff `c` with `count * 2 exp(-c^2 / (2 sigma^2)) <=
-    /// 2^-lambda`: every one of `count` samples of a Gaussian of standard
-    /// deviation `sigma` is within `c` except with probability `2^-lambda`,
-    /// so truncating them there (rejection) changes their joint distribution
-    /// by at most that much.
-    pub fn tail_cutoff(sigma: &BigDecimal, count: &BigUint, statistical_bits: u32) -> BigUint {
-        let sigma = sigma.to_f64().unwrap_or(f64::NAN);
-        let log_count = count.bits() as f64 * std::f64::consts::LN_2;
-        let exponent =
-            statistical_bits as f64 * std::f64::consts::LN_2 + log_count + std::f64::consts::LN_2;
-        BigUint::from((sigma * (2.0 * exponent).sqrt()).ceil().max(1.0) as u64)
-    }
 }
 
 /// Validated scheme parameters.
@@ -170,8 +151,8 @@ impl PeParameters {
         Ok(parameters)
     }
 
-    /// The parameters of `request` at CRT depth `depth`, with every cutoff
-    /// from the tail budget of one encryption and one key.
+    /// The parameters of `request` at CRT depth `depth`, with the default
+    /// cutoffs.
     pub fn at_depth(request: &PeParameterRequest, depth: usize) -> Result<Self, PeError> {
         let level = DCRTPolyParams::try_new(
             request.ring_dimension,
@@ -182,47 +163,14 @@ impl PeParameters {
             None,
         )
         .map_err(|error| PeError::Parameters(format!("{error:?}")))?;
-        let lambda = request.statistical_bits;
-        let class = request.class;
-        let n = BigUint::from(request.ring_dimension);
-        let m = BigUint::from(2 * level.modulus_digits());
-        let w = BigUint::from(class.lookup_width());
-        let l = BigUint::from(class.attribute_length());
-        // The anchor width before the cutoffs: the trapdoor shape does not
-        // depend on them.
-        let provisional = Self::new(
-            class,
-            level.clone(),
+        Self::new(
+            request.class,
+            level,
             request.trapdoor_sigma,
             RnsBggGaussian::with_default_cutoff(request.error_sigma.clone())?,
             RnsBggGaussian::with_default_cutoff(request.flooding_sigma.clone())?,
             RnsBggGaussian::with_default_cutoff(request.programming_sigma.clone())?,
             TrapdoorPreimageCutoffPolicy::Default,
-        )?;
-        let m_b = BigUint::from(provisional.anchor_columns);
-        let one = BigUint::from(1u8);
-        let errors = &n * (&m_b + (&w - &one) * &m + &one);
-        let floods = &n * &m * (&one + (&l + &w - &one) * &m * &m);
-        let programs = &n * &l * &m_b * &m;
-        let keys = &n * provisional.key_length();
-        let contract = |sigma: &BigDecimal, count: &BigUint| {
-            RnsBggGaussian::new(
-                sigma.clone(),
-                PeParameterRequest::tail_cutoff(sigma, count, lambda),
-            )
-        };
-        let key_width = provisional.key_width.clone();
-        Self::new(
-            class,
-            level,
-            request.trapdoor_sigma,
-            contract(&request.error_sigma, &errors)?,
-            contract(&request.flooding_sigma, &floods)?,
-            contract(&request.programming_sigma, &programs)?,
-            TrapdoorPreimageCutoffPolicy::Explicit(
-                PeParameterRequest::tail_cutoff(&key_width, &keys, lambda)
-                    .max(provisional.key_cutoff.clone()),
-            ),
         )
     }
 
@@ -469,17 +417,6 @@ pub(crate) fn real_expr(value: &BigDecimal) -> Result<mxx_ir_core::RealExpr, PeE
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tail_cutoffs_grow_with_the_sample_count_and_the_security_parameter() {
-        let sigma = BigDecimal::from(4u8);
-        let few = PeParameterRequest::tail_cutoff(&sigma, &BigUint::from(10u8), 40);
-        let many = PeParameterRequest::tail_cutoff(&sigma, &BigUint::from(1u64 << 40), 40);
-        let stronger = PeParameterRequest::tail_cutoff(&sigma, &BigUint::from(10u8), 80);
-        assert!(few < many && few < stronger);
-        // 2 exp(-c^2 / 2 sigma^2) <= 2^-40 / 10 needs c >= 31.5 for sigma 4.
-        assert_eq!(few, BigUint::from(32u8));
-    }
 
     #[test]
     fn the_key_width_is_the_samplers_and_the_anchor_its_trapgen_width() {

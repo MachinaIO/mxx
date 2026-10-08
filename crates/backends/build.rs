@@ -86,6 +86,7 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixCrt.cu");
         println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/SubgraphKernel.cuh");
         println!("cargo::rerun-if-changed=cuda/include/Primitive.cuh");
         println!("cargo::rerun-if-changed=cuda/include/Control.cuh");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");

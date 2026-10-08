@@ -14,7 +14,7 @@ use crate::{
     decoder::decoding::{Decoder, DecoderDeclaration, DecoderError},
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
-        GraphParallelLowering, InputBinding, InputShape, LoweringSite, LutId, LutTable, Operand,
+        GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, Operand,
         ProgramLoweringContext, RhsId, RhsRef, WireId, family_of_fields,
     },
 };
@@ -31,13 +31,11 @@ use mxx_ir_core::{
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 mod decoder;
 mod dynamic;
+pub(crate) use self::dynamic::AUTOMORPHISM_HELPER_ROLE;
 mod encrypt;
 mod lowering;
 mod online_eval;
@@ -88,19 +86,20 @@ impl<R, A> RnsBggEncoding<R, A, RnsBggPublicKey> {
 }
 
 impl RnsBggEncoding<RnsBggRow, Mat> {
-    /// Returns the encryption residual against the deterministic BGG relation,
-    /// a private payload being scaled by `message_scale`. Fresh Gaussian
-    /// error is therefore the returned value; no plaintext is reconstructed
-    /// and public payload pairing remains metadata-driven.
+    /// Returns the encryption residual against the deterministic BGG relation
+    /// of `carrier` (see [`RnsBggParameters::output_carrier`]): a private
+    /// payload is scaled by the carrier's scale against its gadget. Fresh
+    /// Gaussian error is therefore the returned value; no plaintext is
+    /// reconstructed and public payload pairing remains metadata-driven.
     pub fn verification_residual(
         &self,
         parameters: &RnsBggParameters,
-        level: usize,
+        carrier: &RnsOutputCarrier,
         payload: &RnsBggPayloadSecret,
         mask: &RnsBggMaskSecret,
         expected: Mat,
-        message_scale: &BigUint,
     ) -> Result<RnsBggRow, RnsBggError> {
+        let level = carrier.level;
         let ring = parameters.ring(level)?;
         if expected.matrix_type() != &ring.matrix_type((1, 1)) {
             return Err(RnsBggError::Binding("verification residual plaintext ring"));
@@ -118,9 +117,9 @@ impl RnsBggEncoding<RnsBggRow, Mat> {
             (mask.0.clone() * scale.clone(), mask.1.clone() * scale)
         } else {
             let payload = reduce_secret(parameters, &payload.row, level)?;
-            let gadget = parameters.state_gadget(level)?;
+            let gadget = parameters.output_gadget(carrier)?;
             let target = (payload.0 * gadget.clone(), payload.1 * gadget);
-            let delta = parameters.scalar(level, message_scale.clone())?;
+            let delta = parameters.scalar(level, carrier.scale.clone())?;
             let scale = delta * expected;
             (target.0 * scale.clone(), target.1 * scale)
         };
@@ -221,6 +220,20 @@ impl RnsBggPayloadSecret {
     /// or `None` for a secret given as a graph expression.
     pub fn input_name(&self) -> Option<&str> {
         self.binding.as_ref().map(|binding| binding.name.as_str())
+    }
+
+    /// The secret row `(s_bar, 1)` at level zero, as graph expressions that
+    /// read the sampled polynomial through [`Self::input_name`].
+    pub fn row(&self) -> &RnsBggRow {
+        &self.row
+    }
+
+    /// Bind the sampled secret to its graph input in `runtime`, for a graph
+    /// that reads [`Self::row`].
+    pub fn bind_runtime(&self, runtime: &mut BTreeMap<String, RuntimeValue>) {
+        if let Some(binding) = &self.binding {
+            binding.bind(runtime);
+        }
     }
 
     /// Re-express the same sampled coefficients in a requested RNS level.
@@ -371,28 +384,11 @@ pub(crate) fn fresh_error(
     level: usize,
     columns: usize,
 ) -> Result<RnsBggRow, RnsBggError> {
-    encoding_error_row(parameters, &parameters.ring(level)?, columns)
+    parameters.encoding_contract().sample_row(&parameters.ring(level)?, columns)
 }
 
-/// One row of encoding error over `ring`; zero when the encoding sigma is
-/// zero, so noise-free encodings add no sampled error.
-fn encoding_error_row(
-    parameters: &RnsBggParameters,
-    ring: &mxx_dsl::Ring,
-    columns: usize,
-) -> Result<RnsBggRow, RnsBggError> {
-    if parameters.encoding_error_sigma().is_zero() {
-        let zero = ring.zero((1, columns));
-        return Ok((zero.clone(), zero));
-    }
-    let sigma = crate::utils::decimal_to_real_expr(parameters.encoding_error_sigma())
-        .map_err(|_| RnsBggError::Parameters("invalid encoding error sigma"))?;
-    Ok((
-        ring.gaussian((1, columns), sigma.clone(), parameters.encoding_error_bound().clone()),
-        ring.gaussian((1, columns), sigma, parameters.encoding_error_bound().clone()),
-    ))
-}
-
+/// The private encoding `s A - Delta x r G + e` of `plaintext` at `level`
+/// under `key`, with its error sampled under `contract`.
 fn encode_private_inner(
     parameters: &RnsBggParameters,
     key: &RnsBggPublicKey,
@@ -400,6 +396,7 @@ fn encode_private_inner(
     mask: &RnsBggMaskSecret,
     plaintext: Mat,
     level: usize,
+    contract: &RnsBggGaussian,
 ) -> Result<RnsBggEncoding, RnsBggError> {
     let ring = parameters.ring(level)?;
     if *plaintext.matrix_type() != ring.matrix_type((1, 1)) {
@@ -414,7 +411,7 @@ fn encode_private_inner(
     let mask_matrix =
         (s.0.clone() * matrix.0.0 + s.1.clone() * matrix.1.0, s.0 * matrix.0.1 + s.1 * matrix.1.1);
     let scale = delta * plaintext;
-    let error = fresh_error(parameters, level, parameters.component_columns(level)?)?;
+    let error = contract.sample_row(&ring, parameters.component_columns(level)?)?;
     let row = (
         mask_matrix.0 - target.0 * scale.clone() + error.0,
         mask_matrix.1 - target.1 * scale + error.1,
@@ -422,12 +419,15 @@ fn encode_private_inner(
     Ok(RnsBggEncoding::new(key.clone(), row, None))
 }
 
+/// The public encoding of `plaintext` at `level` under `key` (see
+/// [`public_encoding_row`]), with its error sampled under `contract`.
 fn encode_public_inner(
     parameters: &RnsBggParameters,
     key: &RnsBggPublicKey,
     mask: &RnsBggMaskSecret,
     plaintext: Mat,
     level: usize,
+    contract: &RnsBggGaussian,
 ) -> Result<RnsBggEncoding, RnsBggError> {
     let ring = parameters.ring(level)?;
     if *plaintext.matrix_type() != ring.matrix_type((1, 1)) {
@@ -440,6 +440,7 @@ fn encode_public_inner(
         plaintext.clone() * parameters.public_gadget(level)?,
         parameters.level(level)?.modulus_digits(),
         level,
+        contract,
     )?;
     Ok(RnsBggEncoding::new(key.clone(), row, Some(plaintext)))
 }
@@ -447,8 +448,8 @@ fn encode_public_inner(
 /// The row `s A - s (d G) + e` encoding a public attribute `d` under key `A`
 /// at `level`, with `public_scale = d G` for the full (unscaled)
 /// current-level public gadget `G` and a fresh error row of `columns`
-/// columns. Ordinary public inputs and Dynamic digit companions share this
-/// equation.
+/// columns sampled under `contract`. Ordinary public inputs and Dynamic
+/// digit companions share this equation.
 fn public_encoding_row(
     parameters: &RnsBggParameters,
     matrix: RnsBggMatrix,
@@ -456,13 +457,14 @@ fn public_encoding_row(
     public_scale: Mat,
     columns: usize,
     level: usize,
+    contract: &RnsBggGaussian,
 ) -> Result<RnsBggRow, RnsBggError> {
     let s = reduce_secret(parameters, mask, level)?;
     let mask_matrix = (
         s.0.clone() * matrix.0.0 + s.1.clone() * matrix.1.0,
         s.0.clone() * matrix.0.1 + s.1.clone() * matrix.1.1,
     );
-    let error = fresh_error(parameters, level, columns)?;
+    let error = contract.sample_row(&parameters.ring(level)?, columns)?;
     Ok((
         mask_matrix.0 - s.0 * public_scale.clone() + error.0,
         mask_matrix.1 - s.1 * public_scale + error.1,
@@ -482,20 +484,45 @@ pub struct EncodingLowering<'a> {
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
-    /// Setup context, part of the Dynamic digit-companion key namespace.
-    pub(crate) context: [u8; 32],
     /// Dynamic: each RHS's digit-companion family, imported where the
     /// Program is bound so a Program family body reads its members in place.
     pub(crate) rhs_companions: BTreeMap<RhsId, Family<RnsBggRow>>,
-    /// The material of each `(level, LUT)` evaluated in a family body,
-    /// imported where the Program is bound so every member reads it in place.
+    /// Static: the material of each `(level, LUT)` evaluated in a family
+    /// body, imported where the Program is bound so every member reads it in
+    /// place.
     pub(crate) lut_material: BTreeMap<(usize, LutId), LutMaterial>,
+    /// How the Program's outputs are consumed (see [`RnsOutputUse`]).
+    pub(crate) output_use: RnsOutputUse,
+    /// Dynamic: the setup, the Program's mapping to its coordinates, and the
+    /// imported automorphism packages.
+    pub(crate) dynamic: Option<DynamicEvaluation>,
 }
 
-/// A LUT's imported switching ciphertexts (one family per matrix port), its
-/// automorphism indices, its helpers, and its Dynamic digit companions.
-pub(crate) type LutMaterial =
-    (Vec<Family<Mat>>, Vec<usize>, (Family<Mat>, Family<Mat>), Option<Family<RnsBggRow>>);
+/// The Dynamic state of an online evaluation.
+#[derive(Clone)]
+pub(crate) struct DynamicEvaluation {
+    pub(crate) setup: Arc<RnsBggDynamicSetup>,
+    pub(crate) binding: RnsBggDynamicBinding,
+    /// The helpers `h_k` and the digit companions of `C_k` of every
+    /// nonidentity setup automorphism, member `i` for the `i`-th one; absent
+    /// when `H` is trivial.
+    pub(crate) automorphisms: Option<(Family<RnsBggRow>, Family<RnsBggRow>)>,
+}
+
+/// A Static LUT's imported switching ciphertexts (one family per matrix
+/// port), its automorphism indices, and its helpers.
+pub(crate) type LutMaterial = (Vec<Family<Mat>>, Vec<usize>, (Family<Mat>, Family<Mat>));
+
+/// The bound value of one Dynamic RHS coordinate of an encryption.
+#[derive(Clone)]
+pub(crate) enum DynamicRhsValue {
+    /// The plaintext of a [`RnsBggPackageSource::Sampled`] coordinate, from
+    /// which encryption samples the gadget ciphertext.
+    Plaintext(InputBinding<Mat, super::PlaintextFamily>),
+    /// A [`RnsBggPackageSource::Supplied`] coordinate, whose gadget
+    /// ciphertexts the bound prelude production exports.
+    Supplied,
+}
 
 /// Encryption builder; secrets and plaintexts are stage-local.
 pub struct RnsEncryptBuild<'a> {
@@ -520,15 +547,14 @@ pub struct RnsEncryptBuild<'a> {
     /// For a smudge child: the decoder declaration whose smudge Program it
     /// encrypts the inputs of.
     decoder_smudge: Option<DecoderDeclaration>,
-    /// Dynamic: the shape and consuming level of each declared RHS and each
-    /// evaluated `(level, LUT)`, known once preprocessing (or, for a smudge
-    /// child, its Program) is bound.
-    dynamic_schema: Option<(BTreeMap<RhsId, (InputShape, usize)>, BTreeSet<(usize, LutId)>)>,
-    /// Dynamic: the encryption batch identifier and the RHS plaintexts, read
-    /// from graph inputs; a family is read member by member.
-    dynamic_rhs: Option<([u8; 32], BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>)>,
-    /// Dynamic: the executed prelude production holding the RHS family
-    /// ciphertexts, with its manifest.
+    /// Dynamic: the setup this encryption belongs to.
+    dynamic_setup: Option<Arc<RnsBggDynamicSetup>>,
+    /// Dynamic: the encryption session identifier and the value of every
+    /// RHS coordinate of the setup.
+    dynamic_rhs: Option<([u8; 32], BTreeMap<u32, DynamicRhsValue>)>,
+    /// Dynamic: the prelude production exporting the RHS family ciphertexts
+    /// encryption samples, or the supplied gadget ciphertexts, with its
+    /// manifest.
     prelude: Option<(ProductionId, Manifest)>,
 }
 
@@ -551,4 +577,12 @@ pub struct RnsOnlineEvalBuild<'a> {
     /// The coefficient bound of the unmask preimage, from the
     /// preprocess binding.
     unmask_preimage_bound: Option<BigUint>,
+    /// How the Program's outputs are consumed; it must match the
+    /// preprocessing binding.
+    output_use: RnsOutputUse,
+    /// The output carriers the preprocessing binding resolved; online
+    /// evaluation resolves the same ones.
+    output_carriers: Vec<RnsOutputCarrier>,
+    /// Dynamic: the setup and the Program's mapping to its coordinates.
+    dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
 }

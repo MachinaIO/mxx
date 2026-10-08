@@ -33,7 +33,7 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggMaskSecret, RnsBggNoiseBindings, RnsBggNoiseFamily,
         RnsBggNoiseValue, RnsBggParameters, RnsBggPayloadSecret, RnsBggPlanRequest,
-        RnsEncryptBuild, RnsNoiseBuild, RnsOnlineEvalBuild, RnsPreprocessBuild,
+        RnsEncryptBuild, RnsNoiseBuild, RnsOnlineEvalBuild, RnsOutputUse, RnsPreprocessBuild,
         decode_public_output, verify_output,
     },
     utils::{
@@ -363,7 +363,7 @@ fn public_ip_end_to_end() {
         &program.encryption_inputs(),
         &ParamEnv::default(),
         &lhs,
-        &preprocess,
+        Some(&preprocess),
         &payload,
         Some(&mask),
         HASH_KEY,
@@ -403,6 +403,7 @@ fn public_ip_end_to_end() {
         &parameters,
         &payload,
         Some(&mask),
+        RnsOutputUse::DirectDecode,
         runtime,
         &mut store,
     )
@@ -416,6 +417,7 @@ fn public_ip_end_to_end() {
             &parameters,
             &payload,
             Some(&mask),
+            RnsOutputUse::DirectDecode,
             runtime,
             &mut store
         )

@@ -5,11 +5,13 @@
 //! live in their respective modules; this file does not provide a scheme
 //! facade or an artifact/material wrapper hierarchy.
 
+mod dynamic;
 mod encoding;
 #[cfg(all(test, feature = "gpu"))]
 pub(crate) mod gpu;
 mod noise;
 mod public_key;
+mod setup;
 mod workload;
 
 use bigdecimal::BigDecimal;
@@ -20,7 +22,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::{
@@ -38,11 +40,17 @@ pub use encoding::{
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
-    RnsBggDecoderNoise, RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound,
-    RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue,
-    RnsBggParameterManifest, RnsBggPlanRequest, RnsNoiseBuild,
+    RnsBggDecoderNoise, RnsBggDynamicNoise, RnsBggMaskSecretComponent, RnsBggNoiseBindings,
+    RnsBggNoiseBound, RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace,
+    RnsBggNoiseValue, RnsBggPackageNoise, RnsBggParameterManifest, RnsBggPlanRequest,
+    RnsNoiseBuild,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
+pub(crate) use setup::RnsBggPackage;
+pub use setup::{
+    RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicRhs, RnsBggDynamicSetup,
+    RnsBggGaussian, RnsBggPackageSource, covering_automorphism_layout,
+};
 pub use workload::RnsBggDerivedWorkload;
 
 /// Name of the graph input carrying the shared 32-byte hash key. A stage
@@ -102,11 +110,9 @@ pub(crate) fn lut_switching_role(
     format!("lut-switching/{level}/{}/{lut:?}/{layout:?}{suffix}", level + 1)
 }
 
-/// Number `N_i = m_i m_(i+1)` of digit-companion encodings of one Dynamic
-/// ciphertext consumed at `level` whose two components have `output_columns`
-/// columns each: one per digit row and output column. An RHS ciphertext has
-/// `component_columns(level + 1)` output columns; a LUT switching
-/// ciphertext has [`RnsBggParameters::lut_output_columns`].
+/// Number `m^2` of digit-companion encodings of one Dynamic package read at
+/// `level` whose two components have `output_columns` columns each: one per
+/// digit row and output column.
 pub(crate) fn companion_count(
     parameters: &RnsBggParameters,
     level: usize,
@@ -171,17 +177,77 @@ fn encoding_error_bound(sigma: &BigDecimal) -> Result<BigUint, RnsBggError> {
 ///
 /// `Static` binds the RHS plaintexts during preprocessing under a payload
 /// secret distinct from the encryption mask, and multiplies by setup-fixed
-/// ciphertexts. `Dynamic` finishes preprocessing from public material only:
-/// encryption then binds one secret `s = (s_bar, 1)` as both mask and
-/// payload, and generates each RHS ciphertext `C` together with the public
-/// encodings `z = s B - d s G + e` of its gadget digits `d`. A private
-/// product then has the ciphertext-independent key `T = sum_a B_a U_a`,
-/// where `U = Dec(A)` is the gadget decomposition of the state key.
+/// ciphertexts. `Dynamic` finishes preprocessing from public material only,
+/// against a [`RnsBggDynamicSetup`] on an equal-basis chain: encryption binds
+/// one secret `s = (s_bar, 1)` as both mask and payload, and publishes one
+/// package per RHS coordinate and per automorphism of the setup, each a
+/// gadget ciphertext `C` with the public encodings `z = s B - d s G + e` of
+/// its gadget digits `d`. A private product then has the
+/// ciphertext-independent key `T = sum_a B_a U_a`, where `U = Dec(A)` is the
+/// gadget decomposition of the state key, and a LUT is a sum of public
+/// scalar actions on automorphism-switched encodings (see [`dynamic`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RhsMode {
     #[default]
     Static,
     Dynamic,
+}
+
+/// How the consumer of a Program uses its outputs. Preprocessing, online
+/// evaluation, and noise simulation resolve every output carrier through
+/// [`RnsBggParameters::output_carrier`] from the same value, so they agree on
+/// its ring, column width, and payload form.
+///
+/// Normalization is separate from this choice: a coefficient output is always
+/// moved once to the level after its LUT (a ModDown by the level's drop, an
+/// identity on an equal-basis chain), whatever its use.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RnsOutputUse {
+    /// The normalized carrier itself: a private output is the full-gadget
+    /// encoding `s (A - v G) + e` with `A` of shape `2 x m`. It is consumed by
+    /// a further key-homomorphic computation (for example a predicate
+    /// encryption key equation), never decoded directly.
+    Gadget,
+    /// The normalized carrier followed by the direct-decoding action: a
+    /// coefficient output is right-multiplied by `G^-1(k)` (see
+    /// [`RnsBggParameters::coefficient_output_scale`]); a Dynamic exponent
+    /// output below the terminal level by `G^-1(floor(q/2))`. Terminal
+    /// exponent outputs already have that scalar form.
+    #[default]
+    DirectDecode,
+}
+
+/// The payload gadget of a resolved output carrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RnsOutputGadget {
+    /// The state gadget of the carrier's level (a private exponent wire).
+    State,
+    /// The full public gadget of the carrier's level (a public wire, or a
+    /// normalized coefficient wire).
+    Public,
+    /// A scalar column per component: the payload is `scale v s_j`.
+    Scalar,
+}
+
+/// The resolved carrier of one Program output: its ring level, its columns
+/// per component, the payload scale and gadget, the weight of the direct
+/// decoding action applied after normalization, and the plaintext modulus a
+/// direct decode reads it with. The public-key, encoding, and noise paths
+/// derive it from one call, so they cannot choose different actions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RnsOutputCarrier {
+    /// Ring level of the normalized carrier.
+    pub level: usize,
+    /// Columns per component.
+    pub columns: usize,
+    /// Payload scale: the row is `s A - scale v s G + e` for gadget `G`.
+    pub scale: BigUint,
+    /// Payload gadget.
+    pub gadget: RnsOutputGadget,
+    /// Weight `w` of the action `G^-1(w)` applied after normalization.
+    pub action: Option<BigUint>,
+    /// Plaintext modulus of a direct decode, when the carrier is decodable.
+    pub plaintext_modulus: Option<u64>,
 }
 
 /// Validated modulus-chain and encoding-noise parameters.
@@ -509,6 +575,14 @@ impl RnsBggParameters {
         &self.encoding_error_bound
     }
 
+    /// The default sampling contract of fresh encoding errors: the encoding
+    /// sigma with its cutoff. Static stages sample every encoding role under
+    /// it; Dynamic stages sample under their setup's contracts.
+    pub fn encoding_contract(&self) -> RnsBggGaussian {
+        RnsBggGaussian::new(self.encoding_error_sigma.clone(), self.encoding_error_bound.clone())
+            .expect("validated encoding sigma and cutoff")
+    }
+
     pub fn operations_per_drop(&self) -> usize {
         self.operations_per_drop
     }
@@ -549,6 +623,39 @@ impl RnsBggParameters {
         digest.finalize().into()
     }
 
+    /// Check that every level has the same ordered CRT basis and gadget and
+    /// that the chain has at least two levels. On such a chain every drop is
+    /// one, every ModDown is an identity with no rounding, and every level
+    /// below the terminal one has the full gadget of its successor as its
+    /// state gadget and message scale one. Dynamic evaluation requires it:
+    /// a package is read at any logical level, so every level must be its
+    /// physical ring.
+    pub fn validate_equal_basis(&self) -> Result<(), RnsBggError> {
+        let first = &self.levels[0];
+        if self.levels.len() < 2 ||
+            self.levels.iter().any(|level| !compatible_level_parameters(first, level))
+        {
+            return Err(RnsBggError::Parameters(
+                "Dynamic evaluation needs an equal-basis chain with a gadget successor",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check one Dynamic evaluation at `level`: Dynamic parameters on an
+    /// equal-basis chain, with a gadget successor after `level`. A route with
+    /// a real modulus drop is rejected; there is no fallback.
+    pub(crate) fn dynamic_route(&self, level: usize) -> Result<(), RnsBggError> {
+        if self.rhs_mode != RhsMode::Dynamic {
+            return Err(RnsBggError::Parameters("a Dynamic route needs Dynamic parameters"));
+        }
+        self.validate_equal_basis()?;
+        if level + 1 >= self.levels.len() {
+            return Err(RnsBggError::Parameters("a Dynamic evaluation level needs a successor"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn state_gadget(&self, level: usize) -> Result<Mat, RnsBggError> {
         self.level(level)?;
         match self.levels.get(level + 1) {
@@ -565,7 +672,9 @@ impl RnsBggParameters {
         }
     }
 
-    pub(crate) fn public_gadget(&self, level: usize) -> Result<Mat, RnsBggError> {
+    /// The full public gadget row `g` of `level`: the RNS gadget of its CRT
+    /// basis with its base and digit count, `1 x modulus_digits`.
+    pub fn public_gadget(&self, level: usize) -> Result<Mat, RnsBggError> {
         let parameters = self.level(level)?;
         let base = public_gadget_base(parameters.base_bits())?;
         Ok(self.ring(level)?.gadget(1, base, parameters.modulus_digits()))
@@ -696,15 +805,116 @@ impl RnsBggParameters {
         Ok((t, k, loss))
     }
 
-    /// The finalization action `G^-1(k)` of a coefficient output finalized at
-    /// `level` with scale `k`: right-multiplying its carrier, whose payload
-    /// is `v G`, gives the payload `k v` against the identity gadget.
-    pub(crate) fn coefficient_output_action(
+    /// The direct-decoding action `G^-1(w)` of an output carrier normalized at
+    /// `level` with weight `w`: right-multiplying a carrier whose payload is
+    /// `v G` gives the payload `w v` against the identity gadget.
+    pub(crate) fn output_action(
         &self,
         level: usize,
-        k: &BigUint,
+        w: &BigUint,
     ) -> Result<SmallMatrix, RnsBggError> {
-        self.gadget_inverse(level, level, self.weight_row(level, std::slice::from_ref(k))?)
+        self.gadget_inverse(level, level, self.weight_row(level, std::slice::from_ref(w))?)
+    }
+
+    /// The carrier of output `wire` of `program`, whose lowered value is at
+    /// logical level `level`, under `output_use`.
+    ///
+    /// A coefficient output is normalized once to `level + 1`: its payload is
+    /// then `v s G` against the full public gadget there. `DirectDecode`
+    /// applies `G^-1(k)` (a scalar column with payload `k v s_j`, decoded
+    /// modulo `t`); `Gadget` keeps the full gadget. An exponent output is not
+    /// moved. A terminal exponent output already has the scalar form `floor(q
+    /// / 2) v s_j` and has no gadget successor, so `Gadget` rejects it. A
+    /// Dynamic exponent output below the terminal level has scale one on an
+    /// equal-basis chain; `DirectDecode` applies `G^-1(floor(q / 2))` to it.
+    /// A Static exponent output below the terminal level keeps its scaled
+    /// state-gadget form, which is not directly decodable. Public outputs
+    /// other than coefficient outputs keep their form.
+    pub fn output_carrier(
+        &self,
+        program: &crate::program::ExponentLutProgram,
+        wire: WireId,
+        level: usize,
+        output_use: RnsOutputUse,
+    ) -> Result<RnsOutputCarrier, RnsBggError> {
+        let metadata = |_| RnsBggError::Binding("output wire metadata");
+        if let Some(bound) = program.wire_coefficient_bound(wire).map_err(metadata)? {
+            let normalized =
+                level.checked_add(1).ok_or(RnsBggError::Parameters("output level overflow"))?;
+            let parameters = self.level(normalized)?;
+            return Ok(match output_use {
+                RnsOutputUse::Gadget => RnsOutputCarrier {
+                    level: normalized,
+                    columns: parameters.modulus_digits(),
+                    scale: BigUint::one(),
+                    gadget: RnsOutputGadget::Public,
+                    action: None,
+                    plaintext_modulus: None,
+                },
+                RnsOutputUse::DirectDecode => {
+                    let t = Self::coefficient_decoding_modulus(bound)?;
+                    let (k, _) = self.coefficient_output_scale(normalized, t)?;
+                    RnsOutputCarrier {
+                        level: normalized,
+                        columns: 1,
+                        scale: k.clone(),
+                        gadget: RnsOutputGadget::Scalar,
+                        action: Some(k),
+                        plaintext_modulus: Some(t),
+                    }
+                }
+            });
+        }
+        if program.wire_knowledge(wire).map_err(metadata)? ==
+            crate::program::AttributeKnowledge::PublicPayload
+        {
+            return Ok(RnsOutputCarrier {
+                level,
+                columns: self.level(level)?.modulus_digits(),
+                scale: BigUint::one(),
+                gadget: RnsOutputGadget::Public,
+                action: None,
+                plaintext_modulus: None,
+            });
+        }
+        let terminal = level + 1 == self.levels.len();
+        let state = RnsOutputCarrier {
+            level,
+            columns: self.component_columns(level)?,
+            scale: self.message_scale(level)?,
+            gadget: if terminal { RnsOutputGadget::Scalar } else { RnsOutputGadget::State },
+            action: None,
+            plaintext_modulus: terminal.then_some(2),
+        };
+        match (output_use, terminal) {
+            (RnsOutputUse::Gadget, true) => {
+                Err(RnsBggError::Parameters("a gadget output needs a gadget successor level"))
+            }
+            (RnsOutputUse::DirectDecode, false)
+                if self.rhs_mode == RhsMode::Dynamic && self.scale(level)?.is_one() =>
+            {
+                let half = self.level(level)?.modulus().as_ref() / 2u8;
+                Ok(RnsOutputCarrier {
+                    level,
+                    columns: 1,
+                    scale: half.clone(),
+                    gadget: RnsOutputGadget::Scalar,
+                    action: Some(half),
+                    plaintext_modulus: Some(2),
+                })
+            }
+            _ => Ok(state),
+        }
+    }
+
+    /// The gadget row of `carrier`'s payload in its ring: the state or public
+    /// gadget of its level, or `1` for a scalar column.
+    pub(crate) fn output_gadget(&self, carrier: &RnsOutputCarrier) -> Result<Mat, RnsBggError> {
+        match carrier.gadget {
+            RnsOutputGadget::State => self.state_gadget(carrier.level),
+            RnsOutputGadget::Public => self.public_gadget(carrier.level),
+            RnsOutputGadget::Scalar => Ok(self.ring(carrier.level)?.identity(1)),
+        }
     }
 
     /// The `l1` norm and the squared `l2` norm of `G^-1(k)` at `level`, the
@@ -782,6 +992,89 @@ impl RnsBggParameters {
         RnsBggDerivedWorkload::from_program(source_program)?.level(declaration.source_output())
     }
 
+    /// The plaintext modulus `p` of `declaration`'s decoder of
+    /// `source_program`, its CRT primes, and the decoding spacing
+    /// `Delta = q_L / p` at the source level `L`.
+    ///
+    /// A Static decoder has no explicit modulus: `p = q_(L+1)`, the strict
+    /// drop after the source, and `Delta` is that drop. A Dynamic chain keeps
+    /// one modulus `q`, so its declaration names `p` explicitly
+    /// ([`DecoderDeclaration::with_plaintext_modulus`]): an odd proper CRT
+    /// divisor of `q`, the product of a nonempty strict subset of its primes.
+    pub fn decoder_plaintext(
+        &self,
+        declaration: &DecoderDeclaration,
+        source_program: &crate::program::ExponentLutProgram,
+    ) -> Result<(BigUint, Vec<u64>, BigUint), RnsBggError> {
+        let relation = || RnsBggError::Decoder(DecoderError::InvalidModulusRelation);
+        let level = Self::decoder_source_level(declaration, source_program)?;
+        let decoding = self.level(level)?;
+        let q: BigUint = decoding.modulus().as_ref().clone();
+        let (p, primes) = match (self.rhs_mode, declaration.plaintext_modulus()) {
+            (RhsMode::Static, None) => {
+                let plaintext = self.level(level + 1).map_err(|_| relation())?;
+                (plaintext.modulus().as_ref().clone(), plaintext.to_crt().0)
+            }
+            (RhsMode::Dynamic, Some(p)) => {
+                let primes = decoding
+                    .to_crt()
+                    .0
+                    .into_iter()
+                    .filter(|prime| (p % prime).is_zero())
+                    .collect::<Vec<_>>();
+                let product: BigUint = primes.iter().copied().map(BigUint::from).product();
+                if &product != p || primes.is_empty() || p == &q {
+                    return Err(relation());
+                }
+                (p.clone(), primes)
+            }
+            _ => return Err(relation()),
+        };
+        if p.is_zero() || !(&q % &p).is_zero() || p == q {
+            return Err(relation());
+        }
+        let spacing = &q / &p;
+        Ok((p, primes, spacing))
+    }
+
+    /// The ring `R_p` of the decoded plaintext.
+    pub(crate) fn decoder_plaintext_ring(
+        &self,
+        declaration: &DecoderDeclaration,
+        source_program: &crate::program::ExponentLutProgram,
+    ) -> Result<Ring, RnsBggError> {
+        let (_, primes, _) = self.decoder_plaintext(declaration, source_program)?;
+        let dimension = self.level(0)?.ring_dimension();
+        Ok(Ring::from_crt_moduli(primes.into_iter().map(IntExpr::from).collect(), dimension))
+    }
+
+    /// The source selection of `declaration`'s decoder: the action
+    /// `Dec_g(w)`, in the source ring, on component 1 of the source output,
+    /// and its gadget level and weight. A Static source at level `L` carries
+    /// `p_L mu s G_(L+1)`, and `Dec_(g_(L+1))(1)` selects `Delta mu` with
+    /// `Delta = p_L`. A Dynamic source carries `mu s G` against the full
+    /// gadget of `q`, and `Dec_g(Delta)` selects `Delta mu`.
+    pub(crate) fn decoder_selection(
+        &self,
+        declaration: &DecoderDeclaration,
+        source_program: &crate::program::ExponentLutProgram,
+    ) -> Result<(SmallMatrix, usize, BigUint), RnsBggError> {
+        let level = Self::decoder_source_level(declaration, source_program)?;
+        let (gadget_level, weight) = match self.rhs_mode {
+            RhsMode::Static => (level + 1, BigUint::one()),
+            RhsMode::Dynamic => {
+                self.dynamic_route(level)?;
+                (level, self.decoder_plaintext(declaration, source_program)?.2)
+            }
+        };
+        let action = self.gadget_inverse(
+            gadget_level,
+            level,
+            self.ring(gadget_level)?.polynomial([IntExpr::constant(weight.clone())]),
+        )?;
+        Ok((action, gadget_level, weight))
+    }
+
     /// The level `s` of the final smudge LUT input of `declaration`: its
     /// smudge chain has `s + 2` levels, the last being the decoding level.
     pub fn decoder_smudge_level(declaration: &DecoderDeclaration) -> Result<usize, RnsBggError> {
@@ -805,9 +1098,21 @@ impl RnsBggParameters {
     ) -> Result<Self, RnsBggError> {
         let level = Self::decoder_source_level(declaration, source_program)?;
         let decoding = self.level(level)?;
+        let smudge_level = Self::decoder_smudge_level(declaration)?;
+        if self.rhs_mode == RhsMode::Dynamic {
+            // The smudge is evaluated at the source modulus itself, with a
+            // gadget successor after its normalized members.
+            let smudge = Self::new(
+                vec![decoding.clone(); smudge_level + 3],
+                self.encoding_error_sigma.clone(),
+                self.operations_per_drop,
+            )?
+            .with_rhs_mode(RhsMode::Dynamic);
+            self.validate_decoder_smudge_parameters(&smudge, declaration, source_program)?;
+            return Ok(smudge);
+        }
         let decoding_primes = decoding.to_crt().0;
         let primes = pool.to_crt().0;
-        let smudge_level = Self::decoder_smudge_level(declaration)?;
         if primes_per_drop == 0 || !primes.starts_with(&decoding_primes) {
             return Err(RnsBggError::Decoder(DecoderError::InvalidModulusRelation));
         }
@@ -834,11 +1139,14 @@ impl RnsBggParameters {
     }
 
     /// Check that `smudge` is a smudge chain of `declaration`'s decoder of
-    /// `source_program` at these parameters: `s + 2` levels of non-increasing
-    /// moduli, each a CRT sub-basis of the one before, with a strict drop into
-    /// the last level, which is the decoding level `L` with its CRT basis. The
-    /// level `L + 1` (the plaintext modulus `p`) must be a strict drop, and the
-    /// declaration must smudge every coefficient of the decoding ring.
+    /// `source_program` at these parameters, and that the decoder has a
+    /// valid plaintext modulus (see [`Self::decoder_plaintext`]). A Static
+    /// chain has `s + 2` levels of non-increasing moduli, each a CRT
+    /// sub-basis of the one before, with a strict drop into the last level,
+    /// which is the decoding level `L` with its CRT basis. A Dynamic chain has
+    /// `s + 3` levels, every one the decoding level's basis. Source and smudge
+    /// share the encoding sigma and RHS mode, and the declaration must smudge
+    /// every coefficient of the decoding ring.
     pub(crate) fn validate_decoder_smudge_parameters(
         &self,
         smudge: &Self,
@@ -848,23 +1156,35 @@ impl RnsBggParameters {
         let relation = RnsBggError::Decoder(DecoderError::InvalidModulusRelation);
         let level = Self::decoder_source_level(declaration, source_program)?;
         let decoding = self.level(level)?;
-        let plaintext = self
-            .level(level + 1)
-            .map_err(|_| RnsBggError::Decoder(DecoderError::InvalidModulusRelation))?;
+        self.decoder_plaintext(declaration, source_program)?;
         // Every coefficient of the decoded row carries noise, so every
         // coefficient is smudged.
         if declaration.coefficients() != decoding.ring_dimension() as usize {
             return Err(RnsBggError::Decoder(DecoderError::InvalidSmudgeProgram));
         }
         let smudge_level = Self::decoder_smudge_level(declaration)?;
+        if smudge.encoding_error_sigma != self.encoding_error_sigma ||
+            smudge.rhs_mode != self.rhs_mode
+        {
+            return Err(relation);
+        }
+        if self.rhs_mode == RhsMode::Dynamic {
+            if smudge.levels.len() != smudge_level + 3 ||
+                smudge.levels.iter().any(|level| !compatible_level_parameters(level, decoding))
+            {
+                return Err(relation);
+            }
+            return Ok(());
+        }
+        let plaintext = self
+            .level(level + 1)
+            .map_err(|_| RnsBggError::Decoder(DecoderError::InvalidModulusRelation))?;
         let levels = smudge.levels();
         let depth = |params: &DCRTPolyParams| params.to_crt().0.len();
         if plaintext.modulus() == decoding.modulus() ||
             levels.len() != smudge_level + 2 ||
             !compatible_level_parameters(&levels[smudge_level + 1], decoding) ||
-            depth(&levels[smudge_level]) <= depth(decoding) ||
-            smudge.encoding_error_sigma != self.encoding_error_sigma ||
-            smudge.rhs_mode != self.rhs_mode
+            depth(&levels[smudge_level]) <= depth(decoding)
         {
             return Err(relation);
         }
@@ -1016,11 +1336,44 @@ pub(crate) fn encryption_projection_identity(
     Ok(digest.finalize().into())
 }
 
+/// Where the public key of a Program input comes from: Static keys are
+/// sampled from the hash key per wire and logical level, Dynamic keys per
+/// setup input coordinate (see [`RnsBggDynamicSetup::input_key`]), so they
+/// do not depend on the Program.
+#[derive(Clone)]
+pub enum InputKeySource {
+    Static { level: usize, knowledge: crate::program::AttributeKnowledge },
+    Dynamic { setup: std::sync::Arc<RnsBggDynamicSetup>, coordinate: u32 },
+}
+
+impl InputKeySource {
+    /// The key of input `wire`, or of its member `member`.
+    pub fn key(
+        &self,
+        parameters: &RnsBggParameters,
+        hash_key: mxx_dsl::Bytes,
+        wire: WireId,
+        member: Option<IntExpr>,
+    ) -> Result<RnsBggPublicKey, RnsBggError> {
+        match self {
+            Self::Static { level, knowledge } => {
+                public_key::sampled_key(parameters, *level, hash_key, wire, *knowledge, member)
+            }
+            Self::Dynamic { setup, coordinate } => Ok(RnsBggPublicKey::new(
+                wire,
+                setup.input_key(parameters, hash_key, *coordinate, member)?,
+            )),
+        }
+    }
+}
+
 /// The sole descriptor shared by RNS-BGG stage checkpoints.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RnsBggArtifactBinding {
     context: [u8; 32],
-    program: ExponentLutProgramId,
+    /// The Program of a preprocessing stage, and of a Static encryption; a
+    /// Dynamic encryption belongs to its setup only.
+    program: Option<ExponentLutProgramId>,
     parameters: [u8; 32],
     hash_key_commitment: [u8; 32],
     sources: Vec<mxx_ir_core::artifact::ProductionId>,
@@ -1032,22 +1385,25 @@ pub(crate) struct RnsBggArtifactBinding {
     input_levels: BTreeMap<WireId, usize>,
     /// RHS timing mode of the bound stages.
     rhs_mode: RhsMode,
-    /// Dynamic only: the shape and consuming level of each declared RHS,
-    /// whose ciphertext and digit companions encryption generates.
-    dynamic_rhs: BTreeMap<RhsId, (InputShape, usize)>,
-    /// Dynamic only: each `(level, LUT)` the Program evaluates, whose
-    /// switching ciphertexts and digit companions encryption generates.
-    dynamic_luts: BTreeSet<(usize, LutId)>,
+    /// Dynamic only: the identity of the setup the stage belongs to.
+    dynamic_setup: Option<[u8; 32]>,
+    /// Dynamic preprocessing only: the mapping of the Program's inputs and
+    /// RHS to setup coordinates.
+    dynamic_binding: Option<RnsBggDynamicBinding>,
     /// Dynamic encryption only: the prelude production holding every RHS
     /// family's ciphertexts, and its manifest.
     ciphertext_prelude:
         Option<(mxx_ir_core::artifact::ProductionId, mxx_ir_core::artifact::Manifest)>,
+    /// Preprocessing only: how the Program's outputs are consumed, and the
+    /// resolved carrier of each declared output.
+    output_use: RnsOutputUse,
+    output_carriers: Vec<RnsOutputCarrier>,
 }
 
 impl RnsBggArtifactBinding {
     pub(crate) fn new(
         context: [u8; 32],
-        program: ExponentLutProgramId,
+        program: Option<ExponentLutProgramId>,
         parameters: [u8; 32],
         hash_key_commitment: [u8; 32],
         sources: Vec<mxx_ir_core::artifact::ProductionId>,
@@ -1066,8 +1422,10 @@ impl RnsBggArtifactBinding {
             ciphertext_prelude: None,
             input_levels: BTreeMap::new(),
             rhs_mode,
-            dynamic_rhs: BTreeMap::new(),
-            dynamic_luts: BTreeSet::new(),
+            dynamic_setup: None,
+            dynamic_binding: None,
+            output_use: RnsOutputUse::default(),
+            output_carriers: Vec::new(),
         };
         for source in sources {
             binding = binding.with_source(source)?;
@@ -1086,14 +1444,15 @@ impl RnsBggArtifactBinding {
         &self.input_levels
     }
 
-    /// Records the RHS and LUT schema encryption needs in Dynamic mode.
-    pub(crate) fn with_dynamic_schema(
+    /// Records the Dynamic setup of the stage and, for preprocessing, the
+    /// Program's mapping to its coordinates.
+    pub(crate) fn with_dynamic_setup(
         mut self,
-        rhs: BTreeMap<RhsId, (InputShape, usize)>,
-        luts: BTreeSet<(usize, LutId)>,
+        setup: [u8; 32],
+        binding: Option<RnsBggDynamicBinding>,
     ) -> Self {
-        self.dynamic_rhs = rhs;
-        self.dynamic_luts = luts;
+        self.dynamic_setup = Some(setup);
+        self.dynamic_binding = binding;
         self
     }
 
@@ -1101,12 +1460,37 @@ impl RnsBggArtifactBinding {
         self.rhs_mode
     }
 
-    pub(crate) fn dynamic_rhs(&self) -> &BTreeMap<RhsId, (InputShape, usize)> {
-        &self.dynamic_rhs
+    /// Records the output use and the resolved carrier of every declared
+    /// output.
+    pub(crate) fn with_outputs(
+        mut self,
+        output_use: RnsOutputUse,
+        carriers: Vec<RnsOutputCarrier>,
+    ) -> Self {
+        self.output_use = output_use;
+        self.output_carriers = carriers;
+        self
     }
 
-    pub(crate) fn dynamic_luts(&self) -> &BTreeSet<(usize, LutId)> {
-        &self.dynamic_luts
+    /// How the Program's outputs are consumed.
+    pub(crate) fn output_use(&self) -> RnsOutputUse {
+        self.output_use
+    }
+
+    /// The resolved carrier of every declared output.
+    pub(crate) fn output_carriers(&self) -> &[RnsOutputCarrier] {
+        &self.output_carriers
+    }
+
+    /// The identity of the stage's Dynamic setup.
+    pub(crate) fn dynamic_setup(&self) -> Option<&[u8; 32]> {
+        self.dynamic_setup.as_ref()
+    }
+
+    /// The Program's mapping to setup coordinates of a Dynamic
+    /// preprocessing stage.
+    pub(crate) fn dynamic_binding(&self) -> Option<&RnsBggDynamicBinding> {
+        self.dynamic_binding.as_ref()
     }
 
     /// Binds a decoder declaration to this stage's artifact identity.
@@ -1136,7 +1520,7 @@ impl RnsBggArtifactBinding {
         &self.context
     }
 
-    pub(crate) fn program(&self) -> ExponentLutProgramId {
+    pub(crate) fn program(&self) -> Option<ExponentLutProgramId> {
         self.program
     }
 
@@ -1485,8 +1869,8 @@ pub(crate) fn add_encoding_rows(lhs: RnsBggRow, rhs: RnsBggRow) -> RnsBggRow {
 }
 
 /// The ciphertext `C = [top; target - prefix * top + e]` at `level`, with a
-/// fresh error row `e` of `columns` columns, so `(prefix, 1) C = target + e`.
-/// RHS and LUT-switching ciphertexts have this form.
+/// fresh error row `e` of `columns` columns sampled under `contract`, so
+/// `(prefix, 1) C = target + e`. RHS ciphertexts have this form.
 pub(crate) fn ciphertext_matrix(
     parameters: &RnsBggParameters,
     level: usize,
@@ -1494,8 +1878,9 @@ pub(crate) fn ciphertext_matrix(
     prefix: Mat,
     top: RnsBggRow,
     target: RnsBggRow,
+    contract: &RnsBggGaussian,
 ) -> Result<RnsBggMatrix, RnsBggError> {
-    let error = encoding::fresh_error(parameters, level, columns)?;
+    let error = contract.sample_row(&parameters.ring(level)?, columns)?;
     let bottom = (
         target.0 - prefix.clone() * top.0.clone() + error.0,
         target.1 - prefix * top.1.clone() + error.1,
@@ -1503,47 +1888,18 @@ pub(crate) fn ciphertext_matrix(
     Ok((top, bottom))
 }
 
-/// Hash tag of the public digit-companion keys `B_{a,j}` of one Dynamic RHS
-/// member or LUT branch consumed at `level`.
-///
-/// It names public setup coordinates only: the parameter identity, setup
-/// context, Program, the decoder declaration of an embedded smudge Program
-/// child, the material (`rhs/<id>` or `lut/<id>`), and its member or branch.
-/// No encryption batch, plaintext, ciphertext, or digit enters it, so every
-/// encryption under one setup shares these keys and the Program keys
-/// evaluated from them.
-pub(crate) fn companion_tag(
-    parameters: &RnsBggParameters,
-    context: &[u8; 32],
-    program: ExponentLutProgramId,
-    namespace: Option<[u8; 32]>,
-    material: String,
-    member: Option<IntExpr>,
-    level: usize,
-) -> mxx_dsl::HashTag {
-    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/dynamic-rhs-digit-key".to_vec());
-    tag.push(hex(&parameters.parameter_identity()));
-    tag.push(hex(context));
-    tag.push(hex(program.as_bytes()));
-    if let Some(commitment) = namespace {
-        tag.push("decoder");
-        tag.push(hex(&commitment));
-    }
-    tag.push(material);
-    if let Some(member) = member {
-        tag.push("member");
-        tag.push(member);
-    }
-    tag.push("level");
-    tag.push(IntExpr::constant(level));
-    tag
+/// Artifact role of a Dynamic root site's public action in the
+/// preprocessing production: `part` is `key` (the site's output key, ports
+/// `.0` to `.3`) or `branches` (a LUT's product keys `T_k`, every switched
+/// branch side by side, ports `.0` and `.1`).
+pub(crate) fn public_action_role(wire: WireId, part: &str) -> String {
+    format!("public-action/{wire:?}/{part}")
 }
 
 /// The public key `B_{a,j}` of digit row `a` of output column `j` of the
-/// ciphertext named by `tag` (see [`companion_tag`]): a `2 x M_i` key at
-/// `level`, as four `1 x D_i` blocks, since a digit is a public attribute
-/// encoded under the full current-level public gadget.
+/// package named by `tag` (see [`RnsBggDynamicSetup::package_tag`]): a
+/// `2 x M` key at `level`, as four `1 x D` blocks, since a digit is a
+/// public attribute encoded under the full public gadget.
 pub(crate) fn companion_key(
     parameters: &RnsBggParameters,
     level: usize,
@@ -1619,14 +1975,14 @@ pub(crate) fn join_row(row: &RnsBggRow) -> Mat {
 ///
 /// `T_{s,j} = sum_a B_{s,a,j} U_{s,:,a}` and `E_{s,j} = sum_a z_{s,a,j} U_{s,:,a}`,
 ///
-/// with `U_s = Dec_{q_i}(A_s)`. `key_entry(s, r, a)` is entry `(r, a)` of
+/// with `U_s = Dec(A_s)`. `key_entry(s, r, a)` is entry `(r, a)` of
 /// `A_s`, `companion_key(s, a, j)` the key `B_{s,a,j}`, and `companion(s, a,
 /// j)` the encoding `z = s B - d s G + eps` of digit `d = Dec(C_s)_{a,j}`.
-/// Then `E_s + c_s Dec(C_s) = s T_s - x (s H_i Dec(C_s)) + eps U + e Dec(C_s)`:
-/// the unit column `e_a` is a preimage of `H_i e_a` under the next-level
-/// gadget, so `s H_i Dec(C_s) = s C_s` up to multiples of `q_(i+1)`, which
-/// the scale `p_i` of the private payload annihilates. `T_s` depends only on
-/// public keys. The caller adds `c_s Dec(C_s)` (see [`column_action`]).
+/// Since `G U_s = A_s`, `E_s = s T_s - s A_s Dec(C_s) + eps U_s`, and for
+/// `c_s = s (A_s - mu G) + e` and `s C_s = nu s G + e_C`,
+/// `E_s + c_s Dec(C_s) = s (T_s - mu nu G) + eps U_s - mu e_C + e Dec(C_s)`.
+/// `T_s` depends only on public keys. The caller adds `c_s Dec(C_s)` (see
+/// [`column_action`]).
 ///
 /// An outer loop visits every `(s, a)` and decomposes column `a` of `A_s`
 /// once; its inner loop visits every `j`, holding one key and two
@@ -1634,18 +1990,24 @@ pub(crate) fn join_row(row: &RnsBggRow) -> Mat {
 /// accumulates the `1 x m_(i+1)` block of branch `s`, which the outer body
 /// then places. Both loops read companions, so on a GPU both are host-driven
 /// and the inner one reads each companion one iteration ahead. The graph and
-/// the working set are linear in `M_i + m_i + branches m_(i+1)`. Returns the key rows and, given
-/// companions, the companion row, each `1 x branches m_(i+1)` with branch `s` at columns `s
-/// m_(i+1) ..`.
+/// the working set are linear in `M_i + m_i + branches m_(i+1)`. Returns, given
+/// `companion_key`, the key rows and, given companions, the companion row, each
+/// `1 x branches m_(i+1)` with branch `s` at columns `s m_(i+1) ..`. An online
+/// evaluation that imports `T_s` from preprocessing (its public actions) passes no
+/// `companion_key`, so it expands no `B_{s,a,j}` and accumulates the companion
+/// row alone.
 pub(crate) fn companion_columns(
     parameters: &RnsBggParameters,
     level: usize,
     branches: usize,
     output_columns: usize,
     key_entry: &dyn Fn(IntExpr, usize, IntExpr) -> Result<Mat, RnsBggError>,
-    companion_key: &dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>,
+    companion_key: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>>,
     companion: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggRow, RnsBggError>>,
 ) -> Result<Vec<Mat>, RnsBggError> {
+    if companion_key.is_none() && companion.is_none() {
+        return Err(RnsBggError::Binding("a companion loop accumulates no row"));
+    }
     let ring = parameters.ring(level)?;
     let current = parameters.level(level)?;
     let base = public_gadget_base(current.base_bits())?;
@@ -1653,7 +2015,7 @@ pub(crate) fn companion_columns(
     let digit_rows = 2 * parameters.component_columns(level)?;
     let block = 2 * output_columns;
     let schema = |_| mxx_dsl::DslError::Schema;
-    let sums = if companion.is_some() { 3 } else { 2 };
+    let sums = 2 * usize::from(companion_key.is_some()) + usize::from(companion.is_some());
     let rows = vec![ring.zero((1, branches * block)); sums];
     Ok(mxx_dsl::iterate(branches * digit_rows, rows, |pair, rows: Vec<Mat>| {
         let pair = Box::new(pair.expression()?);
@@ -1684,9 +2046,12 @@ pub(crate) fn companion_columns(
                 Box::new(IntExpr::constant(block)),
             )
             .canonicalize();
-            let (top, bottom) =
-                companion_key(branch.clone(), a.clone(), j.clone()).map_err(schema)?;
-            let mut terms = vec![act(top), act(bottom)];
+            let mut terms = Vec::with_capacity(sums);
+            if let Some(companion_key) = companion_key {
+                let (top, bottom) =
+                    companion_key(branch.clone(), a.clone(), j.clone()).map_err(schema)?;
+                terms.extend([act(top), act(bottom)]);
+            }
             if let Some((left, right)) = read(next).map_err(schema)? {
                 let current = carried.split_off(sums);
                 terms.push(act((current[0].clone(), current[1].clone())));
@@ -2101,7 +2466,7 @@ mod tests {
         let columns = level.modulus_digits();
         let (scaled, _) = parameters.coefficient_output_scale(0, 12).unwrap();
         for k in [scaled, &q - 1u8, BigUint::from(12345u32)] {
-            let action = parameters.coefficient_output_action(0, &k).unwrap();
+            let action = parameters.output_action(0, &k).unwrap();
             let digits = action.clone().right_multiply(ring.identity(columns));
             let reconstruction = action.right_multiply(parameters.public_gadget(0).unwrap());
             let graph = mxx_dsl::DslContext::new("gadget-inverse-norms")

@@ -7,8 +7,9 @@
 //!
 //! term by term with the encoding stage:
 //!
-//! - `e_c`: the source output's level-`L` error, under the column selection `G_(L+1)^-1(1)`, whose
-//!   `l1` is the tower count of `q_(L+1)`;
+//! - `e_c`: the source output's level-`L` error, under the source selection `Dec_g(w)` of
+//!   [`super::RnsBggParameters::decoder_selection`] (`w = 1` against `g_(L+1)` for a Static source,
+//!   `w = Delta` against the full gadget for a Dynamic one), whose `l1` is the digit sum of `w`;
 //! - the smudge members: the child evaluator lowers the smudge Program with the same member
 //!   transform as the encoding (one finalization, then
 //!   [`super::RnsBggNoiseValue::constant_digit_action`] with the `l1` of the halved weights `w`),
@@ -21,7 +22,7 @@
 //! independent of each other or of the smudge.
 use super::*;
 
-/// The noise of one decoder, for the decoding margin `spacing = q_L / q_(L+1)`.
+/// The noise of one decoder, for the decoding margin `spacing = q_L / p`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RnsBggDecoderNoise {
     /// Commitment of the decoder declaration.
@@ -33,7 +34,7 @@ pub struct RnsBggDecoderNoise {
     /// The smudge magnitude bound `P^d / 2`: the smudge is uniform on
     /// `[-P^d/2, P^d/2)`.
     pub smudge: BigUint,
-    /// The decoding spacing `q_L / q_(L+1)`.
+    /// The decoding spacing `q_L / p`.
     pub spacing: BigUint,
 }
 
@@ -69,8 +70,11 @@ impl Decoder for super::super::RnsBggDecoder<'_, RnsBggNoiseEvaluator<'_>> {
             return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
         let level = evaluator.workload.level(*wire)?;
-        let plaintext = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
-        let selection = parameters.gadget_inverse_l1(plaintext, &[BigUint::one()])?;
+        let (_, gadget_level, weight) =
+            parameters.decoder_selection(declaration, evaluator.program)?;
+        // The balanced digits of `w`, exactly as the runtime decomposition
+        // computes them.
+        let (selection, _) = parameters.gadget_inverse_norms(gadget_level, &weight)?;
         let data = source.clone().constant_digit_action(&selection, &BigUint::one());
         let (unmask_error, unmask_variance) = self.unmask_noise(level)?;
         let mut error = &data.bound.error + &unmask_error;
@@ -92,7 +96,7 @@ impl Decoder for super::super::RnsBggDecoder<'_, RnsBggNoiseEvaluator<'_>> {
             error,
             moments,
             smudge: declaration.smudge_bound(),
-            spacing: parameters.scale(level)?.clone(),
+            spacing: parameters.decoder_plaintext(declaration, evaluator.program)?.2,
         })
     }
 }
@@ -130,10 +134,12 @@ pub(crate) fn simulate_decoder_noise(
     unmask_sigma: f64,
 ) -> Result<RnsBggDecoderNoise, crate::api::ApiError> {
     use crate::api::ApiError;
-    let source_workload = RnsBggDerivedWorkload::from_program(source).map_err(ApiError::scheme)?;
+    let source_workload = RnsBggDerivedWorkload::from_program_with_parameters(parameters, source)
+        .map_err(ApiError::scheme)?;
     let smudge_program = declaration.smudge().program();
     let smudge_workload =
-        RnsBggDerivedWorkload::from_program(smudge_program).map_err(ApiError::scheme)?;
+        RnsBggDerivedWorkload::from_program_with_parameters(smudge_parameters, smudge_program)
+            .map_err(ApiError::scheme)?;
     let one = [num_bigint::BigInt::from(1u8)];
     let smudge_bindings = RnsBggNoiseBindings::from_inputs(
         smudge_program,
@@ -148,6 +154,24 @@ pub(crate) fn simulate_decoder_noise(
         ],
     )
     .map_err(ApiError::scheme)?;
+    // A Dynamic smudge child reads packages of its own setup, sampled under
+    // the source setup's contracts with the automorphisms of its LUTs.
+    let smudge_bindings = match (parameters.rhs_mode(), &bindings.dynamic) {
+        (RhsMode::Static, _) => smudge_bindings,
+        (RhsMode::Dynamic, Some(source)) => smudge_bindings.with_dynamic(
+            RnsBggDynamicNoise::for_program(
+                stable_source_id(&(source.namespace, declaration.commitment())),
+                smudge_program,
+                source.distributions.clone(),
+                super::super::covering_automorphism_layout(smudge_program),
+                smudge_parameters.level(0).map_err(ApiError::scheme)?.ring_dimension() as usize,
+            )
+            .map_err(ApiError::scheme)?,
+        ),
+        (RhsMode::Dynamic, None) => {
+            return Err(ApiError::input("a Dynamic decoder needs the source package contracts"));
+        }
+    };
     let mut smudge =
         RnsNoiseBuild::new(smudge_parameters, smudge_program, &smudge_workload, &smudge_bindings)
             .map_err(ApiError::scheme)?;

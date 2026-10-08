@@ -588,9 +588,12 @@ pub trait EncryptBuild<P: Poly> {
         hash_key: &[u8],
     ) -> Result<(), ApiError>;
 
+    /// Bind the preprocessing artifacts the encryption reads. A scheme whose
+    /// encryption belongs to a setup rather than to a Program (an RNS-BGG
+    /// Dynamic setup) binds none.
     fn bind_artifacts(
         &mut self,
-        preprocess: &StageArtifacts<Self::PreprocessDescriptor>,
+        preprocess: Option<&StageArtifacts<Self::PreprocessDescriptor>>,
     ) -> Result<(), ApiError>;
 
     fn artifact_identity(&self) -> [u8; 32];
@@ -690,7 +693,7 @@ pub trait NoiseBuild {
 /// resume through the normal `StageArtifacts` lifecycle. It does not create a
 /// second executor or bypass graph validation or observers. `identity` selects
 /// the named session of the stage.
-pub(crate) fn execute_artifacts<E, S, D>(
+pub fn execute_artifacts<E, S, D>(
     graph: StageGraph,
     parameters: &ParamEnv,
     descriptor: D,
@@ -788,7 +791,7 @@ where
 /// The graph is validated against its manifest map and the observer runs
 /// before execution. The returned outputs are owned copies, so callers can
 /// download verification residuals or bind them into a later graph.
-pub(crate) fn execute_graph<E, S>(
+pub fn execute_graph<E, S>(
     graph: StageGraph,
     parameters: &ParamEnv,
     execution: &mut E,
@@ -939,12 +942,13 @@ where
 }
 
 /// Build and execute the input-only encryption graph. `mask` is absent when
-/// the scheme encrypts under the single secret `payload`.
+/// the scheme encrypts under the single secret `payload`; `preprocess` is
+/// absent when the encryption belongs to a setup rather than to a Program.
 pub fn encrypt<E, S, P, T>(
     inputs: &crate::program::EncryptionInputs,
     parameters: &ParamEnv,
     lhs: &PlaintextInputs<WireId, P>,
-    preprocess: &StageArtifacts<T::PreprocessDescriptor>,
+    preprocess: Option<&StageArtifacts<T::PreprocessDescriptor>>,
     payload: &T::PayloadSecret,
     mask: Option<&T::MaskSecret>,
     hash_key: &[u8],

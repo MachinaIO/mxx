@@ -177,6 +177,9 @@ pub struct DecoderDeclaration {
     coefficients: usize,
     digits: usize,
     smudge: DecoderSmudgeProgram,
+    /// The explicit plaintext modulus `p` of the decoded output, if any; see
+    /// [`Self::with_plaintext_modulus`].
+    plaintext_modulus: Option<BigUint>,
     commitment: [u8; 32],
 }
 
@@ -220,8 +223,38 @@ impl DecoderDeclaration {
             coefficients,
             digits,
             smudge,
+            plaintext_modulus: None,
             commitment,
         })
+    }
+
+    /// This declaration with the explicit plaintext modulus `p`, committed
+    /// with it. Without one, the plaintext modulus is the modulus of the
+    /// level after the source (a Static chain drops to it). A Dynamic chain
+    /// keeps one modulus `q`, so its decoder names an odd proper CRT divisor
+    /// `p` of `q`; the decoder then reads the source at the spacing `q / p`
+    /// and rounds the decoded row to `R_p`.
+    pub fn with_plaintext_modulus(
+        mut self,
+        plaintext_modulus: BigUint,
+    ) -> Result<Self, DecoderError> {
+        self.commitment = commitment(&(
+            b"mxx-exponent-lut/decoder/v1".as_slice(),
+            self.source_program,
+            self.source_output,
+            &self.profile,
+            self.coefficients,
+            self.digits,
+            self.smudge.id(),
+            &plaintext_modulus,
+        ))?;
+        self.plaintext_modulus = Some(plaintext_modulus);
+        Ok(self)
+    }
+
+    /// The explicit plaintext modulus, if any.
+    pub fn plaintext_modulus(&self) -> Option<&BigUint> {
+        self.plaintext_modulus.as_ref()
     }
 
     pub const fn source_program(&self) -> ExponentLutProgramId {

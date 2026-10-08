@@ -108,10 +108,12 @@ pub struct PublicKeyLowering<'a> {
     /// The Static payload secret; Dynamic preprocessing has none.
     pub(crate) payload_secret: Option<RnsBggPayloadSecret>,
     pub(crate) hash_key: Bytes,
-    /// Setup context and, for a decoder smudge child, its decoder declaration:
-    /// the public namespace of Dynamic digit-companion keys.
-    pub(crate) context: [u8; 32],
+    /// For a decoder smudge child, its decoder declaration.
     pub(crate) decoder_smudge: Option<Arc<DecoderDeclaration>>,
+    /// How the Program's outputs are consumed (see [`RnsOutputUse`]).
+    pub(crate) output_use: RnsOutputUse,
+    /// Dynamic: the setup and the Program's mapping to its coordinates.
+    pub(crate) dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
     /// RHS plaintexts, read from graph inputs; a family is read member by
     /// member.
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
@@ -127,6 +129,10 @@ pub struct PublicKeyLowering<'a> {
     /// under.
     pub(crate) unmask: Option<([u8; 32], Preimage, Mat)>,
     pub(crate) current_site: Option<LoweringSite>,
+    /// Dynamic: the public action of every root-scope `MulPrivate` and
+    /// `Lut` site, its output key and a LUT's product keys `T_k`, which
+    /// preprocessing publishes for online evaluation to import.
+    pub(crate) public_actions: BTreeMap<WireId, (RnsBggMatrix, Option<[Mat; 2]>)>,
     /// Open parallel bodies, outermost first: each one's instance count and
     /// member index, and the RHS family members it prepared.
     parallel_bodies: Vec<(IntExpr, IntExpr, Vec<(RhsId, RnsBggMatrix)>)>,
@@ -155,6 +161,10 @@ pub struct RnsPreprocessBuild<'a> {
     decoder_smudge_child: Option<PublicKeyLowering<'a>>,
     /// The preimage coefficient bound of the applied decoder's unmask key.
     unmask_bound: Option<BigUint>,
+    /// How the Program's outputs are consumed.
+    output_use: RnsOutputUse,
+    /// Dynamic: the setup and the Program's mapping to its coordinates.
+    dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
 }
 
 #[cfg(test)]

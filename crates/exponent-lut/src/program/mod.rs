@@ -215,6 +215,9 @@ pub struct ProgramInputDeclaration {
 }
 
 impl ProgramInputDeclaration {
+    pub fn new(shape: InputShape, knowledge: AttributeKnowledge) -> Self {
+        Self { shape, knowledge }
+    }
     pub fn shape(&self) -> &InputShape {
         &self.shape
     }
@@ -551,6 +554,13 @@ pub struct EncryptionInputs {
 }
 
 impl EncryptionInputs {
+    /// The input-only projection of a Dynamic setup: its input coordinates,
+    /// keyed by `WireId(coordinate)` in the setup's namespace, and no LUT.
+    pub(crate) fn from_setup(
+        inputs: impl IntoIterator<Item = (WireId, ProgramInputDeclaration)>,
+    ) -> Self {
+        Self { inputs: inputs.into_iter().collect(), luts: Vec::new() }
+    }
     pub fn inputs(&self) -> &BTreeMap<WireId, ProgramInputDeclaration> {
         &self.inputs
     }
@@ -585,10 +595,12 @@ impl ExponentLutProgram {
         debug_assert_eq!(canonical_program_id(&program), self.id);
         program
     }
-    pub(crate) fn inputs(&self) -> &BTreeMap<WireId, ProgramInputDeclaration> {
+    /// The declared inputs.
+    pub fn inputs(&self) -> &BTreeMap<WireId, ProgramInputDeclaration> {
         &self.inputs
     }
-    pub(crate) fn rhs_inputs(&self) -> &BTreeMap<RhsId, InputShape> {
+    /// The declared RHS inputs.
+    pub fn rhs_inputs(&self) -> &BTreeMap<RhsId, InputShape> {
         &self.rhs_inputs
     }
     /// Resolve a LUT registration by its validated instruction output, including
@@ -629,6 +641,18 @@ impl ExponentLutProgram {
         let mut pairs = Vec::new();
         visit(&self.body, &mut pairs);
         pairs
+    }
+    /// The outputs of the root-scope `MulPrivate` and `Lut` steps: one
+    /// value each, outside every family body.
+    pub(crate) fn root_private_sites(&self) -> std::collections::BTreeSet<WireId> {
+        self.body
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::MulPrivate { output, .. } | Step::Lut { output, .. } => Some(*output),
+                _ => None,
+            })
+            .collect()
     }
     /// The `(input, table)` of every LUT with a scalar input inside a
     /// family body, in body order. Lowerings prepare their material at root

@@ -1,5 +1,5 @@
 //! The RNS-BGG level workload derived from a Program.
-use super::{RnsBggError, RnsBggParameters};
+use super::{RhsMode, RnsBggError, RnsBggParameters};
 use crate::program::{
     Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution, FamilyRange,
     InputBinding, LutId, LutTable, ProgramLowerError, ProgramLoweringContext, RhsId, WireId,
@@ -15,7 +15,7 @@ pub(crate) struct WorkloadCollector<'a> {
     program: &'a ExponentLutProgram,
     parameters: Option<&'a RnsBggParameters>,
     levels: BTreeMap<WireId, usize>,
-    rhs_levels: BTreeMap<RhsId, usize>,
+    rhs_levels: BTreeMap<RhsId, BTreeSet<usize>>,
     luts: BTreeSet<(usize, LutId)>,
     /// For each public Program input, the lowest level at which it is
     /// consumed, or `None` once any use needs it at its own level.
@@ -49,20 +49,24 @@ impl<'a> WorkloadCollector<'a> {
 pub struct RnsBggDerivedWorkload {
     program: crate::program::ExponentLutProgramId,
     pub(super) levels: BTreeMap<WireId, usize>,
-    rhs_levels: BTreeMap<RhsId, usize>,
+    /// The consuming levels of each RHS: one level for Static parameters,
+    /// any number for Dynamic ones, whose packages are setup material read
+    /// at every consuming level.
+    rhs_levels: BTreeMap<RhsId, BTreeSet<usize>>,
     /// The input level and identity of every LUT the Program evaluates.
     luts: BTreeSet<(usize, LutId)>,
 }
 
 impl RnsBggDerivedWorkload {
-    /// Derive logical levels by lowering the Program once.
+    /// Derive logical levels by lowering the Program once, with the Static
+    /// rule that every RHS has one consuming level.
     pub fn from_program(program: &ExponentLutProgram) -> Result<Self, RnsBggError> {
         Self::derive(program, None)
     }
 
     /// Derive logical levels while validating public operand routes against
-    /// the physical modulus chain. Scheme-independent callers can continue
-    /// using [`Self::from_program`]; RNS noise paths use this variant.
+    /// the physical modulus chain, with the RHS rule of the parameters' mode:
+    /// a Dynamic RHS may be read at several logical levels.
     pub fn from_program_with_parameters(
         parameters: &RnsBggParameters,
         program: &ExponentLutProgram,
@@ -191,12 +195,21 @@ impl RnsBggDerivedWorkload {
             .copied()
             .ok_or(RnsBggError::Graph("missing wire logical level".into()))
     }
-    /// Return the one consuming logical level of an RHS ID.
+    /// Return the one consuming logical level of a Static RHS ID.
     pub fn rhs_level(&self, rhs: RhsId) -> Result<usize, RnsBggError> {
-        self.rhs_levels
-            .get(&rhs)
-            .copied()
-            .ok_or(RnsBggError::Graph("RHS has no consuming level".into()))
+        let levels = self.rhs_levels(rhs)?;
+        match (levels.first(), levels.last()) {
+            (Some(first), Some(last)) if first == last => Ok(*first),
+            (Some(first), Some(last)) => {
+                Err(RnsBggError::RhsLevelMismatch { rhs, expected: *first, actual: *last })
+            }
+            _ => Err(RnsBggError::Graph("RHS has no consuming level".into())),
+        }
+    }
+
+    /// Return every consuming logical level of an RHS ID.
+    pub fn rhs_levels(&self, rhs: RhsId) -> Result<&BTreeSet<usize>, RnsBggError> {
+        self.rhs_levels.get(&rhs).ok_or(RnsBggError::Graph("RHS has no consuming level".into()))
     }
     /// Program identity committed by this workload.
     pub fn program(&self) -> crate::program::ExponentLutProgramId {
@@ -264,17 +277,20 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         self.note_use(input.0, None);
         let output = self.site()?.output;
         let level = input.1;
-        if let Some(&rhs_level) = self.rhs_levels.get(rhs) {
-            if rhs_level != level {
-                return Err(RnsBggError::RhsLevelMismatch {
-                    rhs: *rhs,
-                    expected: level,
-                    actual: rhs_level,
-                });
-            }
-        } else {
-            self.rhs_levels.insert(*rhs, level);
+        let dynamic =
+            self.parameters.is_some_and(|parameters| parameters.rhs_mode() == RhsMode::Dynamic);
+        let levels = self.rhs_levels.entry(*rhs).or_default();
+        if let Some(&rhs_level) = levels.first() &&
+            rhs_level != level &&
+            !dynamic
+        {
+            return Err(RnsBggError::RhsLevelMismatch {
+                rhs: *rhs,
+                expected: level,
+                actual: rhs_level,
+            });
         }
+        levels.insert(level);
         let next = level.checked_add(1).ok_or(RnsBggError::Parameters("logical level overflow"))?;
         self.levels.insert(output, next);
         Ok((output, next))

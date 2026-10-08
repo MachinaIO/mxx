@@ -37,6 +37,7 @@ use crate::noise_utils::{NoiseBreakdown, ReductionCounts, SampleCoordinate};
 mod audit;
 mod build;
 mod decoder;
+mod dynamic;
 mod evaluator;
 mod rules;
 
@@ -59,6 +60,109 @@ pub struct RnsBggNoiseBindings {
     /// RHS contracts are references to logical inputs.  A family has one
     /// logical level and one aggregate support bound across all members.
     pub rhs: BTreeMap<RhsId, InputBinding<RnsBggNoiseRhs, RnsBggNoiseFamily<RnsBggNoiseRhs>>>,
+    /// How the Program's outputs are consumed; the simulated outputs are the
+    /// carriers [`RnsBggParameters::output_carrier`] resolves for it.
+    pub output_use: super::RnsOutputUse,
+    /// Dynamic: the package error contracts of the Program's setup.
+    pub dynamic: Option<RnsBggDynamicNoise>,
+}
+
+/// The error contract of one RHS package read by a Program.
+#[derive(Clone, Debug)]
+pub struct RnsBggPackageNoise {
+    /// The setup coordinate of the package.
+    pub coordinate: u32,
+    /// Coefficient bound of the gadget ciphertext error `e_C`.
+    pub ciphertext_error: BigUint,
+    /// The Gaussian sigma of `e_C` when encryption samples it; a supplied
+    /// ciphertext has only its bound.
+    pub ciphertext_sigma: Option<BigDecimal>,
+}
+
+/// The Dynamic material contracts of one Program: the setup's sampling
+/// contracts of companions and helpers, each RHS package's ciphertext error
+/// contract, and the setup automorphism group. Built from a setup
+/// ([`Self::from_setup`]), its contracts are the setup's, so a sampled width
+/// and an analysed bound cannot differ; parameter planning, which precedes
+/// the setup, states them for a Program directly ([`Self::for_program`]).
+/// `namespace` names the package sources: repeated reads of one package are
+/// one sampled object.
+#[derive(Clone, Debug)]
+pub struct RnsBggDynamicNoise {
+    /// The namespace of the package sources: the setup identity.
+    pub namespace: [u8; 32],
+    /// The sampling contracts of companions and helpers.
+    pub distributions: super::RnsBggDynamicDistributions,
+    /// The package contract of every RHS of the Program.
+    pub rhs: BTreeMap<RhsId, RnsBggPackageNoise>,
+    /// The setup automorphism group, ascending.
+    pub automorphisms: Vec<usize>,
+}
+
+impl RnsBggDynamicNoise {
+    /// The contracts of `program`, bound to `setup` through `binding`.
+    pub fn from_setup(
+        setup: &super::RnsBggDynamicSetup,
+        binding: &super::RnsBggDynamicBinding,
+        program: &ExponentLutProgram,
+    ) -> Result<Self, RnsBggError> {
+        binding.validate(setup, program)?;
+        let distributions = setup.distributions();
+        let rhs = program
+            .rhs_inputs()
+            .keys()
+            .map(|id| {
+                let coordinate = binding.rhs(*id)?;
+                let (ciphertext_error, ciphertext_sigma) = match &setup.rhs()[&coordinate].source {
+                    super::RnsBggPackageSource::Sampled => (
+                        distributions.ciphertext.cutoff().clone(),
+                        Some(distributions.ciphertext.sigma().clone()),
+                    ),
+                    super::RnsBggPackageSource::Supplied { error_bound } => {
+                        (error_bound.clone(), None)
+                    }
+                };
+                Ok((*id, RnsBggPackageNoise { coordinate, ciphertext_error, ciphertext_sigma }))
+            })
+            .collect::<Result<_, RnsBggError>>()?;
+        Ok(Self {
+            namespace: setup.identity(),
+            distributions: distributions.clone(),
+            rhs,
+            automorphisms: setup.automorphisms().to_vec(),
+        })
+    }
+
+    /// The planning contracts of `program` before its setup exists: every
+    /// RHS `RhsId(c)` at coordinate `c`, sampled under `distributions`, and
+    /// the automorphism group of `layout` on rings of dimension
+    /// `ring_dimension`.
+    pub fn for_program(
+        namespace: [u8; 32],
+        program: &ExponentLutProgram,
+        distributions: super::RnsBggDynamicDistributions,
+        layout: crate::program::ExpLayout,
+        ring_dimension: usize,
+    ) -> Result<Self, RnsBggError> {
+        let automorphisms = layout
+            .automorphism_indices(ring_dimension)
+            .map_err(|_| RnsBggError::Parameters("invalid automorphism layout"))?;
+        let rhs = program
+            .rhs_inputs()
+            .keys()
+            .map(|id| {
+                (
+                    *id,
+                    RnsBggPackageNoise {
+                        coordinate: id.0,
+                        ciphertext_error: distributions.ciphertext.cutoff().clone(),
+                        ciphertext_sigma: Some(distributions.ciphertext.sigma().clone()),
+                    },
+                )
+            })
+            .collect();
+        Ok(Self { namespace, distributions, rhs, automorphisms })
+    }
 }
 
 impl RnsBggNoiseBindings {
@@ -80,7 +184,19 @@ impl RnsBggNoiseBindings {
         }) {
             family.validate_support()?;
         }
-        Ok(Self { inputs, rhs })
+        Ok(Self { inputs, rhs, output_use: super::RnsOutputUse::default(), dynamic: None })
+    }
+
+    /// These bindings with the Dynamic package contracts `dynamic`.
+    pub fn with_dynamic(mut self, dynamic: RnsBggDynamicNoise) -> Self {
+        self.dynamic = Some(dynamic);
+        self
+    }
+
+    /// These bindings with the output use `output_use`.
+    pub fn with_output_use(mut self, output_use: super::RnsOutputUse) -> Self {
+        self.output_use = output_use;
+        self
     }
 
     /// Build noise bindings from inputs in the declaration order of `program`.
@@ -281,6 +397,20 @@ impl RnsBggNoiseValue {
             )]),
             heuristics: NoiseHeuristicLedger::new(),
         })
+    }
+
+    /// A fresh encoding-error carrier sampled under `contract`: its bound is
+    /// the contract's cutoff and its moments the contract's Gaussian. A
+    /// Dynamic setup samples each encoding role under its own contract.
+    pub fn sampled_gaussian(
+        contract: &super::RnsBggGaussian,
+        source: &[u8],
+        coefficients: &[BigInt],
+    ) -> Self {
+        let mut value = Self::sampled_encoding_sigma(contract.sigma(), source, coefficients)
+            .expect("a validated Gaussian contract");
+        value.bound.error = contract.cutoff().clone();
+        value
     }
 
     /// Declare that the members of a family bound with this element are
@@ -521,7 +651,7 @@ pub struct RnsBggNoiseEvaluator<'a> {
     trace: RnsBggNoiseTrace,
     current_site: Option<crate::program::LoweringSite>,
     event_multiplier: BigUint,
-    finalized_coefficient_wires: BTreeMap<WireId, RnsBggNoiseValue>,
+    finalized_outputs: BTreeMap<WireId, RnsBggNoiseValue>,
     /// The decoder declaration when this evaluator lowers its smudge Program.
     decoder_smudge: Option<Arc<DecoderDeclaration>>,
     /// The unmask trapdoor sigma when this evaluator composes a decoder.

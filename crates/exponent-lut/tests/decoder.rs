@@ -375,7 +375,7 @@ fn decoder_round_trip() {
         &source.encryption_inputs(),
         &env,
         &lhs,
-        &preprocess,
+        Some(&preprocess),
         &payload,
         Some(&mask),
         &hash_key,

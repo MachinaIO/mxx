@@ -121,9 +121,37 @@ pub fn ring_dimension_candidates(
         .collect()
 }
 
-/// Obtain one positive integer estimate from `lattice-estimator-cli`.
+/// Obtain one positive integer estimate from `lattice-estimator-cli` for
+/// Ring-LWE over `parameters` with a uniform ternary secret.
 pub fn lattice_security_bits(
     parameters: &DCRTPolyParams,
+    error_sigma: &BigDecimal,
+) -> Result<u64, String> {
+    lattice_security_bits_with_secret(parameters, r#"{"name":"Ternary"}"#, error_sigma)
+}
+
+/// [`lattice_security_bits`] for a discrete Gaussian secret of standard
+/// deviation `secret_sigma`, such as a trapdoor's.
+pub fn gaussian_secret_lattice_security_bits(
+    parameters: &DCRTPolyParams,
+    secret_sigma: &BigDecimal,
+    error_sigma: &BigDecimal,
+) -> Result<u64, String> {
+    if secret_sigma <= &BigDecimal::zero() {
+        return Err("secret sigma must be positive".to_owned());
+    }
+    lattice_security_bits_with_secret(
+        parameters,
+        &format!(r#"{{"name":"DiscreteGaussian","stddev":{secret_sigma}}}"#),
+        error_sigma,
+    )
+}
+
+/// One estimate for the secret distribution `secret` (an estimator JSON
+/// specification) and a discrete Gaussian error.
+fn lattice_security_bits_with_secret(
+    parameters: &DCRTPolyParams,
+    secret: &str,
     error_sigma: &BigDecimal,
 ) -> Result<u64, String> {
     if parameters.ring_dimension() == 0 || parameters.modulus().is_zero() {
@@ -136,7 +164,7 @@ pub fn lattice_security_bits(
         .arg(parameters.ring_dimension().to_string())
         .arg(parameters.modulus().to_string())
         .arg("--s-dist")
-        .arg(r#"{"name":"Ternary"}"#)
+        .arg(secret)
         .arg("--e-dist")
         .arg(format!(r#"{{"name":"DiscreteGaussian","stddev":{error_sigma}}}"#))
         .output()
@@ -240,10 +268,13 @@ fn plan_chain(
     let primes = pool.to_crt().0;
     // A decoder source keeps successors beyond its last LUT level: the level
     // below it supplies the plaintext modulus `p` of the decoded output.
+    // A Dynamic chain keeps every evaluated carrier in full-gadget form, so
+    // it reaches one gadget successor past its normalized outputs.
+    let gadget_successor = usize::from(request.rhs_mode == RhsMode::Dynamic);
     let chain_last = logical_count
         .checked_add(successor_levels)
         .ok_or_else(|| "logical level chain overflows".to_owned())?
-        .max(output_last);
+        .max(output_last + gadget_successor);
     let mut levels = Vec::with_capacity(chain_last + 1);
     for logical_level in 0..=chain_last {
         let mut depth = crate::rns_bgg::planned_crt_depth(
@@ -372,9 +403,37 @@ pub fn select_decoder_at_crt_depth(
         .position(|output| matches!(output, Operand::Scalar(wire) if *wire == decoder.output))
         .ok_or_else(|| "the decoded wire is not a scalar Program output".to_owned())?;
     let coefficients = request.ring_dimension as usize;
+    let (per_drop, primes_per_drop) = (request.operations_per_drop, request.primes_per_drop);
+    if per_drop == 0 || primes_per_drop == 0 {
+        return Err("invalid CRT-depth search request".to_owned());
+    }
+    // A Dynamic chain keeps the candidate's `max_crt_depth` primes at every
+    // level; its decoder rounds to the explicit plaintext modulus of the
+    // first `max_crt_depth - primes_per_drop` primes, so its spacing is
+    // `primes_per_drop` primes, as a Static drop's.
+    let dynamic = request.rhs_mode == RhsMode::Dynamic;
+    let dynamic_plaintext = if dynamic {
+        let depth = request
+            .max_crt_depth
+            .checked_sub(primes_per_drop)
+            .filter(|depth| *depth > 0)
+            .ok_or_else(|| "the decoding spacing leaves no plaintext prime".to_owned())?;
+        let pool = DCRTPolyParams::try_new(
+            request.ring_dimension,
+            request.max_crt_depth,
+            request.crt_bits,
+            request.base_bits,
+            None,
+            None,
+        )
+        .map_err(|_| "unsupported prime pool".to_owned())?;
+        Some(pool.to_crt().0[..depth].iter().copied().map(BigUint::from).product::<BigUint>())
+    } else {
+        None
+    };
     let declaration_with = |digits: usize| {
         let layouts = (decoder.layouts)(coefficients * digits)?;
-        DecoderDeclaration::new(
+        let declaration = DecoderDeclaration::new(
             program,
             decoder.output,
             decoder.profile,
@@ -382,14 +441,48 @@ pub fn select_decoder_at_crt_depth(
             digits,
             layouts,
         )
-        .map_err(|error| to_string(&error))
+        .map_err(|error| to_string(&error))?;
+        match &dynamic_plaintext {
+            Some(p) => {
+                declaration.with_plaintext_modulus(p.clone()).map_err(|error| to_string(&error))
+            }
+            None => Ok(declaration),
+        }
     };
     let first = declaration_with(1)?;
     let smudge_level =
         RnsBggParameters::decoder_smudge_level(&first).map_err(|error| to_string(&error))?;
-    let (per_drop, primes_per_drop) = (request.operations_per_drop, request.primes_per_drop);
-    if per_drop == 0 || primes_per_drop == 0 {
-        return Err("invalid CRT-depth search request".to_owned());
+    if dynamic {
+        // One equal-basis chain: the source and the smudge share `q`.
+        let mut candidate = request.clone();
+        candidate.terminal_depth = request.max_crt_depth;
+        let (pool, parameters) = plan_chain(&candidate, program, 1, candidate.max_crt_depth, None)?;
+        let trace = audit_planned(
+            &candidate,
+            &parameters,
+            program,
+            bindings,
+            terminal_value_bounds,
+            average,
+        )?;
+        let smudge_parameters = parameters
+            .decoder_smudge_parameters(&first, program, &pool, primes_per_drop)
+            .map_err(|error| to_string(&error))?;
+        let (_, _, spacing) =
+            parameters.decoder_plaintext(&first, program).map_err(|error| to_string(&error))?;
+        return fit_decoder(
+            &parameters,
+            smudge_parameters,
+            trace,
+            &first,
+            smudge_level,
+            &spacing,
+            &declaration_with,
+            program,
+            bindings,
+            output_index,
+            decoder,
+        );
     }
     let headroom = primes_per_drop * (smudge_level + 1).div_ceil(per_drop);
     let above = (level / per_drop) * primes_per_drop;
@@ -421,10 +514,43 @@ pub fn select_decoder_at_crt_depth(
         .decoder_smudge_parameters(&first, program, &pool, primes_per_drop)
         .map_err(|error| to_string(&error))?;
     let spacing = parameters.scale(level).map_err(|error| to_string(&error))?.clone();
+    fit_decoder(
+        &parameters,
+        smudge_parameters,
+        trace,
+        &first,
+        smudge_level,
+        &spacing,
+        &declaration_with,
+        program,
+        bindings,
+        output_index,
+        decoder,
+    )
+}
+
+/// Fit the smudge digit count of a decoder on planned `parameters` and its
+/// smudge chain: the smallest count whose smudge hides the simulated noise
+/// and fits the margin of `spacing` (see [`fit_smudge_digits`]).
+#[allow(clippy::too_many_arguments)]
+fn fit_decoder(
+    parameters: &RnsBggParameters,
+    smudge_parameters: RnsBggParameters,
+    trace: RnsBggNoiseTrace,
+    first: &DecoderDeclaration,
+    smudge_level: usize,
+    spacing: &BigUint,
+    declaration_with: &dyn Fn(usize) -> Result<DecoderDeclaration, String>,
+    program: &ExponentLutProgram,
+    bindings: &RnsBggNoiseBindings,
+    output_index: usize,
+    decoder: &DecoderRequest<'_>,
+) -> Result<DecoderSelection, String> {
+    let to_string = |error: &dyn fmt::Display| error.to_string();
     let mut trials = BTreeMap::<usize, (DecoderDeclaration, RnsBggDecoderNoise)>::new();
     let mut failure = None;
     let fitted =
-        fit_smudge_digits(&first.digit_base(), decoder.statistical_bits, &spacing, |digits| {
+        fit_smudge_digits(&first.digit_base(), decoder.statistical_bits, spacing, |digits| {
             let trial = declaration_with(digits).and_then(|declaration| {
                 if RnsBggParameters::decoder_smudge_level(&declaration)
                     .map_err(|error| to_string(&error))? !=
@@ -433,7 +559,7 @@ pub fn select_decoder_at_crt_depth(
                     return Err("smudge layouts change the smudge level".to_owned());
                 }
                 let noise = simulate_decoder_noise(
-                    &parameters,
+                    parameters,
                     &smudge_parameters,
                     program,
                     bindings,
@@ -460,7 +586,13 @@ pub fn select_decoder_at_crt_depth(
         fitted.map_err(|error| failure.take().unwrap_or_else(|| to_string(&error)))?;
     let (declaration, noise) =
         trials.remove(&digits).ok_or_else(|| "the fitted trial is missing".to_owned())?;
-    Ok(DecoderSelection { parameters, smudge_parameters, trace, declaration, noise })
+    Ok(DecoderSelection {
+        parameters: parameters.clone(),
+        smudge_parameters,
+        trace,
+        declaration,
+        noise,
+    })
 }
 
 /// Errors raised while converting a finite decimal into an exact IR real.

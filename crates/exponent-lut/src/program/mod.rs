@@ -630,14 +630,19 @@ impl ExponentLutProgram {
         visit(&self.body, &mut pairs);
         pairs
     }
-    /// The `(input, table)` of every LUT with a scalar input inside a
-    /// family body, in body order. Lowerings prepare their material at root
-    /// scope, where every member's body reads it.
+    /// The `(input, table)` of every LUT inside a family body, in body
+    /// order; a member input is named by its family, whose level is its
+    /// members'. Lowerings prepare their material at root scope, where every
+    /// member's body reads it.
     pub(crate) fn family_body_luts(&self) -> Vec<(WireId, LutId)> {
         fn visit(body: &Body, nested: bool, luts: &mut Vec<(WireId, LutId)>) {
             for step in &body.steps {
                 match step {
-                    Step::Lut { input: Operand::Scalar(input), table, .. } if nested => {
+                    Step::Lut {
+                        input: Operand::Scalar(input) | Operand::Member { family: input, .. },
+                        table,
+                        ..
+                    } if nested => {
                         luts.push((*input, *table));
                     }
                     Step::Parallel { body, .. } => visit(body, true, luts),

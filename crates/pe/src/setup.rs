@@ -116,9 +116,11 @@ impl PePublicKey {
         ))
     }
 
+    /// The hash tag of the public matrix `domain`. It names the parameters through the context;
+    /// the hash key, which keys every expansion, separates two setups of one parameter set.
     fn tag(&self, domain: &str) -> HashTag {
         let mut tag = HashTag::from(b"mxx-pe".to_vec());
-        tag.push(self.identity.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        tag.push(self.context.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
         tag.push(domain.to_owned());
         tag
     }
@@ -185,9 +187,10 @@ where
     E: StageExecution<S>,
     S: SessionStore,
 {
+    // The public hash key makes every setup's hash-expanded matrices fresh; the context only
+    // names the parameters, so the stage graphs of one parameter set do not depend on the setup.
     let hash_key: [u8; 32] = rand::random();
-    let nonce: [u8; 32] = rand::random();
-    let context = digest(b"mxx-pe/setup-context/v1", &[&parameters.identity(), &nonce]);
+    let context = digest(b"mxx-pe/setup-context/v2", &[&parameters.identity()]);
     let class = parameters.class();
     let rns = parameters.rns();
     let dynamic = RnsBggDynamicSetup::new(
@@ -233,7 +236,7 @@ where
         StageGraph::new(graph, BTreeMap::new(), BTreeMap::new()),
         &ParamEnv::default(),
         (),
-        digest(b"mxx-pe/setup-trapdoor/v1", &[&context]),
+        digest(b"mxx-pe/setup-trapdoor/v2", &[&context, &hash_key]),
         execution,
         store,
         |_| Ok(()),
@@ -255,7 +258,7 @@ where
         ),
         &ParamEnv::default(),
         (),
-        digest(b"mxx-pe/setup-public/v1", &[&context]),
+        digest(b"mxx-pe/setup-public/v2", &[&context, &hash_key]),
         execution,
         store,
         |_| Ok(()),

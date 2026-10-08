@@ -19,10 +19,35 @@
 //! The decoder rounds each coefficient of `floor(q/2) m + e` to the nearer of
 //! `0` and `floor(q/2)`, i.e. `round(2 x / q) mod 2`; for `q` odd it returns
 //! `m` for both symbols whenever `4 |e| + 2 < q` ([`PeNoiseReport::decrypts`]).
+//!
+//! # Average case
+//!
+//! [`simulate_average`] keeps every bound above except the extension blocks
+//! of the key, whose samples it treats probabilistically. For one coefficient
+//! of the phase, the error is
+//!
+//! `e_m - sum_i sigma_i(e_b) k_i - sum_(i,k) sigma_i(e_(h,k)) v_(i,k) - e_F v_F`.
+//!
+//! - `e_m` and the anchor blocks enter by their worst-case bounds `B_m` and `W m_B n B_b B_key`:
+//!   the preimages `k_i` are bounded by their cutoff only.
+//! - The rest is a linear form in the extension coordinates `v`, which key generation samples from
+//!   a discrete Gaussian of standard deviation `s_key`, independently of encryption. Its
+//!   coefficients are the coefficients of the errors `e_(h,k)` and `e_F`, so its energy is at most
+//!   `W (W - 1) m n B_h^2 + m n E_F^2` on every run. A linear form in fresh sub-Gaussian
+//!   coordinates of proxy `s_key^2` with coefficients of energy at most `E` exceeds `t` in absolute
+//!   value with probability at most `2 exp(-t^2 / (2 s_key^2 E))`.
+//!
+//! Decryption fails with probability at most `2^-k` over the `n` coefficients when
+//! `B_m + W m_B n B_b B_key + z s_key sqrt(E) < (q - 2) / 4`, with `z^2 = 2 ln 2 (k + ceil(log2 n)
+//! + 1)` ([`AverageCaseConfig::z_squared_for_events`]). The argument needs no assumption on the
+//! distribution of the evaluation error: `E_F` is its worst-case bound.
+
 use crate::{BranchingProgram, PeError, PeParameters, branching_program::ATTRIBUTE_COORDINATE};
 use mxx_backends::poly::PolyParams;
 use mxx_exponent_lut::{
     api,
+    decoder::simulation::AverageCaseConfig,
+    noise_utils::{NoiseMoments, NonnegativeRational},
     rns_bgg::{
         RnsBggDerivedWorkload, RnsBggDynamicNoise, RnsBggNoiseBindings, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggPackageNoise, RnsNoiseBuild, RnsOutputUse,
@@ -42,14 +67,43 @@ pub struct PeNoiseReport {
     pub modulus: BigUint,
     /// The exponent-lut simulator's trace of the evaluation.
     pub trace: RnsBggNoiseTrace,
+    /// For [`simulate_average`]: the failure exponent `k` of the target
+    /// `2^-k`, the tail multiplier `z^2`, and one phase coefficient's error as
+    /// a bias (its worst-case terms) and a variance proxy (its linear form in
+    /// the extension samples).
+    pub average: Option<(u32, NonnegativeRational, NoiseMoments)>,
 }
 
 impl PeNoiseReport {
-    /// Whether every coefficient of `floor(q/2) m + e` rounds to `m`:
-    /// `4 E_PE + 2 < q`.
+    /// Whether every coefficient of `floor(q/2) m + e` rounds to `m`: in the
+    /// worst case `4 E_PE + 2 < q`; in the average case `|bias| + z
+    /// sqrt(Var) < (q - 2) / 4` for the bias and variance of
+    /// [`simulate_average`].
     pub fn decrypts(&self) -> bool {
-        &self.decryption * 4u8 + 2u8 < self.modulus
+        match &self.average {
+            None => &self.decryption * 4u8 + 2u8 < self.modulus,
+            Some((_, z_squared, moments)) => {
+                self.modulus > BigUint::from(2u8) && {
+                    let limit = NonnegativeRational::new(&self.modulus - 2u8, 4u8.into())
+                        .expect("positive denominator");
+                    moments.fits(&limit, z_squared)
+                }
+            }
+        }
     }
+}
+
+/// `sigma^2` as an exact rational.
+fn squared(sigma: &bigdecimal::BigDecimal) -> NonnegativeRational {
+    let (integer, exponent) = sigma.as_bigint_and_exponent();
+    let magnitude = integer.magnitude().pow(2u32);
+    let power = BigUint::from(10u8).pow(2 * exponent.unsigned_abs() as u32);
+    if exponent >= 0 {
+        NonnegativeRational::new(magnitude, power)
+    } else {
+        NonnegativeRational::new(magnitude * power, 1u8.into())
+    }
+    .expect("positive denominator")
 }
 
 /// The material contracts of `program`'s packages under `parameters`, in
@@ -89,7 +143,7 @@ pub(crate) fn package_contracts(
 }
 
 /// Simulate `program` under `parameters` with the exponent-lut evaluator,
-/// and bound its decryption.
+/// and bound its decryption in the worst case.
 pub fn simulate(
     parameters: &PeParameters,
     program: &BranchingProgram,
@@ -125,5 +179,42 @@ pub fn simulate(
     let error = parameters.error().cutoff();
     let blocks = &w * &m_b * error + &w * (&w - 1u8) * &m * error + &m * &evaluation;
     let decryption = error + n * parameters.key_cutoff() * blocks;
-    Ok(PeNoiseReport { evaluation, decryption, modulus: parameters.modulus(), trace })
+    Ok(PeNoiseReport {
+        evaluation,
+        decryption,
+        modulus: parameters.modulus(),
+        trace,
+        average: None,
+    })
+}
+
+/// [`simulate`], with the average-case decryption bound of one phase
+/// coefficient (see the module documentation) for the failure target
+/// `2^-failure_exponent`: the worst-case terms as the bias and the linear form
+/// in the extension samples as the variance `s_key^2 E`.
+pub fn simulate_average(
+    parameters: &PeParameters,
+    program: &BranchingProgram,
+    failure_exponent: u32,
+) -> Result<PeNoiseReport, PeError> {
+    let mut report = simulate(parameters, program)?;
+    let class = parameters.class();
+    let w = BigUint::from(class.lookup_width());
+    let m = BigUint::from(parameters.state_columns());
+    let n = BigUint::from(parameters.level().ring_dimension());
+    let error = parameters.error().cutoff();
+    let energy = &w * (&w - 1u8) * &m * &n * error.pow(2) + &m * &n * report.evaluation.pow(2);
+    let bias = error +
+        &w * BigUint::from(parameters.anchor_columns()) * &n * error * parameters.key_cutoff();
+    let moments = NoiseMoments {
+        mean_numerator: 0.into(),
+        mean_denominator: 1u8.into(),
+        mean_radius: NonnegativeRational::new(bias, 1u8.into()).expect("positive denominator"),
+        variance: squared(parameters.key_width()).scaled(&energy),
+    };
+    let config = AverageCaseConfig { failure_exponent, ..AverageCaseConfig::default() };
+    let z_squared =
+        config.z_squared_for_events(&n).map_err(|error| PeError::Parameters(error.to_string()))?;
+    report.average = Some((failure_exponent, z_squared, moments));
+    Ok(report)
 }

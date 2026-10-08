@@ -1674,6 +1674,7 @@ impl Mat {
                 plaintext_modulus: plaintext_modulus.into(),
                 length: IntExpr::constant(length),
                 output_bool: false,
+                family: false,
             },
             vec![self.value],
             vec![WireType::Int; length],
@@ -1681,6 +1682,35 @@ impl Mat {
         (0..length)
             .map(|port| Int { value: node.output(port as u32).expect("decoded integer") })
             .collect()
+    }
+
+    /// [`Self::threshold_decode_ints`] as one integer family of `length`
+    /// members.
+    #[track_caller]
+    pub fn threshold_decode_int_family(
+        self,
+        plaintext_modulus: impl Into<IntExpr>,
+        length: usize,
+    ) -> Family<Int> {
+        let count = IntExpr::constant(length);
+        let node = NodeHandle::new(
+            NodeKind::ThresholdDecode {
+                plaintext_modulus: plaintext_modulus.into(),
+                length: count.clone(),
+                output_bool: false,
+                family: true,
+            },
+            vec![self.value],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("decoded family")],
+            element_schema: IntType,
+            count,
+        }
     }
 
     #[track_caller]
@@ -1694,6 +1724,7 @@ impl Mat {
                 plaintext_modulus: plaintext_modulus.into(),
                 length: IntExpr::constant(length),
                 output_bool: true,
+                family: false,
             },
             vec![self.value],
             vec![WireType::Bool; length],

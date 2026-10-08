@@ -34,6 +34,8 @@ use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::Conca
 use std::collections::BTreeMap;
 
 const OUTPUT_ROW: &str = "mxx-pe/output-row";
+/// The decoded message bits: one integer family of `n` members.
+pub(crate) const MESSAGE_OUTPUT: &str = "mxx-pe/message";
 
 /// Evaluate the key's predicate on the ciphertext: the gadget carrier `c_F`
 /// and its key, as online evaluation outputs.
@@ -100,10 +102,8 @@ where
 {
     let (graph, runtime, manifests) = phase_graph(public_key, key, ciphertext, evaluated)?;
     let dimension = public_key.parameters().level().ring_dimension() as usize;
-    let mut decoded = DslContext::new("mxx-pe/decrypt");
-    for (index, bit) in graph.threshold_decode_ints(2u8, dimension).into_iter().enumerate() {
-        decoded = decoded.output(format!("mxx-pe/message/{index}"), bit)?;
-    }
+    let decoded = DslContext::new("mxx-pe/decrypt")
+        .output(MESSAGE_OUTPUT, graph.threshold_decode_int_family(2u8, dimension))?;
     let outputs = api::execute_graph(
         StageGraph::new(decoded.build()?, runtime, manifests),
         &ParamEnv::default(),
@@ -111,15 +111,12 @@ where
         store,
         |_| Ok(()),
     )?;
-    (0..dimension)
-        .map(|index| {
-            let value =
-                outputs.outputs.get(&format!("mxx-pe/message/{index}")).ok_or(PeError::Mismatch)?;
-            let [bit] = <[num_bigint::BigInt; 1]>::try_from(execution.download_integers(value)?)
-                .map_err(|_| PeError::Mismatch)?;
-            Ok(bit == num_bigint::BigInt::from(1u8))
-        })
-        .collect()
+    let value = outputs.outputs.get(MESSAGE_OUTPUT).ok_or(PeError::Mismatch)?;
+    let bits = execution.download_integers(value)?;
+    if bits.len() != dimension {
+        return Err(PeError::Mismatch);
+    }
+    Ok(bits.iter().map(|bit| *bit == num_bigint::BigInt::from(1u8)).collect())
 }
 
 /// The phase `c_m - d_2 - (y_F - kappa_F) k` as a graph value, with its

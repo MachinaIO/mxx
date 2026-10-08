@@ -22,7 +22,10 @@
 //! By default a sampler relation admits any value within the sampler's support, so a claim holds
 //! for every execution. With [`ExportOptions::sampling_tape`], each sampled coefficient is instead
 //! a sampling-tape entry keyed by its occurrence, which a claim with a failure probability
-//! (`ProtocolDecl::failure_probability_log2`) measures under the ideal sampler laws.
+//! (`ProtocolDecl::failure_probability_log2`) measures under the ideal sampler laws. A trapdoor
+//! sampler then draws its public matrix `[ā | I | G - (ā r + e)]` from the tape as well, while a
+//! preimage sampler stays an existential relation: an execution may return any preimage within
+//! its cutoff, so a claim bounds the tapes on which some admissible preimage fails.
 
 mod backend;
 pub mod claim;
@@ -86,11 +89,13 @@ pub struct PrimitiveNames {
     pub uniform_residue_sample: String,
     pub uniform_interval_sample: String,
     pub gaussian_sample: String,
-    /// Tape-reading forms of the three samplers, used when [`ExportOptions::sampling_tape`] is
-    /// set: each takes the sampling tape and the occurrence's site before its usual arguments.
+    /// Tape-reading forms of the three samplers and of the trapdoor sampler, used when
+    /// [`ExportOptions::sampling_tape`] is set: each takes the sampling tape and the occurrence's
+    /// site before its usual arguments.
     pub uniform_residue_sample_at: String,
     pub uniform_interval_sample_at: String,
     pub gaussian_sample_at: String,
+    pub trapdoor_sample_at: String,
     pub hash_sample: String,
     pub gadget_trapdoor: String,
     pub gadget_decompose: String,
@@ -152,6 +157,7 @@ impl Default for PrimitiveNames {
             uniform_residue_sample_at: "MxxRuntime.uniformResidueSampleAt".into(),
             uniform_interval_sample_at: "MxxRuntime.uniformIntervalSampleAt".into(),
             gaussian_sample_at: "MxxRuntime.gaussianSampleAt".into(),
+            trapdoor_sample_at: "MxxRuntime.trapdoorSampleAt".into(),
             hash_sample: "MxxRuntime.hashSample".into(),
             gadget_trapdoor: "MxxRuntime.gadgetTrapdoorRuns".into(),
             gadget_decompose: "MxxRuntime.gadgetDecomposeRuns".into(),
@@ -235,7 +241,8 @@ pub struct ExportOptions {
     /// within the sampler's support. Each relation then takes `tape` and its call `path`; a
     /// sampler at node `k` reads site `path ++ [k]`, a subgraph call extends the path with its
     /// node, and a loop body with its node and iteration, so distinct occurrences read disjoint
-    /// tape keys. Trapdoor and preimage samplers have no tape semantics and are rejected.
+    /// tape keys. A trapdoor sampler reads its public matrix from the tape; a preimage sampler
+    /// remains existential (see the module documentation).
     pub sampling_tape: bool,
 }
 
@@ -1663,9 +1670,6 @@ impl<'a> Emitter<'a> {
                 preimage_max_coefficient_bound,
                 ..
             } => {
-                if self.requires_tape {
-                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
-                }
                 self.require_layout(
                     scope_id,
                     WireRef { node: node_id, port: crate::types::Port(1) },
@@ -1683,9 +1687,17 @@ impl<'a> Emitter<'a> {
                 self.bind_existential(&p, &ty0);
                 existentials.push((t.clone(), ty1));
                 existentials.push((p.clone(), ty0));
+                let relation = if self.requires_tape {
+                    self.current_uses_tape = true;
+                    format!(
+                        "{} backend tape (path ++ [{}])",
+                        self.options.primitives.trapdoor_sample_at, node_id.0
+                    )
+                } else {
+                    format!("{} backend", self.options.primitives.trapdoor_sample)
+                };
                 relations.push(format!(
-                    "{} backend {} {} {} {} {} {}",
-                    self.options.primitives.trapdoor_sample,
+                    "{relation} {} {} {} {} {} {}",
                     env.real_expr(sigma),
                     env.expr(gadget_base),
                     env.expr(digit_count),
@@ -1695,9 +1707,6 @@ impl<'a> Emitter<'a> {
                 ));
             }
             NodeKind::PreimageSample { max_coefficient_bound, .. } => {
-                if self.requires_tape {
-                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
-                }
                 self.require_layout(scope_id, args[1], None, None)?;
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let k = output(0);
@@ -2161,7 +2170,33 @@ impl<'a> Emitter<'a> {
                     output(0)
                 ));
             }
-            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+            NodeKind::ThresholdDecode { plaintext_modulus, length, family: true, .. } => {
+                append_expression_guards(plaintext_modulus, env, relations);
+                append_expression_guards(length, env, relations);
+                let output_wire = WireRef { node: node_id, port: crate::types::Port(0) };
+                let count = match self.validated.scopes[scope_id].wire_types.get(&output_wire) {
+                    Some(crate::types::ConcreteWireType::IndexedFamily { count, .. }) => *count,
+                    _ => {
+                        return self.unsupported(
+                            scope_id,
+                            node_id,
+                            kind,
+                            "a family decoder returns an indexed family",
+                        )
+                    }
+                };
+                let decoded = output(0);
+                self.bind_existential(&decoded, &self.output_type(scope, node_id, 0));
+                relations.push(format!("({}) = {count}", env.expr(length)));
+                relations.push(format!(
+                    "∀ k : Fin {count}, {} ({}) ({}) (k.val : Int) {} ({decoded} k)",
+                    self.options.primitives.threshold_decode,
+                    env.expr(plaintext_modulus),
+                    env.expr(length),
+                    arg(0)?,
+                ));
+            }
+            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool, .. } => {
                 append_expression_guards(plaintext_modulus, env, relations);
                 append_expression_guards(length, env, relations);
                 let count = scope.node(node_id).expect("decoder node").output_types().len();
@@ -4700,6 +4735,19 @@ mod tests {
         assert!(artifact.source.contains("trapdoorSample backend"));
         assert!(
             artifact
+                .source
+                .contains("preimageRunsDispatched backend w_0_0 w_0_1 w_1_0 (Int.toNat (4)) w_2_0")
+        );
+        // With a sampling tape, the trapdoor draws its public matrix at its own site, and the
+        // preimage keeps its existential relation.
+        let taped =
+            export(&validated, &ExportOptions { sampling_tape: true, ..Default::default() })
+                .unwrap();
+        assert!(taped.root.requires_sampling_tape);
+        assert!(taped.source.contains("MxxRuntime.trapdoorSampleAt backend tape (path ++ [0])"));
+        assert!(!taped.source.contains("trapdoorSample backend"));
+        assert!(
+            taped
                 .source
                 .contains("preimageRunsDispatched backend w_0_0 w_0_1 w_1_0 (Int.toNat (4)) w_2_0")
         );

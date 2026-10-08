@@ -1290,17 +1290,28 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix)]
         }
-        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool, family } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
             let count = positive_usize(length.evaluate(env)?, "decode length", scope, node.id)?;
             if !input.is_scalar() ||
                 count > input.ring.ring_dimension() as usize ||
-                plaintext_modulus.evaluate(env)? <= BigInt::one()
+                plaintext_modulus.evaluate(env)? <= BigInt::one() ||
+                (*family && *output_bool)
             {
                 return node_error(scope, node.id, "invalid threshold decoding parameters");
             }
-            vec![if *output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int }; count]
+            if *family {
+                vec![ConcreteWireType::IndexedFamily {
+                    element: Box::new(ConcreteWireType::Int),
+                    count,
+                }]
+            } else {
+                vec![
+                    if *output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
+                    count
+                ]
+            }
         }
         NodeKind::CrtRecompose { modulus, plaintext_moduli, reconstruction_coefficients } => {
             if node.args.is_empty() ||
@@ -3084,6 +3095,7 @@ mod tests {
                 plaintext_modulus: IntExpr::constant(1),
                 length: IntExpr::constant(9),
                 output_bool: false,
+                family: false,
             },
             vec![level],
             vec![WireType::Int; 9],

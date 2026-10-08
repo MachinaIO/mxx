@@ -741,7 +741,7 @@ pub(super) fn lower_control_node(
                 coefficient_bits,
             )
         }
-        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+        NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool, family } => {
             lower_threshold_decode(
                 ctx,
                 scope,
@@ -752,6 +752,7 @@ pub(super) fn lower_control_node(
                 plaintext_modulus,
                 length,
                 *output_bool,
+                *family,
             )
         }
         NodeKind::PolynomialFromValues { evaluation, .. } => {
@@ -4885,6 +4886,7 @@ fn lower_threshold_decode(
     plaintext_modulus: &IntExpr,
     length_expr: &IntExpr,
     output_bool: bool,
+    family: bool,
 ) -> Result<(), String> {
     let arguments = scope.arguments(node).ok_or("GPU threshold input is out of scope")?;
     let [source_wire] = arguments.as_slice() else {
@@ -4903,17 +4905,33 @@ fn lower_threshold_decode(
     let t_range = integer_range(ctx, t)?;
     let length = lower_device_int_expr(ctx, length_expr, env)?;
     integer_range(ctx, length)?;
-    let count = node.output_types().len();
+    let element = if output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
+    // A family decoder returns the decoded family itself; otherwise every
+    // member is its own port.
+    let count = if family {
+        let [declared] = node.output_types() else {
+            return Err("GPU threshold family decode needs one output".into());
+        };
+        match concretize_wire_type(declared, env, scope_id, node_id)
+            .map_err(|error| error.to_string())?
+        {
+            ConcreteWireType::IndexedFamily { element: actual, count } if *actual == element => {
+                count
+            }
+            _ => return Err("GPU threshold family has the wrong output type".into()),
+        }
+    } else {
+        for (port, declared) in node.output_types().iter().enumerate() {
+            let actual = concretize_wire_type(declared, env, scope_id, node_id)
+                .map_err(|error| error.to_string())?;
+            if actual != element {
+                return Err(format!("GPU threshold port {port} has the wrong output type"));
+            }
+        }
+        node.output_types().len()
+    };
     if count == 0 || count > ty.ring.ring_dimension() as usize {
         return Err("GPU threshold decode has an invalid output count".into());
-    }
-    let element = if output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int };
-    for (port, declared) in node.output_types().iter().enumerate() {
-        let actual = concretize_wire_type(declared, env, scope_id, node_id)
-            .map_err(|error| error.to_string())?;
-        if actual != element {
-            return Err(format!("GPU threshold port {port} has the wrong output type"));
-        }
     }
     let t_magnitude = t_range.start().abs().max(t_range.end().abs());
     let t_words = usize::try_from(t_magnitude.bits().div_ceil(64))
@@ -4991,6 +5009,10 @@ fn lower_threshold_decode(
         body: None,
     });
     ctx.producer.insert(decoded, vec![(ColumnRange { start: 0, end: 1 }, operation)]);
+    if family {
+        ctx.wire_ids.insert(WireRef { node: node_id, port: Port(0) }, decoded);
+        return Ok(());
+    }
     let owner =
         Arc::clone(ctx.owners.get(&decoded).ok_or("GPU threshold output owner is missing")?);
     for port in 0..count {

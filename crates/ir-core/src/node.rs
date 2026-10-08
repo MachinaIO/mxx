@@ -214,10 +214,15 @@ pub enum NodeKind {
     LiftIntegerToConstantPolynomial {
         matrix_type: crate::types::MatrixType,
     },
+    /// Decodes coefficients `0..length` of a scalar polynomial to
+    /// `round(t x / q) mod t`: `length` ports, or with `family` one integer
+    /// family of `length` members.
     ThresholdDecode {
         plaintext_modulus: IntExpr,
         length: IntExpr,
         output_bool: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        family: bool,
     },
     CrtRecompose {
         modulus: IntExpr,

@@ -674,6 +674,7 @@ impl ClosedProtocolBundle {
                     NodeKind::ThresholdDecode {
                         plaintext_modulus: decoder_plaintext_modulus,
                         output_bool: true,
+                        family: false,
                         ..
                     },
                 ) => {

@@ -60,6 +60,10 @@ pub struct PeParameterRequest {
     pub programming_sigma: BigDecimal,
     /// The statistical parameter `lambda` of the tail budget.
     pub statistical_bits: u32,
+    /// The noise model of the correctness check: `None` for the worst case,
+    /// `Some(k)` for the average case with failure target `2^-k` (see
+    /// [`crate::noise::simulate_average`]).
+    pub failure_exponent: Option<u32>,
     /// A Ring-LWE security target for both instances of
     /// [`PeParameters::security_bits`], estimated by `lattice-estimator-cli`;
     /// `None` estimates nothing (test parameters).
@@ -381,7 +385,8 @@ impl PeParameters {
     }
 
     /// Search `request`'s CRT depths, in order, for the first whose
-    /// worst-case evaluation of the class (see [`crate::noise::simulate`])
+    /// evaluation of the class under the request's noise model (see
+    /// [`crate::noise::simulate`] and [`crate::noise::simulate_average`])
     /// decrypts and whose Ring-LWE estimates ([`Self::security_bits`]) both
     /// meet the target, if any. Each
     /// candidate's conditions are checked in full: correctness need not be
@@ -396,10 +401,11 @@ impl PeParameters {
                     continue;
                 }
             };
-            let report = crate::noise::simulate(
-                &parameters,
-                &crate::BranchingProgram::longest(request.class),
-            )?;
+            let longest = crate::BranchingProgram::longest(request.class);
+            let report = match request.failure_exponent {
+                None => crate::noise::simulate(&parameters, &longest)?,
+                Some(exponent) => crate::noise::simulate_average(&parameters, &longest, exponent)?,
+            };
             if !report.decrypts() {
                 rejected.push(format!("depth {depth}: decryption noise exceeds q/4"));
                 continue;

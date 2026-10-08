@@ -148,6 +148,10 @@ pub struct RnsBggDynamicSetup {
     automorphism_layout: ExpLayout,
     automorphisms: Vec<usize>,
     distributions: RnsBggDynamicDistributions,
+    /// The digest of the setup without its hash key: what the hash tags of
+    /// its public matrices name. The hash key, which keys every expansion,
+    /// separates two setups of one schema.
+    schema: [u8; 32],
     identity: [u8; 32],
 }
 
@@ -209,8 +213,13 @@ impl RnsBggDynamicSetup {
             automorphism_layout: layout,
             automorphisms,
             distributions,
+            schema: [0; 32],
             identity: [0; 32],
         };
+        setup.schema = stable_digest(
+            b"mxx-rns-bgg/dynamic-schema/v1",
+            &Self { hash_key_commitment: [0; 32], ..setup.clone() },
+        );
         setup.identity = stable_digest(b"mxx-rns-bgg/dynamic-setup/v1", &setup);
         Ok(setup)
     }
@@ -361,7 +370,7 @@ impl RnsBggDynamicSetup {
 
     fn tag(&self, domain: &str) -> mxx_dsl::HashTag {
         let mut tag = mxx_dsl::HashTag::from(b"rns-bgg/dynamic".to_vec());
-        tag.push(hex(&self.identity));
+        tag.push(hex(&self.schema));
         tag.push(domain.to_owned());
         tag
     }

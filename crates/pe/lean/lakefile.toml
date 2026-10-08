@@ -1,0 +1,16 @@
+name = "MxxPe"
+version = "0.1.0"
+defaultTargets = ["MxxPe"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = "../../exponent-lut/lean"
+
+# Lemmas that hold for every predicate encryption parameter set.
+[[lean_lib]]
+name = "MxxPe"
+roots = ["PeAutomorphism"]

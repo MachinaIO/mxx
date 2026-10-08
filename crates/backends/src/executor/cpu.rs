@@ -1601,7 +1601,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
-            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool, family } => {
                 let input = self.matrix(values, node.args[0])?;
                 let plaintext = plaintext_modulus
                     .evaluate(env)
@@ -1614,13 +1614,17 @@ impl<S: SessionStore> Executor<'_, S> {
                     length,
                 )
                 .map_err(Self::backend_error)?;
-                for (port, value) in decoded.into_iter().enumerate() {
-                    let value = if *output_bool {
-                        RuntimeValue::Bool(!value.is_zero())
-                    } else {
-                        RuntimeValue::Int(value)
-                    };
-                    self.put(values, node.id, port as u32, value);
+                if *family {
+                    self.put(values, node.id, 0, RuntimeValue::integer_values(decoded));
+                } else {
+                    for (port, value) in decoded.into_iter().enumerate() {
+                        let value = if *output_bool {
+                            RuntimeValue::Bool(!value.is_zero())
+                        } else {
+                            RuntimeValue::Int(value)
+                        };
+                        self.put(values, node.id, port as u32, value);
+                    }
                 }
             }
             NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => {
@@ -2511,6 +2515,56 @@ mod tests {
         assert!(
             matches!(&result.outputs["sum"], RuntimeValue::Int(value) if *value == BigInt::from(11))
         );
+    }
+
+    /// A family threshold decode returns, as one integer family, the same
+    /// values as the per-port decode of the same coefficients.
+    #[test]
+    fn threshold_decode_family_matches_the_ports() {
+        let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
+        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let context = DslContext::new("threshold-family");
+        let values = context.int_family_input("values", 8);
+        let polynomial = ring(&parameters).from_coefficients(&values);
+        let ports = polynomial.clone().threshold_decode_ints(2, 8);
+        let graph = context
+            .output("ports", Family::<Int>::pack(ports).unwrap())
+            .unwrap()
+            .output("family", polynomial.threshold_decode_int_family(2, 8))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = cpu_backend([parameters]);
+        let inputs =
+            (0..8).map(|_| BigInt::from(rand::random::<u64>()) % &modulus).collect::<Vec<_>>();
+        let result = crate::executor::execute_in_session(
+            &graph,
+            &mut backend,
+            BTreeMap::from([("values".to_owned(), RuntimeValue::integer_values(inputs.clone()))]),
+            &mut MemoryArtifactStore::default(),
+            rand::random(),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let expected = inputs
+            .iter()
+            .map(|value| ((value * 4 + &modulus) / (&modulus * 2)) % 2)
+            .collect::<Vec<_>>();
+        for name in ["ports", "family"] {
+            let RuntimeValue::IndexedFamily { values, .. } = &result.outputs[name] else {
+                panic!("{name} is an integer family");
+            };
+            let decoded = values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::Int(value) => value.clone(),
+                    _ => panic!("{name} holds integers"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(decoded, expected, "{name}");
+        }
     }
 
     fn ring(parameters: &DCRTPolyParams) -> Ring {

@@ -36,9 +36,9 @@
 //! every field but the next row, whose fields are zero; the public attribute
 //! `X^(E_next)` holds only the next-row fields. The Program multiplies them,
 //! which adds the disjoint exponents: `X^(E_next) X^(E_state) = X^E`. The
-//! input contract is that both exponents only use their own fields below
-//! `2^P`; within it every bit pattern is handled: a digit `>= B` or an index
-//! `>= T - 1` is rejected.
+//! input contract is that both exponents only use their own fields, that the
+//! index lies in `[0, T - 1)`, the flag in `{0, 1}`, and every digit in
+//! `[0, B)`; the Program does not check it.
 //!
 //! A LUT with input layout `(s, width_log2)` reads the exponent bit window
 //! `[s, s + width_log2)` of a monomial with no bits below `s`, replaces it
@@ -55,12 +55,12 @@
 //! field `k`, in its `sigma_k` bits `[p_k - sigma_k, p_k)`, with nothing
 //! below, so LUT `k` reads the window `(state, field k)` and writes the next
 //! state just below field `k + 1`. The index field is widened to
-//! `d_0 >= max sigma_k`, which keeps every state inside the consumed bits;
-//! its extra bits only encode rejected indices. LUT `0` initialises
-//! `ok = [i < T - 1]` and the gate bits; the flag LUT clears `ok` unless
-//! `f == 1`; a cell LUT clears `ok` for a digit `>= B` (keeping `0` as its
-//! value) and for every active constraint whose last cell it reads and whose
-//! predicate fails. The last LUT outputs `X^ok`.
+//! `d_0 >= max sigma_k`, which keeps every state inside the consumed bits.
+//! LUT `0` initialises the gate bits; the flag LUT sets `ok = [f == 1]`; a
+//! cell LUT clears `ok` for every active constraint whose last cell it reads
+//! and whose predicate fails. The last LUT outputs `X^ok`. A table entry
+//! outside the input contract (an index `>= T - 1`, a digit `>= B`, or an
+//! unused state code) is never read; the tables fill it with `0`.
 //!
 //! # State chain
 //!
@@ -81,16 +81,14 @@ use crate::{
         LutOutputRepresentation, LutTable, Operand, ProgramValidationError, WireId,
     },
 };
-use mxx_backends::poly::{Poly, PolyParams};
+use mxx_backends::poly::Poly;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Errors in an AIR declaration or in a packed value.
+/// Errors in an AIR declaration.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum AirError {
     #[error("invalid AIR dimensions or constraint cells, or an unrepresentable packing")]
     InvalidDeclaration,
-    #[error("a value does not fit its packed field, or a packed exponent or ring is malformed")]
-    InvalidValue,
     #[error(transparent)]
     Program(#[from] ProgramValidationError),
 }
@@ -122,6 +120,7 @@ pub enum AirGate {
 pub type AirPredicate = Box<dyn Fn(&[usize]) -> bool>;
 
 /// A constraint: `holds` over the values of `cells`, applied by `gate`.
+/// `cells` must be nonempty.
 pub struct AirConstraint {
     pub gate: AirGate,
     pub cells: Vec<AirCell>,
@@ -249,25 +248,28 @@ impl AirConstraintProgram {
                 .map(|window| {
                     let code = window & ((1 << state_width) - 1);
                     let digit = window >> state_width;
+                    let outside = match field {
+                        0 => digit >= rows - 1,
+                        1 => code >= shapes[0].count,
+                        _ => digit >= bound || code >= shapes[field - 1].count,
+                    };
+                    if outside {
+                        return 0;
+                    }
                     let mut state = match field {
                         0 => AutomatonState {
-                            ok: digit < rows - 1,
+                            ok: true,
                             first: digit == 0,
                             last: digit == rows - 2,
                             values: BTreeMap::new(),
                         },
-                        _ if code < shapes[field - 1].count => {
-                            shapes[field - 1].decode(code, bound)
-                        }
-                        _ => AutomatonState::default(),
+                        _ => shapes[field - 1].decode(code, bound),
                     };
                     if field == 1 {
                         state.ok &= digit == 1;
                     }
                     if field >= 2 {
-                        let in_range = digit < bound;
-                        state.ok &= in_range;
-                        state.values.insert(cell_at(field), if in_range { digit } else { 0 });
+                        state.values.insert(cell_at(field), digit);
                         for (constraint, _) in
                             constraints.iter().zip(&lasts).filter(|(_, last)| **last == field)
                         {
@@ -279,7 +281,7 @@ impl AirConstraintProgram {
                             let cells = constraint
                                 .cells
                                 .iter()
-                                .map(|cell| state.value(*cell))
+                                .map(|cell| state.values[cell])
                                 .collect::<Vec<_>>();
                             state.ok &= !active || (constraint.holds)(&cells);
                         }
@@ -387,8 +389,8 @@ impl AirConstraintProgram {
     }
 
     /// The packed exponents `(E_state, E_next)` of a step's private and
-    /// public inputs. Every value must fit its field; a digit `>= B` or an
-    /// index `>= T - 1` that fits is packed, and the Program rejects it.
+    /// public inputs, whose values follow the input contract, with
+    /// `current.len() == next.len() == W` and `instance.len() == M`.
     pub fn pack(
         &self,
         index: usize,
@@ -396,24 +398,14 @@ impl AirConstraintProgram {
         current: &[usize],
         next: &[usize],
         instance: &[usize],
-    ) -> Result<(usize, usize), AirError> {
-        if current.len() != self.width ||
-            next.len() != self.width ||
-            instance.len() != self.instance_count
-        {
-            return Err(AirError::InvalidValue);
-        }
+    ) -> (usize, usize) {
         let values =
             [index, flag].into_iter().chain(current.iter().chain(next).chain(instance).copied());
-        let exponent =
-            values.zip(self.positions.windows(2)).try_fold(0, |exponent, (value, field)| {
-                if value >> (field[1] - field[0]) != 0 {
-                    return Err(AirError::InvalidValue);
-                }
-                Ok(exponent | value << field[0])
-            })?;
+        let exponent = values
+            .zip(&self.positions)
+            .fold(0, |exponent, (value, position)| exponent | value << position);
         let next = self.next_mask();
-        Ok((exponent & !next, exponent & next))
+        (exponent & !next, exponent & next)
     }
 
     /// The bits of the next-row fields.
@@ -422,61 +414,34 @@ impl AirConstraintProgram {
         (1 << high) - (1 << low)
     }
 
-    /// The next row and the instance packed in a state output exponent,
-    /// which must be a multiple of `2^p` below `2^P`.
-    pub fn unpack_state(&self, exponent: usize) -> Result<(Vec<usize>, Vec<usize>), AirError> {
-        let low = self.positions[2 + self.width];
-        if exponent >> self.packed_bits() != 0 || exponent & ((1 << low) - 1) != 0 {
-            return Err(AirError::InvalidValue);
-        }
+    /// The next row and the instance packed in a state output exponent.
+    pub fn unpack_state(&self, exponent: usize) -> (Vec<usize>, Vec<usize>) {
         let mut values = self.positions[2 + self.width..]
             .windows(2)
             .map(|field| (exponent >> field[0]) & ((1 << (field[1] - field[0])) - 1));
         let next = values.by_ref().take(self.width).collect();
-        Ok((next, values.collect()))
+        (next, values.collect())
     }
 
     /// The plaintext bindings `X^(E_state)` and `X^(E_next)` of the inputs,
-    /// over a ring of dimension at least `2^P`; each exponent may only use
-    /// its own fields.
+    /// over a ring of dimension at least `2^P`.
     pub fn plaintext_inputs<P: Poly>(
         &self,
         parameters: &P::Params,
         state: usize,
         next: usize,
-    ) -> Result<PlaintextInputs<WireId, P>, AirError> {
-        let packed = 1usize << self.packed_bits();
-        let mask = self.next_mask();
-        if state >= packed ||
-            state & mask != 0 ||
-            next & !mask != 0 ||
-            (parameters.ring_dimension() as usize) < packed
-        {
-            return Err(AirError::InvalidValue);
-        }
+    ) -> PlaintextInputs<WireId, P> {
         let monomial = |exponent| InputBinding::Scalar(P::const_rotate_poly(parameters, exponent));
-        Ok(BTreeMap::from([
-            (self.private_state, monomial(state)),
-            (self.public_next, monomial(next)),
-        ]))
+        BTreeMap::from([(self.private_state, monomial(state)), (self.public_next, monomial(next))])
     }
 }
 
 /// The automaton state: `ok`, the gate bits, and the live cell values.
-#[derive(Default)]
 struct AutomatonState {
     ok: bool,
     first: bool,
     last: bool,
     values: BTreeMap<AirCell, usize>,
-}
-
-impl AutomatonState {
-    /// A cell value; a rejected state, decoded from an unused code, has none
-    /// and reads `0`.
-    fn value(&self, cell: AirCell) -> usize {
-        self.values.get(&cell).copied().unwrap_or(0)
-    }
 }
 
 /// The live gates and cells of the state after one field, and its code
@@ -491,7 +456,7 @@ struct StateShape {
 impl StateShape {
     /// The mixed-radix code `ok + 2 (gate bits) + 2^(1 + gates) (cells in base B)`.
     fn encode(&self, state: &AutomatonState, bound: usize) -> usize {
-        let cells = self.cells.iter().rev().fold(0, |code, cell| code * bound + state.value(*cell));
+        let cells = self.cells.iter().rev().fold(0, |code, cell| code * bound + state.values[cell]);
         let gates = [(self.last, state.last), (self.first, state.first)]
             .into_iter()
             .filter(|(live, _)| *live)
@@ -649,8 +614,8 @@ mod tests {
         next: &[usize],
         instance: &[usize],
     ) -> usize {
-        let (state, flag, _) = step(air, air.pack(index, flag, current, next, instance).unwrap());
-        assert_eq!(air.unpack_state(state).unwrap(), (next.to_vec(), instance.to_vec()));
+        let (state, flag, _) = step(air, air.pack(index, flag, current, next, instance));
+        assert_eq!(air.unpack_state(state), (next.to_vec(), instance.to_vec()));
         assert!(flag <= 1, "flag exponent {flag}");
         flag
     }
@@ -667,9 +632,9 @@ mod tests {
         let (mut instance, mut current, mut flag) = (instance.to_vec(), rows[0].clone(), flag);
         let mut flags = Vec::new();
         for (index, next) in rows[1..].iter().enumerate() {
-            let inputs = air.pack(index, flag, &current, next, &instance).unwrap();
+            let inputs = air.pack(index, flag, &current, next, &instance);
             let (state, next_flag, _) = step(air, inputs);
-            (current, instance) = air.unpack_state(state).unwrap();
+            (current, instance) = air.unpack_state(state);
             assert_eq!(&current, next);
             flag = next_flag;
             flags.push(flag);
@@ -696,7 +661,7 @@ mod tests {
         AirConstraint { gate, cells, holds: Box::new(holds) }
     }
 
-    /// `B = 3`, so the two-bit digit `3` is an out-of-range witness value.
+    /// `B = 3`, a bound that is not a power of two.
     const B: usize = 3;
     const ROW_COUNTS: [usize; 3] = [2, 3, 5];
 
@@ -756,7 +721,7 @@ mod tests {
         assert_eq!(widths, [64, 16, 32, 128, 256, 256, 64, 64, 2, 4, 4]);
         // One public multiplication, then LUTs only: the clear evaluator
         // rejects any other step.
-        let inputs = air.pack(0, 1, &[0, 1], &[1, 2], &[0]).unwrap();
+        let inputs = air.pack(0, 1, &[0, 1], &[1, 2], &[0]);
         assert_eq!(step(&air, inputs).2, [widths.len(), 1]);
     }
 
@@ -783,7 +748,7 @@ mod tests {
             let y = trace[rows - 1][1];
             for row in 0..rows {
                 for column in 0..2 {
-                    for value in (0..4).filter(|v| *v != trace[row][column]) {
+                    for value in (0..B).filter(|v| *v != trace[row][column]) {
                         let mut tampered = trace.clone();
                         tampered[row][column] = value;
                         assert_eq!(
@@ -794,7 +759,7 @@ mod tests {
                     }
                 }
             }
-            for wrong in (0..4).filter(|v| *v != y) {
+            for wrong in (0..B).filter(|v| *v != y) {
                 assert_eq!(final_flag(&air, &[wrong], &trace, 1), 0, "T = {rows}, y = {wrong}");
             }
         }
@@ -810,24 +775,6 @@ mod tests {
             let y = trace[rows - 1][1];
             assert_eq!(stream(&air, &[y], &trace, 1), vec![0; rows - 1], "T = {rows}");
         }
-    }
-
-    #[test]
-    fn fibonacci_rejects_out_of_range_indices_and_digits() {
-        let rows = 3;
-        let air = fibonacci(rows);
-        let trace = fibonacci_trace(rows, [0, 1]);
-        let y = [trace[rows - 1][1]];
-        let (current, next) = (&trace[1][..], &trace[2][..]);
-        assert_eq!(next_flag(&air, 1, 1, current, next, &y), 1);
-        for index in [rows - 1, 63] {
-            assert_eq!(next_flag(&air, index, 1, current, next, &y), 0, "index {index}");
-        }
-        assert_eq!(next_flag(&air, 1, 1, current, next, &[B]), 0);
-        assert_eq!(next_flag(&air, 1, 1, &[B, current[1]], next, &y), 0);
-        assert_eq!(next_flag(&air, 1, 1, current, &[next[0], B], &y), 0);
-        // Every check fails at once.
-        assert_eq!(next_flag(&air, 63, 0, &[B, B], &[B, B], &[B]), 0);
     }
 
     #[test]
@@ -856,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn one_step_matches_the_relation_on_every_packed_input() {
+    fn one_step_matches_the_relation_on_every_contract_input() {
         // T = 3, W = 1, M = 1: fields index (7 bits), flag, current, next,
         // instance (2 bits each), so P = 14.
         let rows = 3;
@@ -874,15 +821,17 @@ mod tests {
         let air = AirConstraintProgram::new(rows, 1, B, 1, constraints).unwrap();
         assert_eq!(air.packed_bits(), 14);
         let mut accepted = 0;
-        for exponent in 0..1 << 14 {
-            let field = |position: u32, width: u32| (exponent >> position) & ((1 << width) - 1);
-            let (index, flag) = (field(0, 7), field(7, 1));
-            let (current, next, x) = (field(8, 2), field(10, 2), field(12, 2));
-            let expected = index < rows - 1 &&
-                flag == 1 &&
-                current < B &&
-                next < B &&
-                x < B &&
+        let contract = (0..rows - 1).flat_map(|index| {
+            (0..2).flat_map(move |flag| {
+                (0..B).flat_map(move |current| {
+                    (0..B)
+                        .flat_map(move |next| (0..B).map(move |x| (index, flag, current, next, x)))
+                })
+            })
+        });
+        for (index, flag, current, next, x) in contract {
+            let exponent = index | flag << 7 | current << 8 | next << 10 | x << 12;
+            let expected = flag == 1 &&
                 (index != 0 || current == x) &&
                 next == (current + 1) % B &&
                 (index != rows - 2 || next == (x + 2) % B);
@@ -898,23 +847,12 @@ mod tests {
     }
 
     #[test]
-    fn packing_round_trips_and_rejects_malformed_values() {
+    fn packing_splits_the_next_row_and_round_trips_the_state() {
         let air = fibonacci(3);
-        let (state, next) = air.pack(1, 1, &[1, 2], &[0, 2], &[1]).unwrap();
+        let (state, next) = air.pack(1, 1, &[1, 2], &[0, 2], &[1]);
         assert_eq!((state, next), (1 | 1 << 6 | 1 << 7 | 2 << 9 | 1 << 15, 2 << 13));
-        let exponent = state | next;
-        assert_eq!(air.unpack_state(exponent & !((1 << 11) - 1)).unwrap(), (vec![0, 2], vec![1]));
-        for malformed in [
-            air.pack(64, 1, &[0, 0], &[0, 0], &[0]),
-            air.pack(0, 2, &[0, 0], &[0, 0], &[0]),
-            air.pack(0, 1, &[4, 0], &[0, 0], &[0]),
-            air.pack(0, 1, &[0], &[0, 0], &[0]),
-            air.pack(0, 1, &[0, 0], &[0, 0], &[]),
-        ] {
-            assert_eq!(malformed, Err(AirError::InvalidValue));
-        }
-        assert_eq!(air.unpack_state(exponent), Err(AirError::InvalidValue));
-        assert_eq!(air.unpack_state(1 << 17), Err(AirError::InvalidValue));
+        let forwarded = (state | next) & !((1 << 11) - 1);
+        assert_eq!(air.unpack_state(forwarded), (vec![0, 2], vec![1]));
     }
 
     #[test]
@@ -927,13 +865,12 @@ mod tests {
         let air = AirConstraintProgram::new(2, 1, 2, 0, constraints).unwrap();
         assert_eq!(air.packed_bits(), 5);
         let ring = DCRTPolyParams::new(32, 1, 17, 1, None, None);
-        let (state, next) = air.pack(0, 1, &[1], &[1], &[]).unwrap();
+        let (state, next) = air.pack(0, 1, &[1], &[1], &[]);
         assert_eq!((state, next), (0b1100, 0b10000));
-        let bindings = air.plaintext_inputs::<DCRTPoly>(&ring, state, next).unwrap();
         let monomial =
             |exponent| InputBinding::Scalar(DCRTPoly::const_rotate_poly(&ring, exponent));
         assert_eq!(
-            bindings,
+            air.plaintext_inputs::<DCRTPoly>(&ring, state, next),
             BTreeMap::from([
                 (air.private_state(), monomial(state)),
                 (air.public_next(), monomial(next))
@@ -941,18 +878,6 @@ mod tests {
         );
         assert_eq!(next_flag(&air, 0, 1, &[1], &[1], &[]), 1);
         assert_eq!(next_flag(&air, 0, 1, &[1], &[0], &[]), 0);
-        let small = DCRTPolyParams::new(16, 1, 17, 1, None, None);
-        for (parameters, state, next) in [
-            (&small, state, next),
-            (&ring, 32, next),
-            (&ring, state | next, next),
-            (&ring, state, next | 1),
-        ] {
-            assert_eq!(
-                air.plaintext_inputs::<DCRTPoly>(parameters, state, next),
-                Err(AirError::InvalidValue)
-            );
-        }
     }
 
     #[test]

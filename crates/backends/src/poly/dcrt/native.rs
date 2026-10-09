@@ -24,6 +24,7 @@ pub(crate) mod ffi {
             divisor_words: &[u64],
         ) -> Result<UniquePtr<DCRTPoly>>;
         fn exact_basis_coefficients(input: &DCRTPoly) -> Result<Vec<u8>>;
+        fn exact_basis_small_coefficients(input: &DCRTPoly) -> Result<Vec<i64>>;
         #[namespace = "openfhe"]
         type Matrix = openfhe::ffi::Matrix;
         fn exact_basis_matrix_entry(

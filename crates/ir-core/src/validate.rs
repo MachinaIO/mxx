@@ -670,6 +670,8 @@ fn validate_node(
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation: crate::types::TrapdoorInstantiation::Computational,
+                preimage_sigma: None,
             }]
         }
         NodeKind::TrapdoorPublic => {
@@ -1074,14 +1076,23 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_type)]
         }
-        NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
+        NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound, compact } => {
             require_arity(scope, node, 0)?;
             require_nonnegative_real(sigma.evaluate_f64(env)?, scope, node.id, "Gaussian sigma")?;
             let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
             if max_coefficient_bound.is_negative() {
                 return node_error(scope, node.id, "Gaussian coefficient bound must be nonnegative");
             }
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
+            if *compact {
+                vec![ConcreteWireType::SmallMatrix {
+                    matrix,
+                    max_coefficient_bound,
+                    bound_domain: CoefficientBoundDomain::Global,
+                }]
+            } else {
+                vec![ConcreteWireType::Matrix(matrix)]
+            }
         }
         NodeKind::HashIntFamily { count, modulus, tag_components, .. } => {
             validate_hash_key_and_tag(scope, values, node, tag_components, env)?;
@@ -1166,6 +1177,8 @@ fn validate_node(
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
         } => {
             require_arity(scope, node, 0)?;
             let sigma = sigma.close(env)?;
@@ -1175,6 +1188,16 @@ fn validate_node(
                 node.id,
                 "trapdoor sigma",
             )?;
+            let preimage_sigma =
+                preimage_sigma.as_ref().map(|width| width.close(env)).transpose()?;
+            if let Some(width) = &preimage_sigma {
+                require_positive_real(
+                    width.evaluate_f64(&ParamEnv::default())?,
+                    scope,
+                    node.id,
+                    "preimage sigma",
+                )?;
+            }
             let gadget_base = gadget_base.evaluate(env)?.abs();
             if gadget_base <= BigInt::one() {
                 return node_error(scope, node.id, "gadget base must be greater than one");
@@ -1186,19 +1209,18 @@ fn validate_node(
                 return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
             }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let expected_columns = matrix
-                .rows
-                .checked_mul(digit_count.saturating_add(2))
-                .ok_or_else(|| ValidationError::Node {
-                    scope: scope.clone(),
-                    node: node.id,
-                    message: "trapdoor width overflow".to_owned(),
-                })?;
+            let Some(expected_columns) = instantiation.columns(matrix.rows, digit_count) else {
+                return node_error(
+                    scope,
+                    node.id,
+                    "invalid trapdoor instantiation for the public row count",
+                );
+            };
             if matrix.columns != expected_columns {
                 return node_error(
                     scope,
                     node.id,
-                    "trapdoor columns must equal rows * (digit_count + 2)",
+                    "trapdoor columns must equal the instantiation's trapdoor width",
                 );
             }
             vec![
@@ -1209,6 +1231,8 @@ fn validate_node(
                     gadget_base,
                     digit_count,
                     preimage_max_coefficient_bound,
+                    instantiation: *instantiation,
+                    preimage_sigma,
                 },
             ]
         }
@@ -1931,12 +1955,16 @@ fn concretize_wire_type_inner(
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
         } => ConcreteWireType::Trapdoor {
             matrix: concrete_matrix(matrix, env, scope, node)?,
             sigma: sigma.close(env)?,
             gadget_base: gadget_base.evaluate(env)?,
             digit_count: positive_usize(digit_count.evaluate(env)?, "digit count", scope, node)?,
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.evaluate(env)?,
+            instantiation: *instantiation,
+            preimage_sigma: preimage_sigma.as_ref().map(|width| width.close(env)).transpose()?,
         },
         WireType::IndexedFamily { element, count } => {
             let element = concretize_wire_type(element, env, scope, node)?;
@@ -3006,6 +3034,7 @@ mod tests {
                 matrix_type: gaussian_type.clone(),
                 sigma: crate::RealExpr::from_integer(-1),
                 max_coefficient_bound: IntExpr::constant(0),
+                compact: false,
             },
             Vec::new(),
             vec![WireType::Matrix(gaussian_type)],

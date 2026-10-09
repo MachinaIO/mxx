@@ -6,9 +6,10 @@
 //! Without FHE* (Sections 4 and 5) on the Dynamic RNS-BGG evaluator of
 //! `mxx-exponent-lut`:
 //!
-//! - [`setup::setup`] samples the anchor `B = [B^(1); B^(2)]` with the existing one-row TrapGen and
-//!   fixes the class's Dynamic setup: the initial-state key `A_0`, the attribute and automorphism
-//!   packages' public matrices, and the helper matrices `H_k`.
+//! - [`setup::setup`] samples the anchor `B = [B^(1); B^(2)]` with a one-row TrapGen (statistical
+//!   `[ā | g - ā T]` or computational `[ā | I | G - (ā R + E)]`, see [`params`]) and fixes the
+//!   class's Dynamic setup: the initial-state key `A_0`, the attribute and automorphism packages'
+//!   public matrices, and the helper matrices `H_k`.
 //! - [`encryption::encrypt`] produces, under a fresh secret `s = (s_bar, 1)`, the anchor encoding
 //!   `b = s B + e_b`, the attribute gadget ciphertexts `C_t = P Z_t + X^(Bz x_t) G` with `P = B -
 //!   [0; b]`, the message component `c_m = s d^T + e_m + floor(q/2) m`, and the Dynamic packages
@@ -21,22 +22,34 @@
 //!
 //! [`noise`] obtains the evaluation bound `E_F` from the exponent-lut
 //! simulator and applies the decryption margin; [`params`] fixes the class,
-//! the equal-basis chain, the sampling contracts, and the key width the
-//! existing sampler realizes.
+//! the equal-basis chain, the trapdoor instantiation, the sampling contracts,
+//! and the key width; [`budget`] holds the statistical instantiation's
+//! conditions: the statistical-distance budget, the regularity conditions, the
+//! flooding width, and the SampleRight key width.
+//!
+//! `Statistical` parameters with `Strict` keys implement every construction and
+//! parameter condition of the manuscript, assuming ideal samplers: the
+//! floating-point error of the sampling primitives, the preimage widths, and
+//! the truncation and rejection of preimages and keys are heuristic, as in
+//! OpenFHE. `Practical` keys relax the reduction's key-simulation width, and
+//! `Computational` parameters keep the legacy, heuristic construction outside
+//! the manuscript's theorem.
 //!
 //! # Conventions
 //!
 //! - `F(x) = 0` authorizes decryption. An unauthorized decryption returns the rounded phase; it is
 //!   not a reliable rejection.
-//! - The anchor row `B^(1)` is the public matrix of the existing TrapGen, with its identity block
-//!   and its column count `m_B = D + 2`, as directed for this implementation; the manuscript's
-//!   uniform-anchor and anchor-width requirements are not enforced.
+//! - The anchor row `B^(1)` is the public matrix of TrapGen. The statistical anchor is close to
+//!   uniform by the regularity conditions; the computational one keeps its identity block and its
+//!   `m_B = D + 2` columns, and the manuscript's uniform-anchor and anchor-width requirements are
+//!   not enforced for it.
 //! - The setup's public matrices other than `B^(1)` are expanded from a public hash key; they are
 //!   assumed indistinguishable from the manuscript's uniform matrices.
 //! - Gaussian widths are the sampler's standard-deviation parameter `sigma`; the manuscript's
 //!   `exp(-pi |x|^2 / s^2)` width is `s = sqrt(2 pi) sigma` ([`params::paper_width`]).
 
 pub mod branching_program;
+pub mod budget;
 pub mod decryption;
 pub mod encryption;
 pub mod keygen;

@@ -1,8 +1,10 @@
 //! Setup: the anchor `B = [B^(1); B^(2)]` with the trapdoor of `B^(1)`, the
 //! message row `d = (d_1, d_2)`, and the class's Dynamic setup.
 //!
-//! `B^(1)` is the public row of the existing one-row TrapGen, `1 x m_B` with
-//! `m_B` read from its column metadata. Its trapdoor stays in the secret
+//! `B^(1)` is the public row of the one-row TrapGen of the parameters'
+//! instantiation, `1 x m_B` with `m_B = m̄ + D` (statistical) or `D + 2`
+//! (computational); every preimage under it is sampled at the key width with
+//! the key cutoff, which the trapdoor's type carries. Its trapdoor stays in the secret
 //! setup production, which only [`crate::keygen`] imports; a second
 //! production republishes `B^(1)` alone, and the public key names only that
 //! one. `B^(2)` and `d` are expanded from the public hash key under setup
@@ -164,13 +166,15 @@ impl PePublicKey {
             return Err(PeError::Mismatch);
         }
         let level = self.parameters.level();
-        Ok(self.ring()?.trapdoor_artifact_input(
+        Ok(self.ring()?.trapdoor_artifact_input_with_width(
             master.trapdoor.0.clone(),
             format!("{ANCHOR_TRAPDOOR}.1"),
             1,
+            self.parameters.instantiation(),
             self.parameters.trapdoor_sigma_expr()?,
             1u64 << level.base_bits(),
             level.modulus_digits(),
+            self.parameters.preimage_sigma_expr()?,
             num_bigint::BigInt::from(self.parameters.key_cutoff().clone()),
         ))
     }
@@ -218,11 +222,13 @@ where
     )?;
     let ring = rns.ring(0)?;
     let level = parameters.level();
-    let trapdoor = ring.sample_trapdoor(
+    let trapdoor = ring.sample_trapdoor_with_width(
         1,
+        parameters.instantiation(),
         parameters.trapdoor_sigma_expr()?,
         1u64 << level.base_bits(),
         level.modulus_digits(),
+        parameters.preimage_sigma_expr()?,
         num_bigint::BigInt::from(parameters.key_cutoff().clone()),
     );
     let columns = trapdoor.public_matrix().matrix_type().columns.clone();

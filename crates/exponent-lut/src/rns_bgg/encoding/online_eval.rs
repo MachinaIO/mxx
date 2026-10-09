@@ -442,8 +442,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         evaluator.manifests.extend(child_manifests);
         let commitment = *declaration.commitment();
         let ring = self.parameters.ring(level)?;
-        let columns = crate::decoder::unmask::UNMASK_ROWS *
-            (self.parameters.level(level)?.modulus_digits() + 2);
+        let columns = mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns(
+                crate::decoder::unmask::UNMASK_ROWS,
+                self.parameters.level(level)?.modulus_digits(),
+            )
+            .ok_or(RnsBggError::Parameters("the unmask trapdoor width overflows"))?;
         let bound = self
             .unmask_preimage_bound
             .clone()

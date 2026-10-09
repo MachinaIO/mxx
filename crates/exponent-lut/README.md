@@ -32,6 +32,11 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   and accumulates only the encoding rows. Products and lookups inside family bodies recompute the
   same action from the setup.
 
+Sampling contracts (`RnsBggGaussian`) keep their sigma as a `BigDecimal` and their cutoff as a
+`BigUint`, so a contract may be wide: above `2^40` the backends sample by convolution, as for the
+noise-flooding contract of predicate encryption (sigmas up to `2^58`). The noise simulator reads
+every contract exactly, without floating point.
+
 Outputs are consumed by an explicit `RnsOutputUse`. `DirectDecode`, the default, applies a
 coefficient output's decoding action. `Gadget` keeps the full-gadget carrier for protocols, such
 as predicate encryption, that contract it further.

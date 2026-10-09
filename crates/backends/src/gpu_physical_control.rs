@@ -571,8 +571,9 @@ pub(super) fn pack_resident_family(
                     PhysicalEncoding::CompactCoeffPerCrtLimb { magnitude_bytes: 1 }
                 }
             }]),
-            ConcreteWireType::Trapdoor { .. } => {
-                vec![PhysicalEncoding::FullEval; 6].into_boxed_slice()
+            trapdoor @ ConcreteWireType::Trapdoor { .. } => {
+                vec![PhysicalEncoding::FullEval; trapdoor_leaf_types(trapdoor)?.len()]
+                    .into_boxed_slice()
             }
             ConcreteWireType::Int | ConcreteWireType::ConstantInt => {
                 Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedI64)])
@@ -1733,9 +1734,15 @@ pub(super) fn lower_control_node(
                 producers.extend(writers.iter().copied());
                 member_producers.push(writers);
             }
+            let trapdoor_leaves = match &expected {
+                ConcreteWireType::IndexedFamily { element, .. } => {
+                    trapdoor_leaf_types(element.as_ref()).ok().map(|leaves| leaves.len())
+                }
+                _ => None,
+            };
             let resident = pack_resident_family(expected, &members, ctx.device)?;
-            let secret_family =
-                paired_public_matrix.is_some() && resident.physical().encodings.len() == 6;
+            let secret_family = paired_public_matrix.is_some() &&
+                trapdoor_leaves == Some(resident.physical().encodings.len());
             let id = value_id(ctx.values.len())?;
             ctx.values.push(resident.physical().as_ref().clone());
             ctx.owners.insert(id, resident);
@@ -3326,21 +3333,21 @@ fn lower_dynamic_trapdoor_member(
     }
     let public_gadget =
         family_owner.physical().encodings.as_ref() == [PhysicalEncoding::PublicGadgetEval];
-    let full_secret = family_owner.physical().encodings.as_ref() ==
-        [
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-            PhysicalEncoding::FullEval,
-        ];
+    let full_secret = trapdoor_leaf_types(&expected).is_ok_and(|leaves| {
+        family_owner.physical().encodings.len() == leaves.len() &&
+            family_owner
+                .physical()
+                .encodings
+                .iter()
+                .all(|encoding| *encoding == PhysicalEncoding::FullEval)
+    });
     if !public_gadget && !full_secret {
         return Err("GPU dynamic trapdoor family has an unknown physical provenance".into());
     }
     let family_owner = Arc::clone(family_owner);
     let leaf_types = trapdoor_leaf_types(&expected)?;
-    let mut candidates = vec![Vec::with_capacity(count); if public_gadget { 1 } else { 6 }];
+    let mut candidates =
+        vec![Vec::with_capacity(count); if public_gadget { 1 } else { leaf_types.len() }];
     for member_index in 0..count {
         let selected = static_family_member(&family_owner, member_index)?;
         let writers = ctx
@@ -3351,7 +3358,7 @@ fn lower_dynamic_trapdoor_member(
         if public_gadget {
             candidates[0].push(trapdoor_member_leaf(ctx, &selected, &leaf_types[5], 5, &writers)?);
         } else {
-            for leaf in 0..6 {
+            for leaf in 0..leaf_types.len() {
                 candidates[leaf].push(trapdoor_member_leaf(
                     ctx,
                     &selected,
@@ -3390,7 +3397,7 @@ fn lower_dynamic_trapdoor_member(
         ctx.wire_ids.insert(output_wire, result);
         return Ok(());
     }
-    let leaf_ids = (0..6)
+    let leaf_ids = (0..leaf_types.len())
         .map(|leaf| {
             emit_indexed_matrix_choice(
                 ctx,
@@ -3401,9 +3408,6 @@ fn lower_dynamic_trapdoor_member(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let leaf_ids: [PhysicalValueId; 6] = leaf_ids
-        .try_into()
-        .map_err(|_| "GPU selected trapdoor has the wrong leaf count".to_owned())?;
     let result = pack_trapdoor_leaves(ctx, expected, leaf_ids, PhysicalEncoding::FullEval)?;
     let public_family = *ctx
         .trapdoor_public_ids
@@ -7841,7 +7845,13 @@ fn lower_parallel_loop(
         let ConcreteWireType::IndexedFamily { element, count: declared_count } = &ty else {
             return Err("GPU parallel loop output is not an indexed family".into());
         };
-        if *declared_count != count || !matches!(element.as_ref(), ConcreteWireType::Matrix(_)) {
+        // Members are full or bounded compact matrices; only summed ports (below) need full ones.
+        if *declared_count != count ||
+            !matches!(
+                element.as_ref(),
+                ConcreteWireType::Matrix(_) | ConcreteWireType::SmallMatrix { .. }
+            )
+        {
             return Err("GPU parallel loop needs a homogeneous matrix family".into());
         }
         // Root outputs of this family name its export sites. Later root

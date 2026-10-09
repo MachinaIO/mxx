@@ -13,7 +13,7 @@ CPU and GPU backends, inputs, planning, execution, outputs, and artifact stores.
 | Module or directory | What it provides |
 | --- | --- |
 | `poly`, `matrix`, `element`, `modulus` | Polynomial parameters, polynomials, and matrices over RNS rings. |
-| `sampler` | Uniform, Gaussian, hash-derived, trapdoor, and preimage samplers, and their cutoffs. |
+| `sampler` | Uniform, Gaussian (with a convolution sampler above `2^40`), hash-derived, trapdoor, and preimage samplers, and their widths and cutoffs. Trapdoors come in the computational instantiation `[ā \| I \| G - (ā R + E)]` and the statistical one `[ā \| g - ā T]`; a preimage is sampled at the width its trapdoor requests, at least the trapdoor's minimum. |
 | `openfhe_guard` | CRT basis checks and OpenFHE table initialization. |
 | `backend` | Runtime values and the CPU and GPU backends. |
 | `executor` | The CPU executor. |
@@ -48,3 +48,8 @@ ValidatedGraph --> executor::execute(.., &mut CpuDcrtBackend, ..)   CPU, node by
   return intact payloads.
 - **Multiple GPUs through copies.** A plan spreads matrix products, preimage tiles, and loop
   lanes over its devices, and moves data between devices only with copy nodes.
+- **Two trapdoor instantiations.** A trapdoor's type (`TrapdoorInstantiation` in `mxx-ir-core`)
+  fixes its public width and secret layout. The statistical trapdoor keeps `T` in row chunks; its
+  perturbation sampler never forms `T T*` or `T* T` but evaluates the conditional covariance with
+  a Chebyshev expansion over the Fourier spectra of `T`, on the CPU and in CUDA. The samplers'
+  floating-point error is heuristic, as in OpenFHE.

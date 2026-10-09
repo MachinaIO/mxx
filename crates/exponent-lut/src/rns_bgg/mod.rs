@@ -976,6 +976,7 @@ impl RnsBggParameters {
             digits,
             u32::try_from(base).map_err(|_| RnsBggError::Parameters("unmask gadget base"))?,
             sigma,
+            mxx_ir_core::types::TrapdoorInstantiation::Computational,
         )
         .ok_or(RnsBggError::Parameters("invalid unmask trapdoor sigma"))?;
         Ok((base, digits, bound))

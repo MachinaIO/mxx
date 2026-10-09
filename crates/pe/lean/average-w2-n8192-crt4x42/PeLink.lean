@@ -42,7 +42,7 @@ set_option maxHeartbeats 16000000 in
 theorem prelude_link {model : HashModel} {tape : SampleTape} {x : Fin 1 → Int} {key : ByteArray}
     {m : Fin N → Int} {outputs : PreludeOutputs}
     (h : Stage_prelude.generatedRoot Backend.backend model tape [3] GeneratedClaim.stage_3_params
-      (BOf tape, x, key, (fun _ _ ↦ reducePoly Q N (secOf tape)), m, ()) outputs)
+      (BOf tape, key, (fun _ _ ↦ reducePoly Q N (secOf tape)), x, m, ()) outputs)
     (hx : x 0 = 0) :
     ![outputs.1 0, outputs.2.1 0] = CtopOf tape ∧
       ![outputs.2.2.1 0, outputs.2.2.2.1 0] = CbotOf model key tape ∧

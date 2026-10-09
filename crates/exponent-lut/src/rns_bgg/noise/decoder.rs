@@ -112,7 +112,11 @@ impl super::super::RnsBggDecoder<'_, RnsBggNoiseEvaluator<'_>> {
             .ok_or(RnsBggError::Binding("the unmask trapdoor sigma is not bound"))?;
         let (_, digits, bound) = parameters.unmask_gadget(level, sigma)?;
         let terms = BigUint::from(parameters.level(level)?.ring_dimension()) *
-            BigUint::from(crate::decoder::unmask::UNMASK_ROWS * (digits + 2));
+            BigUint::from(
+                mxx_ir_core::types::TrapdoorInstantiation::Computational
+                    .columns(crate::decoder::unmask::UNMASK_ROWS, digits)
+                    .ok_or(RnsBggError::Parameters("the unmask trapdoor width overflows"))?,
+            );
         let error = &terms * parameters.encoding_error_bound() * &bound;
         let variance = parameters.encoding_error_variance().scaled(&(terms * bound.pow(2u32)));
         Ok((error, variance))

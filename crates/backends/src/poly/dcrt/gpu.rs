@@ -1159,6 +1159,44 @@ unsafe extern "C" {
         column_base: u64,
         destination_binding_base: u32,
     ) -> c_int;
+    fn gpu_raw_statistical_spectra(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        chunk: *const GpuRawMatrixViewAbi,
+        spectra: *mut c_void,
+        spectra_vectors: usize,
+        row_offset: usize,
+        chunk_binding: u32,
+        spectra_binding: u32,
+    ) -> c_int;
+    fn gpu_raw_statistical_perturbation(
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        output: *const GpuRawMatrixViewAbi,
+        seed: *const c_void,
+        spectra: *const c_void,
+        vectors: *mut c_void,
+        vector_bytes: usize,
+        chunk: *mut c_void,
+        chunk_bytes: usize,
+        p2: *mut i64,
+        p2_bytes: usize,
+        m_bar: usize,
+        row_chunk: usize,
+        p2_sigma: f64,
+        center_scale: f64,
+        a: f64,
+        beta: f64,
+        gmax: f64,
+        isotropic: f64,
+        rounding: f64,
+        output_binding_base: u32,
+        seed_binding: u32,
+        spectra_binding: u32,
+        vectors_binding: u32,
+        chunk_binding: u32,
+        p2_binding: u32,
+    ) -> c_int;
     fn gpu_raw_p1_covariance_refresh(
         ctx: *mut GpuContextOpaque,
         stream: *mut c_void,
@@ -2126,6 +2164,124 @@ pub struct GpuRawP1Workspace {
     rows: usize,
     columns: usize,
     degree: u32,
+}
+
+/// Plan-owned storage of the statistical perturbation sampler of one preimage tile: the spectra
+/// of `T` (`m_bar x digits` vectors of `n` complex values), seven `digits x columns` blocks of
+/// Fourier vectors, one row chunk of `columns` Fourier vectors, and the integers of `p_2`.
+pub struct GpuRawStatisticalWorkspace {
+    spectra: GpuDeviceBuffer,
+    vectors: GpuDeviceBuffer,
+    chunk: GpuDeviceBuffer,
+    p2: GpuDeviceBuffer,
+    physical_device: i32,
+    m_bar: usize,
+    digits: usize,
+    columns: usize,
+    degree: u32,
+}
+
+/// The statistical perturbation's scalars (see `sampler::trapdoor::statistical`).
+#[derive(Clone, Copy, Debug)]
+pub struct GpuStatisticalPerturbation {
+    pub p2_sigma: f64,
+    pub center_scale: f64,
+    pub a: f64,
+    pub beta: f64,
+    pub gmax: f64,
+    pub isotropic: f64,
+    pub rounding: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GpuStatisticalBindings {
+    pub output_base: u32,
+    pub seed: u32,
+    pub spectra: u32,
+    pub vectors: u32,
+    pub chunk: u32,
+    pub p2: u32,
+}
+
+impl GpuRawStatisticalWorkspace {
+    pub fn new(
+        params: &GpuDCRTPolyParams,
+        stream: &GpuNativeLaunchStream,
+        m_bar: usize,
+        digits: usize,
+        columns: usize,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let overflow = || GpuNativeGraphError::Native("statistical workspace size overflow".into());
+        let degree = params.ring_dimension() as usize;
+        let complex = 2 * mem::size_of::<f64>();
+        let vector = degree.checked_mul(complex).ok_or_else(overflow)?;
+        let spectra = m_bar
+            .checked_mul(digits)
+            .and_then(|count| count.checked_mul(vector))
+            .ok_or_else(overflow)?;
+        let block = digits.checked_mul(columns).ok_or_else(overflow)?;
+        let vectors = block
+            .checked_mul(7)
+            .and_then(|count| count.checked_mul(vector))
+            .ok_or_else(overflow)?;
+        let chunk = crate::sampler::trapdoor::statistical::ROW_CHUNK
+            .checked_mul(columns)
+            .and_then(|count| count.checked_mul(vector))
+            .ok_or_else(overflow)?;
+        let p2 = block
+            .checked_mul(degree)
+            .and_then(|count| count.checked_mul(mem::size_of::<i64>()))
+            .ok_or_else(overflow)?;
+        if m_bar == 0 || digits == 0 || columns == 0 {
+            return Err(GpuNativeGraphError::Native("empty statistical workspace".into()));
+        }
+        Ok(Self {
+            spectra: GpuDeviceBuffer::allocate(stream, spectra)?,
+            vectors: GpuDeviceBuffer::allocate(stream, vectors)?,
+            chunk: GpuDeviceBuffer::allocate(stream, chunk)?,
+            p2: GpuDeviceBuffer::allocate(stream, p2)?,
+            physical_device: stream.physical_device,
+            m_bar,
+            digits,
+            columns,
+            degree: params.ring_dimension(),
+        })
+    }
+
+    /// Fixed workspace binding ranges in spectra, vectors, chunk, and `p_2` order.
+    pub fn binding_ranges(&self) -> [(u64, usize); 4] {
+        [
+            (self.spectra.as_ptr() as u64, self.spectra.bytes),
+            (self.vectors.as_ptr() as u64, self.vectors.bytes),
+            (self.chunk.as_ptr() as u64, self.chunk.bytes),
+            (self.p2.as_ptr() as u64, self.p2.bytes),
+        ]
+    }
+
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        for buffer in [&self.spectra, &self.vectors, &self.chunk, &self.p2] {
+            buffer.protect_compiled_submission(completion)?;
+        }
+        Ok(())
+    }
+
+    pub fn prepare_graph_launch(
+        &self,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        if stream.physical_device != self.physical_device {
+            return Err(GpuNativeGraphError::Native(
+                "statistical workspace is on another GPU".into(),
+            ));
+        }
+        for buffer in [&self.spectra, &self.vectors, &self.chunk, &self.p2] {
+            buffer.wait_compiled_inputs(self.physical_device, stream, false)?;
+        }
+        Ok(())
+    }
 }
 
 /// Reused within a single GQ operation after each source CRT limb's sampled
@@ -4182,6 +4338,104 @@ impl GpuDCRTPolyParams {
                 base_residues.as_ptr(),
                 column_base,
                 destination_binding_base,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Writes the spectra of one coefficient-domain row chunk of `T`, rows `row_offset..`, into
+    /// the workspace.
+    pub fn emit_raw_statistical_spectra(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        chunk: &GpuRawMatrixView,
+        row_offset: usize,
+        workspace: &GpuRawStatisticalWorkspace,
+        chunk_binding: u32,
+        spectra_binding: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if workspace.physical_device != stream.physical_device ||
+            chunk.physical_device != stream.physical_device ||
+            chunk.degree != workspace.degree ||
+            chunk.columns != workspace.digits as u64 ||
+            row_offset as u64 + chunk.rows > workspace.m_bar as u64
+        {
+            return Err(GpuNativeGraphError::Native(
+                "raw statistical spectra layout mismatch".into(),
+            ));
+        }
+        let chunk = chunk.abi();
+        if unsafe {
+            gpu_raw_statistical_spectra(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &chunk,
+                workspace.spectra.as_ptr(),
+                workspace.m_bar * workspace.digits,
+                row_offset,
+                chunk_binding,
+                spectra_binding,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+
+    /// Samples the perturbation `[p_1; p_2]` of one tile into `output` (`m_bar + digits` rows).
+    pub fn emit_raw_statistical_perturbation(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        output: &GpuRawMatrixView,
+        seed_address: u64,
+        scalars: GpuStatisticalPerturbation,
+        workspace: &GpuRawStatisticalWorkspace,
+        bindings: GpuStatisticalBindings,
+    ) -> Result<(), GpuNativeGraphError> {
+        if workspace.physical_device != stream.physical_device ||
+            seed_address == 0 ||
+            output.physical_device != stream.physical_device ||
+            output.degree != workspace.degree ||
+            output.rows != (workspace.m_bar + workspace.digits) as u64 ||
+            output.columns != workspace.columns as u64
+        {
+            return Err(GpuNativeGraphError::Native(
+                "raw statistical perturbation layout mismatch".into(),
+            ));
+        }
+        let output = output.abi();
+        if unsafe {
+            gpu_raw_statistical_perturbation(
+                self.ctx.raw_ptr(),
+                stream.raw_ptr(),
+                &output,
+                seed_address as *const c_void,
+                workspace.spectra.as_ptr(),
+                workspace.vectors.as_ptr(),
+                workspace.vectors.bytes,
+                workspace.chunk.as_ptr(),
+                workspace.chunk.bytes,
+                workspace.p2.as_ptr() as *mut i64,
+                workspace.p2.bytes,
+                workspace.m_bar,
+                crate::sampler::trapdoor::statistical::ROW_CHUNK,
+                scalars.p2_sigma,
+                scalars.center_scale,
+                scalars.a,
+                scalars.beta,
+                scalars.gmax,
+                scalars.isotropic,
+                scalars.rounding,
+                bindings.output_base,
+                bindings.seed,
+                bindings.spectra,
+                bindings.vectors,
+                bindings.chunk,
+                bindings.p2,
             )
         } != 0
         {
@@ -8840,6 +9094,234 @@ mod tests {
             assert_eq!(status.read().unwrap(), 0);
             assert_eq!(download_matrix(&output, &cpu_params, false), expected);
         }
+    }
+
+    /// The statistical perturbation kernel with its correction made dominant (`a` large, `beta =
+    /// 1 / (2 gmax)`, no isotropic part, rounding width one, zero center): `p_1` has covariance
+    /// `a (I - beta T T*)`, so `E ‖T* p_1‖² = n a Σ_j (tr G_j - beta ‖G_j‖_F²)` over the
+    /// evaluation points `j`, clearly apart from the uncorrected `n a Σ_j tr G_j`.
+    #[test]
+    #[sequential(gpu_context)]
+    fn raw_statistical_perturbation_has_the_corrected_covariance() {
+        use crate::sampler::trapdoor::statistical::{NegacyclicFft, trapgen};
+        let Some(&device) = detected_gpu_device_ids().first() else {
+            return;
+        };
+        let n = 32usize;
+        let cpu = DCRTPolyParams::new(n as u32, 1, 50, 25, None, None);
+        let params = GpuDCRTPolyParams::new(n as u32, cpu.to_crt().0, 25, None);
+        let stream = params.native_launch_stream(device).unwrap();
+        let m_bar = 3usize;
+        let digits = cpu.modulus_digits();
+        let columns = 1024usize;
+        let (chunks, _) = trapgen(&cpu, m_bar, 4.0);
+        let t = &chunks[0];
+        let fft = NegacyclicFft::new(n);
+        let small = |poly: &DCRTPoly| {
+            crate::poly::dcrt::native::ffi::exact_basis_small_coefficients(poly.get_poly())
+                .unwrap()
+                .into_iter()
+                .map(|value| value as f64)
+                .collect::<Vec<_>>()
+        };
+        let spectra = (0..m_bar * digits)
+            .map(|index| fft.forward(&small(&t.entry(index / digits, index % digits))))
+            .collect::<Vec<_>>();
+        // tr G_j and ‖G_j‖_F² per evaluation point.
+        let mut traces = vec![0.0; n];
+        let mut frobenius = vec![0.0; n];
+        for j in 0..n {
+            let entry = |i: usize, k: usize| {
+                (spectra[i * digits + k][2 * j], spectra[i * digits + k][2 * j + 1])
+            };
+            for k in 0..digits {
+                for l in 0..digits {
+                    let (mut re, mut im) = (0.0, 0.0);
+                    for i in 0..m_bar {
+                        let (ar, ai) = entry(i, k);
+                        let (br, bi) = entry(i, l);
+                        re += ar * br + ai * bi;
+                        im += ar * bi - ai * br;
+                    }
+                    if k == l {
+                        traces[j] += re;
+                    }
+                    frobenius[j] += re * re + im * im;
+                }
+            }
+        }
+        let gmax = traces.iter().cloned().fold(0.0, f64::max) * 1.0001;
+        let beta = 1.0 / (2.0 * gmax);
+        let a = 1.0e8;
+        let chunk = upload_coefficients(&params, t);
+        let output = GpuDCRTPolyMatrix::zero_with_state(&params, m_bar + digits, columns).unwrap();
+        let seed = GpuDeviceSeed::new(&params, device).unwrap();
+        seed.upload(&rand::random()).unwrap();
+        chunk.wait_until_ready();
+        output.wait_until_ready();
+        let workspace =
+            GpuRawStatisticalWorkspace::new(&params, &stream, m_bar, digits, columns).unwrap();
+        let view = |matrix: &GpuDCRTPolyMatrix, rows: u64, columns: u64| GpuRawMatrixView {
+            physical_device: device,
+            degree: n as u32,
+            row_origin: 0,
+            column_origin: 0,
+            rows,
+            columns,
+            limbs: matrix
+                .binding_limbs()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, limb)| GpuRawMatrixLimb {
+                    address: limb.data_address,
+                    row_stride_bytes: limb.row_stride_bytes as u64,
+                    column_stride_bytes: limb.poly_stride_bytes as u64,
+                    coefficient_stride_bytes: limb.coefficient_bytes as u64,
+                    word_bytes: limb.coefficient_bytes as u32,
+                    crt_limb_index: index as u32,
+                    modulus: cpu.to_crt().0[index],
+                })
+                .collect(),
+        };
+        let chunk_view = view(&chunk, m_bar as u64, digits as u64);
+        let output_view = view(&output, (m_bar + digits) as u64, columns as u64);
+        let limbs = chunk_view.limbs.len() as u32;
+        // Bindings: the chunk's limbs, the output's limbs, the seed, then the four workspace
+        // ranges.
+        let output_binding = limbs;
+        let seed_binding = 2 * limbs;
+        let workspace_binding = seed_binding + 1;
+        let mut builder = stream.begin_graph().unwrap();
+        builder.begin_operation(0, &[]).unwrap();
+        for (index, limb) in chunk.binding_limbs().unwrap().iter().enumerate() {
+            builder
+                .bind_resident_address(limb.data_address, limb.data_bytes, index as u32)
+                .unwrap();
+        }
+        let ranges = workspace.binding_ranges();
+        for (index, (address, bytes)) in ranges.iter().enumerate() {
+            builder
+                .bind_resident_address(*address, *bytes, workspace_binding + index as u32)
+                .unwrap();
+        }
+        params
+            .emit_raw_statistical_spectra(
+                builder.launch_stream(),
+                &chunk_view,
+                0,
+                &workspace,
+                0,
+                workspace_binding,
+            )
+            .unwrap();
+        builder.finish_operation().unwrap();
+        builder.begin_operation(1, &[0]).unwrap();
+        for (index, limb) in output.binding_limbs().unwrap().iter().enumerate() {
+            builder
+                .bind_resident_address(
+                    limb.data_address,
+                    limb.data_bytes,
+                    output_binding + index as u32,
+                )
+                .unwrap();
+        }
+        builder.bind_resident_address(seed.device_address(), 32, seed_binding).unwrap();
+        for (index, (address, bytes)) in ranges.iter().enumerate() {
+            builder
+                .bind_resident_address(*address, *bytes, workspace_binding + index as u32)
+                .unwrap();
+        }
+        params
+            .emit_raw_statistical_perturbation(
+                builder.launch_stream(),
+                &output_view,
+                seed.device_address(),
+                GpuStatisticalPerturbation {
+                    p2_sigma: 3.0,
+                    center_scale: 0.0,
+                    a,
+                    beta,
+                    gmax,
+                    isotropic: 0.0,
+                    rounding: 1.0,
+                },
+                &workspace,
+                GpuStatisticalBindings {
+                    output_base: output_binding,
+                    seed: seed_binding,
+                    spectra: workspace_binding,
+                    vectors: workspace_binding + 1,
+                    chunk: workspace_binding + 2,
+                    p2: workspace_binding + 3,
+                },
+            )
+            .unwrap();
+        builder.finish_operation().unwrap();
+        let mut graph = builder.finish().unwrap();
+        let mut bindings = chunk
+            .binding_limbs()
+            .unwrap()
+            .iter()
+            .chain(output.binding_limbs().unwrap().iter())
+            .map(|limb| GpuGraphBindingValue::DeviceAddress(limb.data_address))
+            .collect::<Vec<_>>();
+        bindings.push(GpuGraphBindingValue::DeviceAddress(seed.device_address()));
+        bindings.extend(
+            ranges.iter().map(|(address, _)| GpuGraphBindingValue::DeviceAddress(*address)),
+        );
+        graph.bind(&bindings).unwrap();
+        graph.launch(&stream).unwrap().wait().unwrap();
+        let perturbation = download_matrix(&output, &cpu, false);
+        let modulus = cpu.modulus();
+        let half = modulus.as_ref() / 2u8;
+        let centered = |poly: &DCRTPoly| {
+            poly.coeffs_biguints()
+                .into_iter()
+                .map(|value| {
+                    if value > half {
+                        -(modulus.as_ref() - &value).to_f64().unwrap()
+                    } else {
+                        value.to_f64().unwrap()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut energy = 0.0;
+        for column in 0..columns {
+            let p1 = (0..m_bar)
+                .map(|row| fft.forward(&centered(&perturbation.entry(row, column))))
+                .collect::<Vec<_>>();
+            for k in 0..digits {
+                for j in 0..n {
+                    let (mut re, mut im) = (0.0, 0.0);
+                    for (i, p) in p1.iter().enumerate() {
+                        let (tr, ti) =
+                            (spectra[i * digits + k][2 * j], spectra[i * digits + k][2 * j + 1]);
+                        let (pr, pi) = (p[2 * j], p[2 * j + 1]);
+                        re += tr * pr + ti * pi;
+                        im += tr * pi - ti * pr;
+                    }
+                    energy += re * re + im * im;
+                }
+            }
+        }
+        let measured = energy / columns as f64;
+        let expected =
+            (0..n).map(|j| n as f64 * a * (traces[j] - beta * frobenius[j])).sum::<f64>();
+        let uncorrected = (0..n).map(|j| n as f64 * a * traces[j]).sum::<f64>();
+        assert!(uncorrected / expected > 1.1, "the test cannot tell the correction apart");
+        assert!(
+            (measured / expected - 1.0).abs() < 0.03,
+            "measured {measured}, expected {expected}, uncorrected {uncorrected}"
+        );
+        // `p_2` has the requested width.
+        let p2 = (m_bar..m_bar + digits)
+            .flat_map(|row| (0..columns).map(move |column| (row, column)))
+            .flat_map(|(row, column)| centered(&perturbation.entry(row, column)))
+            .collect::<Vec<_>>();
+        let variance = p2.iter().map(|x| x * x).sum::<f64>() / p2.len() as f64;
+        assert!((variance / 9.0 - 1.0).abs() < 0.05, "p_2 variance {variance}");
     }
 
     #[test]

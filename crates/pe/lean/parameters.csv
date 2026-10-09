@@ -1,4 +1,4 @@
-parameter_id,noise_model,failure_exponent,attribute_length,alphabet_size,state_width,max_steps,reads,tables,ring_dimension,crt_bits,base_bits,crt_depth,error_sigma,flooding_sigma,programming_sigma,trapdoor_sigma,encryption_security_bits,trapdoor_security_bits
-worst-w2-n16384-crt4x50,worst,,1,2,1,1,0,0:1,16384,50,25,4,3.19,3.19,3.19,4.578,276,283
-average-w2-n8192-crt5x30,average,100,1,2,1,1,0,0:1,8192,30,15,5,3.19,3.19,3.19,4.578,160,166
-average-w2-n8192-crt4x42,average,100,1,2,1,1,0,0:1,8192,42,21,4,3.19,3.19,3.19,4.578,137,141
+parameter_id,noise_model,failure_exponent,attribute_length,alphabet_size,state_width,max_steps,reads,tables,ring_dimension,crt_bits,base_bits,crt_depth,error_sigma,flooding_sigma,programming_sigma,trapdoor_sigma,encryption_security_bits,trapdoor_security_bits,trapdoor_instantiation,key_width_policy,m_bar,randomness_sigma,cutoff_multiplier
+worst-w2-n16384-crt4x50,worst,,1,2,1,1,0,0:1,16384,50,25,4,3.19,3.19,3.19,4.578,276,283,computational,,,,6.5
+average-w2-n8192-crt5x30,average,128,1,2,1,1,0,0:1,8192,30,15,5,3.19,3.19,3.19,4.578,160,166,computational,,,,6.5
+average-w2-n8192-crt4x42,average,128,1,2,1,1,0,0:1,8192,42,21,4,3.19,3.19,3.19,4.578,137,141,computational,,,,6.5

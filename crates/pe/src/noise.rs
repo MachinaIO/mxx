@@ -42,15 +42,19 @@
 //! + 1)` ([`AverageCaseConfig::z_squared_for_events`]). The argument needs no assumption on the
 //! distribution of the evaluation error: `E_F` is its worst-case bound.
 
-use crate::{BranchingProgram, PeError, PeParameters, branching_program::ATTRIBUTE_COORDINATE};
+use crate::{
+    BranchingProgram, PeClass, PeError, PeParameters, branching_program::ATTRIBUTE_COORDINATE,
+};
+use bigdecimal::BigDecimal;
 use mxx_backends::poly::PolyParams;
 use mxx_exponent_lut::{
     api,
     decoder::simulation::AverageCaseConfig,
     noise_utils::{NoiseMoments, NonnegativeRational},
     rns_bgg::{
-        RnsBggDerivedWorkload, RnsBggDynamicNoise, RnsBggNoiseBindings, RnsBggNoiseRhs,
-        RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggPackageNoise, RnsNoiseBuild, RnsOutputUse,
+        RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise, RnsBggGaussian,
+        RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue,
+        RnsBggPackageNoise, RnsBggParameters, RnsNoiseBuild, RnsOutputUse,
     },
 };
 use num_bigint::{BigInt, BigUint};
@@ -106,17 +110,20 @@ fn squared(sigma: &bigdecimal::BigDecimal) -> NonnegativeRational {
     .expect("positive denominator")
 }
 
-/// The material contracts of `program`'s packages under `parameters`, in
-/// the source namespace `namespace` (a setup identity).
-pub(crate) fn package_contracts(
-    parameters: &PeParameters,
+/// The material contracts of `program`'s packages over `rns` for `class`, in the source namespace
+/// `namespace` (a setup identity): `distributions` for the initial state, companions, and
+/// helpers, and `ciphertext_error` for every supplied attribute ciphertext.
+fn package_contracts(
+    rns: &RnsBggParameters,
+    class: &PeClass,
     program: &crate::CompiledPredicate,
     namespace: [u8; 32],
+    distributions: RnsBggDynamicDistributions,
+    ciphertext_error: &BigUint,
 ) -> Result<RnsBggDynamicNoise, PeError> {
-    let automorphisms = parameters
-        .class()
+    let automorphisms = class
         .layout()
-        .automorphism_indices(parameters.level().ring_dimension() as usize)
+        .automorphism_indices(rns.levels()[0].ring_dimension() as usize)
         .map_err(|error| PeError::Parameters(error.to_string()))?;
     let rhs = program
         .program()
@@ -127,19 +134,93 @@ pub(crate) fn package_contracts(
                 *id,
                 RnsBggPackageNoise {
                     coordinate: program.binding().rhs(*id)?,
-                    ciphertext_error: parameters.ciphertext_error_bound(),
+                    ciphertext_error: ciphertext_error.clone(),
                     ciphertext_sigma: None,
                 },
             ))
         })
         .collect::<Result<BTreeMap<_, _>, PeError>>()?;
     debug_assert!(rhs.values().all(|package| package.coordinate == ATTRIBUTE_COORDINATE));
-    Ok(RnsBggDynamicNoise {
-        namespace,
-        distributions: parameters.distributions(),
-        rhs,
-        automorphisms,
-    })
+    Ok(RnsBggDynamicNoise { namespace, distributions, rhs, automorphisms })
+}
+
+/// The exponent-lut simulator's trace of `program` over `rns` under the given material contracts.
+fn evaluation_trace(
+    rns: &RnsBggParameters,
+    class: &PeClass,
+    program: &BranchingProgram,
+    namespace: [u8; 32],
+    distributions: RnsBggDynamicDistributions,
+    ciphertext_error: &BigUint,
+) -> Result<RnsBggNoiseTrace, PeError> {
+    let compiled = program.compile()?;
+    let initial = RnsBggNoiseValue::sampled_gaussian(
+        &distributions.input,
+        b"mxx-pe/initial-state",
+        &[BigInt::from(1u8)],
+    );
+    let symbol = RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
+    let bindings = RnsBggNoiseBindings::from_inputs(compiled.program(), &[initial], &[symbol])?
+        .with_output_use(RnsOutputUse::Gadget)
+        .with_dynamic(package_contracts(
+            rns,
+            class,
+            &compiled,
+            namespace,
+            distributions,
+            ciphertext_error,
+        )?);
+    let workload = RnsBggDerivedWorkload::from_program_with_parameters(rns, compiled.program())?;
+    Ok(api::noise_simulate(
+        compiled.program(),
+        RnsNoiseBuild::new(rns, compiled.program(), &workload, &bindings)?,
+        |_, outputs| Ok(outputs),
+    )?)
+}
+
+fn output_bound(trace: &RnsBggNoiseTrace) -> Result<BigUint, PeError> {
+    Ok(trace
+        .outputs
+        .first()
+        .ok_or_else(|| PeError::Parameters("the simulator returned no output".into()))?
+        .bound
+        .error
+        .clone())
+}
+
+/// The coefficient bound `B_R̂` of the ledger witness `R̂_F` of the proof's hybrid `H_2`
+/// (`lem:ledger`) for `program` over `rns`.
+///
+/// The witness propagates through the evaluation as the error does (sums add, products and scalar
+/// actions multiply by gadget decompositions from the right, automorphisms permute, mask switches
+/// add `J g^-1(A)`), so the simulator bounds it when every material contract is replaced by the
+/// bound of its witness: `R_0` for `c_0` and `R` for every digit companion, both bounded by
+/// `randomness_bound = B_R`, `J ∈ {0, 1}` for every helper, and `Z_t` (bounded by
+/// `programming_cutoff = B_Z`) for every attribute ciphertext.
+pub fn witness_bound(
+    rns: &RnsBggParameters,
+    class: &PeClass,
+    program: &BranchingProgram,
+    randomness_sigma: &BigDecimal,
+    randomness_bound: &BigUint,
+    programming_cutoff: &BigUint,
+) -> Result<BigUint, PeError> {
+    let randomness = RnsBggGaussian::new(randomness_sigma.clone(), randomness_bound.clone())?;
+    let indicator = RnsBggGaussian::new(BigDecimal::from(1u8), 1u8.into())?;
+    let distributions = RnsBggDynamicDistributions {
+        input: randomness.clone(),
+        companion: randomness,
+        helper: indicator.clone(),
+        ciphertext: indicator,
+    };
+    output_bound(&evaluation_trace(
+        rns,
+        class,
+        program,
+        *b"mxx-pe/witness-bound/namespace/1",
+        distributions,
+        programming_cutoff,
+    )?)
 }
 
 /// Simulate `program` under `parameters` with the exponent-lut evaluator,
@@ -148,30 +229,15 @@ pub fn simulate(
     parameters: &PeParameters,
     program: &BranchingProgram,
 ) -> Result<PeNoiseReport, PeError> {
-    let compiled = program.compile()?;
-    let rns = parameters.rns();
-    let initial = RnsBggNoiseValue::sampled_gaussian(
-        parameters.flooding(),
-        b"mxx-pe/initial-state",
-        &[BigInt::from(1u8)],
-    );
-    let symbol = RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
-    let bindings = RnsBggNoiseBindings::from_inputs(compiled.program(), &[initial], &[symbol])?
-        .with_output_use(RnsOutputUse::Gadget)
-        .with_dynamic(package_contracts(parameters, &compiled, parameters.identity())?);
-    let workload = RnsBggDerivedWorkload::from_program_with_parameters(rns, compiled.program())?;
-    let trace = api::noise_simulate(
-        compiled.program(),
-        RnsNoiseBuild::new(rns, compiled.program(), &workload, &bindings)?,
-        |_, outputs| Ok(outputs),
+    let trace = evaluation_trace(
+        parameters.rns(),
+        parameters.class(),
+        program,
+        parameters.identity(),
+        parameters.distributions(),
+        &parameters.ciphertext_error_bound(),
     )?;
-    let evaluation = trace
-        .outputs
-        .first()
-        .ok_or_else(|| PeError::Parameters("the simulator returned no output".into()))?
-        .bound
-        .error
-        .clone();
+    let evaluation = output_bound(&trace)?;
     let w = BigUint::from(parameters.class().lookup_width());
     let m = BigUint::from(parameters.state_columns());
     let m_b = BigUint::from(parameters.anchor_columns());

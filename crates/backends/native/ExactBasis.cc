@@ -139,6 +139,24 @@ rust::Vec<uint8_t> exact_basis_coefficients(const openfhe::DCRTPoly &input) {
     return output;
 }
 
+// The coefficients of a polynomial whose centered coefficients are below half the first CRT prime,
+// read from that tower alone.
+rust::Vec<int64_t> exact_basis_small_coefficients(const openfhe::DCRTPoly &input) {
+    auto polynomial = input.GetPoly();
+    transform_format(polynomial, Format::COEFFICIENT);
+    const auto &tower = polynomial.GetElementAtIndex(0);
+    const uint64_t modulus = tower.GetModulus().ConvertToInt();
+    const auto &values = tower.GetValues();
+    rust::Vec<int64_t> output;
+    output.reserve(values.GetLength());
+    for (size_t index = 0; index < values.GetLength(); ++index) {
+        const uint64_t value = values[index].ConvertToInt();
+        output.push_back(value > modulus / 2 ? -static_cast<int64_t>(modulus - value)
+                                             : static_cast<int64_t>(value));
+    }
+    return output;
+}
+
 void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli) {
     if (moduli.empty()) throw std::invalid_argument("empty exact CRT basis");
     for (size_t index = 0; index < moduli.size(); ++index) {

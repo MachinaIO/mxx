@@ -71,7 +71,7 @@ def Runs (hashModel : MxxRuntime.HashModel) (external : ExternalInputs) (tape : 
   Stage_setup_trapdoor.generatedRoot Backend.backend tape [0] stage_0_params (()) execution.«stage_0» ∧
   Stage_setup_public.generatedRoot tape [1] stage_1_params (execution.«stage_0».1) execution.«stage_1» ∧
   Stage_payload.generatedRoot tape [2] stage_2_params (()) execution.«stage_2» ∧
-  Stage_prelude.generatedRoot Backend.backend hashModel tape [3] stage_3_params ((execution.«stage_1», external.input_1, external.input_0, execution.«stage_2», external.input_2, ())) execution.«stage_3» ∧
+  Stage_prelude.generatedRoot Backend.backend hashModel tape [3] stage_3_params ((execution.«stage_1», external.input_0, execution.«stage_2», external.input_1, external.input_2, ())) execution.«stage_3» ∧
   Stage_encrypt.generatedRoot Backend.backend hashModel tape [4] stage_4_params ((execution.«stage_2», external.input_0, external.input_3, external.input_4, execution.«stage_3».1, execution.«stage_3».2.1, execution.«stage_3».2.2.1, execution.«stage_3».2.2.2.1, ())) execution.«stage_4» ∧
   Stage_preprocess.generatedRoot Backend.backend hashModel tape [5] stage_5_params (external.input_0) execution.«stage_5» ∧
   Stage_keygen.generatedRoot Backend.backend hashModel tape [6] stage_6_params ((execution.«stage_0».2.1, external.input_0, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.1, ())) execution.«stage_6» ∧
@@ -85,6 +85,6 @@ def Runs (hashModel : MxxRuntime.HashModel) (external : ExternalInputs) (tape : 
 def CorrectnessClaim : Prop :=
   ∀ hashModel external,
     MxxRuntime.tapeMeasure {tape | ∃ execution, Runs hashModel external tape execution ∧
-      ¬ (execution.«stage_8» = execution.«ideal»)} ≤ (2 : ENNReal)⁻¹ ^ 100
+      ¬ (execution.«stage_8» = execution.«ideal»)} ≤ (2 : ENNReal)⁻¹ ^ 128
 
 end GeneratedClaim

@@ -735,15 +735,20 @@ impl ExecutionResult {
 
 pub type ExecutionTrace = BTreeMap<WireId, RuntimeValue>;
 
-type TrapdoorParts = (
-    Option<Arc<crate::sampler::trapdoor::DCRTTrapdoor>>,
-    Arc<crate::matrix::dcrt_poly::DCRTPolyMatrix>,
-    ConcreteMatrixType,
-    f64,
-    BigInt,
-    usize,
-    Option<bool>,
-);
+/// A trapdoor operand: its secret (absent for a public gadget trapdoor), public matrix, and the
+/// sampler parameters of its wire type.
+struct TrapdoorParts {
+    secret: Option<Arc<crate::sampler::trapdoor::DCRTTrapdoor>>,
+    public: Arc<crate::matrix::dcrt_poly::DCRTPolyMatrix>,
+    sigma: f64,
+    gadget_base: BigInt,
+    digit_count: usize,
+    instantiation: mxx_ir_core::types::TrapdoorInstantiation,
+    /// The requested preimage width; `None` for the trapdoor's minimum.
+    preimage_sigma: Option<mxx_ir_core::Rational>,
+    /// `Some(small)` for a public gadget trapdoor, whose preimage is a gadget decomposition.
+    gadget_small: Option<bool>,
+}
 
 struct InstanceResult {
     outputs: Vec<RuntimeValue>,
@@ -1849,8 +1854,14 @@ impl<S: SessionStore> Executor<'_, S> {
         let RuntimeValue::Trapdoor(value) = self.materialize(values, wire)? else {
             return Err(ExecutionError::ValueKind(wire));
         };
-        let ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. } =
-            value.wire_type()
+        let ConcreteWireType::Trapdoor {
+            sigma,
+            gadget_base,
+            digit_count,
+            instantiation,
+            preimage_sigma,
+            ..
+        } = value.wire_type()
         else {
             return Err(ExecutionError::ValueKind(wire));
         };
@@ -1858,9 +1869,23 @@ impl<S: SessionStore> Executor<'_, S> {
         let sigma = sigma
             .evaluate_f64(&ParamEnv::default())
             .map_err(|error| self.expression_error(wire.node, error))?;
+        let preimage_sigma = preimage_sigma
+            .as_ref()
+            .map(|width| width.evaluate_rational(&ParamEnv::default()))
+            .transpose()
+            .map_err(|error| self.expression_error(wire.node, error))?;
         let secret = value.cpu_secret_arc();
         let gadget_small = secret.is_none().then_some(false);
-        Ok((secret, public, matrix.clone(), sigma, gadget_base.clone(), *digit_count, gadget_small))
+        Ok(TrapdoorParts {
+            secret,
+            public,
+            sigma,
+            gadget_base: gadget_base.clone(),
+            digit_count: *digit_count,
+            instantiation: *instantiation,
+            preimage_sigma,
+            gadget_small,
+        })
     }
 
     fn put(
@@ -2511,12 +2536,16 @@ fn artifact_wire_type(artifact: &ArtifactType) -> ConcreteWireType {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
         } => ConcreteWireType::Trapdoor {
             matrix: matrix.clone(),
             sigma: sigma.clone(),
             gadget_base: gadget_base.clone(),
             digit_count: *digit_count,
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            instantiation: *instantiation,
+            preimage_sigma: preimage_sigma.clone(),
         },
         ArtifactType::TypedBlob { type_name, schema_hash } => {
             ConcreteWireType::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash }
@@ -2592,6 +2621,8 @@ fn decode_artifact(
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
+                preimage_sigma,
             },
             ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
         ) => {
@@ -2609,6 +2640,8 @@ fn decode_artifact(
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
+                preimage_sigma,
             };
             let value = TrapdoorValue::new(ty, public, Some(Arc::new(secret)))
                 .map_err(|error| ExecutionError::Artifact(error.into()))?;

@@ -33,7 +33,7 @@ use mxx_exponent_lut::{
 use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::ConcatAxis};
 use std::collections::BTreeMap;
 
-const OUTPUT_ROW: &str = "mxx-pe/output-row";
+pub(crate) const OUTPUT_ROW: &str = "mxx-pe/output-row";
 /// The decoded message bits: one integer family of `n` members.
 pub(crate) const MESSAGE_OUTPUT: &str = "mxx-pe/message";
 
@@ -180,17 +180,20 @@ pub(crate) fn phase_graph(
     let second = public_key.anchor_second_row(hash_key.clone())?;
     let (_, d_2) = public_key.message_row(hash_key.clone())?;
     let key_production = key.key().production().clone();
-    let helper_keys = ring.family_artifact_input(
+    let cutoff = num_bigint::BigInt::from(parameters.key_cutoff().clone());
+    let helper_keys = ring.small_matrix_family_artifact_input(
         key_production.clone(),
         HELPER_KEY,
         w * (w - 1),
         (width, 1),
+        cutoff.clone(),
         ArtifactAvailability::Transferred,
     );
-    let output_key_block = ring.artifact_input(
+    let output_key_block = ring.small_matrix_artifact_input(
         key_production,
         OUTPUT_KEY,
         (width, 1),
+        cutoff,
         ArtifactAvailability::Transferred,
     );
     let packages = ciphertext.packages().production().clone();
@@ -231,9 +234,9 @@ pub(crate) fn phase_graph(
         );
         let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
         let value = (helper - public_second_row).ring_automorphism(i) + gadget_second_row.clone();
-        Ok(sum + value * helper_keys.at(Int::evaluate(pair)))
+        Ok(sum + value.mul_small_rhs(helper_keys.at(Int::evaluate(pair))))
     })?;
-    let outputs = (output_row - output_second_row) * output_key_block;
+    let outputs = (output_row - output_second_row).mul_small_rhs(output_key_block);
     let phase = message - d_2 - (anchors + helpers + outputs);
     let mut manifests = BTreeMap::new();
     for (production, manifest) in [
@@ -508,7 +511,22 @@ mod tests {
     #[test]
     fn authorized_keys_of_several_predicates_decrypt_one_ciphertext() {
         let class = PeClass::new(2, 2, 2, 2).unwrap();
-        let parameters = parameters(class);
+        authorized_keys_decrypt(class, parameters(class));
+    }
+
+    /// The round trip of
+    /// [`authorized_keys_of_several_predicates_decrypt_one_ciphertext`] over a
+    /// statistical trapdoor `[ā | g - ā T]`.
+    #[test]
+    fn authorized_keys_decrypt_over_the_statistical_trapdoor() {
+        let class = PeClass::new(2, 2, 2, 2).unwrap();
+        let parameters = statistical_parameters(class);
+        assert!(!parameters.instantiation().is_computational());
+        assert_eq!(parameters.anchor_columns(), 3 * parameters.digits());
+        authorized_keys_decrypt(class, parameters);
+    }
+
+    fn authorized_keys_decrypt(class: PeClass, parameters: crate::PeParameters) {
         let mut execution = execution(&parameters);
         let mut store = MemoryArtifactStore::default();
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();

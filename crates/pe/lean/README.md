@@ -42,13 +42,16 @@ exports the claim to `<parameter id>/generated`.
 | `reads`, `tables` | The predicate of the round trip: the attribute index read at every step and the LUT table of every step (`:`-separated entries) |
 | `ring_dimension`, `crt_bits`, `base_bits`, `crt_depth` | The equal-basis RNS chain and the gadget base |
 | `error_sigma`, `flooding_sigma`, `programming_sigma`, `trapdoor_sigma` | Widths of `chi`, `chi_fl`, `Z_t`, and TrapGen |
-| `encryption_security_bits`, `trapdoor_security_bits` | Lattice security of the encryption secret and of TrapGen, estimated by `lattice-estimator-cli` |
+| `encryption_security_bits`, `trapdoor_security_bits` | Lattice security of the encryption secret and of TrapGen, estimated by `lattice-estimator-cli` (`trapdoor_security_bits` is empty for the statistical instantiation, whose TrapGen has no estimate) |
+| `trapdoor_instantiation` | `computational` (`[ā \| I \| G - (ā R + E)]`, `m_B = D + 2`) or `statistical` (`[ā \| g - ā T]`, `m_B = m̄ + D`) |
+| `key_width_policy`, `m_bar`, `randomness_sigma` | For a statistical row: `practical` or `strict`, the selected `m̄`, and the sigma of the proof's `R` |
+| `cutoff_multiplier` | The truncation multiplier of `chi`, `chi_fl`, and `Z_t`: `6.5` (computational) or the budget's `c` to four decimals (statistical) |
 
 | ID | Parameters | Proof |
 | --- | --- | --- |
 | `worst-w2-n16384-crt4x50` | One attribute bit, predicate `F(x) = x₀`, `n = 2^14`, four 50-bit primes, 276/283-bit security | None; its claim is not checked in |
-| `average-w2-n8192-crt5x30` | The same class and predicate, `n = 2^13`, five 30-bit primes (`Q ≈ 2^150`), 15-bit digits, 160/166-bit security, failure `2^-100` | `average-w2-n8192-crt5x30/PeCertificate.lean` |
-| `average-w2-n8192-crt4x42` | The same class and predicate, `n = 2^13`, four 42-bit primes (`Q ≈ 2^168`), 21-bit digits, 137/141-bit security, failure `2^-100` | `average-w2-n8192-crt4x42/PeCertificate.lean` |
+| `average-w2-n8192-crt5x30` | The same class and predicate, `n = 2^13`, five 30-bit primes (`Q ≈ 2^150`), 15-bit digits, 160/166-bit security, failure `2^-128` | `average-w2-n8192-crt5x30/PeCertificate.lean` |
+| `average-w2-n8192-crt4x42` | The same class and predicate, `n = 2^13`, four 42-bit primes (`Q ≈ 2^168`), 21-bit digits, 137/141-bit security, failure `2^-128` | `average-w2-n8192-crt4x42/PeCertificate.lean` |
 
 ## The claim
 
@@ -85,9 +88,9 @@ samples of the secret, TrapGen, the prelude, and encryption, which read only the
 **The tail.** The coefficients are clamped to their bounds, so their energy is at most
 `E = m N (c² + c² + onlineBound²)` on every tape, for the encoding width `m` and the cutoff `c` of
 `e_h`. `tapeMeasure_linear_tail` bounds the probability that some coefficient of the linear form
-reaches `mT` by `N · 2 exp(-mT² / (2 σ² E))` for the key width `σ`, and `mT² / (2 σ² E) ≥ 120`
-(`numeric_margin`, decided on the parameters), so the bound is at most `2^-106 ≤ 2^-100`
-(`tail_numeric`).
+reaches `mT` by `N · 2 exp(-mT² / (2 σ² E))` for the key width `σ`, and `mT² / (2 σ² E) ≥ k + 20`
+for the row's failure exponent `k` (`numeric_margin`, decided on the parameters), so the bound is
+at most `2^-(k+6) ≤ 2^-k` (`tail_numeric`); the recorded rows use `k = 128`.
 
 | Module | Contents |
 | --- | --- |
@@ -114,10 +117,16 @@ The proof covers correctness only. The security estimates of the parameter set c
 The proof of every average-case row is written by `generator/gen.py` from the row and its exported
 claim. The templates are written for the class `(1, 2, 1, 1)` with the predicate `F(x) = x₀`, ring
 dimension `2^13`, two digits per CRT prime (`base_bits = crt_bits / 2`), and the average noise
-model; the script rejects other rows. It reads the modulus, the CRT basis, the gadget base, the
-cutoffs, the widths, and the hash tags from the exported claim, derives the digit count `D`, the
-encoding width `m = 2D`, the companion lanes `m²`, and the anchor width `D + 2`, and checks the
-numeric conditions the proof decides before writing the package.
+model, for the computational instantiation with the default cutoffs; the script rejects other
+rows, including statistical ones, whose TrapGen the templates do not model. It reads the modulus,
+the CRT basis, the gadget base, the Gaussian laws (each `(width, cutoff)` pair, of any size), the
+widths, and the hash tags from the exported claim, derives the digit count `D`, the encoding width
+`m = 2D`, the companion lanes `m²`, and the anchor width `D + 2`, and checks the numeric conditions
+the proof decides before writing the package.
+
+Encryption samples `Z_t` one column `z_j` at a time in a sequential loop and adds `P z_j` at
+column `j` through a window of a constant unit row; `PePrelude` reads the rows `P Z_t` back with
+`IterRuns.accumulate_entries`, and `PeIndep` lists the column sites `[3, 11, 0, 3, j, 2]`.
 
 ## Reproduction
 

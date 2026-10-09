@@ -190,6 +190,42 @@ theorem trapdoorSampleAt_sample {q n rows columns : Nat} {Token : Type v}
     trapdoorSample backend sigma gadgetBase digitCount cutoff publicMatrix trapdoor :=
   h.1
 
+/-- Statistical TrapGen's public matrix `[ā | G - ā T]` for the backend's regular gadget `G`. -/
+noncomputable def statTrapGenPublic {q n rows mBar : Nat} (layout : RegularLayout q)
+    (aBar : ExactMatrix q n rows mBar) (t : ExactMatrix q n mBar (rows * layout.digitCount)) :
+    ExactMatrix q n rows (mBar + rows * layout.digitCount) :=
+  fun row column ↦
+    if h : column.val < mBar then aBar row ⟨column.val, h⟩
+    else ((regularGadgetMatrix layout : ExactMatrix q n rows (rows * layout.digitCount)) -
+        aBar * t) row ⟨column.val - mBar, by
+          have hlt := column.isLt
+          omega⟩
+
+/-- `trapdoorSample` of a statistical trapdoor with `mBar` columns of `ā`, drawing its public
+matrix from the tape: `ā` uniform residues at site `site ++ [2]` and `T` Gaussian at
+`site ++ [0]`, as the backends label them. `T` is not truncated. -/
+def statTrapdoorSampleAt {q n rows columns : Nat} {Token : Type v}
+    (backend : BackendContext) (tape : SampleTape) (site : List Nat) (mBar : Nat)
+    (sigma : Rat) (gadgetBase digitCount cutoff : Int)
+    (publicMatrix : ExactMatrix q n rows columns)
+    (trapdoor : TrapdoorValue (ExactMatrix q n rows columns) Token) : Prop :=
+  trapdoorSample backend sigma gadgetBase digitCount cutoff publicMatrix trapdoor ∧
+    ∃ layout, backend.regularLayout q n = some layout ∧
+      ∃ h : mBar + rows * layout.digitCount = columns,
+        publicMatrix = castMatrixColumns h (statTrapGenPublic layout
+          (tapeMatrix tape (site ++ [2]) (.residue q))
+          (tapeMatrix tape (site ++ [0]) (.gaussian sigma trapGenCutoff)))
+
+theorem statTrapdoorSampleAt_sample {q n rows columns : Nat} {Token : Type v}
+    {backend : BackendContext} {tape : SampleTape} {site : List Nat} {mBar : Nat}
+    {sigma : Rat} {gadgetBase digitCount cutoff : Int}
+    {publicMatrix : ExactMatrix q n rows columns}
+    {trapdoor : TrapdoorValue (ExactMatrix q n rows columns) Token}
+    (h : statTrapdoorSampleAt backend tape site mBar sigma gadgetBase digitCount cutoff
+      publicMatrix trapdoor) :
+    trapdoorSample backend sigma gadgetBase digitCount cutoff publicMatrix trapdoor :=
+  h.1
+
 /-- Tape values of a matrix sampled at `site` agree when the tapes agree on its keys. -/
 theorem tapeMatrix_congr {q n rows columns : Nat} {tape tape' : SampleTape} {site : List Nat}
     {law : SamplerLaw}

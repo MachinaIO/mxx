@@ -157,13 +157,19 @@ theorem keygen_explicit {model : HashModel} {tape : SampleTape} {path : List Nat
   obtain ⟨w, h3, h6, h7, -, h10, h11, h13, -, h14, h15, -, h16, h17, -, h18, hout⟩ := h
   subst hout
   obtain ⟨hvF, hbF⟩ := keyBound h7
-  have hv : ∀ i : Fin 2, w.w_10_0 i = v i ∧ CoeffBound (vAt tape path i) keyCutoff := by
+  -- Each helper block is stored compactly (`w_10_0`) and read by the products as `I v`
+  -- (`w_10_1`).
+  have hv : ∀ i : Fin 2, w.w_10_0 i = v i ∧ w.w_10_1 i = v i ∧
+      CoeffBound (vAt tape path i) keyCutoff := by
     intro i
     obtain ⟨w0, x0, xout⟩ := h10 i
     rw [List.append_assoc] at x0
     obtain ⟨hx, hb⟩ := keyBound x0
-    exact ⟨xout.trans hx, hb⟩
+    simp only [Prod.mk.injEq] at xout
+    obtain ⟨h0, h1, -⟩ := xout
+    exact ⟨h0.trans hx, h1.trans ((Matrix.one_mul w0).trans hx), hb⟩
   have hw10 : w.w_10_0 = v := funext fun i ↦ (hv i).1
+  have hw10' : w.w_10_1 = v := funext fun i ↦ (hv i).2.1
   have hg11 : w.w_11_0 = g := gadgetMatrixRuns_unique h11 hg
   have hw13 : w.w_13_0 = gZero g := by
     rw [concat_joinRow (r := ![w.w_11_0, 0]) h13, hg11]
@@ -178,16 +184,16 @@ theorem keygen_explicit {model : HashModel} {tape : SampleTape} {path : List Nat
   obtain ⟨he18, hk18⟩ := preimage_short hkind h18
   rw [hw15] at he16
   rw [hw17] at he18
-  refine ⟨hvF, hw10, hbF, fun i ↦ (hv i).2, ?_, ?_, hk16, hk18⟩
+  refine ⟨hvF, hw10, hbF, fun i ↦ (hv i).2.2, ?_, ?_, hk16, hk18⟩
   · show td.publicMatrix * w.w_16_0 = _
     rw [show td.publicMatrix = trapdoorPublic td from rfl, he16]
     refine ht0.trans ?_
-    rw [hw10, hw13, hw3, hw6, hvF]
+    rw [hw10', hw13, hw3, hw6, hvF]
     simp [matrixSub, matrixMul]
     rfl
   · show td.publicMatrix * w.w_18_0 = _
     rw [show td.publicMatrix = trapdoorPublic td from rfl, he18]
     refine ht1.trans ?_
-    rw [hw10, hw13]
+    rw [hw10', hw13]
 
 end PeProof

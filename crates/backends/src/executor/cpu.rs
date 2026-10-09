@@ -32,8 +32,16 @@ impl<S: SessionStore> Executor<'_, S> {
         for index in 0..envs.len() {
             self.set_placement(placements[index])?;
             let public = self.matrix(&mut values[index], node.args[0])?;
-            let (secret, trapdoor_public, _, sigma, gadget_base, digit_count, gadget_small) =
-                self.trapdoor(&mut values[index], node.args[1])?;
+            let TrapdoorParts {
+                secret,
+                public: trapdoor_public,
+                sigma,
+                gadget_base,
+                digit_count,
+                instantiation,
+                preimage_sigma,
+                gadget_small,
+            } = self.trapdoor(&mut values[index], node.args[1])?;
             if gadget_small.is_some() {
                 return Ok(false);
             }
@@ -57,6 +65,8 @@ impl<S: SessionStore> Executor<'_, S> {
                     sigma,
                     &gadget_base,
                     digit_count,
+                    instantiation,
+                    preimage_sigma.as_ref(),
                     &schema.max_coefficient_bound,
                 )
                 .map_err(Self::backend_error)?;
@@ -82,6 +92,8 @@ impl<S: SessionStore> Executor<'_, S> {
                 sigma,
                 gadget_base,
                 digit_count,
+                instantiation,
+                preimage_sigma,
                 max_coefficient_bound: schema.max_coefficient_bound,
                 trapdoor: secret,
                 public,
@@ -1134,7 +1146,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
-            NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
+            NodeKind::GaussianSample { sigma, max_coefficient_bound, compact, .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, env, wire)?;
                 let sigma = sigma
@@ -1143,10 +1155,25 @@ impl<S: SessionStore> Executor<'_, S> {
                 let max_coefficient_bound = max_coefficient_bound
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
-                let value = self.sample_matrix(path, wire, &ty, |backend| {
-                    backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)
-                })?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(value));
+                if *compact {
+                    let (schema, semantic_kind) =
+                        self.bounded_matrix_schema(scope_id, path, env, wire)?;
+                    let bound = schema.max_coefficient_bound.to_biguint().ok_or_else(|| {
+                        self.expression_error(node.id, "negative Gaussian coefficient bound")
+                    })?;
+                    let value =
+                        self.sample_small_matrix(path, wire, &schema, semantic_kind, |backend| {
+                            let sample =
+                                backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)?;
+                            Ok(CpuSmallMatrix::new(sample, bound)?)
+                        })?;
+                    self.put(values, node.id, 0, RuntimeValue::small_matrix(value));
+                } else {
+                    let value = self.sample_matrix(path, wire, &ty, |backend| {
+                        backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)
+                    })?;
+                    self.put(values, node.id, 0, RuntimeValue::matrix(value));
+                }
             }
             NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } => {
                 let (key, tag) =
@@ -1237,7 +1264,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     }
                 }
             }
-            NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } => {
+            NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, instantiation, .. } => {
                 let matrix_wire = WireRef { node: node.id, port: Port(0) };
                 let trapdoor_wire = WireRef { node: node.id, port: Port(1) };
                 let ty = self.matrix_type(scope_id, path, env, matrix_wire)?;
@@ -1257,6 +1284,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     sigma,
                     &gadget_base,
                     digit_count,
+                    *instantiation,
                 )?;
                 let public = PolyMatrix::from_backend_cpu_full(public);
                 self.put(values, node.id, 0, RuntimeValue::Matrix(public.clone()));
@@ -1267,8 +1295,16 @@ impl<S: SessionStore> Executor<'_, S> {
             }
             NodeKind::PreimageSample { max_coefficient_bound, .. } => {
                 let public = self.matrix(values, node.args[0])?;
-                let (secret, trapdoor_public, _, sigma, gadget_base, digit_count, gadget_small) =
-                    self.trapdoor(values, node.args[1])?;
+                let TrapdoorParts {
+                    secret,
+                    public: trapdoor_public,
+                    sigma,
+                    gadget_base,
+                    digit_count,
+                    instantiation,
+                    preimage_sigma,
+                    gadget_small,
+                } = self.trapdoor(values, node.args[1])?;
                 if !Arc::ptr_eq(&public, &trapdoor_public) &&
                     public.as_ref() != trapdoor_public.as_ref()
                 {
@@ -1325,6 +1361,8 @@ impl<S: SessionStore> Executor<'_, S> {
                                 sigma,
                                 &gadget_base,
                                 digit_count,
+                                instantiation,
+                                preimage_sigma.as_ref(),
                                 &schema.max_coefficient_bound,
                                 secret,
                                 &public,
@@ -2306,6 +2344,7 @@ impl<S: SessionStore> Executor<'_, S> {
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        instantiation: mxx_ir_core::types::TrapdoorInstantiation,
     ) -> Result<(DCRTPolyMatrix, DCRTTrapdoor), ExecutionError> {
         let matrix_site = DrawSite {
             instantiation_path: path.to_vec(),
@@ -2346,7 +2385,7 @@ impl<S: SessionStore> Executor<'_, S> {
                 (None, None) => {
                     let (public, secret) = self
                         .backend
-                        .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                        .sample_trapdoor(ty, sigma, gadget_base, digit_count, instantiation)
                         .map_err(Self::backend_error)?;
                     let public_bytes = self.backend.matrix_to_bytes(&public);
                     self.artifact_store
@@ -2381,12 +2420,12 @@ impl<S: SessionStore> Executor<'_, S> {
         match &mut self.sampling_mode {
             SamplingMode::Fresh => self
                 .backend
-                .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                .sample_trapdoor(ty, sigma, gadget_base, digit_count, instantiation)
                 .map_err(Self::backend_error),
             SamplingMode::Record(recorder) => {
                 let (public, secret) = self
                     .backend
-                    .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                    .sample_trapdoor(ty, sigma, gadget_base, digit_count, instantiation)
                     .map_err(Self::backend_error)?;
                 let public_bytes = self.backend.matrix_to_bytes(&public);
                 recorder.record(

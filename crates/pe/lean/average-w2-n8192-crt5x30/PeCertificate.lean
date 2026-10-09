@@ -365,7 +365,7 @@ abbrev keySigma : Rat := (369559438844220398496863638868447433455010635077863089
 /-- The energy bound of a coefficient of the linear form. -/
 def energyB : Nat := 20 * N * (20 * 20 + 20 * 20 + BF * BF)
 
-theorem numeric_margin : 240 * (524000000 * 524000000) * energyB ≤ mT * mT := by
+theorem numeric_margin : 296 * (524000000 * 524000000) * energyB ≤ mT * mT := by
   unfold energyB mT biasB BF onlineBound keyCutoff
   decide
 
@@ -377,44 +377,44 @@ theorem keySigma_pos : (0 : ℝ) < keySigma := by
   have : (0 : Rat) < keySigma := by unfold keySigma; norm_num
   exact_mod_cast this
 
-/-- `N · 2 exp(-mT² / (2 σ² E)) ≤ 2^-100`. -/
+/-- `N · 2 exp(-mT² / (2 σ² E)) ≤ 2^-128`. -/
 theorem tail_numeric :
     (N : ENNReal) * ENNReal.ofReal (2 * Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB)))) ≤
-      (2 : ENNReal)⁻¹ ^ 100 := by
+      (2 : ENNReal)⁻¹ ^ 128 := by
   have hE : (0 : ℝ) < energyB := by
     have : 0 < energyB := by unfold energyB; positivity
     exact_mod_cast this
   have hσ2 : (keySigma : ℝ) ^ 2 ≤ 524000000 ^ 2 := pow_le_pow_left₀ keySigma_pos.le keySigma_le 2
-  have hm : (240 : ℝ) * (524000000 * 524000000) * energyB ≤ (mT : ℝ) * mT := by
+  have hm : (296 : ℝ) * (524000000 * 524000000) * energyB ≤ (mT : ℝ) * mT := by
     exact_mod_cast numeric_margin
-  have hx : 120 ≤ (mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB)) := by
+  have hx : 148 ≤ (mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB)) := by
     have hpos : 0 < 2 * ((keySigma : ℝ) ^ 2 * energyB) := by
       have := keySigma_pos
       positivity
     rw [le_div_iff₀ hpos]
     nlinarith
-  have hexp : Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB))) ≤ Real.exp (-120) := by
+  have hexp : Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB))) ≤ Real.exp (-148) := by
     apply Real.exp_le_exp.mpr
     rw [neg_div]
     linarith
-  have h120 : Real.exp (-120) ≤ ((2 : ℝ) ^ 120)⁻¹ := by
+  have hTail : Real.exp (-148) ≤ ((2 : ℝ) ^ 148)⁻¹ := by
     rw [Real.exp_neg]
     apply inv_anti₀ (by positivity)
     have h2 : (2 : ℝ) ≤ Real.exp 1 := by
       have := Real.add_one_le_exp (1 : ℝ)
       linarith
-    calc (2 : ℝ) ^ 120 ≤ Real.exp 1 ^ 120 := pow_le_pow_left₀ (by norm_num) h2 120
-      _ = Real.exp 120 := by rw [← Real.exp_nat_mul]; norm_num
+    calc (2 : ℝ) ^ 148 ≤ Real.exp 1 ^ 148 := pow_le_pow_left₀ (by norm_num) h2 148
+      _ = Real.exp 148 := by rw [← Real.exp_nat_mul]; norm_num
   have hreal : (N : ℝ) * (2 * Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB)))) ≤
-      (2⁻¹ : ℝ) ^ 100 := by
+      (2⁻¹ : ℝ) ^ 128 := by
     calc (N : ℝ) * (2 * Real.exp (-(mT : ℝ) ^ 2 / (2 * ((keySigma : ℝ) ^ 2 * energyB))))
-        ≤ (N : ℝ) * (2 * ((2 : ℝ) ^ 120)⁻¹) := by gcongr; exact hexp.trans h120
-      _ ≤ (2⁻¹ : ℝ) ^ 100 := by norm_num
+        ≤ (N : ℝ) * (2 * ((2 : ℝ) ^ 148)⁻¹) := by gcongr; exact hexp.trans hTail
+      _ ≤ (2⁻¹ : ℝ) ^ 128 := by norm_num
   have hlhs : (N : ENNReal) * ENNReal.ofReal (2 * Real.exp (-(mT : ℝ) ^ 2 /
       (2 * ((keySigma : ℝ) ^ 2 * energyB)))) = ENNReal.ofReal ((N : ℝ) * (2 * Real.exp (-(mT : ℝ) ^ 2 /
       (2 * ((keySigma : ℝ) ^ 2 * energyB))))) := by
     rw [ENNReal.ofReal_mul (p := (N : ℝ)) (by positivity), ENNReal.ofReal_natCast]
-  have hrhs : (2 : ENNReal)⁻¹ ^ 100 = ENNReal.ofReal ((2⁻¹ : ℝ) ^ 100) := by
+  have hrhs : (2 : ENNReal)⁻¹ ^ 128 = ENNReal.ofReal ((2⁻¹ : ℝ) ^ 128) := by
     rw [ENNReal.ofReal_pow (by norm_num), ENNReal.ofReal_inv_of_pos (by norm_num)]
     norm_num
   rw [hlhs, hrhs]
@@ -442,7 +442,7 @@ theorem margin_lt : 4 * (21 + 2 * biasB + mT) + 4 < Q := by
 set_option maxHeartbeats 64000000 in
 /-- The average-case correctness claim of `average-w2-n8192-crt5x30`: for every hash model and
 external inputs, the tapes with a run whose decrypted message differs from the ideal one have
-measure at most `2^-100`. -/
+measure at most `2^-128`. -/
 theorem certificate : GeneratedClaim.CorrectnessClaim := by
   intro model external
   let c : SampleTape → Fin N → (Fin 3 × Fin 20 × Fin N) → ℝ := fun ω i x ↦ (coefZ model external.input_0 ω i x : ℝ)
@@ -500,7 +500,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
         MxxPe.tapeMeasure_linear_tail keyOf keyOf_injective (sigma := keySigma)
           (by unfold keySigma; norm_num) (cutoff := 3366109981) (fun _ ↦ rfl) c preKeys keyOf_not_mem
           hdep hE henergy (by positivity)
-    _ ≤ (2 : ENNReal)⁻¹ ^ 100 := tail_numeric
+    _ ≤ (2 : ENNReal)⁻¹ ^ 128 := tail_numeric
 
 /-- info: 'PeProof.certificate' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in

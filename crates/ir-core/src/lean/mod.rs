@@ -96,6 +96,8 @@ pub struct PrimitiveNames {
     pub uniform_interval_sample_at: String,
     pub gaussian_sample_at: String,
     pub trapdoor_sample_at: String,
+    /// Tape-reading form of the statistical trapdoor sampler.
+    pub stat_trapdoor_sample_at: String,
     pub hash_sample: String,
     pub gadget_trapdoor: String,
     pub gadget_decompose: String,
@@ -158,6 +160,7 @@ impl Default for PrimitiveNames {
             uniform_interval_sample_at: "MxxRuntime.uniformIntervalSampleAt".into(),
             gaussian_sample_at: "MxxRuntime.gaussianSampleAt".into(),
             trapdoor_sample_at: "MxxRuntime.trapdoorSampleAt".into(),
+            stat_trapdoor_sample_at: "MxxRuntime.statTrapdoorSampleAt".into(),
             hash_sample: "MxxRuntime.hashSample".into(),
             gadget_trapdoor: "MxxRuntime.gadgetTrapdoorRuns".into(),
             gadget_decompose: "MxxRuntime.gadgetDecomposeRuns".into(),
@@ -1668,6 +1671,7 @@ impl<'a> Emitter<'a> {
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
                 ..
             } => {
                 self.require_layout(
@@ -1689,10 +1693,16 @@ impl<'a> Emitter<'a> {
                 existentials.push((p.clone(), ty0));
                 let relation = if self.requires_tape {
                     self.current_uses_tape = true;
-                    format!(
-                        "{} backend tape (path ++ [{}])",
-                        self.options.primitives.trapdoor_sample_at, node_id.0
-                    )
+                    match instantiation {
+                        crate::types::TrapdoorInstantiation::Computational => format!(
+                            "{} backend tape (path ++ [{}])",
+                            self.options.primitives.trapdoor_sample_at, node_id.0
+                        ),
+                        crate::types::TrapdoorInstantiation::Statistical { m_bar } => format!(
+                            "{} backend tape (path ++ [{}]) {m_bar}",
+                            self.options.primitives.stat_trapdoor_sample_at, node_id.0
+                        ),
+                    }
                 } else {
                     format!("{} backend", self.options.primitives.trapdoor_sample)
                 };
@@ -3491,6 +3501,7 @@ mod tests {
                 matrix_type: matrix.clone(),
                 sigma: crate::expr::RealExpr::from_f64_exact(3.0).unwrap(),
                 max_coefficient_bound: IntExpr::constant(48),
+                compact: false,
             },
             vec![],
             vec![WireType::Matrix(matrix)],
@@ -4668,6 +4679,8 @@ mod tests {
                 gadget_base: IntExpr::constant(32),
                 digit_count: IntExpr::constant(1),
                 preimage_max_coefficient_bound: IntExpr::constant(4),
+                instantiation: Default::default(),
+                preimage_sigma: None,
             },
             vec![],
             vec![
@@ -4678,6 +4691,8 @@ mod tests {
                     gadget_base: IntExpr::constant(32),
                     digit_count: IntExpr::constant(1),
                     preimage_max_coefficient_bound: IntExpr::constant(4),
+                    instantiation: Default::default(),
+                    preimage_sigma: None,
                 },
             ],
         );
@@ -4768,6 +4783,8 @@ mod tests {
                 gadget_base: IntExpr::constant(2),
                 digit_count: IntExpr::constant(1),
                 preimage_max_coefficient_bound: IntExpr::constant(4),
+                instantiation: Default::default(),
+                preimage_sigma: None,
             },
             vec![],
             vec![
@@ -4778,6 +4795,8 @@ mod tests {
                     gadget_base: IntExpr::constant(2),
                     digit_count: IntExpr::constant(1),
                     preimage_max_coefficient_bound: IntExpr::constant(4),
+                    instantiation: Default::default(),
+                    preimage_sigma: None,
                 },
             ],
         );

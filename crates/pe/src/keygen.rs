@@ -37,9 +37,10 @@ use std::collections::BTreeMap;
 /// The anchor blocks `k~_i` in the key production: one preimage artifact
 /// `{ANCHOR_KEY}/{row}` per row of `H` (see [`anchor_key`]).
 pub(crate) const ANCHOR_KEY: &str = "mxx-pe/key/anchor";
-/// The helper blocks `v_(i,k)` (a family, member `i (W - 1) + k`).
+/// The helper blocks `v_(i,k)` (a family, member `i (W - 1) + k`), stored as compact bounded
+/// matrices like the anchor blocks.
 pub(crate) const HELPER_KEY: &str = "mxx-pe/key/helper";
-/// The output block `v_F`.
+/// The output block `v_F`, stored as a compact bounded matrix.
 pub(crate) const OUTPUT_KEY: &str = "mxx-pe/key/output";
 
 /// A key for one predicate: the compiled predicate with its public
@@ -205,16 +206,24 @@ where
     let (d_1, _) = public_key.message_row(hash_key.clone())?;
     let key_sigma = crate::params::real_expr(parameters.key_width())?;
     let key_cutoff = parameters.key_cutoff().clone();
-    let gaussian = || ring.gaussian((width, 1), key_sigma.clone(), key_cutoff.clone());
+    // The extension blocks are bounded by the key cutoff, so they are stored compactly.
+    let gaussian = || ring.small_gaussian((width, 1), key_sigma.clone(), key_cutoff.clone());
     // The one extension sample `v`, shared by every row.
-    let helpers = mxx_dsl::parallel(w * (w - 1), |_| Ok(gaussian()))?;
+    // Each block is stored compactly; the products below read it as a full matrix `I v`.
+    let helpers = mxx_dsl::parallel(w * (w - 1), |_| {
+        let block = gaussian();
+        let full = ring.identity(width).mul_small_rhs(block.clone());
+        Ok((block, full))
+    })?;
+    let stored_helpers = helpers.field(|(block, _)| block)?;
+    let helpers = helpers.field(|(_, full)| full)?;
     let output_block = gaussian();
     let gadget_first_row = Mat::concat(
         ConcatAxis::Columns,
         vec![parameters.rns().public_gadget(0)?, ring.zero((1, columns))],
     );
     // Only row `1` carries the target `d_1` and the output block `A_F^(1) v_F`.
-    let first = d_1 - output_first_row * output_block.clone();
+    let first = d_1 - output_first_row.mul_small_rhs(output_block.clone());
     let setup = public_key.setup();
     // Row `i`'s target `sigma_i^-1(u_i)` in a parallel loop; its preimage
     // under `B^(1)` is one existing sampler call per row.
@@ -254,7 +263,7 @@ where
         graph = graph.transferred_output(format!("{ANCHOR_KEY}/{row}"), anchor)?;
     }
     let graph = graph
-        .transferred_output(HELPER_KEY, helpers)?
+        .transferred_output(HELPER_KEY, stored_helpers)?
         .transferred_output(OUTPUT_KEY, output_block)?
         .build()?;
     let (trapdoor_production, trapdoor_manifest) = master.trapdoor_production().clone();
@@ -337,17 +346,20 @@ mod tests {
         let mut runtime = BTreeMap::new();
         let hash_key = public_key.hash_key_input(&mut runtime).unwrap();
         let production = key.key().production().clone();
-        let helpers = ring.family_artifact_input(
+        let cutoff = num_bigint::BigInt::from(parameters.key_cutoff().clone());
+        let helpers = ring.small_matrix_family_artifact_input(
             production.clone(),
             HELPER_KEY,
             w * (w - 1),
             (width, 1),
+            cutoff.clone(),
             ArtifactAvailability::Transferred,
         );
-        let output_block = ring.artifact_input(
+        let output_block = ring.small_matrix_artifact_input(
             production,
             OUTPUT_KEY,
             (width, 1),
+            cutoff,
             ArtifactAvailability::Transferred,
         );
         let output = key.output().unwrap();
@@ -385,15 +397,17 @@ mod tests {
                 let helper_first_row =
                     Mat::concat(ConcatAxis::Columns, vec![public.0.0, public.0.1])
                         .ring_automorphism(IntExpr::constant(*i));
-                value = value + helper_first_row * helper(row, k_index);
+                value = value + helper_first_row.mul_small_rhs(helper(row, k_index));
                 for (source, j) in group.elements.iter().enumerate() {
                     if j * k % order == *i {
-                        value = value - gadget_first_row.clone() * helper(source, k_index);
+                        value =
+                            value - gadget_first_row.clone().mul_small_rhs(helper(source, k_index));
                     }
                 }
             }
             if row == 0 {
-                value = value + output_first_row.clone() * output_block.clone() - d_1.clone();
+                value = value + output_first_row.clone().mul_small_rhs(output_block.clone()) -
+                    d_1.clone();
             }
             graph = graph.output(format!("row-{row}"), value).unwrap();
         }

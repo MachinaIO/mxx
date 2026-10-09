@@ -165,10 +165,15 @@ pub enum NodeKind {
         matrix_type: crate::types::MatrixType,
         range: SampleRange,
     },
+    /// Samples a discrete Gaussian of width `sigma` truncated at `max_coefficient_bound`. With
+    /// `compact`, the output is a globally bounded `SmallMatrix` whose bound is the cutoff, so an
+    /// export stores it as compact signed coefficients; otherwise it is a `Matrix`.
     GaussianSample {
         matrix_type: crate::types::MatrixType,
         sigma: RealExpr,
         max_coefficient_bound: IntExpr,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
     HashSample {
         matrix_type: crate::types::MatrixType,
@@ -195,6 +200,13 @@ pub enum NodeKind {
         gadget_base: IntExpr,
         digit_count: IntExpr,
         preimage_max_coefficient_bound: IntExpr,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::TrapdoorInstantiation::is_computational"
+        )]
+        instantiation: crate::types::TrapdoorInstantiation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preimage_sigma: Option<RealExpr>,
     },
     PreimageSample {
         matrix_type: crate::types::MatrixType,

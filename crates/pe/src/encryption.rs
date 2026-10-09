@@ -5,8 +5,8 @@
 //!
 //! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`;
 //! - for every attribute symbol `x_t`, the gadget ciphertext `C_t = P Z_t + X^(Bz x_t) G` with `P =
-//!   [B^(1); B^(2) - b]` and a fresh `Z_t` of shape `m_B x m`: `s P = -e_b`, so `s C_t = X^(Bz x_t)
-//!   s G - e_b Z_t`;
+//!   [B^(1); B^(2) - b]` and a fresh `Z_t` of shape `m_B x m`, sampled and multiplied one column at
+//!   a time: `s P = -e_b`, so `s C_t = X^(Bz x_t) s G - e_b Z_t`;
 //! - the message component `c_m = s d^T + e_m + floor(q/2) m = s_bar d_1 + d_2 + e_m + floor(q/2)
 //!   m` for binary coefficients `m`.
 //!
@@ -78,6 +78,23 @@ pub(crate) fn split(row: Mat, columns: usize) -> (Mat, Mat) {
         )
     };
     (block(0), block(columns))
+}
+
+/// The `1 x width` unit row at a loop-dependent `index`: a window of one constant row, so no
+/// constant depends on the loop.
+fn unit_row(ring: &mxx_dsl::Ring, width: usize, index: IntExpr) -> Mat {
+    let start = (IntExpr::constant(width - 1) - index).canonicalize();
+    ring.constant(
+        (1, 2 * width - 1),
+        mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(width - 1) },
+    )
+    .slice(
+        None,
+        Some(IndexRange {
+            start: start.clone(),
+            end: (start + IntExpr::constant(width)).canonicalize(),
+        }),
+    )
 }
 
 /// `Enc(mpk, x, m)` for an attribute of the class and a message of at most
@@ -217,15 +234,23 @@ where
     let programming = parameters.programming();
     let programming_sigma = crate::params::real_expr(programming.sigma())?;
     let ciphertexts = mxx_dsl::parallel(attribute.len(), |member| {
-        let z = ring.gaussian(
-            (m_b, 2 * columns),
-            programming_sigma.clone(),
-            programming.cutoff().clone(),
-        );
+        // `P Z_t` accumulated one column `z_j` of `Z_t` at a time, `P_r Z_t = sum_j (P_r z_j) e_j`
+        // for the unit rows `e_j`, so that one `m_B x 1` column is live.
+        let width = 2 * columns;
+        let zero = ring.zero((1, width));
+        let (top, bottom) = mxx_dsl::iterate(width, (zero.clone(), zero), |j, (top, bottom)| {
+            let unit = unit_row(&ring, width, j.expression()?);
+            let z =
+                ring.gaussian((m_b, 1), programming_sigma.clone(), programming.cutoff().clone());
+            Ok((
+                top + (first.clone() * z.clone()) * unit.clone(),
+                bottom + (lower.clone() * z) * unit,
+            ))
+        })?;
         let symbol = ring.identity(1).multiply_monomial(exponents.at(member));
         let target = symbol * gadget.clone();
-        let (top_left, top_right) = split(first.clone() * z.clone(), columns);
-        let (bottom_left, bottom_right) = split(lower.clone() * z, columns);
+        let (top_left, top_right) = split(top, columns);
+        let (bottom_left, bottom_right) = split(bottom, columns);
         Ok(((top_left + target.clone(), top_right), (bottom_left, bottom_right + target)))
     })?;
     let half = ring.polynomial([IntExpr::constant(parameters.modulus() / 2u8)]);

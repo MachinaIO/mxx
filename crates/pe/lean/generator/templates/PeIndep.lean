@@ -14,8 +14,8 @@ open Mxx.Primitives MxxRuntime MxxExponentLut
 
 /-- The sample sites that precede key generation. -/
 @[irreducible] def preSites : List (List Nat) :=
-  [[2, 0], [0, 0, 0], [0, 0, 1], [0, 0, 2], [3, 8], [3, 11, 0, 1], [4, 25], [4, 35], [4, 4, 0, 12],
-    [4, 4, 0, 20]] ++
+  [[2, 0], [0, 0, 0], [0, 0, 1], [0, 0, 2], [3, 6], [4, 25], [4, 35], [4, 4, 0, 12],
+    [4, 4, 0, 20]] ++ (List.range {{M}}).map (fun j ↦ [3, 11, 0, 3, j, 2]) ++
   (List.range {{L}}).flatMap fun i ↦ [[4, 43, i, 26], [4, 43, i, 35], [4, 8, i, 32], [4, 8, i, 41]]
 
 /-- The laws of the samples that precede key generation. -/
@@ -46,12 +46,17 @@ theorem lane_site_mem {i : Nat} (hi : i < {{L}}) :
     exact List.mem_append_right _ (List.mem_flatMap.mpr ⟨i, List.mem_range.mpr hi, hs⟩)
   exact ⟨h _ (by simp), h _ (by simp), h _ (by simp), h _ (by simp)⟩
 
+theorem z_site_mem {j : Nat} (hj : j < {{M}}) : [3, 11, 0, 3, j, 2] ∈ preSites := by
+  unfold preSites
+  exact List.mem_append_left _ (List.mem_append_right _ (List.mem_map.mpr ⟨j, List.mem_range.mpr hj, rfl⟩))
+
 /-- Every site of `preSites` starts with `0`, `2`, `3`, or `4`. -/
 theorem preSites_head {s : List Nat} (hs : s ∈ preSites) : s.head? ≠ some 6 := by
-  simp only [preSites, List.mem_append, List.mem_flatMap, List.mem_range] at hs
-  rcases hs with hs | ⟨i, -, hs⟩
+  simp only [preSites, List.mem_append, List.mem_flatMap, List.mem_map, List.mem_range] at hs
+  rcases hs with (hs | ⟨j, -, rfl⟩) | ⟨i, -, hs⟩
   · simp at hs
-    rcases hs with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> simp
+    rcases hs with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> simp
+  · simp
   · simp at hs
     rcases hs with rfl | rfl | rfl | rfl <;> simp
 
@@ -78,10 +83,10 @@ theorem preLaws_mem : SamplerLaw.interval (-1) 1 ∈ preLaws ∧ SamplerLaw.resi
   simp
 
 theorem fixed_site_mem {s : List Nat}
-    (h : s ∈ [[2, 0], [0, 0, 0], [0, 0, 1], [0, 0, 2], [3, 8], [3, 11, 0, 1], [4, 25], [4, 35],
+    (h : s ∈ [[2, 0], [0, 0, 0], [0, 0, 1], [0, 0, 2], [3, 6], [4, 25], [4, 35],
       [4, 4, 0, 12], [4, 4, 0, 20]]) : s ∈ preSites := by
   unfold preSites
-  exact List.mem_append_left _ h
+  exact List.mem_append_left _ (List.mem_append_left _ h)
 
 /-- Tapes that agree on `preKeys` have the same samples before key generation. -/
 theorem prims_congr {ω ω' : SampleTape} (h : ∀ k ∈ preKeys, ω k = ω' k) : prims ω = prims ω' := by
@@ -107,9 +112,12 @@ theorem prims_congr {ω ω' : SampleTape} (h : ∀ k ∈ preKeys, ω k = ω' k) 
       hm (rows := 1) (columns := 1 * Backend.layout0.digitCount) (site := [0, 0, 1])
         (fixed_site_mem (by simp)) l3 (by omega) (by decide)]
   have heb : ebAt ω [3] = ebAt ω' [3] :=
-    hw (site := [3, 8]) (fixed_site_mem (by simp)) l4 (by omega) (by omega)
-  have hZ : zAt ω [3] = zAt ω' [3] :=
-    hw (site := [3, 11, 0, 1]) (fixed_site_mem (by simp)) l4 (by omega) (by omega)
+    hw (site := [3, 6]) (fixed_site_mem (by simp)) l4 (by omega) (by omega)
+  have hZ : zAt ω [3] = zAt ω' [3] := by
+    funext r c
+    unfold zAt zColAt
+    exact congrFun (congrFun (hw (rows := {{MB}}) (columns := 1) (site := [3] ++ [11, 0, 3, (c : Nat), 2])
+      (by simpa using z_site_mem c.isLt) l4 (by omega) (by omega)) r) 0
   have he0 : e0Of ω = e0Of ω' := by
     unfold e0Of errAt
     rw [hw (site := [4, 25]) (fixed_site_mem (by simp)) l5 (by omega) (by omega),

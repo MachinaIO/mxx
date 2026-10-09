@@ -46,7 +46,8 @@ use crate::{
                 GpuRawControlStatusView, GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb,
                 GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
                 GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
-                GpuRawSmallMatrixView, GpuSignedValuesEncoding, GpuStridedCopy,
+                GpuRawSmallMatrixView, GpuRawStatisticalWorkspace, GpuSignedValuesEncoding,
+                GpuStatisticalBindings, GpuStatisticalPerturbation, GpuStridedCopy,
                 gpu_device_identity, gpu_device_memory_usage, gpu_device_sync,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
@@ -104,23 +105,14 @@ fn compiled_raw_matrix_part_inner(
         {
             matrix.clone()
         }
-        ConcreteWireType::Trapdoor { matrix, digit_count, .. } => {
-            let secret_columns = matrix
-                .rows
-                .checked_mul(*digit_count)
-                .ok_or_else(|| invalid("trapdoor secret column count overflows"))?;
-            let (rows, columns) = match part.leaf {
-                0 | 1 => (matrix.rows, secret_columns),
-                2..=4 => (matrix.rows, matrix.rows),
-                5 => (
-                    matrix
-                        .rows
-                        .checked_mul(2)
-                        .ok_or_else(|| invalid("trapdoor stacked row count overflows"))?,
-                    secret_columns,
-                ),
-                _ => return Err(invalid("raw trapdoor part references an unknown leaf")),
-            };
+        ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
+            let (rows, columns) = crate::sampler::trapdoor::trapdoor_component_shapes(
+                matrix.rows,
+                *digit_count,
+                *instantiation,
+            )
+            .and_then(|shapes| shapes.get(part.leaf as usize).copied())
+            .ok_or_else(|| invalid("raw trapdoor part references an unknown leaf"))?;
             ConcreteMatrixType { ring: matrix.ring.clone(), rows, columns }
         }
         _ => return Err(invalid("raw matrix operation requires a matrix or trapdoor leaf")),
@@ -665,6 +657,7 @@ pub(crate) struct GpuPreparedNativeResources {
     hash_samples: BTreeMap<u32, (i32, Arc<GpuHashSamplePlan>, Box<[(PhysicalValueId, u32, u32)]>)>,
     dynamic_round_divides: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     p1: BTreeMap<u32, (i32, Arc<GpuRawP1Workspace>)>,
+    statistical: BTreeMap<u32, (i32, Arc<GpuRawStatisticalWorkspace>)>,
     gq: BTreeMap<u32, (i32, Arc<GpuRawGqWorkspace>)>,
     cutoff: BTreeMap<u32, (i32, Arc<GpuRawPreimageCutoffPlan>)>,
     indexed_matrices: BTreeMap<u32, Arc<GpuIndexedMatrixTable>>,
@@ -705,6 +698,14 @@ impl GpuPreparedNativeResources {
                     .map(|(address, bytes)| (*device, address, bytes)),
             );
         }
+        for (device, workspace) in self.statistical.values() {
+            ranges.extend(
+                workspace
+                    .binding_ranges()
+                    .into_iter()
+                    .map(|(address, bytes)| (*device, address, bytes)),
+            );
+        }
         for (device, workspace) in self.gq.values() {
             ranges.push((*device, workspace.sampled_address(), workspace.sampled_bytes()));
         }
@@ -732,6 +733,11 @@ impl GpuPreparedNativeResources {
         match kind {
             GpuPreparedWorkspaceKind::P1 => {
                 let (device, workspace) = self.p1.get(&resource_id)?;
+                let (address, bytes) = *workspace.binding_ranges().get(component as usize)?;
+                Some((*device, address, bytes))
+            }
+            GpuPreparedWorkspaceKind::Statistical => {
+                let (device, workspace) = self.statistical.get(&resource_id)?;
                 let (address, bytes) = *workspace.binding_ranges().get(component as usize)?;
                 Some((*device, address, bytes))
             }
@@ -773,6 +779,11 @@ impl GpuPreparedNativeResources {
             }
         }
         for (device, workspace) in self.p1.values() {
+            if *device == physical_device {
+                workspace.prepare_graph_launch(stream)?;
+            }
+        }
+        for (device, workspace) in self.statistical.values() {
             if *device == physical_device {
                 workspace.prepare_graph_launch(stream)?;
             }
@@ -858,6 +869,11 @@ impl GpuPreparedNativeResources {
             }
         }
         for (device, workspace) in self.p1.values() {
+            if *device == physical_device {
+                workspace.protect_compiled_submission(completion)?;
+            }
+        }
+        for (device, workspace) in self.statistical.values() {
             if *device == physical_device {
                 workspace.protect_compiled_submission(completion)?;
             }
@@ -1048,6 +1064,7 @@ pub(crate) fn prepare_compiled_gpu_program(
         );
     }
     let mut p1 = BTreeMap::new();
+    let mut statistical = BTreeMap::new();
     let mut rns_conversions = BTreeMap::new();
     let mut crt_recompositions = BTreeMap::new();
     let mut compact_packs = BTreeMap::new();
@@ -1651,6 +1668,53 @@ pub(crate) fn prepare_compiled_gpu_program(
                 )?;
                 p1.insert(*resource_id, (operation.device, Arc::new(workspace)));
             }
+            GpuNativePrimitive::StatisticalPerturbation => {
+                let [
+                    KernelArg::U32(resource_id),
+                    KernelArg::Value(output_id),
+                    KernelArg::U32(output_part),
+                    KernelArg::Value(_),
+                    KernelArg::U32(_),
+                    KernelArg::U64(m_bar),
+                    ..,
+                ] = operation.arguments.as_ref()
+                else {
+                    return Err(invalid("statistical perturbation has invalid arguments"));
+                };
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("statistical workspace resource ID is duplicated"));
+                }
+                let output_owner = owners
+                    .get(output_id)
+                    .ok_or_else(|| invalid("statistical perturbation output owner is missing"))?;
+                let (output_ty, output, _) = compiled_raw_matrix_part(
+                    output_owner,
+                    *output_part,
+                    PhysicalEncoding::FullCoeff,
+                )?;
+                let m_bar = usize::try_from(*m_bar)
+                    .map_err(|_| invalid("statistical m_bar exceeds usize"))?;
+                if output.physical_device != operation.device ||
+                    output.row_origin != 0 ||
+                    output.column_origin != 0 ||
+                    output.rows <= m_bar as u64
+                {
+                    return Err(invalid("statistical perturbation output is not a packed tile"));
+                }
+                let params = backend
+                    .parameters_on_physical_device(operation.device, &output_ty)
+                    .map_err(|error| invalid(&error))?;
+                let stream = params.native_launch_stream(operation.device)?;
+                let workspace = GpuRawStatisticalWorkspace::new(
+                    params,
+                    &stream,
+                    m_bar,
+                    output.rows as usize - m_bar,
+                    usize::try_from(output.columns)
+                        .map_err(|_| invalid("statistical columns exceed usize"))?,
+                )?;
+                statistical.insert(*resource_id, (operation.device, Arc::new(workspace)));
+            }
             GpuNativePrimitive::GqSample => {
                 let [
                     KernelArg::U32(resource_id),
@@ -1756,6 +1820,7 @@ pub(crate) fn prepare_compiled_gpu_program(
         hash_samples,
         dynamic_round_divides,
         p1,
+        statistical,
         gq,
         cutoff,
         indexed_matrices: indexed_matrices.clone(),
@@ -4918,6 +4983,140 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(seed_owner));
             builder.retain_owner(Arc::clone(workspace));
         }
+        GpuNativePrimitive::StatisticalSpectra => {
+            let [
+                KernelArg::U32(resource_id),
+                KernelArg::Value(trapdoor_id),
+                KernelArg::U32(chunk_part),
+                KernelArg::U64(row_offset),
+                KernelArg::U32(chunk_binding),
+                KernelArg::U32(spectra_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical spectra has the wrong arguments"));
+            };
+            if !op.outputs.is_empty() {
+                return Err(invalid("compiled statistical spectra must not produce a value"));
+            }
+            let owner = owners
+                .get(trapdoor_id)
+                .ok_or_else(|| invalid("statistical spectra trapdoor owner is missing"))?;
+            let (chunk_ty, chunk, chunk_bindings) =
+                compiled_raw_matrix_part(owner, *chunk_part, PhysicalEncoding::FullCoeff)?;
+            let (device, workspace) = resources
+                .statistical
+                .get(resource_id)
+                .ok_or_else(|| invalid("statistical spectra has no prepared workspace"))?;
+            if *device != op.device || chunk.physical_device != op.device {
+                return Err(invalid("statistical spectra physical contract is inconsistent"));
+            }
+            bind_raw_matrix_part(builder, *chunk_binding, &chunk_bindings)?;
+            let [spectra, ..] = workspace.binding_ranges();
+            builder.bind_resident_address(spectra.0, spectra.1, *spectra_binding)?;
+            let params = backend
+                .parameters_on_physical_device(op.device, &chunk_ty)
+                .map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_spectra(
+                builder.launch_stream(),
+                &chunk,
+                usize::try_from(*row_offset)
+                    .map_err(|_| invalid("statistical spectra row exceeds usize"))?,
+                workspace,
+                *chunk_binding,
+                *spectra_binding,
+            )?;
+            builder.retain_owner(Arc::clone(owner));
+            builder.retain_owner(Arc::clone(workspace));
+        }
+        GpuNativePrimitive::StatisticalPerturbation => {
+            let [
+                KernelArg::U32(resource_id),
+                KernelArg::Value(output_id),
+                KernelArg::U32(output_part),
+                KernelArg::Value(seed_id),
+                KernelArg::U32(seed_part),
+                KernelArg::U64(_),
+                KernelArg::F64(p2_sigma),
+                KernelArg::F64(center_scale),
+                KernelArg::F64(a),
+                KernelArg::F64(beta),
+                KernelArg::F64(gmax),
+                KernelArg::F64(isotropic),
+                KernelArg::F64(rounding),
+                KernelArg::U32(output_binding),
+                KernelArg::U32(seed_binding),
+                KernelArg::U32(spectra_binding),
+                KernelArg::U32(vectors_binding),
+                KernelArg::U32(chunk_binding),
+                KernelArg::U32(p2_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical perturbation has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*output_id] {
+                return Err(invalid("compiled statistical perturbation output is not its tile"));
+            }
+            let output_owner = owners
+                .get(output_id)
+                .ok_or_else(|| invalid("statistical perturbation output owner is missing"))?;
+            let seed_owner = owners
+                .get(seed_id)
+                .ok_or_else(|| invalid("statistical perturbation seed owner is missing"))?;
+            let (output_ty, output, output_bindings) =
+                compiled_raw_matrix_part(output_owner, *output_part, PhysicalEncoding::FullCoeff)?;
+            let seed_address = compiled_bytes_part(seed_owner, *seed_part, 32, op.device)?;
+            let (device, workspace) = resources
+                .statistical
+                .get(resource_id)
+                .ok_or_else(|| invalid("statistical perturbation has no prepared workspace"))?;
+            if *device != op.device ||
+                [p2_sigma, center_scale, a, beta, gmax, isotropic, rounding]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            {
+                return Err(invalid("statistical perturbation physical contract is inconsistent"));
+            }
+            bind_raw_matrix_part(builder, *output_binding, &output_bindings)?;
+            builder.bind_resident_address(seed_address, 32, *seed_binding)?;
+            let ranges = workspace.binding_ranges();
+            for ((address, bytes), binding) in ranges.into_iter().zip([
+                spectra_binding,
+                vectors_binding,
+                chunk_binding,
+                p2_binding,
+            ]) {
+                builder.bind_resident_address(address, bytes, *binding)?;
+            }
+            let params = backend
+                .parameters_on_physical_device(op.device, &output_ty)
+                .map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_perturbation(
+                builder.launch_stream(),
+                &output,
+                seed_address,
+                GpuStatisticalPerturbation {
+                    p2_sigma: *p2_sigma,
+                    center_scale: *center_scale,
+                    a: *a,
+                    beta: *beta,
+                    gmax: *gmax,
+                    isotropic: *isotropic,
+                    rounding: *rounding,
+                },
+                workspace,
+                GpuStatisticalBindings {
+                    output_base: *output_binding,
+                    seed: *seed_binding,
+                    spectra: *spectra_binding,
+                    vectors: *vectors_binding,
+                    chunk: *chunk_binding,
+                    p2: *p2_binding,
+                },
+            )?;
+            builder.retain_owner(Arc::clone(output_owner));
+            builder.retain_owner(Arc::clone(seed_owner));
+            builder.retain_owner(Arc::clone(workspace));
+        }
         GpuNativePrimitive::GqSample => {
             let [
                 KernelArg::U32(resource_id),
@@ -6660,26 +6859,20 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     Ok(written)
 }
 
+/// Stream a trapdoor into its artifact: the public matrix and the tagged secret encoding of
+/// `DCRTTrapdoor::to_compact_bytes`, one component (a leaf) at a time.
 fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     layout: &PhysicalExport,
     source: &mut R,
     sink: &mut W,
     public_matrix: &ConcreteMatrixType,
     digit_count: usize,
+    instantiation: mxx_ir_core::types::TrapdoorInstantiation,
 ) -> Result<u64, String> {
     let public = layout.public.as_ref().ok_or("trapdoor export has no public value")?;
     if public.ty != ConcreteWireType::Matrix(public_matrix.clone()) {
         return Err("trapdoor public value has the wrong matrix type".into());
     }
-    let secret_columns = public_matrix
-        .rows
-        .checked_mul(digit_count)
-        .ok_or("trapdoor secret column count overflows")?;
-    let secret_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows,
-        columns: secret_columns,
-    };
     let mut public_file = tempfile::tempfile().map_err(|error| error.to_string())?;
     let public_len = transcode_raw_eval_matrix(
         layout,
@@ -6688,27 +6881,28 @@ fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
         public_matrix,
         RawExportLeaf::TrapdoorPublic,
     )?;
-    let square_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows,
-        columns: public_matrix.rows,
-    };
-    let stacked_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows.checked_mul(2).ok_or("trapdoor stacked row count overflows")?,
-        columns: secret_columns,
-    };
-    let secret_shapes = [
-        &secret_matrix,
-        &secret_matrix,
-        &square_matrix,
-        &square_matrix,
-        &square_matrix,
-        &stacked_matrix,
-    ];
+    let secret_shapes = crate::sampler::trapdoor::trapdoor_component_shapes(
+        public_matrix.rows,
+        digit_count,
+        instantiation,
+    )
+    .ok_or("trapdoor export has an invalid instantiation")?
+    .into_iter()
+    .map(|(rows, columns)| ConcreteMatrixType { ring: public_matrix.ring.clone(), rows, columns })
+    .collect::<Vec<_>>();
     let mut secret_file = tempfile::tempfile().map_err(|error| error.to_string())?;
-    let mut secret_len = 0u64;
-    for (leaf, shape) in secret_shapes.into_iter().enumerate() {
+    secret_file
+        .write_all(&crate::sampler::trapdoor::TAGGED_MAGIC)
+        .map_err(|error| error.to_string())?;
+    secret_file
+        .write_all(&[if instantiation.is_computational() {
+            crate::sampler::trapdoor::TAG_COMPUTATIONAL
+        } else {
+            crate::sampler::trapdoor::TAG_STATISTICAL
+        }])
+        .map_err(|error| error.to_string())?;
+    let mut secret_len = crate::sampler::trapdoor::TAGGED_MAGIC.len() as u64 + 1;
+    for (leaf, shape) in secret_shapes.iter().enumerate() {
         let mut part_file = tempfile::tempfile().map_err(|error| error.to_string())?;
         let part_len = transcode_raw_full_matrix(
             layout,
@@ -6778,8 +6972,8 @@ pub(crate) fn transcode_raw_artifact<R: Read + Seek + ?Sized, W: Write + ?Sized>
             transcode_raw_bytes(layout, source, sink, *length as u64)
         }
         ConcreteWireType::TypedBlob { .. } => transcode_raw_typed_blob(layout, source, sink),
-        ConcreteWireType::Trapdoor { matrix, digit_count, .. } => {
-            transcode_raw_trapdoor(layout, source, sink, matrix, *digit_count)
+        ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
+            transcode_raw_trapdoor(layout, source, sink, matrix, *digit_count, *instantiation)
         }
         _ => Err("raw artifact transcode does not support this wire type yet".into()),
     }

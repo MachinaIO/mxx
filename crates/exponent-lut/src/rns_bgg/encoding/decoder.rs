@@ -60,8 +60,12 @@ impl RnsEncryptBuild<'_> {
             .as_ref()
             .ok_or_else(|| ApiError::input("the stage mask secret is not bound"))?;
         let ring = parameters.ring(level).map_err(ApiError::scheme)?;
-        let columns = crate::decoder::unmask::UNMASK_ROWS *
-            (parameters.level(level).map_err(ApiError::scheme)?.modulus_digits() + 2);
+        let columns = mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns(
+                crate::decoder::unmask::UNMASK_ROWS,
+                parameters.level(level).map_err(ApiError::scheme)?.modulus_digits(),
+            )
+            .ok_or_else(|| ApiError::input("the unmask trapdoor width overflows"))?;
         let public = ring.artifact_input(
             production.clone(),
             decoder_artifact_name(*declaration.commitment(), "unmask-public"),

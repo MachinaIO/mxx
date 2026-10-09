@@ -64,7 +64,7 @@ pub use mxx_ir_core::{
     Rational,
     artifact::ArtifactAvailability,
     protocol::{IdealSpec, PurePredicateSpec},
-    types::CoefficientBoundDomain,
+    types::{CoefficientBoundDomain, TrapdoorInstantiation},
 };
 #[cfg(test)]
 mod bundle_tests;
@@ -217,6 +217,8 @@ pub struct TrapdoorType {
     pub gadget_base: IntExpr,
     pub digit_count: IntExpr,
     pub preimage_max_coefficient_bound: IntExpr,
+    pub instantiation: TrapdoorInstantiation,
+    pub preimage_sigma: Option<RealExpr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -501,6 +503,35 @@ impl Ring {
         digit_count: impl Into<IntExpr>,
         preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Trapdoor {
+        self.trapdoor_artifact_input_with_width(
+            production_id,
+            trapdoor_artifact_name,
+            rows,
+            TrapdoorInstantiation::Computational,
+            sigma,
+            gadget_base,
+            digit_count,
+            None,
+            preimage_max_coefficient_bound,
+        )
+    }
+
+    /// [`Self::trapdoor_artifact_input`] of a trapdoor in the given instantiation whose preimages
+    /// are sampled with width `preimage_sigma` (`None`: the smallest width the sampler accepts).
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    pub fn trapdoor_artifact_input_with_width(
+        &self,
+        production_id: ProductionId,
+        trapdoor_artifact_name: impl Into<String>,
+        rows: impl Into<IntExpr>,
+        instantiation: TrapdoorInstantiation,
+        sigma: impl Into<RealExpr>,
+        gadget_base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+        preimage_sigma: Option<RealExpr>,
+        preimage_max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Trapdoor {
         let rows = rows.into();
         let sigma = sigma.into();
         let gadget_base = gadget_base.into();
@@ -508,7 +539,7 @@ impl Ring {
         let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
-            columns: (rows * (digit_count.clone() + IntExpr::constant(2))).canonicalize(),
+            columns: instantiation.columns_expr(rows, digit_count.clone()),
         });
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
         let wire_type = WireType::Trapdoor {
@@ -517,6 +548,8 @@ impl Ring {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            instantiation,
+            preimage_sigma,
         };
         let node = NodeHandle::new(
             NodeKind::Input {
@@ -561,6 +594,7 @@ impl Ring {
         digit_count: impl Into<IntExpr>,
         preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Family<Trapdoor> {
+        let instantiation = TrapdoorInstantiation::Computational;
         let count = count.into();
         let rows = rows.into();
         let sigma = sigma.into();
@@ -569,7 +603,7 @@ impl Ring {
         let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
-            columns: (rows * (digit_count.clone() + IntExpr::constant(2))).canonicalize(),
+            columns: instantiation.columns_expr(rows, digit_count.clone()),
         });
         let public_artifact_name = public_artifact_name.into();
         let public = Family::<Mat>::source_input(
@@ -593,6 +627,8 @@ impl Ring {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma: None,
         };
         Family::<Trapdoor>::trapdoor_input(
             format!("artifact:{trapdoor_artifact_name}"),
@@ -941,10 +977,44 @@ impl Ring {
                 matrix_type: ty.clone(),
                 sigma: sigma.into(),
                 max_coefficient_bound: max_coefficient_bound.into(),
+                compact: false,
             },
             Vec::new(),
             ty,
         )
+    }
+
+    /// A Gaussian sample as a globally bounded [`SmallMatrix`] whose bound is the cutoff
+    /// `max_coefficient_bound`, so a transferred output stores compact signed coefficients
+    /// instead of residues; multiply it with [`Mat::mul_small_rhs`].
+    pub fn small_gaussian(
+        &self,
+        shape: impl IntoShape,
+        sigma: impl Into<RealExpr>,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> SmallMatrix {
+        let matrix_type = self.matrix_type(shape);
+        let max_coefficient_bound = max_coefficient_bound.into();
+        let node = NodeHandle::new(
+            NodeKind::GaussianSample {
+                matrix_type: matrix_type.clone(),
+                sigma: sigma.into(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+                compact: true,
+            },
+            Vec::new(),
+            vec![WireType::SmallMatrix {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+                bound_domain: CoefficientBoundDomain::Global,
+            }],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("small Gaussian sample"),
+            matrix_type,
+            max_coefficient_bound,
+            bound_domain: CoefficientBoundDomain::Global,
+        }
     }
 
     #[track_caller]
@@ -1081,6 +1151,34 @@ impl Ring {
         digit_count: impl Into<IntExpr>,
         preimage_max_coefficient_bound: impl Into<IntExpr>,
     ) -> Trapdoor {
+        self.sample_trapdoor_with_width(
+            rows,
+            TrapdoorInstantiation::Computational,
+            sigma,
+            gadget_base,
+            digit_count,
+            None,
+            preimage_max_coefficient_bound,
+        )
+    }
+
+    /// Samples a trapdoor in the given instantiation.
+    ///
+    /// `sigma` is the TrapGen width; every preimage under the trapdoor is sampled with width
+    /// `preimage_sigma` (`None`: the smallest width the sampler accepts) and rejected above
+    /// `preimage_max_coefficient_bound`.
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_trapdoor_with_width(
+        &self,
+        rows: impl Into<IntExpr>,
+        instantiation: TrapdoorInstantiation,
+        sigma: impl Into<RealExpr>,
+        gadget_base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+        preimage_sigma: Option<RealExpr>,
+        preimage_max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Trapdoor {
         let rows = rows.into();
         let sigma = sigma.into();
         let gadget_base = gadget_base.into();
@@ -1088,7 +1186,7 @@ impl Ring {
         let preimage_max_coefficient_bound = preimage_max_coefficient_bound.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
-            columns: (rows * (digit_count.clone() + IntExpr::constant(2))).canonicalize(),
+            columns: instantiation.columns_expr(rows, digit_count.clone()),
         });
         let node = NodeHandle::new(
             NodeKind::TrapdoorSample {
@@ -1097,6 +1195,8 @@ impl Ring {
                 gadget_base: gadget_base.clone(),
                 digit_count: digit_count.clone(),
                 preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                instantiation,
+                preimage_sigma: preimage_sigma.clone(),
             },
             Vec::new(),
             vec![
@@ -1107,6 +1207,8 @@ impl Ring {
                     gadget_base,
                     digit_count,
                     preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                    instantiation,
+                    preimage_sigma,
                 },
             ],
         );
@@ -1151,6 +1253,8 @@ impl Ring {
                 gadget_base: base,
                 digit_count,
                 preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                instantiation: TrapdoorInstantiation::Computational,
+                preimage_sigma: None,
             }],
         );
         let public_node = NodeHandle::new(

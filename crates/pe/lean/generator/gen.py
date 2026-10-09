@@ -54,13 +54,20 @@ def online_bound(d, m, half, b0, bb, bz, bh):
 
 def values(parameter_id):
     row = row_of(parameter_id)
-    if (row['noise_model'], row['failure_exponent']) != ('average', '100'):
-        sys.exit('the templates prove the average model with failure exponent 100')
+    if row['noise_model'] != 'average' or not row['failure_exponent'].isdigit():
+        sys.exit('the templates prove the average model with a failure exponent')
+    # The tail `N 2 exp(-x) <= N 2^(1 - x)` reaches `2^-fail` for `x >= fail + 20` at `N = 2^13`.
+    fail = int(row['failure_exponent'])
+    tail = fail + 20
     if (row['attribute_length'], row['alphabet_size'], row['state_width'], row['max_steps'], row['reads'],
             row['tables']) != ('1', '2', '1', '1', '0', '0:1'):
         sys.exit('the templates prove the class (1, 2, 1, 1) with the predicate F(x) = x₀')
     if int(row['ring_dimension']) != N:
         sys.exit(f'the templates prove the ring dimension {N}')
+    # The templates model the computational TrapGen `[a | I | G - (a R + E)]` (`m_B = D + 2`) and
+    # the default cutoffs; a statistical row needs proof templates of its own TrapGen.
+    if row['trapdoor_instantiation'] != 'computational' or row['cutoff_multiplier'] != '6.5':
+        sys.exit('the templates prove the computational instantiation with the default cutoffs')
     generated = os.path.join(LEAN, parameter_id, 'generated')
     backend = read(generated, 'Backend')
     q = int(one(r'RegularLayout (\d+) :=', backend, 'modulus'))
@@ -75,14 +82,19 @@ def values(parameter_id):
     encrypt, prelude = read(generated, 'Stage_encrypt'), read(generated, 'Stage_prelude')
     keygen, trapdoor = read(generated, 'Stage_keygen'), read(generated, 'Stage_setup_trapdoor')
     preprocess, decode = read(generated, 'Stage_preprocess'), read(generated, 'Stage_decode')
-    cutoffs = lambda text: {int(c) for c in re.findall(r'gaussianSampleAt tape \(path \+\+ \[\d+\]\) \(\(319/100\)\) \((\d+)\)', text)}
-    flooding = cutoffs(encrypt) - cutoffs(prelude)
-    if len(cutoffs(prelude)) != 1:
-        sys.exit('expected one prelude cutoff')
-    ce = cutoffs(prelude).pop()
-    cf = flooding.pop() if flooding else ce
-    if cutoffs(encrypt) - {ce, cf}:
-        sys.exit('unexpected encryption cutoffs')
+    # The (width, cutoff) pairs of the Gaussian laws of a stage: the prelude samples `chi` only,
+    # and encryption adds `chi_fl` unless both laws coincide. Widths and cutoffs of any size are
+    # read whole.
+    laws = lambda text: set(re.findall(
+        r'gaussianSampleAt tape \(path \+\+ \[\d+\]\) \(\((\d+(?:/\d+)?)\)\) \((\d+)\)', text))
+    if len(laws(prelude)) != 1:
+        sys.exit('expected one prelude Gaussian law')
+    (sigma_e, ce), = laws(prelude)
+    flooding = laws(encrypt) - laws(prelude)
+    if len(flooding) > 1 or sigma_e != '319/100':
+        sys.exit('unexpected encryption Gaussian laws')
+    ce = int(ce)
+    cf = int(flooding.pop()[1]) if flooding else ce
     key_sigma, key_cutoff = one(r'gaussianSampleAt tape \(path \+\+ \[7\]\) \(\((\d+/\d+)\)\) \((\d+)\)', keygen,
                                 'key law')
     trap_sigma = one(r'trapdoorSampleAt backend tape \(path \+\+ \[0\]\) \((\d+/\d+)\)', trapdoor, 'TrapGen width')
@@ -100,11 +112,12 @@ def values(parameter_id):
     bias = mb * N * ce * key_cutoff
     mt = (q - 8) // 4 - (ce + 2) - 2 * bias
     energy = m * N * (ce * ce + ce * ce + bf * bf)
-    if not (2 * bf < q and 240 * sigma_bound * sigma_bound * energy <= mt * mt and
+    if not (2 * bf < q and 2 * tail * sigma_bound * sigma_bound * energy <= mt * mt and
             4 * (ce + 1 + 2 * bias + mt) + 4 < q):
-        sys.exit(f'{parameter_id}: the bounds of the proof do not reach a failure probability of 2^-100')
+        sys.exit(f'{parameter_id}: the bounds of the proof do not reach a failure probability of 2^-{fail}')
     return {
         'ID': parameter_id,
+        'FAIL': str(fail), 'TAIL': str(tail), 'TAIL2': str(2 * tail),
         'PACKAGE': 'MxxPe' + ''.join(part.capitalize() for part in parameter_id.split('-')),
         'DEPTH': str(len(moduli)), 'CRT_BITS': row['crt_bits'], 'BASE_BITS': row['base_bits'],
         'QBITS': str(q.bit_length()), 'Q': str(q), 'HALFQ': str(q // 2), 'INV2': str((q + 1) // 2),

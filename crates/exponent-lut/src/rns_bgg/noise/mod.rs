@@ -101,6 +101,11 @@ pub struct RnsBggDynamicNoise {
     /// ([`super::RnsBggDynamicSetup::composed_automorphisms`]); empty without
     /// a split.
     pub composed: std::collections::BTreeSet<usize>,
+    /// The CRT primes of the auxiliary modulus of compact encodings
+    /// ([`super::RnsBggDynamicSetup::with_compact_encodings`]): the companion
+    /// and helper errors are then the expanded bounds of
+    /// [`crate::rns_bgg::compact_expansion_bound`] of their contracts.
+    pub compact_extension: Option<Vec<u64>>,
 }
 
 impl RnsBggDynamicNoise {
@@ -135,6 +140,7 @@ impl RnsBggDynamicNoise {
             rhs,
             automorphisms: setup.automorphisms().to_vec(),
             composed: setup.composed_automorphisms(),
+            compact_extension: setup.compact_extension().map(<[u64]>::to_vec),
         })
     }
 
@@ -166,7 +172,21 @@ impl RnsBggDynamicNoise {
                 )
             })
             .collect();
-        Ok(Self { namespace, distributions, rhs, automorphisms, composed: Default::default() })
+        Ok(Self {
+            namespace,
+            distributions,
+            rhs,
+            automorphisms,
+            composed: Default::default(),
+            compact_extension: None,
+        })
+    }
+
+    /// The planning contracts with compact encodings over the auxiliary
+    /// modulus with CRT primes `extension`.
+    pub fn with_compact_extension(mut self, extension: Vec<u64>) -> Self {
+        self.compact_extension = Some(extension);
+        self
     }
 }
 

@@ -122,6 +122,7 @@ fn package_contracts(
     distributions: RnsBggDynamicDistributions,
     ciphertext_error: &BigUint,
     baby_steps: Option<usize>,
+    compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggDynamicNoise, PeError> {
     let automorphisms = class
         .layout()
@@ -148,7 +149,14 @@ fn package_contracts(
         automorphisms.len(),
         baby_steps,
     );
-    Ok(RnsBggDynamicNoise { namespace, distributions, rhs, automorphisms, composed })
+    Ok(RnsBggDynamicNoise {
+        namespace,
+        distributions,
+        rhs,
+        automorphisms,
+        composed,
+        compact_extension: compact_extension.map(<[u64]>::to_vec),
+    })
 }
 
 /// The exponent-lut simulator's trace of `program` over `rns` under the given material contracts.
@@ -160,13 +168,26 @@ fn evaluation_trace(
     distributions: RnsBggDynamicDistributions,
     ciphertext_error: &BigUint,
     baby_steps: Option<usize>,
+    compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggNoiseTrace, PeError> {
     let compiled = program.compile()?;
-    let initial = RnsBggNoiseValue::sampled_gaussian(
-        &distributions.input,
-        b"mxx-pe/initial-state",
-        &[BigInt::from(1u8)],
-    );
+    // A compact initial state is read through its expansion, bounded by its
+    // expanded bound without a moment model (its errors repeat across columns).
+    let initial = match compact_extension {
+        Some(extension) => RnsBggNoiseValue::public(
+            mxx_exponent_lut::rns_bgg::compact_expansion_bound(
+                rns,
+                extension,
+                distributions.input.cutoff(),
+            )?,
+            &[BigInt::from(1u8)],
+        ),
+        None => RnsBggNoiseValue::sampled_gaussian(
+            &distributions.input,
+            b"mxx-pe/initial-state",
+            &[BigInt::from(1u8)],
+        ),
+    };
     let symbol = RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
     let bindings = RnsBggNoiseBindings::from_inputs(compiled.program(), &[initial], &[symbol])?
         .with_output_use(RnsOutputUse::Gadget)
@@ -178,6 +199,7 @@ fn evaluation_trace(
             distributions,
             ciphertext_error,
             baby_steps,
+            compact_extension,
         )?);
     let workload = RnsBggDerivedWorkload::from_program_with_parameters(rns, compiled.program())?;
     Ok(api::noise_simulate(
@@ -230,7 +252,22 @@ pub fn witness_bound(
         distributions,
         programming_cutoff,
         None,
+        None,
     )?)
+}
+
+/// The coefficient bound of a helper as decryption reads it: the helper
+/// contract's cutoff, or its expanded bound with compact encodings.
+pub(crate) fn helper_error(parameters: &PeParameters) -> Result<BigUint, PeError> {
+    let cutoff = parameters.distributions().helper.cutoff().clone();
+    Ok(match parameters.compact_extension() {
+        Some(extension) => mxx_exponent_lut::rns_bgg::compact_expansion_bound(
+            parameters.rns(),
+            extension,
+            &cutoff,
+        )?,
+        None => cutoff,
+    })
 }
 
 /// Simulate `program` under `parameters` with the exponent-lut evaluator,
@@ -247,6 +284,7 @@ pub fn simulate(
         parameters.distributions(),
         &parameters.ciphertext_error_bound(),
         parameters.baby_steps(),
+        parameters.compact_extension(),
     )?;
     let evaluation = output_bound(&trace)?;
     let w = BigUint::from(parameters.class().lookup_width());
@@ -255,7 +293,8 @@ pub fn simulate(
     let m_b = BigUint::from(parameters.anchor_columns());
     let n = BigUint::from(parameters.level().ring_dimension());
     let error = parameters.error().cutoff();
-    let blocks = &w * &m_b * error + &w * &p * &m * error + &m * &evaluation;
+    let helper = helper_error(parameters)?;
+    let blocks = &w * &m_b * error + &w * &p * &m * &helper + &m * &evaluation;
     let decryption = error + n * parameters.key_cutoff() * blocks;
     Ok(PeNoiseReport {
         evaluation,
@@ -282,7 +321,8 @@ pub fn simulate_average(
     let m = BigUint::from(parameters.state_columns());
     let n = BigUint::from(parameters.level().ring_dimension());
     let error = parameters.error().cutoff();
-    let energy = &w * &p * &m * &n * error.pow(2) + &m * &n * report.evaluation.pow(2);
+    let helper = helper_error(parameters)?;
+    let energy = &w * &p * &m * &n * helper.pow(2) + &m * &n * report.evaluation.pow(2);
     let bias = error +
         &w * BigUint::from(parameters.anchor_columns()) * &n * error * parameters.key_cutoff();
     let moments = NoiseMoments {

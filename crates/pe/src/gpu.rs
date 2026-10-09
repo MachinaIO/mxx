@@ -9,6 +9,23 @@ use mxx_backends::{
     poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
 };
 
+/// The GPU parameters of every ring of `parameters`.
+fn gpu_rings(parameters: &crate::PeParameters) -> Vec<GpuDCRTPolyParams> {
+    parameters
+        .rings()
+        .unwrap()
+        .into_iter()
+        .map(|ring| {
+            GpuDCRTPolyParams::new(
+                ring.ring_dimension(),
+                ring.moduli().to_vec(),
+                ring.base_bits(),
+                None,
+            )
+        })
+        .collect()
+}
+
 /// One setup, one ciphertext of a random message, and keys for an
 /// authorized and an unauthorized equality predicate, all on the GPU, with
 /// parameters whose simulated bound guarantees correctness (by default the
@@ -19,15 +36,25 @@ use mxx_backends::{
 #[ignore = "requires a CUDA GPU"]
 fn test_gpu_authorized_key_decrypts_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
-    let parameters = parameters(class);
+    authorized_key_decrypts_on_the_gpu(class, parameters(class));
+}
+
+/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] over a statistical trapdoor with a baby-step
+/// split and compact encodings: the composed branch `25 = 17 * 9` reads compact helpers and
+/// companions in both switches, all on the GPU with the `q` and `pq` rings registered.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_compact_encodings_with_a_split_decrypt_on_the_gpu() {
+    let class = PeClass::new(2, 2, 2, 2).unwrap();
+    let parameters = crate::test_support::correct_parameters(class, true, |parameters| {
+        parameters.with_baby_steps(2).unwrap().with_compact_encodings().unwrap()
+    });
+    authorized_key_decrypts_on_the_gpu(class, parameters);
+}
+
+fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParameters) {
     let level = parameters.level();
-    let mut execution = GpuRuntime::new(gpu_backend([GpuDCRTPolyParams::new(
-        level.ring_dimension(),
-        level.moduli().to_vec(),
-        level.base_bits(),
-        None,
-    )]))
-    .expect("GPU runtime");
+    let mut execution = GpuRuntime::new(gpu_backend(gpu_rings(&parameters))).expect("GPU runtime");
     let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class)).unwrap();
     assert!(bound.decrypts(), "the parameters must guarantee correctness");
     let mut store = MemoryArtifactStore::default();
@@ -124,6 +151,7 @@ fn test_gpu_measured_noise_against_the_bounds() {
         key_queries: 1 << 20,
         max_anchor_columns: 1024,
         lut_baby_steps: Some(read("BABY_STEPS", 0usize)).filter(|steps| *steps > 0),
+        compact_encodings: read("COMPACT", 0usize) != 0,
         failure_exponent: Some(128),
         lattice_security_bits: None,
     };
@@ -151,13 +179,7 @@ fn test_gpu_measured_noise_against_the_bounds() {
         rational(&moments.mean_radius),
         rational(&moments.variance) / 2.0,
     );
-    let mut execution = GpuRuntime::new(gpu_backend([GpuDCRTPolyParams::new(
-        level.ring_dimension(),
-        level.moduli().to_vec(),
-        level.base_bits(),
-        None,
-    )]))
-    .expect("GPU runtime");
+    let mut execution = GpuRuntime::new(gpu_backend(gpu_rings(&parameters))).expect("GPU runtime");
     let mut store = match read("STORAGE", "device".to_owned()).as_str() {
         "device" => MemoryArtifactStore::on_device(),
         "host" => MemoryArtifactStore::default(),

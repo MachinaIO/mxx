@@ -28,6 +28,11 @@
 //! actions, whose coefficients carry `W^-1`, are applied last, per branch.
 //! The product keys `T` of the first switches come first in a LUT's
 //! `branches` public action, then those of the composed giant switches.
+//!
+//! With compact encodings ([`RnsBggDynamicSetup::with_compact_encodings`]),
+//! the fresh encodings are stored in two columns over `pq` and expanded where
+//! they are read ([`expand_compact_row`]); their keys are the expansions of
+//! `2 x 2` keys over `R_pq` ([`expand_compact_matrix`]).
 use super::*;
 
 /// `Select(selector, values)`: the value at position `selector`.
@@ -144,4 +149,125 @@ pub(crate) fn composed_branches(
         .map(|(k, giant, baby, _)| (*k, *giant, position(*baby)))
         .collect();
     Ok(ComposedBranches { first, direct, composed })
+}
+
+/// `ModSwitch_(pq -> q)(entry G~)` at `level`: the `1 x 1` `entry` over the
+/// compact ring times the lift `G~` of the `1 x D` `gadget` (its centered
+/// integers re-encoded in `R_pq`), rounded to the level ring. For a compact
+/// encoding `c = s (A - p X I_2) + e`, the expansion of each component is the
+/// component of `s (A' - X G) + e'` (see [`compact_expansion_bound`]).
+pub(crate) fn expand_compact_entry(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    level: usize,
+    gadget: &Mat,
+    entry: Mat,
+) -> Result<Mat, RnsBggError> {
+    let ring = setup
+        .compact_ring(parameters, level)?
+        .ok_or(RnsBggError::Parameters("the setup's encodings are not compact"))?;
+    Ok((entry * gadget.clone().centered_rebase(&ring)).modulus_switch(&parameters.ring(level)?))
+}
+
+/// The expansion of a compact row (two `1 x 1` entries over `R_pq`) to a row of
+/// two `1 x D` blocks at `level` under the public gadget.
+pub(crate) fn expand_compact_row(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    level: usize,
+    row: RnsBggRow,
+) -> Result<RnsBggRow, RnsBggError> {
+    expand_compact_row_with(parameters, setup, level, &parameters.public_gadget(level)?, row)
+}
+
+/// [`expand_compact_row`] under `gadget` (the state gadget for a private input).
+pub(crate) fn expand_compact_row_with(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    level: usize,
+    gadget: &Mat,
+    row: RnsBggRow,
+) -> Result<RnsBggRow, RnsBggError> {
+    Ok((
+        expand_compact_entry(parameters, setup, level, gadget, row.0)?,
+        expand_compact_entry(parameters, setup, level, gadget, row.1)?,
+    ))
+}
+
+/// A stored compact companion or helper row (two `1 x 1` entries over `pq`)
+/// expanded at the setup ring under the public gadget, as every reader of the
+/// setup's packages expands it.
+pub fn expand_stored_row(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    row: RnsBggRow,
+) -> Result<RnsBggRow, RnsBggError> {
+    expand_compact_row(parameters, setup, 0, row)
+}
+
+/// The expansion `A' = ModSwitch_(pq -> q)(A~ G~)` of a compact `2 x 2` key
+/// to a `2 x 2` block key of `1 x D` blocks at `level` under `gadget`.
+pub(crate) fn expand_compact_matrix(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    level: usize,
+    gadget: &Mat,
+    matrix: RnsBggMatrix,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    Ok((
+        expand_compact_row_with(parameters, setup, level, gadget, matrix.0)?,
+        expand_compact_row_with(parameters, setup, level, gadget, matrix.1)?,
+    ))
+}
+
+/// The compact encoding `s A~ - p X + e` over the compact ring `ring`: the
+/// secret row `secret` and the payload row `payload` (both already over
+/// `R_pq`), the `2 x 2` key `matrix`, and a fresh `1 x 2` error under
+/// `contract`. For a scalar payload `x`, `X = x s` gives `s (A~ - p x I_2) + e`.
+pub(crate) fn compact_encoding_row(
+    ring: &Ring,
+    matrix: RnsBggMatrix,
+    secret: &RnsBggRow,
+    payload: RnsBggRow,
+    p: &num_bigint::BigUint,
+    contract: &super::RnsBggGaussian,
+) -> Result<RnsBggRow, RnsBggError> {
+    let scale = ring.polynomial([num_bigint::BigInt::from(p.clone()).into()]);
+    let error = contract.sample_row(ring, 1)?;
+    Ok((
+        secret.0.clone() * matrix.0.0 + secret.1.clone() * matrix.1.0 - scale.clone() * payload.0 +
+            error.0,
+        secret.0.clone() * matrix.0.1 + secret.1.clone() * matrix.1.1 - scale * payload.1 + error.1,
+    ))
+}
+
+/// The coefficient bound of an expanded compact encoding's error, for a fresh
+/// error of coefficient bound `cutoff`:
+/// `ceil(cutoff q / p) + ceil((n + 2) / 2)`. The error `e G~ / p` has
+/// coefficients at most `cutoff max |g~| / p <= cutoff q / p`; the rounding of
+/// the key `s (A~ G~ / p - A')` at most `(||s_bar||_1 + 1) / 2 <= (n + 1) / 2`
+/// for the ternary secret; and the rounding of the switch at most `1/2`.
+pub fn compact_expansion_bound(
+    parameters: &RnsBggParameters,
+    extension: &[u64],
+    cutoff: &num_bigint::BigUint,
+) -> Result<num_bigint::BigUint, RnsBggError> {
+    let level = parameters.level(0)?;
+    let q = level.modulus().as_ref().clone();
+    let p = extension
+        .iter()
+        .map(|prime| num_bigint::BigUint::from(*prime))
+        .product::<num_bigint::BigUint>();
+    if p <= num_bigint::BigUint::from(1u8) {
+        return Err(RnsBggError::Parameters("empty compact extension"));
+    }
+    let n = num_bigint::BigUint::from(level.ring_dimension());
+    Ok((cutoff * &q + &p - 1u8) / &p + (n + 3u8) / 2u8)
+}
+
+/// The product `p` of the compact extension of `setup`, if any.
+pub(crate) fn compact_modulus(setup: &RnsBggDynamicSetup) -> Option<num_bigint::BigUint> {
+    setup
+        .compact_extension()
+        .map(|extension| extension.iter().map(|prime| num_bigint::BigUint::from(*prime)).product())
 }

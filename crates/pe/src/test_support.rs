@@ -39,9 +39,13 @@ pub(crate) fn parameters(class: PeClass) -> PeParameters {
 }
 
 fn level() -> DCRTPolyParams {
+    level_at(read("CRT_DEPTH", 4))
+}
+
+fn level_at(depth: usize) -> DCRTPolyParams {
     DCRTPolyParams::new(
         read("RING_DIMENSION", 16),
-        read("CRT_DEPTH", 4),
+        depth,
         read("CRT_BITS", 30),
         read("BASE_BITS", 10),
         None,
@@ -55,9 +59,14 @@ fn contract(name: &str, default: &str) -> RnsBggGaussian {
 
 /// The computational test parameters of [`parameters`].
 pub(crate) fn computational_parameters(class: PeClass) -> PeParameters {
+    computational_parameters_at(class, level())
+}
+
+/// [`computational_parameters`] over `level`.
+fn computational_parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParameters {
     PeParameters::new(
         class,
-        level(),
+        level,
         read("TRAPDOOR_SIGMA", 4.578),
         contract("ERROR_SIGMA", "0"),
         contract("FLOODING_SIGMA", "0"),
@@ -72,7 +81,11 @@ pub(crate) fn computational_parameters(class: PeClass) -> PeParameters {
 /// minimum key width. The production selection rejects their zero widths, so
 /// this fixture bypasses the budget ([`PeParameters::statistical_unchecked`]).
 pub(crate) fn statistical_parameters(class: PeClass) -> PeParameters {
-    let level = level();
+    statistical_parameters_at(class, level())
+}
+
+/// [`statistical_parameters`] over `level`.
+fn statistical_parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParameters {
     let m_bar = read("M_BAR", 2 * level.modulus_digits());
     PeParameters::statistical_unchecked(
         class,
@@ -84,6 +97,31 @@ pub(crate) fn statistical_parameters(class: PeClass) -> PeParameters {
         contract("PROGRAMMING_SIGMA", "1"),
     )
     .unwrap()
+}
+
+/// The test parameters of `class` at the smallest CRT depth from `4` whose simulated bound
+/// guarantees correctness after `adapt` (which may enable options that add noise); over a
+/// statistical trapdoor if `statistical`.
+pub(crate) fn correct_parameters(
+    class: PeClass,
+    statistical: bool,
+    adapt: impl Fn(PeParameters) -> PeParameters,
+) -> PeParameters {
+    (4..=16)
+        .map(|depth| {
+            let level = level_at(depth);
+            adapt(if statistical {
+                statistical_parameters_at(class, level)
+            } else {
+                computational_parameters_at(class, level)
+            })
+        })
+        .find(|parameters| {
+            crate::noise::simulate(parameters, &crate::BranchingProgram::longest(class))
+                .unwrap()
+                .decrypts()
+        })
+        .expect("a CRT depth up to 16 decrypts")
 }
 
 /// A statistical selection request of `class` with small, insecure sizes; the
@@ -113,6 +151,7 @@ pub(crate) fn statistical_request(class: PeClass) -> PeParameterRequest {
         key_queries: 1 << 20,
         max_anchor_columns: 4096,
         lut_baby_steps: None,
+        compact_encodings: false,
         failure_exponent: None,
         lattice_security_bits: None,
     }
@@ -120,7 +159,7 @@ pub(crate) fn statistical_request(class: PeClass) -> PeParameterRequest {
 
 /// A CPU execution registering the one ring of `parameters`.
 pub(crate) fn execution(parameters: &PeParameters) -> CpuExecution {
-    CpuExecution::new(cpu_backend([parameters.level().clone()]))
+    CpuExecution::new(cpu_backend(parameters.rings().unwrap()))
 }
 
 /// The comparison DFA of `x > threshold` over bits, most significant first,

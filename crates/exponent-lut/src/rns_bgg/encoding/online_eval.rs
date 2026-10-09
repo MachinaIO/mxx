@@ -516,6 +516,45 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 .key_component_columns(ring_level, knowledge)
                 .map_err(ApiError::scheme)?;
             let public = matches!(knowledge, AttributeKnowledge::PublicPayload);
+            // A compact input is stored in two columns over `pq` and expanded
+            // here, once, under the state gadget.
+            let compact = match (&key, dynamic) {
+                (InputKeySource::Dynamic { coordinate, .. }, Some((setup, _)))
+                    if setup.compact_input(*coordinate) =>
+                {
+                    Some(setup.clone())
+                }
+                _ => None,
+            };
+            if let Some(setup) = compact {
+                let compact_ring = setup
+                    .compact_ring(self.parameters, 0)
+                    .map_err(ApiError::scheme)?
+                    .ok_or_else(|| ApiError::input("compact input without a compact ring"))?;
+                let port = |port: usize| {
+                    compact_ring.artifact_input(
+                        encryption.clone(),
+                        name(format!("{role}.{port}")),
+                        (1, 1),
+                        ArtifactAvailability::Transferred,
+                    )
+                };
+                let row = crate::rns_bgg::dynamic::expand_compact_row_with(
+                    self.parameters,
+                    &setup,
+                    0,
+                    &self.parameters.state_gadget(0).map_err(ApiError::scheme)?,
+                    (port(0), port(1)),
+                )
+                .map_err(ApiError::scheme)?;
+                let key = key
+                    .key(self.parameters, hash_key.clone(), *wire, None)
+                    .map_err(ApiError::scheme)?;
+                self.environment
+                    .bind_wire(*wire, InputBinding::Scalar(RnsBggEncoding::new(key, row, None)))
+                    .map_err(|error| ApiError::input(error.to_string()))?;
+                continue;
+            }
             let binding = match declaration.shape() {
                 InputBinding::Scalar(()) => {
                     let port = |port: usize, columns: usize| {

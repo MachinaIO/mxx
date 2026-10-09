@@ -41,6 +41,7 @@
 //! | `TRAPDOOR_INSTANTIATION` | `statistical` | `statistical` or `computational` |
 //! | `KEY_WIDTH_POLICY` | `practical` | `practical` or `strict` (statistical only) |
 //! | `ERROR_SIGMA`, `FLOODING_SIGMA` | 3.19 | Sigmas of `chi` and of `chi_fl` (computational, or statistical with `FLOODING=none`) |
+//! | `COMPACT_ENCODINGS` | 0 | 1 publishes the fresh encodings in two columns over `pq` (`PeParameters::with_compact_encodings`) |
 //! | `BABY_STEPS` | unset | Baby steps of the LUT automorphism split (`PeParameters::with_baby_steps`); unset switches every automorphism directly |
 //! | `FLOODING` | `enforce` | `enforce` or `none`: whether the statistical instantiation imposes the flooding width |
 //! | `PROGRAMMING_SIGMA` | 256 (statistical), 3.19 (computational) | Sigma of the entries of `Z_t` |
@@ -224,6 +225,7 @@ fn recorded(row: &ParameterRow) -> (PeParameters, PeNoiseReport, BranchingProgra
         key_queries: DEFAULT_KEY_QUERIES,
         max_anchor_columns: DEFAULT_MAX_ANCHOR_COLUMNS,
         lut_baby_steps: None,
+        compact_encodings: false,
         failure_exponent,
         lattice_security_bits: None,
     };
@@ -283,18 +285,17 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
         TrapdoorMode::Statistical => "256",
         TrapdoorMode::Computational => "3.19",
     };
-    let mut failures = Vec::new();
-    for ring_dimension in ring_dimension_candidates(
+    let dimensions = ring_dimension_candidates(
         &variable("MIN_LOG_RING_DIMENSION"),
         &variable("MAX_LOG_RING_DIMENSION"),
         12,
         15,
     )
-    .unwrap()
+    .unwrap();
     {
         let request = PeParameterRequest {
             class,
-            ring_dimension,
+            ring_dimension: dimensions[0],
             crt_bits,
             base_bits,
             crt_depths: 1..=max_depth,
@@ -327,15 +328,13 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
             key_queries: count("KEY_QUERIES", DEFAULT_KEY_QUERIES as usize) as u64,
             max_anchor_columns: count("MAX_ANCHOR_COLUMNS", DEFAULT_MAX_ANCHOR_COLUMNS),
             lut_baby_steps: Some(count("BABY_STEPS", 0)).filter(|steps| *steps > 0),
+            compact_encodings: count("COMPACT_ENCODINGS", 0) != 0,
             failure_exponent,
             lattice_security_bits: Some(security),
         };
-        match PeParameters::select(&request) {
-            Ok(accepted) => return accepted,
-            Err(error) => failures.push(format!("n = {ring_dimension}: {error}")),
-        }
+        PeParameters::select_dimension(&request, dimensions)
+            .unwrap_or_else(|error| panic!("no parameter candidate was accepted: {error}"))
     }
-    panic!("no parameter candidate was accepted: {}", failures.join("; "));
 }
 
 /// A random program of the class's maximal length whose output on `attribute` is `value`:
@@ -714,7 +713,9 @@ fn test_gpu_pe_round_trip() {
     );
 
     let mut runtime = GpuRuntime::new(gpu_backend_on(
-        [GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)],
+        parameters.rings().unwrap().into_iter().map(|ring| {
+            GpuDCRTPolyParams::new(ring.ring_dimension(), ring.to_crt().0, ring.base_bits(), None)
+        }),
         devices,
     ))
     .expect("GPU runtime");

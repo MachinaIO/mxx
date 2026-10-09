@@ -34,6 +34,7 @@ use crate::{
     program_gadgets::prf::PrfError,
 };
 
+pub use dynamic::{compact_expansion_bound, expand_stored_row};
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
     RnsOnlineEvalBuild, decode_output, decode_public_output, verify_output,
@@ -1904,23 +1905,40 @@ pub(crate) fn public_action_role(wire: WireId, part: &str) -> String {
 /// public attribute encoded under the full public gadget.
 pub(crate) fn companion_key(
     parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
     level: usize,
     hash_key: mxx_dsl::Bytes,
     tag: &mxx_dsl::HashTag,
     a: IntExpr,
     j: IntExpr,
 ) -> Result<RnsBggMatrix, RnsBggError> {
-    let mut tag = tag.clone();
-    tag.push("column");
-    tag.push(j);
-    tag.push("digit-row");
-    tag.push(a);
+    let tag = companion_tag(tag, a, j);
+    if setup.compact_extension().is_some() {
+        let compact = setup.compact_matrix(parameters, level, hash_key, tag)?;
+        return dynamic::expand_compact_matrix(
+            parameters,
+            setup,
+            level,
+            &parameters.public_gadget(level)?,
+            compact,
+        );
+    }
     Ok(public_key::matrix_from_hash(
         &parameters.ring(level)?,
         hash_key,
         tag,
         parameters.level(level)?.modulus_digits(),
     ))
+}
+
+/// The hash tag of the companion key `B_{a,j}` of the package tagged `tag`.
+pub(crate) fn companion_tag(tag: &mxx_dsl::HashTag, a: IntExpr, j: IntExpr) -> mxx_dsl::HashTag {
+    let mut tag = tag.clone();
+    tag.push("column");
+    tag.push(j);
+    tag.push("digit-row");
+    tag.push(a);
+    tag
 }
 
 /// The `1 x width` unit row at a loop-dependent `index`: a window of one

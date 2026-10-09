@@ -224,6 +224,10 @@ where
         Some(baby_steps) => dynamic.with_baby_steps(baby_steps)?,
         None => dynamic,
     };
+    let dynamic = match parameters.compact_extension() {
+        Some(extension) => dynamic.with_compact_encodings(rns, extension.to_vec())?,
+        None => dynamic,
+    };
     let ring = rns.ring(0)?;
     let level = parameters.level();
     let trapdoor = ring.sample_trapdoor_with_width(

@@ -35,6 +35,12 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   (`RnsBggDynamicSetup::with_baby_steps`): encryption then publishes switching packages for
   `(B u G) \ {1}` only (about `2 sqrt |H|` instead of `|H| - 1`), and a branch `k = g b` is switched
   as `Aut_g(Aut_b(c))`, which adds one decomposition gain to its noise.
+  A setup may also publish its fresh encodings compactly
+  (`RnsBggDynamicSetup::with_compact_encodings`): each digit companion, automorphism helper, and
+  private scalar input is a two-column row `s (Ã - p X I_2) + e` over `pq` for an extension `p` of
+  the level's own size, and readers expand it to the full gadget width at `q` by
+  `ModSwitch_{pq -> q}(c G̃)`. The expansion adds about `B q / p + (n + 3) / 2` to the error, and
+  the simulator carries each expanded row as an opaque term. GSW ciphertexts stay at `q`.
 
 Sampling contracts (`RnsBggGaussian`) keep their sigma as a `BigDecimal` and their cutoff as a
 `BigUint`, so a contract may be wide: above `2^40` the backends sample by convolution, as for the

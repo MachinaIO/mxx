@@ -36,6 +36,12 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
   automorphisms instead of `W - 1`, and a key carries `W |P|` helper blocks for the `|P|`
   automorphisms with a published helper (the switching ones and their inverses), at one more
   decomposition gain in the noise of a composed lookup branch.
+- **Compact fresh encodings.** `PeParameterRequest::compact_encodings` publishes the digit
+  companions, automorphism helpers, and the private input `c_0` as two-column rows
+  `s (Ã - p X I_2) + e mod pq`, and decryption expands them to the full gadget width at `q`
+  (see the exponent-lut crate). A package then holds `2 m²` polynomials over `pq` instead of
+  `m³` over `q`. The ring dimension is selected for the lattice estimate at `pq`, and the noise
+  simulation uses the expanded bounds. This option is outside the exported Lean correctness claim.
 - **SampleLeft without the family matrix.** Key generation samples the one extension vector shared
   by every row of `M_F`, then calls the existing preimage sampler once per anchor block. `M_F` is
   never formed; its blocks are contracted where they are used.

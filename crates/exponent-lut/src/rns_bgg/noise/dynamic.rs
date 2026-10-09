@@ -64,6 +64,41 @@ impl RnsBggNoiseEvaluator<'_> {
         }
     }
 
+    /// The error bound of a package component of contract cutoff `cutoff`:
+    /// its expanded bound with compact encodings, else the cutoff.
+    fn package_error(
+        &self,
+        contracts: &RnsBggDynamicNoise,
+        cutoff: &BigUint,
+    ) -> Result<BigUint, RnsBggError> {
+        match &contracts.compact_extension {
+            Some(extension) => {
+                crate::rns_bgg::dynamic::compact_expansion_bound(self.parameters, extension, cutoff)
+            }
+            None => Ok(cutoff.clone()),
+        }
+    }
+
+    /// The contribution of expanded compact package errors whose share of the
+    /// bound is at most `bound`: an opaque term of mean radius `bound` and
+    /// variance `bound^2` (`|X| <= b` gives `|E X| <= b` and `Var X <= b^2`),
+    /// aggregated with every other term under an unknown covariance. Expansion
+    /// repeats each sampled error across columns, so independent-entry
+    /// energies and zero means do not hold for it.
+    fn compact_term(origin: &'static str, bound: &BigUint) -> NoiseBreakdown {
+        NoiseBreakdown::opaque(
+            origin,
+            NoiseMoments {
+                mean_numerator: 0.into(),
+                mean_denominator: BigUint::one(),
+                mean_radius: NonnegativeRational::new(bound.clone(), BigUint::one())
+                    .expect("unit denominator"),
+                variance: NonnegativeRational::new(bound.pow(2u32), BigUint::one())
+                    .expect("unit denominator"),
+            },
+        )
+    }
+
     /// The variance of a Gaussian contract, or of a supplied bound `B`
     /// (`B^2` bounds the variance of any variable bounded by `B`).
     fn contract_variance(sigma: Option<&BigDecimal>, bound: &BigUint) -> NonnegativeRational {
@@ -107,14 +142,20 @@ impl RnsBggNoiseEvaluator<'_> {
         let ciphertext_error = package.ciphertext_error.clone();
         let ciphertext_sigma = package.ciphertext_sigma.as_ref();
         let companion = &distributions.companion;
+        let companion_error = self.package_error(&contracts, companion.cutoff())?;
         let output_l1 = &input.1.bound.payload_l1 * &contract.payload_l1;
         let bound = self.parameters.dynamic_mul_noise_bound(
             level,
             &input.1.bound,
             &ciphertext_error,
-            companion.cutoff(),
+            &companion_error,
             output_l1,
         )?;
+        let compact = contracts.compact_extension.is_some();
+        // The companions' share `m K beta'` of the bound.
+        let companion_share = BigUint::from(2 * self.parameters.component_columns(level)?) *
+            self.parameters.dynamic_decomposition_gain(level)? *
+            &companion_error;
         let k = self.parameters.dynamic_decomposition_gain(level)?;
         let gain = NonnegativeRational::new(k.clone(), BigUint::one()).expect("unit denominator");
         let k_squared = k.pow(2u32);
@@ -135,12 +176,16 @@ impl RnsBggNoiseEvaluator<'_> {
                     rhs.index.as_ref(),
                     ciphertext_variance.clone(),
                 ))
-                .merge(&self.package_term(
-                    companion_source,
-                    "dynamic-rhs-companion-error",
-                    rhs.index.as_ref(),
-                    companion_variance.clone(),
-                ))
+                .merge(&if compact {
+                    Self::compact_term("dynamic-rhs-compact-companion-error", &companion_share)
+                } else {
+                    self.package_term(
+                        companion_source,
+                        "dynamic-rhs-companion-error",
+                        rhs.index.as_ref(),
+                        companion_variance.clone(),
+                    )
+                })
         });
         let sources = [ciphertext_source, companion_source]
             .into_iter()
@@ -201,26 +246,40 @@ impl RnsBggNoiseEvaluator<'_> {
                 BigUint::from(table.max_output())
             }
         };
-        let bound = if composed == 0 {
-            self.parameters.dynamic_lut_noise_bound(
-                level,
-                &input.1.bound,
-                branches,
-                distributions.companion.cutoff(),
-                distributions.helper.cutoff(),
-                output_payload_l1.clone(),
-            )?
-        } else {
-            self.parameters.dynamic_composed_lut_noise_bound(
-                level,
-                &input.1.bound,
-                branches - 1 - composed,
-                composed,
-                distributions.companion.cutoff(),
-                distributions.helper.cutoff(),
-                output_payload_l1.clone(),
-            )?
+        let companion_error = self.package_error(&contracts, distributions.companion.cutoff())?;
+        let helper_error = self.package_error(&contracts, distributions.helper.cutoff())?;
+        let lut_bound = |companion_error: &BigUint, helper_error: &BigUint| {
+            if composed == 0 {
+                self.parameters.dynamic_lut_noise_bound(
+                    level,
+                    &input.1.bound,
+                    branches,
+                    companion_error,
+                    helper_error,
+                    output_payload_l1.clone(),
+                )
+            } else {
+                self.parameters.dynamic_composed_lut_noise_bound(
+                    level,
+                    &input.1.bound,
+                    branches - 1 - composed,
+                    composed,
+                    companion_error,
+                    helper_error,
+                    output_payload_l1.clone(),
+                )
+            }
         };
+        let bound = lut_bound(&companion_error, &helper_error)?;
+        // The package errors' share of the bound, for compact encodings.
+        let package_share = contracts
+            .compact_extension
+            .is_some()
+            .then(|| {
+                lut_bound(&BigUint::zero(), &BigUint::zero())
+                    .map(|without| &bound.error - without.error)
+            })
+            .transpose()?;
         let k = self.parameters.dynamic_decomposition_gain(level)?;
         let s = self.parameters.dynamic_scalar_action_gain(level)?;
         let direct = BigUint::from(branches - 1 - composed);
@@ -255,6 +314,12 @@ impl RnsBggNoiseEvaluator<'_> {
             });
             if branches == 1 {
                 return terms;
+            }
+            if let Some(share) = &package_share {
+                return terms.merge(&Self::compact_term(
+                    "dynamic-automorphism-compact-package-error",
+                    share,
+                ));
             }
             terms
                 .merge(&self.package_term(
@@ -302,5 +367,50 @@ impl RnsBggNoiseEvaluator<'_> {
             node,
             self.event_multiplier.clone() * BigUint::from(branches),
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `value >= bound` for a nonnegative rational and an integer.
+    fn at_least(value: &NonnegativeRational, bound: &BigUint) -> bool {
+        value.numerator >= bound * &value.denominator
+    }
+
+    /// Compact package contributions are opaque enclosures: each carries mean radius `b` and
+    /// variance `b^2` for its deterministic share `b`; a breakdown with them hides its source
+    /// identity (no sampled class); and its total, aggregated with an unknown covariance among
+    /// them and against a sampled term, has mean radius at least `sum b_i`, variance at least
+    /// `(sum b_i)^2` (the fully correlated enclosure), and a tail bound at least `sum b_i`.
+    #[test]
+    fn compact_terms_enclose_their_deterministic_shares() {
+        let shares = [3u32, 5, 11].map(BigUint::from);
+        let sampled = NoiseBreakdown::sampled(
+            [7; 32],
+            "sampled",
+            zero_mean_moments(NonnegativeRational::new(4u8.into(), BigUint::one()).unwrap()),
+            false,
+        );
+        assert!(sampled.operand().is_some());
+        let mut breakdown = sampled.clone();
+        for share in &shares {
+            let term = RnsBggNoiseEvaluator::compact_term("compact", share);
+            let moments = term.total();
+            assert!(at_least(&moments.mean_radius, &share.clone()));
+            assert!(at_least(&moments.variance, &share.pow(2u32)));
+            assert!(term.operand().is_none(), "a compact term is not a sampled source");
+            breakdown = breakdown.merge(&term);
+        }
+        // The same package read again keeps the enclosure (repeated reads add coherently).
+        breakdown = breakdown.merge(&RnsBggNoiseEvaluator::compact_term("compact", &shares[0]));
+        let sum = shares.iter().sum::<BigUint>() + &shares[0];
+        let total = breakdown.total();
+        assert!(breakdown.operand().is_none());
+        assert!(at_least(&total.mean_radius, &sum.clone()));
+        assert!(at_least(&total.variance, &sum.pow(2u32)));
+        let z_squared = NonnegativeRational::new(1u8.into(), BigUint::one()).unwrap();
+        assert!(total.tail_bound(&z_squared) >= sum);
     }
 }

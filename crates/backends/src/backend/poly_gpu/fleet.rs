@@ -650,7 +650,9 @@ fn compiled_raw_small_matrix_part(
 /// compiled executable. Indexes refer to the immutable operation sequence.
 #[derive(Clone)]
 pub(crate) struct GpuPreparedNativeResources {
-    modulus_conversions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
+    /// Keyed by the address of the operation in the prepared program, which
+    /// is unique across loop bodies, whose indices are body-local.
+    modulus_conversions: BTreeMap<usize, (i32, Arc<GpuModulusConversionPlan>)>,
     rns_conversions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     crt_recompositions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     compact_packs: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
@@ -892,6 +894,12 @@ impl GpuPreparedNativeResources {
     }
 }
 
+/// The key of `operation` in [`GpuPreparedNativeResources`] maps that cover
+/// loop bodies: its address in the program that is both prepared and emitted.
+fn operation_key(operation: &CompiledGpuOp) -> usize {
+    std::ptr::from_ref(operation) as usize
+}
+
 pub(crate) fn prepare_compiled_gpu_program(
     backend: &GpuDcrtBackend,
     program: &CompiledGpuProgram,
@@ -901,7 +909,11 @@ pub(crate) fn prepare_compiled_gpu_program(
 ) -> Result<GpuPreparedNativeResources, GpuNativeGraphError> {
     let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
     let mut modulus_conversions = BTreeMap::new();
-    for (index, operation) in program.operations.iter().enumerate() {
+    let mut pending = program.operations.iter().collect::<Vec<_>>();
+    while let Some(operation) = pending.pop() {
+        if let Some(body) = operation.body.as_ref() {
+            pending.extend(body.iter());
+        }
         let implementation = program
             .implementations
             .resolve(operation.implementation)
@@ -1058,10 +1070,7 @@ pub(crate) fn prepare_compiled_gpu_program(
             )?,
             (Some(_), Some(_)) => return Err(invalid("ambiguous CRT conversion plan")),
         };
-        modulus_conversions.insert(
-            u32::try_from(index).map_err(|_| invalid("too many compiled operations"))?,
-            (operation.device, Arc::new(plan)),
-        );
+        modulus_conversions.insert(operation_key(operation), (operation.device, Arc::new(plan)));
     }
     let mut p1 = BTreeMap::new();
     let mut statistical = BTreeMap::new();
@@ -4161,7 +4170,7 @@ pub(crate) fn emit_compiled_gpu_op(
             bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
             let (device, plan) = resources
                 .modulus_conversions
-                .get(&index)
+                .get(&operation_key(op))
                 .ok_or_else(|| invalid("compiled modulus switch has no prepared native plan"))?;
             if *device != op.device {
                 return Err(invalid(
@@ -4267,7 +4276,7 @@ pub(crate) fn emit_compiled_gpu_op(
             bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
             let (device, plan) = resources
                 .modulus_conversions
-                .get(&index)
+                .get(&operation_key(op))
                 .ok_or_else(|| invalid("compiled CRT conversion has no prepared native plan"))?;
             if *device != op.device {
                 return Err(invalid("compiled CRT conversion plan belongs to another device"));

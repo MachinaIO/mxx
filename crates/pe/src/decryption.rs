@@ -198,15 +198,7 @@ pub(crate) fn phase_graph(
         ArtifactAvailability::Transferred,
     );
     let packages = ciphertext.packages().production().clone();
-    let helper_rows = [0, 1].map(|port| {
-        ring.family_artifact_input(
-            packages.clone(),
-            format!("{}.{port}", RnsBggDynamicSetup::automorphism_helper_role()),
-            p,
-            (1, columns),
-            ArtifactAvailability::Transferred,
-        )
-    });
+    let helper_rows = helper_rows(public_key, &packages, p)?;
     let gadget_second_row =
         Mat::concat(ConcatAxis::Columns, vec![ring.zero((1, columns)), rns.public_gadget(0)?]);
     let setup = public_key.setup();
@@ -228,10 +220,8 @@ pub(crate) fn phase_graph(
         let public =
             setup.helper_key(rns, hash_key.clone(), k).map_err(|_| mxx_dsl::DslError::Schema)?;
         let member = Int::evaluate(k_index);
-        let helper = Mat::concat(
-            ConcatAxis::Columns,
-            vec![helper_rows[0].at(member.clone()), helper_rows[1].at(member)],
-        );
+        let helper =
+            read_helper(public_key, &helper_rows, member).map_err(|_| mxx_dsl::DslError::Schema)?;
         let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
         let value = (helper - public_second_row).ring_automorphism(i) + gadget_second_row.clone();
         Ok(sum + value.mul_small_rhs(helper_keys.at(Int::evaluate(pair))))
@@ -248,6 +238,50 @@ pub(crate) fn phase_graph(
         manifests.insert(production.clone(), manifest.clone());
     }
     Ok((phase, runtime, manifests))
+}
+
+/// The `p` automorphism helper rows of a ciphertext's packages, port by port:
+/// two `1 x D` blocks over `q`, or, with compact encodings, two `1 x 1` entries
+/// over `pq` (expanded by [`read_helper`]).
+pub(crate) fn helper_rows(
+    public_key: &PePublicKey,
+    packages: &mxx_ir_core::artifact::ProductionId,
+    p: usize,
+) -> Result<[mxx_dsl::Family<Mat>; 2], PeError> {
+    let parameters = public_key.parameters();
+    let setup = public_key.setup();
+    let (ring, columns) = match setup.compact_ring(parameters.rns(), 0)? {
+        Some(compact) => (compact, 1),
+        None => (public_key.ring()?, parameters.digits()),
+    };
+    Ok([0, 1].map(|port| {
+        ring.family_artifact_input(
+            packages.clone(),
+            format!("{}.{port}", RnsBggDynamicSetup::automorphism_helper_role()),
+            p,
+            (1, columns),
+            ArtifactAvailability::Transferred,
+        )
+    }))
+}
+
+/// Helper member `member` as one `1 x m` row over `q`: its two blocks joined,
+/// after expanding a compact helper to `s H_k' - s_k G + e'`.
+pub(crate) fn read_helper(
+    public_key: &PePublicKey,
+    rows: &[mxx_dsl::Family<Mat>; 2],
+    member: Int,
+) -> Result<Mat, PeError> {
+    let row = (rows[0].at(member.clone()), rows[1].at(member));
+    let row = match public_key.setup().compact_extension() {
+        Some(_) => mxx_exponent_lut::rns_bgg::expand_stored_row(
+            public_key.parameters().rns(),
+            public_key.setup(),
+            row,
+        )?,
+        None => row,
+    };
+    Ok(Mat::concat(ConcatAxis::Columns, vec![row.0, row.1]))
 }
 
 #[cfg(test)]
@@ -340,7 +374,24 @@ mod tests {
     #[test]
     fn family_values_open_to_the_secret_times_the_family_matrix() {
         let class = PeClass::new(2, 2, 2, 2).unwrap();
-        let parameters = parameters(class);
+        family_values_open(class, parameters(class));
+    }
+
+    /// [`family_values_open_to_the_secret_times_the_family_matrix`] with compact encodings: each
+    /// expanded helper block is within the expanded helper bound `B_h'` that the decryption
+    /// noise uses.
+    #[test]
+    fn compact_family_values_open_within_the_expanded_bounds() {
+        let class = PeClass::new(2, 2, 2, 2).unwrap();
+        family_values_open(
+            class,
+            correct_parameters(class, false, |parameters| {
+                parameters.with_compact_encodings().unwrap()
+            }),
+        );
+    }
+
+    fn family_values_open(class: PeClass, parameters: crate::PeParameters) {
         let mut execution = execution(&parameters);
         let mut store = MemoryArtifactStore::default();
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
@@ -407,15 +458,7 @@ mod tests {
             let first = public_key.anchor_row().unwrap();
             let second = public_key.anchor_second_row(hash_key.clone()).unwrap();
             let packages = ciphertext.packages().production().clone();
-            let helper_rows = [0, 1].map(|port| {
-                ring.family_artifact_input(
-                    packages.clone(),
-                    format!("{}.{port}", RnsBggDynamicSetup::automorphism_helper_role()),
-                    p,
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                )
-            });
+            let helper_rows = helper_rows(&public_key, &packages, p).unwrap();
             let mut graph = DslContext::new("mxx-pe/test-family");
             for i in &group.elements {
                 let anchor_block = sigma(anchor.clone() - second.clone(), *i) -
@@ -426,11 +469,8 @@ mod tests {
                         .setup()
                         .helper_key(rns, hash_key.clone(), IntExpr::constant(*k))
                         .unwrap();
-                    let member = Int::constant(member);
-                    let helper = Mat::concat(
-                        ConcatAxis::Columns,
-                        vec![helper_rows[0].at(member.clone()), helper_rows[1].at(member)],
-                    );
+                    let helper =
+                        read_helper(&public_key, &helper_rows, Int::constant(member)).unwrap();
                     let public_first =
                         Mat::concat(ConcatAxis::Columns, vec![public.0.0, public.0.1]);
                     let public_second =
@@ -485,7 +525,7 @@ mod tests {
             )
             .unwrap();
             let error = parameters.error().cutoff();
-            let helper_cutoff = parameters.distributions().helper.cutoff().clone();
+            let helper_cutoff = crate::noise::helper_error(&parameters).unwrap();
             for i in &group.elements {
                 let measured = norm(&q, &download(&execution, &outputs, &format!("anchor-{i}")));
                 assert!(&measured <= error, "anchor {i}: {measured} > {error}");
@@ -537,6 +577,51 @@ mod tests {
         let parameters = parameters(class).with_baby_steps(2).unwrap();
         assert_eq!(parameters.baby_steps(), Some(2));
         authorized_keys_decrypt(class, parameters);
+    }
+
+    /// One step `F(x) = x_0` with the companions, the helper, and the initial state published in
+    /// two columns over `pq` and expanded by every reader, over the computational and the
+    /// statistical trapdoor: the authorized key decrypts, and the measured phase error (which
+    /// carries the expansions' rounding errors) is within the simulated bound.
+    #[test]
+    fn compact_encodings_decrypt_within_the_simulated_bound() {
+        let class = PeClass::new(1, 2, 1, 1).unwrap();
+        for statistical in [false, true] {
+            let parameters = correct_parameters(class, statistical, |parameters| {
+                parameters.with_compact_encodings().unwrap()
+            });
+            let extension = parameters.compact_extension().unwrap();
+            assert_eq!(extension.len(), parameters.level().crt_depth());
+            assert!(extension.iter().all(|prime| !parameters.level().to_crt().0.contains(prime)));
+            let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class))
+                .unwrap()
+                .decryption;
+            let mut execution = execution(&parameters);
+            let mut store = MemoryArtifactStore::default();
+            let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+            let dimension = parameters.level().ring_dimension() as usize;
+            let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+            let ciphertext =
+                encrypt(&public_key, &[0], &message, &mut execution, &mut store).unwrap();
+            let predicate = BranchingProgram::new(class, vec![0], vec![vec![0, 1]]).unwrap();
+            let key = keygen(&public_key, &master, &predicate, &mut execution, &mut store).unwrap();
+            let evaluated =
+                evaluate(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
+            let decrypted =
+                decode(&public_key, &key, &ciphertext, &evaluated, &mut execution, &mut store)
+                    .unwrap();
+            assert_eq!(decrypted, message, "statistical {statistical}");
+            let measured = phase_error(
+                &public_key,
+                &key,
+                &ciphertext,
+                &evaluated,
+                &message,
+                &mut execution,
+                &mut store,
+            );
+            assert!(measured <= bound, "statistical {statistical}: {measured} > {bound}");
+        }
     }
 
     fn authorized_keys_decrypt(class: PeClass, parameters: crate::PeParameters) {

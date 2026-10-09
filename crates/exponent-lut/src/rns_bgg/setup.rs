@@ -24,7 +24,7 @@
 //! manuscript's setup samples them uniformly, and the seeded expansion is
 //! assumed to be indistinguishable from that distribution.
 use super::*;
-use crate::program::{ExpLayout, ExponentLutProgram, ProgramInputDeclaration};
+use crate::program::{AttributeKnowledge, ExpLayout, ExponentLutProgram, ProgramInputDeclaration};
 
 /// A discrete Gaussian sampling contract: the width `sigma` of the existing
 /// sampler (a standard-deviation parameter) and its hard coefficient cutoff.
@@ -151,6 +151,10 @@ pub struct RnsBggDynamicSetup {
     /// [`Self::with_baby_steps`]); `None` switches every automorphism directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     baby_steps: Option<usize>,
+    /// The CRT primes of the auxiliary modulus `p` of compact encodings (see
+    /// [`Self::with_compact_encodings`]); `None` publishes every encoding at `q`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compact_extension: Option<Vec<u64>>,
     distributions: RnsBggDynamicDistributions,
     /// The digest of the setup without its hash key: what the hash tags of
     /// its public matrices name. The hash key, which keys every expansion,
@@ -217,6 +221,7 @@ impl RnsBggDynamicSetup {
             automorphism_layout: layout,
             automorphisms,
             baby_steps: None,
+            compact_extension: None,
             distributions,
             schema: [0; 32],
             identity: [0; 32],
@@ -265,6 +270,70 @@ impl RnsBggDynamicSetup {
         }
         self.seal();
         Ok(self)
+    }
+
+    /// Publish the fresh encodings of encryption in two columns over `pq`, for
+    /// the auxiliary modulus `p` the product of `extension` (CRT primes
+    /// `1 mod 2n`, distinct and disjoint from the setup ring's): an encoding
+    /// `s (A - X G) + e` mod `q` of width `m` becomes
+    /// `s (A~ - p X I_2) + e` mod `pq` of width two, for a `2 x 2` key `A~`
+    /// over `R_pq`, and every reader expands it to
+    /// `ModSwitch_(pq -> q)(c G~) = s (A' - X G) + e'` mod `q` with
+    /// `A' = ModSwitch_(pq -> q)(A~ G~)` and the integer lift `G~` of the gadget
+    /// (see [`crate::rns_bgg::dynamic::expand_compact_row`]). It applies to every
+    /// digit companion, every automorphism helper (payload `X = s_k`), and every
+    /// private scalar input (payload `Delta x r`, under the state gadget). The
+    /// GSW ciphertexts stay at `q`.
+    pub fn with_compact_encodings(
+        mut self,
+        parameters: &RnsBggParameters,
+        extension: Vec<u64>,
+    ) -> Result<Self, RnsBggError> {
+        let base = parameters.level(0)?.to_crt().0;
+        let order = 2 * u64::from(self.ring_dimension);
+        if extension.is_empty() ||
+            extension.iter().enumerate().any(|(index, prime)| {
+                *prime < 3 ||
+                    (prime - 1) % order != 0 ||
+                    base.contains(prime) ||
+                    extension[..index].contains(prime)
+            })
+        {
+            return Err(RnsBggError::Parameters(
+                "compact primes must be distinct, 1 mod 2n, and disjoint from the setup ring",
+            ));
+        }
+        self.compact_extension = Some(extension);
+        self.seal();
+        Ok(self)
+    }
+
+    /// The CRT primes of `p`, if encodings are compact.
+    pub fn compact_extension(&self) -> Option<&[u64]> {
+        self.compact_extension.as_deref()
+    }
+
+    /// The ring over `q p` at `level` (the level's basis followed by `p`'s), if
+    /// encodings are compact.
+    pub fn compact_ring(
+        &self,
+        parameters: &RnsBggParameters,
+        level: usize,
+    ) -> Result<Option<Ring>, RnsBggError> {
+        let Some(extension) = &self.compact_extension else { return Ok(None) };
+        let moduli =
+            parameters.level(level)?.to_crt().0.into_iter().chain(extension.iter().copied());
+        Ok(Some(Ring::from_crt_moduli(moduli.map(IntExpr::from).collect(), self.ring_dimension)))
+    }
+
+    /// Whether input coordinate `coordinate` is published compactly: a private
+    /// scalar input of a compact setup.
+    pub fn compact_input(&self, coordinate: u32) -> bool {
+        self.compact_extension.is_some() &&
+            self.inputs.get(&coordinate).is_some_and(|declaration| {
+                matches!(declaration.shape(), InputBinding::Scalar(())) &&
+                    !matches!(declaration.knowledge(), AttributeKnowledge::PublicPayload)
+            })
     }
 
     /// The baby-step count of the split, `None` if every automorphism is
@@ -527,12 +596,50 @@ impl RnsBggDynamicSetup {
             tag.push("member");
             tag.push(member);
         }
+        if self.compact_input(coordinate) {
+            let compact = self.compact_matrix(parameters, 0, hash_key, tag)?;
+            return crate::rns_bgg::dynamic::expand_compact_matrix(
+                parameters,
+                self,
+                0,
+                &parameters.state_gadget(0)?,
+                compact,
+            );
+        }
         Ok(public_key::matrix_from_hash(
             &parameters.ring(0)?,
             hash_key,
             tag,
             parameters.key_component_columns(0, declaration.knowledge())?,
         ))
+    }
+
+    /// The compact key `A~` of input coordinate `coordinate` (see
+    /// [`Self::with_compact_encodings`]): a `2 x 2` matrix over `R_pq` hashed
+    /// under the tag of [`Self::input_key`].
+    pub fn compact_input_key(
+        &self,
+        parameters: &RnsBggParameters,
+        hash_key: mxx_dsl::Bytes,
+        coordinate: u32,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let mut tag = self.tag("input-key");
+        tag.push(IntExpr::constant(coordinate));
+        self.compact_matrix(parameters, 0, hash_key, tag)
+    }
+
+    /// A `2 x 2` matrix over the compact ring at `level`, hashed under `tag`.
+    pub(crate) fn compact_matrix(
+        &self,
+        parameters: &RnsBggParameters,
+        level: usize,
+        hash_key: mxx_dsl::Bytes,
+        tag: mxx_dsl::HashTag,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let ring = self
+            .compact_ring(parameters, level)?
+            .ok_or(RnsBggError::Parameters("the setup's encodings are not compact"))?;
+        Ok(public_key::matrix_from_hash(&ring, hash_key, tag, 1))
     }
 
     /// The public helper matrix `H_k` of automorphism `k`, a `2 x m` matrix
@@ -545,12 +652,36 @@ impl RnsBggDynamicSetup {
     ) -> Result<RnsBggMatrix, RnsBggError> {
         let mut tag = self.tag("helper-key");
         tag.push(k);
+        if self.compact_extension.is_some() {
+            let compact = self.compact_matrix(parameters, 0, hash_key, tag)?;
+            return crate::rns_bgg::dynamic::expand_compact_matrix(
+                parameters,
+                self,
+                0,
+                &parameters.public_gadget(0)?,
+                compact,
+            );
+        }
         Ok(public_key::matrix_from_hash(
             &parameters.ring(0)?,
             hash_key,
             tag,
             parameters.component_columns(0)?,
         ))
+    }
+
+    /// The compact helper key `H~_k` of automorphism `k` (see
+    /// [`Self::with_compact_encodings`]), hashed under the tag of
+    /// [`Self::helper_key`].
+    pub fn compact_helper_key(
+        &self,
+        parameters: &RnsBggParameters,
+        hash_key: mxx_dsl::Bytes,
+        k: IntExpr,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let mut tag = self.tag("helper-key");
+        tag.push(k);
+        self.compact_matrix(parameters, 0, hash_key, tag)
     }
 }
 

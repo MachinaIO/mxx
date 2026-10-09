@@ -236,6 +236,7 @@ impl<'a> PublicKeyLowering<'a> {
             Some(&|branch, a, j| {
                 super::companion_key(
                     self.parameters,
+                    setup,
                     level,
                     self.hash_key.clone(),
                     &setup.package_tag(&package(branch)),

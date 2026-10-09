@@ -116,6 +116,9 @@ pub struct PeParameterRequest {
     /// The baby-step count of the LUT automorphism split (see
     /// [`PeParameters::with_baby_steps`]); `None` switches every automorphism directly.
     pub lut_baby_steps: Option<usize>,
+    /// Publish the ciphertext's fresh encodings in two columns over `pq` (see
+    /// [`PeParameters::with_compact_encodings`]).
+    pub compact_encodings: bool,
     /// The noise model of the correctness check: `None` for the worst case,
     /// `Some(k)` for the average case with failure target `2^-k` (see
     /// [`crate::noise::simulate_average`]).
@@ -174,6 +177,7 @@ pub struct PeParameters {
     anchor_columns: usize,
     statistical: Option<StatisticalSelection>,
     baby_steps: Option<usize>,
+    compact_extension: Option<Vec<u64>>,
     identity: [u8; 32],
 }
 
@@ -192,6 +196,8 @@ struct ParameterIdentity<'a> {
     statistical: &'a Option<StatisticalSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     baby_steps: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compact_extension: &'a Option<Vec<u64>>,
 }
 
 /// One ring level of `request` at CRT depth `depth`.
@@ -352,6 +358,7 @@ impl PeParameters {
             anchor_columns,
             statistical,
             baby_steps: None,
+            compact_extension: None,
             identity: [0; 32],
         };
         parameters.identity = parameters.digest();
@@ -377,6 +384,79 @@ impl PeParameters {
     /// The baby-step count of the LUT automorphism split, if any.
     pub const fn baby_steps(&self) -> Option<usize> {
         self.baby_steps
+    }
+
+    /// Publish the ciphertext's fresh encodings (the digit companions, the
+    /// automorphism helpers, and the initial state `c_0`) as
+    /// `s (A~ - p X I_2) + e` mod `pq` instead of `s (A - X G) + e` mod `q`, for
+    /// the auxiliary modulus `p`: the product of as many CRT primes as `q`'s,
+    /// of the same bit size, `1 mod 2n`, and disjoint from `q`'s. Decryption
+    /// expands each to `ModSwitch_(pq -> q)(c G~)` (see
+    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_compact_encodings`).
+    /// The packages shrink from `m^3` polynomials over `q` to `2 m^2` over
+    /// `pq`; the attribute GSW ciphertexts `C_t` stay at `q`, and so does the
+    /// number `m^2` of companions per package, which encrypt the digits of a
+    /// GSW ciphertext over `q`. [`Self::security_bits`] then also estimates
+    /// Ring-LWE at `pq`. The manuscript's reduction programs the package keys
+    /// over `q`, so compact parameters are outside its theorem.
+    pub fn with_compact_encodings(mut self) -> Result<Self, PeError> {
+        let level = self.level().clone();
+        let depth = level.crt_depth();
+        let base = level.to_crt().0;
+        let candidates = DCRTPolyParams::try_new(
+            level.ring_dimension(),
+            2 * depth,
+            level.crt_bits(),
+            level.base_bits(),
+            None,
+            None,
+        )
+        .map_err(|error| PeError::Parameters(error.to_string()))?
+        .to_crt()
+        .0;
+        let extension = candidates
+            .into_iter()
+            .filter(|prime| !base.contains(prime))
+            .take(depth)
+            .collect::<Vec<_>>();
+        if extension.len() != depth {
+            return Err(PeError::Parameters("too few auxiliary CRT primes".into()));
+        }
+        self.compact_extension = Some(extension);
+        self.identity = self.digest();
+        Ok(self)
+    }
+
+    /// The CRT primes of the auxiliary modulus `p` of compact encodings.
+    pub fn compact_extension(&self) -> Option<&[u64]> {
+        self.compact_extension.as_deref()
+    }
+
+    /// The ring parameters of `q p` of compact encodings: `q`'s basis followed
+    /// by `p`'s.
+    pub fn compact_level(&self) -> Result<Option<DCRTPolyParams>, PeError> {
+        let Some(extension) = &self.compact_extension else { return Ok(None) };
+        let level = self.level();
+        let moduli =
+            level.to_crt().0.into_iter().chain(extension.iter().copied()).collect::<Vec<_>>();
+        DCRTPolyParams::try_new(
+            level.ring_dimension(),
+            moduli.len(),
+            level.crt_bits(),
+            level.base_bits(),
+            Some(moduli),
+            None,
+        )
+        .map(Some)
+        .map_err(|error| PeError::Parameters(error.to_string()))
+    }
+
+    /// The rings an execution of these parameters registers: the chain's ring,
+    /// and the `q p` ring of compact encodings.
+    pub fn rings(&self) -> Result<Vec<DCRTPolyParams>, PeError> {
+        let mut rings = vec![self.level().clone()];
+        rings.extend(self.compact_level()?);
+        Ok(rings)
     }
 
     /// `|P|`: the automorphisms with a published helper (`W - 1` without a split).
@@ -407,10 +487,11 @@ impl PeParameters {
             ),
             TrapdoorMode::Statistical => Self::statistical_at(request, level),
         }?;
-        match request.lut_baby_steps {
-            Some(baby_steps) => parameters.with_baby_steps(baby_steps),
-            None => Ok(parameters),
-        }
+        let parameters = match request.lut_baby_steps {
+            Some(baby_steps) => parameters.with_baby_steps(baby_steps)?,
+            None => parameters,
+        };
+        if request.compact_encodings { parameters.with_compact_encodings() } else { Ok(parameters) }
     }
 
     /// Steps 1–9 of the statistical selection at one ring level: the budget and `m_B`, the
@@ -553,6 +634,7 @@ impl PeParameters {
             anchor_columns: self.anchor_columns,
             statistical: &self.statistical,
             baby_steps: self.baby_steps,
+            compact_extension: &self.compact_extension,
         };
         let mut digest = Sha256::new();
         digest.update(b"mxx-pe/parameters/v2");
@@ -694,12 +776,22 @@ impl PeParameters {
     ///   the trapdoor sigma. The statistical TrapGen is uniform by the regularity conditions and
     ///   has no estimate (`None`).
     ///
+    /// With compact encodings ([`Self::with_compact_encodings`]), the companions, helpers, and
+    /// initial state are samples over `pq` with the same secret and the same fresh sigmas, so
+    /// the encryption estimate is the smaller of the estimates over `q` and over `pq`.
+    ///
     /// The computational anchor's identity column gives the sample `s_bar + B^(2)_1 + e_b` with
     /// the non-uniform coefficient `1`, which these estimates do not model.
     pub fn security_bits(&self) -> Result<(u64, Option<u64>), PeError> {
         let error = self.error.sigma().min(self.flooding.sigma()).clone();
-        let encryption = mxx_exponent_lut::utils::lattice_security_bits(self.level(), &error)
+        let mut encryption = mxx_exponent_lut::utils::lattice_security_bits(self.level(), &error)
             .map_err(PeError::Parameters)?;
+        if let Some(compact) = self.compact_level()? {
+            encryption = encryption.min(
+                mxx_exponent_lut::utils::lattice_security_bits(&compact, &error)
+                    .map_err(PeError::Parameters)?,
+            );
+        }
         if self.statistical.is_some() || !self.instantiation.is_computational() {
             return Ok((encryption, None));
         }
@@ -756,6 +848,25 @@ impl PeParameters {
             return Ok((parameters, report));
         }
         Err(PeError::Parameters(format!("no candidate accepted: {}", rejected.join("; "))))
+    }
+
+    /// [`Self::select`] over the ring dimensions `dimensions`, in order: the first accepted
+    /// candidate of the first dimension that has one. Each candidate recomputes its auxiliary
+    /// modulus, noise, and security estimates (over `pq` too with compact encodings), so a
+    /// dimension too small for `pq` is rejected by its security estimate.
+    pub fn select_dimension(
+        request: &PeParameterRequest,
+        dimensions: impl IntoIterator<Item = u32>,
+    ) -> Result<(Self, crate::PeNoiseReport), PeError> {
+        let mut rejected = Vec::new();
+        for ring_dimension in dimensions {
+            let request = PeParameterRequest { ring_dimension, ..request.clone() };
+            match Self::select(&request) {
+                Ok(accepted) => return Ok(accepted),
+                Err(error) => rejected.push(format!("n = {ring_dimension}: {error}")),
+            }
+        }
+        Err(PeError::Parameters(format!("no ring dimension accepted: {}", rejected.join("; "))))
     }
 }
 

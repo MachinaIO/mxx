@@ -22,9 +22,78 @@ fn trace_noise_value(
     }
 }
 
-/// The canonical lane index of a family over `range`.
-fn family_lane(range: &FamilyRange) -> IntExpr {
-    IntExpr::Add(Box::new(range.start().clone()), Box::new(IntExpr::LoopIndex(0))).canonicalize()
+/// The canonical lane index of a family over `range` whose body runs at
+/// lane depth `depth` (0 for a top-level family): its own loop symbol, so
+/// the lanes of nested families stay distinct in index expressions.
+fn family_lane(range: &FamilyRange, depth: usize) -> IntExpr {
+    let symbol = IntExpr::LoopIndex(u32::try_from(depth).expect("family depth fits u32"));
+    IntExpr::Add(Box::new(range.start().clone()), Box::new(symbol)).canonicalize()
+}
+
+/// Whether `index` reads, across the lanes `0..count` of the innermost lane
+/// `lane` (symbol `LoopIndex(depth)`), members of one aligned row of length
+/// `row`: `index - lane = row * f(outer lanes)` with `f` affine and
+/// `count <= row`. The check is exact for the affine index expressions it
+/// accepts: every multiplication has a constant factor, so the difference is
+/// determined by its values at the origin and the unit points.
+fn row_injective(
+    index: &IntExpr,
+    lane: &IntExpr,
+    depth: usize,
+    count: &BigUint,
+    row: &BigUint,
+) -> bool {
+    fn affine(expression: &IntExpr) -> bool {
+        match expression {
+            IntExpr::Const(_) | IntExpr::LoopIndex(_) => true,
+            IntExpr::Add(lhs, rhs) | IntExpr::Sub(lhs, rhs) => affine(lhs) && affine(rhs),
+            IntExpr::Mul(lhs, rhs) => {
+                (lhs.evaluate(&ParamEnv::default()).is_ok() && affine(rhs)) ||
+                    (rhs.evaluate(&ParamEnv::default()).is_ok() && affine(lhs))
+            }
+            _ => false,
+        }
+    }
+    fn symbols(expression: &IntExpr, into: &mut std::collections::BTreeSet<u32>) {
+        match expression {
+            IntExpr::LoopIndex(slot) => {
+                into.insert(*slot);
+            }
+            IntExpr::Add(lhs, rhs) | IntExpr::Sub(lhs, rhs) | IntExpr::Mul(lhs, rhs) => {
+                symbols(lhs, into);
+                symbols(rhs, into);
+            }
+            _ => {}
+        }
+    }
+    if count > row || row.is_zero() {
+        return false;
+    }
+    let difference = IntExpr::Sub(Box::new(index.clone()), Box::new(lane.clone())).canonicalize();
+    if !affine(&difference) {
+        return false;
+    }
+    let inner = u32::try_from(depth).expect("family depth fits u32");
+    let mut slots = std::collections::BTreeSet::new();
+    symbols(&difference, &mut slots);
+    slots.insert(inner);
+    let at = |point: &BTreeMap<u32, BigInt>| {
+        difference.evaluate(&ParamEnv { loop_indices: point.clone(), ..ParamEnv::default() }).ok()
+    };
+    let origin = slots.iter().map(|slot| (*slot, BigInt::zero())).collect::<BTreeMap<_, _>>();
+    let row = BigInt::from(row.clone());
+    let Some(base) = at(&origin) else { return false };
+    if !(&base % &row).is_zero() {
+        return false;
+    }
+    slots.iter().all(|slot| {
+        let mut point = origin.clone();
+        point.insert(*slot, BigInt::one());
+        at(&point).is_some_and(|value| {
+            let step = value - &base;
+            if *slot == inner { step.is_zero() } else { (&step % &row).is_zero() }
+        })
+    })
 }
 
 /// Whether distinct lanes of a family read distinct members through
@@ -64,6 +133,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             decoder_smudge: None,
             unmask_trapdoor_sigma: None,
             lane_indices: Vec::new(),
+            lane_counts: Vec::new(),
             payload_support: BTreeMap::new(),
             reduction_counts: ReductionCounts::default(),
         }
@@ -73,12 +143,51 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     fn lane_support(&self, wire: WireId) -> Option<&BigUint> {
         self.payload_support
             .get(&wire)
-            .filter(|support| support.depth == self.lane_indices.len())
+            .filter(|support| {
+                support.depth == self.lane_indices.len() && support.row_length.is_none()
+            })
             .map(|support| &support.count)
     }
 
     fn set_lane_support(&mut self, wire: WireId, count: BigUint) {
-        self.payload_support.insert(wire, PayloadSupport { depth: self.lane_indices.len(), count });
+        self.payload_support.insert(
+            wire,
+            PayloadSupport { depth: self.lane_indices.len(), count, row_length: None },
+        );
+    }
+
+    /// The row contract `(count, row length)` of `wire` in the innermost
+    /// enclosing family, when its lanes are row-wise sparse.
+    fn lane_row_support(&self, wire: WireId) -> Option<(&BigUint, &BigUint)> {
+        self.payload_support
+            .get(&wire)
+            .filter(|support| support.depth == self.lane_indices.len())
+            .and_then(|support| support.row_length.as_ref().map(|row| (&support.count, row)))
+    }
+
+    /// Record that a member of the family `wire` with row contract `(count,
+    /// row)` read at `index` has at most `count` nonzero payloads among the
+    /// innermost lanes when those lanes stay inside one row, and drop any
+    /// earlier record otherwise.
+    pub(super) fn observe_family_read(
+        &mut self,
+        wire: WireId,
+        index: &IntExpr,
+        contract: Option<(&BigUint, &BigUint)>,
+    ) {
+        let depth = self.lane_indices.len();
+        let supported = match (contract, self.lane_indices.last(), self.lane_counts.last()) {
+            (Some((count, row)), Some(lane), Some(lanes)) => {
+                row_injective(index, lane, depth - 1, lanes, row).then(|| count.clone())
+            }
+            _ => None,
+        };
+        match supported {
+            Some(count) => self.set_lane_support(wire, count),
+            None => {
+                self.payload_support.remove(&wire);
+            }
+        }
     }
 
     fn site(&self) -> Result<&crate::program::LoweringSite, RnsBggError> {
@@ -110,12 +219,12 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         let mut provenance: BTreeMap<[u8; 32], NoiseSourceProvenance> = BTreeMap::new();
         for parent in parents {
             for (source, mut identity) in parent {
-                identity.route.extend_from_slice(&suffix);
-                if let Some(existing) = provenance.get_mut(&source) {
-                    existing.route.extend_from_slice(&identity.route);
-                } else {
-                    provenance.insert(source, identity);
-                }
+                // A source already present keeps its first route (see
+                // `RnsBggNoiseValue::combine`).
+                provenance.entry(source).or_insert_with(|| {
+                    identity.route.extend_from_slice(&suffix);
+                    identity
+                });
             }
         }
         value.provenance = provenance;
@@ -424,7 +533,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
         let coordinates = self.event_coordinates(wire)?;
         trace_noise_value(wire, self.level(wire).ok(), &node, &value);
-        self.trace.wires.insert(wire, value.clone());
+        self.trace.wires.insert(wire, value.traced());
         let node_id = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
         self.trace.dependencies.nodes.push(node);
         self.trace.dependencies.wires.insert(wire, node_id);
@@ -531,7 +640,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         let breakdown = family.element.contributions("family-element").map(|breakdown| {
             breakdown.reduce(
                 self.lane_indices.len() + 1,
-                &family_lane(&family.range),
+                &family_lane(&family.range, self.lane_indices.len()),
                 &n,
                 &mut counts,
             )
@@ -563,7 +672,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         self.reduction_counts.independent += counts.independent;
         self.reduction_counts.histogram += counts.histogram;
         self.reduction_counts.unknown_index += counts.unknown_index;
-        self.trace.wires.insert(wire, value.clone());
+        self.trace.wires.insert(wire, value.traced());
         let input_node = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
         self.trace.dependencies.nodes.push(crate::noise_utils::NoiseDependencyNode::Binding(
             crate::noise_utils::NoiseBinding::Input(source_wire),
@@ -864,6 +973,7 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
     type RhsFamily = (RhsId, FamilyRange);
     fn wire_at(
         &mut self,
+        evaluator: &mut RnsBggNoiseEvaluator<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<(WireId, RnsBggNoiseValue), ProgramLowerError<RnsBggError>> {
@@ -874,9 +984,17 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
                 ),
             ));
         }
+        evaluator.observe_family_read(
+            family.0,
+            index,
+            family.1.row_length.as_ref().map(|row| (&family.1.max_nonzero_payloads, row)),
+        );
         let element = &family.1.element;
         let member = element.breakdown.as_ref().map(|breakdown| {
-            let identity = *index == family_lane(&family.1.range);
+            let identity = self
+                .depth
+                .checked_sub(1)
+                .is_some_and(|depth| *index == family_lane(&family.1.range, depth));
             breakdown.member(self.depth, index, identity)
         });
         Ok((family.0, element.clone().with_breakdown(member)))
@@ -905,7 +1023,7 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
             IntExpr,
         ) -> Result<(WireId, RnsBggNoiseValue), ProgramLowerError<RnsBggError>>,
     ) -> Result<Self::WireFamily, ProgramLowerError<RnsBggError>> {
-        let index = family_lane(range);
+        let index = family_lane(range, evaluator.lane_indices.len());
         let count = range
             .count()
             .evaluate(&ParamEnv::default())
@@ -917,6 +1035,7 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
         let previous_multiplier = evaluator.event_multiplier.clone();
         evaluator.event_multiplier *= &count;
         evaluator.lane_indices.push(index.clone());
+        evaluator.lane_counts.push(count.clone());
         self.depth += 1;
         let result = body(self, evaluator, index);
         let body_depth = self.depth;
@@ -925,6 +1044,7 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
             Ok(value) => value,
             Err(error) => {
                 evaluator.lane_indices.pop();
+                evaluator.lane_counts.pop();
                 evaluator.event_multiplier = previous_multiplier;
                 return Err(error);
             }
@@ -934,12 +1054,20 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
             .map(|breakdown| Arc::new(breakdown.as_ref().clone().with_lane_depth(body_depth)));
         // Members weighted by distinct members of a sparse RHS family have
         // nonzero payloads in at most that family's sparse count of lanes.
-        let max_nonzero_payloads = evaluator
-            .lane_support(wire)
-            .map_or(count.clone(), |support| support.min(&count).clone());
+        let row_length = evaluator.lane_row_support(wire).map(|(_, row)| row.clone());
+        let max_nonzero_payloads = match evaluator.lane_row_support(wire) {
+            Some((per_row, _)) => per_row.clone(),
+            None => evaluator
+                .lane_support(wire)
+                .map_or(count.clone(), |support| support.min(&count).clone()),
+        };
         evaluator.lane_indices.pop();
+        evaluator.lane_counts.pop();
         evaluator.event_multiplier = previous_multiplier;
-        Ok((wire, RnsBggNoiseFamily { element, range: range.clone(), max_nonzero_payloads }))
+        Ok((
+            wire,
+            RnsBggNoiseFamily { element, range: range.clone(), max_nonzero_payloads, row_length },
+        ))
     }
     fn sum(
         &mut self,
@@ -1153,16 +1281,18 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         }
         let logical_level = self.level(input.0)?;
         let level = logical_level;
-        let (contract, sparse_count) = match self
+        let (contract, sparse_count, row_length) = match self
             .bindings
             .rhs
             .get(&rhs.id)
             .ok_or(RnsBggError::Binding("missing RHS noise contract"))?
         {
-            InputBinding::Scalar(value) => (value.clone(), None),
-            InputBinding::Family(family) => {
-                (family.element.clone(), Some(family.max_nonzero_payloads.clone()))
-            }
+            InputBinding::Scalar(value) => (value.clone(), None, None),
+            InputBinding::Family(family) => (
+                family.element.clone(),
+                Some(family.max_nonzero_payloads.clone()),
+                family.row_length.clone(),
+            ),
         };
         let fresh_error_gain = self.fresh_gain(level)?;
         let wire = self.site()?.output;
@@ -1307,11 +1437,32 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             rhs: self.rhs_node(rhs),
             helper: None,
         };
-        if let (Some(count), Some(index), Some(lane)) =
-            (sparse_count, rhs.index.as_ref(), self.lane_indices.last())
+        if let (Some(count), Some(index), Some(lane), Some(lanes)) =
+            (sparse_count, rhs.index.as_ref(), self.lane_indices.last(), self.lane_counts.last())
         {
-            if lane_injective(index, lane) {
-                self.set_lane_support(wire, count);
+            // Without a row contract the count bounds the whole family, so the
+            // lanes must read distinct members; with one it bounds each aligned
+            // row, so the lanes must stay inside one row.
+            match &row_length {
+                None if lane_injective(index, lane) => self.set_lane_support(wire, count),
+                Some(row)
+                    if row_injective(index, lane, self.lane_indices.len() - 1, lanes, row) =>
+                {
+                    self.set_lane_support(wire, count)
+                }
+                // The lanes read the whole family member by member: the
+                // family they form keeps the row contract.
+                Some(row) if index.clone().canonicalize() == lane.clone().canonicalize() => {
+                    self.payload_support.insert(
+                        wire,
+                        PayloadSupport {
+                            depth: self.lane_indices.len(),
+                            count,
+                            row_length: Some(row.clone()),
+                        },
+                    );
+                }
+                _ => {}
             }
         }
         self.operation_node(wire, value, node)
@@ -1560,6 +1711,7 @@ mod test {
                     range: FamilyRange::full(IntExpr::constant(4)).unwrap(),
                     // One-hot payloads do not remove the other members' errors.
                     max_nonzero_payloads: BigUint::one(),
+                    row_length: None,
                 }),
             )]),
         );
@@ -1703,6 +1855,7 @@ mod test {
                     element: unit_rhs(),
                     range: FamilyRange::full(IntExpr::constant(2)).unwrap(),
                     max_nonzero_payloads: BigUint::one(),
+                    row_length: None,
                 }),
             )]),
         )
@@ -1790,6 +1943,7 @@ mod test {
                 element,
                 range: FamilyRange::full(IntExpr::constant(4)).unwrap(),
                 max_nonzero_payloads: 4u8.into(),
+                row_length: None,
             })
         };
         let independent = output_variance(

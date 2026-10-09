@@ -52,6 +52,7 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut PublicKeyLowering<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {

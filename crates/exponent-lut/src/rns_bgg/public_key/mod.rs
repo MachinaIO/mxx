@@ -160,6 +160,8 @@ pub struct RnsPreprocessBuild<'a> {
     hash_namespace: Option<[u8; 32]>,
     /// The applied noise refresh.
     refresh: Option<PreparedRefresh<'a>>,
+    /// The graph input name and length of a top refresh's `A'` key.
+    refresh_matrix_key: Option<(String, usize)>,
 }
 
 /// A noise refresh prepared by preprocessing: its lowered children, the
@@ -167,6 +169,7 @@ pub struct RnsPreprocessBuild<'a> {
 /// decoder order) and their coefficient bound.
 struct PreparedRefresh<'a> {
     declaration: crate::refresh::RefreshDeclaration,
+    mask: Option<PublicKeyLowering<'a>>,
     fresh: PublicKeyLowering<'a>,
     smudges: Vec<PublicKeyLowering<'a>>,
     preimages: Vec<Preimage>,

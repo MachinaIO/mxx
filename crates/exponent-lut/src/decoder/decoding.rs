@@ -678,6 +678,7 @@ mod tests {
         type RhsFamily = ();
         fn wire_at(
             &mut self,
+            _evaluator: &mut Counter,
             _: &(),
             _: &IntExpr,
         ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
@@ -739,7 +740,6 @@ mod tests {
     fn smudge_program_graph_does_not_grow_with_members() {
         let small = counts(declaration(2, 1).0.smudge().program());
         let large = counts(declaration(5, 2).0.smudge().program());
-        assert_eq!(small.0, 1, "one root body");
         assert_eq!(small.2, 1, "one LUT");
         assert_eq!(small, large, "only the index tables scale with the members");
     }

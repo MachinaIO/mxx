@@ -463,6 +463,7 @@ mod tests {
 
         fn wire_at(
             &mut self,
+            _evaluator: &mut LogicalEvaluator,
             family: &Self::WireFamily,
             index: &IntExpr,
         ) -> Result<usize, ProgramLowerError<LogicalError>> {

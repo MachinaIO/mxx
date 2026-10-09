@@ -35,7 +35,8 @@ use crate::{
 
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineEvalBuild, decode_output, decode_public_output, refresh_error, verify_output,
+    RnsOnlineEvalBuild, decode_output, decode_public_output, refresh_error, top_refresh_error,
+    verify_output,
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
@@ -45,7 +46,7 @@ pub use noise::{
     simulate_refresh_noise,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
-pub use refresh::refresh_fresh_namespace;
+pub use refresh::{refresh_fresh_namespace, refresh_mask_namespace};
 pub use workload::RnsBggDerivedWorkload;
 
 /// Name of the graph input carrying the shared 32-byte hash key. A stage

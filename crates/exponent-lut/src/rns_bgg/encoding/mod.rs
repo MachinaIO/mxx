@@ -44,7 +44,9 @@ mod online_eval;
 mod verify;
 
 pub(super) use self::lowering::*;
-pub use self::verify::{decode_output, decode_public_output, refresh_error, verify_output};
+pub use self::verify::{
+    decode_output, decode_public_output, refresh_error, top_refresh_error, verify_output,
+};
 #[cfg(test)]
 use crate::{api::execute_graph, program::ExponentLutProgramBuilder};
 #[cfg(test)]
@@ -538,8 +540,10 @@ pub struct RnsEncryptBuild<'a> {
     hash_namespace: Option<[u8; 32]>,
     /// The bound noise refresh: its fresh-noise child and its decoders'
     /// smudge children, in decoder order.
+    /// A top-refresh part also binds its mask child (first).
     refresh: Option<(
         crate::refresh::RefreshDeclaration,
+        Option<Box<RnsEncryptBuild<'a>>>,
         Box<RnsEncryptBuild<'a>>,
         Vec<RnsEncryptBuild<'a>>,
     )>,
@@ -568,10 +572,14 @@ pub struct RnsOnlineEvalBuild<'a> {
     hash_namespace: Option<[u8; 32]>,
     /// The applied noise refresh: its target output index, declaration, and
     /// fresh-noise and smudge children (in decoder order).
+    /// A top-refresh part also has its mask child (after the declaration).
     pending_refresh: Option<(
         usize,
         crate::refresh::RefreshDeclaration,
+        Option<Box<RnsOnlineEvalBuild<'a>>>,
         Box<RnsOnlineEvalBuild<'a>>,
         Vec<RnsOnlineEvalBuild<'a>>,
     )>,
+    /// The namespace and key of a top refresh's `A'`.
+    refresh_matrix_key: Option<([u8; 32], Vec<u8>)>,
 }

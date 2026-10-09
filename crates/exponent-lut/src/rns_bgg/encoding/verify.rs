@@ -422,6 +422,147 @@ where
         .collect())
 }
 
+/// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)`
+/// (`j = 0, 1`) of the refresh to the top level `top`: `y_j` recombines the
+/// output `refresh` of every part `(chain, j)` (`results[chain][j]`, the
+/// residue `y_j mod q`) modulo `Q_0`; `sigma = (sigma_0, 1)` with the mask
+/// child's bit polynomial `sigma`, `x = expected`, `r` the payload secret,
+/// and `Delta_0`, `G^st_0` those of the reference chain `reference`
+/// ([`RnsBggParameters::top_refresh_chain`] with `None`). `A'_(j)` is
+/// sampled under the top refresh's matrix namespace of `hash_key`. Per
+/// column, the `n` coefficients centered modulo `Q_0`.
+#[allow(clippy::too_many_arguments)]
+pub fn top_refresh_error<E, S, P>(
+    top: &crate::refresh::top::TopRefreshDeclaration,
+    results: &[[&StageOutputs; 2]],
+    reference: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    sigma: &P,
+    expected: &P,
+    hash_key: &[u8],
+    execution: &mut E,
+    store: &mut S,
+) -> Result<[Vec<Vec<BigInt>>; 2], ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+    P: Poly,
+{
+    use crate::rns_bgg::refresh::{
+        child_hash_key, hash_key_input_name, top_matrix, top_refresh_combine,
+    };
+    let declaration = top.reference();
+    let columns = declaration.columns();
+    if results.len() != top.chains() {
+        return Err(ApiError::input("one pair of part results per chain"));
+    }
+    let ring = reference.ring(0).map_err(ApiError::scheme)?;
+    let mut runtime = BTreeMap::new();
+    let namespace = top.matrix_namespace();
+    let key_name = hash_key_input_name(Some(&namespace));
+    let key = child_hash_key(hash_key, &namespace);
+    runtime.insert(key_name.clone(), RuntimeValue::Bytes(key.as_slice().into()));
+    let key = ring.bytes_input(key_name, key.len());
+    let mut plaintext = |name: &str, value: &P| match super::plaintext_inputs(
+        &ring,
+        name,
+        &InputBinding::Scalar(value.clone()),
+        &mut runtime,
+    ) {
+        Ok(InputBinding::Scalar(value)) => Ok(value),
+        Ok(InputBinding::Family(_)) => unreachable!("a scalar plaintext binds a scalar"),
+        Err(error) => Err(ApiError::input(error)),
+    };
+    let sigma = plaintext("top-refresh-sigma", sigma)?;
+    let expected = plaintext("top-refresh-expected", expected)?;
+    let r = reduce_secret(reference, &payload.row, 0).map_err(ApiError::scheme)?;
+    let delta = reference
+        .scalar(0, reference.message_scale(0).map_err(ApiError::scheme)?)
+        .map_err(ApiError::scheme)?;
+    let gadget = reference.state_gadget(0).map_err(ApiError::scheme)?;
+    let mut graph = DslContext::new("rns-bgg-top-refresh-error");
+    for component in 0..2 {
+        let part =
+            top.part(0, component).ok_or_else(|| ApiError::input("the top refresh has no part"))?;
+        let residues = results
+            .iter()
+            .enumerate()
+            .map(|(chain, result)| {
+                let name = format!("residue-{chain}-{component}");
+                let value = result[component]
+                    .outputs
+                    .get("refresh")
+                    .ok_or_else(|| ApiError::input("a part's residue is missing"))?
+                    .clone();
+                runtime.insert(name.clone(), value);
+                let prime = top
+                    .output_prime(chain)
+                    .ok_or_else(|| ApiError::input("the top refresh has no such chain"))?;
+                Ok(mxx_dsl::Ring::from_crt_moduli(
+                    vec![IntExpr::from(prime)],
+                    declaration.ring_dimension,
+                )
+                .input(name, (1, columns)))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let refreshed = top_refresh_combine(declaration, residues).map_err(ApiError::scheme)?;
+        let a_prime = top_matrix(declaration, key.clone(), part);
+        let a_row = |row: usize| {
+            a_prime.clone().slice(
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(row),
+                    end: IntExpr::constant(row + 1),
+                }),
+                None,
+            )
+        };
+        let payload_secret = if component == 0 { r.0.clone() } else { r.1.clone() };
+        let error = refreshed -
+            (sigma.clone() * a_row(0) + a_row(1) -
+                delta.clone() * payload_secret * expected.clone() * gadget.clone());
+        graph = graph
+            .output(format!("top-refresh-error-{component}"), error)
+            .map_err(ApiError::scheme)?;
+    }
+    let graph = graph.build().map_err(ApiError::scheme)?;
+    if let Some(binding) = &payload.binding {
+        binding.bind(&mut runtime);
+    }
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
+        execution,
+        store,
+        |_| Ok(()),
+    )?;
+    let modulus =
+        BigInt::from(reference.level(0).map_err(ApiError::scheme)?.modulus().as_ref().clone());
+    let mut errors = [Vec::new(), Vec::new()];
+    for (component, rows) in errors.iter_mut().enumerate() {
+        let error = execution.download_matrix(
+            outputs
+                .outputs
+                .get(&format!("top-refresh-error-{component}"))
+                .ok_or_else(|| ApiError::input("the top refresh error is missing"))?,
+        )?;
+        *rows = (0..columns)
+            .map(|column| {
+                error
+                    .entry(0, column)
+                    .coeffs_biguints()
+                    .into_iter()
+                    .map(|value| {
+                        let value = BigInt::from(value);
+                        if &value * 2u8 > modulus { value - &modulus } else { value }
+                    })
+                    .collect()
+            })
+            .collect();
+    }
+    Ok(errors)
+}
+
 fn verify_output_at_level<E, S, P>(
     program: &ExponentLutProgram,
     result: &StageOutputs,

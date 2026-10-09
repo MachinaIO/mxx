@@ -175,6 +175,7 @@ fn noise_bindings(
                 element: value.independent_family_members(),
                 range: FamilyRange::full(count.clone()).expect("valid input family range"),
                 max_nonzero_payloads: 1u8.into(),
+                row_length: None,
             }),
         );
     }

@@ -703,6 +703,27 @@ impl ExponentLutProgram {
             .ok_or(ProgramValidationError::UndefinedWire(wire))
     }
 
+    /// The output representation of the LUT whose top-level step outputs
+    /// `wire`, or `None` when another step (or an input) defines it.
+    pub fn lut_output_representation(
+        &self,
+        wire: WireId,
+    ) -> Result<Option<LutOutputRepresentation>, ProgramValidationError> {
+        self.metadata()?;
+        for step in &self.body.steps {
+            if let Step::Lut { output, table, .. } = step &&
+                *output == wire
+            {
+                let table = self
+                    .luts
+                    .get(table.0 as usize)
+                    .ok_or(ProgramValidationError::InvalidLutId(*table))?;
+                return Ok(Some(table.output_representation));
+            }
+        }
+        Ok(None)
+    }
+
     /// Return whether a validated wire is the raw output of a coefficient LUT
     /// lineage.  Input declarations intentionally have no inferred layout.
     pub fn wire_is_coefficient_output(&self, wire: WireId) -> Result<bool, ProgramValidationError> {

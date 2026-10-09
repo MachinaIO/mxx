@@ -45,6 +45,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             unmask_bound: None,
             hash_namespace: None,
             refresh: None,
+            refresh_matrix_key: None,
         }
     }
 
@@ -172,17 +173,82 @@ impl<'a> RnsPreprocessBuild<'a> {
         target_index: usize,
         declaration: &crate::refresh::RefreshDeclaration,
         target: RnsBggPublicKey,
+        fresh: RnsPreprocessBuild<'a>,
+        smudges: Vec<RnsPreprocessBuild<'a>>,
+        trapdoor_sigma: &bigdecimal::BigDecimal,
+    ) -> Result<(), ApiError> {
+        self.prepare_refresh(
+            target_index,
+            declaration,
+            target,
+            None,
+            fresh,
+            smudges,
+            trapdoor_sigma,
+        )
+    }
+
+    /// Prepare the top-refresh part `declaration` (see
+    /// [`crate::refresh::top`]) of output `target_index` as
+    /// [`Self::apply_refresh`] does, with its mask child `mask`: the one key
+    /// is the mask carrier's key next to the public one key's second block,
+    /// the target key is the part's component, and only the output prime is
+    /// decoded. `A'` is sampled under the key set by
+    /// [`Self::with_refresh_matrix_key`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_top_refresh(
+        &mut self,
+        target_index: usize,
+        declaration: &crate::refresh::RefreshDeclaration,
+        target: RnsBggPublicKey,
+        mask: RnsPreprocessBuild<'a>,
+        fresh: RnsPreprocessBuild<'a>,
+        smudges: Vec<RnsPreprocessBuild<'a>>,
+        trapdoor_sigma: &bigdecimal::BigDecimal,
+    ) -> Result<(), ApiError> {
+        self.prepare_refresh(
+            target_index,
+            declaration,
+            target,
+            Some(mask),
+            fresh,
+            smudges,
+            trapdoor_sigma,
+        )
+    }
+
+    /// Sample a top refresh's `A'` from the stage key `hash_key` derived
+    /// under `namespace` ([`crate::refresh::top::TopRefreshDeclaration::matrix_namespace`]),
+    /// the same for every chain.
+    pub fn with_refresh_matrix_key(mut self, namespace: [u8; 32], hash_key: &[u8]) -> Self {
+        let name = crate::rns_bgg::refresh::hash_key_input_name(Some(&namespace));
+        let key = crate::rns_bgg::refresh::child_hash_key(hash_key, &namespace);
+        self.runtime.insert(name.clone(), RuntimeValue::Bytes(key.as_slice().into()));
+        self.refresh_matrix_key = Some((name, key.len()));
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_refresh(
+        &mut self,
+        target_index: usize,
+        declaration: &crate::refresh::RefreshDeclaration,
+        target: RnsBggPublicKey,
+        mut mask: Option<RnsPreprocessBuild<'a>>,
         mut fresh: RnsPreprocessBuild<'a>,
         mut smudges: Vec<RnsPreprocessBuild<'a>>,
         trapdoor_sigma: &bigdecimal::BigDecimal,
     ) -> Result<(), ApiError> {
         use crate::rns_bgg::refresh::{
-            refresh_column, refresh_combination, refresh_fresh_namespace,
+            refresh_column, refresh_combination, refresh_fresh_namespace, refresh_mask_namespace,
         };
         if self.decoder_declaration.is_some() || self.refresh.is_some() {
             return Err(ApiError::input("a decoder or refresh was already applied"));
         }
         let mismatch = || ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch));
+        let child_program = |child: &RnsPreprocessBuild<'a>| {
+            child.evaluator.as_ref().map(|evaluator| evaluator.program.id())
+        };
         let evaluator =
             self.evaluator.as_ref().ok_or_else(|| ApiError::input("bind_inputs first"))?;
         let smudge_parameters = smudges.iter().map(|child| child.parameters).collect::<Vec<_>>();
@@ -191,13 +257,18 @@ impl<'a> RnsPreprocessBuild<'a> {
             .validate_refresh_children(
                 declaration,
                 &evaluator.program,
+                mask.as_ref().map(|child| child.parameters),
                 fresh.parameters,
                 &smudge_parameters,
             )
             .map_err(ApiError::scheme)?;
-        let child_program = |child: &RnsPreprocessBuild<'a>| {
-            child.evaluator.as_ref().map(|evaluator| evaluator.program.id())
-        };
+        if let (Some(part), Some(child)) = (declaration.top(), mask.as_ref()) &&
+            (child_program(child) != Some(part.mask().id()) ||
+                child.hash_namespace != Some(refresh_mask_namespace(declaration)) ||
+                child.evaluator.as_ref().is_some_and(|child| child.decoder_smudge.is_some()))
+        {
+            return Err(mismatch());
+        }
         if evaluator.program.outputs().get(target_index) !=
             Some(&Operand::Scalar(declaration.target_output())) ||
             target.wire != declaration.target_output() ||
@@ -237,14 +308,38 @@ impl<'a> RnsPreprocessBuild<'a> {
             .map(|key| super::mod_down_public(key.matrix, &ring))
             .collect::<Vec<_>>();
         let hash_key = evaluator.hash_key.clone();
+        let matrix_key = match (declaration.top(), &self.refresh_matrix_key) {
+            (None, _) => hash_key.clone(),
+            (Some(_), Some((name, length))) => ring.bytes_input(name.clone(), *length),
+            (Some(_), None) => {
+                return Err(ApiError::input("a top refresh needs with_refresh_matrix_key"));
+            }
+        };
         let a_prime = self
             .parameters
-            .refresh_matrix(level, hash_key.clone(), declaration)
+            .refresh_matrix(level, matrix_key, declaration)
             .map_err(ApiError::scheme)?;
         let one = self
             .parameters
             .refresh_one_key(level, hash_key, declaration)
             .map_err(ApiError::scheme)?;
+        // A top-refresh part's one key: the mask carrier's key (component 1,
+        // moved down once like the fresh carriers) for the first block.
+        let one = match mask.as_mut() {
+            None => one,
+            Some(child) => {
+                let key = lower(child)
+                    .map_err(ApiError::scheme)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(mismatch)?;
+                let key = super::mod_down_public(key.matrix, &ring);
+                ((key.0.1, one.0.1), (key.1.1, one.1.1))
+            }
+        };
+        let component = declaration.component();
+        let target_top = if component == 0 { &target.matrix.0.0 } else { &target.matrix.0.1 };
+        let target_bottom = if component == 0 { &target.matrix.1.0 } else { &target.matrix.1.1 };
         let fresh_top = fresh_keys.iter().map(|key| key.0.1.clone()).collect::<Vec<_>>();
         let fresh_bottom = fresh_keys.iter().map(|key| key.1.1.clone()).collect::<Vec<_>>();
         let (trapdoor, bound) = sample_unmask_trapdoor(
@@ -255,25 +350,25 @@ impl<'a> RnsPreprocessBuild<'a> {
         )?;
         let mut preimages = Vec::with_capacity(declaration.decoders().len());
         let columns = declaration.columns();
-        for prime in 0..declaration.primes() {
+        for (position, prime) in declaration.decoded_primes().into_iter().enumerate() {
             let actions = self
                 .parameters
-                .refresh_actions(level, prime, a_prime.clone())
+                .refresh_actions(level, prime, a_prime.clone(), declaration)
                 .map_err(ApiError::scheme)?;
             let top = refresh_combination(
                 (one.0.0.clone(), one.0.1.clone()),
-                target.matrix.0.1.clone(),
+                target_top.clone(),
                 &fresh_top,
                 &actions,
             );
             let bottom = refresh_combination(
                 (one.1.0.clone(), one.1.1.clone()),
-                target.matrix.1.1.clone(),
+                target_bottom.clone(),
                 &fresh_bottom,
                 &actions,
             );
             for column in 0..columns {
-                let smudge = lower(&mut smudges[prime * columns + column])
+                let smudge = lower(&mut smudges[position * columns + column])
                     .map_err(ApiError::scheme)?
                     .into_iter()
                     .next()
@@ -291,6 +386,10 @@ impl<'a> RnsPreprocessBuild<'a> {
         }
         merge_runtime(&mut self.runtime, std::mem::take(&mut fresh.runtime))
             .map_err(ApiError::scheme)?;
+        if let Some(child) = mask.as_mut() {
+            merge_runtime(&mut self.runtime, std::mem::take(&mut child.runtime))
+                .map_err(ApiError::scheme)?;
+        }
         for child in &mut smudges {
             merge_runtime(&mut self.runtime, std::mem::take(&mut child.runtime))
                 .map_err(ApiError::scheme)?;
@@ -300,6 +399,7 @@ impl<'a> RnsPreprocessBuild<'a> {
         };
         self.refresh = Some(PreparedRefresh {
             declaration: declaration.clone(),
+            mask: mask.map(take).transpose()?,
             fresh: take(fresh)?,
             smudges: smudges.into_iter().map(take).collect::<Result<Vec<_>, _>>()?,
             preimages,
@@ -671,6 +771,18 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                     crate::rns_bgg::refresh::refresh_fresh_input_key_artifact_name(spec, wire, port)
                 },
             )?;
+            if let Some(mask) = &refresh.mask {
+                graph = publish_child(
+                    graph,
+                    mask,
+                    |role| crate::rns_bgg::refresh::refresh_mask_artifact_name(spec, role),
+                    |wire, port| {
+                        crate::rns_bgg::refresh::refresh_mask_input_key_artifact_name(
+                            spec, wire, port,
+                        )
+                    },
+                )?;
+            }
             for ((child, decoder), preimage) in
                 refresh.smudges.iter().zip(refresh.declaration.decoders()).zip(&refresh.preimages)
             {

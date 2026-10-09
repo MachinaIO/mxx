@@ -88,6 +88,29 @@ impl<'a> RnsEncryptBuild<'a> {
         fresh: RnsEncryptBuild<'a>,
         smudges: Vec<RnsEncryptBuild<'a>>,
     ) -> Result<(), ApiError> {
+        self.bind_refresh_children(declaration, None, fresh, smudges)
+    }
+
+    /// Attach the top-refresh part `declaration`'s children as
+    /// [`Self::bind_refresh`] does, with its mask child `mask` (bound to the
+    /// shared mask keys' inputs under [`crate::rns_bgg::refresh_mask_namespace`]).
+    pub fn bind_top_refresh(
+        &mut self,
+        declaration: &crate::refresh::RefreshDeclaration,
+        mask: RnsEncryptBuild<'a>,
+        fresh: RnsEncryptBuild<'a>,
+        smudges: Vec<RnsEncryptBuild<'a>>,
+    ) -> Result<(), ApiError> {
+        self.bind_refresh_children(declaration, Some(mask), fresh, smudges)
+    }
+
+    fn bind_refresh_children(
+        &mut self,
+        declaration: &crate::refresh::RefreshDeclaration,
+        mask: Option<RnsEncryptBuild<'a>>,
+        fresh: RnsEncryptBuild<'a>,
+        smudges: Vec<RnsEncryptBuild<'a>>,
+    ) -> Result<(), ApiError> {
         let mismatch = || ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch));
         if self.decoder_smudge_child.is_some() || self.refresh.is_some() {
             return Err(ApiError::input("a decoder or refresh was already bound"));
@@ -122,7 +145,15 @@ impl<'a> RnsEncryptBuild<'a> {
                 return Err(mismatch());
             }
         }
-        self.refresh = Some((declaration.clone(), Box::new(fresh), smudges));
+        match (declaration.top(), &mask) {
+            (None, None) => {}
+            (Some(part), Some(child))
+                if bound(child, crate::rns_bgg::refresh::refresh_mask_namespace(declaration)) &&
+                    child.inputs.as_ref().map(|inputs| inputs.inputs()) ==
+                        Some(part.mask().program().inputs()) => {}
+            _ => return Err(mismatch()),
+        }
+        self.refresh = Some((declaration.clone(), mask.map(Box::new), Box::new(fresh), smudges));
         Ok(())
     }
 
@@ -438,9 +469,11 @@ impl<'a> RnsEncryptBuild<'a> {
     /// namespace and hash key, the one encoding `c_1 = s A_1 - s (I_2 ⊗ G_Q) +
     /// e_1` (a public encoding of `1` at the decoding ring) and the unmask
     /// hint `b = s B + e_b`. `hash_key` is the stage hash key.
+    #[allow(clippy::too_many_arguments)]
     fn append_refresh(
         &mut self,
         declaration: &crate::refresh::RefreshDeclaration,
+        mask_child: Option<&RnsEncryptBuild<'a>>,
         fresh: &RnsEncryptBuild<'a>,
         smudges: &[RnsEncryptBuild<'a>],
         mut graph: DslContext,
@@ -449,7 +482,8 @@ impl<'a> RnsEncryptBuild<'a> {
     ) -> Result<DslContext, ApiError> {
         use crate::rns_bgg::refresh::{
             hash_key_input_name, refresh_artifact_name, refresh_fresh_artifact_name,
-            refresh_fresh_input_key_artifact_name,
+            refresh_fresh_input_key_artifact_name, refresh_mask_artifact_name,
+            refresh_mask_input_key_artifact_name,
         };
         let spec = *declaration.spec();
         let mut child_graph = |graph: DslContext,
@@ -477,6 +511,15 @@ impl<'a> RnsEncryptBuild<'a> {
             &|role| refresh_fresh_artifact_name(spec, role),
             &|wire, port| refresh_fresh_input_key_artifact_name(spec, wire, port),
         )?;
+        if let (Some(child), Some(part)) = (mask_child, declaration.top()) {
+            graph = child_graph(
+                graph,
+                child,
+                part.mask().program(),
+                &|role| refresh_mask_artifact_name(spec, role),
+                &|wire, port| refresh_mask_input_key_artifact_name(spec, wire, port),
+            )?;
+        }
         for (child, decoder) in smudges.iter().zip(declaration.decoders()) {
             let commitment = *decoder.commitment();
             graph = child_graph(
@@ -838,8 +881,16 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             merge_runtime_inputs(&mut self.runtime, &child.runtime)?;
             self.manifests.extend(child.manifests.clone());
         }
-        if let Some((declaration, fresh, smudges)) = self.refresh.take() {
-            graph = self.append_refresh(&declaration, &fresh, &smudges, graph, &hash_key, &mask)?;
+        if let Some((declaration, mask_child, fresh, smudges)) = self.refresh.take() {
+            graph = self.append_refresh(
+                &declaration,
+                mask_child.as_deref(),
+                &fresh,
+                &smudges,
+                graph,
+                &hash_key,
+                &mask,
+            )?;
         }
         for (name, family) in
             self.lut_helper_families(&mask, &hash_key, &inputs).map_err(ApiError::scheme)?

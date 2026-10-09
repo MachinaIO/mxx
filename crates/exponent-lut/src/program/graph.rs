@@ -107,6 +107,7 @@ where
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut E,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>> {

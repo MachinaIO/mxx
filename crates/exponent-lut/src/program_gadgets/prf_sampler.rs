@@ -517,6 +517,7 @@ mod tests {
                         element: value.independent_family_members(),
                         range: FamilyRange::full(count.clone()).unwrap(),
                         max_nonzero_payloads: 1u8.into(),
+                        row_length: None,
                     }),
                 };
                 (*wire, binding)
@@ -537,6 +538,7 @@ mod tests {
                         element: unit.clone(),
                         range: FamilyRange::full(IntExpr::constant(family.members)).unwrap(),
                         max_nonzero_payloads: family.max_nonzero.into(),
+                        row_length: family.row_length.map(BigUint::from),
                     }),
                 )
             })

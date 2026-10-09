@@ -308,6 +308,7 @@ fn noise_bindings(program: &LwrPrf, sigma: &BigDecimal) -> RnsBggNoiseBindings {
                 element: value.independent_family_members(),
                 range: FamilyRange::full(count.clone()).expect("valid input family range"),
                 max_nonzero_payloads: 1u8.into(),
+                row_length: None,
             }),
         };
         input_bindings.insert(*wire, binding);
@@ -329,6 +330,7 @@ fn noise_bindings(program: &LwrPrf, sigma: &BigDecimal) -> RnsBggNoiseBindings {
                     range: FamilyRange::full(IntExpr::constant(family.members))
                         .expect("valid selector family range"),
                     max_nonzero_payloads: family.max_nonzero.into(),
+                    row_length: None,
                 }),
             )
         })

@@ -80,6 +80,7 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut EncodingLowering<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>> {

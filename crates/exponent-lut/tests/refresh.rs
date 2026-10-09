@@ -171,6 +171,7 @@ fn search(
         let smudges = vec![&smudge; declaration.decoders().len()];
         let noise = simulate_refresh_noise(
             parameters,
+            None,
             &fresh,
             &smudges,
             source,
@@ -178,6 +179,7 @@ fn search(
             &declaration,
             0,
             trapdoor_sigma,
+            None,
         )
         .expect("refresh noise");
         if noise.fits() && noise.hides(statistical_bits) {

@@ -113,8 +113,11 @@ where
 {
     type WireFamily: Clone;
     type RhsFamily: Clone;
+    /// Member `index` of `family`. The evaluator observes the read (the noise
+    /// evaluator records the read's payload support).
     fn wire_at(
         &mut self,
+        evaluator: &mut E,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>>;
@@ -225,6 +228,7 @@ where
     F: FamilyExecution<E>,
 {
     let mut direct = Vec::new();
+    let releases = last_reads(body);
     let result = (|| -> Result<Vec<E::Wire>, ProgramLowerError<E::Error>> {
         for (position, step) in body.steps.iter().enumerate() {
             progress.step(indices.len());
@@ -232,28 +236,28 @@ where
             let site = LoweringSite { output, indices: indices.clone(), ranges: ranges.clone() };
             let value = match step {
                 Step::Add { lhs, rhs, .. } => {
-                    let lhs = resolve_wire(lhs, families, environment, indices)?;
-                    let rhs = resolve_wire(rhs, families, environment, indices)?;
+                    let lhs = resolve_wire(lhs, evaluator, families, environment, indices)?;
+                    let rhs = resolve_wire(rhs, evaluator, families, environment, indices)?;
                     LoweredValue::Scalar(with_site(evaluator, site, |evaluator| {
                         evaluator.add(&lhs, &rhs).map_err(ProgramLowerError::Backend)
                     })?)
                 }
                 Step::MulPublic { lhs, rhs, .. } => {
-                    let lhs = resolve_wire(lhs, families, environment, indices)?;
-                    let rhs = resolve_wire(rhs, families, environment, indices)?;
+                    let lhs = resolve_wire(lhs, evaluator, families, environment, indices)?;
+                    let rhs = resolve_wire(rhs, evaluator, families, environment, indices)?;
                     LoweredValue::Scalar(with_site(evaluator, site, |evaluator| {
                         evaluator.mul_public(&lhs, &rhs).map_err(ProgramLowerError::Backend)
                     })?)
                 }
                 Step::MulPrivate { input, rhs, .. } => {
-                    let input = resolve_wire(input, families, environment, indices)?;
+                    let input = resolve_wire(input, evaluator, families, environment, indices)?;
                     let rhs = resolve_rhs(rhs, families, environment, indices)?;
                     LoweredValue::Scalar(with_site(evaluator, site, |evaluator| {
                         evaluator.mul_private(&input, &rhs).map_err(ProgramLowerError::Backend)
                     })?)
                 }
                 Step::Lut { input, table: lut, .. } => {
-                    let input = resolve_wire(input, families, environment, indices)?;
+                    let input = resolve_wire(input, evaluator, families, environment, indices)?;
                     let table = program
                         .luts
                         .get(lut.0 as usize)
@@ -263,7 +267,7 @@ where
                     })?)
                 }
                 Step::MulSmallConstant { input, coefficients, shift, .. } => {
-                    let input = resolve_wire(input, families, environment, indices)?;
+                    let input = resolve_wire(input, evaluator, families, environment, indices)?;
                     let shift = substitute_indices(shift, indices)?;
                     LoweredValue::Scalar(with_site(evaluator, site, |evaluator| {
                         evaluator
@@ -330,6 +334,12 @@ where
             };
             environment.wires.insert(output, scalar);
             direct.push(output);
+            // A body-local wire no later step (nor nested body, nor the body's
+            // outputs) reads is released, so a long body holds only its live
+            // values.
+            for wire in &releases[position] {
+                environment.wires.remove(wire);
+            }
             if indices.is_empty() {
                 tracing::info!(
                     step = position + 1,
@@ -343,7 +353,7 @@ where
         let outputs = body
             .outputs
             .iter()
-            .map(|operand| resolve_wire(operand, families, environment, indices))
+            .map(|operand| resolve_wire(operand, evaluator, families, environment, indices))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(outputs)
     })();
@@ -351,6 +361,62 @@ where
         environment.wires.remove(&id);
     }
     result
+}
+
+/// For each step of `body`, the wires defined by this body whose last read
+/// is that step: an operand of it or of any step of its nested bodies. A wire
+/// the body's outputs read, or no step reads, is never listed (an unread wire
+/// is released at its own step).
+fn last_reads(body: &Body) -> Vec<Vec<WireId>> {
+    fn reads(step: &Step, into: &mut Vec<WireId>) {
+        let operand = |operand: &Operand<WireId>, into: &mut Vec<WireId>| match operand {
+            Operand::Scalar(id) | Operand::Member { family: id, .. } => into.push(*id),
+        };
+        match step {
+            Step::Add { lhs, rhs, .. } | Step::MulPublic { lhs, rhs, .. } => {
+                operand(lhs, into);
+                operand(rhs, into);
+            }
+            Step::MulPrivate { input, .. } |
+            Step::Lut { input, .. } |
+            Step::MulSmallConstant { input, .. } => operand(input, into),
+            Step::Parallel { body, .. } => {
+                for step in &body.steps {
+                    reads(step, into);
+                }
+                for output in &body.outputs {
+                    operand(output, into);
+                }
+            }
+            Step::Sum { family, .. } => into.push(*family),
+        }
+    }
+    let defined = body.steps.iter().map(step_output).collect::<BTreeSet<_>>();
+    let mut last = BTreeMap::<WireId, usize>::new();
+    for (position, step) in body.steps.iter().enumerate() {
+        // A wire is defined before any later read, so its own step is its
+        // first candidate position.
+        last.insert(step_output(step), position);
+        let mut read = Vec::new();
+        reads(step, &mut read);
+        for wire in read {
+            if defined.contains(&wire) {
+                last.insert(wire, position);
+            }
+        }
+    }
+    for output in &body.outputs {
+        match output {
+            Operand::Scalar(id) | Operand::Member { family: id, .. } => {
+                last.remove(id);
+            }
+        }
+    }
+    let mut releases = vec![Vec::new(); body.steps.len()];
+    for (wire, position) in last {
+        releases[position].push(wire);
+    }
+    releases
 }
 
 fn step_output(step: &Step) -> WireId {
@@ -367,6 +433,7 @@ fn step_output(step: &Step) -> WireId {
 
 fn resolve_wire<E, F>(
     operand: &Operand<WireId>,
+    evaluator: &mut E,
     families: &mut F,
     environment: &Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily>,
     indices: &[IntExpr],
@@ -385,7 +452,7 @@ where
         },
         Operand::Member { family, index } => match environment.wires.get(family) {
             Some(InputBinding::Family(value)) => {
-                families.wire_at(value, &substitute_indices(index, indices)?)
+                families.wire_at(evaluator, value, &substitute_indices(index, indices)?)
             }
             Some(InputBinding::Scalar(_)) => {
                 Err(ProgramLowerError::Program(ProgramValidationError::ExpectedFamilyWire(*family)))
@@ -563,6 +630,7 @@ mod tests {
 
         fn wire_at(
             &mut self,
+            _evaluator: &mut MockEvaluator,
             family: &Self::WireFamily,
             index: &IntExpr,
         ) -> Result<i32, ProgramLowerError<MockError>> {

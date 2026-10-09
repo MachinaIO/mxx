@@ -328,6 +328,7 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut WorkloadCollector<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {

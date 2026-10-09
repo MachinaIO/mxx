@@ -5,7 +5,10 @@
 //! the combination `d_i` (the same on keys and rows), the CRT coefficients,
 //! and the refresh children's chains, hash namespaces and artifact names.
 use super::*;
-use crate::{program::ExponentLutProgram, refresh::RefreshDeclaration};
+use crate::{
+    program::ExponentLutProgram,
+    refresh::{RefreshDeclaration, TopReference, top::TopRefreshDeclaration},
+};
 
 /// `refresh/<spec>/<role>`: the namespace of every refresh artifact.
 pub(crate) fn refresh_artifact_name(spec: [u8; 32], role: &str) -> String {
@@ -24,6 +27,29 @@ pub(crate) fn refresh_fresh_input_key_artifact_name(
     port: usize,
 ) -> String {
     refresh_fresh_artifact_name(spec, &format!("input-key/{wire:?}.{port}"))
+}
+
+/// `refresh/<spec>/mask/<role>`: an artifact of a top-refresh part's mask
+/// child.
+pub(crate) fn refresh_mask_artifact_name(spec: [u8; 32], role: &str) -> String {
+    refresh_artifact_name(spec, &format!("mask/{role}"))
+}
+
+/// The public-key artifact `port` of mask child input `wire`.
+pub(crate) fn refresh_mask_input_key_artifact_name(
+    spec: [u8; 32],
+    wire: WireId,
+    port: usize,
+) -> String {
+    refresh_mask_artifact_name(spec, &format!("input-key/{wire:?}.{port}"))
+}
+
+/// The hash namespace of a top-refresh part's mask child.
+pub fn refresh_mask_namespace(declaration: &RefreshDeclaration) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"mxx-exponent-lut/refresh/mask-namespace/v1");
+    digest.update(declaration.spec());
+    digest.finalize().into()
 }
 
 /// The hash namespace of `declaration`'s fresh-noise child (each decoder's
@@ -86,10 +112,24 @@ impl RnsBggParameters {
         let primes = parameters.to_crt().0;
         if level + 1 >= self.levels.len() ||
             primes.len() != declaration.primes() ||
-            parameters.modulus_digits() != declaration.columns() ||
             parameters.ring_dimension() as usize != declaration.coefficients() ||
             primes.iter().any(|prime| *prime <= u64::from(declaration.eta()))
         {
+            return Err(invalid);
+        }
+        let shape = match declaration.top() {
+            None => parameters.modulus_digits() == declaration.columns(),
+            // The output prime is the decoded prime and survives into the
+            // plaintext modulus of the level (the target action inverts the
+            // level's scale modulo it).
+            Some(part) => {
+                primes.get(part.output_prime()) == Some(&part.output_modulus()) &&
+                    self.level(level + 1)?.to_crt().0.contains(&part.output_modulus()) &&
+                    part.reference().ring_dimension == parameters.ring_dimension() &&
+                    part.reference().top.contains(&part.output_modulus())
+            }
+        };
+        if !shape {
             return Err(invalid);
         }
         Ok(level)
@@ -113,17 +153,29 @@ impl RnsBggParameters {
     pub(crate) fn refresh_fresh_level(
         declaration: &RefreshDeclaration,
     ) -> Result<usize, RnsBggError> {
-        let workload = RnsBggDerivedWorkload::from_program(declaration.fresh().program())?;
-        let levels = declaration
-            .fresh()
-            .outputs()
-            .iter()
-            .map(|wire| workload.level(*wire))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        match levels.into_iter().collect::<Vec<_>>().as_slice() {
-            [level] => Ok(*level),
-            _ => Err(RnsBggError::Parameters("fresh-noise outputs on different levels")),
-        }
+        noise_program_level(declaration.fresh())
+    }
+
+    /// The LUT input level of a top-refresh part's mask child output.
+    pub(crate) fn refresh_mask_level(
+        declaration: &RefreshDeclaration,
+    ) -> Result<usize, RnsBggError> {
+        let part =
+            declaration.top().ok_or(RnsBggError::Parameters("the refresh has no mask child"))?;
+        noise_program_level(part.mask())
+    }
+
+    /// The mask child's chain of a top-refresh part (see
+    /// [`Self::refresh_fresh_parameters`]).
+    pub fn refresh_mask_parameters(
+        &self,
+        declaration: &RefreshDeclaration,
+        source_program: &ExponentLutProgram,
+        pool: &DCRTPolyParams,
+        primes_per_drop: usize,
+    ) -> Result<Self, RnsBggError> {
+        let level = self.refresh_level(declaration, source_program)?;
+        self.child_chain(level, Self::refresh_mask_level(declaration)?, pool, primes_per_drop)
     }
 
     /// Check `fresh` and every chain of `smudges` (one per decoder, in
@@ -132,11 +184,19 @@ impl RnsBggParameters {
         &self,
         declaration: &RefreshDeclaration,
         source_program: &ExponentLutProgram,
+        mask: Option<&Self>,
         fresh: &Self,
         smudges: &[&Self],
     ) -> Result<usize, RnsBggError> {
         let level = self.refresh_level(declaration, source_program)?;
         self.validate_child_chain(fresh, level, Self::refresh_fresh_level(declaration)?)?;
+        match (declaration.top(), mask) {
+            (None, None) => {}
+            (Some(_), Some(mask)) => {
+                self.validate_child_chain(mask, level, Self::refresh_mask_level(declaration)?)?
+            }
+            _ => return Err(RnsBggError::Decoder(DecoderError::TargetMismatch)),
+        }
         if smudges.len() != declaration.decoders().len() {
             return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
@@ -147,7 +207,10 @@ impl RnsBggParameters {
     }
 
     /// The public `A' in R_Q^(2 x m)` of `declaration` at level `level`,
-    /// sampled from the stage hash key.
+    /// sampled from `hash_key` (the stage key; for a top-refresh part the key
+    /// of [`TopRefreshDeclaration::matrix_namespace`]). A top-refresh part's
+    /// `A'_(j)` is sampled in the reference's level-0 ring, the same for every
+    /// chain, and reduced to level `level`.
     pub(crate) fn refresh_matrix(
         &self,
         level: usize,
@@ -155,8 +218,15 @@ impl RnsBggParameters {
         declaration: &RefreshDeclaration,
     ) -> Result<Mat, RnsBggError> {
         let ring = self.ring(level)?;
-        let columns = self.level(level)?.modulus_digits();
-        Ok(ring.hash_matrix(hash_key, declaration.matrix_hash_tag(), (2, columns)))
+        match declaration.top() {
+            None => {
+                let columns = self.level(level)?.modulus_digits();
+                Ok(ring.hash_matrix(hash_key, declaration.matrix_hash_tag(), (2, columns)))
+            }
+            Some(part) => {
+                Ok(top_matrix(part.reference(), hash_key, declaration).reduce_modulus(&ring))
+            }
+        }
     }
 
     /// The public key `A_1` of the one encoding at level `level`: a public
@@ -176,12 +246,13 @@ impl RnsBggParameters {
     }
 
     /// The digit actions of prime `prime` at level `level` for the public
-    /// `a_prime = A'`.
+    /// `a_prime = A'` of `declaration`.
     pub(crate) fn refresh_actions(
         &self,
         level: usize,
         prime: usize,
         a_prime: Mat,
+        declaration: &RefreshDeclaration,
     ) -> Result<RefreshActions, RnsBggError> {
         let parameters = self.level(level)?;
         let modulus: BigUint = parameters.modulus().as_ref().clone();
@@ -194,11 +265,51 @@ impl RnsBggParameters {
         let cofactor = &modulus / q_i;
         let cofactor_scalar = self.scalar(level, BigInt::from(cofactor.clone()))?;
         let x = self.gadget_inverse(level, level, cofactor_scalar.clone() * a_prime)?;
-        let weight =
-            (cofactor_scalar * self.public_gadget(level)?).reduce_modulus(&self.ring(level + 1)?);
+        let weight = match declaration.top() {
+            None => (cofactor_scalar * self.public_gadget(level)?)
+                .reduce_modulus(&self.ring(level + 1)?),
+            Some(part) => self.top_target_weight(level, q_i, part.reference())?,
+        };
         let y = self.gadget_inverse(level + 1, level, weight)?;
         let z = self.gadget_inverse(level, level, self.scalar(level, BigInt::from(cofactor))?)?;
         Ok(RefreshActions { x, y, z })
+    }
+
+    /// The target weight `R_q` of a top-refresh part decoding the prime `q`
+    /// of level `level` (`1 x w_0`, ring of level `level + 1`):
+    /// `R_q = (Delta_l^-1 Q_q T_q mod q)` modulo `q` and `0` modulo the other
+    /// primes of level `l + 1`, with `T_q = Delta_0 G^st_0 mod q` of the
+    /// reference. Then `Delta_l G^st_l G^-1(R_q) = Q_q T_q (mod Q)`: modulo
+    /// `q` because `q` is a plaintext prime (`Delta_l` is invertible), and
+    /// modulo every other prime both sides vanish (see [`crate::refresh::top`]).
+    pub(crate) fn top_target_weight(
+        &self,
+        level: usize,
+        q: u64,
+        reference: &TopReference,
+    ) -> Result<Mat, RnsBggError> {
+        let invalid = RnsBggError::Parameters("the top refresh does not match its chain");
+        let modulus: BigUint = self.level(level)?.modulus().as_ref().clone();
+        let next_parameters = self.level(level + 1)?;
+        let next_modulus: BigUint = next_parameters.modulus().as_ref().clone();
+        let prime = BigUint::from(q);
+        if !(&next_modulus % &prime).is_zero() {
+            return Err(invalid);
+        }
+        let delta = &modulus / &next_modulus;
+        let cofactor = &modulus / &prime;
+        let kappa = (delta % &prime).modinv(&prime).ok_or(invalid)? * (cofactor % &prime) % &prime;
+        let next_cofactor = &next_modulus / &prime;
+        let idempotent = (&next_cofactor % &prime)
+            .modinv(&prime)
+            .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))? *
+            &next_cofactor %
+            &next_modulus;
+        let ring_q = Ring::from_crt_moduli(vec![IntExpr::from(q)], reference.ring_dimension);
+        let scalar = |ring: &Ring, value: BigUint| ring.polynomial([BigInt::from(value).into()]);
+        let target = top_reference_target(reference, &ring_q, q) * scalar(&ring_q, kappa);
+        let next = self.ring(level + 1)?;
+        Ok(target.centered_rebase(&next) * scalar(&next, idempotent))
     }
 
     /// The CRT recomposition of level `level`: its primes and the
@@ -222,6 +333,137 @@ impl RnsBggParameters {
             })
             .collect::<Result<Vec<_>, RnsBggError>>()?;
         Ok((primes.into_iter().map(IntExpr::from).collect(), coefficients))
+    }
+}
+
+/// The common LUT input level of the outputs of a refresh child of
+/// [`crate::refresh::FreshNoiseProgram`] shape.
+fn noise_program_level(program: &crate::refresh::FreshNoiseProgram) -> Result<usize, RnsBggError> {
+    let workload = RnsBggDerivedWorkload::from_program(program.program())?;
+    let levels = program
+        .outputs()
+        .iter()
+        .map(|wire| workload.level(*wire))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    match levels.into_iter().collect::<Vec<_>>().as_slice() {
+        [level] => Ok(*level),
+        _ => Err(RnsBggError::Parameters("refresh child outputs on different levels")),
+    }
+}
+
+/// The reference ring of `reference`: its level-0 primes in canonical order.
+pub(crate) fn top_reference_ring(reference: &TopReference) -> Ring {
+    Ring::from_crt_moduli(
+        reference.top.iter().copied().map(IntExpr::from).collect(),
+        reference.ring_dimension,
+    )
+}
+
+/// `T_q = Delta_0 G^st_0 mod q` of `reference` (`1 x w_0`, in `ring_q`):
+/// `G^st_0` is the gadget of the level-1 primes, its centered entries
+/// re-encoded at level 0 as the state gadget is.
+pub(crate) fn top_reference_target(reference: &TopReference, ring_q: &Ring, q: u64) -> Mat {
+    let next = Ring::from_crt_moduli(
+        reference.next.iter().copied().map(IntExpr::from).collect(),
+        reference.ring_dimension,
+    );
+    let gadget = next
+        .gadget(1, 1u64 << reference.base_bits, reference.columns())
+        .centered_rebase(&top_reference_ring(reference))
+        .reduce_modulus(ring_q);
+    let top: BigUint = reference.top.iter().map(|prime| BigUint::from(*prime)).product();
+    let next_modulus: BigUint = reference.next.iter().map(|prime| BigUint::from(*prime)).product();
+    let delta = (top / next_modulus) % q;
+    gadget * ring_q.polynomial([BigInt::from(delta).into()])
+}
+
+/// `A'_(j)` of a top-refresh part in the reference ring (`2 x w_0`).
+pub(crate) fn top_matrix(
+    reference: &TopReference,
+    hash_key: Bytes,
+    declaration: &RefreshDeclaration,
+) -> Mat {
+    top_reference_ring(reference).hash_matrix(
+        hash_key,
+        declaration.matrix_hash_tag(),
+        (2, reference.columns()),
+    )
+}
+
+/// `y_j` of a top refresh from its residues, one `1 x w_0` row per chain in
+/// the ring of that chain's output prime (chain order): each centered residue
+/// re-encoded in the reference ring times its CRT coefficient
+/// `Q_0 / q ((Q_0 / q)^-1 mod q)`, summed.
+pub(crate) fn top_refresh_combine(
+    reference: &TopReference,
+    residues: Vec<Mat>,
+) -> Result<Mat, RnsBggError> {
+    if residues.len() != reference.top.len() {
+        return Err(RnsBggError::Parameters("one residue per prime of the top refresh"));
+    }
+    let ring = top_reference_ring(reference);
+    let modulus: BigUint = reference.top.iter().map(|prime| BigUint::from(*prime)).product();
+    residues
+        .into_iter()
+        .zip(&reference.top)
+        .map(|(residue, prime)| {
+            let prime = BigUint::from(*prime);
+            let cofactor = &modulus / &prime;
+            let coefficient = (&cofactor % &prime)
+                .modinv(&prime)
+                .ok_or(RnsBggError::Parameters("refresh CRT primes are not coprime"))? *
+                cofactor %
+                &modulus;
+            Ok(residue.centered_rebase(&ring) * ring.polynomial([BigInt::from(coefficient).into()]))
+        })
+        .reduce(|sum, term| Ok(sum? + term?))
+        .ok_or(RnsBggError::Parameters("one residue per prime of the top refresh"))?
+}
+
+impl RnsBggParameters {
+    /// Chain `chain` of `declaration` (see [`crate::refresh::top`]): the
+    /// prefix chain of its pool order with `depths[l]` primes at level `l`,
+    /// and that pool, which also hosts the chain's children. `None` for
+    /// `chain` gives the reference chain (canonical order).
+    pub fn top_refresh_chain(
+        declaration: &TopRefreshDeclaration,
+        chain: Option<usize>,
+        encoding_error_sigma: impl Into<BigDecimal>,
+        operations_per_drop: usize,
+    ) -> Result<(DCRTPolyParams, Self), RnsBggError> {
+        let invalid = || RnsBggError::Parameters("invalid top refresh chain");
+        let reference = declaration.reference();
+        let order = match chain {
+            Some(chain) => declaration.pool_order(chain).ok_or_else(invalid)?,
+            None => {
+                let mut order = reference.top.clone();
+                order.extend(declaration.pool_order(0).ok_or_else(invalid)?.split_off(order.len()));
+                order
+            }
+        };
+        let bits = order
+            .iter()
+            .map(|prime| (u64::BITS - prime.leading_zeros()) as usize)
+            .max()
+            .ok_or_else(invalid)?;
+        let pool = DCRTPolyParams::try_new(
+            reference.ring_dimension,
+            order.len(),
+            bits,
+            reference.base_bits,
+            Some(order.clone()),
+            None,
+        )
+        .map_err(|_| RnsBggError::Parameters("invalid top refresh prime pool"))?;
+        let levels = declaration
+            .depths()
+            .iter()
+            .map(|depth| {
+                let modulus = order[..*depth].iter().map(|prime| BigUint::from(*prime)).product();
+                pool.select_modulus(&modulus).ok_or_else(invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((pool, Self::new(levels, encoding_error_sigma, operations_per_drop)?))
     }
 }
 
@@ -318,6 +560,110 @@ pub(crate) mod tests {
     /// mask times the same combination of the keys is exactly
     /// `-Q_i (s A' - Delta x G_Q + e')`: the decompositions `(I_2 ⊗ G_Q)^-1`,
     /// `G^st^-1(. mod q_(l+1))` and `G_Q^-1` reconstruct their weights.
+    /// On every chain of a top refresh, the target action of the output prime
+    /// `q` maps the level-`L` payload scale to the reference format:
+    /// `Delta_L G^st_L G^-1(R_q) = Q_q (Delta_0 G^st_0 mod q)` modulo `Q_L`,
+    /// with `T_q` the reference chain's own `Delta_0 G^st_0` modulo `q`;
+    /// reductions between rings of different prime orders agree; and the
+    /// residues of every chain recombine to the value modulo `Q_0`.
+    #[test]
+    fn top_refresh_target_weight_and_combination_are_exact() {
+        use crate::refresh::top::tests::{declaration, lut_source, primes, reference};
+        let (source, output) = lut_source(false);
+        let top = declaration(&source, output, vec![3, 2, 2]).unwrap();
+        let reference = reference();
+        let (reference_pool, reference_chain) =
+            RnsBggParameters::top_refresh_chain(&top, None, 0, 1).unwrap();
+        let ring_of = |prime: u64| Ring::from_crt_moduli(vec![IntExpr::from(prime)], 8);
+        let scalar = |ring: &Ring, value: BigUint| ring.polynomial([BigInt::from(value).into()]);
+        let canonical = top_reference_ring(&reference);
+        let hash = canonical.bytes_input("hash-key", 32);
+        let value = canonical.hash_matrix(hash.clone(), b"value".to_vec(), (1, 4));
+        let mut graph = DslContext::new("top-refresh-exact");
+        let mut parameters = reference_chain.levels().to_vec();
+        let mut residues = Vec::new();
+        for chain in 0..top.chains() {
+            let q = top.output_prime(chain).unwrap();
+            let (pool, chain_parameters) =
+                RnsBggParameters::top_refresh_chain(&top, Some(chain), 0, 1).unwrap();
+            parameters.extend(chain_parameters.levels().iter().cloned());
+            parameters.push(pool.select_modulus(&BigUint::from(q)).unwrap());
+            let level = top.level();
+            let ring = chain_parameters.ring(level).unwrap();
+            let modulus: BigUint =
+                chain_parameters.level(level).unwrap().modulus().as_ref().clone();
+            let weight = chain_parameters.top_target_weight(level, q, &reference).unwrap();
+            let y = chain_parameters.gadget_inverse(level + 1, level, weight).unwrap();
+            let delta = chain_parameters
+                .scalar(level, chain_parameters.message_scale(level).unwrap())
+                .unwrap();
+            let lhs = delta * chain_parameters.state_gadget(level).unwrap().mul_small_rhs(y);
+            let target = top_reference_target(&reference, &ring_of(q), q);
+            let rhs = scalar(&ring, &modulus / q) * target.clone().centered_rebase(&ring);
+            let expected =
+                (reference_chain.scalar(0, reference_chain.message_scale(0).unwrap()).unwrap() *
+                    reference_chain.state_gadget(0).unwrap())
+                .reduce_modulus(&ring_of(q));
+            let direct = value.clone().reduce_modulus(&ring_of(q));
+            let through_chain = value.clone().reduce_modulus(&ring).reduce_modulus(&ring_of(q));
+            residues.push(direct.clone());
+            graph = graph
+                .output(format!("action-{chain}"), lhs - rhs)
+                .unwrap()
+                .output(format!("target-{chain}"), target - expected)
+                .unwrap()
+                .output(format!("order-{chain}"), direct - through_chain)
+                .unwrap();
+        }
+        let combined = top_refresh_combine(&reference, residues).unwrap();
+        let graph = graph.output("combine", combined - value).unwrap().build().unwrap();
+        parameters.push(reference_pool);
+        assert_eq!(primes().len(), 16);
+        let result = execute_cpu(
+            &validate(&graph),
+            parameters,
+            std::collections::BTreeMap::from([(
+                "hash-key".to_owned(),
+                RuntimeValue::Bytes(rand::random::<[u8; 32]>().as_slice().into()),
+            )]),
+        );
+        for (name, output) in &result.outputs {
+            let matrix = full(output);
+            let (rows, columns) = matrix.size();
+            for row in 0..rows {
+                for column in 0..columns {
+                    assert!(
+                        matrix.entry(row, column).coeffs_biguints().iter().all(Zero::is_zero),
+                        "{name} is not zero at ({row}, {column})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A top-refresh part is checked against its own chain: on another
+    /// chain its output prime is not the decoding level's first prime, so
+    /// the part is rejected. Distinct chains derive distinct stage keys.
+    #[test]
+    fn top_refresh_parts_bind_to_their_chain() {
+        use crate::refresh::top::tests::{declaration, lut_source};
+        let (source, output) = lut_source(false);
+        let top = declaration(&source, output, vec![3, 2, 1]).unwrap();
+        let chain =
+            |index: usize| RnsBggParameters::top_refresh_chain(&top, Some(index), 0, 1).unwrap().1;
+        let (first, second) = (chain(0), chain(1));
+        let part = top.part(0, 1).unwrap();
+        assert_eq!(first.refresh_level(part, &source).unwrap(), 1);
+        assert!(second.refresh_level(part, &source).is_err(), "a swapped chain");
+        assert_eq!(first.level(2).unwrap().to_crt().0, vec![top.output_prime(0).unwrap()]);
+        let key = [5; 32];
+        let keys = (0..top.chains())
+            .map(|chain| child_hash_key(&key, &top.chain_namespace(chain)))
+            .chain(std::iter::once(child_hash_key(&key, &top.matrix_namespace())))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys.len(), top.chains() + 1);
+    }
+
     #[test]
     fn refresh_combination_of_exact_carriers_is_the_scaled_target_row() {
         let (_, parameters) = crate::rns_bgg::tests::decoder_test_chain();
@@ -371,7 +717,8 @@ pub(crate) mod tests {
         let modulus: BigUint = parameters.level(0).unwrap().modulus().as_ref().clone();
         let mut graph = DslContext::new("refresh-exact-carriers");
         for (prime, q_i) in parameters.level(0).unwrap().to_crt().0.into_iter().enumerate() {
-            let actions = parameters.refresh_actions(0, prime, a_prime.clone()).unwrap();
+            let actions =
+                parameters.refresh_actions(0, prime, a_prime.clone(), &declaration).unwrap();
             let decoded =
                 refresh_combination(one_row.clone(), target_row.clone(), &fresh_rows, &actions);
             let top = refresh_combination(
@@ -493,16 +840,20 @@ pub(crate) mod tests {
             .unwrap();
         let smudges = vec![&smudge; declaration.decoders().len()];
         assert_eq!(
-            parameters.validate_refresh_children(&declaration, &source, &fresh, &smudges).unwrap(),
+            parameters
+                .validate_refresh_children(&declaration, &source, None, &fresh, &smudges)
+                .unwrap(),
             0
         );
         assert!(
-            parameters.validate_refresh_children(&declaration, &source, &smudge, &smudges).is_err(),
+            parameters
+                .validate_refresh_children(&declaration, &source, None, &smudge, &smudges)
+                .is_err(),
             "the smudge chain is not the fresh chain"
         );
         assert!(
             parameters
-                .validate_refresh_children(&declaration, &source, &fresh, &smudges[1..])
+                .validate_refresh_children(&declaration, &source, None, &fresh, &smudges[1..])
                 .is_err()
         );
     }

@@ -323,6 +323,7 @@ mod tests {
 
         fn wire_at(
             &mut self,
+            _evaluator: &mut Depth,
             family: &usize,
             _: &IntExpr,
         ) -> Result<usize, ProgramLowerError<DepthError>> {

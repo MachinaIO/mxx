@@ -1,6 +1,6 @@
 # Exponent-LUT integration tests
 
-The integration suite contains exactly five GPU-gated targets. Each target
+The integration suite contains exactly six GPU-gated targets. Each target
 contains exactly one sequential test and runs the complete production flow:
 parameter search with noise simulation, benchmark estimation, then an
 artifact-backed round trip (preprocess, encrypt, and online evaluation). Benchmark estimation is the GPU runtime's
@@ -16,11 +16,13 @@ at `info` level (run with `RUST_LOG=info` to see it).
 | `public_ip.rs` | `public_ip_end_to_end` | Public inner product |
 | `decoder.rs` | `decoder_round_trip` | Smudged trapdoor decoder of a Program output |
 | `refresh.rs` | `refresh_round_trip` | Noise refresh of a Program output's encoding row |
+| `refresh_top.rs` | `refresh_top_round_trip` | Refresh of a Program output to a level-0 encoding under a new mask |
 
 The workflows use the public RNS-BGG application API (the decoder target applies
 the PRF-smudged decoder to the output of an identity Program, and the refresh
-target refreshes that output's encoding row, on fixed small chains without a
-lattice-security gate), and all five
+target refreshes that output's encoding row, and the top-refresh target
+re-encrypts an exponent LUT output on one chain per level-0 prime, all on fixed
+small chains without a lattice-security gate), and all six
 take the `dcrt_runtime` sequential lock. They require the `gpu` feature and a
 GPU-visible environment. Before execution, the NAND and Sparse-LWR targets
 search their configured CRT-depth and ring-dimension candidates, validate the
@@ -33,7 +35,8 @@ Parameter controls are namespaced per target rather than shared globally:
 `MXX_EXPONENT_LUT_NAND_*` controls the NAND workflow and
 `MXX_EXPONENT_LUT_LWR_PRF_*` controls Sparse-LWR,
 `MXX_EXPONENT_LUT_PUBLIC_IP_*` controls the public inner product, and
-`MXX_EXPONENT_LUT_DECODER_*` controls the decoder (its rustdoc lists the
+`MXX_EXPONENT_LUT_DECODER_*` controls the decoder, and `MXX_EXPONENT_LUT_REFRESH_*` and
+`MXX_EXPONENT_LUT_REFRESH_TOP_*` the two refresh targets (their rustdoc lists the
 variables). The decoder search accepts the first candidate whose smudge
 hides the simulated decoder noise and fits the decoding margin and whose
 two chains, the source and the smudge, reach the lattice-security target. Their
@@ -69,11 +72,12 @@ cargo test -r -p mxx-exponent-lut --features gpu \
   --test lwr_prf lwr_prf_end_to_end -- --nocapture
 ```
 
-Compile all five targets without running them:
+Compile all six targets without running them:
 
 ```sh
 cargo test -r -p mxx-exponent-lut --features gpu \
-  --test nand_circuit --test lwr_prf --test public_ip --test decoder --test refresh --no-run
+  --test nand_circuit --test lwr_prf --test public_ip --test decoder --test refresh \
+  --test refresh_top --no-run
 ```
 
 Run one target when GPU execution is explicitly authorized:
@@ -87,6 +91,10 @@ cargo test -r -p mxx-exponent-lut --features gpu \
   --test public_ip public_ip_end_to_end -- --nocapture
 cargo test -r -p mxx-exponent-lut --features gpu \
   --test decoder decoder_round_trip -- --nocapture
+cargo test -r -p mxx-exponent-lut --features gpu \
+  --test refresh refresh_round_trip -- --nocapture
+cargo test -r -p mxx-exponent-lut --features gpu \
+  --test refresh_top refresh_top_round_trip -- --nocapture
 ```
 
 The NAND target builds a complete binary NAND tree whose depth is controlled

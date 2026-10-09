@@ -50,8 +50,8 @@ pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{
     RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicRhs, RnsBggDynamicSetup,
-    RnsBggGaussian, RnsBggPackageSource, composed_automorphisms, covering_automorphism_layout,
-    helper_automorphisms, switching_automorphisms,
+    RnsBggGaussian, RnsBggPackageSource, covering_automorphism_layout, helper_automorphisms,
+    radix_depths, radix_step, switching_automorphisms,
 };
 pub use workload::RnsBggDerivedWorkload;
 

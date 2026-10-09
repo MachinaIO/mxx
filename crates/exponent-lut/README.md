@@ -31,10 +31,13 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   lookup: its output key and its lookup branches' product keys. Online evaluation imports them
   and accumulates only the encoding rows. Products and lookups inside family bodies recompute the
   same action from the setup.
-  A setup may split its cyclic group `H` into baby steps `B` and giant steps `G`
-  (`RnsBggDynamicSetup::with_baby_steps`): encryption then publishes switching packages for
-  `(B u G) \ {1}` only (about `2 sqrt |H|` instead of `|H| - 1`), and a branch `k = g b` is switched
-  as `Aut_g(Aut_b(c))`, which adds one decomposition gain to its noise.
+  A setup may decompose its cyclic group `H = <g>` of order `B^r` in radix `B`
+  (`RnsBggDynamicSetup::with_lut_radix`): encryption then publishes switching packages for
+  `K_B = {g^(a B^j) : 1 <= a < B, j < r}` only (`(B - 1) log_B |H|` instead of `|H| - 1`) and
+  helpers for `J_B = K_B u K_B^-1`. A branch `k = g^e` is switched once per nonzero radix-`B`
+  digit of `e`, from the branch without its top digit, so a lookup still performs `|H| - 1`
+  switches, in a tree of depth at most `log_B |H|`; each switch adds one decomposition gain to the
+  noise of the branches below it. `B = |H|` is the direct switching.
   A setup may also publish its fresh encodings compactly
   (`RnsBggDynamicSetup::with_compact_encodings`): each digit companion, automorphism helper, and
   private scalar input is a two-column row `s (Ã - p X I_2) + e` over `pq` for an extension `p` of

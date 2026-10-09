@@ -113,9 +113,9 @@ pub struct PeParameterRequest {
     pub key_queries: u64,
     /// `m_B,max`: the largest anchor accepted, which fixes the truncation multiplier.
     pub max_anchor_columns: usize,
-    /// The baby-step count of the LUT automorphism split (see
-    /// [`PeParameters::with_baby_steps`]); `None` switches every automorphism directly.
-    pub lut_baby_steps: Option<usize>,
+    /// The radix `B` of the LUT automorphism decomposition (see
+    /// [`PeParameters::with_lut_radix`]); `None` switches every automorphism directly (`B = W`).
+    pub lut_radix: Option<usize>,
     /// Publish the ciphertext's fresh encodings in two columns over `pq` (see
     /// [`PeParameters::with_compact_encodings`]).
     pub compact_encodings: bool,
@@ -176,7 +176,7 @@ pub struct PeParameters {
     key_cutoff: BigUint,
     anchor_columns: usize,
     statistical: Option<StatisticalSelection>,
-    baby_steps: Option<usize>,
+    lut_radix: Option<usize>,
     compact_extension: Option<Vec<u64>>,
     identity: [u8; 32],
 }
@@ -195,7 +195,7 @@ struct ParameterIdentity<'a> {
     anchor_columns: usize,
     statistical: &'a Option<StatisticalSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    baby_steps: Option<usize>,
+    lut_radix: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_extension: &'a Option<Vec<u64>>,
 }
@@ -236,6 +236,25 @@ fn chain(
 fn gadget_base(level: &DCRTPolyParams) -> Result<u32, PeError> {
     1u32.checked_shl(level.base_bits())
         .ok_or_else(|| PeError::Parameters("gadget base overflow".into()))
+}
+
+/// `|J_B|`: the helper automorphisms of `class` over rings of dimension `n` under the LUT radix
+/// `radix` (`W - 1` without one).
+fn helper_count(class: &PeClass, n: usize, radix: Option<usize>) -> Result<usize, PeError> {
+    let automorphisms = class
+        .layout()
+        .automorphism_indices(n)
+        .map_err(|error| PeError::Parameters(error.to_string()))?;
+    Ok(mxx_exponent_lut::rns_bgg::helper_automorphisms(&automorphisms, n, radix).len())
+}
+
+/// `r = log_B W`: the most helper switches on a path from row 1 to any row of the key simulation
+/// (`lem:keysim`) under the LUT radix `radix`, one per nonzero digit; one without a radix.
+fn radix_path_length(lookup_width: usize, radix: Option<usize>) -> usize {
+    match radix.filter(|radix| *radix >= 2 && *radix < lookup_width) {
+        Some(radix) => lookup_width.ilog(radix) as usize,
+        None => 1,
+    }
 }
 
 impl PeParameters {
@@ -357,7 +376,7 @@ impl PeParameters {
             key_cutoff,
             anchor_columns,
             statistical,
-            baby_steps: None,
+            lut_radix: None,
             compact_extension: None,
             identity: [0; 32],
         };
@@ -365,25 +384,51 @@ impl PeParameters {
         Ok(parameters)
     }
 
-    /// Split the LUT automorphism group `H` (of order `W`) into `baby_steps`
-    /// baby steps and `W / baby_steps` giant steps: encryption publishes
-    /// switching packages for about `2 sqrt W` automorphisms instead of `W - 1`,
-    /// and a branch `k = g b` is switched twice (see
-    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_baby_steps`).
-    /// `baby_steps` must divide `W`; `1` or `W` keeps the direct switching.
-    pub fn with_baby_steps(mut self, baby_steps: usize) -> Result<Self, PeError> {
-        let order = self.class.lookup_width();
-        if baby_steps == 0 || !order.is_multiple_of(baby_steps) {
-            return Err(PeError::Parameters("the baby steps must divide the lookup width".into()));
+    /// Decompose the LUT automorphism group `H = <g>` (of order `W = B^r`) in
+    /// radix `B`: encryption publishes switching packages for the `(B - 1) r`
+    /// automorphisms `K_B = {g^(a B^j)}` instead of `W - 1`, the key carries
+    /// helper blocks for `J_B = K_B u K_B^-1`, and a branch is switched once
+    /// per nonzero radix-`B` digit of its exponent, at most `r` times (see
+    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_lut_radix`). `B`
+    /// is a power of two with `B^r = W`; `B = W` keeps the direct switching.
+    /// `B < W` needs the cyclic group of `W <= n / 2`.
+    /// A `Strict` statistical selection bounds its key width with the radix,
+    /// so it takes the radix from its request ([`PeParameterRequest::lut_radix`]).
+    pub fn with_lut_radix(self, radix: usize) -> Result<Self, PeError> {
+        if self.statistical.as_ref().is_some_and(|selection| selection.witness_bound.is_some()) {
+            return Err(PeError::Parameters(
+                "a Strict selection takes its LUT radix from the request".into(),
+            ));
         }
-        self.baby_steps = (baby_steps != 1 && baby_steps != order).then_some(baby_steps);
+        self.lut_radix_unchecked(radix)
+    }
+
+    /// [`Self::with_lut_radix`] without the `Strict` check.
+    fn lut_radix_unchecked(mut self, radix: usize) -> Result<Self, PeError> {
+        let order = self.class.lookup_width();
+        let mut power = 1usize;
+        while radix >= 2 && power < order {
+            power = power.saturating_mul(radix);
+        }
+        if radix < 2 || !radix.is_power_of_two() || power != order {
+            return Err(PeError::Parameters(
+                "the LUT radix must be a power of two whose power is the lookup width".into(),
+            ));
+        }
+        if radix < order && 2 * order > self.level().ring_dimension() as usize {
+            return Err(PeError::Parameters(
+                "a LUT radix below the lookup width needs a cyclic group (W <= n / 2)".into(),
+            ));
+        }
+        self.lut_radix = (radix < order).then_some(radix);
         self.identity = self.digest();
         Ok(self)
     }
 
-    /// The baby-step count of the LUT automorphism split, if any.
-    pub const fn baby_steps(&self) -> Option<usize> {
-        self.baby_steps
+    /// The radix of the LUT automorphism decomposition, `None` if every
+    /// automorphism is switched directly.
+    pub const fn lut_radix(&self) -> Option<usize> {
+        self.lut_radix
     }
 
     /// Publish the ciphertext's fresh encodings (the digit companions, the
@@ -459,16 +504,9 @@ impl PeParameters {
         Ok(rings)
     }
 
-    /// `|P|`: the automorphisms with a published helper (`W - 1` without a split).
+    /// `|P| = |J_B|`: the automorphisms with a published helper (`W - 1` without a radix).
     pub fn helper_automorphism_count(&self) -> Result<usize, PeError> {
-        let n = self.level().ring_dimension() as usize;
-        let automorphisms = self
-            .class
-            .layout()
-            .automorphism_indices(n)
-            .map_err(|error| PeError::Parameters(error.to_string()))?;
-        Ok(mxx_exponent_lut::rns_bgg::helper_automorphisms(&automorphisms, n, self.baby_steps)
-            .len())
+        helper_count(&self.class, self.level().ring_dimension() as usize, self.lut_radix)
     }
 
     /// The parameters of `request` at CRT depth `depth`: the legacy contracts with the default
@@ -484,13 +522,14 @@ impl PeParameters {
                 RnsBggGaussian::with_default_cutoff(request.flooding_sigma.clone())?,
                 RnsBggGaussian::with_default_cutoff(request.programming_sigma.clone())?,
                 TrapdoorPreimageCutoffPolicy::Default,
-            ),
+            )
+            .and_then(|parameters| match request.lut_radix {
+                Some(radix) => parameters.with_lut_radix(radix),
+                None => Ok(parameters),
+            }),
+            // The statistical selection bounds the key width with the radix.
             TrapdoorMode::Statistical => Self::statistical_at(request, level),
         }?;
-        let parameters = match request.lut_baby_steps {
-            Some(baby_steps) => parameters.with_baby_steps(baby_steps)?,
-            None => parameters,
-        };
         if request.compact_encodings { parameters.with_compact_encodings() } else { Ok(parameters) }
     }
 
@@ -505,12 +544,24 @@ impl PeParameters {
         let digits = level.modulus_digits();
         let base = gadget_base(&level)?;
         let modulus = level.modulus().as_ref().clone();
+        let n = level.ring_dimension() as usize;
+        let automorphisms = class
+            .layout()
+            .automorphism_indices(n)
+            .map_err(|error| PeError::Parameters(error.to_string()))?;
         let shape = BudgetShape {
-            ring_dimension: level.ring_dimension() as usize,
+            ring_dimension: n,
             digits,
             attribute_length: class.attribute_length(),
             lookup_width: class.lookup_width(),
             crt_depth: level.crt_depth(),
+            switching_packages: mxx_exponent_lut::rns_bgg::switching_automorphisms(
+                &automorphisms,
+                n,
+                request.lut_radix,
+            )
+            .len(),
+            helpers: helper_count(&class, n, request.lut_radix)?,
         };
         let strict = request.key_width_policy == KeyWidthPolicy::Strict;
         let budget = StatisticalBudget::new(&BudgetRequest {
@@ -521,6 +572,7 @@ impl PeParameters {
             flooding_bits: request.flooding_statistical_bits,
             max_anchor_columns: request.max_anchor_columns,
             key_queries: strict.then_some(request.key_queries),
+            flooding_enforced: request.enforce_flooding,
             trapdoor_sigma: request.trapdoor_sigma,
             programming_sigma: &request.programming_sigma,
             randomness_sigma: &request.randomness_sigma,
@@ -562,14 +614,17 @@ impl PeParameters {
                 &request.randomness_sigma,
                 &randomness_bound,
                 programming.cutoff(),
+                request.lut_radix,
             )?;
             let m = 2 * digits;
             let w = class.lookup_width();
-            let key_length = w * budget.anchor_columns + w * (w - 1) * m + m;
+            let helpers = helper_count(&class, level.ring_dimension() as usize, request.lut_radix)?;
+            let key_length = w * budget.anchor_columns + w * helpers * m + m;
             let sample_right_sigma = budget.sample_right_sigma(
                 &shape,
                 &witness_bound,
                 key_length,
+                radix_path_length(w, request.lut_radix),
                 base,
                 gadget_sampler_sigma(base, request.trapdoor_sigma),
             )?;
@@ -611,7 +666,10 @@ impl PeParameters {
                 parameters.key_cutoff().bits()
             )));
         }
-        Ok(parameters)
+        match request.lut_radix {
+            Some(radix) => parameters.lut_radix_unchecked(radix),
+            None => Ok(parameters),
+        }
     }
 
     fn digest(&self) -> [u8; 32] {
@@ -633,7 +691,7 @@ impl PeParameters {
             key_cutoff: &self.key_cutoff,
             anchor_columns: self.anchor_columns,
             statistical: &self.statistical,
-            baby_steps: self.baby_steps,
+            lut_radix: self.lut_radix,
             compact_extension: &self.compact_extension,
         };
         let mut digest = Sha256::new();
@@ -733,7 +791,7 @@ impl PeParameters {
     }
 
     /// The key length `N = W m_B + W |P| m + m` in ring elements, for the `|P|`
-    /// helper automorphisms (`W - 1` without a split).
+    /// helper automorphisms (`W - 1` without a radix).
     pub fn key_length(&self) -> usize {
         let w = self.class.lookup_width();
         let helpers = self.helper_automorphism_count().unwrap_or(w - 1);
@@ -1003,5 +1061,79 @@ mod tests {
         let mut request = crate::test_support::statistical_request(class);
         request.max_anchor_columns = 8;
         assert!(PeParameters::at_depth(&request, 4).is_err());
+    }
+
+    /// The LUT radix `B` is a power of two with `B^r = W`: over rings of dimension 16, `W = 8`
+    /// takes `B = 2` (`|K_2| = 3`, so at most 6 helpers) and `B = 8` (the direct switching, 7
+    /// helpers) but not `B = 4` or `B = 3`, and `W = 16 = n`, whose group is not cyclic, takes
+    /// only the direct `B = 16`. The key length counts the `|J_B|` helpers.
+    #[test]
+    fn lut_radices_are_powers_of_two_of_the_lookup_width() {
+        let width_8 = crate::test_support::parameters(PeClass::new(1, 4, 2, 1).unwrap());
+        assert_eq!(width_8.class().lookup_width(), 8);
+        let radix_2 = width_8.clone().with_lut_radix(2).unwrap();
+        assert_eq!(radix_2.lut_radix(), Some(2));
+        let helpers = radix_2.helper_automorphism_count().unwrap();
+        assert!((3..=6).contains(&helpers), "{helpers}");
+        let m = radix_2.state_columns();
+        assert_eq!(radix_2.key_length(), 8 * radix_2.anchor_columns() + 8 * helpers * m + m);
+        let direct = width_8.clone().with_lut_radix(8).unwrap();
+        assert_eq!(direct.lut_radix(), None);
+        assert_eq!(direct.identity(), width_8.identity());
+        assert_eq!(direct.helper_automorphism_count().unwrap(), 7);
+        assert_ne!(radix_2.identity(), direct.identity());
+        for radix in [0, 1, 3, 4, 16] {
+            assert!(width_8.clone().with_lut_radix(radix).is_err(), "radix {radix}");
+        }
+        let width_16 = crate::test_support::parameters(PeClass::new(1, 8, 2, 1).unwrap());
+        assert_eq!(width_16.level().ring_dimension(), 16);
+        assert!(width_16.clone().with_lut_radix(2).is_err());
+        assert_eq!(width_16.with_lut_radix(16).unwrap().lut_radix(), None);
+    }
+
+    /// The ledger witness `B_R̂` follows the radix evaluation, whose branch of two nonzero digits
+    /// is switched twice, so it exceeds the direct one; a `Strict` selection takes the radix
+    /// from its request, bounds its witness and `s_SR` with it (`s_SR` over a helper path of
+    /// `log_B W = 2` steps), and rejects a later radix.
+    #[test]
+    fn the_witness_and_the_sample_right_width_follow_the_radix() {
+        let class = PeClass::new(1, 2, 2, 1).unwrap();
+        let request = crate::test_support::statistical_request(class);
+        let practical = PeParameters::at_depth(&request, 4).unwrap();
+        let rns = chain(&class, practical.level(), practical.flooding()).unwrap();
+        let longest = BranchingProgram::longest(class);
+        let witness = |radix| {
+            crate::noise::witness_bound(
+                &rns,
+                &class,
+                &longest,
+                &request.randomness_sigma,
+                &BigUint::from(64u8),
+                practical.programming().cutoff(),
+                radix,
+            )
+            .unwrap()
+        };
+        assert!(witness(Some(2)) > witness(None));
+        let mut strict = request.clone();
+        strict.key_width_policy = KeyWidthPolicy::Strict;
+        let mut radix = strict.clone();
+        radix.lut_radix = Some(2);
+        match (PeParameters::at_depth(&strict, 4), PeParameters::at_depth(&radix, 4)) {
+            (Ok(direct), Ok(split)) => {
+                assert_eq!(split.lut_radix(), Some(2));
+                let [direct, split] = [&direct, &split].map(|p| p.statistical().unwrap());
+                assert!(split.witness_bound > direct.witness_bound);
+                assert!(split.sample_right_sigma > direct.sample_right_sigma);
+                assert!(
+                    PeParameters::at_depth(&strict, 4).unwrap().with_lut_radix(2).is_err(),
+                    "a Strict selection fixes its radix"
+                );
+            }
+            (Err(PeError::Parameters(message)), _) | (_, Err(PeError::Parameters(message))) => {
+                assert!(message.contains("key cutoff"), "{message}")
+            }
+            (Err(error), _) | (_, Err(error)) => panic!("{error}"),
+        }
     }
 }

@@ -568,15 +568,69 @@ mod tests {
 
     /// The round trip of
     /// [`authorized_keys_of_several_predicates_decrypt_one_ciphertext`] with the lookup group
-    /// `H = {1, 9, 17, 25}` split into baby steps `{1, 9}` and giant steps `{1, 17}`: encryption
-    /// publishes the switching packages of `9` and `17` only, and the branch `25 = 17 * 9` is
-    /// switched twice.
+    /// `H = <9> = {1, 9, 17, 25}` in radix 2: encryption publishes the switching packages of
+    /// `K_2 = {9, 17}` only, and the branch `25 = 9^3` of two nonzero digits is switched twice,
+    /// from the branch `9`; radix 4 (= `W`) is the direct switching.
     #[test]
-    fn authorized_keys_decrypt_with_a_baby_step_split() {
+    fn authorized_keys_decrypt_over_radix_decompositions() {
         let class = PeClass::new(2, 2, 2, 2).unwrap();
-        let parameters = parameters(class).with_baby_steps(2).unwrap();
-        assert_eq!(parameters.baby_steps(), Some(2));
-        authorized_keys_decrypt(class, parameters);
+        let radix_2 = parameters(class).with_lut_radix(2).unwrap();
+        assert_eq!(radix_2.lut_radix(), Some(2));
+        assert!(radix_2.helper_automorphism_count().unwrap() <= 2 * 2);
+        authorized_keys_decrypt(class, radix_2);
+        let direct = parameters(class).with_lut_radix(4).unwrap();
+        assert_eq!(direct.lut_radix(), None);
+        assert_eq!(direct.identity(), parameters(class).identity());
+    }
+
+    /// A lookup of width `W = 8` in radix 2, whose branch `g^7` is switched three times (once per
+    /// binary digit): a random predicate's authorized key decrypts, within the simulated bound.
+    #[test]
+    fn a_radix_2_lookup_of_width_8_decrypts() {
+        let class = PeClass::new(1, 4, 2, 1).unwrap();
+        random_predicate_decrypts(class, parameters(class).with_lut_radix(2).unwrap());
+    }
+
+    /// [`family_values_open_to_the_secret_times_the_family_matrix`] under the LUT radix 2: the
+    /// helper blocks of `J_2` open as the direct ones do.
+    #[test]
+    fn radix_family_values_open_to_the_secret_times_the_family_matrix() {
+        let class = PeClass::new(2, 2, 2, 2).unwrap();
+        family_values_open(class, parameters(class).with_lut_radix(2).unwrap());
+    }
+
+    /// One authorized key of a random program of `class` decrypts a random message, with a phase
+    /// error within the simulated bound.
+    fn random_predicate_decrypts(class: PeClass, parameters: crate::PeParameters) {
+        let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class)).unwrap();
+        assert!(bound.decrypts(), "the parameters must guarantee correctness");
+        let mut execution = execution(&parameters);
+        let mut store = MemoryArtifactStore::default();
+        let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+        let dimension = parameters.level().ring_dimension() as usize;
+        let attribute = (0..class.attribute_length())
+            .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
+            .collect::<Vec<_>>();
+        let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+        let ciphertext =
+            encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+        let predicate = random_program(class, &attribute, 0);
+        let key = keygen(&public_key, &master, &predicate, &mut execution, &mut store).unwrap();
+        let evaluated =
+            evaluate(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
+        let decrypted =
+            decode(&public_key, &key, &ciphertext, &evaluated, &mut execution, &mut store).unwrap();
+        assert_eq!(decrypted, message);
+        let measured = phase_error(
+            &public_key,
+            &key,
+            &ciphertext,
+            &evaluated,
+            &message,
+            &mut execution,
+            &mut store,
+        );
+        assert!(measured <= bound.decryption, "{measured} > {}", bound.decryption);
     }
 
     /// One step `F(x) = x_0` with the companions, the helper, and the initial state published in

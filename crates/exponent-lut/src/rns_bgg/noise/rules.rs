@@ -620,35 +620,36 @@ impl RnsBggParameters {
             &input.payload_l1 * helper_error)
     }
 
-    /// One Dynamic LUT whose nonidentity branches are `direct` switches and
-    /// `composed` switches `Aut_g Aut_b` (see [`crate::rns_bgg::dynamic`]):
-    /// `S E + direct S E_Aut(E) + composed S E_Aut(E_Aut(E))`. Both switches
-    /// of a composed branch act on the input payload's automorphism, of the
-    /// same `l1` norm.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dynamic_composed_lut_noise_bound(
+    /// One Dynamic LUT whose nonidentity branches are switched `d` times for
+    /// `depths[d - 1]` of them (see [`crate::rns_bgg::dynamic`]):
+    /// `S E + sum_d depths[d - 1] S E_Aut^d(E)`, with `E_Aut^d` the bound of
+    /// `d` successive switches. Every switch acts on the input payload's
+    /// automorphism, of the same `l1` norm.
+    pub fn dynamic_radix_lut_noise_bound(
         &self,
         level: usize,
         input: &RnsBggNoiseBound,
-        direct: usize,
-        composed: usize,
+        depths: &[usize],
         companion_error: &BigUint,
         helper_error: &BigUint,
         output_payload_l1: BigUint,
     ) -> Result<RnsBggNoiseBound, RnsBggError> {
         let s = self.dynamic_scalar_action_gain(level)?;
-        let first =
-            self.dynamic_automorphism_noise_bound(level, input, companion_error, helper_error)?;
-        let switched =
-            RnsBggNoiseBound { error: first.clone(), payload_l1: input.payload_l1.clone() };
-        let second =
-            self.dynamic_automorphism_noise_bound(level, &switched, companion_error, helper_error)?;
-        Ok(RnsBggNoiseBound {
-            error: &s * &input.error +
-                BigUint::from(direct) * &s * first +
-                BigUint::from(composed) * &s * second,
-            payload_l1: output_payload_l1,
-        })
+        let mut error = &s * &input.error;
+        let mut switched = input.clone();
+        for count in depths {
+            switched = RnsBggNoiseBound {
+                error: self.dynamic_automorphism_noise_bound(
+                    level,
+                    &switched,
+                    companion_error,
+                    helper_error,
+                )?,
+                payload_l1: input.payload_l1.clone(),
+            };
+            error += BigUint::from(*count) * &s * &switched.error;
+        }
+        Ok(RnsBggNoiseBound { error, payload_l1: output_payload_l1 })
     }
 
     /// One Dynamic LUT with `branches` automorphisms (the identity among
@@ -682,6 +683,48 @@ mod test {
         super::test::{nested_alignment_parameters, value},
         *,
     };
+
+    /// The radix LUT bound adds, for the `depths[d - 1]` branches switched `d` times, the scalar
+    /// action of `d` successive switches, and reduces to the direct bound with every branch at
+    /// depth one.
+    #[test]
+    fn radix_lut_bounds_compose_one_switch_per_depth() {
+        let level = DCRTPolyParams::new(16, 4, 17, 6, None, None);
+        let parameters = RnsBggParameters::new(vec![level], bigdecimal::BigDecimal::from(1u8), 1)
+            .unwrap()
+            .with_rhs_mode(crate::rns_bgg::RhsMode::Dynamic);
+        let input = RnsBggNoiseBound { error: BigUint::from(1000u32), payload_l1: BigUint::one() };
+        let [companion, helper] = [7u8, 11].map(BigUint::from);
+        let s = parameters.dynamic_scalar_action_gain(0).unwrap();
+        let switch = |error: &BigUint| {
+            parameters
+                .dynamic_automorphism_noise_bound(
+                    0,
+                    &RnsBggNoiseBound { error: error.clone(), payload_l1: BigUint::one() },
+                    &companion,
+                    &helper,
+                )
+                .unwrap()
+        };
+        let once = switch(&input.error);
+        let twice = switch(&once);
+        let thrice = switch(&twice);
+        let bound = parameters
+            .dynamic_radix_lut_noise_bound(0, &input, &[3, 3, 1], &companion, &helper, 1u8.into())
+            .unwrap();
+        assert_eq!(
+            bound.error,
+            &s * &input.error + 3u8 * &s * &once + 3u8 * &s * &twice + &s * &thrice
+        );
+        let radix = parameters
+            .dynamic_radix_lut_noise_bound(0, &input, &[7], &companion, &helper, 1u8.into())
+            .unwrap();
+        let direct = parameters
+            .dynamic_lut_noise_bound(0, &input, 8, &companion, &helper, 1u8.into())
+            .unwrap();
+        assert_eq!(radix.error, direct.error);
+        assert!(bound.error > direct.error);
+    }
 
     fn alignment_rounding(
         alpha: &BigUint,

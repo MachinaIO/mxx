@@ -31,11 +31,14 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 - **One ciphertext for every predicate.** Packages are bound to setup coordinates, not to a
   Program, level, or table, so a ciphertext's size depends on the attribute length and the class's
   lookup width but not on the program length or the predicate.
-- **Baby-step giant-step packages.** `PeParameterRequest::lut_baby_steps` splits the lookup group
-  of `W` automorphisms: a ciphertext then carries switching packages for about `2 sqrt W`
-  automorphisms instead of `W - 1`, and a key carries `W |P|` helper blocks for the `|P|`
-  automorphisms with a published helper (the switching ones and their inverses), at one more
-  decomposition gain in the noise of a composed lookup branch.
+- **Radix-`B` lookups.** `PeParameterRequest::lut_radix` decomposes the cyclic lookup group of
+  `W = B^r` automorphisms in radix `B` (a power of two; `W <= n / 2` for `B < W`): a ciphertext
+  then carries switching packages for the `(B - 1) log_B W` automorphisms `K_B = {g^(a B^j)}`
+  instead of `W - 1`, and a key carries `W |J_B|` helper blocks for `J_B = K_B u K_B^-1`. A lookup
+  branch is switched once per nonzero radix-`B` digit of its exponent, at most `log_B W` times,
+  and the noise, the ledger witness `B_R̂`, and the `Strict` width `s_SR` (one decomposition gain
+  per step of a helper path) follow those switches. `B = W` (the default) is the direct
+  switching; `B < W` is outside the exported Lean correctness claim.
 - **Compact fresh encodings.** `PeParameterRequest::compact_encodings` publishes the digit
   companions, automorphism helpers, and the private input `c_0` as two-column rows
   `s (Ã - p X I_2) + e mod pq`, and decryption expands them to the full gadget width at `q`

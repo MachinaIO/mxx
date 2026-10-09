@@ -220,8 +220,8 @@ where
         class.layout(),
         parameters.distributions(),
     )?;
-    let dynamic = match parameters.baby_steps() {
-        Some(baby_steps) => dynamic.with_baby_steps(baby_steps)?,
+    let dynamic = match parameters.lut_radix() {
+        Some(radix) => dynamic.with_lut_radix(radix)?,
         None => dynamic,
     };
     let dynamic = match parameters.compact_extension() {

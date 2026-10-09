@@ -39,15 +39,15 @@ fn test_gpu_authorized_key_decrypts_on_the_gpu() {
     authorized_key_decrypts_on_the_gpu(class, parameters(class));
 }
 
-/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] over a statistical trapdoor with a baby-step
-/// split and compact encodings: the composed branch `25 = 17 * 9` reads compact helpers and
-/// companions in both switches, all on the GPU with the `q` and `pq` rings registered.
+/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] over a statistical trapdoor with the LUT radix
+/// 2 and compact encodings: the branch `25 = 17 * 9` of two nonzero digits reads compact helpers
+/// and companions in both switches, all on the GPU with the `q` and `pq` rings registered.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_gpu_compact_encodings_with_a_split_decrypt_on_the_gpu() {
+fn test_gpu_compact_encodings_with_a_radix_decrypt_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
     let parameters = crate::test_support::correct_parameters(class, true, |parameters| {
-        parameters.with_baby_steps(2).unwrap().with_compact_encodings().unwrap()
+        parameters.with_lut_radix(2).unwrap().with_compact_encodings().unwrap()
     });
     authorized_key_decrypts_on_the_gpu(class, parameters);
 }
@@ -77,12 +77,12 @@ fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParam
 }
 
 /// The measured noise of one authorized decryption against the simulated bounds, at parameters
-/// read from `MXX_PE_NOISE_*` (statistical, average case, no estimator): for each of `TRIALS`
-/// fresh ciphertexts and keys of a random maximal-length program, the evaluation error
-/// `e_F = c_F - A_F^(2) - s_bar A_F^(1)` of the output row (the secret is known to the test) and
-/// the phase error `phase - floor(q/2) m`, each as `log2` of its largest and root-mean-square
-/// centered coefficient, next to `log2 E_F`, `log2 E_PE`, and the average-case bias and standard
-/// deviation of [`crate::noise::simulate_average`].
+/// read from `MXX_PE_NOISE_*` (statistical, average case, compact encodings unless `COMPACT=0`,
+/// no estimator): for each of `TRIALS` fresh ciphertexts and keys of a random maximal-length
+/// program, the evaluation error `e_F = c_F - A_F^(2) - s_bar A_F^(1)` of the output row (the
+/// secret is known to the test) and the phase error `phase - floor(q/2) m`, each as `log2` of its
+/// largest and root-mean-square centered coefficient, next to `log2 E_F`, `log2 E_PE`, and the
+/// average-case bias and standard deviation of [`crate::noise::simulate_average`].
 #[test]
 #[ignore = "requires a CUDA GPU; measures noise"]
 fn test_gpu_measured_noise_against_the_bounds() {
@@ -150,8 +150,8 @@ fn test_gpu_measured_noise_against_the_bounds() {
         flooding_statistical_bits: DEFAULT_FLOODING_BITS,
         key_queries: 1 << 20,
         max_anchor_columns: 1024,
-        lut_baby_steps: Some(read("BABY_STEPS", 0usize)).filter(|steps| *steps > 0),
-        compact_encodings: read("COMPACT", 0usize) != 0,
+        lut_radix: Some(read("LUT_RADIX", 0usize)).filter(|radix| *radix > 0),
+        compact_encodings: read("COMPACT", 1usize) != 0,
         failure_exponent: Some(128),
         lattice_security_bits: None,
     };

@@ -12,7 +12,7 @@
 //! Decryption contracts the family row with the key by blocks. With the key
 //! cutoff `B_key`, the anchor blocks contribute `n B_key m_B B_b` each
 //! (`W` of them), the helper blocks `n B_key m B_h` each (`W |P|`, for the
-//! `|P|` helper automorphisms: `W - 1` without a baby-step split), and the
+//! `|P|` helper automorphisms: `W - 1` without a LUT radix, `|J_B|` with one), and the
 //! output block `n B_key m E_F`; with the message error `B_m`,
 //!
 //! `E_PE <= B_m + n B_key (W m_B B_b + W |P| m B_h + m E_F)`.
@@ -121,7 +121,7 @@ fn package_contracts(
     namespace: [u8; 32],
     distributions: RnsBggDynamicDistributions,
     ciphertext_error: &BigUint,
-    baby_steps: Option<usize>,
+    lut_radix: Option<usize>,
     compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggDynamicNoise, PeError> {
     let automorphisms = class
@@ -144,17 +144,17 @@ fn package_contracts(
         })
         .collect::<Result<BTreeMap<_, _>, PeError>>()?;
     debug_assert!(rhs.values().all(|package| package.coordinate == ATTRIBUTE_COORDINATE));
-    let composed = mxx_exponent_lut::rns_bgg::composed_automorphisms(
+    let depths = mxx_exponent_lut::rns_bgg::radix_depths(
+        &automorphisms,
         rns.levels()[0].ring_dimension() as usize,
-        automorphisms.len(),
-        baby_steps,
+        lut_radix,
     );
     Ok(RnsBggDynamicNoise {
         namespace,
         distributions,
         rhs,
         automorphisms,
-        composed,
+        depths,
         compact_extension: compact_extension.map(<[u64]>::to_vec),
     })
 }
@@ -167,7 +167,7 @@ fn evaluation_trace(
     namespace: [u8; 32],
     distributions: RnsBggDynamicDistributions,
     ciphertext_error: &BigUint,
-    baby_steps: Option<usize>,
+    lut_radix: Option<usize>,
     compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggNoiseTrace, PeError> {
     let compiled = program.compile()?;
@@ -198,7 +198,7 @@ fn evaluation_trace(
             namespace,
             distributions,
             ciphertext_error,
-            baby_steps,
+            lut_radix,
             compact_extension,
         )?);
     let workload = RnsBggDerivedWorkload::from_program_with_parameters(rns, compiled.program())?;
@@ -227,7 +227,9 @@ fn output_bound(trace: &RnsBggNoiseTrace) -> Result<BigUint, PeError> {
 /// add `J g^-1(A)`), so the simulator bounds it when every material contract is replaced by the
 /// bound of its witness: `R_0` for `c_0` and `R` for every digit companion, both bounded by
 /// `randomness_bound = B_R`, `J ∈ {0, 1}` for every helper, and `Z_t` (bounded by
-/// `programming_cutoff = B_Z`) for every attribute ciphertext.
+/// `programming_cutoff = B_Z`) for every attribute ciphertext. The evaluation is the one the
+/// LUT radix `lut_radix` performs (`lem:ledger` follows the switches actually applied).
+#[allow(clippy::too_many_arguments)]
 pub fn witness_bound(
     rns: &RnsBggParameters,
     class: &PeClass,
@@ -235,6 +237,7 @@ pub fn witness_bound(
     randomness_sigma: &BigDecimal,
     randomness_bound: &BigUint,
     programming_cutoff: &BigUint,
+    lut_radix: Option<usize>,
 ) -> Result<BigUint, PeError> {
     let randomness = RnsBggGaussian::new(randomness_sigma.clone(), randomness_bound.clone())?;
     let indicator = RnsBggGaussian::new(BigDecimal::from(1u8), 1u8.into())?;
@@ -251,7 +254,7 @@ pub fn witness_bound(
         *b"mxx-pe/witness-bound/namespace/1",
         distributions,
         programming_cutoff,
-        None,
+        lut_radix,
         None,
     )?)
 }
@@ -283,7 +286,7 @@ pub fn simulate(
         parameters.identity(),
         parameters.distributions(),
         &parameters.ciphertext_error_bound(),
-        parameters.baby_steps(),
+        parameters.lut_radix(),
         parameters.compact_extension(),
     )?;
     let evaluation = output_bound(&trace)?;

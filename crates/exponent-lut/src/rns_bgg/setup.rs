@@ -147,10 +147,10 @@ pub struct RnsBggDynamicSetup {
     rhs: BTreeMap<u32, RnsBggDynamicRhs>,
     automorphism_layout: ExpLayout,
     automorphisms: Vec<usize>,
-    /// The baby-step count `n_1` of a baby-step giant-step split of `H` (see
-    /// [`Self::with_baby_steps`]); `None` switches every automorphism directly.
+    /// The radix `B` of the LUT automorphism decomposition (see
+    /// [`Self::with_lut_radix`]); `None` switches every automorphism directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    baby_steps: Option<usize>,
+    lut_radix: Option<usize>,
     /// The CRT primes of the auxiliary modulus `p` of compact encodings (see
     /// [`Self::with_compact_encodings`]); `None` publishes every encoding at `q`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,7 +220,7 @@ impl RnsBggDynamicSetup {
             rhs,
             automorphism_layout: layout,
             automorphisms,
-            baby_steps: None,
+            lut_radix: None,
             compact_extension: None,
             distributions,
             schema: [0; 32],
@@ -247,25 +247,28 @@ impl RnsBggDynamicSetup {
         );
     }
 
-    /// Split the cyclic group `H = <g>` (`g = 1 + 2n/|H|`) into baby steps
-    /// `B = {g^i : i < n_1}` and giant steps `G = {g^(n_1 t) : t < |H| / n_1}`:
-    /// every `k = g^(n_1 t + i)` is then switched as `Aut_(g^(n_1 t))` after
-    /// `Aut_(g^i)`, so encryption publishes the switching packages of
-    /// `(B u G) \ {1}` only (about `2 sqrt |H|` instead of `|H| - 1`), and the
-    /// helpers of those automorphisms and their inverses. A composed branch
-    /// adds one decomposition gain to its noise. `n_1 = |H|` (or `1`) is the
-    /// direct switching of every automorphism.
-    pub fn with_baby_steps(mut self, baby_steps: usize) -> Result<Self, RnsBggError> {
+    /// Decompose the cyclic group `H = <g>` (`g = 1 + 2n/|H|`, `|H| = B^r`)
+    /// in radix `B`: encryption publishes the switching packages of
+    /// `K_B = {g^(a B^j) : 1 <= a < B, j < r}` only (`(B - 1) r` instead of
+    /// `|H| - 1`) and the helpers of `J_B = K_B u K_B^-1`, and a branch
+    /// `k = g^e` is switched once per nonzero radix-`B` digit of `e`: the
+    /// branch without the top digit, `parent(k)`, is switched by
+    /// `g^(a_top B^top)` ([`Self::radix_step`]). Each switch adds one
+    /// decomposition gain to the noise of the branches below it. `B` is a
+    /// power of two; `B = |H|` is the direct switching of every automorphism.
+    pub fn with_lut_radix(mut self, radix: usize) -> Result<Self, RnsBggError> {
         let order = self.automorphisms.len();
-        if baby_steps == 0 || !order.is_multiple_of(baby_steps) {
-            return Err(RnsBggError::Parameters("baby steps must divide the group order"));
+        if radix < 2 || !radix.is_power_of_two() || radix_digits(order, radix).is_none() {
+            return Err(RnsBggError::Parameters(
+                "the LUT radix must be a power of two whose power is the group order",
+            ));
         }
-        self.baby_steps = (baby_steps != 1 && baby_steps != order).then_some(baby_steps);
-        if self.baby_steps.is_some() {
+        self.lut_radix = (radix < order).then_some(radix);
+        if self.lut_radix.is_some() {
             let mut powers = self.generator_powers();
             powers.sort_unstable();
             if powers != self.automorphisms {
-                return Err(RnsBggError::Parameters("a baby-step split needs a cyclic group"));
+                return Err(RnsBggError::Parameters("a radix decomposition needs a cyclic group"));
             }
         }
         self.seal();
@@ -336,10 +339,10 @@ impl RnsBggDynamicSetup {
             })
     }
 
-    /// The baby-step count of the split, `None` if every automorphism is
-    /// switched directly.
-    pub fn baby_steps(&self) -> Option<usize> {
-        self.baby_steps
+    /// The radix of the LUT automorphism decomposition, `None` if every
+    /// automorphism is switched directly.
+    pub fn lut_radix(&self) -> Option<usize> {
+        self.lut_radix
     }
 
     /// `g^e mod 2n` for `e < |H|`, with `g = 1 + 2n/|H|`.
@@ -347,44 +350,31 @@ impl RnsBggDynamicSetup {
         generator_powers(self.ring_dimension as usize, self.automorphisms.len())
     }
 
-    /// The branches switched as a composition `Aut_g Aut_b` (both steps not
-    /// the identity) under the split; empty without one.
-    pub fn composed_automorphisms(&self) -> std::collections::BTreeSet<usize> {
-        composed_automorphisms(
-            self.ring_dimension as usize,
-            self.automorphisms.len(),
-            self.baby_steps,
-        )
+    /// The parent and the switch `(parent(k), g^(a_top B^top))` of a
+    /// nonidentity branch `k = g^e`, for the top nonzero radix-`B` digit
+    /// `a_top` of `e` (see [`Self::with_lut_radix`]); `(1, k)` without a
+    /// radix.
+    pub fn radix_step(&self, k: usize) -> Result<(usize, usize), RnsBggError> {
+        radix_step(&self.automorphisms, self.ring_dimension as usize, self.lut_radix, k)
     }
 
-    /// The giant and baby steps `(g^(n_1 t), g^i)` of `k = g^(n_1 t + i)`;
-    /// `(1, k)` without a split.
-    pub fn decomposition(&self, k: usize) -> Result<(usize, usize), RnsBggError> {
-        let Some(baby_steps) = self.baby_steps else {
-            self.automorphisms
-                .binary_search(&k)
-                .map_err(|_| RnsBggError::Parameters("automorphism is not a setup coordinate"))?;
-            return Ok((1, k));
-        };
-        let powers = self.generator_powers();
-        let exponent = powers
-            .iter()
-            .position(|power| *power == k)
-            .ok_or(RnsBggError::Parameters("automorphism is not a setup coordinate"))?;
-        Ok((powers[exponent - exponent % baby_steps], powers[exponent % baby_steps]))
+    /// The number of switches of every nonidentity automorphism (its nonzero
+    /// radix-`B` digits; one without a radix).
+    pub fn radix_depths(&self) -> BTreeMap<usize, usize> {
+        radix_depths(&self.automorphisms, self.ring_dimension as usize, self.lut_radix)
     }
 
     /// The automorphisms with a switching package, ascending: `H \ {1}`, or
-    /// `(B u G) \ {1}` with a split. The member order of the companion family.
+    /// `K_B` with a radix. The member order of the companion family.
     pub fn switching_automorphisms(&self) -> Vec<usize> {
-        switching_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.baby_steps)
+        switching_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.lut_radix)
     }
 
     /// The automorphisms with a published helper, ascending: the switching
     /// automorphisms and their inverses (`C_k` reads the helper of `k^-1`).
     /// The member order of the helper family.
     pub fn helper_automorphisms(&self) -> Vec<usize> {
-        helper_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.baby_steps)
+        helper_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.lut_radix)
     }
 
     /// The member of `k` in [`Self::switching_automorphisms`].
@@ -790,46 +780,94 @@ fn generator_powers(ring_dimension: usize, order: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The automorphisms `g^(n_1 t + i)` with `t, i > 0` of the cyclic group of
-/// `order` automorphisms split with `baby_steps = n_1` (see
-/// [`RnsBggDynamicSetup::with_baby_steps`]): the branches switched as a
-/// composition. Empty without a split.
-pub fn composed_automorphisms(
+/// `r` with `radix^r = order`, if any.
+fn radix_digits(order: usize, radix: usize) -> Option<usize> {
+    let mut power = 1usize;
+    let mut digits = 0;
+    while power < order {
+        power = power.checked_mul(radix)?;
+        digits += 1;
+    }
+    (power == order).then_some(digits)
+}
+
+/// The exponent `e` of `k = g^e` in the cyclic group `automorphisms` of rings
+/// of dimension `ring_dimension` (see [`generator_powers`]).
+fn generator_exponent(
+    automorphisms: &[usize],
     ring_dimension: usize,
-    order: usize,
-    baby_steps: Option<usize>,
-) -> std::collections::BTreeSet<usize> {
-    let Some(baby_steps) = baby_steps.filter(|steps| *steps > 1 && *steps < order) else {
-        return std::collections::BTreeSet::new();
+    k: usize,
+) -> Result<usize, RnsBggError> {
+    generator_powers(ring_dimension, automorphisms.len())
+        .iter()
+        .position(|power| *power == k)
+        .ok_or(RnsBggError::Parameters("automorphism is not a setup coordinate"))
+}
+
+/// The radix-`radix` decomposition step `(parent(k), switch)` of a
+/// nonidentity `k` (see [`RnsBggDynamicSetup::with_lut_radix`]): `(1, k)`
+/// without a radix.
+pub fn radix_step(
+    automorphisms: &[usize],
+    ring_dimension: usize,
+    radix: Option<usize>,
+    k: usize,
+) -> Result<(usize, usize), RnsBggError> {
+    if k == 1 || automorphisms.binary_search(&k).is_err() {
+        return Err(RnsBggError::Parameters("a radix step needs a nonidentity setup automorphism"));
+    }
+    let Some(radix) = radix.filter(|radix| *radix < automorphisms.len()) else {
+        return Ok((1, k));
     };
-    generator_powers(ring_dimension, order)
+    let exponent = generator_exponent(automorphisms, ring_dimension, k)?;
+    let mut top = 1;
+    while top * radix <= exponent {
+        top *= radix;
+    }
+    let switch = exponent - exponent % top;
+    let powers = generator_powers(ring_dimension, automorphisms.len());
+    Ok((powers[exponent - switch], powers[switch]))
+}
+
+/// The number of switches of every nonidentity automorphism of the group
+/// `automorphisms` under the radix `radix`: its exponent's nonzero digits,
+/// or one without a radix.
+pub fn radix_depths(
+    automorphisms: &[usize],
+    ring_dimension: usize,
+    radix: Option<usize>,
+) -> BTreeMap<usize, usize> {
+    let Some(radix) = radix.filter(|radix| *radix < automorphisms.len()) else {
+        return automorphisms.iter().filter(|k| **k != 1).map(|k| (*k, 1)).collect();
+    };
+    generator_powers(ring_dimension, automorphisms.len())
         .into_iter()
         .enumerate()
-        .filter(|(exponent, _)| *exponent >= baby_steps && exponent % baby_steps != 0)
-        .map(|(_, k)| k)
+        .skip(1)
+        .map(|(mut exponent, k)| {
+            let mut depth = 0;
+            while exponent > 0 {
+                depth += usize::from(exponent % radix != 0);
+                exponent /= radix;
+            }
+            (k, depth)
+        })
         .collect()
 }
 
 /// The automorphisms of the group `automorphisms` (ascending, of rings of
-/// dimension `ring_dimension`) with a switching package under the split
-/// `baby_steps` (see [`RnsBggDynamicSetup::with_baby_steps`]), ascending:
-/// `H \ {1}` without a split, else `(B u G) \ {1}`.
+/// dimension `ring_dimension`) with a switching package under the radix
+/// `radix` (see [`RnsBggDynamicSetup::with_lut_radix`]), ascending: `H \ {1}`
+/// without a radix, else `K_B = {g^(a B^j)}`.
 pub fn switching_automorphisms(
     automorphisms: &[usize],
     ring_dimension: usize,
-    baby_steps: Option<usize>,
+    radix: Option<usize>,
 ) -> Vec<usize> {
-    let order = automorphisms.len();
-    let Some(baby_steps) = baby_steps.filter(|steps| *steps > 1 && *steps < order) else {
-        return automorphisms.iter().copied().filter(|k| *k != 1).collect();
-    };
-    let mut switching = generator_powers(ring_dimension, order)
+    let mut switching = radix_depths(automorphisms, ring_dimension, radix)
         .into_iter()
-        .enumerate()
-        .filter(|(exponent, _)| {
-            *exponent != 0 && (*exponent < baby_steps || exponent % baby_steps == 0)
-        })
-        .map(|(_, k)| k)
+        .filter(|(_, depth)| *depth == 1)
+        .map(|(k, _)| k)
         .collect::<Vec<_>>();
     switching.sort_unstable();
     switching
@@ -840,10 +878,10 @@ pub fn switching_automorphisms(
 pub fn helper_automorphisms(
     automorphisms: &[usize],
     ring_dimension: usize,
-    baby_steps: Option<usize>,
+    radix: Option<usize>,
 ) -> Vec<usize> {
     let mut helpers = std::collections::BTreeSet::new();
-    for k in switching_automorphisms(automorphisms, ring_dimension, baby_steps) {
+    for k in switching_automorphisms(automorphisms, ring_dimension, radix) {
         helpers.insert(k);
         helpers.extend(automorphism_inverse(k, ring_dimension));
     }
@@ -874,38 +912,49 @@ fn stable_digest<T: Serialize>(domain: &[u8], value: &T) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    /// A split of the cyclic group of 16 automorphisms of a ring of dimension 64 into 4 baby
-    /// and 4 giant steps publishes 6 switching packages instead of 15; the composed branches are
-    /// the 9 with both steps nonidentity, each the product of a baby and a giant switch; and the
-    /// helpers are the switching automorphisms closed under inversion.
+    /// The cyclic group of 16 automorphisms of a ring of dimension 64 in radix 2 publishes the
+    /// 4 switching packages `g^(2^j)` and in radix 4 the 6 packages `g^(a 4^j)`; every branch is
+    /// its parent times its switch, its parent has one switch fewer, and its depth is its
+    /// exponent's nonzero digits. The helpers are the switching automorphisms closed under
+    /// inversion. Radix 16 (the group order) switches every automorphism directly.
     #[test]
-    fn a_baby_step_split_switches_two_square_roots_of_the_group() {
+    fn a_radix_decomposition_switches_each_nonzero_digit() {
         let n = 64;
         let group = ExpLayout { stride_log2: 0, width_log2: 4 }.automorphism_indices(n).unwrap();
-        assert_eq!(switching_automorphisms(&group, n, None), group[1..].to_vec());
-        assert_eq!(helper_automorphisms(&group, n, None), group[1..].to_vec());
-        assert!(composed_automorphisms(n, group.len(), None).is_empty());
-        let switching = switching_automorphisms(&group, n, Some(4));
-        let helpers = helper_automorphisms(&group, n, Some(4));
-        let composed = composed_automorphisms(n, group.len(), Some(4));
-        assert_eq!(switching.len(), 6);
-        assert_eq!(composed.len(), 9);
         let powers = generator_powers(n, group.len());
         let mut sorted = powers.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, group, "the group is cyclic");
-        for k in &group[1..] {
-            let exponent = powers.iter().position(|power| power == k).unwrap();
-            let (giant, baby) = (powers[exponent - exponent % 4], powers[exponent % 4]);
-            assert_eq!(giant * baby % (2 * n), *k);
-            assert_eq!(composed.contains(k), giant != 1 && baby != 1);
-            for step in [giant, baby].into_iter().filter(|step| *step != 1) {
-                assert!(switching.contains(&step), "{step} of {k} has no package");
-            }
+        for radix in [None, Some(16)] {
+            assert_eq!(switching_automorphisms(&group, n, radix), group[1..].to_vec());
+            assert_eq!(helper_automorphisms(&group, n, radix), group[1..].to_vec());
+            assert!(radix_depths(&group, n, radix).values().all(|depth| *depth == 1));
         }
-        for k in &switching {
-            assert!(helpers.contains(k));
-            assert!(helpers.contains(&automorphism_inverse(*k, n).unwrap()));
+        for (radix, digits) in [(2, 4), (4, 2)] {
+            let switching = switching_automorphisms(&group, n, Some(radix));
+            let helpers = helper_automorphisms(&group, n, Some(radix));
+            let depths = radix_depths(&group, n, Some(radix));
+            assert_eq!(switching.len(), (radix - 1) * digits);
+            assert!(helpers.len() <= 2 * switching.len());
+            assert_eq!(depths.values().max(), Some(&digits));
+            for k in &group[1..] {
+                let (parent, switch) = radix_step(&group, n, Some(radix), *k).unwrap();
+                assert_eq!(parent * switch % (2 * n), *k);
+                assert!(switching.contains(&switch), "{switch} of {k} has no package");
+                let parent_depth = if parent == 1 { 0 } else { depths[&parent] };
+                assert_eq!(parent_depth + 1, depths[k]);
+                let mut exponent = powers.iter().position(|power| power == k).unwrap();
+                let mut nonzero = 0;
+                while exponent > 0 {
+                    nonzero += usize::from(exponent % radix != 0);
+                    exponent /= radix;
+                }
+                assert_eq!(depths[k], nonzero);
+            }
+            for k in &switching {
+                assert!(helpers.contains(k));
+                assert!(helpers.contains(&automorphism_inverse(*k, n).unwrap()));
+            }
         }
     }
 }

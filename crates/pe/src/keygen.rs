@@ -93,7 +93,7 @@ impl PePredicateKey {
 }
 
 /// The canonical group `H` of the class, its inverses, the automorphisms
-/// `P` with a published helper (`H \ {1}`, or fewer under a baby-step split,
+/// `P` with a published helper (`H \ {1}`, or `J_B` under a LUT radix `B`,
 /// see [`mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::helper_automorphisms`]),
 /// and, for row `i` and `k` in `P`, the row `i k^-1` whose helper block
 /// `(i k^-1, k)` places `-G^(1)` in row `i`.
@@ -343,7 +343,18 @@ mod tests {
     #[test]
     fn keys_solve_the_implicit_family_matrix() {
         let class = PeClass::new(2, 2, 2, 2).unwrap();
-        let parameters = parameters(class);
+        keys_solve(class, parameters(class));
+    }
+
+    /// [`keys_solve_the_implicit_family_matrix`] under the LUT radix 2: the helper blocks are
+    /// those of `J_2`, fewer than `W - 1` per row.
+    #[test]
+    fn radix_keys_solve_the_implicit_family_matrix() {
+        let class = PeClass::new(2, 2, 2, 2).unwrap();
+        keys_solve(class, parameters(class).with_lut_radix(2).unwrap());
+    }
+
+    fn keys_solve(class: PeClass, parameters: crate::PeParameters) {
         let mut execution = execution(&parameters);
         let mut store = MemoryArtifactStore::default();
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();

@@ -150,7 +150,7 @@ pub(crate) fn statistical_request(class: PeClass) -> PeParameterRequest {
         flooding_statistical_bits: crate::budget::DEFAULT_FLOODING_BITS,
         key_queries: 1 << 20,
         max_anchor_columns: 4096,
-        lut_baby_steps: None,
+        lut_radix: None,
         compact_encodings: false,
         failure_exponent: None,
         lattice_security_bits: None,
@@ -206,4 +206,31 @@ pub(crate) fn equals(class: PeClass, pattern: &[usize]) -> BranchingProgram {
             .collect(),
     )
     .unwrap()
+}
+
+/// A random program of the class's maximal length whose output on `attribute` is `value`: random
+/// reads and intermediate tables, and a random final table with its reached entry set.
+pub(crate) fn random_program(
+    class: PeClass,
+    attribute: &[usize],
+    value: usize,
+) -> BranchingProgram {
+    let random = |bound: usize| rand::random::<u32>() as usize % bound;
+    let entries = class.state_width() * class.alphabet_size();
+    let steps = class.max_steps();
+    let reads = (0..steps).map(|_| random(class.attribute_length())).collect::<Vec<_>>();
+    let mut tables = (0..steps)
+        .map(|step| {
+            let bound = if step + 1 == steps { 2 } else { class.state_width() };
+            (0..entries).map(|_| random(bound)).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut state = 0;
+    for (read, table) in reads.iter().zip(&tables).take(steps - 1) {
+        state = table[state + class.state_width() * attribute[*read]];
+    }
+    tables[steps - 1][state + class.state_width() * attribute[reads[steps - 1]]] = value;
+    let program = BranchingProgram::new(class, reads, tables).unwrap();
+    assert_eq!(program.evaluate(attribute).unwrap(), value);
+    program
 }

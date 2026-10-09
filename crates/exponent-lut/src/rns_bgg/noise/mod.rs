@@ -97,10 +97,10 @@ pub struct RnsBggDynamicNoise {
     pub rhs: BTreeMap<RhsId, RnsBggPackageNoise>,
     /// The setup automorphism group, ascending.
     pub automorphisms: Vec<usize>,
-    /// The branches a baby-step split switches as a composition `Aut_g Aut_b`
-    /// ([`super::RnsBggDynamicSetup::composed_automorphisms`]); empty without
-    /// a split.
-    pub composed: std::collections::BTreeSet<usize>,
+    /// The number of switches of every nonidentity automorphism under the
+    /// setup's LUT radix ([`super::RnsBggDynamicSetup::radix_depths`]); an
+    /// automorphism without an entry is switched once.
+    pub depths: BTreeMap<usize, usize>,
     /// The CRT primes of the auxiliary modulus of compact encodings
     /// ([`super::RnsBggDynamicSetup::with_compact_encodings`]): the companion
     /// and helper errors are then the expanded bounds of
@@ -139,7 +139,7 @@ impl RnsBggDynamicNoise {
             distributions: distributions.clone(),
             rhs,
             automorphisms: setup.automorphisms().to_vec(),
-            composed: setup.composed_automorphisms(),
+            depths: setup.radix_depths(),
             compact_extension: setup.compact_extension().map(<[u64]>::to_vec),
         })
     }
@@ -177,7 +177,7 @@ impl RnsBggDynamicNoise {
             distributions,
             rhs,
             automorphisms,
-            composed: Default::default(),
+            depths: Default::default(),
             compact_extension: None,
         })
     }

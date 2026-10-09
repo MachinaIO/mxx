@@ -620,6 +620,37 @@ impl RnsBggParameters {
             &input.payload_l1 * helper_error)
     }
 
+    /// One Dynamic LUT whose nonidentity branches are `direct` switches and
+    /// `composed` switches `Aut_g Aut_b` (see [`crate::rns_bgg::dynamic`]):
+    /// `S E + direct S E_Aut(E) + composed S E_Aut(E_Aut(E))`. Both switches
+    /// of a composed branch act on the input payload's automorphism, of the
+    /// same `l1` norm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dynamic_composed_lut_noise_bound(
+        &self,
+        level: usize,
+        input: &RnsBggNoiseBound,
+        direct: usize,
+        composed: usize,
+        companion_error: &BigUint,
+        helper_error: &BigUint,
+        output_payload_l1: BigUint,
+    ) -> Result<RnsBggNoiseBound, RnsBggError> {
+        let s = self.dynamic_scalar_action_gain(level)?;
+        let first =
+            self.dynamic_automorphism_noise_bound(level, input, companion_error, helper_error)?;
+        let switched =
+            RnsBggNoiseBound { error: first.clone(), payload_l1: input.payload_l1.clone() };
+        let second =
+            self.dynamic_automorphism_noise_bound(level, &switched, companion_error, helper_error)?;
+        Ok(RnsBggNoiseBound {
+            error: &s * &input.error +
+                BigUint::from(direct) * &s * first +
+                BigUint::from(composed) * &s * second,
+            payload_l1: output_payload_l1,
+        })
+    }
+
     /// One Dynamic LUT with `branches` automorphisms (the identity among
     /// them): `S E + (branches - 1) S E_Aut`, the scalar action of every
     /// branch summed.

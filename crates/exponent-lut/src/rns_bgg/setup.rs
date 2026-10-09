@@ -147,6 +147,10 @@ pub struct RnsBggDynamicSetup {
     rhs: BTreeMap<u32, RnsBggDynamicRhs>,
     automorphism_layout: ExpLayout,
     automorphisms: Vec<usize>,
+    /// The baby-step count `n_1` of a baby-step giant-step split of `H` (see
+    /// [`Self::with_baby_steps`]); `None` switches every automorphism directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baby_steps: Option<usize>,
     distributions: RnsBggDynamicDistributions,
     /// The digest of the setup without its hash key: what the hash tags of
     /// its public matrices name. The hash key, which keys every expansion,
@@ -212,16 +216,122 @@ impl RnsBggDynamicSetup {
             rhs,
             automorphism_layout: layout,
             automorphisms,
+            baby_steps: None,
             distributions,
             schema: [0; 32],
             identity: [0; 32],
         };
-        setup.schema = stable_digest(
-            b"mxx-rns-bgg/dynamic-schema/v1",
-            &Self { hash_key_commitment: [0; 32], ..setup.clone() },
-        );
-        setup.identity = stable_digest(b"mxx-rns-bgg/dynamic-setup/v1", &setup);
+        setup.seal();
         Ok(setup)
+    }
+
+    /// Fix the schema and identity digests of the current fields.
+    fn seal(&mut self) {
+        self.schema = stable_digest(
+            b"mxx-rns-bgg/dynamic-schema/v1",
+            &Self {
+                hash_key_commitment: [0; 32],
+                schema: [0; 32],
+                identity: [0; 32],
+                ..self.clone()
+            },
+        );
+        self.identity = stable_digest(
+            b"mxx-rns-bgg/dynamic-setup/v1",
+            &Self { identity: [0; 32], ..self.clone() },
+        );
+    }
+
+    /// Split the cyclic group `H = <g>` (`g = 1 + 2n/|H|`) into baby steps
+    /// `B = {g^i : i < n_1}` and giant steps `G = {g^(n_1 t) : t < |H| / n_1}`:
+    /// every `k = g^(n_1 t + i)` is then switched as `Aut_(g^(n_1 t))` after
+    /// `Aut_(g^i)`, so encryption publishes the switching packages of
+    /// `(B u G) \ {1}` only (about `2 sqrt |H|` instead of `|H| - 1`), and the
+    /// helpers of those automorphisms and their inverses. A composed branch
+    /// adds one decomposition gain to its noise. `n_1 = |H|` (or `1`) is the
+    /// direct switching of every automorphism.
+    pub fn with_baby_steps(mut self, baby_steps: usize) -> Result<Self, RnsBggError> {
+        let order = self.automorphisms.len();
+        if baby_steps == 0 || !order.is_multiple_of(baby_steps) {
+            return Err(RnsBggError::Parameters("baby steps must divide the group order"));
+        }
+        self.baby_steps = (baby_steps != 1 && baby_steps != order).then_some(baby_steps);
+        if self.baby_steps.is_some() {
+            let mut powers = self.generator_powers();
+            powers.sort_unstable();
+            if powers != self.automorphisms {
+                return Err(RnsBggError::Parameters("a baby-step split needs a cyclic group"));
+            }
+        }
+        self.seal();
+        Ok(self)
+    }
+
+    /// The baby-step count of the split, `None` if every automorphism is
+    /// switched directly.
+    pub fn baby_steps(&self) -> Option<usize> {
+        self.baby_steps
+    }
+
+    /// `g^e mod 2n` for `e < |H|`, with `g = 1 + 2n/|H|`.
+    fn generator_powers(&self) -> Vec<usize> {
+        generator_powers(self.ring_dimension as usize, self.automorphisms.len())
+    }
+
+    /// The branches switched as a composition `Aut_g Aut_b` (both steps not
+    /// the identity) under the split; empty without one.
+    pub fn composed_automorphisms(&self) -> std::collections::BTreeSet<usize> {
+        composed_automorphisms(
+            self.ring_dimension as usize,
+            self.automorphisms.len(),
+            self.baby_steps,
+        )
+    }
+
+    /// The giant and baby steps `(g^(n_1 t), g^i)` of `k = g^(n_1 t + i)`;
+    /// `(1, k)` without a split.
+    pub fn decomposition(&self, k: usize) -> Result<(usize, usize), RnsBggError> {
+        let Some(baby_steps) = self.baby_steps else {
+            self.automorphisms
+                .binary_search(&k)
+                .map_err(|_| RnsBggError::Parameters("automorphism is not a setup coordinate"))?;
+            return Ok((1, k));
+        };
+        let powers = self.generator_powers();
+        let exponent = powers
+            .iter()
+            .position(|power| *power == k)
+            .ok_or(RnsBggError::Parameters("automorphism is not a setup coordinate"))?;
+        Ok((powers[exponent - exponent % baby_steps], powers[exponent % baby_steps]))
+    }
+
+    /// The automorphisms with a switching package, ascending: `H \ {1}`, or
+    /// `(B u G) \ {1}` with a split. The member order of the companion family.
+    pub fn switching_automorphisms(&self) -> Vec<usize> {
+        switching_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.baby_steps)
+    }
+
+    /// The automorphisms with a published helper, ascending: the switching
+    /// automorphisms and their inverses (`C_k` reads the helper of `k^-1`).
+    /// The member order of the helper family.
+    pub fn helper_automorphisms(&self) -> Vec<usize> {
+        helper_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.baby_steps)
+    }
+
+    /// The member of `k` in [`Self::switching_automorphisms`].
+    pub fn switching_member(&self, k: usize) -> Result<usize, RnsBggError> {
+        self.switching_automorphisms()
+            .iter()
+            .position(|candidate| *candidate == k)
+            .ok_or(RnsBggError::Parameters("automorphism has no switching package"))
+    }
+
+    /// The member of `k` in [`Self::helper_automorphisms`].
+    pub fn helper_member(&self, k: usize) -> Result<usize, RnsBggError> {
+        self.helper_automorphisms()
+            .iter()
+            .position(|candidate| *candidate == k)
+            .ok_or(RnsBggError::Parameters("automorphism has no helper"))
     }
 
     /// The setup of one Program whose inputs and RHS are its own
@@ -538,6 +648,77 @@ pub fn covering_automorphism_layout(program: &ExponentLutProgram) -> ExpLayout {
     ExpLayout { stride_log2: 0, width_log2 }
 }
 
+/// `g^e mod 2n` for `e < order`, with `g = 1 + 2n/order`: the cyclic group
+/// `H` of `order` automorphisms of rings of dimension `ring_dimension`, in
+/// exponent order.
+fn generator_powers(ring_dimension: usize, order: usize) -> Vec<usize> {
+    let modulus = 2 * ring_dimension;
+    let generator = (1 + modulus / order) % modulus;
+    std::iter::successors(Some(1usize), |power| Some(power * generator % modulus))
+        .take(order)
+        .collect()
+}
+
+/// The automorphisms `g^(n_1 t + i)` with `t, i > 0` of the cyclic group of
+/// `order` automorphisms split with `baby_steps = n_1` (see
+/// [`RnsBggDynamicSetup::with_baby_steps`]): the branches switched as a
+/// composition. Empty without a split.
+pub fn composed_automorphisms(
+    ring_dimension: usize,
+    order: usize,
+    baby_steps: Option<usize>,
+) -> std::collections::BTreeSet<usize> {
+    let Some(baby_steps) = baby_steps.filter(|steps| *steps > 1 && *steps < order) else {
+        return std::collections::BTreeSet::new();
+    };
+    generator_powers(ring_dimension, order)
+        .into_iter()
+        .enumerate()
+        .filter(|(exponent, _)| *exponent >= baby_steps && exponent % baby_steps != 0)
+        .map(|(_, k)| k)
+        .collect()
+}
+
+/// The automorphisms of the group `automorphisms` (ascending, of rings of
+/// dimension `ring_dimension`) with a switching package under the split
+/// `baby_steps` (see [`RnsBggDynamicSetup::with_baby_steps`]), ascending:
+/// `H \ {1}` without a split, else `(B u G) \ {1}`.
+pub fn switching_automorphisms(
+    automorphisms: &[usize],
+    ring_dimension: usize,
+    baby_steps: Option<usize>,
+) -> Vec<usize> {
+    let order = automorphisms.len();
+    let Some(baby_steps) = baby_steps.filter(|steps| *steps > 1 && *steps < order) else {
+        return automorphisms.iter().copied().filter(|k| *k != 1).collect();
+    };
+    let mut switching = generator_powers(ring_dimension, order)
+        .into_iter()
+        .enumerate()
+        .filter(|(exponent, _)| {
+            *exponent != 0 && (*exponent < baby_steps || exponent % baby_steps == 0)
+        })
+        .map(|(_, k)| k)
+        .collect::<Vec<_>>();
+    switching.sort_unstable();
+    switching
+}
+
+/// The automorphisms with a published helper: the switching automorphisms
+/// ([`switching_automorphisms`]) and their inverses, ascending.
+pub fn helper_automorphisms(
+    automorphisms: &[usize],
+    ring_dimension: usize,
+    baby_steps: Option<usize>,
+) -> Vec<usize> {
+    let mut helpers = std::collections::BTreeSet::new();
+    for k in switching_automorphisms(automorphisms, ring_dimension, baby_steps) {
+        helpers.insert(k);
+        helpers.extend(automorphism_inverse(k, ring_dimension));
+    }
+    helpers.into_iter().collect()
+}
+
 /// The automorphism index `k^-1 mod 2n` inverting `X -> X^k`.
 pub(crate) fn automorphism_inverse(k: usize, ring_dimension: usize) -> Option<usize> {
     let order = BigUint::from(2 * ring_dimension);
@@ -556,4 +737,44 @@ fn stable_digest<T: Serialize>(domain: &[u8], value: &T) -> [u8; 32] {
     digest.update((encoded.len() as u64).to_le_bytes());
     digest.update(encoded);
     digest.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A split of the cyclic group of 16 automorphisms of a ring of dimension 64 into 4 baby
+    /// and 4 giant steps publishes 6 switching packages instead of 15; the composed branches are
+    /// the 9 with both steps nonidentity, each the product of a baby and a giant switch; and the
+    /// helpers are the switching automorphisms closed under inversion.
+    #[test]
+    fn a_baby_step_split_switches_two_square_roots_of_the_group() {
+        let n = 64;
+        let group = ExpLayout { stride_log2: 0, width_log2: 4 }.automorphism_indices(n).unwrap();
+        assert_eq!(switching_automorphisms(&group, n, None), group[1..].to_vec());
+        assert_eq!(helper_automorphisms(&group, n, None), group[1..].to_vec());
+        assert!(composed_automorphisms(n, group.len(), None).is_empty());
+        let switching = switching_automorphisms(&group, n, Some(4));
+        let helpers = helper_automorphisms(&group, n, Some(4));
+        let composed = composed_automorphisms(n, group.len(), Some(4));
+        assert_eq!(switching.len(), 6);
+        assert_eq!(composed.len(), 9);
+        let powers = generator_powers(n, group.len());
+        let mut sorted = powers.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, group, "the group is cyclic");
+        for k in &group[1..] {
+            let exponent = powers.iter().position(|power| power == k).unwrap();
+            let (giant, baby) = (powers[exponent - exponent % 4], powers[exponent % 4]);
+            assert_eq!(giant * baby % (2 * n), *k);
+            assert_eq!(composed.contains(k), giant != 1 && baby != 1);
+            for step in [giant, baby].into_iter().filter(|step| *step != 1) {
+                assert!(switching.contains(&step), "{step} of {k} has no package");
+            }
+        }
+        for k in &switching {
+            assert!(helpers.contains(k));
+            assert!(helpers.contains(&automorphism_inverse(*k, n).unwrap()));
+        }
+    }
 }

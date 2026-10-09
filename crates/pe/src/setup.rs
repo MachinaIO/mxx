@@ -220,6 +220,10 @@ where
         class.layout(),
         parameters.distributions(),
     )?;
+    let dynamic = match parameters.baby_steps() {
+        Some(baby_steps) => dynamic.with_baby_steps(baby_steps)?,
+        None => dynamic,
+    };
     let ring = rns.ring(0)?;
     let level = parameters.level();
     let trapdoor = ring.sample_trapdoor_with_width(

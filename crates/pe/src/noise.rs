@@ -11,10 +11,11 @@
 //!
 //! Decryption contracts the family row with the key by blocks. With the key
 //! cutoff `B_key`, the anchor blocks contribute `n B_key m_B B_b` each
-//! (`W` of them), the helper blocks `n B_key m B_h` each (`W (W - 1)`), and
-//! the output block `n B_key m E_F`; with the message error `B_m`,
+//! (`W` of them), the helper blocks `n B_key m B_h` each (`W |P|`, for the
+//! `|P|` helper automorphisms: `W - 1` without a baby-step split), and the
+//! output block `n B_key m E_F`; with the message error `B_m`,
 //!
-//! `E_PE <= B_m + n B_key (W m_B B_b + W (W - 1) m B_h + m E_F)`.
+//! `E_PE <= B_m + n B_key (W m_B B_b + W |P| m B_h + m E_F)`.
 //!
 //! The decoder rounds each coefficient of `floor(q/2) m + e` to the nearer of
 //! `0` and `floor(q/2)`, i.e. `round(2 x / q) mod 2`; for `q` odd it returns
@@ -33,9 +34,9 @@
 //! - The rest is a linear form in the extension coordinates `v`, which key generation samples from
 //!   a discrete Gaussian of standard deviation `s_key`, independently of encryption. Its
 //!   coefficients are the coefficients of the errors `e_(h,k)` and `e_F`, so its energy is at most
-//!   `W (W - 1) m n B_h^2 + m n E_F^2` on every run. A linear form in fresh sub-Gaussian
-//!   coordinates of proxy `s_key^2` with coefficients of energy at most `E` exceeds `t` in absolute
-//!   value with probability at most `2 exp(-t^2 / (2 s_key^2 E))`.
+//!   `W |P| m n B_h^2 + m n E_F^2` on every run. A linear form in fresh sub-Gaussian coordinates of
+//!   proxy `s_key^2` with coefficients of energy at most `E` exceeds `t` in absolute value with
+//!   probability at most `2 exp(-t^2 / (2 s_key^2 E))`.
 //!
 //! Decryption fails with probability at most `2^-k` over the `n` coefficients when
 //! `B_m + W m_B n B_b B_key + z s_key sqrt(E) < (q - 2) / 4`, with `z^2 = 2 ln 2 (k + ceil(log2 n)
@@ -120,6 +121,7 @@ fn package_contracts(
     namespace: [u8; 32],
     distributions: RnsBggDynamicDistributions,
     ciphertext_error: &BigUint,
+    baby_steps: Option<usize>,
 ) -> Result<RnsBggDynamicNoise, PeError> {
     let automorphisms = class
         .layout()
@@ -141,7 +143,12 @@ fn package_contracts(
         })
         .collect::<Result<BTreeMap<_, _>, PeError>>()?;
     debug_assert!(rhs.values().all(|package| package.coordinate == ATTRIBUTE_COORDINATE));
-    Ok(RnsBggDynamicNoise { namespace, distributions, rhs, automorphisms })
+    let composed = mxx_exponent_lut::rns_bgg::composed_automorphisms(
+        rns.levels()[0].ring_dimension() as usize,
+        automorphisms.len(),
+        baby_steps,
+    );
+    Ok(RnsBggDynamicNoise { namespace, distributions, rhs, automorphisms, composed })
 }
 
 /// The exponent-lut simulator's trace of `program` over `rns` under the given material contracts.
@@ -152,6 +159,7 @@ fn evaluation_trace(
     namespace: [u8; 32],
     distributions: RnsBggDynamicDistributions,
     ciphertext_error: &BigUint,
+    baby_steps: Option<usize>,
 ) -> Result<RnsBggNoiseTrace, PeError> {
     let compiled = program.compile()?;
     let initial = RnsBggNoiseValue::sampled_gaussian(
@@ -169,6 +177,7 @@ fn evaluation_trace(
             namespace,
             distributions,
             ciphertext_error,
+            baby_steps,
         )?);
     let workload = RnsBggDerivedWorkload::from_program_with_parameters(rns, compiled.program())?;
     Ok(api::noise_simulate(
@@ -220,6 +229,7 @@ pub fn witness_bound(
         *b"mxx-pe/witness-bound/namespace/1",
         distributions,
         programming_cutoff,
+        None,
     )?)
 }
 
@@ -236,14 +246,16 @@ pub fn simulate(
         parameters.identity(),
         parameters.distributions(),
         &parameters.ciphertext_error_bound(),
+        parameters.baby_steps(),
     )?;
     let evaluation = output_bound(&trace)?;
     let w = BigUint::from(parameters.class().lookup_width());
+    let p = BigUint::from(parameters.helper_automorphism_count()?);
     let m = BigUint::from(parameters.state_columns());
     let m_b = BigUint::from(parameters.anchor_columns());
     let n = BigUint::from(parameters.level().ring_dimension());
     let error = parameters.error().cutoff();
-    let blocks = &w * &m_b * error + &w * (&w - 1u8) * &m * error + &m * &evaluation;
+    let blocks = &w * &m_b * error + &w * &p * &m * error + &m * &evaluation;
     let decryption = error + n * parameters.key_cutoff() * blocks;
     Ok(PeNoiseReport {
         evaluation,
@@ -266,10 +278,11 @@ pub fn simulate_average(
     let mut report = simulate(parameters, program)?;
     let class = parameters.class();
     let w = BigUint::from(class.lookup_width());
+    let p = BigUint::from(parameters.helper_automorphism_count()?);
     let m = BigUint::from(parameters.state_columns());
     let n = BigUint::from(parameters.level().ring_dimension());
     let error = parameters.error().cutoff();
-    let energy = &w * (&w - 1u8) * &m * &n * error.pow(2) + &m * &n * report.evaluation.pow(2);
+    let energy = &w * &p * &m * &n * error.pow(2) + &m * &n * report.evaluation.pow(2);
     let bias = error +
         &w * BigUint::from(parameters.anchor_columns()) * &n * error * parameters.key_cutoff();
     let moments = NoiseMoments {

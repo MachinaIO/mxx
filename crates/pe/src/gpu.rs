@@ -123,6 +123,7 @@ fn test_gpu_measured_noise_against_the_bounds() {
         flooding_statistical_bits: DEFAULT_FLOODING_BITS,
         key_queries: 1 << 20,
         max_anchor_columns: 1024,
+        lut_baby_steps: Some(read("BABY_STEPS", 0usize)).filter(|steps| *steps > 0),
         failure_exponent: Some(128),
         lattice_security_bits: None,
     };

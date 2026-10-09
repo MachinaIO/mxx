@@ -97,6 +97,10 @@ pub struct RnsBggDynamicNoise {
     pub rhs: BTreeMap<RhsId, RnsBggPackageNoise>,
     /// The setup automorphism group, ascending.
     pub automorphisms: Vec<usize>,
+    /// The branches a baby-step split switches as a composition `Aut_g Aut_b`
+    /// ([`super::RnsBggDynamicSetup::composed_automorphisms`]); empty without
+    /// a split.
+    pub composed: std::collections::BTreeSet<usize>,
 }
 
 impl RnsBggDynamicNoise {
@@ -130,6 +134,7 @@ impl RnsBggDynamicNoise {
             distributions: distributions.clone(),
             rhs,
             automorphisms: setup.automorphisms().to_vec(),
+            composed: setup.composed_automorphisms(),
         })
     }
 
@@ -161,7 +166,7 @@ impl RnsBggDynamicNoise {
                 )
             })
             .collect();
-        Ok(Self { namespace, distributions, rhs, automorphisms })
+        Ok(Self { namespace, distributions, rhs, automorphisms, composed: Default::default() })
     }
 }
 

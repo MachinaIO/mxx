@@ -283,7 +283,9 @@ impl<'a> RnsEncryptBuild<'a> {
                 .transferred_output(name(dynamic_companion_role(*coordinate)), companions)
                 .map_err(ApiError::scheme)?;
         }
-        let automorphisms = setup.nonidentity_automorphisms().to_vec();
+        // The switching packages of `switching_automorphisms` and the helpers of
+        // `helper_automorphisms` (all of `H \ {1}` without a baby-step split).
+        let automorphisms = setup.switching_automorphisms();
         if automorphisms.is_empty() {
             return Ok(graph);
         }
@@ -296,7 +298,7 @@ impl<'a> RnsEncryptBuild<'a> {
             .map_err(ApiError::scheme)?;
         let inverse_members = inverses
             .iter()
-            .map(|k| setup.automorphism_member(*k))
+            .map(|k| setup.helper_member(*k))
             .collect::<Result<Vec<_>, _>>()
             .map_err(ApiError::scheme)?;
         // Every `C_k` once, from the helper of `k^-1`; the companion lanes
@@ -418,16 +420,17 @@ impl<'a> RnsEncryptBuild<'a> {
         Ok(graph)
     }
 
-    /// The helper `h_k = s H_k - s_k G + e_h` of every nonidentity setup
-    /// automorphism `k`, member `i` for the `i`-th, with its error under the
-    /// setup's helper contract. `s_k G = (sigma_k(s_bar) g, g)`.
+    /// The helper `h_k = s H_k - s_k G + e_h` of every helper automorphism `k`
+    /// of the setup ([`RnsBggDynamicSetup::helper_automorphisms`]), member `i`
+    /// for the `i`-th, with its error under the setup's helper contract.
+    /// `s_k G = (sigma_k(s_bar) g, g)`.
     fn automorphism_helpers(
         &self,
         setup: &RnsBggDynamicSetup,
         payload: &RnsBggRow,
         hash_key: &Bytes,
     ) -> Result<Family<RnsBggRow>, RnsBggError> {
-        let automorphisms = setup.nonidentity_automorphisms();
+        let automorphisms = &setup.helper_automorphisms();
         let ring = self.parameters.ring(0)?;
         let columns = self.parameters.component_columns(0)?;
         let gadget = self.parameters.public_gadget(0)?;
@@ -641,18 +644,19 @@ impl EncodingLowering<'_> {
             )?;
             self.rhs_companions.insert(*rhs, family);
         }
-        let automorphisms = state.setup.nonidentity_automorphisms().len();
-        let imported = (automorphisms > 0)
+        let switching = state.setup.switching_automorphisms().len();
+        let helpers = state.setup.helper_automorphisms().len();
+        let imported = (switching > 0)
             .then(|| {
                 Ok::<_, RnsBggError>((
                     self.encryption_row_family(
                         AUTOMORPHISM_HELPER_ROLE.to_owned(),
-                        automorphisms,
+                        helpers,
                         columns,
                     )?,
                     self.encryption_row_family(
                         AUTOMORPHISM_COMPANION_ROLE.to_owned(),
-                        automorphisms * count,
+                        switching * count,
                         digits,
                     )?,
                 ))
@@ -765,6 +769,64 @@ impl EncodingLowering<'_> {
         Ok(Some(((k00, k01), (k10, k11))).map(|key| (key, branches)))
     }
 
+    /// `Aut_k` of an encoding row (see [`crate::rns_bgg::dynamic`]): `r_k =
+    /// sigma_k(c) Dec(C_k) + E_k` with the companion block `companion()` of
+    /// `k`'s package, then the mask switch `h_k Dec(T_k) + r_k` against the
+    /// product key `pre_key()`. Returns the switched row and, if `recompute`,
+    /// the two rows of the switched key `H_k Dec(T_k)` (each `1 x m`). The
+    /// closures run where their values are first needed.
+    #[allow(clippy::too_many_arguments)]
+    fn automorphism_branch(
+        &self,
+        level: usize,
+        row: &RnsBggRow,
+        switch: &AutomorphismSwitch,
+        companion: &dyn Fn() -> RnsBggRow,
+        pre_key: &dyn Fn() -> RnsBggMatrix,
+        recompute: bool,
+    ) -> Result<(RnsBggRow, Vec<Mat>), RnsBggError> {
+        let state = self.dynamic_state()?;
+        let setup = &state.setup;
+        let (helpers, _) = state
+            .automorphisms
+            .as_ref()
+            .ok_or(RnsBggError::Binding("the automorphism packages are not imported"))?;
+        let columns = self.parameters.component_columns(level)?;
+        let split = |row: &Mat| super::split_row(row, columns);
+        let k = switch.k.clone();
+        // `r_k = sigma_k(c) Dec(C_k) + E_k`, under the key `T_k`.
+        let routed = map_row(row.clone(), |entry| entry.ring_automorphism(k.clone()));
+        let switching = automorphism_ciphertext(
+            self.parameters,
+            setup,
+            self.hash_key.clone(),
+            k.clone(),
+            switch.inverse.clone(),
+            helpers.at(Int::evaluate(switch.inverse_helper.clone())),
+        )?;
+        let product = super::column_action(
+            self.parameters,
+            level,
+            level,
+            &switching,
+            columns,
+            vec![super::join_row(&routed)],
+        )?;
+        let switched_row = add_encoding_rows(split(&product[0]), companion());
+        let pre_key = pre_key();
+        // `Aut_k(c) = h_k Dec(T_k) + r_k` under `A_k = H_k Dec(T_k)`.
+        let helper = helpers.at(Int::evaluate(switch.helper.clone()));
+        let mut acted = vec![super::join_row(&helper)];
+        if recompute {
+            let public = setup.helper_key(self.parameters, self.hash_key.clone(), k)?;
+            acted.extend([super::join_row(&public.0), super::join_row(&public.1)]);
+        }
+        let mut actions =
+            super::column_action(self.parameters, level, level, &pre_key, columns, acted)?;
+        let automorphed_row = add_encoding_rows(split(&actions[0]), switched_row);
+        Ok((automorphed_row, actions.split_off(1)))
+    }
+
     /// The Dynamic LUT `sum_{k in H_L} SMul_{D_{k,L}}(Aut_k(c))` of `input`
     /// (see [`crate::rns_bgg::dynamic`]), its row and key. One companion loop
     /// nest first builds every nonidentity branch's key rows `T_k` and
@@ -808,22 +870,24 @@ impl EncodingLowering<'_> {
         if switched.is_empty() {
             return Ok(initial);
         }
-        let (helpers, companions) = state
+        let (_, companions) = state
             .automorphisms
             .as_ref()
             .ok_or(RnsBggError::Binding("the automorphism packages are not imported"))?;
-        let members = switched
-            .iter()
-            .map(|k| setup.automorphism_member(*k))
-            .collect::<Result<Vec<_>, _>>()?;
+        if switched.iter().any(|k| setup.decomposition(*k).is_ok_and(|(g, b)| g != 1 && b != 1)) {
+            return self.composed_dynamic_lut(input, table, &automorphisms, initial);
+        }
+        // Every branch is switched directly by its own package.
+        let members =
+            switched.iter().map(|k| setup.switching_member(*k)).collect::<Result<Vec<_>, _>>()?;
+        let helper_members =
+            switched.iter().map(|k| setup.helper_member(*k)).collect::<Result<Vec<_>, _>>()?;
         let inverses = switched
             .iter()
             .map(|k| setup.automorphism_inverse(*k))
             .collect::<Result<Vec<_>, _>>()?;
-        let inverse_members = inverses
-            .iter()
-            .map(|k| setup.automorphism_member(*k))
-            .collect::<Result<Vec<_>, _>>()?;
+        let inverse_members =
+            inverses.iter().map(|k| setup.helper_member(*k)).collect::<Result<Vec<_>, _>>()?;
         let count = companion_count(self.parameters, level, columns)?;
         let width = 2 * columns;
         let key_rows =
@@ -875,45 +939,25 @@ impl EncodingLowering<'_> {
                     }),
                 ))
             };
-            // `r_k = sigma_k(c) Dec(C_k) + E_k`, under the key `T_k`.
-            let routed = map_row(input.row.clone(), |entry| entry.ring_automorphism(k.clone()));
-            let switching = automorphism_ciphertext(
-                self.parameters,
-                setup,
-                self.hash_key.clone(),
-                k.clone(),
-                select(&inverses, branch.clone()),
-                helpers.at(Int::evaluate(select(&inverse_members, branch.clone()))),
-            )
-            .map_err(schema)?;
-            let product = super::column_action(
-                self.parameters,
-                level,
-                level,
-                &switching,
-                columns,
-                vec![super::join_row(&routed)],
-            )
-            .map_err(schema)?;
-            let switched_row = add_encoding_rows(split(&product[0]), block(companion));
-            let pre_key = (block(&key_rows[0]), block(&key_rows[1]));
-            // `Aut_k(c) = h_k Dec(T_k) + r_k` under `A_k = H_k Dec(T_k)`.
-            let helper = helpers.at(Int::evaluate(select(&members, branch)));
-            let mut acted = vec![super::join_row(&helper)];
-            if recompute {
-                let public = setup
-                    .helper_key(self.parameters, self.hash_key.clone(), k.clone())
-                    .map_err(schema)?;
-                acted.extend([super::join_row(&public.0), super::join_row(&public.1)]);
-            }
-            let actions =
-                super::column_action(self.parameters, level, level, &pre_key, columns, acted)
-                    .map_err(schema)?;
-            let automorphed_row = add_encoding_rows(split(&actions[0]), switched_row);
+            let (automorphed_row, key_rows) = self
+                .automorphism_branch(
+                    level,
+                    &input.row,
+                    &AutomorphismSwitch {
+                        k: k.clone(),
+                        inverse: select(&inverses, branch.clone()),
+                        inverse_helper: select(&inverse_members, branch.clone()),
+                        helper: select(&helper_members, branch),
+                    },
+                    &|| block(companion),
+                    &|| (block(&key_rows[0]), block(&key_rows[1])),
+                    recompute,
+                )
+                .map_err(schema)?;
             let action = scalar_action(self.parameters, level, coefficient(k).map_err(schema)?)
                 .map_err(schema)?;
             let key = recompute
-                .then(|| scalar_action_matrix((split(&actions[1]), split(&actions[2])), &action));
+                .then(|| scalar_action_matrix((split(&key_rows[0]), split(&key_rows[1])), &action));
             Ok((scalar_action_row(automorphed_row, &action), key))
         };
         let count = IntExpr::constant(switched.len());
@@ -935,10 +979,238 @@ impl EncodingLowering<'_> {
     }
 }
 
+impl EncodingLowering<'_> {
+    /// The Dynamic LUT of `input` under a baby-step split whose branches
+    /// include a composed `k = g b` (see [`crate::rns_bgg::dynamic`]),
+    /// continuing from the identity branch `initial`. One companion loop
+    /// nest switches every first switch `f` of the plan (its row and key
+    /// `H_f Dec(T_f)` are kept per `f`); a second nest builds the giant
+    /// switches of the composed branches from those keys; the branch loops
+    /// then add the scalar actions of the direct and composed branches.
+    fn composed_dynamic_lut(
+        &self,
+        input: &RnsBggEncoding,
+        table: &LutTable,
+        automorphisms: &[usize],
+        initial: (RnsBggRow, RnsBggMatrix),
+    ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let state = self.dynamic_state()?;
+        let setup = &state.setup;
+        let (_, companions) = state
+            .automorphisms
+            .as_ref()
+            .ok_or(RnsBggError::Binding("the automorphism packages are not imported"))?;
+        let level = self.workload.level(input.wire())?;
+        let values = table.values().ok_or(RnsBggError::Lut)?;
+        let layout = table.input_layout();
+        let representation = table.output_representation();
+        let columns = self.parameters.component_columns(level)?;
+        let count = companion_count(self.parameters, level, columns)?;
+        let width = 2 * columns;
+        let coefficient = |k: IntExpr| {
+            EncodingLowering::lut_coefficient(
+                self.parameters,
+                level,
+                layout,
+                representation,
+                k,
+                values,
+            )
+        };
+        let plan = crate::rns_bgg::dynamic::composed_branches(setup, &automorphisms[1..])?;
+        let first = &plan.first;
+        let members = |ks: &[usize], member: &dyn Fn(usize) -> Result<usize, RnsBggError>| {
+            ks.iter().map(|k| member(*k)).collect::<Result<Vec<_>, _>>()
+        };
+        let switch = |ks: &[usize], index: IntExpr| -> Result<AutomorphismSwitch, RnsBggError> {
+            let inverses = members(ks, &|k| setup.automorphism_inverse(k))?;
+            Ok(AutomorphismSwitch {
+                k: select(ks, index.clone()),
+                inverse: select(&inverses, index.clone()),
+                inverse_helper: select(
+                    &members(&inverses, &|k| setup.helper_member(k))?,
+                    index.clone(),
+                ),
+                helper: select(&members(ks, &|k| setup.helper_member(k))?, index),
+            })
+        };
+        let first_members = members(first, &|k| setup.switching_member(k))?;
+        let imported = self.imported_public_action(level, first.len() + plan.composed.len())?;
+        let recompute = imported.is_none();
+        let split = |row: &Mat| super::split_row(row, columns);
+        let block = |row: &Mat, index: IntExpr| {
+            let start = (index * IntExpr::constant(width)).canonicalize();
+            split(&row.clone().slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: start.clone(),
+                    end: (start + IntExpr::constant(width)).canonicalize(),
+                }),
+            ))
+        };
+        let companion_key = |ks: &[usize], branch: IntExpr, a, j| {
+            let tag = setup.package_tag(&RnsBggPackage::Automorphism(select(ks, branch)));
+            super::companion_key(self.parameters, level, self.hash_key.clone(), &tag, a, j)
+        };
+        let companion = |ks_members: &[usize], branch: IntExpr, a: IntExpr, j: IntExpr| {
+            let index = select(ks_members, branch) * IntExpr::constant(count) +
+                a * IntExpr::constant(width) +
+                j;
+            Ok(companions.at(Int::evaluate(index.canonicalize())))
+        };
+        // The first switches of the input.
+        let key_rows =
+            [&input.public_key.matrix.0, &input.public_key.matrix.1].map(super::join_row);
+        let first_rows = super::companion_columns(
+            self.parameters,
+            level,
+            first.len(),
+            columns,
+            &|branch, r, a| {
+                Ok(super::row_entry(&key_rows[r], a).ring_automorphism(select(first, branch)))
+            },
+            recompute.then_some(&|branch, a, j| companion_key(first, branch, a, j) as _),
+            Some(&|branch, a, j| companion(&first_members, branch, a, j)),
+        )?;
+        let first_companion = first_rows.last().ok_or(RnsBggError::Binding("companion row"))?;
+        let product_keys = match &imported {
+            Some((_, Some(branches))) => branches.clone(),
+            Some((_, None)) => return Err(RnsBggError::Binding("LUT branch keys are missing")),
+            None => [first_rows[0].clone(), first_rows[1].clone()],
+        };
+        let mut switched_rows = Vec::with_capacity(first.len());
+        let mut switched_keys = Vec::with_capacity(first.len());
+        for position in 0..first.len() {
+            let index = IntExpr::constant(position);
+            let (row, key) = self.automorphism_branch(
+                level,
+                &input.row,
+                &switch(first, index.clone())?,
+                &|| block(first_companion, index.clone()),
+                &|| {
+                    (block(&product_keys[0], index.clone()), block(&product_keys[1], index.clone()))
+                },
+                true,
+            )?;
+            switched_rows.push(row);
+            switched_keys.push((split(&key[0]), split(&key[1])));
+        }
+        let switched_rows = Family::pack(switched_rows).map_err(graph)?;
+        let switched_keys = Family::pack(switched_keys).map_err(graph)?;
+        let schema = |_| DslError::Schema;
+        let direct_ks = plan.direct.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let direct_positions =
+            plan.direct.iter().map(|(_, position)| *position).collect::<Vec<_>>();
+        let composed_ks = plan.composed.iter().map(|(k, ..)| *k).collect::<Vec<_>>();
+        let giants = plan.composed.iter().map(|(_, giant, _)| *giant).collect::<Vec<_>>();
+        let babies = plan.composed.iter().map(|(_, _, position)| *position).collect::<Vec<_>>();
+        let giant_members = members(&giants, &|k| setup.switching_member(k))?;
+        // The giant switches of the composed branches, from the first switches'
+        // keys.
+        let giant_rows = (!plan.composed.is_empty())
+            .then(|| {
+                super::companion_columns(
+                    self.parameters,
+                    level,
+                    plan.composed.len(),
+                    columns,
+                    &|branch, r, a| {
+                        let key = switched_keys.at(Int::evaluate(select(&babies, branch.clone())));
+                        let row = super::join_row(if r == 0 { &key.0 } else { &key.1 });
+                        Ok(super::row_entry(&row, a).ring_automorphism(select(&giants, branch)))
+                    },
+                    recompute.then_some(&|branch, a, j| companion_key(&giants, branch, a, j) as _),
+                    Some(&|branch, a, j| companion(&giant_members, branch, a, j)),
+                )
+            })
+            .transpose()?;
+        // Each branch's row term and, unless the key is imported, its key term.
+        let direct_terms = |index: Int| -> Result<(RnsBggRow, Option<RnsBggMatrix>), DslError> {
+            let branch = index.expression()?;
+            let position = Int::evaluate(select(&direct_positions, branch.clone()));
+            let action = scalar_action(
+                self.parameters,
+                level,
+                coefficient(select(&direct_ks, branch)).map_err(schema)?,
+            )
+            .map_err(schema)?;
+            let key = recompute
+                .then(|| scalar_action_matrix(switched_keys.at(position.clone()), &action));
+            Ok((scalar_action_row(switched_rows.at(position), &action), key))
+        };
+        let composed_terms = |index: Int| -> Result<(RnsBggRow, Option<RnsBggMatrix>), DslError> {
+            let branch = index.expression()?;
+            let giant_rows = giant_rows.as_ref().ok_or(DslError::Schema)?;
+            let companion_row = giant_rows.last().ok_or(DslError::Schema)?;
+            let offset = (IntExpr::constant(first.len()) + branch.clone()).canonicalize();
+            let (row, key) = self
+                .automorphism_branch(
+                    level,
+                    &switched_rows.at(Int::evaluate(select(&babies, branch.clone()))),
+                    &switch(&giants, branch.clone()).map_err(schema)?,
+                    &|| block(companion_row, branch.clone()),
+                    &|| match &imported {
+                        Some(_) => (
+                            block(&product_keys[0], offset.clone()),
+                            block(&product_keys[1], offset.clone()),
+                        ),
+                        None => (
+                            block(&giant_rows[0], branch.clone()),
+                            block(&giant_rows[1], branch.clone()),
+                        ),
+                    },
+                    recompute,
+                )
+                .map_err(schema)?;
+            let action = scalar_action(
+                self.parameters,
+                level,
+                coefficient(select(&composed_ks, branch)).map_err(schema)?,
+            )
+            .map_err(schema)?;
+            let key =
+                recompute.then(|| scalar_action_matrix((split(&key[0]), split(&key[1])), &action));
+            Ok((scalar_action_row(row, &action), key))
+        };
+        let sum = |terms: &dyn Fn(Int) -> Result<(RnsBggRow, Option<RnsBggMatrix>), DslError>,
+                   count: usize,
+                   state: (RnsBggRow, RnsBggMatrix)|
+         -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+            if count == 0 {
+                return Ok(state);
+            }
+            mxx_dsl::iterate(IntExpr::constant(count), state, |index, (row_sum, key_sum)| {
+                let (row, key) = terms(index)?;
+                let key_sum = match key {
+                    Some(key) => add_public_matrices(key_sum, key),
+                    None => key_sum,
+                };
+                Ok((add_encoding_rows(row_sum, row), key_sum))
+            })
+            .map_err(graph)
+        };
+        let (row, key) = sum(&direct_terms, plan.direct.len(), initial)?;
+        let (row, key) = sum(&composed_terms, plan.composed.len(), (row, key))?;
+        match imported {
+            Some((cached, _)) => Ok((row, cached)),
+            None => Ok((row, key)),
+        }
+    }
+}
+
 /// A row of two uniform blocks of `columns` columns over `ring`: the top row
 /// of a ciphertext sampled in the encryption that publishes it.
 pub(super) fn uniform_row(ring: &Ring, columns: usize) -> RnsBggRow {
     (ring.uniform_residue((1, columns)), ring.uniform_residue((1, columns)))
+}
+
+/// The coordinates of one automorphism switch `Aut_k`: `k`, `k^-1`, and the
+/// helper members of `k^-1` (for `C_k`) and of `k` (for the mask switch).
+struct AutomorphismSwitch {
+    k: IntExpr,
+    inverse: IntExpr,
+    inverse_helper: IntExpr,
+    helper: IntExpr,
 }
 
 /// Shared helpers of the Dynamic stage tests.

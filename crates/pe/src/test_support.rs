@@ -112,6 +112,7 @@ pub(crate) fn statistical_request(class: PeClass) -> PeParameterRequest {
         flooding_statistical_bits: crate::budget::DEFAULT_FLOODING_BITS,
         key_queries: 1 << 20,
         max_anchor_columns: 4096,
+        lut_baby_steps: None,
         failure_exponent: None,
         lattice_security_bits: None,
     }

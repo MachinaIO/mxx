@@ -143,6 +143,7 @@ pub(crate) fn phase_graph(
     let m_b = parameters.anchor_columns();
     let group = Group::of(public_key)?;
     let w = group.width();
+    let p = group.helper_count();
     let mut runtime = BTreeMap::new();
     let hash_key = public_key.hash_key_input(&mut runtime)?;
     for port in [4, 5] {
@@ -184,7 +185,7 @@ pub(crate) fn phase_graph(
     let helper_keys = ring.small_matrix_family_artifact_input(
         key_production.clone(),
         HELPER_KEY,
-        w * (w - 1),
+        w * p,
         (width, 1),
         cutoff.clone(),
         ArtifactAvailability::Transferred,
@@ -201,7 +202,7 @@ pub(crate) fn phase_graph(
         ring.family_artifact_input(
             packages.clone(),
             format!("{}.{port}", RnsBggDynamicSetup::automorphism_helper_role()),
-            w - 1,
+            p,
             (1, columns),
             ArtifactAvailability::Transferred,
         )
@@ -216,15 +217,14 @@ pub(crate) fn phase_graph(
             .mul_small_rhs(anchor_key(&ring, parameters, key, row))
             .ring_automorphism(IntExpr::constant(*i))
     });
-    let helpers = mxx_dsl::iterate(w * (w - 1), ring.zero((1, 1)), |pair, sum| {
+    let helpers = mxx_dsl::iterate(w * p, ring.zero((1, 1)), |pair, sum| {
         let pair = pair.expression()?;
-        let quotient =
-            IntExpr::FloorDiv(Box::new(pair.clone()), Box::new(IntExpr::constant(w - 1)))
-                .canonicalize();
+        let quotient = IntExpr::FloorDiv(Box::new(pair.clone()), Box::new(IntExpr::constant(p)))
+            .canonicalize();
         let k_index =
-            IntExpr::Rem(Box::new(pair.clone()), Box::new(IntExpr::constant(w - 1))).canonicalize();
+            IntExpr::Rem(Box::new(pair.clone()), Box::new(IntExpr::constant(p))).canonicalize();
         let i = Group::select(&group.elements, quotient);
-        let k = Group::select(&group.elements[1..], k_index.clone());
+        let k = Group::select(&group.helpers, k_index.clone());
         let public =
             setup.helper_key(rns, hash_key.clone(), k).map_err(|_| mxx_dsl::DslError::Schema)?;
         let member = Int::evaluate(k_index);
@@ -368,7 +368,7 @@ mod tests {
         let columns = parameters.digits();
         let m_b = parameters.anchor_columns();
         let group = Group::of(&public_key).unwrap();
-        let w = group.width();
+        let p = group.helper_count();
         let order = 2 * dimension;
         let gadget = rns.public_gadget(0).unwrap();
         let zero = ring.zero((1, columns));
@@ -411,7 +411,7 @@ mod tests {
                 ring.family_artifact_input(
                     packages.clone(),
                     format!("{}.{port}", RnsBggDynamicSetup::automorphism_helper_role()),
-                    w - 1,
+                    p,
                     (1, columns),
                     ArtifactAvailability::Transferred,
                 )
@@ -421,7 +421,7 @@ mod tests {
                 let anchor_block = sigma(anchor.clone() - second.clone(), *i) -
                     sigma(s_bar.clone(), *i) * sigma(first.clone(), *i);
                 graph = graph.output(format!("anchor-{i}"), anchor_block).unwrap();
-                for (member, k) in group.elements[1..].iter().enumerate() {
+                for (member, k) in group.helpers.iter().enumerate() {
                     let public = public_key
                         .setup()
                         .helper_key(rns, hash_key.clone(), IntExpr::constant(*k))
@@ -489,7 +489,7 @@ mod tests {
             for i in &group.elements {
                 let measured = norm(&q, &download(&execution, &outputs, &format!("anchor-{i}")));
                 assert!(&measured <= error, "anchor {i}: {measured} > {error}");
-                for k in &group.elements[1..] {
+                for k in &group.helpers {
                     let measured =
                         norm(&q, &download(&execution, &outputs, &format!("helper-{i}-{k}")));
                     assert!(measured <= helper_cutoff, "helper ({i}, {k}): {measured}");
@@ -523,6 +523,19 @@ mod tests {
         let parameters = statistical_parameters(class);
         assert!(!parameters.instantiation().is_computational());
         assert_eq!(parameters.anchor_columns(), 3 * parameters.digits());
+        authorized_keys_decrypt(class, parameters);
+    }
+
+    /// The round trip of
+    /// [`authorized_keys_of_several_predicates_decrypt_one_ciphertext`] with the lookup group
+    /// `H = {1, 9, 17, 25}` split into baby steps `{1, 9}` and giant steps `{1, 17}`: encryption
+    /// publishes the switching packages of `9` and `17` only, and the branch `25 = 17 * 9` is
+    /// switched twice.
+    #[test]
+    fn authorized_keys_decrypt_with_a_baby_step_split() {
+        let class = PeClass::new(2, 2, 2, 2).unwrap();
+        let parameters = parameters(class).with_baby_steps(2).unwrap();
+        assert_eq!(parameters.baby_steps(), Some(2));
         authorized_keys_decrypt(class, parameters);
     }
 

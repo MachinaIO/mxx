@@ -186,13 +186,14 @@ impl RnsBggNoiseEvaluator<'_> {
         let lut = self.program.lut_id_at(wire).map_err(|_| RnsBggError::Lut)?;
         let normalized = level + usize::from(table.output_representation().is_coefficient());
         self.parameters.dynamic_route(normalized.max(self.level(wire)?))?;
-        let branches = crate::rns_bgg::dynamic::lut_automorphisms(
+        let automorphisms = crate::rns_bgg::dynamic::lut_automorphisms(
             self.parameters,
             &contracts.automorphisms,
             level,
             table,
-        )?
-        .len();
+        )?;
+        let branches = automorphisms.len();
+        let composed = automorphisms.iter().filter(|k| contracts.composed.contains(k)).count();
         let distributions = &contracts.distributions;
         let output_payload_l1 = match table.output_representation() {
             crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
@@ -200,20 +201,37 @@ impl RnsBggNoiseEvaluator<'_> {
                 BigUint::from(table.max_output())
             }
         };
-        let bound = self.parameters.dynamic_lut_noise_bound(
-            level,
-            &input.1.bound,
-            branches,
-            distributions.companion.cutoff(),
-            distributions.helper.cutoff(),
-            output_payload_l1.clone(),
-        )?;
+        let bound = if composed == 0 {
+            self.parameters.dynamic_lut_noise_bound(
+                level,
+                &input.1.bound,
+                branches,
+                distributions.companion.cutoff(),
+                distributions.helper.cutoff(),
+                output_payload_l1.clone(),
+            )?
+        } else {
+            self.parameters.dynamic_composed_lut_noise_bound(
+                level,
+                &input.1.bound,
+                branches - 1 - composed,
+                composed,
+                distributions.companion.cutoff(),
+                distributions.helper.cutoff(),
+                output_payload_l1.clone(),
+            )?
+        };
         let k = self.parameters.dynamic_decomposition_gain(level)?;
         let s = self.parameters.dynamic_scalar_action_gain(level)?;
-        let switched = BigUint::from(branches - 1);
-        // The input reaches the output through the identity branch (`S`) and
-        // every switched branch (`S K`), coherently.
-        let input_gain = &s + &switched * &s * &k;
+        let direct = BigUint::from(branches - 1 - composed);
+        let composed = BigUint::from(composed);
+        // The input reaches the output through the identity branch (`S`),
+        // every direct switch (`S K`), and every composed switch (`S K^2`),
+        // coherently.
+        let input_gain = &s + &direct * &s * &k + &composed * &s * &k * &k;
+        // A composed branch's first switch's fresh errors pass the second
+        // switch's decomposition (at most `K` in `l1`) as well.
+        let switched = &direct + &composed * (BigUint::one() + &k);
         let mean_gain =
             NonnegativeRational::new(input_gain.clone(), BigUint::one()).expect("unit denominator");
         let input_variance_gain = input_gain.pow(2u32);

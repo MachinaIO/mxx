@@ -19,6 +19,15 @@
 //! `D_{k,L} = W^-1 sum_j X^{L(j)} sigma_k(X^-j)` (or `L(j)` in place of
 //! `X^{L(j)}`) is [`super::EncodingLowering::lut_coefficient`], so the table
 //! values enter only these public actions, never encryption.
+//!
+//! With a baby-step split of `H` ([`RnsBggDynamicSetup::with_baby_steps`]),
+//! a branch `k = g b` with a giant step `g != 1` and a baby step `b != 1` is
+//! switched as `Aut_g(Aut_b(c))` ([`composed_branches`]); every other branch
+//! is switched directly. Each switch acts on an encoding whose payload is a
+//! monomial, so the payload term of `C_g` keeps its `l1` norm one; the scalar
+//! actions, whose coefficients carry `W^-1`, are applied last, per branch.
+//! The product keys `T` of the first switches come first in a LUT's
+//! `branches` public action, then those of the composed giant switches.
 use super::*;
 
 /// `Select(selector, values)`: the value at position `selector`.
@@ -95,4 +104,44 @@ pub(crate) fn scalar_action_row(row: RnsBggRow, action: &Preimage) -> RnsBggRow 
 /// `A V_D` for a `2 x 2` block key.
 pub(crate) fn scalar_action_matrix(matrix: RnsBggMatrix, action: &Preimage) -> RnsBggMatrix {
     map_matrix(matrix, |entry| entry.mul_small_rhs(action.clone()))
+}
+
+/// The switching plan of a LUT's nonidentity branches under a baby-step
+/// split (see the module documentation).
+pub(crate) struct ComposedBranches {
+    /// The first switches, ascending: every directly switched branch and the
+    /// baby step of every composed branch.
+    pub(crate) first: Vec<usize>,
+    /// Every directly switched branch `k` with its position in `first`.
+    pub(crate) direct: Vec<(usize, usize)>,
+    /// Every composed branch `k = g b`: `(k, g, position of b in first)`.
+    pub(crate) composed: Vec<(usize, usize, usize)>,
+}
+
+/// The switching plan of the nonidentity branches `switched` of a LUT.
+pub(crate) fn composed_branches(
+    setup: &RnsBggDynamicSetup,
+    switched: &[usize],
+) -> Result<ComposedBranches, RnsBggError> {
+    let mut first = std::collections::BTreeSet::new();
+    let mut pairs = Vec::with_capacity(switched.len());
+    for k in switched {
+        let (giant, baby) = setup.decomposition(*k)?;
+        let composed = giant != 1 && baby != 1;
+        first.insert(if composed { baby } else { *k });
+        pairs.push((*k, giant, baby, composed));
+    }
+    let first = first.into_iter().collect::<Vec<_>>();
+    let position = |k: usize| first.binary_search(&k).expect("first switch");
+    let direct = pairs
+        .iter()
+        .filter(|(_, _, _, composed)| !composed)
+        .map(|(k, ..)| (*k, position(*k)))
+        .collect();
+    let composed = pairs
+        .iter()
+        .filter(|(_, _, _, composed)| *composed)
+        .map(|(k, giant, baby, _)| (*k, *giant, position(*baby)))
+        .collect();
+    Ok(ComposedBranches { first, direct, composed })
 }

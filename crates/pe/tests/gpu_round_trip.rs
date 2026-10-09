@@ -41,6 +41,7 @@
 //! | `TRAPDOOR_INSTANTIATION` | `statistical` | `statistical` or `computational` |
 //! | `KEY_WIDTH_POLICY` | `practical` | `practical` or `strict` (statistical only) |
 //! | `ERROR_SIGMA`, `FLOODING_SIGMA` | 3.19 | Sigmas of `chi` and of `chi_fl` (computational, or statistical with `FLOODING=none`) |
+//! | `BABY_STEPS` | unset | Baby steps of the LUT automorphism split (`PeParameters::with_baby_steps`); unset switches every automorphism directly |
 //! | `FLOODING` | `enforce` | `enforce` or `none`: whether the statistical instantiation imposes the flooding width |
 //! | `PROGRAMMING_SIGMA` | 256 (statistical), 3.19 (computational) | Sigma of the entries of `Z_t` |
 //! | `RANDOMNESS_SIGMA` | 64 | Sigma of the proof's `R` (statistical only) |
@@ -222,6 +223,7 @@ fn recorded(row: &ParameterRow) -> (PeParameters, PeNoiseReport, BranchingProgra
         flooding_statistical_bits: DEFAULT_FLOODING_BITS,
         key_queries: DEFAULT_KEY_QUERIES,
         max_anchor_columns: DEFAULT_MAX_ANCHOR_COLUMNS,
+        lut_baby_steps: None,
         failure_exponent,
         lattice_security_bits: None,
     };
@@ -324,6 +326,7 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
             .unwrap(),
             key_queries: count("KEY_QUERIES", DEFAULT_KEY_QUERIES as usize) as u64,
             max_anchor_columns: count("MAX_ANCHOR_COLUMNS", DEFAULT_MAX_ANCHOR_COLUMNS),
+            lut_baby_steps: Some(count("BABY_STEPS", 0)).filter(|steps| *steps > 0),
             failure_exponent,
             lattice_security_bits: Some(security),
         };

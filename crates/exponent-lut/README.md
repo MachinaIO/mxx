@@ -31,6 +31,10 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   lookup: its output key and its lookup branches' product keys. Online evaluation imports them
   and accumulates only the encoding rows. Products and lookups inside family bodies recompute the
   same action from the setup.
+  A setup may split its cyclic group `H` into baby steps `B` and giant steps `G`
+  (`RnsBggDynamicSetup::with_baby_steps`): encryption then publishes switching packages for
+  `(B u G) \ {1}` only (about `2 sqrt |H|` instead of `|H| - 1`), and a branch `k = g b` is switched
+  as `Aut_g(Aut_b(c))`, which adds one decomposition gain to its noise.
 
 Sampling contracts (`RnsBggGaussian`) keep their sigma as a `BigDecimal` and their cutoff as a
 `BigUint`, so a contract may be wide: above `2^40` the backends sample by convolution, as for the

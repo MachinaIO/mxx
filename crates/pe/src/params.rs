@@ -113,6 +113,9 @@ pub struct PeParameterRequest {
     pub key_queries: u64,
     /// `m_B,max`: the largest anchor accepted, which fixes the truncation multiplier.
     pub max_anchor_columns: usize,
+    /// The baby-step count of the LUT automorphism split (see
+    /// [`PeParameters::with_baby_steps`]); `None` switches every automorphism directly.
+    pub lut_baby_steps: Option<usize>,
     /// The noise model of the correctness check: `None` for the worst case,
     /// `Some(k)` for the average case with failure target `2^-k` (see
     /// [`crate::noise::simulate_average`]).
@@ -170,6 +173,7 @@ pub struct PeParameters {
     key_cutoff: BigUint,
     anchor_columns: usize,
     statistical: Option<StatisticalSelection>,
+    baby_steps: Option<usize>,
     identity: [u8; 32],
 }
 
@@ -186,6 +190,8 @@ struct ParameterIdentity<'a> {
     key_cutoff: &'a BigUint,
     anchor_columns: usize,
     statistical: &'a Option<StatisticalSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baby_steps: Option<usize>,
 }
 
 /// One ring level of `request` at CRT depth `depth`.
@@ -345,17 +351,51 @@ impl PeParameters {
             key_cutoff,
             anchor_columns,
             statistical,
+            baby_steps: None,
             identity: [0; 32],
         };
         parameters.identity = parameters.digest();
         Ok(parameters)
     }
 
+    /// Split the LUT automorphism group `H` (of order `W`) into `baby_steps`
+    /// baby steps and `W / baby_steps` giant steps: encryption publishes
+    /// switching packages for about `2 sqrt W` automorphisms instead of `W - 1`,
+    /// and a branch `k = g b` is switched twice (see
+    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_baby_steps`).
+    /// `baby_steps` must divide `W`; `1` or `W` keeps the direct switching.
+    pub fn with_baby_steps(mut self, baby_steps: usize) -> Result<Self, PeError> {
+        let order = self.class.lookup_width();
+        if baby_steps == 0 || !order.is_multiple_of(baby_steps) {
+            return Err(PeError::Parameters("the baby steps must divide the lookup width".into()));
+        }
+        self.baby_steps = (baby_steps != 1 && baby_steps != order).then_some(baby_steps);
+        self.identity = self.digest();
+        Ok(self)
+    }
+
+    /// The baby-step count of the LUT automorphism split, if any.
+    pub const fn baby_steps(&self) -> Option<usize> {
+        self.baby_steps
+    }
+
+    /// `|P|`: the automorphisms with a published helper (`W - 1` without a split).
+    pub fn helper_automorphism_count(&self) -> Result<usize, PeError> {
+        let n = self.level().ring_dimension() as usize;
+        let automorphisms = self
+            .class
+            .layout()
+            .automorphism_indices(n)
+            .map_err(|error| PeError::Parameters(error.to_string()))?;
+        Ok(mxx_exponent_lut::rns_bgg::helper_automorphisms(&automorphisms, n, self.baby_steps)
+            .len())
+    }
+
     /// The parameters of `request` at CRT depth `depth`: the legacy contracts with the default
     /// cutoffs for `Computational`, the budget's selection ([`crate::budget`]) for `Statistical`.
     pub fn at_depth(request: &PeParameterRequest, depth: usize) -> Result<Self, PeError> {
         let level = level_at(request, depth)?;
-        match request.trapdoor_instantiation {
+        let parameters = match request.trapdoor_instantiation {
             TrapdoorMode::Computational => Self::new(
                 request.class,
                 level,
@@ -366,6 +406,10 @@ impl PeParameters {
                 TrapdoorPreimageCutoffPolicy::Default,
             ),
             TrapdoorMode::Statistical => Self::statistical_at(request, level),
+        }?;
+        match request.lut_baby_steps {
+            Some(baby_steps) => parameters.with_baby_steps(baby_steps),
+            None => Ok(parameters),
         }
     }
 
@@ -508,6 +552,7 @@ impl PeParameters {
             key_cutoff: &self.key_cutoff,
             anchor_columns: self.anchor_columns,
             statistical: &self.statistical,
+            baby_steps: self.baby_steps,
         };
         let mut digest = Sha256::new();
         digest.update(b"mxx-pe/parameters/v2");
@@ -605,10 +650,12 @@ impl PeParameters {
         2 * self.digits()
     }
 
-    /// The key length `N = W m_B + W (W - 1) m + m` in ring elements.
+    /// The key length `N = W m_B + W |P| m + m` in ring elements, for the `|P|`
+    /// helper automorphisms (`W - 1` without a split).
     pub fn key_length(&self) -> usize {
         let w = self.class.lookup_width();
-        w * self.anchor_columns + w * (w - 1) * self.state_columns() + self.state_columns()
+        let helpers = self.helper_automorphism_count().unwrap_or(w - 1);
+        w * self.anchor_columns + w * helpers * self.state_columns() + self.state_columns()
     }
 
     /// The bound `B_C <= m_B n B_b B_Z` on the attribute ciphertext error

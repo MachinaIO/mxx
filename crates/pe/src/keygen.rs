@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 /// The anchor blocks `k~_i` in the key production: one preimage artifact
 /// `{ANCHOR_KEY}/{row}` per row of `H` (see [`anchor_key`]).
 pub(crate) const ANCHOR_KEY: &str = "mxx-pe/key/anchor";
-/// The helper blocks `v_(i,k)` (a family, member `i (W - 1) + k`), stored as compact bounded
+/// The helper blocks `v_(i,k)` (a family, member `i |P| + k`), stored as compact bounded
 /// matrices like the anchor blocks.
 pub(crate) const HELPER_KEY: &str = "mxx-pe/key/helper";
 /// The output block `v_F`, stored as a compact bounded matrix.
@@ -92,12 +92,15 @@ impl PePredicateKey {
     }
 }
 
-/// The canonical group `H` of the class, its inverses, and, for row `i`
-/// and nonidentity `k`, the row `i k^-1` whose helper block `(i k^-1, k)`
-/// places `-G^(1)` in row `i`.
+/// The canonical group `H` of the class, its inverses, the automorphisms
+/// `P` with a published helper (`H \ {1}`, or fewer under a baby-step split,
+/// see [`mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::helper_automorphisms`]),
+/// and, for row `i` and `k` in `P`, the row `i k^-1` whose helper block
+/// `(i k^-1, k)` places `-G^(1)` in row `i`.
 pub(crate) struct Group {
     pub(crate) elements: Vec<usize>,
     pub(crate) inverses: Vec<usize>,
+    pub(crate) helpers: Vec<usize>,
     pub(crate) sources: Vec<usize>,
 }
 
@@ -113,16 +116,26 @@ impl Group {
         let position = |value: usize| {
             elements.iter().position(|element| *element == value).ok_or(PeError::Mismatch)
         };
+        let helpers = setup.helper_automorphisms();
+        let helper_inverses = helpers
+            .iter()
+            .map(|k| setup.automorphism_inverse(*k))
+            .collect::<Result<Vec<_>, _>>()?;
         let sources = elements
             .iter()
-            .flat_map(|i| inverses[1..].iter().map(move |k_inverse| i * k_inverse % order))
+            .flat_map(|i| helper_inverses.iter().map(move |k_inverse| i * k_inverse % order))
             .map(position)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { elements, inverses, sources })
+        Ok(Self { elements, inverses, helpers, sources })
     }
 
     pub(crate) fn width(&self) -> usize {
         self.elements.len()
+    }
+
+    /// `|P|`: the helper blocks per row.
+    pub(crate) fn helper_count(&self) -> usize {
+        self.helpers.len()
     }
 
     pub(crate) fn select(values: &[usize], index: IntExpr) -> IntExpr {
@@ -191,6 +204,7 @@ where
     let m_b = parameters.anchor_columns();
     let group = Group::of(public_key)?;
     let w = group.width();
+    let p = group.helper_count();
     let mut runtime = BTreeMap::new();
     let hash_key = public_key.hash_key_input(&mut runtime)?;
     let trapdoor = public_key.trapdoor(master)?;
@@ -210,7 +224,7 @@ where
     let gaussian = || ring.small_gaussian((width, 1), key_sigma.clone(), key_cutoff.clone());
     // The one extension sample `v`, shared by every row.
     // Each block is stored compactly; the products below read it as a full matrix `I v`.
-    let helpers = mxx_dsl::parallel(w * (w - 1), |_| {
+    let helpers = mxx_dsl::parallel(w * p, |_| {
         let block = gaussian();
         let full = ring.identity(width).mul_small_rhs(block.clone());
         Ok((block, full))
@@ -230,23 +244,23 @@ where
     let targets = mxx_dsl::parallel(w, |row| {
         let row = row.expression()?;
         let i = Group::select(&group.elements, row.clone());
-        let residual = mxx_dsl::iterate(w - 1, ring.zero((1, 1)), |k_index, sum| {
+        let residual = mxx_dsl::iterate(p, ring.zero((1, 1)), |k_index, sum| {
             let k_index = k_index.expression()?;
-            let k = Group::select(&group.elements[1..], k_index.clone());
+            let k = Group::select(&group.helpers, k_index.clone());
             let helper = setup
                 .helper_key(rns, hash_key.clone(), k)
                 .map_err(|_| mxx_dsl::DslError::Schema)?;
             let helper_first_row = Mat::concat(ConcatAxis::Columns, vec![helper.0.0, helper.0.1])
                 .ring_automorphism(i.clone());
             let own = helpers.at(Int::evaluate(
-                (row.clone() * IntExpr::constant(w - 1) + k_index.clone()).canonicalize(),
+                (row.clone() * IntExpr::constant(p) + k_index.clone()).canonicalize(),
             ));
             let source = Group::select(
                 &group.sources,
-                (row.clone() * IntExpr::constant(w - 1) + k_index.clone()).canonicalize(),
+                (row.clone() * IntExpr::constant(p) + k_index.clone()).canonicalize(),
             );
-            let switched = helpers
-                .at(Int::evaluate((source * IntExpr::constant(w - 1) + k_index).canonicalize()));
+            let switched =
+                helpers.at(Int::evaluate((source * IntExpr::constant(p) + k_index).canonicalize()));
             Ok(sum + helper_first_row * own - gadget_first_row.clone() * switched)
         })?;
         let indicator = Int::evaluate(IntExpr::Select {
@@ -342,6 +356,7 @@ mod tests {
         let width = 2 * columns;
         let group = Group::of(&public_key).unwrap();
         let w = group.width();
+        let p = group.helper_count();
         let order = 2 * parameters.level().ring_dimension() as usize;
         let mut runtime = BTreeMap::new();
         let hash_key = public_key.hash_key_input(&mut runtime).unwrap();
@@ -350,7 +365,7 @@ mod tests {
         let helpers = ring.small_matrix_family_artifact_input(
             production.clone(),
             HELPER_KEY,
-            w * (w - 1),
+            w * p,
             (width, 1),
             cutoff.clone(),
             ArtifactAvailability::Transferred,
@@ -383,14 +398,14 @@ mod tests {
         );
         let first = public_key.anchor_row().unwrap();
         let (d_1, _) = public_key.message_row(hash_key.clone()).unwrap();
-        let helper = |row: usize, k: usize| helpers.at(Int::constant(row * (w - 1) + k - 1));
+        let helper = |row: usize, k: usize| helpers.at(Int::constant(row * p + k));
         let mut graph = DslContext::new("mxx-pe/test-sample-left");
         for (row, i) in group.elements.iter().enumerate() {
             let mut value = first
                 .clone()
                 .mul_small_rhs(anchor_key(&ring, &parameters, &key, row))
                 .ring_automorphism(IntExpr::constant(*i));
-            for (k_index, k) in group.elements.iter().enumerate().skip(1) {
+            for (k_index, k) in group.helpers.iter().enumerate() {
                 let public =
                     public_key.setup().helper_key(rns, hash_key.clone(), IntExpr::constant(*k));
                 let public = public.unwrap();

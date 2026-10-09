@@ -314,6 +314,9 @@ impl<'a> PublicKeyLowering<'a> {
         if switched.is_empty() {
             return Ok((initial, None));
         }
+        if switched.iter().any(|k| setup.decomposition(*k).is_ok_and(|(g, b)| g != 1 && b != 1)) {
+            return self.composed_dynamic_lut_key(level, key, table, &switched, initial);
+        }
         let rows = [&key.0, &key.1].map(super::join_row);
         let product = self.dynamic_product_rows(
             level,
@@ -361,6 +364,146 @@ impl<'a> PublicKeyLowering<'a> {
         })
         .map_err(graph)
         .map(|key| (key, Some([product[0].clone(), product[1].clone()])))
+    }
+
+    /// The key of [`EncodingLowering::composed_dynamic_lut`], built in the
+    /// same order from the identity branch's key `initial`: the first
+    /// switches' keys `A_f = H_f Dec(T_f)`, the giant switches' keys
+    /// `H_g Dec(T')` of the composed branches, and the scalar actions. Also
+    /// returns the product key rows of the first switches followed by those
+    /// of the giant switches.
+    fn composed_dynamic_lut_key(
+        &self,
+        level: usize,
+        key: &RnsBggMatrix,
+        table: &LutTable,
+        switched: &[usize],
+        initial: RnsBggMatrix,
+    ) -> Result<(RnsBggMatrix, Option<[Mat; 2]>), RnsBggError> {
+        use crate::rns_bgg::dynamic::{
+            composed_branches, scalar_action, scalar_action_matrix, select,
+        };
+        let (setup, _) = self.dynamic_state()?;
+        let values = table.values().ok_or(RnsBggError::Lut)?;
+        let layout = table.input_layout();
+        let representation = table.output_representation();
+        let columns = self.parameters.component_columns(level)?;
+        let width = 2 * columns;
+        let coefficient = |k: IntExpr| {
+            EncodingLowering::lut_coefficient(
+                self.parameters,
+                level,
+                layout,
+                representation,
+                k,
+                values,
+            )
+        };
+        let plan = composed_branches(setup, switched)?;
+        let first = &plan.first;
+        let split = |row: &Mat| super::split_row(row, columns);
+        let schema = |_| DslError::Schema;
+        let block = |row: &Mat, index: IntExpr| {
+            let start = (index * IntExpr::constant(width)).canonicalize();
+            split(&row.clone().slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: start.clone(),
+                    end: (start + IntExpr::constant(width)).canonicalize(),
+                }),
+            ))
+        };
+        // `H_k Dec(T_k)` for the product key blocks `pre_key` of `k`.
+        let switched_key =
+            |k: IntExpr, pre_key: RnsBggMatrix| -> Result<RnsBggMatrix, RnsBggError> {
+                let public = setup.helper_key(self.parameters, self.hash_key.clone(), k)?;
+                let actions = super::column_action(
+                    self.parameters,
+                    level,
+                    level,
+                    &pre_key,
+                    columns,
+                    vec![super::join_row(&public.0), super::join_row(&public.1)],
+                )?;
+                Ok((split(&actions[0]), split(&actions[1])))
+            };
+        let rows = [&key.0, &key.1].map(super::join_row);
+        let first_product = self.dynamic_product_rows(
+            level,
+            first.len(),
+            &|branch, r, a| {
+                Ok(super::row_entry(&rows[r], a).ring_automorphism(select(first, branch)))
+            },
+            &|branch| RnsBggPackage::Automorphism(select(first, branch)),
+        )?;
+        let mut first_keys = Vec::with_capacity(first.len());
+        for (position, k) in first.iter().enumerate() {
+            let index = IntExpr::constant(position);
+            first_keys.push(switched_key(
+                IntExpr::constant(*k),
+                (block(&first_product[0], index.clone()), block(&first_product[1], index)),
+            )?);
+        }
+        let first_keys = mxx_dsl::Family::pack(first_keys).map_err(graph)?;
+        let direct_ks = plan.direct.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let direct_positions =
+            plan.direct.iter().map(|(_, position)| *position).collect::<Vec<_>>();
+        let composed_ks = plan.composed.iter().map(|(k, ..)| *k).collect::<Vec<_>>();
+        let giants = plan.composed.iter().map(|(_, giant, _)| *giant).collect::<Vec<_>>();
+        let babies = plan.composed.iter().map(|(_, _, position)| *position).collect::<Vec<_>>();
+        let giant_product = (!plan.composed.is_empty())
+            .then(|| {
+                self.dynamic_product_rows(
+                    level,
+                    plan.composed.len(),
+                    &|branch, r, a| {
+                        let key = first_keys.at(Int::evaluate(select(&babies, branch.clone())));
+                        let row = super::join_row(if r == 0 { &key.0 } else { &key.1 });
+                        Ok(super::row_entry(&row, a).ring_automorphism(select(&giants, branch)))
+                    },
+                    &|branch| RnsBggPackage::Automorphism(select(&giants, branch)),
+                )
+            })
+            .transpose()?;
+        let mut key = initial;
+        if !plan.direct.is_empty() {
+            key = mxx_dsl::iterate(IntExpr::constant(plan.direct.len()), key, |index, sum| {
+                let branch = index.expression()?;
+                let action = scalar_action(
+                    self.parameters,
+                    level,
+                    coefficient(select(&direct_ks, branch.clone())).map_err(schema)?,
+                )
+                .map_err(schema)?;
+                let switched = first_keys.at(Int::evaluate(select(&direct_positions, branch)));
+                Ok(super::add_public_matrices(sum, scalar_action_matrix(switched, &action)))
+            })
+            .map_err(graph)?;
+        }
+        if let Some(product) = &giant_product {
+            key = mxx_dsl::iterate(IntExpr::constant(plan.composed.len()), key, |index, sum| {
+                let branch = index.expression()?;
+                let switched = switched_key(
+                    select(&giants, branch.clone()),
+                    (block(&product[0], branch.clone()), block(&product[1], branch.clone())),
+                )
+                .map_err(schema)?;
+                let action = scalar_action(
+                    self.parameters,
+                    level,
+                    coefficient(select(&composed_ks, branch)).map_err(schema)?,
+                )
+                .map_err(schema)?;
+                Ok(super::add_public_matrices(sum, scalar_action_matrix(switched, &action)))
+            })
+            .map_err(graph)?;
+        }
+        let branches = [0, 1].map(|port| {
+            let mut parts = vec![first_product[port].clone()];
+            parts.extend(giant_product.iter().map(|product| product[port].clone()));
+            Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, parts)
+        });
+        Ok((key, Some(branches)))
     }
 
     /// Record the public action of a Dynamic site at root scope for

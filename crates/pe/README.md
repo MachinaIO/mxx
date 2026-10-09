@@ -31,6 +31,11 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 - **One ciphertext for every predicate.** Packages are bound to setup coordinates, not to a
   Program, level, or table, so a ciphertext's size depends on the attribute length and the class's
   lookup width but not on the program length or the predicate.
+- **Baby-step giant-step packages.** `PeParameterRequest::lut_baby_steps` splits the lookup group
+  of `W` automorphisms: a ciphertext then carries switching packages for about `2 sqrt W`
+  automorphisms instead of `W - 1`, and a key carries `W |P|` helper blocks for the `|P|`
+  automorphisms with a published helper (the switching ones and their inverses), at one more
+  decomposition gain in the noise of a composed lookup branch.
 - **SampleLeft without the family matrix.** Key generation samples the one extension vector shared
   by every row of `M_F`, then calls the existing preimage sampler once per anchor block. `M_F` is
   never formed; its blocks are contracted where they are used.

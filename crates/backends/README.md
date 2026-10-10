@@ -19,6 +19,7 @@ CPU and GPU backends, inputs, planning, execution, outputs, and artifact stores.
 | `backend` | Runtime values and the CPU and GPU backends. |
 | `executor` | The CPU executor. |
 | `gpu_runtime` (`gpu` feature) | The GPU runtime: planning, execution, options, and limitations. |
+| `gpu_cost_model` | A device-free prediction of the GPU work of a graph (NTTs, modular and wide multiplies, gadget digits), following the GPU lowering; available without the `gpu` feature. |
 | `artifact`, `session`, `transcript`, `authority` | Artifact stores, durable sessions, sampling transcripts, and the prepare-then-run boundary. |
 | `host_control` | Structural node dispatch shared by execution and measurement. |
 | `env` | Environment variables read by native primitives and backends. |

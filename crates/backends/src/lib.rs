@@ -26,6 +26,7 @@ pub mod backend;
 #[cfg(feature = "gpu")]
 pub mod device_artifact;
 pub mod executor;
+pub mod gpu_cost_model;
 pub mod gpu_execution_plan;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_graph_memory;

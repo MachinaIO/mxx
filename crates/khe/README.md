@@ -46,7 +46,10 @@ commitments. It depends on `mxx-dsl`, `mxx-ir-core`, and `mxx-backends`.
 
 The unit tests run on the CPU. `tests/test_gpu_ring_gsw_boolean_bgg.rs` lowers one Ring-GSW
 multiplication, selects the BGG+ parameters of `boolean_protocol` for it, and exports the Lean claim
-of a recorded parameter row; its rustdoc lists the `MXX_KHE_RING_GSW_BGG_*` variables. It needs
+of a recorded parameter row. It also prints the GPU work one evaluation would issue, predicted from
+the evaluate graph by `mxx_backends::gpu_cost_model`; every one of the `depth * max_layer_width`
+slots is evaluated, active or not, and `select` evaluates every candidate. Its rustdoc lists the
+`MXX_KHE_RING_GSW_BGG_*` variables. It needs
 `lattice-estimator-cli` on `PATH` and about 40 GiB of host memory:
 
 ```bash

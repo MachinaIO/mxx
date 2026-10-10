@@ -43,6 +43,7 @@ use crate::{
         BoundStorage, GpuResidentValue, PolyMatrix, RuntimeValue,
         poly_gpu::{GpuDcrtBackend, PhysicalExport, RawExportLeaf},
     },
+    gpu_cost_model::{gadget_origin, lazy_gadget},
     gpu_execution_plan::{
         ColumnRange, CompiledGpuOp, CompiledGpuProgram, FrozenGpuPlan, GpuBindingSource,
         GpuExecutionSiteKey, GpuHashResourceSpec, GpuImplementation, GpuImplementationRegistry,
@@ -2080,96 +2081,6 @@ pub(super) fn matrix_columns_on_device(
         dense
     };
     replicate_to_device(ctx, dense, device)
-}
-
-/// The gadget constant a lazy gadget read through `wire` comes from, and
-/// whether a centered rebase lifts it into `wire`'s ring.
-fn gadget_origin(scope: &mxx_ir_core::graph::GraphScope, wire: WireRef) -> Option<(WireRef, bool)> {
-    let is_gadget = |wire: WireRef| {
-        scope.nodes().get(wire.node.0 as usize).is_some_and(|node| {
-            matches!(
-                node.kind(),
-                NodeKind::ConstantMatrix { value: ConstantMatrix::Gadget { .. }, .. }
-            )
-        })
-    };
-    if is_gadget(wire) {
-        return Some((wire, false));
-    }
-    let node = scope.nodes().get(wire.node.0 as usize)?;
-    match (node.kind(), scope.arguments(node)?.as_slice()) {
-        (NodeKind::CenteredRebase { .. }, [source]) if is_gadget(*source) => Some((*source, true)),
-        _ => None,
-    }
-}
-
-/// Whether `wire` has readers in `scope`, each using it as the right factor
-/// of a product with a one-row left factor, and is not a scope output.
-fn read_by_row_products(
-    scope: &mxx_ir_core::graph::GraphScope,
-    wire: WireRef,
-    wire_types: &BTreeMap<WireRef, ConcreteWireType>,
-) -> bool {
-    let Some(right) = wire_types.get(&wire).and_then(ConcreteWireType::matrix_type) else {
-        return false;
-    };
-    if scope.outputs().contains(&wire) {
-        return false;
-    }
-    let mut read = false;
-    for consumer in scope.nodes() {
-        let Some(arguments) = scope.arguments(consumer) else { return false };
-        if !arguments.contains(&wire) {
-            continue;
-        }
-        read = true;
-        let row_product = matches!(
-            consumer.kind(),
-            NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)
-        ) && matches!(arguments.as_slice(), [left, right_wire] if *right_wire == wire && *left != wire &&
-        wire_types.get(left).and_then(ConcreteWireType::matrix_type).is_some_and(|left| {
-            left.rows == 1 && left.columns == right.rows && left.ring == right.ring
-        }));
-        if !row_product {
-            return false;
-        }
-    }
-    read
-}
-
-/// Whether `wire`, a gadget constant or its centered rebase, is never stored:
-/// every product reading it scales its row by the gadget's entries (see
-/// `lower_gadget_product`). A gadget constant qualifies when each reader is
-/// such a product or a rebase that qualifies.
-fn lazy_gadget(
-    scope: &mxx_ir_core::graph::GraphScope,
-    wire: WireRef,
-    wire_types: &BTreeMap<WireRef, ConcreteWireType>,
-) -> bool {
-    match gadget_origin(scope, wire) {
-        Some((_, true)) => read_by_row_products(scope, wire, wire_types),
-        Some((_, false)) => {
-            if scope.outputs().contains(&wire) {
-                return false;
-            }
-            let mut read = false;
-            for (index, consumer) in scope.nodes().iter().enumerate() {
-                let Some(arguments) = scope.arguments(consumer) else { return false };
-                if !arguments.contains(&wire) {
-                    continue;
-                }
-                read = true;
-                let rebase = WireRef { node: NodeId(index as u64), port: Port(0) };
-                let lazy_rebase = matches!(consumer.kind(), NodeKind::CenteredRebase { .. }) &&
-                    read_by_row_products(scope, rebase, wire_types);
-                if !lazy_rebase && !read_by_row_products(scope, wire, wire_types) {
-                    return false;
-                }
-            }
-            read
-        }
-        None => false,
-    }
 }
 
 /// The product `left * G` of a one-row `left` and a gadget `G = I_r (x) g`

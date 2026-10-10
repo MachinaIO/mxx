@@ -734,4 +734,118 @@ mod tests {
             );
         }
     }
+
+    /// The GPU counts of the evaluate graph, derived by hand from `evaluate_graph` and
+    /// `evaluate_boolean_encoding_layers` for moduli of at least 31 bits and `inverse`
+    /// multiplies per one-limb inverse NTT.
+    fn expected_evaluate_counts(
+        n: u128,
+        crt_depth: u128,
+        m: u128,
+        depth: u128,
+        width: u128,
+        inverse: u128,
+    ) -> BTreeMap<String, u128> {
+        let limb_coefficients = n * crt_depth;
+        let wide_mod_calls = |inner: u128| {
+            (0..4).map(|slice| inner.saturating_sub(slice).div_ceil(4) / 63 + 1).sum::<u128>()
+        };
+        let slots = depth * width;
+        // Root: the one-key slice (2 x m) and the packed key family (2 x mW) leave the hash
+        // samples, each lane lifts its plaintext, and the decoding target concatenates two
+        // constants and multiplies two m-digit decompositions. Every slot transforms the
+        // m x m digits of G^(-1)(A_right) twice and its constant 2; every layer transforms the
+        // constant-one plaintext once.
+        let forward = 2 * m + 2 * m * width + width + slots * (2 * m * m + 1) + depth + 2 + 2 * m;
+        // Every slot decomposes A_right (2 x m); the decoding target is 2 x 1.
+        let inverse_polys = slots * 2 * m + 2;
+        let shoup =
+            (forward * (n / 2 * u128::from(n.ilog2()) + n) + inverse_polys * inverse) * crt_depth;
+        // Per slot: c_L D (1 x m x m), A_L D (2 x m x m), and two 1 x 1 plaintext products;
+        // the decoding products are 1 x m x 1 and 2 x m x 1.
+        let wide_mul = (slots * (3 * m * m + 2) + 3 * m) * limb_coefficients;
+        let wide_mod = (slots * (3 * m * wide_mod_calls(m) + 2 * wide_mod_calls(1)) +
+            3 * wide_mod_calls(m)) *
+            limb_coefficients;
+        // Per slot: c_R x_L, the doubled vector, and the doubled public key (1x1 scalars).
+        let mulmod = slots * 4 * m * limb_coefficients;
+        let digit_polynomials = slots * m * m + m;
+        BTreeMap::from([
+            ("gadget_decompositions".to_owned(), inverse_polys),
+            ("gadget_digit_coefficients".to_owned(), digit_polynomials * n),
+            ("gadget_digit_polynomials".to_owned(), digit_polynomials),
+            ("mul64_instructions".to_owned(), wide_mul + 3 * shoup + mulmod),
+            ("mulmod_u64".to_owned(), mulmod),
+            ("ntt_forward".to_owned(), forward * crt_depth),
+            ("ntt_inverse".to_owned(), inverse_polys * crt_depth),
+            ("shoup_mul".to_owned(), shoup),
+            ("unsupported(sequential_family_carry)".to_owned(), 3),
+            ("wide_mod_calls".to_owned(), wide_mod),
+            ("wide_mul".to_owned(), wide_mul),
+        ])
+    }
+
+    fn generated_parameters(
+        ring_dimension: u32,
+        crt_depth: usize,
+        crt_bits: usize,
+        base_bits: usize,
+    ) -> BooleanBggProtocolParameters {
+        let moduli = mxx_ir_core::generate_crt_basis(ring_dimension, crt_depth, crt_bits).unwrap();
+        BooleanBggProtocolParameters {
+            ring: Ring::from_crt_moduli(
+                moduli.into_iter().map(Into::into).collect(),
+                ring_dimension,
+            ),
+            base_bits,
+            digit_count: crt_depth * crt_bits.div_ceil(base_bits),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn gpu_operation_counts_of_the_evaluate_graph_match_the_per_slot_work() {
+        let parameters = generated_parameters(8, 2, 33, 2);
+        let graphs = BooleanBggProtocolGraphs::new(&parameters);
+        let (depth, width) = (2, 3);
+        let counts = mxx_backends::gpu_cost_model::gpu_operation_counts(
+            &graphs.evaluate.graph,
+            &circuit_bindings(4, depth, width),
+            None,
+            4,
+        )
+        .unwrap();
+        let m = parameters.columns() as u128;
+        // n = 8 runs one whole-ring blocked inverse transform: (n / 2) log2 n + 2n.
+        let expected = expected_evaluate_counts(8, 2, m, depth as u128, width, 4 * 3 + 16);
+        assert_eq!(counts, expected);
+    }
+
+    /// The selected row (n = 2^20, 215 x 60-bit moduli, base 4, depth 361) is counted in closed
+    /// form: the walk visits each scope a constant number of times, whatever the loop counts.
+    #[test]
+    fn selected_row_gpu_operation_counts_are_closed_form() {
+        let parameters = generated_parameters(1 << 20, 215, 60, 2);
+        let graphs = BooleanBggProtocolGraphs::new(&parameters);
+        let (depth, width) = (361, 15_057_592_995_680u128);
+        let mut counts = mxx_backends::gpu_cost_model::gpu_operation_counts(
+            &graphs.evaluate.graph,
+            &circuit_bindings(26_214_400, depth, width),
+            None,
+            4,
+        )
+        .unwrap();
+        let n = 1u128 << 20;
+        assert!(counts.remove("unsupported(ring_dimension_above_131072)").unwrap() > 0);
+        // n / 1024 = 1024 > 32 tiles: the wide-stage inverse, 10n + (n / 2) log2(1024 / 32) + 2n.
+        let expected = expected_evaluate_counts(
+            n,
+            215,
+            parameters.columns() as u128,
+            depth as u128,
+            width,
+            10 * n + n / 2 * 5 + 2 * n,
+        );
+        assert_eq!(counts, expected);
+    }
 }

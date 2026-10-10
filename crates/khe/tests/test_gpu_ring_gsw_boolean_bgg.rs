@@ -13,7 +13,9 @@
 //! `test_gpu_ring_gsw_boolean_bgg_parameters` simulates the BGG+ errors of that evaluation
 //! (`mxx_khe::noise_simulate`) and selects the smallest ring dimension and CRT depth that decode
 //! and whose Ring-LWE estimate (`lattice-estimator-cli`, which must be on `PATH` with its Sage
-//! environment) reaches the security target, printing the selection as a parameter row. With
+//! environment) reaches the security target, printing the selection as a parameter row and the
+//! GPU work one evaluation of the row would issue, predicted from the evaluate graph without a
+//! device (`mxx_backends::gpu_cost_model`, one `RING_GSW_BGG_GPU_COUNT` line per counter). With
 //! `PARAMETER_ID` it instead checks that row of `lean/ring_gsw_bgg/parameters.csv` against the
 //! lowered circuit, the simulation, and the estimate, and exports the protocol's average-case
 //! correctness claim to `lean/ring_gsw_bgg/<id>/generated`. The protocol's execution is covered by
@@ -35,6 +37,7 @@
 
 use bigdecimal::BigDecimal;
 use mxx_backends::{
+    gpu_cost_model::gpu_operation_counts,
     lattice_estimator::lattice_security_bits,
     poly::{
         PolyParams,
@@ -309,10 +312,23 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     );
     assert!(report.decrypts(), "the simulated output error decodes");
     assert!(row.security_bits >= security_target, "the row reaches the security target");
+    let sigma = BigDecimal::from_str(&row.error_sigma).unwrap();
+    let bgg = BooleanBggProtocolParameters {
+        ring: mxx_dsl::Ring::new(row.crt_bits, row.crt_depth, row.ring_dimension),
+        base_bits: row.base_bits,
+        digit_count: noise.digit_count,
+        error: Some((rational(&sigma), BigUint::from(row.error_cutoff))),
+    };
+    let bindings = circuit_bindings(row.instance_width, row.circuit_depth, row.max_layer_width);
+    let graphs = BooleanBggProtocolGraphs::new(&bgg);
+    // The GPU work of one evaluation, predicted from the evaluate graph alone.
+    let counts = gpu_operation_counts(&graphs.evaluate.graph, &bindings, None, 4).unwrap();
+    for (name, count) in &counts {
+        println!("RING_GSW_BGG_GPU_COUNT {name}={count}");
+    }
     if env_string("PARAMETER_ID").is_none() {
         return;
     }
-    let sigma = BigDecimal::from_str(&row.error_sigma).unwrap();
     assert_eq!(
         hard_cutoff_from_sigma_bound(&sigma),
         BigUint::from(row.error_cutoff),
@@ -322,14 +338,6 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
         lattice_security_bits(row.ring_dimension, &modulus, &sigma).unwrap() >= row.security_bits,
         "the estimate reproduces the recorded security"
     );
-    let bgg = BooleanBggProtocolParameters {
-        ring: mxx_dsl::Ring::new(row.crt_bits, row.crt_depth, row.ring_dimension),
-        base_bits: row.base_bits,
-        digit_count: noise.digit_count,
-        error: Some((rational(&sigma), BigUint::from(row.error_cutoff))),
-    };
-    let bindings = circuit_bindings(row.instance_width, row.circuit_depth, row.max_layer_width);
-    let graphs = BooleanBggProtocolGraphs::new(&bgg);
     let directory = lean_directory().join(&row.parameter_id).join("generated");
     mxx_ir_core::lean::protocol::export(
         &boolean_bgg_protocol(&graphs, &bgg, &bindings),

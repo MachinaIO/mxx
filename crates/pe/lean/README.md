@@ -24,6 +24,7 @@ the proofs reuse. Mathlib and the ir-core Lean library come through it.
 | File | Contents |
 | --- | --- |
 | `PeDynamic.lean` | The Dynamic LUT branch of a key-homomorphic automorphism: the switching ciphertext `C_k` opened by the helper of `k⁻¹` (`switching_rhs`), the switched product under the routed mask (`aut_switch`), the mask switch by the helper of `k` (`mask_switch`), the public scalar action (`Rel.blockAction`), and the digits of a gadget row (`decompose_row`) |
+| `PeCompact.lean` | The expansion of a compact encoding: a compact encoding of `P x` over `PQ` times the centered gadget `G̃`, switched to `Q`, is an encoding of `x g` under the expanded key with the named error `expandErr` of at most `(B ⌊Q/2⌋ + (N + 2) ⌊P/2⌋) / P` (`RelE.expandCompact`) |
 | `PeTail.lean` | The tail of a linear form in fresh Gaussian tape keys whose coefficients read only other keys and have bounded energy: some of `rows` forms reaches `m` with probability at most `rows · 2 exp(-m² / (2 σ² E))` (`tapeMeasure_linear_tail`) |
 
 ## Parameter IDs
@@ -46,12 +47,14 @@ exports the claim to `<parameter id>/generated`.
 | `trapdoor_instantiation` | `computational` (`[ā \| I \| G - (ā R + E)]`, `m_B = D + 2`) or `statistical` (`[ā \| g - ā T]`, `m_B = m̄ + D`) |
 | `key_width_policy`, `m_bar`, `randomness_sigma` | For a statistical row: `practical` or `strict`, the selected `m̄`, and the sigma of the proof's `R` |
 | `cutoff_multiplier` | The truncation multiplier of `chi`, `chi_fl`, and `Z_t`: `6.5` (computational) or the budget's `c` to four decimals (statistical) |
+| `compact_encodings` | `1` if the fresh encodings are compact two-column rows over `PQ` (`PeParameterRequest::compact_encodings`), `0` otherwise |
 
 | ID | Parameters | Proof |
 | --- | --- | --- |
 | `worst-w2-n16384-crt4x50` | One attribute bit, predicate `F(x) = x₀`, `n = 2^14`, four 50-bit primes, 276/283-bit security | None; its claim is not checked in |
 | `average-w2-n8192-crt5x30` | The same class and predicate, `n = 2^13`, five 30-bit primes (`Q ≈ 2^150`), 15-bit digits, 160/166-bit security, failure `2^-128` | `average-w2-n8192-crt5x30/PeCertificate.lean` |
 | `average-w2-n8192-crt4x42` | The same class and predicate, `n = 2^13`, four 42-bit primes (`Q ≈ 2^168`), 21-bit digits, 137/141-bit security, failure `2^-128` | `average-w2-n8192-crt4x42/PeCertificate.lean` |
+| `average-w2-n32768-crt6x30-compact` | The same class and predicate with compact fresh encodings, `n = 2^15`, six 30-bit primes (`Q ≈ 2^180`, `P ≈ 2^180`), 15-bit digits, 318-bit encryption security at `PQ` (the trapdoor estimate saturates at `u32::MAX`), failure `2^-128` | `average-w2-n32768-crt6x30-compact/PeCertificate.lean` |
 
 ## The claim
 
@@ -76,9 +79,9 @@ every error named by its tape site. The phase of decryption is
 remainder is a linear form in the key extension `v = (v₀, v₁, v_F)`, whose coefficients are the
 helper error `e_h` and the error `e_F` of the online output. `e_F` is bounded by
 `onlineBound` (`PeOnlineRel`; `2^101.7` for `average-w2-n8192-crt5x30`, `2^118.4` for
-`average-w2-n8192-crt4x42`), from the Dynamic product, the identity branch, and the
-branch of `K` of the LUT of the table `(0, 1)`. Each coefficient whose linear form stays below
-`mT ≈ Q/4` decodes to its message bit (`run_decode`).
+`average-w2-n8192-crt4x42` and `average-w2-n32768-crt6x30-compact`), from the Dynamic product,
+the identity branch, and the branch of `K` of the LUT of the table `(0, 1)`. Each coefficient whose
+linear form stays below `mT ≈ Q/4` decodes to its message bit (`run_decode`).
 
 **The coefficients read no key of the extension.** `e_h` and `e_F` are functions of `prims`, the
 samples of the secret, TrapGen, the prelude, and encryption, which read only the tape keys of
@@ -94,7 +97,7 @@ at most `2^-(k+6) ≤ 2^-k` (`tail_numeric`); the recorded rows use `k = 128`.
 
 | Module | Contents |
 | --- | --- |
-| `PeSetup` | The ring, the modulus, `K = 8193`, the hash tags, and the keys hashed from the hash key |
+| `PeSetup` | The ring, the modulus, `K = N + 1`, the hash tags, and the keys hashed from the hash key |
 | `PeOnline` | The output rows of online evaluation: the column loop of the product, its companion loop, the companion loop of the automorphism, and the branch of `K` (`online_rows`) |
 | `PeOnlineRel` | The online output is an encoding of `0` under the output key `A_F = M V_1 + (H Dec(T)) V_K` (`online_rel`); `D_1 + D_K = 0` for the table `(0, 1)` |
 | `PePreprocess` | Preprocessing outputs the companion keys `M`, the switched keys `T`, and `A_F` (`preprocess_keys`) |
@@ -127,6 +130,14 @@ the proof decides before writing the package.
 Encryption samples `Z_t` one column `z_j` at a time in a sequential loop and adds `P z_j` at
 column `j` through a window of a constant unit row; `PePrelude` reads the rows `P Z_t` back with
 `IterRuns.accumulate_entries`, and `PeIndep` lists the column sites `[3, 11, 0, 3, j, 2]`.
+
+A row with `compact_encodings = 1` is filled from `generator/templates_compact` instead, for any
+power-of-two ring dimension. Encryption there publishes the input `c_0`, the helper of `K`, and the
+digit companions as compact rows over `PQ` with `1 × 1` errors (`PeEncrypt`), and every consumer
+reads their expansions `expand` (`PeSetup`, by `RelE.expandCompact`). The expanded input, helper,
+and companions carry errors within `(c ⌊Q/2⌋ + (N + 2) ⌊P/2⌋) / P` for the cutoff `c` (16395 for
+`average-w2-n32768-crt6x30-compact`), which replace the cutoffs in `onlineBound` and in the
+energy of the helper error.
 
 ## Reproduction
 

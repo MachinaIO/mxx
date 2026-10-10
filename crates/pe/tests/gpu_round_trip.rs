@@ -41,7 +41,7 @@
 //! | `TRAPDOOR_INSTANTIATION` | `statistical` | `statistical` or `computational` |
 //! | `KEY_WIDTH_POLICY` | `practical` | `practical` or `strict` (statistical only) |
 //! | `ERROR_SIGMA`, `FLOODING_SIGMA` | 3.19 | Sigmas of `chi` and of `chi_fl` (computational, or statistical with `FLOODING=none`) |
-//! | `COMPACT_ENCODINGS` | 1 | 1 publishes the fresh encodings in two columns over `pq` (`PeParameters::with_compact_encodings`), 0 at `q` in full gadget width; a recorded row (`PARAMETER_ID`) is always at `q` |
+//! | `COMPACT_ENCODINGS` | 1 | 1 publishes the fresh encodings in two columns over `pq` (`PeParameters::with_compact_encodings`), 0 at `q` in full gadget width; a recorded row (`PARAMETER_ID`) follows its `compact_encodings` column |
 //! | `LUT_RADIX` | unset | Radix `B` of the LUT automorphism decomposition (`PeParameters::with_lut_radix`); unset switches every automorphism directly (`B = W`) |
 //! | `FLOODING` | `enforce` | `enforce` or `none`: whether the statistical instantiation imposes the flooding width |
 //! | `PROGRAMMING_SIGMA` | 256 (statistical), 3.19 (computational) | Sigma of the entries of `Z_t` |
@@ -225,7 +225,7 @@ fn recorded(row: &ParameterRow) -> (PeParameters, PeNoiseReport, BranchingProgra
         key_queries: DEFAULT_KEY_QUERIES,
         max_anchor_columns: DEFAULT_MAX_ANCHOR_COLUMNS,
         lut_radix: None,
-        compact_encodings: false,
+        compact_encodings: row.get("compact_encodings").is_some_and(|value| value == "1"),
         failure_exponent,
         lattice_security_bits: None,
     };

@@ -44,7 +44,8 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
   `s (Ã - p X I_2) + e mod pq`, and decryption expands them to the full gadget width at `q`
   (see the exponent-lut crate). A package then holds `2 m²` polynomials over `pq` instead of
   `m³` over `q`. The ring dimension is selected for the lattice estimate at `pq`, and the noise
-  simulation uses the expanded bounds. This option is outside the exported Lean correctness claim.
+  simulation uses the expanded bounds. The Lean claim covers it for the average-case row
+  `average-w2-n32768-crt6x30-compact`.
 - **SampleLeft without the family matrix.** Key generation samples the one extension vector shared
   by every row of `M_F`, then calls the existing preimage sampler once per anchor block. `M_F` is
   never formed; its blocks are contracted where they are used.
@@ -145,7 +146,8 @@ do not model.
 
 [`lean/`](lean/README.md) proves, in Lean, the correctness claim that the integration test exports
 for a recorded parameter set of `lean/parameters.csv`. For the average-case rows
-`average-w2-n8192-crt5x30` and `average-w2-n8192-crt4x42`, the tapes on which a run meeting the
+`average-w2-n8192-crt5x30`, `average-w2-n8192-crt4x42`, and the compact row
+`average-w2-n32768-crt6x30-compact`, the tapes on which a run meeting the
 input contract and the requirement decrypts a wrong message have measure at most `2^-128`.
 `lean/generator/gen.py` writes the proof of such a row from its exported claim; the proofs reuse the
 exponent-LUT Lean library and depend only on the standard axioms.

@@ -1,0 +1,26 @@
+name = "{{PACKAGE}}"
+version = "0.1.0"
+defaultTargets = ["RingGswBggGenerated", "RingGswBggProof"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxKheRingGswBgg"
+path = ".."
+
+# Modules written by `test_gpu_ring_gsw_boolean_bgg_parameters`
+# (`tests/test_gpu_ring_gsw_boolean_bgg.rs`) for this parameter set.
+[[lean_lib]]
+name = "RingGswBggGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "Ideal", "Requirement_0", "Stage_keygen", "Stage_encrypt",
+  "Stage_evaluate", "Stage_decrypt"
+]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "RingGswBggProof"
+roots = ["RingGswBggStep", "RingGswBggCertificate"]

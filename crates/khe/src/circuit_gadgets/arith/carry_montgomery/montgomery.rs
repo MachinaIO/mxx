@@ -1,9 +1,24 @@
+//! Montgomery arithmetic modulo every q-level of a CRT basis, over carry-arithmetic limbs.
+//!
+//! A [`MontgomeryPoly`] holds a polynomial of `N` coefficients: at every active q-level `q_i`
+//! each coefficient is the Montgomery residue `x R mod q_i` for the radix `R = 2^(w L)` of `L`
+//! limbs of `w` bits. Additions, subtractions, and products act coefficient by coefficient, and
+//! the Ring-GSW product (`DecomposeArithmeticGadget`) multiplies negacyclically in
+//! `Z_q[X] / (X^N + 1)`.
+//!
+//! With one-bit limbs (`w = 1`) every operation is a Boolean circuit of AND, XOR, and NOT gates
+//! and no public lookup table is registered. Wider limbs use the lookup tables of
+//! [`CarryArithPoly`], and the Ring-GSW product requires one-bit limbs.
+
 use super::carry_arith::{CarryArithPoly, CarryArithPolyContext, encode_carry_arith_poly};
 use crate::{
     circuit::{BatchedWire, PolyCircuit, gate::GateId},
-    circuit_gadgets::arith::{
-        BinaryPlannerResult, CrtWindow, DecomposeArithmeticGadget, ModularArithmeticContext,
-        ModularArithmeticGadget, ModularArithmeticPlanner,
+    circuit_gadgets::{
+        arith::{
+            BinaryPlannerResult, CrtWindow, DecomposeArithmeticGadget, ModularArithmeticContext,
+            ModularArithmeticGadget, ModularArithmeticPlanner,
+        },
+        conv_mul::montgomery::negacyclic_decomposed_products,
     },
     matrix::PolyMatrix,
     poly::{Poly, PolyParams},
@@ -27,6 +42,10 @@ pub struct MontgomeryAddPlanKey;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MontgomerySubPlanKey;
 
+/// The public constants of Montgomery arithmetic over the CRT basis of `params`.
+///
+/// The context holds no gate of a particular circuit: constants become wires of the circuit that
+/// uses them, so one context also serves the sub-circuits built from that circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MontgomeryPolyContext<P: Poly> {
     pub params: P::Params,
@@ -36,9 +55,16 @@ pub struct MontgomeryPolyContext<P: Poly> {
     pub q_moduli_big: Vec<BigUint>,
     pub reconst_coeffs: Vec<Vec<Vec<BigUint>>>,
     pub num_limbs: usize,
-    pub moduli_poly: Vec<CarryArithPoly<P>>,
-    pub r2_poly: Vec<CarryArithPoly<P>>,
-    pub moduli_prime_poly: Vec<CarryArithPoly<P>>,
+    /// `R^2 mod q_i` for the Montgomery radix `R`.
+    pub r2_values: Vec<BigUint>,
+    /// `-q_i^(-1) mod R`.
+    pub moduli_prime_values: Vec<BigUint>,
+}
+
+/// The constant wires of one q-level used by a Montgomery reduction.
+struct LevelConstants<P: Poly> {
+    modulus: CarryArithPoly<P>,
+    modulus_prime: CarryArithPoly<P>,
 }
 
 impl<P: Poly + 'static> MontgomeryPolyContext<P> {
@@ -61,47 +87,10 @@ impl<P: Poly + 'static> MontgomeryPolyContext<P> {
             .div_ceil(limb_bit_size);
         let carry_arith_ctx =
             Arc::new(CarryArithPolyContext::setup(circuit, limb_bit_size, dummy_scalar));
-
-        let r_bits = limb_bit_size * num_limbs;
-        let r = BigUint::one() << r_bits;
-        let moduli_poly = q_moduli_big
-            .iter()
-            .map(|q_i| {
-                Self::constant_carry_arith_poly(
-                    circuit,
-                    params,
-                    carry_arith_ctx.clone(),
-                    num_limbs,
-                    q_i,
-                )
-            })
-            .collect::<Vec<_>>();
-        let r2_poly = q_moduli_big
-            .iter()
-            .map(|q_i| {
-                let r2_value = (&r * &r) % q_i;
-                Self::constant_carry_arith_poly(
-                    circuit,
-                    params,
-                    carry_arith_ctx.clone(),
-                    num_limbs,
-                    &r2_value,
-                )
-            })
-            .collect::<Vec<_>>();
-        let moduli_prime_poly = q_moduli_big
-            .iter()
-            .map(|q_i| {
-                let moduli_prime_value = Self::calculate_modulus_prime(q_i, &r);
-                Self::constant_carry_arith_poly(
-                    circuit,
-                    params,
-                    carry_arith_ctx.clone(),
-                    num_limbs,
-                    &moduli_prime_value,
-                )
-            })
-            .collect::<Vec<_>>();
+        let r = BigUint::one() << (limb_bit_size * num_limbs);
+        let r2_values = q_moduli_big.par_iter().map(|q_i| (&r * &r) % q_i).collect();
+        let moduli_prime_values =
+            q_moduli_big.par_iter().map(|q_i| Self::calculate_modulus_prime(q_i, &r)).collect();
 
         Self {
             params: params.clone(),
@@ -111,9 +100,8 @@ impl<P: Poly + 'static> MontgomeryPolyContext<P> {
             q_moduli_big,
             reconst_coeffs,
             num_limbs,
-            moduli_poly,
-            r2_poly,
-            moduli_prime_poly,
+            r2_values,
+            moduli_prime_values,
         }
     }
 
@@ -123,15 +111,31 @@ impl<P: Poly + 'static> MontgomeryPolyContext<P> {
         r - n_inv
     }
 
-    fn constant_carry_arith_poly(
+    /// The Montgomery radix `R = 2^(limb_bit_size num_limbs)`.
+    fn radix(&self) -> BigUint {
+        BigUint::one() << (self.carry_arith_ctx.limb_bit_size * self.num_limbs)
+    }
+
+    /// The Montgomery residue `value R mod q_i` of the q-level `q_idx` of the full basis.
+    pub(crate) fn montgomery_residue(&self, q_idx: usize, value: &BigUint) -> BigUint {
+        let q_i = &self.q_moduli_big[q_idx];
+        ((value % q_i) * (self.radix() % q_i)) % q_i
+    }
+
+    /// The constant `value` as `num_limbs` limbs of `circuit`.
+    pub(crate) fn constant_level(
+        &self,
         circuit: &mut PolyCircuit<P>,
-        params: &P::Params,
-        ctx: Arc<CarryArithPolyContext<P>>,
-        num_limbs_per_value: usize,
         value: &BigUint,
     ) -> CarryArithPoly<P> {
-        let limbs = encode_carry_arith_poly(ctx.limb_bit_size, num_limbs_per_value, params, value);
-        CarryArithPoly::const_limbs(ctx, circuit, &limbs)
+        CarryArithPoly::constant(self.carry_arith_ctx.clone(), circuit, self.num_limbs, value)
+    }
+
+    fn level_constants(&self, circuit: &mut PolyCircuit<P>, q_idx: usize) -> LevelConstants<P> {
+        LevelConstants {
+            modulus: self.constant_level(circuit, &self.q_moduli_big[q_idx]),
+            modulus_prime: self.constant_level(circuit, &self.moduli_prime_values[q_idx]),
+        }
     }
 
     fn precompute_reconst_coeffs(q_moduli: &[u64]) -> Vec<Vec<Vec<BigUint>>> {
@@ -199,7 +203,9 @@ impl<P: Poly + 'static> MontgomeryPolyContext<P> {
 #[derive(Debug, Clone)]
 pub struct MontgomeryPoly<P: Poly> {
     pub ctx: Arc<MontgomeryPolyContext<P>>,
-    pub value: Vec<CarryArithPoly<P>>,
+    /// `value[level][coefficient]`: the Montgomery residue of one coefficient at one active
+    /// q-level.
+    pub value: Vec<Vec<CarryArithPoly<P>>>,
     pub window: CrtWindow,
     pub max_plaintexts: Vec<BigUint>,
     pub p_max_traces: Vec<BigUint>,
@@ -223,7 +229,7 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
 
     fn with_metadata(
         ctx: Arc<MontgomeryPolyContext<P>>,
-        value: Vec<CarryArithPoly<P>>,
+        value: Vec<Vec<CarryArithPoly<P>>>,
         window: CrtWindow,
         max_plaintexts: Vec<BigUint>,
         p_max_traces: Vec<BigUint>,
@@ -231,6 +237,12 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
         Self::validate_window(ctx.as_ref(), window);
         let levels = window.depth;
         assert_eq!(value.len(), levels, "MontgomeryPoly value rows must match active q levels");
+        let num_coefficients = value[0].len();
+        assert!(num_coefficients > 0, "MontgomeryPoly requires at least one coefficient");
+        assert!(
+            value.iter().all(|level| level.len() == num_coefficients),
+            "every MontgomeryPoly q-level must hold the same number of coefficients",
+        );
         assert_eq!(
             max_plaintexts.len(),
             levels,
@@ -242,6 +254,17 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
             "MontgomeryPoly trace metadata must match active q levels",
         );
         Self { ctx, value, window, max_plaintexts, p_max_traces }
+    }
+
+    /// An entry whose metadata bounds every residue by `q_i - 1`.
+    pub(crate) fn normalized(
+        ctx: Arc<MontgomeryPolyContext<P>>,
+        value: Vec<Vec<CarryArithPoly<P>>>,
+        window: CrtWindow,
+    ) -> Self {
+        let max_plaintexts = Self::default_max_plaintexts(ctx.as_ref(), window);
+        let p_max_traces = Self::default_p_max_traces(ctx.as_ref(), window);
+        Self::with_metadata(ctx, value, window, max_plaintexts, p_max_traces)
     }
 
     fn planner_metadata(&self) -> MontgomeryPlannerMetadata {
@@ -266,8 +289,13 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
         ctx.num_limbs * ctx.carry_arith_ctx.limb_bit_size
     }
 
-    fn zero_level(ctx: &MontgomeryPolyContext<P>) -> CarryArithPoly<P> {
-        CarryArithPoly::zero(ctx.carry_arith_ctx.clone(), Self::bit_size(ctx))
+    fn zero_coefficients(
+        ctx: &MontgomeryPolyContext<P>,
+        circuit: &mut PolyCircuit<P>,
+        num_coefficients: usize,
+    ) -> Vec<CarryArithPoly<P>> {
+        let zero = CarryArithPoly::zero(ctx.carry_arith_ctx.clone(), circuit, Self::bit_size(ctx));
+        vec![zero; num_coefficients]
     }
 
     fn digit_radix(ctx: &MontgomeryPolyContext<P>) -> BigUint {
@@ -278,55 +306,72 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
         self.window.offset..self.window.end()
     }
 
-    pub fn new(ctx: Arc<MontgomeryPolyContext<P>>, value: Vec<CarryArithPoly<P>>) -> Self {
-        let window = CrtWindow::full(ctx.q_moduli_depth());
-        let max_plaintexts = Self::default_max_plaintexts(ctx.as_ref(), window);
-        let p_max_traces = Self::default_p_max_traces(ctx.as_ref(), window);
-        Self::with_metadata(ctx, value, window, max_plaintexts, p_max_traces)
+    pub fn num_coefficients(&self) -> usize {
+        self.value[0].len()
     }
 
-    pub fn input(ctx: Arc<MontgomeryPolyContext<P>>, circuit: &mut PolyCircuit<P>) -> Self {
-        let bit_size = Self::bit_size(ctx.as_ref());
-        let values = (0..ctx.q_moduli_depth())
-            .map(|_| CarryArithPoly::input(ctx.carry_arith_ctx.clone(), circuit, bit_size))
-            .collect::<Vec<_>>();
-        let window = CrtWindow::full(ctx.q_moduli_depth());
-        let max_plaintexts = Self::default_max_plaintexts(ctx.as_ref(), window);
-        let p_max_traces = Self::default_p_max_traces(ctx.as_ref(), window);
-        Self::with_metadata(ctx, values, window, max_plaintexts, p_max_traces)
+    fn input_value(
+        ctx: &MontgomeryPolyContext<P>,
+        num_coefficients: usize,
+        window: CrtWindow,
+        circuit: &mut PolyCircuit<P>,
+    ) -> Vec<Vec<CarryArithPoly<P>>> {
+        Self::validate_window(ctx, window);
+        let bit_size = Self::bit_size(ctx);
+        (0..window.depth)
+            .map(|_| {
+                (0..num_coefficients)
+                    .map(|_| CarryArithPoly::input(ctx.carry_arith_ctx.clone(), circuit, bit_size))
+                    .collect()
+            })
+            .collect()
     }
 
     fn pad_value(
         ctx: &MontgomeryPolyContext<P>,
-        mut value: CarryArithPoly<P>,
+        circuit: &mut PolyCircuit<P>,
+        value: CarryArithPoly<P>,
     ) -> CarryArithPoly<P> {
-        if value.limbs.len() != ctx.num_limbs {
-            value = value.extend_size(Self::bit_size(ctx));
+        if value.limbs.len() < ctx.num_limbs {
+            value.extend_size(circuit, Self::bit_size(ctx))
+        } else {
+            value
         }
-        value
+    }
+
+    /// Converts regular residues `x < q_i` of the q-level `q_idx` to Montgomery residues.
+    fn montgomery_level(
+        ctx: &MontgomeryPolyContext<P>,
+        circuit: &mut PolyCircuit<P>,
+        q_idx: usize,
+        values: Vec<CarryArithPoly<P>>,
+    ) -> Vec<CarryArithPoly<P>> {
+        let r2 = ctx.constant_level(circuit, &ctx.r2_values[q_idx]);
+        let constants = ctx.level_constants(circuit, q_idx);
+        values
+            .into_iter()
+            .map(|value| {
+                let value = Self::pad_value(ctx, circuit, value);
+                let r2_mul = value.mul(&r2, circuit, None);
+                Self::montgomery_reduce(ctx, circuit, &r2_mul, &constants)
+            })
+            .collect()
     }
 
     pub fn from_regular_values(
         circuit: &mut PolyCircuit<P>,
         ctx: Arc<MontgomeryPolyContext<P>>,
-        values: Vec<CarryArithPoly<P>>,
+        values: Vec<Vec<CarryArithPoly<P>>>,
         window: CrtWindow,
     ) -> Self {
         let range = ctx.active_range(window);
         assert_eq!(values.len(), range.len(), "regular Montgomery inputs must match active levels");
         let mont_values = values
             .into_iter()
-            .enumerate()
-            .map(|(local_q_idx, value)| {
-                let q_idx = range.start + local_q_idx;
-                let value = Self::pad_value(ctx.as_ref(), value);
-                let r2_mul = value.mul(&ctx.r2_poly[q_idx], circuit, None);
-                Self::montgomery_reduce_level(ctx.as_ref(), q_idx, circuit, &r2_mul)
-            })
+            .zip(range)
+            .map(|(level, q_idx)| Self::montgomery_level(ctx.as_ref(), circuit, q_idx, level))
             .collect::<Vec<_>>();
-        let max_plaintexts = Self::default_max_plaintexts(ctx.as_ref(), window);
-        let p_max_traces = Self::default_p_max_traces(ctx.as_ref(), window);
-        Self::with_metadata(ctx, mont_values, window, max_plaintexts, p_max_traces)
+        Self::normalized(ctx, mont_values, window)
     }
 
     pub fn add(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -338,22 +383,25 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
             .iter()
             .zip(other.value.iter())
             .zip(self.active_range())
-            .map(|((lhs, rhs), q_idx)| {
-                let sum_full = lhs.add(rhs, circuit);
-                let n_ext = self.ctx.moduli_poly[q_idx].extend_size(n_ext_bits);
-                let (is_less, diff) = sum_full.less_than(&n_ext, circuit);
-                let reduced_full = sum_full.cmux(&diff, is_less, circuit);
-                reduced_full.mod_limbs(self.ctx.num_limbs)
+            .map(|((lhs_level, rhs_level), q_idx)| {
+                let n_ext = self
+                    .ctx
+                    .constant_level(circuit, &self.ctx.q_moduli_big[q_idx])
+                    .extend_size(circuit, n_ext_bits);
+                lhs_level
+                    .iter()
+                    .zip(rhs_level)
+                    .map(|(lhs, rhs)| {
+                        let sum_full = lhs.add(rhs, circuit);
+                        let (is_less, diff) = sum_full.less_than(&n_ext, circuit);
+                        let reduced_full = sum_full.cmux(&diff, is_less, circuit);
+                        reduced_full.mod_limbs(self.ctx.num_limbs)
+                    })
+                    .collect()
             })
             .collect::<Vec<_>>();
         debug!("num gates {:?} at MontgomeryPoly::add", circuit.count_gates_by_type_vec());
-        Self::with_metadata(
-            self.ctx.clone(),
-            reduced,
-            self.window,
-            Self::default_max_plaintexts(self.ctx.as_ref(), self.window),
-            Self::default_p_max_traces(self.ctx.as_ref(), self.window),
-        )
+        Self::normalized(self.ctx.clone(), reduced, self.window)
     }
 
     pub fn sub(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
@@ -364,24 +412,24 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
             .iter()
             .zip(other.value.iter())
             .zip(self.active_range())
-            .map(|((lhs, rhs), q_idx)| {
-                let (is_less, raw_sub) = lhs.less_than(rhs, circuit);
-                let added = raw_sub
-                    .add(&self.ctx.moduli_poly[q_idx], circuit)
-                    .mod_limbs(self.ctx.num_limbs);
-                added.cmux(&raw_sub, is_less, circuit)
+            .map(|((lhs_level, rhs_level), q_idx)| {
+                let modulus = self.ctx.constant_level(circuit, &self.ctx.q_moduli_big[q_idx]);
+                lhs_level
+                    .iter()
+                    .zip(rhs_level)
+                    .map(|(lhs, rhs)| {
+                        let (is_less, raw_sub) = lhs.less_than(rhs, circuit);
+                        let added = raw_sub.add(&modulus, circuit).mod_limbs(self.ctx.num_limbs);
+                        added.cmux(&raw_sub, is_less, circuit)
+                    })
+                    .collect()
             })
             .collect::<Vec<_>>();
         debug!("num gates {:?} at MontgomeryPoly::sub", circuit.count_gates_by_type_vec());
-        Self::with_metadata(
-            self.ctx.clone(),
-            result,
-            self.window,
-            Self::default_max_plaintexts(self.ctx.as_ref(), self.window),
-            Self::default_p_max_traces(self.ctx.as_ref(), self.window),
-        )
+        Self::normalized(self.ctx.clone(), result, self.window)
     }
 
+    /// The coefficient-wise product.
     pub fn mul(&self, other: &Self, circuit: &mut PolyCircuit<P>) -> Self {
         debug_assert_eq!(self.ctx, other.ctx);
         debug_assert_eq!(self.window, other.window);
@@ -390,27 +438,53 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
             .iter()
             .zip(other.value.iter())
             .zip(self.active_range())
-            .map(|((lhs, rhs), q_idx)| {
-                let product = lhs.mul(rhs, circuit, None);
-                Self::montgomery_reduce_level(self.ctx.as_ref(), q_idx, circuit, &product)
+            .map(|((lhs_level, rhs_level), q_idx)| {
+                let constants = self.ctx.level_constants(circuit, q_idx);
+                lhs_level
+                    .iter()
+                    .zip(rhs_level)
+                    .map(|(lhs, rhs)| {
+                        let product = lhs.mul(rhs, circuit, None);
+                        Self::montgomery_reduce(self.ctx.as_ref(), circuit, &product, &constants)
+                    })
+                    .collect()
             })
             .collect::<Vec<_>>();
         debug!("num gates {:?} at MontgomeryPoly::mul", circuit.count_gates_by_type_vec());
-        Self::with_metadata(
-            self.ctx.clone(),
-            reduced,
-            self.window,
-            Self::default_max_plaintexts(self.ctx.as_ref(), self.window),
-            Self::default_p_max_traces(self.ctx.as_ref(), self.window),
-        )
+        Self::normalized(self.ctx.clone(), reduced, self.window)
     }
 
-    pub fn to_regular(&self, circuit: &mut PolyCircuit<P>) -> Vec<CarryArithPoly<P>> {
+    /// The regular residues `x < q_i`, as `[level][coefficient]`. Every q-level registers one
+    /// reduction sub-circuit and calls it once per coefficient.
+    pub fn to_regular(&self, circuit: &mut PolyCircuit<P>) -> Vec<Vec<CarryArithPoly<P>>> {
+        let num_limbs = self.ctx.num_limbs;
         self.value
             .iter()
             .zip(self.active_range())
-            .map(|(value, q_idx)| {
-                Self::montgomery_reduce_level(self.ctx.as_ref(), q_idx, circuit, value)
+            .map(|(level, q_idx)| {
+                let mut reduction = circuit.fresh_sub_circuit();
+                let input = CarryArithPoly::input(
+                    self.ctx.carry_arith_ctx.clone(),
+                    &mut reduction,
+                    Self::bit_size(self.ctx.as_ref()),
+                );
+                let constants = self.ctx.level_constants(&mut reduction, q_idx);
+                let regular =
+                    Self::montgomery_reduce(self.ctx.as_ref(), &mut reduction, &input, &constants);
+                reduction.output(regular.limbs);
+                let reduction_id = circuit.register_sub_circuit(reduction);
+                level
+                    .iter()
+                    .map(|value| {
+                        let limbs = circuit
+                            .call_sub_circuit(reduction_id, value.limbs.clone())
+                            .into_iter()
+                            .map(BatchedWire::as_single_wire)
+                            .collect::<Vec<_>>();
+                        debug_assert_eq!(limbs.len(), num_limbs);
+                        CarryArithPoly::new(self.ctx.carry_arith_ctx.clone(), limbs)
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -419,75 +493,96 @@ impl<P: Poly + 'static> MontgomeryPoly<P> {
         self.reconstruct_value(circuit)
     }
 
-    fn montgomery_reduce_level(
+    /// REDC: `t R^(-1) mod q_i` for `t < q_i R`.
+    fn montgomery_reduce(
         ctx: &MontgomeryPolyContext<P>,
-        q_idx: usize,
         circuit: &mut PolyCircuit<P>,
         t: &CarryArithPoly<P>,
+        constants: &LevelConstants<P>,
     ) -> CarryArithPoly<P> {
         let r = ctx.num_limbs;
         let limb_bits = ctx.carry_arith_ctx.limb_bit_size;
 
         let t_low = t.mod_limbs(r);
-        let m = t_low.mul(&ctx.moduli_prime_poly[q_idx], circuit, Some(r * limb_bits));
-        let m_times_n = m.mul(&ctx.moduli_poly[q_idx], circuit, None);
+        let m = t_low.mul(&constants.modulus_prime, circuit, Some(r * limb_bits));
+        let m_times_n = m.mul(&constants.modulus, circuit, None);
         let u = t.add(&m_times_n, circuit);
 
         let u_shifted = u.left_shift(r);
         let n_ext_bits = (r + 1) * limb_bits;
-        let n_ext = ctx.moduli_poly[q_idx].extend_size(n_ext_bits);
+        let n_ext = constants.modulus.extend_size(circuit, n_ext_bits);
         let (is_less, diff) = u_shifted.less_than(&n_ext, circuit);
         let reduced_full = u_shifted.cmux(&diff, is_less, circuit);
         reduced_full.mod_limbs(r)
     }
 
+    /// One gate whose plaintext is `sum_i X^i c_i` for the CRT reconstructions `c_i` of the
+    /// coefficients.
     pub fn reconstruct_value(&self, circuit: &mut PolyCircuit<P>) -> GateId {
         let residues = self.to_regular(circuit);
         let reconst_coeffs = self.ctx.reconst_coeffs_for_window(self.window);
         let mut sum = circuit.const_zero_gate();
-        for (residue, reconst_coeff) in residues.iter().zip(reconst_coeffs.iter()) {
-            let residue_gate = residue.finalize(circuit);
-            let scaled =
-                circuit.large_scalar_mul(residue_gate, std::slice::from_ref(reconst_coeff));
-            sum = circuit.add_gate(sum, scaled);
+        for (residue_level, reconst_coeff) in residues.iter().zip(reconst_coeffs.iter()) {
+            for (coefficient, residue) in residue_level.iter().enumerate() {
+                let residue_gate = residue.finalize(circuit);
+                let mut scalar = vec![BigUint::ZERO; coefficient + 1];
+                scalar[coefficient] = reconst_coeff.clone();
+                let scaled = circuit.large_scalar_mul(residue_gate, &scalar);
+                sum = circuit.add_gate(sum, scaled);
+            }
         }
         sum.as_single_wire()
+    }
+
+    /// One gate whose plaintext is `sum_i X^i gates[i]`.
+    fn coefficient_embedding(circuit: &mut PolyCircuit<P>, gates: &[GateId]) -> GateId {
+        let mut sum = gates[0];
+        for (coefficient, &gate) in gates.iter().enumerate().skip(1) {
+            let rotated = circuit.rotate_gate(gate, coefficient as u64);
+            sum = circuit.add_gate(sum, rotated).as_single_wire();
+        }
+        sum
     }
 
     pub fn active_q_moduli(&self) -> Vec<u64> {
         self.ctx.q_moduli[self.active_range()].to_vec()
     }
 
-    fn digit_value_poly(
-        ctx: &MontgomeryPolyContext<P>,
-        digit_gate: GateId,
-        circuit: &mut PolyCircuit<P>,
-    ) -> CarryArithPoly<P> {
-        let mut limbs = vec![circuit.const_zero_gate().as_single_wire(); ctx.num_limbs];
-        limbs[0] = digit_gate;
-        CarryArithPoly::new(ctx.carry_arith_ctx.clone(), limbs)
-    }
-
+    /// The entry whose only nonzero q-level is `target_q_idx`, holding the regular residues
+    /// `target_values`, with the given metadata at that level.
     fn sparse_regular_level_poly_with_metadata(
         ctx: Arc<MontgomeryPolyContext<P>>,
-        active_levels: usize,
+        circuit: &mut PolyCircuit<P>,
         window: CrtWindow,
         target_q_idx: usize,
-        target_value: CarryArithPoly<P>,
+        target_values: Vec<CarryArithPoly<P>>,
         max_plaintext: BigUint,
         p_max_trace: BigUint,
-        circuit: &mut PolyCircuit<P>,
     ) -> Self {
+        let active_levels = window.depth;
         assert!(target_q_idx < active_levels, "target_q_idx must lie within active_levels");
-        let mut values =
-            (0..active_levels).map(|_| Self::zero_level(ctx.as_ref())).collect::<Vec<_>>();
-        values[target_q_idx] = Self::pad_value(ctx.as_ref(), target_value);
-        let mont = Self::from_regular_values(circuit, ctx.clone(), values, window);
+        let num_coefficients = target_values.len();
+        let target_level = Self::montgomery_level(
+            ctx.as_ref(),
+            circuit,
+            window.offset + target_q_idx,
+            target_values,
+        );
+        let mut target_level = Some(target_level);
+        let value = (0..active_levels)
+            .map(|q_idx| {
+                if q_idx == target_q_idx {
+                    target_level.take().expect("the target level is used once")
+                } else {
+                    Self::zero_coefficients(ctx.as_ref(), circuit, num_coefficients)
+                }
+            })
+            .collect::<Vec<_>>();
         let mut max_plaintexts = vec![BigUint::ZERO; active_levels];
         let mut p_max_traces = vec![BigUint::ZERO; active_levels];
         max_plaintexts[target_q_idx] = max_plaintext;
         p_max_traces[target_q_idx] = p_max_trace;
-        Self::with_metadata(ctx, mont.value, window, max_plaintexts, p_max_traces)
+        Self::with_metadata(ctx, value, window, max_plaintexts, p_max_traces)
     }
 
     fn native_sparse_gadget_constant(
@@ -557,37 +652,29 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
         &self.p_max_traces
     }
 
+    fn num_coefficient_slots(&self) -> usize {
+        self.num_coefficients()
+    }
+
     fn input(
         ctx: Arc<Self::Context>,
-        _num_coefficient_slots: usize,
+        num_coefficient_slots: usize,
         window: CrtWindow,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        Self::validate_window(ctx.as_ref(), window);
-        let bit_size = Self::bit_size(ctx.as_ref());
-        let levels = window.depth;
-        let value = (0..levels)
-            .map(|_| CarryArithPoly::input(ctx.carry_arith_ctx.clone(), circuit, bit_size))
-            .collect::<Vec<_>>();
-        let max_plaintexts = Self::default_max_plaintexts(ctx.as_ref(), window);
-        let p_max_traces = Self::default_p_max_traces(ctx.as_ref(), window);
-        Self::with_metadata(ctx, value, window, max_plaintexts, p_max_traces)
+        let value = Self::input_value(ctx.as_ref(), num_coefficient_slots, window, circuit);
+        Self::normalized(ctx, value, window)
     }
 
     fn input_with_metadata(
         ctx: Arc<Self::Context>,
-        _num_coefficient_slots: usize,
+        num_coefficient_slots: usize,
         window: CrtWindow,
         max_plaintexts: Vec<BigUint>,
         p_max_traces: Vec<BigUint>,
         circuit: &mut PolyCircuit<P>,
     ) -> Self {
-        Self::validate_window(ctx.as_ref(), window);
-        let bit_size = Self::bit_size(ctx.as_ref());
-        let levels = window.depth;
-        let value = (0..levels)
-            .map(|_| CarryArithPoly::input(ctx.carry_arith_ctx.clone(), circuit, bit_size))
-            .collect::<Vec<_>>();
+        let value = Self::input_value(ctx.as_ref(), num_coefficient_slots, window, circuit);
         Self::with_metadata(ctx, value, window, max_plaintexts, p_max_traces)
     }
 
@@ -598,6 +685,7 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
     fn flatten(&self) -> Vec<BatchedWire> {
         self.value
             .iter()
+            .flatten()
             .flat_map(|residue| residue.limbs.iter().copied().map(BatchedWire::single))
             .collect()
     }
@@ -609,14 +697,23 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
         p_max_traces: Vec<BigUint>,
     ) -> Self {
         let levels = template.window.depth;
+        let num_coefficients = template.num_coefficients();
+        let num_limbs = template.ctx.num_limbs;
         assert_eq!(
             outputs.len(),
-            levels * template.ctx.num_limbs,
-            "Montgomery flattened outputs must match active_levels * num_limbs",
+            levels * num_coefficients * num_limbs,
+            "Montgomery flattened outputs must match active_levels * coefficients * num_limbs",
         );
         let value = outputs
-            .par_chunks(template.ctx.num_limbs)
-            .map(|row| CarryArithPoly::new(template.ctx.carry_arith_ctx.clone(), row.to_vec()))
+            .par_chunks(num_coefficients * num_limbs)
+            .map(|level| {
+                level
+                    .chunks(num_limbs)
+                    .map(|limbs| {
+                        CarryArithPoly::new(template.ctx.carry_arith_ctx.clone(), limbs.to_vec())
+                    })
+                    .collect()
+            })
             .collect::<Vec<_>>();
         Self::with_metadata(
             template.ctx.clone(),
@@ -628,37 +725,48 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
     }
 
     fn q_level_row_batch(&self, q_idx: usize) -> BatchedWire {
-        BatchedWire::from_batches(self.value[q_idx].limbs.iter().copied())
+        BatchedWire::from_batches(
+            self.value[q_idx].iter().flat_map(|residue| residue.limbs.iter().copied()),
+        )
     }
 
     fn sparse_level_poly_with_metadata(
         ctx: Arc<Self::Context>,
-        _num_coefficient_slots: usize,
+        num_coefficient_slots: usize,
         window: CrtWindow,
         target_q_idx: usize,
         target_row: BatchedWire,
         max_plaintext: BigUint,
         p_max_trace: BigUint,
-        _circuit: &mut PolyCircuit<P>,
+        circuit: &mut PolyCircuit<P>,
     ) -> Self {
         let active_levels = window.depth;
         assert!(target_q_idx < active_levels, "target_q_idx must lie within active_levels");
-        let mut value = Vec::with_capacity(active_levels);
+        let target_row = target_row.gate_ids().collect::<Vec<_>>();
+        assert_eq!(
+            target_row.len(),
+            num_coefficient_slots * ctx.num_limbs,
+            "a sparse Montgomery row must hold every limb of every coefficient",
+        );
+        let mut target_level = Some(
+            target_row
+                .chunks(ctx.num_limbs)
+                .map(|limbs| CarryArithPoly::new(ctx.carry_arith_ctx.clone(), limbs.to_vec()))
+                .collect::<Vec<_>>(),
+        );
+        let value = (0..active_levels)
+            .map(|q_idx| {
+                if q_idx == target_q_idx {
+                    target_level.take().expect("the target level is used once")
+                } else {
+                    Self::zero_coefficients(ctx.as_ref(), circuit, num_coefficient_slots)
+                }
+            })
+            .collect::<Vec<_>>();
         let mut max_plaintexts = vec![BigUint::ZERO; active_levels];
         let mut p_max_traces = vec![BigUint::ZERO; active_levels];
-        let mut target_row = Some(target_row.gate_ids().collect::<Vec<_>>());
         max_plaintexts[target_q_idx] = max_plaintext;
         p_max_traces[target_q_idx] = p_max_trace;
-        for q_idx in 0..active_levels {
-            if q_idx == target_q_idx {
-                value.push(CarryArithPoly::new(
-                    ctx.carry_arith_ctx.clone(),
-                    target_row.take().expect("target row must be present exactly once"),
-                ));
-            } else {
-                value.push(Self::zero_level(ctx.as_ref()));
-            }
-        }
         Self::with_metadata(ctx, value, window, max_plaintexts, p_max_traces)
     }
 
@@ -679,15 +787,22 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
         let value = self
             .value
             .iter()
-            .map(|residue| {
-                let limbs = residue
-                    .limbs
+            .map(|level| {
+                level
                     .iter()
-                    .map(|&gate_id| {
-                        circuit.slot_transfer_gate(gate_id, &lowered_src_slots).as_single_wire()
+                    .map(|residue| {
+                        let limbs = residue
+                            .limbs
+                            .iter()
+                            .map(|&gate_id| {
+                                circuit
+                                    .slot_transfer_gate(gate_id, &lowered_src_slots)
+                                    .as_single_wire()
+                            })
+                            .collect::<Vec<_>>();
+                        CarryArithPoly::new(self.ctx.carry_arith_ctx.clone(), limbs)
                     })
-                    .collect::<Vec<_>>();
-                CarryArithPoly::new(self.ctx.carry_arith_ctx.clone(), limbs)
+                    .collect()
             })
             .collect::<Vec<_>>();
         Self::with_metadata(
@@ -725,21 +840,28 @@ impl<P: Poly + 'static> ModularArithmeticGadget<P> for MontgomeryPoly<P> {
             self.window.depth,
             "MontgomeryPoly const_mul requires one scalar per active q-level"
         );
-        let constants = tower_constants
+        let value = self
+            .value
             .iter()
-            .map(|constant| {
-                MontgomeryPolyContext::constant_carry_arith_poly(
+            .zip(self.active_range())
+            .zip(tower_constants)
+            .map(|((level, q_idx), constant)| {
+                // REDC(x R * c R) = x c R.
+                let mont_constant = self.ctx.constant_level(
                     circuit,
-                    &self.ctx.params,
-                    self.ctx.carry_arith_ctx.clone(),
-                    self.ctx.num_limbs,
-                    &BigUint::from(*constant),
-                )
+                    &self.ctx.montgomery_residue(q_idx, &BigUint::from(*constant)),
+                );
+                let constants = self.ctx.level_constants(circuit, q_idx);
+                level
+                    .iter()
+                    .map(|residue| {
+                        let product = residue.mul(&mont_constant, circuit, None);
+                        Self::montgomery_reduce(self.ctx.as_ref(), circuit, &product, &constants)
+                    })
+                    .collect()
             })
             .collect::<Vec<_>>();
-        let mont_constant =
-            MontgomeryPoly::from_regular_values(circuit, self.ctx.clone(), constants, self.window);
-        self.mul(&mont_constant, circuit)
+        Self::normalized(self.ctx.clone(), value, self.window)
     }
 
     fn reconstruct(&self, circuit: &mut PolyCircuit<P>) -> GateId {
@@ -896,7 +1018,7 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
 
     fn gadget_vector(
         ctx: Arc<Self::Context>,
-        _num_coefficient_slots: usize,
+        num_coefficient_slots: usize,
         window: CrtWindow,
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<Self> {
@@ -908,22 +1030,33 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
             for digit_idx in 0..ctx.num_limbs {
                 let value = radix
                     .pow(u32::try_from(digit_idx).expect("Montgomery digit index must fit in u32"));
-                let carry = MontgomeryPolyContext::constant_carry_arith_poly(
+                // The constant polynomial `value` at q-level `q_idx`, already in Montgomery form.
+                let mut target_level =
+                    Self::zero_coefficients(ctx.as_ref(), circuit, num_coefficient_slots);
+                target_level[0] = ctx.constant_level(
                     circuit,
-                    &ctx.params,
-                    ctx.carry_arith_ctx.clone(),
-                    ctx.num_limbs,
-                    &value,
+                    &ctx.montgomery_residue(window.offset + q_idx, &value),
                 );
-                gadget.push(Self::sparse_regular_level_poly_with_metadata(
+                let mut target_level = Some(target_level);
+                let entry_value = (0..active_levels)
+                    .map(|level| {
+                        if level == q_idx {
+                            target_level.take().expect("the target level is used once")
+                        } else {
+                            Self::zero_coefficients(ctx.as_ref(), circuit, num_coefficient_slots)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut max_plaintexts = vec![BigUint::ZERO; active_levels];
+                let mut p_max_traces = vec![BigUint::ZERO; active_levels];
+                max_plaintexts[q_idx] = value.clone();
+                p_max_traces[q_idx] = value;
+                gadget.push(Self::with_metadata(
                     ctx.clone(),
-                    active_levels,
+                    entry_value,
                     window,
-                    q_idx,
-                    carry,
-                    value.clone(),
-                    value.clone(),
-                    circuit,
+                    max_plaintexts,
+                    p_max_traces,
                 ));
             }
         }
@@ -932,21 +1065,27 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
 
     fn gadget_decompose(&self, circuit: &mut PolyCircuit<P>) -> Vec<Self> {
         let regular_rows = self.to_regular(circuit);
-        let active_levels = self.window.depth;
         let digit_bound = Self::digit_radix(self.ctx.as_ref()) - BigUint::from(1u64);
-        let mut decomposition = Vec::with_capacity(active_levels * self.ctx.num_limbs);
-        for (q_idx, regular_row) in regular_rows.into_iter().enumerate() {
-            for digit_gate in regular_row.limbs {
-                let digit_value = Self::digit_value_poly(self.ctx.as_ref(), digit_gate, circuit);
+        let mut decomposition = Vec::with_capacity(self.window.depth * self.ctx.num_limbs);
+        for (q_idx, regular_level) in regular_rows.iter().enumerate() {
+            for digit_idx in 0..self.ctx.num_limbs {
+                let digit_values = regular_level
+                    .iter()
+                    .map(|regular| {
+                        CarryArithPoly::new(
+                            self.ctx.carry_arith_ctx.clone(),
+                            vec![regular.limbs[digit_idx]],
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 decomposition.push(Self::sparse_regular_level_poly_with_metadata(
                     self.ctx.clone(),
-                    active_levels,
+                    circuit,
                     self.window,
                     q_idx,
-                    digit_value,
+                    digit_values,
                     digit_bound.clone(),
                     digit_bound.clone(),
-                    circuit,
                 ));
             }
         }
@@ -959,54 +1098,65 @@ impl<P: Poly + 'static> DecomposeArithmeticGadget<P> for MontgomeryPoly<P> {
         circuit: &mut PolyCircuit<P>,
     ) -> (Vec<GateId>, GateId) {
         let regular_rows = self.to_regular(circuit);
-        let row = &regular_rows[q_idx].limbs;
-        debug_assert_eq!(row.len(), self.ctx.num_limbs);
-        (
-            row[..row.len().saturating_sub(1)].to_vec(),
-            *row.last().expect("Montgomery decomposition requires at least one limb"),
-        )
+        let level = &regular_rows[q_idx];
+        let mut digits = (0..self.ctx.num_limbs)
+            .map(|digit_idx| {
+                let coefficient_digits =
+                    level.iter().map(|regular| regular.limbs[digit_idx]).collect::<Vec<_>>();
+                Self::coefficient_embedding(circuit, &coefficient_digits)
+            })
+            .collect::<Vec<_>>();
+        let last = digits.pop().expect("Montgomery decomposition requires at least one limb");
+        (digits, last)
     }
 
     fn conv_mul_right_decomposed_many(
         &self,
         _params: &P::Params,
         left_rows: &[&[Self]],
-        _num_slots: usize,
+        num_slots: usize,
         circuit: &mut PolyCircuit<P>,
     ) -> Vec<Self> {
-        let decomposed_rhs = self.gadget_decompose(circuit);
-        left_rows
-            .iter()
-            .map(|row| {
-                assert_eq!(
-                    row.len(),
-                    decomposed_rhs.len(),
-                    "Montgomery decomposed rows must match the gadget decomposition width",
-                );
-                let mut row_iter = row.iter().zip(decomposed_rhs.iter());
-                let (first_left, first_right) =
-                    row_iter.next().expect("Montgomery decomposition width must be non-zero");
-                row_iter.fold(first_left.mul(first_right, circuit), |acc, (left, right)| {
-                    let product = left.mul(right, circuit);
-                    acc.add(&product, circuit)
-                })
-            })
-            .collect()
+        assert_eq!(num_slots, self.num_coefficients(), "num_slots must match the coefficients");
+        negacyclic_decomposed_products(&[self], left_rows, circuit)
+    }
+
+    /// Both rows of a Ring-GSW column product in one sum per row: the top and bottom halves of
+    /// each row are accumulated together and reduced once.
+    fn mul_rows_with_decomposed_rhs(
+        _params: &P::Params,
+        lhs_row0: &[Self],
+        lhs_row1: &[Self],
+        rhs_top: &Self,
+        rhs_bottom: &Self,
+        num_slots: usize,
+        circuit: &mut PolyCircuit<P>,
+    ) -> [Self; 2] {
+        assert_eq!(num_slots, rhs_top.num_coefficients(), "num_slots must match the coefficients");
+        let mut rows =
+            negacyclic_decomposed_products(&[rhs_top, rhs_bottom], &[lhs_row0, lhs_row1], circuit)
+                .into_iter();
+        let row0 = rows.next().expect("the product has a first row");
+        let row1 = rows.next().expect("the product has a second row");
+        [row0, row1]
     }
 }
 
+/// The inputs of a [`MontgomeryPoly`] of the given coefficients over the full CRT basis.
 pub fn encode_montgomery_poly<P: Poly>(
     limb_bit_size: usize,
     params: &P::Params,
-    input: &BigUint,
+    coefficients: &[BigUint],
 ) -> Vec<P> {
-    encode_montgomery_poly_with_window(limb_bit_size, params, input, None, 0)
+    encode_montgomery_poly_with_window(limb_bit_size, params, coefficients, None, 0)
 }
 
+/// The inputs of a [`MontgomeryPoly`] of the given coefficients over `enable_levels` q-levels
+/// starting at `level_offset`, ordered by level, then coefficient, then limb.
 pub fn encode_montgomery_poly_with_window<P: Poly>(
     limb_bit_size: usize,
     params: &P::Params,
-    input: &BigUint,
+    coefficients: &[BigUint],
     enable_levels: Option<usize>,
     level_offset: usize,
 ) -> Vec<P> {
@@ -1025,8 +1175,13 @@ pub fn encode_montgomery_poly_with_window<P: Poly>(
         .par_iter()
         .map(|q_i| {
             let modulus = BigUint::from(*q_i);
-            let montgomery_value = ((input % &modulus) * (&r % &modulus)) % &modulus;
-            encode_carry_arith_poly(limb_bit_size, num_limbs, params, &montgomery_value)
+            coefficients
+                .iter()
+                .flat_map(|coefficient| {
+                    let montgomery_value = ((coefficient % &modulus) * (&r % &modulus)) % &modulus;
+                    encode_carry_arith_poly(limb_bit_size, num_limbs, params, &montgomery_value)
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -1119,7 +1274,7 @@ mod tests {
         let inputs = encode_montgomery_poly_with_window(
             limb_bit_size,
             &parameters,
-            &value,
+            std::slice::from_ref(&value),
             Some(window.depth),
             window.offset,
         );
@@ -1158,14 +1313,14 @@ mod tests {
         let mut inputs = encode_montgomery_poly_with_window(
             LIMB_BIT_SIZE,
             &parameters,
-            &left_value,
+            std::slice::from_ref(&left_value),
             Some(window.depth),
             window.offset,
         );
         inputs.extend(encode_montgomery_poly_with_window(
             LIMB_BIT_SIZE,
             &parameters,
-            &right_value,
+            std::slice::from_ref(&right_value),
             Some(window.depth),
             window.offset,
         ));
@@ -1238,7 +1393,7 @@ mod tests {
         let inputs = encode_montgomery_poly_with_window(
             LIMB_BIT_SIZE,
             &parameters,
-            &value,
+            std::slice::from_ref(&value),
             Some(window.depth),
             window.offset,
         );

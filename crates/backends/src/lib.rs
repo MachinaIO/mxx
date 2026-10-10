@@ -11,6 +11,7 @@
 
 pub mod element;
 pub mod env;
+pub mod lattice_estimator;
 pub mod matrix;
 pub mod modulus;
 pub mod openfhe_guard;

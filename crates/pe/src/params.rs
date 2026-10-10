@@ -784,12 +784,20 @@ impl PeParameters {
     /// the non-uniform coefficient `1`, which these estimates do not model.
     pub fn security_bits(&self) -> Result<(u64, Option<u64>), PeError> {
         let error = self.error.sigma().min(self.flooding.sigma()).clone();
-        let mut encryption = mxx_exponent_lut::utils::lattice_security_bits(self.level(), &error)
-            .map_err(PeError::Parameters)?;
+        let mut encryption = mxx_backends::lattice_estimator::lattice_security_bits(
+            self.level().ring_dimension(),
+            self.level().modulus().as_ref(),
+            &error,
+        )
+        .map_err(PeError::Parameters)?;
         if let Some(compact) = self.compact_level()? {
             encryption = encryption.min(
-                mxx_exponent_lut::utils::lattice_security_bits(&compact, &error)
-                    .map_err(PeError::Parameters)?,
+                mxx_backends::lattice_estimator::lattice_security_bits(
+                    compact.ring_dimension(),
+                    compact.modulus().as_ref(),
+                    &error,
+                )
+                .map_err(PeError::Parameters)?,
             );
         }
         if self.statistical.is_some() || !self.instantiation.is_computational() {
@@ -801,8 +809,9 @@ impl PeParameters {
             .to_string()
             .parse::<BigDecimal>()
             .map_err(|_| PeError::Parameters("the trapdoor sigma is not finite".into()))?;
-        let trapdoor = mxx_exponent_lut::utils::gaussian_secret_lattice_security_bits(
-            self.level(),
+        let trapdoor = mxx_backends::lattice_estimator::gaussian_secret_lattice_security_bits(
+            self.level().ring_dimension(),
+            self.level().modulus().as_ref(),
             &sigma,
             &sigma,
         )

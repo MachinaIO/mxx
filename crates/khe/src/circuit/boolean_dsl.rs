@@ -1,7 +1,12 @@
 //! Parameterized layered Boolean circuits represented by flattened DSL families.
 
+use super::{BooleanCircuitData, BooleanCircuitShape, BooleanGateData};
+use mxx_backends::RuntimeValue;
 use mxx_dsl::{Bool, DslContext, DslError, Family, Int, Mat, iterate, parallel, select};
 use mxx_ir_core::IntExpr;
+use num_bigint::BigInt;
+use rayon::prelude::*;
+use std::collections::BTreeMap;
 
 pub const BOOLEAN_INSTANCE_INPUT: &str = "boolean-instance";
 pub const BOOLEAN_WITNESS_INPUT: &str = "boolean-witness";
@@ -102,6 +107,41 @@ impl BooleanCircuitFamilyInputs {
 
     pub fn output_source(&self) -> Int {
         self.output_sources.at(0)
+    }
+
+    /// The runtime values of [`Self::protocol_inputs`] for `circuit`: every layer is padded to
+    /// `max_layer_width` with the canonical all-zero record.
+    pub fn runtime_values(
+        circuit: &BooleanCircuitData,
+        shape: &BooleanCircuitShape,
+    ) -> BTreeMap<String, RuntimeValue> {
+        let width = shape.max_layer_width;
+        let records = |field: fn(&BooleanGateData) -> usize| {
+            RuntimeValue::integer_values(
+                circuit
+                    .layers
+                    .par_iter()
+                    .flat_map_iter(|layer| {
+                        (0..width).map(move |slot| BigInt::from(layer.get(slot).map_or(0, field)))
+                    })
+                    .collect(),
+            )
+        };
+        BTreeMap::from([
+            (
+                "circuit-active-gate-count".to_owned(),
+                RuntimeValue::integer_values(
+                    circuit.layers.iter().map(|layer| BigInt::from(layer.len())).collect(),
+                ),
+            ),
+            ("circuit-gate-kind".to_owned(), records(|gate| gate.kind as usize)),
+            ("circuit-left-source".to_owned(), records(|gate| gate.left)),
+            ("circuit-right-source".to_owned(), records(|gate| gate.right)),
+            (
+                "circuit-output-source".to_owned(),
+                RuntimeValue::integer_values(vec![BigInt::from(circuit.output_source)]),
+            ),
+        ])
     }
 }
 

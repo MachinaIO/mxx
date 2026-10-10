@@ -11,16 +11,17 @@ commitments. It depends on `mxx-dsl`, `mxx-ir-core`, and `mxx-backends`.
 
 | Module | What it provides |
 | --- | --- |
-| `bgg` | BGG+ public keys and encodings, circuit compilation into public-key and encoding graphs, Boolean circuit evaluation, LWE lookup tables, slot transfer, and Tall encodings. |
+| `bgg` | BGG+ public keys and encodings, circuit compilation into public-key and encoding graphs, Boolean circuit evaluation, the closed protocol that evaluates a layered Boolean circuit on encodings and decrypts its output bit (`boolean_protocol`), LWE lookup tables, slot transfer, and Tall encodings. |
 | `wee25` | WEE25 commitment trees, public-parameter preprocessing, and openings with their verification. |
-| `circuit` | Polynomial and Boolean circuits, public lookup programs, serialization, and the lowering traits an encoding scheme implements. |
-| `circuit_gadgets` | Modular and nested-RNS arithmetic, negacyclic convolution, NTT circuits, nested-RNS modulus switching, Ring-GSW, a Goldreich PRG, and secret inner products. |
+| `circuit` | Polynomial and Boolean circuits, public lookup programs, serialization, the lowering traits an encoding scheme implements, and the lowering of Boolean-idiom polynomial circuits to layered Boolean circuits with its depth computed without expansion (`boolean_lowering`). |
+| `circuit_gadgets` | Modular arithmetic (carry and Montgomery arithmetic over polynomial entries, and nested RNS), negacyclic convolution, NTT circuits, nested-RNS modulus switching, Ring-GSW, a Goldreich PRG, and secret inner products. With one-bit Montgomery limbs, the Ring-GSW product is a Boolean circuit without lookup tables. |
 | `decoder` | Masked-decoder and PRG layout helpers. |
 | `noise_refresh` | Noise-refresh circuits (decrypt, merge, PRG) and their material. |
+| `noise_simulate` | BGG+ error bounds that follow the evaluators term by term, the error of a layered Boolean evaluation and its decryption condition, and the selection of the ring dimension, CRT depth, and gadget base that decrypt at a Ring-LWE security target. |
 | `input_injector` | Input-injection preprocessing shared by Diamond constructions. |
 | `ring_from_params` | A DSL ring with the same ordered basis as backend parameters. |
 | `test_utils` (`test-support` feature) | Test helpers for dependent crates. |
-| `lean/` | The `MxxKhe` Lean package: gadget-matrix, decomposition, and BGG+ encoding facts. |
+| `lean/` | The `MxxKhe` Lean package: gadget-matrix, decomposition, and BGG+ encoding facts; `lean/ring_gsw_bgg/` proves the correctness claim of `boolean_protocol` for one Ring-GSW multiplication ([README](lean/ring_gsw_bgg/README.md)). |
 
 ## Design
 
@@ -35,3 +36,19 @@ commitments. It depends on `mxx-dsl`, `mxx-ir-core`, and `mxx-backends`.
   right gate.
 - **Gadgets stay above the IR.** Operations such as nested-RNS level switching are gadgets built
   from graph operations, not new graph nodes.
+- **Layered Boolean evaluation keeps graphs small.** `boolean_protocol` evaluates a circuit given
+  as runtime gate records with one `iterate` over its layers and one `parallel` over a layer's
+  slots, so its graphs and their Lean statements do not grow with the circuit. A circuit enters
+  this form through `lower_to_boolean_layers`; `boolean_layering_bound` gives the depth and a
+  width bound of a circuit too large to expand.
+
+## Tests
+
+The unit tests run on the CPU. `tests/test_gpu_ring_gsw_boolean_bgg.rs` lowers one Ring-GSW
+multiplication, selects the BGG+ parameters of `boolean_protocol` for it, and exports the Lean claim
+of a recorded parameter row; its rustdoc lists the `MXX_KHE_RING_GSW_BGG_*` variables. It needs
+`lattice-estimator-cli` on `PATH` and about 40 GiB of host memory:
+
+```bash
+cargo test -r -p mxx-khe --features gpu --test test_gpu_ring_gsw_boolean_bgg
+```

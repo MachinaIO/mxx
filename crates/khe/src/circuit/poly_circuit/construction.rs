@@ -195,6 +195,9 @@ impl<P: Poly> PolyCircuit<P> {
         self.not_gate(or_result)
     }
 
+    /// Computes the XOR gate as `left + right - 2 left right` with one multiplication.
+    /// This operation follows the same restriction as the NOT gate:
+    /// `left` and `right` must be bit distribution (0 or 1)
     pub fn xor_gate<L: Into<BatchedWire>, R: Into<BatchedWire>>(
         &mut self,
         left: L,
@@ -202,9 +205,8 @@ impl<P: Poly> PolyCircuit<P> {
     ) -> BatchedWire {
         let left = left.into();
         let right = right.into();
-        let two = self.add_gate(GateId(0), GateId(0));
         let mul = self.mul_gate(left, right);
-        let two_mul = self.mul_gate(two, mul);
+        let two_mul = self.small_scalar_mul(mul, &[2]);
         let add = self.add_gate(left, right);
         self.sub_gate(add, two_mul)
     }

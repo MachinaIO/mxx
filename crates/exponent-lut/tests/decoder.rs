@@ -40,6 +40,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use mxx_backends::{
     GpuRuntime,
     backend::poly_gpu::gpu_backend_on,
+    lattice_estimator::lattice_security_bits,
     poly::{
         Poly, PolyParams,
         dcrt::{
@@ -65,8 +66,8 @@ use mxx_exponent_lut::{
         RnsOnlineEvalBuild, RnsPreprocessBuild,
     },
     utils::{
-        DecoderRequest, DecoderSelection, env_usize, lattice_security_bits, noise_model,
-        ring_dimension_candidates, ring_dimension_stride_log2, select_decoder_at_crt_depth,
+        DecoderRequest, DecoderSelection, env_usize, noise_model, ring_dimension_candidates,
+        ring_dimension_stride_log2, select_decoder_at_crt_depth,
     },
 };
 use mxx_ir_core::ParamEnv;
@@ -217,8 +218,12 @@ fn search(source: &ExponentLutProgram, input: WireId) -> Accepted {
                 let achieved = [&selection.parameters, &selection.smudge_parameters]
                     .into_iter()
                     .map(|parameters| {
-                        lattice_security_bits(&parameters.levels()[0], &error_sigma)
-                            .expect("lattice security estimator must be available")
+                        lattice_security_bits(
+                            parameters.levels()[0].ring_dimension(),
+                            parameters.levels()[0].modulus().as_ref(),
+                            &error_sigma,
+                        )
+                        .expect("lattice security estimator must be available")
                     })
                     .min()
                     .expect("two chains");

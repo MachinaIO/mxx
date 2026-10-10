@@ -20,7 +20,7 @@ use mxx_dsl::{Family, GraphValue, Int};
 use mxx_ir_core::{ParamEnv, Rational, RealExpr};
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
-use std::{collections::BTreeMap, env, error::Error, fmt, process::Command};
+use std::{collections::BTreeMap, env, error::Error, fmt};
 
 /// Read an optional unsigned environment setting without accepting malformed values.
 pub fn env_usize(name: &str, default: usize) -> Result<usize, String> {
@@ -119,76 +119,6 @@ pub fn ring_dimension_candidates(
                 .map_err(|_| format!("ring dimension 2^{log} does not fit in u32"))
         })
         .collect()
-}
-
-/// Obtain one positive integer estimate from `lattice-estimator-cli` for
-/// Ring-LWE over `parameters` with a uniform ternary secret.
-pub fn lattice_security_bits(
-    parameters: &DCRTPolyParams,
-    error_sigma: &BigDecimal,
-) -> Result<u64, String> {
-    lattice_security_bits_with_secret(parameters, r#"{"name":"Ternary"}"#, error_sigma)
-}
-
-/// [`lattice_security_bits`] for a discrete Gaussian secret of standard
-/// deviation `secret_sigma`, such as a trapdoor's.
-pub fn gaussian_secret_lattice_security_bits(
-    parameters: &DCRTPolyParams,
-    secret_sigma: &BigDecimal,
-    error_sigma: &BigDecimal,
-) -> Result<u64, String> {
-    if secret_sigma <= &BigDecimal::zero() {
-        return Err("secret sigma must be positive".to_owned());
-    }
-    lattice_security_bits_with_secret(
-        parameters,
-        &format!(r#"{{"name":"DiscreteGaussian","stddev":{secret_sigma}}}"#),
-        error_sigma,
-    )
-}
-
-/// One estimate for the secret distribution `secret` (an estimator JSON
-/// specification) and a discrete Gaussian error.
-fn lattice_security_bits_with_secret(
-    parameters: &DCRTPolyParams,
-    secret: &str,
-    error_sigma: &BigDecimal,
-) -> Result<u64, String> {
-    if parameters.ring_dimension() == 0 || parameters.modulus().is_zero() {
-        return Err("ring parameters must be positive".to_owned());
-    }
-    if error_sigma <= &BigDecimal::zero() {
-        return Err("error sigma must be positive".to_owned());
-    }
-    let output = Command::new("lattice-estimator-cli")
-        .arg(parameters.ring_dimension().to_string())
-        .arg(parameters.modulus().to_string())
-        .arg("--s-dist")
-        .arg(secret)
-        .arg("--e-dist")
-        .arg(format!(r#"{{"name":"DiscreteGaussian","stddev":{error_sigma}}}"#))
-        .output()
-        .map_err(|error| format!("failed to start lattice-estimator-cli: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "lattice-estimator-cli failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let result = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| "lattice-estimator-cli returned no security estimate".to_owned())?
-        .trim();
-    let bits = result.parse::<u64>().map_err(|error| {
-        format!("lattice-estimator-cli returned a non-integer security estimate: {error}")
-    })?;
-    if bits == 0 {
-        return Err("lattice-estimator-cli returned a non-positive security estimate".to_owned());
-    }
-    Ok(bits)
 }
 
 /// Audit one exact CRT-depth candidate using the same workload and noise path

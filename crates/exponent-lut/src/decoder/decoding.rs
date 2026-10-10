@@ -657,6 +657,14 @@ mod tests {
         ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
             Ok(())
         }
+        fn rhs_selected(
+            &mut self,
+            _: &(),
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
+            Ok(())
+        }
         fn parallel(
             &mut self,
             evaluator: &mut Counter,

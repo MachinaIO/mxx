@@ -20,16 +20,14 @@ where
 }
 
 /// Test parameters of `class`: ring dimension, CRT depth and prime bits,
-/// base bits, trapdoor sigma, and the error, flooding, and programming
-/// sigmas overridable by `MXX_PE_TEST_{RING_DIMENSION,CRT_DEPTH,CRT_BITS,
-/// BASE_BITS,TRAPDOOR_SIGMA,ERROR_SIGMA,FLOODING_SIGMA,PROGRAMMING_SIGMA}`,
+/// base bits, trapdoor sigma, and the error and flooding sigmas overridable
+/// by `MXX_PE_TEST_{RING_DIMENSION,CRT_DEPTH,CRT_BITS,BASE_BITS,
+/// TRAPDOOR_SIGMA,ERROR_SIGMA,FLOODING_SIGMA}`,
 /// and the instantiation by `MXX_PE_TEST_TRAPDOOR_INSTANTIATION`
 /// (`computational`, the default, or `statistical`, see
 /// [`statistical_parameters`]). They are functional, not secure. By default
 /// every error (`chi` and `chi_fl`) is zero, so the evaluation is exact, the
-/// simulated bounds are zero, and correctness holds without a noise margin;
-/// the entries of `Z_t` are encryption randomness, not noise, and keep sigma
-/// one.
+/// simulated bounds are zero, and correctness holds without a noise margin.
 pub(crate) fn parameters(class: PeClass) -> PeParameters {
     match read("TRAPDOOR_INSTANTIATION", "computational".to_owned()).as_str() {
         "computational" => computational_parameters(class),
@@ -70,7 +68,6 @@ fn computational_parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParam
         read("TRAPDOOR_SIGMA", 4.578),
         contract("ERROR_SIGMA", "0"),
         contract("FLOODING_SIGMA", "0"),
-        contract("PROGRAMMING_SIGMA", "1"),
         TrapdoorPreimageCutoffPolicy::Default,
     )
     .unwrap()
@@ -94,7 +91,6 @@ fn statistical_parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParamet
         m_bar,
         contract("ERROR_SIGMA", "0"),
         contract("FLOODING_SIGMA", "0"),
-        contract("PROGRAMMING_SIGMA", "1"),
     )
     .unwrap()
 }
@@ -144,7 +140,6 @@ pub(crate) fn statistical_request(class: PeClass) -> PeParameterRequest {
         error_sigma: "3.19".parse().unwrap(),
         flooding_sigma: "3.19".parse().unwrap(),
         enforce_flooding: true,
-        programming_sigma: "64".parse().unwrap(),
         randomness_sigma: read("RANDOMNESS_SIGMA", "64".to_owned()).parse().unwrap(),
         statistical_security_bits: crate::budget::DEFAULT_STATISTICAL_BITS,
         flooding_statistical_bits: crate::budget::DEFAULT_FLOODING_BITS,

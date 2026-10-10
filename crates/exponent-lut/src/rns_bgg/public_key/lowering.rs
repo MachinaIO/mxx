@@ -67,6 +67,21 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
         })
     }
 
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        data: crate::program::DataId,
+        position: &IntExpr,
+    ) -> Result<RhsRef<Int>, crate::program::ProgramLowerError<RnsBggError>> {
+        Ok(RhsRef {
+            id: mxx_dsl::GraphValue::schema(family).element.id,
+            index: Some(
+                self.selected_member(data, position)
+                    .map_err(crate::program::ProgramLowerError::Backend)?,
+            ),
+        })
+    }
+
     fn parallel(
         &mut self,
         evaluator: &mut PublicKeyLowering<'a>,
@@ -114,6 +129,7 @@ impl<'a> PublicKeyLowering<'a> {
             decoder_smudge: None,
             output_use: RnsOutputUse::default(),
             dynamic: None,
+            data: BTreeMap::new(),
             rhs: BTreeMap::new(),
             rhs_material: BTreeMap::new(),
             lut_material: BTreeMap::new(),
@@ -217,14 +233,16 @@ impl<'a> PublicKeyLowering<'a> {
     /// The product keys `T = sum_a B_{a,j} Dec(A)_{:,a}` of state key `key`
     /// at `level` with the companion keys of `branches` packages, branch `s`
     /// having the key entries `key_entry(s, r, a)` and the package
-    /// `package(s)` (see [`super::companion_columns`]). Returns the two key
-    /// rows, each `1 x branches m`.
+    /// `package(s)` (see [`super::companion_columns`]); an automorphism
+    /// package passes its public digit rows (`public_rows`). Returns the two
+    /// key rows, each `1 x branches m`.
     fn dynamic_product_rows(
         &self,
         level: usize,
         branches: usize,
         key_entry: &dyn Fn(IntExpr, usize, IntExpr) -> Result<Mat, RnsBggError>,
         package: &dyn Fn(IntExpr) -> RnsBggPackage,
+        public_rows: Option<(usize, &dyn Fn(IntExpr) -> Result<Mat, RnsBggError>)>,
     ) -> Result<Vec<Mat>, RnsBggError> {
         let (setup, _) = self.dynamic_state()?;
         super::companion_columns(
@@ -245,6 +263,7 @@ impl<'a> PublicKeyLowering<'a> {
                 )
             }),
             None,
+            public_rows,
         )
     }
 
@@ -259,21 +278,46 @@ impl<'a> PublicKeyLowering<'a> {
     ) -> Result<RnsBggMatrix, RnsBggError> {
         let (_, binding) = self.dynamic_state()?;
         let coordinate = binding.rhs(rhs.id)?;
-        let member = rhs
-            .index
-            .as_ref()
-            .map(Int::expression)
-            .transpose()
-            .map_err(|_| RnsBggError::Binding("RHS member index is not an index expression"))?;
         let rows = [&key.0, &key.1].map(super::join_row);
         let columns = self.parameters.component_columns(level)?;
-        let product = self.dynamic_product_rows(
-            level,
-            1,
-            &|_, r, a| Ok(super::row_entry(&rows[r], a)),
-            &|_| RnsBggPackage::Rhs { coordinate, member: member.clone() },
-        )?;
-        Ok((super::split_row(&product[0], columns), super::split_row(&product[1], columns)))
+        let key_of = |member: Option<IntExpr>| -> Result<RnsBggMatrix, RnsBggError> {
+            let product = self.dynamic_product_rows(
+                level,
+                1,
+                &|_, r, a| Ok(super::row_entry(&rows[r], a)),
+                &|_| RnsBggPackage::Rhs { coordinate, member: member.clone() },
+                None,
+            )?;
+            Ok((super::split_row(&product[0], columns), super::split_row(&product[1], columns)))
+        };
+        let Some(index) = &rhs.index else {
+            return key_of(None);
+        };
+        if let Ok(member) = index.expression() {
+            return key_of(Some(member));
+        }
+        // A member selected at run time (`Operand::Selected`): the key of every member, of
+        // which the index selects one. The companion keys stay hashed by the member's
+        // constant tag, as encryption hashes them.
+        let count = match self.program.rhs_inputs().get(&rhs.id) {
+            Some(crate::program::InputBinding::Family(count)) => {
+                count.evaluate(&mxx_ir_core::ParamEnv::default()).ok()
+            }
+            _ => None,
+        }
+        .and_then(|count| count.to_usize())
+        .ok_or(RnsBggError::Binding("a selected RHS family has no concrete count"))?;
+        let keys = (0..count)
+            .map(|member| key_of(Some(IntExpr::constant(member))))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pick = |part: fn(&RnsBggMatrix) -> &Mat| {
+            mxx_dsl::select(index.clone(), keys.iter().map(|key| part(key).clone()).collect())
+                .map_err(graph)
+        };
+        Ok((
+            (pick(|key| &key.0.0)?, pick(|key| &key.0.1)?),
+            (pick(|key| &key.1.0)?, pick(|key| &key.1.1)?),
+        ))
     }
 
     /// The Dynamic LUT key `sum_{k in H_L} A_k V_{D_k}` of state key `key`
@@ -295,7 +339,7 @@ impl<'a> PublicKeyLowering<'a> {
         let (setup, _) = self.dynamic_state()?;
         let automorphisms =
             lut_automorphisms(self.parameters, setup.automorphisms(), level, table)?;
-        let values = table.values().ok_or(RnsBggError::Lut)?;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.data)?;
         let layout = table.input_layout();
         let representation = table.output_representation();
         let columns = self.parameters.component_columns(level)?;
@@ -306,7 +350,7 @@ impl<'a> PublicKeyLowering<'a> {
                 layout,
                 representation,
                 k,
-                values,
+                values.clone(),
             )
         };
         let identity = scalar_action(self.parameters, level, coefficient(IntExpr::constant(1))?)?;
@@ -320,6 +364,19 @@ impl<'a> PublicKeyLowering<'a> {
             return self.radix_dynamic_lut_key(level, key, table, &plan, initial);
         }
         let rows = [&key.0, &key.1].map(super::join_row);
+        let inverses = switched
+            .iter()
+            .map(|k| setup.automorphism_inverse(*k))
+            .collect::<Result<Vec<_>, _>>()?;
+        let public_top = |branch: IntExpr| {
+            crate::rns_bgg::dynamic::automorphism_public_top(
+                self.parameters,
+                setup,
+                self.hash_key.clone(),
+                select(&switched, branch.clone()),
+                select(&inverses, branch),
+            )
+        };
         let product = self.dynamic_product_rows(
             level,
             switched.len(),
@@ -327,6 +384,7 @@ impl<'a> PublicKeyLowering<'a> {
                 Ok(super::row_entry(&rows[r], a).ring_automorphism(select(&switched, branch)))
             },
             &|branch| RnsBggPackage::Automorphism(select(&switched, branch)),
+            Some((super::automorphism_public_rows(self.parameters, level)?, &public_top)),
         )?;
         let width = 2 * columns;
         let split = |row: &Mat| super::split_row(row, columns);
@@ -384,7 +442,7 @@ impl<'a> PublicKeyLowering<'a> {
     ) -> Result<(RnsBggMatrix, Option<[Mat; 2]>), RnsBggError> {
         use crate::rns_bgg::dynamic::{scalar_action, scalar_action_matrix, select};
         let (setup, _) = self.dynamic_state()?;
-        let values = table.values().ok_or(RnsBggError::Lut)?;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.data)?;
         let layout = table.input_layout();
         let representation = table.output_representation();
         let columns = self.parameters.component_columns(level)?;
@@ -396,7 +454,7 @@ impl<'a> PublicKeyLowering<'a> {
                 layout,
                 representation,
                 k,
-                values,
+                values.clone(),
             )
         };
         let split = |row: &Mat| super::split_row(row, columns);
@@ -431,6 +489,19 @@ impl<'a> PublicKeyLowering<'a> {
         let mut products = [Vec::with_capacity(plan.len()), Vec::with_capacity(plan.len())];
         for depth in plan {
             let switches = &depth.switches;
+            let inverses = switches
+                .iter()
+                .map(|k| setup.automorphism_inverse(*k))
+                .collect::<Result<Vec<_>, _>>()?;
+            let public_top = |branch: IntExpr| {
+                crate::rns_bgg::dynamic::automorphism_public_top(
+                    self.parameters,
+                    setup,
+                    self.hash_key.clone(),
+                    select(switches, branch.clone()),
+                    select(&inverses, branch),
+                )
+            };
             let product = self.dynamic_product_rows(
                 level,
                 depth.branches.len(),
@@ -449,6 +520,7 @@ impl<'a> PublicKeyLowering<'a> {
                     Ok(entry.ring_automorphism(select(switches, branch)))
                 },
                 &|branch| RnsBggPackage::Automorphism(select(switches, branch)),
+                Some((super::automorphism_public_rows(self.parameters, level)?, &public_top)),
             )?;
             let mut keys = Vec::with_capacity(depth.internal);
             for position in 0..depth.internal {

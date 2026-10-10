@@ -22,13 +22,17 @@ structure ExternalInputs where
   input_2 : Fin 32768 → Int
   input_3 : Int
   input_4 : Int
+  input_5 : Fin 1 → Int
+  input_6 : Fin 2 → Int
 
 def ValidExternals (external : ExternalInputs) : Prop :=
   (external.input_0).size = 32 ∧
   (∀ contract_i_0 : Fin 1, ((0 : Int) ≤ (external.input_1 contract_i_0) ∧ (external.input_1 contract_i_0) ≤ (1 : Int))) ∧
   (∀ contract_i_0 : Fin 32768, ((0 : Int) ≤ (external.input_2 contract_i_0) ∧ (external.input_2 contract_i_0) ≤ (1 : Int))) ∧
   ((1 : Int) ≤ external.input_3 ∧ external.input_3 ≤ (1 : Int)) ∧
-  ((0 : Int) ≤ external.input_4 ∧ external.input_4 ≤ (0 : Int))
+  ((0 : Int) ≤ external.input_4 ∧ external.input_4 ≤ (0 : Int)) ∧
+  (∀ contract_i_0 : Fin 1, ((0 : Int) ≤ (external.input_5 contract_i_0) ∧ (external.input_5 contract_i_0) ≤ (0 : Int))) ∧
+  (∀ contract_i_0 : Fin 2, ((0 : Int) ≤ (external.input_6 contract_i_0) ∧ (external.input_6 contract_i_0) ≤ (1 : Int)))
 
 structure Execution where
   «stage_0» : Mxx.Primitives.ExactMatrix 1509155612652322963894981558308021422531187968728956929 32768 1 14 × MxxRuntime.TrapdoorValue (Mxx.Primitives.ExactMatrix 1509155612652322963894981558308021422531187968728956929 32768 1 14) Unit × Unit
@@ -73,11 +77,11 @@ def Runs (hashModel : MxxRuntime.HashModel) (external : ExternalInputs) (tape : 
   Stage_payload.generatedRoot tape [2] stage_2_params (()) execution.«stage_2» ∧
   Stage_prelude.generatedRoot Backend.backend hashModel tape [3] stage_3_params ((execution.«stage_1», external.input_0, execution.«stage_2», external.input_1, external.input_2, ())) execution.«stage_3» ∧
   Stage_encrypt.generatedRoot Backend.backend hashModel tape [4] stage_4_params ((execution.«stage_2», external.input_0, external.input_3, external.input_4, execution.«stage_3».1, execution.«stage_3».2.1, execution.«stage_3».2.2.1, execution.«stage_3».2.2.2.1, ())) execution.«stage_4» ∧
-  Stage_preprocess.generatedRoot Backend.backend hashModel tape [5] stage_5_params (external.input_0) execution.«stage_5» ∧
+  Stage_preprocess.generatedRoot Backend.backend hashModel tape [5] stage_5_params ((external.input_5, external.input_0, external.input_6, ())) execution.«stage_5» ∧
   Stage_keygen.generatedRoot Backend.backend hashModel tape [6] stage_6_params ((execution.«stage_0».2.1, external.input_0, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.1, ())) execution.«stage_6» ∧
-  Stage_online_eval.generatedRoot Backend.backend hashModel tape [7] stage_7_params ((execution.«stage_5».2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_4».2.2.2.2.1, execution.«stage_4».2.2.2.2.2.1, execution.«stage_3».1, execution.«stage_3».2.1, execution.«stage_3».2.2.1, execution.«stage_3».2.2.2.1, execution.«stage_4».2.2.2.2.2.2.1, execution.«stage_4».2.2.2.2.2.2.2.1, external.input_0, execution.«stage_4».2.2.1, execution.«stage_4».2.2.2.1, execution.«stage_5».2.2.2.2.1, execution.«stage_5».2.2.2.2.2.1, execution.«stage_4».1, execution.«stage_4».2.1, execution.«stage_5».1, execution.«stage_5».2.1, execution.«stage_5».2.2.1, execution.«stage_5».2.2.2.1, ())) execution.«stage_7» ∧
+  Stage_online_eval.generatedRoot Backend.backend hashModel tape [7] stage_7_params ((execution.«stage_5».2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_4».2.2.2.2.1, execution.«stage_4».2.2.2.2.2.1, execution.«stage_3».1, external.input_5, execution.«stage_3».2.1, execution.«stage_3».2.2.1, execution.«stage_3».2.2.2.1, execution.«stage_4».2.2.2.2.2.2.1, execution.«stage_4».2.2.2.2.2.2.2.1, external.input_0, external.input_6, execution.«stage_4».2.2.1, execution.«stage_4».2.2.2.1, execution.«stage_5».2.2.2.2.1, execution.«stage_5».2.2.2.2.2.1, execution.«stage_4».1, execution.«stage_4».2.1, execution.«stage_5».1, execution.«stage_5».2.1, execution.«stage_5».2.2.1, execution.«stage_5».2.2.2.1, ())) execution.«stage_7» ∧
   Stage_decode.generatedRoot Backend.backend hashModel tape [8] stage_8_params ((execution.«stage_3».2.2.2.2.2.1, external.input_0, execution.«stage_3».2.2.2.2.1, execution.«stage_6».1, execution.«stage_6».2.1, execution.«stage_4».2.2.1, execution.«stage_4».2.2.2.1, execution.«stage_6».2.2.1, execution.«stage_7».2.2.2.2.1, execution.«stage_7».2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_5».2.2.2.2.2.2.2.2.2.2.2.2.2.1, execution.«stage_6».2.2.2.1, ())) execution.«stage_8» ∧
-  Requirement_0.generatedRoot tape [9] requirement_0_params (external.input_1) execution.«requirement_0» ∧
+  Requirement_0.generatedRoot tape [9] requirement_0_params ((external.input_1, external.input_6, external.input_5, ())) execution.«requirement_0» ∧
   Ideal.generatedRoot tape [10] ideal_params (external.input_2) execution.«ideal» ∧
   execution.«requirement_0» = true
 

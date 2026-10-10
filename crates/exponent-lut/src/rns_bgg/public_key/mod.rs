@@ -114,6 +114,8 @@ pub struct PublicKeyLowering<'a> {
     pub(crate) output_use: RnsOutputUse,
     /// Dynamic: the setup and the Program's mapping to its coordinates.
     pub(crate) dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+    /// The Program's integer data inputs ([`crate::program::data_inputs`]).
+    pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
     /// RHS plaintexts, read from graph inputs; a family is read member by
     /// member.
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
@@ -165,6 +167,8 @@ pub struct RnsPreprocessBuild<'a> {
     output_use: RnsOutputUse,
     /// Dynamic: the setup and the Program's mapping to its coordinates.
     dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+    /// The values of the Program's integer data.
+    data: crate::program::ProgramData,
 }
 
 #[cfg(test)]

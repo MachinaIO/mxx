@@ -580,6 +580,20 @@ impl RnsBggParameters {
         Ok(&m * &m * current.ring_dimension() * &rho * &rho)
     }
 
+    /// The energy `D m n rho^2` of the companion sum of one automorphism
+    /// package read: only the `D` private digit rows of `C_k` have companions
+    /// (see `automorphism_public_rows`).
+    pub(super) fn dynamic_automorphism_companion_energy(
+        &self,
+        level: usize,
+    ) -> Result<BigUint, RnsBggError> {
+        let current = self.level(level)?;
+        let d = BigUint::from(self.component_columns(level)?);
+        let m = BigUint::from(2 * self.component_columns(level)?);
+        let rho = (BigUint::one() << current.base_bits()) / 2u8;
+        Ok(&d * &m * current.ring_dimension() * &rho * &rho)
+    }
+
     /// One Dynamic product: `E' <= K E + m K beta + ||mu||_1 B_C` for the
     /// input error `E`, the companion error bound `beta`, and the gadget
     /// ciphertext error bound `B_C`; `-mu e_C` is the input payload times
@@ -602,9 +616,11 @@ impl RnsBggParameters {
         })
     }
 
-    /// One nonidentity automorphism: `E_Aut <= K E + m K beta + K B_h +
+    /// One nonidentity automorphism: `E_Aut <= K E + D K beta + K B_h +
     /// ||mu||_1 B_h`, the product with `C_k` (whose error is the automorphed
-    /// inverse helper's) followed by the mask switch `h_k Dec(T_k)`.
+    /// inverse helper's) followed by the mask switch `h_k Dec(T_k)`. Only the
+    /// `D` private digit rows of `C_k` have companions; the public top row's
+    /// digits are absorbed by the key.
     pub fn dynamic_automorphism_noise_bound(
         &self,
         level: usize,
@@ -613,9 +629,9 @@ impl RnsBggParameters {
         helper_error: &BigUint,
     ) -> Result<BigUint, RnsBggError> {
         let k = self.dynamic_decomposition_gain(level)?;
-        let m = BigUint::from(2 * self.component_columns(level)?);
+        let d = BigUint::from(self.component_columns(level)?);
         Ok(&k * &input.error +
-            m * &k * companion_error +
+            d * &k * companion_error +
             &k * helper_error +
             &input.payload_l1 * helper_error)
     }

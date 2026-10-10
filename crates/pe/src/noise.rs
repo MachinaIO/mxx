@@ -6,8 +6,8 @@
 //! carrier `c_F = s (A_F - F(x) G) + e_F` and no direct-decoding action or
 //! margin of another consumer is applied. Its material contracts are the
 //! setup's: `chi_fl` for the initial state and every companion, `chi` for
-//! the helpers, and the supplied attribute ciphertexts' bound
-//! `B_C = m_B n B_b B_Z` on `e_C = -e_b Z_t`.
+//! the helpers, and the supplied attribute ciphertexts' bound `B_C` on their
+//! fresh error `e_C = e_t`, a `chi_fl` sample.
 //!
 //! Decryption contracts the family row with the key by blocks. With the key
 //! cutoff `B_key`, the anchor blocks contribute `n B_key m_B B_b` each
@@ -170,7 +170,7 @@ fn evaluation_trace(
     lut_radix: Option<usize>,
     compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggNoiseTrace, PeError> {
-    let compiled = program.compile()?;
+    let compiled = program.class().compile()?;
     // A compact initial state is read through its expansion, bounded by its
     // expanded bound without a moment model (its errors repeat across columns).
     let initial = match compact_extension {
@@ -226,9 +226,10 @@ fn output_bound(trace: &RnsBggNoiseTrace) -> Result<BigUint, PeError> {
 /// actions multiply by gadget decompositions from the right, automorphisms permute, mask switches
 /// add `J g^-1(A)`), so the simulator bounds it when every material contract is replaced by the
 /// bound of its witness: `R_0` for `c_0` and `R` for every digit companion, both bounded by
-/// `randomness_bound = B_R`, `J ∈ {0, 1}` for every helper, and `Z_t` (bounded by
-/// `programming_cutoff = B_Z`) for every attribute ciphertext. The evaluation is the one the
-/// LUT radix `lut_radix` performs (`lem:ledger` follows the switches actually applied).
+/// `randomness_bound = B_R`, `J ∈ {0, 1}` for every helper, and the `Z_t` by which the hybrids
+/// simulate every attribute ciphertext from `(B, b)`, of the width of `R` and also bounded by
+/// `B_R`. The evaluation is the one the LUT radix `lut_radix` performs (`lem:ledger` follows the
+/// switches actually applied).
 #[allow(clippy::too_many_arguments)]
 pub fn witness_bound(
     rns: &RnsBggParameters,
@@ -236,7 +237,6 @@ pub fn witness_bound(
     program: &BranchingProgram,
     randomness_sigma: &BigDecimal,
     randomness_bound: &BigUint,
-    programming_cutoff: &BigUint,
     lut_radix: Option<usize>,
 ) -> Result<BigUint, PeError> {
     let randomness = RnsBggGaussian::new(randomness_sigma.clone(), randomness_bound.clone())?;
@@ -253,7 +253,7 @@ pub fn witness_bound(
         program,
         *b"mxx-pe/witness-bound/namespace/1",
         distributions,
-        programming_cutoff,
+        randomness_bound,
         lut_radix,
         None,
     )?)

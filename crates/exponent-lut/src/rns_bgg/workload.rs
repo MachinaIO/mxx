@@ -121,9 +121,7 @@ impl RnsBggDerivedWorkload {
         };
         // A public input that is itself an output keeps its own level.
         for output in program.outputs() {
-            let (crate::program::Operand::Scalar(wire) |
-            crate::program::Operand::Member { family: wire, .. }) = output;
-            collector.public_input_uses.insert(*wire, None);
+            collector.public_input_uses.insert(*output.source(), None);
         }
         let mut environment = Environment::new();
         for id in program.inputs().keys() {
@@ -356,6 +354,14 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
                 ),
             ));
         }
+        Ok(family.0)
+    }
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        _: crate::program::DataId,
+        _: &IntExpr,
+    ) -> Result<RhsId, ProgramLowerError<RnsBggError>> {
         Ok(family.0)
     }
     fn parallel(

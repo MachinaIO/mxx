@@ -4,9 +4,9 @@
 //! production computes
 //!
 //! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`;
-//! - for every attribute symbol `x_t`, the gadget ciphertext `C_t = P Z_t + X^(Bz x_t) G` with `P =
-//!   [B^(1); B^(2) - b]` and a fresh `Z_t` of shape `m_B x m`, sampled and multiplied one column at
-//!   a time: `s P = -e_b`, so `s C_t = X^(Bz x_t) s G - e_b Z_t`;
+//! - for every attribute symbol `x_t`, the gadget ciphertext `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz
+//!   x_t) G` with a fresh uniform `a_t` and a fresh `e_t` from `chi_fl`, both `1 x m`, so `s C_t =
+//!   X^(Bz x_t) s G + e_t`;
 //! - the message component `c_m = s d^T + e_m + floor(q/2) m = s_bar d_1 + d_2 + e_m + floor(q/2)
 //!   m` for binary coefficients `m`.
 //!
@@ -14,8 +14,8 @@
 //! role, and the exponent-lut Dynamic encryption, bound to the prelude and
 //! to the same secret and session, adds the initial state `c_0 = s (A_0 -
 //! G) + e_0`, the attribute packages' digit companions, the helpers `h_k`,
-//! and the companions of the derived `C_k`. Neither production exports `s`,
-//! a `Z_t`, or any sampling transcript.
+//! and the companions of the derived `C_k`. Neither production exports `s`
+//! or any sampling transcript.
 use crate::{PeError, PePublicKey, setup::digest};
 use mxx_backends::{
     RuntimeValue, SessionStore,
@@ -78,23 +78,6 @@ pub(crate) fn split(row: Mat, columns: usize) -> (Mat, Mat) {
         )
     };
     (block(0), block(columns))
-}
-
-/// The `1 x width` unit row at a loop-dependent `index`: a window of one constant row, so no
-/// constant depends on the loop.
-fn unit_row(ring: &mxx_dsl::Ring, width: usize, index: IntExpr) -> Mat {
-    let start = (IntExpr::constant(width - 1) - index).canonicalize();
-    ring.constant(
-        (1, 2 * width - 1),
-        mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(width - 1) },
-    )
-    .slice(
-        None,
-        Some(IndexRange {
-            start: start.clone(),
-            end: (start + IntExpr::constant(width)).canonicalize(),
-        }),
-    )
 }
 
 /// `Enc(mpk, x, m)` for an attribute of the class and a message of at most
@@ -228,25 +211,21 @@ where
             contract.cutoff().clone(),
         ))
     };
-    let anchor = s_bar.clone() * first.clone() + second.clone() + error(m_b)?;
-    let lower = second - anchor.clone();
+    let anchor = s_bar.clone() * first + second + error(m_b)?;
     let gadget = parameters.rns().public_gadget(0)?;
-    let programming = parameters.programming();
-    let programming_sigma = crate::params::real_expr(programming.sigma())?;
+    // `chi_fl` for the attribute ciphertexts' errors `e_t`.
+    let flooding = parameters.flooding();
+    let flooding_sigma = crate::params::real_expr(flooding.sigma())?;
     let ciphertexts = mxx_dsl::parallel(attribute.len(), |member| {
-        // `P Z_t` accumulated one column `z_j` of `Z_t` at a time, `P_r Z_t = sum_j (P_r z_j) e_j`
-        // for the unit rows `e_j`, so that one `m_B x 1` column is live.
+        // `[a_t; -s_bar a_t + e_t]`, with a fresh uniform `a_t`.
         let width = 2 * columns;
-        let zero = ring.zero((1, width));
-        let (top, bottom) = mxx_dsl::iterate(width, (zero.clone(), zero), |j, (top, bottom)| {
-            let unit = unit_row(&ring, width, j.expression()?);
-            let z =
-                ring.gaussian((m_b, 1), programming_sigma.clone(), programming.cutoff().clone());
-            Ok((
-                top + (first.clone() * z.clone()) * unit.clone(),
-                bottom + (lower.clone() * z) * unit,
-            ))
-        })?;
+        let top = ring.uniform_residue((1, width));
+        let e_t = if flooding.sigma().is_zero() {
+            ring.zero((1, width))
+        } else {
+            ring.gaussian((1, width), flooding_sigma.clone(), flooding.cutoff().clone())
+        };
+        let bottom = e_t - s_bar.clone() * top.clone();
         let symbol = ring.identity(1).multiply_monomial(exponents.at(member));
         let target = symbol * gadget.clone();
         let (top_left, top_right) = split(top, columns);

@@ -3,9 +3,9 @@ import PeOnline
 /-!
 # The encoding relation of the online output
 
-With `x₀ = 0` (the requirement `F(x) = 0`), the state after the product is an encoding of `X⁰ = 1`
-under the companion keys `M`, and the LUT of the table `(0, 1)` maps it to an encoding of `0`:
-`D_1 + D_K = 0`.
+For an attribute `x₀ ∈ {0, 1}`, the state after the product is an encoding of `X^{x₀}` under the
+companion keys `M`, and the LUT of the table `(t₀, t₁)` maps it to an encoding of `t_{x₀}`:
+`X^{x₀} D_1 + σ_K(X^{x₀}) D_K = t_{x₀}`. The requirement `F(x) = 0` gives `t_{x₀} = 0`.
 -/
 
 namespace PeProof
@@ -21,14 +21,26 @@ theorem substitution_rotation_8191 :
   rw [show 65535 = 32768 + 32767 from rfl, pow_add, Negacyclic.root_pow_n]
   ring
 
-/-- The scalars of the two branches of the table `(0, 1)` cancel: `D_1 + D_K = 0`. -/
-theorem lutScalar_sum : lutScalarOne 0 0 + lutScalar (substituteMatrix K hK) 0 0 = 0 := by
+/-- The two branches of the table `(t₀, t₁)` cancel on `X^{x₀}` when `t_{x₀} = 0`:
+`X^{x₀} D_1 + σ_K(X^{x₀}) D_K = 0`. -/
+theorem lutScalar_sum (xa : Fin 2) {t0 t1 : Int} (ht : ![t0, t1] xa = 0) :
+    reducePoly Q N (Xe xa) * lutScalarOne t0 t1 0 0 +
+      reducePoly Q N (substitution K hK (Xe xa)) * lutScalar t0 t1 (substituteMatrix K hK) 0 0 = 0 := by
   simp only [lutScalarOne, lutScalar, matrixMulScalarLeft, matrixAdd, matrixNeg, matrixPolynomial_single,
-    rotationPolynomial, substituteMatrix, id, Matrix.add_apply, Matrix.neg_apply]
-  simp only [Int.toNat_zero, pow_zero, map_one, map_neg]
-  erw [substitution_rotation_8191]
-  push_cast
-  ring
+    rotationPolynomial, substituteMatrix, id, Matrix.add_apply, Matrix.neg_apply, liftInteger]
+  rw [Xe, substitution_root_pow, reducePoly_Xe, reducePoly_Xe]
+  fin_cases xa
+  · subst ht
+    simp only [Int.toNat_zero, pow_zero, map_one, map_neg, zero_mul, Int.cast_zero, zero_add, one_mul]
+    erw [substitution_rotation_8191]
+    push_cast
+    ring
+  · subst ht
+    have hX : X (n := N) Q ^ (1 * K) = -X Q := by
+      rw [one_mul, show K = N + 1 from rfl, pow_add, Negacyclic.root_pow_n, pow_one]
+      ring
+    simp only [hX, pow_one, Int.toNat_zero, pow_zero, map_one, Int.cast_zero, zero_mul, add_zero]
+    ring
 
 /-- The public scalar action `V = Dec(D g)` on a gadget target: `(x g) V = (x D) g`. -/
 theorem gadget_scalar_action {D : ExactMatrix Q N 1 1} {g : ExactMatrix Q N 1 12}
@@ -67,16 +79,16 @@ set_option maxHeartbeats 16000000 in
 (`x₀ = 0`), the digit companions of the product and of the automorphism, and the helper of `K`. -/
 theorem online_rel {model : HashModel} {key : ByteArray} {s : ErrorPoly N}
     {g : ExactMatrix Q N 1 12} (hg : gadgetMatrixRuns Backend.backend 32768 12 g)
-    {V1 VK : ExactMatrix Q N 12 12}
-    (hV1 : gadgetDecomposeRuns Backend.backend 32768 12 (matrixMulScalarLeft lutScalarOne g) V1)
+    {xa : Fin 2} {t0 t1 : Int} (ht : ![t0, t1] xa = 0) {V1 VK : ExactMatrix Q N 12 12}
+    (hV1 : gadgetDecomposeRuns Backend.backend 32768 12 (matrixMulScalarLeft (lutScalarOne t0 t1) g) V1)
     (hVK : gadgetDecomposeRuns Backend.backend 32768 12
-      (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g) VK)
+      (matrixMulScalarLeft (lutScalar t0 t1 (substituteMatrix K hK)) g) VK)
     {cIn : Fin 2 → ExactMatrix Q N 1 12} {B0 : Nat}
     (hin : MxxExponentLut.Rel s (inputKey model key)
       (fun j ↦ reducePoly Q N (((1 : Nat) : Int) * 1 * unitPair s j) • g) cIn B0)
     {Ctop Cbot : Fin 2 → ExactMatrix Q N 1 12} {eB : Fin 2 → ErrorMatrix N 1 12} {BB : Nat}
     (hrhs : ∀ j, reducePoly Q N s • Ctop j + Cbot j =
-      reducePoly Q N (unitPair s j) • g + reduceMatrix Q N 1 12 (eB j))
+      reducePoly Q N (Xe xa * unitPair s j) • g + reduceMatrix Q N 1 12 (eB j))
     (heB : ∀ j, CoeffBound (eB j) BB)
     (hD : ∀ (j : Fin 2) (l : Fin 12), ∃ D' : ExactMatrix Q N (12 + 12) 1,
       gadgetDecomposeRuns Backend.backend 32768 12 (pairColumn (Ctop j 0 l) (Cbot j 0 l)) D' ∧
@@ -148,13 +160,14 @@ theorem online_rel {model : HashModel} {key : ByteArray} {s : ErrorPoly N}
     have h : SmulGain (AdjoinRoot.root (negacyclicModulus N Int) ^ 0) 1 := smulGain_root_pow hN1 0
     rwa [pow_zero] at h
   have hmul := mul_private_dynamic hN hQ Backend.layout0 layoutQ rfl hg hg0 hin hD
-    (T := fun j ↦ reducePoly Q N (unitPair s j) • g) hrhs heB hone hE hf
+    (T := fun j ↦ reducePoly Q N (Xe xa * unitPair s j) • g) hrhs heB hone hE hf
   -- The identity branch.
   obtain ⟨v1, hv1, hb1⟩ := scalar_digits hg hV1
   have hid := MxxPe.Rel.blockAction hN hmul v1 hb1
   rw [← hv1] at hid
   -- The branch of `K`: the switch, the mask switch, and the scalar action.
-  have henc : MxxExponentLut.Rel s Mmul (fun j ↦ reducePoly Q N (((1 : Nat) : Int) * 1 * unitPair s j) • g)
+  have henc : MxxExponentLut.Rel s Mmul
+      (fun j ↦ reducePoly Q N ((((1 : Nat) : Int) : ErrorPoly N) * Xe xa * unitPair s j) • g)
       (fun j ↦ pairMul cIn (actionDigits (joinRow Ctop) (joinRow Cbot) j) + halves Emul j)
       (24 * N * B0 * 16384 + 24 * (12 * N * Bz * 16384 + 12 * N * Bz * 16384) + 1 * BB) := by
     refine MxxExponentLut.Rel.target_eq hmul ?_
@@ -175,9 +188,9 @@ theorem online_rel {model : HashModel} {key : ByteArray} {s : ErrorPoly N}
       simp only [halves, rowWindow, Elut, lutCompanionSum, Matrix.sum_apply]
       rfl)
     hT
-  have hσone : SmulGain (substitution K hK (1 : ErrorPoly N)) 1 := by
-    rw [map_one]
-    exact hone
+  have hσone : SmulGain (substitution K hK (Xe (n := N) xa)) 1 := by
+    rw [Xe, substitution_root_pow]
+    exact smulGain_root_pow hN1 _
   have hsw := aut_switch hN hQ Backend.layout0 layoutQ rfl hg hg0 henc hK hK hKinv hKcoprime hh
     (top := top) (bot := bot) (fun _ ↦ rfl) (fun _ ↦ rfl) hDK hσone
     (E := fun j ↦ halves Elut j) (M := fun k j ↦ halves (![T0, T1] k) j) (fun j ↦ hEa j) hfa
@@ -195,6 +208,13 @@ theorem online_rel {model : HashModel} {key : ByteArray} {s : ErrorPoly N}
   ring
   funext j
   simp only [Pi.add_apply, map_one, one_smul]
-  rw [gadget_scalar_action hg hV1, gadget_scalar_action hg hVK, ← add_smul, ← mul_add, lutScalarOne,
-    lutScalar_sum]
+  rw [smul_smul, gadget_scalar_action hg hV1, gadget_scalar_action hg hVK, ← add_smul]
+  have hsum := congrArg (fun y ↦ reducePoly Q N (unitPair s j) * y) (lutScalar_sum xa ht)
+  simp only [mul_zero] at hsum
+  rw [show reducePoly Q N (Xe xa * unitPair s j) * lutScalarOne t0 t1 0 0 +
+      reducePoly Q N (substitution K hK (Xe xa)) * reducePoly Q N (unitPair s j) *
+        lutScalar t0 t1 (substituteMatrix K hK) 0 0 =
+      reducePoly Q N (unitPair s j) * (reducePoly Q N (Xe xa) * lutScalarOne t0 t1 0 0 +
+        reducePoly Q N (substitution K hK (Xe xa)) * lutScalar t0 t1 (substituteMatrix K hK) 0 0) by
+    rw [map_mul]; ring, hsum]
   simp

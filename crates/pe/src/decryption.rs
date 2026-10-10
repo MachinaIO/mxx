@@ -16,7 +16,7 @@
 //! accumulated by blocks: the anchor blocks as `sigma_i((b - B^(2)) k~_i)`
 //! with the stored inverse-coordinate blocks, the helper blocks against
 //! their extension coordinates, and the output block. Decryption reads no
-//! secret: not `s`, the trapdoor, or any `Z_t`. For `F(x) != 0` the phase
+//! secret: not `s` or the trapdoor. For `F(x) != 0` the phase
 //! keeps the term `-F(x) (s G)_2 v_F`, and the rounded output is not a
 //! reliable rejection.
 use crate::{
@@ -63,7 +63,8 @@ where
         public_key.hash_key(),
         RnsOnlineEvalBuild::new(parameters.rns(), *public_key.context())
             .with_output_use(RnsOutputUse::Gadget)
-            .with_dynamic_setup(public_key.setup(), key.compiled().binding().clone())?,
+            .with_dynamic_setup(public_key.setup(), key.compiled().binding().clone())?
+            .with_data(key.data().clone()),
         execution,
         store,
         |_, outputs| Ok(outputs),

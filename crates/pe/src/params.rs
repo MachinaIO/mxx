@@ -9,8 +9,8 @@
 //! standard-deviation convention with hard cutoffs:
 //!
 //! - `chi` (the error contract) for the anchor `b`, the helpers `h_k`, and the message `c_m`;
-//! - `chi_fl` (the flooding contract) for the initial state `c_0` and every digit companion;
-//! - the programming contract for the entries of every `Z_t`.
+//! - `chi_fl` (the flooding contract) for the initial state `c_0`, every digit companion, and the
+//!   error `e_t` of every attribute ciphertext `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz x_t) G`.
 //!
 //! The key is sampled at one width `s_key` with one cutoff `B_key = floor(6.5 s_key)` for both the
 //! anchor preimages and the extension coordinates.
@@ -22,7 +22,7 @@
 //! | TrapGen | `[ā | g - ā T]`, `m_B = m̄ + D` columns | `[ā | I | G - (ā R + E)]`, `m_B = D + 2` |
 //! | `m_B` | the regularity conditions of [`crate::budget`] | `D + 2` |
 //! | `chi_fl` | the flooding width of [`crate::budget`], or the requested width without `enforce_flooding` | the requested width |
-//! | cutoffs of `chi`, `chi_fl`, `Z_t` | `c` standard deviations from the budget | `6.5` |
+//! | cutoffs of `chi`, `chi_fl` | `c` standard deviations from the budget | `6.5` |
 //! | conditions | regularity, flooding, budget, key width, numeric range | none |
 //! | Ring-LWE estimates | encryption | encryption and TrapGen |
 //! | key width | [`KeyWidthPolicy`] | the trapdoor's minimum preimage width |
@@ -100,10 +100,10 @@ pub struct PeParameterRequest {
     /// budget's flooding width. Without it, `chi_fl` is `flooding_sigma` with the budget's cutoff,
     /// and the proof's hybrid `H_1` no longer applies.
     pub enforce_flooding: bool,
-    /// `σ_Z`: sigma of the entries of `Z_t`.
-    pub programming_sigma: BigDecimal,
-    /// `σ_R`: sigma of the matrix `R` of the proof's hybrids `H_1` and `H_4`. The scheme never
-    /// samples it; it sizes `m_B` and the flooding width.
+    /// `σ_R`: sigma of the matrix `R` of the proof's hybrids `H_1` and `H_4`, and of the `Z_t` by
+    /// which the proof simulates the attribute ciphertexts from `(B, b)`. The scheme never samples
+    /// either; it sizes `m_B` and the flooding width (`Z_t`'s regularity over two rows and its
+    /// flooding bound follow from `R`'s over three).
     pub randomness_sigma: BigDecimal,
     /// `log(1 / ε_total)` of the statistical budget ([`crate::budget`]).
     pub statistical_security_bits: u32,
@@ -171,7 +171,6 @@ pub struct PeParameters {
     instantiation: TrapdoorInstantiation,
     error: RnsBggGaussian,
     flooding: RnsBggGaussian,
-    programming: RnsBggGaussian,
     key_width: BigDecimal,
     key_cutoff: BigUint,
     anchor_columns: usize,
@@ -189,7 +188,6 @@ struct ParameterIdentity<'a> {
     instantiation: TrapdoorInstantiation,
     error: &'a RnsBggGaussian,
     flooding: &'a RnsBggGaussian,
-    programming: &'a RnsBggGaussian,
     key_width: String,
     key_cutoff: &'a BigUint,
     anchor_columns: usize,
@@ -267,7 +265,6 @@ impl PeParameters {
         trapdoor_sigma: f64,
         error: RnsBggGaussian,
         flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
         key_cutoff: TrapdoorPreimageCutoffPolicy,
     ) -> Result<Self, PeError> {
         Self::with_minimum_key_width(
@@ -277,7 +274,6 @@ impl PeParameters {
             TrapdoorInstantiation::Computational,
             error,
             flooding,
-            programming,
             key_cutoff,
         )
     }
@@ -291,7 +287,6 @@ impl PeParameters {
         instantiation: TrapdoorInstantiation,
         error: RnsBggGaussian,
         flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
         key_cutoff: TrapdoorPreimageCutoffPolicy,
     ) -> Result<Self, PeError> {
         let key_width = minimum_preimage_sigma(
@@ -310,7 +305,6 @@ impl PeParameters {
             instantiation,
             error,
             flooding,
-            programming,
             key_width,
             key_cutoff,
             None,
@@ -329,7 +323,6 @@ impl PeParameters {
         m_bar: usize,
         error: RnsBggGaussian,
         flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
     ) -> Result<Self, PeError> {
         Self::with_minimum_key_width(
             class,
@@ -338,7 +331,6 @@ impl PeParameters {
             TrapdoorInstantiation::Statistical { m_bar },
             error,
             flooding,
-            programming,
             TrapdoorPreimageCutoffPolicy::Default,
         )
     }
@@ -351,7 +343,6 @@ impl PeParameters {
         instantiation: TrapdoorInstantiation,
         error: RnsBggGaussian,
         flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
         key_width: BigDecimal,
         key_cutoff: TrapdoorPreimageCutoffPolicy,
         statistical: Option<StatisticalSelection>,
@@ -371,7 +362,6 @@ impl PeParameters {
             instantiation,
             error,
             flooding,
-            programming,
             key_width,
             key_cutoff,
             anchor_columns,
@@ -520,7 +510,6 @@ impl PeParameters {
                 request.trapdoor_sigma,
                 RnsBggGaussian::with_default_cutoff(request.error_sigma.clone())?,
                 RnsBggGaussian::with_default_cutoff(request.flooding_sigma.clone())?,
-                RnsBggGaussian::with_default_cutoff(request.programming_sigma.clone())?,
                 TrapdoorPreimageCutoffPolicy::Default,
             )
             .and_then(|parameters| match request.lut_radix {
@@ -574,7 +563,6 @@ impl PeParameters {
             key_queries: strict.then_some(request.key_queries),
             flooding_enforced: request.enforce_flooding,
             trapdoor_sigma: request.trapdoor_sigma,
-            programming_sigma: &request.programming_sigma,
             randomness_sigma: &request.randomness_sigma,
             error_sigma: &request.error_sigma,
         })?;
@@ -583,7 +571,6 @@ impl PeParameters {
             Ok(RnsBggGaussian::new(sigma.clone(), budget.cutoff(sigma)?)?)
         };
         let error = contract(&request.error_sigma)?;
-        let programming = contract(&request.programming_sigma)?;
         let flooding_sigma =
             if request.enforce_flooding { &budget.flooding_sigma } else { &request.flooding_sigma };
         let flooding = contract(flooding_sigma)?;
@@ -613,7 +600,6 @@ impl PeParameters {
                 &BranchingProgram::longest(class),
                 &request.randomness_sigma,
                 &randomness_bound,
-                programming.cutoff(),
                 request.lut_radix,
             )?;
             let m = 2 * digits;
@@ -644,7 +630,6 @@ impl PeParameters {
             instantiation,
             error,
             flooding,
-            programming,
             key_width,
             TrapdoorPreimageCutoffPolicy::Default,
             Some(StatisticalSelection {
@@ -686,7 +671,6 @@ impl PeParameters {
             instantiation: self.instantiation,
             error: &self.error,
             flooding: &self.flooding,
-            programming: &self.programming,
             key_width: self.key_width.to_string(),
             key_cutoff: &self.key_cutoff,
             anchor_columns: self.anchor_columns,
@@ -753,14 +737,9 @@ impl PeParameters {
         &self.error
     }
 
-    /// `chi_fl`: the initial-state and digit-companion errors.
+    /// `chi_fl`: the initial-state, digit-companion, and attribute-ciphertext errors.
     pub const fn flooding(&self) -> &RnsBggGaussian {
         &self.flooding
-    }
-
-    /// The entries of every `Z_t`.
-    pub const fn programming(&self) -> &RnsBggGaussian {
-        &self.programming
     }
 
     /// The key width `σ_key` (a standard deviation): the trapdoor's minimum preimage width
@@ -800,13 +779,10 @@ impl PeParameters {
         w * self.anchor_columns + w * helpers * self.state_columns() + self.state_columns()
     }
 
-    /// The bound `B_C <= m_B n B_b B_Z` on the attribute ciphertext error
-    /// `e_C = -e_b Z_t`.
+    /// The bound `B_C` on the attribute ciphertext error `e_C = e_t`, a fresh `chi_fl` sample:
+    /// the flooding contract's cutoff.
     pub fn ciphertext_error_bound(&self) -> BigUint {
-        BigUint::from(self.anchor_columns) *
-            self.level().ring_dimension() *
-            self.error.cutoff() *
-            self.programming.cutoff()
+        self.flooding.cutoff().clone()
     }
 
     /// The sampling contracts of the Dynamic packages: `chi_fl` for the
@@ -949,7 +925,6 @@ mod tests {
             level.clone(),
             4.578,
             contract.clone(),
-            contract.clone(),
             contract,
             TrapdoorPreimageCutoffPolicy::Default,
         )
@@ -995,7 +970,7 @@ mod tests {
         );
         // Every truncated contract has the budget's cutoff `c σ`, above the default `6.5 σ`.
         assert!(budget.cutoff_multiplier > 6.5);
-        for contract in [parameters.error(), parameters.programming(), parameters.flooding()] {
+        for contract in [parameters.error(), parameters.flooding()] {
             assert_eq!(contract.cutoff(), &budget.cutoff(contract.sigma()).unwrap());
         }
         assert_eq!(parameters.flooding().sigma(), &budget.flooding_sigma);
@@ -1111,7 +1086,6 @@ mod tests {
                 &longest,
                 &request.randomness_sigma,
                 &BigUint::from(64u8),
-                practical.programming().cutoff(),
                 radix,
             )
             .unwrap()

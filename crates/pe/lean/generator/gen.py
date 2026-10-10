@@ -7,8 +7,9 @@ Reads the row of `lean/parameters.csv` and the claim the integration test export
 `lean/<parameter id>/generated`, derives every parameter-dependent constant of the proof (the
 modulus, the digit counts, the gadget base, the cutoffs, the widths, and the hash tags), and fills
 `generator/templates` into `lean/<parameter id>`. The templates are the proof of
-`average-w2-n8192-crt5x30`; they hold for every row of the same class and predicate (one attribute
-bit, `F(x) = x₀`), ring dimension `2^13`, two digits per CRT prime, and the average noise model.
+`average-w2-n8192-crt5x30`; they hold for every row of the same class (one attribute bit and one
+step of width 1, for every attribute and every program of the class), ring dimension `2^13`, two
+digits per CRT prime, and the average noise model.
 A row with `compact_encodings = 1` is filled from `generator/templates_compact`, which proves the
 compact fresh encodings over `PQ` for any power-of-two ring dimension.
 Before writing, the script checks the numeric conditions the proof decides (`numeric_margin`,
@@ -61,9 +62,9 @@ def values(parameter_id):
     # The tail `N 2 exp(-x) <= N 2^(1 - x)` reaches `2^-fail` for `x >= fail + 20` at `N = 2^13`.
     fail = int(row['failure_exponent'])
     tail = fail + 20
-    if (row['attribute_length'], row['alphabet_size'], row['state_width'], row['max_steps'], row['reads'],
-            row['tables']) != ('1', '2', '1', '1', '0', '0:1'):
-        sys.exit('the templates prove the class (1, 2, 1, 1) with the predicate F(x) = x₀')
+    if (row['attribute_length'], row['alphabet_size'], row['state_width'], row['max_steps']) != (
+            '1', '2', '1', '1'):
+        sys.exit('the templates prove the class (1, 2, 1, 1)')
     compact = row.get('compact_encodings') == '1'
     n = int(row['ring_dimension'])
     if not compact and n != N:

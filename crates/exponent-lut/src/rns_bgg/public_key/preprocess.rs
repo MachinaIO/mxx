@@ -37,7 +37,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             context,
             hash_key_commitment: [0; 32],
             evaluator: None,
-            families: super::encoding::OnlineEvalFamilies { parameters },
+            families: super::encoding::OnlineEvalFamilies::new(parameters),
             environment: Environment::new(),
             runtime: BTreeMap::new(),
             decoder_declaration: None,
@@ -45,7 +45,15 @@ impl<'a> RnsPreprocessBuild<'a> {
             unmask_bound: None,
             output_use: RnsOutputUse::default(),
             dynamic: None,
+            data: crate::program::ProgramData::new(),
         }
+    }
+
+    /// This builder for a Program with integer data ([`crate::program::ProgramData`]), which
+    /// preprocessing reads as graph inputs and commits to.
+    pub fn with_data(mut self, data: crate::program::ProgramData) -> Self {
+        self.data = data;
+        self
     }
 
     /// This builder for compiling a Program against the Dynamic `setup`,
@@ -285,6 +293,17 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         );
         evaluator.output_use = self.output_use;
         evaluator.dynamic = self.dynamic.clone();
+        self.data.validate(&program).map_err(|error| ApiError::input(error.to_string()))?;
+        let data = crate::program::data_inputs(&program);
+        self.families.data = data.clone();
+        evaluator.data = data;
+        for (family, _) in program.data_families() {
+            let values = self.data.values(*family).expect("validated program data");
+            self.runtime.insert(
+                crate::program::ProgramData::input_name(*family),
+                RuntimeValue::integer_values(values.iter().map(|value| (*value).into()).collect()),
+            );
+        }
         // Static LUT switching material is prepared at root scope, so that
         // a LUT in a family body only reads it in every member.
         if !dynamic {
@@ -424,6 +443,9 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         if let Some((setup, binding)) = &self.dynamic {
             digest.update(setup.identity());
             digest.update(serde_json::to_vec(binding).expect("setup mapping encoding"));
+        }
+        if !evaluator.program.data_families().is_empty() {
+            digest.update(self.data.commitment());
         }
         let encryption = digest.clone().finalize().into();
         digest.update(b"online-eval");
@@ -616,6 +638,9 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         .map_err(ApiError::scheme)?
         .with_input_levels(input_levels)
         .with_outputs(evaluator.output_use, carriers);
+        if !evaluator.program.data_families().is_empty() {
+            binding = binding.with_data(self.data.commitment());
+        }
         if let Some((setup, mapping)) = &evaluator.dynamic {
             binding = binding.with_dynamic_setup(setup.identity(), Some(mapping.clone()));
         }

@@ -115,6 +115,14 @@ where
         family: &Self::RhsFamily,
         index: &IntExpr,
     ) -> Result<E::Rhs, ProgramLowerError<E::Error>>;
+    /// The member of `family` whose index is entry `position` of the integer data family `data`
+    /// ([`Operand::Selected`]).
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        data: DataId,
+        position: &IntExpr,
+    ) -> Result<E::Rhs, ProgramLowerError<E::Error>>;
     fn parallel(
         &mut self,
         evaluator: &mut E,
@@ -374,6 +382,11 @@ where
             }
             None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedWire(*family))),
         },
+        Operand::Selected { .. } => {
+            Err(ProgramLowerError::Program(ProgramValidationError::InvalidStructure(
+                "only a private product's RHS is selected at run time".into(),
+            )))
+        }
     }
 }
 
@@ -398,6 +411,15 @@ where
         Operand::Member { family, index } => match environment.rhs.get(family) {
             Some(InputBinding::Family(value)) => {
                 families.rhs_at(value, &substitute_indices(index, indices)?)
+            }
+            Some(InputBinding::Scalar(_)) => {
+                Err(ProgramLowerError::Program(ProgramValidationError::ExpectedFamilyRhs(*family)))
+            }
+            None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedRhs(*family))),
+        },
+        Operand::Selected { family, data, position } => match environment.rhs.get(family) {
+            Some(InputBinding::Family(value)) => {
+                families.rhs_selected(value, *data, &substitute_indices(position, indices)?)
             }
             Some(InputBinding::Scalar(_)) => {
                 Err(ProgramLowerError::Program(ProgramValidationError::ExpectedFamilyRhs(*family)))
@@ -556,6 +578,14 @@ mod tests {
                 .map_err(|_| ProgramValidationError::MemberOutOfBounds)?;
             let index = index.to_usize().ok_or(ProgramValidationError::MemberOutOfBounds)?;
             family.get(index).copied().ok_or(ProgramValidationError::MemberOutOfBounds.into())
+        }
+        fn rhs_selected(
+            &mut self,
+            _: &Self::RhsFamily,
+            _: DataId,
+            _: &IntExpr,
+        ) -> Result<i32, ProgramLowerError<MockError>> {
+            Err(ProgramLowerError::UnsupportedStructure { reason: "mock has no data".into() })
         }
         fn parallel(
             &mut self,

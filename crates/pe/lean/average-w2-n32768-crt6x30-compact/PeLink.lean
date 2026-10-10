@@ -43,9 +43,9 @@ theorem prelude_link {model : HashModel} {tape : SampleTape} {x : Fin 1 → Int}
     {m : Fin N → Int} {outputs : PreludeOutputs}
     (h : Stage_prelude.generatedRoot Backend.backend model tape [3] GeneratedClaim.stage_3_params
       (BOf tape, key, (fun _ _ ↦ reducePoly Q N (secOf tape)), x, m, ()) outputs)
-    (hx : x 0 = 0) :
-    ![outputs.1 0, outputs.2.1 0] = CtopOf tape ∧
-      ![outputs.2.2.1 0, outputs.2.2.2.1 0] = CbotOf model key tape ∧
+    {xa : Fin 2} (hx : x 0 = (xa : Nat)) :
+    ![outputs.1 0, outputs.2.1 0] = CtopOf xa tape ∧
+      ![outputs.2.2.1 0, outputs.2.2.2.1 0] = CbotOf model key xa tape ∧
       outputs.2.2.2.2.1 = bOf model key tape ∧
       outputs.2.2.2.2.2.1 = reducePoly Q N (secOf tape) • messageRow model key 0 + messageRow model key 1 +
         reduceMatrix Q N 1 1 (emAt tape [3]) +
@@ -71,16 +71,16 @@ theorem lane_eq (i : Fin 576) :
   Fin.ext (by simp only [laneCol, laneRow]; omega)
 
 set_option maxHeartbeats 64000000 in
-theorem encrypt_link {model : HashModel} {tape : SampleTape} {key : ByteArray}
+theorem encrypt_link {model : HashModel} {tape : SampleTape} {key : ByteArray} {xa : Fin 2}
     {C00 C01 C10 C11 : Fin 1 → ExactMatrix Q N 1 12} {outputs : EncryptOutputs}
     (h : Stage_encrypt.generatedRoot Backend.backend model tape [4] GeneratedClaim.stage_4_params
       ((fun _ _ ↦ reducePoly Q N (secOf tape)), key, 1, 0, C00, C01, C10, C11, ()) outputs)
     (hsn : polyNorm (secOf tape) ≤ 1)
-    (hCt : ![C00 0, C01 0] = CtopOf tape) (hCb : ![C10 0, C11 0] = CbotOf model key tape) :
+    (hCt : ![C00 0, C01 0] = CtopOf xa tape) (hCb : ![C10 0, C11 0] = CbotOf model key xa tape) :
     ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1] = c0COf model key tape ∧
       ![outputs.2.2.1 0, outputs.2.2.2.1 0] = hrowCOf model key tape ∧
       (∀ i, ![outputs.2.2.2.2.2.2.1 i, outputs.2.2.2.2.2.2.2.1 i] =
-        zCOf model key tape (laneCol i) (laneRow i)) ∧
+        zCOf model key xa tape (laneCol i) (laneRow i)) ∧
       (∀ i, ![outputs.1 i, outputs.2.1 i] = zaCOf model key tape (laneCol i) (laneRow i)) := by
   have hhelp : ![outputs.2.2.1 0, outputs.2.2.2.1 0] = hrowCOf model key tape := by
     rw [hrowCOf_eq]
@@ -103,15 +103,16 @@ theorem encrypt_link {model : HashModel} {tape : SampleTape} {key : ByteArray}
 
 set_option maxHeartbeats 64000000 in
 theorem preprocess_link {model : HashModel} {tape : SampleTape} {key : ByteArray}
-    {outputs : PreprocessOutputs}
+    {reads : Fin 1 → Int} {tables : Fin 2 → Int} {outputs : PreprocessOutputs}
     (h : Stage_preprocess.generatedRoot Backend.backend model tape [5] GeneratedClaim.stage_5_params
-      key outputs) :
+      (reads, key, tables, ()) outputs) :
     ![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]] = MM model key ∧
       outputs.2.2.2.2.1 = TM model key 0 ∧ outputs.2.2.2.2.2.1 = TM model key 1 ∧
       ![![outputs.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.1],
-        ![outputs.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.1]] = AFM model key ∧
+        ![outputs.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.1]] = AFM model key (tables 0) (tables 1) ∧
       ![![outputs.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.1],
-        ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.1]] = AFM model key := by
+        ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.1]] =
+        AFM model key (tables 0) (tables 1) := by
   obtain ⟨hM, hT, g, V1, VK, hg, hV1, hVK, hA, hA'⟩ := preprocess_keys h
   have hMM : ![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]] = MM model key := by
     funext k j r l
@@ -130,7 +131,7 @@ theorem preprocess_link {model : HashModel} {tape : SampleTape} {key : ByteArray
   have hVK' := VKc_eq hg hVK
   have hAF : ∀ k j : Fin 2, outputKey model key
       ![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]] outputs.2.2.2.2.1
-      outputs.2.2.2.2.2.1 V1 VK k j = AFM model key k j := by
+      outputs.2.2.2.2.2.1 V1 VK k j = AFM model key (tables 0) (tables 1) k j := by
     intro k j
     rw [hMM, hV1', hVK', show outputs.2.2.2.2.1 = TM model key 0 from hTk 0,
       show outputs.2.2.2.2.2.1 = TM model key 1 from hTk 1]
@@ -142,30 +143,30 @@ theorem preprocess_link {model : HashModel} {tape : SampleTape} {key : ByteArray
     rw [hA' k j, hAF]
 
 set_option maxHeartbeats 64000000 in
-theorem online_link {model : HashModel} {tape : SampleTape} {key : ByteArray}
+theorem online_link {model : HashModel} {tape : SampleTape} {key : ByteArray} {xa : Fin 2}
     {v0 v1 v2 v3 : ExactMatrix Q N 1 12} {c0a c0b : ExactMatrix PQ N 1 1}
     {C00 C01 C10 C11 : Fin 1 → ExactMatrix Q N 1 12}
     {z0 z1 : Fin 576 → ExactMatrix PQ N 1 1} {hf0 hf1 : Fin 1 → ExactMatrix PQ N 1 1}
     {T0 T1 : ExactMatrix Q N 1 24} {za0 za1 : Fin 576 → ExactMatrix PQ N 1 1}
-    {M00 M01 M10 M11 : ExactMatrix Q N 1 12}
+    {M00 M01 M10 M11 : ExactMatrix Q N 1 12} {reads : Fin 1 → Int} {tables : Fin 2 → Int}
     {outputs : ExactMatrix Q N 1 12 × ExactMatrix Q N 1 12 × ExactMatrix Q N 1 12 ×
       ExactMatrix Q N 1 12 × ExactMatrix Q N 1 12 × ExactMatrix Q N 1 12 × Unit}
     (h : Stage_online_eval.generatedRoot Backend.backend model tape [7]
-      GeneratedClaim.stage_7_params (v0, v1, v2, v3, c0a, c0b, C00, C01, C10, C11, z0, z1, key, hf0,
-        hf1, T0, T1, za0, za1, M00, M01, M10, M11, ()) outputs)
-    (hc0 : ![c0a, c0b] = c0COf model key tape) (hCt : ![C00 0, C01 0] = CtopOf tape)
-    (hCb : ![C10 0, C11 0] = CbotOf model key tape)
-    (hz : ∀ i, ![z0 i, z1 i] = zCOf model key tape (laneCol i) (laneRow i))
+      GeneratedClaim.stage_7_params (v0, v1, v2, v3, c0a, c0b, C00, reads, C01, C10, C11, z0, z1, key,
+        tables, hf0, hf1, T0, T1, za0, za1, M00, M01, M10, M11, ()) outputs)
+    (hc0 : ![c0a, c0b] = c0COf model key tape) (hCt : ![C00 0, C01 0] = CtopOf xa tape)
+    (hCb : ![C10 0, C11 0] = CbotOf model key xa tape)
+    (hz : ∀ i, ![z0 i, z1 i] = zCOf model key xa tape (laneCol i) (laneRow i))
     (hhf : ![hf0 0, hf1 0] = hrowCOf model key tape)
     (hza : ∀ i, ![za0 i, za1 i] = zaCOf model key tape (laneCol i) (laneRow i))
     (hM : ![![M00, M01], ![M10, M11]] = MM model key) (hT0 : T0 = TM model key 0)
     (hT1 : T1 = TM model key 1) :
-    ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1] = cFOf model key tape ∧
+    ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1] = cFOf model key xa (tables 0) (tables 1) tape ∧
       (∀ (j : Fin 2) (l : Fin 12), ∃ D' : ExactMatrix Q N (12 + 12) 1,
         gadgetDecomposeRuns Backend.backend 32768 12
-          (pairColumn (CtopOf tape j 0 l) (CbotOf model key tape j 0 l)) D' ∧
+          (pairColumn (CtopOf xa tape j 0 l) (CbotOf model key xa tape j 0 l)) D' ∧
           compactCenteredRebaseRuns 16384 D'
-            (fun a _ ↦ actionDigits (joinRow (CtopOf tape)) (joinRow (CbotOf model key tape)) j a l)) ∧
+            (fun a _ ↦ actionDigits (joinRow (CtopOf xa tape)) (joinRow (CbotOf model key xa tape)) j a l)) ∧
       (∀ (j : Fin 2) (l : Fin 12), ∃ D' : ExactMatrix Q N (12 + 12) 1,
         gadgetDecomposeRuns Backend.backend 32768 12
           (pairColumn (halves (TM model key 0) j 0 l) (halves (TM model key 1) j 0 l)) D' ∧
@@ -176,12 +177,14 @@ theorem online_link {model : HashModel} {tape : SampleTape} {key : ByteArray}
           (pairColumn (switchTop model key j 0 l) (switchBot model key (hrowOf model key tape) j 0 l)) D' ∧
           compactCenteredRebaseRuns 16384 D' (fun a _ ↦ actionDigits (joinRow (switchTop model key))
             (joinRow (switchBot model key (hrowOf model key tape))) j a l)) ∧
-      gadgetDecomposeRuns Backend.backend 32768 12 (matrixMulScalarLeft lutScalarOne g0) V1c ∧
       gadgetDecomposeRuns Backend.backend 32768 12
-        (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g0) VKc := by
+        (matrixMulScalarLeft (lutScalarOne (tables 0) (tables 1)) g0) (V1c (tables 0) (tables 1)) ∧
+      gadgetDecomposeRuns Backend.backend 32768 12
+        (matrixMulScalarLeft (lutScalar (tables 0) (tables 1) (substituteMatrix K hK)) g0)
+        (VKc (tables 0) (tables 1)) := by
   obtain ⟨g, V1, VK, hg, hV1, hVK, hD, hDt, hDK, -, -, -, -, hout⟩ := online_rows h
-  have hz0 : z0 = fun i ↦ zCOf model key tape (laneCol i) (laneRow i) 0 := funext fun i ↦ congrFun (hz i) 0
-  have hz1 : z1 = fun i ↦ zCOf model key tape (laneCol i) (laneRow i) 1 := funext fun i ↦ congrFun (hz i) 1
+  have hz0 : z0 = fun i ↦ zCOf model key xa tape (laneCol i) (laneRow i) 0 := funext fun i ↦ congrFun (hz i) 0
+  have hz1 : z1 = fun i ↦ zCOf model key xa tape (laneCol i) (laneRow i) 1 := funext fun i ↦ congrFun (hz i) 1
   have hza0 : za0 = fun i ↦ zaCOf model key tape (laneCol i) (laneRow i) 0 :=
     funext fun i ↦ congrFun (hza i) 0
   have hza1 : za1 = fun i ↦ zaCOf model key tape (laneCol i) (laneRow i) 1 :=
@@ -242,7 +245,8 @@ set_option maxHeartbeats 64000000 in
 /-- The online output of the model is an encoding of `0` under `A_F`, with error at most
 `onlineBound 16395 (14 N 20²) 16395 16395` for the bounds of the expanded encodings,
 given the cutoffs of the samples, a ternary secret, and the digit runs. -/
-theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
+theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape} {xa : Fin 2} {t0 t1 : Int}
+    (ht : ![t0, t1] xa = 0)
     (hsn : polyNorm (secOf ω) ≤ 1)
     (hb0 : ∀ j, CoeffBound (![errAt ω [4, 28] encLaw, errAt ω [4, 39] encLaw] j) 20)
     (hbh : ∀ j, CoeffBound (ehOf ω j) 20)
@@ -251,9 +255,9 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
     (heb : CoeffBound (ebAt ω [3]) 20) (hzb : CoeffBound (zAt ω [3]) 20)
     (hD : ∀ (j : Fin 2) (l : Fin 12), ∃ D' : ExactMatrix Q N (12 + 12) 1,
         gadgetDecomposeRuns Backend.backend 32768 12
-          (pairColumn (CtopOf ω j 0 l) (CbotOf model key ω j 0 l)) D' ∧
+          (pairColumn (CtopOf xa ω j 0 l) (CbotOf model key xa ω j 0 l)) D' ∧
           compactCenteredRebaseRuns 16384 D'
-            (fun a _ ↦ actionDigits (joinRow (CtopOf ω)) (joinRow (CbotOf model key ω)) j a l))
+            (fun a _ ↦ actionDigits (joinRow (CtopOf xa ω)) (joinRow (CbotOf model key xa ω)) j a l))
     (hDt : ∀ (j : Fin 2) (l : Fin 12), ∃ D' : ExactMatrix Q N (12 + 12) 1,
         gadgetDecomposeRuns Backend.backend 32768 12
           (pairColumn (halves (TM model key 0) j 0 l) (halves (TM model key 1) j 0 l)) D' ∧
@@ -264,19 +268,21 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
           (pairColumn (switchTop model key j 0 l) (switchBot model key (hrowOf model key ω) j 0 l)) D' ∧
           compactCenteredRebaseRuns 16384 D' (fun a _ ↦ actionDigits (joinRow (switchTop model key))
             (joinRow (switchBot model key (hrowOf model key ω))) j a l))
-    (hV1 : gadgetDecomposeRuns Backend.backend 32768 12 (matrixMulScalarLeft lutScalarOne g0) V1c)
+    (hV1 : gadgetDecomposeRuns Backend.backend 32768 12 (matrixMulScalarLeft (lutScalarOne t0 t1) g0)
+      (V1c t0 t1))
     (hVK : gadgetDecomposeRuns Backend.backend 32768 12
-      (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g0) VKc) :
-    MxxExponentLut.Rel (secOf ω) (AFM model key) (fun _ ↦ 0) (cFOf model key ω)
+      (matrixMulScalarLeft (lutScalar t0 t1 (substituteMatrix K hK)) g0) (VKc t0 t1)) :
+    MxxExponentLut.Rel (secOf ω) (AFM model key t0 t1) (fun _ ↦ 0) (cFOf model key xa t0 t1 ω)
       (onlineBound 16395 (14 * N * 20 * 20) 16395 16395) := by
   have hrhs := prelude_rhs (model := model) (key := key) (tape := ω) (path := [3]) (B := BOf ω)
-    (sm := secOf ω) (g := g0) (b := bOf model key ω) (C00 := CtopOf ω 0) (C01 := CtopOf ω 1)
-    (C10 := CbotOf model key ω 0) (C11 := CbotOf model key ω 1) (bOf_eq model key ω)
+    (sm := secOf ω) (μ := Xe xa) (g := g0) (b := bOf model key ω) (C00 := CtopOf xa ω 0)
+    (C01 := CtopOf xa ω 1) (C10 := CbotOf model key xa ω 0) (C11 := CbotOf model key xa ω 1)
+    (bOf_eq model key ω)
     (by rw [CtopOf_eq]; rfl) (by rw [CtopOf_eq]; rfl) (by rw [CbotOf_eq]; rfl) (by rw [CbotOf_eq]; rfl)
-  have hCt : ![CtopOf ω 0, CtopOf ω 1] = CtopOf ω := by
+  have hCt : ![CtopOf xa ω 0, CtopOf xa ω 1] = CtopOf xa ω := by
     funext j
     fin_cases j <;> rfl
-  have hCb : ![CbotOf model key ω 0, CbotOf model key ω 1] = CbotOf model key ω := by
+  have hCb : ![CbotOf model key xa ω 0, CbotOf model key xa ω 1] = CbotOf model key xa ω := by
     funext j
     fin_cases j <;> rfl
   rw [hCt, hCb] at hrhs
@@ -284,24 +290,24 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
     (polyNorm_substitution_le hN hK hKcoprime _).trans hsn
   have hz : ∀ (j : Fin 2) (l : Fin 12) (a : Fin (12 + 12)), MxxExponentLut.Rel (secOf ω)
       (fun k r ↦ rhsKey model key (12 * (j : Nat) + l) a (2 * k + r))
-      (fun r ↦ (actionDigits (joinRow (CtopOf ω)) (joinRow (CbotOf model key ω)) j a l *
+      (fun r ↦ (actionDigits (joinRow (CtopOf xa ω)) (joinRow (CbotOf model key xa ω)) j a l *
         reducePoly Q N (unitPair (secOf ω) r)) • g0)
-      ![zOf model key ω (laneCol ⟨12 * (j : Nat) + l + 24 * a, by omega⟩)
+      ![zOf model key xa ω (laneCol ⟨12 * (j : Nat) + l + 24 * a, by omega⟩)
           (laneRow ⟨12 * (j : Nat) + l + 24 * a, by omega⟩) 0,
-        zOf model key ω (laneCol ⟨12 * (j : Nat) + l + 24 * a, by omega⟩)
+        zOf model key xa ω (laneCol ⟨12 * (j : Nat) + l + 24 * a, by omega⟩)
           (laneRow ⟨12 * (j : Nat) + l + 24 * a, by omega⟩) 1] 16395 := by
     intro j l a
     obtain ⟨hc, hr⟩ := lane_split j l a
     rw [hc, hr]
-    have hzz : ![zOf model key ω ⟨12 * (j : Nat) + l, by omega⟩ a 0,
-        zOf model key ω ⟨12 * (j : Nat) + l, by omega⟩ a 1] =
-        fun r ↦ expand (zCOf model key ω ⟨12 * (j : Nat) + l, by omega⟩ a r) := by
+    have hzz : ![zOf model key xa ω ⟨12 * (j : Nat) + l, by omega⟩ a 0,
+        zOf model key xa ω ⟨12 * (j : Nat) + l, by omega⟩ a 1] =
+        fun r ↦ expand (zCOf model key xa ω ⟨12 * (j : Nat) + l, by omega⟩ a r) := by
       funext r
       fin_cases r <;> rfl
     rw [hzz, zCOf_eq]
     have h := expanded_rel hsn (hbz ⟨12 * (j : Nat) + l + 24 * a, by omega⟩) (le_of_eq expandF_eq)
       (At := fun k r ↦ rhsKeyC model key (12 * (j : Nat) + l) a (2 * k + r))
-      (x := fun r ↦ centeredIntLift (colDigits (joinRow (CtopOf ω)) (joinRow (CbotOf model key ω))
+      (x := fun r ↦ centeredIntLift (colDigits (joinRow (CtopOf xa ω)) (joinRow (CbotOf model key xa ω))
         ⟨12 * (j : Nat) + l, by omega⟩ a 0) * unitPair (secOf ω) r)
     refine h.target_eq (funext fun r ↦ ?_)
     exact lift_target _ _
@@ -354,16 +360,16 @@ theorem online_error {model : HashModel} {key : ByteArray} {ω : SampleTape}
     exact expanded_rel hsn hbh (le_of_eq expandH_eq) (At := helperKeyC model key)
       (x := fun j ↦ (((1 : Nat) : Int) : ErrorPoly N) * unitPair (substitution K hK (secOf ω)) j)
   rw [cFOf_eq]
-  exact online_rel (model := model) (key := key) (s := secOf ω) (g := g0) (V1 := V1c) (VK := VKc)
-    (cIn := c0Of model key ω) (Ctop := CtopOf ω) (Cbot := CbotOf model key ω)
+  exact online_rel (model := model) (key := key) (s := secOf ω) (g := g0) (V1 := V1c t0 t1) (VK := VKc t0 t1)
+    (cIn := c0Of model key ω) (Ctop := CtopOf xa ω) (Cbot := CbotOf model key xa ω)
     (Bm := fun j l a k r ↦ rhsKey model key (12 * (j : Nat) + l) a (2 * k + r))
-    (z0 := fun i ↦ zOf model key ω (laneCol i) (laneRow i) 0)
-    (z1 := fun i ↦ zOf model key ω (laneCol i) (laneRow i) 1) (Mmul := MM model key)
+    (z0 := fun i ↦ zOf model key xa ω (laneCol i) (laneRow i) 0)
+    (z1 := fun i ↦ zOf model key xa ω (laneCol i) (laneRow i) 1) (Mmul := MM model key)
     (hrow := hrowOf model key ω)
     (Ba := fun j l a k r ↦ autKey model key (12 * (j : Nat) + l) a (2 * k + r))
     (za0 := fun i ↦ zaOf model key ω (laneCol i) (laneRow i) 0)
     (za1 := fun i ↦ zaOf model key ω (laneCol i) (laneRow i) 1)
     (T0 := TM model key 0) (T1 := TM model key 1)
-    g0_runs hV1 hVK hin hrhs (rhsErr_bound heb hzb) hD hz hM hh hDK hza hT hDt
+    g0_runs ht hV1 hVK hin hrhs (rhsErr_bound heb hzb) hD hz hM hh hDK hza hT hDt
 
 end PeProof

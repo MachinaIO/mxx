@@ -476,6 +476,17 @@ mod tests {
             })
         }
 
+        fn rhs_selected(
+            &mut self,
+            _: &Self::RhsFamily,
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: "NAND test has no RHS families".into(),
+            })
+        }
+
         fn parallel(
             &mut self,
             evaluator: &mut LogicalEvaluator,

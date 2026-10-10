@@ -2216,19 +2216,7 @@ impl DslContext {
         name: impl Into<String>,
         fixed_count: impl Into<IntExpr>,
     ) -> Family<Int> {
-        let count = fixed_count.into();
-        let wire_type =
-            WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
-        let node = NodeHandle::new(
-            NodeKind::Input { name: name.into(), wire_type: wire_type.clone(), artifact: None },
-            Vec::new(),
-            vec![wire_type],
-        );
-        Family {
-            values: vec![node.output(0).expect("integer family input")],
-            element_schema: IntType,
-            count,
-        }
+        int_family_input(name, fixed_count)
     }
 
     pub fn output<V: GraphValue>(
@@ -2474,6 +2462,25 @@ macro_rules! tag {
 }
 
 pub use mxx_ir_core::node::ConcatAxis;
+
+/// A runtime integer family input of `fixed_count` members named `name`, declared where it is
+/// first used: a graph built from values that read it declares the input.
+#[track_caller]
+pub fn int_family_input(name: impl Into<String>, fixed_count: impl Into<IntExpr>) -> Family<Int> {
+    let count = fixed_count.into();
+    let wire_type =
+        WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
+    let node = NodeHandle::new(
+        NodeKind::Input { name: name.into(), wire_type: wire_type.clone(), artifact: None },
+        Vec::new(),
+        vec![wire_type],
+    );
+    Family {
+        values: vec![node.output(0).expect("integer family input")],
+        element_schema: IntType,
+        count,
+    }
+}
 
 #[cfg(test)]
 mod tests {

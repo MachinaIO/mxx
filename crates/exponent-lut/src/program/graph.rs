@@ -121,6 +121,17 @@ where
         Ok(family.at(mxx_dsl::Int::evaluate(index.clone())))
     }
 
+    fn rhs_selected(
+        &mut self,
+        _: &Self::RhsFamily,
+        _: DataId,
+        _: &IntExpr,
+    ) -> Result<E::Rhs, ProgramLowerError<E::Error>> {
+        Err(ProgramLowerError::UnsupportedStructure {
+            reason: "the generic graph lowering has no integer data".into(),
+        })
+    }
+
     fn parallel(
         &mut self,
         evaluator: &mut E,

@@ -12,20 +12,20 @@
 //! [`PeParameters::security_bits`] (the encryption secret, and TrapGen for the computational
 //! instantiation) reach the target according to `lattice-estimator-cli`, which must be on `PATH`
 //! with its Sage environment. The computational instantiation uses the samplers' default cutoffs
-//! (`6.5 sigma`); the statistical one truncates `chi`, `chi_fl`, and `Z_t` at the budget's
+//! (`6.5 sigma`); the statistical one truncates `chi` and `chi_fl` at the budget's
 //! multiplier. Both use the default preimage cutoff for the key.
 //!
-//! On the accepted parameters, every stage runs on the GPU with file-backed artifacts: setup,
-//! one encryption of a random attribute and a random binary message, and keys for two random
-//! branching programs of the class's maximal length, one authorized (`F(x) = 0`) and one not. The
+//! On the accepted parameters, every stage runs on the GPU: setup, one encryption of a random
+//! attribute and a random binary message, and keys for two random branching programs of the
+//! class's maximal length, adjusted to output `0` (authorized) and `1` on the attribute. The
 //! authorized key must decrypt the message; the unauthorized decryption must complete, and its
 //! rounded phase is not constrained.
 //!
-//! With `MXX_PE_ROUND_TRIP_PARAMETER_ID`, the test runs the recorded row of
-//! `lean/parameters.csv` instead of searching: it checks that the row's noise model accepts the
-//! parameters and that its recorded security estimates are reproduced, runs the round trip with
-//! the row's predicate on an attribute it authorizes, and exports the Lean correctness claim of
-//! the executed graphs to `lean/<parameter id>/generated`.
+//! With `MXX_PE_ROUND_TRIP_LEAN_EXPORT=<parameter id>`, the test exports the Lean correctness
+//! claim of the executed graphs to `lean/<parameter id>/generated`. The claim does not depend on
+//! the predicate: the program is an external input of key generation (preprocessing) and online
+//! evaluation, and the requirement is that the attribute and the program form a valid instance
+//! with `F(x) = 0`.
 //!
 //! The computational instantiation is checked only for correctness and security: the
 //! manuscript's leftover-hash, noise-flooding, and key-width conditions are enforced only by the
@@ -33,7 +33,7 @@
 //!
 //! | Variable (`MXX_PE_ROUND_TRIP_` prefix) | Default | Meaning |
 //! | --- | --- | --- |
-//! | `PARAMETER_ID` | unset | Run and export a recorded row of `lean/parameters.csv` |
+//! | `LEAN_EXPORT` | unset | Export the Lean correctness claim to `lean/<value>/generated` |
 //! | `ATTRIBUTE_LENGTH`, `ALPHABET_SIZE`, `STATE_WIDTH`, `MAX_STEPS` | 1, 2, 1, 1 | The class |
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 12, 15 | Ring-dimension candidates |
 //! | `MAX_CRT_DEPTH` | 12 | CRT-depth candidates `1..=` |
@@ -41,10 +41,9 @@
 //! | `TRAPDOOR_INSTANTIATION` | `statistical` | `statistical` or `computational` |
 //! | `KEY_WIDTH_POLICY` | `practical` | `practical` or `strict` (statistical only) |
 //! | `ERROR_SIGMA`, `FLOODING_SIGMA` | 3.19 | Sigmas of `chi` and of `chi_fl` (computational, or statistical with `FLOODING=none`) |
-//! | `COMPACT_ENCODINGS` | 1 | 1 publishes the fresh encodings in two columns over `pq` (`PeParameters::with_compact_encodings`), 0 at `q` in full gadget width; a recorded row (`PARAMETER_ID`) follows its `compact_encodings` column |
-//! | `LUT_RADIX` | unset | Radix `B` of the LUT automorphism decomposition (`PeParameters::with_lut_radix`); unset switches every automorphism directly (`B = W`) |
+//! | `COMPACT_ENCODINGS` | 1 | 1 publishes the fresh encodings in two columns over `pq` (`PeParameters::with_compact_encodings`), 0 at `q` in full gadget width |
+//! | `LUT_RADIX` | `PeClass::default_lut_radix` | Radix `B` of the LUT automorphism decomposition (`PeParameters::with_lut_radix`); 0 switches every automorphism directly (`B = W`). The default takes 3 or 2 switches per branch when they divide `log2 W` (`W = 4096`: `B = 16`; `W = 2`: direct) |
 //! | `FLOODING` | `enforce` | `enforce` or `none`: whether the statistical instantiation imposes the flooding width |
-//! | `PROGRAMMING_SIGMA` | 256 (statistical), 3.19 (computational) | Sigma of the entries of `Z_t` |
 //! | `RANDOMNESS_SIGMA` | 64 | Sigma of the proof's `R` (statistical only) |
 //! | `STATISTICAL_BITS`, `FLOODING_BITS` | 30, 30 | `log(1/ε_total)` and the per-coefficient flooding exponent |
 //! | `KEY_QUERIES`, `MAX_ANCHOR_COLUMNS` | `2^20`, 1024 | `Q_key` and `m_B,max` |
@@ -66,6 +65,7 @@ use mxx_backends::{
 use mxx_dsl::{DslContext, IdealSpec, Int};
 use mxx_exponent_lut::{
     api::{ApiError, StageExecution, StageOutputs, StageStorage, StageStore},
+    program::ProgramData,
     utils::{env_usize, ring_dimension_candidates},
 };
 use mxx_ir_core::{
@@ -105,8 +105,6 @@ fn key_width_policy(value: &str) -> KeyWidthPolicy {
     }
 }
 
-type ParameterRow = BTreeMap<String, String>;
-
 fn variable(name: &str) -> String {
     format!("{PREFIX}{name}")
 }
@@ -139,127 +137,6 @@ fn lean_directory() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lean")
 }
 
-/// Row `id` of `lean/parameters.csv`, as column name to value.
-fn parameter_row(id: &str) -> ParameterRow {
-    let path = lean_directory().join("parameters.csv");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-    let mut lines = text.lines();
-    let header = lines.next().expect("parameter CSV header").split(',').collect::<Vec<_>>();
-    let rows = lines
-        .map(|line| {
-            header.iter().map(|name| name.to_string()).zip(line.split(',').map(str::to_owned))
-        })
-        .map(BTreeMap::from_iter)
-        .filter(|row: &ParameterRow| row["parameter_id"] == id)
-        .collect::<Vec<_>>();
-    let [row] = <[_; 1]>::try_from(rows)
-        .unwrap_or_else(|_| panic!("{} must have exactly one row {id}", path.display()));
-    row
-}
-
-fn column<T: std::str::FromStr>(row: &ParameterRow, name: &str) -> T
-where
-    T::Err: std::fmt::Debug,
-{
-    row.get(name)
-        .unwrap_or_else(|| panic!("parameter column {name} is missing"))
-        .parse()
-        .unwrap_or_else(|error| panic!("parameter column {name} is malformed: {error:?}"))
-}
-
-/// The class of a recorded row.
-fn row_class(row: &ParameterRow) -> PeClass {
-    PeClass::new(
-        column(row, "attribute_length"),
-        column(row, "alphabet_size"),
-        column(row, "state_width"),
-        column(row, "max_steps"),
-    )
-    .unwrap()
-}
-
-/// The parameters of a recorded row, its noise report, and its predicate: the reads are
-/// `;`-separated, and the tables are `;`-separated steps of `:`-separated entries.
-fn recorded(row: &ParameterRow) -> (PeParameters, PeNoiseReport, BranchingProgram) {
-    let class = row_class(row);
-    let depth = column(row, "crt_depth");
-    let failure_exponent = match row["noise_model"].as_str() {
-        "worst" => None,
-        "average" => Some(column(row, "failure_exponent")),
-        model => panic!("unknown noise model {model}"),
-    };
-    let statistical = match row["trapdoor_instantiation"].as_str() {
-        "computational" => false,
-        "statistical" => true,
-        mode => panic!("unknown trapdoor instantiation {mode}"),
-    };
-    let request = PeParameterRequest {
-        class,
-        ring_dimension: column(row, "ring_dimension"),
-        crt_bits: column(row, "crt_bits"),
-        base_bits: column(row, "base_bits"),
-        crt_depths: depth..=depth,
-        trapdoor_instantiation: if statistical {
-            TrapdoorMode::Statistical
-        } else {
-            TrapdoorMode::Computational
-        },
-        key_width_policy: if statistical {
-            key_width_policy(&row["key_width_policy"])
-        } else {
-            KeyWidthPolicy::Practical
-        },
-        trapdoor_sigma: column(row, "trapdoor_sigma"),
-        error_sigma: column(row, "error_sigma"),
-        flooding_sigma: column(row, "flooding_sigma"),
-        enforce_flooding: true,
-        programming_sigma: column(row, "programming_sigma"),
-        randomness_sigma: if statistical {
-            column(row, "randomness_sigma")
-        } else {
-            BigDecimal::from(0u8)
-        },
-        statistical_security_bits: DEFAULT_STATISTICAL_BITS,
-        flooding_statistical_bits: DEFAULT_FLOODING_BITS,
-        key_queries: DEFAULT_KEY_QUERIES,
-        max_anchor_columns: DEFAULT_MAX_ANCHOR_COLUMNS,
-        lut_radix: None,
-        compact_encodings: row.get("compact_encodings").is_some_and(|value| value == "1"),
-        failure_exponent,
-        lattice_security_bits: None,
-    };
-    let parameters = PeParameters::at_depth(&request, depth).unwrap();
-    // A statistical row records the selection's `m̄` and truncation multiplier.
-    match parameters.statistical() {
-        Some(selection) => {
-            assert_eq!(
-                parameters.anchor_columns() - parameters.digits(),
-                column::<usize>(row, "m_bar"),
-                "the recorded m_bar must be reproduced"
-            );
-            assert_eq!(
-                format!("{:.4}", selection.budget.cutoff_multiplier),
-                row["cutoff_multiplier"],
-                "the recorded cutoff multiplier must be reproduced"
-            );
-        }
-        None => assert_eq!(row["cutoff_multiplier"], "6.5"),
-    }
-    let longest = BranchingProgram::longest(class);
-    let report = match failure_exponent {
-        None => mxx_pe::noise::simulate(&parameters, &longest),
-        Some(exponent) => mxx_pe::noise::simulate_average(&parameters, &longest, exponent),
-    }
-    .unwrap();
-    let reads = row["reads"].split(';').map(|read| read.parse().unwrap()).collect();
-    let tables = row["tables"]
-        .split(';')
-        .map(|table| table.split(':').map(|entry| entry.parse().unwrap()).collect())
-        .collect();
-    (parameters, report, BranchingProgram::new(class, reads, tables).unwrap())
-}
-
 /// The first accepted candidate over the ring dimensions, with its noise report.
 fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
     let crt_bits = count("CRT_BITS", 50);
@@ -279,11 +156,6 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
         Err(error) => {
             panic!("{} is not valid Unicode: {error}", variable("TRAPDOOR_INSTANTIATION"))
         }
-    };
-    // The regularity condition of `Z_t` asks for a wide programming Gaussian.
-    let programming_default = match trapdoor_instantiation {
-        TrapdoorMode::Statistical => "256",
-        TrapdoorMode::Computational => "3.19",
     };
     let dimensions = ring_dimension_candidates(
         &variable("MIN_LOG_RING_DIMENSION"),
@@ -313,7 +185,6 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
                     panic!("{} must be `enforce` or `none`, got `{value}`", variable("FLOODING"))
                 }
             },
-            programming_sigma: decimal("PROGRAMMING_SIGMA", programming_default),
             randomness_sigma: decimal("RANDOMNESS_SIGMA", "64"),
             statistical_security_bits: u32::try_from(count(
                 "STATISTICAL_BITS",
@@ -327,7 +198,10 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
             .unwrap(),
             key_queries: count("KEY_QUERIES", DEFAULT_KEY_QUERIES as usize) as u64,
             max_anchor_columns: count("MAX_ANCHOR_COLUMNS", DEFAULT_MAX_ANCHOR_COLUMNS),
-            lut_radix: Some(count("LUT_RADIX", 0)).filter(|radix| *radix > 0),
+            lut_radix: match env::var(variable("LUT_RADIX")) {
+                Err(_) => class.default_lut_radix(),
+                Ok(_) => Some(count("LUT_RADIX", 0)).filter(|radix| *radix > 0),
+            },
             compact_encodings: count("COMPACT_ENCODINGS", 1) != 0,
             failure_exponent,
             lattice_security_bits: Some(security),
@@ -436,13 +310,14 @@ fn root_inputs(graph: &Graph) -> Vec<String> {
 /// The executed authorized workflow as a closed protocol: setup, payload sampling, the prelude
 /// and the Dynamic encryption, the predicate's preprocessing and key generation, online
 /// evaluation, and decryption, compared with the message. External inputs are the hash key, the
-/// attribute exponents `Bz x_t`, the message bits, and the fixed initial-state plaintext `X^0`;
-/// the requirement checks that the exponents encode an attribute in the alphabet that the
-/// predicate authorizes.
+/// attribute exponents `Bz x_t`, the message bits, the fixed initial-state plaintext `X^0`, and
+/// the program as the class Program's data (its reads and its `T_max` tables of `W` entries,
+/// read by preprocessing and online evaluation); the requirement checks that the exponents
+/// encode an attribute in the alphabet, that the program is one of the class (intermediate
+/// outputs below `Bz`, final outputs bits), and that it outputs `0` on the attribute.
 fn pe_protocol(
     recorded: Vec<Recorded>,
     parameters: &PeParameters,
-    predicate: &BranchingProgram,
     failure_exponent: Option<u32>,
 ) -> ProtocolDecl {
     let id = |name: &str| StageId(name.to_owned());
@@ -464,6 +339,13 @@ fn pe_protocol(
     let dimension = parameters.level().ring_dimension() as usize;
     let attributes = class.attribute_length();
     let width = class.state_width();
+    let lookup = class.lookup_width();
+    let steps = class.max_steps();
+    let compiled = class.compile().expect("class Program");
+    let reads_input = ProgramData::input_name(compiled.reads());
+    let tables_input = ProgramData::input_name(compiled.tables());
+    let mut reads = Vec::new();
+    let mut tables = Vec::new();
     let mut hash_key = Vec::new();
     let mut exponents = Vec::new();
     let mut message = Vec::new();
@@ -511,6 +393,10 @@ fn pe_protocol(
                 unit.push(to(&name));
             } else if name.ends_with(".exponent") {
                 state.push(to(&name));
+            } else if name == reads_input {
+                reads.push(to(&name));
+            } else if name == tables_input {
+                tables.push(to(&name));
             } else {
                 panic!("{stage} input {name} has no source");
             }
@@ -519,21 +405,28 @@ fn pe_protocol(
     }
 
     // The requirement: every exponent is `Bz x` for a symbol `x` of the alphabet (the contract
-    // bounds its range), and the predicate, evaluated on the exponents, authorizes.
+    // bounds its range), every intermediate table entry is a state below `Bz` and every final
+    // one a bit (the contracts bound the reads and the entries), and the program, evaluated on
+    // the exponents, outputs `0`.
     let requirement = DslContext::new("pe-authorized-attribute");
     let family = requirement.int_family_input("exponents", attributes);
+    let read_family = requirement.int_family_input("reads", steps);
+    let table_family = requirement.int_family_input("tables", steps * lookup);
     let mut valid = (0..attributes)
         .map(|index| (family.at(index) % (width as i64)).equal(Int::constant(0)))
         .reduce(|left, right| left & right)
         .expect("a class has an attribute");
+    for step in 0..steps {
+        let bound = if step + 1 == steps { 2 } else { width };
+        for entry in 0..lookup {
+            valid =
+                valid & table_family.at(step * lookup + entry).less(Int::constant(bound as i64));
+        }
+    }
     let mut current = Int::constant(0);
-    for (read, table) in predicate.reads().iter().zip(predicate.tables()) {
-        let index = current + family.at(*read);
-        current = mxx_dsl::select(
-            index,
-            table.iter().map(|value| Int::constant(*value as i64)).collect(),
-        )
-        .unwrap();
+    for step in 0..steps {
+        let index = current + family.at(read_family.at(step));
+        current = table_family.at(Int::constant((step * lookup) as i64) + index);
     }
     valid = valid & current.equal(Int::constant(0));
     let requirement =
@@ -559,6 +452,9 @@ fn pe_protocol(
         requirement: 0,
         input: "exponents".to_owned(),
     });
+    reads.push(ProtocolInputDestination::Requirement { requirement: 0, input: "reads".to_owned() });
+    tables
+        .push(ProtocolInputDestination::Requirement { requirement: 0, input: "tables".to_owned() });
     message.push(ProtocolInputDestination::Ideal { input: "message".to_owned() });
     let (contracts, bindings): (Vec<_>, Vec<_>) = [
         external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
@@ -577,6 +473,22 @@ fn pe_protocol(
         ),
         external("unit_coefficient", range(1, 1), unit),
         external("state_exponent", range(0, 0), state),
+        external(
+            "program_reads",
+            InputValueContract::Family {
+                count: steps.into(),
+                element: Box::new(range(0, attributes as i64 - 1)),
+            },
+            reads,
+        ),
+        external(
+            "program_tables",
+            InputValueContract::Family {
+                count: (steps * lookup).into(),
+                element: Box::new(range(0, lookup as i64 - 1)),
+            },
+            tables,
+        ),
     ]
     .into_iter()
     .unzip();
@@ -657,37 +569,15 @@ fn test_gpu_pe_round_trip() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "the PE round trip needs a CUDA device");
     let started = Instant::now();
-    let recorded_id = env::var(variable("PARAMETER_ID")).ok();
-    let (class, parameters, report, recorded_predicate, failure_exponent) = match &recorded_id {
-        Some(id) => {
-            let row = parameter_row(id);
-            let (parameters, report, predicate) = recorded(&row);
-            let estimates = parameters.security_bits().unwrap();
-            let recorded_trapdoor = match row["trapdoor_security_bits"].as_str() {
-                "" => None,
-                bits => Some(bits.parse::<u64>().expect("trapdoor security bits")),
-            };
-            assert_eq!(
-                estimates,
-                (column(&row, "encryption_security_bits"), recorded_trapdoor),
-                "the recorded security estimates must be reproduced"
-            );
-            let failure = report.average.as_ref().map(|(exponent, ..)| *exponent);
-            (row_class(&row), parameters, report, Some(predicate), failure)
-        }
-        None => {
-            let class = PeClass::new(
-                count("ATTRIBUTE_LENGTH", 1),
-                count("ALPHABET_SIZE", 2),
-                count("STATE_WIDTH", 1),
-                count("MAX_STEPS", 1),
-            )
-            .unwrap();
-            let (parameters, report) = search(class);
-            let failure = report.average.as_ref().map(|(exponent, ..)| *exponent);
-            (class, parameters, report, None, failure)
-        }
-    };
+    let class = PeClass::new(
+        count("ATTRIBUTE_LENGTH", 1),
+        count("ALPHABET_SIZE", 2),
+        count("STATE_WIDTH", 1),
+        count("MAX_STEPS", 1),
+    )
+    .unwrap();
+    let (parameters, report) = search(class);
+    let failure_exponent = report.average.as_ref().map(|(exponent, ..)| *exponent);
     assert!(report.decrypts(), "the accepted parameters must guarantee correctness");
     let (encryption_bits, trapdoor_bits) = parameters.security_bits().unwrap();
     let level = parameters.level();
@@ -727,23 +617,16 @@ fn test_gpu_pe_round_trip() {
     let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
     eprintln!("setup: {:?}", stage.elapsed());
     report_device_bytes(&store);
-    // A recorded predicate is decrypted on an attribute it authorizes.
-    let attribute = loop {
-        let attribute = (0..class.attribute_length())
-            .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
-            .collect::<Vec<_>>();
-        match &recorded_predicate {
-            Some(predicate) if predicate.evaluate(&attribute).unwrap() != 0 => continue,
-            _ => break attribute,
-        }
-    };
+    let attribute = (0..class.attribute_length())
+        .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
+        .collect::<Vec<_>>();
     let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
     let stage = Instant::now();
     let ciphertext =
         encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
     eprintln!("encryption: {:?}", stage.elapsed());
     report_device_bytes(&store);
-    let authorized = recorded_predicate.clone().unwrap_or_else(|| program(class, &attribute, 0));
+    let authorized = program(class, &attribute, 0);
     let stage = Instant::now();
     let key = keygen(&public_key, &master, &authorized, &mut execution, &mut store).unwrap();
     eprintln!("key generation (F(x) = 0): {:?}", stage.elapsed());
@@ -765,9 +648,9 @@ fn test_gpu_pe_round_trip() {
     eprintln!("decryption (F(x) = 1): {:?}", stage.elapsed());
     report_device_bytes(&store);
 
-    if let Some(id) = recorded_id {
+    if let Ok(id) = env::var(variable("LEAN_EXPORT")) {
         let directory = lean_directory().join(&id).join("generated");
-        let protocol = pe_protocol(graphs, &parameters, &authorized, failure_exponent);
+        let protocol = pe_protocol(graphs, &parameters, failure_exponent);
         mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("PE claim export");
         eprintln!("exported the PE correctness claim to {}", directory.display());
     }

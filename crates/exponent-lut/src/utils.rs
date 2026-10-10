@@ -240,9 +240,7 @@ fn plan_chain(
     let output_levels = program
         .outputs()
         .iter()
-        .map(|output| match output {
-            Operand::Scalar(wire) | Operand::Member { family: wire, .. } => *wire,
-        })
+        .map(|output| *output.source())
         .map(|wire| {
             let level = workload.level(wire).map_err(|error| error.to_string())?;
             let coefficient = program

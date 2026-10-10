@@ -23,7 +23,7 @@ every column decomposition runs. -/
 theorem colLoopMul {model : HashModel} {tape : SampleTape} {path : List Nat} {c : ExactMatrix Q N 1 {{M}}} {top bot : ExactMatrix Q N 1 {{M}}}
     {final : ExactMatrix Q N 1 {{M}}}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 {{M}}) ↦
-      Stage_online_eval.sequential_generatedRoot_18 Backend.backend model tape (path ++ [18, i]) GeneratedClaim.stage_7_params i
+      Stage_online_eval.sequential_generatedRoot_20 Backend.backend model tape (path ++ [20, i]) GeneratedClaim.stage_7_params i
         (current, (c, (top, (bot, ())))) next) (Int.toNat {{M}}) 0 final) (jj : Fin {{M}}) :
     final 0 jj = (c * colDigits top bot jj) 0 0 ∧
       ∃ D' : ExactMatrix Q N ({{D}} + {{D}}) 1,
@@ -75,7 +75,7 @@ every column decomposition runs. -/
 theorem colLoopHelper {model : HashModel} {tape : SampleTape} {path : List Nat} {i0 : Nat} {c : ExactMatrix Q N 1 {{M}}} {top bot : ExactMatrix Q N 1 {{M}}}
     {final : ExactMatrix Q N 1 {{M}}}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 {{M}}) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_64_18 Backend.backend model tape (path ++ [18, i]) GeneratedClaim.stage_7_params i0 i
+      Stage_online_eval.sequential_sequential_generatedRoot_69_18 Backend.backend model tape (path ++ [18, i]) GeneratedClaim.stage_7_params i0 i
         (current, (c, (top, (bot, ())))) next) (Int.toNat {{M}}) 0 final) (jj : Fin {{M}}) :
     final 0 jj = (c * colDigits top bot jj) 0 0 ∧
       ∃ D' : ExactMatrix Q N ({{D}} + {{D}}) 1,
@@ -127,7 +127,7 @@ every column decomposition runs. -/
 theorem colLoopSwitch {model : HashModel} {tape : SampleTape} {path : List Nat} {i0 : Nat} {c : ExactMatrix Q N 1 {{M}}} {top bot : ExactMatrix Q N 1 {{M}}}
     {final : ExactMatrix Q N 1 {{M}}}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 {{M}}) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_64_44 Backend.backend model tape (path ++ [44, i]) GeneratedClaim.stage_7_params i0 i
+      Stage_online_eval.sequential_sequential_generatedRoot_69_44 Backend.backend model tape (path ++ [44, i]) GeneratedClaim.stage_7_params i0 i
         (current, (c, (top, (bot, ())))) next) (Int.toNat {{M}}) 0 final) (jj : Fin {{M}}) :
     final 0 jj = (c * colDigits top bot jj) 0 0 ∧
       ∃ D' : ExactMatrix Q N ({{D}} + {{D}}) 1,
@@ -188,10 +188,10 @@ set_option maxHeartbeats 8000000 in
 `j`, companion `j + {{M}} a` paired with the digits `U`, and reads the next companion. -/
 theorem mulInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {U : Fin 2 → ExactMatrix Q N {{D}} 1} {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {a j : Nat}
-    (ha : a < {{M}}) (hj : j < {{M}}) {s t : MulBlock}
+    {m : Int} (hm : m = 0) (ha : a < {{M}}) (hj : j < {{M}}) {s t : MulBlock}
     (hs : s.2.1 = z0 ⟨j + {{M}} * a, by omega⟩ ∧ s.2.2.1 = z1 ⟨j + {{M}} * a, by omega⟩)
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_29_15 Backend.backend model tape path
-      GeneratedClaim.stage_7_params a j (s.1, s.2.1, s.2.2.1, U 0, U 1, z0, z1, ()) t) :
+    (h : Stage_online_eval.sequential_sequential_generatedRoot_31_19 Backend.backend model tape path
+      GeneratedClaim.stage_7_params a j (s.1, s.2.1, s.2.2.1, U 0, U 1, z0, m, z1, ()) t) :
     t.1 = s.1 + (z0 ⟨j + {{M}} * a, by omega⟩ * U 0 + z1 ⟨j + {{M}} * a, by omega⟩ * U 1) 0 0 •
         unitRow ((j : Nat) : Int) ∧
       t.2.1 = z0 ⟨(j + 1) % {{M}} + {{M}} * a, by omega⟩ ∧
@@ -201,7 +201,7 @@ theorem mulInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
       Int.ofNat ((j + 1) % {{M}} + {{M}} * a) := by
     simp only [Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ {{M}} by norm_num), Int.ofNat_eq_natCast]
     omega
-  rw [hnext] at x14 x16
+  rw [hm, zero_mul, zero_add, hnext] at x14 x16
   obtain ⟨_, hw14⟩ := familyGet_eq x14
   obtain ⟨_, hw16⟩ := familyGet_eq x16
   have hw9 := unitRow_window (c := ((j : Nat) : Int)) (by simp only [Int.ofNat_eq_natCast]; omega) x9
@@ -215,12 +215,12 @@ set_option maxHeartbeats 8000000 in
 row, column by column. -/
 theorem mulInner {model : HashModel} {tape : SampleTape} {path : List Nat}
     (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}}) {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} (a : Fin {{M}})
-    {final : MulBlock}
+    {m : Int} (hm : m = 0) {final : MulBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : MulBlock) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_29_15 Backend.backend model tape
-        (path ++ [15, i]) GeneratedClaim.stage_7_params a i
+      Stage_online_eval.sequential_sequential_generatedRoot_31_19 Backend.backend model tape
+        (path ++ [19, i]) GeneratedClaim.stage_7_params a i
         (current.1, (current.2.1, (current.2.2.1, (keyDigits A a 0, (keyDigits A a 1, (z0,
-          (z1, ()))))))) next) (Int.toNat {{M}})
+          (m, (z1, ())))))))) next) (Int.toNat {{M}})
       (0, (z0 ⟨{{M}} * a, by omega⟩, (z1 ⟨{{M}} * a, by omega⟩, ()))) final) (jj : Fin {{M}}) :
     final.1 0 jj = mulCompanionSum A z0 z1 jj a := by
   let Inv : Nat → MulBlock → Prop := fun i s ↦
@@ -228,9 +228,9 @@ theorem mulInner {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hInv0 : Inv 0 (0, (z0 ⟨{{M}} * a, by omega⟩, (z1 ⟨{{M}} * a, by omega⟩, ()))) :=
     ⟨congrArg z0 (Fin.ext (by simp)), congrArg z1 (Fin.ext (by simp))⟩
   have hstep : ∀ i (s t : MulBlock) (hi : i < {{M}}), Inv i s →
-      Stage_online_eval.sequential_sequential_generatedRoot_29_15 Backend.backend model tape
-        (path ++ [15, i]) GeneratedClaim.stage_7_params a i
-        (s.1, (s.2.1, (s.2.2.1, (keyDigits A a 0, (keyDigits A a 1, (z0, (z1, ()))))))) t →
+      Stage_online_eval.sequential_sequential_generatedRoot_31_19 Backend.backend model tape
+        (path ++ [19, i]) GeneratedClaim.stage_7_params a i
+        (s.1, (s.2.1, (s.2.2.1, (keyDigits A a 0, (keyDigits A a 1, (z0, (m, (z1, ())))))))) t →
       (∀ w, t.1 0 w = s.1 0 w + mulCompanionSum A z0 z1 ⟨i, hi⟩ a *
           (unitRow ((i : Nat) : Int) : ExactMatrix Q N 1 {{M}}) 0 w) ∧ Inv (i + 1) t := by
     intro i s t hi hq hb
@@ -238,7 +238,7 @@ theorem mulInner {model : HashModel} {tape : SampleTape} {path : List Nat}
       obtain ⟨h0, h1⟩ := hq
       exact ⟨h0.trans (congrArg z0 (Fin.ext (by simp [Nat.mod_eq_of_lt hi]))),
         h1.trans (congrArg z1 (Fin.ext (by simp [Nat.mod_eq_of_lt hi])))⟩
-    obtain ⟨h0, h1, h2⟩ := mulInner_step (U := keyDigits A a) a.isLt hi hq' hb
+    obtain ⟨h0, h1, h2⟩ := mulInner_step (U := keyDigits A a) hm a.isLt hi hq' hb
     refine ⟨fun w ↦ ?_, h1, h2⟩
     rw [h0]
     rfl
@@ -254,9 +254,10 @@ the companion row of digit row `a`, column by column. -/
 theorem mulLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}}} {A0 A1 : ExactMatrix Q N 1 {{M}}}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
-    {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {i : Nat} (hi : i < {{M}}) {s t : ExactMatrix Q N 1 {{M}}}
-    (h : Stage_online_eval.sequential_generatedRoot_29 Backend.backend model tape path
-      GeneratedClaim.stage_7_params i (s, z0, z1, A0, A1, ()) t) (jj : Fin {{M}}) :
+    {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {m : Int} (hm : m = 0) {i : Nat} (hi : i < {{M}})
+    {s t : ExactMatrix Q N 1 {{M}}}
+    (h : Stage_online_eval.sequential_generatedRoot_31 Backend.backend model tape path
+      GeneratedClaim.stage_7_params i (s, z0, m, z1, A0, A1, ()) t) (jj : Fin {{M}}) :
     t 0 jj = s 0 jj + mulCompanionSum A z0 z1 jj ⟨i, hi⟩ := by
   obtain ⟨w, -, -, -, -, -, -, -, -, -, -, x2, -, -, -, x6, -, -, x8, -, -, -, -, -, -, -, -, x10,
     x11, -, -, -, -, -, -, -, -, x13, x14, -, hin, x16, xout⟩ := h
@@ -274,7 +275,7 @@ theorem mulLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     omega
   rw [hdiv] at x2
   rw [hrow] at x10 x13
-  rw [hfirst] at x6 x8
+  rw [hm, zero_mul, zero_add, hfirst] at x6 x8
   have hw2 := unitRow_window (c := 0) (by omega) x2
   obtain ⟨_, hw6⟩ := familyGet_eq x6
   obtain ⟨_, hw8⟩ := familyGet_eq x8
@@ -294,7 +295,7 @@ theorem mulLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hw11 := hentry hA0 x10 x11
   have hw14 := hentry hA1 x13 x14
   rw [hw11, hw14, hw6, hw8] at hin
-  have hblock := mulInner (model := model) (tape := tape) (path := path) A ⟨i, hi⟩ hin jj
+  have hblock := mulInner (model := model) (tape := tape) (path := path) A ⟨i, hi⟩ hm hin jj
   have hone : w.w_2_0 0 0 = 1 := by rw [hw2]; simp [unitRow]
   have ht : ∀ {x y : ExactMatrix Q N 1 {{M}}}, tensorRuns w.w_2_0 x y → y 0 jj = x 0 jj := by
     intro x y hxy
@@ -310,17 +311,17 @@ set_option maxHeartbeats 8000000 in
 theorem mulLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
     {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}}} {A0 A1 : ExactMatrix Q N 1 {{M}}}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
-    {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {final : ExactMatrix Q N 1 {{M}}}
+    {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {m : Int} (hm : m = 0) {final : ExactMatrix Q N 1 {{M}}}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 {{M}}) ↦
-      Stage_online_eval.sequential_generatedRoot_29 Backend.backend model tape (path ++ [29, i])
-        GeneratedClaim.stage_7_params i (current, (z0, (z1, (A0, (A1, ()))))) next)
+      Stage_online_eval.sequential_generatedRoot_31 Backend.backend model tape (path ++ [31, i])
+        GeneratedClaim.stage_7_params i (current, (z0, (m, (z1, (A0, (A1, ())))))) next)
       (Int.toNat {{M}}) 0 final) (jj : Fin {{M}}) :
     final 0 jj = ∑ a, mulCompanionSum A z0 z1 jj a := by
   have hcount : Int.toNat {{M}} = {{M}} := rfl
   rw [hcount] at h
   have hk := IterRuns.accumulate_entries (fun s : ExactMatrix Q N 1 {{M}} ↦ s)
     (fun w a ↦ mulCompanionSum A z0 z1 w a) (fun _ _ ↦ True) trivial
-    (fun i s t hi _ hb ↦ ⟨fun w ↦ mulLoop_step hA0 hA1 hi hb w, trivial⟩) h jj
+    (fun i s t hi _ hb ↦ ⟨fun w ↦ mulLoop_step hA0 hA1 hm hi hb w, trivial⟩) h jj
   rw [hk]
   simp
 
@@ -343,7 +344,7 @@ theorem lutInner_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {U : Fin 2 → ExactMatrix Q N {{D}} 1} {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {a j : Nat}
     (ha : a < {{M}}) (hj : j < {{M}}) {s t : MulBlock}
     (hs : s.2.1 = z0 ⟨j + {{M}} * a, by omega⟩ ∧ s.2.2.1 = z1 ⟨j + {{M}} * a, by omega⟩)
-    (h : Stage_online_eval.sequential_sequential_generatedRoot_63_17 Backend.backend model tape path
+    (h : Stage_online_eval.sequential_sequential_generatedRoot_68_17 Backend.backend model tape path
       GeneratedClaim.stage_7_params a j (s.1, s.2.1, s.2.2.1, U 0, U 1, z0, z1, ()) t) :
     t.1 = s.1 + (z0 ⟨j + {{M}} * a, by omega⟩ * U 0 + z1 ⟨j + {{M}} * a, by omega⟩ * U 1) 0 0 •
         unitRow ((j : Nat) : Int) ∧
@@ -374,7 +375,7 @@ theorem lutInner {model : HashModel} {tape : SampleTape} {path : List Nat}
     (A : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}}) {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} (a : Fin {{M}})
     {final : MulBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : MulBlock) ↦
-      Stage_online_eval.sequential_sequential_generatedRoot_63_17 Backend.backend model tape
+      Stage_online_eval.sequential_sequential_generatedRoot_68_17 Backend.backend model tape
         (path ++ [17, i]) GeneratedClaim.stage_7_params a i
         (current.1, (current.2.1, (current.2.2.1, (keyDigits (routedKey A) a 0,
           (keyDigits (routedKey A) a 1, (z0, (z1, ()))))))) next) (Int.toNat {{M}})
@@ -385,7 +386,7 @@ theorem lutInner {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hInv0 : Inv 0 (0, (z0 ⟨{{M}} * a, by omega⟩, (z1 ⟨{{M}} * a, by omega⟩, ()))) :=
     ⟨congrArg z0 (Fin.ext (by simp)), congrArg z1 (Fin.ext (by simp))⟩
   have hstep : ∀ i (s t : MulBlock) (hi : i < {{M}}), Inv i s →
-      Stage_online_eval.sequential_sequential_generatedRoot_63_17 Backend.backend model tape
+      Stage_online_eval.sequential_sequential_generatedRoot_68_17 Backend.backend model tape
         (path ++ [17, i]) GeneratedClaim.stage_7_params a i
         (s.1, (s.2.1, (s.2.2.1, (keyDigits (routedKey A) a 0, (keyDigits (routedKey A) a 1,
           (z0, (z1, ()))))))) t →
@@ -444,7 +445,7 @@ theorem lutLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat}
     {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}}} {A0 A1 : ExactMatrix Q N 1 {{M}}}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {i : Nat} (hi : i < {{M}}) {s t : ExactMatrix Q N 1 {{M}}}
-    (h : Stage_online_eval.sequential_generatedRoot_63 Backend.backend model tape path
+    (h : Stage_online_eval.sequential_generatedRoot_68 Backend.backend model tape path
       GeneratedClaim.stage_7_params i (s, z0, z1, A0, A1, ()) t) (jj : Fin {{M}}) :
     t 0 jj = s 0 jj + lutCompanionSum A z0 z1 jj ⟨i, hi⟩ := by
   obtain ⟨w, -, -, -, -, -, -, -, -, -, -, x2, -, -, -, -, -, -, x6, -, -, x8, -, -, -, -, -, -, -,
@@ -489,7 +490,7 @@ theorem lutLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {final : ExactMatrix Q N 1 {{M}}}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : ExactMatrix Q N 1 {{M}}) ↦
-      Stage_online_eval.sequential_generatedRoot_63 Backend.backend model tape (path ++ [63, i])
+      Stage_online_eval.sequential_generatedRoot_68 Backend.backend model tape (path ++ [68, i])
         GeneratedClaim.stage_7_params i (current, (z0, (z1, (A0, (A1, ()))))) next)
       (Int.toNat {{M}}) 0 final) (jj : Fin {{M}}) :
     final 0 jj = ∑ a, lutCompanionSum A z0 z1 jj a := by
@@ -538,12 +539,13 @@ theorem colAction {c : ExactMatrix Q N 1 {{M}}} {row : Fin 2 → ExactMatrix Q N
 /-- `2⁻¹ mod Q`. -/
 abbrev inverse2 : Int := {{INV2}}
 
-/-- The scalar `D_k = 2⁻¹ (L(0) σ_k(X⁰) + L(1) σ_k(-X^8191))` of the branch of `k` for the table
-`L = (0, 1)`, as the graph computes it, with `σ` the routing of `k`. -/
-noncomputable def lutScalar (σ : ExactMatrix Q N 1 1 → ExactMatrix Q N 1 1) : ExactMatrix Q N 1 1 :=
+/-- The scalar `D_k = 2⁻¹ (t₀ σ_k(X⁰) + t₁ σ_k(-X^8191))` of the branch of `k` for the table
+`(t₀, t₁)` of the key's program, as the graph computes it, with `σ` the routing of `k`. -/
+noncomputable def lutScalar (t0 t1 : Int) (σ : ExactMatrix Q N 1 1 → ExactMatrix Q N 1 1) :
+    ExactMatrix Q N 1 1 :=
   matrixMulScalarLeft (matrixPolynomial [inverse2])
-    (matrixAdd (matrixMulScalarLeft (matrixPolynomial [0]) (σ (rotationPolynomial 0)))
-      (matrixMulScalarLeft (matrixPolynomial [1]) (σ (matrixNeg (rotationPolynomial 8191)))))
+    (matrixAdd (matrixMulScalarLeft (liftInteger t0) (σ (rotationPolynomial 0)))
+      (matrixMulScalarLeft (liftInteger t1) (σ (matrixNeg (rotationPolynomial 8191)))))
 
 /-- The two halves of a row, concatenated, are the row. -/
 theorem concat_windows {x y : ExactMatrix Q N 1 {{M}}}
@@ -627,9 +629,10 @@ component `j`, the helper action `h Dec(T)`, the switch `σ_K(c) Dec(C_K)`, and 
 theorem branch_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
     {acc0 acc1 : ExactMatrix Q N 1 {{D}}} {hf0 hf1 : Fin 1 → ExactMatrix Q N 1 {{D}}}
     {T0 T1 : ExactMatrix Q N 1 {{M}}} {c0 c1 : ExactMatrix Q N 1 {{D}}} {key : ByteArray}
-    {E : ExactMatrix Q N 1 {{M}}} {outputs : ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} × Unit}
-    (h : Stage_online_eval.sequential_generatedRoot_64 Backend.backend model tape path
-      GeneratedClaim.stage_7_params 0 (acc0, acc1, hf0, hf1, T0, T1, c0, c1, key, E, ()) outputs) :
+    {E : ExactMatrix Q N 1 {{M}}} {t0 t1 : Int}
+    {outputs : ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} × Unit}
+    (h : Stage_online_eval.sequential_generatedRoot_69 Backend.backend model tape path
+      GeneratedClaim.stage_7_params 0 (acc0, acc1, hf0, hf1, T0, T1, c0, c1, key, E, t0, t1, ()) outputs) :
     let hrow : Fin 2 → ExactMatrix Q N 1 {{D}} := ![hf0 0, hf1 0]
     let top : Fin 2 → ExactMatrix Q N 1 {{D}} := fun j ↦ substituteMatrix K hK (helperKey model key 0 j)
     let bot : Fin 2 → ExactMatrix Q N 1 {{D}} := fun j ↦
@@ -638,7 +641,7 @@ theorem branch_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
     ∃ (g : ExactMatrix Q N 1 {{D}}) (V : ExactMatrix Q N {{D}} {{D}}),
       gadgetMatrixRuns Backend.backend {{BASE}} {{D}} g ∧
       gadgetDecomposeRuns Backend.backend {{BASE}} {{D}}
-        (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g) V ∧
+        (matrixMulScalarLeft (lutScalar t0 t1 (substituteMatrix K hK)) g) V ∧
       (∀ (j : Fin 2) (l : Fin {{D}}), ∃ D' : ExactMatrix Q N ({{D}} + {{D}}) 1,
         gadgetDecomposeRuns Backend.backend {{BASE}} {{D}} (pairColumn (halves T0 j 0 l) (halves T1 j 0 l)) D' ∧
           compactCenteredRebaseRuns {{HALFBASE}} D' (fun a _ ↦ actionDigits T0 T1 j a l)) ∧
@@ -654,8 +657,8 @@ theorem branch_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
     -, -, -, -, -, -, x19, -, -, x22, -, -, x24, x25, -, -, x27, -, -, x28, -, -, x29, -, -, x30,
     x31, -, -, x32, -, -, x33, -, -, -, -, x35, -, -, x36, -, -, x38, -, -, x39, -, -, x40, -, -,
     x41, x43, -, x44, -, -, -, -, -, -, x45, -, -, -, -, -, -, x47, -, -, -, -, -, -, x48, -, -, -,
-    -, x54, -, -, -, -, x59, x63, x65, -, -, -, -, -, -, x69, -, -, -, -, -, -, x70, -, -, -, -,
-    -, -, x71, xout⟩ := h
+    -, x55, -, -, -, -, x61, x65, x67, -, -, -, -, -, -, x71, -, -, -, -, -, -, x72, -, -, -, -,
+    -, -, x73, xout⟩ := h
   have hzero : MxxIR.selectInt (Int.ofNat 0) [0] = Int.ofNat 0 := by decide
   -- The helper of `K`.
   rw [hzero] at x4 x6
@@ -719,27 +722,27 @@ theorem branch_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
     (fun _ ↦ rfl) (fun _ ↦ rfl) (colLoopSwitch (i0 := 0) x44)
   -- The companion row and the halves of the actions.
   have hw47 := (sliceMatrix_window 0 x47 (by simp) (by omega)).trans (rowWindow_full E)
-  rw [hw47] at x48 x71
+  rw [hw47] at x48 x73
   have hw48 : w.w_48_0 = halves E 0 := sliceMatrix_window 0 x48 (by simp) (by omega)
-  have hw71 : w.w_71_0 = halves E 1 := sliceMatrix_window {{D}} x71 (by simp) (by omega)
+  have hw73 : w.w_73_0 = halves E 1 := sliceMatrix_window {{D}} x73 (by simp) (by omega)
   have hw19 : w.w_19_0 = pairMul hrow (actionDigits T0 T1 0) :=
     (sliceMatrix_window 0 x19 (by simp) (by omega)).trans (hhelp.1 0)
-  have hw69 : w.w_69_0 = pairMul hrow (actionDigits T0 T1 1) :=
-    (sliceMatrix_window {{D}} x69 (by simp) (by omega)).trans (hhelp.1 1)
+  have hw71 : w.w_71_0 = pairMul hrow (actionDigits T0 T1 1) :=
+    (sliceMatrix_window {{D}} x71 (by simp) (by omega)).trans (hhelp.1 1)
   have hw45 : w.w_45_0 = pairMul σc (actionDigits (joinRow top) (joinRow bot) 0) :=
     (sliceMatrix_window 0 x45 (by simp) (by omega)).trans (hswitch.1 0)
-  have hw70 : w.w_70_0 = pairMul σc (actionDigits (joinRow top) (joinRow bot) 1) :=
-    (sliceMatrix_window {{D}} x70 (by simp) (by omega)).trans (hswitch.1 1)
+  have hw72 : w.w_72_0 = pairMul σc (actionDigits (joinRow top) (joinRow bot) 1) :=
+    (sliceMatrix_window {{D}} x72 (by simp) (by omega)).trans (hswitch.1 1)
   -- The scalar action.
-  have hw54 := routing_K x54
-  have hw59 := routing_K x59
-  refine ⟨w.w_63_0, w.w_65_0, x63, ?_, hhelp.2, hswitch.2, fun j ↦ ?_⟩
-  · convert x65 using 2
-    simp only [lutScalar, hw54, hw59]
+  have hw55 := routing_K x55
+  have hw61 := routing_K x61
+  refine ⟨w.w_65_0, w.w_67_0, x65, ?_, hhelp.2, hswitch.2, fun j ↦ ?_⟩
+  · convert x67 using 2
+    simp only [lutScalar, hw55, hw61]
   · subst xout
     fin_cases j
     · simp [matrixAdd, matrixMul, hw19, hw45, hw48]
-    · simp [matrixAdd, matrixMul, hw69, hw70, hw71]
+    · simp [matrixAdd, matrixMul, hw71, hw72, hw73]
 
 /-- The substitution `X ↦ X` is the identity. -/
 theorem substitution_one {R : Type} [CommRing R] (h : Odd 1) (x : Negacyclic N R) :
@@ -760,8 +763,15 @@ theorem routing_one {rows columns : Nat} {x y : ExactMatrix Q N rows columns}
   funext r c
   exact substitution_one hodd (x r c)
 
-/-- The scalar `D_1` of the identity branch. -/
-noncomputable abbrev lutScalarOne : ExactMatrix Q N 1 1 := lutScalar id
+/-- The scalar `D_1` of the identity branch for the table `(t₀, t₁)`. -/
+noncomputable abbrev lutScalarOne (t0 t1 : Int) : ExactMatrix Q N 1 1 := lutScalar t0 t1 id
+
+/-- A read from a one-member family is at index 0. -/
+theorem familyGet_one {α : Type} {f : Fin 1 → α} {i : Int} {out : α} (h : familyGetDynamic f i out) :
+    i = 0 ∧ out = f 0 := by
+  obtain ⟨position, hposition, hout⟩ := h
+  rw [Subsingleton.elim position 0] at hposition hout
+  exact ⟨hposition.symm, hout⟩
 
 set_option maxHeartbeats 64000000 in
 /-- The output rows of online evaluation: the product row `c Dec(C) + E` of the initial state and
@@ -772,11 +782,12 @@ theorem online_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
     {z0 z1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {key : ByteArray}
     {hf0 hf1 : Fin 1 → ExactMatrix Q N 1 {{D}}} {T0 T1 : ExactMatrix Q N 1 {{M}}}
     {za0 za1 : Fin {{L}} → ExactMatrix Q N 1 {{D}}} {M00 M01 M10 M11 : ExactMatrix Q N 1 {{D}}}
+    {reads : Fin 1 → Int} {tables : Fin 2 → Int}
     {outputs : ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} ×
       ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} × Unit}
     (h : Stage_online_eval.generatedRoot Backend.backend model tape path
-      GeneratedClaim.stage_7_params (v0, v1, v2, v3, c0a, c0b, C00, C01, C10, C11, z0, z1, key, hf0,
-        hf1, T0, T1, za0, za1, M00, M01, M10, M11, ()) outputs) :
+      GeneratedClaim.stage_7_params (v0, v1, v2, v3, c0a, c0b, C00, reads, C01, C10, C11, z0, z1, key,
+        tables, hf0, hf1, T0, T1, za0, za1, M00, M01, M10, M11, ()) outputs) :
     let cIn : Fin 2 → ExactMatrix Q N 1 {{D}} := ![c0a, c0b]
     let Ctop : Fin 2 → ExactMatrix Q N 1 {{D}} := ![C00 0, C01 0]
     let Cbot : Fin 2 → ExactMatrix Q N 1 {{D}} := ![C10 0, C11 0]
@@ -793,9 +804,10 @@ theorem online_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
     let σc : Fin 2 → ExactMatrix Q N 1 {{D}} := fun j ↦ substituteMatrix K hK (mulRow j)
     ∃ (g : ExactMatrix Q N 1 {{D}}) (V1 VK : ExactMatrix Q N {{D}} {{D}}),
       gadgetMatrixRuns Backend.backend {{BASE}} {{D}} g ∧
-      gadgetDecomposeRuns Backend.backend {{BASE}} {{D}} (matrixMulScalarLeft lutScalarOne g) V1 ∧
       gadgetDecomposeRuns Backend.backend {{BASE}} {{D}}
-        (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g) VK ∧
+        (matrixMulScalarLeft (lutScalarOne (tables 0) (tables 1)) g) V1 ∧
+      gadgetDecomposeRuns Backend.backend {{BASE}} {{D}}
+        (matrixMulScalarLeft (lutScalar (tables 0) (tables 1) (substituteMatrix K hK)) g) VK ∧
       (∀ (j : Fin 2) (l : Fin {{D}}), ∃ D' : ExactMatrix Q N ({{D}} + {{D}}) 1,
         gadgetDecomposeRuns Backend.backend {{BASE}} {{D}} (pairColumn (Ctop j 0 l) (Cbot j 0 l)) D' ∧
           compactCenteredRebaseRuns {{HALFBASE}} D' (fun a _ ↦ actionDigits (joinRow Ctop) (joinRow Cbot) j a l)) ∧
@@ -810,65 +822,69 @@ theorem online_rows {model : HashModel} {tape : SampleTape} {path : List Nat}
         (pairMul hrow (actionDigits T0 T1 j) +
           (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Elut j)) * VK := by
   intro cIn Ctop Cbot A Mmul Emul mulRow Elut hrow top bot σc
-  obtain ⟨w, x7, x9, x11, x12, x14, x16, x17, -, x18, x23, x24, x25, x26, x27, x28, -, x29, -, -, -,
-    -, -, -, x31, -, -, x35, -, -, x40, x44, x46, -, -, -, -, -, -, x48, x59, x62, -, x63, -, x64,
-    xout⟩ := h
-  -- The state and the attribute package.
-  obtain ⟨_, hw9⟩ := familyGet_eq (k := 0) x9
-  obtain ⟨_, hw11⟩ := familyGet_eq (k := 0) x11
-  obtain ⟨_, hw14⟩ := familyGet_eq (k := 0) x14
-  obtain ⟨_, hw16⟩ := familyGet_eq (k := 0) x16
+  obtain ⟨w, x7, -, -, -, x11, -, -, x13, x14, -, -, x16, -, -, x18, x19, -, x20, x25, x26, x27, x28,
+    x29, x30, -, x31, -, -, -, -, -, -, x33, x36, -, -, x39, x41, -, -, x45, x49, x51, -, -, -, -, -,
+    -, x53, x64, x67, -, x68, -, x69, xout⟩ := h
+  -- The state and the attribute package, read at the member of the one-member families.
+  obtain ⟨hm, hw11⟩ := familyGet_one x11
+  obtain ⟨_, hw13⟩ := familyGet_one x13
+  obtain ⟨_, hw16⟩ := familyGet_one x16
+  obtain ⟨_, hw18⟩ := familyGet_one x18
   have hw7 : w.w_7_0 = joinRow cIn := concat_joinRow (r := cIn) x7
-  have hw12 : w.w_12_0 = joinRow Ctop := by
-    rw [hw9, hw11] at x12
-    exact concat_joinRow (r := Ctop) x12
-  have hw17 : w.w_17_0 = joinRow Cbot := by
-    rw [hw14, hw16] at x17
-    exact concat_joinRow (r := Cbot) x17
-  rw [hw7, hw12, hw17] at x18
+  have hw14 : w.w_14_0 = joinRow Ctop := by
+    rw [hw11, hw13] at x14
+    exact concat_joinRow (r := Ctop) x14
+  have hw19 : w.w_19_0 = joinRow Cbot := by
+    rw [hw16, hw18] at x19
+    exact concat_joinRow (r := Cbot) x19
+  rw [hw7, hw14, hw19] at x20
   have hmul := colAction (row := cIn) (concatColumns_joinRow cIn) (tk := Ctop) (bk := Cbot)
-    (fun _ ↦ rfl) (fun _ ↦ rfl) (colLoopMul x18)
+    (fun _ ↦ rfl) (fun _ ↦ rfl) (colLoopMul x20)
   -- The product's companion row.
-  have hkey : ∀ k j, A k j = ![![w.w_23_0, w.w_24_0], ![w.w_26_0, w.w_27_0]] k j := by
+  have hkey : ∀ k j, A k j = ![![w.w_25_0, w.w_26_0], ![w.w_28_0, w.w_29_0]] k j := by
     intro k j
     fin_cases k <;> fin_cases j <;>
-      simp [A, inputKey, dynamicPrefix, schemaBytes, componentBytes, hashSample_eq x23,
-        hashSample_eq x24, hashSample_eq x26, hashSample_eq x27]
-  have hA0 : concatColumns (A 0 0) (A 0 1) w.w_25_0 := by rw [hkey, hkey]; exact x25
-  have hA1 : concatColumns (A 1 0) (A 1 1) w.w_28_0 := by rw [hkey, hkey]; exact x28
-  have hw29 := mulLoop hA0 hA1 x29
-  have hw30 : ∀ j : Fin 2, halves (matrixAdd w.w_18_0 w.w_29_0) j = mulRow j := by
+      simp [A, inputKey, dynamicPrefix, schemaBytes, componentBytes, hashSample_eq x25,
+        hashSample_eq x26, hashSample_eq x28, hashSample_eq x29]
+  have hA0 : concatColumns (A 0 0) (A 0 1) w.w_27_0 := by rw [hkey, hkey]; exact x27
+  have hA1 : concatColumns (A 1 0) (A 1 1) w.w_30_0 := by rw [hkey, hkey]; exact x30
+  have hw31 := mulLoop hA0 hA1 hm x31
+  have hw32 : ∀ j : Fin 2, halves (matrixAdd w.w_20_0 w.w_31_0) j = mulRow j := by
     intro j
-    have h18 := hmul.1 j
+    have h20 := hmul.1 j
     funext a l
     rw [Subsingleton.elim a 0]
-    have h18l := congrFun (congrFun h18 0) l
-    simp only [halves, rowWindow, matrixAdd, Matrix.add_apply, mulRow] at h18l ⊢
-    rw [h18l, hw29]
-  have hw31 : w.w_31_0 = mulRow 0 :=
-    (sliceMatrix_window 0 x31 (by simp) (by omega)).trans (hw30 0)
-  have hw48 : w.w_48_0 = mulRow 1 :=
-    (sliceMatrix_window {{D}} x48 (by simp) (by omega)).trans (hw30 1)
+    have h20l := congrFun (congrFun h20 0) l
+    simp only [halves, rowWindow, matrixAdd, Matrix.add_apply, mulRow] at h20l ⊢
+    rw [h20l, hw31]
+  have hw33 : w.w_33_0 = mulRow 0 :=
+    (sliceMatrix_window 0 x33 (by simp) (by omega)).trans (hw32 0)
+  have hw53 : w.w_53_0 = mulRow 1 :=
+    (sliceMatrix_window {{D}} x53 (by simp) (by omega)).trans (hw32 1)
+  -- The table entries.
+  obtain ⟨_, hw36⟩ := familyGet_eq (k := 0) x36
+  obtain ⟨_, hw41⟩ := familyGet_eq (k := 1) x41
   -- The identity branch.
-  have hw35 := routing_one x35
-  have hw40 := routing_one x40
+  have hw39 := routing_one x39
+  have hw45 := routing_one x45
   -- The companion row of the automorphism.
-  have hw63 := lutLoop (A := Mmul) x59 x62 x63
+  have hw68 := lutLoop (A := Mmul) x64 x67 x68
   -- The branch of `K`.
   have hcount : Int.toNat 1 = 0 + 1 := rfl
-  rw [hcount] at x64
-  obtain ⟨cur, h0, hbranch⟩ := MxxIR.IterRuns.step_of_succ x64
+  rw [hcount] at x69
+  obtain ⟨cur, h0, hbranch⟩ := MxxIR.IterRuns.step_of_succ x69
   cases h0
-  rw [hw31, hw48] at hbranch
+  rw [hw33, hw53] at hbranch
   obtain ⟨g, VK, hg, hVK, hT, hC, hout⟩ := branch_rows hbranch
-  have hg' := gadgetMatrixRuns_unique hg x44
-  rw [hg'] at hVK
-  have hE : w.w_63_0 = Elut := by
+  have hg' := gadgetMatrixRuns_unique hg x49
+  rw [hg', hw36, hw41] at hVK
+  have hE : w.w_68_0 = Elut := by
     funext a jj
-    rw [Subsingleton.elim a 0, hw63]
-  refine ⟨w.w_44_0, w.w_46_0, VK, x44, ?_, hVK, hmul.2, hT, ?_, ?_, ?_, ?_, ?_, fun j ↦ ?_⟩
-  · convert x46 using 2
-    simp only [lutScalarOne, lutScalar, hw35, hw40, id]
+    rw [Subsingleton.elim a 0, hw68]
+  refine ⟨w.w_49_0, w.w_51_0, VK, x49, ?_, hVK, hmul.2, hT, ?_, ?_, ?_, ?_, ?_, fun j ↦ ?_⟩
+  · convert x51 using 2
+    simp only [lutScalarOne, lutScalar, hw36, hw41, hw39, hw45, id]
+    rfl
   · exact hC
   all_goals subst xout
   all_goals try rfl

@@ -35,12 +35,63 @@
 //! they are read ([`expand_compact_row`]); their keys are the expansions of
 //! `2 x 2` keys over `R_pq` ([`expand_compact_matrix`]).
 use super::*;
+use mxx_dsl::Int;
 
 /// `Select(selector, values)`: the value at position `selector`.
 pub(crate) fn select(values: &[usize], selector: IntExpr) -> IntExpr {
     IntExpr::Select {
         selector: Box::new(selector),
         branches: values.iter().map(|value| IntExpr::constant(*value)).collect(),
+    }
+}
+
+/// The output values of `table`: its constants, or its window of the Program's integer data
+/// inputs `data`.
+pub(crate) fn lut_entries<'a>(
+    table: &'a crate::program::LutTable,
+    data: &BTreeMap<crate::program::DataId, Family<Int>>,
+) -> Result<LutEntries<'a>, RnsBggError> {
+    if let Some(values) = table.values() {
+        return Ok(LutEntries::Constant(values));
+    }
+    let (family, offset) = table.data_values().ok_or(RnsBggError::Lut)?;
+    let family = data.get(&family).ok_or(RnsBggError::Binding("Program data is not bound"))?;
+    Ok(LutEntries::Graph(
+        (0..table.input_width()).map(|index| family.at(Int::constant(offset + index))).collect(),
+    ))
+}
+
+/// The output values a LUT branch coefficient is built from: constants, or graph integers.
+#[derive(Clone)]
+pub(crate) enum LutEntries<'a> {
+    Constant(&'a [usize]),
+    Graph(Vec<Int>),
+}
+
+impl<'a> From<&'a [usize]> for LutEntries<'a> {
+    fn from(values: &'a [usize]) -> Self {
+        Self::Constant(values)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [usize; N]> for LutEntries<'a> {
+    fn from(values: &'a [usize; N]) -> Self {
+        Self::Constant(values)
+    }
+}
+
+impl<'a> From<&'a Vec<usize>> for LutEntries<'a> {
+    fn from(values: &'a Vec<usize>) -> Self {
+        Self::Constant(values)
+    }
+}
+
+impl LutEntries<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Constant(values) => values.len(),
+            Self::Graph(values) => values.len(),
+        }
     }
 }
 
@@ -55,7 +106,7 @@ pub(crate) fn lut_automorphisms(
     table: &crate::program::LutTable,
 ) -> Result<Vec<usize>, RnsBggError> {
     parameters.dynamic_route(level)?;
-    if table.values().is_none() {
+    if !table.has_values() {
         return Err(RnsBggError::Binding("a Dynamic LUT needs its table values"));
     }
     let indices = table
@@ -86,6 +137,22 @@ pub(crate) fn automorphism_ciphertext(
     });
     let helper = map_row(inverse_helper, |entry| entry.ring_automorphism(k.clone()));
     Ok((routed.0, (routed.1.0 - helper.0, routed.1.1 - helper.1)))
+}
+
+/// The top row `sigma_k(H^0_{k^-1})` of the switching ciphertext `C_k` (see
+/// [`automorphism_ciphertext`]), joined: it is public, so its digit rows need
+/// no companion (see [`super::automorphism_public_rows`]).
+pub(crate) fn automorphism_public_top(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    hash_key: mxx_dsl::Bytes,
+    k: IntExpr,
+    inverse: IntExpr,
+) -> Result<mxx_dsl::Mat, RnsBggError> {
+    let routed = map_row(setup.helper_key(parameters, hash_key, inverse)?.0, |entry| {
+        entry.ring_automorphism(k.clone())
+    });
+    Ok(super::join_row(&routed))
 }
 
 /// The `D x D` block `Dec_g(D g)` of the public scalar action

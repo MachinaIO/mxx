@@ -884,6 +884,17 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
         }
         Ok(RhsRef { id: family.0, index: Some(index.clone()) })
     }
+    /// A member selected at run time is analyzed as member `0` at every selection: all
+    /// selected products then read one member, whose errors add coherently, the worst case of
+    /// the correlation bookkeeping.
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        _: crate::program::DataId,
+        _: &IntExpr,
+    ) -> Result<RhsRef<IntExpr>, ProgramLowerError<RnsBggError>> {
+        Ok(RhsRef { id: family.0, index: Some(IntExpr::constant(0)) })
+    }
     fn parallel(
         &mut self,
         evaluator: &mut RnsBggNoiseEvaluator<'a>,

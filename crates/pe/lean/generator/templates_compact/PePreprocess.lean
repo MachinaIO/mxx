@@ -65,7 +65,7 @@ theorem fdiv20 {a : Nat} (ha : a < {{M}}) : Int.fdiv (Int.ofNat a) {{M}} = 0 := 
 set_option maxHeartbeats 8000000 in
 theorem rhsKeyInner_step {model : HashModel} {tape : SampleTape} {path : List Nat} {key : ByteArray}
     {u0 u1 : ExactMatrix Q N {{D}} 1} {a j : Nat} (ha : a < {{M}}) {s t : KeyBlock}
-    (h : Stage_preprocess.sequential_sequential_generatedRoot_22_11 Backend.backend model tape path
+    (h : Stage_preprocess.sequential_sequential_generatedRoot_24_11 Backend.backend model tape path
       GeneratedClaim.stage_5_params a j (s.1, s.2.1, key, u0, u1, ()) t) :
     t.1 = s.1 + (rhsKey model key j a 0 * u0 + rhsKey model key j a 1 * u1) 0 0 •
         unitRow ((j : Nat) : Int) ∧
@@ -91,7 +91,7 @@ set_option maxHeartbeats 8000000 in
 theorem rhsKeyInner {model : HashModel} {tape : SampleTape} {path : List Nat} {key : ByteArray}
     {u0 u1 : ExactMatrix Q N {{D}} 1} {a : Nat} (ha : a < {{M}}) {final : KeyBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyBlock) ↦
-      Stage_preprocess.sequential_sequential_generatedRoot_22_11 Backend.backend model tape
+      Stage_preprocess.sequential_sequential_generatedRoot_24_11 Backend.backend model tape
         (path ++ [11, i]) GeneratedClaim.stage_5_params a i
         (current.1, (current.2.1, (key, (u0, (u1, ()))))) next) (Int.toNat {{M}}) (0, (0, ())) final)
     (jj : Fin {{M}}) :
@@ -133,7 +133,7 @@ theorem rhsKeyLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat
     {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}}} {A0 A1 : ExactMatrix Q N 1 {{M}}}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {i : Nat} (hi : i < {{M}}) {s t : KeyBlock}
-    (h : Stage_preprocess.sequential_generatedRoot_22 Backend.backend model tape path
+    (h : Stage_preprocess.sequential_generatedRoot_24 Backend.backend model tape path
       GeneratedClaim.stage_5_params i (s.1, s.2.1, key, A0, A1, ()) t) (jj : Fin {{M}}) :
     t.1 0 jj = s.1 0 jj + keySum (rhsKey model key) A 0 jj ⟨i, hi⟩ ∧
       t.2.1 0 jj = s.2.1 0 jj + keySum (rhsKey model key) A 1 jj ⟨i, hi⟩ := by
@@ -163,7 +163,7 @@ theorem rhsKeyLoop {model : HashModel} {tape : SampleTape} {path : List Nat} {ke
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {final : KeyBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyBlock) ↦
-      Stage_preprocess.sequential_generatedRoot_22 Backend.backend model tape (path ++ [22, i])
+      Stage_preprocess.sequential_generatedRoot_24 Backend.backend model tape (path ++ [24, i])
         GeneratedClaim.stage_5_params i (current.1, (current.2.1, (key, (A0, (A1, ()))))) next)
       (Int.toNat {{M}}) (0, (0, ())) final) (jj : Fin {{M}}) :
     final.1 0 jj = ∑ a, keySum (rhsKey model key) A 0 jj a ∧
@@ -183,7 +183,7 @@ theorem selectK0 : MxxIR.selectInt 0 [{{K}}] = (K : Int) := by decide
 set_option maxHeartbeats 8000000 in
 theorem autKeyInner_step {model : HashModel} {tape : SampleTape} {path : List Nat} {key : ByteArray}
     {u0 u1 : ExactMatrix Q N {{D}} 1} {a j : Nat} (ha : a < {{M}}) {s t : KeyBlock}
-    (h : Stage_preprocess.sequential_sequential_generatedRoot_30_13 Backend.backend model tape path
+    (h : Stage_preprocess.sequential_sequential_generatedRoot_36_13 Backend.backend model tape path
       GeneratedClaim.stage_5_params a j (s.1, s.2.1, key, u0, u1, ()) t) :
     t.1 = s.1 + (autKey model key j a 0 * u0 + autKey model key j a 1 * u1) 0 0 •
         unitRow ((j : Nat) : Int) ∧
@@ -210,7 +210,7 @@ set_option maxHeartbeats 8000000 in
 theorem autKeyInner {model : HashModel} {tape : SampleTape} {path : List Nat} {key : ByteArray}
     {u0 u1 : ExactMatrix Q N {{D}} 1} {a : Nat} (ha : a < {{M}}) {final : KeyBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyBlock) ↦
-      Stage_preprocess.sequential_sequential_generatedRoot_30_13 Backend.backend model tape
+      Stage_preprocess.sequential_sequential_generatedRoot_36_13 Backend.backend model tape
         (path ++ [13, i]) GeneratedClaim.stage_5_params a i
         (current.1, (current.2.1, (key, (u0, (u1, ()))))) next) (Int.toNat {{M}}) (0, (0, ())) final)
     (jj : Fin {{M}}) :
@@ -237,7 +237,7 @@ theorem autKeyLoop_step {model : HashModel} {tape : SampleTape} {path : List Nat
     {A : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}}} {A0 A1 : ExactMatrix Q N 1 {{M}}}
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {i : Nat} (hi : i < {{M}}) {s t : KeyBlock}
-    (h : Stage_preprocess.sequential_generatedRoot_30 Backend.backend model tape path
+    (h : Stage_preprocess.sequential_generatedRoot_36 Backend.backend model tape path
       GeneratedClaim.stage_5_params i (s.1, s.2.1, key, A0, A1, ()) t) (jj : Fin {{M}}) :
     t.1 0 jj = s.1 0 jj + keySum (autKey model key) (routedKey A) 0 jj ⟨i, hi⟩ ∧
       t.2.1 0 jj = s.2.1 0 jj + keySum (autKey model key) (routedKey A) 1 jj ⟨i, hi⟩ := by
@@ -267,7 +267,7 @@ theorem autKeyLoop {model : HashModel} {tape : SampleTape} {path : List Nat} {ke
     (hA0 : concatColumns (A 0 0) (A 0 1) A0) (hA1 : concatColumns (A 1 0) (A 1 1) A1)
     {final : KeyBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyBlock) ↦
-      Stage_preprocess.sequential_generatedRoot_30 Backend.backend model tape (path ++ [30, i])
+      Stage_preprocess.sequential_generatedRoot_36 Backend.backend model tape (path ++ [36, i])
         GeneratedClaim.stage_5_params i (current.1, (current.2.1, (key, (A0, (A1, ()))))) next)
       (Int.toNat {{M}}) (0, (0, ())) final) (jj : Fin {{M}}) :
     final.1 0 jj = ∑ a, keySum (autKey model key) (routedKey A) 0 jj a ∧
@@ -288,7 +288,7 @@ set_option maxHeartbeats 8000000 in
 theorem helperKeyLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
     {H0 H1 T0 T1 : ExactMatrix Q N 1 {{M}}} {final : KeyBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : KeyBlock) ↦
-      Stage_preprocess.sequential_sequential_generatedRoot_50_32 Backend.backend model tape
+      Stage_preprocess.sequential_sequential_generatedRoot_59_32 Backend.backend model tape
         (path ++ [32, i]) GeneratedClaim.stage_5_params 0 i
         (current.1, (current.2.1, (H0, (T0, (T1, (H1, ())))))) next) (Int.toNat {{M}}) (0, (0, ()))
       final) (jj : Fin {{M}}) :
@@ -299,7 +299,7 @@ theorem helperKeyLoop {model : HashModel} {tape : SampleTape} {path : List Nat}
   have hcount : Int.toNat {{M}} = {{M}} := rfl
   rw [hcount] at h
   have hstep : ∀ i (s t : KeyBlock) (hi : i < {{M}}), True →
-      Stage_preprocess.sequential_sequential_generatedRoot_50_32 Backend.backend model tape
+      Stage_preprocess.sequential_sequential_generatedRoot_59_32 Backend.backend model tape
         (path ++ [32, i]) GeneratedClaim.stage_5_params 0 i
         (s.1, (s.2.1, (H0, (T0, (T1, (H1, ())))))) t →
       t.1 = s.1 + (H0 * colDigits T0 T1 ⟨i, hi⟩) 0 0 • unitRow ((i : Nat) : Int) ∧
@@ -353,21 +353,28 @@ noncomputable def outputKey (model : HashModel) (key : ByteArray) (Mmul : Fin 2 
     (T0 T1 : ExactMatrix Q N 1 {{M}}) (V1 VK : ExactMatrix Q N {{D}} {{D}}) : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}} :=
   fun k j ↦ Mmul k j * V1 + pairMul (helperKey model key k) (actionDigits T0 T1 j) * VK
 
+/-- A selection from a one-element list is that element. -/
+theorem select_one {α : Type} {i : Int} {x out : α} (h : MxxRuntime.select i [x] out) : out = x := by
+  obtain ⟨⟨p, hp⟩, -, hout⟩ := h
+  simp only [List.length_singleton, Nat.lt_one_iff] at hp
+  subst hp
+  exact hout
+
 abbrev PortBlock := ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} ×
   ExactMatrix Q N 1 {{D}} × Unit
 
 set_option maxHeartbeats 64000000 in
 /-- The loop over the one branch of `K` adds `(H Dec(T)) V_K` to the identity keys. -/
 theorem branchKeys {model : HashModel} {tape : SampleTape} {path : List Nat} {key : ByteArray}
-    {T0 T1 : ExactMatrix Q N 1 {{M}}} {init final : PortBlock}
+    {T0 T1 : ExactMatrix Q N 1 {{M}}} {t0 t1 : Int} {init final : PortBlock}
     (h : MxxIR.IterRuns (fun (i : Nat) (current next : PortBlock) ↦
-      Stage_preprocess.sequential_generatedRoot_50 Backend.backend model tape (path ++ [50, i])
+      Stage_preprocess.sequential_generatedRoot_59 Backend.backend model tape (path ++ [59, i])
         GeneratedClaim.stage_5_params i (current.1, (current.2.1, (current.2.2.1, (current.2.2.2.1,
-          (key, (T0, (T1, ()))))))) next) (Int.toNat 1) init final) :
+          (key, (T0, (T1, (t0, (t1, ()))))))))) next) (Int.toNat 1) init final) :
     ∃ (g : ExactMatrix Q N 1 {{D}}) (VK : ExactMatrix Q N {{D}} {{D}}),
       gadgetMatrixRuns Backend.backend {{BASE}} {{D}} g ∧
       gadgetDecomposeRuns Backend.backend {{BASE}} {{D}}
-        (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g) VK ∧
+        (matrixMulScalarLeft (lutScalar t0 t1 (substituteMatrix K hK)) g) VK ∧
       ∀ k j : Fin 2, ![![final.1, final.2.1], ![final.2.2.1, final.2.2.2.1]] k j =
         ![![init.1, init.2.1], ![init.2.2.1, init.2.2.2.1]] k j +
           pairMul (helperKey model key k) (actionDigits T0 T1 j) * VK := by
@@ -377,8 +384,8 @@ theorem branchKeys {model : HashModel} {tape : SampleTape} {path : List Nat} {ke
   cases h0
   obtain ⟨w, -, -, x3, x4, x5, x7, -, -, x8, x9, x11, x12, -, -, -, -, -, -, x14, -, -, -, -, -, -, x15,
     -, -, -, -, -, -, x16, x17, -, -, -, -, -, -, x19, -, -, -, -, -, -, x20, -, -, -, -, -, -, x21,
-    x22, -, -, x23, x24, x26, -, -, x27, x28, x30, x31, -, x32, -, -, -, -, -, -, x33, -, -, -, -, x37,
-    -, -, -, -, x42, x46, x48, -, -, -, -, -, -, x52, -, -, -, -, -, -, x56, -, -, -, -, -, -, x60,
+    x22, -, -, x23, x24, x26, -, -, x27, x28, x30, x31, -, x32, -, -, -, -, -, -, x33, -, -, -, -, x38,
+    -, -, -, -, x44, x48, x50, -, -, -, -, -, -, x54, -, -, -, -, -, -, x58, -, -, -, -, -, -, x62,
     xout⟩ := hb
   have hz : ({{M}} * Int.ofNat 0 : Int) = 0 := by decide
   rw [hz] at x14 x19
@@ -427,20 +434,20 @@ theorem branchKeys {model : HashModel} {tape : SampleTape} {path : List Nat} {ke
   have h0 := hact 0 hH0 (fun p ↦ (hloop p).1)
   have h1 := hact 1 hH1 (fun p ↦ (hloop p).2.1)
   have hw33 := (sliceMatrix_window 0 x33 (by simp) (by omega)).trans (h0 0)
-  have hw52 := (sliceMatrix_window {{D}} x52 (by simp) (by omega)).trans (h0 1)
-  have hw56 := (sliceMatrix_window 0 x56 (by simp) (by omega)).trans (h1 0)
-  have hw60 := (sliceMatrix_window {{D}} x60 (by simp) (by omega)).trans (h1 1)
-  have hw37 := routing_K x37
-  have hw42 := routing_K x42
-  refine ⟨w.w_46_0, w.w_48_0, x46, ?_, fun k j ↦ ?_⟩
-  · convert x48 using 2
-    simp only [lutScalar, hw37, hw42]
+  have hw54 := (sliceMatrix_window {{D}} x54 (by simp) (by omega)).trans (h0 1)
+  have hw58 := (sliceMatrix_window 0 x58 (by simp) (by omega)).trans (h1 0)
+  have hw62 := (sliceMatrix_window {{D}} x62 (by simp) (by omega)).trans (h1 1)
+  have hw38 := routing_K x38
+  have hw44 := routing_K x44
+  refine ⟨w.w_48_0, w.w_50_0, x48, ?_, fun k j ↦ ?_⟩
+  · convert x50 using 2
+    simp only [lutScalar, hw38, hw44]
   · subst xout
     fin_cases k <;> fin_cases j
     · simp [matrixAdd, matrixMul, hw33]
-    · simp [matrixAdd, matrixMul, hw52]
-    · simp [matrixAdd, matrixMul, hw56]
-    · simp [matrixAdd, matrixMul, hw60]
+    · simp [matrixAdd, matrixMul, hw54]
+    · simp [matrixAdd, matrixMul, hw58]
+    · simp [matrixAdd, matrixMul, hw62]
 
 abbrev PreprocessOutputs := ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{D}} ×
   ExactMatrix Q N 1 {{D}} × ExactMatrix Q N 1 {{M}} × ExactMatrix Q N 1 {{M}} × ExactMatrix Q N 1 {{D}} ×
@@ -452,9 +459,9 @@ set_option maxHeartbeats 64000000 in
 branch of `K`, and the output key `A_F = M V_1 + (H Dec(T)) V_K` (twice: for key generation and
 for online evaluation). -/
 theorem preprocess_keys {model : HashModel} {tape : SampleTape} {path : List Nat} {key : ByteArray}
-    {outputs : PreprocessOutputs}
+    {reads : Fin 1 → Int} {tables : Fin 2 → Int} {outputs : PreprocessOutputs}
     (h : Stage_preprocess.generatedRoot Backend.backend model tape path GeneratedClaim.stage_5_params
-      key outputs) :
+      (reads, key, tables, ()) outputs) :
     let Mmul : Fin 2 → Fin 2 → ExactMatrix Q N 1 {{D}} :=
       ![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]]
     let T0 := outputs.2.2.2.2.1
@@ -465,9 +472,10 @@ theorem preprocess_keys {model : HashModel} {tape : SampleTape} {path : List Nat
       ∑ a, keySum (autKey model key) (routedKey Mmul) k ⟨{{D}} * (j : Nat) + l, by omega⟩ a) ∧
     ∃ (g : ExactMatrix Q N 1 {{D}}) (V1 VK : ExactMatrix Q N {{D}} {{D}}),
       gadgetMatrixRuns Backend.backend {{BASE}} {{D}} g ∧
-      gadgetDecomposeRuns Backend.backend {{BASE}} {{D}} (matrixMulScalarLeft lutScalarOne g) V1 ∧
       gadgetDecomposeRuns Backend.backend {{BASE}} {{D}}
-        (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g) VK ∧
+        (matrixMulScalarLeft (lutScalarOne (tables 0) (tables 1)) g) V1 ∧
+      gadgetDecomposeRuns Backend.backend {{BASE}} {{D}}
+        (matrixMulScalarLeft (lutScalar (tables 0) (tables 1) (substituteMatrix K hK)) g) VK ∧
       (∀ k j : Fin 2, ![![outputs.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.1],
           ![outputs.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.1]] k j =
         outputKey model key Mmul T0 T1 V1 VK k j) ∧
@@ -475,69 +483,75 @@ theorem preprocess_keys {model : HashModel} {tape : SampleTape} {path : List Nat
           ![outputs.2.2.2.2.2.2.2.2.2.2.2.2.1, outputs.2.2.2.2.2.2.2.2.2.2.2.2.2.1]] k j =
         outputKey model key Mmul T0 T1 V1 VK k j) := by
   intro Mmul T0 T1
-  obtain ⟨w, x2, x3, x4, x5, x7, x8, x9, x11, x12, x13, x14, x16, x17, x18, x20, x21, -, x22, -, -, -,
-    -, -, -, x23, -, -, -, -, -, -, x24, -, -, -, -, -, -, x25, -, -, -, -, -, -, x26, x28, x29, -, x30,
-    -, -, x34, -, -, x39, x43, x45, -, x50, xout⟩ := h
+  obtain ⟨w, -, x4, x5, x6, x7, x9, x10, x11, x13, x14, x15, x16, x18, x19, x20, x22, x23, -, x24, -, -, -,
+    -, -, -, x25, -, -, -, x26, -, -, -, -, -, -, x27, -, -, -, x28, -, -, -, -, -, -, x29, -, -, -, x30, -,
+    -, -, -, -, -, x31, -, -, -, x32, x34, x35, -, x36, x39, -, -, x42, x44, -, -, x48, x52, x54, -, x59,
+    xout⟩ := h
   subst xout
   -- The companion keys of the product, against the expanded input key.
-  have hkeyC : ∀ k j, inputKeyC model key k j = ![![w.w_2_0, w.w_8_0], ![w.w_13_0, w.w_17_0]] k j := by
+  have hkeyC : ∀ k j, inputKeyC model key k j = ![![w.w_4_0, w.w_10_0], ![w.w_15_0, w.w_19_0]] k j := by
     intro k j
     fin_cases k <;> fin_cases j
-    · exact (hashSample_eq x2).symm
-    · exact (hashSample_eq x8).symm
-    · exact (hashSample_eq x13).symm
-    · exact (hashSample_eq x17).symm
-  have hkey : ∀ k j, inputKey model key k j = ![![w.w_7_0, w.w_11_0], ![w.w_16_0, w.w_20_0]] k j := by
-    have h7 := expand_read2 x3 x4 x5 x7
-    have h11 := expand_read2 x3 x4 x9 x11
-    have h16 := expand_read2 x3 x4 x14 x16
-    have h20 := expand_read2 x3 x4 x18 x20
+    · exact (hashSample_eq x4).symm
+    · exact (hashSample_eq x10).symm
+    · exact (hashSample_eq x15).symm
+    · exact (hashSample_eq x19).symm
+  have hkey : ∀ k j, inputKey model key k j = ![![w.w_9_0, w.w_13_0], ![w.w_18_0, w.w_22_0]] k j := by
+    have h9 := expand_read2 x5 x6 x7 x9
+    have h13 := expand_read2 x5 x6 x11 x13
+    have h18 := expand_read2 x5 x6 x16 x18
+    have h22 := expand_read2 x5 x6 x20 x22
     intro k j
-    fin_cases k <;> fin_cases j <;> simp [inputKey, expandKey, hkeyC, h7, h11, h16, h20]
-  have hA0 : concatColumns (inputKey model key 0 0) (inputKey model key 0 1) w.w_12_0 := by
-    rw [hkey, hkey]; exact x12
-  have hA1 : concatColumns (inputKey model key 1 0) (inputKey model key 1 1) w.w_21_0 := by
-    rw [hkey, hkey]; exact x21
-  have hM := rhsKeyLoop hA0 hA1 x22
-  have hw9 := sliceMatrix_window 0 x23 (by simp) (by omega)
-  have hw10 := sliceMatrix_window {{D}} x24 (by simp) (by omega)
-  have hw11 := sliceMatrix_window 0 x25 (by simp) (by omega)
-  have hw12 := sliceMatrix_window {{D}} x26 (by simp) (by omega)
+    fin_cases k <;> fin_cases j <;> simp [inputKey, expandKey, hkeyC, h9, h13, h18, h22]
+  have hA0 : concatColumns (inputKey model key 0 0) (inputKey model key 0 1) w.w_14_0 := by
+    rw [hkey, hkey]; exact x14
+  have hA1 : concatColumns (inputKey model key 1 0) (inputKey model key 1 1) w.w_23_0 := by
+    rw [hkey, hkey]; exact x23
+  have hM := rhsKeyLoop hA0 hA1 x24
+  -- The keys of the one member, selected at the member read.
+  have hm00 := (select_one x26).trans (sliceMatrix_window 0 x25 (by simp) (by omega))
+  have hm01 := (select_one x28).trans (sliceMatrix_window {{D}} x27 (by simp) (by omega))
+  have hm10 := (select_one x30).trans (sliceMatrix_window 0 x29 (by simp) (by omega))
+  have hm11 := (select_one x32).trans (sliceMatrix_window {{D}} x31 (by simp) (by omega))
   have hMrow : ∀ (k j : Fin 2) (l : Fin {{D}}), Mmul k j 0 l =
       ∑ a, keySum (rhsKey model key) (inputKey model key) k ⟨{{D}} * (j : Nat) + l, by omega⟩ a := by
     intro k j l
     fin_cases k <;> fin_cases j
-    · simp only [Mmul, hw9]
+    · simp only [Mmul, hm00]
       exact (hM _).1
-    · simp only [Mmul, hw10]
+    · simp only [Mmul, hm01]
       exact (hM _).1
-    · simp only [Mmul, hw11]
+    · simp only [Mmul, hm10]
       exact (hM _).2
-    · simp only [Mmul, hw12]
+    · simp only [Mmul, hm11]
       exact (hM _).2
   -- The switched keys.
-  have hM0 : concatColumns (Mmul 0 0) (Mmul 0 1) w.w_28_0 := x28
-  have hM1 : concatColumns (Mmul 1 0) (Mmul 1 1) w.w_29_0 := x29
-  have hT := autKeyLoop hM0 hM1 x30
+  have hM0 : concatColumns (Mmul 0 0) (Mmul 0 1) w.w_34_0 := x34
+  have hM1 : concatColumns (Mmul 1 0) (Mmul 1 1) w.w_35_0 := x35
+  have hT := autKeyLoop hM0 hM1 x36
   refine ⟨hMrow, fun k j l ↦ ?_, ?_⟩
   · fin_cases k
     · exact (hT _).1
     · exact (hT _).2
   -- The output keys.
-  have hw34 := routing_one x34
-  have hw39 := routing_one x39
-  obtain ⟨g, VK, hg, hVK, hports⟩ := branchKeys x50
-  have hgg := gadgetMatrixRuns_unique x43 hg
+  obtain ⟨_, hw39⟩ := familyGet_eq (k := 0) x39
+  obtain ⟨_, hw44⟩ := familyGet_eq (k := 1) x44
+  have hw42 := routing_one x42
+  have hw48 := routing_one x48
+  obtain ⟨g, VK, hg, hVK, hports⟩ := branchKeys x59
+  have hgg := gadgetMatrixRuns_unique x52 hg
   subst hgg
-  have hV1 : gadgetDecomposeRuns Backend.backend {{BASE}} {{D}} (matrixMulScalarLeft lutScalarOne w.w_43_0)
-      w.w_45_0 := by
-    convert x45 using 2
-    simp only [lutScalarOne, lutScalar, hw34, hw39, id]
-  have hout : ∀ k j : Fin 2, ![![w.w_50_0, w.w_50_1], ![w.w_50_2, w.w_50_3]] k j =
-      outputKey model key Mmul T0 T1 w.w_45_0 VK k j := by
+  rw [hw39, hw44] at hVK
+  have hV1 : gadgetDecomposeRuns Backend.backend {{BASE}} {{D}}
+      (matrixMulScalarLeft (lutScalarOne (tables 0) (tables 1)) w.w_52_0) w.w_54_0 := by
+    convert x54 using 2
+    simp only [lutScalarOne, lutScalar, hw39, hw44, hw42, hw48, id]
+    rfl
+  have hout : ∀ k j : Fin 2, ![![w.w_59_0, w.w_59_1], ![w.w_59_2, w.w_59_3]] k j =
+      outputKey model key Mmul T0 T1 w.w_54_0 VK k j := by
     intro k j
     rw [hports k j]
     fin_cases k <;> fin_cases j <;> rfl
-  exact ⟨w.w_43_0, w.w_45_0, VK, x43, hV1, hVK, hout, hout⟩
+  exact ⟨w.w_52_0, w.w_54_0, VK, x52, hV1, hVK, hout, hout⟩
 
 end PeProof

@@ -23,10 +23,21 @@ def biasB : Nat := 10 * N * 20 * keyCutoff
 /-- The budget of the linear form. -/
 def mT : Nat := (Q - 8) / 4 - 22 - 2 * biasB
 
+/-- The attribute `x₀` of the external inputs, as an index of the table. -/
+def attrOf (external : GeneratedClaim.ExternalInputs) : Fin 2 :=
+  ⟨(external.input_1 0).toNat % 2, Nat.mod_lt _ (by norm_num)⟩
+
+/-- The error of the online output of the run of `external`: the hash key, the attribute, and the
+table `(t₀, t₁)` of the key's program are external inputs. -/
+noncomputable abbrev eFX (model : HashModel) (external : GeneratedClaim.ExternalInputs) (P : Prims) :
+    Fin 2 → ErrorMatrix N 1 8 :=
+  eFP model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) P
+
 /-- The output error, clamped to its bound so that every tape has a bounded coefficient. -/
-noncomputable def eFcP (model : HashModel) (key : ByteArray) (P : Prims) : Fin 2 → ErrorMatrix N 1 8 := by
+noncomputable def eFcP (model : HashModel) (external : GeneratedClaim.ExternalInputs) (P : Prims) :
+    Fin 2 → ErrorMatrix N 1 8 := by
   classical
-  exact if ∀ j, CoeffBound (eFP model key P j) BF then eFP model key P else 0
+  exact if ∀ j, CoeffBound (eFX model external P j) BF then eFX model external P else 0
 
 /-- The helper error, clamped to its cutoff. -/
 noncomputable def ehcP (P : Prims) : Fin 2 → ErrorMatrix N 1 8 := by
@@ -34,9 +45,10 @@ noncomputable def ehcP (P : Prims) : Fin 2 → ErrorMatrix N 1 8 := by
   exact if ∀ j, CoeffBound (P.eh j) 20 then P.eh else 0
 
 /-- The rows that multiply the three extension blocks `v₀`, `v₁`, `v_F`. -/
-noncomputable def crowP (model : HashModel) (key : ByteArray) (P : Prims) : Fin 3 → Fin 16 → ErrorPoly N :=
+noncomputable def crowP (model : HashModel) (external : GeneratedClaim.ExternalInputs) (P : Prims) :
+    Fin 3 → Fin 16 → ErrorPoly N :=
   ![fun r ↦ jZ (ehcP P) 0 r, fun r ↦ substitution K hK (jZ (ehcP P) 0 r),
-    fun r ↦ jZ (eFcP model key P) 0 r]
+    fun r ↦ jZ (eFcP model external P) 0 r]
 
 /-- The sites of the extension blocks. -/
 def keySite : Fin 3 → List Nat := ![[6, 10, 0, 0], [6, 10, 1, 0], [6, 7]]
@@ -45,31 +57,44 @@ def keySite : Fin 3 → List Nat := ![[6, 10, 0, 0], [6, 10, 1, 0], [6, 7]]
 def keyOf (x : Fin 3 × Fin 16 × Fin N) : SampleKey := ⟨keySite x.1, x.2.1, 0, x.2.2, keyLaw⟩
 
 /-- The coefficient of a tape coordinate in coefficient `i` of the linear form. -/
-noncomputable def coefZ (model : HashModel) (key : ByteArray) (ω : SampleTape) (i : Fin N)
-    (x : Fin 3 × Fin 16 × Fin N) : Int :=
-  maskCoefficient (crowP model key (prims ω) x.1 x.2.1) i x.2.2
+noncomputable def coefZ (model : HashModel) (external : GeneratedClaim.ExternalInputs) (ω : SampleTape)
+    (i : Fin N) (x : Fin 3 × Fin 16 × Fin N) : Int :=
+  maskCoefficient (crowP model external (prims ω) x.1 x.2.1) i x.2.2
 
 /-- Coefficient `i` of the linear form in the key extension. -/
-noncomputable def lin (model : HashModel) (key : ByteArray) (ω : SampleTape) (i : Fin N) : Int :=
-  ∑ x, coefZ model key ω i x * ω (keyOf x)
+noncomputable def lin (model : HashModel) (external : GeneratedClaim.ExternalInputs) (ω : SampleTape)
+    (i : Fin N) : Int :=
+  ∑ x, coefZ model external ω i x * ω (keyOf x)
 
-/-- The requirement accepts exactly the attribute `x₀ = 0`, for which the predicate `x ↦ x₀`
-is `0`. -/
-theorem requirement_zero {tape : SampleTape} {x : Fin 1 → Int} {out : Bool}
-    (h : Requirement_0.generatedRoot tape [9] GeneratedClaim.requirement_0_params x out)
-    (ht : out = true) : x 0 = 0 := by
-  obtain ⟨w, h1, -, h8, -, h9, -, hsel, hout⟩ := h
-  obtain ⟨_, hw8⟩ := familyGet_eq (k := 0) h8
-  subst ht
-  obtain ⟨pos, hpos, hw16⟩ := hsel
-  fin_cases pos
-  · simp only [List.get] at hw16
-    simp only [Nat.cast_zero] at hpos
-    rw [hw8] at hpos
-    simpa using hpos.symm
-  · simp only [List.get] at hw16
-    rw [hw16] at hout
-    simp at hout
+/-- The requirement `F(x) = 0` of the key's program: its step reads the attribute `x₀` at the read
+index `0` and accepts exactly when the table entry `t_{x₀}` is `0`. -/
+theorem requirement_table {tape : SampleTape} {x : Fin 1 → Int} {tables : Fin 2 → Int}
+    {reads : Fin 1 → Int} {out : Bool}
+    (h : Requirement_0.generatedRoot tape [9] GeneratedClaim.requirement_0_params (x, tables, reads, ())
+      out)
+    (ht : out = true) : ∃ p : Fin 2, x 0 = ((p : Nat) : Int) ∧ tables p = 0 := by
+  obtain ⟨w, -, -, -, -, -, -, -, h28, -, -, h31, hout⟩ := h
+  obtain ⟨p0, -, hw28⟩ := h28
+  rw [Subsingleton.elim p0 0] at hw28
+  obtain ⟨p, hp, hw31⟩ := h31
+  refine ⟨p, ?_, ?_⟩
+  · have hw28' : w.w_28_0 = x 0 := hw28
+    rw [← hw28']
+    simpa using hp.symm
+  · have hw31' : w.w_31_0 = tables p := hw31
+    rw [← hw31']
+    by_contra hne
+    subst ht
+    simp [hne] at hout
+    repeat' split at hout
+    all_goals omega
+
+/-- The attribute of the external inputs is the attribute that the requirement reads. -/
+theorem attrOf_eq {external : GeneratedClaim.ExternalInputs} {p : Fin 2}
+    (hx : external.input_1 0 = ((p : Nat) : Int)) : attrOf external = p := by
+  apply Fin.ext
+  simp only [attrOf, hx, Int.toNat_natCast]
+  exact Nat.mod_eq_of_lt p.isLt
 
 theorem ideal_eq {tape : SampleTape} {m out : Fin N → Int}
     (h : Ideal.generatedRoot tape [10] GeneratedClaim.ideal_params m out) : out = m := by
@@ -118,14 +143,14 @@ theorem joinRow_helperTarget (sm : ErrorPoly N) :
       smul_zero, zero_add, map_one, one_smul]
 
 /-- The error of the online output, from its encoding relation. -/
-theorem eF_props {model : HashModel} {key : ByteArray} {ω : SampleTape}
-    (hrel : MxxExponentLut.Rel (secOf ω) (AFM model key) (fun _ ↦ 0) (cFOf model key ω) BF) :
-    (∀ j, CoeffBound (eFOf model key ω j) BF) ∧ ∀ j, cFOf model key ω j =
-      reducePoly Q N (secOf ω) • AFM model key 0 j + AFM model key 1 j +
-        reduceMatrix Q N 1 8 (eFOf model key ω j) := by
+theorem eF_props {model : HashModel} {key : ByteArray} {xa : Fin 2} {t0 t1 : Int} {ω : SampleTape}
+    (hrel : MxxExponentLut.Rel (secOf ω) (AFM model key t0 t1) (fun _ ↦ 0) (cFOf model key xa t0 t1 ω) BF) :
+    (∀ j, CoeffBound (eFOf model key xa t0 t1 ω j) BF) ∧ ∀ j, cFOf model key xa t0 t1 ω j =
+      reducePoly Q N (secOf ω) • AFM model key t0 t1 0 j + AFM model key t0 t1 1 j +
+        reduceMatrix Q N 1 8 (eFOf model key xa t0 t1 ω j) := by
   obtain ⟨e, he, hc⟩ := hrel
   have hBF : 2 * BF < Q := by decide
-  have heq : ∀ j, eFOf model key ω j = e j := by
+  have heq : ∀ j, eFOf model key xa t0 t1 ω j = e j := by
     intro j
     rw [eFOf_eq, hc j]
     simp only [sub_zero, add_sub_cancel_left]
@@ -136,11 +161,12 @@ theorem eF_props {model : HashModel} {key : ByteArray} {ω : SampleTape}
 
 /-- On a tape whose errors lie within their bounds, `lin` is the coefficient of
 `e_h v₀ + σ_K(e_h) v₁ + e_F v_F`. -/
-theorem lin_eq {model : HashModel} {key : ByteArray} {ω : SampleTape}
-    (heh : ehcP (prims ω) = ehOf ω) (heF : eFcP model key (prims ω) = eFOf model key ω) (i : Fin N) :
-    lin model key ω i = ((jZ (ehOf ω) * vAt ω [6] 0) 0 0).coeff i +
+theorem lin_eq {model : HashModel} {external : GeneratedClaim.ExternalInputs} {ω : SampleTape}
+    {eF : Fin 2 → ErrorMatrix N 1 8}
+    (heh : ehcP (prims ω) = ehOf ω) (heF : eFcP model external (prims ω) = eF) (i : Fin N) :
+    lin model external ω i = ((jZ (ehOf ω) * vAt ω [6] 0) 0 0).coeff i +
       ((substituteMatrix K hK (jZ (ehOf ω)) * vAt ω [6] 1) 0 0).coeff i +
-      ((jZ (eFOf model key ω) * vFAt ω [6]) 0 0).coeff i := by
+      ((jZ eF * vFAt ω [6]) 0 0).coeff i := by
   unfold vAt vFAt
   rw [lin_coeff, lin_coeff, lin_coeff]
   unfold lin coefZ
@@ -154,7 +180,7 @@ set_option maxHeartbeats 64000000 in
 theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs} {ω : SampleTape}
     {exec : GeneratedClaim.Execution} (hruns : GeneratedClaim.Runs model external ω exec) :
     exec.«ideal» = external.input_2 ∧ (∀ k, external.input_2 k = 0 ∨ external.input_2 k = 1) ∧
-    ∀ i : Fin N, ∃ e : Int, |e| ≤ 21 + 2 * biasB + |lin model external.input_0 ω i| ∧
+    ∀ i : Fin N, ∃ e : Int, |e| ≤ 21 + 2 * biasB + |lin model external ω i| ∧
       exec.«stage_8» i = ((2 * ((((-(((Q / 2 : Nat) : Int) * external.input_2 i) + e : Int) : ZMod Q).val :
         Nat) : Int) + (Q : Int) / 2) / (Q : Int)) % 2 := by
   obtain ⟨⟨B0, td, ⟨⟩⟩, s1, s2, ⟨C00, C01, C10, C11, b, cm, ⟨⟩⟩,
@@ -164,7 +190,12 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
   obtain ⟨hvalid, h0, h1, h2, h3, h4, h5, h6, h7, h8, hreq, hideal, hrq⟩ := hruns
   dsimp only at h0 h1 h2 h3 h4 h5 h6 h7 h8 hreq hideal hrq ⊢
   obtain ⟨-, -, hm, ⟨h31, h32⟩, ⟨h41, h42⟩⟩ := hvalid
-  have hx0 := requirement_zero hreq hrq
+  obtain ⟨p, hx0, htab⟩ := requirement_table hreq hrq
+  have hattr := attrOf_eq hx0
+  rw [← hattr] at hx0
+  have ht : ![external.input_6 0, external.input_6 1] (attrOf external) = 0 := by
+    rw [hattr]
+    fin_cases p <;> simpa using htab
   have hidl := ideal_eq hideal
   obtain ⟨hB, htdB, hkind⟩ := setup_explicit h0
   have hs1 : s1 = B0 := by
@@ -183,8 +214,10 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
   obtain ⟨hb0, hbh, hbz, hbza⟩ := encrypt_err_bounds h4
   obtain ⟨hMM, hT0, hT1, hAF, hAF'⟩ := preprocess_link h5
   dsimp only at hMM hT0 hT1 hAF hAF'
-  have hAF0 : ![a00', a01'] = AFM model external.input_0 0 := congrFun hAF' 0
-  have hAF1 : ![a10', a11'] = AFM model external.input_0 1 := congrFun hAF' 1
+  have hAF0 : ![a00', a01'] = AFM model external.input_0 (external.input_6 0) (external.input_6 1) 0 :=
+    congrFun hAF' 0
+  have hAF1 : ![a10', a11'] = AFM model external.input_0 (external.input_6 0) (external.input_6 1) 1 :=
+    congrFun hAF' 1
   -- Key generation.
   obtain ⟨hvF, hv, hbvF, hbv, hk0, hk1, ⟨k0', hk0', hbk0⟩, ⟨k1', hk1', hbk1⟩⟩ :=
     keygen_explicit h6 hkind g0_runs
@@ -194,7 +227,7 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
   -- Online evaluation and its error.
   obtain ⟨hcF, hD, hDt, hDK, hV1, hVK⟩ := online_link h7 hc0 hCt hCb hz hhf hza hMM hT0 hT1
   dsimp only at hcF
-  have hrel := online_error (model := model) (key := external.input_0) (ω := ω) hb0 hbh hbz hbza heb hzb
+  have hrel := online_error (model := model) (key := external.input_0) (ω := ω) ht hb0 hbh hbz hbza heb hzb
     hD hDt hDK hV1 hVK
   obtain ⟨hbF, hcFe⟩ := eF_props hrel
   -- Decryption.
@@ -209,10 +242,10 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
     rw [hhf, hrowOf_eq, joinRow_encRow, joinRow_helperTarget]
     abel
   have hCF : joinRow ![cF0, cF1] - joinRow ![a10', a11'] =
-      s • joinRow ![a00', a01'] + joinRow (fun j ↦ reduceMatrix Q N 1 8 (eFOf model external.input_0 ω j)) := by
+      s • joinRow ![a00', a01'] + joinRow (fun j ↦ reduceMatrix Q N 1 8 (eFOf model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) ω j)) := by
     rw [hcF, hAF0, hAF1]
-    have : cFOf model external.input_0 ω = fun j ↦ (s • AFM model external.input_0 0 j +
-        AFM model external.input_0 1 j) + reduceMatrix Q N 1 8 (eFOf model external.input_0 ω j) :=
+    have : cFOf model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) ω = fun j ↦ (s • AFM model external.input_0 (external.input_6 0) (external.input_6 1) 0 j +
+        AFM model external.input_0 (external.input_6 0) (external.input_6 1) 1 j) + reduceMatrix Q N 1 8 (eFOf model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) ω j) :=
       funext hcFe
     rw [this, joinRow_add, joinRow_add, joinRow_smul]
     abel
@@ -230,8 +263,8 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
     have hb : ∀ j, CoeffBound ((prims ω).eh j) 20 := fun j ↦ hbh j
     simp only [ehcP, if_pos hb]
     rfl
-  have heF : eFcP model external.input_0 (prims ω) = eFOf model external.input_0 ω := by
-    have hb : ∀ j, CoeffBound (eFP model external.input_0 (prims ω) j) BF := hbF
+  have heF : eFcP model external (prims ω) = eFOf model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) ω := by
+    have hb : ∀ j, CoeffBound (eFX model external (prims ω) j) BF := hbF
     simp only [eFcP, if_pos hb]
     rfl
   have hlin := lin_eq heh heF i
@@ -245,7 +278,7 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
         joinRow (fun j ↦ reduceMatrix Q N 1 8 (ehOf ω j)) * reduceMatrix Q N 16 1 (vAt ω [6] 0) +
         substituteMatrix K hK (joinRow (fun j ↦ reduceMatrix Q N 1 8 (ehOf ω j))) *
           reduceMatrix Q N 16 1 (vAt ω [6] 1) +
-        joinRow (fun j ↦ reduceMatrix Q N 1 8 (eFOf model external.input_0 ω j)) *
+        joinRow (fun j ↦ reduceMatrix Q N 1 8 (eFOf model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) ω j)) *
           reduceMatrix Q N 16 1 (vFAt ω [6]))) (out i) := by
     exact (congrArg (fun p ↦ thresholdDecode 2 8192 (((i : Fin N) : Nat) : Int) p (out i)) hphase).mp (hdec i)
   rw [hk0', hk1'] at hd
@@ -253,7 +286,7 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
   have hidx' : i = idx := Fin.ext (by exact_mod_cast hidx.symm)
   subst hidx'
   have hentry := phase_entry (em := emAt ω [3]) (m := external.input_2) (eb := ebAt ω [3]) (k0 := k0')
-    (k1 := k1') (eh := ehOf ω) (eF := eFOf model external.input_0 ω) (v0 := vAt ω [6] 0)
+    (k1 := k1') (eh := ehOf ω) (eF := eFOf model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) ω) (v0 := vAt ω [6] 0)
     (v1 := vAt ω [6] 1) (vF := vFAt ω [6])
   simp only [σK] at hentry
   rw [hentry, reducePoly_coeff hQ hN] at hout
@@ -261,11 +294,11 @@ theorem run_decode {model : HashModel} {external : GeneratedClaim.ExternalInputs
   set emi := ((emAt ω [3]) 0 0).coeff i
   set b0 := ((ebAt ω [3] * k0') 0 0).coeff i
   set b1 := (substitution K hK ((ebAt ω [3] * k1') 0 0)).coeff i
-  set L := lin model external.input_0 ω i
+  set L := lin model external ω i
   have hX : (emAt ω [3] 0 0 + (halfQ : ErrorPoly N) * intPoly m -
       ((ebAt ω [3] * k0') 0 0 + substitution K hK ((ebAt ω [3] * k1') 0 0) +
         (jZ (ehOf ω) * vAt ω [6] 0) 0 0 + (substituteMatrix K hK (jZ (ehOf ω)) * vAt ω [6] 1) 0 0 +
-        (jZ (eFOf model external.input_0 ω) * vFAt ω [6]) 0 0)).coeff i =
+        (jZ (eFOf model external.input_0 (attrOf external) (external.input_6 0) (external.input_6 1) ω) * vFAt ω [6]) 0 0)).coeff i =
       emi + halfQ * m i - (b0 + b1 + L) := by
     rw [hlin]
     simp only [Negacyclic.coeff_add, Negacyclic.coeff_sub, halfQ_coeff]
@@ -340,8 +373,8 @@ theorem ehcP_bound (P : Prims) (j : Fin 2) : CoeffBound (ehcP P j) 20 := by
   · intro r c k
     simp
 
-theorem eFcP_bound (model : HashModel) (key : ByteArray) (P : Prims) (j : Fin 2) :
-    CoeffBound (eFcP model key P j) BF := by
+theorem eFcP_bound (model : HashModel) (external : GeneratedClaim.ExternalInputs) (P : Prims) (j : Fin 2) :
+    CoeffBound (eFcP model external P j) BF := by
   unfold eFcP
   split
   · next h => exact h j
@@ -351,13 +384,13 @@ theorem eFcP_bound (model : HashModel) (key : ByteArray) (P : Prims) (j : Fin 2)
 /-- The bound of the rows of extension block `p`. -/
 def rowBound : Fin 3 → Nat := ![20, 20, BF]
 
-theorem crowP_bound (model : HashModel) (key : ByteArray) (P : Prims) (p : Fin 3) (r : Fin 16)
-    (k : Fin N) : ((crowP model key P p r).coeff k).natAbs ≤ rowBound p := by
+theorem crowP_bound (model : HashModel) (external : GeneratedClaim.ExternalInputs) (P : Prims) (p : Fin 3)
+    (r : Fin 16) (k : Fin N) : ((crowP model external P p r).coeff k).natAbs ≤ rowBound p := by
   fin_cases p
   · exact jZ_bound (ehcP_bound P) r k
   · exact (coeff_natAbs_le_polyNorm _ k).trans ((polyNorm_substitution_le hN hK hKcoprime _).trans
       (polyNorm_le_of_coeff fun k ↦ jZ_bound (ehcP_bound P) r k))
-  · exact jZ_bound (eFcP_bound model key P) r k
+  · exact jZ_bound (eFcP_bound model external P) r k
 
 /-- The width of the key extension. -/
 abbrev keySigma : Rat := (4389025337902376125660995805558403571735000606365759330490212352000200390911288650386268272995948791531926191579113733444167099470786667475975131864934951407850793966346594722185551921261089014531894904905967892780706350909928212818870220803113408526907/142724769270595988105828596944949513638274662400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
@@ -445,7 +478,7 @@ external inputs, the tapes with a run whose decrypted message differs from the i
 measure at most `2^-128`. -/
 theorem certificate : GeneratedClaim.CorrectnessClaim := by
   intro model external
-  let c : SampleTape → Fin N → (Fin 3 × Fin 16 × Fin N) → ℝ := fun ω i x ↦ (coefZ model external.input_0 ω i x : ℝ)
+  let c : SampleTape → Fin N → (Fin 3 × Fin 16 × Fin N) → ℝ := fun ω i x ↦ (coefZ model external ω i x : ℝ)
   have hsub : {tape | ∃ execution, GeneratedClaim.Runs model external tape execution ∧
       ¬ (execution.«stage_8» = execution.«ideal»)} ⊆
       {ω | ∃ i, (mT : ℝ) ≤ |∑ x, c ω i x * (ω (keyOf x) : ℝ)|} := by
@@ -457,10 +490,10 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     funext i
     obtain ⟨e, he, hout⟩ := hdec i
     rw [hout, hidl]
-    have hlin : |(lin model external.input_0 ω i : ℝ)| < mT := by
+    have hlin : |(lin model external ω i : ℝ)| < mT := by
       have := hnot i
       simpa [c, lin, Int.cast_sum, Int.cast_mul] using this
-    have hlinZ : |lin model external.input_0 ω i| < (mT : Int) := by exact_mod_cast hlin
+    have hlinZ : |lin model external ω i| < (mT : Int) := by exact_mod_cast hlin
     apply threshold_decode_value hQ hQodd (hbits i)
     have hmt : (4 * (21 + 2 * biasB + mT) + 4 : Int) < Q := by exact_mod_cast margin_lt
     have he' := he
@@ -477,7 +510,7 @@ theorem certificate : GeneratedClaim.CorrectnessClaim := by
     intro ω i
     have hterm : ∀ x : Fin 3 × Fin 16 × Fin N, c ω i x ^ 2 ≤ ((rowBound x.1 : Nat) : ℝ) ^ 2 := by
       intro x
-      have hb := maskCoefficient_le (crowP_bound model external.input_0 (prims ω) x.1 x.2.1) i x.2.2
+      have hb := maskCoefficient_le (crowP_bound model external (prims ω) x.1 x.2.1) i x.2.2
       have habs : |c ω i x| ≤ ((rowBound x.1 : Nat) : ℝ) := by
         simp only [c, coefZ]
         rw [← Int.cast_abs, Int.abs_eq_natAbs]

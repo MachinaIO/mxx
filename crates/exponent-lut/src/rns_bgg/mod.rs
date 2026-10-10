@@ -123,6 +123,30 @@ pub(crate) fn companion_count(
     Ok(4 * parameters.component_columns(level)? * output_columns)
 }
 
+/// Number `D` of leading digit rows of an automorphism package's switching
+/// ciphertext `C_k` that need no companion: its top row `sigma_k(H^0_{k^-1})`
+/// is public, so the key absorbs `A_{:,a} Dec(C_k)_{a,:}` for those rows (see
+/// [`companion_columns`]). The rows are the digits of the top entry of each
+/// stacked column `[top; bottom]`.
+pub(crate) fn automorphism_public_rows(
+    parameters: &RnsBggParameters,
+    level: usize,
+) -> Result<usize, RnsBggError> {
+    parameters.component_columns(level)
+}
+
+/// Number `m D` of digit-companion encodings of one automorphism package read
+/// at `level`: one per private digit row (the bottom row of `C_k`, see
+/// [`automorphism_public_rows`]) and output column.
+pub(crate) fn automorphism_companion_count(
+    parameters: &RnsBggParameters,
+    level: usize,
+    output_columns: usize,
+) -> Result<usize, RnsBggError> {
+    Ok(companion_count(parameters, level, output_columns)? -
+        2 * automorphism_public_rows(parameters, level)? * output_columns)
+}
+
 /// Errors raised by the retained RNS-BGG contracts.
 #[derive(Debug, Error)]
 pub enum RnsBggError {
@@ -1393,6 +1417,10 @@ pub(crate) struct RnsBggArtifactBinding {
     /// Dynamic preprocessing only: the mapping of the Program's inputs and
     /// RHS to setup coordinates.
     dynamic_binding: Option<RnsBggDynamicBinding>,
+    /// Preprocessing of a Program with integer data: the commitment to the data
+    /// ([`crate::program::ProgramData::commitment`]), which online evaluation must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<[u8; 32]>,
     /// Dynamic encryption only: the prelude production holding every RHS
     /// family's ciphertexts, and its manifest.
     ciphertext_prelude:
@@ -1427,6 +1455,7 @@ impl RnsBggArtifactBinding {
             rhs_mode,
             dynamic_setup: None,
             dynamic_binding: None,
+            data: None,
             output_use: RnsOutputUse::default(),
             output_carriers: Vec::new(),
         };
@@ -1461,6 +1490,17 @@ impl RnsBggArtifactBinding {
 
     pub(crate) fn rhs_mode(&self) -> RhsMode {
         self.rhs_mode
+    }
+
+    /// Records the commitment to the preprocessed Program's integer data.
+    pub(crate) fn with_data(mut self, commitment: [u8; 32]) -> Self {
+        self.data = Some(commitment);
+        self
+    }
+
+    /// The commitment to the preprocessed Program's integer data.
+    pub(crate) fn data(&self) -> Option<&[u8; 32]> {
+        self.data.as_ref()
     }
 
     /// Records the output use and the resolved carrier of every declared
@@ -2004,6 +2044,13 @@ pub(crate) fn join_row(row: &RnsBggRow) -> Mat {
 /// `T_s` depends only on public keys. The caller adds `c_s Dec(C_s)` (see
 /// [`column_action`]).
 ///
+/// With `public_rows` (`public_top(s)` the joined top row of `C_s`, known
+/// when keys are built), the first `public_rows` digit rows, which are the
+/// digits of that row, have no companion: the loop visits only the digit
+/// rows `a >= public_rows`, and the keys add `sum_{a < public_rows} A_{s,:,a}
+/// Dec(C_s)_{a,:}` instead, which `c_s Dec(C_s)` carries as `s A_s Dec(C_s)`
+/// without a companion to cancel it.
+///
 /// An outer loop visits every `(s, a)` and decomposes column `a` of `A_s`
 /// once; its inner loop visits every `j`, holding one key and two
 /// companions (the current one and the next one, read ahead), and
@@ -2024,6 +2071,7 @@ pub(crate) fn companion_columns(
     key_entry: &dyn Fn(IntExpr, usize, IntExpr) -> Result<Mat, RnsBggError>,
     companion_key: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>>,
     companion: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggRow, RnsBggError>>,
+    public_rows: Option<(usize, &dyn Fn(IntExpr) -> Result<Mat, RnsBggError>)>,
 ) -> Result<Vec<Mat>, RnsBggError> {
     if companion_key.is_none() && companion.is_none() {
         return Err(RnsBggError::Binding("a companion loop accumulates no row"));
@@ -2032,16 +2080,51 @@ pub(crate) fn companion_columns(
     let current = parameters.level(level)?;
     let base = public_gadget_base(current.base_bits())?;
     let digits = current.modulus_digits();
-    let digit_rows = 2 * parameters.component_columns(level)?;
+    let first_row = public_rows.as_ref().map_or(0, |(rows, _)| *rows);
+    if first_row > digits {
+        return Err(RnsBggError::Binding("public digit rows exceed one entry's digits"));
+    }
+    let digit_rows = 2 * parameters.component_columns(level)? - first_row;
     let block = 2 * output_columns;
     let schema = |_| mxx_dsl::DslError::Schema;
     let sums = 2 * usize::from(companion_key.is_some()) + usize::from(companion.is_some());
-    let rows = vec![ring.zero((1, branches * block)); sums];
+    let mut rows = vec![ring.zero((1, branches * block)); sums];
+    // The public rows' keys `A_{s,:,a} Dec(top_s)_{a,:}`: per branch, the top
+    // row is decomposed once and each of its digit rows scales one key entry.
+    if let (Some((count, top)), true) = (&public_rows, companion_key.is_some()) {
+        let count = *count;
+        let public = mxx_dsl::iterate(branches, rows[..2].to_vec(), |branch, rows: Vec<Mat>| {
+            let branch = branch.expression()?;
+            let decomposition =
+                top(branch.clone()).map_err(schema)?.decompose(base, digits).centered_rebase(&ring);
+            let keys =
+                mxx_dsl::iterate(count, vec![ring.zero((1, block)); 2], |a, keys: Vec<Mat>| {
+                    let a = a.expression()?;
+                    let digit =
+                        unit_row(&ring, digits, a.clone()).mul_small_rhs(decomposition.clone());
+                    keys.into_iter()
+                        .enumerate()
+                        .map(|(r, key)| {
+                            Ok(key +
+                                key_entry(branch.clone(), r, a.clone()).map_err(schema)? *
+                                    digit.clone())
+                        })
+                        .collect()
+                })?;
+            let place = unit_row(&ring, branches, branch);
+            Ok(rows
+                .into_iter()
+                .zip(keys)
+                .map(|(row, key)| row + place.clone().tensor(key))
+                .collect())
+        })?;
+        rows.splice(..2, public);
+    }
     Ok(mxx_dsl::iterate(branches * digit_rows, rows, |pair, rows: Vec<Mat>| {
         let pair = Box::new(pair.expression()?);
         let digit_rows = Box::new(IntExpr::constant(digit_rows));
         let branch = IntExpr::FloorDiv(pair.clone(), digit_rows.clone()).canonicalize();
-        let a = IntExpr::Rem(pair, digit_rows).canonicalize();
+        let a = (IntExpr::Rem(pair, digit_rows) + IntExpr::constant(first_row)).canonicalize();
         let [u0, u1] = [0, 1].map(|r| {
             key_entry(branch.clone(), r, a.clone()).map(|entry| entry.decompose(base, digits))
         });

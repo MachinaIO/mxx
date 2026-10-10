@@ -36,28 +36,31 @@ noncomputable def g0 : ExactMatrix Q N 1 10 :=
 theorem g0_runs : gadgetMatrixRuns Backend.backend 32768 10 g0 :=
   Classical.choose_spec (gadget_exists (m := 10) (base := 32768) layoutQ rfl (by decide) (by decide))
 
-/-- The public scalar actions `V_1 = Dec(D_1 g)` and `V_K = Dec(D_K g)`. -/
-noncomputable def V1c : ExactMatrix Q N 10 10 :=
-  Classical.epsilon fun V ↦ gadgetDecomposeRuns Backend.backend 32768 10 (matrixMulScalarLeft lutScalarOne g0) V
-
-noncomputable def VKc : ExactMatrix Q N 10 10 :=
+/-- The public scalar actions `V_1 = Dec(D_1 g)` and `V_K = Dec(D_K g)` of the table `(t₀, t₁)`. -/
+noncomputable def V1c (t0 t1 : Int) : ExactMatrix Q N 10 10 :=
   Classical.epsilon fun V ↦ gadgetDecomposeRuns Backend.backend 32768 10
-    (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g0) V
+    (matrixMulScalarLeft (lutScalarOne t0 t1) g0) V
 
-theorem V1c_eq {g : ExactMatrix Q N 1 10} {V : ExactMatrix Q N 10 10} (hg : gadgetMatrixRuns Backend.backend 32768 10 g)
-    (hV : gadgetDecomposeRuns Backend.backend 32768 10 (matrixMulScalarLeft lutScalarOne g) V) :
-    V = V1c := by
+noncomputable def VKc (t0 t1 : Int) : ExactMatrix Q N 10 10 :=
+  Classical.epsilon fun V ↦ gadgetDecomposeRuns Backend.backend 32768 10
+    (matrixMulScalarLeft (lutScalar t0 t1 (substituteMatrix K hK)) g0) V
+
+theorem V1c_eq {t0 t1 : Int} {g : ExactMatrix Q N 1 10} {V : ExactMatrix Q N 10 10}
+    (hg : gadgetMatrixRuns Backend.backend 32768 10 g)
+    (hV : gadgetDecomposeRuns Backend.backend 32768 10 (matrixMulScalarLeft (lutScalarOne t0 t1) g) V) :
+    V = V1c t0 t1 := by
   rw [gadgetMatrixRuns_unique hg g0_runs] at hV
   exact gadgetDecomposeRuns_unique hV (Classical.epsilon_spec (p := fun V ↦
-    gadgetDecomposeRuns Backend.backend 32768 10 (matrixMulScalarLeft lutScalarOne g0) V) ⟨V, hV⟩)
+    gadgetDecomposeRuns Backend.backend 32768 10 (matrixMulScalarLeft (lutScalarOne t0 t1) g0) V) ⟨V, hV⟩)
 
-theorem VKc_eq {g : ExactMatrix Q N 1 10} {V : ExactMatrix Q N 10 10} (hg : gadgetMatrixRuns Backend.backend 32768 10 g)
+theorem VKc_eq {t0 t1 : Int} {g : ExactMatrix Q N 1 10} {V : ExactMatrix Q N 10 10}
+    (hg : gadgetMatrixRuns Backend.backend 32768 10 g)
     (hV : gadgetDecomposeRuns Backend.backend 32768 10
-      (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g) V) : V = VKc := by
+      (matrixMulScalarLeft (lutScalar t0 t1 (substituteMatrix K hK)) g) V) : V = VKc t0 t1 := by
   rw [gadgetMatrixRuns_unique hg g0_runs] at hV
   exact gadgetDecomposeRuns_unique hV (Classical.epsilon_spec (p := fun V ↦
     gadgetDecomposeRuns Backend.backend 32768 10
-      (matrixMulScalarLeft (lutScalar (substituteMatrix K hK)) g0) V) ⟨V, hV⟩)
+      (matrixMulScalarLeft (lutScalar t0 t1 (substituteMatrix K hK)) g0) V) ⟨V, hV⟩)
 
 /-- The tape samples that precede key generation. -/
 structure Prims where
@@ -101,7 +104,8 @@ noncomputable def prims (ω : SampleTape) : Prims where
 
 section Model
 
-variable (model : HashModel) (key : ByteArray)
+/- The run's attribute `x₀ = xa` and the table `(t₀, t₁)` of the key's program. -/
+variable (model : HashModel) (key : ByteArray) (xa : Fin 2) (t0 t1 : Int)
 
 /-- The companion keys `M` of the product. -/
 noncomputable def MM : Fin 2 → Fin 2 → ExactMatrix Q N 1 10 :=
@@ -113,7 +117,7 @@ noncomputable def TM : Fin 2 → ExactMatrix Q N 1 20 :=
 
 /-- The output key `A_F`. -/
 noncomputable def AFM : Fin 2 → Fin 2 → ExactMatrix Q N 1 10 :=
-  outputKey model key (MM model key) (TM model key 0) (TM model key 1) V1c VKc
+  outputKey model key (MM model key) (TM model key 0) (TM model key 1) (V1c t0 t1) (VKc t0 t1)
 
 variable (P : Prims)
 
@@ -123,13 +127,15 @@ noncomputable def bP : ExactMatrix Q N 1 12 :=
 
 noncomputable def ZP : ExactMatrix Q N 12 20 := reduceMatrix Q N 12 20 (P.Z)
 
-/-- The attribute ciphertext `C = P Z + G` (attribute `0`). -/
+/-- The attribute ciphertext `C = P Z + X^{x₀} G`. -/
 noncomputable def CtopP : Fin 2 → ExactMatrix Q N 1 10 :=
-  ![rowWindow 10 0 (by omega) (P.B * ZP P) + g0, rowWindow 10 10 (by omega) (P.B * ZP P)]
+  ![rowWindow 10 0 (by omega) (P.B * ZP P) + reducePoly Q N (Xe xa) • g0,
+    rowWindow 10 10 (by omega) (P.B * ZP P)]
 
 noncomputable def CbotP : Fin 2 → ExactMatrix Q N 1 10 :=
   ![rowWindow 10 0 (by omega) ((anchorSecond model key - bP model key P) * ZP P),
-    rowWindow 10 10 (by omega) ((anchorSecond model key - bP model key P) * ZP P) + g0]
+    rowWindow 10 10 (by omega) ((anchorSecond model key - bP model key P) * ZP P) +
+      reducePoly Q N (Xe xa) • g0]
 
 /-- The encoding of the initial state. -/
 noncomputable def c0P : Fin 2 → ExactMatrix Q N 1 10 :=
@@ -146,7 +152,7 @@ noncomputable def hrowP : Fin 2 → ExactMatrix Q N 1 10 :=
 /-- The digit companions of the attribute ciphertext: digit `a` of column `jj`. -/
 noncomputable def zP (jj a : Fin 20) : Fin 2 → ExactMatrix Q N 1 10 :=
   encRow (P.sec) (fun k r ↦ rhsKey model key jj a (2 * k + r))
-    (fun r ↦ (colDigits (joinRow (CtopP P)) (joinRow (CbotP model key P)) jj a 0 *
+    (fun r ↦ (colDigits (joinRow (CtopP xa P)) (joinRow (CbotP model key xa P)) jj a 0 *
       reducePoly Q N (unitPair (P.sec) r)) • g0)
     (P.ez jj a)
 
@@ -164,12 +170,12 @@ def laneRow (i : Fin 400) : Fin 20 := ⟨i / 20, by omega⟩
 /-- The online output `c_F`. -/
 noncomputable def cFP : Fin 2 → ExactMatrix Q N 1 10 :=
   let cIn := c0P model key P
-  let Ctop := CtopP P
-  let Cbot := CbotP model key P
+  let Ctop := CtopP xa P
+  let Cbot := CbotP model key xa P
   let A := inputKey model key
   let Mmul := MM model key
-  let z0 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zP model key P (laneCol i) (laneRow i) 0
-  let z1 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zP model key P (laneCol i) (laneRow i) 1
+  let z0 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zP model key xa P (laneCol i) (laneRow i) 0
+  let z1 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zP model key xa P (laneCol i) (laneRow i) 1
   let za0 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zaP model key P (laneCol i) (laneRow i) 0
   let za1 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zaP model key P (laneCol i) (laneRow i) 1
   let Emul : ExactMatrix Q N 1 20 := fun _ jj ↦ ∑ a, mulCompanionSum A z0 z1 jj a
@@ -181,13 +187,13 @@ noncomputable def cFP : Fin 2 → ExactMatrix Q N 1 10 :=
   let bot : Fin 2 → ExactMatrix Q N 1 10 := fun j ↦
     substituteMatrix K hK (helperKey model key 1 j) - substituteMatrix K hK (hrow j)
   let σc : Fin 2 → ExactMatrix Q N 1 10 := fun j ↦ substituteMatrix K hK (mulRow j)
-  fun j ↦ mulRow j * V1c + (pairMul hrow (actionDigits (TM model key 0) (TM model key 1) j) +
-    (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Elut j)) * VKc
+  fun j ↦ mulRow j * V1c t0 t1 + (pairMul hrow (actionDigits (TM model key 0) (TM model key 1) j) +
+    (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Elut j)) * VKc t0 t1
 
 /-- The error `e_F` of the online output. -/
 noncomputable def eFP : Fin 2 → ErrorMatrix N 1 10 :=
-  fun j ↦ liftMatrix (cFP model key P j -
-    (reducePoly Q N (P.sec) • AFM model key 0 j + AFM model key 1 j))
+  fun j ↦ liftMatrix (cFP model key xa t0 t1 P j -
+    (reducePoly Q N (P.sec) • AFM model key t0 t1 0 j + AFM model key t0 t1 1 j))
 
 end Model
 
@@ -195,18 +201,18 @@ end Model
 
 section Tape
 
-variable (model : HashModel) (key : ByteArray) (ω : SampleTape)
+variable (model : HashModel) (key : ByteArray) (xa : Fin 2) (t0 t1 : Int) (ω : SampleTape)
 
 noncomputable def bOf := bP model key (prims ω)
 noncomputable def ZOf := ZP (prims ω)
-noncomputable def CtopOf := CtopP (prims ω)
-noncomputable def CbotOf := CbotP model key (prims ω)
+noncomputable def CtopOf := CtopP xa (prims ω)
+noncomputable def CbotOf := CbotP model key xa (prims ω)
 noncomputable def c0Of := c0P model key (prims ω)
 noncomputable def hrowOf := hrowP model key (prims ω)
-noncomputable def zOf := zP model key (prims ω)
+noncomputable def zOf := zP model key xa (prims ω)
 noncomputable def zaOf := zaP model key (prims ω)
-noncomputable def cFOf := cFP model key (prims ω)
-noncomputable def eFOf := eFP model key (prims ω)
+noncomputable def cFOf := cFP model key xa t0 t1 (prims ω)
+noncomputable def eFOf := eFP model key xa t0 t1 (prims ω)
 
 end Tape
 
@@ -218,20 +224,21 @@ open Mxx.Primitives MxxRuntime MxxExponentLut
 
 section Unfold
 
-variable (model : HashModel) (key : ByteArray) (ω : SampleTape)
+variable (model : HashModel) (key : ByteArray) (xa : Fin 2) (t0 t1 : Int) (ω : SampleTape)
 
 theorem bOf_eq : bOf model key ω =
     reducePoly Q N (secOf ω) • BOf ω + anchorSecond model key + reduceMatrix Q N 1 12 (ebAt ω [3]) := by
   simp only [bOf, bP, prims]
 
-theorem CtopOf_eq : CtopOf ω = ![rowWindow 10 0 (by omega) (BOf ω * reduceMatrix Q N 12 20 (zAt ω [3])) + g0,
+theorem CtopOf_eq : CtopOf xa ω = ![rowWindow 10 0 (by omega) (BOf ω * reduceMatrix Q N 12 20 (zAt ω [3])) +
+      reducePoly Q N (Xe xa) • g0,
     rowWindow 10 10 (by omega) (BOf ω * reduceMatrix Q N 12 20 (zAt ω [3]))] := by
   simp only [CtopOf, CtopP, ZP, prims]
 
-theorem CbotOf_eq : CbotOf model key ω =
+theorem CbotOf_eq : CbotOf model key xa ω =
     ![rowWindow 10 0 (by omega) ((anchorSecond model key - bOf model key ω) * reduceMatrix Q N 12 20 (zAt ω [3])),
       rowWindow 10 10 (by omega) ((anchorSecond model key - bOf model key ω) *
-        reduceMatrix Q N 12 20 (zAt ω [3])) + g0] := by
+        reduceMatrix Q N 12 20 (zAt ω [3])) + reducePoly Q N (Xe xa) • g0] := by
   simp only [CbotOf, CbotP, ZP, bOf, prims]
 
 theorem c0Of_eq : c0Of model key ω = encRow (secOf ω) (inputKey model key)
@@ -244,9 +251,9 @@ theorem hrowOf_eq : hrowOf model key ω = encRow (secOf ω) (helperKey model key
       unitPair (substitution K hK (secOf ω)) j) • g0) (ehOf ω) := by
   simp only [hrowOf, hrowP, prims]
 
-theorem zOf_eq (jj a : Fin 20) : zOf model key ω jj a =
+theorem zOf_eq (jj a : Fin 20) : zOf model key xa ω jj a =
     encRow (secOf ω) (fun k r ↦ rhsKey model key jj a (2 * k + r))
-      (fun r ↦ (colDigits (joinRow (CtopOf ω)) (joinRow (CbotOf model key ω)) jj a 0 *
+      (fun r ↦ (colDigits (joinRow (CtopOf xa ω)) (joinRow (CbotOf model key xa ω)) jj a 0 *
         reducePoly Q N (unitPair (secOf ω) r)) • g0)
       ![errAt ω [4, 43, (jj : Nat) + 20 * (a : Nat), 26] encLaw,
         errAt ω [4, 43, (jj : Nat) + 20 * (a : Nat), 35] encLaw] := by
@@ -260,14 +267,14 @@ theorem zaOf_eq (jj a : Fin 20) : zaOf model key ω jj a =
         errAt ω [4, 8, (jj : Nat) + 20 * (a : Nat), 41] encLaw] := by
   simp only [zaOf, zaP, hrowOf, prims, ezaOf]
 
-theorem cFOf_eq : cFOf model key ω =
+theorem cFOf_eq : cFOf model key xa t0 t1 ω =
     let cIn := c0Of model key ω
-    let Ctop := CtopOf ω
-    let Cbot := CbotOf model key ω
+    let Ctop := CtopOf xa ω
+    let Cbot := CbotOf model key xa ω
     let A := inputKey model key
     let Mmul := MM model key
-    let z0 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zOf model key ω (laneCol i) (laneRow i) 0
-    let z1 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zOf model key ω (laneCol i) (laneRow i) 1
+    let z0 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zOf model key xa ω (laneCol i) (laneRow i) 0
+    let z1 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zOf model key xa ω (laneCol i) (laneRow i) 1
     let za0 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zaOf model key ω (laneCol i) (laneRow i) 0
     let za1 : Fin 400 → ExactMatrix Q N 1 10 := fun i ↦ zaOf model key ω (laneCol i) (laneRow i) 1
     let Emul : ExactMatrix Q N 1 20 := fun _ jj ↦ ∑ a, mulCompanionSum A z0 z1 jj a
@@ -279,12 +286,12 @@ theorem cFOf_eq : cFOf model key ω =
     let bot : Fin 2 → ExactMatrix Q N 1 10 := fun j ↦
       substituteMatrix K hK (helperKey model key 1 j) - substituteMatrix K hK (hrow j)
     let σc : Fin 2 → ExactMatrix Q N 1 10 := fun j ↦ substituteMatrix K hK (mulRow j)
-    fun j ↦ mulRow j * V1c + (pairMul hrow (actionDigits (TM model key 0) (TM model key 1) j) +
-      (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Elut j)) * VKc := by
+    fun j ↦ mulRow j * V1c t0 t1 + (pairMul hrow (actionDigits (TM model key 0) (TM model key 1) j) +
+      (pairMul σc (actionDigits (joinRow top) (joinRow bot) j) + halves Elut j)) * VKc t0 t1 := by
   simp only [cFOf, cFP, c0Of, CtopOf, CbotOf, zOf, zaOf, hrowOf]
 
-theorem eFOf_eq (j : Fin 2) : eFOf model key ω j = liftMatrix (cFOf model key ω j -
-    (reducePoly Q N (secOf ω) • AFM model key 0 j + AFM model key 1 j)) := by
+theorem eFOf_eq (j : Fin 2) : eFOf model key xa t0 t1 ω j = liftMatrix (cFOf model key xa t0 t1 ω j -
+    (reducePoly Q N (secOf ω) • AFM model key t0 t1 0 j + AFM model key t0 t1 1 j)) := by
   simp only [eFOf, eFP, cFOf, prims]
 
 end Unfold

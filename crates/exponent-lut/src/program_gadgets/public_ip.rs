@@ -323,6 +323,14 @@ mod tests {
         fn rhs_at(&mut self, _: &(), _: &IntExpr) -> Result<(), ProgramLowerError<DepthError>> {
             Err(ProgramLowerError::Backend(DepthError))
         }
+        fn rhs_selected(
+            &mut self,
+            _: &(),
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<(), ProgramLowerError<DepthError>> {
+            Err(ProgramLowerError::Backend(DepthError))
+        }
         fn parallel(
             &mut self,
             evaluator: &mut Depth,

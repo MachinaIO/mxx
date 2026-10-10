@@ -117,7 +117,7 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     {m : Fin N → Int} {outputs : PreludeOutputs}
     (h : Stage_prelude.generatedRoot Backend.backend model tape path GeneratedClaim.stage_3_params
       (B, key, secret, x, m, ()) outputs)
-    (hx : x 0 = 0) {sm : ErrorPoly N} (hsecret : secret = fun _ _ ↦ reducePoly Q N sm)
+    {xa : Fin 2} (hx : x 0 = (xa : Nat)) {sm : ErrorPoly N} (hsecret : secret = fun _ _ ↦ reducePoly Q N sm)
     {g : ExactMatrix Q N 1 12} (hg : gadgetMatrixRuns Backend.backend 32768 12 g) :
     let Z := reduceMatrix Q N 14 24 (zAt tape path)
     let b := outputs.2.2.2.2.1
@@ -125,10 +125,11 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     outputs.2.2.2.2.2.1 = reducePoly Q N sm • messageRow model key 0 + messageRow model key 1 +
       reduceMatrix Q N 1 1 (emAt tape path) +
       ((halfQ : ExactPoly Q N) • (fun _ _ ↦ polynomialOfCoefficients m) : ExactMatrix Q N 1 1) ∧
-    outputs.1 0 = rowWindow 12 0 (by omega) (B * Z) + g ∧
+    outputs.1 0 = rowWindow 12 0 (by omega) (B * Z) + reducePoly Q N (Xe xa) • g ∧
     outputs.2.1 0 = rowWindow 12 12 (by omega) (B * Z) ∧
     outputs.2.2.1 0 = rowWindow 12 0 (by omega) ((anchorSecond model key - b) * Z) ∧
-    outputs.2.2.2.1 0 = rowWindow 12 12 (by omega) ((anchorSecond model key - b) * Z) + g ∧
+    outputs.2.2.2.1 0 = rowWindow 12 12 (by omega) ((anchorSecond model key - b) * Z) +
+      reducePoly Q N (Xe xa) • g ∧
     CoeffBound (ebAt tape path) 20 ∧ CoeffBound (zAt tape path) 20 ∧ CoeffBound (emAt tape path) 20 := by
   intro Z b
   obtain ⟨w, h2, h6, h10, -, h11, h12, h14, h16, h20, hout⟩ := h
@@ -146,10 +147,14 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
   subst hout
   have hb : b = reducePoly Q N sm • B + anchorSecond model key + reduceMatrix Q N 1 14 (ebAt tape path) := by
     simp only [b, matrixAdd, matrixMulScalarLeft_eq, hsecret, hw2, he6, ebAt]
-  have hmono : (multiplyMonomial (1 : ExactMatrix Q N 1 1) (x 0) : ExactMatrix Q N 1 1) = 1 := by
+  have hmono : (multiplyMonomial (1 : ExactMatrix Q N 1 1) (x 0) : ExactMatrix Q N 1 1) =
+      fun _ _ ↦ reducePoly Q N (Xe xa) := by
     funext a c
     fin_cases a; fin_cases c
-    simp [multiplyMonomial, hx]
+    have := xa.isLt
+    simp only [multiplyMonomial, hx]
+    rw [Int.emod_eq_of_lt (by omega) (by norm_num; omega)]
+    simp [reducePoly_Xe]
   have hb6' : CoeffBound (ebAt tape path) 20 := by
     intro r c k
     have := hb6 r c k
@@ -172,7 +177,8 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     show w.w_11_0 0 = _
     rw [ho0, hw0, htop]
     funext r c
-    simp [matrixAdd, hmono, hg10, Z, rowWindow]
+    rw [Subsingleton.elim r 0]
+    simp [matrixAdd, hmono, hg10, Z, rowWindow, Matrix.mul_apply]
   · simp only [Prod.mk.injEq] at vout
     obtain ⟨-, ho1, -⟩ := vout
     have hw1 := sliceMatrix_window 12 x1 (by simp) (by omega)
@@ -189,7 +195,8 @@ theorem prelude_explicit {model : HashModel} {tape : SampleTape} {path : List Na
     show w.w_11_3 0 = _
     rw [ho3, hw3, hbottom]
     funext r c
-    simp [matrixAdd, hmono, hg10, Z, rowWindow]
+    rw [Subsingleton.elim r 0]
+    simp [matrixAdd, hmono, hg10, Z, rowWindow, Matrix.mul_apply]
 
 /-- The error of the attribute ciphertext's opening: `-(e_b Z)`, by component. -/
 noncomputable def rhsErr (tape : SampleTape) (path : List Nat) (j : Fin 2) : ErrorMatrix N 1 12 :=
@@ -203,19 +210,20 @@ theorem rhsErr_bound {tape : SampleTape} {path : List Nat} (heb : CoeffBound (eb
   have := hb r ⟨12 * (j : Nat) + c, by omega⟩ k
   simpa [rhsErr] using this
 
-/-- The attribute ciphertext opens under `(s, 1)` to `(s, 1) G` up to `-(e_b Z)`, for `x₀ = 0`. -/
+/-- The attribute ciphertext opens under `(s, 1)` to `X^{x₀} (s, 1) G` up to `-(e_b Z)`. -/
 theorem prelude_rhs {model : HashModel} {key : ByteArray} {tape : SampleTape} {path : List Nat}
-    {B : ExactMatrix Q N 1 14} {sm : ErrorPoly N} {g : ExactMatrix Q N 1 12}
+    {B : ExactMatrix Q N 1 14} {sm : ErrorPoly N} {μ : ErrorPoly N} {g : ExactMatrix Q N 1 12}
     {b : ExactMatrix Q N 1 14} {C00 C01 C10 C11 : ExactMatrix Q N 1 12}
     (hb : b = reducePoly Q N sm • B + anchorSecond model key + reduceMatrix Q N 1 14 (ebAt tape path))
-    (h00 : C00 = rowWindow 12 0 (by omega) (B * reduceMatrix Q N 14 24 (zAt tape path)) + g)
+    (h00 : C00 = rowWindow 12 0 (by omega) (B * reduceMatrix Q N 14 24 (zAt tape path)) +
+      reducePoly Q N μ • g)
     (h01 : C01 = rowWindow 12 12 (by omega) (B * reduceMatrix Q N 14 24 (zAt tape path)))
     (h10 : C10 = rowWindow 12 0 (by omega)
       ((anchorSecond model key - b) * reduceMatrix Q N 14 24 (zAt tape path)))
     (h11 : C11 = rowWindow 12 12 (by omega)
-      ((anchorSecond model key - b) * reduceMatrix Q N 14 24 (zAt tape path)) + g) :
+      ((anchorSecond model key - b) * reduceMatrix Q N 14 24 (zAt tape path)) + reducePoly Q N μ • g) :
     ∀ j, reducePoly Q N sm • ![C00, C01] j + ![C10, C11] j =
-      reducePoly Q N (unitPair sm j) • g + reduceMatrix Q N 1 12 (rhsErr tape path j) := by
+      reducePoly Q N (μ * unitPair sm j) • g + reduceMatrix Q N 1 12 (rhsErr tape path j) := by
   have hP : (anchorSecond model key - b) * reduceMatrix Q N 14 24 (zAt tape path) =
       -(reducePoly Q N sm • (B * reduceMatrix Q N 14 24 (zAt tape path))) -
         reduceMatrix Q N 1 24 (ebAt tape path * zAt tape path) := by

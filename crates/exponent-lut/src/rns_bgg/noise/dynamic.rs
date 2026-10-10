@@ -310,7 +310,7 @@ impl RnsBggNoiseEvaluator<'_> {
         let energy = self.parameters.dynamic_scalar_action_energy(level)?;
         let coherent = switched.pow(2u32) * &energy;
         let companion_variance = encoding_variance_from_sigma(distributions.companion.sigma())
-            .scaled(&(self.parameters.dynamic_companion_energy(level)? * &coherent));
+            .scaled(&(self.parameters.dynamic_automorphism_companion_energy(level)? * &coherent));
         let decomposition_energy = BigUint::from(2 * self.parameters.component_columns(level)?) *
             self.parameters.level(level)?.ring_dimension() *
             ((BigUint::one() << self.parameters.level(level)?.base_bits()) / 2u8).pow(2u32);

@@ -12,12 +12,12 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 
 | Item | What it provides |
 | --- | --- |
-| `branching_program` | `PeClass` (attribute length, alphabet, state width, maximal length) and `BranchingProgram`, checked against its class, evaluated in the clear, and compiled into an Exponent-LUT Program bound to the setup coordinates. |
-| `params` | `PeParameters`: the class, the equal-basis chain of `2 T_max + 2` levels, the trapdoor instantiation, the error, flooding, and programming contracts, and the key width and cutoff; `PeParameters::select` picks the CRT depth from the conditions of the instantiation and the simulated noise. |
+| `branching_program` | `PeClass` (attribute length, alphabet, state width, maximal length) and `BranchingProgram`, checked against its class and evaluated in the clear. `PeClass::compile` gives the class's Exponent-LUT Program, bound to the setup coordinates, and `BranchingProgram::data` its runtime data: the attribute index and the table of every step. |
+| `params` | `PeParameters`: the class, the equal-basis chain of `2 T_max + 2` levels, the trapdoor instantiation, the error and flooding contracts, and the key width and cutoff; `PeParameters::select` picks the CRT depth from the conditions of the instantiation and the simulated noise. |
 | `budget` | The statistical instantiation's conditions: the split of the statistical-distance target `ε_total` (default `2^-30`), the regularity (leftover hash lemma) column counts `m̄` and `m_B`, the truncation and flooding multipliers, the flooding width, and the SampleRight key width of the `Strict` policy. |
 | `setup` | `setup`: the anchor `B` from TrapGen (computational `[ā \| I \| G - (ā R + E)]` or statistical `[ā \| g - ā T]`), the class's Dynamic setup, and the public message row. `PePublicKey` and `PeMasterSecretKey` keep public and secret material apart. |
-| `encryption` | `encrypt(mpk, x, m)`: the anchor encoding, the attribute gadget ciphertexts `C_t = P Z_t + X^(Bz x_t) G` (with `Z_t` sampled one column at a time), the message component, and the Dynamic packages, under one fresh secret and session. |
-| `keygen` | `keygen(msk, F)`: the predicate's public evaluation, including its output key `A_F`, and a short `k` with `M_F k = d_1 delta_1` for the implicit family matrix `M_F`. |
+| `encryption` | `encrypt(mpk, x, m)`: the anchor encoding, the attribute gadget ciphertexts `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz x_t) G` (with a fresh uniform `a_t` and `e_t` from `chi_fl`), the message component, and the Dynamic packages, under one fresh secret and session. |
+| `keygen` | `keygen(msk, F)`: the predicate's public evaluation on its program data, including its output key `A_F`, and a short `k` with `M_F k = d_1 delta_1` for the implicit family matrix `M_F`. |
 | `decryption` | `decrypt(sk_F, ct)`: the predicate evaluated on the ciphertext's packages and the family row contracted with the key, rounded to the message bits. |
 | `noise` | `simulate`: the evaluation bound `E_F` from the exponent-lut simulator, the decryption bound `E_PE`, and the condition `4 E_PE + 2 < q`; `witness_bound`: the bound `B_R̂` of the proof's ledger witness, from the same simulator with witness contracts. |
 
@@ -31,14 +31,24 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 - **One ciphertext for every predicate.** Packages are bound to setup coordinates, not to a
   Program, level, or table, so a ciphertext's size depends on the attribute length and the class's
   lookup width but not on the program length or the predicate.
+- **One graph for every program of a class.** The class compiles into one Program of `T_max` steps
+  whose reads and tables are runtime data families; a shorter program is padded with leading
+  identity steps. The Dynamic product selects the attribute package by the step's read, and the
+  LUT scalars are computed from the step's table, so key generation and decryption run the same
+  graph for every program, and the key's commitment binds its data.
 - **Radix-`B` lookups.** `PeParameterRequest::lut_radix` decomposes the cyclic lookup group of
   `W = B^r` automorphisms in radix `B` (a power of two; `W <= n / 2` for `B < W`): a ciphertext
   then carries switching packages for the `(B - 1) log_B W` automorphisms `K_B = {g^(a B^j)}`
   instead of `W - 1`, and a key carries `W |J_B|` helper blocks for `J_B = K_B u K_B^-1`. A lookup
   branch is switched once per nonzero radix-`B` digit of its exponent, at most `log_B W` times,
   and the noise, the ledger witness `B_R̂`, and the `Strict` width `s_SR` (one decomposition gain
-  per step of a helper path) follow those switches. `B = W` (the default) is the direct
-  switching; `B < W` is outside the exported Lean correctness claim.
+  per step of a helper path) follow those switches. `B = W` (`lut_radix: None`) is the direct
+  switching. Each switch multiplies the noise by a decomposition gain, so a small `B` trades
+  packages for noise (at `W = 4096`, `T = 4`: `log2 E_F` 557 direct, 705 at `B = 64`, 853 at
+  `B = 16`, 2147 at `B = 2`). `PeClass::default_lut_radix` takes 3 or 2 switches per branch when
+  they divide `log2 W` (`W = 4096`: `B = 16`; `W = 2`: direct), and the integration and noise
+  tests use it unless `LUT_RADIX` is set (0 selects the direct switching). `B < W` is outside the
+  exported Lean correctness claim.
 - **Compact fresh encodings.** `PeParameterRequest::compact_encodings` publishes the digit
   companions, automorphism helpers, and the private input `c_0` as two-column rows
   `s (Ã - p X I_2) + e mod pq`, and decryption expands them to the full gadget width at `q`
@@ -60,7 +70,7 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 | TrapGen | `[ā \| g - ā T]`, `m_B = m̄ + D` columns | `[ā \| I \| G - (ā R + E)]`, `m_B = D + 2` |
 | `m_B` | the regularity conditions of `budget` | `D + 2` |
 | `chi_fl` | `σ_fl = 2^s_flood B_coef / √(2π)`, from the flooding condition; the requested sigma when `enforce_flooding` is off (outside the reduction) | the requested sigma |
-| Cutoffs of `chi`, `chi_fl`, `Z_t` | `c` standard deviations from the budget | `6.5` standard deviations |
+| Cutoffs of `chi`, `chi_fl` | `c` standard deviations from the budget | `6.5` standard deviations |
 | Checked conditions | regularity, flooding (unless `enforce_flooding` is off), budget, key width, numeric range (`PeError::Parameters` otherwise) | none |
 | Ring-LWE estimates | encryption | encryption and TrapGen |
 | Key width | `Strict`: `max(s_min, s_SR)`; `Practical`: `s_min` | the trapdoor's minimum preimage width |
@@ -132,7 +142,8 @@ cargo test -r -p mxx-pe --lib --features gpu -- --ignored gpu::
 and CRT depths for parameters that the instantiation accepts (by default the statistical one with
 `Practical` keys), whose simulated noise guarantees correctness, and whose Ring-LWE instances
 reach the security target (128 bits by default) according to `lattice-estimator-cli`. It then runs
-setup, encryption, and authorized and unauthorized key generation and decryption on the GPU. By
+on the GPU setup, the encryption of a random attribute, and key generation and decryption for two
+random programs of the class adjusted to output `0` (authorized) and `1` on it. By
 default its matrix artifacts stay in GPU memory (`MXX_PE_ROUND_TRIP_STORAGE=device`); the
 ciphertext's digit companions grow as `m² D n` polynomial coefficients, so large parameters, such
 as the statistical instantiation at `n = 2^14`, need `host` or `file` storage on a 16 GiB GPU. Its
@@ -150,7 +161,9 @@ do not model.
 ## Lean proofs
 
 [`lean/`](lean/README.md) proves, in Lean, the correctness claim that the integration test exports
-for a recorded parameter set of `lean/parameters.csv`. For the average-case rows
+(`MXX_PE_ROUND_TRIP_LEAN_EXPORT`) for a parameter set of `lean/parameters.csv`. The claim takes the
+attribute and the branching program as inputs, so it covers every attribute and every program of
+the class with `F(x) = 0`. For the average-case rows
 `average-w2-n8192-crt5x30`, `average-w2-n8192-crt4x42`, and the compact row
 `average-w2-n32768-crt6x30-compact`, the tapes on which a run meeting the
 input contract and the requirement decrypts a wrong message have measure at most `2^-128`.

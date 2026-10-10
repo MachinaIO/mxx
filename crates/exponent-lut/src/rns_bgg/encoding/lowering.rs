@@ -39,6 +39,27 @@ pub struct OnlineEvalRhsFamily {
 /// preprocessing both use it.
 pub struct OnlineEvalFamilies<'a> {
     pub(crate) parameters: &'a RnsBggParameters,
+    /// The Program's integer data inputs ([`crate::program::data_inputs`]).
+    pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
+}
+
+impl<'a> OnlineEvalFamilies<'a> {
+    pub(crate) fn new(parameters: &'a RnsBggParameters) -> Self {
+        Self { parameters, data: BTreeMap::new() }
+    }
+
+    /// The member index entry `position` of data family `data` selects.
+    pub(crate) fn selected_member(
+        &self,
+        data: crate::program::DataId,
+        position: &IntExpr,
+    ) -> Result<Int, RnsBggError> {
+        Ok(self
+            .data
+            .get(&data)
+            .ok_or(RnsBggError::Binding("Program data is not bound"))?
+            .at(Int::evaluate(position.clone())))
+    }
 }
 
 impl OnlineEvalFamilies<'_> {
@@ -98,6 +119,24 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
         };
         Ok((
             (top, family.bottoms.at(member.clone())),
+            RhsRef { id: family.rhs, index: Some(member) },
+        ))
+    }
+
+    /// A Dynamic RHS family stores both halves of every member, which a runtime index reads.
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        data: crate::program::DataId,
+        position: &IntExpr,
+    ) -> Result<(RnsBggMatrix, RhsRef<Int>), crate::program::ProgramLowerError<RnsBggError>> {
+        use crate::program::ProgramLowerError;
+        let member = self.selected_member(data, position).map_err(ProgramLowerError::Backend)?;
+        let tops = family.tops.as_ref().ok_or(ProgramLowerError::Backend(RnsBggError::Binding(
+            "an RHS member selected at run time needs the Dynamic RHS mode",
+        )))?;
+        Ok((
+            (tops.at(member.clone()), family.bottoms.at(member.clone())),
             RhsRef { id: family.rhs, index: Some(member) },
         ))
     }
@@ -298,14 +337,16 @@ impl EncodingLowering<'_> {
     /// Compute the native Walsh/automorphism branch polynomial for one unary
     /// LUT branch.  The coefficient depends on the complete table, not only
     /// its width; public-key preparation uses this same helper.
-    pub(crate) fn lut_coefficient(
+    pub(crate) fn lut_coefficient<'v>(
         parameters: &RnsBggParameters,
         level: usize,
         input_layout: ExpLayout,
         representation: crate::program::LutOutputRepresentation,
         sigma: impl Into<IntExpr>,
-        values: &[usize],
+        values: impl Into<crate::rns_bgg::dynamic::LutEntries<'v>>,
     ) -> Result<Mat, RnsBggError> {
+        use crate::rns_bgg::dynamic::LutEntries;
+        let values = values.into();
         let width = values.len();
         if width == 0 || !width.is_power_of_two() {
             return Err(RnsBggError::Lut);
@@ -322,19 +363,37 @@ impl EncodingLowering<'_> {
             mxx_backends::utils::mod_inverse_biguints(&(BigUint::from(width) % &modulus), &modulus)
                 .ok_or(RnsBggError::Lut)?;
         let sigma = sigma.into();
-        let mut terms = values
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, output)| {
-                let left = match representation {
-                    crate::program::LutOutputRepresentation::Coefficient => {
-                        ring.polynomial([IntExpr::constant(BigInt::from(output))])
-                    }
-                    crate::program::LutOutputRepresentation::Exponent(layout) => {
-                        layout.mono(&ring, &BigInt::from(output)).map_err(|_| RnsBggError::Lut)?
-                    }
-                };
+        // The output monomial of entry `index`: the constant `v` or `X^(v stride)`.
+        let output_term = |index: usize| -> Result<Mat, RnsBggError> {
+            Ok(match (&values, representation) {
+                (
+                    LutEntries::Constant(values),
+                    crate::program::LutOutputRepresentation::Coefficient,
+                ) => ring.polynomial([IntExpr::constant(BigInt::from(values[index]))]),
+                (
+                    LutEntries::Constant(values),
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                ) => layout
+                    .mono(&ring, &BigInt::from(values[index]))
+                    .map_err(|_| RnsBggError::Lut)?,
+                (
+                    LutEntries::Graph(values),
+                    crate::program::LutOutputRepresentation::Coefficient,
+                ) => values[index].clone().lift_to_constant_polynomial(ring.matrix_type((1, 1))),
+                (
+                    LutEntries::Graph(values),
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                ) => {
+                    // `multiply_monomial` reduces the exponent modulo `2n` as `mono` does.
+                    ring.identity(1).multiply_monomial(
+                        values[index].clone().mul(Int::constant(layout.stride() as i64)),
+                    )
+                }
+            })
+        };
+        let mut terms = (0..width)
+            .map(|index| {
+                let left = output_term(index)?;
                 let right = input_layout
                     .mono(&ring, &-BigInt::from(index))
                     .map_err(|_| RnsBggError::Lut)?
@@ -1254,7 +1313,7 @@ mod test {
             value.node().kind(),
             mxx_ir_core::node::NodeKind::Input { artifact: Some(_), .. }
         )));
-        let mut families = OnlineEvalFamilies { parameters: &parameters };
+        let mut families = OnlineEvalFamilies::new(&parameters);
         let mut member_at = |index: IntExpr| {
             <OnlineEvalFamilies<'_> as crate::program::FamilyExecution<EncodingLowering<'_>>>::rhs_at(
                 &mut families,

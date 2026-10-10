@@ -78,11 +78,13 @@ fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParam
 
 /// The measured noise of one authorized decryption against the simulated bounds, at parameters
 /// read from `MXX_PE_NOISE_*` (statistical, average case, compact encodings unless `COMPACT=0`,
-/// no estimator): for each of `TRIALS` fresh ciphertexts and keys of a random maximal-length
-/// program, the evaluation error `e_F = c_F - A_F^(2) - s_bar A_F^(1)` of the output row (the
-/// secret is known to the test) and the phase error `phase - floor(q/2) m`, each as `log2` of its
-/// largest and root-mean-square centered coefficient, next to `log2 E_F`, `log2 E_PE`, and the
-/// average-case bias and standard deviation of [`crate::noise::simulate_average`].
+/// LUT radix [`PeClass::default_lut_radix`] unless `LUT_RADIX` sets it (0 switches directly), no
+/// estimator): for
+/// each of `TRIALS` fresh ciphertexts and keys of a random maximal-length program, the evaluation
+/// error `e_F = c_F - A_F^(2) - s_bar A_F^(1)` of the output row (the secret is known to the test)
+/// and the phase error `phase - floor(q/2) m`, each as `log2` of its largest and root-mean-square
+/// centered coefficient, next to `log2 E_F`, `log2 E_PE`, and the average-case bias and standard
+/// deviation of [`crate::noise::simulate_average`].
 #[test]
 #[ignore = "requires a CUDA GPU; measures noise"]
 fn test_gpu_measured_noise_against_the_bounds() {
@@ -144,13 +146,15 @@ fn test_gpu_measured_noise_against_the_bounds() {
         error_sigma: "3.19".parse().unwrap(),
         flooding_sigma: "3.19".parse().unwrap(),
         enforce_flooding: read("FLOODING", "none".to_owned()) == "enforce",
-        programming_sigma: read("PROGRAMMING_SIGMA", "256".to_owned()).parse().unwrap(),
         randomness_sigma: read("RANDOMNESS_SIGMA", "4096".to_owned()).parse().unwrap(),
         statistical_security_bits: DEFAULT_STATISTICAL_BITS,
         flooding_statistical_bits: DEFAULT_FLOODING_BITS,
         key_queries: 1 << 20,
         max_anchor_columns: 1024,
-        lut_radix: Some(read("LUT_RADIX", 0usize)).filter(|radix| *radix > 0),
+        lut_radix: match std::env::var("MXX_PE_NOISE_LUT_RADIX") {
+            Err(_) => class.default_lut_radix(),
+            Ok(value) => Some(value.parse::<usize>().unwrap()).filter(|radix| *radix > 0),
+        },
         compact_encodings: read("COMPACT", 1usize) != 0,
         failure_exponent: Some(128),
         lattice_security_bits: None,

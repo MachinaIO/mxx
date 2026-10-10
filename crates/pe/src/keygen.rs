@@ -28,7 +28,7 @@ use mxx_backends::{
 use mxx_dsl::{DslContext, Int, Mat, Preimage, Ring};
 use mxx_exponent_lut::{
     api::{self, PlaintextInputs, StageArtifacts, StageExecution, StageGraph},
-    program::{Operand, RhsId, WireId},
+    program::{Operand, ProgramData, RhsId, WireId},
     rns_bgg::{RnsBggPreprocessOnlineEvalDescriptor, RnsOutputUse, RnsPreprocessBuild},
 };
 use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::ConcatAxis};
@@ -43,12 +43,13 @@ pub(crate) const HELPER_KEY: &str = "mxx-pe/key/helper";
 /// The output block `v_F`, stored as a compact bounded matrix.
 pub(crate) const OUTPUT_KEY: &str = "mxx-pe/key/output";
 
-/// A key for one predicate: the compiled predicate with its public
-/// evaluation artifacts, and the key production.
+/// A key for one predicate: the class Program with the predicate as its data,
+/// the public evaluation artifacts, and the key production.
 pub struct PePredicateKey {
     public_key: [u8; 32],
     predicate: BranchingProgram,
     compiled: CompiledPredicate,
+    data: ProgramData,
     evaluation: StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
     key: StageArtifacts<()>,
     commitment: [u8; 32],
@@ -65,6 +66,11 @@ impl PePredicateKey {
 
     pub const fn compiled(&self) -> &CompiledPredicate {
         &self.compiled
+    }
+
+    /// The predicate as the class Program's data ([`BranchingProgram::data`]).
+    pub const fn data(&self) -> &ProgramData {
+        &self.data
     }
 
     /// The compiled predicate's public evaluation artifacts, including `A_F`.
@@ -178,7 +184,8 @@ where
     if predicate.class() != parameters.class() || master.public_key() != public_key.identity() {
         return Err(PeError::Mismatch);
     }
-    let compiled = predicate.compile()?;
+    let compiled = predicate.class().compile()?;
+    let data = predicate.data(&compiled);
     let rns = parameters.rns();
     let (_, evaluation) = api::preprocess(
         compiled.program(),
@@ -188,7 +195,8 @@ where
         public_key.hash_key(),
         RnsPreprocessBuild::new(rns, *public_key.context())
             .with_output_use(RnsOutputUse::Gadget)
-            .with_dynamic_setup(public_key.setup(), compiled.binding().clone())?,
+            .with_dynamic_setup(public_key.setup(), compiled.binding().clone())?
+            .with_data(data.clone()),
         execution,
         store,
         |_, outputs| Ok(outputs),
@@ -295,7 +303,12 @@ where
         (),
         digest(
             b"mxx-pe/keygen/v1",
-            &[public_key.identity(), compiled.program().id().as_bytes(), &nonce],
+            &[
+                public_key.identity(),
+                compiled.program().id().as_bytes(),
+                &data.commitment(),
+                &nonce,
+            ],
         ),
         execution,
         store,
@@ -306,6 +319,7 @@ where
         &[
             public_key.identity(),
             compiled.program().id().as_bytes(),
+            &data.commitment(),
             &serde_json::to_vec(compiled.binding())
                 .map_err(|error| PeError::Graph(error.to_string()))?,
             b"gadget-output",
@@ -321,6 +335,7 @@ where
         public_key: *public_key.identity(),
         predicate: predicate.clone(),
         compiled,
+        data,
         evaluation,
         key,
         commitment,

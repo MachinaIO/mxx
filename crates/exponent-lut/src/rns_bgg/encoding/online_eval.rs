@@ -37,14 +37,22 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             hash_key_commitment: [0; 32],
             hash_key: Vec::new(),
             evaluator: None,
-            families: OnlineEvalFamilies { parameters },
+            families: OnlineEvalFamilies::new(parameters),
             environment: Environment::new(),
             pending_decoder: None,
             unmask_preimage_bound: None,
             output_use: RnsOutputUse::default(),
             output_carriers: Vec::new(),
             dynamic: None,
+            data: crate::program::ProgramData::new(),
         }
+    }
+
+    /// This builder for a Program with integer data ([`crate::program::ProgramData`]): the
+    /// data its preprocessing was given.
+    pub fn with_data(mut self, data: crate::program::ProgramData) -> Self {
+        self.data = data;
+        self
     }
 
     /// This builder for a Program bound to the Dynamic `setup` through
@@ -360,6 +368,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 setup,
                 binding,
                 automorphisms: None,
+                data: BTreeMap::new(),
             }),
         };
         if evaluator.dynamic.is_some() {
@@ -698,6 +707,15 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 "RNS-BGG preprocess binding does not match the online evaluation Program",
             ));
         }
+        self.data.validate(program).map_err(|error| ApiError::input(error.to_string()))?;
+        let expected_data = (!program.data_families().is_empty()).then(|| self.data.commitment());
+        if preprocess_binding.data() != expected_data.as_ref() {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess binding has other Program data than the online evaluation",
+            ));
+        }
+        let data = crate::program::data_inputs(program);
+        self.families.data = data.clone();
         if !preprocess_binding.sources().is_empty() {
             return Err(ApiError::compatibility(
                 "RNS-BGG preprocess root unexpectedly declares sources",
@@ -791,6 +809,7 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 setup,
                 binding,
                 automorphisms: None,
+                data,
             }),
         };
         if evaluator.dynamic.is_some() {
@@ -853,6 +872,18 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 super::HASH_KEY_INPUT.to_owned(),
                 RuntimeValue::Bytes(self.hash_key.as_slice().into()),
             );
+        }
+        for (family, _) in evaluator.program.data_families() {
+            let name = crate::program::ProgramData::input_name(*family);
+            if super::graph_declares_input(&graph, &name) {
+                let values = self.data.values(*family).expect("validated program data");
+                runtime.insert(
+                    name,
+                    RuntimeValue::integer_values(
+                        values.iter().map(|value| (*value).into()).collect(),
+                    ),
+                );
+            }
         }
         Ok(StageGraph::new(graph, runtime, evaluator.manifests.clone()))
     }

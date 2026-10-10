@@ -11,9 +11,10 @@
 //!   class's Dynamic setup: the initial-state key `A_0`, the attribute and automorphism packages'
 //!   public matrices, and the helper matrices `H_k`.
 //! - [`encryption::encrypt`] produces, under a fresh secret `s = (s_bar, 1)`, the anchor encoding
-//!   `b = s B + e_b`, the attribute gadget ciphertexts `C_t = P Z_t + X^(Bz x_t) G` with `P = B -
-//!   [0; b]`, the message component `c_m = s d^T + e_m + floor(q/2) m`, and the Dynamic packages
-//!   (digit companions, helpers, and the initial state `c_0`). It needs no predicate.
+//!   `b = s B + e_b`, the attribute gadget ciphertexts `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz x_t)
+//!   G` with fresh uniform `a_t` and `e_t` from `chi_fl`, the message component `c_m = s d^T + e_m
+//!   + floor(q/2) m`, and the Dynamic packages (digit companions, helpers, and the initial state
+//!   `c_0`). It needs no predicate.
 //! - [`keygen::keygen`] evaluates the predicate's public key `A_F` and samples a short key `k` with
 //!   `M_F k = d_1 delta_1` for the implicit family matrix `M_F` by SampleLeft: one shared extension
 //!   sample, then one existing preimage call per anchor block.

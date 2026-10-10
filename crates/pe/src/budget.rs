@@ -13,10 +13,11 @@
 //! regularity lemma gets `ε / 2`, and the other `k` items share `ε / 2`, `ε_item = ε / (2 k)` each.
 //!
 //! - The regularity lemma, applied `N_LHL = D + 2 ℓ D + 2 E 2D` times column by column (TrapGen,
-//!   the `Z_t` of hybrid `H_4`, and the encodings of `H_1` and `H_4`), with `E = 1 + (ℓ + |K|) 4
-//!   D²` fresh encodings for the `|K|` switching packages of the ciphertext (`W - 1`, or `(B - 1)
-//!   log_B W` under the LUT radix `B`); each application gets `ε_LHL = (ε / 2) / N_LHL`.
-//! - The truncation of `χ`, `Z_t`, and `χ_fl` at `c` standard deviations: every one of their `K`
+//!   the `Z_t` of hybrid `H_4`, of the width of `R`, and the encodings of `H_1` and `H_4`), with `E
+//!   = 1 + ℓ 4 D² + |K| 2 D²` fresh encodings for the `|K|` switching packages of the ciphertext
+//!   (`W - 1`, or `(B - 1) log_B W` under the LUT radix `B`), whose companions cover only the
+//!   private bottom row of `C_k`; each application gets `ε_LHL = (ε / 2) / N_LHL`.
+//! - The truncation of `χ` and `χ_fl` at `c` standard deviations: every one of their `K`
 //!   coefficients has tail mass at most `ε_item / K`, so `c = √(2 ln(2 K / ε_item))`.
 //! - Other statistical steps of the proof.
 //! - With enforced flooding: the convolution of the wide flooding sampler.
@@ -126,10 +127,12 @@ pub struct BudgetShape {
 }
 
 impl BudgetShape {
-    /// `E = 1 + (ℓ + |K|) 4 D²`: `c_0` and the digit companions of every package.
+    /// `E = 1 + ℓ 4 D² + |K| 2 D²`: `c_0` and the digit companions of every package. A
+    /// switching package has companions for the `D` private digit rows of `C_k` only, whose top
+    /// row is public.
     pub fn encodings(&self) -> f64 {
-        1.0 + ((self.attribute_length + self.switching_packages) * 4 * self.digits * self.digits)
-            as f64
+        1.0 + (self.attribute_length * 4 * self.digits * self.digits +
+            self.switching_packages * 2 * self.digits * self.digits) as f64
     }
 
     /// `N_LHL = D + 2 ℓ D + 2 E 2D`.
@@ -138,19 +141,21 @@ impl BudgetShape {
             2.0 * self.encodings() * (2 * self.digits) as f64
     }
 
-    /// The truncated coefficients `K` of `χ` (the anchor, the helpers, and the message), `Z_t`,
-    /// and `χ_fl` for an anchor of `m_b` columns.
+    /// The truncated coefficients `K` of `χ` (the anchor, the helpers, and the message) and `χ_fl`
+    /// for an anchor of `m_b` columns.
     pub fn truncated_coefficients(&self, m_b: usize) -> f64 {
         let n = self.ring_dimension as f64;
         let m = (2 * self.digits) as f64;
         let chi = n * (m_b as f64 + self.helpers as f64 * m + 1.0);
-        let programming = n * (self.attribute_length * m_b) as f64 * m;
-        chi + programming + self.flooded_coefficients()
+        chi + self.flooded_coefficients()
     }
 
-    /// `K_fl = n 2D E`.
+    /// `K_fl = n 2D (E + ℓ)`: the fresh encodings and the errors `e_t` of the attribute
+    /// ciphertexts.
     pub fn flooded_coefficients(&self) -> f64 {
-        self.ring_dimension as f64 * (2 * self.digits) as f64 * self.encodings()
+        self.ring_dimension as f64 *
+            (2 * self.digits) as f64 *
+            (self.encodings() + self.attribute_length as f64)
     }
 
     /// `K_R = E m_B 2D n`.
@@ -180,9 +185,8 @@ pub struct StatisticalBudget {
     pub smoothing: f64,
     /// The largest regularity width (a manuscript width).
     pub max_width: f64,
-    /// `m̄_T`, `m_Z`, `m_R`, and `m_B`.
+    /// `m̄_T`, `m_R`, and `m_B`.
     pub trapdoor_columns: usize,
-    pub programming_columns: usize,
     pub randomness_columns: usize,
     pub anchor_columns: usize,
     /// The flooding tail multiplier `c_t`.
@@ -214,9 +218,8 @@ pub struct BudgetRequest<'a> {
     pub key_queries: Option<u64>,
     /// Whether the flooding width is enforced (its wide sampler takes a share of `ε`).
     pub flooding_enforced: bool,
-    /// Standard deviations of TrapGen, `Z_t`, the proof's `R`, and `χ`.
+    /// Standard deviations of TrapGen, the proof's `R` (and its `Z_t`), and `χ`.
     pub trapdoor_sigma: f64,
-    pub programming_sigma: &'a BigDecimal,
     pub randomness_sigma: &'a BigDecimal,
     pub error_sigma: &'a BigDecimal,
 }
@@ -257,7 +260,6 @@ impl StatisticalBudget {
         let scale = paper_scale();
         let widths = [
             ("TrapGen", request.trapdoor_sigma * scale),
-            ("Z_t", to_f64(request.programming_sigma) * scale),
             ("R", to_f64(request.randomness_sigma) * scale),
         ];
         for (name, width) in widths {
@@ -279,11 +281,11 @@ impl StatisticalBudget {
             }
             Ok(((rows * log_modulus + rho) / denominator).ceil() as usize)
         };
+        // The proof's `Z_t` has the width of `R`, so its regularity over two rows follows from
+        // `R`'s over three.
         let trapdoor_columns = columns(1.0, widths[0].1)?;
-        let programming_columns = columns(2.0, widths[1].1)?;
-        let randomness_columns = columns(3.0, widths[2].1)?;
-        let anchor_columns =
-            (trapdoor_columns + shape.digits).max(programming_columns).max(randomness_columns);
+        let randomness_columns = columns(3.0, widths[1].1)?;
+        let anchor_columns = (trapdoor_columns + shape.digits).max(randomness_columns);
         if anchor_columns > request.max_anchor_columns {
             return reject(format!(
                 "the anchor needs {anchor_columns} columns, above the maximum {}",
@@ -321,7 +323,6 @@ impl StatisticalBudget {
             smoothing,
             max_width,
             trapdoor_columns,
-            programming_columns,
             randomness_columns,
             anchor_columns,
             flooding_tail,
@@ -426,8 +427,8 @@ mod tests {
     #[test]
     fn the_budget_reproduces_the_plan_estimates() {
         let shape = recorded_shape();
-        assert_eq!(shape.encodings(), 513.0);
-        assert_eq!(shape.lhl_applications(), 16_440.0);
+        assert_eq!(shape.encodings(), 385.0);
+        assert_eq!(shape.lhl_applications(), 12_344.0);
         let modulus = BigUint::from(1u8) << 168u32;
         let request = BudgetRequest {
             shape,
@@ -439,24 +440,23 @@ mod tests {
             key_queries: None,
             flooding_enforced: true,
             trapdoor_sigma: 256.0,
-            programming_sigma: &BigDecimal::from(256),
             randomness_sigma: &BigDecimal::from(256),
             error_sigma: &"3.19".parse().unwrap(),
         };
         let budget = StatisticalBudget::new(&request).unwrap();
         // The regularity lemma takes `ε / 2`; truncation, the wide flooding sampler, and the other
         // steps share the other half.
-        assert!((budget.lhl_bits - (31.0 + 16_440f64.log2())).abs() < 1e-9);
+        assert!((budget.lhl_bits - (31.0 + 12_344f64.log2())).abs() < 1e-9);
         assert!((budget.item_bits - (31.0 + 3f64.log2())).abs() < 1e-9);
-        assert!((budget.rho - 146.0).abs() < 2.0, "rho {}", budget.rho);
-        // K counts χ (anchor, helpers, message), Z_t, and χ_fl at m_B,max: about 2^27 here.
+        assert!((budget.rho - 145.0).abs() < 2.0, "rho {}", budget.rho);
+        // K counts χ (anchor, helpers, message) and χ_fl at m_B,max.
         let count = shape.truncated_coefficients(400);
-        assert!((count.log2() - 26.9).abs() < 0.1, "log K {}", count.log2());
+        assert!((count.log2() - 25.7).abs() < 0.1, "log K {}", count.log2());
         let c = budget.cutoff_multiplier;
         assert!((count * 2.0 * (-c * c / 2.0).exp() - 2f64.powf(-budget.item_bits)).abs() < 1e-15);
         assert!((budget.flooding_tail - 8.89).abs() < 0.05, "c_t {}", budget.flooding_tail);
-        assert!((budget.smoothing - 3.75).abs() < 0.1, "η {}", budget.smoothing);
-        assert_eq!(budget.anchor_columns, 79);
+        assert!((budget.smoothing - 3.65).abs() < 0.1, "η {}", budget.smoothing);
+        assert_eq!(budget.anchor_columns, 78);
         let log_flooding = (to_f64(&budget.flooding_sigma) * paper_scale()).log2();
         assert!((log_flooding - 55.7).abs() < 0.3, "log s_fl {log_flooding}");
     }
@@ -474,7 +474,6 @@ mod tests {
             key_queries: Some(1 << 20),
             flooding_enforced: true,
             trapdoor_sigma: 1.0,
-            programming_sigma: &BigDecimal::from(256),
             randomness_sigma: &BigDecimal::from(256),
             error_sigma: &"3.19".parse().unwrap(),
         };
@@ -482,7 +481,7 @@ mod tests {
         // lower bound.
         assert!(StatisticalBudget::new(&request).is_err());
         request.trapdoor_sigma = 256.0;
-        request.max_anchor_columns = 78;
+        request.max_anchor_columns = 77;
         assert!(StatisticalBudget::new(&request).is_err());
         request.max_anchor_columns = 400;
         let budget = StatisticalBudget::new(&request).unwrap();
@@ -497,7 +496,7 @@ mod tests {
     }
 
     /// `N_LHL` counts the ciphertext's switching packages: under the LUT radix 2, `W = 256` has 8
-    /// instead of 255, so with one attribute the regularity lemma is applied about 28 times
+    /// instead of 255, so with one attribute the regularity lemma is applied about 26 times
     /// less, and the `K` of truncation counts the published helpers.
     #[test]
     fn the_regularity_count_follows_the_switching_packages() {
@@ -508,8 +507,9 @@ mod tests {
             ..recorded_shape()
         };
         let radix = BudgetShape { switching_packages: 8, helpers: 15, ..direct };
+        // `E` is about `(2 ℓ + |K|) 2 D²` with `ℓ = 1`.
         let ratio = direct.lhl_applications() / radix.lhl_applications();
-        assert!((ratio - 256.0 / 9.0).abs() < 0.1, "ratio {ratio}");
+        assert!((ratio - 257.0 / 10.0).abs() < 0.1, "ratio {ratio}");
         assert!(radix.truncated_coefficients(400) < direct.truncated_coefficients(400));
     }
 }

@@ -13,11 +13,19 @@
 //! tables return exponent payloads; the last returns the bit as a
 //! coefficient. Since `z + Bz x < W <= n`, no negacyclic sign enters a
 //! reachable state; unreachable table entries are zero.
+//!
+//! One Program serves the whole class ([`PeClass::compile`]): it has `T_max`
+//! steps, and the program is its integer data ([`BranchingProgram::data`]),
+//! which key generation and decryption supply at run time. Step `i` selects
+//! its attribute by entry `i` of the read data, and its table is window `i`
+//! of the table data. A program shorter than `T_max` starts with identity
+//! steps, which read attribute `0` and keep the state.
 use crate::PeError;
 use mxx_exponent_lut::{
     ExpLayout, ExponentLutProgram,
     program::{
-        AttributeKnowledge, ExponentLutProgramBuilder, LutOutputRepresentation, LutTable, Operand,
+        AttributeKnowledge, DataId, ExponentLutProgramBuilder, LutOutputRepresentation, LutTable,
+        Operand, ProgramData,
     },
     rns_bgg::RnsBggDynamicBinding,
 };
@@ -80,6 +88,21 @@ impl PeClass {
         (self.state_width * self.alphabet_size).next_power_of_two()
     }
 
+    /// The default radix `B` of the LUT automorphism decomposition
+    /// ([`crate::PeParameters::with_lut_radix`]): `B = W^(1/r)` for the
+    /// largest `r` in `{3, 2}` that divides `log2 W`, so that a branch is
+    /// switched at most 2 or 3 times; `None` (the direct switching, one
+    /// switch per branch) when neither divides it. Each switch multiplies
+    /// the noise by a decomposition gain, while the direct switching
+    /// publishes `W - 1` switching packages.
+    pub fn default_lut_radix(&self) -> Option<usize> {
+        let bits = self.lookup_width().trailing_zeros();
+        [3, 2]
+            .into_iter()
+            .find(|switches| bits % switches == 0)
+            .map(|switches| 1 << (bits / switches))
+    }
+
     /// The exponent layout of every table: stride zero, width `W`.
     pub fn layout(&self) -> ExpLayout {
         ExpLayout { stride_log2: 0, width_log2: self.lookup_width().trailing_zeros() }
@@ -99,6 +122,73 @@ impl PeClass {
     /// follows the longest program's output.
     pub fn levels(&self) -> usize {
         2 * self.max_steps + 2
+    }
+
+    /// Reject an attribute of another length or with a symbol outside the
+    /// alphabet.
+    pub fn validate_attribute(&self, attribute: &[usize]) -> Result<(), PeError> {
+        if attribute.len() != self.attribute_length ||
+            attribute.iter().any(|symbol| *symbol >= self.alphabet_size)
+        {
+            return Err(PeError::Attribute);
+        }
+        Ok(())
+    }
+
+    /// Compile the class into the Exponent-LUT Program the setup evaluates,
+    /// with its mapping to the setup coordinates: the Program input is the
+    /// initial state, its RHS family the attribute packages, and its integer
+    /// data a program of the class ([`BranchingProgram::data`]).
+    pub fn compile(&self) -> Result<CompiledPredicate, PeError> {
+        let invalid = |error: mxx_exponent_lut::program::ProgramValidationError| {
+            PeError::Compilation(error.to_string())
+        };
+        let width = self.lookup_width();
+        let layout = self.layout();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let initial = builder.input(AttributeKnowledge::PrivatePayload).map_err(invalid)?;
+        let attributes =
+            builder.rhs_family(IntExpr::constant(self.attribute_length)).map_err(invalid)?;
+        let reads = builder.data_family(self.max_steps).map_err(invalid)?;
+        let tables = builder.data_family(self.max_steps * width).map_err(invalid)?;
+        let mut state = initial;
+        for step in 0..self.max_steps {
+            let product = builder
+                .mul_private(
+                    Operand::Scalar(state),
+                    Operand::Selected {
+                        family: attributes,
+                        data: reads,
+                        position: IntExpr::constant(step),
+                    },
+                )
+                .map_err(invalid)?;
+            let (output_width, representation) = if step + 1 == self.max_steps {
+                (2, LutOutputRepresentation::Coefficient)
+            } else {
+                (width, LutOutputRepresentation::Exponent(layout))
+            };
+            let table = builder
+                .register_lut(
+                    LutTable::from_data(
+                        width,
+                        layout,
+                        output_width,
+                        tables,
+                        step * width,
+                        representation,
+                    )
+                    .map_err(invalid)?,
+                )
+                .map_err(invalid)?;
+            state = builder.lut(Operand::Scalar(product), table).map_err(invalid)?;
+        }
+        let program = builder.finish(vec![Operand::Scalar(state)]).map_err(invalid)?;
+        let binding = RnsBggDynamicBinding::new(
+            BTreeMap::from([(initial, INITIAL_STATE_COORDINATE)]),
+            BTreeMap::from([(attributes, ATTRIBUTE_COORDINATE)]),
+        );
+        Ok(CompiledPredicate { program, binding, reads, tables })
     }
 }
 
@@ -184,65 +274,22 @@ impl BranchingProgram {
         Self { class, reads: vec![0; class.max_steps], tables }
     }
 
-    /// Compile into the Exponent-LUT Program the setup evaluates, with its
-    /// mapping to the setup coordinates: the Program input is the initial
-    /// state and its RHS family the attribute packages.
-    pub fn compile(&self) -> Result<CompiledPredicate, PeError> {
-        let invalid = |error: mxx_exponent_lut::program::ProgramValidationError| {
-            PeError::Compilation(error.to_string())
-        };
+    /// The Program data of this program ([`PeClass::compile`]): the reads and
+    /// the tables, each padded to the lookup width `W` with zeros, of the
+    /// `T_max` steps, the first `T_max - T` of them identity steps.
+    pub fn data(&self, compiled: &CompiledPredicate) -> ProgramData {
         let class = &self.class;
         let width = class.lookup_width();
-        let layout = class.layout();
-        let entries = class.state_width * class.alphabet_size;
-        let mut builder = ExponentLutProgramBuilder::new();
-        let initial = builder.input(AttributeKnowledge::PrivatePayload).map_err(invalid)?;
-        let attributes =
-            builder.rhs_family(IntExpr::constant(class.attribute_length)).map_err(invalid)?;
-        let mut state = initial;
-        for (step, (read, table)) in self.reads.iter().zip(&self.tables).enumerate() {
-            let product = builder
-                .mul_private(
-                    Operand::Scalar(state),
-                    Operand::Member { family: attributes, index: IntExpr::constant(*read) },
-                )
-                .map_err(invalid)?;
-            let last = step + 1 == self.length();
-            let values = (0..width)
-                .map(|index| if index < entries { table[index] } else { 0 })
-                .collect::<Vec<_>>();
-            let (output_width, representation) = if last {
-                (2, LutOutputRepresentation::Coefficient)
-            } else {
-                (width, LutOutputRepresentation::Exponent(layout))
-            };
-            let table = builder
-                .register_lut(
-                    LutTable::unary(width, layout, output_width, values, representation)
-                        .map_err(invalid)?,
-                )
-                .map_err(invalid)?;
-            state = builder.lut(Operand::Scalar(product), table).map_err(invalid)?;
-        }
-        let program = builder.finish(vec![Operand::Scalar(state)]).map_err(invalid)?;
-        let binding = RnsBggDynamicBinding::new(
-            BTreeMap::from([(initial, INITIAL_STATE_COORDINATE)]),
-            BTreeMap::from([(attributes, ATTRIBUTE_COORDINATE)]),
-        );
-        Ok(CompiledPredicate { program, binding })
-    }
-}
-
-impl PeClass {
-    /// Reject an attribute of another length or with a symbol outside the
-    /// alphabet.
-    pub fn validate_attribute(&self, attribute: &[usize]) -> Result<(), PeError> {
-        if attribute.len() != self.attribute_length ||
-            attribute.iter().any(|symbol| *symbol >= self.alphabet_size)
-        {
-            return Err(PeError::Attribute);
-        }
-        Ok(())
+        let padding = class.max_steps - self.length();
+        let identity = (0..class.state_width * class.alphabet_size)
+            .map(|index| index % class.state_width)
+            .collect::<Vec<_>>();
+        let reads = std::iter::repeat_n(0, padding).chain(self.reads.iter().copied()).collect();
+        let tables = std::iter::repeat_n(&identity, padding)
+            .chain(&self.tables)
+            .flat_map(|table| (0..width).map(move |index| table.get(index).copied().unwrap_or(0)))
+            .collect();
+        ProgramData::new().with(compiled.reads, reads).with(compiled.tables, tables)
     }
 }
 
@@ -252,11 +299,24 @@ impl PeClass {
 pub struct CompiledPredicate {
     pub(crate) program: ExponentLutProgram,
     pub(crate) binding: RnsBggDynamicBinding,
+    /// The data families of the reads and of the tables.
+    reads: DataId,
+    tables: DataId,
 }
 
 impl CompiledPredicate {
     pub fn program(&self) -> &ExponentLutProgram {
         &self.program
+    }
+
+    /// The data family of the reads: entry `i` is the attribute step `i` reads.
+    pub const fn reads(&self) -> DataId {
+        self.reads
+    }
+
+    /// The data family of the tables: window `i` of `W` entries is the table of step `i`.
+    pub const fn tables(&self) -> DataId {
+        self.tables
     }
 
     pub fn binding(&self) -> &RnsBggDynamicBinding {
@@ -287,6 +347,20 @@ mod tests {
         assert!(class.validate_ring_dimension(4).is_err());
     }
 
+    /// The default radix switches a branch 3 or 2 times when that divides `log2 W`, and
+    /// directly otherwise.
+    #[test]
+    fn the_default_lut_radix_takes_three_or_two_switches() {
+        let radix =
+            |alphabet, state| PeClass::new(1, alphabet, state, 1).unwrap().default_lut_radix();
+        assert_eq!(radix(2, 1), None);
+        assert_eq!(radix(2, 2), Some(2));
+        assert_eq!(radix(4, 2), Some(2));
+        assert_eq!(radix(16, 1), Some(4));
+        assert_eq!(radix(32, 1), None);
+        assert_eq!(radix(256, 16), Some(16));
+    }
+
     #[test]
     fn evaluation_follows_the_read_map_and_tables() {
         let class = class();
@@ -300,16 +374,28 @@ mod tests {
     }
 
     #[test]
-    fn compilation_reads_the_attribute_family_and_ends_in_a_coefficient() {
-        let program = greater_than(class(), &[1, 0, 1]).compile().unwrap();
-        let output = match program.program().outputs() {
+    fn the_class_program_takes_every_program_as_data() {
+        let compiled = class().compile().unwrap();
+        let output = match compiled.program().outputs() {
             [Operand::Scalar(output)] => *output,
             _ => panic!("one scalar output"),
         };
-        assert_eq!(program.program().wire_coefficient_bound(output).unwrap(), Some(1));
-        assert_eq!(program.program().encryption_inputs().luts().len(), 3);
+        assert_eq!(compiled.program().wire_coefficient_bound(output).unwrap(), Some(1));
+        assert_eq!(compiled.program().encryption_inputs().luts().len(), class().max_steps());
+        // A program of 3 of the 4 steps starts with one identity step, which reads attribute
+        // 0 and keeps the state, and its data validates against the class Program.
+        let program = greater_than(class(), &[1, 0, 1]);
+        let data = program.data(&compiled);
+        data.validate(compiled.program()).unwrap();
+        let width = class().lookup_width();
+        assert_eq!(data.values(compiled.reads()).unwrap(), [0, 0, 1, 2]);
+        let tables = data.values(compiled.tables()).unwrap();
+        assert_eq!(&tables[..6], [0, 1, 2, 0, 1, 2]);
+        for (step, table) in program.tables().iter().enumerate() {
+            assert_eq!(&tables[(step + 1) * width..][..table.len()], table.as_slice());
+        }
+        // Every program of the class compiles to the same Program.
         let longest = BranchingProgram::longest(class());
-        assert_eq!(longest.length(), 4);
-        longest.compile().unwrap();
+        assert_eq!(longest.class().compile().unwrap().program().id(), compiled.program().id());
     }
 }

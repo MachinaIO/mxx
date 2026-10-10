@@ -277,6 +277,7 @@ impl<'a> RnsEncryptBuild<'a> {
                     &package,
                     &secret,
                     hash_key,
+                    0,
                 )
                 .map_err(ApiError::scheme)?;
             graph = graph
@@ -333,6 +334,7 @@ impl<'a> RnsEncryptBuild<'a> {
                 &|member| RnsBggPackage::Automorphism(select(&automorphisms, member)),
                 &automorphed_secret,
                 hash_key,
+                super::automorphism_public_rows(self.parameters, 0).map_err(ApiError::scheme)?,
             )
             .map_err(ApiError::scheme)?;
         graph = graph
@@ -525,7 +527,10 @@ impl<'a> RnsEncryptBuild<'a> {
 
     /// The digit companions of `members` packages: member `t`'s gadget
     /// ciphertext is `ciphertext(t)`, its package `package(t)`, and its
-    /// payload secret `secret(t)`. Element `(t m + a) m + j` (the order
+    /// payload secret `secret(t)`. Only the digit rows `a >= first_row` have
+    /// companions (an automorphism package's leading rows are public, see
+    /// [`super::automorphism_public_rows`]); with `r = m - first_row` of them,
+    /// element `(t r + a - first_row) m + j` (the order
     /// [`super::companion_columns`] reads) is
     /// `z_{a,j} = s' B_{a,j} - d_{a,j} s' G + eps` for the digit
     /// `d_{a,j} = Dec_G(C)_{a,j}`, with its error under the setup's companion
@@ -539,6 +544,7 @@ impl<'a> RnsEncryptBuild<'a> {
         package: &dyn Fn(IntExpr) -> RnsBggPackage,
         secret: &dyn Fn(IntExpr) -> Result<RnsBggRow, RnsBggError>,
         hash_key: &Bytes,
+        first_row: usize,
     ) -> Result<Family<RnsBggRow>, RnsBggError> {
         let parameters = self.parameters;
         let ring = parameters.ring(0)?;
@@ -549,7 +555,8 @@ impl<'a> RnsEncryptBuild<'a> {
         let digits = current.modulus_digits();
         let columns = parameters.component_columns(0)?;
         let width = 2 * columns;
-        let count = companion_count(parameters, 0, columns)?;
+        let rows = width - first_row;
+        let count = rows * width;
         let gadget = parameters.public_gadget(0)?;
         let contract = &setup.distributions().companion;
         let compact = setup.compact_ring(parameters, 0)?;
@@ -567,7 +574,8 @@ impl<'a> RnsEncryptBuild<'a> {
             let member_index = member_of.at(lane.clone());
             let index = lane.expression()?;
             let member = quotient(&index, count);
-            let a = remainder(quotient(&index, width), width);
+            let a = (remainder(quotient(&index, width), rows) + IntExpr::constant(first_row))
+                .canonicalize();
             let j = remainder(index, width);
             let ciphertext = ciphertext(member_index);
             let [top, bottom] = [&ciphertext.0, &ciphertext.1].map(super::join_row);
@@ -770,7 +778,7 @@ impl EncodingLowering<'_> {
                     )?,
                     self.encryption_row_family(
                         AUTOMORPHISM_COMPANION_ROLE.to_owned(),
-                        switching * count,
+                        switching * automorphism_companion_count(self.parameters, 0, columns)?,
                         digits,
                     )?,
                 ))
@@ -799,12 +807,18 @@ impl EncodingLowering<'_> {
         self.parameters.dynamic_route(level)?;
         self.parameters.dynamic_route(self.workload.level(self.site()?.output)?)?;
         let coordinate = state.binding.rhs(reference.id)?;
-        let member = reference
-            .index
-            .as_ref()
-            .map(Int::expression)
-            .transpose()
-            .map_err(|_| RnsBggError::Binding("RHS member index"))?;
+        // A member selected at run time (`Operand::Selected`) has no constant tag; its key is
+        // the one preprocessing published for the root site.
+        let selected = reference.index.as_ref().filter(|index| index.expression().is_err());
+        let member = match selected {
+            Some(_) => None,
+            None => reference
+                .index
+                .as_ref()
+                .map(Int::expression)
+                .transpose()
+                .map_err(|_| RnsBggError::Binding("RHS member index"))?,
+        };
         let companions = self
             .rhs_companions
             .get(&reference.id)
@@ -817,6 +831,15 @@ impl EncodingLowering<'_> {
             [&input.public_key.matrix.0, &input.public_key.matrix.1].map(super::join_row);
         let offset = member.unwrap_or(IntExpr::constant(0)) * IntExpr::constant(count);
         let imported = self.imported_public_action(level, 0)?;
+        if selected.is_some() && imported.is_none() {
+            return Err(RnsBggError::Binding(
+                "an RHS member selected at run time is read only at root scope",
+            ));
+        }
+        let companion_index = |index: IntExpr| match selected {
+            Some(member) => member.clone().mul(Int::constant(count)).add(Int::evaluate(index)),
+            None => Int::evaluate((offset.clone() + index).canonicalize()),
+        };
         let companion_key = |_, a, j| {
             super::companion_key(
                 self.parameters,
@@ -836,9 +859,10 @@ impl EncodingLowering<'_> {
             &|_, r, a| Ok(super::row_entry(&key_rows[r], a)),
             imported.is_none().then_some(&companion_key as _),
             Some(&|_, a: IntExpr, j: IntExpr| {
-                let index = offset.clone() + a * IntExpr::constant(2 * columns) + j;
-                self.read_row(companions.at(Int::evaluate(index.canonicalize())))
+                let index = a * IntExpr::constant(2 * columns) + j;
+                self.read_row(companions.at(companion_index(index)))
             }),
+            None,
         )?;
         let product = super::column_action(
             self.parameters,
@@ -968,7 +992,7 @@ impl EncodingLowering<'_> {
         self.parameters.dynamic_route(normalized.max(self.workload.level(self.site()?.output)?))?;
         let automorphisms =
             lut_automorphisms(self.parameters, setup.automorphisms(), level, table)?;
-        let values = table.values().ok_or(RnsBggError::Lut)?;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.dynamic_state()?.data)?;
         let layout = table.input_layout();
         let representation = table.output_representation();
         let columns = self.parameters.component_columns(level)?;
@@ -979,7 +1003,7 @@ impl EncodingLowering<'_> {
                 layout,
                 representation,
                 k,
-                values,
+                values.clone(),
             )
         };
         // The identity branch: `Aut_1 = id`.
@@ -1011,11 +1035,21 @@ impl EncodingLowering<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         let inverse_members =
             inverses.iter().map(|k| setup.helper_member(*k)).collect::<Result<Vec<_>, _>>()?;
-        let count = companion_count(self.parameters, level, columns)?;
+        let count = automorphism_companion_count(self.parameters, level, columns)?;
+        let public_rows = super::automorphism_public_rows(self.parameters, level)?;
         let width = 2 * columns;
         let key_rows =
             [&input.public_key.matrix.0, &input.public_key.matrix.1].map(super::join_row);
         let imported = self.imported_public_action(level, switched.len())?;
+        let public_top = |branch: IntExpr| {
+            crate::rns_bgg::dynamic::automorphism_public_top(
+                self.parameters,
+                setup,
+                self.hash_key.clone(),
+                select(&switched, branch.clone()),
+                select(&inverses, branch),
+            )
+        };
         let companion_key = |branch, a, j| {
             let tag = setup.package_tag(&RnsBggPackage::Automorphism(select(&switched, branch)));
             super::companion_key(self.parameters, setup, level, self.hash_key.clone(), &tag, a, j)
@@ -1031,10 +1065,11 @@ impl EncodingLowering<'_> {
             imported.is_none().then_some(&companion_key as _),
             Some(&|branch, a: IntExpr, j: IntExpr| {
                 let index = select(&members, branch) * IntExpr::constant(count) +
-                    a * IntExpr::constant(width) +
+                    (a - IntExpr::constant(public_rows)) * IntExpr::constant(width) +
                     j;
                 self.read_row(companions.at(Int::evaluate(index.canonicalize())))
             }),
+            Some((public_rows, &public_top)),
         )?;
         let split = |row: &Mat| super::split_row(row, columns);
         let schema = |_| DslError::Schema;
@@ -1124,11 +1159,12 @@ impl EncodingLowering<'_> {
             .as_ref()
             .ok_or(RnsBggError::Binding("the automorphism packages are not imported"))?;
         let level = self.workload.level(input.wire())?;
-        let values = table.values().ok_or(RnsBggError::Lut)?;
+        let values = crate::rns_bgg::dynamic::lut_entries(table, &self.dynamic_state()?.data)?;
         let layout = table.input_layout();
         let representation = table.output_representation();
         let columns = self.parameters.component_columns(level)?;
-        let count = companion_count(self.parameters, level, columns)?;
+        let count = automorphism_companion_count(self.parameters, level, columns)?;
+        let public_rows = super::automorphism_public_rows(self.parameters, level)?;
         let width = 2 * columns;
         let coefficient = |k: IntExpr| {
             EncodingLowering::lut_coefficient(
@@ -1137,7 +1173,7 @@ impl EncodingLowering<'_> {
                 layout,
                 representation,
                 k,
-                values,
+                values.clone(),
             )
         };
         let members = |ks: &[usize], member: &dyn Fn(usize) -> Result<usize, RnsBggError>| {
@@ -1175,7 +1211,7 @@ impl EncodingLowering<'_> {
         };
         let companion = |ks_members: &[usize], branch: IntExpr, a: IntExpr, j: IntExpr| {
             let index = select(ks_members, branch) * IntExpr::constant(count) +
-                a * IntExpr::constant(width) +
+                (a - IntExpr::constant(public_rows)) * IntExpr::constant(width) +
                 j;
             self.read_row(companions.at(Int::evaluate(index.canonicalize())))
         };
@@ -1189,6 +1225,16 @@ impl EncodingLowering<'_> {
         for depth in plan {
             let switches = &depth.switches;
             let switch_members = members(switches, &|k| setup.switching_member(k))?;
+            let switch_inverses = members(switches, &|k| setup.automorphism_inverse(k))?;
+            let public_top = |branch: IntExpr| {
+                crate::rns_bgg::dynamic::automorphism_public_top(
+                    self.parameters,
+                    setup,
+                    self.hash_key.clone(),
+                    select(switches, branch.clone()),
+                    select(&switch_inverses, branch),
+                )
+            };
             let parent_row = |branch: IntExpr| match &parents {
                 None => input.row.clone(),
                 Some((rows, _)) => rows.at(Int::evaluate(select(&depth.parents, branch))),
@@ -1214,6 +1260,7 @@ impl EncodingLowering<'_> {
                 },
                 recompute.then_some(&|branch, a, j| companion_key(switches, branch, a, j) as _),
                 Some(&|branch, a, j| companion(&switch_members, branch, a, j)),
+                Some((public_rows, &public_top)),
             )?;
             let companion_row = rows.last().ok_or(RnsBggError::Binding("companion row"))?;
             let product_key = |branch: IntExpr| match &imported {

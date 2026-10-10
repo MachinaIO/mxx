@@ -62,7 +62,7 @@ fn output_wire_carrier(
         .ok_or_else(|| ApiError::input("verification output index is out of range"))?
     {
         Operand::Scalar(wire) => *wire,
-        Operand::Member { family, .. } => program
+        Operand::Member { family, .. } | Operand::Selected { family, .. } => program
             .family_body_outputs()
             .into_iter()
             .find_map(|(output, inner)| (output == *family).then_some(inner))

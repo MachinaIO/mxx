@@ -44,6 +44,12 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   the level's own size, and readers expand it to the full gadget width at `q` by
   `ModSwitch_{pq -> q}(c G̃)`. The expansion adds about `B q / p + (n + 3) / 2` to the error, and
   the simulator carries each expanded row as an opaque term. GSW ciphertexts stay at `q`.
+  A Dynamic Program may declare integer data families (`ExponentLutProgramBuilder::data_family`)
+  whose values are supplied at run time (`ProgramData`) to preprocessing and online evaluation:
+  a root-scope private product may read the RHS member at a data entry (`Operand::Selected`),
+  and a lookup may take its table from data (`LutTable::from_data`). One graph then serves every
+  value of the data; preprocessing binds the data's commitment, and online evaluation checks it.
+  The noise simulator treats a selected member as member 0.
 
 Sampling contracts (`RnsBggGaussian`) keep their sigma as a `BigDecimal` and their cutoff as a
 `BigUint`, so a contract may be wide: above `2^40` the backends sample by convolution, as for the

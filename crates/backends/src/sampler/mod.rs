@@ -8,8 +8,9 @@
 //!   come from the entry `(0, 0)` coefficient streams of the same transcript.
 //! - `trapdoor::DCRTPolyTrapdoorSampler` samples gadget trapdoors in the computational or the
 //!   statistical instantiation (`TrapdoorInstantiation`) and preimages of a caller-requested width.
-//!   Preimage sampling redraws a whole candidate that exceeds its cutoff, so the preimage equation
-//!   always holds.
+//!   A statistical trapdoor precomputes for the preimage width of its TrapGen and samples only at
+//!   that width (`trapdoor::statistical`). Preimage sampling redraws a whole candidate that exceeds
+//!   its cutoff, so the preimage equation always holds.
 //! - `bounds` defines the authoritative widths and cutoffs: `minimum_preimage_sigma` is the
 //!   smallest preimage width a trapdoor accepts, `hard_cutoff_from_sigma_bound` is `floor(6.5 *
 //!   sigma)`, and `default_preimage_cutoff` is the cutoff of the minimum width.
@@ -167,11 +168,15 @@ pub trait PolyTrapdoorSampler {
         instantiation: mxx_ir_core::types::TrapdoorInstantiation,
     ) -> Self;
 
+    /// TrapGen of a trapdoor of `size` public rows whose preimages are sampled with width
+    /// `preimage_sigma` (`None`: the minimum width). The statistical instantiation precomputes
+    /// for that width and fails if its covariance check rejects every draw.
     fn trapdoor(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         size: usize,
-    ) -> (Self::Trapdoor, Self::M);
+        preimage_sigma: Option<&mxx_ir_core::Rational>,
+    ) -> Result<(Self::Trapdoor, Self::M), SmallMatrixError>;
 
     fn trapdoor_to_bytes(trapdoor: &Self::Trapdoor) -> Vec<u8>;
 

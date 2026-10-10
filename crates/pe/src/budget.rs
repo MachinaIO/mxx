@@ -385,7 +385,10 @@ impl StatisticalBudget {
                 .sqrt()
                 .ok_or_else(|| PeError::Parameters("sqrt".into()))?;
         let s1 = frobenius * BigDecimal::from(num_bigint::BigInt::from(n * b_x));
-        let spread = (BigDecimal::from(1u8) + s1.square())
+        // `BigDecimal::sqrt` (0.4.10) is wrong by `√10` for inputs of an even scale from 200 on,
+        // which the square of the inexact Frobenius norm reaches; round first.
+        let spread = (BigDecimal::from(1u8) + &s1 * &s1)
+            .with_prec(100)
             .sqrt()
             .ok_or_else(|| PeError::Parameters("sqrt".into()))?;
         Ok(decimal_of(smoothing_parameter(bits))? * decimal_of(gadget_sigma)? * spread)

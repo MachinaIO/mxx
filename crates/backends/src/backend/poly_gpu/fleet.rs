@@ -47,8 +47,9 @@ use crate::{
                 GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
                 GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
                 GpuRawSmallMatrixView, GpuRawStatisticalWorkspace, GpuSignedValuesEncoding,
-                GpuStatisticalBindings, GpuStatisticalPerturbation, GpuStridedCopy,
-                gpu_device_identity, gpu_device_memory_usage, gpu_device_sync,
+                GpuStatisticalBindings, GpuStatisticalFactor, GpuStatisticalPerturbation,
+                GpuStatisticalTrapGenOperands, GpuStridedCopy, gpu_device_identity,
+                gpu_device_memory_usage, gpu_device_sync,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
             params::DCRTPolyParams,
@@ -429,6 +430,23 @@ fn compiled_bytes_part(
         return Err(invalid("compiled byte operand has an invalid physical layout"));
     }
     compiled_contiguous_part(owner, part_index, bytes, device)
+}
+
+/// The owner and `(address, bytes)` of a whole Bytes operand of a statistical trapdoor
+/// operation: the precomputation or a scratch.
+fn statistical_bytes_operand<'a>(
+    owners: &'a BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    id: &PhysicalValueId,
+    part: u32,
+    device: i32,
+) -> Result<(&'a Arc<GpuResidentValue>, (u64, usize)), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let owner = owners.get(id).ok_or_else(|| invalid("statistical bytes operand is missing"))?;
+    let ConcreteWireType::Bytes { length } = owner.wire_type() else {
+        return Err(invalid("statistical bytes operand is not a Bytes value"));
+    };
+    let address = compiled_bytes_part(owner, part, *length as u64, device)?;
+    Ok((owner, (address, *length)))
 }
 
 fn compiled_raw_integer_part(
@@ -1682,6 +1700,8 @@ pub(crate) fn prepare_compiled_gpu_program(
                     KernelArg::U32(resource_id),
                     KernelArg::Value(output_id),
                     KernelArg::U32(output_part),
+                    KernelArg::Value(_),
+                    KernelArg::U32(_),
                     KernelArg::Value(_),
                     KernelArg::U32(_),
                     KernelArg::U64(m_bar),
@@ -4994,48 +5014,150 @@ pub(crate) fn emit_compiled_gpu_op(
         }
         GpuNativePrimitive::StatisticalSpectra => {
             let [
-                KernelArg::U32(resource_id),
-                KernelArg::Value(trapdoor_id),
+                KernelArg::Value(chunk_id),
                 KernelArg::U32(chunk_part),
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::Value(scratch_id),
+                KernelArg::U32(scratch_part),
+                KernelArg::U64(m_bar),
                 KernelArg::U64(row_offset),
                 KernelArg::U32(chunk_binding),
-                KernelArg::U32(spectra_binding),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(scratch_binding),
             ] = op.arguments.as_ref()
             else {
                 return Err(invalid("compiled statistical spectra has the wrong arguments"));
             };
-            if !op.outputs.is_empty() {
-                return Err(invalid("compiled statistical spectra must not produce a value"));
+            if op.outputs.as_ref() != [*precomputation_id] {
+                return Err(invalid(
+                    "compiled statistical spectra output is not its precomputation",
+                ));
             }
-            let owner = owners
-                .get(trapdoor_id)
-                .ok_or_else(|| invalid("statistical spectra trapdoor owner is missing"))?;
+            let chunk_owner = owners
+                .get(chunk_id)
+                .ok_or_else(|| invalid("statistical spectra chunk owner is missing"))?;
             let (chunk_ty, chunk, chunk_bindings) =
-                compiled_raw_matrix_part(owner, *chunk_part, PhysicalEncoding::FullCoeff)?;
-            let (device, workspace) = resources
-                .statistical
-                .get(resource_id)
-                .ok_or_else(|| invalid("statistical spectra has no prepared workspace"))?;
-            if *device != op.device || chunk.physical_device != op.device {
+                compiled_raw_matrix_part(chunk_owner, *chunk_part, PhysicalEncoding::FullCoeff)?;
+            if chunk.physical_device != op.device {
                 return Err(invalid("statistical spectra physical contract is inconsistent"));
             }
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let (scratch_owner, scratch) =
+                statistical_bytes_operand(owners, scratch_id, *scratch_part, op.device)?;
             bind_raw_matrix_part(builder, *chunk_binding, &chunk_bindings)?;
-            let [spectra, ..] = workspace.binding_ranges();
-            builder.bind_resident_address(spectra.0, spectra.1, *spectra_binding)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            builder.bind_resident_address(scratch.0, scratch.1, *scratch_binding)?;
             let params = backend
                 .parameters_on_physical_device(op.device, &chunk_ty)
                 .map_err(|error| invalid(&error))?;
             params.emit_raw_statistical_spectra(
                 builder.launch_stream(),
                 &chunk,
+                usize::try_from(*m_bar).map_err(|_| invalid("statistical m_bar exceeds usize"))?,
                 usize::try_from(*row_offset)
                     .map_err(|_| invalid("statistical spectra row exceeds usize"))?,
-                workspace,
+                GpuStatisticalTrapGenOperands {
+                    precomputation,
+                    precomputation_binding: *precomputation_binding,
+                    auxiliary: scratch,
+                    auxiliary_binding: *scratch_binding,
+                },
                 *chunk_binding,
-                *spectra_binding,
             )?;
-            builder.retain_owner(Arc::clone(owner));
-            builder.retain_owner(Arc::clone(workspace));
+            builder.retain_owner(Arc::clone(chunk_owner));
+            builder.retain_owner(Arc::clone(precomputation_owner));
+            builder.retain_owner(Arc::clone(scratch_owner));
+        }
+        GpuNativePrimitive::StatisticalFactor => {
+            let [
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::Value(attempt_id),
+                KernelArg::U32(attempt_part),
+                KernelArg::Value(status_id),
+                KernelArg::U32(status_part),
+                KernelArg::U64(m_bar),
+                KernelArg::U64(digits),
+                KernelArg::U64(degree),
+                KernelArg::F64(preimage_sigma),
+                KernelArg::F64(variance),
+                KernelArg::F64(alpha),
+                KernelArg::F64(pivot_floor),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(attempt_binding),
+                KernelArg::U32(status_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical factor has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*status_id] ||
+                [preimage_sigma, variance, alpha, pivot_floor]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            {
+                return Err(invalid("compiled statistical factor output or scalars are invalid"));
+            }
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let attempt_owner = owners
+                .get(attempt_id)
+                .ok_or_else(|| invalid("statistical factor attempt owner is missing"))?;
+            let status_owner = owners
+                .get(status_id)
+                .ok_or_else(|| invalid("statistical factor status owner is missing"))?;
+            let attempt_address = compiled_bytes_part(attempt_owner, *attempt_part, 8, op.device)?;
+            let status_address = compiled_bytes_part(status_owner, *status_part, 16, op.device)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            builder.bind_resident_address(attempt_address, 8, *attempt_binding)?;
+            builder.bind_resident_address(status_address, 16, *status_binding)?;
+            let m_bar =
+                usize::try_from(*m_bar).map_err(|_| invalid("statistical m_bar exceeds usize"))?;
+            let digits =
+                usize::try_from(*digits).map_err(|_| invalid("statistical digits exceed usize"))?;
+            let degree = u32::try_from(*degree)
+                .map_err(|_| invalid("statistical ring dimension exceeds u32"))?;
+            let params =
+                backend.control_parameters_on_device(op.device).map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_factor(
+                builder.launch_stream(),
+                m_bar,
+                digits,
+                GpuStatisticalFactor {
+                    degree,
+                    preimage_sigma: *preimage_sigma,
+                    variance: *variance,
+                    alpha: *alpha,
+                    pivot_floor: *pivot_floor,
+                },
+                GpuStatisticalTrapGenOperands {
+                    precomputation,
+                    precomputation_binding: *precomputation_binding,
+                    auxiliary: (attempt_address, 8),
+                    auxiliary_binding: *attempt_binding,
+                },
+                (status_address, *status_binding),
+            )?;
+            builder.retain_owner(Arc::clone(precomputation_owner));
+            builder.retain_owner(Arc::clone(attempt_owner));
+            builder.retain_owner(Arc::clone(status_owner));
         }
         GpuNativePrimitive::StatisticalPerturbation => {
             let [
@@ -5044,19 +5166,17 @@ pub(crate) fn emit_compiled_gpu_op(
                 KernelArg::U32(output_part),
                 KernelArg::Value(seed_id),
                 KernelArg::U32(seed_part),
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
                 KernelArg::U64(_),
                 KernelArg::F64(p2_sigma),
                 KernelArg::F64(center_scale),
-                KernelArg::F64(a),
-                KernelArg::F64(beta),
-                KernelArg::F64(gmax),
-                KernelArg::F64(isotropic),
                 KernelArg::F64(rounding),
                 KernelArg::U32(output_binding),
                 KernelArg::U32(seed_binding),
-                KernelArg::U32(spectra_binding),
-                KernelArg::U32(vectors_binding),
-                KernelArg::U32(chunk_binding),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(centers_binding),
+                KernelArg::U32(buffer_binding),
                 KernelArg::U32(p2_binding),
             ] = op.arguments.as_ref()
             else {
@@ -5074,26 +5194,32 @@ pub(crate) fn emit_compiled_gpu_op(
             let (output_ty, output, output_bindings) =
                 compiled_raw_matrix_part(output_owner, *output_part, PhysicalEncoding::FullCoeff)?;
             let seed_address = compiled_bytes_part(seed_owner, *seed_part, 32, op.device)?;
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
             let (device, workspace) = resources
                 .statistical
                 .get(resource_id)
                 .ok_or_else(|| invalid("statistical perturbation has no prepared workspace"))?;
             if *device != op.device ||
-                [p2_sigma, center_scale, a, beta, gmax, isotropic, rounding]
-                    .iter()
-                    .any(|value| !value.is_finite())
+                [p2_sigma, center_scale, rounding].iter().any(|value| !value.is_finite())
             {
                 return Err(invalid("statistical perturbation physical contract is inconsistent"));
             }
             bind_raw_matrix_part(builder, *output_binding, &output_bindings)?;
             builder.bind_resident_address(seed_address, 32, *seed_binding)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
             let ranges = workspace.binding_ranges();
-            for ((address, bytes), binding) in ranges.into_iter().zip([
-                spectra_binding,
-                vectors_binding,
-                chunk_binding,
-                p2_binding,
-            ]) {
+            for ((address, bytes), binding) in
+                ranges.into_iter().zip([centers_binding, buffer_binding, p2_binding])
+            {
                 builder.bind_resident_address(address, bytes, *binding)?;
             }
             let params = backend
@@ -5103,27 +5229,25 @@ pub(crate) fn emit_compiled_gpu_op(
                 builder.launch_stream(),
                 &output,
                 seed_address,
+                precomputation,
                 GpuStatisticalPerturbation {
                     p2_sigma: *p2_sigma,
                     center_scale: *center_scale,
-                    a: *a,
-                    beta: *beta,
-                    gmax: *gmax,
-                    isotropic: *isotropic,
                     rounding: *rounding,
                 },
                 workspace,
                 GpuStatisticalBindings {
                     output_base: *output_binding,
                     seed: *seed_binding,
-                    spectra: *spectra_binding,
-                    vectors: *vectors_binding,
-                    chunk: *chunk_binding,
+                    precomputation: *precomputation_binding,
+                    centers: *centers_binding,
+                    buffer: *buffer_binding,
                     p2: *p2_binding,
                 },
             )?;
             builder.retain_owner(Arc::clone(output_owner));
             builder.retain_owner(Arc::clone(seed_owner));
+            builder.retain_owner(Arc::clone(precomputation_owner));
             builder.retain_owner(Arc::clone(workspace));
         }
         GpuNativePrimitive::GqSample => {
@@ -6927,6 +7051,36 @@ fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
             .checked_add(8)
             .and_then(|length| length.checked_add(part_len))
             .ok_or("trapdoor secret payload length overflows")?;
+    }
+    // A statistical trapdoor's last leaf is its precomputation, a dense byte range.
+    if let mxx_ir_core::types::TrapdoorInstantiation::Statistical { m_bar } = instantiation {
+        let bytes = crate::sampler::trapdoor::statistical::precomputation_bytes(
+            public_matrix.ring.ring_dimension() as usize,
+            m_bar,
+            digit_count,
+        )
+        .ok_or("trapdoor precomputation length overflows")? as u64;
+        let leaf = RawExportLeaf::Value(secret_shapes.len() as u32);
+        let [fragment] = layout
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.leaf == leaf)
+            .collect::<Vec<_>>()[..]
+        else {
+            return Err("trapdoor precomputation export must be one fragment".into());
+        };
+        if fragment.raw_bytes != bytes {
+            return Err("trapdoor precomputation export has the wrong length".into());
+        }
+        source.seek(SeekFrom::Start(fragment.raw_offset)).map_err(|error| error.to_string())?;
+        secret_file.write_all(&bytes.to_le_bytes()).map_err(|error| error.to_string())?;
+        let copied = std::io::copy(&mut Read::take(&mut *source, bytes), &mut secret_file)
+            .map_err(|error| error.to_string())?;
+        if copied != bytes {
+            return Err("trapdoor precomputation export is truncated".into());
+        }
+        secret_len =
+            secret_len.checked_add(8 + bytes).ok_or("trapdoor secret payload length overflows")?;
     }
     sink.write_all(&public_len.to_le_bytes()).map_err(|error| error.to_string())?;
     public_file.rewind().map_err(|error| error.to_string())?;

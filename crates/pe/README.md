@@ -74,9 +74,14 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
   manuscript's theorem.
 
 The budget bounds statistical distances assuming that every sampler returns its ideal discrete
-Gaussian. The floating-point error of the sampling primitives (as in OpenFHE), the preimage widths
-(the same heuristic singular-value estimate as the existing sampler), and the truncation and
-rejection of preimages and key samples (cutoff `floor(6.5 σ_key)`) are heuristic and not budgeted.
+Gaussian. The floating-point error of the sampling primitives (as in OpenFHE), the preimage widths,
+and the truncation and rejection of preimages and key samples (cutoff `floor(6.5 σ_key)`) are
+heuristic and not budgeted. The statistical key width `√(c_G² (1 + ŝ_1²) + r²)` uses the estimate
+`ŝ_1 = σ_T √n (√m̄ + √D + √(ln(n / (2δ))))`, `δ = 2^-10`, of `s_1(T)`; Setup checks it against the
+sampled `T` by factoring the perturbation covariance at every evaluation point, redraws `T` on a
+failure, and fails after 8 draws, so no key is sampled from a trapdoor the estimate does not
+cover. The factors (`(n / 2)(m̄ D + m̄ (m̄ + 1) / 2)` complex values) belong to the master secret key
+and stay in GPU memory.
 Flooding is evaluated per coefficient at `2^-s_flood` (default `s_flood = 30`), separately from
 `ε_total`, as in Noah's Ark. The `Strict` key width grows with the witness bound `B_R̂` and is
 rejected when its key cutoff is not below `2^52` and `q / 2`.

@@ -572,8 +572,13 @@ pub(super) fn pack_resident_family(
                 }
             }]),
             trapdoor @ ConcreteWireType::Trapdoor { .. } => {
-                vec![PhysicalEncoding::FullEval; trapdoor_leaf_types(trapdoor)?.len()]
-                    .into_boxed_slice()
+                let mut encodings =
+                    vec![PhysicalEncoding::FullEval; trapdoor_leaf_types(trapdoor)?.len()];
+                if crate::gpu_physical_lowering::trapdoor_precomputation_bytes(trapdoor)?.is_some()
+                {
+                    encodings.push(PhysicalEncoding::Bytes);
+                }
+                encodings.into_boxed_slice()
             }
             ConcreteWireType::Int | ConcreteWireType::ConstantInt => {
                 Box::new([PhysicalEncoding::Signed(GpuSignedValuesEncoding::SignedI64)])

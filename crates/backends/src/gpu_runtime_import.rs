@@ -278,7 +278,7 @@ unsafe fn upload_selected_payload(
         }
         (
             ArtifactType::Trapdoor { matrix, digit_count, instantiation, .. },
-            ImportDestination::Trapdoor { public, secret },
+            ImportDestination::Trapdoor { public, secret, precomputation },
             ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
         ) => {
             if &public.1 != matrix {
@@ -290,9 +290,14 @@ unsafe fn upload_selected_payload(
                 *instantiation,
             )
             .ok_or("trapdoor import has an invalid instantiation")?;
-            let (tag, secret_parts) =
+            let (tag, mut secret_parts) =
                 crate::sampler::trapdoor::trapdoor_encoding_parts(&secret_bytes)
                     .map_err(|error| error.to_string())?;
+            // A statistical encoding ends with the precomputation, which stays on the device.
+            let precomputation_bytes = match precomputation {
+                Some(owner) => Some((owner, secret_parts.pop().ok_or("trapdoor import is empty")?)),
+                None => None,
+            };
             let expected_tag = if instantiation.is_computational() {
                 crate::sampler::trapdoor::TAG_COMPUTATIONAL
             } else {
@@ -320,6 +325,10 @@ unsafe fn upload_selected_payload(
                 unsafe {
                     backend.upload_physical_matrix_import_after_completion(owner, ty, bytes)
                 }?;
+            }
+            if let Some((owner, bytes)) = precomputation_bytes {
+                owner.upload(bytes).map_err(|error| error.to_string())?;
+                owner.wait_until_ready().map_err(|error| error.to_string())?;
             }
             public.0.wait_until_ready();
             for (owner, _) in secret {

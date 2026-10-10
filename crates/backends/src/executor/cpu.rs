@@ -1264,7 +1264,14 @@ impl<S: SessionStore> Executor<'_, S> {
                     }
                 }
             }
-            NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, instantiation, .. } => {
+            NodeKind::TrapdoorSample {
+                sigma,
+                gadget_base,
+                digit_count,
+                instantiation,
+                preimage_sigma,
+                ..
+            } => {
                 let matrix_wire = WireRef { node: node.id, port: Port(0) };
                 let trapdoor_wire = WireRef { node: node.id, port: Port(1) };
                 let ty = self.matrix_type(scope_id, path, env, matrix_wire)?;
@@ -1276,6 +1283,11 @@ impl<S: SessionStore> Executor<'_, S> {
                     .map_err(|error| self.expression_error(node.id, error))?
                     .abs();
                 let digit_count = self.eval_usize(node.id, digit_count, env)?;
+                let preimage_sigma = preimage_sigma
+                    .as_ref()
+                    .map(|width| width.evaluate_rational(env))
+                    .transpose()
+                    .map_err(|error| self.expression_error(node.id, error))?;
                 let (public, secret) = self.sample_trapdoor(
                     path,
                     matrix_wire,
@@ -1285,6 +1297,7 @@ impl<S: SessionStore> Executor<'_, S> {
                     &gadget_base,
                     digit_count,
                     *instantiation,
+                    preimage_sigma.as_ref(),
                 )?;
                 let public = PolyMatrix::from_backend_cpu_full(public);
                 self.put(values, node.id, 0, RuntimeValue::Matrix(public.clone()));
@@ -2345,6 +2358,7 @@ impl<S: SessionStore> Executor<'_, S> {
         gadget_base: &BigInt,
         digit_count: usize,
         instantiation: mxx_ir_core::types::TrapdoorInstantiation,
+        preimage_sigma: Option<&mxx_ir_core::Rational>,
     ) -> Result<(DCRTPolyMatrix, DCRTTrapdoor), ExecutionError> {
         let matrix_site = DrawSite {
             instantiation_path: path.to_vec(),
@@ -2385,7 +2399,14 @@ impl<S: SessionStore> Executor<'_, S> {
                 (None, None) => {
                     let (public, secret) = self
                         .backend
-                        .sample_trapdoor(ty, sigma, gadget_base, digit_count, instantiation)
+                        .sample_trapdoor(
+                            ty,
+                            sigma,
+                            gadget_base,
+                            digit_count,
+                            instantiation,
+                            preimage_sigma,
+                        )
                         .map_err(Self::backend_error)?;
                     let public_bytes = self.backend.matrix_to_bytes(&public);
                     self.artifact_store
@@ -2420,12 +2441,19 @@ impl<S: SessionStore> Executor<'_, S> {
         match &mut self.sampling_mode {
             SamplingMode::Fresh => self
                 .backend
-                .sample_trapdoor(ty, sigma, gadget_base, digit_count, instantiation)
+                .sample_trapdoor(ty, sigma, gadget_base, digit_count, instantiation, preimage_sigma)
                 .map_err(Self::backend_error),
             SamplingMode::Record(recorder) => {
                 let (public, secret) = self
                     .backend
-                    .sample_trapdoor(ty, sigma, gadget_base, digit_count, instantiation)
+                    .sample_trapdoor(
+                        ty,
+                        sigma,
+                        gadget_base,
+                        digit_count,
+                        instantiation,
+                        preimage_sigma,
+                    )
                     .map_err(Self::backend_error)?;
                 let public_bytes = self.backend.matrix_to_bytes(&public);
                 recorder.record(

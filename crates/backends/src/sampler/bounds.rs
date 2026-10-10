@@ -12,12 +12,13 @@ use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 use rayon::prelude::*;
 use thiserror::Error;
 
-/// Constant of the heuristic singular-value estimate `s_1(X) ≈ C·σ·(√rows + √columns + C')` of a
-/// Gaussian matrix of width `σ` (MP12, GM18). The same constants size every trapdoor preimage
-/// width.
+/// Constant of the heuristic singular-value estimate `s_1(X) ≈ C·σ·(√rows + √columns + C')` of the
+/// computational trapdoor's Gaussian matrix of width `σ` (MP12, GM18, as OpenFHE).
 pub const SPECTRAL_CONSTANT: f64 = 1.8;
-/// Additive constant `C'` of the singular-value estimate.
+/// Additive constant `C'` of the computational singular-value estimate.
 pub const SPECTRAL_OFFSET: f64 = 4.7;
+/// The probability `δ` with which the statistical estimate `ŝ_1` may fall below `s_1(T)`.
+pub const STATISTICAL_SPECTRAL_FAILURE: f64 = 1.0 / 1024.0;
 
 /// Selects the hard coefficient cutoff for a trapdoor-sampled preimage.
 ///
@@ -124,7 +125,14 @@ pub fn gadget_sampler_sigma(base: u32, sigma: f64) -> f64 {
 ///
 /// - `Computational` (`T' = [R; E]`, `2·rows x rows·D`): `1.8 σ (√(n·rows·D) + √(2n) + 4.7)`, the
 ///   estimate of the existing sampler (the `√(2n)` term is not scaled by `rows`).
-/// - `Statistical { m_bar }` (`T`, `m_bar x D`, one row): `1.8 σ (√(n D) + √(n m_bar) + 4.7)`.
+/// - `Statistical { m_bar }` (`T`, `m_bar x D`, one row): `σ √n (√m_bar + √D + √(ln(n / (2δ))))`
+///   with `δ` = [`STATISTICAL_SPECTRAL_FAILURE`]. The negacyclic Fourier transform diagonalizes
+///   `T`, so `s_1(T) = max_j s_1(T(ω_j))` over the `n / 2` conjugate pairs of evaluation points,
+///   and each `T(ω_j)` is an `m_bar x D` matrix of independent complex Gaussian entries of variance
+///   `n σ²`. Gordon's theorem gives the mean `σ √n (√m_bar + √D)`, and Gaussian concentration with
+///   a union bound over the points the deviation `σ √n √(ln(n / (2δ)))`. The estimate is heuristic
+///   (the entries are discrete Gaussians); the statistical sampler checks the actual `T` when it
+///   factors the perturbation covariance at TrapGen ([`crate::sampler::trapdoor::statistical`]).
 ///
 /// Returns `None` for invalid parameters, including a statistical trapdoor with other than one
 /// row.
@@ -145,17 +153,22 @@ pub fn trapdoor_singular_value_estimate(
     }
     let ring_dim_sqrt = BigDecimal::from_u32(ring_dimension)?.sqrt()?;
     let m_g = BigDecimal::from(u64::try_from(public_rows.checked_mul(modulus_digits)?).ok()?);
-    let other = match instantiation {
-        TrapdoorInstantiation::Computational => BigDecimal::from(2u8),
-        TrapdoorInstantiation::Statistical { m_bar } if public_rows == 1 && m_bar > 0 => {
-            BigDecimal::from(u64::try_from(m_bar).ok()?)
+    match instantiation {
+        TrapdoorInstantiation::Computational => {
+            let term = ring_dim_sqrt.clone() * m_g.sqrt()? +
+                BigDecimal::from(2u8).sqrt()? * ring_dim_sqrt +
+                BigDecimal::from_f64(SPECTRAL_OFFSET)?;
+            Some(BigDecimal::from_f64(SPECTRAL_CONSTANT)? * BigDecimal::from_f64(sigma)? * term)
         }
-        TrapdoorInstantiation::Statistical { .. } => return None,
-    };
-    let term = ring_dim_sqrt.clone() * m_g.sqrt()? +
-        other.sqrt()? * ring_dim_sqrt +
-        BigDecimal::from_f64(SPECTRAL_OFFSET)?;
-    Some(BigDecimal::from_f64(SPECTRAL_CONSTANT)? * BigDecimal::from_f64(sigma)? * term)
+        TrapdoorInstantiation::Statistical { m_bar } if public_rows == 1 && m_bar > 0 => {
+            let deviation = (ring_dimension as f64 / (2.0 * STATISTICAL_SPECTRAL_FAILURE)).ln();
+            let term = BigDecimal::from(u64::try_from(m_bar).ok()?).sqrt()? +
+                m_g.sqrt()? +
+                BigDecimal::from_f64(deviation.max(0.0))?.sqrt()?;
+            Some(BigDecimal::from_f64(sigma)? * ring_dim_sqrt * term)
+        }
+        TrapdoorInstantiation::Statistical { .. } => None,
+    }
 }
 
 /// The smallest preimage width (a standard deviation) the trapdoor sampler accepts.
@@ -165,9 +178,11 @@ pub fn trapdoor_singular_value_estimate(
 ///
 /// - `Computational`: `c_G ŝ_1 = 1.8 (b + 1) σ² (√(n·rows·D) + √(2n) + 4.7)`, the width of the
 ///   existing sampler.
-/// - `Statistical`: `√(c_G² (1 + 2 ŝ_1²) + r²)` with the rounding width `r = σ`, about `√2` times
-///   `c_G ŝ_1`. It makes the isotropic part `s² - r² - 2 α ŝ_1²` of the matrix-free perturbation
-///   sampler nonnegative for `α = c_G² s² / (s² - c_G²)`.
+/// - `Statistical`: `√(c_G² (1 + ŝ_1²) + r²)` with the rounding width `r = σ`. The covariance `(s²
+///   - r²) I - α T T*` of the continuous perturbation, `α = c_G² s² / (s² - c_G²)`, is positive
+///   definite iff `(s² - r²)(s² - c_G²) > c_G² s² s_1(T)²`, i.e. `s⁴ - s² (c_G² (1 + s_1(T)²) + r²)
+///   + r² c_G² > 0`, which holds for `s² ≥ c_G² (1 + s_1(T)²) + r²`, so for this width whenever
+///   `s_1(T) ≤ ŝ_1`.
 ///
 /// The estimate is heuristic in the same way as the existing sampler's.
 pub fn minimum_preimage_sigma(
@@ -195,10 +210,10 @@ pub fn minimum_preimage_sigma(
             Some(sigma * (BigDecimal::from(base) + BigDecimal::from(1u8)) * s1)
         }
         TrapdoorInstantiation::Statistical { .. } => {
-            let variance = c.square() *
-                (BigDecimal::from(1u8) + BigDecimal::from(2u8) * s1.square()) +
-                sigma.square();
-            variance.sqrt()
+            let variance = &c * &c * (BigDecimal::from(1u8) + &s1 * &s1) + &sigma * &sigma;
+            // `BigDecimal::sqrt` (0.4.10) is wrong by `√10` for inputs of an even scale from 200
+            // on, as the products of the inexact square roots above have; round first.
+            variance.with_prec(100).sqrt()
         }
     }
 }
@@ -389,23 +404,28 @@ mod tests {
     }
 
     #[test]
-    fn statistical_minimum_width_admits_the_perturbation_decomposition() {
+    fn statistical_minimum_width_makes_the_perturbation_covariance_positive_definite() {
         let (n, digits, base, sigma, m_bar) = (16u32, 4usize, 4u32, 4.578f64, 7usize);
         let instantiation = TrapdoorInstantiation::Statistical { m_bar };
         let s1 = trapdoor_singular_value_estimate(n, 1, digits, sigma, instantiation)
             .unwrap()
             .to_f64()
             .unwrap();
-        let expected_s1 = 1.8 * sigma * ((16.0f64 * 4.0).sqrt() + (16.0f64 * 7.0).sqrt() + 4.7);
+        let expected_s1 = sigma *
+            4.0 *
+            ((7.0f64).sqrt() +
+                (4.0f64).sqrt() +
+                (16.0 / (2.0 * STATISTICAL_SPECTRAL_FAILURE)).ln().sqrt());
         assert!((s1 - expected_s1).abs() < 1e-9 * expected_s1);
         let s = minimum_preimage_sigma(n, 1, digits, base, sigma, instantiation)
             .unwrap()
             .to_f64()
             .unwrap();
         let c = gadget_sampler_sigma(base, sigma);
+        assert!((s * s - (c * c * (1.0 + s1 * s1) + sigma * sigma)).abs() < 1e-6 * s * s);
+        // (s² - r²) I - α T T* is positive definite for s_1(T) up to the estimate.
         let alpha = c * c * s * s / (s * s - c * c);
-        assert!(s * s - sigma * sigma - 2.0 * alpha * s1 * s1 > -1e-6 * s * s);
-        assert!(s > c * s1);
+        assert!(s * s - sigma * sigma > alpha * s1 * s1);
         assert!(minimum_preimage_sigma(n, 2, digits, base, sigma, instantiation).is_none());
     }
 

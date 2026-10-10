@@ -181,6 +181,10 @@ impl PhysicalValue {
                         )
                         .map_or(0, |shapes| shapes.len());
                         out.extend(std::iter::repeat_n((family_axes + 4, 0), leaves));
+                        // A statistical trapdoor ends with its precomputation bytes.
+                        if !instantiation.is_computational() {
+                            out.push((family_axes + 1, 4));
+                        }
                     }
                 }
                 ConcreteWireType::Matrix(_) |
@@ -472,6 +476,7 @@ pub(crate) enum GpuNativePrimitive {
     P1CovarianceRefresh,
     P1Sample,
     StatisticalSpectra,
+    StatisticalFactor,
     StatisticalPerturbation,
     GqSample,
     PreimageCorrection,
@@ -924,29 +929,46 @@ impl GpuImplementation {
         }
     }
 
-    /// The spectra of one row chunk of a statistical trapdoor's `T` into the prepared
-    /// statistical workspace: resource ID, the coefficient-domain trapdoor and the part of the
-    /// chunk's first limb, the chunk's first row, and the chunk and spectra bindings.
+    /// Statistical TrapGen: the values at the points `j < n / 2` of one coefficient-domain row
+    /// chunk of `T` into the spectra of the precomputation. The chunk and its part, the
+    /// precomputation and its part, the spectra scratch and its part, `m_bar`, the chunk's
+    /// first row, and the chunk, precomputation, and scratch bindings.
     pub(crate) fn statistical_spectra() -> Self {
         use GpuArgumentKind::{U32, U64, Value};
         Self {
             primitive: GpuNativePrimitive::StatisticalSpectra,
-            argument_kinds: Box::new([U32, Value, U32, U64, U32, U32]),
-            output_count: 0,
+            argument_kinds: Box::new([Value, U32, Value, U32, Value, U32, U64, U64, U32, U32, U32]),
+            output_count: 1,
+        }
+    }
+
+    /// Statistical TrapGen: one attempt's Cholesky factorization of the precomputation, which
+    /// accepts or rejects the attempt in the preimage status record. The precomputation, the
+    /// attempt word, and the status with their parts, `m_bar`, `D`, `n`, the width, `s² - r²`,
+    /// `α`, the pivot floor, and the precomputation, attempt, and status bindings.
+    pub(crate) fn statistical_factor() -> Self {
+        use GpuArgumentKind::{F64, U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::StatisticalFactor,
+            argument_kinds: Box::new([
+                Value, U32, Value, U32, Value, U32, U64, U64, U64, F64, F64, F64, F64, U32, U32,
+                U32,
+            ]),
+            output_count: 1,
         }
     }
 
     /// The statistical perturbation of one tile: resource ID, the coefficient-domain output and
-    /// its part, the seed and its part, `m_bar`, the sampler's scalars (`p_2` width, center
-    /// scale, `a`, `beta`, `gmax`, isotropic and rounding widths), and the output, seed, and four
-    /// workspace bindings.
+    /// its part, the seed and its part, the trapdoor's precomputation and its part, `m_bar`, the
+    /// sampler's scalars (`p_2` width, center scale, rounding width), and the output, seed,
+    /// precomputation, and three workspace bindings.
     pub(crate) fn statistical_perturbation() -> Self {
         use GpuArgumentKind::{F64, U32, U64, Value};
         Self {
             primitive: GpuNativePrimitive::StatisticalPerturbation,
             argument_kinds: Box::new([
-                U32, Value, U32, Value, U32, U64, F64, F64, F64, F64, F64, F64, F64, U32, U32, U32,
-                U32, U32, U32,
+                U32, Value, U32, Value, U32, Value, U32, U64, F64, F64, F64, U32, U32, U32, U32,
+                U32, U32,
             ]),
             output_count: 1,
         }
@@ -1324,7 +1346,7 @@ pub(crate) enum GpuPreparedWorkspaceKind {
     P1,
     Gq,
     Cutoff,
-    /// The statistical perturbation workspace: spectra, vectors, chunk, and `p_2`.
+    /// The statistical perturbation workspace: centers, buffer, and `p_2`.
     Statistical,
 }
 
@@ -1476,7 +1498,7 @@ impl CompiledGpuProgram {
             } else if let GpuBindingSource::PreparedWorkspace { kind, component, .. } = *source {
                 let valid = match kind {
                     GpuPreparedWorkspaceKind::P1 => component < 5,
-                    GpuPreparedWorkspaceKind::Statistical => component < 4,
+                    GpuPreparedWorkspaceKind::Statistical => component < 3,
                     GpuPreparedWorkspaceKind::Gq | GpuPreparedWorkspaceKind::Cutoff => {
                         component == 0
                     }

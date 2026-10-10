@@ -25,7 +25,8 @@ fn bench_cpu_preimage() {
         DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
     let uniform_sampler = DCRTPolyUniformSampler::new();
 
-    let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, TRAPDOOR_SIZE);
+    let (trapdoor, public_matrix) =
+        trapdoor_sampler.trapdoor(&params, TRAPDOOR_SIZE, None).unwrap();
     let target =
         uniform_sampler.sample_uniform(&params, TRAPDOOR_SIZE, TARGET_COLS, DistType::FinRingDist);
 

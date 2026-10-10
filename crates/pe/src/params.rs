@@ -765,7 +765,9 @@ impl PeParameters {
 
     /// The key width `σ_key` (a standard deviation): the trapdoor's minimum preimage width
     /// ([`minimum_preimage_sigma`]; for `Computational`, `1.8 (b + 1) σ_T² (√(n D) + √(2 n) +
-    /// 4.7)`), or for `Strict` the larger of it and the SampleRight width.
+    /// 4.7)`; for `Statistical`, `√(c_G² (1 + ŝ_1²) + σ_T²)` with
+    /// `ŝ_1 = σ_T √n (√m̄ + √D + √(ln(n / (2δ))))`), or for `Strict` the larger of it and the
+    /// SampleRight width.
     pub const fn key_width(&self) -> &BigDecimal {
         &self.key_width
     }

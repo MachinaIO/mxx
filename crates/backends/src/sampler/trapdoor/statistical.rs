@@ -11,39 +11,44 @@
 //! (`x ↦ x^{-1}` entrywise) followed by transposition. Widths here are standard deviations, and
 //! a covariance is the covariance of the coefficient vector.
 //!
-//! The perturbation is drawn as `p_2` from `D_{Z^{nD}, √(s² - c²)}` and `p_1` from the conditional
-//! distribution, whose center and covariance are
+//! The perturbation is drawn by Peikert's convolution sampler (CRYPTO 2010, Algorithm 2), as in
+//! the statistical trapdoor of DRTV26: `p_2` from `D_{Z^{nD}, √(s² - c²)}`, and `p_1` from the
+//! conditional distribution, whose center and covariance are
 //!
 //! ```text
 //! μ   = -c² / (s² - c²) · T p_2
-//! Σ_1 = s² I - α T T*,   α = c² s² / (s² - c²).
+//! Σ_1 = s² I - α T T*,   α = c² s² / (s² - c²),
 //! ```
 //!
-//! `Σ_1` is never formed. With `ŝ_1` the estimate of `s_1(T)` from
-//! [`crate::sampler::bounds::trapdoor_singular_value_estimate`], `a = 2 α ŝ_1²` and `β = α / a =
-//! 1 / (2 ŝ_1²)`,
+//! as the randomized rounding `p_1 = ⌊μ + y⌉_r` (a sample of `D_{Z, μ + y, r}` per coefficient)
+//! of a continuous `y` of covariance `Σ' = Σ_1 - r² I = (s² - r²) I - α T T*`, with rounding
+//! width `r = σ`.
 //!
-//! ```text
-//! Σ_1 - r² I = s_iso² I + a (I - β T T*),   s_iso² = s² - r² - a,
-//! ```
+//! The negacyclic Fourier transform diagonalizes ring multiplication, so `Σ'` is block diagonal
+//! over the evaluation points `ω_j = exp(iπ(2j + 1)/n)`: its block at `ω_j` is the Hermitian
+//! `m̄ x m̄` matrix `Σ'_j = (s² - r²) I - α T(ω_j) T(ω_j)*`. The points pair up as
+//! `ω_{n-1-j} = conj(ω_j)`, and the values of a real polynomial at a pair are conjugate, so TrapGen
+//! keeps the values of `T` and the Cholesky factors `L_j L_j* = Σ'_j` at the `n / 2` points
+//! `j < n / 2` only ([`StatisticalPrecomputation`]). The sampler draws `q̂_j` for `j < n / 2` as
+//! independent circular complex Gaussians with `E|q̂_j|² = n` (the law of the transform `q̂ = F q`
+//! of a real standard normal `q`, whose partner values are the conjugates), takes
+//! `ŷ_j = L_j q̂_j` and `ŷ_{n-1-j} = conj(ŷ_j)`, and transforms back with the factor `1 / n`, so
+//! `y` is real with covariance `F^{-1} diag(Σ'_j) F^{-*} n = Σ'`. The center `μ` is added in the
+//! same domain.
 //!
-//! and `s_iso² ≥ 0` is the condition of [`crate::sampler::bounds::minimum_preimage_sigma`]. The
-//! correlated part is `y_corr = √a (z - T f(G) T* z)` for `z` standard normal and `G = T* T`,
-//! where `f(g) = (1 - √(1 - β g)) / g = β / (1 + √(1 - β g))` is the smaller root of
-//! `2 k - k² g = β`, so that `(I - T f(G) T*)² = I - β T T*`. `f(G) v` is evaluated by the
-//! Chebyshev expansion of `f` on `[0, ŝ_1²]` with the Clenshaw recurrence, and `G v = T* (T v)`
-//! streams over the row chunks of `T`. On `[0, ŝ_1²]`, `β g ≤ 1/2`, and the branch point of `f` at
-//! `β g = 1` maps to `x = 3` of the Chebyshev variable, so the expansion converges like
-//! `(3 + 2√2)^{-K}`. Every product runs in the negacyclic Fourier domain, where ring
-//! multiplication is pointwise and the adjoint is complex conjugation.
+//! The factorization is also the check of the trapdoor: it succeeds iff every `Σ'_j` is positive
+//! definite, i.e. `s_1(T(ω_j))² < (s² - r²) / α` at every point, which the minimum width of
+//! [`crate::sampler::bounds::minimum_preimage_sigma`] predicts for the estimate
+//! [`crate::sampler::bounds::trapdoor_singular_value_estimate`]. A pivot below
+//! [`PIVOT_FLOOR`]` · s²` counts as a failure, since a binary64 factorization of a nearly singular
+//! matrix may still complete. TrapGen redraws `T` after a failure and reports an error after
+//! [`TRAPGEN_ATTEMPTS`] failures, which means that the estimate is wrong for the parameters. The
+//! largest point singular value of the accepted `T` (by power iteration, a lower bound of
+//! `s_1(T)`) is logged next to the estimate.
 //!
-//! Finally `p_1` is the randomized rounding (Peikert, CRYPTO 2010) `D_{Z, μ + y, r}` of
-//! `y = y_corr + s_iso N(0, I)` with rounding width `r = σ`.
-//!
-//! The floating-point evaluation, the Chebyshev truncation, the estimate `ŝ_1 ≥ s_1(T)`, and the
-//! convolution of the continuous and discrete parts are heuristic, as are the samplers of the
-//! computational instantiation. Peak memory holds one row chunk of `T` in the Fourier domain and
-//! `D x columns` Fourier vectors, besides the perturbation itself.
+//! The floating-point evaluation and the convolution of the continuous and discrete parts are
+//! heuristic, as are the samplers of the computational instantiation. The precomputation holds
+//! `(n / 2) (m̄ D + m̄ (m̄ + 1) / 2)` complex values.
 
 use crate::{
     matrix::{
@@ -56,22 +61,24 @@ use crate::{
         dcrt::{native::ffi::exact_basis_small_coefficients, params::DCRTPolyParams},
     },
     sampler::{
-        DistType, PolyUniformSampler, bounds::trapdoor_singular_value_estimate,
-        trapdoor::utils::split_int64_mat_to_elems, uniform::DCRTPolyUniformSampler,
+        DistType, PolyUniformSampler, trapdoor::utils::split_int64_mat_to_elems,
+        uniform::DCRTPolyUniformSampler,
     },
 };
-use mxx_ir_core::types::TrapdoorInstantiation;
-use num_traits::ToPrimitive;
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::{f64::consts::PI, ops::Range};
+use tracing::{info, warn};
 
 /// Rows of `T` per stored chunk.
 pub const ROW_CHUNK: usize = 8;
-/// Degree of the Chebyshev expansion of `f`; its relative error is about `(3 + 2√2)^{-24} <
-/// 2^{-60}`.
-pub(crate) const CHEBYSHEV_DEGREE: usize = 24;
+/// Draws of `T` before TrapGen reports that the perturbation covariance is not positive definite.
+pub const TRAPGEN_ATTEMPTS: usize = 8;
+/// The smallest accepted Cholesky pivot, relative to `s²`.
+pub const PIVOT_FLOOR: f64 = 1.0 / (1u64 << 20) as f64;
+/// Iterations of the power iteration that measures the point singular values of `T`.
+pub const POWER_ITERATIONS: usize = 64;
 /// Tail cut, in rounding widths, of the rejection sampler of the randomized rounding.
 const ROUNDING_TAIL: f64 = 12.0;
 
@@ -80,28 +87,165 @@ pub fn chunk_row_counts(m_bar: usize) -> Vec<usize> {
     (0..m_bar).step_by(ROW_CHUNK).map(|start| ROW_CHUNK.min(m_bar - start)).collect()
 }
 
-/// Statistical TrapGen: the row chunks of `T` and the public matrix `[ā | g - ā T]`.
+/// The entries `m_bar (m_bar + 1) / 2` of a packed `m_bar x m_bar` lower triangle.
+pub fn triangle_len(m_bar: usize) -> Option<usize> {
+    Some(m_bar.checked_mul(m_bar.checked_add(1)?)? / 2)
+}
+
+/// The index of entry `(i, k)`, `k ≤ i`, of a packed lower triangle.
+pub(crate) const fn triangle_index(i: usize, k: usize) -> usize {
+    i * (i + 1) / 2 + k
+}
+
+/// The bytes of the header of a [`StatisticalPrecomputation`]: the width and the measured
+/// singular value.
+pub const PRECOMPUTATION_HEADER_BYTES: usize = 16;
+
+/// The byte length of the [`StatisticalPrecomputation`] of an `m_bar x digits` trapdoor in ring
+/// dimension `n`: the header, then `(n / 2) (m_bar · digits + m_bar (m_bar + 1) / 2)` complex
+/// binary64 values.
+pub fn precomputation_bytes(n: usize, m_bar: usize, digits: usize) -> Option<usize> {
+    let complex =
+        (n / 2).checked_mul(m_bar.checked_mul(digits)?.checked_add(triangle_len(m_bar)?)?)?;
+    complex.checked_mul(16)?.checked_add(PRECOMPUTATION_HEADER_BYTES)
+}
+
+/// What statistical TrapGen precomputes for the preimages of width `preimage_sigma`, with the
+/// largest point singular value `measured_singular_value` of `T` by power iteration (recorded
+/// next to the estimate), in the negacyclic Fourier domain at the points `j < n / 2` (module
+/// documentation), as interleaved complex binary64 values with consecutive points adjacent:
+///
+/// - `spectra`: `T_{ik}(ω_j)` at `(i · D + k) · n / 2 + j`;
+/// - `factor`: entry `(i, k)`, `k ≤ i`, of the Cholesky factor `L_j` at `triangle_index(i, k) · n /
+///   2 + j`.
+///
+/// Its encoding ([`Self::to_bytes`]) is also the layout of the trapdoor's precomputation leaf on
+/// the GPU.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatisticalPrecomputation {
+    pub preimage_sigma: f64,
+    pub measured_singular_value: f64,
+    pub spectra: Vec<f64>,
+    pub factor: Vec<f64>,
+}
+
+impl StatisticalPrecomputation {
+    /// `preimage_sigma`, `measured_singular_value`, `spectra`, and `factor`, little-endian
+    /// binary64.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        [self.preimage_sigma, self.measured_singular_value]
+            .into_iter()
+            .chain(self.spectra.iter().copied())
+            .chain(self.factor.iter().copied())
+            .flat_map(f64::to_le_bytes)
+            .collect()
+    }
+
+    /// Decodes [`Self::to_bytes`] of an `m_bar x digits` trapdoor in ring dimension `n`.
+    pub fn from_bytes(bytes: &[u8], n: usize, m_bar: usize, digits: usize) -> Option<Self> {
+        if bytes.len() != precomputation_bytes(n, m_bar, digits)? {
+            return None;
+        }
+        let words = bytes
+            .chunks_exact(8)
+            .map(|word| f64::from_le_bytes(word.try_into().expect("eight bytes")))
+            .collect::<Vec<_>>();
+        let spectra_end = 2 + n * m_bar * digits;
+        Some(Self {
+            preimage_sigma: words[0],
+            measured_singular_value: words[1],
+            spectra: words[2..spectra_end].to_vec(),
+            factor: words[spectra_end..].to_vec(),
+        })
+    }
+}
+
+/// The scalars of the statistical perturbation sampler for preimage width `s`, gadget width `c`,
+/// and rounding width `r`.
+#[derive(Clone, Copy, Debug)]
+pub struct PerturbationWidths {
+    /// `-c² / (s² - c²)`, the scale of the center `μ = center_scale · T p_2`.
+    pub center_scale: f64,
+    /// `α = c² s² / (s² - c²)`.
+    pub alpha: f64,
+    /// `s² - r²`, the diagonal of `Σ'`.
+    pub variance: f64,
+    /// The smallest accepted pivot, [`PIVOT_FLOOR`]` · s²`.
+    pub pivot_floor: f64,
+    /// The rounding width `r`.
+    pub rounding: f64,
+}
+
+impl PerturbationWidths {
+    /// `None` unless `s > c` and `s > r`.
+    pub fn new(s: f64, c: f64, rounding: f64) -> Option<Self> {
+        (s.is_finite() && c > 0.0 && rounding > 0.0 && s > c && s > rounding).then(|| Self {
+            center_scale: -c * c / (s * s - c * c),
+            alpha: c * c * s * s / (s * s - c * c),
+            variance: s * s - rounding * rounding,
+            pivot_floor: PIVOT_FLOOR * s * s,
+            rounding,
+        })
+    }
+}
+
+/// Statistical TrapGen for preimages of width `preimage_sigma` (`widths`): the row chunks of
+/// `T`, the precomputation, and the public matrix `[ā | g - ā T]`. Redraws `T` while the
+/// factorization fails, at most [`TRAPGEN_ATTEMPTS`] times; `None` after that many failures.
+/// `estimate` is `ŝ_1`, which is logged next to the measured value.
 pub(crate) fn trapgen(
     params: &DCRTPolyParams,
     m_bar: usize,
     sigma: f64,
-) -> (Vec<DCRTPolyMatrix>, DCRTPolyMatrix) {
+    preimage_sigma: f64,
+    widths: &PerturbationWidths,
+    estimate: f64,
+) -> Option<(Vec<DCRTPolyMatrix>, StatisticalPrecomputation, DCRTPolyMatrix)> {
     let sampler = DCRTPolyUniformSampler::new();
     let digits = params.modulus_digits();
-    let a_bar = sampler.sample_uniform(params, 1, m_bar, DistType::FinRingDist);
+    let n = params.ring_dimension() as usize;
+    let fft = NegacyclicFft::new(n);
     let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
-    let mut a_bar_t = DCRTPolyMatrix::zero(params, 1, digits);
-    let mut chunks = Vec::with_capacity(m_bar.div_ceil(ROW_CHUNK));
-    let mut start = 0;
-    for rows in chunk_row_counts(m_bar) {
-        let chunk = sampler.sample_uniform(params, rows, digits, dist.clone());
-        a_bar_t = a_bar_t + &(a_bar.slice_columns(start, start + rows) * &chunk);
-        chunks.push(chunk);
-        start += rows;
+    for attempt in 1..=TRAPGEN_ATTEMPTS {
+        let chunks = chunk_row_counts(m_bar)
+            .into_iter()
+            .map(|rows| sampler.sample_uniform(params, rows, digits, dist.clone()))
+            .collect::<Vec<_>>();
+        let spectra = half_spectra(&fft, &chunks);
+        let measured = measured_singular_value(&spectra, n, m_bar, digits);
+        match factor(&spectra, n, m_bar, digits, widths) {
+            Ok(factor) => {
+                info!(
+                    attempt,
+                    measured_s1 = measured,
+                    estimated_s1 = estimate,
+                    "statistical trapdoor accepted"
+                );
+                let a_bar = sampler.sample_uniform(params, 1, m_bar, DistType::FinRingDist);
+                let mut a_bar_t = DCRTPolyMatrix::zero(params, 1, digits);
+                for (range, chunk) in chunk_row_ranges(&chunks).into_iter().zip(&chunks) {
+                    a_bar_t = a_bar_t + &(a_bar.slice_columns(range.start, range.end) * chunk);
+                }
+                let public = a_bar
+                    .concat_columns(&[&(DCRTPolyMatrix::gadget_matrix(params, 1, None) - a_bar_t)]);
+                let precomputation = StatisticalPrecomputation {
+                    preimage_sigma,
+                    measured_singular_value: measured,
+                    spectra,
+                    factor,
+                };
+                return Some((chunks, precomputation, public));
+            }
+            Err(point) => warn!(
+                attempt,
+                point,
+                measured_s1 = measured,
+                estimated_s1 = estimate,
+                "statistical trapdoor redrawn: its perturbation covariance is not positive definite"
+            ),
+        }
     }
-    let public =
-        a_bar.concat_columns(&[&(DCRTPolyMatrix::gadget_matrix(params, 1, None) - a_bar_t)]);
-    (chunks, public)
+    None
 }
 
 /// Whether two chunked `T` hold the same rows, whatever their chunking.
@@ -144,31 +288,147 @@ pub(crate) fn combine(
     top[0].concat_rows(&top[1..].iter().chain(std::iter::once(&bottom)).collect::<Vec<_>>())
 }
 
-/// The perturbation `[p_1; p_2]` of the module documentation for the integers `p2z_vec` of `p_2`
-/// (`n·D x columns`), preimage width `s`, gadget width `c`, and TrapGen width `sigma` (also the
-/// rounding width).
+/// The values of the entries of `T` at the points `j < n / 2`, in the layout of
+/// [`StatisticalPrecomputation::spectra`].
+pub(crate) fn half_spectra(fft: &NegacyclicFft, t: &[DCRTPolyMatrix]) -> Vec<f64> {
+    let spectra = t.iter().flat_map(|chunk| chunk_spectra(fft, chunk)).collect::<Vec<_>>();
+    let points = fft.n / 2;
+    spectra.par_iter().flat_map_iter(|spectrum| spectrum[..2 * points].iter().copied()).collect()
+}
+
+/// The value at the point `j` of entry `index` of a point-major array of `points` points.
+fn at(values: &[f64], points: usize, index: usize, j: usize) -> (f64, f64) {
+    let offset = 2 * (index * points + j);
+    (values[offset], values[offset + 1])
+}
+
+/// The packed Cholesky factors of `Σ'_j = variance I - α T(ω_j) T(ω_j)*` of the points
+/// `j < n / 2` for the `spectra` of [`StatisticalPrecomputation`], in the layout of its `factor`,
+/// or the first point with a pivot below `pivot_floor`.
+pub(crate) fn factor(
+    spectra: &[f64],
+    n: usize,
+    m_bar: usize,
+    digits: usize,
+    widths: &PerturbationWidths,
+) -> Result<Vec<f64>, usize> {
+    let points = n / 2;
+    let triangle = m_bar * (m_bar + 1) / 2;
+    let factors = (0..points)
+        .into_par_iter()
+        .map(|j| {
+            let entry = |i: usize, k: usize| at(spectra, points, i * digits + k, j);
+            // The lower triangle of Σ'_j, overwritten by its factor.
+            let mut l = vec![(0.0, 0.0); triangle];
+            for i in 0..m_bar {
+                for p in 0..=i {
+                    let (mut re, mut im) = (0.0, 0.0);
+                    for k in 0..digits {
+                        // T_ik conj(T_pk)
+                        let (a, b) = entry(i, k);
+                        let (c, d) = entry(p, k);
+                        re += a * c + b * d;
+                        im += b * c - a * d;
+                    }
+                    let diagonal = if i == p { widths.variance } else { 0.0 };
+                    l[triangle_index(i, p)] = (diagonal - widths.alpha * re, -widths.alpha * im);
+                }
+            }
+            for k in 0..m_bar {
+                let mut pivot = l[triangle_index(k, k)].0;
+                for p in 0..k {
+                    let (a, b) = l[triangle_index(k, p)];
+                    pivot -= a * a + b * b;
+                }
+                // `!(≥)` also rejects a NaN pivot.
+                if !(pivot >= widths.pivot_floor) {
+                    return Err(j);
+                }
+                let diagonal = pivot.sqrt();
+                l[triangle_index(k, k)] = (diagonal, 0.0);
+                for i in k + 1..m_bar {
+                    let (mut re, mut im) = l[triangle_index(i, k)];
+                    for p in 0..k {
+                        // L_ip conj(L_kp)
+                        let (a, b) = l[triangle_index(i, p)];
+                        let (c, d) = l[triangle_index(k, p)];
+                        re -= a * c + b * d;
+                        im -= b * c - a * d;
+                    }
+                    l[triangle_index(i, k)] = (re / diagonal, im / diagonal);
+                }
+            }
+            Ok(l)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = vec![0.0; 2 * triangle * points];
+    values.par_chunks_mut(2 * points).enumerate().for_each(|(entry, out)| {
+        for (j, l) in factors.iter().enumerate() {
+            out[2 * j] = l[entry].0;
+            out[2 * j + 1] = l[entry].1;
+        }
+    });
+    Ok(values)
+}
+
+/// The largest singular value of `T(ω_j)` over the points `j < n / 2` for the `spectra` of
+/// [`StatisticalPrecomputation`], by [`POWER_ITERATIONS`] steps of the power iteration on
+/// `T(ω_j)* T(ω_j)` from the all-ones vector: a lower bound of `s_1(T)`.
+pub(crate) fn measured_singular_value(
+    spectra: &[f64],
+    n: usize,
+    m_bar: usize,
+    digits: usize,
+) -> f64 {
+    let points = n / 2;
+    (0..points)
+        .into_par_iter()
+        .map(|j| {
+            let entry = |i: usize, k: usize| at(spectra, points, i * digits + k, j);
+            let mut v = vec![(1.0, 0.0); digits];
+            let mut lambda = 0.0f64;
+            for _ in 0..POWER_ITERATIONS {
+                let norm = v.iter().map(|(a, b)| a * a + b * b).sum::<f64>().sqrt();
+                if norm == 0.0 {
+                    return 0.0;
+                }
+                let mut next = vec![(0.0, 0.0); digits];
+                for i in 0..m_bar {
+                    // u = T_i· v / ‖v‖
+                    let (mut ur, mut ui) = (0.0, 0.0);
+                    for (k, (a, b)) in v.iter().enumerate() {
+                        let (c, d) = entry(i, k);
+                        ur += (c * a - d * b) / norm;
+                        ui += (c * b + d * a) / norm;
+                    }
+                    // next += conj(T_i·) u
+                    for (k, out) in next.iter_mut().enumerate() {
+                        let (c, d) = entry(i, k);
+                        out.0 += c * ur + d * ui;
+                        out.1 += c * ui - d * ur;
+                    }
+                }
+                // ‖G v‖ / ‖v‖ for G = T* T increases to λ_max(G).
+                lambda = next.iter().map(|(a, b)| a * a + b * b).sum::<f64>().sqrt();
+                v = next;
+            }
+            lambda.sqrt()
+        })
+        .reduce(|| 0.0, f64::max)
+}
+
+/// The perturbation `[p_1; p_2]` of the module documentation for an `m_bar`-row trapdoor with
+/// `precomputation`, the integers `p2z_vec` of `p_2` (`n·D x columns`), and `widths`.
 pub(crate) fn perturbation(
     params: &DCRTPolyParams,
-    t: &[DCRTPolyMatrix],
+    m_bar: usize,
+    precomputation: &StatisticalPrecomputation,
     p2z_vec: I64Matrix,
-    s: f64,
-    c: f64,
-    sigma: f64,
+    widths: &PerturbationWidths,
 ) -> DCRTPolyMatrix {
     let n = params.ring_dimension() as usize;
     let digits = params.modulus_digits();
     let columns = p2z_vec.ncol;
-    let m_bar = t.iter().map(|chunk| chunk.row_size()).sum::<usize>();
-    let s1 = trapdoor_singular_value_estimate(
-        params.ring_dimension(),
-        1,
-        digits,
-        sigma,
-        TrapdoorInstantiation::Statistical { m_bar },
-    )
-    .and_then(|estimate| estimate.to_f64())
-    .expect("valid statistical trapdoor parameters");
-    let widths = PerturbationWidths::new(s, c, sigma, s1);
     let fft = NegacyclicFft::new(n);
     let center_spectra = (0..digits * columns)
         .into_par_iter()
@@ -183,204 +443,89 @@ pub(crate) fn perturbation(
         .collect::<Vec<_>>();
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
+    let centers =
+        continuous_centers(&fft, precomputation, m_bar, digits, &center_spectra, columns, &seed);
+    // `rounded[row · columns + column]` holds the `n` coefficients of entry `(row, column)`.
+    let rounded = centers
+        .into_par_iter()
+        .map(|centers| {
+            let mut rng = rand::rng();
+            centers
+                .into_iter()
+                .map(|center| round_gaussian(&mut rng, center, widths.rounding))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let mut p1 = I64Matrix::new_empty(&I64MatrixParams, m_bar * n, columns);
-    correlated_centers(t, &fft, &widths, &center_spectra, columns, &seed, |range, rows| {
-        let rows = rows
-            .into_par_iter()
-            .map(|(row, column, centers)| {
-                let mut rng = rand::rng();
-                let rounded = centers
-                    .into_iter()
-                    .map(|center| {
-                        let center = center + widths.isotropic * gaussian(&mut rng);
-                        round_gaussian(&mut rng, center, widths.rounding)
-                    })
-                    .collect::<Vec<_>>();
-                (row, column, rounded)
+    p1.replace_entries(0..m_bar * n, 0..columns, |row_range, column_range| {
+        row_range
+            .map(|index| {
+                column_range
+                    .clone()
+                    .map(|column| rounded[(index / n) * columns + column][index % n])
+                    .collect()
             })
-            .collect::<Vec<_>>();
-        p1.replace_entries(range.start * n..range.end * n, 0..columns, |row_range, _| {
-            let mut block = vec![vec![0i64; columns]; row_range.len()];
-            for (row, column, values) in &rows {
-                for (k, value) in values.iter().enumerate() {
-                    block[(row - range.start) * n + k][*column] = *value;
-                }
-            }
-            block
-        });
+            .collect()
     });
     let p1 = split_int64_mat_to_elems(&p1, params);
     let p2 = split_int64_mat_to_elems(&p2z_vec, params);
     p1.concat_rows(&[&p2])
 }
 
-/// `μ + y_corr = T (center - √a f(G) T* z) + √a z` for `center = center_scale · p_2` given as
-/// `D x columns` Fourier vectors and `z` standard normal derived from `seed`. The values of each
-/// row chunk, in the coefficient domain, are passed to `consume` with the chunk's row range as
-/// `(row, column, coefficients)`.
-fn correlated_centers(
-    t: &[DCRTPolyMatrix],
+/// The coefficients of `μ + y = F^{-1}(T̂ ĉ + L q̂)` of every entry `(row, column)` of `p_1`, at
+/// `row · columns + column`, for the centers `ĉ` (`D x columns` Fourier vectors of
+/// `center_scale · p_2`) and `q̂` derived from `seed`.
+fn continuous_centers(
     fft: &NegacyclicFft,
-    widths: &PerturbationWidths,
+    precomputation: &StatisticalPrecomputation,
+    m_bar: usize,
+    digits: usize,
     center_spectra: &[Vec<f64>],
     columns: usize,
     seed: &[u8; 32],
-    mut consume: impl FnMut(Range<usize>, Vec<(usize, usize, Vec<f64>)>),
-) {
+) -> Vec<Vec<f64>> {
     let n = fft.n;
-    let digits = t[0].col_size();
-    let operator = TrapdoorOperator { t, fft, columns };
-    // w = T* z, regenerating z from `seed` row by row.
-    let w = operator.adjoint(|row, column| fft.forward(&standard_normal(seed, row, column, n)));
-    // h = f(G) w.
-    let coefficients = chebyshev_coefficients(widths.beta, widths.gmax, CHEBYSHEV_DEGREE);
-    let h = clenshaw(&coefficients, widths.gmax, &w, |v| operator.gram(v));
-    drop(w);
-    let sqrt_a = widths.a.sqrt();
-    let q = center_spectra
-        .par_iter()
-        .zip(h)
-        .map(|(center, h)| center.iter().zip(h).map(|(center, h)| center - sqrt_a * h).collect())
-        .collect::<Vec<Vec<f64>>>();
-    for (range, chunk) in chunk_row_ranges(t).into_iter().zip(t) {
-        let spectra = chunk_spectra(fft, chunk);
-        let rows = range
-            .clone()
-            .into_par_iter()
-            .flat_map(|row| (0..columns).into_par_iter().map(move |column| (row, column)))
-            .map(|(row, column)| {
-                let mut spectrum = vec![0.0; 2 * n];
+    let points = n / 2;
+    // q̂ at the points j < n / 2: the real and imaginary parts are N(0, n / 2).
+    let scale = (n as f64 / 2.0).sqrt();
+    let normals = (0..m_bar * columns)
+        .into_par_iter()
+        .map(|index| {
+            standard_normal(seed, index / columns, index % columns, n)
+                .into_iter()
+                .map(|z| scale * z)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    (0..m_bar * columns)
+        .into_par_iter()
+        .map(|index| {
+            let (row, column) = (index / columns, index % columns);
+            let mut spectrum = vec![0.0; 2 * n];
+            for j in 0..points {
+                let (mut re, mut im) = (0.0, 0.0);
                 for digit in 0..digits {
-                    mul_acc(
-                        &mut spectrum,
-                        &spectra[(row - range.start) * digits + digit],
-                        &q[digit * columns + column],
-                    );
+                    let (a, b) = at(&precomputation.spectra, points, row * digits + digit, j);
+                    let center = &center_spectra[digit * columns + column];
+                    let (c, d) = (center[2 * j], center[2 * j + 1]);
+                    re += a * c - b * d;
+                    im += a * d + b * c;
                 }
-                let centers = fft
-                    .inverse(&spectrum)
-                    .into_iter()
-                    .zip(standard_normal(seed, row, column, n))
-                    .map(|(tq, z)| tq + sqrt_a * z)
-                    .collect::<Vec<_>>();
-                (row, column, centers)
-            })
-            .collect::<Vec<_>>();
-        consume(range, rows);
-    }
-}
-
-/// The scalars of the statistical perturbation sampler.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PerturbationWidths {
-    /// `-c² / (s² - c²)`, the scale of the center `μ = center_scale · T p_2`.
-    pub center_scale: f64,
-    /// `a = 2 α ŝ_1²`, the scale of the correlated part.
-    pub a: f64,
-    /// `β = α / a`.
-    pub beta: f64,
-    /// `ŝ_1²`, the right end of the Chebyshev interval.
-    pub gmax: f64,
-    /// `s_iso = √(s² - r² - a)`.
-    pub isotropic: f64,
-    /// The rounding width `r`.
-    pub rounding: f64,
-}
-
-impl PerturbationWidths {
-    pub(crate) fn new(s: f64, c: f64, rounding: f64, s1: f64) -> Self {
-        assert!(s > c, "the preimage width is below the gadget sampler's width");
-        let alpha = c * c * s * s / (s * s - c * c);
-        let a = 2.0 * alpha * s1 * s1;
-        // s² - a = s² (s² - c² (1 + 2 ŝ_1²)) / (s² - c²); at the minimum width of
-        // `minimum_preimage_sigma` it is about r², and the isotropic variance about 0. Rounding
-        // errors of the order of `s²` ulps are clamped.
-        let isotropic_variance =
-            s * s * (s * s - c * c * (1.0 + 2.0 * s1 * s1)) / (s * s - c * c) - rounding * rounding;
-        assert!(
-            isotropic_variance >= -1e-12 * s * s,
-            "the preimage width is below the statistical trapdoor's minimum"
-        );
-        let isotropic_variance = isotropic_variance.max(0.0);
-        Self {
-            center_scale: -c * c / (s * s - c * c),
-            a,
-            beta: alpha / a,
-            gmax: s1 * s1,
-            isotropic: isotropic_variance.sqrt(),
-            rounding,
-        }
-    }
-}
-
-/// Streaming products with the chunked `T` on Fourier vectors.
-struct TrapdoorOperator<'a> {
-    t: &'a [DCRTPolyMatrix],
-    fft: &'a NegacyclicFft,
-    columns: usize,
-}
-
-impl TrapdoorOperator<'_> {
-    fn digits(&self) -> usize {
-        self.t[0].col_size()
-    }
-
-    /// `T* x` for `x` given row by row (`x(row, column)`), as `D x columns` Fourier vectors.
-    fn adjoint(&self, x: impl Fn(usize, usize) -> Vec<f64> + Sync) -> Vec<Vec<f64>> {
-        let (digits, columns, n2) = (self.digits(), self.columns, 2 * self.fft.n);
-        let mut out = vec![vec![0.0; n2]; digits * columns];
-        for (range, chunk) in chunk_row_ranges(self.t).into_iter().zip(self.t) {
-            let spectra = chunk_spectra(self.fft, chunk);
-            let rows = range
-                .clone()
-                .into_par_iter()
-                .flat_map(|row| (0..columns).into_par_iter().map(move |column| (row, column)))
-                .map(|(row, column)| ((row, column), x(row, column)))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            out.par_iter_mut().enumerate().for_each(|(index, out)| {
-                let (digit, column) = (index / columns, index % columns);
-                for row in range.clone() {
-                    conj_mul_acc(
-                        out,
-                        &spectra[(row - range.start) * digits + digit],
-                        &rows[&(row, column)],
-                    );
+                for k in 0..=row {
+                    let (a, b) = at(&precomputation.factor, points, triangle_index(row, k), j);
+                    let q = &normals[k * columns + column];
+                    let (c, d) = (q[2 * j], q[2 * j + 1]);
+                    re += a * c - b * d;
+                    im += a * d + b * c;
                 }
-            });
-        }
-        out
-    }
-
-    /// `G v = T* (T v)` for `D x columns` Fourier vectors `v`.
-    fn gram(&self, v: &[Vec<f64>]) -> Vec<Vec<f64>> {
-        let (digits, columns, n2) = (self.digits(), self.columns, 2 * self.fft.n);
-        let mut out = vec![vec![0.0; n2]; digits * columns];
-        for (range, chunk) in chunk_row_ranges(self.t).into_iter().zip(self.t) {
-            let spectra = chunk_spectra(self.fft, chunk);
-            let tv = (0..range.len() * columns)
-                .into_par_iter()
-                .map(|index| {
-                    let (row, column) = (index / columns, index % columns);
-                    let mut acc = vec![0.0; n2];
-                    for digit in 0..digits {
-                        mul_acc(
-                            &mut acc,
-                            &spectra[row * digits + digit],
-                            &v[digit * columns + column],
-                        );
-                    }
-                    acc
-                })
-                .collect::<Vec<_>>();
-            out.par_iter_mut().enumerate().for_each(|(index, out)| {
-                let (digit, column) = (index / columns, index % columns);
-                for row in 0..range.len() {
-                    conj_mul_acc(out, &spectra[row * digits + digit], &tv[row * columns + column]);
-                }
-            });
-        }
-        out
-    }
+                spectrum[2 * j] = re;
+                spectrum[2 * j + 1] = im;
+                spectrum[2 * (n - 1 - j)] = re;
+                spectrum[2 * (n - 1 - j) + 1] = -im;
+            }
+            fft.inverse(&spectrum)
+        })
+        .collect()
 }
 
 /// The Fourier vectors of the entries of one row chunk of `T`, row-major.
@@ -430,86 +575,6 @@ fn round_gaussian(rng: &mut impl Rng, center: f64, width: f64) -> i64 {
         if rng.random::<f64>() < (-distance * distance / (2.0 * width * width)).exp() {
             return x;
         }
-    }
-}
-
-/// `f(g) = β / (1 + √(1 - β g))`.
-pub(crate) fn correction(beta: f64, g: f64) -> f64 {
-    beta / (1.0 + (1.0 - beta * g).sqrt())
-}
-
-/// Coefficients of the degree-`degree` Chebyshev interpolant of [`correction`] on `[0, gmax]` in
-/// the variable `x = 2 g / gmax - 1`, with the constant coefficient halved.
-pub(crate) fn chebyshev_coefficients(beta: f64, gmax: f64, degree: usize) -> Vec<f64> {
-    let nodes = degree + 1;
-    let values = (0..nodes)
-        .map(|m| {
-            let x = (PI * (m as f64 + 0.5) / nodes as f64).cos();
-            correction(beta, gmax * (x + 1.0) / 2.0)
-        })
-        .collect::<Vec<_>>();
-    (0..nodes)
-        .map(|k| {
-            let sum = values
-                .iter()
-                .enumerate()
-                .map(|(m, value)| value * (PI * k as f64 * (m as f64 + 0.5) / nodes as f64).cos())
-                .sum::<f64>();
-            let coefficient = 2.0 * sum / nodes as f64;
-            if k == 0 { coefficient / 2.0 } else { coefficient }
-        })
-        .collect()
-}
-
-/// `Σ_k c_k T_k(X) w` for `X = 2 G / gmax - I` by the Clenshaw recurrence, with `apply_g`
-/// computing `G v`.
-pub(crate) fn clenshaw(
-    coefficients: &[f64],
-    gmax: f64,
-    w: &[Vec<f64>],
-    apply_g: impl Fn(&[Vec<f64>]) -> Vec<Vec<f64>>,
-) -> Vec<Vec<f64>> {
-    let apply_x = |v: &[Vec<f64>]| {
-        apply_g(v)
-            .into_par_iter()
-            .zip(v)
-            .map(|(gv, v)| gv.iter().zip(v).map(|(gv, v)| 2.0 * gv / gmax - v).collect())
-            .collect::<Vec<Vec<f64>>>()
-    };
-    let zero = || w.iter().map(|v| vec![0.0; v.len()]).collect::<Vec<_>>();
-    let combine = |scale: f64, x: &[Vec<f64>], twice: f64, b2: &[Vec<f64>]| {
-        w.par_iter()
-            .zip(x)
-            .zip(b2)
-            .map(|((w, x), b2)| {
-                w.iter().zip(x).zip(b2).map(|((w, x), b2)| scale * w + twice * x - b2).collect()
-            })
-            .collect::<Vec<Vec<f64>>>()
-    };
-    let degree = coefficients.len() - 1;
-    let (mut b1, mut b2) = (zero(), zero());
-    for k in (1..=degree).rev() {
-        let xb1 = if k == degree { zero() } else { apply_x(&b1) };
-        let bk = combine(coefficients[k], &xb1, 2.0, &b2);
-        b2 = std::mem::replace(&mut b1, bk);
-    }
-    let xb1 = if degree == 0 { zero() } else { apply_x(&b1) };
-    combine(coefficients[0], &xb1, 1.0, &b2)
-}
-
-/// `acc += a b` for interleaved complex vectors.
-fn mul_acc(acc: &mut [f64], a: &[f64], b: &[f64]) {
-    for ((acc, a), b) in acc.chunks_exact_mut(2).zip(a.chunks_exact(2)).zip(b.chunks_exact(2)) {
-        acc[0] += a[0] * b[0] - a[1] * b[1];
-        acc[1] += a[0] * b[1] + a[1] * b[0];
-    }
-}
-
-/// `acc += conj(a) b` for interleaved complex vectors.
-fn conj_mul_acc(acc: &mut [f64], a: &[f64], b: &[f64]) {
-    for ((acc, a), b) in acc.chunks_exact_mut(2).zip(a.chunks_exact(2)).zip(b.chunks_exact(2)) {
-        acc[0] += a[0] * b[0] + a[1] * b[1];
-        acc[1] += a[0] * b[1] - a[1] * b[0];
     }
 }
 
@@ -598,6 +663,23 @@ impl NegacyclicFft {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_traits::ToPrimitive;
+
+    /// `acc += a b` for interleaved complex vectors.
+    fn mul_acc(acc: &mut [f64], a: &[f64], b: &[f64]) {
+        for ((acc, a), b) in acc.chunks_exact_mut(2).zip(a.chunks_exact(2)).zip(b.chunks_exact(2)) {
+            acc[0] += a[0] * b[0] - a[1] * b[1];
+            acc[1] += a[0] * b[1] + a[1] * b[0];
+        }
+    }
+
+    /// `acc += conj(a) b` for interleaved complex vectors.
+    fn conj_mul_acc(acc: &mut [f64], a: &[f64], b: &[f64]) {
+        for ((acc, a), b) in acc.chunks_exact_mut(2).zip(a.chunks_exact(2)).zip(b.chunks_exact(2)) {
+            acc[0] += a[0] * b[0] + a[1] * b[1];
+            acc[1] += a[0] * b[1] - a[1] * b[0];
+        }
+    }
 
     fn negacyclic_product(a: &[f64], b: &[f64]) -> Vec<f64> {
         let n = a.len();
@@ -639,44 +721,6 @@ mod tests {
         assert!(plain.iter().zip(&expected).any(|(x, y)| (x - y).abs() > 1e-3));
     }
 
-    #[test]
-    fn chebyshev_expansion_of_the_correction_is_accurate_on_its_interval() {
-        let gmax = 1234.5;
-        let beta = 1.0 / (2.0 * gmax);
-        let coefficients = chebyshev_coefficients(beta, gmax, CHEBYSHEV_DEGREE);
-        for step in 0..=200 {
-            let g = gmax * step as f64 / 200.0;
-            let x = 2.0 * g / gmax - 1.0;
-            let (mut b1, mut b2) = (0.0, 0.0);
-            for coefficient in coefficients[1..].iter().rev() {
-                let bk = coefficient + 2.0 * x * b1 - b2;
-                b2 = b1;
-                b1 = bk;
-            }
-            let value = coefficients[0] + x * b1 - b2;
-            let exact = correction(beta, g);
-            assert!((value - exact).abs() <= 1e-14 * exact, "g = {g}");
-            // 2 f - f² g = β, so (I - T f T*)² = I - β T T*.
-            assert!((2.0 * exact - exact * exact * g - beta).abs() < 1e-15 * beta);
-        }
-    }
-
-    #[test]
-    fn clenshaw_matches_the_scalar_expansion_on_diagonal_operators() {
-        let gmax = 50.0;
-        let beta = 1.0 / (2.0 * gmax);
-        let coefficients = chebyshev_coefficients(beta, gmax, CHEBYSHEV_DEGREE);
-        let eigenvalues = [0.0, 3.0, 17.5, 50.0];
-        let w = eigenvalues.iter().map(|_| vec![1.0, -2.0]).collect::<Vec<_>>();
-        let result = clenshaw(&coefficients, gmax, &w, |v| {
-            v.iter().zip(eigenvalues).map(|(v, g)| v.iter().map(|x| g * x).collect()).collect()
-        });
-        for (out, g) in result.iter().zip(eigenvalues) {
-            let expected = correction(beta, g);
-            assert!((out[0] - expected).abs() < 1e-14 && (out[1] + 2.0 * expected).abs() < 1e-14);
-        }
-    }
-
     /// The real `m̄n x Dn` coefficient-embedding matrix of a chunked `T`: column `k n + b` holds
     /// the coefficients of `T_{·k} x^b`.
     fn embedding(t: &[DCRTPolyMatrix], n: usize) -> Vec<Vec<f64>> {
@@ -705,6 +749,22 @@ mod tests {
         matrix
     }
 
+    fn sample_t(params: &DCRTPolyParams, m_bar: usize, sigma: f64) -> Vec<DCRTPolyMatrix> {
+        let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
+        chunk_row_counts(m_bar)
+            .into_iter()
+            .map(|rows| {
+                DCRTPolyUniformSampler::new().sample_uniform(
+                    params,
+                    rows,
+                    params.modulus_digits(),
+                    dist.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The sample covariance of the continuous part `y` (zero centers) of the coefficient vector.
     fn sampled_covariance(
         t: &[DCRTPolyMatrix],
         n: usize,
@@ -713,56 +773,76 @@ mod tests {
         let columns = 20_000;
         let fft = NegacyclicFft::new(n);
         let digits = t[0].col_size();
+        let m_bar = t.iter().map(|chunk| chunk.row_size()).sum::<usize>();
+        let spectra = half_spectra(&fft, t);
+        let factor = factor(&spectra, n, m_bar, digits, widths).expect("positive definite");
+        let precomputation = StatisticalPrecomputation {
+            preimage_sigma: 0.0,
+            measured_singular_value: 0.0,
+            spectra,
+            factor,
+        };
         let zero = vec![vec![0.0; 2 * n]; digits * columns];
-        let rows = t.iter().map(|chunk| chunk.row_size()).sum::<usize>() * n;
-        let mut samples = vec![vec![0.0; rows]; columns];
-        correlated_centers(t, &fft, widths, &zero, columns, &[3u8; 32], |_, values| {
-            for (row, column, centers) in values {
-                for (k, center) in centers.into_iter().enumerate() {
-                    samples[column][row * n + k] = center;
-                }
+        let mut seed = [0u8; 32];
+        rand::rng().fill_bytes(&mut seed);
+        let mut samples = vec![vec![0.0; m_bar * n]; columns];
+        for (index, centers) in
+            continuous_centers(&fft, &precomputation, m_bar, digits, &zero, columns, &seed)
+                .into_iter()
+                .enumerate()
+        {
+            let (row, column) = (index / columns, index % columns);
+            for (k, center) in centers.into_iter().enumerate() {
+                samples[column][row * n + k] = center;
             }
-        });
-        (0..rows)
+        }
+        (0..m_bar * n)
             .map(|i| {
-                (0..rows)
+                (0..m_bar * n)
                     .map(|j| samples.iter().map(|y| y[i] * y[j]).sum::<f64>() / columns as f64)
                     .collect()
             })
             .collect()
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn correlated_part_has_the_target_covariance_with_the_ring_adjoint() {
-        let n = 4;
-        let params = DCRTPolyParams::new(n as u32, 1, 20, 10, None, None);
-        let (t, _) = trapgen(&params, 3, 2.0);
-        let m = embedding(&t, n);
-        // s_1(T)² by power iteration on M Mᵀ.
-        let gram = (0..m.len())
+    /// `M Mᵀ` of the coefficient embedding `M` of `T`.
+    fn embedding_gram(t: &[DCRTPolyMatrix], n: usize) -> Vec<Vec<f64>> {
+        let m = embedding(t, n);
+        (0..m.len())
             .map(|i| {
                 (0..m.len()).map(|j| m[i].iter().zip(&m[j]).map(|(x, y)| x * y).sum()).collect()
             })
-            .collect::<Vec<Vec<f64>>>();
-        let mut v = vec![1.0; m.len()];
-        let mut lambda = 0.0;
-        for _ in 0..500 {
-            let next = gram
-                .iter()
-                .map(|row| row.iter().zip(&v).map(|(g, x)| g * x).sum())
-                .collect::<Vec<f64>>();
-            lambda = next.iter().map(|x| x * x).sum::<f64>().sqrt();
-            v = next.iter().map(|x| x / lambda).collect();
-        }
-        let widths = PerturbationWidths::new(1000.0, 1.0, 1.0, 1.1 * lambda.sqrt());
+            .collect()
+    }
+
+    /// Widths of `s = 10`, `r = 1` whose `α` makes `α λ = variance / 2`.
+    fn widths_for(lambda: f64) -> PerturbationWidths {
+        let (s, r) = (10.0f64, 1.0f64);
+        let alpha = 0.5 * (s * s - r * r) / lambda;
+        let c = (alpha * s * s / (s * s + alpha)).sqrt();
+        let widths = PerturbationWidths::new(s, c, r).unwrap();
+        assert!((widths.alpha - alpha).abs() < 1e-9 * alpha);
+        widths
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn continuous_part_has_the_target_covariance_with_the_ring_adjoint() {
+        let n = 4;
+        let params = DCRTPolyParams::new(n as u32, 1, 20, 10, None, None);
+        let t = sample_t(&params, 3, 2.0);
+        let gram = embedding_gram(&t, n);
+        let fft = NegacyclicFft::new(n);
+        let lambda =
+            measured_singular_value(&half_spectra(&fft, &t), n, 3, params.modulus_digits()).powi(2);
+        let widths = widths_for(lambda);
         let covariance = sampled_covariance(&t, n, &widths);
-        for i in 0..m.len() {
-            for j in 0..m.len() {
+        for i in 0..gram.len() {
+            for j in 0..gram.len() {
                 let expected =
-                    widths.a * (if i == j { 1.0 } else { 0.0 } - widths.beta * gram[i][j]);
+                    if i == j { widths.variance } else { 0.0 } - widths.alpha * gram[i][j];
                 assert!(
-                    (covariance[i][j] - expected).abs() < 0.06 * widths.a,
+                    (covariance[i][j] - expected).abs() < 0.06 * widths.variance,
                     "covariance ({i}, {j}) = {}, expected {expected}",
                     covariance[i][j]
                 );
@@ -772,23 +852,129 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn correlated_part_of_a_zero_trapdoor_is_isotropic() {
+    fn continuous_part_of_a_zero_trapdoor_is_isotropic() {
         let n = 4;
         let params = DCRTPolyParams::new(n as u32, 1, 20, 10, None, None);
         let t = vec![DCRTPolyMatrix::zero(&params, 3, params.modulus_digits())];
-        let widths = PerturbationWidths::new(1000.0, 1.0, 1.0, 5.0);
+        let widths = widths_for(1.0);
         let covariance = sampled_covariance(&t, n, &widths);
         for (i, row) in covariance.iter().enumerate() {
             for (j, value) in row.iter().enumerate() {
-                let expected = if i == j { widths.a } else { 0.0 };
-                assert!((value - expected).abs() < 0.06 * widths.a);
+                let expected = if i == j { widths.variance } else { 0.0 };
+                assert!((value - expected).abs() < 0.06 * widths.variance);
             }
         }
     }
 
     #[test]
+    #[serial_test::serial]
+    fn factorization_accepts_exactly_the_widths_above_the_singular_value() {
+        let n = 16;
+        let params = DCRTPolyParams::new(n as u32, 1, 20, 10, None, None);
+        let t = sample_t(&params, 5, 3.0);
+        let fft = NegacyclicFft::new(n);
+        let spectra = half_spectra(&fft, &t);
+        let digits = params.modulus_digits();
+        let s1 = measured_singular_value(&spectra, n, 5, digits);
+        // Σ' = variance I - T T* is positive definite iff variance > s_1(T)².
+        let widths = |variance: f64| PerturbationWidths {
+            center_scale: 0.0,
+            alpha: 1.0,
+            variance,
+            pivot_floor: 0.0,
+            rounding: 1.0,
+        };
+        assert!(factor(&spectra, n, 5, digits, &widths(1.01 * s1 * s1)).is_ok());
+        assert!(factor(&spectra, n, 5, digits, &widths(0.99 * s1 * s1)).is_err());
+        // A pivot floor above every pivot rejects a positive definite covariance.
+        let floored = PerturbationWidths { pivot_floor: 2.0 * s1 * s1, ..widths(1.5 * s1 * s1) };
+        assert!(factor(&spectra, n, 5, digits, &floored).is_err());
+    }
+
+    /// The statistical singular-value estimate bounds `s_1(T)` of sampled trapdoors: the
+    /// factorization of `ŝ_1² I - T T*` succeeds for each sample (it fails with probability about
+    /// [`crate::sampler::bounds::STATISTICAL_SPECTRAL_FAILURE`] each).
+    #[test]
+    #[serial_test::serial]
+    fn statistical_singular_value_estimate_bounds_sampled_trapdoors() {
+        let samples = std::env::var("MXX_TEST_STATISTICAL_ESTIMATE_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4usize);
+        let sigma = 4.578;
+        for (n, m_bar, crt_bits, base_bits) in
+            [(64u32, 12usize, 20usize, 10u32), (256, 20, 20, 5), (512, 9, 30, 15)]
+        {
+            let params = DCRTPolyParams::new(n, 2, crt_bits, base_bits, None, None);
+            let digits = params.modulus_digits();
+            let estimate = crate::sampler::bounds::trapdoor_singular_value_estimate(
+                n,
+                1,
+                digits,
+                sigma,
+                mxx_ir_core::types::TrapdoorInstantiation::Statistical { m_bar },
+            )
+            .unwrap()
+            .to_f64()
+            .unwrap();
+            let fft = NegacyclicFft::new(n as usize);
+            for _ in 0..samples {
+                let t = sample_t(&params, m_bar, sigma);
+                let spectra = half_spectra(&fft, &t);
+                let measured = measured_singular_value(&spectra, n as usize, m_bar, digits);
+                let widths = PerturbationWidths {
+                    center_scale: 0.0,
+                    alpha: 1.0,
+                    variance: estimate * estimate,
+                    pivot_floor: 0.0,
+                    rounding: 1.0,
+                };
+                assert!(
+                    factor(&spectra, n as usize, m_bar, digits, &widths).is_ok(),
+                    "n = {n}, m̄ = {m_bar}, D = {digits}: s_1 ≥ {measured} exceeds {estimate}"
+                );
+                // The estimate is not loose by more than a constant factor.
+                assert!(measured > 0.5 * estimate, "n = {n}: s_1 ≈ {measured}, ŝ_1 = {estimate}");
+            }
+        }
+    }
+
+    /// TrapGen at a width far below the trapdoor's minimum rejects every draw and gives up after
+    /// [`TRAPGEN_ATTEMPTS`].
+    #[test]
+    #[serial_test::serial]
+    fn trapgen_fails_when_the_covariance_is_never_positive_definite() {
+        let params = DCRTPolyParams::new(16, 1, 20, 10, None, None);
+        let sigma = 4.0;
+        let c = crate::sampler::bounds::gadget_sampler_sigma(1 << params.base_bits(), sigma);
+        let s = 1.01 * c;
+        let widths = PerturbationWidths::new(s, c, sigma).unwrap();
+        assert!(trapgen(&params, 5, sigma, s, &widths, 1.0).is_none());
+    }
+
+    #[test]
+    fn precomputation_encoding_round_trips() {
+        let (n, m_bar, digits) = (8, 3, 2);
+        let precomputation = StatisticalPrecomputation {
+            preimage_sigma: 123.25,
+            measured_singular_value: 17.5,
+            spectra: (0..n * m_bar * digits).map(|i| i as f64 * 0.25 + 1.0).collect(),
+            factor: (0..n / 2 * 2 * triangle_len(m_bar).unwrap())
+                .map(|i| i as f64 * 0.5 - 3.0)
+                .collect(),
+        };
+        let bytes = precomputation.to_bytes();
+        assert_eq!(bytes.len(), precomputation_bytes(n, m_bar, digits).unwrap());
+        assert_eq!(
+            StatisticalPrecomputation::from_bytes(&bytes, n, m_bar, digits),
+            Some(precomputation)
+        );
+        assert_eq!(StatisticalPrecomputation::from_bytes(&bytes, n, m_bar + 1, digits), None);
+    }
+
+    #[test]
     fn rounding_and_normal_samplers_have_their_moments() {
-        let mut rng = StdRng::seed_from_u64(7);
+        let mut rng = rand::rng();
         let count = 200_000;
         let normals = (0..count).map(|_| gaussian(&mut rng)).collect::<Vec<_>>();
         let mean = normals.iter().sum::<f64>() / count as f64;

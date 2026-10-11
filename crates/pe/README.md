@@ -37,14 +37,15 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
   LUT scalars are computed from the step's table, so key generation and decryption run the same
   graph for every program, and the key's commitment binds its data.
 - **Add and map steps.** A class may fix each step's kind (`PeClass::with_steps`). An add step
-  only multiplies the state by the package of `X^x` or `X^(Bx - 1 - x)`, adding to the exponent
+  only multiplies the state by a distance package `X^(popcount(x xor z))` of a template symbol `z`
+  (`Bx = 2^k`), adding to the exponent
   without a table, and a map step applies a table to the state without reading an attribute, so a
   program whose steps need no table avoids the table's noise (one to three automorphism switches
-  of gain `K` each) and work. Encryption then publishes the add packages `X^(x_t)` and
-  `X^(Bx - 1 - x_t)` of every attribute, and the lookup packages only if a lookup step reads
+  of gain `K` each) and work. Encryption then publishes the `Bx` distance packages of every
+  attribute, and the lookup packages only if a lookup step reads
   them; without lookup steps the lookup width is `next_pow2(Bz)`. The kinds are the class's
-  because one graph serves every program. The Hamming threshold programs add `x_i` or `1 - x_i`
-  per bit and compare the sum in one map step.
+  because one graph serves every program. The Hamming threshold programs add
+  `popcount(x_i xor z_i)` per symbol of `k` bits and compare the sum in one map step.
 - **Radix-`B` lookups.** `PeParameterRequest::lut_radix` decomposes the cyclic lookup group of
   `W = B^r` automorphisms in radix `B` (a power of two; `W <= n / 2` for `B < W`): a ciphertext
   then carries switching packages for the `(B - 1) log_B W` automorphisms `K_B = {g^(a B^j)}`

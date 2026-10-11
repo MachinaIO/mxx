@@ -212,7 +212,11 @@ where
         // class reads, both supplied by the prelude.
         [
             (class.has_lookup_packages(), ATTRIBUTE_COORDINATE, class.attribute_length()),
-            (class.has_add_packages(), ADD_ATTRIBUTE_COORDINATE, 2 * class.attribute_length()),
+            (
+                class.has_add_packages(),
+                ADD_ATTRIBUTE_COORDINATE,
+                class.alphabet_size() * class.attribute_length(),
+            ),
         ]
         .into_iter()
         .filter(|(read, ..)| *read)

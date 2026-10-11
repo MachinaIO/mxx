@@ -23,10 +23,11 @@
 //!
 //! `test_gpu_pe_hamming_round_trip` runs the same search and round trip for the Hamming
 //! threshold programs (`BranchingProgram::hamming_threshold`) of the class `PeClass::hamming` over
-//! `HAMMING_BITS` binary attributes, whose steps but the last only add `x_i` or `1 - x_i` to the
-//! state exponent, without a table, and whose last step compares the sum with the threshold: the
-//! authorized key's threshold exceeds the distance of the attribute to a random template, and
-//! the unauthorized key's equals it. The class variables below do not apply to it.
+//! `HAMMING_BITS` attribute bits in symbols of `HAMMING_SYMBOL_BITS` bits, whose steps but the
+//! last only add `popcount(x_i xor z_i)` to the state exponent, without a table, and whose last
+//! step compares the sum with the threshold: the authorized key's threshold exceeds the distance
+//! of the attribute to a random template, and the unauthorized key's equals it. The class variables
+//! below do not apply to it.
 //!
 //! With `MXX_PE_ROUND_TRIP_LEAN_EXPORT=<parameter id>`, `test_gpu_pe_round_trip` exports the Lean
 //! correctness claim of the executed graphs to `lean/<parameter id>/generated`. The claim does not
@@ -42,7 +43,7 @@
 //! | --- | --- | --- |
 //! | `LEAN_EXPORT` | unset | Export the Lean correctness claim to `lean/<value>/generated` |
 //! | `ATTRIBUTE_LENGTH`, `ALPHABET_SIZE`, `STATE_WIDTH`, `MAX_STEPS` | 1, 2, 1, 1 | The class |
-//! | `HAMMING_BITS` | 2 | The attribute bits of the Hamming round trip |
+//! | `HAMMING_BITS`, `HAMMING_SYMBOL_BITS` | 2, 1 | The attribute bits of the Hamming round trip and the bits per symbol |
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 12, 15 | Ring-dimension candidates |
 //! | `MAX_CRT_DEPTH` | 12 | CRT-depth candidates `1..=` |
 //! | `CRT_BITS`, `BASE_BITS` | 50, `ceil(CRT_BITS / 2)` | CRT prime and gadget base widths |
@@ -585,20 +586,28 @@ fn test_gpu_pe_round_trip() {
 }
 
 /// The round trip of the Hamming threshold programs ([`BranchingProgram::hamming_threshold`])
-/// over `HAMMING_BITS` binary attributes: every step but the last only adds `x_i` or `1 - x_i`
-/// to the exponent, and the last compares the distance with the threshold. The authorized key's
-/// threshold exceeds the distance of the attribute to a random template; the unauthorized key's
-/// equals it.
+/// over `HAMMING_BITS` attribute bits in symbols of `HAMMING_SYMBOL_BITS` bits: every step but
+/// the last only adds `popcount(x_i xor z_i)` to the exponent, and the last compares the distance
+/// with the threshold. The authorized key's threshold exceeds the distance of the attribute to a
+/// random template; the unauthorized key's equals it.
 #[test]
 #[sequential(dcrt_runtime)]
 fn test_gpu_pe_hamming_round_trip() {
-    let class = PeClass::hamming(count("HAMMING_BITS", 2)).unwrap();
-    let program = |attribute: &[usize], value: usize| {
-        let template =
-            attribute.iter().map(|_| rand::random::<bool>() as usize).collect::<Vec<_>>();
-        let distance = attribute.iter().zip(&template).filter(|(x, z)| x != z).count();
+    let symbol_bits = count("HAMMING_SYMBOL_BITS", 1);
+    let bits = count("HAMMING_BITS", 2);
+    assert_eq!(bits % symbol_bits, 0, "HAMMING_BITS must be a multiple of HAMMING_SYMBOL_BITS");
+    let symbol_bits = u32::try_from(symbol_bits).unwrap();
+    let class = PeClass::hamming(bits / symbol_bits as usize, symbol_bits).unwrap();
+    let program = move |attribute: &[usize], value: usize| {
+        let template = attribute
+            .iter()
+            .map(|_| rand::random::<u32>() as usize % (1 << symbol_bits))
+            .collect::<Vec<_>>();
+        let distance =
+            attribute.iter().zip(&template).map(|(x, z)| (x ^ z).count_ones() as usize).sum();
         let threshold = if value == 0 { distance + 1 } else { distance };
-        let program = BranchingProgram::hamming_threshold(&template, threshold).unwrap();
+        let program =
+            BranchingProgram::hamming_threshold(symbol_bits, &template, threshold).unwrap();
         assert_eq!(program.evaluate(attribute).unwrap(), value);
         program
     };

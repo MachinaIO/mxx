@@ -22,14 +22,17 @@
 //! steps, which read attribute `0` and keep the state.
 //!
 //! A class may fix the kind of every step ([`PeClass::with_steps`]). Besides the
-//! lookup step above, an *add* step only multiplies the state by the package of
-//! `X^x` or of its complement `X^(Bx - 1 - x)`, adding `x` or `Bx - 1 - x` to the
-//! exponent without a table, and a *map* step only applies a table to the state,
-//! reading no attribute. Each kind is fixed by the class because the Program is
-//! one graph for every program; an add step thus saves the noise and the work of
-//! a table. Encryption then publishes the add packages `X^(x_t)` and
-//! `X^(Bx - 1 - x_t)` of every attribute, and the lookup packages only if a
-//! lookup step reads them. A program of such a class has exactly `T_max` steps.
+//! lookup step above, an *add* step only multiplies the state by an add package,
+//! adding to the exponent without a table, and a *map* step only applies a table
+//! to the state, reading no attribute. Each kind is fixed by the class because the
+//! Program is one graph for every program; an add step thus saves the noise and
+//! the work of a table. With symbols of `k` bits (`Bx = 2^k`), the add packages of
+//! attribute `t` are `X^(popcount(x_t xor z))` for every template symbol
+//! `z < 2^k`, the Hamming distance of the symbol to `z`, which a program selects
+//! by its read (for `k = 1`, `X^(x_t)` and `X^(1 - x_t)`): encryption knows `x_t`
+//! and publishes the distance to every `z`, so one product adds it. Encryption
+//! publishes them for every attribute, and the lookup packages only if a lookup
+//! step reads them. A program of such a class has exactly `T_max` steps.
 use crate::PeError;
 use mxx_exponent_lut::{
     ExpLayout, ExponentLutProgram,
@@ -47,8 +50,8 @@ use std::collections::BTreeMap;
 pub const INITIAL_STATE_COORDINATE: u32 = 0;
 /// Setup coordinate of the attribute packages: a family of `l` members.
 pub const ATTRIBUTE_COORDINATE: u32 = 0;
-/// Setup coordinate of the add packages: a family of `2 l` members, `X^(x_t)`
-/// then `X^(Bx - 1 - x_t)`.
+/// Setup coordinate of the add packages: a family of `Bx l` members, member
+/// `t + l z` being the distance package `X^(popcount(x_t xor z))`.
 pub const ADD_ATTRIBUTE_COORDINATE: u32 = 1;
 
 /// The kind of one step of a class ([`PeClass::with_steps`]).
@@ -56,7 +59,7 @@ pub const ADD_ATTRIBUTE_COORDINATE: u32 = 1;
 pub enum StepKind {
     /// `z <- f(z + Bz x)`: the product by the package of `X^(Bz x)`, then a table.
     Lookup,
-    /// `z <- z + x` or `z <- z + Bx - 1 - x`: the product by an add package only.
+    /// `z <- z + popcount(x xor t)` for a template symbol `t`: the product by an add package only.
     Add,
     /// `z <- f(z)`: a table only.
     Map,
@@ -67,8 +70,9 @@ pub enum StepKind {
 pub enum ProgramStep {
     /// Read attribute `read` and apply `table` at `z + Bz x`.
     Lookup { read: usize, table: Vec<usize> },
-    /// Add attribute `read`, or its complement `Bx - 1 - x` with `complement`.
-    Add { read: usize, complement: bool },
+    /// Add the Hamming distance `popcount(x xor template)` of attribute `read` to the symbol
+    /// `template` (for binary symbols, `x` or `1 - x`).
+    Add { read: usize, template: usize },
     /// Apply `table` at `z`.
     Map { table: Vec<usize> },
 }
@@ -134,6 +138,9 @@ impl PeClass {
         if steps.last() == Some(&StepKind::Add) {
             return Err(PeError::Class("the last step must apply a table"));
         }
+        if steps.contains(&StepKind::Add) && !alphabet_size.is_power_of_two() {
+            return Err(PeError::Class("add steps need symbols of k bits (Bx = 2^k)"));
+        }
         let mask = |kind| {
             steps
                 .iter()
@@ -160,13 +167,19 @@ impl PeClass {
         }
     }
 
-    /// The class of the Hamming threshold programs over `bits` binary attributes
-    /// ([`BranchingProgram::hamming_threshold`]): `bits` add steps and one map
-    /// step, of state width `bits + 1`.
-    pub fn hamming(bits: usize) -> Result<Self, PeError> {
-        let mut steps = vec![StepKind::Add; bits];
+    /// The class of the Hamming threshold programs over `symbols` attribute symbols
+    /// of `symbol_bits` bits each ([`BranchingProgram::hamming_threshold`]): one add
+    /// step per symbol and one map step, of state width `symbols symbol_bits + 1`.
+    pub fn hamming(symbols: usize, symbol_bits: u32) -> Result<Self, PeError> {
+        let mut steps = vec![StepKind::Add; symbols];
         steps.push(StepKind::Map);
-        Self::with_steps(bits, 2, bits + 1, &steps)
+        let bits = symbols * symbol_bits as usize;
+        Self::with_steps(symbols, 1 << symbol_bits, bits + 1, &steps)
+    }
+
+    /// The bits `k` of a symbol, for `Bx = 2^k`; add steps add up to `k` to the state.
+    pub const fn symbol_bits(&self) -> u32 {
+        self.alphabet_size.trailing_zeros()
     }
 
     /// Whether every step is a lookup.
@@ -179,10 +192,12 @@ impl PeClass {
     }
 
     /// The RHS packages of a ciphertext: `l` lookup packages if a lookup step
-    /// reads them, and `2 l` add packages if an add step reads them.
+    /// reads them, and `l Bx` add packages (one per template symbol) if an add
+    /// step reads them.
     pub fn rhs_packages(&self) -> usize {
         self.attribute_length *
-            (usize::from(self.has(StepKind::Lookup)) + 2 * usize::from(self.has(StepKind::Add)))
+            (usize::from(self.has(StepKind::Lookup)) +
+                self.alphabet_size * usize::from(self.has(StepKind::Add)))
     }
 
     /// Whether encryption publishes the lookup packages `X^(Bz x_t)`.
@@ -190,7 +205,7 @@ impl PeClass {
         self.has(StepKind::Lookup)
     }
 
-    /// Whether encryption publishes the add packages `X^(x_t)` and `X^(Bx - 1 - x_t)`.
+    /// Whether encryption publishes the add packages `X^(popcount(x_t xor z))`.
     pub fn has_add_packages(&self) -> bool {
         self.has(StepKind::Add)
     }
@@ -297,7 +312,9 @@ impl PeClass {
             .map_err(invalid)?;
         let adds = self
             .has_add_packages()
-            .then(|| builder.rhs_family(IntExpr::constant(2 * self.attribute_length)))
+            .then(|| {
+                builder.rhs_family(IntExpr::constant(self.alphabet_size * self.attribute_length))
+            })
             .transpose()
             .map_err(invalid)?;
         rhs.extend(attributes.map(|id| (id, ATTRIBUTE_COORDINATE)));
@@ -353,14 +370,14 @@ impl PeClass {
 
 /// A checked branching program of a class: its read map and transition
 /// tables, table `i` at index `z + Bz x` holding `f_i(z, x)` (at `z` for a map
-/// step), and for an add step its complement flag (and an empty table).
+/// step), and for an add step its template symbol (and an empty table).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BranchingProgram {
     class: PeClass,
     reads: Vec<usize>,
     tables: Vec<Vec<usize>>,
     #[serde(default)]
-    complements: Vec<bool>,
+    templates: Vec<usize>,
 }
 
 impl BranchingProgram {
@@ -398,16 +415,16 @@ impl BranchingProgram {
             return Err(PeError::Predicate("the program length is outside 1..=T_max"));
         }
         let offset = class.max_steps - length;
-        let (mut reads, mut tables, mut complements) = (vec![], vec![], vec![]);
+        let (mut reads, mut tables, mut templates) = (vec![], vec![], vec![]);
         // The largest reachable state.
         let mut state = 0;
         for (index, step) in steps.into_iter().enumerate() {
             let position = offset + index;
             let last = index + 1 == length;
-            let (read, table, complement) = match step {
-                ProgramStep::Lookup { read, table } => (Some(read), table, false),
-                ProgramStep::Add { read, complement } => (Some(read), vec![], complement),
-                ProgramStep::Map { table } => (None, table, false),
+            let (read, table, template) = match step {
+                ProgramStep::Lookup { read, table } => (Some(read), table, 0),
+                ProgramStep::Add { read, template } => (Some(read), vec![], template),
+                ProgramStep::Map { table } => (None, table, 0),
             };
             let kind = match (&read, table.is_empty()) {
                 (Some(_), false) => StepKind::Lookup,
@@ -420,8 +437,11 @@ impl BranchingProgram {
             if read.is_some_and(|read| read >= class.attribute_length) {
                 return Err(PeError::Predicate("a read is not an attribute index"));
             }
+            if template >= class.alphabet_size {
+                return Err(PeError::Predicate("a template symbol is outside the alphabet"));
+            }
             if kind == StepKind::Add {
-                state += class.alphabet_size - 1;
+                state += class.symbol_bits() as usize;
             } else {
                 let bound = if last { 2 } else { class.state_width };
                 if state >= class.state_width ||
@@ -434,25 +454,26 @@ impl BranchingProgram {
             }
             reads.push(read.unwrap_or(0));
             tables.push(table);
-            complements.push(complement);
+            templates.push(template);
         }
-        Ok(Self { class, reads, tables, complements })
+        Ok(Self { class, reads, tables, templates })
     }
 
-    /// The threshold program of the Hamming distance to `template` over the class
-    /// [`PeClass::hamming`] of `template.len()` bits: `F(x) = 0`, which decrypts,
-    /// exactly when `x` differs from `template` in fewer than `threshold` bits.
-    /// Step `i` adds `x_i` if `template_i = 0` and `1 - x_i` otherwise, and the
-    /// final map step compares the sum with `threshold`.
-    pub fn hamming_threshold(template: &[usize], threshold: usize) -> Result<Self, PeError> {
-        let class = PeClass::hamming(template.len())?;
-        if template.iter().any(|bit| *bit > 1) {
-            return Err(PeError::Predicate("a template bit is not binary"));
-        }
+    /// The threshold program of the Hamming distance to `template`, `template.len()`
+    /// symbols of `symbol_bits` bits, over the class [`PeClass::hamming`]: `F(x) = 0`,
+    /// which decrypts, exactly when `x` differs from `template` in fewer than
+    /// `threshold` bits. Step `i` adds `popcount(x_i xor template_i)`, and the final
+    /// map step compares the sum with `threshold`.
+    pub fn hamming_threshold(
+        symbol_bits: u32,
+        template: &[usize],
+        threshold: usize,
+    ) -> Result<Self, PeError> {
+        let class = PeClass::hamming(template.len(), symbol_bits)?;
         let mut steps = template
             .iter()
             .enumerate()
-            .map(|(read, bit)| ProgramStep::Add { read, complement: *bit == 1 })
+            .map(|(read, symbol)| ProgramStep::Add { read, template: *symbol })
             .collect::<Vec<_>>();
         steps.push(ProgramStep::Map {
             table: (0..class.state_width)
@@ -479,13 +500,13 @@ impl BranchingProgram {
         &self.tables
     }
 
-    /// The complement flags of the steps (set only on add steps).
-    pub fn complements(&self) -> &[bool] {
-        &self.complements
+    /// The template symbols of the steps (set only on add steps).
+    pub fn templates(&self) -> &[usize] {
+        &self.templates
     }
 
-    fn complement(&self, index: usize) -> bool {
-        self.complements.get(index).copied().unwrap_or(false)
+    fn template(&self, index: usize) -> usize {
+        self.templates.get(index).copied().unwrap_or(0)
     }
 
     /// The kind of step `index` of this program.
@@ -502,10 +523,7 @@ impl BranchingProgram {
             let symbol = attribute[*read];
             state = match self.kind(index) {
                 StepKind::Lookup => table[state + self.class.state_width * symbol],
-                StepKind::Add if self.complement(index) => {
-                    state + self.class.alphabet_size - 1 - symbol
-                }
-                StepKind::Add => state + symbol,
+                StepKind::Add => state + (symbol ^ self.template(index)).count_ones() as usize,
                 StepKind::Map => table[state],
             };
         }
@@ -527,16 +545,11 @@ impl BranchingProgram {
                     .collect()
             })
             .collect();
-        Self {
-            class,
-            reads: vec![0; class.max_steps],
-            tables,
-            complements: vec![false; class.max_steps],
-        }
+        Self { class, reads: vec![0; class.max_steps], tables, templates: vec![0; class.max_steps] }
     }
 
     /// The Program data of this program ([`PeClass::compile`]): the reads (an
-    /// add step's read `t` of the add family, `t + l` for a complement) and
+    /// add step's read `t` of template symbol `z` is member `t + l z` of the add family) and
     /// the tables, each padded to the lookup width `W` with zeros (an add step's
     /// all zeros), of the `T_max` steps, the first `T_max - T` of them identity
     /// steps.
@@ -548,9 +561,12 @@ impl BranchingProgram {
             .map(|index| index % class.state_width)
             .collect::<Vec<_>>();
         let reads = std::iter::repeat_n(0, padding)
-            .chain(self.reads.iter().enumerate().map(|(index, read)| {
-                read + class.attribute_length * usize::from(self.complement(index))
-            }))
+            .chain(
+                self.reads
+                    .iter()
+                    .enumerate()
+                    .map(|(index, read)| read + class.attribute_length * self.template(index)),
+            )
             .collect();
         let tables = std::iter::repeat_n(&identity, padding)
             .chain(&self.tables)
@@ -672,9 +688,9 @@ mod tests {
     #[test]
     fn hamming_threshold_programs_compare_the_distance() {
         let template = [1, 0, 1, 1];
-        let program = BranchingProgram::hamming_threshold(&template, 2).unwrap();
+        let program = BranchingProgram::hamming_threshold(1, &template, 2).unwrap();
         let class = *program.class();
-        assert_eq!(class, PeClass::hamming(4).unwrap());
+        assert_eq!(class, PeClass::hamming(4, 1).unwrap());
         assert_eq!(class.step_kind(0), StepKind::Add);
         assert_eq!(class.step_kind(4), StepKind::Map);
         assert_eq!(class.lookup_width(), 8);
@@ -694,7 +710,7 @@ mod tests {
             &[StepKind::Add; 4].iter().copied().chain([StepKind::Map]).collect::<Vec<_>>(),
         )
         .unwrap();
-        let adds = (0..4).map(|read| ProgramStep::Add { read, complement: false });
+        let adds = (0..4).map(|read| ProgramStep::Add { read, template: 0 });
         let map = ProgramStep::Map { table: vec![0; 4] };
         assert!(BranchingProgram::from_steps(narrow, adds.clone().chain([map]).collect()).is_err());
         let lookup = ProgramStep::Lookup { read: 0, table: vec![0; 10] };
@@ -707,6 +723,33 @@ mod tests {
                 .is_err()
         );
         assert!(PeClass::with_steps(1, 2, 2, &[StepKind::Map, StepKind::Add]).is_err());
+        assert!(PeClass::with_steps(1, 3, 3, &[StepKind::Add, StepKind::Map]).is_err());
+    }
+
+    /// With symbols of two bits, a step adds the Hamming distance of a symbol to its template
+    /// symbol, so the same number of steps reads twice the bits, from `4` add packages per symbol.
+    #[test]
+    fn hamming_threshold_programs_read_symbols_of_several_bits() {
+        let template = [2, 1, 3];
+        let program = BranchingProgram::hamming_threshold(2, &template, 3).unwrap();
+        let class = *program.class();
+        assert_eq!(class, PeClass::hamming(3, 2).unwrap());
+        assert_eq!((class.max_steps(), class.state_width(), class.lookup_width()), (4, 7, 8));
+        assert_eq!(class.rhs_packages(), 12);
+        for value in 0..64usize {
+            let symbols = (0..3).map(|i| value >> (2 * i) & 3).collect::<Vec<_>>();
+            let distance = symbols
+                .iter()
+                .zip(&template)
+                .map(|(x, z)| (x ^ z).count_ones() as usize)
+                .sum::<usize>();
+            assert_eq!(program.evaluate(&symbols).unwrap(), usize::from(distance >= 3));
+        }
+        let compiled = class.compile().unwrap();
+        let data = program.data(&compiled);
+        data.validate(compiled.program()).unwrap();
+        assert_eq!(data.values(compiled.reads()).unwrap(), [6, 4, 11, 0]);
+        assert!(BranchingProgram::hamming_threshold(2, &[4, 0, 0], 1).is_err());
     }
 
     /// The Hamming class compiles to products by the add family and one table, and a program's
@@ -714,7 +757,7 @@ mod tests {
     #[test]
     fn the_hamming_class_reads_the_add_family() {
         let template = [1, 0, 1];
-        let program = BranchingProgram::hamming_threshold(&template, 1).unwrap();
+        let program = BranchingProgram::hamming_threshold(1, &template, 1).unwrap();
         let compiled = program.class().compile().unwrap();
         assert_eq!(compiled.program().rhs_inputs().len(), 1);
         assert_eq!(compiled.program().encryption_inputs().luts().len(), 1);

@@ -39,14 +39,14 @@ fn test_gpu_authorized_key_decrypts_on_the_gpu() {
     authorized_key_decrypts_on_the_gpu(class, parameters(class));
 }
 
-/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] over a statistical trapdoor with the LUT radix
-/// 2 and compact encodings: the branch `25 = 17 * 9` of two nonzero digits reads compact helpers
-/// and companions in both switches, all on the GPU with the `q` and `pq` rings registered.
+/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] with the LUT radix 2 and compact encodings: the
+/// branch `25 = 17 * 9` of two nonzero digits reads compact helpers and companions in both
+/// switches, all on the GPU with the `q` and `pq` rings registered.
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn test_gpu_compact_encodings_with_a_radix_decrypt_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
-    let parameters = crate::test_support::correct_parameters(class, true, |parameters| {
+    let parameters = crate::test_support::correct_parameters(class, |parameters| {
         parameters.with_lut_radix(2).unwrap().with_compact_encodings().unwrap()
     });
     authorized_key_decrypts_on_the_gpu(class, parameters);
@@ -90,10 +90,8 @@ fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParam
 fn test_gpu_measured_noise_against_the_bounds() {
     use crate::{
         PeParameterRequest, PeParameters,
-        budget::{DEFAULT_FLOODING_BITS, DEFAULT_STATISTICAL_BITS, KeyWidthPolicy},
         decryption::{OUTPUT_ROW, evaluate, phase_graph},
         encryption::encrypt_with_secret,
-        params::TrapdoorMode,
     };
     use mxx_backends::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -140,17 +138,8 @@ fn test_gpu_measured_noise_against_the_bounds() {
         crt_bits: read("CRT_BITS", 32),
         base_bits: read("BASE_BITS", 16),
         crt_depths: read("MIN_CRT_DEPTH", 1)..=16,
-        trapdoor_instantiation: TrapdoorMode::Statistical,
-        key_width_policy: KeyWidthPolicy::Practical,
         trapdoor_sigma: read("TRAPDOOR_SIGMA", 64.0),
         error_sigma: "3.19".parse().unwrap(),
-        flooding_sigma: "3.19".parse().unwrap(),
-        enforce_flooding: read("FLOODING", "none".to_owned()) == "enforce",
-        randomness_sigma: read("RANDOMNESS_SIGMA", "4096".to_owned()).parse().unwrap(),
-        statistical_security_bits: DEFAULT_STATISTICAL_BITS,
-        flooding_statistical_bits: DEFAULT_FLOODING_BITS,
-        key_queries: 1 << 20,
-        max_anchor_columns: 1024,
         lut_radix: match std::env::var("MXX_PE_NOISE_LUT_RADIX") {
             Err(_) => class.default_lut_radix(),
             Ok(value) => Some(value.parse::<usize>().unwrap()).filter(|radix| *radix > 0),

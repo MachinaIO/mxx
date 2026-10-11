@@ -1,9 +1,8 @@
 //! Setup: the anchor `B = [B^(1); B^(2)]` with the trapdoor of `B^(1)`, the
 //! message row `d = (d_1, d_2)`, and the class's Dynamic setup.
 //!
-//! `B^(1)` is the public row of the one-row TrapGen of the parameters'
-//! instantiation, `1 x m_B` with `m_B = m̄ + D` (statistical) or `D + 2`
-//! (computational); every preimage under it is sampled at the key width with
+//! `B^(1)` is the public row of the one-row statistical TrapGen `[ā | g - ā T]`,
+//! `1 x m_B` with `m_B = m̄ + D`; every preimage under it is sampled at the key width with
 //! the key cutoff, which the trapdoor's type carries. Its trapdoor stays in the secret
 //! setup production, which only [`crate::keygen`] imports; a second
 //! production republishes `B^(1)` alone, and the public key names only that

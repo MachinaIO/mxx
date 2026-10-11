@@ -32,6 +32,11 @@ the proofs reuse. Mathlib and the ir-core Lean library come through it.
 
 ## Parameter IDs
 
+The recorded rows and the templates use the computational TrapGen, which `mxx-pe` no longer
+provides: the scheme now always uses the statistical TrapGen without noise flooding. The rows are
+reproducible at commit `5b30d1198`; a statistical row needs templates that model the statistical
+TrapGen (see [Generation](#generation)).
+
 `parameters.csv` records the parameter sets of the proofs under unique `parameter_id`s; `gen.py`
 reads a row to write its proof package and checks that the exported layout matches it. The
 integration test does not read the file: run with the environment variables that select the row's

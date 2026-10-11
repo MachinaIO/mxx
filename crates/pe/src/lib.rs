@@ -12,7 +12,7 @@
 //!   public matrices, and the helper matrices `H_k`.
 //! - [`encryption::encrypt`] produces, under a fresh secret `s = (s_bar, 1)`, the anchor encoding
 //!   `b = s B + e_b`, the attribute gadget ciphertexts `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz x_t)
-//!   G` with fresh uniform `a_t` and `e_t` from `chi_fl`, the message component `c_m = s d^T + e_m
+//!   G` with fresh uniform `a_t` and `e_t` from `chi`, the message component `c_m = s d^T + e_m
 //!   + floor(q/2) m`, and the Dynamic packages (digit companions, helpers, and the initial state
 //!   `c_0`). It needs no predicate.
 //! - [`keygen::keygen`] evaluates the predicate's public key `A_F` and samples a short key `k` with
@@ -23,27 +23,25 @@
 //!
 //! [`noise`] obtains the evaluation bound `E_F` from the exponent-lut
 //! simulator and applies the decryption margin; [`params`] fixes the class,
-//! the equal-basis chain, the trapdoor instantiation, the sampling contracts,
-//! and the key width; [`budget`] holds the statistical instantiation's
-//! conditions: the statistical-distance budget, the regularity conditions, the
-//! flooding width, and the SampleRight key width.
+//! the equal-basis chain, the statistical trapdoor, the sampling contracts,
+//! and the key width; [`budget`] holds the trapdoor's conditions: the
+//! statistical-distance budget, the regularity condition, and the truncation.
 //!
-//! `Statistical` parameters with `Strict` keys implement every construction and
-//! parameter condition of the manuscript, assuming ideal samplers: the
-//! floating-point error of the sampling primitives, the preimage widths, and
-//! the truncation and rejection of preimages and keys are heuristic, as in
-//! OpenFHE. `Practical` keys relax the reduction's key-simulation width, and
-//! `Computational` parameters keep the legacy, heuristic construction outside
-//! the manuscript's theorem.
+//! The trapdoor is the manuscript's statistical TrapGen, with the relaxations of
+//! the manuscript's implementation section: every fresh error is a `chi` sample
+//! (no noise flooding), the uniformity conditions on the hybrids' `R` and `Z_t`
+//! are dropped, and keys take the trapdoor's minimum preimage width, which
+//! relaxes the reduction's key-simulation width. The parameters are therefore
+//! outside the manuscript's theorem. The floating-point error of the sampling
+//! primitives, the preimage widths, and the truncation and rejection of
+//! preimages and keys are heuristic, as in OpenFHE.
 //!
 //! # Conventions
 //!
 //! - `F(x) = 0` authorizes decryption. An unauthorized decryption returns the rounded phase; it is
 //!   not a reliable rejection.
-//! - The anchor row `B^(1)` is the public matrix of TrapGen. The statistical anchor is close to
-//!   uniform by the regularity conditions; the computational one keeps its identity block and its
-//!   `m_B = D + 2` columns, and the manuscript's uniform-anchor and anchor-width requirements are
-//!   not enforced for it.
+//! - The anchor row `B^(1)` is the public matrix of TrapGen, close to uniform by the regularity
+//!   conditions.
 //! - The setup's public matrices other than `B^(1)` are expanded from a public hash key; they are
 //!   assumed indistinguishable from the manuscript's uniform matrices.
 //! - Gaussian widths are the sampler's standard-deviation parameter `sigma`; the manuscript's

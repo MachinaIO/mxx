@@ -1,14 +1,10 @@
 //! Shared unit-test helpers: small, environment-overridable parameters and
 //! branching programs.
-use crate::{
-    BranchingProgram, PeClass, PeParameterRequest, PeParameters, budget::KeyWidthPolicy,
-    params::TrapdoorMode,
-};
+use crate::{BranchingProgram, PeClass, PeParameterRequest, PeParameters};
 use mxx_backends::{
     authority::CpuExecution,
     backend::poly::cpu_backend,
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
-    sampler::bounds::TrapdoorPreimageCutoffPolicy,
 };
 use mxx_exponent_lut::rns_bgg::RnsBggGaussian;
 
@@ -20,20 +16,15 @@ where
 }
 
 /// Test parameters of `class`: ring dimension, CRT depth and prime bits,
-/// base bits, trapdoor sigma, and the error and flooding sigmas overridable
-/// by `MXX_PE_TEST_{RING_DIMENSION,CRT_DEPTH,CRT_BITS,BASE_BITS,
-/// TRAPDOOR_SIGMA,ERROR_SIGMA,FLOODING_SIGMA}`,
-/// and the instantiation by `MXX_PE_TEST_TRAPDOOR_INSTANTIATION`
-/// (`computational`, the default, or `statistical`, see
-/// [`statistical_parameters`]). They are functional, not secure. By default
-/// every error (`chi` and `chi_fl`) is zero, so the evaluation is exact, the
-/// simulated bounds are zero, and correctness holds without a noise margin.
+/// base bits, trapdoor sigma, and the error sigma overridable by
+/// `MXX_PE_TEST_{RING_DIMENSION,CRT_DEPTH,CRT_BITS,BASE_BITS,TRAPDOOR_SIGMA,ERROR_SIGMA}`, over a
+/// statistical trapdoor of `m̄ = MXX_PE_TEST_M_BAR` (default `2 D`) and the minimum key width. They
+/// are functional, not secure: the production selection rejects their zero widths, so
+/// this fixture bypasses the budget ([`PeParameters::statistical_unchecked`]). By
+/// default every error (`chi`) is zero, so the evaluation is exact,
+/// the simulated bounds are zero, and correctness holds without a noise margin.
 pub(crate) fn parameters(class: PeClass) -> PeParameters {
-    match read("TRAPDOOR_INSTANTIATION", "computational".to_owned()).as_str() {
-        "computational" => computational_parameters(class),
-        "statistical" => statistical_parameters(class),
-        other => panic!("unknown trapdoor instantiation {other}"),
-    }
+    parameters_at(class, level())
 }
 
 fn level() -> DCRTPolyParams {
@@ -55,34 +46,8 @@ fn contract(name: &str, default: &str) -> RnsBggGaussian {
     RnsBggGaussian::with_default_cutoff(read(name, default.to_owned()).parse().unwrap()).unwrap()
 }
 
-/// The computational test parameters of [`parameters`].
-pub(crate) fn computational_parameters(class: PeClass) -> PeParameters {
-    computational_parameters_at(class, level())
-}
-
-/// [`computational_parameters`] over `level`.
-fn computational_parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParameters {
-    PeParameters::new(
-        class,
-        level,
-        read("TRAPDOOR_SIGMA", 4.578),
-        contract("ERROR_SIGMA", "0"),
-        contract("FLOODING_SIGMA", "0"),
-        TrapdoorPreimageCutoffPolicy::Default,
-    )
-    .unwrap()
-}
-
-/// Statistical test parameters: the contracts of [`parameters`] with a
-/// statistical trapdoor of `m̄ = MXX_PE_TEST_M_BAR` (default `2 D`) and the
-/// minimum key width. The production selection rejects their zero widths, so
-/// this fixture bypasses the budget ([`PeParameters::statistical_unchecked`]).
-pub(crate) fn statistical_parameters(class: PeClass) -> PeParameters {
-    statistical_parameters_at(class, level())
-}
-
-/// [`statistical_parameters`] over `level`.
-fn statistical_parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParameters {
+/// [`parameters`] over `level`.
+fn parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParameters {
     let m_bar = read("M_BAR", 2 * level.modulus_digits());
     PeParameters::statistical_unchecked(
         class,
@@ -90,28 +55,18 @@ fn statistical_parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParamet
         read("TRAPDOOR_SIGMA", 4.578),
         m_bar,
         contract("ERROR_SIGMA", "0"),
-        contract("FLOODING_SIGMA", "0"),
     )
     .unwrap()
 }
 
 /// The test parameters of `class` at the smallest CRT depth from `4` whose simulated bound
-/// guarantees correctness after `adapt` (which may enable options that add noise); over a
-/// statistical trapdoor if `statistical`.
+/// guarantees correctness after `adapt` (which may enable options that add noise).
 pub(crate) fn correct_parameters(
     class: PeClass,
-    statistical: bool,
     adapt: impl Fn(PeParameters) -> PeParameters,
 ) -> PeParameters {
     (4..=16)
-        .map(|depth| {
-            let level = level_at(depth);
-            adapt(if statistical {
-                statistical_parameters_at(class, level)
-            } else {
-                computational_parameters_at(class, level)
-            })
-        })
+        .map(|depth| adapt(parameters_at(class, level_at(depth))))
         .find(|parameters| {
             crate::noise::simulate(parameters, &crate::BranchingProgram::longest(class))
                 .unwrap()
@@ -120,9 +75,7 @@ pub(crate) fn correct_parameters(
         .expect("a CRT depth up to 16 decrypts")
 }
 
-/// A statistical selection request of `class` with small, insecure sizes; the
-/// key-width policy and `σ_R` are overridable by
-/// `MXX_PE_TEST_{KEY_WIDTH_POLICY,RANDOMNESS_SIGMA}` (`practical` or `strict`).
+/// A selection request of `class` with small, insecure sizes.
 pub(crate) fn statistical_request(class: PeClass) -> PeParameterRequest {
     PeParameterRequest {
         class,
@@ -130,21 +83,8 @@ pub(crate) fn statistical_request(class: PeClass) -> PeParameterRequest {
         crt_bits: read("CRT_BITS", 50),
         base_bits: read("BASE_BITS", 25),
         crt_depths: 1..=8,
-        trapdoor_instantiation: TrapdoorMode::Statistical,
-        key_width_policy: match read("KEY_WIDTH_POLICY", "practical".to_owned()).as_str() {
-            "practical" => KeyWidthPolicy::Practical,
-            "strict" => KeyWidthPolicy::Strict,
-            other => panic!("unknown key width policy {other}"),
-        },
         trapdoor_sigma: read("TRAPDOOR_SIGMA", 4.578),
         error_sigma: "3.19".parse().unwrap(),
-        flooding_sigma: "3.19".parse().unwrap(),
-        enforce_flooding: true,
-        randomness_sigma: read("RANDOMNESS_SIGMA", "64".to_owned()).parse().unwrap(),
-        statistical_security_bits: crate::budget::DEFAULT_STATISTICAL_BITS,
-        flooding_statistical_bits: crate::budget::DEFAULT_FLOODING_BITS,
-        key_queries: 1 << 20,
-        max_anchor_columns: 4096,
         lut_radix: None,
         compact_encodings: false,
         failure_exponent: None,

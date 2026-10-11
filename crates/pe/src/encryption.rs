@@ -5,7 +5,7 @@
 //!
 //! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`;
 //! - for every attribute symbol `x_t`, the gadget ciphertext `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz
-//!   x_t) G` with a fresh uniform `a_t` and a fresh `e_t` from `chi_fl`, both `1 x m`, so `s C_t =
+//!   x_t) G` with a fresh uniform `a_t` and a fresh `e_t` from `chi`, both `1 x m`, so `s C_t =
 //!   X^(Bz x_t) s G + e_t`, if a lookup step reads it, and the same ciphertexts of the distances
 //!   `X^(popcount(x_t xor z))` to every symbol `z` if an add step does
 //!   ([`crate::branching_program::StepKind`]);
@@ -242,19 +242,19 @@ where
     };
     let anchor = s_bar.clone() * first + second + error(m_b)?;
     let gadget = parameters.rns().public_gadget(0)?;
-    // `chi_fl` for the attribute ciphertexts' errors `e_t`.
-    let flooding = parameters.flooding();
-    let flooding_sigma = crate::params::real_expr(flooding.sigma())?;
+    // `chi` for the attribute ciphertexts' errors `e_t`.
+    let chi = parameters.error();
+    let chi_sigma = crate::params::real_expr(chi.sigma())?;
     let mut context = context.transferred_output(ANCHOR_ENCODING, anchor)?;
     for (coordinate, family) in exponents {
         let ciphertexts = mxx_dsl::parallel(family.count().clone(), |member| {
             // `[a_t; -s_bar a_t + e_t]`, with a fresh uniform `a_t`.
             let width = 2 * columns;
             let top = ring.uniform_residue((1, width));
-            let e_t = if flooding.sigma().is_zero() {
+            let e_t = if chi.sigma().is_zero() {
                 ring.zero((1, width))
             } else {
-                ring.gaussian((1, width), flooding_sigma.clone(), flooding.cutoff().clone())
+                ring.gaussian((1, width), chi_sigma.clone(), chi.cutoff().clone())
             };
             let bottom = e_t - s_bar.clone() * top.clone();
             let symbol = ring.identity(1).multiply_monomial(family.at(member));

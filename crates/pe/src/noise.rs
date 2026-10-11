@@ -5,9 +5,9 @@
 //! the gadget output use, so `E_F` bounds the error of the full-gadget
 //! carrier `c_F = s (A_F - F(x) G) + e_F` and no direct-decoding action or
 //! margin of another consumer is applied. Its material contracts are the
-//! setup's: `chi_fl` for the initial state and every companion, `chi` for
-//! the helpers, and the supplied attribute ciphertexts' bound `B_C` on their
-//! fresh error `e_C = e_t`, a `chi_fl` sample.
+//! setup's: `chi` for the initial state, every companion, and the helpers,
+//! and the supplied attribute ciphertexts' bound `B_C` on their fresh error
+//! `e_C = e_t`, a `chi` sample.
 //!
 //! Decryption contracts the family row with the key by blocks. With the key
 //! cutoff `B_key`, the anchor blocks contribute `n B_key m_B B_b` each
@@ -44,16 +44,15 @@
 //! distribution of the evaluation error: `E_F` is its worst-case bound.
 
 use crate::{BranchingProgram, PeClass, PeError, PeParameters};
-use bigdecimal::BigDecimal;
 use mxx_backends::poly::PolyParams;
 use mxx_exponent_lut::{
     api,
     decoder::simulation::AverageCaseConfig,
     noise_utils::{NoiseMoments, NonnegativeRational},
     rns_bgg::{
-        RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise, RnsBggGaussian,
-        RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue,
-        RnsBggPackageNoise, RnsBggParameters, RnsNoiseBuild, RnsOutputUse,
+        RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise, RnsBggNoiseBindings,
+        RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggPackageNoise, RnsBggParameters,
+        RnsNoiseBuild, RnsOutputUse,
     },
 };
 use num_bigint::{BigInt, BigUint};
@@ -215,46 +214,6 @@ fn output_bound(trace: &RnsBggNoiseTrace) -> Result<BigUint, PeError> {
         .bound
         .error
         .clone())
-}
-
-/// The coefficient bound `B_R̂` of the ledger witness `R̂_F` of the proof's hybrid `H_2`
-/// (`lem:ledger`) for `program` over `rns`.
-///
-/// The witness propagates through the evaluation as the error does (sums add, products and scalar
-/// actions multiply by gadget decompositions from the right, automorphisms permute, mask switches
-/// add `J g^-1(A)`), so the simulator bounds it when every material contract is replaced by the
-/// bound of its witness: `R_0` for `c_0` and `R` for every digit companion, both bounded by
-/// `randomness_bound = B_R`, `J ∈ {0, 1}` for every helper, and the `Z_t` by which the hybrids
-/// simulate every attribute ciphertext from `(B, b)`, of the width of `R` and also bounded by
-/// `B_R`. The evaluation is the one the LUT radix `lut_radix` performs (`lem:ledger` follows the
-/// switches actually applied).
-#[allow(clippy::too_many_arguments)]
-pub fn witness_bound(
-    rns: &RnsBggParameters,
-    class: &PeClass,
-    program: &BranchingProgram,
-    randomness_sigma: &BigDecimal,
-    randomness_bound: &BigUint,
-    lut_radix: Option<usize>,
-) -> Result<BigUint, PeError> {
-    let randomness = RnsBggGaussian::new(randomness_sigma.clone(), randomness_bound.clone())?;
-    let indicator = RnsBggGaussian::new(BigDecimal::from(1u8), 1u8.into())?;
-    let distributions = RnsBggDynamicDistributions {
-        input: randomness.clone(),
-        companion: randomness,
-        helper: indicator.clone(),
-        ciphertext: indicator,
-    };
-    output_bound(&evaluation_trace(
-        rns,
-        class,
-        program,
-        *b"mxx-pe/witness-bound/namespace/1",
-        distributions,
-        randomness_bound,
-        lut_radix,
-        None,
-    )?)
 }
 
 /// The coefficient bound of a helper as decryption reads it: the helper

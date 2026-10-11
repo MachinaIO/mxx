@@ -386,9 +386,7 @@ mod tests {
         let class = PeClass::new(2, 2, 2, 2).unwrap();
         family_values_open(
             class,
-            correct_parameters(class, false, |parameters| {
-                parameters.with_compact_encodings().unwrap()
-            }),
+            correct_parameters(class, |parameters| parameters.with_compact_encodings().unwrap()),
         );
     }
 
@@ -556,18 +554,6 @@ mod tests {
     }
 
     /// The round trip of
-    /// [`authorized_keys_of_several_predicates_decrypt_one_ciphertext`] over a
-    /// statistical trapdoor `[ā | g - ā T]`.
-    #[test]
-    fn authorized_keys_decrypt_over_the_statistical_trapdoor() {
-        let class = PeClass::new(2, 2, 2, 2).unwrap();
-        let parameters = statistical_parameters(class);
-        assert!(!parameters.instantiation().is_computational());
-        assert_eq!(parameters.anchor_columns(), 3 * parameters.digits());
-        authorized_keys_decrypt(class, parameters);
-    }
-
-    /// The round trip of
     /// [`authorized_keys_of_several_predicates_decrypt_one_ciphertext`] with the lookup group
     /// `H = <9> = {1, 9, 17, 25}` in radix 2: encryption publishes the switching packages of
     /// `K_2 = {9, 17}` only, and the branch `25 = 9^3` of two nonzero digits is switched twice,
@@ -635,48 +621,43 @@ mod tests {
     }
 
     /// One step `F(x) = x_0` with the companions, the helper, and the initial state published in
-    /// two columns over `pq` and expanded by every reader, over the computational and the
-    /// statistical trapdoor: the authorized key decrypts, and the measured phase error (which
-    /// carries the expansions' rounding errors) is within the simulated bound.
+    /// two columns over `pq` and expanded by every reader: the authorized key decrypts, and the
+    /// measured phase error (which carries the expansions' rounding errors) is within the
+    /// simulated bound.
     #[test]
     fn compact_encodings_decrypt_within_the_simulated_bound() {
         let class = PeClass::new(1, 2, 1, 1).unwrap();
-        for statistical in [false, true] {
-            let parameters = correct_parameters(class, statistical, |parameters| {
-                parameters.with_compact_encodings().unwrap()
-            });
-            let extension = parameters.compact_extension().unwrap();
-            assert_eq!(extension.len(), parameters.level().crt_depth());
-            assert!(extension.iter().all(|prime| !parameters.level().to_crt().0.contains(prime)));
-            let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class))
-                .unwrap()
-                .decryption;
-            let mut execution = execution(&parameters);
-            let mut store = MemoryArtifactStore::default();
-            let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
-            let dimension = parameters.level().ring_dimension() as usize;
-            let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
-            let ciphertext =
-                encrypt(&public_key, &[0], &message, &mut execution, &mut store).unwrap();
-            let predicate = BranchingProgram::new(class, vec![0], vec![vec![0, 1]]).unwrap();
-            let key = keygen(&public_key, &master, &predicate, &mut execution, &mut store).unwrap();
-            let evaluated =
-                evaluate(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
-            let decrypted =
-                decode(&public_key, &key, &ciphertext, &evaluated, &mut execution, &mut store)
-                    .unwrap();
-            assert_eq!(decrypted, message, "statistical {statistical}");
-            let measured = phase_error(
-                &public_key,
-                &key,
-                &ciphertext,
-                &evaluated,
-                &message,
-                &mut execution,
-                &mut store,
-            );
-            assert!(measured <= bound, "statistical {statistical}: {measured} > {bound}");
-        }
+        let parameters =
+            correct_parameters(class, |parameters| parameters.with_compact_encodings().unwrap());
+        let extension = parameters.compact_extension().unwrap();
+        assert_eq!(extension.len(), parameters.level().crt_depth());
+        assert!(extension.iter().all(|prime| !parameters.level().to_crt().0.contains(prime)));
+        let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class))
+            .unwrap()
+            .decryption;
+        let mut execution = execution(&parameters);
+        let mut store = MemoryArtifactStore::default();
+        let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+        let dimension = parameters.level().ring_dimension() as usize;
+        let message = (0..dimension).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+        let ciphertext = encrypt(&public_key, &[0], &message, &mut execution, &mut store).unwrap();
+        let predicate = BranchingProgram::new(class, vec![0], vec![vec![0, 1]]).unwrap();
+        let key = keygen(&public_key, &master, &predicate, &mut execution, &mut store).unwrap();
+        let evaluated =
+            evaluate(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
+        let decrypted =
+            decode(&public_key, &key, &ciphertext, &evaluated, &mut execution, &mut store).unwrap();
+        assert_eq!(decrypted, message);
+        let measured = phase_error(
+            &public_key,
+            &key,
+            &ciphertext,
+            &evaluated,
+            &message,
+            &mut execution,
+            &mut store,
+        );
+        assert!(measured <= bound, "{measured} > {bound}");
     }
 
     fn authorized_keys_decrypt(class: PeClass, parameters: crate::PeParameters) {

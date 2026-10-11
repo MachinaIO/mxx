@@ -4,16 +4,15 @@
 //! correctness and whose Ring-LWE instances reach a lattice security target.
 //!
 //! The parameter search tries the ring dimensions in order and, for each, the CRT depths through
-//! [`PeParameters::select`]: a candidate is accepted when [`PeParameters::at_depth`] accepts it (for
-//! the statistical instantiation, the budget, regularity, flooding, key-width, and numeric-range
-//! conditions of `mxx_pe::budget`), the simulation of the class's longest program decrypts under
+//! [`PeParameters::select`]: a candidate is accepted when [`PeParameters::at_depth`] accepts it (the
+//! regularity, truncation, and numeric-range conditions of the statistical trapdoor in
+//! `mxx_pe::budget`), the simulation of the class's longest program
+//! decrypts under
 //! the selected noise model (`worst`: `4 E_PE + 2 < q`; `average`: failure probability at most
-//! `2^-FAILURE_EXPONENT`, see `mxx_pe::noise::simulate_average`), and the Ring-LWE instances of
-//! [`PeParameters::security_bits`] (the encryption secret, and TrapGen for the computational
-//! instantiation) reach the target according to `lattice-estimator-cli`, which must be on `PATH`
-//! with its Sage environment. The computational instantiation uses the samplers' default cutoffs
-//! (`6.5 sigma`); the statistical one truncates `chi` and `chi_fl` at the budget's
-//! multiplier. Both use the default preimage cutoff for the key.
+//! `2^-FAILURE_EXPONENT`, see `mxx_pe::noise::simulate_average`), and the Ring-LWE instance of the
+//! encryption secret ([`PeParameters::security_bits`]) reaches the target according to
+//! `lattice-estimator-cli`, which must be on `PATH` with its Sage environment. `chi` is
+//! truncated at the budget's multiplier, and the key at the default preimage cutoff.
 //!
 //! On the accepted parameters, every stage runs on the GPU: setup, one encryption of a random
 //! attribute and a random binary message, and keys for two random branching programs of the
@@ -35,10 +34,6 @@
 //! online evaluation, and the requirement is that the attribute and the program form a valid
 //! instance with `F(x) = 0`.
 //!
-//! The computational instantiation is checked only for correctness and security: the
-//! manuscript's leftover-hash, noise-flooding, and key-width conditions are enforced only by the
-//! statistical instantiation (see the `mxx-pe` crate documentation).
-//!
 //! | Variable (`MXX_PE_ROUND_TRIP_` prefix) | Default | Meaning |
 //! | --- | --- | --- |
 //! | `LEAN_EXPORT` | unset | Export the Lean correctness claim to `lean/<value>/generated` |
@@ -47,18 +42,12 @@
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 12, 15 | Ring-dimension candidates |
 //! | `MAX_CRT_DEPTH` | 12 | CRT-depth candidates `1..=` |
 //! | `CRT_BITS`, `BASE_BITS` | 50, `ceil(CRT_BITS / 2)` | CRT prime and gadget base widths |
-//! | `TRAPDOOR_INSTANTIATION` | `statistical` | `statistical` or `computational` |
-//! | `KEY_WIDTH_POLICY` | `practical` | `practical` or `strict` (statistical only) |
-//! | `ERROR_SIGMA`, `FLOODING_SIGMA` | 3.19 | Sigmas of `chi` and of `chi_fl` (computational, or statistical with `FLOODING=none`) |
+//! | `ERROR_SIGMA` | 3.19 | Sigma of `chi`, the contract of every fresh error |
 //! | `COMPACT_ENCODINGS` | 1 | 1 publishes the fresh encodings in two columns over `pq` (`PeParameters::with_compact_encodings`), 0 at `q` in full gadget width |
 //! | `LUT_RADIX` | `PeClass::default_lut_radix` | Radix `B` of the LUT automorphism decomposition (`PeParameters::with_lut_radix`); 0 switches every automorphism directly (`B = W`). The default takes 3 or 2 switches per branch when they divide `log2 W` (`W = 4096`: `B = 16`; `W = 2`: direct) |
-//! | `FLOODING` | `enforce` | `enforce` or `none`: whether the statistical instantiation imposes the flooding width |
-//! | `RANDOMNESS_SIGMA` | 64 | Sigma of the proof's `R` (statistical only) |
-//! | `STATISTICAL_BITS`, `FLOODING_BITS` | 30, 30 | `log(1/ε_total)` and the per-coefficient flooding exponent |
-//! | `KEY_QUERIES`, `MAX_ANCHOR_COLUMNS` | `2^20`, 1024 | `Q_key` and `m_B,max` |
 //! | `TRAPDOOR_SIGMA` | 4.578 | TrapGen sigma |
 //! | `NOISE_MODEL`, `FAILURE_EXPONENT` | `worst`, 128 | Noise model of the correctness check |
-//! | `SECURITY_BITS` | 128 | Required lattice security of both instances |
+//! | `SECURITY_BITS` | 128 | Required lattice security of the encryption secret |
 //! | `STORAGE` | `device` | Stage artifacts: `device` (matrices in GPU memory, others in host memory), `host`, `file` (a temporary directory), or `file:<directory>` |
 
 use bigdecimal::BigDecimal;
@@ -90,30 +79,14 @@ use mxx_ir_core::{
     },
 };
 use mxx_pe::{
-    BranchingProgram, PeClass, PeNoiseReport, PeParameterRequest, PeParameters,
-    budget::{DEFAULT_FLOODING_BITS, DEFAULT_STATISTICAL_BITS, KeyWidthPolicy},
-    decrypt, encrypt, keygen,
-    params::TrapdoorMode,
-    setup,
+    BranchingProgram, PeClass, PeNoiseReport, PeParameterRequest, PeParameters, decrypt, encrypt,
+    keygen, setup,
 };
 use num_bigint::BigInt;
 use serial_test::serial as sequential;
 use std::{collections::BTreeMap, env, path::PathBuf, time::Instant};
 
 const PREFIX: &str = "MXX_PE_ROUND_TRIP_";
-/// `Q_key` of the `Strict` budget.
-const DEFAULT_KEY_QUERIES: u64 = 1 << 20;
-/// `m_B,max`, which fixes the truncation multiplier.
-const DEFAULT_MAX_ANCHOR_COLUMNS: usize = 1024;
-
-fn key_width_policy(value: &str) -> KeyWidthPolicy {
-    match value {
-        "practical" => KeyWidthPolicy::Practical,
-        "strict" => KeyWidthPolicy::Strict,
-        other => panic!("unknown key width policy `{other}`"),
-    }
-}
-
 fn variable(name: &str) -> String {
     format!("{PREFIX}{name}")
 }
@@ -155,17 +128,6 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
     assert!(security > 0, "{} must be positive", variable("SECURITY_BITS"));
     let trapdoor_sigma = decimal("TRAPDOOR_SIGMA", "4.578").to_string().parse::<f64>().unwrap();
     let failure_exponent = noise_model();
-    let trapdoor_instantiation = match env::var(variable("TRAPDOOR_INSTANTIATION")).as_deref() {
-        Err(env::VarError::NotPresent) | Ok("statistical") => TrapdoorMode::Statistical,
-        Ok("computational") => TrapdoorMode::Computational,
-        Ok(value) => panic!(
-            "{} must be `statistical` or `computational`, got `{value}`",
-            variable("TRAPDOOR_INSTANTIATION")
-        ),
-        Err(error) => {
-            panic!("{} is not valid Unicode: {error}", variable("TRAPDOOR_INSTANTIATION"))
-        }
-    };
     let dimensions = ring_dimension_candidates(
         &variable("MIN_LOG_RING_DIMENSION"),
         &variable("MAX_LOG_RING_DIMENSION"),
@@ -180,33 +142,8 @@ fn search(class: PeClass) -> (PeParameters, PeNoiseReport) {
             crt_bits,
             base_bits,
             crt_depths: 1..=max_depth,
-            trapdoor_instantiation,
-            key_width_policy: key_width_policy(
-                &env::var(variable("KEY_WIDTH_POLICY")).unwrap_or_else(|_| "practical".into()),
-            ),
             trapdoor_sigma,
             error_sigma: decimal("ERROR_SIGMA", "3.19"),
-            flooding_sigma: decimal("FLOODING_SIGMA", "3.19"),
-            enforce_flooding: match env::var(variable("FLOODING")).as_deref() {
-                Err(_) | Ok("enforce") => true,
-                Ok("none") => false,
-                Ok(value) => {
-                    panic!("{} must be `enforce` or `none`, got `{value}`", variable("FLOODING"))
-                }
-            },
-            randomness_sigma: decimal("RANDOMNESS_SIGMA", "64"),
-            statistical_security_bits: u32::try_from(count(
-                "STATISTICAL_BITS",
-                DEFAULT_STATISTICAL_BITS as usize,
-            ))
-            .unwrap(),
-            flooding_statistical_bits: u32::try_from(count(
-                "FLOODING_BITS",
-                DEFAULT_FLOODING_BITS as usize,
-            ))
-            .unwrap(),
-            key_queries: count("KEY_QUERIES", DEFAULT_KEY_QUERIES as usize) as u64,
-            max_anchor_columns: count("MAX_ANCHOR_COLUMNS", DEFAULT_MAX_ANCHOR_COLUMNS),
             lut_radix: match env::var(variable("LUT_RADIX")) {
                 Err(_) => class.default_lut_radix(),
                 Ok(_) => Some(count("LUT_RADIX", 0)).filter(|radix| *radix > 0),
@@ -634,13 +571,13 @@ fn round_trip(
     let (parameters, report) = search(class);
     let failure_exponent = report.average.as_ref().map(|(exponent, ..)| *exponent);
     assert!(report.decrypts(), "the accepted parameters must guarantee correctness");
-    let (encryption_bits, trapdoor_bits) = parameters.security_bits().unwrap();
+    let security_bits = parameters.security_bits().unwrap();
     let level = parameters.level();
     eprintln!(
         "accepted PE parameters in {:?}: n = {}, CRT {} x {} bits (log2 q = {}), base 2^{}, \
          m = {}, m_B = {}, W = {}, T_max = {}; noise model {}; log2 E_F = {}, log2 E_PE = {}; \
-         security {encryption_bits} bits (encryption), {trapdoor_bits:?} bits (trapdoor); \
-         statistical selection {:?}",
+         security {security_bits} bits (encryption); \
+         budget {:?}",
         started.elapsed(),
         level.ring_dimension(),
         level.to_crt().0.len(),
@@ -654,7 +591,7 @@ fn round_trip(
         failure_exponent.map_or("worst".to_owned(), |exponent| format!("average 2^-{exponent}")),
         report.evaluation.bits(),
         report.decryption.bits(),
-        parameters.statistical(),
+        parameters.budget(),
     );
 
     let mut runtime = GpuRuntime::new(gpu_backend_on(

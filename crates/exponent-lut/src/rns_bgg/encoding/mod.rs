@@ -45,7 +45,8 @@ mod verify;
 
 pub(super) use self::lowering::*;
 pub use self::verify::{
-    decode_output, decode_public_output, refresh_error, top_refresh_error, verify_output,
+    decode_output, decode_public_output, decode_top_refresh, refresh_error, top_refresh_error,
+    verify_output,
 };
 #[cfg(test)]
 use crate::{api::execute_graph, program::ExponentLutProgramBuilder};

@@ -705,7 +705,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             return Err(ApiError::input("encryption inputs do not exactly match Program inputs"));
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let prefix = super::plaintext_input_prefix();
+        let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "input");
         for (wire, declaration) in inputs.inputs() {
             let value = lhs.get(wire).ok_or_else(|| ApiError::input("missing encryption input"))?;
             match (declaration.shape(), value) {

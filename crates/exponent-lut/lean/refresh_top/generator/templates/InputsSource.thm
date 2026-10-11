@@ -1,0 +1,39 @@
+set_option maxHeartbeats 64000000 in
+set_option maxRecDepth 65536 in
+/-- The inputs of the source LUT. -/
+theorem sourceInputs {model : HashModel} {params' : @PRE@.Params} {params'' : @ENC@.Params}
+@BINDERS@
+    {r sm : ErrorPoly N} (hr : polyNorm r ≤ 1) (hsm : polyNorm sm ≤ 1)
+    (hpay : pw_9_0 = fun _ _ ↦ reducePoly Q0 N r) (qhm : qw_4_0 = fun _ _ ↦ reducePoly Q0 N sm)
+    (qhp : qw_11_0 = fun _ _ ↦ reducePoly Q0 N r) (q272 : qw_272_0 = 1) (q274 : 0 ≤ qw_274_0 ∧ qw_274_0 ≤ 1)
+    {GQ1_6 : ExactMatrix Q1 N 1 6} {RQ0_6 : ExactMatrix Q0 N 1 6}
+    {GM01_4 : ExactMatrix @MX@ N 1 4} {RQ1_4 : ExactMatrix Q1 N 1 4}
+    (hGQ1_6 : gadgetMatrixRuns Backend.backend 32768 6 GQ1_6) (hRQ0_6 : centeredRebaseRuns GQ1_6 RQ0_6)
+    (hGM01_4 : gadgetMatrixRuns Backend.backend 32768 4 GM01_4) (hRQ1_4 : centeredRebaseRuns GM01_4 RQ1_4) :
+    Rel sm ![![qw_263_0, qw_281_0], ![qw_265_0, qw_283_0]]
+      (fun j ↦ reducePoly Q0 N (((q3 : Nat) : Int) * Xe (n := N) qw_274_0.toNat * unitPair r j) • RQ0_6)
+      ![qw_280_0, qw_290_0] 26 ∧
+    (∀ i : Fin 2, Rel sm (lutA model qw_262_0 Q0 6 0 (sigma2 i))
+      (fun j ↦ reducePoly Q0 N (((q3 : Nat) : Int) *
+        unitPair (substitution (sigma2 i).toNat (sigma2_odd i) sm) j) • RQ0_6) ![qw_291_0 i, qw_291_1 i] 26) ∧
+    (∀ i : Fin 2, ∃ e : Fin 2 → ErrorMatrix N 1 4, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
+      reducePoly Q1 N (substitution (sigma2 i).toNat (sigma2_odd i) r) •
+          ![![pw_182_0, pw_182_1], ![pw_182_2, pw_182_3]] 0 j i +
+            ![![pw_182_0, pw_182_1], ![pw_182_2, pw_182_3]] 1 j i =
+        (lutCoefficient2 Q1 618968813111010066723674601 (fun k ↦ reducePoly Q1 N (sourceTable k))
+          (sigma2 i).toNat * reducePoly Q1 N ((((@PS@ : Nat) : Int) : ErrorPoly N) * unitPair r j)) • RQ1_4 +
+            reduceMatrix Q1 N 1 4 (e j)) := by
+  have h1 := encOne_280_0 (model := model) @ARGS@ (hsm := hsm) (hsp := hr)
+    (hsmIn := qhm) (hspIn := qhp) (hg' := hGQ1_6) (hg := hRQ0_6)
+  rw [q272, message_one_exp q274.1 (by omega)] at h1
+  have htab : (fun k ↦ reducePoly Q1 N (sourceTable k)) =
+      fun k ↦ reducePoly Q1 N (![Xe (n := N) 1, Xe (n := N) 0] k) := by
+    funext k; fin_cases k <;> simp [sourceTable, Xe]
+  refine ⟨h1, fun i ↦ encHelper291 i (qh291_1 i) qhm qe_7_0 hGQ1_6 hRQ0_6, fun i ↦ ?_⟩
+  obtain ⟨e, he, hs⟩ := preSwitch182 i (ph182_3 i) hpay pe_11_0 hGM01_4 hRQ1_4
+  refine ⟨e, he, fun j ↦ ?_⟩
+  rw [htab]
+  fin_cases j
+  · exact hs 0
+  · exact hs 1
+

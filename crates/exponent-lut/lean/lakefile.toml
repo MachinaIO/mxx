@@ -17,4 +17,4 @@ path = "../../ir-core/lean"
 # Lemmas that hold for every exponent-LUT program and parameter set.
 [[lean_lib]]
 name = "MxxExponentLut"
-roots = ["ExponentAutomorphism", "ExponentScale", "ExponentEncoding", "ExponentGadget", "ExponentStacking", "ExponentWalsh", "ExponentLut", "ExponentDecode", "ExponentSampling", "ExponentPublic", "ExponentRuntime", "ExponentIterate", "ExponentDynamic", "ExponentErrorForm", "ExponentMaskForm", "ExponentFunctional", "ExponentPairing", "ExponentDecomp", "ExponentCellStep", "ExponentH2"]
+roots = ["ExponentAutomorphism", "ExponentScale", "ExponentEncoding", "ExponentGadget", "ExponentStacking", "ExponentWalsh", "ExponentLut", "ExponentDecode", "ExponentSampling", "ExponentPublic", "ExponentRuntime", "ExponentIterate", "ExponentDynamic", "ExponentErrorForm", "ExponentMaskForm", "ExponentFunctional", "ExponentPairing", "ExponentDecomp", "ExponentCellStep", "ExponentH2", "ExponentRefresh"]

@@ -49,10 +49,20 @@ pub(crate) fn reference() -> TopReference {
     }
 }
 
+/// The refresh of every slot of [`reference`].
 pub(crate) fn declaration(
     source: &ExponentLutProgram,
     target: WireId,
     depths: Vec<usize>,
+) -> Result<TopRefreshDeclaration, RefreshError> {
+    declaration_of(source, target, depths, vec![0, 1, 2])
+}
+
+fn declaration_of(
+    source: &ExponentLutProgram,
+    target: WireId,
+    depths: Vec<usize>,
+    slots: Vec<usize>,
 ) -> Result<TopRefreshDeclaration, RefreshError> {
     let n = profile().ring_dimension().unwrap();
     let columns = reference().columns();
@@ -64,6 +74,7 @@ pub(crate) fn declaration(
         1,
         reference(),
         depths,
+        slots,
         primes()[3..].to_vec(),
         1,
         TopRefreshLayouts {
@@ -77,8 +88,9 @@ pub(crate) fn declaration(
 
 /// One chain per prime of `Q_0`, two parts per chain decoding only their
 /// output prime over the reference's `w_0` columns, one label for every part,
-/// distinct chain namespaces and `A'` tags per component, and pool orders that
-/// put the output prime first.
+/// distinct chain namespaces and `A'` tags per component, pool orders that
+/// put the output prime first, and the output prime's position in the
+/// canonical tower order of the decoding level.
 #[test]
 fn top_refresh_lays_out_one_chain_per_prime() {
     let (source, output) = lut_source(false);
@@ -90,14 +102,20 @@ fn top_refresh_lays_out_one_chain_per_prime() {
         let pool = top.pool_order(chain).unwrap();
         assert_eq!(pool[0], reference().top[chain]);
         assert_eq!(pool.len(), 16);
+        // The decoding level keeps two primes: chain 0 keeps `[q_0, q_1]`,
+        // chains 1 and 2 keep `q_0` and their own prime after it.
+        let position = chain.min(1);
         for component in 0..2 {
             let part = top.part(chain, component).unwrap();
             let details = part.top().unwrap();
-            assert_eq!((details.component(), details.output_prime()), (component, 0));
+            assert_eq!((details.component(), details.output_prime()), (component, position));
             assert_eq!(part.component(), component);
-            assert_eq!(part.decoded_primes(), vec![0]);
+            assert_eq!(part.decoded_primes(), vec![position]);
             assert_eq!(part.decoders().len(), columns);
-            assert!(part.decoder(0, columns - 1).is_some() && part.decoder(1, 0).is_none());
+            assert!(
+                part.decoder(position, columns - 1).is_some() &&
+                    part.decoder(1 - position, 0).is_none()
+            );
             assert_eq!(part.label([3; 32], b"nu").unwrap(), top.label([3; 32], b"nu").unwrap());
         }
         assert_ne!(
@@ -109,6 +127,32 @@ fn top_refresh_lays_out_one_chain_per_prime() {
     let namespaces = (0..3).map(|chain| top.chain_namespace(chain)).collect::<BTreeSet<_>>();
     assert_eq!(namespaces.len(), 3);
     assert!(!namespaces.contains(&top.matrix_namespace()));
+}
+
+/// A refresh of some slots has one chain per refreshed slot, each decoding its slot's prime at
+/// that prime's canonical position; empty, unordered, repeated, and out-of-range slots are
+/// rejected.
+#[test]
+fn top_refresh_of_some_slots_lays_out_their_chains() {
+    let (source, output) = lut_source(false);
+    let top = declaration_of(&source, output, vec![3, 2, 2], vec![2]).unwrap();
+    assert_eq!((top.chains(), top.parts().len(), top.slots()), (1, 2, [2].as_slice()));
+    assert_eq!(top.output_prime(0), Some(reference().top[2]));
+    assert_eq!(top.output_primes(), vec![reference().top[2]]);
+    assert_eq!(top.output_prime(1), None);
+    assert_eq!(top.pool_order(0).unwrap()[0], reference().top[2]);
+    for component in 0..2 {
+        // The decoding level keeps `q_0` and the slot's prime after it.
+        assert_eq!(top.part(0, component).unwrap().top().unwrap().output_prime(), 1);
+    }
+    let all = declaration(&source, output, vec![3, 2, 2]).unwrap();
+    assert_ne!(top.spec(), all.spec());
+    for slots in [vec![], vec![1, 0], vec![1, 1], vec![3]] {
+        assert!(
+            declaration_of(&source, output, vec![3, 2, 2], slots.clone()).is_err(),
+            "{slots:?}"
+        );
+    }
 }
 
 /// Coefficient targets, inputs, and depth profiles that do not match the

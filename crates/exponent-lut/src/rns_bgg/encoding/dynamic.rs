@@ -206,7 +206,7 @@ impl<'a> RnsEncryptBuild<'a> {
             return Err(ApiError::input("RHS bindings do not exactly match Program inputs"));
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let prefix = super::plaintext_input_prefix();
+        let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "rhs");
         let mut plaintexts = BTreeMap::new();
         for (id, (shape, _)) in schema {
             let value = &rhs[id];

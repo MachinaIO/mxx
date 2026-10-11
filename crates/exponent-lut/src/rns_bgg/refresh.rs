@@ -390,22 +390,36 @@ pub(crate) fn top_matrix(
     )
 }
 
-/// `y_j` of a top refresh from its residues, one `1 x w_0` row per chain in
-/// the ring of that chain's output prime (chain order): each centered residue
-/// re-encoded in the reference ring times its CRT coefficient
-/// `Q_0 / q ((Q_0 / q)^-1 mod q)`, summed.
+/// The ring of the product `P` of a top refresh's refreshed primes (`Q_0` when every slot is
+/// refreshed), towers in canonical order.
+pub(crate) fn top_output_ring(top: &TopRefreshDeclaration) -> Ring {
+    Ring::from_crt_moduli(
+        top.output_primes().into_iter().map(IntExpr::from).collect(),
+        top.reference().ring_dimension,
+    )
+}
+
+/// `y_j mod P` of a top refresh from its residues, one `1 x w_0` row per
+/// chain in the ring of that chain's output prime (chain order), in the ring
+/// of [`top_output_ring`]: one residue is the row itself; otherwise each
+/// centered residue re-encoded in that ring times its CRT coefficient
+/// `P / q ((P / q)^-1 mod q)`, summed.
 pub(crate) fn top_refresh_combine(
-    reference: &TopReference,
+    top: &TopRefreshDeclaration,
     residues: Vec<Mat>,
 ) -> Result<Mat, RnsBggError> {
-    if residues.len() != reference.top.len() {
-        return Err(RnsBggError::Parameters("one residue per prime of the top refresh"));
+    let primes = top.output_primes();
+    if residues.len() != primes.len() {
+        return Err(RnsBggError::Parameters("one residue per refreshed prime of the top refresh"));
     }
-    let ring = top_reference_ring(reference);
-    let modulus: BigUint = reference.top.iter().map(|prime| BigUint::from(*prime)).product();
+    if residues.len() == 1 {
+        return Ok(residues.into_iter().next().expect("one residue"));
+    }
+    let ring = top_output_ring(top);
+    let modulus: BigUint = primes.iter().map(|prime| BigUint::from(*prime)).product();
     residues
         .into_iter()
-        .zip(&reference.top)
+        .zip(&primes)
         .map(|(residue, prime)| {
             let prime = BigUint::from(*prime);
             let cofactor = &modulus / &prime;
@@ -417,14 +431,18 @@ pub(crate) fn top_refresh_combine(
             Ok(residue.centered_rebase(&ring) * ring.polynomial([BigInt::from(coefficient).into()]))
         })
         .reduce(|sum, term| Ok(sum? + term?))
-        .ok_or(RnsBggError::Parameters("one residue per prime of the top refresh"))?
+        .ok_or(RnsBggError::Parameters("one residue per refreshed prime of the top refresh"))?
 }
 
 impl RnsBggParameters {
-    /// Chain `chain` of `declaration` (see [`crate::refresh::top`]): the
-    /// prefix chain of its pool order with `depths[l]` primes at level `l`,
-    /// and that pool, which also hosts the chain's children. `None` for
-    /// `chain` gives the reference chain (canonical order).
+    /// Chain `chain` of `declaration` (see [`crate::refresh::top`]): level
+    /// `l` has the first `depths[l]` primes of the chain's pool order, and
+    /// the returned pool, which also hosts the chain's children. `None` for
+    /// `chain` gives the reference chain (canonical order). Every chain's
+    /// pool lists its towers in the canonical order (the primes of `Q_0`,
+    /// then the extension primes), so rings of one modulus have one tower
+    /// order (and one gadget layout) across chains; the pool order only
+    /// selects each level's primes.
     pub fn top_refresh_chain(
         declaration: &TopRefreshDeclaration,
         chain: Option<usize>,
@@ -433,13 +451,11 @@ impl RnsBggParameters {
     ) -> Result<(DCRTPolyParams, Self), RnsBggError> {
         let invalid = || RnsBggError::Parameters("invalid top refresh chain");
         let reference = declaration.reference();
+        let mut canonical = reference.top.clone();
+        canonical.extend(declaration.pool_order(0).ok_or_else(invalid)?.split_off(canonical.len()));
         let order = match chain {
             Some(chain) => declaration.pool_order(chain).ok_or_else(invalid)?,
-            None => {
-                let mut order = reference.top.clone();
-                order.extend(declaration.pool_order(0).ok_or_else(invalid)?.split_off(order.len()));
-                order
-            }
+            None => canonical.clone(),
         };
         let bits = order
             .iter()
@@ -448,10 +464,10 @@ impl RnsBggParameters {
             .ok_or_else(invalid)?;
         let pool = DCRTPolyParams::try_new(
             reference.ring_dimension,
-            order.len(),
+            canonical.len(),
             bits,
             reference.base_bits,
-            Some(order.clone()),
+            Some(canonical),
             None,
         )
         .map_err(|_| RnsBggError::Parameters("invalid top refresh prime pool"))?;
@@ -615,7 +631,7 @@ pub(crate) mod tests {
                 .output(format!("order-{chain}"), direct - through_chain)
                 .unwrap();
         }
-        let combined = top_refresh_combine(&reference, residues).unwrap();
+        let combined = top_refresh_combine(&top, residues).unwrap();
         let graph = graph.output("combine", combined - value).unwrap().build().unwrap();
         parameters.push(reference_pool);
         assert_eq!(primes().len(), 16);
@@ -641,9 +657,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// A top-refresh part is checked against its own chain: on another
-    /// chain its output prime is not the decoding level's first prime, so
-    /// the part is rejected. Distinct chains derive distinct stage keys.
+    /// A top-refresh part is checked against its own chain: another chain
+    /// drops its output prime before the plaintext level, so the part is
+    /// rejected. Distinct chains derive distinct stage keys.
     #[test]
     fn top_refresh_parts_bind_to_their_chain() {
         use crate::refresh::top::tests::{declaration, lut_source};
@@ -655,7 +671,11 @@ pub(crate) mod tests {
         let part = top.part(0, 1).unwrap();
         assert_eq!(first.refresh_level(part, &source).unwrap(), 1);
         assert!(second.refresh_level(part, &source).is_err(), "a swapped chain");
+        assert_eq!(second.refresh_level(top.part(1, 0).unwrap(), &source).unwrap(), 1);
         assert_eq!(first.level(2).unwrap().to_crt().0, vec![top.output_prime(0).unwrap()]);
+        assert_eq!(second.level(2).unwrap().to_crt().0, vec![top.output_prime(1).unwrap()]);
+        // Both chains list the decoding primes in the canonical order.
+        assert_eq!(first.level(1).unwrap().to_crt().0, second.level(1).unwrap().to_crt().0);
         let key = [5; 32];
         let keys = (0..top.chains())
             .map(|chain| child_hash_key(&key, &top.chain_namespace(chain)))

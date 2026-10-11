@@ -17,16 +17,19 @@
 //!
 //! Decoding `y_j mod q` needs `q` in the decoding modulus, but level `L` has
 //! lost most primes of `Q_0`. The refresh therefore evaluates the source
-//! Program on one chain per prime `q` of `Q_0`: chain `q` is the prefix chain
-//! of the pool `[q, the other primes of Q_0 in canonical order, extension
-//! primes]` with the reference's prime count per level, so it keeps `q` to
-//! level `L + 1` (the plaintext modulus of level `L`). On chain `q` the part
+//! Program on one chain per refreshed slot, a prime `q` of `Q_0`: level `l` of chain `q` has
+//! the first `depths[l]` primes of its pool order `[q, the other primes of
+//! Q_0 in canonical order, extension primes]`, so it keeps `q` to level
+//! `L + 1` (the plaintext modulus of level `L`). Every ring lists its towers
+//! in the canonical order, so a modulus has one tower order on every chain. On chain `q` the part
 //! `(q, j)` ([`RefreshDeclaration::top_part`]) decodes `y_j mod q` with the
 //! existing refresh combination, two changes aside: the one encoding is
 //! `[g | c_one]` with `g` the mask child's carrier of payload
 //! `(M + 1) sigma_0 G` (`= sigma_0 G` modulo `q`), and the target action
 //! maps `Delta_L r_j x G^st_L` to `Q_q (Delta_0 r_j x G^st_0 mod q)`.
-//! [`crate::rns_bgg`] recombines the residues of every chain modulo `Q_0`.
+//! [`crate::rns_bgg`] recombines the residues of every chain modulo the
+//! product `P` of the refreshed slots' primes (`Q_0` when every slot is
+//! refreshed); refreshing a subset of the slots yields `y_j mod P` only.
 //!
 //! # Shared and chain-specific material
 //!
@@ -78,6 +81,8 @@ pub struct TopRefreshDeclaration {
     depths: Vec<usize>,
     extension: Vec<u64>,
     level: usize,
+    /// The refreshed slots: chain `chain` decodes prime `reference.top[slots[chain]]`.
+    slots: Vec<usize>,
     /// Part `(chain, component)` at `2 chain + component`.
     parts: Vec<RefreshDeclaration>,
     spec: [u8; 32],
@@ -89,7 +94,8 @@ impl TopRefreshDeclaration {
     /// chains have `depths[l]` primes at level `l` (`depths[0]` the primes of
     /// `reference.top`, `depths[1]` those of `reference.next`), the children
     /// extend them with primes of `extension`, the fresh noise is CBD(`eta`)
-    /// and every decoder smudges with `digits` digits.
+    /// and every decoder smudges with `digits` digits. `slots` lists the
+    /// refreshed primes of `reference.top` by increasing index, one chain each.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_program: &ExponentLutProgram,
@@ -98,6 +104,7 @@ impl TopRefreshDeclaration {
         eta: u32,
         reference: TopReference,
         depths: Vec<usize>,
+        slots: Vec<usize>,
         extension: Vec<u64>,
         digits: usize,
         layouts: TopRefreshLayouts<'_>,
@@ -114,7 +121,10 @@ impl TopRefreshDeclaration {
             depths.windows(2).any(|pair| pair[1] > pair[0]) ||
             depths[level] < 2 ||
             depths[level + 1] == 0 ||
-            extension.iter().any(|prime| reference.top.contains(prime))
+            extension.iter().any(|prime| reference.top.contains(prime)) ||
+            slots.is_empty() ||
+            slots.windows(2).any(|pair| pair[1] <= pair[0]) ||
+            slots.last().is_some_and(|slot| *slot >= reference.top.len())
         {
             return Err(invalid);
         }
@@ -127,6 +137,7 @@ impl TopRefreshDeclaration {
             eta,
             &reference,
             &depths,
+            &slots,
             &extension,
             digits,
             &matrix_tag,
@@ -138,8 +149,18 @@ impl TopRefreshDeclaration {
                 .collect::<Vec<_>>(),
         ))?;
         let primes = depths[level];
-        let mut parts = Vec::with_capacity(2 * reference.top.len());
-        for (chain, prime) in reference.top.iter().enumerate() {
+        let mut parts = Vec::with_capacity(2 * slots.len());
+        for (chain, prime) in slots.iter().map(|slot| &reference.top[*slot]).enumerate() {
+            // The decoding level keeps the output prime and the first `primes - 1` other
+            // primes of `Q_0`, in canonical tower order.
+            let kept = reference.top.iter().filter(|other| *other != prime).take(primes - 1);
+            let kept = kept.collect::<Vec<_>>();
+            let position = reference
+                .top
+                .iter()
+                .take_while(|other| *other != prime)
+                .filter(|other| kept.contains(other))
+                .count();
             for component in 0..2 {
                 let smudges = (0..reference.columns())
                     .map(|column| (layouts.smudge)(chain, component, column))
@@ -150,7 +171,7 @@ impl TopRefreshDeclaration {
                     profile,
                     eta,
                     primes,
-                    (0, *prime),
+                    (position, *prime),
                     component,
                     digits,
                     reference.clone(),
@@ -162,7 +183,7 @@ impl TopRefreshDeclaration {
                 )?);
             }
         }
-        Ok(Self { reference, depths, extension, level, parts, spec })
+        Ok(Self { reference, depths, extension, level, slots, parts, spec })
     }
 
     pub const fn spec(&self) -> &[u8; 32] {
@@ -183,14 +204,25 @@ impl TopRefreshDeclaration {
         &self.depths
     }
 
-    /// The number of chains: one per prime of `Q_0`.
+    /// The number of chains: one per refreshed slot.
     pub fn chains(&self) -> usize {
-        self.reference.top.len()
+        self.slots.len()
+    }
+
+    /// The refreshed slots, indices into the reference's `Q_0` primes.
+    pub fn slots(&self) -> &[usize] {
+        &self.slots
     }
 
     /// Chain `chain`'s output prime.
     pub fn output_prime(&self, chain: usize) -> Option<u64> {
-        self.reference.top.get(chain).copied()
+        self.slots.get(chain).map(|slot| self.reference.top[*slot])
+    }
+
+    /// The primes of the refreshed slots in canonical order; their product
+    /// `P` is the modulus of the recombined rows.
+    pub fn output_primes(&self) -> Vec<u64> {
+        self.slots.iter().map(|slot| self.reference.top[*slot]).collect()
     }
 
     /// Chain `chain`'s pool order: its output prime, the other primes of

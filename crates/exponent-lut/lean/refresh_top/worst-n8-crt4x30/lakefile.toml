@@ -1,0 +1,22 @@
+name = "MxxExponentLutRefreshTopWorstN8Crt4x30"
+version = "0.1.0"
+defaultTargets = ["RefreshTopGenerated"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = "../.."
+
+# Modules written by `refresh_top_round_trip` (`tests/refresh_top.rs`) for this parameter set.
+[[lean_lib]]
+name = "RefreshTopGenerated"
+srcDir = "generated"
+roots = ["Backend", "Claim", "Ideal", "Requirement_0", "Stage_decode", "Stage_encrypt_0_0", "Stage_encrypt_0_1", "Stage_mask", "Stage_online_eval_0_0", "Stage_online_eval_0_1", "Stage_payload", "Stage_preprocess_0_0", "Stage_preprocess_0_1"]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "RefreshTopProof"
+roots = ["TopSetup", "TopRow", "Part_0_1_Assembly", "Part_0_1_Cells", "Part_0_1_Enc", "Part_0_1_EncFacts", "Part_0_1_EncRoot", "Part_0_1_Encrypt", "Part_0_1_Fresh", "Part_0_1_FreshCarrier", "Part_0_1_FreshChain", "Part_0_1_Inputs", "Part_0_1_KeyFacts", "Part_0_1_KeyFresh", "Part_0_1_KeyMask", "Part_0_1_KeySmudge", "Part_0_1_KeySource", "Part_0_1_KeysCells", "Part_0_1_KeysLuts", "Part_0_1_KeysRoot", "Part_0_1_Labels", "Part_0_1_Mask", "Part_0_1_MaskCarrier", "Part_0_1_Online", "Part_0_1_OnlineChain", "Part_0_1_OnlineFinal", "Part_0_1_PrePlace", "Part_0_1_PreRhs", "Part_0_1_PreRootSums", "Part_0_1_PreSums", "Part_0_1_PreSwitch", "Part_0_1_Readout", "Part_0_1_RootLuts", "Part_0_1_RootSums", "Part_0_1_Smudge", "Part_0_1_SmudgeChain", "Part_0_1_SmudgeMembers", "Part_0_1_SmudgeTotal", "Part_0_1_Sums", "TopLinkC", "TopChain", "TopSecrets", "TopFinal", "Part_0_0_KeyFacts", "TopGlue", "TopLink", "TopSigma", "TopLemmas", "TopLut", "TopLut2", "Part_0_0_OnlineFinal", "Part_0_0_Inputs", "Part_0_0_EncFacts", "RequirementRoot", "ReqSigma", "ReqLabel", "RequirementFacts", "TopRequirement", "Part_0_0_Assembly", "TopTarget", "Part_0_0_KeySmudge", "Part_0_0_KeyFresh", "Part_0_0_KeySource", "Part_0_0_KeyMask", "TopHint", "TopColumn", "TopCorrect", "TopGadgets", "TopLabel", "Part_0_0_Labels", "Part_0_0_SmudgeChain", "Part_0_0_FreshChain", "Part_0_0_OnlineChain", "TopAction", "Part_0_0_PreSwitch", "TopSwitch", "Part_0_0_PreRhs", "Part_0_0_EncRoot", "Part_0_0_Enc", "Part_0_0_PrePlace", "Part_0_0_PreRootSums", "Part_0_0_KeysRoot", "Part_0_0_KeysLuts", "TopKeyForms", "Part_0_0_PreSums", "Part_0_0_KeysCells", "TopKeys", "TopDecompose", "TopResidue", "TopRefresh", "Part_0_0_SmudgeTotal", "Part_0_0_SmudgeMembers", "Part_0_0_FreshCarrier", "Part_0_0_Fresh", "Part_0_0_MaskCarrier", "Part_0_0_Mask", "TopPrf", "TopFinish", "Part_0_0_Online", "Part_0_0_RootSums", "Part_0_0_RootLuts", "TopPlace", "TopDecode", "TopDecodeRun", "Part_0_0_Encrypt", "Part_0_0_Sums", "Part_0_0_Readout", "Part_0_0_Cells", "Part_0_0_Smudge"]

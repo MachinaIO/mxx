@@ -891,13 +891,15 @@ where
     let started = std::time::Instant::now();
     validate_hash_key(hash_key)?;
     build.bind_inputs(program, parameters, rhs, payload, hash_key)?;
-    let (encryption_identity, _) = build.artifact_identities();
     let bound_at = std::time::Instant::now();
     let outputs = {
         let (evaluator, families, environment) = build.lowering_state()?;
         lower_program(program, evaluator, families, environment).map_err(ApiError::lowering)?
     };
     let outputs = compose(&mut build, outputs)?;
+    // The identity covers what `compose` applied (a decoder or a refresh), so two compositions
+    // of one Program never share a session.
+    let (encryption_identity, _) = build.artifact_identities();
     let lowered_at = std::time::Instant::now();
     let (graph, (encrypt_descriptor, online_eval_descriptor)) = build.build_graph(outputs)?;
     let built_at = std::time::Instant::now();

@@ -35,8 +35,8 @@ use crate::{
 
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineEvalBuild, decode_output, decode_public_output, refresh_error, top_refresh_error,
-    verify_output,
+    RnsOnlineEvalBuild, decode_output, decode_public_output, decode_top_refresh, refresh_error,
+    top_refresh_error, verify_output,
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
@@ -800,9 +800,9 @@ impl RnsBggParameters {
 
     /// The chain of a child Program evaluated down to the decoding level
     /// `level`, whose last LUT input level is `child_level`: `child_level + 2`
-    /// levels `j` whose moduli are the first `depth(level) + primes_per_drop *
-    /// ceil((child_level + 1 - j) / operations_per_drop)` primes of `pool`,
-    /// which lists the primes of level `level` first. The last level is
+    /// levels `j` whose moduli are the primes of level `level` and the first
+    /// `primes_per_drop * ceil((child_level + 1 - j) / operations_per_drop)`
+    /// other primes of `pool`, in `pool`'s tower order. The last level is
     /// level `level` itself, entered by a drop.
     pub(crate) fn child_chain(
         &self,
@@ -813,17 +813,22 @@ impl RnsBggParameters {
     ) -> Result<Self, RnsBggError> {
         let decoding_primes = self.level(level)?.to_crt().0;
         let primes = pool.to_crt().0;
-        if primes_per_drop == 0 || !primes.starts_with(&decoding_primes) {
+        if primes_per_drop == 0 || !decoding_primes.iter().all(|prime| primes.contains(prime)) {
             return Err(RnsBggError::Decoder(DecoderError::InvalidModulusRelation));
         }
+        let extra = primes
+            .iter()
+            .copied()
+            .filter(|prime| !decoding_primes.contains(prime))
+            .collect::<Vec<_>>();
         let levels = (0..child_level + 2)
             .map(|j| {
                 let drops = (child_level + 1 - j).div_ceil(self.operations_per_drop);
-                let depth = decoding_primes.len() + drops * primes_per_drop;
-                let modulus = primes
-                    .get(..depth)
+                let modulus = extra
+                    .get(..drops * primes_per_drop)
                     .ok_or(RnsBggError::Decoder(DecoderError::InvalidModulusRelation))?
                     .iter()
+                    .chain(&decoding_primes)
                     .copied()
                     .map(BigUint::from)
                     .product();
@@ -860,7 +865,7 @@ impl RnsBggParameters {
         }
         for pair in levels.windows(2) {
             if !compatible_level_parameters_except_basis(&pair[0], &pair[1]) ||
-                !pair[0].to_crt().0.starts_with(&pair[1].to_crt().0)
+                !pair[1].to_crt().0.iter().all(|prime| pair[0].to_crt().0.contains(prime))
             {
                 return Err(relation);
             }
@@ -1467,9 +1472,18 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
     })
 }
 
-/// A random name prefix for one binding's plaintext inputs.
-pub(crate) fn plaintext_input_prefix() -> String {
-    format!("rns-bgg/plaintext/{:032x}", rand::random::<u128>())
+/// The name prefix of one binding's plaintext inputs: `role` (`input` or `rhs`) of the builder
+/// with hash namespace `namespace` (`None` for a stage's own Program). One stage binds each
+/// (namespace, role) once, so the names are unique in a stage graph and reproducible, and an
+/// exported claim can route each external input by its builder.
+pub fn plaintext_input_prefix(namespace: Option<&[u8; 32]>, role: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"mxx-exponent-lut/plaintext-prefix/v1");
+    digest.update(role.as_bytes());
+    digest.update([u8::from(namespace.is_some())]);
+    digest.update(namespace.copied().unwrap_or([0; 32]));
+    let digest: [u8; 32] = digest.finalize().into();
+    format!("rns-bgg/plaintext/{}", decoder_commitment_hex(digest)[..32].to_owned())
 }
 
 pub(crate) fn concrete_ring(value: &Mat) -> Result<ConcreteRing, RnsBggError> {

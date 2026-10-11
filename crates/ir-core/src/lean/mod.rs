@@ -235,7 +235,9 @@ pub struct ExportOptions {
     /// within the sampler's support. Each relation then takes `tape` and its call `path`; a
     /// sampler at node `k` reads site `path ++ [k]`, a subgraph call extends the path with its
     /// node, and a loop body with its node and iteration, so distinct occurrences read disjoint
-    /// tape keys. Trapdoor and preimage samplers have no tape semantics and are rejected.
+    /// tape keys. Trapdoor and preimage samplers read no tape: their outputs stay existential
+    /// within the relation's support, so a tape claim quantifies them adversarially (its failure
+    /// event contains every run whose trapdoor and preimages fail).
     pub sampling_tape: bool,
 }
 
@@ -1663,9 +1665,8 @@ impl<'a> Emitter<'a> {
                 preimage_max_coefficient_bound,
                 ..
             } => {
-                if self.requires_tape {
-                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
-                }
+                // No tape read: within a tape claim the trapdoor is any value of the relation's
+                // support, chosen adversarially inside the failure event.
                 self.require_layout(
                     scope_id,
                     WireRef { node: node_id, port: crate::types::Port(1) },
@@ -1695,9 +1696,7 @@ impl<'a> Emitter<'a> {
                 ));
             }
             NodeKind::PreimageSample { max_coefficient_bound, .. } => {
-                if self.requires_tape {
-                    return self.unsupported(scope_id, node_id, kind, "sampling tape");
-                }
+                // No tape read, as for the trapdoor: any preimage within the cutoff.
                 self.require_layout(scope_id, args[1], None, None)?;
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let k = output(0);

@@ -422,15 +422,156 @@ where
         .collect())
 }
 
+/// The polynomial `sum_k v_k X^k` of the integer input family `{name}.coefficients` (one member
+/// per coefficient, centered), whose values `value` are inserted into `runtime`. Unlike
+/// [`super::plaintext_inputs`], `value` need not be a monomial.
+fn polynomial_input<P: Poly>(
+    ring: &mxx_dsl::Ring,
+    modulus: &BigUint,
+    name: &str,
+    value: &P,
+    runtime: &mut BTreeMap<String, RuntimeValue>,
+) -> Result<Mat, ApiError> {
+    let modulus = BigInt::from(modulus.clone());
+    let coefficients = value
+        .coeffs_biguints()
+        .into_iter()
+        .map(|value| {
+            let value = BigInt::from(value);
+            if &value * 2u8 > modulus { value - &modulus } else { value }
+        })
+        .collect::<Vec<_>>();
+    let count = coefficients.len();
+    let input = format!("{name}.coefficients");
+    runtime.insert(input.clone(), RuntimeValue::integer_values(coefficients));
+    let family = DslContext::new("polynomial")
+        .input::<mxx_dsl::Family<Int>>(
+            input,
+            mxx_dsl::FamilyType { element: mxx_dsl::IntType, count: IntExpr::constant(count) },
+        )
+        .map_err(ApiError::scheme)?;
+    (0..count)
+        .map(|k| {
+            crate::rns_bgg::signed_monomial(
+                ring,
+                family.at(Int::constant(k as i64)),
+                Int::constant(k as i64),
+            )
+        })
+        .reduce(|sum, term| sum + term)
+        .ok_or_else(|| ApiError::input("an empty polynomial"))
+}
+
+/// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` (`j = 0, 1`) of the
+/// refresh to the top level, as graph values, and the runtime inputs they read: `y_j` recombines
+/// the residue inputs `residue-{chain}-{j}`; see [`top_refresh_error`].
+#[allow(clippy::too_many_arguments)]
+fn top_refresh_error_rows<P: Poly>(
+    top: &crate::refresh::top::TopRefreshDeclaration,
+    results: Option<&[[&StageOutputs; 2]]>,
+    reference: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    sigma: &P,
+    expected: &P,
+    hash_key: &[u8],
+) -> Result<([Mat; 2], BTreeMap<String, RuntimeValue>), ApiError> {
+    use crate::rns_bgg::refresh::{
+        child_hash_key, hash_key_input_name, top_matrix, top_output_ring, top_refresh_combine,
+    };
+    let declaration = top.reference();
+    let columns = declaration.columns();
+    if results.is_some_and(|results| results.len() != top.chains()) {
+        return Err(ApiError::input("one pair of part results per chain"));
+    }
+    let ring = reference.ring(0).map_err(ApiError::scheme)?;
+    let mut runtime = BTreeMap::new();
+    let namespace = top.matrix_namespace();
+    let key_name = hash_key_input_name(Some(&namespace));
+    let key = child_hash_key(hash_key, &namespace);
+    runtime.insert(key_name.clone(), RuntimeValue::Bytes(key.as_slice().into()));
+    let key = ring.bytes_input(key_name, key.len());
+    let modulus: BigUint = reference.level(0).map_err(ApiError::scheme)?.modulus().as_ref().clone();
+    let sigma = polynomial_input(&ring, &modulus, "top-refresh-sigma", sigma, &mut runtime)?;
+    let expected = match super::plaintext_inputs(
+        &ring,
+        "top-refresh-expected",
+        &InputBinding::Scalar(expected.clone()),
+        &mut runtime,
+    )
+    .map_err(ApiError::input)?
+    {
+        InputBinding::Scalar(value) => value,
+        InputBinding::Family(_) => unreachable!("a scalar plaintext binds a scalar"),
+    };
+    let r = reduce_secret(reference, &payload.row, 0).map_err(ApiError::scheme)?;
+    let delta = reference
+        .scalar(0, reference.message_scale(0).map_err(ApiError::scheme)?)
+        .map_err(ApiError::scheme)?;
+    let gadget = reference.state_gadget(0).map_err(ApiError::scheme)?;
+    let rows = [0, 1].map(|component| -> Result<Mat, ApiError> {
+        let part =
+            top.part(0, component).ok_or_else(|| ApiError::input("the top refresh has no part"))?;
+        let residues = (0..top.chains())
+            .map(|chain| {
+                let name = format!("residue-{chain}-{component}");
+                if let Some(results) = results {
+                    let value = results[chain][component]
+                        .outputs
+                        .get("refresh")
+                        .ok_or_else(|| ApiError::input("a part's residue is missing"))?
+                        .clone();
+                    runtime.insert(name.clone(), value);
+                }
+                let prime = top
+                    .output_prime(chain)
+                    .ok_or_else(|| ApiError::input("the top refresh has no such chain"))?;
+                Ok(mxx_dsl::Ring::from_crt_moduli(
+                    vec![IntExpr::from(prime)],
+                    declaration.ring_dimension,
+                )
+                .input(name, (1, columns)))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let refreshed = top_refresh_combine(top, residues).map_err(ApiError::scheme)?;
+        let a_prime = top_matrix(declaration, key.clone(), part);
+        let a_row = |row: usize| {
+            a_prime.clone().slice(
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(row),
+                    end: IntExpr::constant(row + 1),
+                }),
+                None,
+            )
+        };
+        let payload_secret = if component == 0 { r.0.clone() } else { r.1.clone() };
+        let encoding = sigma.clone() * a_row(0) + a_row(1) -
+            delta.clone() * payload_secret * expected.clone() * gadget.clone();
+        // A refresh of some slots only compares modulo their product `P`.
+        let encoding = if top.chains() == declaration.top.len() {
+            encoding
+        } else {
+            encoding.reduce_modulus(&top_output_ring(top))
+        };
+        Ok(refreshed - encoding)
+    });
+    let [first, second] = rows;
+    let rows = [first?, second?];
+    if let Some(binding) = &payload.binding {
+        binding.bind(&mut runtime);
+    }
+    Ok((rows, runtime))
+}
+
 /// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)`
 /// (`j = 0, 1`) of the refresh to the top level `top`: `y_j` recombines the
 /// output `refresh` of every part `(chain, j)` (`results[chain][j]`, the
-/// residue `y_j mod q`) modulo `Q_0`; `sigma = (sigma_0, 1)` with the mask
+/// residue `y_j mod q`) modulo the product `P` of the refreshed primes (`Q_0` when every slot
+/// is refreshed); `sigma = (sigma_0, 1)` with the mask
 /// child's bit polynomial `sigma`, `x = expected`, `r` the payload secret,
 /// and `Delta_0`, `G^st_0` those of the reference chain `reference`
 /// ([`RnsBggParameters::top_refresh_chain`] with `None`). `A'_(j)` is
 /// sampled under the top refresh's matrix namespace of `hash_key`. Per
-/// column, the `n` coefficients centered modulo `Q_0`.
+/// column, the `n` coefficients centered modulo `P`.
 #[allow(clippy::too_many_arguments)]
 pub fn top_refresh_error<E, S, P>(
     top: &crate::refresh::top::TopRefreshDeclaration,
@@ -448,86 +589,16 @@ where
     S: SessionStore,
     P: Poly,
 {
-    use crate::rns_bgg::refresh::{
-        child_hash_key, hash_key_input_name, top_matrix, top_refresh_combine,
-    };
-    let declaration = top.reference();
-    let columns = declaration.columns();
-    if results.len() != top.chains() {
-        return Err(ApiError::input("one pair of part results per chain"));
-    }
-    let ring = reference.ring(0).map_err(ApiError::scheme)?;
-    let mut runtime = BTreeMap::new();
-    let namespace = top.matrix_namespace();
-    let key_name = hash_key_input_name(Some(&namespace));
-    let key = child_hash_key(hash_key, &namespace);
-    runtime.insert(key_name.clone(), RuntimeValue::Bytes(key.as_slice().into()));
-    let key = ring.bytes_input(key_name, key.len());
-    let mut plaintext = |name: &str, value: &P| match super::plaintext_inputs(
-        &ring,
-        name,
-        &InputBinding::Scalar(value.clone()),
-        &mut runtime,
-    ) {
-        Ok(InputBinding::Scalar(value)) => Ok(value),
-        Ok(InputBinding::Family(_)) => unreachable!("a scalar plaintext binds a scalar"),
-        Err(error) => Err(ApiError::input(error)),
-    };
-    let sigma = plaintext("top-refresh-sigma", sigma)?;
-    let expected = plaintext("top-refresh-expected", expected)?;
-    let r = reduce_secret(reference, &payload.row, 0).map_err(ApiError::scheme)?;
-    let delta = reference
-        .scalar(0, reference.message_scale(0).map_err(ApiError::scheme)?)
-        .map_err(ApiError::scheme)?;
-    let gadget = reference.state_gadget(0).map_err(ApiError::scheme)?;
+    let columns = top.reference().columns();
+    let (rows, runtime) =
+        top_refresh_error_rows(top, Some(results), reference, payload, sigma, expected, hash_key)?;
     let mut graph = DslContext::new("rns-bgg-top-refresh-error");
-    for component in 0..2 {
-        let part =
-            top.part(0, component).ok_or_else(|| ApiError::input("the top refresh has no part"))?;
-        let residues = results
-            .iter()
-            .enumerate()
-            .map(|(chain, result)| {
-                let name = format!("residue-{chain}-{component}");
-                let value = result[component]
-                    .outputs
-                    .get("refresh")
-                    .ok_or_else(|| ApiError::input("a part's residue is missing"))?
-                    .clone();
-                runtime.insert(name.clone(), value);
-                let prime = top
-                    .output_prime(chain)
-                    .ok_or_else(|| ApiError::input("the top refresh has no such chain"))?;
-                Ok(mxx_dsl::Ring::from_crt_moduli(
-                    vec![IntExpr::from(prime)],
-                    declaration.ring_dimension,
-                )
-                .input(name, (1, columns)))
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
-        let refreshed = top_refresh_combine(declaration, residues).map_err(ApiError::scheme)?;
-        let a_prime = top_matrix(declaration, key.clone(), part);
-        let a_row = |row: usize| {
-            a_prime.clone().slice(
-                Some(mxx_ir_core::node::IndexRange {
-                    start: IntExpr::constant(row),
-                    end: IntExpr::constant(row + 1),
-                }),
-                None,
-            )
-        };
-        let payload_secret = if component == 0 { r.0.clone() } else { r.1.clone() };
-        let error = refreshed -
-            (sigma.clone() * a_row(0) + a_row(1) -
-                delta.clone() * payload_secret * expected.clone() * gadget.clone());
+    for (component, row) in rows.into_iter().enumerate() {
         graph = graph
-            .output(format!("top-refresh-error-{component}"), error)
+            .output(format!("top-refresh-error-{component}"), row)
             .map_err(ApiError::scheme)?;
     }
     let graph = graph.build().map_err(ApiError::scheme)?;
-    if let Some(binding) = &payload.binding {
-        binding.bind(&mut runtime);
-    }
     let runtime = declared_runtime_inputs(&graph, runtime);
     let outputs = crate::api::execute_graph(
         StageGraph::new(graph, runtime, BTreeMap::new()),
@@ -536,8 +607,7 @@ where
         store,
         |_| Ok(()),
     )?;
-    let modulus =
-        BigInt::from(reference.level(0).map_err(ApiError::scheme)?.modulus().as_ref().clone());
+    let modulus = top.output_primes().into_iter().map(BigInt::from).product::<BigInt>();
     let mut errors = [Vec::new(), Vec::new()];
     for (component, rows) in errors.iter_mut().enumerate() {
         let error = execution.download_matrix(
@@ -561,6 +631,71 @@ where
             .collect();
     }
     Ok(errors)
+}
+
+/// The decode stage of the refresh to the top level: the number of coefficients of the error
+/// rows of [`top_refresh_error`] that threshold-decode to one modulo 2 (an error of at least
+/// `P / 4`, `P` the product of the refreshed primes); zero when both rows are level-0 encodings
+/// of `expected` under `sigma` modulo `P` with errors below `P / 4`. Without `results` the graph is
+/// built and observed but not executed (its residue inputs `residue-{chain}-{j}` are then unbound),
+/// as the export of its claim needs.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_top_refresh<E, S, P>(
+    top: &crate::refresh::top::TopRefreshDeclaration,
+    results: Option<&[[&StageOutputs; 2]]>,
+    reference: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    sigma: &P,
+    expected: &P,
+    hash_key: &[u8],
+    execution: &mut E,
+    store: &mut S,
+    before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
+) -> Result<BigInt, ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+    P: Poly,
+{
+    let columns = top.reference().columns();
+    let dimension = top.reference().ring_dimension as usize;
+    let (rows, runtime) =
+        top_refresh_error_rows(top, results, reference, payload, sigma, expected, hash_key)?;
+    let mut total = Int::constant(0);
+    for row in rows {
+        for column in 0..columns {
+            let entry = row.clone().slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(column),
+                    end: IntExpr::constant(column + 1),
+                }),
+            );
+            for decoded in entry.threshold_decode_ints(2u8, dimension) {
+                total = total.add(decoded);
+            }
+        }
+    }
+    let graph = DslContext::new("rns-bgg-top-refresh-decode")
+        .output("decoded-residual", total)
+        .map_err(ApiError::scheme)?
+        .build()
+        .map_err(ApiError::scheme)?;
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
+        execution,
+        store,
+        before_execute,
+    )?;
+    let value = outputs
+        .outputs
+        .get("decoded-residual")
+        .ok_or_else(|| ApiError::input("decoded residual is missing"))?;
+    let [value] = <[BigInt; 1]>::try_from(execution.download_integers(value)?)
+        .map_err(|_| ApiError::input("decoded residual is not one integer"))?;
+    Ok(value)
 }
 
 fn verify_output_at_level<E, S, P>(

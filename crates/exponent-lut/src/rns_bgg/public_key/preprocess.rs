@@ -605,7 +605,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 .bind_wire(*wire, binding)
                 .map_err(|e| ApiError::input(e.to_string()))?;
         }
-        let prefix = super::plaintext_input_prefix();
+        let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "rhs");
         for (id, declaration) in program.rhs_inputs() {
             if dynamic {
                 // Only references: every key derives from public companion

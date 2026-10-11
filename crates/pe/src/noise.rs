@@ -43,9 +43,7 @@
 //! + 1)` ([`AverageCaseConfig::z_squared_for_events`]). The argument needs no assumption on the
 //! distribution of the evaluation error: `E_F` is its worst-case bound.
 
-use crate::{
-    BranchingProgram, PeClass, PeError, PeParameters, branching_program::ATTRIBUTE_COORDINATE,
-};
+use crate::{BranchingProgram, PeClass, PeError, PeParameters};
 use bigdecimal::BigDecimal;
 use mxx_backends::poly::PolyParams;
 use mxx_exponent_lut::{
@@ -143,7 +141,6 @@ fn package_contracts(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, PeError>>()?;
-    debug_assert!(rhs.values().all(|package| package.coordinate == ATTRIBUTE_COORDINATE));
     let depths = mxx_exponent_lut::rns_bgg::radix_depths(
         &automorphisms,
         rns.levels()[0].ring_dimension() as usize,
@@ -189,7 +186,8 @@ fn evaluation_trace(
         ),
     };
     let symbol = RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
-    let bindings = RnsBggNoiseBindings::from_inputs(compiled.program(), &[initial], &[symbol])?
+    let symbols = vec![symbol; compiled.program().rhs_inputs().len()];
+    let bindings = RnsBggNoiseBindings::from_inputs(compiled.program(), &[initial], &symbols)?
         .with_output_use(RnsOutputUse::Gadget)
         .with_dynamic(package_contracts(
             rns,

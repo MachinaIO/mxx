@@ -11,7 +11,7 @@
 //! tags, as are the Dynamic setup's `A_0`, `H_k`, and companion matrices.
 use crate::{
     PeError, PeParameters,
-    branching_program::{ATTRIBUTE_COORDINATE, INITIAL_STATE_COORDINATE},
+    branching_program::{ADD_ATTRIBUTE_COORDINATE, ATTRIBUTE_COORDINATE, INITIAL_STATE_COORDINATE},
 };
 use mxx_backends::{SessionStore, poly::PolyParams};
 use mxx_dsl::{Bytes, DslContext, HashTag, Mat, Ring, Trapdoor};
@@ -208,15 +208,26 @@ where
                 AttributeKnowledge::PrivatePayload,
             ),
         )]),
-        BTreeMap::from([(
-            ATTRIBUTE_COORDINATE,
-            RnsBggDynamicRhs {
-                shape: InputBinding::Family(IntExpr::constant(class.attribute_length())),
-                source: RnsBggPackageSource::Supplied {
-                    error_bound: parameters.ciphertext_error_bound(),
+        // The lookup packages and the add packages ([`crate::branching_program::StepKind`]) the
+        // class reads, both supplied by the prelude.
+        [
+            (class.has_lookup_packages(), ATTRIBUTE_COORDINATE, class.attribute_length()),
+            (class.has_add_packages(), ADD_ATTRIBUTE_COORDINATE, 2 * class.attribute_length()),
+        ]
+        .into_iter()
+        .filter(|(read, ..)| *read)
+        .map(|(_, coordinate, members)| {
+            (
+                coordinate,
+                RnsBggDynamicRhs {
+                    shape: InputBinding::Family(IntExpr::constant(members)),
+                    source: RnsBggPackageSource::Supplied {
+                        error_bound: parameters.ciphertext_error_bound(),
+                    },
                 },
-            },
-        )]),
+            )
+        })
+        .collect(),
         class.layout(),
         parameters.distributions(),
     )?;

@@ -12,7 +12,7 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 
 | Item | What it provides |
 | --- | --- |
-| `branching_program` | `PeClass` (attribute length, alphabet, state width, maximal length) and `BranchingProgram`, checked against its class and evaluated in the clear. `PeClass::compile` gives the class's Exponent-LUT Program, bound to the setup coordinates, and `BranchingProgram::data` its runtime data: the attribute index and the table of every step. |
+| `branching_program` | `PeClass` (attribute length, alphabet, state width, maximal length) and `BranchingProgram`, checked against its class and evaluated in the clear. `PeClass::compile` gives the class's Exponent-LUT Program, bound to the setup coordinates, and `BranchingProgram::data` its runtime data: the attribute index and the table of every step. `PeClass::with_steps` fixes the kind of every step (`StepKind`: lookup, add, or map), and `BranchingProgram::hamming_threshold` is the Hamming-distance threshold program of `PeClass::hamming`. |
 | `params` | `PeParameters`: the class, the equal-basis chain of `2 T_max + 2` levels, the trapdoor instantiation, the error and flooding contracts, and the key width and cutoff; `PeParameters::select` picks the CRT depth from the conditions of the instantiation and the simulated noise. |
 | `budget` | The statistical instantiation's conditions: the split of the statistical-distance target `ε_total` (default `2^-30`), the regularity (leftover hash lemma) column counts `m̄` and `m_B`, the truncation and flooding multipliers, the flooding width, and the SampleRight key width of the `Strict` policy. |
 | `setup` | `setup`: the anchor `B` from TrapGen (computational `[ā \| I \| G - (ā R + E)]` or statistical `[ā \| g - ā T]`), the class's Dynamic setup, and the public message row. `PePublicKey` and `PeMasterSecretKey` keep public and secret material apart. |
@@ -36,6 +36,15 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
   identity steps. The Dynamic product selects the attribute package by the step's read, and the
   LUT scalars are computed from the step's table, so key generation and decryption run the same
   graph for every program, and the key's commitment binds its data.
+- **Add and map steps.** A class may fix each step's kind (`PeClass::with_steps`). An add step
+  only multiplies the state by the package of `X^x` or `X^(Bx - 1 - x)`, adding to the exponent
+  without a table, and a map step applies a table to the state without reading an attribute, so a
+  program whose steps need no table avoids the table's noise (one to three automorphism switches
+  of gain `K` each) and work. Encryption then publishes the add packages `X^(x_t)` and
+  `X^(Bx - 1 - x_t)` of every attribute, and the lookup packages only if a lookup step reads
+  them; without lookup steps the lookup width is `next_pow2(Bz)`. The kinds are the class's
+  because one graph serves every program. The Hamming threshold programs add `x_i` or `1 - x_i`
+  per bit and compare the sum in one map step.
 - **Radix-`B` lookups.** `PeParameterRequest::lut_radix` decomposes the cyclic lookup group of
   `W = B^r` automorphisms in radix `B` (a power of two; `W <= n / 2` for `B < W`): a ciphertext
   then carries switching packages for the `(B - 1) log_B W` automorphisms `K_B = {g^(a B^j)}`

@@ -21,11 +21,18 @@
 //! authorized key must decrypt the message; the unauthorized decryption must complete, and its
 //! rounded phase is not constrained.
 //!
-//! With `MXX_PE_ROUND_TRIP_LEAN_EXPORT=<parameter id>`, the test exports the Lean correctness
-//! claim of the executed graphs to `lean/<parameter id>/generated`. The claim does not depend on
-//! the predicate: the program is an external input of key generation (preprocessing) and online
-//! evaluation, and the requirement is that the attribute and the program form a valid instance
-//! with `F(x) = 0`.
+//! `test_gpu_pe_hamming_round_trip` runs the same search and round trip for the Hamming
+//! threshold programs (`BranchingProgram::hamming_threshold`) of the class `PeClass::hamming` over
+//! `HAMMING_BITS` binary attributes, whose steps but the last only add `x_i` or `1 - x_i` to the
+//! state exponent, without a table, and whose last step compares the sum with the threshold: the
+//! authorized key's threshold exceeds the distance of the attribute to a random template, and
+//! the unauthorized key's equals it. The class variables below do not apply to it.
+//!
+//! With `MXX_PE_ROUND_TRIP_LEAN_EXPORT=<parameter id>`, `test_gpu_pe_round_trip` exports the Lean
+//! correctness claim of the executed graphs to `lean/<parameter id>/generated`. The claim does not
+//! depend on the predicate: the program is an external input of key generation (preprocessing) and
+//! online evaluation, and the requirement is that the attribute and the program form a valid
+//! instance with `F(x) = 0`.
 //!
 //! The computational instantiation is checked only for correctness and security: the
 //! manuscript's leftover-hash, noise-flooding, and key-width conditions are enforced only by the
@@ -35,6 +42,7 @@
 //! | --- | --- | --- |
 //! | `LEAN_EXPORT` | unset | Export the Lean correctness claim to `lean/<value>/generated` |
 //! | `ATTRIBUTE_LENGTH`, `ALPHABET_SIZE`, `STATE_WIDTH`, `MAX_STEPS` | 1, 2, 1, 1 | The class |
+//! | `HAMMING_BITS` | 2 | The attribute bits of the Hamming round trip |
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 12, 15 | Ring-dimension candidates |
 //! | `MAX_CRT_DEPTH` | 12 | CRT-depth candidates `1..=` |
 //! | `CRT_BITS`, `BASE_BITS` | 50, `ceil(CRT_BITS / 2)` | CRT prime and gadget base widths |
@@ -560,6 +568,51 @@ fn report_device_bytes(store: &StageStore) {
 #[test]
 #[sequential(dcrt_runtime)]
 fn test_gpu_pe_round_trip() {
+    let class = PeClass::new(
+        count("ATTRIBUTE_LENGTH", 1),
+        count("ALPHABET_SIZE", 2),
+        count("STATE_WIDTH", 1),
+        count("MAX_STEPS", 1),
+    )
+    .unwrap();
+    let (graphs, parameters, failure_exponent) = round_trip(class, &program);
+    if let Ok(id) = env::var(variable("LEAN_EXPORT")) {
+        let directory = lean_directory().join(&id).join("generated");
+        let protocol = pe_protocol(graphs, &parameters, failure_exponent);
+        mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("PE claim export");
+        eprintln!("exported the PE correctness claim to {}", directory.display());
+    }
+}
+
+/// The round trip of the Hamming threshold programs ([`BranchingProgram::hamming_threshold`])
+/// over `HAMMING_BITS` binary attributes: every step but the last only adds `x_i` or `1 - x_i`
+/// to the exponent, and the last compares the distance with the threshold. The authorized key's
+/// threshold exceeds the distance of the attribute to a random template; the unauthorized key's
+/// equals it.
+#[test]
+#[sequential(dcrt_runtime)]
+fn test_gpu_pe_hamming_round_trip() {
+    let class = PeClass::hamming(count("HAMMING_BITS", 2)).unwrap();
+    let program = |attribute: &[usize], value: usize| {
+        let template =
+            attribute.iter().map(|_| rand::random::<bool>() as usize).collect::<Vec<_>>();
+        let distance = attribute.iter().zip(&template).filter(|(x, z)| x != z).count();
+        let threshold = if value == 0 { distance + 1 } else { distance };
+        let program = BranchingProgram::hamming_threshold(&template, threshold).unwrap();
+        assert_eq!(program.evaluate(attribute).unwrap(), value);
+        program
+    };
+    round_trip(class, &move |_, attribute, value| program(attribute, value));
+}
+
+/// Search the parameters of `class`, then run setup, the encryption of a random attribute, and
+/// key generation and decryption for the programs `program(class, x, 0)` (which must decrypt)
+/// and `program(class, x, 1)` on the GPU. Returns the graphs of the authorized round trip, the
+/// parameters, and the failure exponent of the noise model.
+fn round_trip(
+    class: PeClass,
+    program: &dyn Fn(PeClass, &[usize], usize) -> BranchingProgram,
+) -> (Vec<Recorded>, PeParameters, Option<u32>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -569,13 +622,6 @@ fn test_gpu_pe_round_trip() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "the PE round trip needs a CUDA device");
     let started = Instant::now();
-    let class = PeClass::new(
-        count("ATTRIBUTE_LENGTH", 1),
-        count("ALPHABET_SIZE", 2),
-        count("STATE_WIDTH", 1),
-        count("MAX_STEPS", 1),
-    )
-    .unwrap();
     let (parameters, report) = search(class);
     let failure_exponent = report.average.as_ref().map(|(exponent, ..)| *exponent);
     assert!(report.decrypts(), "the accepted parameters must guarantee correctness");
@@ -647,11 +693,5 @@ fn test_gpu_pe_round_trip() {
     decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
     eprintln!("decryption (F(x) = 1): {:?}", stage.elapsed());
     report_device_bytes(&store);
-
-    if let Ok(id) = env::var(variable("LEAN_EXPORT")) {
-        let directory = lean_directory().join(&id).join("generated");
-        let protocol = pe_protocol(graphs, &parameters, failure_exponent);
-        mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("PE claim export");
-        eprintln!("exported the PE correctness claim to {}", directory.display());
-    }
+    (graphs, parameters, failure_exponent)
 }

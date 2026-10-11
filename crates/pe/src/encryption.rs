@@ -6,7 +6,8 @@
 //! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`;
 //! - for every attribute symbol `x_t`, the gadget ciphertext `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz
 //!   x_t) G` with a fresh uniform `a_t` and a fresh `e_t` from `chi_fl`, both `1 x m`, so `s C_t =
-//!   X^(Bz x_t) s G + e_t`;
+//!   X^(Bz x_t) s G + e_t`, if a lookup step reads it, and the same ciphertexts of `X^(x_t)` and
+//!   `X^(Bx - 1 - x_t)` if an add step does ([`crate::branching_program::StepKind`]);
 //! - the message component `c_m = s d^T + e_m + floor(q/2) m = s_bar d_1 + d_2 + e_m + floor(q/2)
 //!   m` for binary coefficients `m`.
 //!
@@ -39,6 +40,7 @@ pub(crate) const ANCHOR_ENCODING: &str = "mxx-pe/anchor-encoding";
 /// `c_m` in the prelude production.
 pub(crate) const MESSAGE_ENCODING: &str = "mxx-pe/message-encoding";
 const ATTRIBUTE_INPUT: &str = "mxx-pe/attribute-exponents";
+const ADD_ATTRIBUTE_INPUT: &str = "mxx-pe/add-exponents";
 const MESSAGE_INPUT: &str = "mxx-pe/message-coefficients";
 
 /// A ciphertext: the prelude production (`b`, every `C_t`, `c_m`) and the
@@ -179,13 +181,36 @@ where
     secret.bind_runtime(&mut runtime);
     let hash_key = public_key.hash_key_input(&mut runtime)?;
     let context = DslContext::new("mxx-pe/encrypt-prelude");
-    let exponents = context.int_family_input(ATTRIBUTE_INPUT, attribute.len());
-    runtime.insert(
-        ATTRIBUTE_INPUT.to_owned(),
-        RuntimeValue::integer_values(
-            attribute.iter().map(|symbol| BigInt::from(class.state_width() * symbol)).collect(),
-        ),
-    );
+    // The exponents of the lookup packages, `Bz x_t`, and of the add packages, `x_t` then
+    // `Bx - 1 - x_t`, for the packages the class reads.
+    let mut families = Vec::new();
+    if class.has_lookup_packages() {
+        families.push((
+            crate::branching_program::ATTRIBUTE_COORDINATE,
+            ATTRIBUTE_INPUT,
+            attribute.iter().map(|symbol| class.state_width() * symbol).collect::<Vec<_>>(),
+        ));
+    }
+    if class.has_add_packages() {
+        let complement = attribute.iter().map(|symbol| class.alphabet_size() - 1 - symbol);
+        families.push((
+            crate::branching_program::ADD_ATTRIBUTE_COORDINATE,
+            ADD_ATTRIBUTE_INPUT,
+            attribute.iter().copied().chain(complement).collect(),
+        ));
+    }
+    let exponents = families
+        .iter()
+        .map(|(coordinate, name, values)| {
+            runtime.insert(
+                (*name).to_owned(),
+                RuntimeValue::integer_values(
+                    values.iter().map(|value| BigInt::from(*value)).collect(),
+                ),
+            );
+            (*coordinate, context.int_family_input(*name, values.len()))
+        })
+        .collect::<Vec<_>>();
     let coefficients = context.int_family_input(MESSAGE_INPUT, dimension);
     runtime.insert(
         MESSAGE_INPUT.to_owned(),
@@ -216,35 +241,32 @@ where
     // `chi_fl` for the attribute ciphertexts' errors `e_t`.
     let flooding = parameters.flooding();
     let flooding_sigma = crate::params::real_expr(flooding.sigma())?;
-    let ciphertexts = mxx_dsl::parallel(attribute.len(), |member| {
-        // `[a_t; -s_bar a_t + e_t]`, with a fresh uniform `a_t`.
-        let width = 2 * columns;
-        let top = ring.uniform_residue((1, width));
-        let e_t = if flooding.sigma().is_zero() {
-            ring.zero((1, width))
-        } else {
-            ring.gaussian((1, width), flooding_sigma.clone(), flooding.cutoff().clone())
-        };
-        let bottom = e_t - s_bar.clone() * top.clone();
-        let symbol = ring.identity(1).multiply_monomial(exponents.at(member));
-        let target = symbol * gadget.clone();
-        let (top_left, top_right) = split(top, columns);
-        let (bottom_left, bottom_right) = split(bottom, columns);
-        Ok(((top_left + target.clone(), top_right), (bottom_left, bottom_right + target)))
-    })?;
+    let mut context = context.transferred_output(ANCHOR_ENCODING, anchor)?;
+    for (coordinate, family) in exponents {
+        let ciphertexts = mxx_dsl::parallel(family.count().clone(), |member| {
+            // `[a_t; -s_bar a_t + e_t]`, with a fresh uniform `a_t`.
+            let width = 2 * columns;
+            let top = ring.uniform_residue((1, width));
+            let e_t = if flooding.sigma().is_zero() {
+                ring.zero((1, width))
+            } else {
+                ring.gaussian((1, width), flooding_sigma.clone(), flooding.cutoff().clone())
+            };
+            let bottom = e_t - s_bar.clone() * top.clone();
+            let symbol = ring.identity(1).multiply_monomial(family.at(member));
+            let target = symbol * gadget.clone();
+            let (top_left, top_right) = split(top, columns);
+            let (bottom_left, bottom_right) = split(bottom, columns);
+            Ok(((top_left + target.clone(), top_right), (bottom_left, bottom_right + target)))
+        })?;
+        context = context.transferred_output(
+            RnsBggDynamicSetup::rhs_ciphertext_role(coordinate, true),
+            ciphertexts,
+        )?;
+    }
     let half = ring.polynomial([IntExpr::constant(parameters.modulus() / 2u8)]);
     let message = s_bar * d_1 + d_2 + error(1)? + half * ring.from_coefficients(&coefficients);
-    let graph = context
-        .transferred_output(ANCHOR_ENCODING, anchor)?
-        .transferred_output(
-            RnsBggDynamicSetup::rhs_ciphertext_role(
-                crate::branching_program::ATTRIBUTE_COORDINATE,
-                true,
-            ),
-            ciphertexts,
-        )?
-        .transferred_output(MESSAGE_ENCODING, message)?
-        .build()?;
+    let graph = context.transferred_output(MESSAGE_ENCODING, message)?.build()?;
     let (anchor_production, anchor_manifest) = public_key.anchor_production().clone();
     Ok(api::execute_artifacts(
         StageGraph::new(graph, runtime, BTreeMap::from([(anchor_production, anchor_manifest)])),

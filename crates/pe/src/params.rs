@@ -541,7 +541,7 @@ impl PeParameters {
         let shape = BudgetShape {
             ring_dimension: n,
             digits,
-            attribute_length: class.attribute_length(),
+            attribute_length: class.rhs_packages(),
             lookup_width: class.lookup_width(),
             crt_depth: level.crt_depth(),
             switching_packages: mxx_exponent_lut::rns_bgg::switching_automorphisms(

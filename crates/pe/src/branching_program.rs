@@ -97,6 +97,14 @@ impl PeClass {
         Ok(Self { attribute_length, alphabet_size, state_width, max_steps, map_steps: 0 })
     }
 
+    /// The class of the decimal range programs over `digits` decimal digits
+    /// ([`BranchingProgram::decimal_range`]): one attribute symbol of 4 bits per digit
+    /// (`Bx = 16`, BCD, with `10..=15` not digits), one lookup step per digit, and the 5 states
+    /// of the range comparison padded to `Bz = 8`, so `W = 128`.
+    pub fn decimal_range(digits: usize) -> Result<Self, PeError> {
+        Self::new(digits, DECIMAL_ALPHABET, DECIMAL_STATES, digits)
+    }
+
     /// A class whose step `i` has kind `steps[i]`, `T_max = steps.len() <= 64`.
     /// Every step applies a table; the last one's coefficient is the output.
     pub fn with_steps(
@@ -295,7 +303,71 @@ pub struct BranchingProgram {
     tables: Vec<Vec<usize>>,
 }
 
+/// The alphabet of the decimal range programs: 4-bit symbols, of which `0..=9` are digits.
+const DECIMAL_ALPHABET: usize = 16;
+/// The state width of the decimal range programs: the states `EQ_EQ`, `GT_EQ`, `EQ_LT`, `GT_LT`,
+/// and `REJ` padded to a power of two.
+const DECIMAL_STATES: usize = 8;
+/// The rejecting state of the decimal range programs, which absorbs the padding states.
+const DECIMAL_REJECT: usize = 4;
+
 impl BranchingProgram {
+    /// The program of [`PeClass::decimal_range`] that accepts (`F(x) = 0`) exactly the
+    /// attributes `x = (x_1, ..., x_D)` of `digits = D` decimal digits, most significant first,
+    /// that match `[1-9][0-9]{D-1}` and whose value `N(x)` satisfies `low <= N(x) <= high`, for
+    /// `10^(D-1) <= low <= high <= 10^D - 1`.
+    ///
+    /// Step `i` reads digit `x_(i+1)` and tracks whether the prefix equals the prefix of `low`
+    /// (`EQ`) or exceeds it (`GT`), and whether it equals the prefix of `high` (`EQ`) or is below
+    /// it (`LT`): states `0 = (EQ, EQ)`, `1 = (GT, EQ)`, `2 = (EQ, LT)`, `3 = (GT, LT)`, and the
+    /// absorbing `4 = REJ`, which a prefix below `low`, above `high`, a symbol `>= 10`, or a
+    /// leading zero reaches; the padding states `5..=7` go to `REJ`. The table at `z + 8 x` is
+    /// the next state, and the last step's is `0` unless it is `REJ`.
+    pub fn decimal_range(digits: usize, low: u64, high: u64) -> Result<Self, PeError> {
+        let class = PeClass::decimal_range(digits)?;
+        let bound = u32::try_from(digits)
+            .ok()
+            .and_then(|digits| 10u64.checked_pow(digits))
+            .ok_or(PeError::Predicate("the number of digits overflows"))?;
+        if low < bound / 10 || low > high || high >= bound {
+            return Err(PeError::Predicate("the range is not of D-digit numbers"));
+        }
+        let digit =
+            |value: u64, i: usize| (value / 10u64.pow((digits - 1 - i) as u32) % 10) as usize;
+        let step = |i: usize, z: usize, x: usize| -> usize {
+            if z >= DECIMAL_REJECT || x >= 10 || (i == 0 && x == 0) {
+                return DECIMAL_REJECT;
+            }
+            // `z = lo + 2 hi` with `lo, hi` one when the prefix exceeds `low`'s or is below
+            // `high`'s.
+            let (mut above, mut below) = (z & 1 == 1, z & 2 == 2);
+            if !above {
+                if x < digit(low, i) {
+                    return DECIMAL_REJECT;
+                }
+                above = x > digit(low, i);
+            }
+            if !below {
+                if x > digit(high, i) {
+                    return DECIMAL_REJECT;
+                }
+                below = x < digit(high, i);
+            }
+            usize::from(above) + 2 * usize::from(below)
+        };
+        let tables = (0..digits)
+            .map(|i| {
+                (0..DECIMAL_STATES * DECIMAL_ALPHABET)
+                    .map(|u| {
+                        let next = step(i, u % DECIMAL_STATES, u / DECIMAL_STATES);
+                        if i + 1 == digits { usize::from(next == DECIMAL_REJECT) } else { next }
+                    })
+                    .collect()
+            })
+            .collect();
+        Self::new(class, (0..digits).collect(), tables)
+    }
+
     /// Check a program of lookup steps of `class`: `1 <= T <= T_max` steps,
     /// every read an attribute index, every table of `Bz Bx` entries,
     /// intermediate outputs below `Bz`, and final outputs in `{0, 1}`.
@@ -557,5 +629,55 @@ mod tests {
         assert!(BranchingProgram::from_steps(class, vec![lookup.clone(), wide]).is_err());
         assert!(BranchingProgram::from_steps(class, vec![lookup.clone(), lookup.clone()]).is_err());
         assert!(BranchingProgram::from_steps(class, vec![lookup]).is_err());
+    }
+
+    /// The decimal range program of the specification's test vectors (`D = 4`, `[2000, 2025]`),
+    /// evaluated in the clear and through the Program data: every step's table window of `W = 128`
+    /// entries at `u = z + 8 x`.
+    #[test]
+    fn decimal_range_programs_check_the_notation_and_the_range() {
+        let program = BranchingProgram::decimal_range(4, 2000, 2025).unwrap();
+        let class = *program.class();
+        assert_eq!(class, PeClass::decimal_range(4).unwrap());
+        assert_eq!(
+            (class.state_width(), class.alphabet_size(), class.lookup_width()),
+            (8, 16, 128)
+        );
+        let compiled = class.compile().unwrap();
+        let data = program.data(&compiled);
+        data.validate(compiled.program()).unwrap();
+        let tables = data.values(compiled.tables()).unwrap();
+        let through_luts = |attribute: &[usize]| {
+            attribute.iter().enumerate().fold(0, |z, (i, x)| tables[i * 128 + z + 8 * x])
+        };
+        for (attribute, expected) in [
+            ([2, 0, 0, 0], 0),
+            ([2, 0, 2, 5], 0),
+            ([2, 0, 1, 7], 0),
+            ([1, 9, 9, 9], 1),
+            ([2, 0, 2, 6], 1),
+            ([3, 0, 0, 0], 1),
+            ([0, 9, 9, 9], 1),
+            ([2, 0, 10, 5], 1),
+        ] {
+            assert_eq!(program.evaluate(&attribute).unwrap(), expected, "{attribute:?}");
+            assert_eq!(through_luts(&attribute), expected, "{attribute:?}");
+        }
+        // Every 4-digit string over the alphabet agrees with the predicate.
+        for value in 0..1 << 16 {
+            let attribute = (0..4).map(|i| value >> (12 - 4 * i) & 15).collect::<Vec<usize>>();
+            let number = attribute.iter().fold(0, |number, x| 10 * number + *x as u64);
+            let accepted = attribute.iter().all(|x| *x < 10) &&
+                attribute[0] != 0 &&
+                (2000..=2025).contains(&number);
+            assert_eq!(program.evaluate(&attribute).unwrap(), usize::from(!accepted));
+        }
+        // One digit: the leading zero and the range in one final step.
+        let single = BranchingProgram::decimal_range(1, 3, 5).unwrap();
+        let accepted = (0..16).filter(|x| single.evaluate(&[*x]).unwrap() == 0).collect::<Vec<_>>();
+        assert_eq!(accepted, [3, 4, 5]);
+        for (low, high) in [(999, 2000), (2000, 1999), (2000, 10_000)] {
+            assert!(BranchingProgram::decimal_range(4, low, high).is_err(), "{low} {high}");
+        }
     }
 }

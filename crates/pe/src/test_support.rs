@@ -32,8 +32,12 @@ fn level() -> DCRTPolyParams {
 }
 
 fn level_at(depth: usize) -> DCRTPolyParams {
+    level_of(read("RING_DIMENSION", 16), depth)
+}
+
+fn level_of(ring_dimension: u32, depth: usize) -> DCRTPolyParams {
     DCRTPolyParams::new(
-        read("RING_DIMENSION", 16),
+        ring_dimension,
         depth,
         read("CRT_BITS", 30),
         read("BASE_BITS", 10),
@@ -60,13 +64,17 @@ fn parameters_at(class: PeClass, level: DCRTPolyParams) -> PeParameters {
 }
 
 /// The test parameters of `class` at the smallest CRT depth from `4` whose simulated bound
-/// guarantees correctness after `adapt` (which may enable options that add noise).
+/// guarantees correctness after `adapt` (which may enable options that add noise), over a ring
+/// of dimension at least the lookup width.
 pub(crate) fn correct_parameters(
     class: PeClass,
     adapt: impl Fn(PeParameters) -> PeParameters,
 ) -> PeParameters {
     (4..=16)
-        .map(|depth| adapt(parameters_at(class, level_at(depth))))
+        .map(|depth| {
+            let ring_dimension = read("RING_DIMENSION", 16).max(class.lookup_width() as u32);
+            adapt(parameters_at(class, level_of(ring_dimension, depth)))
+        })
         .find(|parameters| {
             crate::noise::simulate(parameters, &crate::BranchingProgram::longest(class))
                 .unwrap()

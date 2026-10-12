@@ -36,13 +36,30 @@ fn gpu_rings(parameters: &crate::PeParameters) -> Vec<GpuDCRTPolyParams> {
 #[ignore = "requires a CUDA GPU"]
 fn test_gpu_authorized_key_decrypts_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
-    authorized_key_decrypts_on_the_gpu(class, parameters(class), &equality_programs);
+    authorized_key_decrypts_on_the_gpu(class, parameters(class), None, &equality_programs);
 }
 
 /// The equality predicates of `attribute` (authorized) and of its complement.
 fn equality_programs(class: PeClass, attribute: &[usize]) -> [BranchingProgram; 2] {
     let complement = attribute.iter().map(|bit| 1 - bit).collect::<Vec<_>>();
     [equals(class, attribute), equals(class, &complement)]
+}
+
+/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] for the decimal range programs over two
+/// digits (`W = 128`): the key for a range containing the attribute's value decrypts, and the key
+/// for a range above it does not.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_decimal_range_decrypts_on_the_gpu() {
+    let class = PeClass::decimal_range(2).unwrap();
+    let parameters = crate::test_support::correct_parameters(class, |parameters| parameters);
+    // A random two-digit number and the ranges `[value - 3, value + 3]` and just above it.
+    let value = 10 + rand::random::<u64>() % 80;
+    let attribute = vec![(value / 10) as usize, (value % 10) as usize];
+    authorized_key_decrypts_on_the_gpu(class, parameters, Some(attribute), &|_, _| {
+        [(value.max(13) - 3, value + 3), (value + 1, 99)]
+            .map(|(low, high)| BranchingProgram::decimal_range(2, low, high).unwrap())
+    });
 }
 
 /// [`test_gpu_authorized_key_decrypts_on_the_gpu`] with the LUT radix 2 and compact encodings: the
@@ -55,14 +72,16 @@ fn test_gpu_compact_encodings_with_a_radix_decrypt_on_the_gpu() {
     let parameters = crate::test_support::correct_parameters(class, |parameters| {
         parameters.with_lut_radix(2).unwrap().with_compact_encodings().unwrap()
     });
-    authorized_key_decrypts_on_the_gpu(class, parameters, &equality_programs);
+    authorized_key_decrypts_on_the_gpu(class, parameters, None, &equality_programs);
 }
 
-/// One setup, one ciphertext of a random attribute and message, and keys for the programs
-/// `programs(class, attribute)`, the first authorized and the second not, all on the GPU.
+/// One setup, one ciphertext of `attribute` (a random one if `None`) and a random message, and
+/// keys for the programs `programs(class, attribute)`, the first authorized and the second not,
+/// all on the GPU.
 fn authorized_key_decrypts_on_the_gpu(
     class: PeClass,
     parameters: crate::PeParameters,
+    attribute: Option<Vec<usize>>,
     programs: &dyn Fn(PeClass, &[usize]) -> [BranchingProgram; 2],
 ) {
     let level = parameters.level();
@@ -71,9 +90,11 @@ fn authorized_key_decrypts_on_the_gpu(
     assert!(bound.decrypts(), "the parameters must guarantee correctness");
     let mut store = MemoryArtifactStore::default();
     let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
-    let attribute = (0..class.attribute_length())
-        .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
-        .collect::<Vec<_>>();
+    let attribute = attribute.unwrap_or_else(|| {
+        (0..class.attribute_length())
+            .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
+            .collect()
+    });
     let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
     let ciphertext =
         encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();

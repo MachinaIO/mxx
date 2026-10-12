@@ -224,23 +224,19 @@ impl PeParameters {
         Ok(parameters)
     }
 
-    /// Decompose the LUT automorphism group `H = <g>` (of order `W = B^r`) in
-    /// radix `B`: encryption publishes switching packages for the `(B - 1) r`
-    /// automorphisms `K_B = {g^(a B^j)}` instead of `W - 1`, the key carries
-    /// helper blocks for `J_B = K_B u K_B^-1`, and a branch is switched once
-    /// per nonzero radix-`B` digit of its exponent, at most `r` times (see
-    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_lut_radix`). `B`
-    /// is a power of two with `B^r = W`; `B = W` keeps the direct switching.
-    /// `B < W` needs the cyclic group of `W <= n / 2`.
+    /// Decompose the LUT automorphism group `H = <g>` (of order `W`) in radix `B`
+    /// (see `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_lut_radix`): with
+    /// `r = ceil(log_B W)` rounds, all of radix `B` but the last, of radix
+    /// `B' = W / B^(r - 1)`, encryption publishes switching packages for the
+    /// `(B - 1)(r - 1) + B' - 1` automorphisms `K_B = {g^(a B^j)}` instead of `W - 1`, the key
+    /// carries helper blocks for `J_B = K_B u K_B^-1`, and a branch is switched once per nonzero
+    /// digit of its exponent, at most `r` times. `B` is a power of two up to `W`; `B = W` keeps
+    /// the direct switching. `B < W` needs the cyclic group of `W <= n / 2`.
     pub fn with_lut_radix(mut self, radix: usize) -> Result<Self, PeError> {
         let order = self.class.lookup_width();
-        let mut power = 1usize;
-        while radix >= 2 && power < order {
-            power = power.saturating_mul(radix);
-        }
-        if radix < 2 || !radix.is_power_of_two() || power != order {
+        if radix < 2 || !radix.is_power_of_two() || radix > order {
             return Err(PeError::Parameters(
-                "the LUT radix must be a power of two whose power is the lookup width".into(),
+                "the LUT radix must be a power of two up to the lookup width".into(),
             ));
         }
         if radix < order && 2 * order > self.level().ring_dimension() as usize {
@@ -703,12 +699,13 @@ mod tests {
         assert!(PeParameters::at_depth(&request, 4).is_err());
     }
 
-    /// The LUT radix `B` is a power of two with `B^r = W`: over rings of dimension 16, `W = 8`
-    /// takes `B = 2` (`|K_2| = 3`, so at most 6 helpers) and `B = 8` (the direct switching, 7
-    /// helpers) but not `B = 4` or `B = 3`, and `W = 16 = n`, whose group is not cyclic, takes
-    /// only the direct `B = 16`. The key length counts the `|J_B|` helpers.
+    /// The LUT radix `B` is a power of two up to `W`, whose last round takes the rest: over rings
+    /// of dimension 16, `W = 8` takes `B = 2` (`|K_2| = 3`, so at most 6 helpers), `B = 4` (rounds
+    /// of radix 4 and 2, `|K_4| = 3 + 1`), and `B = 8` (the direct switching, 7 helpers) but not
+    /// `B = 3` or `B = 16`, and `W = 16 = n`, whose group is not cyclic, takes only the direct
+    /// `B = 16`. The key length counts the `|J_B|` helpers.
     #[test]
-    fn lut_radices_are_powers_of_two_of_the_lookup_width() {
+    fn lut_radices_are_powers_of_two_up_to_the_lookup_width() {
         let width_8 = crate::test_support::parameters(PeClass::new(1, 4, 2, 1).unwrap());
         assert_eq!(width_8.class().lookup_width(), 8);
         let radix_2 = width_8.clone().with_lut_radix(2).unwrap();
@@ -722,7 +719,19 @@ mod tests {
         assert_eq!(direct.identity(), width_8.identity());
         assert_eq!(direct.helper_automorphism_count().unwrap(), 7);
         assert_ne!(radix_2.identity(), direct.identity());
-        for radix in [0, 1, 3, 4, 16] {
+        let radix_4 = width_8.clone().with_lut_radix(4).unwrap();
+        let switching = |parameters: &PeParameters| {
+            let n = parameters.level().ring_dimension() as usize;
+            let automorphisms = parameters.class().layout().automorphism_indices(n).unwrap();
+            mxx_exponent_lut::rns_bgg::switching_automorphisms(
+                &automorphisms,
+                n,
+                parameters.lut_radix(),
+            )
+            .len()
+        };
+        assert_eq!((switching(&radix_2), switching(&radix_4), switching(&direct)), (3, 4, 7));
+        for radix in [0, 1, 3, 16] {
             assert!(width_8.clone().with_lut_radix(radix).is_err(), "radix {radix}");
         }
         let width_16 = crate::test_support::parameters(PeClass::new(1, 8, 2, 1).unwrap());

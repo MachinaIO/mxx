@@ -225,20 +225,23 @@ impl RnsBggDynamicSetup {
         );
     }
 
-    /// Decompose the cyclic group `H = <g>` (`g = 1 + 2n/|H|`, `|H| = B^r`)
-    /// in radix `B`: encryption publishes the switching packages of
-    /// `K_B = {g^(a B^j) : 1 <= a < B, j < r}` only (`(B - 1) r` instead of
-    /// `|H| - 1`) and the helpers of `J_B = K_B u K_B^-1`, and a branch
-    /// `k = g^e` is switched once per nonzero radix-`B` digit of `e`: the
-    /// branch without the top digit, `parent(k)`, is switched by
-    /// `g^(a_top B^top)` ([`Self::radix_step`]). Each switch adds one
-    /// decomposition gain to the noise of the branches below it. `B` is a
-    /// power of two; `B = |H|` is the direct switching of every automorphism.
+    /// Decompose the cyclic group `H = <g>` (`g = 1 + 2n/|H|`) in radix `B`:
+    /// with `r = ceil(log_B |H|)` rounds, the exponent `e` of a branch `k = g^e`
+    /// has digits `e_j < B` for `j < r - 1` and a last digit below
+    /// `B' = |H| / B^(r - 1)` (`B' = B` when `|H| = B^r`). Encryption publishes
+    /// the switching packages of `K_B = {g^(a B^j)}` for the nonzero digits `a`
+    /// of every round only (`(B - 1)(r - 1) + B' - 1` instead of `|H| - 1`) and
+    /// the helpers of `J_B = K_B u K_B^-1`, and a branch is switched once per
+    /// nonzero digit of `e`: the branch without the top digit, `parent(k)`, is
+    /// switched by `g^(a_top B^top)` ([`Self::radix_step`]). Each switch adds one
+    /// decomposition gain to the noise of the branches below it. `B` is a power
+    /// of two below or equal to `|H|`; `B = |H|` is the direct switching of
+    /// every automorphism.
     pub fn with_lut_radix(mut self, radix: usize) -> Result<Self, RnsBggError> {
         let order = self.automorphisms.len();
-        if radix < 2 || !radix.is_power_of_two() || radix_digits(order, radix).is_none() {
+        if radix < 2 || !radix.is_power_of_two() || radix > order {
             return Err(RnsBggError::Parameters(
-                "the LUT radix must be a power of two whose power is the group order",
+                "the LUT radix must be a power of two up to the group order",
             ));
         }
         self.lut_radix = (radix < order).then_some(radix);
@@ -811,17 +814,6 @@ fn generator_powers(ring_dimension: usize, order: usize) -> Vec<usize> {
         .collect()
 }
 
-/// `r` with `radix^r = order`, if any.
-fn radix_digits(order: usize, radix: usize) -> Option<usize> {
-    let mut power = 1usize;
-    let mut digits = 0;
-    while power < order {
-        power = power.checked_mul(radix)?;
-        digits += 1;
-    }
-    (power == order).then_some(digits)
-}
-
 /// The exponent `e` of `k = g^e` in the cyclic group `automorphisms` of rings
 /// of dimension `ring_dimension` (see [`generator_powers`]).
 fn generator_exponent(
@@ -944,7 +936,8 @@ mod tests {
     use super::*;
 
     /// The cyclic group of 16 automorphisms of a ring of dimension 64 in radix 2 publishes the
-    /// 4 switching packages `g^(2^j)` and in radix 4 the 6 packages `g^(a 4^j)`; every branch is
+    /// 4 switching packages `g^(2^j)`, in radix 4 the 6 packages `g^(a 4^j)`, and in radix 8 the
+    /// 7 packages `g^a` and, in a last round of radix 2, `g^8`; every branch is
     /// its parent times its switch, its parent has one switch fewer, and its depth is its
     /// exponent's nonzero digits. The helpers are the switching automorphisms closed under
     /// inversion. Radix 16 (the group order) switches every automorphism directly.
@@ -961,11 +954,11 @@ mod tests {
             assert_eq!(helper_automorphisms(&group, n, radix), group[1..].to_vec());
             assert!(radix_depths(&group, n, radix).values().all(|depth| *depth == 1));
         }
-        for (radix, digits) in [(2, 4), (4, 2)] {
+        for (radix, digits, packages) in [(2, 4, 4), (4, 2, 6), (8, 2, 8)] {
             let switching = switching_automorphisms(&group, n, Some(radix));
             let helpers = helper_automorphisms(&group, n, Some(radix));
             let depths = radix_depths(&group, n, Some(radix));
-            assert_eq!(switching.len(), (radix - 1) * digits);
+            assert_eq!(switching.len(), packages);
             assert!(helpers.len() <= 2 * switching.len());
             assert_eq!(depths.values().max(), Some(&digits));
             for k in &group[1..] {

@@ -13,7 +13,7 @@ from patterns import destruct_inline, parse_inline
 
 
 def loop_lemmas(path, ns, name, tag, q, qp, p, m, mp, layout, hlayout, qeq, level, bound,
-                params='params', extra_args='', width=4):
+                params='params', extra_args='', width=4, inst=False):
     """`name`: the loop body (`sequential_…`), whose inputs are the state (10 blocks), the helper
     rows `h0`, the hash key, `h1`, the input encoding `c 0, A 0 0, A 1 0, c 1, A 0 1, A 1 1`, and
     the switching families. `extra_args`: the leading Nat arguments of the body before `i` (e.g.
@@ -29,6 +29,12 @@ def loop_lemmas(path, ns, name, tag, q, qp, p, m, mp, layout, hlayout, qeq, leve
     body = text[text.index(f'def {name} '):]
     one = re.search(rf'let {nxt} : Int := \(w_2_0 \+ (w_\d+_0)\)', body).group(1)
     st = f'LoopState {q} {qp} {mp}'
+    # `inst`: `qp` is the decoding ring `R i0` of instance `i0 < 8` (`hi0`), laid out by `layoutR`.
+    hi0 = '[Fact (i0 < 8)] ' if inst else ''
+    get_layout = '  obtain ⟨L, hL, hLx, -, hLd⟩ := layoutR i0 hi0\n' if inst else ''
+    layout_args = 'L hL hLx' if inst else f'{layout} {hlayout} rfl'
+    side = '(by inst_num) (by inst_num)' if inst else '(by norm_num) (by norm_num)'
+    step_hi0 = ''
     args = extra_args + ' ' if extra_args else ''
     text = f'''
 /-- The error bound added by one branch of the LUT `{tag}`. -/
@@ -40,7 +46,7 @@ set_option maxRecDepth 65536 in
 /-- One iteration of the LUT loop `{tag}` adds branch `i` to the accumulated relation and carries
 the switching ciphertext of branch `i + 1`. -/
 theorem lutStep{tag} {{model : HashModel}} {{key : ByteArray}} {{sm sp μ : ErrorPoly N}}
-    (hsm : polyNorm sm ≤ 1)
+    {hi0}(hsm : polyNorm sm ≤ 1)
     {{g' : ExactMatrix {qp} N 1 {m}}} {{g : ExactMatrix {q} N 1 {m}}}
     (hg' : gadgetMatrixRuns Backend.backend 32768 {m} g') (hg : centeredRebaseRuns g' g)
     {{c : Fin 2 → ExactMatrix {q} N 1 {m}}} {{A : Fin 2 → Fin 2 → ExactMatrix {q} N 1 {m}}} {{B : Nat}}
@@ -62,7 +68,7 @@ theorem lutStep{tag} {{model : HashModel}} {{key : ByteArray}} {{sm sp μ : Erro
     Rel sm next.key (T + branchTarget (q := {q}) (p := {p}) μ sp fam ⟨i, by omega⟩) next.row
         (Bs + lutBranchBound{tag} B Bh) ∧
       next.switch = fun k j ↦ fam k j ⟨i + 1, by omega⟩ := by
-{d}  have hidx : w_2_0 = Int.ofNat i := rfl
+{get_layout}{d}  have hidx : w_2_0 = Int.ofNat i := rfl
   have hnext : {nxt} = Int.ofNat (i + 1) := by
     simp only [{nxt}, {one}, w_2_0, Int.ofNat_eq_natCast]; push_cast; ring
   rw [hidx] at {" ".join(help_gets)}
@@ -80,8 +86,8 @@ theorem lutStep{tag} {{model : HashModel}} {{key : ByteArray}} {{sm sp μ : Erro
     · exact (hashSample_eq h12_0).symm
   simp only [hAd] at hhelp'
   have hbranch := lut_branch (n := N) (q := {q}) (q' := {qp}) (p := {p}) (m := {m}) (m' := {mp})
-    (log := 3) (bound := {bound}) (index := sigma i) hN hpow {qeq} (by norm_num) (by norm_num)
-    {layout} {hlayout} rfl hg' hg hsm
+    (log := 3) (bound := {bound}) (index := sigma i) hN hpow {qeq} {side}
+    {layout_args} hg' hg hsm
     henc h16_0 h18_0 h20_0 h23_0 h25_0 h27_0 h18_0_1 h21_0 h25_0_1 h28_0 h29_0
     (bsw := state.switch) (Xb := ![w_32_0, w_51_0])
     (fun j ↦ by fin_cases j; exacts [h32_0, h51_0])
@@ -114,7 +120,7 @@ theorem lutStep{tag} {{model : HashModel}} {{key : ByteArray}} {{sm sp μ : Erro
 /-- The generated loop `{tag}` accumulates the first `count` branches and carries the switching
 ciphertext of branch `count`. -/
 theorem lutLoop{tag} {{model : HashModel}} {{key : ByteArray}} {{sm sp μ : ErrorPoly N}}
-    (hsm : polyNorm sm ≤ 1)
+    {hi0}(hsm : polyNorm sm ≤ 1)
     {{g' : ExactMatrix {qp} N 1 {m}}} {{g : ExactMatrix {q} N 1 {m}}}
     (hg' : gadgetMatrixRuns Backend.backend 32768 {m} g') (hg : centeredRebaseRuns g' g)
     {{c : Fin 2 → ExactMatrix {q} N 1 {m}}} {{A : Fin 2 → Fin 2 → ExactMatrix {q} N 1 {m}}} {{B : Nat}}
@@ -152,12 +158,17 @@ theorem lutLoop{tag} {{model : HashModel}} {{key : ByteArray}} {{sm sp μ : Erro
       fin_cases k <;> fin_cases j <;> rfl
   · intro i current next hinv hbody hk
     obtain ⟨hrel, hsw⟩ := hinv (by omega)
-    obtain ⟨hrel', hsw'⟩ := lutStep{tag} hsm hg' hg henc hhelp (by omega) hsw hrel hbody
+    obtain ⟨hrel', hsw'⟩ := lutStep{tag}{step_hi0} hsm hg' hg henc hhelp (by omega) hsw hrel hbody
     refine ⟨?_, hsw'⟩
     rw [Finset.sum_range_succ, lutBranchTarget, dif_pos (by omega), add_mul, one_mul]
     exact hrel'
 '''
 
+    if inst:
+        # The bound depends on the instance's dropped prime.
+        text = text.replace(f'abbrev lutBranchBound{tag} (B Bh : Nat)',
+                            f'abbrev lutBranchBound{tag} (i0 : Nat) (B Bh : Nat)')
+        text = re.sub(rf'\blutBranchBound{tag} (?!\(i0)', f'lutBranchBound{tag} i0 ', text)
     if width == 2:
         text = text.replace('Fin 4', 'Fin 2').replace('sigma_odd', 'sigma2_odd')
         text = re.sub(r'\bsigma\b', 'sigma2', text)
@@ -165,6 +176,21 @@ theorem lutLoop{tag} {{model : HashModel}} {{key : ByteArray}} {{sm sp μ : Erro
         text = text.replace('branchTarget (', 'branchTarget2 (')
         text = text.replace('i < 3', 'i < 1').replace('≤ 3', '≤ 1')
     return text
+
+def inst_layout(text, layout, hlayout):
+    """The layout arguments `layout hlayout rfl` of the decoding ring as those of instance `i0`
+    (`L hL hLx`, obtained from `layoutR` at the start of each proof that uses them)."""
+    out = []
+    for block in re.split(r'(?=^(?:set_option[^\n]*\n)*(?:/--[^\n]*\n)?theorem )', text, flags=re.M):
+        pattern = rf'{re.escape(layout)}\s+{re.escape(hlayout)}\s+rfl\b'
+        if re.search(pattern, block):
+            # the digit count equation that follows the layout (`m = 1 * layout.digitCount`)
+            block = re.sub(pattern + r'(\s+)rfl\b', r'L hL hLx\1(by rw [hLd])', block)
+            block = re.sub(pattern, 'L hL hLx', block)
+            block = block.replace(':= by\n', ':= by\n  obtain ⟨L, hL, hLx, -, hLd⟩ := layoutR i0 hi0\n', 1)
+        out.append(block)
+    return ''.join(out)
+
 
 def extra_binders(extra_args):
     return ' '.join(f'{{{x} : Nat}}' for x in extra_args.split()) if extra_args else ''
@@ -255,7 +281,7 @@ def branch_call(r, sigma3_help):
 
 
 def member_lut(path, ns, k, kind, q, qp, p, m, mp, layout, hlayout, qeq, level, scale=None,
-               table=None, offset=False):
+               table=None, offset=False, inst=False):
     """The LUT of member `o` in the parallel `parallel_generatedRoot_<k>` (loop
     `sequential_parallel_generatedRoot_<k>_<l>`): `kind = 'round'` (with the move down to `qp`,
     the output scale `scale` and the table `table`) or `'branches'` (before the move down, plus
@@ -280,7 +306,7 @@ def member_lut(path, ns, k, kind, q, qp, p, m, mp, layout, hlayout, qeq, level, 
     tag = str(k)
     level = int(re.search(r'\(\[\.u64Le \((\d+)\), \.integer', atom[hashes[0]]).group(1))
     loops = loop_lemmas(path, ns, loop, tag, q, qp, p, m, mp, layout, hlayout, qeq, level, 16384,
-                        extra_args='o')
+                        extra_args='o', inst=inst)
     dd = destruct(path, ns, name, 'h')
     off_bind = ' {off : Blocks ' + q + f' {mp}' + '}' if offset else ''
     off_in = ', off.1, off.2.1, off.2.2.1, off.2.2.2.1, off.2.2.2.2.1, off.2.2.2.2.2.1' if offset else ''
@@ -294,7 +320,7 @@ def member_lut(path, ns, k, kind, q, qp, p, m, mp, layout, hlayout, qeq, level, 
     head = f'''
 set_option maxHeartbeats 64000000 in
 set_option maxRecDepth 65536 in
-theorem lut{tag} {{model : HashModel}} {{key : ByteArray}} {{params}} {{o : Nat}}
+theorem lut{tag} {{model : HashModel}} {{key : ByteArray}} {{params}} {{o : Nat}}{' [Fact (i0 < 8)]' if inst else ''}
     {{fam00 fam01 fam10 fam11 : Fin 4 → ExactMatrix {qp} N 1 {mp}}} {{h0 h1 : Fin 4 → ExactMatrix {q} N 1 {m}}}
     {{c0 A00 A10 c1 A01 A11 : ExactMatrix {q} N 1 {m}}}{off_bind} {{outputs : Blocks {qp if kind != 'branches' else q} {1 if kind == 'smudge' else mp}}}
     (h : {ns}.{name} Backend.backend model params o
@@ -357,7 +383,7 @@ theorem lut{tag} {{model : HashModel}} {{key : ByteArray}} {{params}} {{o : Nat}
       ((3 * lutBranchBound{tag} B Bh + (({m} + {m}) * N * Bh * 16384 + ({m} + {m}) * N * B * 16384 +
         (N * 1 * ({p} / 2) + {p} / 2))){" + Boff" if offset else ""}) := by'''
     proof = f'''
-{dd}  obtain ⟨_, hwa⟩ := familyGet_eq (k := 0) {init_gets[0]}
+{'  obtain ⟨L, hL, hLx, -, hLd⟩ := layoutR i0 hi0' + chr(10) if inst else ''}{dd}  obtain ⟨_, hwa⟩ := familyGet_eq (k := 0) {init_gets[0]}
   obtain ⟨_, hwb⟩ := familyGet_eq (k := 0) {init_gets[1]}
   obtain ⟨_, hwc⟩ := familyGet_eq (k := 0) {init_gets[2]}
   obtain ⟨_, hwd⟩ := familyGet_eq (k := 0) {init_gets[3]}
@@ -423,7 +449,7 @@ theorem lut{tag} {{model : HashModel}} {{key : ByteArray}} {{params}} {{o : Nat}
                    and (re.search(rf'{row}$', atom[x]) or re.search(rf'{row[:-2]}_concat_\d+$', atom[x]))]
         weights = [w_ for w_ in re.findall(r'concatColumns (w_\d+_0|w_\d+_concat_\d+) (w_\d+_0)', ' '.join(atom[x] for x in concats))]
         firsts = [weights[0][0]] + [b_ for _, b_ in weights]
-        consts = [re.search(r'\[\((\d+)\)\]', lets[x]).group(1) for x in firsts]
+        consts = [re.search(r'matrixPolynomial \[\((.+?)\)\] :', lets[x]).group(1) for x in firsts]
         fdiv = next(x for x in lets if lets[x].startswith('(Int.fdiv ((Int.ofNat'))
         monos = [x for x in lets if re.match(rf'MxxRuntime\.multiplyMonomial \S+ {fdiv}$', lets[x])]
         placed = monos + [re.match(r'MxxRuntime\.multiplyMonomial (\S+) ', lets[x]).group(1) for x in monos]
@@ -478,5 +504,14 @@ theorem lut{tag} {{model : HashModel}} {{key : ByteArray}} {{params}} {{o : Nat}
     | (funext j; fin_cases j <;> rfl)
 '''
     if kind == 'smudge':
-        loops = f"\n/-- The digit weights of the smudge LUT `{tag}`. -/\ndef smudgeWeight{tag} : Fin 20 → Int := ![{', '.join(consts)}]\n" + loops
-    return loops + head + proof
+        weight_binder = ' (i0 : Nat)' if any('i0' in c for c in consts) else ''
+        loops = f"\n/-- The digit weights of the smudge LUT `{tag}`. -/\ndef smudgeWeight{tag}{weight_binder} : Fin 20 → Int := ![{', '.join(consts)}]\n" + loops
+    out = head + proof
+    if inst and kind == 'smudge' and weight_binder:
+        out = re.sub(rf'\bsmudgeWeight{tag}\b(?! i0)', f'smudgeWeight{tag} i0', out)
+        out = out.replace(f'smudgeWeight{tag} i0]', f'smudgeWeight{tag}]')
+    if inst:
+        # The instance's ring: its layout from `layoutR`, its facts from the certificates.
+        out = out.replace(f'{layout} {hlayout} rfl', 'L hL hLx').replace('(by norm_num)', '(by inst_num)')
+        out = re.sub(rf'\blutBranchBound{tag} (?!i0)', f'lutBranchBound{tag} i0 ', out)
+    return loops + out

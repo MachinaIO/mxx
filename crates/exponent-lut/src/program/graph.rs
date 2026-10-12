@@ -68,7 +68,7 @@ pub fn family_of_fields<T: mxx_dsl::GraphValue>(
     count: IntExpr,
     fields: &[ValueHandle],
 ) -> Result<mxx_dsl::Family<T>, mxx_dsl::DslError> {
-    let schema = mxx_dsl::FamilyType { element: element.schema(), count };
+    let schema = mxx_dsl::FamilyType { element: element.schema(), count, member_slot: None };
     <mxx_dsl::Family<T> as mxx_dsl::GraphValue>::from_values(&schema, fields)
 }
 

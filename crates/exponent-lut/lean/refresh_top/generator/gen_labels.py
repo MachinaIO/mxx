@@ -34,7 +34,7 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
         if not m:
             continue
         k = m.group(1)
-        q = short(re.search(rf'def parallel_generatedRoot_{k} .*?\(outputs : Mxx\.Primitives\.ExactMatrix (\d+) ', text).group(1), ab)
+        q = short(re.search(rf'def parallel_generatedRoot_{k} .*?\(outputs : Mxx\.Primitives\.ExactMatrix (\w+) ', text).group(1), ab)
         out.append(f'''
 theorem labelPay{k} {{model : HashModel}} {{params : {ns}.Params}} (i : Fin 5)
     {{out : ExactMatrix {q} N 1 1}}

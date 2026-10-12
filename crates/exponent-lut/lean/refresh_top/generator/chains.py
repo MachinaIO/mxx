@@ -26,7 +26,17 @@ CHAINS = {
 }
 
 
+# Instance `I` of the merged stages (`i0 < 8`, chain `i0 / 2`): the constants of `TopTables.lean`.
+# Integer constants are their tables (as the stages compute with them); natural numbers the moduli.
+INSTANCE = dict(R='(R i0)', hlayoutR='(layoutR i0 hi0)', qc='(qc i0)', Qq='(QqZ (i0 : Int))',
+                cp='(cpZ (i0 : Int))', kdiv='(kdiv i0)', k3='(k3Z (i0 : Int))', k1='(k1Z (i0 : Int))',
+                h='(hmZ (i0 : Int))', Mx='(Mx i0)', hlayoutX='(layoutMx i0 hi0)', p='(pp i0)',
+                half='(halfZ (i0 : Int))')
+
+
 def chain_of(part):
+    if part == 'I':
+        return INSTANCE
     return CHAINS[int(part.split('_')[0])]
 
 

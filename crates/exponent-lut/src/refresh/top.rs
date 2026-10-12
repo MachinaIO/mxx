@@ -178,7 +178,7 @@ impl TopRefreshDeclaration {
                     layouts.mask.clone(),
                     layouts.fresh[component].clone(),
                     smudges,
-                    [matrix_tag.as_slice(), &[component as u8]].concat(),
+                    matrix_tag.clone(),
                     spec,
                 )?);
             }

@@ -12,8 +12,11 @@ from gen_part import parts_of
 from patterns import destruct_inline, parse_inline
 from segment import abbreviations, short
 from layouts import layouts
+from ids import online, pre
 
 LAYOUT = {ring: (lay, 'layout' + ring) for ring, lay in layouts(sys.argv[1]).items()}
+# the decoding ring of instance `I` (laid out by `layoutR`, see `view.instance_names`)
+LAYOUT['Ri0'] = LAYOUT['Q1']
 LUT_A = '[114, 110, 115, 45, 98, 103, 103, 47, 108, 117, 116, 45, 97]'
 
 
@@ -423,7 +426,9 @@ theorem keyRound{k} {{model : HashModel}} {{key : ByteArray}} {{params : {ns}.Pa
     return head + proof
 
 
-def pre_par(part, d, k, kind, ab, weights='smudgeWeight560'):
+def pre_par(part, d, k, kind, ab, weights=None):
+    # every decoder's smudge digits have the weights of decoder `0`'s LUT
+    weights = weights or f'smudgeWeight{online(560, part)}'
     """The keys the preprocessing computes in its LUT parallel `parallel_generatedRoot_<k>`."""
     from patterns import destruct, parse
     ns = f'Stage_preprocess_{part}'
@@ -556,17 +561,17 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
             obodies.append(nm)
     for nm in obodies:
         out.append(on_step(part, d, nm, ab))
-    out.append(on_round(part, d, 121, 'round', ab))
-    out.append(on_round(part, d, 392, 'round', ab))
-    out.append(on_round(part, d, 393, 'branches', ab))
-    out.append(on_round(part, d, 312, 'offset', ab))
-    out.append(pre_par(part, d, 42, 'round', ab))
-    out.append(pre_par(part, d, 217, 'round', ab))
-    out.append(pre_par(part, d, 219, 'branches', ab))
-    out.append(pre_par(part, d, 152, 'offset', ab))
+    out.append(on_round(part, d, online(121, part), 'round', ab))
+    out.append(on_round(part, d, online(392, part), 'round', ab))
+    out.append(on_round(part, d, online(393, part), 'branches', ab))
+    out.append(on_round(part, d, online(312, part), 'offset', ab))
+    out.append(pre_par(part, d, pre(42, part), 'round', ab))
+    out.append(pre_par(part, d, pre(217, part), 'round', ab))
+    out.append(pre_par(part, d, pre(219, part), 'branches', ab))
+    out.append(pre_par(part, d, pre(152, part), 'offset', ab))
     for nm in bodies:
         mm = re.match(r'sequential_parallel_generatedRoot_(\d+)_10$', nm)
-        if mm and int(mm.group(1)) not in (42, 217, 219, 152):
+        if mm and int(mm.group(1)) not in [pre(k, part) for k in (42, 217, 219, 152)]:
             out.append(pre_par(part, d, int(mm.group(1)), 'smudge', ab))
     smudge_text = open(f'{d}/Part_{part}_Smudge.lean').read()
     for k in re.findall(r'theorem lut(\d+) ', smudge_text):

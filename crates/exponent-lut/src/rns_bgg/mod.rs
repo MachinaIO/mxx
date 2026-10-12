@@ -74,25 +74,27 @@ fn decoder_commitment_hex(commitment: [u8; 32]) -> String {
     commitment.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// `decoder/<commitment>/<role>`: the namespace of every artifact of one
-/// decoder declaration.
-pub(crate) fn decoder_artifact_name(commitment: [u8; 32], role: &str) -> String {
-    format!("decoder/{}/{role}", decoder_commitment_hex(commitment))
+/// `decoder/<key>/<role>`: the namespace of every artifact of one decoder
+/// declaration (`key` its [`DecoderDeclaration::artifact_key`]).
+///
+/// [`DecoderDeclaration::artifact_key`]: crate::decoder::decoding::DecoderDeclaration::artifact_key
+pub(crate) fn decoder_artifact_name(key: &str, role: &str) -> String {
+    format!("decoder/{key}/{role}")
 }
 
-/// `decoder/<commitment>/smudge/<role>`: an artifact of the decoder's smudge
+/// `decoder/<key>/smudge/<role>`: an artifact of the decoder's smudge
 /// Program child.
-pub(crate) fn decoder_smudge_artifact_name(commitment: [u8; 32], role: &str) -> String {
-    decoder_artifact_name(commitment, &format!("smudge/{role}"))
+pub(crate) fn decoder_smudge_artifact_name(key: &str, role: &str) -> String {
+    decoder_artifact_name(key, &format!("smudge/{role}"))
 }
 
 /// The public-key artifact `port` of smudge Program input `wire`.
 pub(crate) fn decoder_smudge_input_key_artifact_name(
-    commitment: [u8; 32],
+    key: &str,
     wire: WireId,
     port: usize,
 ) -> String {
-    decoder_smudge_artifact_name(commitment, &format!("input-key/{wire:?}.{port}"))
+    decoder_smudge_artifact_name(key, &format!("input-key/{wire:?}.{port}"))
 }
 
 /// Build the canonical path of the switching ciphertexts of LUT `lut`
@@ -1565,6 +1567,13 @@ pub(crate) fn ciphertext_matrix(
         target.1 - prefix * top.1.clone() + error.1,
     );
     Ok((top, bottom))
+}
+
+/// Push a 32-byte digest to `tag` as one decimal integer component.
+pub(crate) fn push_digest(tag: &mut mxx_dsl::HashTag, digest: &[u8]) {
+    let value = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, digest);
+    tag.push_decimal(mxx_dsl::Int::evaluate(IntExpr::Const(value)))
+        .expect("a constant is a compile-time integer");
 }
 
 /// Hash tag of the public digit-companion keys `B_{a,j}` of one Dynamic RHS

@@ -56,7 +56,12 @@ def rhs(part, d, k, ab):
     Qt = re.match(r'ExactMatrix (\S+) ', types[sec]).group(1)
     gad = WIRE.findall(atom[producer(hw)])[0]
     gq, gw = re.match(r'ExactMatrix (\S+) \d+ 1 (\d+)', types[gad]).groups()
-    tag = re.search(r'hashSample \(hashModel\) \((\[[^\]]*\])\)', atom[producer(top0)]).group(1)
+    # the tag: its prefix and the components before `member` (an instance's digests)
+    mt = re.search(r'hashSample \(hashModel\) \((\[[^\]]*\])\) \(\[(.*?)\.bytes \[109, 101, 109, 98, 101, 114\]',
+                   atom[producer(top0)])
+    pre = mt.group(2).strip().rstrip(',').strip()
+    tag = f'(completeHashTag {mt.group(1)} [{pre}])' if pre else mt.group(1)
+    tag_rw = 'rw [rhsTop_tag]; ' if pre else ''
     dd = destruct_inline(path, ns, name, 'h')
     inputs = re.search(r'\(inputs : (.*?)\) \(outputs', text[i:i + 4000]).group(1)
     nin = inputs.count(' × ')
@@ -121,8 +126,8 @@ theorem preTop{k} {{model : HashModel}} {{params : {ns}.Params}} {{i : Nat}} {{x
 {dd}  subst hout
   funext j
   fin_cases j
-  · exact hashSample_eq {producer(top0)}
-  · exact hashSample_eq {producer(top1)}
+  · {tag_rw}exact hashSample_eq {producer(top0)}
+  · {tag_rw}exact hashSample_eq {producer(top1)}
 """
 
 

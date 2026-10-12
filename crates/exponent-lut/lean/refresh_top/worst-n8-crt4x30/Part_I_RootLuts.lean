@@ -1,0 +1,607 @@
+import TopLut2
+import TopInst
+
+/-! The LUT loops of the online root: the source LUT and the two LUTs of the mask's binary offset
+(written by `generator/gen_root_luts.py`). -/
+
+namespace RefreshTopProof.Part_I
+
+open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
+
+/-- The error bound added by one branch of the LUT `18`. -/
+abbrev lutBranchBound18 (i0 : Nat) (B Bh : Nat) : Nat :=
+  (6 + 6) * N * Bh * 16384 + (6 + 6) * N * B * 16384 + (N * 1 * ((qd i0) / 2) + (qd i0) / 2)
+
+set_option maxHeartbeats 16000000 in
+set_option maxRecDepth 65536 in
+/-- One iteration of the LUT loop `18` adds branch `i` to the accumulated relation and carries
+the switching ciphertext of branch `i + 1`. -/
+theorem lutStep18 {i0 : Nat} {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
+    [Fact (i0 < 8)] (hsm : polyNorm sm ≤ 1)
+    {g' : ExactMatrix (R i0) N 1 6} {g : ExactMatrix Q0 N 1 6}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 6 g') (hg : centeredRebaseRuns g' g)
+    {c : Fin 2 → ExactMatrix Q0 N 1 6} {A : Fin 2 → Fin 2 → ExactMatrix Q0 N 1 6} {B : Nat}
+    (henc : Rel sm A (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) * μ * unitPair sp j) • g) c B)
+    {h0 h1 : Fin 2 → ExactMatrix Q0 N 1 6} {Bh : Nat}
+    (hhelp : ∀ i : Fin 2, Rel sm (lutA model key Q0 6 0 (sigma2 i))
+      (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) *
+        unitPair (substitution (sigma2 i).toNat (sigma2_odd i) sm) j) • g) ![h0 i, h1 i] Bh)
+    {fam : Fin 2 → Fin 2 → Fin 2 → ExactMatrix (R i0) N 1 4}
+    {i : Nat} (hi : i < 1) {state next : LoopState Q0 (R i0) 4}
+    (hswitch : state.switch = fun k j ↦ fam k j ⟨i, by omega⟩)
+    {T : Fin 2 → ExactMatrix Q0 N 1 4} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
+    {params} 
+    (hbody : Stage_online_eval.sequential_parallel_generatedRoot_290_18 Backend.backend model params i0 i
+      (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
+        state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
+        state.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0, c 1, A 0 1, A 1 1, fam 0 0,
+        fam 0 1, fam 1 0, fam 1 1, ()) next) :
+    Rel sm next.key (T + branchTarget2 (q := Q0) (p := (qd i0)) μ sp fam ⟨i, by omega⟩) next.row
+        (Bs + lutBranchBound18 i0 B Bh) ∧
+      next.switch = fun k j ↦ fam k j ⟨i + 1, by omega⟩ := by
+  obtain ⟨L, hL, hLx, -, hLd⟩ := layoutR i0 hi0
+  unfold Stage_online_eval.sequential_parallel_generatedRoot_290_18 at hbody
+  extract_lets -merge _params _backend w_0_0 w_48_0 w_67_0 w_70_0 w_73_0 w_76_0 w_30_0 w_49_0 w_31_0 w_50_0 w_1_0 w_4_0 w_9_0 w_15_0 w_17_0 w_19_0 w_22_0 w_24_0 w_26_0 w_79_0 w_83_0 w_85_0 w_87_0 w_2_0 w_5_0 w_80_0 w_81_0 at hbody
+  obtain ⟨w_3_0, hbody⟩ := hbody
+  obtain ⟨w_6_0, hbody⟩ := hbody
+  obtain ⟨w_7_0, hbody⟩ := hbody
+  obtain ⟨w_8_0, hbody⟩ := hbody
+  obtain ⟨w_8_concat_1, hbody⟩ := hbody
+  obtain ⟨w_10_0, hbody⟩ := hbody
+  obtain ⟨w_11_0, hbody⟩ := hbody
+  obtain ⟨w_12_0, hbody⟩ := hbody
+  obtain ⟨w_13_0, hbody⟩ := hbody
+  obtain ⟨w_13_concat_1, hbody⟩ := hbody
+  obtain ⟨w_14_0, hbody⟩ := hbody
+  obtain ⟨w_16_0, hbody⟩ := hbody
+  obtain ⟨w_18_0, hbody⟩ := hbody
+  obtain ⟨w_20_0, hbody⟩ := hbody
+  obtain ⟨w_21_0, hbody⟩ := hbody
+  obtain ⟨w_21_concat_1, hbody⟩ := hbody
+  obtain ⟨w_23_0, hbody⟩ := hbody
+  obtain ⟨w_25_0, hbody⟩ := hbody
+  obtain ⟨w_27_0, hbody⟩ := hbody
+  obtain ⟨w_28_0, hbody⟩ := hbody
+  obtain ⟨w_28_concat_1, hbody⟩ := hbody
+  obtain ⟨w_29_0, hbody⟩ := hbody
+  obtain ⟨w_32_0, hbody⟩ := hbody
+  obtain ⟨w_33_0, hbody⟩ := hbody
+  obtain ⟨w_34_0, hbody⟩ := hbody
+  extract_lets -merge w_35_0 at hbody
+  obtain ⟨w_36_0, hbody⟩ := hbody
+  obtain ⟨w_37_0, hbody⟩ := hbody
+  obtain ⟨w_38_0, hbody⟩ := hbody
+  obtain ⟨w_39_0, hbody⟩ := hbody
+  obtain ⟨w_40_0, hbody⟩ := hbody
+  obtain ⟨w_41_0, hbody⟩ := hbody
+  obtain ⟨w_42_0, hbody⟩ := hbody
+  extract_lets -merge w_43_0 at hbody
+  obtain ⟨w_44_0, hbody⟩ := hbody
+  obtain ⟨w_45_0, hbody⟩ := hbody
+  extract_lets -merge w_46_0 w_47_0 at hbody
+  obtain ⟨w_51_0, hbody⟩ := hbody
+  obtain ⟨w_52_0, hbody⟩ := hbody
+  obtain ⟨w_53_0, hbody⟩ := hbody
+  extract_lets -merge w_54_0 at hbody
+  obtain ⟨w_55_0, hbody⟩ := hbody
+  obtain ⟨w_56_0, hbody⟩ := hbody
+  obtain ⟨w_57_0, hbody⟩ := hbody
+  obtain ⟨w_58_0, hbody⟩ := hbody
+  obtain ⟨w_59_0, hbody⟩ := hbody
+  obtain ⟨w_60_0, hbody⟩ := hbody
+  obtain ⟨w_61_0, hbody⟩ := hbody
+  extract_lets -merge w_62_0 at hbody
+  obtain ⟨w_63_0, hbody⟩ := hbody
+  obtain ⟨w_64_0, hbody⟩ := hbody
+  extract_lets -merge w_65_0 w_66_0 at hbody
+  obtain ⟨w_68_0, hbody⟩ := hbody
+  extract_lets -merge w_69_0 at hbody
+  obtain ⟨w_71_0, hbody⟩ := hbody
+  extract_lets -merge w_72_0 at hbody
+  obtain ⟨w_74_0, hbody⟩ := hbody
+  extract_lets -merge w_75_0 at hbody
+  obtain ⟨w_77_0, hbody⟩ := hbody
+  extract_lets -merge w_78_0 at hbody
+  obtain ⟨w_82_0, hbody⟩ := hbody
+  obtain ⟨w_84_0, hbody⟩ := hbody
+  obtain ⟨w_86_0, hbody⟩ := hbody
+  obtain ⟨w_88_0, hbody⟩ := hbody
+  simp only [Stage_online_eval.sequential_parallel_generatedRoot_290_18.constraints_0, Stage_online_eval.sequential_parallel_generatedRoot_290_18.constraints_1, Stage_online_eval.sequential_parallel_generatedRoot_290_18.constraints_2, Stage_online_eval.sequential_parallel_generatedRoot_290_18.constraints_3, Stage_online_eval.sequential_parallel_generatedRoot_290_18.constraints_4] at hbody
+  obtain ⟨h2_0, h2_0_1, h3_0, -, -, h6_0, h7_0, h6_0_1, h8_0, h2_0_2, h2_0_3, h10_0, h11_0, h12_0, h11_0_1, h13_0, h14_0, -, -, h16_0, -, -, h18_0, -, -, h20_0, h18_0_1, h21_0, -, -, h23_0, -, -, h25_0, -, -, h27_0, h25_0_1, h28_0, h29_0, h32_0, h33_0, h34_0, -, -, -, -, -, -, h36_0, h37_0, -, -, -, -, -, -, h38_0, h39_0, h40_0, h41_0, h42_0, -, -, -, -, -, -, h44_0, -, -, -, -, -, -, h45_0, h51_0, h52_0, h53_0, -, -, -, -, -, -, h55_0, h56_0, -, -, -, -, -, -, h57_0, h58_0, h59_0, h60_0, h61_0, -, -, -, -, -, -, h63_0, -, -, -, -, -, -, h64_0, -, -, -, -, -, -, h68_0, -, -, -, -, -, -, h71_0, -, -, -, -, -, -, h74_0, -, -, -, -, -, -, h77_0, h81_0, h81_0_1, h82_0, h81_0_2, h81_0_3, h84_0, h81_0_4, h81_0_5, h86_0, h81_0_6, h81_0_7, h88_0, hout⟩ := hbody
+  have hidx : w_2_0 = Int.ofNat i := rfl
+  have hnext : w_81_0 = Int.ofNat (i + 1) := by
+    simp only [w_81_0, w_80_0, w_2_0, Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at h3_0 h10_0
+  rw [hnext] at h82_0 h84_0 h86_0 h88_0
+  obtain ⟨_, hw3⟩ := familyGet_eq h3_0
+  obtain ⟨_, hw10⟩ := familyGet_eq h10_0
+  obtain ⟨_, hs0⟩ := familyGet_eq h82_0
+  obtain ⟨_, hs1⟩ := familyGet_eq h84_0
+  obtain ⟨_, hs2⟩ := familyGet_eq h86_0
+  obtain ⟨_, hs3⟩ := familyGet_eq h88_0
+  subst hw3 hw10
+  have hhelp' := hhelp ⟨i, by omega⟩
+  have hAd : lutA model key Q0 6 0 (sigma2 i) = ![![w_6_0, w_11_0], ![w_7_0, w_12_0]] := by
+    funext k j
+    fin_cases k <;> fin_cases j
+    · exact (hashSample_eq h6_0).symm
+    · exact (hashSample_eq h11_0).symm
+    · exact (hashSample_eq h7_0).symm
+    · exact (hashSample_eq h12_0).symm
+  simp only [hAd] at hhelp'
+  have hbranch := lut_branch (n := N) (q := Q0) (q' := (R i0)) (p := (qd i0)) (m := 6) (m' := 4)
+    (log := 3) (bound := 16384) (index := sigma2 i) hN hpow (q0_eqR i0 hi0) (by inst_num) (by inst_num)
+    L hL hLx hg' hg hsm
+    henc h16_0 h18_0 h20_0 h23_0 h25_0 h27_0 h18_0_1 h21_0 h25_0_1 h28_0 h29_0
+    (bsw := state.switch) (Xb := ![w_32_0, w_51_0])
+    (fun j ↦ by fin_cases j; exacts [h32_0, h51_0])
+    (D' := ![w_33_0, w_52_0]) (fun j ↦ by fin_cases j; exacts [h33_0, h52_0])
+    (D := ![w_34_0, w_53_0]) (fun j ↦ by fin_cases j; exacts [h34_0, h53_0])
+    (M := ![![w_36_0, w_55_0], ![w_38_0, w_57_0]])
+    (fun j ↦ by fin_cases j; exacts [h36_0, h55_0]) (fun j ↦ by fin_cases j; exacts [h38_0, h57_0])
+    (Asw := ![![w_37_0, w_56_0], ![w_39_0, w_58_0]])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h37_0, h56_0, h39_0, h58_0])
+    (Z := ![w_40_0, w_59_0]) (fun j ↦ by fin_cases j; exacts [h40_0, h59_0])
+    (E' := ![w_41_0, w_60_0]) (fun j ↦ by fin_cases j; exacts [h41_0, h60_0])
+    (E := ![w_42_0, w_61_0]) (fun j ↦ by fin_cases j; exacts [h42_0, h61_0])
+    (h := ![_, _]) (sigma2_odd ⟨i, by omega⟩) hhelp' h6_0_1 h8_0 h11_0_1 h13_0 h14_0
+    (Y := ![w_44_0, w_63_0]) (X := ![w_45_0, w_64_0])
+    (K := ![![w_68_0, w_71_0], ![w_74_0, w_77_0]])
+    (fun j ↦ by fin_cases j; exacts [h44_0, h63_0]) (fun j ↦ by fin_cases j; exacts [h45_0, h64_0])
+    (fun j ↦ by fin_cases j; exacts [h68_0, h71_0]) (fun j ↦ by fin_cases j; exacts [h74_0, h77_0])
+  subst hout
+  rw [hswitch] at hbranch
+  refine ⟨?_, ?_⟩
+  · convert hstate.add hbranch using 1
+    · funext k j
+      fin_cases k <;> fin_cases j <;> rfl
+    · funext j
+      fin_cases j <;> rfl
+  · funext k j
+    fin_cases k <;> fin_cases j
+    exacts [hs0, hs1, hs2, hs3]
+
+/-- The generated loop `18` accumulates the first `count` branches and carries the switching
+ciphertext of branch `count`. -/
+theorem lutLoop18 {i0 : Nat} {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
+    [Fact (i0 < 8)] (hsm : polyNorm sm ≤ 1)
+    {g' : ExactMatrix (R i0) N 1 6} {g : ExactMatrix Q0 N 1 6}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 6 g') (hg : centeredRebaseRuns g' g)
+    {c : Fin 2 → ExactMatrix Q0 N 1 6} {A : Fin 2 → Fin 2 → ExactMatrix Q0 N 1 6} {B : Nat}
+    (henc : Rel sm A (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) * μ * unitPair sp j) • g) c B)
+    {h0 h1 : Fin 2 → ExactMatrix Q0 N 1 6} {Bh : Nat}
+    (hhelp : ∀ i : Fin 2, Rel sm (lutA model key Q0 6 0 (sigma2 i))
+      (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) *
+        unitPair (substitution (sigma2 i).toNat (sigma2_odd i) sm) j) • g) ![h0 i, h1 i] Bh)
+    {fam : Fin 2 → Fin 2 → Fin 2 → ExactMatrix (R i0) N 1 4} {count : Nat} (hcount : count ≤ 1)
+    {final : LoopState Q0 (R i0) 4} {params} 
+    (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : LoopState Q0 (R i0) 4) ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_290_18 Backend.backend model params i0 i
+        (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
+          current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
+          current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0,
+          c 1, A 0 1, A 1 1, fam 0 0, fam 0 1, fam 1 0, fam 1 1, ()) next) count
+      (0, 0, 0, 0, 0, 0, fam 0 0 0, fam 0 1 0, fam 1 0 0, fam 1 1 0, ()) final) :
+    Rel sm final.key (∑ i ∈ Finset.range count, lutBranchTarget2 (q := Q0) (p := (qd i0)) μ sp fam i)
+        final.row (count * lutBranchBound18 i0 B Bh) ∧
+      final.switch = fun k j ↦ fam k j ⟨count, by omega⟩ := by
+  refine MxxIR.IterRuns.invariant
+    (Invariant := fun k (s : LoopState Q0 (R i0) 4) ↦ ∀ hk : k ≤ 1,
+      Rel sm s.key (∑ i ∈ Finset.range k, lutBranchTarget2 (q := Q0) (p := (qd i0)) μ sp fam i) s.row
+        (k * lutBranchBound18 i0 B Bh) ∧
+        s.switch = fun k' j ↦ fam k' j ⟨k, by omega⟩) ?_ ?_ hruns hcount
+  · intro _
+    refine ⟨?_, ?_⟩
+    · rw [Finset.range_zero, Finset.sum_empty, zero_mul]
+      have hrow : (![0, 0] : Fin 2 → ExactMatrix Q0 N 1 4) = 0 := by
+        funext j
+        fin_cases j <;> rfl
+      simp only [LoopState.key, LoopState.row, hrow]
+      exact Rel.zero
+    · funext k j
+      fin_cases k <;> fin_cases j <;> rfl
+  · intro i current next hinv hbody hk
+    obtain ⟨hrel, hsw⟩ := hinv (by omega)
+    obtain ⟨hrel', hsw'⟩ := lutStep18 hsm hg' hg henc hhelp (by omega) hsw hrel hbody
+    refine ⟨?_, hsw'⟩
+    rw [Finset.sum_range_succ, lutBranchTarget2, dif_pos (by omega), add_mul, one_mul]
+    exact hrel'
+
+/-- The error bound added by one branch of the LUT `186`. -/
+abbrev lutBranchBound186 (B Bh : Nat) : Nat :=
+  (8 + 8) * N * Bh * 16384 + (8 + 8) * N * B * 16384 + (N * 1 * (p4 / 2) + p4 / 2)
+
+set_option maxHeartbeats 16000000 in
+set_option maxRecDepth 65536 in
+/-- One iteration of the LUT loop `186` adds branch `i` to the accumulated relation and carries
+the switching ciphertext of branch `i + 1`. -/
+theorem lutStep186 {i0 : Nat} [Fact (i0 < 8)] {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
+    (hsm : polyNorm sm ≤ 1)
+    {g' : ExactMatrix Q0 N 1 8} {g : ExactMatrix Q5 N 1 8}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 8 g') (hg : centeredRebaseRuns g' g)
+    {c : Fin 2 → ExactMatrix Q5 N 1 8} {A : Fin 2 → Fin 2 → ExactMatrix Q5 N 1 8} {B : Nat}
+    (henc : Rel sm A (fun j ↦ reducePoly Q5 N (((p4 : Nat) : Int) * μ * unitPair sp j) • g) c B)
+    {h0 h1 : Fin 4 → ExactMatrix Q5 N 1 8} {Bh : Nat}
+    (hhelp : ∀ i : Fin 4, Rel sm (lutA model key Q5 8 2 (sigma i))
+      (fun j ↦ reducePoly Q5 N (((p4 : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g) ![h0 i, h1 i] Bh)
+    {fam : Fin 2 → Fin 2 → Fin 4 → ExactMatrix Q0 N 1 6}
+    {i : Nat} (hi : i < 3) {state next : LoopState Q5 Q0 6}
+    (hswitch : state.switch = fun k j ↦ fam k j ⟨i, by omega⟩)
+    {T : Fin 2 → ExactMatrix Q5 N 1 6} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
+    {params} 
+    (hbody : Stage_online_eval.sequential_parallel_generatedRoot_290_186 Backend.backend model params i0 i
+      (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
+        state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
+        state.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0, c 1, A 0 1, A 1 1, fam 0 0,
+        fam 0 1, fam 1 0, fam 1 1, ()) next) :
+    Rel sm next.key (T + branchTarget (q := Q5) (p := p4) μ sp fam ⟨i, by omega⟩) next.row
+        (Bs + lutBranchBound186 B Bh) ∧
+      next.switch = fun k j ↦ fam k j ⟨i + 1, by omega⟩ := by
+  unfold Stage_online_eval.sequential_parallel_generatedRoot_290_186 at hbody
+  extract_lets -merge _params _backend w_0_0 w_48_0 w_67_0 w_70_0 w_73_0 w_76_0 w_30_0 w_49_0 w_31_0 w_50_0 w_1_0 w_4_0 w_9_0 w_15_0 w_17_0 w_19_0 w_22_0 w_24_0 w_26_0 w_79_0 w_83_0 w_85_0 w_87_0 w_2_0 w_5_0 w_80_0 w_81_0 at hbody
+  obtain ⟨w_3_0, hbody⟩ := hbody
+  obtain ⟨w_6_0, hbody⟩ := hbody
+  obtain ⟨w_7_0, hbody⟩ := hbody
+  obtain ⟨w_8_0, hbody⟩ := hbody
+  obtain ⟨w_8_concat_1, hbody⟩ := hbody
+  obtain ⟨w_10_0, hbody⟩ := hbody
+  obtain ⟨w_11_0, hbody⟩ := hbody
+  obtain ⟨w_12_0, hbody⟩ := hbody
+  obtain ⟨w_13_0, hbody⟩ := hbody
+  obtain ⟨w_13_concat_1, hbody⟩ := hbody
+  obtain ⟨w_14_0, hbody⟩ := hbody
+  obtain ⟨w_16_0, hbody⟩ := hbody
+  obtain ⟨w_18_0, hbody⟩ := hbody
+  obtain ⟨w_20_0, hbody⟩ := hbody
+  obtain ⟨w_21_0, hbody⟩ := hbody
+  obtain ⟨w_21_concat_1, hbody⟩ := hbody
+  obtain ⟨w_23_0, hbody⟩ := hbody
+  obtain ⟨w_25_0, hbody⟩ := hbody
+  obtain ⟨w_27_0, hbody⟩ := hbody
+  obtain ⟨w_28_0, hbody⟩ := hbody
+  obtain ⟨w_28_concat_1, hbody⟩ := hbody
+  obtain ⟨w_29_0, hbody⟩ := hbody
+  obtain ⟨w_32_0, hbody⟩ := hbody
+  obtain ⟨w_33_0, hbody⟩ := hbody
+  obtain ⟨w_34_0, hbody⟩ := hbody
+  extract_lets -merge w_35_0 at hbody
+  obtain ⟨w_36_0, hbody⟩ := hbody
+  obtain ⟨w_37_0, hbody⟩ := hbody
+  obtain ⟨w_38_0, hbody⟩ := hbody
+  obtain ⟨w_39_0, hbody⟩ := hbody
+  obtain ⟨w_40_0, hbody⟩ := hbody
+  obtain ⟨w_41_0, hbody⟩ := hbody
+  obtain ⟨w_42_0, hbody⟩ := hbody
+  extract_lets -merge w_43_0 at hbody
+  obtain ⟨w_44_0, hbody⟩ := hbody
+  obtain ⟨w_45_0, hbody⟩ := hbody
+  extract_lets -merge w_46_0 w_47_0 at hbody
+  obtain ⟨w_51_0, hbody⟩ := hbody
+  obtain ⟨w_52_0, hbody⟩ := hbody
+  obtain ⟨w_53_0, hbody⟩ := hbody
+  extract_lets -merge w_54_0 at hbody
+  obtain ⟨w_55_0, hbody⟩ := hbody
+  obtain ⟨w_56_0, hbody⟩ := hbody
+  obtain ⟨w_57_0, hbody⟩ := hbody
+  obtain ⟨w_58_0, hbody⟩ := hbody
+  obtain ⟨w_59_0, hbody⟩ := hbody
+  obtain ⟨w_60_0, hbody⟩ := hbody
+  obtain ⟨w_61_0, hbody⟩ := hbody
+  extract_lets -merge w_62_0 at hbody
+  obtain ⟨w_63_0, hbody⟩ := hbody
+  obtain ⟨w_64_0, hbody⟩ := hbody
+  extract_lets -merge w_65_0 w_66_0 at hbody
+  obtain ⟨w_68_0, hbody⟩ := hbody
+  extract_lets -merge w_69_0 at hbody
+  obtain ⟨w_71_0, hbody⟩ := hbody
+  extract_lets -merge w_72_0 at hbody
+  obtain ⟨w_74_0, hbody⟩ := hbody
+  extract_lets -merge w_75_0 at hbody
+  obtain ⟨w_77_0, hbody⟩ := hbody
+  extract_lets -merge w_78_0 at hbody
+  obtain ⟨w_82_0, hbody⟩ := hbody
+  obtain ⟨w_84_0, hbody⟩ := hbody
+  obtain ⟨w_86_0, hbody⟩ := hbody
+  obtain ⟨w_88_0, hbody⟩ := hbody
+  simp only [Stage_online_eval.sequential_parallel_generatedRoot_290_186.constraints_0, Stage_online_eval.sequential_parallel_generatedRoot_290_186.constraints_1, Stage_online_eval.sequential_parallel_generatedRoot_290_186.constraints_2, Stage_online_eval.sequential_parallel_generatedRoot_290_186.constraints_3, Stage_online_eval.sequential_parallel_generatedRoot_290_186.constraints_4] at hbody
+  obtain ⟨h2_0, h2_0_1, h3_0, -, -, h6_0, h7_0, h6_0_1, h8_0, h2_0_2, h2_0_3, h10_0, h11_0, h12_0, h11_0_1, h13_0, h14_0, -, -, h16_0, -, -, h18_0, -, -, h20_0, h18_0_1, h21_0, -, -, h23_0, -, -, h25_0, -, -, h27_0, h25_0_1, h28_0, h29_0, h32_0, h33_0, h34_0, -, -, -, -, -, -, h36_0, h37_0, -, -, -, -, -, -, h38_0, h39_0, h40_0, h41_0, h42_0, -, -, -, -, -, -, h44_0, -, -, -, -, -, -, h45_0, h51_0, h52_0, h53_0, -, -, -, -, -, -, h55_0, h56_0, -, -, -, -, -, -, h57_0, h58_0, h59_0, h60_0, h61_0, -, -, -, -, -, -, h63_0, -, -, -, -, -, -, h64_0, -, -, -, -, -, -, h68_0, -, -, -, -, -, -, h71_0, -, -, -, -, -, -, h74_0, -, -, -, -, -, -, h77_0, h81_0, h81_0_1, h82_0, h81_0_2, h81_0_3, h84_0, h81_0_4, h81_0_5, h86_0, h81_0_6, h81_0_7, h88_0, hout⟩ := hbody
+  have hidx : w_2_0 = Int.ofNat i := rfl
+  have hnext : w_81_0 = Int.ofNat (i + 1) := by
+    simp only [w_81_0, w_80_0, w_2_0, Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at h3_0 h10_0
+  rw [hnext] at h82_0 h84_0 h86_0 h88_0
+  obtain ⟨_, hw3⟩ := familyGet_eq h3_0
+  obtain ⟨_, hw10⟩ := familyGet_eq h10_0
+  obtain ⟨_, hs0⟩ := familyGet_eq h82_0
+  obtain ⟨_, hs1⟩ := familyGet_eq h84_0
+  obtain ⟨_, hs2⟩ := familyGet_eq h86_0
+  obtain ⟨_, hs3⟩ := familyGet_eq h88_0
+  subst hw3 hw10
+  have hhelp' := hhelp ⟨i, by omega⟩
+  have hAd : lutA model key Q5 8 2 (sigma i) = ![![w_6_0, w_11_0], ![w_7_0, w_12_0]] := by
+    funext k j
+    fin_cases k <;> fin_cases j
+    · exact (hashSample_eq h6_0).symm
+    · exact (hashSample_eq h11_0).symm
+    · exact (hashSample_eq h7_0).symm
+    · exact (hashSample_eq h12_0).symm
+  simp only [hAd] at hhelp'
+  have hbranch := lut_branch (n := N) (q := Q5) (q' := Q0) (p := p4) (m := 8) (m' := 6)
+    (log := 3) (bound := 16384) (index := sigma i) hN hpow q5_eq (by inst_num) (by inst_num)
+    Backend.layout5 layoutQ0 rfl hg' hg hsm
+    henc h16_0 h18_0 h20_0 h23_0 h25_0 h27_0 h18_0_1 h21_0 h25_0_1 h28_0 h29_0
+    (bsw := state.switch) (Xb := ![w_32_0, w_51_0])
+    (fun j ↦ by fin_cases j; exacts [h32_0, h51_0])
+    (D' := ![w_33_0, w_52_0]) (fun j ↦ by fin_cases j; exacts [h33_0, h52_0])
+    (D := ![w_34_0, w_53_0]) (fun j ↦ by fin_cases j; exacts [h34_0, h53_0])
+    (M := ![![w_36_0, w_55_0], ![w_38_0, w_57_0]])
+    (fun j ↦ by fin_cases j; exacts [h36_0, h55_0]) (fun j ↦ by fin_cases j; exacts [h38_0, h57_0])
+    (Asw := ![![w_37_0, w_56_0], ![w_39_0, w_58_0]])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h37_0, h56_0, h39_0, h58_0])
+    (Z := ![w_40_0, w_59_0]) (fun j ↦ by fin_cases j; exacts [h40_0, h59_0])
+    (E' := ![w_41_0, w_60_0]) (fun j ↦ by fin_cases j; exacts [h41_0, h60_0])
+    (E := ![w_42_0, w_61_0]) (fun j ↦ by fin_cases j; exacts [h42_0, h61_0])
+    (h := ![_, _]) (sigma_odd ⟨i, by omega⟩) hhelp' h6_0_1 h8_0 h11_0_1 h13_0 h14_0
+    (Y := ![w_44_0, w_63_0]) (X := ![w_45_0, w_64_0])
+    (K := ![![w_68_0, w_71_0], ![w_74_0, w_77_0]])
+    (fun j ↦ by fin_cases j; exacts [h44_0, h63_0]) (fun j ↦ by fin_cases j; exacts [h45_0, h64_0])
+    (fun j ↦ by fin_cases j; exacts [h68_0, h71_0]) (fun j ↦ by fin_cases j; exacts [h74_0, h77_0])
+  subst hout
+  rw [hswitch] at hbranch
+  refine ⟨?_, ?_⟩
+  · convert hstate.add hbranch using 1
+    · funext k j
+      fin_cases k <;> fin_cases j <;> rfl
+    · funext j
+      fin_cases j <;> rfl
+  · funext k j
+    fin_cases k <;> fin_cases j
+    exacts [hs0, hs1, hs2, hs3]
+
+/-- The generated loop `186` accumulates the first `count` branches and carries the switching
+ciphertext of branch `count`. -/
+theorem lutLoop186 {i0 : Nat} [Fact (i0 < 8)] {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
+    (hsm : polyNorm sm ≤ 1)
+    {g' : ExactMatrix Q0 N 1 8} {g : ExactMatrix Q5 N 1 8}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 8 g') (hg : centeredRebaseRuns g' g)
+    {c : Fin 2 → ExactMatrix Q5 N 1 8} {A : Fin 2 → Fin 2 → ExactMatrix Q5 N 1 8} {B : Nat}
+    (henc : Rel sm A (fun j ↦ reducePoly Q5 N (((p4 : Nat) : Int) * μ * unitPair sp j) • g) c B)
+    {h0 h1 : Fin 4 → ExactMatrix Q5 N 1 8} {Bh : Nat}
+    (hhelp : ∀ i : Fin 4, Rel sm (lutA model key Q5 8 2 (sigma i))
+      (fun j ↦ reducePoly Q5 N (((p4 : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g) ![h0 i, h1 i] Bh)
+    {fam : Fin 2 → Fin 2 → Fin 4 → ExactMatrix Q0 N 1 6} {count : Nat} (hcount : count ≤ 3)
+    {final : LoopState Q5 Q0 6} {params} 
+    (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : LoopState Q5 Q0 6) ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_290_186 Backend.backend model params i0 i
+        (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
+          current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
+          current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0,
+          c 1, A 0 1, A 1 1, fam 0 0, fam 0 1, fam 1 0, fam 1 1, ()) next) count
+      (0, 0, 0, 0, 0, 0, fam 0 0 0, fam 0 1 0, fam 1 0 0, fam 1 1 0, ()) final) :
+    Rel sm final.key (∑ i ∈ Finset.range count, lutBranchTarget (q := Q5) (p := p4) μ sp fam i)
+        final.row (count * lutBranchBound186 B Bh) ∧
+      final.switch = fun k j ↦ fam k j ⟨count, by omega⟩ := by
+  refine MxxIR.IterRuns.invariant
+    (Invariant := fun k (s : LoopState Q5 Q0 6) ↦ ∀ hk : k ≤ 3,
+      Rel sm s.key (∑ i ∈ Finset.range k, lutBranchTarget (q := Q5) (p := p4) μ sp fam i) s.row
+        (k * lutBranchBound186 B Bh) ∧
+        s.switch = fun k' j ↦ fam k' j ⟨k, by omega⟩) ?_ ?_ hruns hcount
+  · intro _
+    refine ⟨?_, ?_⟩
+    · rw [Finset.range_zero, Finset.sum_empty, zero_mul]
+      have hrow : (![0, 0] : Fin 2 → ExactMatrix Q5 N 1 6) = 0 := by
+        funext j
+        fin_cases j <;> rfl
+      simp only [LoopState.key, LoopState.row, hrow]
+      exact Rel.zero
+    · funext k j
+      fin_cases k <;> fin_cases j <;> rfl
+  · intro i current next hinv hbody hk
+    obtain ⟨hrel, hsw⟩ := hinv (by omega)
+    obtain ⟨hrel', hsw'⟩ := lutStep186 hsm hg' hg henc hhelp (by omega) hsw hrel hbody
+    refine ⟨?_, hsw'⟩
+    rw [Finset.sum_range_succ, lutBranchTarget, dif_pos (by omega), add_mul, one_mul]
+    exact hrel'
+
+/-- The error bound added by one branch of the LUT `252`. -/
+abbrev lutBranchBound252 (i0 : Nat) (B Bh : Nat) : Nat :=
+  (6 + 6) * N * Bh * 16384 + (6 + 6) * N * B * 16384 + (N * 1 * ((qd i0) / 2) + (qd i0) / 2)
+
+set_option maxHeartbeats 16000000 in
+set_option maxRecDepth 65536 in
+/-- One iteration of the LUT loop `252` adds branch `i` to the accumulated relation and carries
+the switching ciphertext of branch `i + 1`. -/
+theorem lutStep252 {i0 : Nat} {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
+    [Fact (i0 < 8)] (hsm : polyNorm sm ≤ 1)
+    {g' : ExactMatrix (R i0) N 1 6} {g : ExactMatrix Q0 N 1 6}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 6 g') (hg : centeredRebaseRuns g' g)
+    {c : Fin 2 → ExactMatrix Q0 N 1 6} {A : Fin 2 → Fin 2 → ExactMatrix Q0 N 1 6} {B : Nat}
+    (henc : Rel sm A (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) * μ * unitPair sp j) • g) c B)
+    {h0 h1 : Fin 4 → ExactMatrix Q0 N 1 6} {Bh : Nat}
+    (hhelp : ∀ i : Fin 4, Rel sm (lutA model key Q0 6 3 (sigma i))
+      (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g) ![h0 i, h1 i] Bh)
+    {fam : Fin 2 → Fin 2 → Fin 4 → ExactMatrix (R i0) N 1 6}
+    {i : Nat} (hi : i < 3) {state next : LoopState Q0 (R i0) 6}
+    (hswitch : state.switch = fun k j ↦ fam k j ⟨i, by omega⟩)
+    {T : Fin 2 → ExactMatrix Q0 N 1 6} {Bs : Nat} (hstate : Rel sm state.key T state.row Bs)
+    {params} 
+    (hbody : Stage_online_eval.sequential_parallel_generatedRoot_290_252 Backend.backend model params i0 i
+      (state.1, state.2.1, state.2.2.1, state.2.2.2.1, state.2.2.2.2.1, state.2.2.2.2.2.1,
+        state.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.1, state.2.2.2.2.2.2.2.2.1,
+        state.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0, c 1, A 0 1, A 1 1, fam 0 0,
+        fam 0 1, fam 1 0, fam 1 1, ()) next) :
+    Rel sm next.key (T + branchTarget (q := Q0) (p := (qd i0)) μ sp fam ⟨i, by omega⟩) next.row
+        (Bs + lutBranchBound252 i0 B Bh) ∧
+      next.switch = fun k j ↦ fam k j ⟨i + 1, by omega⟩ := by
+  obtain ⟨L, hL, hLx, -, hLd⟩ := layoutR i0 hi0
+  unfold Stage_online_eval.sequential_parallel_generatedRoot_290_252 at hbody
+  extract_lets -merge _params _backend w_0_0 w_48_0 w_67_0 w_70_0 w_73_0 w_76_0 w_30_0 w_49_0 w_31_0 w_50_0 w_1_0 w_4_0 w_9_0 w_15_0 w_17_0 w_19_0 w_22_0 w_24_0 w_26_0 w_79_0 w_83_0 w_85_0 w_87_0 w_2_0 w_5_0 w_80_0 w_81_0 at hbody
+  obtain ⟨w_3_0, hbody⟩ := hbody
+  obtain ⟨w_6_0, hbody⟩ := hbody
+  obtain ⟨w_7_0, hbody⟩ := hbody
+  obtain ⟨w_8_0, hbody⟩ := hbody
+  obtain ⟨w_8_concat_1, hbody⟩ := hbody
+  obtain ⟨w_10_0, hbody⟩ := hbody
+  obtain ⟨w_11_0, hbody⟩ := hbody
+  obtain ⟨w_12_0, hbody⟩ := hbody
+  obtain ⟨w_13_0, hbody⟩ := hbody
+  obtain ⟨w_13_concat_1, hbody⟩ := hbody
+  obtain ⟨w_14_0, hbody⟩ := hbody
+  obtain ⟨w_16_0, hbody⟩ := hbody
+  obtain ⟨w_18_0, hbody⟩ := hbody
+  obtain ⟨w_20_0, hbody⟩ := hbody
+  obtain ⟨w_21_0, hbody⟩ := hbody
+  obtain ⟨w_21_concat_1, hbody⟩ := hbody
+  obtain ⟨w_23_0, hbody⟩ := hbody
+  obtain ⟨w_25_0, hbody⟩ := hbody
+  obtain ⟨w_27_0, hbody⟩ := hbody
+  obtain ⟨w_28_0, hbody⟩ := hbody
+  obtain ⟨w_28_concat_1, hbody⟩ := hbody
+  obtain ⟨w_29_0, hbody⟩ := hbody
+  obtain ⟨w_32_0, hbody⟩ := hbody
+  obtain ⟨w_33_0, hbody⟩ := hbody
+  obtain ⟨w_34_0, hbody⟩ := hbody
+  extract_lets -merge w_35_0 at hbody
+  obtain ⟨w_36_0, hbody⟩ := hbody
+  obtain ⟨w_37_0, hbody⟩ := hbody
+  obtain ⟨w_38_0, hbody⟩ := hbody
+  obtain ⟨w_39_0, hbody⟩ := hbody
+  obtain ⟨w_40_0, hbody⟩ := hbody
+  obtain ⟨w_41_0, hbody⟩ := hbody
+  obtain ⟨w_42_0, hbody⟩ := hbody
+  extract_lets -merge w_43_0 at hbody
+  obtain ⟨w_44_0, hbody⟩ := hbody
+  obtain ⟨w_45_0, hbody⟩ := hbody
+  extract_lets -merge w_46_0 w_47_0 at hbody
+  obtain ⟨w_51_0, hbody⟩ := hbody
+  obtain ⟨w_52_0, hbody⟩ := hbody
+  obtain ⟨w_53_0, hbody⟩ := hbody
+  extract_lets -merge w_54_0 at hbody
+  obtain ⟨w_55_0, hbody⟩ := hbody
+  obtain ⟨w_56_0, hbody⟩ := hbody
+  obtain ⟨w_57_0, hbody⟩ := hbody
+  obtain ⟨w_58_0, hbody⟩ := hbody
+  obtain ⟨w_59_0, hbody⟩ := hbody
+  obtain ⟨w_60_0, hbody⟩ := hbody
+  obtain ⟨w_61_0, hbody⟩ := hbody
+  extract_lets -merge w_62_0 at hbody
+  obtain ⟨w_63_0, hbody⟩ := hbody
+  obtain ⟨w_64_0, hbody⟩ := hbody
+  extract_lets -merge w_65_0 w_66_0 at hbody
+  obtain ⟨w_68_0, hbody⟩ := hbody
+  extract_lets -merge w_69_0 at hbody
+  obtain ⟨w_71_0, hbody⟩ := hbody
+  extract_lets -merge w_72_0 at hbody
+  obtain ⟨w_74_0, hbody⟩ := hbody
+  extract_lets -merge w_75_0 at hbody
+  obtain ⟨w_77_0, hbody⟩ := hbody
+  extract_lets -merge w_78_0 at hbody
+  obtain ⟨w_82_0, hbody⟩ := hbody
+  obtain ⟨w_84_0, hbody⟩ := hbody
+  obtain ⟨w_86_0, hbody⟩ := hbody
+  obtain ⟨w_88_0, hbody⟩ := hbody
+  simp only [Stage_online_eval.sequential_parallel_generatedRoot_290_252.constraints_0, Stage_online_eval.sequential_parallel_generatedRoot_290_252.constraints_1, Stage_online_eval.sequential_parallel_generatedRoot_290_252.constraints_2, Stage_online_eval.sequential_parallel_generatedRoot_290_252.constraints_3, Stage_online_eval.sequential_parallel_generatedRoot_290_252.constraints_4] at hbody
+  obtain ⟨h2_0, h2_0_1, h3_0, -, -, h6_0, h7_0, h6_0_1, h8_0, h2_0_2, h2_0_3, h10_0, h11_0, h12_0, h11_0_1, h13_0, h14_0, -, -, h16_0, -, -, h18_0, -, -, h20_0, h18_0_1, h21_0, -, -, h23_0, -, -, h25_0, -, -, h27_0, h25_0_1, h28_0, h29_0, h32_0, h33_0, h34_0, -, -, -, -, -, -, h36_0, h37_0, -, -, -, -, -, -, h38_0, h39_0, h40_0, h41_0, h42_0, -, -, -, -, -, -, h44_0, -, -, -, -, -, -, h45_0, h51_0, h52_0, h53_0, -, -, -, -, -, -, h55_0, h56_0, -, -, -, -, -, -, h57_0, h58_0, h59_0, h60_0, h61_0, -, -, -, -, -, -, h63_0, -, -, -, -, -, -, h64_0, -, -, -, -, -, -, h68_0, -, -, -, -, -, -, h71_0, -, -, -, -, -, -, h74_0, -, -, -, -, -, -, h77_0, h81_0, h81_0_1, h82_0, h81_0_2, h81_0_3, h84_0, h81_0_4, h81_0_5, h86_0, h81_0_6, h81_0_7, h88_0, hout⟩ := hbody
+  have hidx : w_2_0 = Int.ofNat i := rfl
+  have hnext : w_81_0 = Int.ofNat (i + 1) := by
+    simp only [w_81_0, w_80_0, w_2_0, Int.ofNat_eq_natCast]; push_cast; ring
+  rw [hidx] at h3_0 h10_0
+  rw [hnext] at h82_0 h84_0 h86_0 h88_0
+  obtain ⟨_, hw3⟩ := familyGet_eq h3_0
+  obtain ⟨_, hw10⟩ := familyGet_eq h10_0
+  obtain ⟨_, hs0⟩ := familyGet_eq h82_0
+  obtain ⟨_, hs1⟩ := familyGet_eq h84_0
+  obtain ⟨_, hs2⟩ := familyGet_eq h86_0
+  obtain ⟨_, hs3⟩ := familyGet_eq h88_0
+  subst hw3 hw10
+  have hhelp' := hhelp ⟨i, by omega⟩
+  have hAd : lutA model key Q0 6 3 (sigma i) = ![![w_6_0, w_11_0], ![w_7_0, w_12_0]] := by
+    funext k j
+    fin_cases k <;> fin_cases j
+    · exact (hashSample_eq h6_0).symm
+    · exact (hashSample_eq h11_0).symm
+    · exact (hashSample_eq h7_0).symm
+    · exact (hashSample_eq h12_0).symm
+  simp only [hAd] at hhelp'
+  have hbranch := lut_branch (n := N) (q := Q0) (q' := (R i0)) (p := (qd i0)) (m := 6) (m' := 6)
+    (log := 3) (bound := 16384) (index := sigma i) hN hpow (q0_eqR i0 hi0) (by inst_num) (by inst_num)
+    L hL hLx hg' hg hsm
+    henc h16_0 h18_0 h20_0 h23_0 h25_0 h27_0 h18_0_1 h21_0 h25_0_1 h28_0 h29_0
+    (bsw := state.switch) (Xb := ![w_32_0, w_51_0])
+    (fun j ↦ by fin_cases j; exacts [h32_0, h51_0])
+    (D' := ![w_33_0, w_52_0]) (fun j ↦ by fin_cases j; exacts [h33_0, h52_0])
+    (D := ![w_34_0, w_53_0]) (fun j ↦ by fin_cases j; exacts [h34_0, h53_0])
+    (M := ![![w_36_0, w_55_0], ![w_38_0, w_57_0]])
+    (fun j ↦ by fin_cases j; exacts [h36_0, h55_0]) (fun j ↦ by fin_cases j; exacts [h38_0, h57_0])
+    (Asw := ![![w_37_0, w_56_0], ![w_39_0, w_58_0]])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h37_0, h56_0, h39_0, h58_0])
+    (Z := ![w_40_0, w_59_0]) (fun j ↦ by fin_cases j; exacts [h40_0, h59_0])
+    (E' := ![w_41_0, w_60_0]) (fun j ↦ by fin_cases j; exacts [h41_0, h60_0])
+    (E := ![w_42_0, w_61_0]) (fun j ↦ by fin_cases j; exacts [h42_0, h61_0])
+    (h := ![_, _]) (sigma_odd ⟨i, by omega⟩) hhelp' h6_0_1 h8_0 h11_0_1 h13_0 h14_0
+    (Y := ![w_44_0, w_63_0]) (X := ![w_45_0, w_64_0])
+    (K := ![![w_68_0, w_71_0], ![w_74_0, w_77_0]])
+    (fun j ↦ by fin_cases j; exacts [h44_0, h63_0]) (fun j ↦ by fin_cases j; exacts [h45_0, h64_0])
+    (fun j ↦ by fin_cases j; exacts [h68_0, h71_0]) (fun j ↦ by fin_cases j; exacts [h74_0, h77_0])
+  subst hout
+  rw [hswitch] at hbranch
+  refine ⟨?_, ?_⟩
+  · convert hstate.add hbranch using 1
+    · funext k j
+      fin_cases k <;> fin_cases j <;> rfl
+    · funext j
+      fin_cases j <;> rfl
+  · funext k j
+    fin_cases k <;> fin_cases j
+    exacts [hs0, hs1, hs2, hs3]
+
+/-- The generated loop `252` accumulates the first `count` branches and carries the switching
+ciphertext of branch `count`. -/
+theorem lutLoop252 {i0 : Nat} {model : HashModel} {key : ByteArray} {sm sp μ : ErrorPoly N}
+    [Fact (i0 < 8)] (hsm : polyNorm sm ≤ 1)
+    {g' : ExactMatrix (R i0) N 1 6} {g : ExactMatrix Q0 N 1 6}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 6 g') (hg : centeredRebaseRuns g' g)
+    {c : Fin 2 → ExactMatrix Q0 N 1 6} {A : Fin 2 → Fin 2 → ExactMatrix Q0 N 1 6} {B : Nat}
+    (henc : Rel sm A (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) * μ * unitPair sp j) • g) c B)
+    {h0 h1 : Fin 4 → ExactMatrix Q0 N 1 6} {Bh : Nat}
+    (hhelp : ∀ i : Fin 4, Rel sm (lutA model key Q0 6 3 (sigma i))
+      (fun j ↦ reducePoly Q0 N ((((qd i0) : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • g) ![h0 i, h1 i] Bh)
+    {fam : Fin 2 → Fin 2 → Fin 4 → ExactMatrix (R i0) N 1 6} {count : Nat} (hcount : count ≤ 3)
+    {final : LoopState Q0 (R i0) 6} {params} 
+    (hruns : MxxIR.IterRuns (fun (i : Nat) (current next : LoopState Q0 (R i0) 6) ↦
+      Stage_online_eval.sequential_parallel_generatedRoot_290_252 Backend.backend model params i0 i
+        (current.1, current.2.1, current.2.2.1, current.2.2.2.1, current.2.2.2.2.1,
+          current.2.2.2.2.2.1, current.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.1,
+          current.2.2.2.2.2.2.2.2.1, current.2.2.2.2.2.2.2.2.2.1, h0, key, h1, c 0, A 0 0, A 1 0,
+          c 1, A 0 1, A 1 1, fam 0 0, fam 0 1, fam 1 0, fam 1 1, ()) next) count
+      (0, 0, 0, 0, 0, 0, fam 0 0 0, fam 0 1 0, fam 1 0 0, fam 1 1 0, ()) final) :
+    Rel sm final.key (∑ i ∈ Finset.range count, lutBranchTarget (q := Q0) (p := (qd i0)) μ sp fam i)
+        final.row (count * lutBranchBound252 i0 B Bh) ∧
+      final.switch = fun k j ↦ fam k j ⟨count, by omega⟩ := by
+  refine MxxIR.IterRuns.invariant
+    (Invariant := fun k (s : LoopState Q0 (R i0) 6) ↦ ∀ hk : k ≤ 3,
+      Rel sm s.key (∑ i ∈ Finset.range k, lutBranchTarget (q := Q0) (p := (qd i0)) μ sp fam i) s.row
+        (k * lutBranchBound252 i0 B Bh) ∧
+        s.switch = fun k' j ↦ fam k' j ⟨k, by omega⟩) ?_ ?_ hruns hcount
+  · intro _
+    refine ⟨?_, ?_⟩
+    · rw [Finset.range_zero, Finset.sum_empty, zero_mul]
+      have hrow : (![0, 0] : Fin 2 → ExactMatrix Q0 N 1 6) = 0 := by
+        funext j
+        fin_cases j <;> rfl
+      simp only [LoopState.key, LoopState.row, hrow]
+      exact Rel.zero
+    · funext k j
+      fin_cases k <;> fin_cases j <;> rfl
+  · intro i current next hinv hbody hk
+    obtain ⟨hrel, hsw⟩ := hinv (by omega)
+    obtain ⟨hrel', hsw'⟩ := lutStep252 hsm hg' hg henc hhelp (by omega) hsw hrel hbody
+    refine ⟨?_, hsw'⟩
+    rw [Finset.sum_range_succ, lutBranchTarget, dif_pos (by omega), add_mul, one_mul]
+    exact hrel'
+
+end RefreshTopProof.Part_I

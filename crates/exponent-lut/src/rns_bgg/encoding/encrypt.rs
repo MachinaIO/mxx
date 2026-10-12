@@ -6,7 +6,7 @@ fn validate_decoder_smudge_input_key_artifacts(
     production: &ProductionId,
     parameters: &RnsBggParameters,
     inputs: &crate::program::EncryptionInputs,
-    commitment: [u8; 32],
+    key: &str,
 ) -> Result<(), RnsBggError> {
     let manifest = manifests
         .get(production)
@@ -27,7 +27,7 @@ fn validate_decoder_smudge_input_key_artifacts(
             ),
         };
         for port in 0..4 {
-            let name = decoder_smudge_input_key_artifact_name(commitment, *wire, port);
+            let name = decoder_smudge_input_key_artifact_name(&key, *wire, port);
             let artifact = manifest
                 .artifacts
                 .get(&name)
@@ -298,7 +298,7 @@ impl<'a> RnsEncryptBuild<'a> {
                 .inputs
                 .as_ref()
                 .ok_or(RnsBggError::Binding("decoder smudge child inputs are not bound"))?,
-            *declaration.commitment(),
+            &declaration.artifact_key(),
         )?;
         // A Dynamic child encrypts under the parent's single secret, in the
         // parent's batch.
@@ -521,13 +521,13 @@ impl<'a> RnsEncryptBuild<'a> {
             )?;
         }
         for (child, decoder) in smudges.iter().zip(declaration.decoders()) {
-            let commitment = *decoder.commitment();
+            let key = decoder.artifact_key();
             graph = child_graph(
                 graph,
                 child,
                 decoder.smudge().program(),
-                &|role| decoder_smudge_artifact_name(commitment, role),
-                &|wire, port| decoder_smudge_input_key_artifact_name(commitment, wire, port),
+                &|role| decoder_smudge_artifact_name(&key, role),
+                &|wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
             )?;
         }
         // The decoding ring is the children's last level, with the CRT basis
@@ -804,10 +804,10 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         if let (Some(declaration), Some(child)) =
             (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
-            let commitment = *declaration.commitment();
+            let key = declaration.artifact_key();
             let (child_graph, child_exported) = child
                 .dynamic_family_ciphertexts(graph, |role| {
-                    decoder_smudge_artifact_name(commitment, &role)
+                    decoder_smudge_artifact_name(&key, &role)
                 })?;
             graph = child_graph;
             exported |= child_exported;
@@ -855,12 +855,12 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         if let (Some(declaration), Some(child)) =
             (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
-            let commitment = *declaration.commitment();
+            let key = declaration.artifact_key();
             graph = Self::append_child(
                 child,
                 declaration.smudge().program(),
-                |role| decoder_smudge_artifact_name(commitment, role),
-                |wire, port| decoder_smudge_input_key_artifact_name(commitment, wire, port),
+                |role| decoder_smudge_artifact_name(&key, role),
+                |wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
                 graph,
                 &hash_key,
             )?;
@@ -868,13 +868,13 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             // basis (checked when the child is bound).
             let decoding = child.parameters.levels().len() - 1;
             let hint = self.unmask_hint(
-                decoder_artifact_name(commitment, "unmask-public"),
+                decoder_artifact_name(&key, "unmask-public"),
                 child.parameters,
                 decoding,
             )?;
             graph = graph
                 .transferred_output(
-                    decoder_artifact_name(*declaration.commitment(), "unmask-hint"),
+                    decoder_artifact_name(&declaration.artifact_key(), "unmask-hint"),
                     hint,
                 )
                 .map_err(ApiError::scheme)?;

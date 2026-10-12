@@ -34,7 +34,7 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
 ''']
     text = open(f'{d}/generated/{pre}.lean').read()
     pat = (r'abbrev (parallel_generatedRoot_(\d+))\.constraints_0 \(hashModel : MxxRuntime\.HashModel\) '
-           r'\(i_0 : Nat\) \(w_0_0 : ByteArray\) \(w_1_0 : Mxx\.Primitives\.ExactMatrix (\d+) 8 1 (\d+)\)[^\n]*\n'
+           r'\(i_0 : Nat\) \(w_0_0 : ByteArray\) \(w_1_0 : Mxx\.Primitives\.ExactMatrix (\w+) 8 1 (\d+)\)[^\n]*\n'
            r'  MxxRuntime\.hashSample \(hashModel\) \(\[' + LABEL + r'\]\) \(\[[^\n]*\.u64Le \((\d)\)\]\) '
            r'\(w_0_0\) w_1_0 ∧\n  outputs = w_1_0\n')
     for m in re.finditer(pat, text):

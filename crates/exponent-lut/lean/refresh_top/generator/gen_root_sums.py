@@ -36,7 +36,7 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
         if lut_a in c0[:c0.index('\n\n')]:
             continue
         body = text[text.index(f'def sequential_generatedRoot_{k} '):]
-        fam = re.search(r'let w_1_0 : Fin (\d+) → Mxx\.Primitives\.ExactMatrix (\d+) 8 1 (\d+)', body)
+        fam = re.search(r'let w_1_0 : Fin (\d+) → Mxx\.Primitives\.ExactMatrix (\w+) 8 1 (\d+)', body)
         w, q, cols = int(fam.group(1)), modulus(fam.group(2)), int(fam.group(3))
         M = f'ExactMatrix {q} N 1 {cols}'
         B = f'Blocks {q} {cols}' if nf == 6 else f'Keys {q} {cols}'

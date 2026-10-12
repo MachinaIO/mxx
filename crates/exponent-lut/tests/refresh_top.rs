@@ -556,6 +556,13 @@ fn export_only() -> bool {
     env::var(format!("{PREFIX}EXPORT_ONLY")).is_ok_and(|value| value == "1")
 }
 
+/// `MXX_EXPONENT_LUT_REFRESH_TOP_LEAN_FACTS=1`: also export each module's facts module
+/// (`<module>_Facts.lean`: wire constants and named atoms, see
+/// `mxx_ir_core::lean::protocol::export`).
+fn lean_facts() -> bool {
+    env::var(format!("{PREFIX}LEAN_FACTS")).is_ok_and(|value| value == "1")
+}
+
 /// A recorded column, or else the setting `name` with `default`.
 fn row_setting(row: Option<&ParameterRow>, column: &str, name: &str, default: usize) -> usize {
     row.map_or_else(|| setting(name, default), |row| common::column(row, column))
@@ -840,8 +847,213 @@ fn export_claim(
 ) {
     let directory = common::generated_directory("refresh_top", id);
     let protocol = top_protocol(top, input, &graphs, productions, secrets, row);
-    mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("top refresh claim export");
+    mxx_ir_core::lean::protocol::export(&protocol, &directory, lean_facts())
+        .expect("top refresh claim export");
     eprintln!("exported the top refresh correctness claim to {}", directory.display());
+}
+
+/// The protocol's stages with the per-part stages of each phase (`preprocess`, `encrypt`,
+/// `online_eval`) replaced by one stage running every part in a parallel loop
+/// ([`mxx_ir_core::merge::merge_instances`], part `(chain, component)` the instance at its
+/// position in `parts`): input destinations, artifact bindings and links name the merged stages
+/// and the instances' merged input and output names. Stages pass families between merged phases:
+/// instance `k` reading an artifact of the producer's instance `k` reads member `k` of the
+/// producer's output family; only outputs read outside the merged stages (the residues) are
+/// unpacked per instance.
+fn merged_stages(
+    stages: Vec<mxx_ir_core::protocol::ProtocolStage>,
+    bindings: &mut [mxx_ir_core::protocol::ProtocolInputBinding],
+    parts: &[(usize, usize)],
+    productions: &BTreeMap<mxx_ir_core::artifact::ProductionId, StageId>,
+    links: &BTreeMap<String, (StageId, String)>,
+) -> Vec<mxx_ir_core::protocol::ProtocolStage> {
+    use mxx_ir_core::protocol::{ArtifactBinding, ArtifactName, ProtocolStage, StageInputName};
+    const PHASES: [&str; 3] = ["preprocess", "encrypt", "online_eval"];
+    // A per-part stage name: its phase and instance.
+    let instance_of = |stage: &str| {
+        PHASES.iter().find_map(|phase| {
+            let rest = stage.strip_prefix(phase)?.strip_prefix('_')?;
+            let (chain, component) = rest.split_once('_')?;
+            let part = (chain.parse::<usize>().ok()?, component.parse::<usize>().ok()?);
+            Some((*phase, parts.iter().position(|candidate| *candidate == part)?))
+        })
+    };
+    let graphs = stages
+        .iter()
+        .map(|stage| (stage.id.0.clone(), stage.graph.clone()))
+        .collect::<BTreeMap<_, _>>();
+    // Outputs of per-part stages read outside the merged stages, by links or bindings.
+    let unpacked = links
+        .values()
+        .map(|(stage, output)| (stage.clone(), output.clone()))
+        .chain(stages.iter().filter(|stage| instance_of(&stage.id.0).is_none()).flat_map(|stage| {
+            stage
+                .bindings
+                .iter()
+                .map(|binding| (binding.producer_stage.clone(), binding.producer_output.0.clone()))
+        }))
+        .filter_map(|(stage, output)| Some((instance_of(&stage.0)?.0, output)))
+        .collect::<std::collections::BTreeSet<_>>();
+    // Phases are merged in order; instance `k` reading output `o` of instance `k` of a merged
+    // producer reads member `k` of the producer's family named `merged[..].outputs[k][o]`.
+    let mut merged: BTreeMap<&str, (Graph, mxx_ir_core::merge::MergeNames)> = BTreeMap::new();
+    // The family inputs of the merged stages, by phase and name.
+    let family_inputs = RefCell::new(std::collections::BTreeSet::new());
+    for phase in PHASES {
+        let instances = parts
+            .iter()
+            .map(|(chain, component)| graphs[&format!("{phase}_{chain}_{component}")].clone())
+            .collect::<Vec<_>>();
+        let family_input = |kinds: &[&mxx_ir_core::node::NodeKind]| {
+            let mut families = kinds.iter().enumerate().map(|(index, kind)| {
+                let mxx_ir_core::node::NodeKind::Input { artifact: Some(artifact), .. } = kind
+                else {
+                    return None;
+                };
+                let (producer_phase, instance) =
+                    instance_of(&productions.get(&artifact.production_id)?.0)?;
+                (instance == index).then_some(())?;
+                let family = merged.get(producer_phase)?.1.outputs[index]
+                    .get(&artifact.artifact_name)?
+                    .clone();
+                Some((family, artifact))
+            });
+            let (family, artifact) = families.next()??;
+            for other in families {
+                if other?.0 != family {
+                    return None;
+                }
+            }
+            let mxx_ir_core::node::NodeKind::Input { name, .. } = kinds[0] else {
+                return None;
+            };
+            family_inputs.borrow_mut().insert((phase, name.clone()));
+            Some((
+                name.clone(),
+                Some(mxx_ir_core::node::ArtifactInput {
+                    artifact_name: family,
+                    ..(*artifact).clone()
+                }),
+            ))
+        };
+        let is_unpacked = |name: &str| unpacked.contains(&(phase, name.to_owned()));
+        let interface = mxx_ir_core::merge::MergeInterface {
+            family_input: &family_input,
+            unpacked: &is_unpacked,
+        };
+        let result = mxx_ir_core::merge::merge_instances(phase, &instances, &interface)
+            .unwrap_or_else(|error| panic!("merging the {phase} stages: {error}"));
+        merged.insert(phase, result);
+    }
+    // A producer (per-part stage, output) as a merged stage and output.
+    let producer = |stage: &StageId, output: &str| match instance_of(&stage.0) {
+        Some((phase, instance)) => {
+            let names = &merged[phase].1;
+            let name = names.unpacked[instance]
+                .get(output)
+                .or_else(|| names.outputs[instance].get(output))
+                .cloned()
+                .unwrap_or_else(|| output.to_owned());
+            (StageId(phase.to_owned()), name)
+        }
+        None => (stage.clone(), output.to_owned()),
+    };
+    for binding in bindings.iter_mut() {
+        let mut destinations = Vec::new();
+        for destination in binding.destinations.drain(..) {
+            let destination = match destination {
+                ProtocolInputDestination::WorkflowStage { stage, input } => {
+                    match instance_of(&stage.0) {
+                        Some((phase, instance)) => ProtocolInputDestination::WorkflowStage {
+                            stage: StageId(phase.to_owned()),
+                            input: StageInputName(
+                                merged[phase].1.inputs[instance]
+                                    .get(&input.0)
+                                    .cloned()
+                                    .unwrap_or(input.0),
+                            ),
+                        },
+                        None => ProtocolInputDestination::WorkflowStage { stage, input },
+                    }
+                }
+                other => other,
+            };
+            if !destinations.contains(&destination) {
+                destinations.push(destination);
+            }
+        }
+        binding.destinations = destinations;
+    }
+    let merged_stage = |phase: &str| {
+        let (graph, names) = &merged[phase];
+        let bindings = graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| {
+                let mxx_ir_core::node::NodeKind::Input { name, artifact, .. } = node.kind() else {
+                    return None;
+                };
+                let (stage, output) = match artifact {
+                    // A family input reads the producer's output family itself.
+                    Some(artifact) if family_inputs.borrow().contains(&(phase, name.clone())) => (
+                        StageId(instance_of(&productions[&artifact.production_id].0)?.0.to_owned()),
+                        artifact.artifact_name.clone(),
+                    ),
+                    Some(artifact) => {
+                        producer(&productions[&artifact.production_id], &artifact.artifact_name)
+                    }
+                    None => {
+                        // The original name of a plain input, in any instance.
+                        let original = names
+                            .inputs
+                            .iter()
+                            .find_map(|instance| {
+                                instance
+                                    .iter()
+                                    .find(|(_, merged)| *merged == name)
+                                    .map(|(original, _)| original)
+                            })
+                            .cloned()
+                            .unwrap_or_else(|| name.clone());
+                        let (stage, output) = links.get(&original)?;
+                        producer(stage, output)
+                    }
+                };
+                Some(ArtifactBinding {
+                    consumer_input: StageInputName(name.clone()),
+                    producer_stage: stage,
+                    producer_output: ArtifactName(output),
+                })
+            })
+            .collect();
+        ProtocolStage { id: StageId(phase.to_owned()), graph: graph.clone(), bindings }
+    };
+    let mut result = Vec::new();
+    for stage in stages {
+        match instance_of(&stage.id.0) {
+            // The merged stage takes the place of its first part.
+            Some((phase, 0)) => result.push(merged_stage(phase)),
+            Some(_) => {}
+            None => {
+                let bindings = stage
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        let (producer_stage, output) =
+                            producer(&binding.producer_stage, &binding.producer_output.0);
+                        ArtifactBinding {
+                            consumer_input: binding.consumer_input.clone(),
+                            producer_stage,
+                            producer_output: ArtifactName(output),
+                        }
+                    })
+                    .collect();
+                result.push(ProtocolStage { bindings, ..stage });
+            }
+        }
+    }
+    result
 }
 
 /// One PRF child of a part: its hash namespace, its PRF, its offset RHS (bound to one), and the
@@ -1070,7 +1282,11 @@ fn top_protocol(
     }
 
     // The requirement.
-    let family = |count: usize| FamilyType { element: IntType, count: IntExpr::constant(count) };
+    let family = |count: usize| FamilyType {
+        element: IntType,
+        count: IntExpr::constant(count),
+        member_slot: None,
+    };
     let requirement = DslContext::new("refresh-top-inputs");
     let a = requirement.input::<Family<Int>>("a", family(members)).unwrap();
     let a_coefficient = requirement.input::<Family<Int>>("a_coefficient", family(members)).unwrap();
@@ -1164,7 +1380,9 @@ fn top_protocol(
     let ideal = ideal.output("value", x.mul(0)).unwrap().build();
     let ideal = IdealSpec::new(ideal.unwrap().graph).unwrap();
 
-    let (contracts, bindings): (Vec<_>, Vec<_>) = externals.into_iter().unzip();
+    let (contracts, mut bindings): (Vec<_>, Vec<_>) = externals.into_iter().unzip();
+    // Every phase of every part is one stage: the parts' graphs merged into one parallel loop.
+    let stages = merged_stages(stages, &mut bindings, &parts, &productions, &links);
     let endpoint = EndpointSpecId::Exact;
     let failure_probability_log2 = match row["noise_model"].as_str() {
         "worst" => None,

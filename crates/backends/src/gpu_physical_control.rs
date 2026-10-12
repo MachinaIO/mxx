@@ -587,7 +587,7 @@ pub(super) fn pack_resident_family(
             ConcreteWireType::TypedBlob { .. } => {
                 Box::new([PhysicalEncoding::TypedBlobLengthPrefixed])
             }
-            ConcreteWireType::IndexedFamily { .. } => {
+            ConcreteWireType::IndexedFamily { .. } | ConcreteWireType::DependentFamily { .. } => {
                 return Err("GPU nested indexed family has no valid element type".into());
             }
         };

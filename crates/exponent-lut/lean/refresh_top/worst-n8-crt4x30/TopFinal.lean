@@ -1,6 +1,6 @@
 import TopSigma
 import TopLink
-import Part_0_0_Online
+import Part_I_Online
 import TopLabel
 import TopColumn
 
@@ -15,7 +15,7 @@ error `e'` reads the fresh table `(0, 0, 0, 1)` at `readoutExp z_o`, and the sou
 
 namespace RefreshTopProof
 
-open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof.Part_0_0
+open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof.Part_I
 
 /-- The label exponent that member `o` of the selector families `s`, `s'` reads. -/
 def zOf {m : Nat} (s s' : Fin (m * 5) → Int) (o : Fin m) : Int :=

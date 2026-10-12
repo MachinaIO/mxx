@@ -149,4 +149,31 @@ theorem link_chain0 {R qc : Nat} (hR : 1 < R) (hqc : 1 < qc) (hqcR : qc ∣ R) (
   linear_combination (-(reducePoly qc N (message c e) * reducePoly qc N rI * reducePoly qc N (Lg 0 j))) * hc +
     (reducePoly qc N rI * reducePoly qc N (message c e) * reducePoly qc N (centeredIntLift (G 0 j))) * hc3
 
+/-- The decode stage's residues of any chain: its gadget lifts as `Q₁`'s and its action scales to
+`q₃` (`link_chain`), or its action and `q₃` vanish modulo its prime (`link_chain0`). -/
+theorem link_any {R qc : Nat} (hR : 1 < R) (hqc : 1 < qc) (hqcR : qc ∣ R) (hqcQ0 : qc ∣ Q0)
+    {A : ExactMatrix Q0 N (1 + 1) 6} {A' : ExactMatrix R N (1 + 1) 6} (hA' : modulusReduceRuns A A')
+    {GR : ExactMatrix R N 1 6} {G : ExactMatrix Q1 N 1 6}
+    {w345 : ExactMatrix Q0 N 1 6} (h345 : centeredRebaseRuns GR w345) {w346 : ExactMatrix qc N 1 6}
+    (h346 : modulusReduceRuns w345 w346) {k3 k1 k : Int} {w347 w349 : ExactMatrix qc N 1 1}
+    (e347 : w347 = (matrixPolynomial [k3] : ExactMatrix qc N 1 1))
+    (e349 : w349 = (matrixPolynomial [k1] : ExactMatrix qc N 1 1))
+    {w348 w350 : ExactMatrix qc N 1 6} (e348 : w348 = matrixMulScalarRight w346 w347)
+    (e350 : w350 = matrixMulScalarRight w348 w349)
+    (hcase : ((∀ c, centeredIntLift (GR 0 c) = centeredIntLift (G 0 c)) ∧
+        ((k * k3 * k1 : Int) : ZMod qc) = ((q3 : Int) : ZMod qc)) ∨
+      (((k * k3 * k1 : Int) : ZMod qc) = 0 ∧ ((q3 : Int) : ZMod qc) = 0))
+    {βI σI xI rI : ErrorPoly N} (hβ : reducePoly qc N βI = reducePoly qc N σI)
+    {σ : ExactMatrix Q0 N 1 1} (hσ : σ = fun _ _ ↦ reducePoly Q0 N σI) {c e : Int}
+    (hx : xI = message c e * rI) (E : ErrorMatrix N 1 6) {e' : ExactMatrix R N 1 6}
+    (hE : e' = reduceMatrix R N 1 6 E) {res : ExactMatrix qc N 1 6}
+    (hres : ∀ col i, (res 0 col).coeff i =
+      ((((reducePoly R N βI • rowOf A' 0 + rowOf A' 1 - actionValueC k xI w350 + e' :
+        ExactMatrix R N 1 6) 0 col).coeff i).val :
+        ZMod qc)) :
+    Residue res (expectedRow A σ (fun _ _ ↦ reducePoly Q0 N rI) c e G + reduceMatrix Q0 N 1 6 E) := by
+  rcases hcase with ⟨hLG, hk⟩ | ⟨hk, hq3⟩
+  · exact link_chain hR hqc hqcR hqcQ0 hA' hLG h345 h346 e347 e349 e348 e350 hk hβ hσ hx E hE hres
+  · exact link_chain0 hR hqc hqcR hqcQ0 hA' h345 h346 e347 e349 e348 e350 hk hq3 hβ hσ hx E hE hres
+
 end RefreshTopProof

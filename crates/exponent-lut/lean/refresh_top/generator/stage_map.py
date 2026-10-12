@@ -40,8 +40,30 @@ def stage_numbers(d):
             re.finditer(r'def stage_(\d+)_params : (\S+)\.Params', claim)}
 
 
+def merged_input_sources(d, stage):
+    """`input_sources` of the body of a merged stage (its view `Stage_<stage>_I`): a family read
+    at the instance comes from the producer body's output of the same port."""
+    from wiring import merged_body_sources, root_inputs, _leaves
+    nums = {v: k for k, v in stage_numbers(d).items()}
+    args, _ = merged_body_sources(d, f'Stage_{stage}_I')
+    ins = root_inputs(f'{d}/generated/Stage_{stage}_I.lean')
+    out = []
+    for w, a in zip(ins, args):
+        if a[0] == 'stage' and a[2] is not None:
+            name = nums[a[1]]
+            _, names, atoms = parse(f'{d}/generated/{name}.lean', 'generatedRoot')
+            outs = _leaves(dict(zip(names, atoms))['hout'][len('outputs ='):])
+            port = int(outs[a[2]].rsplit('_', 1)[1])
+            out.append((w, ('stage', name, port)))
+        else:
+            out.append((w, ('external', a)))
+    return out
+
+
 def input_sources(d, stage, part):
     """`[(input wire, source)]` with source `('stage', name, index)` or `('external', k)`."""
+    if part == 'I':
+        return merged_input_sources(d, stage)
     claim = open(f'{d}/generated/Claim.lean').read()
     nums = {v: k for k, v in stage_numbers(d).items()}
     ns = f'Stage_{stage}_{part}'

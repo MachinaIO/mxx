@@ -24,6 +24,14 @@ COLS = [(531, 85, 86, 579, (580, 581, 583)), (586, 584, 585, 634, (635, 636, 637
 for part in parts_of(d):
     C = chain_of(part)
     Qq, qc = ('RefreshTopProof.' + ab[str(C['Qq'])] if str(C['Qq']) in ab else C['Qq']), C['qc']
+    # Instance `I`: `Qq` as the integer table where lemmas take an integer (`QqN` where a natural
+    # number), the rings' layouts and the chain's identities from the certificates of `TopInst`.
+    inst = part == 'I'
+    QqN = Qq
+    cp = C['cp']
+    Mx = 'RefreshTopProof.' + C['Mx']
+    if inst:
+        Qq, QqN, cp, Mx = '(QqZ (i0 : Int))', '(Qq i0)', '(cpZ (i0 : Int))', C['Mx']
     QqP = f'(({Qq} : Int) : ExactPoly Q1 N)'
     ns = f'Stage_online_eval_{part}'
     _t = open(f'{d}/generated/{ns}.lean').read()
@@ -38,7 +46,7 @@ for part in parts_of(d):
     {Kg K₁ Kw : Fin 2 → ExactMatrix Q1 N 1 6} {Kx : Fin 2 → ExactMatrix Q1 N 1 4}
     {Bh : Fin 2 → ExactMatrix Q1 N 1 16} {e' : ExactMatrix Q1 N 1 6}
     {GQ1_6 : ExactMatrix Q1 N 1 6} (hGQ1_6 : gadgetMatrixRuns Backend.backend 32768 6 GQ1_6)
-    {GM01_4 : ExactMatrix RefreshTopProof.''' + C['Mx'] + ''' N 1 4} {RQ1_4 : ExactMatrix Q1 N 1 4}
+    {GM01_4 : ExactMatrix ''' + Mx + ''' N 1 4} {RQ1_4 : ExactMatrix Q1 N 1 4}
     (hGM01_4 : gadgetMatrixRuns Backend.backend 32768 4 GM01_4) (hRQ1_4 : centeredRebaseRuns GM01_4 RQ1_4)
     {egI e1I ewI : ErrorMatrix N 1 6} {exI : ErrorMatrix N 1 4} {ebI : ErrorMatrix N 1 16}
     {Beg Be1 Bew Bex Beb Bpre BM : Nat}
@@ -60,13 +68,19 @@ for part in parts_of(d):
     (hV{k} : reducePoly Q1 N V{k} - w_582_0 0 0 = reducePoly Q1 N M{k})
     (hM{k} : CoeffBound (fun _ _ ↦ M{k} : ErrorMatrix N 1 1) BM)
     (hnoise{k} : 2 * (BM + 16 * N * Beb * Bpre + (6 * N * Beg * 16384 + 6 * N * Be1 * 16384 +
-      4 * N * Bex * 16384 + Bew) + Besm{k}) < {Qq})''')
-    proof = ['''  obtain ⟨DI, hDI, hDIb⟩ := h342_0.2.2.2
+      4 * N * Bex * 16384 + Bew) + Besm{k}) < {QqN})''')
+    proof = (['''  obtain ⟨L, hL, hLx, hLb, hLd⟩ := layoutR i0 hi0
+  obtain ⟨LX, hLX, hLXx, -, -⟩ := layoutMx i0 hi0'''] if inst else []) + ['''  obtain ⟨DI, hDI, hDIb⟩ := h342_0.2.2.2
   obtain ⟨YI, hYI, hYIb⟩ := h355_0.2.2.2''']
     cols = []
     for k, (sl, P, bK, SM, (a, b, o)) in enumerate(COLS):
-        proof.append(f'''  have hcol{k} := column_valueR (Qq := {Qq}) (c' := {C['cp']}) (k := actionConst' {C['cp']} {C['kdiv']}) Backend.{L[C['R']]} {C['hlayoutR']} rfl
-    (by norm_num) rfl rfl rfl (p := {C['p']}) (Mx := RefreshTopProof.{C['Mx']}) (by norm_num) (by norm_num) Backend.{L[C['Mx']]} {C['hlayoutX']} rfl (by norm_num)
+        if inst:
+            layout_args = (f"L hL hLx (by inst_num) (by rw [hLb]; norm_num) (by rw [hLd]; norm_num) (by rw [hLd])\n"
+                           f"    (p := {C['p']}) (Mx := {Mx}) (R_eq_pMx i0 hi0) (by inst_num) LX hLX hLXx (action_cert i0 hi0)")
+        else:
+            layout_args = (f"Backend.{L[C['R']]} {C['hlayoutR']} rfl\n    (by norm_num) rfl rfl rfl (p := {C['p']}) "
+                           f"(Mx := RefreshTopProof.{C['Mx']}) (by norm_num) (by norm_num) Backend.{L[C['Mx']]} {C['hlayoutX']} rfl (by norm_num)")
+        proof.append(f'''  have hcol{k} := column_valueR (Qq := {Qq}) (c' := {cp}) (k := actionConst' {cp} {C['kdiv']}) {layout_args}
     (G := GQ1_6) (H := w_582_0) h335_0 (z := w_340_0) (A' := w_339_0) (by rw [e_340_0, e_336_0]) h341_0 h342_0 hGQ1_6
     h351_0 (by rw [e_353_0, e_352_0]) h354_0 h355_0 hGM01_4 hRQ1_4 (comb := w_530_0)
     (by rw [e_530_0, e_357_0, e_343_0, e_356_0]) (by decide : (({k} : Int)).toNat < 6) h{sl}_0 hg hc₁ hcx hfw hb
@@ -79,16 +93,16 @@ for part in parts_of(d):
     simp only [Matrix.sub_apply, Matrix.smul_apply, Matrix.one_apply_eq, smul_eq_mul, mul_one, reduceMatrix]
     exact hV{k}
   rw [hSH{k}, hK{k}, hDI, hYI] at hcol{k}
-  obtain ⟨ν{k}, hν{k}, hc{k}⟩ := column_noiseQ (Qq := {Qq}) (y := β • rowOf w_339_0 0 + rowOf w_339_0 1 - actionValueC (actionConst' {C['cp']} {C['kdiv']}) x w_350_0 + e')
+  obtain ⟨ν{k}, hν{k}, hc{k}⟩ := column_noiseQ (Qq := {Qq}) (y := β • rowOf w_339_0 0 + rowOf w_339_0 1 - actionValueC (actionConst' {cp} {C['kdiv']}) x w_350_0 + e')
     {k} hM{k} heb hKb{k} heg he1 hew (X0I := topRows DI) (X1I := bottomRows DI)
     (fun r c i ↦ hDIb _ c i) (fun r c i ↦ hDIb _ c i) hex hYIb hesm{k} (out := w_{o}_0) (by rw [hcol{k}]; try rfl)''')
         cols.append(f'w_{o}_0')
     proof.append(f'''  have hz := concat_six h637_0 h691_0 h745_0 h799_0 h854_0
   intro k i
-  refine switch_residue (Qq := {Qq}) (by norm_num) (by norm_num) (by norm_num) h855_0
-    (y := β • rowOf w_339_0 0 + rowOf w_339_0 1 - actionValueC (actionConst' {C['cp']} {C['kdiv']}) x w_350_0 + e')
+  refine switch_residue (Qq := {QqN}) (by norm_num) (by norm_num) (by norm_num) h855_0
+    (y := β • rowOf w_339_0 0 + rowOf w_339_0 1 - actionValueC (actionConst' {cp} {C['kdiv']}) x w_350_0 + e')
     (ν := ![ν0 0 0, ν1 0 0, ν2 0 0, ν3 0 0, ν4 0 0, ν5 0 0]) (fun k ↦ ?_) (fun k j ↦ ?_) k i
-  · rw [hz k]
+  · {'simp only [Qq_cast]' + chr(10) + '    ' if inst else ''}rw [hz k]
     fin_cases k
     · exact hc0
     · exact hc1
@@ -98,22 +112,22 @@ for part in parts_of(d):
     · exact hc5
   · fin_cases k
     · have := hν0 0 0 j
-      show 2 * |(ν0 0 0).coeff j| < (({Qq} : Nat) : Int)
+      show 2 * |(ν0 0 0).coeff j| < (({QqN} : Nat) : Int)
       rw [Int.abs_eq_natAbs]; omega
     · have := hν1 0 0 j
-      show 2 * |(ν1 0 0).coeff j| < (({Qq} : Nat) : Int)
+      show 2 * |(ν1 0 0).coeff j| < (({QqN} : Nat) : Int)
       rw [Int.abs_eq_natAbs]; omega
     · have := hν2 0 0 j
-      show 2 * |(ν2 0 0).coeff j| < (({Qq} : Nat) : Int)
+      show 2 * |(ν2 0 0).coeff j| < (({QqN} : Nat) : Int)
       rw [Int.abs_eq_natAbs]; omega
     · have := hν3 0 0 j
-      show 2 * |(ν3 0 0).coeff j| < (({Qq} : Nat) : Int)
+      show 2 * |(ν3 0 0).coeff j| < (({QqN} : Nat) : Int)
       rw [Int.abs_eq_natAbs]; omega
     · have := hν4 0 0 j
-      show 2 * |(ν4 0 0).coeff j| < (({Qq} : Nat) : Int)
+      show 2 * |(ν4 0 0).coeff j| < (({QqN} : Nat) : Int)
       rw [Int.abs_eq_natAbs]; omega
     · have := hν5 0 0 j
-      show 2 * |(ν5 0 0).coeff j| < (({Qq} : Nat) : Int)
+      show 2 * |(ν5 0 0).coeff j| < (({QqN} : Nat) : Int)
       rw [Int.abs_eq_natAbs]; omega''')
     body = f'''import TopColumn
 import TopTarget
@@ -133,7 +147,7 @@ set_option maxRecDepth 65536 in
 theorem onlineFinal {{model : HashModel}} {{params : {ns}.Params}}
 ''' + '\n'.join('    ' + b for b in binders) + '\n' + '\n'.join(hyps) + ''' :
     ∀ (k : Fin 6) (i : Fin N), (w_855_0 0 k).coeff i =
-      ((((β • rowOf w_339_0 0 + rowOf w_339_0 1 - actionValueC (actionConst' ''' + str(C['cp']) + ' ' + C['kdiv'] + ''') x w_350_0 + e' : ExactMatrix Q1 N 1 6) 0 k).coeff i).val : ZMod ''' + qc + ''') := by
+      ((((β • rowOf w_339_0 0 + rowOf w_339_0 1 - actionValueC (actionConst' ''' + str(cp) + ' ' + C['kdiv'] + ''') x w_350_0 + e' : ExactMatrix Q1 N 1 6) 0 k).coeff i).val : ZMod ''' + qc + ''') := by
 ''' + '\n'.join(proof) + f'''
 
 end RefreshTopProof.Part_{part}

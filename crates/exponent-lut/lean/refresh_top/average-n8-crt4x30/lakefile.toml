@@ -14,24 +14,27 @@ path = "../.."
 [[lean_lib]]
 name = "RefreshTopGenerated"
 srcDir = "generated"
-roots = ["Backend", "Claim", "Ideal", "Requirement_0", "Stage_decode", "Stage_encrypt_0_0", "Stage_encrypt_0_1", "Stage_mask", "Stage_online_eval_0_0", "Stage_online_eval_0_1", "Stage_payload", "Stage_preprocess_0_0", "Stage_preprocess_0_1"]
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["Backend", "Claim", "Ideal", "Requirement_0", "Stage_decode", "Stage_encrypt", "Stage_mask", "Stage_online_eval", "Stage_payload", "Stage_preprocess"]
 
 # The worst-case export of the same graph, renamed (written by `generator/gen_bridge.py`).
 [[lean_lib]]
 name = "RefreshTopWorst"
 srcDir = "worst"
-roots = ["W_Claim","W_Ideal","W_Requirement_0","W_Stage_decode","W_Stage_encrypt_0_0","W_Stage_encrypt_0_1","W_Stage_mask","W_Stage_online_eval_0_0","W_Stage_online_eval_0_1","W_Stage_payload","W_Stage_preprocess_0_0","W_Stage_preprocess_0_1"]
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["W_Claim", "W_Ideal", "W_Ideal_Facts", "W_Requirement_0", "W_Requirement_0_Facts", "W_Stage_decode", "W_Stage_decode_Facts", "W_Stage_encrypt", "W_Stage_encrypt_Facts", "W_Stage_mask", "W_Stage_mask_Facts", "W_Stage_online_eval", "W_Stage_online_eval_Facts", "W_Stage_payload", "W_Stage_payload_Facts", "W_Stage_preprocess", "W_Stage_preprocess_Facts"]
 
 # Every average-case run is a worst-case run (written by `generator/gen_bridge.py`).
 [[lean_lib]]
 name = "RefreshTopBridge"
 srcDir = "bridge"
 moreLeanArgs = ["--tstack=262144"]
-roots = ["BridgeRuns","Bridge_Ideal","Bridge_Requirement_0","Bridge_Stage_decode","Bridge_Stage_encrypt_0_0","Bridge_Stage_encrypt_0_1","Bridge_Stage_mask","Bridge_Stage_online_eval_0_0","Bridge_Stage_online_eval_0_1","Bridge_Stage_payload","Bridge_Stage_preprocess_0_0","Bridge_Stage_preprocess_0_1"]
+roots = ["BridgeRuns","Bridge_Ideal","Bridge_Requirement_0","Bridge_Stage_decode","Bridge_Stage_encrypt","Bridge_Stage_mask","Bridge_Stage_online_eval","Bridge_Stage_payload","Bridge_Stage_preprocess"]
 
 # The worst-case proof over the renamed export (written by `generator/gen_port.py`) and the
 # average-case certificate.
 [[lean_lib]]
 name = "RefreshTopProof"
 srcDir = "proof"
-roots = ["Part_0_0_Assembly", "Part_0_0_Cells", "Part_0_0_Enc", "Part_0_0_EncFacts", "Part_0_0_EncRoot", "Part_0_0_Encrypt", "Part_0_0_Fresh", "Part_0_0_FreshCarrier", "Part_0_0_FreshChain", "Part_0_0_Inputs", "Part_0_0_KeyFacts", "Part_0_0_KeyFresh", "Part_0_0_KeyMask", "Part_0_0_KeySmudge", "Part_0_0_KeySource", "Part_0_0_KeysCells", "Part_0_0_KeysLuts", "Part_0_0_KeysRoot", "Part_0_0_Labels", "Part_0_0_Mask", "Part_0_0_MaskCarrier", "Part_0_0_Online", "Part_0_0_OnlineChain", "Part_0_0_OnlineFinal", "Part_0_0_PrePlace", "Part_0_0_PreRhs", "Part_0_0_PreRootSums", "Part_0_0_PreSums", "Part_0_0_PreSwitch", "Part_0_0_Readout", "Part_0_0_RootLuts", "Part_0_0_RootSums", "Part_0_0_Smudge", "Part_0_0_SmudgeChain", "Part_0_0_SmudgeMembers", "Part_0_0_SmudgeTotal", "Part_0_0_Sums", "Part_0_1_Assembly", "Part_0_1_Cells", "Part_0_1_Enc", "Part_0_1_EncFacts", "Part_0_1_EncRoot", "Part_0_1_Encrypt", "Part_0_1_Fresh", "Part_0_1_FreshCarrier", "Part_0_1_FreshChain", "Part_0_1_Inputs", "Part_0_1_KeyFacts", "Part_0_1_KeyFresh", "Part_0_1_KeyMask", "Part_0_1_KeySmudge", "Part_0_1_KeySource", "Part_0_1_KeysCells", "Part_0_1_KeysLuts", "Part_0_1_KeysRoot", "Part_0_1_Labels", "Part_0_1_Mask", "Part_0_1_MaskCarrier", "Part_0_1_Online", "Part_0_1_OnlineChain", "Part_0_1_OnlineFinal", "Part_0_1_PrePlace", "Part_0_1_PreRhs", "Part_0_1_PreRootSums", "Part_0_1_PreSums", "Part_0_1_PreSwitch", "Part_0_1_Readout", "Part_0_1_RootLuts", "Part_0_1_RootSums", "Part_0_1_Smudge", "Part_0_1_SmudgeChain", "Part_0_1_SmudgeMembers", "Part_0_1_SmudgeTotal", "Part_0_1_Sums", "RefreshTopCertificate", "ReqLabel", "ReqSigma", "RequirementFacts", "RequirementRoot", "TopAction", "TopChain", "TopColumn", "TopCorrect", "TopDecode", "TopDecodeRun", "TopDecompose", "TopFinal", "TopFinish", "TopGadgets", "TopGlue", "TopHint", "TopKeyForms", "TopKeys", "TopLabel", "TopLemmas", "TopLink", "TopLinkC", "TopLut", "TopLut2", "TopPlace", "TopPrf", "TopRefresh", "TopRequirement", "TopResidue", "TopRow", "TopSecrets", "TopSetup", "TopSigma", "TopSwitch", "TopTarget"]
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["ModularGlue", "Modular_Part_I_Assembly", "Part_I_Cells", "Part_I_Enc", "Part_I_EncFacts", "Part_I_EncRoot", "Part_I_Fresh", "Part_I_FreshCarrier", "Part_I_FreshChain", "Part_I_Inputs", "Part_I_KeyFacts", "Part_I_KeyFresh", "Part_I_KeyMask", "Part_I_KeySmudge", "Part_I_KeySource", "Part_I_KeysCells", "Part_I_KeysLuts", "Part_I_KeysRoot", "Part_I_Labels", "Part_I_Local", "Part_I_Mask", "Part_I_MaskCarrier", "Part_I_Online", "Part_I_OnlineChain", "Part_I_OnlineFinal", "Part_I_PrePlace", "Part_I_PreRhs", "Part_I_PreRootSums", "Part_I_PreSums", "Part_I_PreSwitch", "Part_I_Readout", "Part_I_RootLuts", "Part_I_RootSums", "Part_I_Smudge", "Part_I_SmudgeChain", "Part_I_SmudgeMembers", "Part_I_SmudgeTotal", "Part_I_Sums", "RefreshTopCertificate", "ReqLabel", "ReqSigma", "RequirementFacts", "RequirementRoot", "StageWrappers", "TopAction", "TopAssembly", "TopChain", "TopColumn", "TopCorrect", "TopCrt", "TopDecode", "TopDecodeCrt", "TopDecompose", "TopFinal", "TopFinish", "TopGadgets", "TopGlue", "TopHint", "TopInst", "TopKeyForms", "TopKeys", "TopLabel", "TopLemmas", "TopLink", "TopLinkC", "TopLut", "TopLut2", "TopPlace", "TopPrf", "TopRefresh", "TopRequirement", "TopResidue", "TopRow", "TopSecrets", "TopSetup", "TopSigma", "TopStage", "TopSwitch", "TopTables", "TopTarget", "TopUnpack"]

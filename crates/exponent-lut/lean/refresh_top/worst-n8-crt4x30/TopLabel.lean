@@ -12,18 +12,20 @@ namespace RefreshTopProof
 open Mxx.Primitives MxxRuntime MxxExponentLut
 
 /-- The label exponents: the payload of label member `i` is `X^(2 a_i)`. -/
-def labelExp : Fin 5 → Nat := ![3, 3, 3, 6, 0]
+def labelExp : Fin 5 → Nat := ![7, 5, 2, 3, 0]
 
 theorem label_value {q : Nat} (i : Fin 5) :
-    multiplyMonomial (liftInteger (MxxIR.selectInt (Int.ofNat i) [(1), (1), (1), (-1), (1)]) :
-      ExactMatrix q N 1 1) (MxxIR.selectInt (Int.ofNat i) [(6), (6), (6), (4), (0)]) =
+    multiplyMonomial (liftInteger (MxxIR.selectInt (Int.ofNat i) [(-1), (-1), (1), (1), (1)]) :
+      ExactMatrix q N 1 1) (MxxIR.selectInt (Int.ofNat i) [(6), (2), (4), (6), (0)]) =
       fun _ _ ↦ reducePoly q N (Xe (n := N) (2 * labelExp i)) := by
   rw [multiplyMonomial_liftInteger]
   have h8 : (AdjoinRoot.root (negacyclicModulus N ℤ)) ^ 8 = -1 := Negacyclic.root_pow_n
   funext r c
   congr 1
-  fin_cases i <;> simp [message, labelExp, MxxIR.selectInt, Xe, N]
-  rw [show (12 : Nat) = 8 + 4 from rfl, pow_add, h8]; ring
+  fin_cases i <;> simp [message, labelExp, MxxIR.selectInt, Xe, N] <;>
+    first
+      | (rw [show (14 : Nat) = 8 + 6 from rfl, pow_add, h8]; ring)
+      | (rw [show (10 : Nat) = 8 + 2 from rfl, pow_add, h8]; ring)
 
 end RefreshTopProof
 

@@ -125,7 +125,7 @@ def parse_inline(path, name):
     body = _def_block(lines, name)
     items, first = [], None
     for line in body:
-        m = re.match(r'let (\S+) :[^:]*?:= (.*)$', line) or re.match(r'let (\S+) := (.*)$', line)
+        m = re.match(r'let (\S+) : .*? := (.*)$', line) or re.match(r'let (\S+) := (.*)$', line)
         if m:
             items.append(('let', m.group(1), set(re.findall(r'\bw_\d+_\d+(?:_concat_\d+)?\b', m.group(2)))))
             continue

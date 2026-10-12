@@ -1,4 +1,4 @@
-import Part_0_0_MaskCarrier
+import Part_I_MaskCarrier
 import TopDecode
 
 /-!
@@ -12,7 +12,7 @@ otherwise, that is, `σ = 1 - ⌊(z mod 8) / 4⌋`.
 
 namespace RefreshTopProof
 
-open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof.Part_0_0
+open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof.Part_I
 
 /-- The sampling table of the mask at chain `0`. -/
 noncomputable def maskTable0 (k : Fin 4) : ErrorPoly N :=

@@ -6,6 +6,14 @@
 //! validation. A [`MatrixType`] refers to a ring, not a single modulus. [`CoefficientBoundDomain`]
 //! says whether a bounded coefficient is a single `Global` integer or a signed residue per CRT limb
 //! (`PerCrtLimb`).
+//!
+//! # Index-dependent families
+//!
+//! Inside an `IndexedFamily` element type, `IntExpr::LoopIndex(MEMBER_INDEX)` is the member's
+//! index, so members may have different types (for example matrices over different rings); a
+//! parallel loop whose body types depend on its index produces such a family. A family whose
+//! members resolve to one type is an ordinary `ConcreteWireType::IndexedFamily`; one whose
+//! members differ resolves to `ConcreteWireType::DependentFamily`, member by member.
 
 use crate::{
     expr::{IntExpr, RealExpr},
@@ -14,6 +22,9 @@ use crate::{
 };
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
+
+/// The loop-index slot that denotes a family member's index inside a family element type.
+pub const MEMBER_INDEX: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
@@ -148,9 +159,73 @@ pub enum ConcreteWireType {
         element: Box<ConcreteWireType>,
         count: usize,
     },
+    /// A family whose members have different types (an index-dependent element type).
+    DependentFamily {
+        members: Vec<ConcreteWireType>,
+    },
+}
+
+impl MatrixType {
+    fn substitute_loop_index(&self, slot: u32, value: &IntExpr) -> Self {
+        Self {
+            ring: self.ring.substitute_loop_index(slot, value),
+            rows: self.rows.substitute_loop_index(slot, value),
+            columns: self.columns.substitute_loop_index(slot, value),
+        }
+    }
 }
 
 impl WireType {
+    /// This type with every `LoopIndex(slot)` replaced by `value`.
+    pub fn substitute_loop_index(&self, slot: u32, value: &IntExpr) -> Self {
+        let sub = |expression: &IntExpr| expression.substitute_loop_index(slot, value);
+        match self {
+            Self::ConstantInt |
+            Self::ConstantReal |
+            Self::ConstantBool |
+            Self::Int |
+            Self::Real |
+            Self::Bool |
+            Self::TypedBlob { .. } => self.clone(),
+            Self::Bytes { length } => Self::Bytes { length: sub(length) },
+            Self::Matrix(matrix) => Self::Matrix(matrix.substitute_loop_index(slot, value)),
+            Self::Trapdoor {
+                matrix,
+                sigma,
+                gadget_base,
+                digit_count,
+                preimage_max_coefficient_bound,
+            } => Self::Trapdoor {
+                matrix: matrix.substitute_loop_index(slot, value),
+                sigma: sigma.substitute_loop_index(slot, value),
+                gadget_base: sub(gadget_base),
+                digit_count: sub(digit_count),
+                preimage_max_coefficient_bound: sub(preimage_max_coefficient_bound),
+            },
+            Self::SmallMatrix { matrix, max_coefficient_bound, bound_domain } => {
+                Self::SmallMatrix {
+                    matrix: matrix.substitute_loop_index(slot, value),
+                    max_coefficient_bound: sub(max_coefficient_bound),
+                    bound_domain: *bound_domain,
+                }
+            }
+            Self::Preimage { matrix, max_coefficient_bound, bound_domain } => Self::Preimage {
+                matrix: matrix.substitute_loop_index(slot, value),
+                max_coefficient_bound: sub(max_coefficient_bound),
+                bound_domain: *bound_domain,
+            },
+            Self::IndexedFamily { element, count } => Self::IndexedFamily {
+                element: Box::new(element.substitute_loop_index(slot, value)),
+                count: sub(count),
+            },
+        }
+    }
+
+    /// The type of member `index` of a family with element type `element`.
+    pub fn family_member(element: &Self, index: &IntExpr) -> Self {
+        element.substitute_loop_index(MEMBER_INDEX, index)
+    }
+
     /// Whether this type's shape, ring, or bounds depend on a loop index.
     pub fn contains_loop_index(&self) -> bool {
         let matrix = |matrix: &MatrixType| {

@@ -36,6 +36,10 @@ abbrev Q0 : Nat := 1329223801648636169536407324729467329
 abbrev Q1 : Nat := 1237937626222020133447349201
 /-- The plaintext moduli `q₀ q₁` (chains `0`, `1`), `q₀ q₂` (chain `2`), `q₀ q₃` (chain `3`). -/
 abbrev M01 : Nat := 1152920561861715089
+/-- `D₃ = q₀ q₁ q₃`, the decoding modulus of chain `3`. -/
+abbrev D3 : Nat := 1237937533988375184510142081
+abbrev M02 : Nat := 1152919788767877569
+abbrev M03 : Nat := 1152919702868562289
 theorem hN : 0 < N := by decide
 theorem hN1 : 1 < N := by decide
 theorem hpow : N = 2 ^ 3 := rfl
@@ -45,17 +49,23 @@ theorem q6_eq : Q6 = p5 * Q5 := by norm_num
 theorem q5_eq : Q5 = p4 * Q0 := by norm_num
 theorem q0_eq : Q0 = q3 * Q1 := by norm_num
 
-theorem layoutM01 : Backend.backend.regularLayout M01 N = some Backend.layout0 := by
+theorem layoutM03 : Backend.backend.regularLayout M03 N = some Backend.layout0 := by
   simp [Backend.backend]
-theorem layoutQ1 : Backend.backend.regularLayout Q1 N = some Backend.layout1 := by
+theorem layoutM02 : Backend.backend.regularLayout M02 N = some Backend.layout1 := by
   simp [Backend.backend]
-theorem layoutQ0 : Backend.backend.regularLayout Q0 N = some Backend.layout2 := by
+theorem layoutM01 : Backend.backend.regularLayout M01 N = some Backend.layout2 := by
   simp [Backend.backend]
-theorem layoutQ5 : Backend.backend.regularLayout Q5 N = some Backend.layout3 := by
+theorem layoutD3 : Backend.backend.regularLayout D3 N = some Backend.layout3 := by
   simp [Backend.backend]
-theorem layoutQ6 : Backend.backend.regularLayout Q6 N = some Backend.layout4 := by
+theorem layoutQ1 : Backend.backend.regularLayout Q1 N = some Backend.layout4 := by
   simp [Backend.backend]
-theorem layoutQ7 : Backend.backend.regularLayout Q7 N = some Backend.layout5 := by
+theorem layoutQ0 : Backend.backend.regularLayout Q0 N = some Backend.layout5 := by
+  simp [Backend.backend]
+theorem layoutQ5 : Backend.backend.regularLayout Q5 N = some Backend.layout6 := by
+  simp [Backend.backend]
+theorem layoutQ6 : Backend.backend.regularLayout Q6 N = some Backend.layout7 := by
+  simp [Backend.backend]
+theorem layoutQ7 : Backend.backend.regularLayout Q7 N = some Backend.layout8 := by
   simp [Backend.backend]
 
 theorem matrixPolynomial_single {q : Nat} (k : Int) :

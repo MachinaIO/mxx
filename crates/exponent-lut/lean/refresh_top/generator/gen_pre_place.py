@@ -30,7 +30,7 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
 ''']
     for k in ks:
         q = re.search(rf'def parallel_generatedRoot_{k} [^\n]*?inputs : ExactMatrix (\S+) 8 1 (\d+)', text)
-        q = re.search(rf'def parallel_generatedRoot_{k} [^\n]*?Mxx\.Primitives\.ExactMatrix (\d+) 8 1 (\d+)', text)
+        q = re.search(rf'def parallel_generatedRoot_{k} [^\n]*?Mxx\.Primitives\.ExactMatrix (\w+) 8 1 (\d+)', text)
         out.append(f'''
 theorem prePlace{k} {{model : HashModel}} {{params : {ns}.Params}} {{o : Nat}}
     {{x y : Keys {q.group(1)} {q.group(2)}}}

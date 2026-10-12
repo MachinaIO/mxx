@@ -88,7 +88,7 @@ fn declaration_of(
 
 /// One chain per prime of `Q_0`, two parts per chain decoding only their
 /// output prime over the reference's `w_0` columns, one label for every part,
-/// distinct chain namespaces and `A'` tags per component, pool orders that
+/// distinct chain namespaces and an `A'` component index per component, pool orders that
 /// put the output prime first, and the output prime's position in the
 /// canonical tower order of the decoding level.
 #[test]
@@ -118,9 +118,14 @@ fn top_refresh_lays_out_one_chain_per_prime() {
             );
             assert_eq!(part.label([3; 32], b"nu").unwrap(), top.label([3; 32], b"nu").unwrap());
         }
-        assert_ne!(
+        // The components share the matrix tag; `A'` separates them by the component index.
+        assert_eq!(
             top.part(chain, 0).unwrap().matrix_tag(),
             top.part(chain, 1).unwrap().matrix_tag()
+        );
+        assert_ne!(
+            top.part(chain, 0).unwrap().component(),
+            top.part(chain, 1).unwrap().component()
         );
     }
     assert_eq!(top.part(0, 0).unwrap().matrix_tag(), top.part(2, 0).unwrap().matrix_tag());

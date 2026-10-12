@@ -145,7 +145,7 @@ impl<'a> RnsPreprocessBuild<'a> {
         let preimage = crate::decoder::unmask::preimage(&trapdoor, key);
         let evaluator =
             self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?;
-        evaluator.unmask = Some((*declaration.commitment(), preimage, trapdoor.public_matrix()));
+        evaluator.unmask = Some((declaration.artifact_key(), preimage, trapdoor.public_matrix()));
         merge_runtime(&mut self.runtime, std::mem::take(&mut smudge.runtime))
             .map_err(ApiError::scheme)?;
         self.decoder_smudge_child = Some(
@@ -753,12 +753,12 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         if let (Some(declaration), Some(child)) =
             (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
-            let commitment = *declaration.commitment();
+            let key = declaration.artifact_key();
             graph = publish_child(
                 graph,
                 child,
-                |role| decoder_smudge_artifact_name(commitment, role),
-                |wire, port| decoder_smudge_input_key_artifact_name(commitment, wire, port),
+                |role| decoder_smudge_artifact_name(&key, role),
+                |wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
             )?;
         }
         if let Some(refresh) = &self.refresh {
@@ -786,15 +786,15 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             for ((child, decoder), preimage) in
                 refresh.smudges.iter().zip(refresh.declaration.decoders()).zip(&refresh.preimages)
             {
-                let commitment = *decoder.commitment();
+                let key = decoder.artifact_key();
                 graph = publish_child(
                     graph,
                     child,
-                    |role| decoder_smudge_artifact_name(commitment, role),
-                    |wire, port| decoder_smudge_input_key_artifact_name(commitment, wire, port),
+                    |role| decoder_smudge_artifact_name(&key, role),
+                    |wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
                 )?
                 .transferred_output(
-                    decoder_artifact_name(commitment, "unmask-preimage"),
+                    decoder_artifact_name(&key, "unmask-preimage"),
                     preimage.clone(),
                 )
                 .map_err(ApiError::scheme)?;
@@ -842,17 +842,11 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         }
         // The unmasking of the decoder: `K` for online evaluation and `B` for
         // encryption. The trapdoor itself stays in the setup production.
-        if let Some((commitment, preimage, public)) = &evaluator.unmask {
+        if let Some((key, preimage, public)) = &evaluator.unmask {
             graph = graph
-                .transferred_output(
-                    decoder_artifact_name(*commitment, "unmask-preimage"),
-                    preimage.clone(),
-                )
+                .transferred_output(decoder_artifact_name(key, "unmask-preimage"), preimage.clone())
                 .map_err(ApiError::scheme)?
-                .transferred_output(
-                    decoder_artifact_name(*commitment, "unmask-public"),
-                    public.clone(),
-                )
+                .transferred_output(decoder_artifact_name(key, "unmask-public"), public.clone())
                 .map_err(ApiError::scheme)?;
         }
         let graph = graph.build().map_err(ApiError::scheme)?;

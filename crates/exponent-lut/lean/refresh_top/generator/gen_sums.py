@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from patterns import destruct, destruct_inline, parse, parse_inline
 
 d = sys.argv[1]
-parts = sorted(re.match(r'Stage_online_eval_(\d_\d)\.lean', f).group(1)
-               for f in os.listdir(f'{d}/generated') if re.match(r'Stage_online_eval_\d_\d\.lean', f))
+from gen_part import parts_of
+parts = parts_of(d)
 abbrevs = {}
 setup = open(f'{d}/TopSetup.lean').read()
 for name, value in re.findall(r'abbrev (\w+) : Nat := (\d+)', setup):
@@ -37,7 +37,7 @@ def sums(path):
         l = re.search(rf'sequential_parallel_generatedRoot_{k}_(\d+) backend', text[text.index(f'abbrev {name}.constraints_0'):])
         if not g or not l:
             continue
-        fam = re.search(r'let w_0_0 : Fin (\d+) → Mxx\.Primitives\.ExactMatrix (\d+) 8 1 (\d+) := inputs\.1', body)
+        fam = re.search(r'let w_0_0 : Fin (\d+) → Mxx\.Primitives\.ExactMatrix (\w+) 8 1 (\d+) := inputs\.1', body)
         if not fam:
             continue
         cells, q, cols = int(fam.group(1)), fam.group(2), int(fam.group(3))

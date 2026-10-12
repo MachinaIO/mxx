@@ -19,6 +19,7 @@ pub mod expr;
 pub mod graph;
 pub mod inventory;
 pub mod lean;
+pub mod merge;
 pub mod node;
 pub mod protocol;
 pub mod ring;

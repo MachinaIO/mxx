@@ -239,7 +239,7 @@ theorem row_mul_qqQ {Qq : Int} {sm : ErrorPoly N} {K : Fin 2 → ExactMatrix Q1 
         reducePoly Q1 N t • (matrixPolynomial [Qq] : ExactMatrix Q1 N 1 1) +
           reduceMatrix Q1 N 1 1 e' := by
   obtain ⟨W, hW, hWb⟩ := hD.2.2.2
-  have hg := gadget_mul_decompose_one (by norm_num) Backend.layout1 layoutQ1 rfl hgq hD'
+  have hg := gadget_mul_decompose_one (by norm_num) Backend.layout4 layoutQ1 rfl hgq hD'
   rw [← compactRebase_self (by norm_num) hD] at hg
   refine ⟨e * W, coeffBound_mul hN he hWb, ?_⟩
   rw [hc, Matrix.add_mul, Matrix.sub_mul, maskPart_mul, Matrix.smul_mul, hg, hW,
@@ -322,26 +322,26 @@ noncomputable def maskTableC (h : Int) (k : Fin 4) : ErrorPoly N :=
     ((h : Int) : ErrorPoly N)] k
 
 theorem sampled_maskC (h : Int) (z : Nat) :
-    Part_0_0.sampled (maskTableC h) (Part_0_0.readoutExp z) = (((-1 : Int) ^ (z / 4) * h : Int) : ErrorPoly N) := by
+    Part_I.sampled (maskTableC h) (Part_I.readoutExp z) = (((-1 : Int) ^ (z / 4) * h : Int) : ErrorPoly N) := by
   obtain ⟨hdiv, hmod⟩ := readoutExp_split z
-  unfold Part_0_0.sampled
+  unfold Part_I.sampled
   rw [hdiv]
-  have ht : maskTableC h ⟨Part_0_0.readoutExp z % 4, Nat.mod_lt _ (by norm_num)⟩ = ((h : Int) : ErrorPoly N) := by
+  have ht : maskTableC h ⟨Part_I.readoutExp z % 4, Nat.mod_lt _ (by norm_num)⟩ = ((h : Int) : ErrorPoly N) := by
     rcases hmod with hm | hm
-    · rw [show (⟨Part_0_0.readoutExp z % 4, Nat.mod_lt _ (by norm_num)⟩ : Fin 4) = 1 from Fin.ext hm]; rfl
-    · rw [show (⟨Part_0_0.readoutExp z % 4, Nat.mod_lt _ (by norm_num)⟩ : Fin 4) = 3 from Fin.ext hm]; rfl
+    · rw [show (⟨Part_I.readoutExp z % 4, Nat.mod_lt _ (by norm_num)⟩ : Fin 4) = 1 from Fin.ext hm]; rfl
+    · rw [show (⟨Part_I.readoutExp z % 4, Nat.mod_lt _ (by norm_num)⟩ : Fin 4) = 3 from Fin.ext hm]; rfl
   rw [ht]
   push_cast
   ring
 
-theorem sampled_one_maskC (h : Int) : Part_0_0.sampled (maskTableC h) 1 = ((h : Int) : ErrorPoly N) := by
-  unfold Part_0_0.sampled
+theorem sampled_one_maskC (h : Int) : Part_I.sampled (maskTableC h) 1 = ((h : Int) : ErrorPoly N) := by
+  unfold Part_I.sampled
   rw [show (⟨1 % 4, Nat.mod_lt _ (by norm_num)⟩ : Fin 4) = 1 from rfl]
   simp [maskTableC]
 
 /-- A member's value is its `σ` modulo `qc`, when `2 h ≡ 1`. -/
 theorem member_sigmaC {qc : Nat} {h : Int} (h2 : ((2 * h : Int) : ZMod qc) = 1) (z : Nat) :
-    reducePoly qc N (Part_0_0.sampled (maskTableC h) (Part_0_0.readoutExp z) + Part_0_0.sampled (maskTableC h) 1) =
+    reducePoly qc N (Part_I.sampled (maskTableC h) (Part_I.readoutExp z) + Part_I.sampled (maskTableC h) 1) =
       reducePoly qc N (((1 - ((z : Int) % 8) / 4 : Int)) : ErrorPoly N) := by
   rw [sampled_maskC, sampled_one_maskC, ← Int.cast_add, reducePoly_intCast, reducePoly_intCast,
     intCast_eq_algebraMap, intCast_eq_algebraMap]
@@ -362,9 +362,9 @@ theorem mask_sigmaC {qc : Nat} {h : Int} (h2 : ((2 * h : Int) : ZMod qc) = 1)
     (hsel : ∀ o (k : Fin 5), s (cellIndex o k) = if k = sel o then 1 else 0)
     (hsel' : ∀ o (k : Fin 5), s' (cellIndex o k) = if k = sel' o then 1 else 0) (sp : ErrorPoly N) :
     reducePoly qc N (((1 : Int) : ErrorPoly N) * (∑ o : Fin 8, Xe (n := N) o *
-      (Part_0_0.sampled (fun k ↦ ![((0 : Int) : ErrorPoly N), ((h : Int) : ErrorPoly N), ((0 : Int) : ErrorPoly N),
-        ((h : Int) : ErrorPoly N)] k) (Part_0_0.readoutExp (labelExp (sel' o) + labelExp (sel o))) +
-       Part_0_0.sampled (fun k ↦ ![((0 : Int) : ErrorPoly N), ((h : Int) : ErrorPoly N), ((0 : Int) : ErrorPoly N),
+      (Part_I.sampled (fun k ↦ ![((0 : Int) : ErrorPoly N), ((h : Int) : ErrorPoly N), ((0 : Int) : ErrorPoly N),
+        ((h : Int) : ErrorPoly N)] k) (Part_I.readoutExp (labelExp (sel' o) + labelExp (sel o))) +
+       Part_I.sampled (fun k ↦ ![((0 : Int) : ErrorPoly N), ((h : Int) : ErrorPoly N), ((0 : Int) : ErrorPoly N),
         ((h : Int) : ErrorPoly N)] k) 1)) * unitPair sp 1) =
       reducePoly qc N (∑ o : Fin 8, ((sigmaOf s s' o : Int) : ErrorPoly N) * Xe (n := N) o) := by
   rw [Int.cast_one, show unitPair sp 1 = 1 from rfl, one_mul, mul_one, map_sum, map_sum]

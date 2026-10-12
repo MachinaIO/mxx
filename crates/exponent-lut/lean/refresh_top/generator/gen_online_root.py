@@ -15,6 +15,7 @@ from patterns import parse
 from private_chain import root_offset
 from segment import abbreviations, segment
 from layouts import layouts
+from gen_luts import inst_layout
 
 WIRE = re.compile(r'\bw_\d+_(?:\d+|concat_\d+)\b')
 
@@ -193,8 +194,11 @@ theorem rootLut{k} {{model : HashModel}} {{params : {ns}.Params}}
 d = sys.argv[1]
 L = layouts(d)
 ab = abbreviations(open(f'{d}/TopSetup.lean').read())
-Q3 = '(((q3 : Nat) : Int) : ErrorPoly N)'
 for part in parts_of(d):
+    # Instance `I` of the merged stages decodes at `R i0`, dropping `qd i0` from `Q0`.
+    inst = part == 'I'
+    R, qd, q0eq = ('(R i0)', '(qd i0)', '(q0_eqR i0 hi0)') if inst else ('Q1', 'q3', 'q0_eq')
+    Q3 = f'((({qd} : Nat) : Int) : ErrorPoly N)'
     path = f'{d}/generated/Stage_online_eval_{part}.lean'
     ns = f'Stage_online_eval_{part}'
     text = open(path).read()
@@ -217,13 +221,13 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
 /-- The table `[X, 1]` of the source LUT. -/
 noncomputable def sourceTable (k : Fin 2) : ErrorPoly N := ![Xe 1, 1] k
 '''
-    out += root_lut(path, ns, names, atoms, lets, ab, loops[0], 'round', 'Q0', 'Q1', 'q3', 6, 4,
-                    'Backend.' + L['Q1'], 'layoutQ1', 'q0_eq', 2, scale=Q3.replace('q3', chain_of(part)['p']),
-                    table='sourceTable')
+    out += root_lut(path, ns, names, atoms, lets, ab, loops[0], 'round', 'Q0', R, qd, 6, 4,
+                    'Backend.' + L['Q1'], 'layoutQ1', q0eq, 2,
+                    scale=f'((({chain_of(part)["p"]} : Nat) : Int) : ErrorPoly N)', table='sourceTable')
     out += root_lut(path, ns, names, atoms, lets, ab, loops[1], 'round', 'Q5', 'Q0', 'p4', 8, 6,
                     'Backend.' + L['Q0'], 'layoutQ0', 'q5_eq', 4, scale=Q3, table='readoutTable')
-    out += root_lut(path, ns, names, atoms, lets, ab, loops[2], 'branches', 'Q0', 'Q1', 'q3', 6, 6,
-                    'Backend.' + L['Q1'], 'layoutQ1', 'q0_eq', 4)
+    out += root_lut(path, ns, names, atoms, lets, ab, loops[2], 'branches', 'Q0', R, qd, 6, 6,
+                    'Backend.' + L['Q1'], 'layoutQ1', q0eq, 4)
     rhs = '[114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115'
     tops = {WIRE.findall(a)[-1] for a in atoms if a.startswith('MxxRuntime.hashSample') and rhs in a}
     xbs = {WIRE.findall(a)[-1] for a in atoms
@@ -237,6 +241,8 @@ noncomputable def sourceTable (k : Fin 2) : ErrorPoly N := ![Xe 1, 1] k
                           v.split()[-1] in ds for v in lets.values()))
     out += root_offset(path, ns, names, atoms, lets, ab, first_both)
     out += f'\nend RefreshTopProof.Part_{part}\n'
+    if inst:
+        out = inst_layout(out, 'Backend.' + L['Q1'], 'layoutQ1')
     open(f'{d}/Part_{part}_Online.lean', 'w').write(out)
     print(part, loops)
     break

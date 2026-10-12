@@ -1,7 +1,7 @@
 import TopTarget
 import TopHint
 import TopColumn
-import Part_0_0_Smudge
+import Part_I_Smudge
 import ExponentFunctional
 
 /-!
@@ -164,7 +164,7 @@ theorem smudge_glue (w : Fin 20 → Int) (hw : w 0 = halfQ1) (hwb : ∑ r : Fin 
       reducePoly Q1 N ((∑ o : Fin 160, Xe (n := N) (o / 20) *
         (((w ⟨o % 20, Nat.mod_lt _ (by norm_num)⟩ : Int) : ErrorPoly N) *
           ((1 : ErrorPoly N) * ((((-1 : Int) ^ (z o / 4) : Int) : ErrorPoly N) *
-            Part_0_0.smudgeTable ⟨z o % 4, Nat.mod_lt _ (by norm_num)⟩)))) * unitPair sp 1) - H 0 0 =
+            Part_I.smudgeTable ⟨z o % 4, Nat.mod_lt _ (by norm_num)⟩)))) * unitPair sp 1) - H 0 0 =
         reducePoly Q1 N M := by
   set d : Fin 160 → Int := fun o ↦ (-1 : Int) ^ (z o / 4) * (![1, 1, 3, 3] ⟨z o % 4, Nat.mod_lt _ (by norm_num)⟩ : Int)
     with hd
@@ -183,7 +183,7 @@ theorem smudge_glue (w : Fin 20 → Int) (hw : w 0 = halfQ1) (hwb : ∑ r : Fin 
   · rw [← smudge_minus_half w hw d hodd, hH, show unitPair sp 1 = 1 from rfl, mul_one]
     congr 2
     refine Finset.sum_congr rfl fun o _ ↦ ?_
-    simp only [hd, Part_0_0.smudgeTable, Int.cast_mul, one_mul]
+    simp only [hd, Part_I.smudgeTable, Int.cast_mul, one_mul]
 
 /-- A row with target `(a b) s` has target `a (b s)`. -/
 theorem row_assoc {q m : Nat} {c M E : ExactMatrix q N 1 m} {a b s : ErrorPoly N}

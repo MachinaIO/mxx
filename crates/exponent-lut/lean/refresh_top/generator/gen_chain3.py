@@ -17,7 +17,6 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from chains import d3_subst
 
-d, part = sys.argv[1], sys.argv[2]
 TOP = ['TopRefresh', 'TopAction', 'TopColumn', 'TopHint', 'TopTarget', 'TopGlue', 'TopChain']
 MARK = re.compile(r'\bQ1\b|\bhalfQ1\b|\bQqPoly\b|\blayoutQ1\b')
 SKIP = {'actionConst', 'QqPoly', 'actionConst_mul', 'action_mul', 'actionValue', 'column_value',
@@ -25,7 +24,6 @@ SKIP = {'actionConst', 'QqPoly', 'actionConst_mul', 'action_mul', 'actionValue',
         'y_unique', 'actionValue_eq'}
 
 
-subst = lambda text: d3_subst(text, d)
 
 
 def chunks(text):
@@ -53,36 +51,39 @@ def name_of(chunk):
     return m.group(1) if m else None
 
 
-local = [f'''import TopChain
-import TopLinkC
-import TopFinal
+if __name__ == '__main__':
+    d, part = sys.argv[1], sys.argv[2]
+    subst = lambda text: d3_subst(text, d)
+    local = [f'''import TopChain
+    import TopLinkC
+    import TopFinal
 
-/-! The lemmas of the decoding ring for chain-3 part `{part}`: those of the shared `Top*` files
-that mention `Q₁`, at `D3` (written by `generator/gen_chain3.py`). -/
+    /-! The lemmas of the decoding ring for chain-3 part `{part}`: those of the shared `Top*` files
+    that mention `Q₁`, at `D3` (written by `generator/gen_chain3.py`). -/
 
-namespace RefreshTopProof.Part_{part}
+    namespace RefreshTopProof.Part_{part}
 
-open Mxx.Primitives MxxRuntime MxxExponentLut Mxx.ExponentLut.Refresh RefreshTopProof
-''']
-for f in TOP:
-    for c in chunks(open(f'{d}/{f}.lean').read()):
-        n = name_of(c)
-        if n is None or n in SKIP or not MARK.search(c):
+    open Mxx.Primitives MxxRuntime MxxExponentLut Mxx.ExponentLut.Refresh RefreshTopProof
+    ''']
+    for f in TOP:
+        for c in chunks(open(f'{d}/{f}.lean').read()):
+            n = name_of(c)
+            if n is None or n in SKIP or not MARK.search(c):
+                continue
+            local.append(subst(c).rstrip() + '\n')
+    local.append(f'end RefreshTopProof.Part_{part}\n')
+    open(f'{d}/Part_{part}_Local.lean', 'w').write('\n'.join(local))
+
+    for fn in sorted(os.listdir(d)):
+        if not re.fullmatch(rf'Part_{part}_\w+\.lean', fn) or fn.endswith(('_Local.lean', '_Assembly.lean')):
             continue
-        local.append(subst(c).rstrip() + '\n')
-local.append(f'end RefreshTopProof.Part_{part}\n')
-open(f'{d}/Part_{part}_Local.lean', 'w').write('\n'.join(local))
-
-for fn in sorted(os.listdir(d)):
-    if not re.fullmatch(rf'Part_{part}_\w+\.lean', fn) or fn.endswith(('_Local.lean', '_Assembly.lean')):
-        continue
-    text = open(f'{d}/{fn}').read()
-    if 'import Part_' + part + '_Local' not in text:
-        text = re.sub(r'^(import [^\n]*\n)', r'\1import Part_' + part + '_Local\n', text, count=1)
-    text = subst(text)
-    if not fn.endswith('_OnlineFinal.lean'):
-        # The scale of the level above the ring: `Q₀ = q₂ D3` (the basis lists keep `q₃`).
-        text = re.sub(r'\[q0, q1, q2, q3', '[@BASIS@', text)
-        text = re.sub(r'\bq3\b', 'q2', text)
-        text = text.replace('[@BASIS@', '[q0, q1, q2, q3')
-    open(f'{d}/{fn}', 'w').write(text)
+        text = open(f'{d}/{fn}').read()
+        if 'import Part_' + part + '_Local' not in text:
+            text = re.sub(r'^(import [^\n]*\n)', r'\1import Part_' + part + '_Local\n', text, count=1)
+        text = subst(text)
+        if not fn.endswith('_OnlineFinal.lean'):
+            # The scale of the level above the ring: `Q₀ = q₂ D3` (the basis lists keep `q₃`).
+            text = re.sub(r'\[q0, q1, q2, q3', '[@BASIS@', text)
+            text = re.sub(r'\bq3\b', 'q2', text)
+            text = text.replace('[@BASIS@', '[q0, q1, q2, q3')
+        open(f'{d}/{fn}', 'w').write(text)

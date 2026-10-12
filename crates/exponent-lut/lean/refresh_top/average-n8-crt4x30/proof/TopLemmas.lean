@@ -21,6 +21,17 @@ noncomputable def rhsTop (model : HashModel) (key : ByteArray) (q m : Nat) (tagP
   fun j ↦ model.sample q N 1 m key (completeHashTag tagPrefix
     [.bytes memberBytes, .u64Le i, .bytes componentBytes, .u64Le (j : Int)])
 
+theorem completeHashTag_append (p : Blob) (a b : List HashTagComponent) :
+    completeHashTag (completeHashTag p a) b = completeHashTag p (a ++ b) := by
+  simp [completeHashTag, List.flatMap_append, List.append_assoc]
+
+/-- The RHS tops under a tag whose prefix carries components of its own (an instance's digests). -/
+theorem rhsTop_tag (model : HashModel) (key : ByteArray) (q m : Nat) (p : Blob)
+    (pre : List HashTagComponent) (i : Int) (j : Fin 2) :
+    rhsTop model key q m (completeHashTag p pre) i j = model.sample q N 1 m key (completeHashTag p
+      (pre ++ [.bytes memberBytes, .u64Le i, .bytes componentBytes, .u64Le (j : Int)])) := by
+  simp only [rhsTop, completeHashTag_append]
+
 theorem select_slot (i : Nat) :
     MxxIR.selectInt (Int.fmod (Int.ofNat i) 5) [(0), (1), (2), (3), (4)] = ((i % 5 : Nat) : Int) := by
   have hi : Int.fmod (Int.ofNat i) 5 = Int.ofNat (i % 5) := by

@@ -58,6 +58,7 @@ theorem encLabel{k} {{model : HashModel}} {{params : {ns}.Params}} {{o : Nat}}
       obtain rfl : r = 0 := Subsingleton.elim _ _
       simp [matrixAdd, matrixSub, unitPair, reduceMatrix]
       try ring
+    try exact rfl
     · show w_25_0 = _
       simp only [w_25_0, w_23_0, w_22_0, w_21_0, w_19_0, w_20_0, w_14_0, w_12_0, w_10_0, w_4_0, w_6_0,
         w_1_0, w_3_0, w_9_0, w_11_0, hsm, hone, he1, multiplyMonomial_liftInteger]
@@ -66,6 +67,7 @@ theorem encLabel{k} {{model : HashModel}} {{params : {ns}.Params}} {{o : Nat}}
       obtain rfl : r = 0 := Subsingleton.elim _ _
       simp [matrixAdd, matrixSub, unitPair, reduceMatrix]
       try ring
+    try exact rfl
   · show w_12_0 = _
     simp only [w_12_0, w_10_0, w_9_0, w_11_0, multiplyMonomial_liftInteger]
 '''
@@ -102,7 +104,7 @@ def helper(part, d, k, ab, low):
     level = re.search(r'\[\.u64Le \((\d+)\), \.integer', atom[hA]).group(1)
     gw = re.search(r'gadgetMatrixRuns backend 32768 (\d+)', atom[names['gad']]).group(1)
     gadw = re.search(r'gadgetMatrixRuns backend 32768 \d+ (w_\d+_0)', atom[names['gad']]).group(1)
-    gq = short(re.search(rf'∃ \({gadw} : Mxx\.Primitives\.ExactMatrix (\d+) 8 1', body).group(1), ab)
+    gq = short(re.search(rf'∃ \({gadw} : Mxx\.Primitives\.ExactMatrix (\w+) 8 1', body).group(1), ab)
     dd = destruct_inline(path, ns, f'parallel_generatedRoot_{k}', 'h')
     hash_names = {0: names['A00'], 2: names['A10'], 1: names['A01'], 3: names['A11']}
     hashes = {c: next(x for x in n if x != '-' and re.search(rf'\b{w}$', atom[x])) for c, w in hash_names.items()}
@@ -171,6 +173,7 @@ theorem encHelper{k} {{model : HashModel}} {{params : {ns}.Params}} (o : Fin {W}
     obtain rfl : r = 0 := Subsingleton.elim _ _
     simp [matrixAdd, matrixSub, unitPair, reduceMatrix, matrixPolynomial_single, map_ofNat]
     try ring
+    try exact rfl
   · show {names['c1']} = _
     simp only [{lets1}, hsm', hone', he1, hsub1']
     simp only [matrixMulScalarLeft_eq]
@@ -178,6 +181,7 @@ theorem encHelper{k} {{model : HashModel}} {{params : {ns}.Params}} (o : Fin {W}
     obtain rfl : r = 0 := Subsingleton.elim _ _
     simp [matrixAdd, matrixSub, unitPair, reduceMatrix, matrixPolynomial_single, map_ofNat]
     try ring
+    try exact rfl
 """
 
 

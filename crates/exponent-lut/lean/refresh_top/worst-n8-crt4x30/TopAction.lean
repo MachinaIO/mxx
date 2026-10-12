@@ -36,7 +36,7 @@ theorem action_mul {g' : ExactMatrix M01 N 1 4} (hg' : gadgetMatrixRuns Backend.
     (x : ErrorPoly N) :
     (reducePoly Q1 N (((q2 : Nat) : Int) * x) • g) * Y =
       QqPoly • reduceMatrix Q1 N 1 6 ((((actionConst / q1 : Int) : ErrorPoly N) * x) • W) := by
-  rw [gadget_mul_action_scaleUp_one (q' := M01) (p := q2) (by norm_num) (by norm_num) Backend.layout0
+  rw [gadget_mul_action_scaleUp_one (q' := M01) (p := q2) (by norm_num) (by norm_num) Backend.layout2
     layoutM01 rfl hg' hg hY' hY x, hX, ← reduceMatrix_smul]
   funext r c
   simp only [scaleUpMatrix, reduceMatrix, Matrix.smul_apply, smul_eq_mul]
@@ -66,15 +66,15 @@ theorem decompose_rows {z : ExactMatrix Q1 N (1 + 1) 6} {Dz' Dz : ExactMatrix Q1
     intro row column
     fin_cases row <;> rfl
   obtain ⟨Dx, hDx⟩ := gadgetDecomposeRuns_exists (inner := 6) (backend := Backend.backend)
-    (base := 32768) (digits := 6) Backend.layout1 layoutQ1 rfl (by norm_num) rfl rfl rfl
+    (base := 32768) (digits := 6) Backend.layout4 layoutQ1 rfl (by norm_num) rfl rfl rfl
     (fun _ c ↦ z 0 c : ExactMatrix Q1 N 1 6)
   obtain ⟨Dy, hDy⟩ := gadgetDecomposeRuns_exists (inner := 6) (backend := Backend.backend)
-    (base := 32768) (digits := 6) Backend.layout1 layoutQ1 rfl (by norm_num) rfl rfl rfl
+    (base := 32768) (digits := 6) Backend.layout4 layoutQ1 rfl (by norm_num) rfl rfl rfl
     (fun _ c ↦ z 1 c : ExactMatrix Q1 N 1 6)
-  obtain ⟨ht, hb⟩ := decompose_stack Backend.layout1 layoutQ1 rfl hz hDz hDx hDy
+  obtain ⟨ht, hb⟩ := decompose_stack Backend.layout4 layoutQ1 rfl hz hDz hDx hDy
   rw [ht, hb]
-  exact ⟨gadget_mul_decompose_one (by norm_num) Backend.layout1 layoutQ1 rfl hG hDx,
-    gadget_mul_decompose_one (by norm_num) Backend.layout1 layoutQ1 rfl hG hDy⟩
+  exact ⟨gadget_mul_decompose_one (by norm_num) Backend.layout4 layoutQ1 rfl hG hDx,
+    gadget_mul_decompose_one (by norm_num) Backend.layout4 layoutQ1 rfl hG hDy⟩
 
 /-- `T = (c' / q₁) x W` with `W` the centered lift of `w`. -/
 noncomputable def actionValue (x : ErrorPoly N) (w : ExactMatrix q0 N 1 6) : ExactMatrix Q1 N 1 6 :=
@@ -161,7 +161,7 @@ theorem row_mul_qq {sm : ErrorPoly N} {K : Fin 2 → ExactMatrix Q1 N 1 6} {t : 
         reducePoly Q1 N t • (matrixPolynomial [1152919668508929361] : ExactMatrix Q1 N 1 1) +
           reduceMatrix Q1 N 1 1 e' := by
   obtain ⟨W, hW, hWb⟩ := hD.2.2.2
-  have hg := gadget_mul_decompose_one (by norm_num) Backend.layout1 layoutQ1 rfl hgq hD'
+  have hg := gadget_mul_decompose_one (by norm_num) Backend.layout4 layoutQ1 rfl hgq hD'
   rw [← compactRebase_self (by norm_num) hD] at hg
   refine ⟨e * W, coeffBound_mul hN he hWb, ?_⟩
   rw [hc, Matrix.add_mul, Matrix.sub_mul, maskPart_mul, Matrix.smul_mul, hg, hW,

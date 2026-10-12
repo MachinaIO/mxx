@@ -994,7 +994,7 @@ fn export_claim(
     let directory = common::generated_directory("lwr_prf", id);
     let protocol =
         lwr_protocol(profile, program, graphs.into_inner(), payload, mask, productions, row);
-    mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("LWR claim export");
+    mxx_ir_core::lean::protocol::export(&protocol, &directory, false).expect("LWR claim export");
     eprintln!("exported the LWR correctness claim to {}", directory.display());
 }
 
@@ -1039,7 +1039,11 @@ fn lwr_protocol(
     let width = profile.native_width();
     let stride = profile.layout.stride();
     let members = profile.lwr_dimension + 1;
-    let family = |count: usize| FamilyType { element: IntType, count: IntExpr::constant(count) };
+    let family = |count: usize| FamilyType {
+        element: IntType,
+        count: IntExpr::constant(count),
+        member_slot: None,
+    };
     // Block `j` of output 0 reads coordinate `cells[j][c]` of `a`; dummy and padding cells read
     // the last member.
     assert_eq!(program.prf.members(), 1, "the exported claim covers one key");

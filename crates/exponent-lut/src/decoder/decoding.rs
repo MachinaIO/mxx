@@ -303,6 +303,22 @@ impl DecoderDeclaration {
         &self.commitment
     }
 
+    /// The key naming this decoder's artifacts (`decoder/<key>/<role>`): the hexadecimal
+    /// commitment of an output decoder; `<spec>/<column>/<prime>` (the refresh specification in
+    /// hexadecimal, zero-padded indices) of a refresh decoder, so that the artifacts of the
+    /// decoders of refreshes with different specifications sort alike (a graph's node order
+    /// follows its output names, so refreshes on different chains build aligned graphs).
+    pub fn artifact_key(&self) -> String {
+        let hex =
+            |bytes: &[u8; 32]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        match self.target {
+            DecoderTarget::Output => hex(&self.commitment),
+            DecoderTarget::Refresh { spec, prime, column } => {
+                format!("{}/{column:04}/{prime:04}", hex(&spec))
+            }
+        }
+    }
+
     /// The digit base `P = 2 p'`.
     pub fn digit_base(&self) -> BigUint {
         BigUint::from(self.profile.p())

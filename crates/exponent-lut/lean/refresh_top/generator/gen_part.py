@@ -47,6 +47,7 @@ def atoms_of(path, name):
 def root_defs(path):
     text = open(path).read()
     body = text[text.index('abbrev generatedRoot.body'):]
+    body = body[:body.index('\n\n')]
     return dict(re.findall(r'^  let (w_\S+) : [^\n]*?:= (.*)$', body, re.M))
 
 
@@ -68,6 +69,15 @@ def instantiate(template, part):
         at = atoms_of(stage_file(stage, part), name)[atom]
         return re.search(r'hashSample \(hashModel\) \(\[([\d, ]+)\]\)', at).group(1)
 
+    def tag_full_marker(m):
+        # The whole tag of atom `atom` before its member components: the literal prefix, and the
+        # components before `member` (an instance's digests) when there are any.
+        stage, name, atom = (x.strip() for x in m.group(1).split(','))
+        at = atoms_of(stage_file(stage, part), name)[atom]
+        mm = re.search(r'hashSample \(hashModel\) \(\[([\d, ]+)\]\) \(\[(.*?)\.bytes \[109, 101, 109, 98, 101, 114\]', at)
+        pre = mm.group(2).strip().rstrip(',').strip()
+        return f'completeHashTag [{mm.group(1)}] [{pre}]' if pre else f'[{mm.group(1)}]'
+
     def input_marker(m):
         stage, wire = (x.strip() for x in m.group(1).split(','))
         return root_defs(stage_file(stage, part))[wire]
@@ -81,6 +91,7 @@ def instantiate(template, part):
 
     out = re.sub(r'@DESTRUCT\(([^)]*)\)@', destruct_marker, out)
     out = re.sub(r'@TAG\(([^)]*)\)@', tag_marker, out)
+    out = re.sub(r'@TAGX\(([^)]*)\)@', tag_full_marker, out)
     out = re.sub(r'@INPUT\(([^)]*)\)@', input_marker, out)
     out = re.sub(r'@OUTPUT\(([^)]*)\)@', output_marker, out)
     return out

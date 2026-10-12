@@ -241,7 +241,9 @@ impl RnsBggParameters {
         let ring = self.ring(level)?;
         let columns =
             self.key_component_columns(level, crate::program::AttributeKnowledge::PublicPayload)?;
-        let tag = [b"refresh/v1/one".as_slice(), declaration.spec().as_slice()].concat();
+        // The specification is an integer component, so parts differ only in integers.
+        let mut tag = mxx_dsl::HashTag::from(b"refresh/v1/one".to_vec());
+        super::push_digest(&mut tag, declaration.spec());
         Ok(super::public_key::matrix_from_hash(&ring, hash_key, tag, columns))
     }
 

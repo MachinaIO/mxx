@@ -311,13 +311,22 @@ impl<S: SessionStore> Executor<'_, S> {
         members: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ExecutionError> {
         let wire = WireRef { node, port: Port(port) };
-        let ConcreteWireType::IndexedFamily { element, count } =
-            self.resolved_wire_type(scope_id, wire, env)?
-        else {
-            return Err(ExecutionError::MissingMetadata(WireId {
-                instantiation_path: Vec::new(),
-                wire,
-            }));
+        let (element, count) = match self.resolved_wire_type(scope_id, wire, env)? {
+            ConcreteWireType::IndexedFamily { element, count } => (element, count),
+            ConcreteWireType::DependentFamily { members: types } => {
+                if members.len() != types.len() ||
+                    members.iter().zip(&types).any(|(value, ty)| !value.matches_wire_type(ty))
+                {
+                    return Err(ExecutionError::ValueKind(wire));
+                }
+                return Ok(RuntimeValue::DependentFamily { values: members.into() });
+            }
+            _ => {
+                return Err(ExecutionError::MissingMetadata(WireId {
+                    instantiation_path: Vec::new(),
+                    wire,
+                }));
+            }
         };
         if members.len() != count {
             return Err(ExecutionError::ValueKind(wire));
@@ -3100,6 +3109,57 @@ mod tests {
         };
         assert!(matches!(&values[0], RuntimeValue::Int(value) if value == &BigInt::from(1649)));
         assert!(matches!(&values[1], RuntimeValue::Int(value) if value == &BigInt::from(10961)));
+    }
+
+    /// A parallel body whose matrices live in a ring chosen by the loop index: each instance
+    /// computes in its own ring and the output is a family with one type per member.
+    #[test]
+    fn loop_dependent_rings_execute_per_instance() {
+        let primes = [1073741441u64, 1073741329];
+        let prime = IntExpr::Select {
+            selector: Box::new(IntExpr::LoopIndex(0)),
+            branches: primes.iter().map(|&prime| IntExpr::from(prime)).collect(),
+        };
+        let ring = Ring::from_crt_moduli(vec![prime], 8);
+        let squares = parallel(2, |_| {
+            let value = ring.polynomial([3.into()]);
+            Ok(value.clone() * value)
+        })
+        .unwrap();
+        let graph = DslContext::new("cpu-loop-dependent-ring")
+            .output("squares", squares)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let parameters = primes
+            .iter()
+            .map(|&prime| DCRTPolyParams::new(8, 1, 30, 15, Some(vec![prime]), None))
+            .collect::<Vec<_>>();
+        let mut backend = cpu_backend(parameters.clone());
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let output = result.materialize_output("squares", &backend, &mut store).unwrap();
+        let RuntimeValue::DependentFamily { values } = output else {
+            panic!("squares must be a family with one type per member")
+        };
+        for (value, parameters) in values.iter().zip(&parameters) {
+            let expected = DCRTPolyMatrix::from_poly_vec(
+                parameters,
+                vec![vec![DCRTPoly::from_biguint_to_constant(parameters, 9u32.into())]],
+            );
+            let RuntimeValue::Matrix(matrix) = value else { panic!("member must be a matrix") };
+            assert_eq!(matrix.as_cpu_full().expect("CPU matrix"), &expected);
+        }
     }
 
     #[test]

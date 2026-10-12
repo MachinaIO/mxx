@@ -40,12 +40,17 @@ for part in parts_of(d):
     open(f'{d}/Part_{part}_KeyMask.lean', 'w').write(body)
     # The source LUT.
     sb = chain_binders(f'{d}/generated/{on_ns}.lean', on_ns, [(kr, 'keyRootLut18')], ab)
+    # instance `I`: the preprocessing selects the row's keys (`select_row`), the row is `jr i0`
+    inst = part == 'I'
+    sel_atoms = ['h10187_0', 'h10345_0'] if inst else []
     pb = [prefixed(b) for b in chain_binders(f'{d}/generated/{pre_ns}.lean', pre_ns, [], ab,
-                                             ['h185_3', 'h186_0', 'h342_0'])]
-    body = open(os.path.join(os.path.dirname(__file__), 'templates', 'KeySource.body')).read()
-    row = int(part[2])
-    body = body.replace('@KX0@', ['w_52_0', 'w_67_0'][row]).replace('@KX1@', ['w_70_0', 'w_73_0'][row])
-    body = body.replace('@KXP@', ['⟨a.1, a.2.2.1⟩', '⟨a.2.1, a.2.2.2.1⟩'][row]).replace('@ROW@', str(row))
+                                             ['h185_3', 'h186_0', 'h342_0'] + sel_atoms)]
+    body = open(os.path.join(os.path.dirname(__file__), 'templates',
+                             'KeySourceI.body' if inst else 'KeySource.body')).read()
+    if not inst:
+        row = int(part[2])
+        body = body.replace('@KX0@', ['w_52_0', 'w_67_0'][row]).replace('@KX1@', ['w_70_0', 'w_73_0'][row])
+        body = body.replace('@KXP@', ['⟨a.1, a.2.2.1⟩', '⟨a.2.1, a.2.2.2.1⟩'][row]).replace('@ROW@', str(row))
     body = body.replace('@P@', part).replace('@ON@', on_ns).replace('@PRE@', pre_ns)
     body = body.replace('@ARGS(keyRootLut18)@', call('keyRootLut18'))
     body = body.replace('@BINDERS@', '\n'.join('    ' + b for b in sb + pb))

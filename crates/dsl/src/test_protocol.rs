@@ -170,7 +170,7 @@ mod tests {
             .join("../../test_data/lean_ir_fixtures/threshold_protocol");
         // The stage layout is part of the fixture; drop modules of an earlier layout.
         let _ = fs::remove_dir_all(&directory);
-        mxx_ir_core::lean::protocol::export(&declaration, &directory)
+        mxx_ir_core::lean::protocol::export(&declaration, &directory, false)
             .expect("generic export accepts the validated threshold decoder");
 
         let source = fs::read_to_string(directory.join("Claim.lean")).unwrap();

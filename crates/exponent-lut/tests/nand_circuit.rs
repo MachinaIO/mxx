@@ -581,7 +581,8 @@ fn nand_circuit_end_to_end() {
             (preprocess.production().clone(), encrypted.production().clone()),
             &row,
         );
-        mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("NAND claim export");
+        mxx_ir_core::lean::protocol::export(&protocol, &directory, false)
+            .expect("NAND claim export");
         eprintln!("exported the NAND correctness claim to {}", directory.display());
     }
 }

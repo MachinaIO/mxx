@@ -15,8 +15,11 @@ from layouts import layouts
 
 d = sys.argv[1]
 L = layouts(d)
-Q3 = '(((q3 : Nat) : Int) : ErrorPoly N)'
 for part in parts_of(d):
+    # Instance `I` of the merged stages decodes at `R i0`, dropping `qd i0` from `Q0`.
+    inst = part == 'I'
+    R, qd, q0eq = ('(R i0)', '(qd i0)', '(q0_eqR i0 hi0)') if inst else ('Q1', 'q3', 'q0_eq')
+    Q3 = f'((({qd} : Nat) : Int) : ErrorPoly N)'
     path = f'{d}/generated/Stage_online_eval_{part}.lean'
     ns = f'Stage_online_eval_{part}'
     text = open(path).read()
@@ -34,13 +37,14 @@ for part in parts_of(d):
     body = ''
     body += member_lut(path, ns, readout[0], 'round', 'Q5', 'Q0', 'p4', 8, 6, 'Backend.' + L['Q0'],
                        'layoutQ0', 'q5_eq', 0, scale=Q3, table='readoutTable')
-    body += member_lut(path, ns, sample[0], 'branches', 'Q0', 'Q1', 'q3', 6, 6, 'Backend.' + L['Q1'],
-                       'layoutQ1', 'q0_eq', 0, offset=True)
+    body += member_lut(path, ns, sample[0], 'branches', 'Q0', R, qd, 6, 6, 'Backend.' + L['Q1'],
+                       'layoutQ1', q0eq, 0, offset=True, inst=inst)
     body += member_lut(path, ns, readout[1], 'round', 'Q5', 'Q0', 'p4', 8, 6, 'Backend.' + L['Q0'],
                        'layoutQ0', 'q5_eq', 0, scale=Q3, table='readoutTable')
-    body += member_lut(path, ns, sample[1], 'branches', 'Q0', 'Q1', 'q3', 6, 6, 'Backend.' + L['Q1'],
-                       'layoutQ1', 'q0_eq', 0)
+    body += member_lut(path, ns, sample[1], 'branches', 'Q0', R, qd, 6, 6, 'Backend.' + L['Q1'],
+                       'layoutQ1', q0eq, 0, inst=inst)
     open(f'{d}/Part_{part}_Readout.lean', 'w').write(f'''import TopLut
+{'import TopInst' if inst else ''}
 
 /-! The PRF readout and sampling LUTs of the mask and the fresh noise (written by
 `generator/gen_online_luts.py`). -/
@@ -54,11 +58,13 @@ noncomputable def readoutTable (k : Fin 4) : ErrorPoly N := Xe (2 * ![1, 1, 3, 3
 {body}
 end RefreshTopProof.Part_{part}
 ''')
-    sm = ''.join(member_lut(path, ns, k, 'smudge', 'Q0', 'Q1', 'q3', 6, 6, 'Backend.' + L['Q1'],
-                            'layoutQ1', 'q0_eq', 0, scale='(1 : ErrorPoly N)', table='smudgeTable')
+    sm = ''.join(member_lut(path, ns, k, 'smudge', 'Q0', R, qd, 6, 6, 'Backend.' + L['Q1'],
+                            'layoutQ1', q0eq, 0, scale='(1 : ErrorPoly N)', table='smudgeTable',
+                            inst=inst)
                  for k in smudges)
     open(f'{d}/Part_{part}_Smudge.lean', 'w').write(f'''import TopLut
 import TopPlace
+{'import TopInst' if inst else ''}
 
 /-! The smudge LUTs of the decoders (written by `generator/gen_online_luts.py`). -/
 

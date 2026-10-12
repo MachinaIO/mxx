@@ -122,10 +122,10 @@ pub struct PublicKeyLowering<'a> {
     /// identity.  The family member is the concrete automorphism branch.
     pub(crate) lut_material:
         BTreeMap<(usize, usize, crate::program::LutId, ExpLayout), Family<RnsBggMatrix>>,
-    /// The unmasking of the composed decoder: its declaration commitment, the
+    /// The unmasking of the composed decoder: its artifact key, the
     /// preimage `K` of the summed key, and the public `B` it is a preimage
     /// under.
-    pub(crate) unmask: Option<([u8; 32], Preimage, Mat)>,
+    pub(crate) unmask: Option<(String, Preimage, Mat)>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Open parallel bodies, outermost first: each one's instance count and
     /// member index, and the RHS family members it prepared.

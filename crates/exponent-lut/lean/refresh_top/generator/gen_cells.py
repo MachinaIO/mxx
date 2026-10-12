@@ -71,8 +71,10 @@ open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
         cells = 40 if name == 'mask' else 240 if name == 'fresh' else 800
         members = cells // 5
         lv = TOP if name in ('mask', 'fresh') else LOW
-        out.append(f'def {name}Rhs0 : Blob := [@TAG(online_eval, parallel_generatedRoot_{d0}, h46_0)@]\n')
-        out.append(f'def {name}Rhs1 : Blob := [@TAG(online_eval, parallel_generatedRoot_{d1}, h76_0)@]\n\n')
+        # The RHS tags: the prefix and the instance's digests (instance `I`, see `rhsTop_tag`).
+        binder = ' (i0 : Nat)' if part == 'I' else ''
+        out.append(f'abbrev {name}Rhs0{binder} : Blob := @TAGX(online_eval, parallel_generatedRoot_{d0}, h46_0)@\n')
+        out.append(f'abbrev {name}Rhs1{binder} : Blob := @TAGX(online_eval, parallel_generatedRoot_{d1}, h76_0)@\n\n')
         out.append(fmt.format(NAME=name, D0=d0, D1=d1, CELLS=cells, MEMBERS=members, **lv))
     out.append('\nend RefreshTopProof.Part_@P@\n')
     open(f'{d}/Part_{part}_Cells.lean', 'w').write(instantiate(''.join(out), part))

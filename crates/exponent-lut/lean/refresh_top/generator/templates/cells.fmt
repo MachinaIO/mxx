@@ -63,8 +63,8 @@ theorem {NAME}_cell0 {{model : HashModel}} {{key : ByteArray}}
   have htop : rhsTop model key {QB} {MC} {NAME}Rhs0 i = ![w_46_0, w_54_0] := by
     funext j
     fin_cases j
-    · exact (hashSample_eq h46_0).symm
-    · exact (hashSample_eq h54_0).symm
+    · rw [rhsTop_tag]; exact (hashSample_eq h46_0).symm
+    · rw [rhsTop_tag]; exact (hashSample_eq h54_0).symm
   have hrhs' := hrhs
   rw [htop] at hrhs'
   have hpriv := mul_private_down (q := {QA}) (q' := {QB}) (p := {PA}) (m := {MB}) (m' := {MC})
@@ -181,8 +181,8 @@ theorem {NAME}_cell1 {{model : HashModel}} {{key : ByteArray}}
   have htop : rhsTop model key {QC} {MD} {NAME}Rhs1 i = ![w_76_0, w_84_0] := by
     funext j
     fin_cases j
-    · exact (hashSample_eq h76_0).symm
-    · exact (hashSample_eq h84_0).symm
+    · rw [rhsTop_tag]; exact (hashSample_eq h76_0).symm
+    · rw [rhsTop_tag]; exact (hashSample_eq h84_0).symm
   have hrhs' := hrhs
   rw [htop] at hrhs'
   have hpriv := mul_private_down (q := {QB}) (q' := {QC}) (p := {PB}) (m := {MC}) (m' := {MD})

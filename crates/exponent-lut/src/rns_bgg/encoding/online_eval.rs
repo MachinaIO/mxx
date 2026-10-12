@@ -111,11 +111,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             return Err(ApiError::input("a refresh decoder binds through bind_refresh_child"));
         }
         let commitment = *declaration.commitment();
+        let key = declaration.artifact_key();
         self.bind_child(
             declaration.smudge().program(),
             commitment,
             Some(declaration.clone()),
-            decoder_artifact_name(commitment, "smudge"),
+            decoder_artifact_name(&key, "smudge"),
             None,
             preprocess,
             encryption,
@@ -236,12 +237,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 hash_key,
             ),
             Some(decoder) => {
-                let commitment = *decoder.commitment();
+                let key = decoder.artifact_key();
                 self.bind_child(
                     program,
                     spec,
                     Some(decoder.clone()),
-                    decoder_artifact_name(commitment, "smudge"),
+                    decoder_artifact_name(&key, "smudge"),
                     label,
                     preprocess,
                     encryption,
@@ -501,7 +502,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             .as_mut()
             .ok_or(RnsBggError::Binding("online evaluation artifacts are not bound"))?;
         evaluator.manifests.extend(child_manifests);
-        let commitment = *declaration.commitment();
+        let key = declaration.artifact_key();
         let ring = self.parameters.ring(level)?;
         let columns = crate::decoder::unmask::UNMASK_ROWS *
             (self.parameters.level(level)?.modulus_digits() + 2);
@@ -511,14 +512,14 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             .ok_or(RnsBggError::Binding("the unmask preimage bound is not bound"))?;
         let preimage = ring.preimage_artifact_input(
             evaluator.preprocess.clone(),
-            decoder_artifact_name(commitment, "unmask-preimage"),
+            decoder_artifact_name(&key, "unmask-preimage"),
             (columns, 1),
             BigInt::from(bound),
             ArtifactAvailability::Transferred,
         );
         let hint = ring.artifact_input(
             evaluator.encryption.clone(),
-            decoder_artifact_name(commitment, "unmask-hint"),
+            decoder_artifact_name(&key, "unmask-hint"),
             (1, columns),
             ArtifactAvailability::Transferred,
         );
@@ -750,7 +751,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                     checked_modulus_convert(smudge.row.1, &ring)?;
                 let preimage = ring.preimage_artifact_input(
                     preprocess.clone(),
-                    decoder_artifact_name(*decoder.commitment(), "unmask-preimage"),
+                    decoder_artifact_name(&decoder.artifact_key(), "unmask-preimage"),
                     (hint_columns, 1),
                     BigInt::from(bound.clone()),
                     ArtifactAvailability::Transferred,

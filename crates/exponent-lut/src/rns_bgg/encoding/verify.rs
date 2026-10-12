@@ -447,7 +447,11 @@ fn polynomial_input<P: Poly>(
     let family = DslContext::new("polynomial")
         .input::<mxx_dsl::Family<Int>>(
             input,
-            mxx_dsl::FamilyType { element: mxx_dsl::IntType, count: IntExpr::constant(count) },
+            mxx_dsl::FamilyType {
+                element: mxx_dsl::IntType,
+                count: IntExpr::constant(count),
+                member_slot: None,
+            },
         )
         .map_err(ApiError::scheme)?;
     (0..count)

@@ -33,6 +33,11 @@ def renamed(text):
 
 for m in modules:
     open(f'{avg}/worst/W_{m}.lean', 'w').write(renamed(open(f'{worst}/generated/{m}.lean').read()))
+# The worst-case export's facts modules (`<module>_Facts`, exported with
+# `MXX_EXPONENT_LUT_REFRESH_TOP_LEAN_FACTS=1`), renamed alike: the modular proof reads them.
+for f in sorted(os.listdir(f'{worst}/generated')):
+    if f.endswith('_Facts.lean') and ROOTS.fullmatch(f[:-len('_Facts.lean')]):
+        open(f'{avg}/worst/W_{f}', 'w').write(renamed(open(f'{worst}/generated/{f}').read()))
 
 claim = open(f'{worst}/generated/Claim.lean').read()
 imports = ''.join(f'import W_{m}\n' for m in modules)

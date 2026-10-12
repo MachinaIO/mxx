@@ -2365,6 +2365,23 @@ pub(crate) fn hash_runtime_value(
                 hash_runtime_value(backend, value, element, hasher)?;
             }
         }
+        RuntimeValue::DependentFamily { values } => {
+            let ConcreteWireType::DependentFamily { members } = concrete else {
+                return Err(ExecutionError::Manifest(
+                    "dependent family input has non-family metadata".into(),
+                ));
+            };
+            if values.len() != members.len() {
+                return Err(ExecutionError::Manifest(
+                    "dependent family input does not match validated family metadata".into(),
+                ));
+            }
+            hasher.update([12]);
+            hasher.update(values.len().to_le_bytes());
+            for (value, member) in values.iter().zip(members) {
+                hash_runtime_value(backend, value, member, hasher)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2520,6 +2537,18 @@ fn artifact_wire_type(artifact: &ArtifactType) -> ConcreteWireType {
         },
         ArtifactType::TypedBlob { type_name, schema_hash } => {
             ConcreteWireType::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash }
+        }
+        ArtifactType::Family(members) => {
+            let members = members.iter().map(artifact_wire_type).collect::<Vec<_>>();
+            match members.first() {
+                Some(first) if members.iter().all(|member| member == first) => {
+                    ConcreteWireType::IndexedFamily {
+                        element: Box::new(first.clone()),
+                        count: members.len(),
+                    }
+                }
+                _ => ConcreteWireType::DependentFamily { members },
+            }
         }
     }
 }

@@ -566,9 +566,18 @@ impl RefreshDeclaration {
         .collect()
     }
 
-    /// The hash tag of the public matrix `A'`.
-    pub fn matrix_hash_tag(&self) -> Vec<u8> {
-        [b"refresh/v1/A".as_slice(), self.matrix_tag.as_slice()].concat()
+    /// The hash tag of the public matrix `A'`: the matrix tag, and for a part of a refresh to the
+    /// top level its component as an integer component (parts differ only in integers, so their
+    /// stages share one structure).
+    pub fn matrix_hash_tag(&self) -> mxx_dsl::HashTag {
+        let mut tag = mxx_dsl::HashTag::from(
+            [b"refresh/v1/A".as_slice(), self.matrix_tag.as_slice()].concat(),
+        );
+        if self.top.is_some() {
+            tag.push("component");
+            tag.push(mxx_ir_core::IntExpr::constant(self.component()));
+        }
+        tag
     }
 }
 

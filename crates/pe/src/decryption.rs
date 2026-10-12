@@ -16,13 +16,20 @@
 //! accumulated by blocks: the anchor blocks as `sigma_i((b - B^(2)) k~_i)`
 //! with the stored inverse-coordinate blocks, the helper blocks against
 //! their extension coordinates, and the output block. Decryption reads no
-//! secret: not `s` or the trapdoor. For `F(x) != 0` the phase
+//! secret: not `s` or the trapdoor.
+//!
+//! With compact encodings (the manuscript's Appendix C), the ciphertext carries
+//! `b_Q` over `R_Q`; decryption rounds `b = round(b_Q / p)`, decompresses
+//! `b'' = Dc(b_c)` from its first `m_c` entries, and extends the rows by
+//! `((sigma_i(b''))_i, 0_W)` and `((sigma_i(B''^(2)))_i, 0_W)`, so the
+//! blocks `v''_i` contract `sigma_i(b'' - B''^(2))` and `v_iota` contracts
+//! zero (see [`crate::keygen`]). For `F(x) != 0` the phase
 //! keeps the term `-F(x) (s G)_2 v_F`, and the rounded output is not a
 //! reliable rejection.
 use crate::{
     PeCiphertext, PeError, PePredicateKey, PePublicKey,
     encryption::{ANCHOR_ENCODING, MESSAGE_ENCODING},
-    keygen::{Group, HELPER_KEY, OUTPUT_KEY, anchor_key},
+    keygen::{COMPRESSED_KEY, Group, HELPER_KEY, OUTPUT_KEY, anchor_key},
 };
 use mxx_backends::{RuntimeValue, SessionStore, poly::PolyParams};
 use mxx_dsl::{DslContext, Int, Mat};
@@ -171,12 +178,13 @@ pub(crate) fn phase_graph(
     };
     let output_second_row = Mat::concat(ConcatAxis::Columns, vec![output_key(2), output_key(3)]);
     let prelude = ciphertext.prelude().production().clone();
-    let anchor = ring.artifact_input(
+    let published = public_key.anchor_ring()?.artifact_input(
         prelude.clone(),
         ANCHOR_ENCODING,
         (1, m_b),
         ArtifactAvailability::Transferred,
     );
+    let anchor = public_key.round_anchor(published.clone())?;
     let message =
         ring.artifact_input(prelude, MESSAGE_ENCODING, (1, 1), ArtifactAvailability::Transferred);
     let second = public_key.anchor_second_row(hash_key.clone())?;
@@ -191,6 +199,25 @@ pub(crate) fn phase_graph(
         cutoff.clone(),
         ArtifactAvailability::Transferred,
     );
+    // `sum_i sigma_i(b'' - B''^(2)) v''_i` with compact encodings.
+    let compressed = match public_key.compressed_anchor_rows(hash_key.clone())? {
+        Some((_, second_row)) => {
+            let masked = public_key.decompress_anchor(published)? - second_row;
+            let blocks = ring.small_matrix_family_artifact_input(
+                key_production.clone(),
+                COMPRESSED_KEY,
+                w,
+                (parameters.compressed_anchor_width(), 1),
+                cutoff.clone(),
+                ArtifactAvailability::Transferred,
+            );
+            mxx_dsl::iterate(w, ring.zero((1, 1)), |row, sum| {
+                let i = Group::select(&group.elements, row.expression()?);
+                Ok(sum + masked.clone().ring_automorphism(i).mul_small_rhs(blocks.at(row)))
+            })?
+        }
+        None => ring.zero((1, 1)),
+    };
     let output_key_block = ring.small_matrix_artifact_input(
         key_production,
         OUTPUT_KEY,
@@ -221,14 +248,13 @@ pub(crate) fn phase_graph(
         let public =
             setup.helper_key(rns, hash_key.clone(), k).map_err(|_| mxx_dsl::DslError::Schema)?;
         let member = Int::evaluate(k_index);
-        let helper =
-            read_helper(public_key, &helper_rows, member).map_err(|_| mxx_dsl::DslError::Schema)?;
+        let helper = read_helper(&helper_rows, member);
         let public_second_row = Mat::concat(ConcatAxis::Columns, vec![public.1.0, public.1.1]);
         let value = (helper - public_second_row).ring_automorphism(i) + gadget_second_row.clone();
         Ok(sum + value.mul_small_rhs(helper_keys.at(Int::evaluate(pair))))
     })?;
     let outputs = (output_row - output_second_row).mul_small_rhs(output_key_block);
-    let phase = message - d_2 - (anchors + helpers + outputs);
+    let phase = message - d_2 - (anchors + compressed + helpers + outputs);
     let mut manifests = BTreeMap::new();
     for (production, manifest) in [
         (ciphertext.prelude().production(), ciphertext.prelude().manifest()),
@@ -242,19 +268,14 @@ pub(crate) fn phase_graph(
 }
 
 /// The `p` automorphism helper rows of a ciphertext's packages, port by port:
-/// two `1 x D` blocks over `q`, or, with compact encodings, two `1 x 1` entries
-/// over `pq` (expanded by [`read_helper`]).
+/// two `1 x D` blocks over `q`.
 pub(crate) fn helper_rows(
     public_key: &PePublicKey,
     packages: &mxx_ir_core::artifact::ProductionId,
     p: usize,
 ) -> Result<[mxx_dsl::Family<Mat>; 2], PeError> {
-    let parameters = public_key.parameters();
-    let setup = public_key.setup();
-    let (ring, columns) = match setup.compact_ring(parameters.rns(), 0)? {
-        Some(compact) => (compact, 1),
-        None => (public_key.ring()?, parameters.digits()),
-    };
+    let ring = public_key.ring()?;
+    let columns = public_key.parameters().digits();
     Ok([0, 1].map(|port| {
         ring.family_artifact_input(
             packages.clone(),
@@ -266,23 +287,9 @@ pub(crate) fn helper_rows(
     }))
 }
 
-/// Helper member `member` as one `1 x m` row over `q`: its two blocks joined,
-/// after expanding a compact helper to `s H_k' - s_k G + e'`.
-pub(crate) fn read_helper(
-    public_key: &PePublicKey,
-    rows: &[mxx_dsl::Family<Mat>; 2],
-    member: Int,
-) -> Result<Mat, PeError> {
-    let row = (rows[0].at(member.clone()), rows[1].at(member));
-    let row = match public_key.setup().compact_extension() {
-        Some(_) => mxx_exponent_lut::rns_bgg::expand_stored_row(
-            public_key.parameters().rns(),
-            public_key.setup(),
-            row,
-        )?,
-        None => row,
-    };
-    Ok(Mat::concat(ConcatAxis::Columns, vec![row.0, row.1]))
+/// Helper member `member` as one `1 x m` row over `q`: its two blocks joined.
+pub(crate) fn read_helper(rows: &[mxx_dsl::Family<Mat>; 2], member: Int) -> Mat {
+    Mat::concat(ConcatAxis::Columns, vec![rows[0].at(member.clone()), rows[1].at(member)])
 }
 
 #[cfg(test)]
@@ -378,9 +385,10 @@ mod tests {
         family_values_open(class, parameters(class));
     }
 
-    /// [`family_values_open_to_the_secret_times_the_family_matrix`] with compact encodings: each
-    /// expanded helper block is within the expanded helper bound `B_h'` that the decryption
-    /// noise uses.
+    /// [`family_values_open_to_the_secret_times_the_family_matrix`] with compact encodings: the
+    /// rounded anchor blocks are within `B_b` and the blocks
+    /// `sigma_i(b'' - B''^(2)) - sigma_i(s_bar) sigma_i(B''^(1))` within `B''`, the bounds the
+    /// decryption noise uses.
     #[test]
     fn compact_family_values_open_within_the_expanded_bounds() {
         let class = PeClass::new(2, 2, 2, 2).unwrap();
@@ -448,11 +456,15 @@ mod tests {
             let s_bar = secret.row().0.clone();
             let sigma = |value: Mat, i: usize| value.ring_automorphism(IntExpr::constant(i));
             let prelude = ciphertext.prelude().production().clone();
-            let anchor = ring.artifact_input(
+            let published = public_key.anchor_ring().unwrap().artifact_input(
                 prelude,
                 ANCHOR_ENCODING,
                 (1, m_b),
                 ArtifactAvailability::Transferred,
+            );
+            let anchor = public_key.round_anchor(published.clone()).unwrap();
+            let compressed = public_key.compressed_anchor_rows(hash_key.clone()).unwrap().map(
+                |(first, second)| (public_key.decompress_anchor(published).unwrap(), first, second),
             );
             let first = public_key.anchor_row().unwrap();
             let second = public_key.anchor_second_row(hash_key.clone()).unwrap();
@@ -463,13 +475,17 @@ mod tests {
                 let anchor_block = sigma(anchor.clone() - second.clone(), *i) -
                     sigma(s_bar.clone(), *i) * sigma(first.clone(), *i);
                 graph = graph.output(format!("anchor-{i}"), anchor_block).unwrap();
+                if let Some((decompressed, first, second)) = &compressed {
+                    let block = sigma(decompressed.clone() - second.clone(), *i) -
+                        sigma(s_bar.clone(), *i) * sigma(first.clone(), *i);
+                    graph = graph.output(format!("compressed-{i}"), block).unwrap();
+                }
                 for (member, k) in group.helpers.iter().enumerate() {
                     let public = public_key
                         .setup()
                         .helper_key(rns, hash_key.clone(), IntExpr::constant(*k))
                         .unwrap();
-                    let helper =
-                        read_helper(&public_key, &helper_rows, Int::constant(member)).unwrap();
+                    let helper = read_helper(&helper_rows, Int::constant(member));
                     let public_first =
                         Mat::concat(ConcatAxis::Columns, vec![public.0.0, public.0.1]);
                     let public_second =
@@ -523,11 +539,17 @@ mod tests {
                 |_| Ok(()),
             )
             .unwrap();
-            let error = parameters.error().cutoff();
-            let helper_cutoff = crate::noise::helper_error(&parameters).unwrap();
+            let error = crate::noise::anchor_error(&parameters).unwrap();
+            let compressed_error = crate::noise::compressed_anchor_error(&parameters).unwrap();
+            let helper_cutoff = parameters.error().cutoff().clone();
             for i in &group.elements {
                 let measured = norm(&q, &download(&execution, &outputs, &format!("anchor-{i}")));
-                assert!(&measured <= error, "anchor {i}: {measured} > {error}");
+                assert!(measured <= error, "anchor {i}: {measured} > {error}");
+                if compressed.is_some() {
+                    let measured =
+                        norm(&q, &download(&execution, &outputs, &format!("compressed-{i}")));
+                    assert!(measured <= compressed_error, "compressed {i}: {measured}");
+                }
                 for k in &group.helpers {
                     let measured =
                         norm(&q, &download(&execution, &outputs, &format!("helper-{i}-{k}")));

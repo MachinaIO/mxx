@@ -38,12 +38,12 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   digit of `e`, from the branch without its top digit, so a lookup still performs `|H| - 1`
   switches, in a tree of depth at most `log_B |H|`; each switch adds one decomposition gain to the
   noise of the branches below it. `B = |H|` is the direct switching.
-  A setup may also publish its fresh encodings compactly
-  (`RnsBggDynamicSetup::with_compact_encodings`): each digit companion, automorphism helper, and
-  private scalar input is a two-column row `s (Ã - p X I_2) + e` over `pq` for an extension `p` of
-  the level's own size, and readers expand it to the full gadget width at `q` by
-  `ModSwitch_{pq -> q}(c G̃)`. The expansion adds about `B q / p + (n + 3) / 2` to the error, and
-  the simulator carries each expanded row as an opaque term. GSW ciphertexts stay at `q`.
+  A setup may also publish its digit companions compactly
+  (`RnsBggDynamicSetup::with_compact_encodings`): each is a two-column row `s (Ã - p d I_2) + e`
+  over `pq` for an extension `p` of the level's own size, and readers expand it to the full gadget
+  width at `q` by `ModSwitch_{pq -> q}(c G̃)`. The expansion adds about `B q / p + (n + 3) / 2` to
+  the error, and the simulator carries each expanded row as an opaque term. Helpers, inputs, and
+  GSW ciphertexts stay at `q`.
   Every RHS gadget ciphertext `C = [a; c]` has a public top row `a` that the setup hashes
   (`rhs_public_top`); encryption samples only the bottom row `c` (`rhs_bottom`), in its own
   prelude from the bound plaintexts or in an enclosing scheme's prelude, and, as for an

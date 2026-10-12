@@ -8,6 +8,13 @@
 //! production republishes `B^(1)` alone, and the public key names only that
 //! one. `B^(2)` and `d` are expanded from the public hash key under setup
 //! tags, as are the Dynamic setup's `A_0`, `H_k`, and companion matrices.
+//!
+//! With compact encodings (the manuscript's compressed digit encodings, its Appendix C), the
+//! anchor is defined modulo `Q = pq`: the public production publishes
+//! `B_Q^(1) = p B^(1) + r^(1)` for `r^(1)` uniform with coefficients in `(-p/2, p/2]`, `B_Q^(2)`
+//! is hashed over `R_Q`, and `B = round(B_Q / p) mod q`. The first `m_c` columns `B_c` of
+//! `B_Q` give `B'' = Dc(B_c)` ([`PePublicKey::compressed_anchor_rows`]), whose blocks extend the
+//! key's family matrix.
 use crate::{
     PeError, PeParameters,
     branching_program::{ATTRIBUTE_COORDINATE, INITIAL_STATE_COORDINATE},
@@ -107,14 +114,84 @@ impl PePublicKey {
         Ok(self.parameters.rns().ring(0)?)
     }
 
-    /// `B^(1)`, imported from the public setup production.
-    pub(crate) fn anchor_row(&self) -> Result<Mat, PeError> {
-        Ok(self.ring()?.artifact_input(
+    /// The ring `R_Q` of the anchor with compact encodings, `None` without them.
+    pub(crate) fn compact_ring(&self) -> Result<Option<Ring>, PeError> {
+        Ok(self.setup.compact_ring(self.parameters.rns(), 0)?)
+    }
+
+    /// The ring of the published anchor: `R_Q` with compact encodings, else `R_q`.
+    pub(crate) fn anchor_ring(&self) -> Result<Ring, PeError> {
+        self.compact_ring()?.map_or_else(|| self.ring(), Ok)
+    }
+
+    /// The published first row: `B_Q^(1)` over `R_Q` with compact encodings, else `B^(1)`,
+    /// imported from the public setup production.
+    pub(crate) fn published_anchor_row(&self) -> Result<Mat, PeError> {
+        Ok(self.anchor_ring()?.artifact_input(
             self.anchor.0.clone(),
             ANCHOR_PUBLIC,
             (1, self.parameters.anchor_columns()),
             ArtifactAvailability::Transferred,
         ))
+    }
+
+    /// The published second row: `B_Q^(2)` over `R_Q` with compact encodings, else `B^(2)`,
+    /// expanded from the hash key.
+    pub(crate) fn published_anchor_second_row(&self, hash_key: Bytes) -> Result<Mat, PeError> {
+        Ok(self.anchor_ring()?.hash_matrix(
+            hash_key,
+            self.tag("anchor-second-row"),
+            (1, self.parameters.anchor_columns()),
+        ))
+    }
+
+    /// `round(row / p) mod q` of a published anchor row over `R_Q`; the row itself without
+    /// compact encodings.
+    pub(crate) fn round_anchor(&self, row: Mat) -> Result<Mat, PeError> {
+        Ok(match self.compact_ring()? {
+            Some(_) => row.modulus_switch(&self.ring()?),
+            None => row,
+        })
+    }
+
+    /// `Dc(row_c)`: the decompression of the first `m_c` entries of a row over `R_Q`, a
+    /// `1 x m_c D` row over `R_q` whose column `(l, j)` is `round(row_l g~_j / p)`.
+    pub(crate) fn decompress_anchor(&self, row: Mat) -> Result<Mat, PeError> {
+        let rns = self.parameters.rns();
+        let gadget = rns.public_gadget(0)?;
+        let columns = (0..crate::params::COMPRESSED_ANCHOR_COLUMNS)
+            .map(|column| {
+                let entry = row.clone().slice(
+                    None,
+                    Some(mxx_ir_core::node::IndexRange {
+                        start: IntExpr::constant(column),
+                        end: IntExpr::constant(column + 1),
+                    }),
+                );
+                mxx_exponent_lut::rns_bgg::expand_compact_entry(rns, &self.setup, 0, &gadget, entry)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, columns))
+    }
+
+    /// `B^(1) = round(B_Q^(1) / p)` over `R_q`.
+    #[cfg(test)]
+    pub(crate) fn anchor_row(&self) -> Result<Mat, PeError> {
+        self.round_anchor(self.published_anchor_row()?)
+    }
+
+    /// `(B''^(1), B''^(2)) = Dc(B_c)` with compact encodings, `None` without them.
+    pub(crate) fn compressed_anchor_rows(
+        &self,
+        hash_key: Bytes,
+    ) -> Result<Option<(Mat, Mat)>, PeError> {
+        if self.compact_ring()?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((
+            self.decompress_anchor(self.published_anchor_row()?)?,
+            self.decompress_anchor(self.published_anchor_second_row(hash_key)?)?,
+        )))
     }
 
     /// The hash tag of the public matrix `domain`. It names the parameters through the context;
@@ -126,13 +203,9 @@ impl PePublicKey {
         tag
     }
 
-    /// `B^(2)`, expanded from the hash key.
+    /// `B^(2)` over `R_q`, rounded from `B_Q^(2)` with compact encodings.
     pub(crate) fn anchor_second_row(&self, hash_key: Bytes) -> Result<Mat, PeError> {
-        Ok(self.ring()?.hash_matrix(
-            hash_key,
-            self.tag("anchor-second-row"),
-            (1, self.parameters.anchor_columns()),
-        ))
+        self.round_anchor(self.published_anchor_second_row(hash_key)?)
     }
 
     /// The message row `(d_1, d_2)`, expanded from the hash key.
@@ -263,6 +336,18 @@ where
         (1, parameters.anchor_columns()),
         ArtifactAvailability::Transferred,
     );
+    // With compact encodings, `B_Q^(1) = p B^(1) + r^(1)` with `r^(1) = u - p round(u / p)` for
+    // `u` uniform over `R_Q`, so `r^(1)` is uniform with coefficients in `(-p/2, p/2]`.
+    let anchor = match dynamic.compact_ring(rns, 0)? {
+        Some(compact) => {
+            let p = compact.polynomial([IntExpr::constant(parameters.compact_modulus()?)]);
+            let uniform = compact.uniform_residue((1, parameters.anchor_columns()));
+            let quotient = uniform.clone().modulus_switch(&ring).centered_rebase(&compact);
+            let remainder = uniform - p.clone() * quotient;
+            p * anchor.centered_rebase(&compact) + remainder
+        }
+        None => anchor,
+    };
     let graph = DslContext::new("mxx-pe/setup-public")
         .transferred_output(ANCHOR_PUBLIC, anchor)?
         .build()?;

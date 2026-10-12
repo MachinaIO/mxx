@@ -35,7 +35,9 @@ the proofs reuse. Mathlib and the ir-core Lean library come through it.
 The recorded rows and the templates use the computational TrapGen, which `mxx-pe` no longer
 provides: the scheme now always uses the statistical TrapGen without noise flooding. The rows are
 reproducible at commit `5b30d1198`; a statistical row needs templates that model the statistical
-TrapGen (see [Generation](#generation)).
+TrapGen (see [Generation](#generation)). The compact row also predates the compressed digit
+encodings of the manuscript's Appendix C, which compact only the digit companions, define the
+anchor modulo `PQ`, and extend the key; its templates need the same update.
 
 `parameters.csv` records the parameter sets of the proofs under unique `parameter_id`s; `gen.py`
 reads a row to write its proof package and checks that the exported layout matches it. The

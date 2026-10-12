@@ -42,6 +42,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ops::RangeInclusive;
 
+/// `m_c`: the columns of the anchor whose decompression `B'' = Dc(B_c)` extends the key's family
+/// matrix with compact encodings (the manuscript's Appendix C). The compressed digit matrices
+/// are sampled uniformly; `m_c` enters only the security proof, through the leftover hash lemma
+/// that programs them as `sigma_i(B_c) R + p d I_2`, the uniformity condition on `σ_R` that the
+/// selection relaxes (Subsection 6.2). The relaxation takes `m_c = 1`, the smallest key.
+pub const COMPRESSED_ANCHOR_COLUMNS: usize = 1;
+
 /// The manuscript's Gaussian width `s` (density `exp(-pi |x|^2 / s^2)`) of
 /// the sampler's standard deviation `sigma`: `s = sqrt(2 pi) sigma`.
 pub fn paper_width(sigma: &BigDecimal) -> f64 {
@@ -67,7 +74,7 @@ pub struct PeParameterRequest {
     /// The radix `B` of the LUT automorphism decomposition (see
     /// [`PeParameters::with_lut_radix`]); `None` switches every automorphism directly (`B = W`).
     pub lut_radix: Option<usize>,
-    /// Publish the ciphertext's fresh encodings in two columns over `pq` (see
+    /// Publish the digit companions in two columns over `pq` and the anchor over `pq` (see
     /// [`PeParameters::with_compact_encodings`]).
     pub compact_encodings: bool,
     /// The noise model of the correctness check: `None` for the worst case,
@@ -255,19 +262,23 @@ impl PeParameters {
         self.lut_radix
     }
 
-    /// Publish the ciphertext's fresh encodings (the digit companions, the
-    /// automorphism helpers, and the initial state `c_0`) as
-    /// `s (A~ - p X I_2) + e` mod `pq` instead of `s (A - X G) + e` mod `q`, for
-    /// the auxiliary modulus `p`: the product of as many CRT primes as `q`'s,
-    /// of the same bit size, `1 mod 2n`, and disjoint from `q`'s. Decryption
-    /// expands each to `ModSwitch_(pq -> q)(c G~)` (see
-    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_compact_encodings`).
-    /// The packages shrink from `m^3` polynomials over `q` to `2 m^2` over
-    /// `pq`; the attribute GSW ciphertexts `C_t` stay at `q`, and so does the
-    /// number `m^2` of companions per package, which encrypt the digits of a
-    /// GSW ciphertext over `q`. [`Self::security_bits`] then also estimates
-    /// Ring-LWE at `pq`. The manuscript's reduction programs the package keys
-    /// over `q`, so compact parameters are outside its theorem.
+    /// The manuscript's compressed digit encodings (its Appendix C): publish every digit
+    /// companion as `s (A~ - p d I_2) + e` mod `Q = pq` instead of `s (A - d G) + e` mod `q`,
+    /// for the auxiliary modulus `p`: the product of as many CRT primes as `q`'s, of the same
+    /// bit size, `1 mod 2n`, and disjoint from `q`'s. Evaluation decompresses each to
+    /// `Dc(c) = ModSwitch_(pq -> q)(c G~)` (see
+    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_compact_encodings`). The packages
+    /// shrink from `m^3` polynomials over `q` to `2 m^2` over `pq`; the helpers, the initial
+    /// state, and the attribute GSW ciphertexts `C_t` stay at `q`.
+    ///
+    /// As the reduction requires, the anchor is defined modulo `Q` (see [`crate::setup`]):
+    /// the ciphertext carries `b_Q` (`m_B` polynomials over `pq`), from which decryption
+    /// rounds `b = round(b_Q / p)` and decompresses `b'' = Dc(b_c)`, and the key extends the
+    /// family matrix by the blocks `delta_i (x) sigma_i(B''^(1))` and `I_W`, `W (m_c D + 1)`
+    /// more short polynomials ([`Self::key_length`]). With the RNS gadget, no column of
+    /// `Dc(B_c)` is a column of `B`, so `B''` takes all `m_c D` of them, where the manuscript's
+    /// binary gadget needs only the `m_c (D - 1)` with `j >= 1`. [`Self::security_bits`] then
+    /// also estimates Ring-LWE at `pq`.
     pub fn with_compact_encodings(mut self) -> Result<Self, PeError> {
         let level = self.level().clone();
         let depth = level.crt_depth();
@@ -299,6 +310,20 @@ impl PeParameters {
     /// The CRT primes of the auxiliary modulus `p` of compact encodings.
     pub fn compact_extension(&self) -> Option<&[u64]> {
         self.compact_extension.as_deref()
+    }
+
+    /// The auxiliary modulus `p` of compact encodings.
+    pub fn compact_modulus(&self) -> Result<BigUint, PeError> {
+        self.compact_extension
+            .as_ref()
+            .map(|extension| extension.iter().map(|prime| BigUint::from(*prime)).product())
+            .ok_or_else(|| PeError::Parameters("the encodings are not compact".into()))
+    }
+
+    /// `m_c D`: the columns of `B''` per row of the family matrix with compact encodings, `0`
+    /// without them.
+    pub fn compressed_anchor_width(&self) -> usize {
+        if self.compact_extension.is_some() { COMPRESSED_ANCHOR_COLUMNS * self.digits() } else { 0 }
     }
 
     /// The ring parameters of `q p` of compact encodings: `q`'s basis followed
@@ -511,11 +536,20 @@ impl PeParameters {
     }
 
     /// The key length `N = W m_B + W |P| m + m` in ring elements, for the `|P|`
-    /// helper automorphisms (`W - 1` without a radix).
+    /// helper automorphisms (`W - 1` without a radix); with compact encodings
+    /// `N~ = N + W (m_c D + 1)` for the blocks of `B''` and `I_W`.
     pub fn key_length(&self) -> usize {
         let w = self.class.lookup_width();
         let helpers = self.helper_automorphism_count().unwrap_or(w - 1);
-        w * self.anchor_columns + w * helpers * self.state_columns() + self.state_columns()
+        let compressed = if self.compact_extension.is_some() {
+            w * (self.compressed_anchor_width() + 1)
+        } else {
+            0
+        };
+        w * self.anchor_columns +
+            w * helpers * self.state_columns() +
+            self.state_columns() +
+            compressed
     }
 
     /// The sampling contracts of the Dynamic packages, all `chi`. Encryption supplies the
@@ -540,8 +574,8 @@ impl PeParameters {
     /// initial state, and the digit companions) is a sample of it. TrapGen is uniform by the
     /// regularity conditions and has no estimate.
     ///
-    /// With compact encodings ([`Self::with_compact_encodings`]), the companions, helpers, and
-    /// initial state are samples over `pq` with the same secret and the same fresh sigmas, so
+    /// With compact encodings ([`Self::with_compact_encodings`]), the anchor `b_Q` and the
+    /// companions are samples over `pq` with the same secret and the same fresh sigmas, so
     /// the estimate is the smaller of the estimates over `q` and over `pq`.
     pub fn security_bits(&self) -> Result<u64, PeError> {
         let error = self.error.sigma().clone();

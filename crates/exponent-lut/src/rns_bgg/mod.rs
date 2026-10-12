@@ -34,7 +34,7 @@ use crate::{
     program_gadgets::prf::PrfError,
 };
 
-pub use dynamic::{compact_expansion_bound, expand_stored_row};
+pub use dynamic::{compact_expansion_bound, expand_compact_entry};
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
     RnsOnlineEvalBuild, decode_output, decode_public_output, verify_output,

@@ -63,7 +63,7 @@ fn test_gpu_decimal_range_decrypts_on_the_gpu() {
 }
 
 /// [`test_gpu_authorized_key_decrypts_on_the_gpu`] with the LUT radix 2 and compact encodings: the
-/// branch `25 = 17 * 9` of two nonzero digits reads compact helpers and companions in both
+/// branch `25 = 17 * 9` of two nonzero digits reads compact companions in both
 /// switches, all on the GPU with the `q` and `pq` rings registered.
 #[test]
 #[ignore = "requires a CUDA GPU"]

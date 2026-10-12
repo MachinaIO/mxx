@@ -287,12 +287,7 @@ impl<'a> RnsEncryptBuild<'a> {
                 hash_key.clone(),
                 select(&automorphisms, member.clone()),
                 select(&inverses, member.clone()),
-                stored_row(
-                    self.parameters,
-                    &setup,
-                    helpers.at(Int::evaluate(select(&inverse_members, member))),
-                )
-                .map_err(|_| DslError::Schema)?,
+                helpers.at(Int::evaluate(select(&inverse_members, member))),
             )
             .map_err(|_| DslError::Schema)
         })
@@ -371,44 +366,6 @@ impl<'a> RnsEncryptBuild<'a> {
                         .ok_or_else(|| ApiError::input("public encoding has no payload"))?;
                     graph.transferred_output(role, (encoding.row.0, encoding.row.1, payload))
                 }
-                (InputBinding::Scalar(value), false) if setup.compact_input(*coordinate) => {
-                    // `s A~ - p (Delta x) r + e` over `pq`: the private
-                    // payload row `Delta x r`, expanded under the state gadget.
-                    let compact = setup
-                        .compact_ring(self.parameters, 0)
-                        .map_err(ApiError::scheme)?
-                        .ok_or_else(|| ApiError::input("compact input without a compact ring"))?;
-                    let p = crate::rns_bgg::dynamic::compact_modulus(setup)
-                        .ok_or_else(|| ApiError::input("compact input without a modulus"))?;
-                    let lift = |row: &RnsBggRow| {
-                        map_row(row.clone(), |entry| entry.centered_rebase(&compact))
-                    };
-                    let s = lift(
-                        &reduce_secret(self.parameters, &mask.row, 0).map_err(ApiError::scheme)?,
-                    );
-                    let r = lift(
-                        &reduce_secret(self.parameters, &payload.row, 0)
-                            .map_err(ApiError::scheme)?,
-                    );
-                    let delta = self
-                        .parameters
-                        .scalar(0, self.parameters.message_scale(0).map_err(ApiError::scheme)?)
-                        .map_err(ApiError::scheme)?;
-                    let scale = (delta * value.clone()).centered_rebase(&compact);
-                    let key = setup
-                        .compact_input_key(self.parameters, hash_key.clone(), *coordinate)
-                        .map_err(ApiError::scheme)?;
-                    let row = crate::rns_bgg::dynamic::compact_encoding_row(
-                        &compact,
-                        key,
-                        &s,
-                        (scale.clone() * r.0, scale * r.1),
-                        &p,
-                        contract,
-                    )
-                    .map_err(ApiError::scheme)?;
-                    graph.transferred_output(role, row)
-                }
                 (InputBinding::Scalar(value), false) => {
                     let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
                     graph.transferred_output(role, encoding.row)
@@ -455,34 +412,6 @@ impl<'a> RnsEncryptBuild<'a> {
         let columns = self.parameters.component_columns(0)?;
         let gadget = self.parameters.public_gadget(0)?;
         let secret = reduce_secret(self.parameters, payload, 0)?;
-        if let (Some(compact), Some(p)) = (
-            setup.compact_ring(self.parameters, 0)?,
-            crate::rns_bgg::dynamic::compact_modulus(setup),
-        ) {
-            // `s H~_k - p s_k + e` over `pq` for `s_k = (sigma_k(s_bar), 1)`.
-            let lifted = map_row(secret.clone(), |entry| entry.centered_rebase(&compact));
-            return mxx_dsl::parallel(automorphisms.len(), |member| {
-                let k = select(automorphisms, member.expression()?);
-                let schema = |_| DslError::Schema;
-                let public = setup
-                    .compact_helper_key(self.parameters, hash_key.clone(), k.clone())
-                    .map_err(schema)?;
-                let payload = (
-                    secret.0.clone().ring_automorphism(k).centered_rebase(&compact),
-                    lifted.1.clone(),
-                );
-                crate::rns_bgg::dynamic::compact_encoding_row(
-                    &compact,
-                    public,
-                    &lifted,
-                    payload,
-                    &p,
-                    &setup.distributions().helper,
-                )
-                .map_err(schema)
-            })
-            .map_err(graph);
-        }
         mxx_dsl::parallel(automorphisms.len(), |member| {
             let k = select(automorphisms, member.expression()?);
             let schema = |_| DslError::Schema;
@@ -606,10 +535,10 @@ impl<'a> RnsEncryptBuild<'a> {
     }
 }
 
-/// A stored companion or helper row at the setup ring as its readers use it:
-/// expanded from its two-column form over `pq` if the setup's encodings are
+/// A stored digit companion at the setup ring as its readers use it:
+/// expanded from its two-column form over `pq` if the setup's companions are
 /// compact ([`crate::rns_bgg::dynamic::expand_compact_row`]), else as stored.
-fn stored_row(
+fn stored_companion(
     parameters: &RnsBggParameters,
     setup: &RnsBggDynamicSetup,
     row: RnsBggRow,
@@ -705,25 +634,26 @@ impl EncodingLowering<'_> {
         self.dynamic.as_ref().ok_or(RnsBggError::Binding("the Dynamic setup is not bound"))
     }
 
-    /// A stored encoding row as evaluation reads it (see [`stored_row`]).
-    fn read_row(&self, row: RnsBggRow) -> Result<RnsBggRow, RnsBggError> {
-        stored_row(self.parameters, &self.dynamic_state()?.setup, row)
+    /// A stored digit companion as evaluation reads it (see [`stored_companion`]).
+    fn read_companion(&self, row: RnsBggRow) -> Result<RnsBggRow, RnsBggError> {
+        stored_companion(self.parameters, &self.dynamic_state()?.setup, row)
     }
 
     /// A family of `count` rows of `columns` columns per component imported
     /// from the encryption under `role`.
-    /// A compact setup stores its companions and helpers in two columns over
-    /// `pq` (`columns` is then ignored).
+    /// A compact setup stores its companions (`companions`) in two columns over
+    /// `pq` (`columns` is then ignored); helpers stay at `q`.
     fn encryption_row_family(
         &self,
         role: String,
         count: usize,
         columns: usize,
+        companions: bool,
     ) -> Result<Family<RnsBggRow>, RnsBggError> {
         let setup = &self.dynamic_state()?.setup;
         let (ring, columns) = match setup.compact_ring(self.parameters, 0)? {
-            Some(compact) => (compact, 1),
-            None => (self.parameters.ring(0)?, columns),
+            Some(compact) if companions => (compact, 1),
+            _ => (self.parameters.ring(0)?, columns),
         };
         let families = [0, 1].map(|port| {
             ring.family_artifact_input(
@@ -762,6 +692,7 @@ impl EncodingLowering<'_> {
                 dynamic_companion_role(coordinate),
                 members * count,
                 digits,
+                true,
             )?;
             self.rhs_companions.insert(*rhs, family);
         }
@@ -774,11 +705,13 @@ impl EncodingLowering<'_> {
                         AUTOMORPHISM_HELPER_ROLE.to_owned(),
                         helpers,
                         columns,
+                        false,
                     )?,
                     self.encryption_row_family(
                         AUTOMORPHISM_COMPANION_ROLE.to_owned(),
                         switching * automorphism_companion_count(self.parameters, 0, columns)?,
                         digits,
+                        true,
                     )?,
                 ))
             })
@@ -871,7 +804,7 @@ impl EncodingLowering<'_> {
             Some(&|_, a: IntExpr, j: IntExpr| {
                 let index =
                     (a - IntExpr::constant(public_rows)) * IntExpr::constant(2 * columns) + j;
-                self.read_row(companions.at(companion_index(index)))
+                self.read_companion(companions.at(companion_index(index)))
             }),
             Some((public_rows, &public_top)),
         )?;
@@ -959,7 +892,7 @@ impl EncodingLowering<'_> {
             self.hash_key.clone(),
             k.clone(),
             switch.inverse.clone(),
-            self.read_row(helpers.at(Int::evaluate(switch.inverse_helper.clone())))?,
+            helpers.at(Int::evaluate(switch.inverse_helper.clone())),
         )?;
         let product = super::column_action(
             self.parameters,
@@ -972,7 +905,7 @@ impl EncodingLowering<'_> {
         let switched_row = add_encoding_rows(split(&product[0]), companion());
         let pre_key = pre_key();
         // `Aut_k(c) = h_k Dec(T_k) + r_k` under `A_k = H_k Dec(T_k)`.
-        let helper = self.read_row(helpers.at(Int::evaluate(switch.helper.clone())))?;
+        let helper = helpers.at(Int::evaluate(switch.helper.clone()));
         let mut acted = vec![super::join_row(&helper)];
         if recompute {
             let public = setup.helper_key(self.parameters, self.hash_key.clone(), k)?;
@@ -1078,7 +1011,7 @@ impl EncodingLowering<'_> {
                 let index = select(&members, branch) * IntExpr::constant(count) +
                     (a - IntExpr::constant(public_rows)) * IntExpr::constant(width) +
                     j;
-                self.read_row(companions.at(Int::evaluate(index.canonicalize())))
+                self.read_companion(companions.at(Int::evaluate(index.canonicalize())))
             }),
             Some((public_rows, &public_top)),
         )?;
@@ -1224,7 +1157,7 @@ impl EncodingLowering<'_> {
             let index = select(ks_members, branch) * IntExpr::constant(count) +
                 (a - IntExpr::constant(public_rows)) * IntExpr::constant(width) +
                 j;
-            self.read_row(companions.at(Int::evaluate(index.canonicalize())))
+            self.read_companion(companions.at(Int::evaluate(index.canonicalize())))
         };
         let schema = |_| DslError::Schema;
         let input_rows =
@@ -2082,7 +2015,9 @@ mod test {
         );
         let gadget = parameters.public_gadget(0).unwrap();
         let hash_key = ring.bytes_input("hash-key", 32);
-        let hashed = setup.compact_helper_key(&parameters, hash_key, IntExpr::constant(3)).unwrap();
+        let hashed = setup
+            .compact_matrix(&parameters, 0, hash_key, mxx_dsl::HashTag::from(b"compact".to_vec()))
+            .unwrap();
         let expand = |entry| {
             crate::rns_bgg::dynamic::expand_compact_entry(&parameters, &setup, 0, &gadget, entry)
                 .unwrap()
@@ -2243,24 +2178,11 @@ mod test {
                 .unwrap();
 
             let distributions = setup.setup.distributions();
-            // A compact input is read through its expansion, bounded without moments.
-            let initial = if compact {
-                crate::rns_bgg::RnsBggNoiseValue::public(
-                    crate::rns_bgg::compact_expansion_bound(
-                        &parameters,
-                        &extension,
-                        distributions.input.cutoff(),
-                    )
-                    .unwrap(),
-                    &[BigInt::from(1u8)],
-                )
-            } else {
-                crate::rns_bgg::RnsBggNoiseValue::sampled_gaussian(
-                    &distributions.input,
-                    b"dynamic-residual-input",
-                    &[BigInt::from(1u8)],
-                )
-            };
+            let initial = crate::rns_bgg::RnsBggNoiseValue::sampled_gaussian(
+                &distributions.input,
+                b"dynamic-residual-input",
+                &[BigInt::from(1u8)],
+            );
             let bindings = crate::rns_bgg::RnsBggNoiseBindings::from_inputs(
                 &program,
                 &[initial],

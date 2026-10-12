@@ -17,6 +17,14 @@
 //!
 //! `E_PE <= B_m + n B_key (W m_B B_b + W |P| m B_h + m E_F)`.
 //!
+//! With compact encodings (the manuscript's Appendix C), the companions are
+//! read through their decompression, the anchor `b = round(b_Q / p)` has the
+//! error `B_b = ceil(B_chi / p) + ceil((n + 2) / 2)` (Lemma 12 with `j = 0`),
+//! and the blocks of `B''` add `W m_c D n B_key B''` for the error
+//! `B'' = ceil(B_chi q / p) + ceil((n + 2) / 2)` of `b'' = Dc(b_c)`
+//! ([`mxx_exponent_lut::rns_bgg::compact_expansion_bound`]); the block `I_W`
+//! contracts zero.
+//!
 //! The decoder rounds each coefficient of `floor(q/2) m + e` to the nearer of
 //! `0` and `floor(q/2)`, i.e. `round(2 x / q) mod 2`; for `q` odd it returns
 //! `m` for both symbols whenever `4 |e| + 2 < q` ([`PeNoiseReport::decrypts`]).
@@ -33,10 +41,11 @@
 //!   the preimages `k_i` are bounded by their cutoff only.
 //! - The rest is a linear form in the extension coordinates `v`, which key generation samples from
 //!   a discrete Gaussian of standard deviation `s_key`, independently of encryption. Its
-//!   coefficients are the coefficients of the errors `e_(h,k)` and `e_F`, so its energy is at most
-//!   `W |P| m n B_h^2 + m n E_F^2` on every run. A linear form in fresh sub-Gaussian coordinates of
-//!   proxy `s_key^2` with coefficients of energy at most `E` exceeds `t` in absolute value with
-//!   probability at most `2 exp(-t^2 / (2 s_key^2 E))`.
+//!   coefficients are the coefficients of the errors `e_(h,k)` and `e_F` (and of `e''` with compact
+//!   encodings), so its energy is at most `W |P| m n B_h^2 + m n E_F^2 (+ W m_c D n B''^2)` on
+//!   every run. A linear form in fresh sub-Gaussian coordinates of proxy `s_key^2` with
+//!   coefficients of energy at most `E` exceeds `t` in absolute value with probability at most `2
+//!   exp(-t^2 / (2 s_key^2 E))`.
 //!
 //! Decryption fails with probability at most `2^-k` over the `n` coefficients when
 //! `B_m + W m_B n B_b B_key + z s_key sqrt(E) < (q - 2) / 4`, with `z^2 = 2 ln 2 (k + ceil(log2 n)
@@ -156,23 +165,11 @@ fn evaluation_trace(
     compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggNoiseTrace, PeError> {
     let compiled = program.class().compile()?;
-    // A compact initial state is read through its expansion, bounded by its
-    // expanded bound without a moment model (its errors repeat across columns).
-    let initial = match compact_extension {
-        Some(extension) => RnsBggNoiseValue::public(
-            mxx_exponent_lut::rns_bgg::compact_expansion_bound(
-                rns,
-                extension,
-                distributions.input.cutoff(),
-            )?,
-            &[BigInt::from(1u8)],
-        ),
-        None => RnsBggNoiseValue::sampled_gaussian(
-            &distributions.input,
-            b"mxx-pe/initial-state",
-            &[BigInt::from(1u8)],
-        ),
-    };
+    let initial = RnsBggNoiseValue::sampled_gaussian(
+        &distributions.input,
+        b"mxx-pe/initial-state",
+        &[BigInt::from(1u8)],
+    );
     let symbol = RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
     let symbols = vec![symbol; compiled.program().rhs_inputs().len()];
     let bindings = RnsBggNoiseBindings::from_inputs(compiled.program(), &[initial], &symbols)?
@@ -204,17 +201,28 @@ fn output_bound(trace: &RnsBggNoiseTrace) -> Result<BigUint, PeError> {
         .clone())
 }
 
-/// The coefficient bound of a helper as decryption reads it: the helper
-/// contract's cutoff, or its expanded bound with compact encodings.
-pub(crate) fn helper_error(parameters: &PeParameters) -> Result<BigUint, PeError> {
-    let cutoff = parameters.distributions().helper.cutoff().clone();
+/// The coefficient bound of the anchor's error as decryption reads it: the cutoff of `chi`, or,
+/// with compact encodings, that of `round(b_Q / p)`, `ceil(B_chi / p) + ceil((n + 2) / 2)`.
+pub(crate) fn anchor_error(parameters: &PeParameters) -> Result<BigUint, PeError> {
+    let cutoff = parameters.error().cutoff();
+    if parameters.compact_extension().is_none() {
+        return Ok(cutoff.clone());
+    }
+    let p = parameters.compact_modulus()?;
+    let n = BigUint::from(parameters.level().ring_dimension());
+    Ok((cutoff + &p - 1u8) / &p + (n + 3u8) / 2u8)
+}
+
+/// With compact encodings, the coefficient bound of the error of `b'' = Dc(b_c)`; zero without
+/// them.
+pub(crate) fn compressed_anchor_error(parameters: &PeParameters) -> Result<BigUint, PeError> {
     Ok(match parameters.compact_extension() {
         Some(extension) => mxx_exponent_lut::rns_bgg::compact_expansion_bound(
             parameters.rns(),
             extension,
-            &cutoff,
+            parameters.error().cutoff(),
         )?,
-        None => cutoff,
+        None => BigUint::ZERO,
     })
 }
 
@@ -240,8 +248,13 @@ pub fn simulate(
     let m_b = BigUint::from(parameters.anchor_columns());
     let n = BigUint::from(parameters.level().ring_dimension());
     let error = parameters.error().cutoff();
-    let helper = helper_error(parameters)?;
-    let blocks = &w * &m_b * error + &w * &p * &m * &helper + &m * &evaluation;
+    let helper = parameters.distributions().helper.cutoff().clone();
+    let compressed =
+        BigUint::from(parameters.compressed_anchor_width()) * compressed_anchor_error(parameters)?;
+    let blocks = &w * &m_b * anchor_error(parameters)? +
+        &w * &compressed +
+        &w * &p * &m * &helper +
+        &m * &evaluation;
     let decryption = error + n * parameters.key_cutoff() * blocks;
     Ok(PeNoiseReport {
         evaluation,
@@ -268,10 +281,17 @@ pub fn simulate_average(
     let m = BigUint::from(parameters.state_columns());
     let n = BigUint::from(parameters.level().ring_dimension());
     let error = parameters.error().cutoff();
-    let helper = helper_error(parameters)?;
-    let energy = &w * &p * &m * &n * helper.pow(2) + &m * &n * report.evaluation.pow(2);
+    let helper = parameters.distributions().helper.cutoff().clone();
+    let energy = &w * &p * &m * &n * helper.pow(2) +
+        &m * &n * report.evaluation.pow(2) +
+        &w * BigUint::from(parameters.compressed_anchor_width()) *
+            &n *
+            compressed_anchor_error(parameters)?.pow(2);
     let bias = error +
-        &w * BigUint::from(parameters.anchor_columns()) * &n * error * parameters.key_cutoff();
+        &w * BigUint::from(parameters.anchor_columns()) *
+            &n *
+            anchor_error(parameters)? *
+            parameters.key_cutoff();
     let moments = NoiseMoments {
         mean_numerator: 0.into(),
         mean_denominator: 1u8.into(),

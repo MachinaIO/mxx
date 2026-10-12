@@ -34,7 +34,7 @@
 //! | `MAX_CRT_DEPTH` | 12 | CRT-depth candidates `1..=` |
 //! | `CRT_BITS`, `BASE_BITS` | 50, `ceil(CRT_BITS / 2)` | CRT prime and gadget base widths |
 //! | `ERROR_SIGMA` | 3.19 | Sigma of `chi`, the contract of every fresh error |
-//! | `COMPACT_ENCODINGS` | 1 | 1 publishes the fresh encodings in two columns over `pq` (`PeParameters::with_compact_encodings`), 0 at `q` in full gadget width |
+//! | `COMPACT_ENCODINGS` | 1 | 1 publishes the compressed digit encodings over `pq` and the anchor over `pq` (`PeParameters::with_compact_encodings`), 0 everything at `q` in full gadget width |
 //! | `LUT_RADIX` | `PeClass::default_lut_radix` | Radix `B` of the LUT automorphism decomposition (`PeParameters::with_lut_radix`); 0 switches every automorphism directly (`B = W`). The default takes 3 or 2 switches per branch when they divide `log2 W` (`W = 4096`: `B = 16`; `W = 2`: direct) |
 //! | `TRAPDOOR_SIGMA` | 4.578 | TrapGen sigma |
 //! | `NOISE_MODEL`, `FAILURE_EXPONENT` | `worst`, 128 | Noise model of the correctness check |

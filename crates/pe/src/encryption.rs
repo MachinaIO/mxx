@@ -3,7 +3,9 @@
 //! Under a fresh secret `s = (s_bar, 1)` and encryption session, one prelude
 //! production computes
 //!
-//! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`;
+//! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`, or, with compact encodings,
+//!   `b_Q = s B_Q + e_Q` over `R_Q` (`m_B` polynomials over `pq`, see [`crate::setup`]), from which
+//!   decryption rounds `b = round(b_Q / p)`;
 //! - for every attribute symbol `x_t`, the bottom row `c_t = X^(Bz x_t) s G - s_bar a_t + e_t` of
 //!   the gadget ciphertext `C_t = [a_t; c_t]`, whose top row `a_t` is public and hashed by the
 //!   setup (`RnsBggDynamicSetup::rhs_public_top`), with a fresh `e_t` from `chi`, both `1 x m`, so
@@ -197,11 +199,9 @@ where
         ),
     );
     let (s_bar, _) = secret.row().clone();
-    let first = public_key.anchor_row()?;
-    let second = public_key.anchor_second_row(hash_key.clone())?;
     let (d_1, d_2) = public_key.message_row(hash_key.clone())?;
-    // `chi`; a zero sigma (noise-free parameters) adds no error.
-    let error = |columns: usize| -> Result<Mat, PeError> {
+    // `chi` over `ring`; a zero sigma (noise-free parameters) adds no error.
+    let error_over = |ring: &mxx_dsl::Ring, columns: usize| -> Result<Mat, PeError> {
         let contract = parameters.error();
         if contract.sigma().is_zero() {
             return Ok(ring.zero((1, columns)));
@@ -212,7 +212,16 @@ where
             contract.cutoff().clone(),
         ))
     };
-    let anchor = s_bar.clone() * first + second + error(m_b)?;
+    let error = |columns: usize| error_over(&ring, columns);
+    // `b_Q = s_bar B_Q^(1) + B_Q^(2) + e_Q` over `R_Q` with compact encodings.
+    let anchor_ring = public_key.anchor_ring()?;
+    let lifted = match public_key.compact_ring()? {
+        Some(compact) => s_bar.clone().centered_rebase(&compact),
+        None => s_bar.clone(),
+    };
+    let anchor = lifted * public_key.published_anchor_row()? +
+        public_key.published_anchor_second_row(hash_key.clone())? +
+        error_over(&anchor_ring, m_b)?;
     let mut context = context.transferred_output(ANCHOR_ENCODING, anchor)?;
     let setup = public_key.setup();
     for (coordinate, family) in exponents {

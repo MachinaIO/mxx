@@ -31,7 +31,7 @@
 //! product keys `T` depth by depth, in the order of [`RadixDepth::branches`].
 //!
 //! With compact encodings ([`RnsBggDynamicSetup::with_compact_encodings`]),
-//! the fresh encodings are stored in two columns over `pq` and expanded where
+//! the digit companions are stored in two columns over `pq` and expanded where
 //! they are read ([`expand_compact_row`]); their keys are the expansions of
 //! `2 x 2` keys over `R_pq` ([`expand_compact_matrix`]).
 use super::*;
@@ -256,10 +256,11 @@ pub(crate) fn radix_plan(
 
 /// `ModSwitch_(pq -> q)(entry G~)` at `level`: the `1 x 1` `entry` over the
 /// compact ring times the lift `G~` of the `1 x D` `gadget` (its centered
-/// integers re-encoded in `R_pq`), rounded to the level ring. For a compact
+/// integers re-encoded in `R_pq`), rounded to the level ring: the
+/// manuscript's decompression `Dc` of one entry. For a compact
 /// encoding `c = s (A - p X I_2) + e`, the expansion of each component is the
 /// component of `s (A' - X G) + e'` (see [`compact_expansion_bound`]).
-pub(crate) fn expand_compact_entry(
+pub fn expand_compact_entry(
     parameters: &RnsBggParameters,
     setup: &RnsBggDynamicSetup,
     level: usize,
@@ -280,32 +281,11 @@ pub(crate) fn expand_compact_row(
     level: usize,
     row: RnsBggRow,
 ) -> Result<RnsBggRow, RnsBggError> {
-    expand_compact_row_with(parameters, setup, level, &parameters.public_gadget(level)?, row)
-}
-
-/// [`expand_compact_row`] under `gadget` (the state gadget for a private input).
-pub(crate) fn expand_compact_row_with(
-    parameters: &RnsBggParameters,
-    setup: &RnsBggDynamicSetup,
-    level: usize,
-    gadget: &Mat,
-    row: RnsBggRow,
-) -> Result<RnsBggRow, RnsBggError> {
+    let gadget = parameters.public_gadget(level)?;
     Ok((
-        expand_compact_entry(parameters, setup, level, gadget, row.0)?,
-        expand_compact_entry(parameters, setup, level, gadget, row.1)?,
+        expand_compact_entry(parameters, setup, level, &gadget, row.0)?,
+        expand_compact_entry(parameters, setup, level, &gadget, row.1)?,
     ))
-}
-
-/// A stored compact companion or helper row (two `1 x 1` entries over `pq`)
-/// expanded at the setup ring under the public gadget, as every reader of the
-/// setup's packages expands it.
-pub fn expand_stored_row(
-    parameters: &RnsBggParameters,
-    setup: &RnsBggDynamicSetup,
-    row: RnsBggRow,
-) -> Result<RnsBggRow, RnsBggError> {
-    expand_compact_row(parameters, setup, 0, row)
 }
 
 /// The expansion `A' = ModSwitch_(pq -> q)(A~ G~)` of a compact `2 x 2` key
@@ -318,8 +298,14 @@ pub(crate) fn expand_compact_matrix(
     matrix: RnsBggMatrix,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     Ok((
-        expand_compact_row_with(parameters, setup, level, gadget, matrix.0)?,
-        expand_compact_row_with(parameters, setup, level, gadget, matrix.1)?,
+        (
+            expand_compact_entry(parameters, setup, level, gadget, matrix.0.0)?,
+            expand_compact_entry(parameters, setup, level, gadget, matrix.0.1)?,
+        ),
+        (
+            expand_compact_entry(parameters, setup, level, gadget, matrix.1.0)?,
+            expand_compact_entry(parameters, setup, level, gadget, matrix.1.1)?,
+        ),
     ))
 }
 

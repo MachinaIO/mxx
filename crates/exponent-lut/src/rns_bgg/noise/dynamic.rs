@@ -252,7 +252,8 @@ impl RnsBggNoiseEvaluator<'_> {
             }
         };
         let companion_error = self.package_error(&contracts, distributions.companion.cutoff())?;
-        let helper_error = self.package_error(&contracts, distributions.helper.cutoff())?;
+        // Helpers stay at `q`: only the companions are compact.
+        let helper_error = distributions.helper.cutoff().clone();
         let lut_bound = |companion_error: &BigUint, helper_error: &BigUint| {
             if depths.len() <= 1 {
                 self.parameters.dynamic_lut_noise_bound(
@@ -275,12 +276,12 @@ impl RnsBggNoiseEvaluator<'_> {
             }
         };
         let bound = lut_bound(&companion_error, &helper_error)?;
-        // The package errors' share of the bound, for compact encodings.
-        let package_share = contracts
+        // The companion errors' share of the bound, for compact companions.
+        let companion_share = contracts
             .compact_extension
             .is_some()
             .then(|| {
-                lut_bound(&BigUint::zero(), &BigUint::zero())
+                lut_bound(&BigUint::zero(), &helper_error)
                     .map(|without| &bound.error - without.error)
             })
             .transpose()?;
@@ -322,25 +323,23 @@ impl RnsBggNoiseEvaluator<'_> {
             if branches == 1 {
                 return terms;
             }
-            if let Some(share) = &package_share {
-                return terms.merge(&Self::compact_term(
-                    "dynamic-automorphism-compact-package-error",
-                    share,
-                ));
-            }
-            terms
-                .merge(&self.package_term(
+            let companions = match &companion_share {
+                Some(share) => {
+                    Self::compact_term("dynamic-automorphism-compact-companion-error", share)
+                }
+                None => self.package_term(
                     companion_source,
                     "dynamic-automorphism-companion-error",
                     None,
                     companion_variance.clone(),
-                ))
-                .merge(&self.package_term(
-                    helper_source,
-                    "dynamic-automorphism-helper-error",
-                    None,
-                    helper_variance.clone(),
-                ))
+                ),
+            };
+            terms.merge(&companions).merge(&self.package_term(
+                helper_source,
+                "dynamic-automorphism-helper-error",
+                None,
+                helper_variance.clone(),
+            ))
         });
         let sources = if branches == 1 {
             BTreeMap::new()

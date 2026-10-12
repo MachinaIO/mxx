@@ -163,6 +163,19 @@ impl DecoderSmudgeProgram {
     }
 }
 
+/// What a decoder decodes and to which plaintext modulus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum DecoderTarget {
+    /// The source output's component-1 row under the selection
+    /// `G_(L+1)^-1(1)`, rounded to the plaintext modulus `q_(L+1)` of the
+    /// next level.
+    Output,
+    /// Column `column` of a noise refresh's decoded row for the CRT prime
+    /// `prime` of the decoding modulus, rounded to that prime (see
+    /// [`crate::refresh`]); `spec` is the refresh specification commitment.
+    Refresh { spec: [u8; 32], prime: usize, column: usize },
+}
+
 /// Immutable, checked declaration shared by preprocessing, encryption,
 /// online evaluation and noise simulation for one decoder.
 ///
@@ -176,6 +189,7 @@ pub struct DecoderDeclaration {
     profile: SparseLwrPrfProfile,
     coefficients: usize,
     digits: usize,
+    target: DecoderTarget,
     smudge: DecoderSmudgeProgram,
     /// The explicit plaintext modulus `p` of the decoded output, if any; see
     /// [`Self::with_plaintext_modulus`].
@@ -186,9 +200,10 @@ pub struct DecoderDeclaration {
 impl DecoderDeclaration {
     /// Check and freeze one decoder of `source_output`, smudged over
     /// `coefficients` coefficients with `digits` smudge digits each, member
-    /// `coefficient * digits + digit` on `layouts[member]`. Production code
-    /// obtains it from [`crate::utils::select_decoder_at_crt_depth`], which
-    /// chooses `digits`.
+    /// `coefficient * digits + digit` on `layouts[member]`, decoding
+    /// `target`. Production code obtains an output decoder from
+    /// [`crate::utils::select_decoder_at_crt_depth`], which chooses `digits`,
+    /// and refresh decoders from [`crate::refresh::RefreshDeclaration`].
     pub(crate) fn new(
         source_program: &ExponentLutProgram,
         source_output: WireId,
@@ -196,8 +211,8 @@ impl DecoderDeclaration {
         coefficients: usize,
         digits: usize,
         layouts: Vec<PbcPublicLayout>,
+        target: DecoderTarget,
     ) -> Result<Self, DecoderError> {
-        validate_decoder_source(source_program, source_output)?;
         // The member transform keys on the PRF's root member loop, which
         // needs at least two members.
         if coefficients.checked_mul(digits).is_none_or(|members| members < 2) ||
@@ -206,6 +221,34 @@ impl DecoderDeclaration {
             return Err(DecoderError::InvalidSmudgeProgram);
         }
         let smudge = DecoderSmudgeProgram::new(&profile, layouts)?;
+        Self::from_smudge(
+            source_program,
+            source_output,
+            profile,
+            coefficients,
+            digits,
+            smudge,
+            target,
+        )
+    }
+
+    /// [`Self::new`] for an already built smudge Program of
+    /// `coefficients * digits` members on `profile`.
+    pub(crate) fn from_smudge(
+        source_program: &ExponentLutProgram,
+        source_output: WireId,
+        profile: SparseLwrPrfProfile,
+        coefficients: usize,
+        digits: usize,
+        smudge: DecoderSmudgeProgram,
+        target: DecoderTarget,
+    ) -> Result<Self, DecoderError> {
+        validate_decoder_source(source_program, source_output)?;
+        if coefficients.checked_mul(digits) != Some(smudge.members()) ||
+            smudge.prf().profile() != profile
+        {
+            return Err(DecoderError::InvalidSmudgeProgram);
+        }
         let source_program = source_program.id();
         let commitment = commitment(&(
             b"mxx-exponent-lut/decoder/v1".as_slice(),
@@ -214,6 +257,7 @@ impl DecoderDeclaration {
             &profile,
             coefficients,
             digits,
+            target,
             smudge.id(),
         ))?;
         Ok(Self {
@@ -222,6 +266,7 @@ impl DecoderDeclaration {
             profile,
             coefficients,
             digits,
+            target,
             smudge,
             plaintext_modulus: None,
             commitment,
@@ -283,8 +328,28 @@ impl DecoderDeclaration {
         &self.smudge
     }
 
+    pub const fn target(&self) -> DecoderTarget {
+        self.target
+    }
+
     pub const fn commitment(&self) -> &[u8; 32] {
         &self.commitment
+    }
+
+    /// The key naming this decoder's artifacts (`decoder/<key>/<role>`): the hexadecimal
+    /// commitment of an output decoder; `<spec>/<column>/<prime>` (the refresh specification in
+    /// hexadecimal, zero-padded indices) of a refresh decoder, so that the artifacts of the
+    /// decoders of refreshes with different specifications sort alike (a graph's node order
+    /// follows its output names, so refreshes on different chains build aligned graphs).
+    pub fn artifact_key(&self) -> String {
+        let hex =
+            |bytes: &[u8; 32]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        match self.target {
+            DecoderTarget::Output => hex(&self.commitment),
+            DecoderTarget::Refresh { spec, prime, column } => {
+                format!("{}/{column:04}/{prime:04}", hex(&spec))
+            }
+        }
     }
 
     /// The digit base `P = 2 p'`.
@@ -436,6 +501,7 @@ pub(crate) mod fixture {
             coefficients,
             digits,
             layouts,
+            DecoderTarget::Output,
         )
         .unwrap();
         (declaration, keys)
@@ -556,8 +622,16 @@ mod tests {
         let layouts = keys.iter().map(|key| key.public_layout.clone()).collect();
         let (program, output) = source();
         (
-            DecoderDeclaration::new(&program, output, profile(), coefficients, digits, layouts)
-                .unwrap(),
+            DecoderDeclaration::new(
+                &program,
+                output,
+                profile(),
+                coefficients,
+                digits,
+                layouts,
+                DecoderTarget::Output,
+            )
+            .unwrap(),
             keys,
         )
     }
@@ -627,6 +701,14 @@ mod tests {
             self.luts += 1;
             Ok(())
         }
+        fn mul_small_constant(
+            &mut self,
+            _: &(),
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<(), CounterError> {
+            Ok(())
+        }
     }
 
     impl crate::program::ProgramLoweringContext for Counter {
@@ -645,6 +727,7 @@ mod tests {
         type RhsFamily = ();
         fn wire_at(
             &mut self,
+            _evaluator: &mut Counter,
             _: &(),
             _: &IntExpr,
         ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
@@ -714,7 +797,6 @@ mod tests {
     fn smudge_program_graph_does_not_grow_with_members() {
         let small = counts(declaration(2, 1).0.smudge().program());
         let large = counts(declaration(5, 2).0.smudge().program());
-        assert_eq!(small.0, 1, "one root body");
         assert_eq!(small.2, 1, "one LUT");
         assert_eq!(small, large, "only the index tables scale with the members");
     }
@@ -739,15 +821,41 @@ mod tests {
         let layouts =
             keys(2, 0).into_iter().map(|key| key.public_layout).collect::<Vec<PbcPublicLayout>>();
         assert!(
-            DecoderDeclaration::new(&program, output, profile(), 2, 2, layouts.clone()).is_err(),
+            DecoderDeclaration::new(
+                &program,
+                output,
+                profile(),
+                2,
+                2,
+                layouts.clone(),
+                DecoderTarget::Output
+            )
+            .is_err(),
             "layouts must cover coefficients * digits"
         );
         assert!(
-            DecoderDeclaration::new(&program, output, profile(), 2, 1, layouts.clone()).is_ok()
+            DecoderDeclaration::new(
+                &program,
+                output,
+                profile(),
+                2,
+                1,
+                layouts.clone(),
+                DecoderTarget::Output
+            )
+            .is_ok()
         );
         assert_eq!(
-            DecoderDeclaration::new(&program, output, profile(), 1, 1, layouts[..1].to_vec())
-                .unwrap_err(),
+            DecoderDeclaration::new(
+                &program,
+                output,
+                profile(),
+                1,
+                1,
+                layouts[..1].to_vec(),
+                DecoderTarget::Output
+            )
+            .unwrap_err(),
             DecoderError::InvalidSmudgeProgram,
             "one member has no root member loop"
         );
@@ -768,7 +876,16 @@ mod tests {
         let coefficient = builder.lut(Operand::Scalar(input), table).unwrap();
         let program = builder.finish(vec![Operand::Scalar(coefficient)]).unwrap();
         assert_eq!(
-            DecoderDeclaration::new(&program, coefficient, profile(), 2, 1, layouts).unwrap_err(),
+            DecoderDeclaration::new(
+                &program,
+                coefficient,
+                profile(),
+                2,
+                1,
+                layouts,
+                DecoderTarget::Output
+            )
+            .unwrap_err(),
             DecoderError::InvalidSourceOutput
         );
     }

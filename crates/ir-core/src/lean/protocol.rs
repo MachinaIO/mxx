@@ -31,10 +31,13 @@ pub enum ProtocolExportError {
 /// stage (`Stage_<id>`), per requirement (`Requirement_<i>`), and for the ideal graph (`Ideal`),
 /// the gadget layouts they use (`Backend`), and the linked claim (`Claim`). The claim is stated at
 /// the declaration's parameter bindings and failure probability; a proof package imports `Claim`
-/// and proves `GeneratedClaim.CorrectnessClaim`.
+/// and proves `GeneratedClaim.CorrectnessClaim`. With `facts`, each of these graph modules
+/// `M` also gets `M_Facts` ([`ExportOptions::facts`](crate::lean::ExportOptions::facts)): its
+/// record scopes' wire constants and named facts, for proofs that read atoms by name.
 pub fn export(
     protocol: &ProtocolDecl,
     directory: &std::path::Path,
+    facts: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
         artifact::export_validated_manifest,
@@ -101,6 +104,7 @@ pub fn export(
                 namespace: name.clone(),
                 module_name: name.clone(),
                 sampling_tape: declaration.failure_probability_log2.is_some(),
+                facts,
                 ..ExportOptions::default()
             },
         )?;
@@ -118,6 +122,9 @@ pub fn export(
             layouts.insert(key, merged);
         }
         fs::write(directory.join(format!("{name}.lean")), &artifact.source)?;
+        if let Some(facts) = &artifact.facts_source {
+            fs::write(directory.join(format!("{name}_Facts.lean")), facts)?;
+        }
         generated.insert(name, artifact);
     }
     let layouts = layouts.into_values().collect::<Vec<_>>();

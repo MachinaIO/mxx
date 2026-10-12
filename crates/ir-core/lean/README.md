@@ -33,6 +33,11 @@ LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean \
   test_data/lean_ir_fixtures/sampler/Generated.lean
 ```
 
+`cargo test -p mxx-ir-core --lib lean::tests::facts` writes `test_data/lean_ir_fixtures/facts/`:
+`GeneratedFacts.lean` and its facts module `GeneratedFacts_Facts.lean` (`ExportOptions::facts`:
+wire constants, named atoms and their extraction theorems). Compile the first to an `.olean` as
+for the linked-claim fixtures below, then check the second against it.
+
 Linked-claim fixtures hold several modules. `cargo test -p mxx-dsl --lib test_lwe_protocol`
 writes `test_data/lean_ir_fixtures/lwe_protocol/`: a two-stage integer-LWE claim whose ciphertext
 crosses stages as an integer-family artifact, its proof, and the certificate. Check the modules in

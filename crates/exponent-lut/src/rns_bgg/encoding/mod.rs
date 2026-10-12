@@ -42,7 +42,10 @@ mod online_eval;
 mod verify;
 
 pub(super) use self::lowering::*;
-pub use self::verify::{decode_output, decode_public_output, verify_output};
+pub use self::verify::{
+    decode_output, decode_public_output, decode_top_refresh, refresh_error, top_refresh_error,
+    verify_output,
+};
 #[cfg(test)]
 use crate::{api::execute_graph, program::ExponentLutProgramBuilder};
 #[cfg(test)]
@@ -481,6 +484,10 @@ pub struct EncodingLowering<'a> {
     pub(crate) encryption: ProductionId,
     pub(crate) manifests: BTreeMap<ProductionId, Manifest>,
     pub(crate) decoder_smudge: Option<Arc<DecoderDeclaration>>,
+    /// For a child Program: the namespace `<prefix>/<role>` its imported
+    /// artifacts are published under (see `decoder_smudge_artifact_name` and
+    /// `refresh_fresh_artifact_name`).
+    pub(crate) artifact_prefix: Option<String>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Graph input of the shared hash key, from which `A_sigma` is sampled.
     pub(crate) hash_key: Bytes,
@@ -557,6 +564,17 @@ pub struct RnsEncryptBuild<'a> {
     /// gadget ciphertexts (the encryption's own, or one an enclosing scheme
     /// binds), with its manifest.
     prelude: Option<(ProductionId, Manifest)>,
+    /// For a refresh child: the namespace its hash key is derived under.
+    hash_namespace: Option<[u8; 32]>,
+    /// The bound noise refresh: its fresh-noise child and its decoders'
+    /// smudge children, in decoder order.
+    /// A top-refresh part also binds its mask child (first).
+    refresh: Option<(
+        crate::refresh::RefreshDeclaration,
+        Option<Box<RnsEncryptBuild<'a>>>,
+        Box<RnsEncryptBuild<'a>>,
+        Vec<RnsEncryptBuild<'a>>,
+    )>,
 }
 
 /// Online evaluation builder with no backend, secrets, or plaintexts.
@@ -588,4 +606,18 @@ pub struct RnsOnlineEvalBuild<'a> {
     dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
     /// The values of the Program's integer data, which must be the preprocessed data.
     data: crate::program::ProgramData,
+    /// For a refresh child: the namespace its hash key is derived under.
+    hash_namespace: Option<[u8; 32]>,
+    /// The applied noise refresh: its target output index, declaration, and
+    /// fresh-noise and smudge children (in decoder order).
+    /// A top-refresh part also has its mask child (after the declaration).
+    pending_refresh: Option<(
+        usize,
+        crate::refresh::RefreshDeclaration,
+        Option<Box<RnsOnlineEvalBuild<'a>>>,
+        Box<RnsOnlineEvalBuild<'a>>,
+        Vec<RnsOnlineEvalBuild<'a>>,
+    )>,
+    /// The namespace and key of a top refresh's `A'`.
+    refresh_matrix_key: Option<([u8; 32], Vec<u8>)>,
 }

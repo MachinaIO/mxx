@@ -213,6 +213,11 @@ fn physical_input_shape(value: &RuntimeValue) -> String {
             values.len(),
             values.iter().map(physical_input_shape).collect::<Vec<_>>()
         ),
+        RuntimeValue::DependentFamily { values } => format!(
+            "host-dependent-family:{}:{:?}",
+            values.len(),
+            values.iter().map(physical_input_shape).collect::<Vec<_>>()
+        ),
         RuntimeValue::Trapdoor(trapdoor) => {
             format!(
                 "host-trapdoor:{:?}:{}",

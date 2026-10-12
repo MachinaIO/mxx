@@ -1,0 +1,143 @@
+import Part_@P@_KeysRoot
+import Part_@P@_KeysLuts
+import Part_@P@_KeysCells
+import Part_@P@_Sums
+import Part_@P@_PreSums
+import Part_@P@_PrePlace
+import Part_@P@_PreRootSums
+import Part_@P@_RootSums
+import Part_@P@_MaskCarrier
+
+/-! The mask keys of the online root of part `@P@` are those the preprocessing computes (written
+by `generator/gen_key_links.py`). -/
+
+namespace RefreshTopProof.Part_@P@
+
+open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
+
+set_option maxHeartbeats 64000000 in
+set_option maxRecDepth 65536 in
+/-- The mask carrier's keys: the online root's are the preprocessing's. -/
+theorem maskKeyLink {model : HashModel} {params : @ON@.Params} {params' : @PRE@.Params}
+@BINDERS@
+    (hk : w_92_0 = pw_26_0)
+    (ho0 : w_106_0 = pw_27_0) (ho1 : w_107_0 = pw_28_0) (ho2 : w_110_0 = pw_29_0) (ho3 : w_111_0 = pw_30_0)
+    (ht0 : w_135_0 = pw_47_0) (ht1 : w_148_0 = pw_81_0) (ht2 : w_162_0 = pw_77_0) (ht3 : w_174_0 = pw_126_0)
+    (hb0 : w_136_0 = pw_67_0) (hb1 : w_149_0 = pw_92_0) (hb2 : w_163_0 = pw_117_0) (hb3 : w_175_0 = pw_137_0)
+    (hf0 : w_94_0 = pw_41_0) (hf1 : w_95_0 = pw_41_1) (hf2 : w_96_0 = pw_41_2) (hf3 : w_97_0 = pw_41_3)
+    (hg0 : w_87_0 = pw_43_0) (hg1 : w_88_0 = pw_43_1) (hg2 : w_89_0 = pw_43_2) (hg3 : w_90_0 = pw_43_3)
+    (hc0 : w_113_0 = pw_35_6) (hc1 : w_114_0 = pw_35_7) (hc2 : w_117_0 = pw_39_6) (hc3 : w_118_0 = pw_39_7)
+    (haA : ∀ (k : Fin 5) (c : Fin 4), ![w_101_0, w_104_0, w_102_0, w_105_0] c k =
+      model.sample Q7 N 1 14 w_92_0 (completeHashTag labelPrefix
+        [.bytes memberBytes, .u64Le (k : Int), .bytes componentBytes, .u64Le (c : Int)])) :
+    blockModSwitch [q0, q1, q2, q3] 1 w_332_1 = pw_167_0 ∧
+      blockModSwitch [q0, q1, q2, q3] 1 w_332_3 = pw_338_0 := by
+  have hon := keyRootOffset (model := model) @ARGS(keyRootOffset)@
+  have hpo := preKeyOffset (model := model) @ARGS(preKeyOffset)@
+  subst hk ho0 ho1 ho2 ho3 ht0 ht1 ht2 ht3 hb0 hb1 hb2 hb3 hf0 hf1 hf2 hf3 hg0 hg1 hg2 hg3 hc0 hc1 hc2 hc3
+  rw [← hpo] at hon
+  -- The offset's readout keys.
+  have h186 := keyRootLut186 (model := model) @ARGS(keyRootLut186)@
+  rw [hon] at h186
+  have h146 := preKeyLoop_sequential_generatedRoot_146 (by decide) ph146_3
+  subst pe_45_0
+  rw [blockModSwitchRuns_eq ph147_0, blockModSwitchRuns_eq ph148_0, blockModSwitchRuns_eq ph149_0,
+    blockModSwitchRuns_eq ph150_0] at ph151_3
+  simp only [keyMap, Prod.mk.injEq] at h186
+  obtain ⟨e225, e248, e228, e251, -⟩ := h186
+  rw [show ((0 : ExactMatrix Q5 N 1 6), (0 : ExactMatrix Q5 N 1 6), (0 : ExactMatrix Q5 N 1 6),
+    (0 : ExactMatrix Q5 N 1 6), ()) = (0 : Keys Q5 6) from rfl, zero_add,
+    show Int.toNat 4 = 4 from rfl] at h146
+  have f0 := congrArg (fun x : Keys Q5 6 ↦ x.1) h146
+  have f1 := congrArg (fun x : Keys Q5 6 ↦ x.2.1) h146
+  have f2 := congrArg (fun x : Keys Q5 6 ↦ x.2.2.1) h146
+  have f3 := congrArg (fun x : Keys Q5 6 ↦ x.2.2.2.1) h146
+  simp only at f0 f1 f2 f3
+  rw [← f0] at e225
+  rw [← f1] at e248
+  rw [← f2] at e228
+  rw [← f3] at e251
+  -- The offset's branch keys.
+  have h252 := keyRootLut252 (model := model) @ARGS(keyRootLut252)@
+  rw [e225, e248, e228, e251] at h252
+  have h151 := preKeyLoop_sequential_generatedRoot_151 (by decide) ph151_3
+  subst pe_44_0
+  rw [show ((0 : ExactMatrix Q0 N 1 6), (0 : ExactMatrix Q0 N 1 6), (0 : ExactMatrix Q0 N 1 6),
+    (0 : ExactMatrix Q0 N 1 6), ()) = (0 : Keys Q0 6) from rfl, zero_add,
+    show Int.toNat 4 = 4 from rfl] at h151
+  have hoff : (w_285_0, w_299_0, w_301_0, w_303_0, ()) =
+      (pw_151_0, pw_151_1, pw_151_2, pw_151_3, ()) := by
+    rw [h252, h151]
+  -- The cells and members of the PRF.
+  have hc115 : ∀ i : Fin 40, w_115_0 i = pw_35_0 i ∧ w_115_1 i = pw_35_1 i ∧ w_115_2 i = pw_35_2 i ∧
+      w_115_3 i = pw_35_3 i := fun i ↦
+    keysCell115 (hon := h115_5 i) (hpre := ph35_7 i) (haA := haA) (hbot0 := rfl) (hbot1 := rfl)
+  have hm116 : w_116_0 = pw_36_0 ∧ w_116_1 = pw_36_1 ∧ w_116_2 = pw_36_2 ∧ w_116_3 = pw_36_3 := by
+    have a := fun o ↦ members116 (h116_5 o)
+    have b := fun o ↦ premembers36 (ph36_3 o)
+    simp only [Prod.mk.injEq] at a b
+    refine ⟨funext fun o ↦ ?_, funext fun o ↦ ?_, funext fun o ↦ ?_, funext fun o ↦ ?_⟩
+    · rw [(a o).1, (b o).1]; exact Finset.sum_congr rfl fun k _ ↦ (hc115 _).1
+    · rw [(a o).2.1, (b o).2.1]; exact Finset.sum_congr rfl fun k _ ↦ (hc115 _).2.1
+    · rw [(a o).2.2.1, (b o).2.2.1]; exact Finset.sum_congr rfl fun k _ ↦ (hc115 _).2.2.1
+    · rw [(a o).2.2.2.1, (b o).2.2.2.1]; exact Finset.sum_congr rfl fun k _ ↦ (hc115 _).2.2.2
+  obtain ⟨m0, m1, m2, m3⟩ := hm116
+  rw [m0, m1, m2, m3] at h119_5
+  have hc119 : ∀ i : Fin 40, w_119_0 i = pw_39_0 i ∧ w_119_1 i = pw_39_1 i ∧ w_119_2 i = pw_39_2 i ∧
+      w_119_3 i = pw_39_3 i := fun i ↦
+    keysCell119 (hon := h119_5 i) (hpre := ph39_7 i) (haA := haA) (hbot0 := rfl) (hbot1 := rfl)
+  have hm120 : w_120_0 = pw_40_0 ∧ w_120_1 = pw_40_1 ∧ w_120_2 = pw_40_2 ∧ w_120_3 = pw_40_3 := by
+    have a := fun o ↦ members120 (h120_5 o)
+    have b := fun o ↦ premembers40 (ph40_3 o)
+    simp only [Prod.mk.injEq] at a b
+    refine ⟨funext fun o ↦ ?_, funext fun o ↦ ?_, funext fun o ↦ ?_, funext fun o ↦ ?_⟩
+    · rw [(a o).1, (b o).1]; exact Finset.sum_congr rfl fun k _ ↦ (hc119 _).1
+    · rw [(a o).2.1, (b o).2.1]; exact Finset.sum_congr rfl fun k _ ↦ (hc119 _).2.1
+    · rw [(a o).2.2.1, (b o).2.2.1]; exact Finset.sum_congr rfl fun k _ ↦ (hc119 _).2.2.1
+    · rw [(a o).2.2.2.1, (b o).2.2.2.1]; exact Finset.sum_congr rfl fun k _ ↦ (hc119 _).2.2.2
+  obtain ⟨n0, n1, n2, n3⟩ := hm120
+  rw [n0, n1, n2, n3] at h121_5
+  -- The readout.
+  have hr : ∀ o : Fin 8, w_121_0 o = pw_42_0 o ∧ w_121_1 o = pw_42_1 o ∧ w_121_2 o = pw_42_2 o ∧
+      w_121_3 o = pw_42_3 o := by
+    intro o
+    have a := keyRound121 (h121_5 o)
+    have b := preKeyRound42 (ph42_3 o)
+    rw [← b] at a
+    simp only [Prod.mk.injEq] at a
+    exact ⟨a.1, a.2.1, a.2.2.1, a.2.2.2.1⟩
+  -- The sampling with the offset.
+  have hs : ∀ o : Fin 8, w_312_0 o = pw_152_0 o ∧ w_312_1 o = pw_152_1 o ∧ w_312_2 o = pw_152_2 o ∧
+      w_312_3 o = pw_152_3 o := by
+    intro o
+    have a := keyRound312 (h := h312_5 o) (off := (w_285_0, w_299_0, w_301_0, w_303_0, w_307_0, w_311_0, ()))
+    have b := preKeyRound152 (h := ph152_3 o) (off := (pw_151_0, pw_151_1, pw_151_2, pw_151_3, ()))
+    simp only at a b
+    obtain ⟨r0, r1, r2, r3⟩ := hr o
+    rw [r0, r1, r2, r3, hoff, ← b] at a
+    simp only [Prod.mk.injEq] at a
+    exact ⟨a.1, a.2.1, a.2.2.1, a.2.2.2.1⟩
+  -- The placement.
+  have hp : ∀ o : Fin 8, w_313_0 o = pw_153_0 o ∧ w_313_1 o = pw_153_1 o ∧ w_313_2 o = pw_153_2 o ∧
+      w_313_3 o = pw_153_3 o := by
+    intro o
+    have a := place313 (h := h313_5 o) (x := (w_312_0 o, w_312_1 o, w_312_2 o, w_312_3 o, w_312_4 o, w_312_5 o, ()))
+    have b := prePlace153 (h := ph153_3 o) (x := (pw_152_0 o, pw_152_1 o, pw_152_2 o, pw_152_3 o, ()))
+    simp only [Prod.mk.injEq] at a b
+    obtain ⟨s0, s1, s2, s3⟩ := hs o
+    refine ⟨?_, ?_, ?_, ?_⟩
+    · rw [a.1, b.1, s0]
+    · rw [a.2.1, b.2.1, s1]
+    · rw [a.2.2.1, b.2.2.1, s2]
+    · rw [a.2.2.2.1, b.2.2.2.1, s3]
+  -- The member sums and the move down.
+  subst e_316_0 e_319_0 e_322_0 e_325_0 e_328_0 e_331_0 pe_156_0 pe_159_0 pe_162_0 pe_165_0
+  have a := rootSum332 h314_0 h315_0 h317_0 h318_0 h320_0 h321_0 h323_0 h324_0 h326_0 h327_0
+    h329_0 h330_0 h332_5
+  have b := prerootSum166 ph154_0 ph155_0 ph157_0 ph158_0 ph160_0 ph161_0 ph163_0 ph164_0 ph166_3
+  simp only [Prod.mk.injEq] at a b
+  rw [blockModSwitchRuns_eq ph167_0, blockModSwitchRuns_eq ph338_0, a.2.1, a.2.2.2.1, b.2.1, b.2.2.2.1]
+  exact ⟨congrArg _ (Finset.sum_congr rfl fun o _ ↦ (hp o).2.1),
+    congrArg _ (Finset.sum_congr rfl fun o _ ↦ (hp o).2.2.2)⟩
+
+end RefreshTopProof.Part_@P@

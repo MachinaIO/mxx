@@ -309,19 +309,21 @@ impl RnsBggParameters {
         Ok(parameters)
     }
 
-    /// Evaluate the selected Program noise contract and terminal envelopes.
-    pub fn audit_program(
+    /// The noise trace of `program` under `bindings` with every wire's
+    /// evaluation budget checked: under the average-case model (when
+    /// `average` allows its acceptance) each wire's moments fit `q/4` of its
+    /// level at the tail of the program's event budget. Decryption outputs
+    /// are not checked (see [`Self::audit_program`]); a child Program whose
+    /// outputs are consumed by another computation uses this check alone.
+    /// Returns the trace and the tail multiplier `z^2` of the average model.
+    pub fn audit_evaluation(
         &self,
         program: &ExponentLutProgram,
         bindings: &RnsBggNoiseBindings,
-        terminal_value_bounds: &[BigUint],
         average: Option<&crate::decoder::simulation::AverageCaseConfig>,
-    ) -> Result<RnsBggNoiseTrace, RnsBggError> {
-        if terminal_value_bounds.len() != program.outputs().len() {
-            return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
-        }
+    ) -> Result<(RnsBggNoiseTrace, Option<NonnegativeRational>), RnsBggError> {
         let started = std::time::Instant::now();
-        let mut trace = trace_program(self, program, bindings).map_err(|error| match error {
+        let trace = trace_program(self, program, bindings).map_err(|error| match error {
             ProgramLowerError::Backend(error) => error,
             ProgramLowerError::Program(error) => RnsBggError::Graph(error.to_string()),
             ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
@@ -401,6 +403,22 @@ impl RnsBggParameters {
             }
         }
 
+        Ok((trace, z_squared))
+    }
+
+    /// Evaluate the selected Program noise contract and terminal envelopes.
+    pub fn audit_program(
+        &self,
+        program: &ExponentLutProgram,
+        bindings: &RnsBggNoiseBindings,
+        terminal_value_bounds: &[BigUint],
+        average: Option<&crate::decoder::simulation::AverageCaseConfig>,
+    ) -> Result<RnsBggNoiseTrace, RnsBggError> {
+        if terminal_value_bounds.len() != program.outputs().len() {
+            return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
+        }
+        let (mut trace, z_squared) = self.audit_evaluation(program, bindings, average)?;
+        let workload = RnsBggDerivedWorkload::from_program_with_parameters(self, program)?;
         for ((index, output), terminal_bound) in
             program.outputs().iter().enumerate().zip(terminal_value_bounds)
         {

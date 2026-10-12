@@ -313,6 +313,18 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         self.levels.insert(output, next);
         Ok((output, next))
     }
+    fn mul_small_constant(
+        &mut self,
+        input: &Self::Wire,
+        _: &[i64],
+        _: &IntExpr,
+    ) -> Result<Self::Wire, Self::Error> {
+        // A plaintext factor applies to the carrier in place.
+        self.note_use(input.0, None);
+        let output = self.site()?.output;
+        self.levels.insert(output, input.1);
+        Ok((output, input.1))
+    }
 }
 
 impl<'a> ProgramLoweringContext for WorkloadCollector<'a> {
@@ -330,6 +342,7 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut WorkloadCollector<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {

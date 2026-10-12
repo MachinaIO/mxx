@@ -68,7 +68,7 @@ pub fn family_of_fields<T: mxx_dsl::GraphValue>(
     count: IntExpr,
     fields: &[ValueHandle],
 ) -> Result<mxx_dsl::Family<T>, mxx_dsl::DslError> {
-    let schema = mxx_dsl::FamilyType { element: element.schema(), count };
+    let schema = mxx_dsl::FamilyType { element: element.schema(), count, member_slot: None };
     <mxx_dsl::Family<T> as mxx_dsl::GraphValue>::from_values(&schema, fields)
 }
 
@@ -107,6 +107,7 @@ where
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut E,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
@@ -398,6 +399,14 @@ mod tests {
             table: &crate::program::LutTable,
         ) -> Result<Self::Wire, Self::Error> {
             assert!(table.input_width() > 0);
+            Ok(input.clone())
+        }
+        fn mul_small_constant(
+            &mut self,
+            input: &Self::Wire,
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<Self::Wire, Self::Error> {
             Ok(input.clone())
         }
     }

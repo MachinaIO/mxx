@@ -170,6 +170,12 @@ impl PhysicalValue {
                 ConcreteWireType::IndexedFamily { element, .. } => {
                     collect_leaves(element, family_axes + 1, public_gadget, out)
                 }
+                // GPU plans reject member-dependent families before allocation.
+                ConcreteWireType::DependentFamily { members } => {
+                    if let Some(member) = members.first() {
+                        collect_leaves(member, family_axes + 1, public_gadget, out)
+                    }
+                }
                 ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
                     if public_gadget {
                         out.push((family_axes + 4, 5));

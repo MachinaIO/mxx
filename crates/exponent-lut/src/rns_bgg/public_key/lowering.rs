@@ -46,6 +46,7 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut PublicKeyLowering<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
@@ -785,6 +786,23 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
     type Wire = RnsBggPublicKey;
     type Rhs = RhsRef<Int>;
     type Error = RnsBggError;
+    /// `A c`: the encoding relation `s A - mu G + e` times the plaintext
+    /// `c` is `s (A c) - (mu c) G + e c`, so the key is multiplied as the
+    /// encoding is.
+    fn mul_small_constant(
+        &mut self,
+        input: &Self::Wire,
+        coefficients: &[i64],
+        shift: &IntExpr,
+    ) -> Result<Self::Wire, Self::Error> {
+        let ring = self.parameters.ring(self.workload.level(input.wire)?)?;
+        Ok(RnsBggPublicKey::new(
+            self.output()?,
+            map_matrix(input.matrix.clone(), |entry| {
+                super::mul_small_constant_entry(&ring, entry, coefficients, shift)
+            }),
+        ))
+    }
     fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
         if self.workload.level(lhs.wire)? != self.workload.level(rhs.wire)? {
             return Err(RnsBggError::Binding("Add level mismatch"));
@@ -1147,6 +1165,7 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
             output_use: RnsOutputUse::default(),

@@ -571,12 +571,44 @@ impl LutTable {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Step {
-    Add { lhs: Operand<WireId>, rhs: Operand<WireId>, output: WireId },
-    MulPublic { lhs: Operand<WireId>, rhs: Operand<WireId>, output: WireId },
-    MulPrivate { input: Operand<WireId>, rhs: Operand<RhsId>, output: WireId },
-    Lut { input: Operand<WireId>, table: LutId, output: WireId },
-    Parallel { range: FamilyRange, body: Box<Body>, output: WireId },
-    Sum { family: WireId, output: WireId },
+    Add {
+        lhs: Operand<WireId>,
+        rhs: Operand<WireId>,
+        output: WireId,
+    },
+    MulPublic {
+        lhs: Operand<WireId>,
+        rhs: Operand<WireId>,
+        output: WireId,
+    },
+    MulPrivate {
+        input: Operand<WireId>,
+        rhs: Operand<RhsId>,
+        output: WireId,
+    },
+    Lut {
+        input: Operand<WireId>,
+        table: LutId,
+        output: WireId,
+    },
+    /// `input * c(X) X^shift` for the fixed small polynomial `c` of
+    /// `coefficients` (`c_i` at `X^i`) and the shift, which may depend on the
+    /// enclosing loop indices.
+    MulSmallConstant {
+        input: Operand<WireId>,
+        coefficients: Vec<i64>,
+        shift: IntExpr,
+        output: WireId,
+    },
+    Parallel {
+        range: FamilyRange,
+        body: Box<Body>,
+        output: WireId,
+    },
+    Sum {
+        family: WireId,
+        output: WireId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -843,14 +875,19 @@ impl ExponentLutProgram {
             })
             .collect()
     }
-    /// The `(input, table)` of every LUT with a scalar input inside a
-    /// family body, in body order. Lowerings prepare their material at root
-    /// scope, where every member's body reads it.
+    /// The `(input, table)` of every LUT inside a family body, in body
+    /// order; a member input is named by its family, whose level is its
+    /// members'. Lowerings prepare their material at root scope, where every
+    /// member's body reads it.
     pub(crate) fn family_body_luts(&self) -> Vec<(WireId, LutId)> {
         fn visit(body: &Body, nested: bool, luts: &mut Vec<(WireId, LutId)>) {
             for step in &body.steps {
                 match step {
-                    Step::Lut { input: Operand::Scalar(input), table, .. } if nested => {
+                    Step::Lut {
+                        input: Operand::Scalar(input) | Operand::Member { family: input, .. },
+                        table,
+                        ..
+                    } if nested => {
                         luts.push((*input, *table));
                     }
                     Step::Parallel { body, .. } => visit(body, true, luts),
@@ -877,6 +914,27 @@ impl ExponentLutProgram {
             .get(&wire)
             .map(|metadata| metadata.knowledge)
             .ok_or(ProgramValidationError::UndefinedWire(wire))
+    }
+
+    /// The output representation of the LUT whose top-level step outputs
+    /// `wire`, or `None` when another step (or an input) defines it.
+    pub fn lut_output_representation(
+        &self,
+        wire: WireId,
+    ) -> Result<Option<LutOutputRepresentation>, ProgramValidationError> {
+        self.metadata()?;
+        for step in &self.body.steps {
+            if let Step::Lut { output, table, .. } = step &&
+                *output == wire
+            {
+                let table = self
+                    .luts
+                    .get(table.0 as usize)
+                    .ok_or(ProgramValidationError::InvalidLutId(*table))?;
+                return Ok(Some(table.output_representation));
+            }
+        }
+        Ok(None)
     }
 
     /// Return whether a validated wire is the raw output of a coefficient LUT
@@ -1131,6 +1189,16 @@ fn derive_body_metadata(
                     table.output_representation.is_coefficient().then_some(table.max_output as u64);
                 WireMetadata { knowledge: input.knowledge, coefficient_bound }
             }
+            Step::MulSmallConstant { input, coefficients, .. } => {
+                let input = metadata_for_operand(input, metadata)?;
+                // `|(v c)_j| <= max_i |v_i| * ||c||_1`.
+                let l1 = small_constant_l1(coefficients).ok_or_else(overflow)?;
+                let coefficient_bound = input
+                    .coefficient_bound
+                    .map(|bound| bound.checked_mul(l1).ok_or_else(overflow))
+                    .transpose()?;
+                WireMetadata { knowledge: input.knowledge, coefficient_bound }
+            }
             Step::Parallel { range, body, output } => {
                 derive_body_metadata(body, luts, metadata, counts)?;
                 counts.insert(*output, range.count().clone());
@@ -1167,6 +1235,7 @@ fn derive_body_metadata(
             Step::MulPublic { output, .. } |
             Step::MulPrivate { output, .. } |
             Step::Lut { output, .. } |
+            Step::MulSmallConstant { output, .. } |
             Step::Parallel { output, .. } |
             Step::Sum { output, .. } => *output,
         };
@@ -1237,6 +1306,11 @@ fn validate_body(
                 if (*table).0 as usize >= luts.len() {
                     return Err(ProgramValidationError::InvalidLutId(*table));
                 }
+                (*output, VisibleKind::Scalar)
+            }
+            Step::MulSmallConstant { input, coefficients, shift, output } => {
+                check_wire_operand(input, visible, false, depth, loop_bounds)?;
+                check_small_constant(coefficients, shift, depth)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::Parallel { range, body, output } => {
@@ -1577,6 +1651,40 @@ fn log2_ceil(value: &BigInt) -> BigInt {
     let floor = value.bits() - 1;
     let power = num_bigint::BigUint::from(1u8) << floor as usize;
     BigInt::from(if value == power { floor } else { floor + 1 })
+}
+
+/// `||c||_1` of a small constant's coefficients, `None` on overflow.
+pub(crate) fn small_constant_l1(coefficients: &[i64]) -> Option<u64> {
+    coefficients
+        .iter()
+        .try_fold(0u64, |sum, coefficient| sum.checked_add(coefficient.unsigned_abs()))
+}
+
+/// Whether a small constant has exactly one nonzero coefficient: it is then
+/// `c X^k`, which scales every coefficient of its operand by the same `|c|`
+/// up to sign and position.
+pub(crate) fn small_constant_is_single_term(coefficients: &[i64]) -> bool {
+    coefficients.iter().filter(|coefficient| **coefficient != 0).count() == 1
+}
+
+/// A small constant has a nonzero coefficient, a representable `l1` norm,
+/// and a shift reading only enclosing loop indices.
+pub(crate) fn check_small_constant(
+    coefficients: &[i64],
+    shift: &IntExpr,
+    depth: u32,
+) -> Result<(), ProgramValidationError> {
+    if coefficients.iter().all(|coefficient| *coefficient == 0) ||
+        small_constant_l1(coefficients).is_none()
+    {
+        return Err(ProgramValidationError::InvalidStructure(
+            "MulSmallConstant needs a nonzero constant with a representable l1 norm".into(),
+        ));
+    }
+    if let Some(slot) = invalid_loop_slot(shift, depth) {
+        return Err(ProgramValidationError::InvalidLoopIndex(slot));
+    }
+    Ok(())
 }
 
 fn invalid_loop_slot(expression: &IntExpr, depth: u32) -> Option<u32> {

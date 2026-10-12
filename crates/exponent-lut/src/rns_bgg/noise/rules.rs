@@ -260,11 +260,7 @@ impl RnsBggParameters {
         let mut provenance = source.provenance.clone();
         for rounding in [ciphertext_rounding, public_key_rounding] {
             for (source_id, identity) in &rounding.provenance {
-                if let Some(existing) = provenance.get_mut(source_id) {
-                    existing.route.extend_from_slice(&identity.route);
-                } else {
-                    provenance.insert(*source_id, identity.clone());
-                }
+                provenance.entry(*source_id).or_insert_with(|| identity.clone());
             }
         }
         let mut heuristics = source.heuristics.clone();
@@ -924,7 +920,7 @@ mod test {
                 0usize,
                 1usize,
             ));
-            assert_eq!(second.provenance[&id].route.len(), 6);
+            assert_eq!(second.provenance[&id].route, first.provenance[&id].route);
         }
     }
 

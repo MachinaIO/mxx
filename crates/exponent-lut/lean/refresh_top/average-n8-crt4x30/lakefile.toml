@@ -1,0 +1,40 @@
+name = "MxxExponentLutRefreshTopAverageN8Crt4x30"
+version = "0.1.0"
+defaultTargets = ["RefreshTopGenerated"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = "../.."
+
+# Modules written by `refresh_top_round_trip` (`tests/refresh_top.rs`) for this parameter set.
+[[lean_lib]]
+name = "RefreshTopGenerated"
+srcDir = "generated"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["Backend", "Claim", "Ideal", "Requirement_0", "Stage_decode", "Stage_encrypt", "Stage_mask", "Stage_online_eval", "Stage_payload", "Stage_preprocess"]
+
+# The worst-case export of the same graph, renamed (written by `generator/gen_bridge.py`).
+[[lean_lib]]
+name = "RefreshTopWorst"
+srcDir = "worst"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["W_Claim", "W_Ideal", "W_Ideal_Facts", "W_Requirement_0", "W_Requirement_0_Facts", "W_Stage_decode", "W_Stage_decode_Facts", "W_Stage_encrypt", "W_Stage_encrypt_Facts", "W_Stage_mask", "W_Stage_mask_Facts", "W_Stage_online_eval", "W_Stage_online_eval_Facts", "W_Stage_payload", "W_Stage_payload_Facts", "W_Stage_preprocess", "W_Stage_preprocess_Facts"]
+
+# Every average-case run is a worst-case run (written by `generator/gen_bridge.py`).
+[[lean_lib]]
+name = "RefreshTopBridge"
+srcDir = "bridge"
+moreLeanArgs = ["--tstack=262144"]
+roots = ["BridgeRuns","Bridge_Ideal","Bridge_Requirement_0","Bridge_Stage_decode","Bridge_Stage_encrypt","Bridge_Stage_mask","Bridge_Stage_online_eval","Bridge_Stage_payload","Bridge_Stage_preprocess"]
+
+# The worst-case proof over the renamed export (written by `generator/gen_port.py`) and the
+# average-case certificate.
+[[lean_lib]]
+name = "RefreshTopProof"
+srcDir = "proof"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["ModularGlue", "Modular_Part_I_Assembly", "Part_I_Cells", "Part_I_Enc", "Part_I_EncFacts", "Part_I_EncRoot", "Part_I_Fresh", "Part_I_FreshCarrier", "Part_I_FreshChain", "Part_I_Inputs", "Part_I_KeyFacts", "Part_I_KeyFresh", "Part_I_KeyMask", "Part_I_KeySmudge", "Part_I_KeySource", "Part_I_KeysCells", "Part_I_KeysLuts", "Part_I_KeysRoot", "Part_I_Labels", "Part_I_Local", "Part_I_Mask", "Part_I_MaskCarrier", "Part_I_Online", "Part_I_OnlineChain", "Part_I_OnlineFinal", "Part_I_PrePlace", "Part_I_PreRhs", "Part_I_PreRootSums", "Part_I_PreSums", "Part_I_PreSwitch", "Part_I_Readout", "Part_I_RootLuts", "Part_I_RootSums", "Part_I_Smudge", "Part_I_SmudgeChain", "Part_I_SmudgeMembers", "Part_I_SmudgeTotal", "Part_I_Sums", "RefreshTopCertificate", "ReqLabel", "ReqSigma", "RequirementFacts", "RequirementRoot", "StageWrappers", "TopAction", "TopAssembly", "TopChain", "TopColumn", "TopCorrect", "TopCrt", "TopDecode", "TopDecodeCrt", "TopDecompose", "TopFinal", "TopFinish", "TopGadgets", "TopGlue", "TopHint", "TopInst", "TopKeyForms", "TopKeys", "TopLabel", "TopLemmas", "TopLink", "TopLinkC", "TopLut", "TopLut2", "TopPlace", "TopPrf", "TopRefresh", "TopRequirement", "TopResidue", "TopRow", "TopSecrets", "TopSetup", "TopSigma", "TopStage", "TopSwitch", "TopTables", "TopTarget", "TopUnpack"]

@@ -4142,7 +4142,9 @@ fn planned_export_slots(
                 raw_offset: fragment.raw_offset,
                 raw_bytes: fragment.raw_bytes,
                 final_chunk: site.final_chunk,
-                payload_kind: artifact_payload_kind(&site.artifact_type),
+                payload_kind: artifact_payload_kind(&site.artifact_type).ok_or_else(|| {
+                    GpuRuntimeError::Artifact("a nested family artifact has no GPU payload".into())
+                })?,
                 export: Arc::clone(&site.export),
                 commit_to_session: true,
             })
@@ -4234,13 +4236,16 @@ fn streamed_family_outputs(
     Ok(outputs)
 }
 
-fn artifact_payload_kind(artifact: &ArtifactType) -> u8 {
+/// The GPU payload kind of a stored artifact; a nested family has none (GPU lowering rejects
+/// index-dependent families).
+fn artifact_payload_kind(artifact: &ArtifactType) -> Option<u8> {
     match artifact {
-        ArtifactType::Matrix(_) => 0,
-        ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. } => 1,
-        ArtifactType::Int | ArtifactType::Bytes { .. } => 2,
-        ArtifactType::Trapdoor { .. } => 3,
-        ArtifactType::TypedBlob { .. } => 4,
+        ArtifactType::Matrix(_) => Some(0),
+        ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. } => Some(1),
+        ArtifactType::Int | ArtifactType::Bytes { .. } => Some(2),
+        ArtifactType::Trapdoor { .. } => Some(3),
+        ArtifactType::TypedBlob { .. } => Some(4),
+        ArtifactType::Family(_) => None,
     }
 }
 

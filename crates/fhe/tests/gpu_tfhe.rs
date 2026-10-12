@@ -255,7 +255,7 @@ fn test_gpu_tfhe_round_trip() {
         ),
     ];
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lean/tfhe/generated");
-    mxx_ir_core::lean::protocol::export(&gate_protocol(stages), &directory).unwrap();
+    mxx_ir_core::lean::protocol::export(&gate_protocol(stages), &directory, false).unwrap();
 
     let gates = timings.iter().filter(|(stage, _)| stage == "nand").collect::<Vec<_>>();
     let mean_ms =

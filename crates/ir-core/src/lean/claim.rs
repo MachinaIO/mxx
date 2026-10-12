@@ -93,7 +93,8 @@ fn tuple(values: &[String]) -> String {
     match values {
         [] => "()".into(),
         [value] => value.clone(),
-        _ => format!("({}, ())", values.join(", ")),
+        _ if values.len() <= super::BALANCED_TUPLE => format!("({}, ())", values.join(", ")),
+        _ => super::tuple_expr(values),
     }
 }
 

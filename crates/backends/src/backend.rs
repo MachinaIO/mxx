@@ -642,6 +642,10 @@ pub enum RuntimeValue {
         element_type: ConcreteWireType,
         values: Arc<[RuntimeValue]>,
     },
+    /// A family whose members have different types (`ConcreteWireType::DependentFamily`).
+    DependentFamily {
+        values: Arc<[RuntimeValue]>,
+    },
     LazyArtifact {
         production: mxx_ir_core::artifact::ProductionId,
         name: String,
@@ -892,6 +896,13 @@ impl RuntimeValue {
                 values.len() == *count &&
                     element_type == element.as_ref() &&
                     values.iter().all(|value| value.matches_wire_type(element))
+            }
+            (Self::DependentFamily { values }, ConcreteWireType::DependentFamily { members }) => {
+                values.len() == members.len() &&
+                    values
+                        .iter()
+                        .zip(members)
+                        .all(|(value, member)| value.matches_wire_type(member))
             }
             (
                 Self::LazyArtifactFamily { descriptor, .. } |

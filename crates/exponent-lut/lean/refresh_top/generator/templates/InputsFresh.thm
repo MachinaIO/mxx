@@ -1,0 +1,105 @@
+set_option maxHeartbeats 64000000 in
+set_option maxRecDepth 65536 in
+/-- The inputs of the fresh chain. -/
+theorem freshInputs {model : HashModel} {params' : @PRE@.Params} {params'' : @ENC@.Params}
+@BINDERS@
+    {r sm : ErrorPoly N} (hr : polyNorm r ≤ 1) (hsm : polyNorm sm ≤ 1)
+    (hpay : pw_9_0 = fun _ _ ↦ reducePoly Q0 N r) (qhm : qw_4_0 = fun _ _ ↦ reducePoly Q0 N sm)
+    (qhp : qw_11_0 = fun _ _ ↦ reducePoly Q0 N r) (q307 : qw_307_0 = 1) (q309 : qw_309_0 = 0)
+        {GQ7_14 : ExactMatrix Q7 N 1 14} {GQ6_12 : ExactMatrix Q6 N 1 12} {RQ7_12 : ExactMatrix Q7 N 1 12}
+    {GQ5_10 : ExactMatrix Q5 N 1 10} {RQ6_10 : ExactMatrix Q6 N 1 10}
+    {GQ0_8 : ExactMatrix Q0 N 1 8} {RQ5_8 : ExactMatrix Q5 N 1 8}
+    {GQ1_6 : ExactMatrix Q1 N 1 6} {RQ0_6 : ExactMatrix Q0 N 1 6}
+    (hGQ7_14 : gadgetMatrixRuns Backend.backend 32768 14 GQ7_14)
+    (hGQ6_12 : gadgetMatrixRuns Backend.backend 32768 12 GQ6_12) (hRQ7_12 : centeredRebaseRuns GQ6_12 RQ7_12)
+    (hGQ5_10 : gadgetMatrixRuns Backend.backend 32768 10 GQ5_10) (hRQ6_10 : centeredRebaseRuns GQ5_10 RQ6_10)
+    (hGQ0_8 : gadgetMatrixRuns Backend.backend 32768 8 GQ0_8) (hRQ5_8 : centeredRebaseRuns GQ0_8 RQ5_8)
+    (hGQ1_6 : gadgetMatrixRuns Backend.backend 32768 6 GQ1_6) (hRQ0_6 : centeredRebaseRuns GQ1_6 RQ0_6)
+    (hlc : ∀ k, qw_329_0 k * qw_329_0 k = 1)
+    (hlr : ∀ k, qw_330_0 k * 2 + (1 - qw_329_0 k) * 8 = (labelExp k : Int) * 4)
+    (hle : ∀ k, 0 ≤ qw_330_0 k ∧ qw_330_0 k ≤ 7)
+    (hs01 : ∀ i, 0 ≤ pw_207_0 i ∧ pw_207_0 i ≤ 1) (hs01' : ∀ i, 0 ≤ pw_212_0 i ∧ pw_212_0 i ≤ 1)
+    (he0 : ∀ i, pw_208_0 i = 0) (he0' : ∀ i, pw_213_0 i = 0)
+    (hsum : ∀ o : Fin 48, ∑ k : Fin 5, pw_207_0 (cellIndex o k) = 1)
+    (hsum' : ∀ o : Fin 48, ∑ k : Fin 5, pw_212_0 (cellIndex o k) = 1) :
+    Rel sm ![![qw_293_0, qw_294_0], ![qw_295_0, qw_296_0]]
+      (fun j ↦ reducePoly Q7 N (((p6 : Nat) : Int) * 1 * unitPair r j) • RQ7_12) ![qw_315_0, qw_324_0] 26 ∧
+    (∀ i : Fin 4, Rel sm (lutA model qw_332_0 Q5 8 2 (sigma i))
+      (fun j ↦ reducePoly Q5 N (((p4 : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • RQ5_8) ![qw_335_0 i, qw_335_1 i] 26) ∧
+    (∀ i : Fin 4, ∃ e : Fin 2 → ErrorMatrix N 1 6, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
+      reducePoly Q0 N (substitution (sigma i).toNat (sigma_odd i) r) •
+          ![![pw_216_0, pw_216_1], ![pw_216_2, pw_216_3]] 0 j i + ![![pw_216_0, pw_216_1], ![pw_216_2, pw_216_3]] 1 j i =
+        (lutCoefficient Q0 996917851236477127152305493547100497 (fun k ↦ reducePoly Q0 N (readoutTable k))
+          (sigma i).toNat * reducePoly Q0 N ((((q3 : Nat) : Int) : ErrorPoly N) * unitPair r j)) • RQ0_6 +
+            reduceMatrix Q0 N 1 6 (e j)) ∧
+    (∀ i : Fin 4, Rel sm (lutA model qw_332_0 Q0 6 3 (sigma i))
+      (fun j ↦ reducePoly Q0 N (((q3 : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • RQ0_6) ![qw_336_0 i, qw_336_1 i] 26) ∧
+    (∀ k : Fin 5, Rel sm ![![qw_331_0 k, qw_331_1 k], ![qw_331_2 k, qw_331_3 k]]
+      (fun j ↦ reducePoly Q7 N (Xe (n := N) (2 * labelExp k) * unitPair sm j) • GQ7_14)
+      ![qw_331_4 k, qw_331_5 k] 26) ∧
+    (∃ eBm : Fin 240 → Fin 2 → ErrorMatrix N 1 10, (∀ i j, CoeffBound (eBm i j) 26) ∧ ∀ (i : Fin 240) j,
+      reducePoly Q6 N r • rhsTop model pw_201_0 Q6 10 freshRhs0 i j + ![pw_210_6 i, pw_210_7 i] j =
+        reducePoly Q6 N (((p5 : Nat) : Int) * ((pw_207_0 i : Int) : ErrorPoly N) * unitPair r j) • RQ6_10 +
+          reduceMatrix Q6 N 1 10 (eBm i j)) ∧
+    (∃ eBm : Fin 240 → Fin 2 → ErrorMatrix N 1 8, (∀ i j, CoeffBound (eBm i j) 26) ∧ ∀ (i : Fin 240) j,
+      reducePoly Q5 N r • rhsTop model pw_201_0 Q5 8 freshRhs1 i j + ![pw_214_6 i, pw_214_7 i] j =
+        reducePoly Q5 N (((p4 : Nat) : Int) * ((pw_212_0 i : Int) : ErrorPoly N) * unitPair r j) • RQ5_8 +
+          reduceMatrix Q5 N 1 8 (eBm i j)) ∧
+    (∃ sel : Fin 48 → Fin 5, ∀ o k, pw_207_0 (cellIndex o k) = if k = sel o then 1 else 0) ∧
+    (∃ sel : Fin 48 → Fin 5, ∀ o k, pw_212_0 (cellIndex o k) = if k = sel o then 1 else 0) ∧
+    (∀ i : Fin 4, ∃ e : Fin 2 → ErrorMatrix N 1 6, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
+      reducePoly Q1 N (substitution (sigma i).toNat (sigma_odd i) r) •
+          ![![pw_218_0, pw_218_1], ![pw_218_2, pw_218_3]] 0 j i + ![![pw_218_0, pw_218_1], ![pw_218_2, pw_218_3]] 1 j i =
+        (lutCoefficient Q1 928453219666515100085511901 (fun k ↦ reducePoly Q1 N
+          (![((0 : Int) : ErrorPoly N), ((0 : Int) : ErrorPoly N), ((0 : Int) : ErrorPoly N),
+            ((1 : Int) : ErrorPoly N)] k)) (sigma i).toNat *
+          reducePoly Q1 N (((1 : Int) : ErrorPoly N) * unitPair r j)) • GQ1_6 + reduceMatrix Q1 N 1 6 (e j)) := by
+  have hone : qw_29_0 = 1 := qe_29_0
+  have h1 := encOne_315_0 (model := model) @ARGS(encOne_315_0)@ (hsm := hsm) (hsp := hr)
+    (hsmIn := qhm) (hspIn := qhp) (hone := hone) (hg' := hGQ6_12) (hg := hRQ7_12)
+  rw [q307, q309, message_one_zero] at h1
+  have hsec : pw_206_0 = fun _ _ ↦ reducePoly Q7 N r :=
+    rebase_small (q := Q0) (by norm_num) hr (by rw [← hpay]; exact ph206_0)
+  have h34 : pw_209_0 = 1 := rebase_one (q := Q0) (by norm_num) (by rw [← pe_11_0]; exact ph209_0)
+  have hsmQ7 : qw_297_0 = fun _ _ ↦ reducePoly Q7 N sm :=
+    rebase_small (q := Q0) (by norm_num) hsm (by rw [← qhm]; exact qh297_0)
+  have h343 : qw_299_0 = 1 := rebase_one (q := Q0) (by norm_num) (by rw [← qe_7_0]; exact qh299_0)
+  have hread : (fun k ↦ reducePoly Q0 N (readoutTable k)) =
+      fun k ↦ reducePoly Q0 N (![Xe (n := N) 2, Xe (n := N) 2, Xe (n := N) 6, Xe (n := N) 6] k) := by
+    funext k; fin_cases k <;> rfl
+  refine ⟨h1, fun i ↦ encHelper335 i (qh335_1 i) hsmQ7 h343 hGQ0_8 hRQ5_8, fun i ↦ ?_,
+    fun i ↦ encHelper336 i (qh336_1 i) hsmQ7 h343 hGQ1_6 hRQ0_6,
+    encLabelRel331 qh331_6 hsmQ7 h343 hGQ7_14 hlc hlr hle, ?_, ?_, ?_, ?_,
+    fun i ↦ ?_⟩
+  · obtain ⟨e, he, hs⟩ := preSwitch216 i (ph216_3 i) hsec h34 hGQ1_6 hRQ0_6
+    refine ⟨e, he, fun j ↦ ?_⟩
+    rw [hread]
+    fin_cases j
+    · exact hs 0
+    · exact hs 1
+  · have hc := fun i : Fin 240 ↦ preRhs210 (ph210_7 i) hsec h34 hGQ5_10 hRQ6_10
+    choose eB heB hrel using hc
+    refine ⟨eB, heB, fun i j ↦ ?_⟩
+    have ht := preTop210 (ph210_7 i)
+    have := hrel i j
+    rw [ht, he0 i, message_zero] at this
+    exact this
+  · have hc := fun i : Fin 240 ↦ preRhs214 (ph214_7 i) hsec h34 hGQ0_8 hRQ5_8
+    choose eB heB hrel using hc
+    refine ⟨eB, heB, fun i j ↦ ?_⟩
+    have ht := preTop214 (ph214_7 i)
+    have := hrel i j
+    rw [ht, he0' i, message_zero] at this
+    exact this
+  · choose sel hsel using fun o : Fin 48 ↦ onehot_of_sum (fun k ↦ hs01 (cellIndex o k)) (hsum o)
+    exact ⟨sel, hsel⟩
+  · choose sel hsel using fun o : Fin 48 ↦ onehot_of_sum (fun k ↦ hs01' (cellIndex o k)) (hsum' o)
+    exact ⟨sel, hsel⟩
+  · obtain ⟨e, he, hs⟩ := preSwitch218 i (ph218_3 i) hsec h34 hGQ1_6
+    refine ⟨e, he, fun j ↦ ?_⟩
+    fin_cases j
+    · exact hs 0
+    · exact hs 1
+

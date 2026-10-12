@@ -191,6 +191,54 @@ fn lattice_security_bits_with_secret(
     Ok(bits)
 }
 
+/// Obtain one positive integer estimate from `lattice-estimator-cli` for the
+/// output of a refresh to the top level ([`crate::refresh::top`]): RLWE in
+/// dimension `ring_dimension` over `modulus` with a binary secret and a
+/// CBD(`eta`) error, given `samples` published coefficient equations (the
+/// estimator's LWE model, ignoring the ring structure as the other gates do).
+pub fn top_refresh_output_security_bits(
+    ring_dimension: u32,
+    modulus: &BigUint,
+    eta: u32,
+    samples: u64,
+) -> Result<u64, String> {
+    if ring_dimension == 0 || modulus.is_zero() || eta == 0 || samples == 0 {
+        return Err("top refresh output parameters must be positive".to_owned());
+    }
+    let output = Command::new("lattice-estimator-cli")
+        .arg(ring_dimension.to_string())
+        .arg(modulus.to_string())
+        .arg("--s-dist")
+        .arg(r#"{"name":"Binary"}"#)
+        .arg("--e-dist")
+        .arg(format!(r#"{{"name":"CenteredBinomial","eta":{eta}}}"#))
+        .arg("--m")
+        .arg(samples.to_string())
+        .output()
+        .map_err(|error| format!("failed to start lattice-estimator-cli: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "lattice-estimator-cli failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let bits = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| "lattice-estimator-cli returned no security estimate".to_owned())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| {
+            format!("lattice-estimator-cli returned a non-integer security estimate: {error}")
+        })?;
+    if bits == 0 {
+        return Err("lattice-estimator-cli returned a non-positive security estimate".to_owned());
+    }
+    Ok(bits)
+}
+
 /// Audit one exact CRT-depth candidate using the same workload and noise path
 /// as the public search API.  Keeping the requested terminal depth unchanged
 /// lets callers try deeper source CRT chains without silently changing the
@@ -438,6 +486,7 @@ pub fn select_decoder_at_crt_depth(
             coefficients,
             digits,
             layouts,
+            crate::decoder::decoding::DecoderTarget::Output,
         )
         .map_err(|error| to_string(&error))?;
         match &dynamic_plaintext {

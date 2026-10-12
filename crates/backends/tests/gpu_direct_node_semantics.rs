@@ -978,6 +978,16 @@ fn rns_mod_down_nonprefix_wide_plaintext_matches_cpu() {
 #[test]
 #[serial_test::serial]
 fn crt_recompose_matches_independent_cpu_formula() {
+    assert_crt_recompose_matches_independent_cpu_formula(1);
+}
+
+#[test]
+#[serial_test::serial]
+fn crt_recompose_multi_column_matches_independent_cpu_formula() {
+    assert_crt_recompose_matches_independent_cpu_formula(3);
+}
+
+fn assert_crt_recompose_matches_independent_cpu_formula(columns: usize) {
     let full = DCRTPolyParams::new(8, 2, 20, 4, None, None);
     let moduli = full.moduli();
     let left_params = full.select_modulus(&BigUint::from(moduli[0])).unwrap();
@@ -1005,8 +1015,8 @@ fn crt_recompose_matches_independent_cpu_formula() {
     };
     let output = Mat::crt_recompose(
         vec![
-            make_ring(&left_params).input("left", (1, 1)),
-            make_ring(&right_params).input("right", (1, 1)),
+            make_ring(&left_params).input("left", (1, columns)),
+            make_ring(&right_params).input("right", (1, columns)),
         ],
         vec![5.into(), 7.into()],
         vec![21.into(), 15.into()],
@@ -1019,8 +1029,10 @@ fn crt_recompose_matches_independent_cpu_formula() {
         .unwrap()
         .validate(&ParamEnv::default())
         .unwrap();
-    let make_coefficients = |modulus: u64| {
-        [
+    // Each column rotates the coefficient pattern so that a column landing in
+    // another column's slot changes the recomposed values.
+    let make_coefficients = |modulus: u64, column: usize| {
+        let mut coefficients = [
             0,
             modulus / 7,
             modulus / 4,
@@ -1029,33 +1041,47 @@ fn crt_recompose_matches_independent_cpu_formula() {
             3 * modulus / 4,
             modulus - 2,
             modulus - 1,
-        ]
-        .map(BigUint::from)
+        ];
+        coefficients.rotate_left(3 * column % 8);
+        coefficients.map(BigUint::from)
     };
-    let left_coefficients = make_coefficients(moduli[0]);
-    let right_coefficients = make_coefficients(moduli[1]);
-    let left = DCRTPolyMatrix::from_poly_vec_row(
-        &left_params,
-        vec![DCRTPoly::from_biguints(&left_params, &left_coefficients)],
-    );
-    let right = DCRTPolyMatrix::from_poly_vec_row(
-        &right_params,
-        vec![DCRTPoly::from_biguints(&right_params, &right_coefficients)],
-    );
+    let left_coefficients =
+        (0..columns).map(|column| make_coefficients(moduli[0], column)).collect::<Vec<_>>();
+    let right_coefficients =
+        (0..columns).map(|column| make_coefficients(moduli[1], 5 * column + 1)).collect::<Vec<_>>();
+    let row = |parameters: &DCRTPolyParams, coefficients: &[[BigUint; 8]]| {
+        DCRTPolyMatrix::from_poly_vec_row(
+            parameters,
+            coefficients
+                .iter()
+                .map(|coefficients| DCRTPoly::from_biguints(parameters, coefficients))
+                .collect(),
+        )
+    };
+    let left = row(&left_params, &left_coefficients);
+    let right = row(&right_params, &right_coefficients);
     let expected_coefficients = left_coefficients
         .iter()
         .zip(&right_coefficients)
         .map(|(left, right)| {
-            let left = left.to_u64_digits().first().copied().unwrap_or(0);
-            let right = right.to_u64_digits().first().copied().unwrap_or(0);
-            let rounded_left = ((5 * left + moduli[0] / 2) / moduli[0]) % 5;
-            let rounded_right = ((7 * right + moduli[1] / 2) / moduli[1]) % 7;
-            BigUint::from(21 * rounded_left + 15 * rounded_right)
+            left.iter()
+                .zip(right)
+                .map(|(left, right)| {
+                    let left = left.to_u64_digits().first().copied().unwrap_or(0);
+                    let right = right.to_u64_digits().first().copied().unwrap_or(0);
+                    let rounded_left = ((5 * left + moduli[0] / 2) / moduli[0]) % 5;
+                    let rounded_right = ((7 * right + moduli[1] / 2) / moduli[1]) % 7;
+                    BigUint::from(21 * rounded_left + 15 * rounded_right)
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     let expected = DCRTPolyMatrix::from_poly_vec_row(
         &full,
-        vec![DCRTPoly::from_biguints(&full, &expected_coefficients)],
+        expected_coefficients
+            .iter()
+            .map(|coefficients| DCRTPoly::from_biguints(&full, coefficients))
+            .collect(),
     );
     let wire = |parameters: &DCRTPolyParams| {
         let ring = RingRef::new(RingExpr::Explicit {
@@ -1064,7 +1090,7 @@ fn crt_recompose_matches_independent_cpu_formula() {
         })
         .resolve(&ParamEnv::default())
         .unwrap();
-        ConcreteWireType::Matrix(ConcreteMatrixType { ring, rows: 1, columns: 1 })
+        ConcreteWireType::Matrix(ConcreteMatrixType { ring, rows: 1, columns })
     };
     let inputs = BTreeMap::from([
         (

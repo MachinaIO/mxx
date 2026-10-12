@@ -19,6 +19,11 @@
 //! states only that the workflow endpoint equals the ideal one; noise bounds are proof obligations,
 //! not part of the statement. Applications supply the proofs.
 //!
+//! With [`ExportOptions::facts`], the artifact also carries a facts module
+//! ([`LeanArtifact::facts_source`], see `facts.rs`): every record scope's wires as top-level
+//! constants and its conjuncts as named fields with a theorem extracting them from the relation, so
+//! proofs read atoms by name instead of destructuring the relation in one large context.
+//!
 //! By default a sampler relation admits any value within the sampler's support, so a claim holds
 //! for every execution. With [`ExportOptions::sampling_tape`], each sampled coefficient is instead
 //! a sampling-tape entry keyed by its occurrence, which a claim with a failure probability
@@ -29,6 +34,7 @@
 
 mod backend;
 pub mod claim;
+mod facts;
 #[cfg(test)]
 mod fixtures;
 pub mod protocol;
@@ -247,6 +253,9 @@ pub struct ExportOptions {
     /// tape keys. A trapdoor sampler reads its public matrix from the tape; a preimage sampler
     /// remains existential (see the module documentation).
     pub sampling_tape: bool,
+    /// Also render the facts declarations of every record scope ([`LeanArtifact::facts_source`],
+    /// see `facts.rs`): wire constants, per-fragment fact records and their extraction theorems.
+    pub facts: bool,
 }
 
 impl Default for ExportOptions {
@@ -257,6 +266,7 @@ impl Default for ExportOptions {
             runtime_import: "MxxRuntime".into(),
             primitives: Default::default(),
             sampling_tape: false,
+            facts: false,
         }
     }
 }
@@ -334,6 +344,8 @@ pub struct LeanArtifact {
     pub backend_layouts: Vec<BackendLayout>,
     pub module_name: String,
     pub source: String,
+    /// The module `<module_name>_Facts` importing `source`, when [`ExportOptions::facts`] is set.
+    pub facts_source: Option<String>,
     pub source_map: SourceMap,
     pub root: RootBoundary,
     pub scope_relations: BTreeMap<FrozenGraphScopeId, String>,
@@ -379,6 +391,32 @@ struct LexicalEnv {
     // a child's shadowing index `i` must not mark an outer `i_slot` as used.
     referenced_loop_names: Rc<RefCell<BTreeSet<String>>>,
     ring_values: BTreeMap<crate::RingRef, crate::ConcreteRing>,
+    // Constant tables selected by a non-constant index, shared by the whole export: each is the
+    // abbreviation `sel_<k>`, so a table a merged stage selects per instance has one name.
+    selection_tables: Rc<RefCell<Vec<Vec<String>>>>,
+    // Render selected tables inline (`MxxIR.selectInt`), for text shared between modules.
+    inline_selections: bool,
+    // Whether tables selected by the instance index (`LoopIndex(0)`) of a merged graph (a root
+    // loop over instances of index-dependent types, see `crate::merge`) are named `sel_<k>`.
+    instance_tables: bool,
+    // The moduli of rings that depend on the instance index only, each the abbreviation
+    // `mod_<k> (i : Int) : Nat`, so no modulus arithmetic appears inside types.
+    modulus_tables: Rc<RefCell<Vec<String>>>,
+}
+
+/// The declared type of `wire` in `scope`.
+fn symbolic_type(scope: &GraphScope, wire: WireRef) -> crate::types::WireType {
+    scope.nodes()[wire.node.0 as usize].output_types()[wire.port.0 as usize].clone()
+}
+
+/// Whether `ty` is a family whose member types depend on the member index.
+fn member_dependent(ty: &crate::types::WireType) -> bool {
+    match ty {
+        crate::types::WireType::IndexedFamily { element, .. } => {
+            crate::types::WireType::family_member(element, &IntExpr::constant(0)) != **element
+        }
+        _ => false,
+    }
 }
 
 fn has_dynamic_generated_basis(ring: &crate::RingRef) -> bool {
@@ -419,8 +457,22 @@ impl LexicalEnv {
             }
             IntExpr::FloorDiv(a, b) => format!("(Int.fdiv ({}) ({}))", self.expr(a), self.expr(b)),
             IntExpr::Rem(a, b) => format!("(Int.fmod ({}) ({}))", self.expr(a), self.expr(b)),
+            IntExpr::Select { selector, branches }
+                if !self.inline_selections &&
+                    self.instance_tables &&
+                    matches!(selector.as_ref(), IntExpr::LoopIndex(0)) &&
+                    branches.iter().all(|branch| matches!(branch, IntExpr::Const(_))) =>
+            {
+                let table = branches.iter().map(|branch| self.expr(branch)).collect::<Vec<_>>();
+                let mut tables = self.selection_tables.borrow_mut();
+                let index = tables.iter().position(|known| *known == table).unwrap_or_else(|| {
+                    tables.push(table);
+                    tables.len() - 1
+                });
+                format!("(sel_{index} ({}))", self.expr(selector))
+            }
             IntExpr::Select { selector, branches } => format!(
-                "MxxIR.selectInt ({}) [{}]",
+                "(MxxIR.selectInt ({}) [{}])",
                 self.expr(selector),
                 branches
                     .iter()
@@ -523,6 +575,32 @@ impl LexicalEnv {
                 )
             }
         }
+    }
+
+    /// The natural-number modulus of `ring` for a type: `(mod_<k> (index))` for a ring of a
+    /// merged graph depending on the instance index only, else `(<modulus>).toNat`.
+    fn modulus_nat(&self, ring: &crate::RingRef) -> String {
+        let inline = format!("({}).toNat", self.ring_modulus_expr(ring));
+        if !self.instance_tables || self.inline_selections {
+            return inline;
+        }
+        let mut abstracted = self.clone();
+        abstracted.loop_indices.retain(|slot, _| *slot == 0);
+        abstracted.loop_indices.insert(0, "i".into());
+        abstracted.loop_index_nats.clear();
+        abstracted.missing_loop_index = Cell::new(None);
+        abstracted.referenced_loop_names = Rc::default();
+        let body = abstracted.ring_modulus_expr(ring);
+        if abstracted.take_missing_loop_index().is_some() {
+            return inline;
+        }
+        let mut tables = self.modulus_tables.borrow_mut();
+        let index = tables.iter().position(|known| *known == body).unwrap_or_else(|| {
+            tables.push(body);
+            tables.len() - 1
+        });
+        drop(tables);
+        format!("(mod_{index} ({}))", self.expr(&IntExpr::LoopIndex(0)))
     }
 
     fn ring_modulus_expr(&self, ring: &crate::RingRef) -> String {
@@ -707,6 +785,10 @@ struct Emitter<'a> {
     layouts: BTreeMap<(num_bigint::BigInt, usize), BackendLayout>,
     /// Top-level definitions of the packed constant tables, inserted before the first scope.
     tables: String,
+    selection_tables: Rc<RefCell<Vec<Vec<String>>>>,
+    /// A merged graph (see `LexicalEnv::instance_tables`).
+    instance_tables: bool,
+    modulus_tables: Rc<RefCell<Vec<String>>>,
     source_map: SourceMap,
     scopes: BTreeMap<FrozenGraphScopeId, String>,
     params: BTreeSet<String>,
@@ -717,6 +799,9 @@ struct Emitter<'a> {
     requires_tape: bool,
     layout_environments: BTreeMap<FrozenGraphScopeId, Vec<crate::expr::ParamEnv>>,
     current_wire_types: BTreeMap<String, String>,
+    /// Lean types of the current scope's wires whose type depends on a loop index or a family
+    /// member index, rendered symbolically (one type for every instance).
+    current_symbolic_types: BTreeMap<WireRef, String>,
     current_scope_values: Vec<(String, String)>,
     current_referenced_wires: BTreeSet<String>,
     current_anonymous_lets: BTreeSet<String>,
@@ -726,6 +811,11 @@ struct Emitter<'a> {
     current_record: bool,
     current_value_expressions: BTreeMap<String, String>,
     scope_proofs: BTreeMap<FrozenGraphScopeId, ScopeProofShape>,
+    /// The facts declarations of the record scopes emitted so far, and their names.
+    facts: String,
+    record_scopes: BTreeSet<String>,
+    /// The current scope's parallel loops whose conjunct is a plain call of the child.
+    current_loops: Vec<facts::ChildLoop>,
 }
 
 impl<'a> Emitter<'a> {
@@ -751,6 +841,12 @@ impl<'a> Emitter<'a> {
             source: String::new(),
             layouts: BTreeMap::new(),
             tables: String::new(),
+            selection_tables: Rc::default(),
+            modulus_tables: Rc::default(),
+            instance_tables: graph.root_scope().nodes().iter().any(|node| {
+                matches!(node.kind(), NodeKind::ParallelLoop(_)) &&
+                    node.output_types().iter().any(member_dependent)
+            }),
             source_map: Default::default(),
             scopes,
             params,
@@ -770,6 +866,7 @@ impl<'a> Emitter<'a> {
             }),
             layout_environments: BTreeMap::new(),
             current_wire_types: BTreeMap::new(),
+            current_symbolic_types: BTreeMap::new(),
             current_scope_values: Vec::new(),
             current_referenced_wires: BTreeSet::new(),
             current_anonymous_lets: BTreeSet::new(),
@@ -780,6 +877,9 @@ impl<'a> Emitter<'a> {
             current_record: false,
             current_value_expressions: BTreeMap::new(),
             scope_proofs: BTreeMap::new(),
+            facts: String::new(),
+            record_scopes: BTreeSet::new(),
+            current_loops: Vec::new(),
             requires_hash_model: graph.scopes().values().any(|scope| {
                 scope.nodes().iter().any(|node| {
                     matches!(
@@ -815,7 +915,18 @@ impl<'a> Emitter<'a> {
         for scope_id in scope_ids {
             self.emit_scope_postorder(&scope_id, &mut emitted)?;
         }
-        let tables = std::mem::take(&mut self.tables);
+        let mut tables = std::mem::take(&mut self.tables);
+        for (index, table) in self.selection_tables.borrow().iter().enumerate() {
+            tables.push_str(&format!(
+                "/-- A constant table selected by an index. -/\nabbrev sel_{index} (i : Int) : Int := MxxIR.selectInt i [{}]\n\n",
+                table.join(", ")
+            ));
+        }
+        for (index, modulus) in self.modulus_tables.borrow().iter().enumerate() {
+            tables.push_str(&format!(
+                "/-- The modulus of a ring selected by the instance index. -/\nabbrev mod_{index} (i : Int) : Nat := ({modulus}).toNat\n\n"
+            ));
+        }
         self.source.insert_str(tables_at, &tables);
         self.source.push_str("\nend ");
         self.source.push_str(&self.options.namespace);
@@ -832,10 +943,30 @@ impl<'a> Emitter<'a> {
         let root_types = &self.validated.scopes[&FrozenGraphScopeId::Root].wire_types;
         let input_wires = scope_input_wires(root_scope);
         let output_wires = root_scope.outputs();
-        let input_types =
-            input_wires.iter().map(|w| self.lean_type(&root_types[w])).collect::<Vec<_>>();
-        let output_types =
-            output_wires.iter().map(|w| self.lean_type(&root_types[w])).collect::<Vec<_>>();
+        // A root family whose member types depend on the member index has its symbolic type at
+        // the boundary (as in the root relation), with tables inline, so that a producer's output
+        // and a consumer's input of one type have one Lean type in the claim.
+        let boundary_env = LexicalEnv {
+            ring_values: self
+                .validated
+                .resolved_rings
+                .iter()
+                .filter(|((scope, _), _)| *scope == FrozenGraphScopeId::Root)
+                .map(|((_, ring), value)| (ring.clone(), value.clone()))
+                .collect(),
+            inline_selections: true,
+            ..LexicalEnv::default()
+        };
+        let boundary_type = |wire: &WireRef| {
+            let symbolic = symbolic_type(root_scope, *wire);
+            if symbolic.contains_loop_index() {
+                self.symbolic_lean_type(&boundary_env, &symbolic, &root_types[wire])
+            } else {
+                self.lean_type(&root_types[wire])
+            }
+        };
+        let input_types = input_wires.iter().map(boundary_type).collect::<Vec<_>>();
+        let output_types = output_wires.iter().map(boundary_type).collect::<Vec<_>>();
         let inputs = input_wires
             .iter()
             .enumerate()
@@ -931,6 +1062,12 @@ impl<'a> Emitter<'a> {
         Ok(LeanArtifact {
             backend_layouts: std::mem::take(&mut self.layouts).into_values().collect(),
             module_name: self.options.module_name.clone(),
+            facts_source: self.options.facts.then(|| {
+                format!(
+                    "import {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nset_option linter.unusedVariables false\n\nnoncomputable section\n\nnamespace {}\n\n{}end {}\n\nend\n",
+                    self.options.module_name, self.options.namespace, self.facts, self.options.namespace
+                )
+            }),
             source: self.source,
             source_map: self.source_map,
             root,
@@ -1004,6 +1141,7 @@ impl<'a> Emitter<'a> {
         self.indent = 1;
         self.current_witnesses.clear();
         self.current_value_expressions.clear();
+        self.current_loops.clear();
         let scope = self.graph.scope(scope_id).expect("scope key came from graph");
         for node in scope.nodes() {
             for entries in [
@@ -1043,21 +1181,70 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        let input_types = inputs
-            .iter()
-            .map(|wire| self.lean_type(&validated.wire_types[wire]))
-            .collect::<Vec<_>>();
-        let output_types = scope
-            .outputs()
-            .iter()
-            .map(|wire| self.lean_type(&validated.wire_types[wire]))
-            .collect::<Vec<_>>();
+        let mut env = LexicalEnv {
+            vars: self
+                .params
+                .iter()
+                .map(|name| (name.clone(), format!("params.«{name}»")))
+                .collect(),
+            loop_indices: scope_loop_slots(self.graph, scope_id)
+                .into_iter()
+                .map(|slot| (slot, format!("(Int.ofNat i_{slot})")))
+                .collect(),
+            loop_index_nats: scope_loop_slots(self.graph, scope_id)
+                .into_iter()
+                .map(|slot| (slot, format!("i_{slot}")))
+                .collect(),
+            missing_loop_index: Cell::new(None),
+            referenced_loop_names: Rc::default(),
+            ring_values: self
+                .validated
+                .resolved_rings
+                .iter()
+                .filter(|((scope, _), _)| scope == scope_id)
+                .map(|((_, ring), value)| (ring.clone(), value.clone()))
+                .collect(),
+            selection_tables: self.selection_tables.clone(),
+            inline_selections: false,
+            instance_tables: self.instance_tables,
+            modulus_tables: self.modulus_tables.clone(),
+        };
+        // Types depending on a loop index or a member index are rendered symbolically, so one
+        // relation covers every instance.
+        self.current_symbolic_types.clear();
+        for (position, node) in scope.nodes().iter().enumerate() {
+            for (port, symbolic) in node.output_types().iter().enumerate() {
+                if !symbolic.contains_loop_index() {
+                    continue;
+                }
+                let wire = WireRef {
+                    node: NodeId(position as u64),
+                    port: crate::types::Port(port as u32),
+                };
+                let rendered =
+                    self.symbolic_lean_type(&env, symbolic, &validated.wire_types[&wire]);
+                self.current_symbolic_types.insert(wire, rendered);
+            }
+        }
+        if let Some(slot) = env.take_missing_loop_index() {
+            return Err(ExportError::MissingLoopIndex(slot));
+        }
+        let wire_type = |exporter: &Self, wire: &WireRef| {
+            exporter
+                .current_symbolic_types
+                .get(wire)
+                .cloned()
+                .unwrap_or_else(|| exporter.lean_type(&validated.wire_types[wire]))
+        };
+        let input_types = inputs.iter().map(|wire| wire_type(self, wire)).collect::<Vec<_>>();
+        let output_types =
+            scope.outputs().iter().map(|wire| wire_type(self, wire)).collect::<Vec<_>>();
         let input_ty = tuple_type(&input_types);
         let output_ty = tuple_type(&output_types);
         self.current_wire_types = validated
             .wire_types
-            .iter()
-            .map(|(wire, ty)| (wire_name(*wire), self.lean_type(ty)))
+            .keys()
+            .map(|wire| (wire_name(*wire), wire_type(self, wire)))
             .collect();
         // Preserve every computation, including retained dead roots, but name a pure result
         // only when a node consumes it or the scope returns it. Anonymous lets keep their RHS.
@@ -1082,30 +1269,6 @@ impl<'a> Emitter<'a> {
         if self.requires_backend {
             self.source.push_str("  let _backend := backend\n");
         }
-        let mut env = LexicalEnv {
-            vars: self
-                .params
-                .iter()
-                .map(|name| (name.clone(), format!("params.«{name}»")))
-                .collect(),
-            loop_indices: scope_loop_slots(self.graph, scope_id)
-                .into_iter()
-                .map(|slot| (slot, format!("(Int.ofNat i_{slot})")))
-                .collect(),
-            loop_index_nats: scope_loop_slots(self.graph, scope_id)
-                .into_iter()
-                .map(|slot| (slot, format!("i_{slot}")))
-                .collect(),
-            missing_loop_index: Cell::new(None),
-            referenced_loop_names: Rc::default(),
-            ring_values: self
-                .validated
-                .resolved_rings
-                .iter()
-                .filter(|((scope, _), _)| scope == scope_id)
-                .map(|((_, ring), value)| (ring.clone(), value.clone()))
-                .collect(),
-        };
         for (pos, wire) in inputs.iter().enumerate() {
             let value = tuple_projection("inputs", pos, inputs.len());
             self.let_output(&wire_name(*wire), &value);
@@ -1160,6 +1323,7 @@ impl<'a> Emitter<'a> {
         let mut constraint_definition = String::new();
         // Include the output equation in the final fragment even for a closed pure scope.
         let fragment_count = relations.len().max(1).div_ceil(32);
+        let mut fragment_calls = vec![String::new(); fragment_count];
         for part in (0..fragment_count).rev() {
             let start = (part * 32).min(relations.len());
             let end = ((part + 1) * 32).min(relations.len());
@@ -1169,6 +1333,7 @@ impl<'a> Emitter<'a> {
                 format!("{} ∧ {}", relations[start..end].join(" ∧ "), constraint_call)
             };
             let (definition, call) = self.scope_constraints(scope_id, &body, &output_ty, part);
+            fragment_calls[part] = call.clone();
             constraint_definition.push_str(&definition);
             constraint_call = call;
         }
@@ -1248,6 +1413,53 @@ impl<'a> Emitter<'a> {
             let loop_arguments =
                 loop_names.iter().map(|name| format!("{name} ")).collect::<String>();
             self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness\n\n"));
+            if self.options.facts {
+                let name = name.clone();
+                let mut env = Vec::new();
+                if self.requires_backend {
+                    env.push(("backend".to_owned(), "MxxRuntime.BackendContext".to_owned()));
+                }
+                if self.requires_hash_model {
+                    env.push(("hashModel".to_owned(), "MxxRuntime.HashModel".to_owned()));
+                }
+                if self.requires_tape {
+                    env.push(("tape".to_owned(), "MxxRuntime.SampleTape".to_owned()));
+                    env.push(("path".to_owned(), "List Nat".to_owned()));
+                }
+                env.push(("params".to_owned(), "Params".to_owned()));
+                env.extend(loop_names.iter().map(|index| (index.clone(), "Nat".to_owned())));
+                let wires = self
+                    .current_scope_values
+                    .iter()
+                    .map(|(wire, ty)| {
+                        (wire.clone(), ty.clone(), self.current_value_expressions[wire].clone())
+                    })
+                    .collect();
+                let fragments = fragment_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(part, call)| {
+                        let start = (part * 32).min(relations.len());
+                        let end = ((part + 1) * 32).min(relations.len());
+                        (call, relations[start..end].to_vec())
+                    })
+                    .collect();
+                let scope_facts = facts::render(
+                    &facts::RecordScope {
+                        name: &name,
+                        env,
+                        input_type: &input_ty,
+                        output_type: &output_ty,
+                        wires,
+                        fragments,
+                        output_tuple: output.clone(),
+                        loops: std::mem::take(&mut self.current_loops),
+                    },
+                    &self.record_scopes,
+                );
+                self.facts.push_str(&scope_facts);
+                self.record_scopes.insert(name);
+            }
         } else {
             self.source.insert_str(declaration_start, &(constraint_definition + &final_header));
         }
@@ -1305,9 +1517,20 @@ impl<'a> Emitter<'a> {
         if referenced.contains("params") {
             constraint_arguments.push(("params".to_owned(), "Params".to_owned()));
         }
+        // A loop index is an argument when the body or a type of the fragment names it (an
+        // index-dependent ring appears in the types).
+        let names_identifier = |text: &str, name: &str| {
+            text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .any(|identifier| identifier == name)
+        };
         for slot in scope_loop_slots(self.graph, scope_id) {
             let name = format!("i_{slot}");
-            if referenced.contains(name.as_str()) {
+            if referenced.contains(name.as_str()) ||
+                names_identifier(output_ty, &name) ||
+                self.current_scope_values.iter().any(|(value, ty)| {
+                    referenced.contains(value.as_str()) && names_identifier(ty, &name)
+                })
+            {
                 constraint_arguments.push((name, "Nat".to_owned()));
             }
         }
@@ -1886,15 +2109,7 @@ impl<'a> Emitter<'a> {
             }
             NodeKind::RnsModUp { digit_size, normalize, .. } => {
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
-                let basis = self.validated.scopes[scope_id].wire_types[&args[0]]
-                    .matrix_type()
-                    .expect("validated RNS input")
-                    .ring
-                    .crt_moduli()
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let basis = self.basis_list(scope, scope_id, args[0], env);
                 relations.push(format!(
                     "{} [{}] {} {} {} {}",
                     self.options.primitives.rns_mod_up,
@@ -1908,15 +2123,7 @@ impl<'a> Emitter<'a> {
             NodeKind::RnsModDown { plaintext_modulus, .. } => {
                 append_expression_guards(plaintext_modulus, env, relations);
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
-                let basis = self.validated.scopes[scope_id].wire_types[&args[0]]
-                    .matrix_type()
-                    .expect("validated RNS input")
-                    .ring
-                    .crt_moduli()
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let basis = self.basis_list(scope, scope_id, args[0], env);
                 relations.push(format!(
                     "{} [{}] ({}) {} {}",
                     self.options.primitives.rns_mod_down,
@@ -1929,15 +2136,7 @@ impl<'a> Emitter<'a> {
             NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
                 append_expression_guards(plaintext_modulus, env, relations);
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
-                let basis = self.validated.scopes[scope_id].wire_types[&args[0]]
-                    .matrix_type()
-                    .expect("validated block-switch input")
-                    .ring
-                    .crt_moduli()
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let basis = self.basis_list(scope, scope_id, args[0], env);
                 relations.push(format!(
                     "{} [{}] ({}) {} {}",
                     self.options.primitives.block_mod_switch,
@@ -2088,8 +2287,28 @@ impl<'a> Emitter<'a> {
                                     }
                                 }
                             };
-                            let result_ty =
-                                self.lean_type(&crate::types::ConcreteWireType::Matrix(result_ty));
+                            // An index-dependent ring keeps its symbolic modulus.
+                            let symbolic_ring =
+                                match &scope.nodes()[node_id.0 as usize].output_types()[0] {
+                                    crate::types::WireType::Matrix(m)
+                                        if m.ring.contains_loop_index() =>
+                                    {
+                                        Some(m.ring.clone())
+                                    }
+                                    _ => None,
+                                };
+                            let result_ty = match symbolic_ring {
+                                Some(ring) => format!(
+                                    "{} {} {} {} {}",
+                                    self.options.primitives.matrix_type,
+                                    env.modulus_nat(&ring),
+                                    result_ty.ring.ring_dimension(),
+                                    result_ty.rows,
+                                    result_ty.columns
+                                ),
+                                None => self
+                                    .lean_type(&crate::types::ConcreteWireType::Matrix(result_ty)),
+                            };
                             self.bind_existential(&name, &result_ty);
                             existentials.push((name.clone(), result_ty));
                             name
@@ -2235,6 +2454,33 @@ impl<'a> Emitter<'a> {
                     kind,
                     "operation is not yet in the generic primitive interface",
                 )
+            }
+            NodeKind::FamilyPack { count }
+                if member_dependent(&scope.nodes()[node_id.0 as usize].output_types()[0]) =>
+            {
+                // Members of different types: each member is its own equation.
+                append_expression_guards(count, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let members = args.len();
+                for (member, wire) in args.iter().enumerate() {
+                    relations.push(format!(
+                        "{} ⟨{member}, by decide⟩ = {}",
+                        output(0),
+                        wire_name(*wire)
+                    ));
+                }
+                relations.push(format!("({}) = {members}", env.expr(count)));
+            }
+            NodeKind::FamilyGetStatic { index }
+                if member_dependent(&symbolic_type(scope, args[0])) =>
+            {
+                // A member of a family whose members have different types, by its index.
+                let family = arg(0)?;
+                let index = index.evaluate(&crate::ParamEnv::default()).map_err(|error| {
+                    ExportError::Encoding(format!("dependent family index: {error}"))
+                })?;
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!("{} = {family} ⟨{index}, by decide⟩", output(0)));
             }
             NodeKind::FamilyPack { count } => {
                 let values =
@@ -2412,6 +2658,28 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            // A body whose types depend on its index has one ring per instance.
+            if let NodeKind::ParallelLoop(body) = node.kind() {
+                if crate::validate::scope_types_reference_slot(
+                    self.graph,
+                    &child_id,
+                    body.index_slot,
+                ) {
+                    if let Some(count) = body
+                        .count
+                        .evaluate(&env)
+                        .ok()
+                        .and_then(|count| num_traits::ToPrimitive::to_u64(&count))
+                    {
+                        for index in 0..count {
+                            let mut instance = child.clone();
+                            instance.loop_indices.insert(body.index_slot, index.into());
+                            self.collect_layout_environments(&child_id, instance);
+                        }
+                        continue;
+                    }
+                }
+            }
             self.collect_layout_environments(&child_id, child);
         }
     }
@@ -2428,14 +2696,37 @@ impl<'a> Emitter<'a> {
         use crate::types::ConcreteWireType;
         let error = |message: &str| ExportError::BackendLayout(message.into());
         let ty = &self.validated.scopes[scope].wire_types[&wire];
-        let matrix = match ty {
+        let ring_of = |ty: &ConcreteWireType| match ty {
             ConcreteWireType::Matrix(m) |
             ConcreteWireType::SmallMatrix { matrix: m, .. } |
             ConcreteWireType::Preimage { matrix: m, .. } |
-            ConcreteWireType::Trapdoor { matrix: m, .. } => m,
-            _ => return Err(error("layout operand is not a ring value")),
+            ConcreteWireType::Trapdoor { matrix: m, .. } => Ok(m.ring.clone()),
+            _ => Err(error("layout operand is not a ring value")),
         };
-        let towers = matrix.ring.crt_moduli().len();
+        // A ring depending on a loop index needs the layout of every instance's ring.
+        let symbolic = self.graph.scope(scope).map(|graph_scope| {
+            graph_scope.nodes()[wire.node.0 as usize].output_types()[wire.port.0 as usize].clone()
+        });
+        let rings = match symbolic {
+            Some(symbolic) if symbolic.contains_loop_index() => {
+                let mut rings = Vec::new();
+                for env in &self.layout_environments[scope] {
+                    let instance =
+                        crate::validate::concretize_wire_type(&symbolic, env, scope, wire.node)
+                            .map_err(|e| error(&format!("instance layout type: {e}")))?;
+                    let ring = ring_of(&instance)?;
+                    if !rings.contains(&ring) {
+                        rings.push(ring);
+                    }
+                }
+                rings
+            }
+            _ => vec![ring_of(ty)?],
+        };
+        if rings.iter().any(|ring| ring.crt_moduli().len() != rings[0].crt_moduli().len()) {
+            return Err(error("instance rings of one layout operand differ in depth"));
+        }
+        let towers = rings[0].crt_moduli().len();
         // The base and regular digit count this node declares, uniform over loop environments.
         let mut declared: Option<(num_bigint::BigInt, Option<num_bigint::BigInt>)> = None;
         // The per-tower digit count of a small decomposition, uniform over loop environments.
@@ -2488,8 +2779,12 @@ impl<'a> Emitter<'a> {
         }
         // The runtime gives every tower enough digits for the widest one, and a regular
         // decomposition keeps the leading `digits / digits_per_tower` towers.
-        let crt_moduli = matrix.ring.crt_moduli().to_vec();
-        let widest = crt_moduli.iter().map(|modulus| u64::BITS - modulus.leading_zeros()).max();
+        let widest = rings
+            .iter()
+            .flat_map(|ring| {
+                ring.crt_moduli().iter().map(|modulus| u64::BITS - modulus.leading_zeros())
+            })
+            .max();
         let digits_per_tower = (widest.unwrap_or(0) as usize).div_ceil(base_bits as usize - 1);
         if small_digits.is_some_and(|count| count != digits_per_tower.into()) {
             return Err(error("small gadget digit count must cover the widest tower"));
@@ -2506,22 +2801,24 @@ impl<'a> Emitter<'a> {
                 Some(towers - kept)
             }
         };
-        let layout = BackendLayout {
-            modulus: matrix.ring.modulus(),
-            ring_dimension: matrix.ring.ring_dimension() as usize,
-            crt_moduli,
-            base,
-            digits_per_tower,
-            dropped_towers,
-        };
-        let key = (layout.modulus.clone(), layout.ring_dimension);
-        let merged = match self.layouts.get(&key) {
-            Some(previous) => previous
-                .merge(&layout)
-                .ok_or_else(|| error("gadget nodes of one ring declare different layouts"))?,
-            None => layout,
-        };
-        self.layouts.insert(key, merged);
+        for ring in rings {
+            let layout = BackendLayout {
+                modulus: ring.modulus(),
+                ring_dimension: ring.ring_dimension() as usize,
+                crt_moduli: ring.crt_moduli().to_vec(),
+                base: base.clone(),
+                digits_per_tower,
+                dropped_towers,
+            };
+            let key = (layout.modulus.clone(), layout.ring_dimension);
+            let merged = match self.layouts.get(&key) {
+                Some(previous) => previous
+                    .merge(&layout)
+                    .ok_or_else(|| error("gadget nodes of one ring declare different layouts"))?,
+                None => layout,
+            };
+            self.layouts.insert(key, merged);
+        }
         Ok(())
     }
     fn bind_existential(&mut self, name: &str, ty: &str) {
@@ -2540,6 +2837,9 @@ impl<'a> Emitter<'a> {
     }
     fn output_type(&self, scope: &GraphScope, node: NodeId, port: u32) -> String {
         let wire = WireRef { node, port: crate::types::Port(port) };
+        if let Some(symbolic) = self.current_symbolic_types.get(&wire) {
+            return symbolic.clone();
+        }
         self.validated.scopes[scope.id()]
             .wire_types
             .get(&wire)
@@ -2650,18 +2950,20 @@ impl<'a> Emitter<'a> {
         };
         let parallel_count = if let Some(count_expression) = &count {
             let wire = WireRef { node, port: crate::types::Port(0) };
-            let Some(crate::types::ConcreteWireType::IndexedFamily { count, .. }) =
-                self.validated.scopes[scope_id].wire_types.get(&wire)
-            else {
-                return self.unsupported(
-                    scope_id,
-                    node,
-                    node_ref.kind(),
-                    "parallel scope needs an indexed output",
-                );
+            let count = match self.validated.scopes[scope_id].wire_types.get(&wire) {
+                Some(crate::types::ConcreteWireType::IndexedFamily { count, .. }) => *count,
+                Some(crate::types::ConcreteWireType::DependentFamily { members }) => members.len(),
+                _ => {
+                    return self.unsupported(
+                        scope_id,
+                        node,
+                        node_ref.kind(),
+                        "parallel scope needs an indexed output",
+                    );
+                }
             };
             relations.push(format!("({count_expression}) = {count}"));
-            Some(*count)
+            Some(count)
         } else {
             None
         };
@@ -2702,12 +3004,14 @@ impl<'a> Emitter<'a> {
                 let wire = &args[position];
                 match modes[position] {
                     crate::node::LoopInputMode::Zip => {
-                        let crate::types::ConcreteWireType::IndexedFamily { count, .. } =
-                            &self.validated.scopes[scope_id].wire_types[wire]
-                        else {
-                            unreachable!("validated zip input is an indexed family")
+                        let count = match &self.validated.scopes[scope_id].wire_types[wire] {
+                            crate::types::ConcreteWireType::IndexedFamily { count, .. } => *count,
+                            crate::types::ConcreteWireType::DependentFamily { members } => {
+                                members.len()
+                            }
+                            _ => unreachable!("validated zip input is an indexed family"),
                         };
-                        if Some(*count) == parallel_count {
+                        if Some(count) == parallel_count {
                             format!("({} i)", wire_name(*wire))
                         } else {
                             // A zip may read a prefix of a longer family. Validation proves
@@ -2758,6 +3062,16 @@ impl<'a> Emitter<'a> {
                 .map(|name| if parallel { format!("({} i)", name) } else { name.clone() })
                 .collect::<Vec<_>>(),
         );
+        // A loop whose conjunct is a plain call of its body (no gathered members or guards).
+        let plain_loop = parallel && gathered.is_empty() && binding_guards.is_empty();
+        let child_arguments = plain_loop.then(|| {
+            format!(
+                "{} {} {}",
+                &child_name[self.scopes[&child].len()..],
+                child_params,
+                child_index_args(self.graph, &child, &child_env)
+            )
+        });
         let call = if parallel {
             binding_guards.extend(gather_relations);
             format!(
@@ -2782,6 +3096,16 @@ impl<'a> Emitter<'a> {
             relations.extend(binding_guards);
             format!("{} {} {} {}", child_name, child_params, input, output)
         };
+        if let Some(child_arguments) = child_arguments {
+            self.current_loops.push(facts::ChildLoop {
+                conjunct: call.clone(),
+                count: parallel_count.expect("count"),
+                child: self.scopes[&child].clone(),
+                env_arguments: child_arguments.trim().to_owned(),
+                inputs: input,
+                outputs: output,
+            });
+        }
         relations.push(call);
         Ok(())
     }
@@ -2855,7 +3179,11 @@ impl<'a> Emitter<'a> {
             tuple_type(
                 &args[..spec.carried_count]
                     .iter()
-                    .map(|wire| self.lean_type(&self.validated.scopes[scope_id].wire_types[wire]))
+                    .map(|wire| {
+                        self.current_symbolic_types.get(wire).cloned().unwrap_or_else(|| {
+                            self.lean_type(&self.validated.scopes[scope_id].wire_types[wire])
+                        })
+                    })
                     .collect::<Vec<_>>()
             ),
             if binding_guards.is_empty() {
@@ -2925,7 +3253,121 @@ impl<'a> Emitter<'a> {
             crate::types::ConcreteWireType::IndexedFamily { element, count } => {
                 format!("Fin {} → {}", count, self.lean_type(element))
             }
+            crate::types::ConcreteWireType::DependentFamily { members } => format!(
+                "(i : Fin {}) → (![{}] : Fin {} → Type) i",
+                members.len(),
+                members
+                    .iter()
+                    .map(|member| format!("({})", self.lean_type(member)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                members.len()
+            ),
         }
+    }
+
+    /// The CRT basis of the ring of `wire` as a Lean list body: concrete primes, or Lean
+    /// expressions of the loop index when the ring depends on one.
+    fn basis_list(
+        &self,
+        scope: &GraphScope,
+        scope_id: &FrozenGraphScopeId,
+        wire: WireRef,
+        env: &LexicalEnv,
+    ) -> String {
+        let concrete = self.validated.scopes[scope_id].wire_types[&wire]
+            .matrix_type()
+            .expect("validated ring operand")
+            .ring
+            .clone();
+        let symbolic =
+            scope.nodes()[wire.node.0 as usize].output_types()[wire.port.0 as usize].clone();
+        let ring = match &symbolic {
+            crate::types::WireType::Matrix(m) |
+            crate::types::WireType::SmallMatrix { matrix: m, .. } |
+            crate::types::WireType::Preimage { matrix: m, .. } |
+            crate::types::WireType::Trapdoor { matrix: m, .. }
+                if m.ring.contains_loop_index() =>
+            {
+                Some(m.ring.clone())
+            }
+            _ => None,
+        };
+        match ring {
+            Some(ring) => (0..concrete.crt_moduli().len())
+                .map(|tower| {
+                    format!("({}).toNat", env.ring_crt_modulus_expr(&ring, &tower.to_string()))
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => concrete.crt_moduli().iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
+        }
+    }
+
+    /// The Lean type of a wire of symbolic type `symbolic` whose index-zero instance is
+    /// `concrete`: rings naming a loop index or a member index render their modulus as a Lean
+    /// expression of the index (`Int.toNat`), shapes come from `concrete` (they may not depend
+    /// on an index), and a family whose element names the member index is a dependent function
+    /// over `m : Fin count`.
+    fn symbolic_lean_type(
+        &self,
+        env: &LexicalEnv,
+        symbolic: &crate::types::WireType,
+        concrete: &crate::types::ConcreteWireType,
+    ) -> String {
+        use crate::types::{ConcreteWireType, MEMBER_INDEX, WireType};
+        let matrix = |matrix: &crate::types::MatrixType, prefix: &str| -> Option<String> {
+            if !matrix.ring.contains_loop_index() {
+                return None;
+            }
+            let shape = concrete.matrix_type()?;
+            Some(format!(
+                "{} {} {} {} {}",
+                prefix,
+                env.modulus_nat(&matrix.ring),
+                shape.ring.ring_dimension(),
+                shape.rows,
+                shape.columns
+            ))
+        };
+        let primitives = &self.options.primitives;
+        let rendered = match symbolic {
+            WireType::Matrix(m) => matrix(m, &primitives.matrix_type),
+            WireType::SmallMatrix { matrix: m, .. } => matrix(m, &primitives.small_matrix_type),
+            WireType::Preimage { matrix: m, .. } => matrix(m, &primitives.preimage_type),
+            WireType::Trapdoor { matrix: m, .. } => matrix(m, &primitives.matrix_type)
+                .map(|matrix| format!("{} ({}) Unit", primitives.trapdoor_type, matrix)),
+            WireType::IndexedFamily { element, .. } => {
+                let (count, member) = match concrete {
+                    ConcreteWireType::IndexedFamily { element, count } => {
+                        (*count, element.as_ref())
+                    }
+                    ConcreteWireType::DependentFamily { members } if !members.is_empty() => {
+                        (members.len(), &members[0])
+                    }
+                    _ => return self.lean_type(concrete),
+                };
+                // Each family level binds its member index to its own variable, so a nested
+                // family's element does not capture the outer index.
+                let depth =
+                    env.loop_indices.keys().filter(|slot| **slot >= MEMBER_INDEX - 64).count()
+                        as u32;
+                let slot = MEMBER_INDEX - 1 - depth;
+                let name = format!("m{depth}");
+                let element =
+                    element.substitute_loop_index(MEMBER_INDEX, &IntExpr::LoopIndex(slot));
+                let mut member_env = env.clone();
+                member_env.loop_indices.insert(slot, format!("(Int.ofNat {name}.val)"));
+                member_env.loop_index_nats.insert(slot, name.clone());
+                let element = self.symbolic_lean_type(&member_env, &element, member);
+                if let Some(slot) = member_env.take_missing_loop_index() {
+                    env.missing_loop_index.set(Some(slot));
+                }
+                Some(format!("(({name} : Fin {count}) → {element})"))
+            }
+            _ => None,
+        };
+        rendered.unwrap_or_else(|| self.lean_type(concrete))
     }
 
     fn matrix_type(&self, matrix: &crate::types::ConcreteMatrixType, prefix: &str) -> String {
@@ -3008,10 +3450,19 @@ fn sanitize(name: &str) -> String {
 fn wire_name(wire: WireRef) -> String {
     format!("w_{}_{}", wire.node.0, wire.port.0)
 }
+/// Tuples longer than this are nested as a balanced tree of right-nested chunks, so a component
+/// is a logarithmic number of projections away (a right-nested tuple of a merged stage's thousand
+/// outputs makes projections, and the claim reading them, quadratic).
+const BALANCED_TUPLE: usize = 256;
+
 fn tuple_type(types: &[String]) -> String {
     match types {
         [] => "Unit".into(),
         [one] => one.clone(),
+        _ if types.len() > BALANCED_TUPLE => {
+            let (left, right) = types.split_at(types.len() / 2);
+            format!("({}) × ({})", tuple_type(left), tuple_type(right))
+        }
         _ => types.iter().rev().fold("Unit".into(), |tail, ty| {
             let ty = if ty.contains('→') { format!("({ty})") } else { ty.clone() };
             format!("{} × {}", ty, tail)
@@ -3022,6 +3473,10 @@ fn tuple_expr(values: &[String]) -> String {
     match values {
         [] => "()".into(),
         [one] => one.clone(),
+        _ if values.len() > BALANCED_TUPLE => {
+            let (left, right) = values.split_at(values.len() / 2);
+            format!("({}, {})", tuple_expr(left), tuple_expr(right))
+        }
         _ => values.iter().rev().fold("()".into(), |tail, value| format!("({}, {})", value, tail)),
     }
 }
@@ -3029,15 +3484,19 @@ fn tuple_projection(name: &str, position: usize, total: usize) -> String {
     if total == 1 {
         return name.into();
     }
+    if total > BALANCED_TUPLE {
+        let half = total / 2;
+        return if position < half {
+            tuple_projection(&format!("{name}.1"), position, half)
+        } else {
+            tuple_projection(&format!("{name}.2"), position - half, total - half)
+        };
+    }
     let mut current = name.to_owned();
     for _ in 0..position {
         current.push_str(".2");
     }
-    if position + 1 == total {
-        current.push_str(".1");
-    } else {
-        current.push_str(".1");
-    }
+    current.push_str(".1");
     current
 }
 fn scope_input_wires(scope: &GraphScope) -> Vec<WireRef> {
@@ -3232,6 +3691,76 @@ mod tests {
         assert!(artifact.source.contains("Int.ofNat i_0"));
         assert!(artifact.source.contains("96"));
         assert!(!artifact.source.contains("let w_0_0 := 1649"));
+    }
+
+    /// A parallel body over a ring chosen by the loop index: its matrix types render the
+    /// modulus as an expression of the index and the loop's output is a dependent family.
+    #[test]
+    fn loop_dependent_matrix_types_render_symbolically() {
+        let prime = IntExpr::Select {
+            selector: Box::new(IntExpr::LoopIndex(0)),
+            branches: vec![1073741441u64.into(), 1073741329u64.into()],
+        };
+        let ring = crate::RingRef::new(crate::RingExpr::Explicit {
+            crt_moduli: vec![prime],
+            ring_dimension: 8,
+        });
+        let matrix_type = crate::types::MatrixType { ring, rows: 1.into(), columns: 1.into() };
+        let child = with_new_construction_scope(|scope| {
+            let value = NodeHandle::new(
+                NodeKind::ConstantMatrix {
+                    matrix_type: matrix_type.clone(),
+                    value: crate::node::ConstantMatrix::Polynomial { coefficients: vec![3.into()] },
+                },
+                vec![],
+                vec![WireType::Matrix(matrix_type.clone())],
+            )
+            .output(0)
+            .unwrap();
+            let square = NodeHandle::new(
+                NodeKind::MatrixBinary(crate::node::MatrixBinaryOp::Multiply),
+                vec![value.clone(), value],
+                vec![WireType::Matrix(matrix_type.clone())],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("loop-dependent-square", scope, vec![], vec![square]).unwrap()
+        });
+        let member = WireType::Matrix(matrix_type.clone())
+            .substitute_loop_index(0, &IntExpr::LoopIndex(crate::types::MEMBER_INDEX));
+        let output = NodeHandle::parallel_loop(
+            child,
+            vec![],
+            vec![WireType::IndexedFamily { element: Box::new(member), count: 2.into() }],
+            ParallelLoop {
+                count: 2.into(),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: vec![],
+                input_modes: vec![],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "loop-dependent-square",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: output, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        eprintln!("{}", artifact.source);
+        assert!(artifact.source.contains(
+            "abbrev sel_0 (i : Int) : Int := MxxIR.selectInt i [1073741441, 1073741329]"
+        ));
+        assert!(artifact.source.contains("abbrev mod_0 (i : Int) : Nat := (((sel_0 (i)))).toNat"));
+        assert!(artifact.source.contains("ExactMatrix (mod_0 ((Int.ofNat i_0))) 8 1 1"));
+        assert!(artifact.source.contains("(m0 : Fin 2) →"));
     }
 
     #[test]
@@ -3842,6 +4371,128 @@ mod tests {
     }
 
     #[test]
+    fn facts_name_the_atoms_of_record_scopes_and_their_loop_bodies() {
+        let family_type = || WireType::IndexedFamily {
+            element: Box::new(WireType::Int),
+            count: IntExpr::constant(2),
+        };
+        let parallel = |child, input| {
+            NodeHandle::parallel_loop(
+                child,
+                vec![input],
+                vec![family_type()],
+                ParallelLoop {
+                    count: IntExpr::constant(2),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: vec![],
+                    input_modes: vec![LoopInputMode::Zip],
+                },
+            )
+            .output(0)
+            .unwrap()
+        };
+        let child = with_new_construction_scope(|scope| {
+            let value = scalar_input("value");
+            let doubled = NodeHandle::new(
+                NodeKind::IntBinary(IntBinaryOp::Add),
+                vec![value.clone(), value.clone()],
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("double", scope, vec![value], vec![doubled]).unwrap()
+        });
+        // A body with a loop is a record scope.
+        let body = with_new_construction_scope(|scope| {
+            let input = NodeHandle::new(
+                NodeKind::Input { name: "row".into(), wire_type: family_type(), artifact: None },
+                vec![],
+                vec![family_type()],
+            )
+            .output(0)
+            .unwrap();
+            let out = parallel(child, input.clone());
+            SubgraphHandle::new("rows", scope, vec![input], vec![out]).unwrap()
+        });
+        let matrix = NodeHandle::new(
+            NodeKind::Input {
+                name: "matrix".into(),
+                wire_type: WireType::IndexedFamily {
+                    element: Box::new(family_type()),
+                    count: IntExpr::constant(2),
+                },
+                artifact: None,
+            },
+            vec![],
+            vec![WireType::IndexedFamily {
+                element: Box::new(family_type()),
+                count: IntExpr::constant(2),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let out = NodeHandle::parallel_loop(
+            body,
+            vec![matrix],
+            vec![WireType::IndexedFamily {
+                element: Box::new(family_type()),
+                count: IntExpr::constant(2),
+            }],
+            ParallelLoop {
+                count: IntExpr::constant(2),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: vec![],
+                input_modes: vec![LoopInputMode::Zip],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "facts",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: out, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::ring::test_validate(&graph, &ParamEnv::default()).unwrap();
+        assert!(export(&validated, &ExportOptions::default()).unwrap().facts_source.is_none());
+        let artifact = export(
+            &validated,
+            &ExportOptions {
+                namespace: "GeneratedFacts".into(),
+                module_name: "GeneratedFacts".into(),
+                facts: true,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        let facts = artifact.facts_source.expect("facts module");
+        for declaration in [
+            "import GeneratedFacts\n",
+            "structure generatedRoot.Ctx (params : Params) where",
+            "structure generatedRoot.Facts {params : Params}",
+            "theorem generatedRoot.facts {params : Params} (ctx : generatedRoot.Ctx params)",
+            "structure parallel_generatedRoot_1.Ctx (params : Params) (i_0 : Nat) where",
+            "hout : outputs = parallel_generatedRoot_1.outs ctx",
+            "∃ w : parallel_generatedRoot_1.Witness, parallel_generatedRoot_1.Facts",
+        ] {
+            assert!(facts.contains(declaration), "missing {declaration:?} in\n{facts}");
+        }
+        // Every root conjunct is a field; the loop's facts lemma is named after its field.
+        assert!(facts.contains("theorem generatedRoot.h1_0_at "));
+        // The facts module is a Lean fixture next to its relations.
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_ir_fixtures/facts");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("GeneratedFacts.lean"), &artifact.source).unwrap();
+        std::fs::write(directory.join("GeneratedFacts_Facts.lean"), facts).unwrap();
+    }
+
+    #[test]
     fn export_gather_binds_the_dynamic_member_of_each_instance() {
         let child = with_new_construction_scope(|scope| {
             let member = scalar_input("member");
@@ -4316,7 +4967,7 @@ mod tests {
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("MxxIR.exactDiv ((Int.fdiv (8) (2))) (2)"));
         assert!(artifact.source.contains("MxxIR.roundDiv ((Int.fmod (7) (4))) (2)"));
-        assert!(artifact.source.contains("MxxIR.log2Ceil (MxxIR.selectInt"));
+        assert!(artifact.source.contains("MxxIR.log2Ceil ((MxxIR.selectInt"));
     }
 
     #[test]

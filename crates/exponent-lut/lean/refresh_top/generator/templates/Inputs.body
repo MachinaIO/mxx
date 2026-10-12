@@ -1,0 +1,152 @@
+import Part_@P@_EncRoot
+import Part_@P@_EncFacts
+import Part_@P@_PreRhs
+import Part_@P@_PreSwitch
+import Part_@P@_OnlineChain
+import Part_@P@_SmudgeChain
+import TopHint
+import TopRequirement
+
+/-! The facts the online chains of part `@P@` assume about the online root's inputs (written by
+`generator/gen_inputs.py`). -/
+
+namespace RefreshTopProof.Part_@P@
+
+open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
+
+set_option maxHeartbeats 64000000 in
+set_option maxRecDepth 65536 in
+/-- The inputs of the mask chain. -/
+theorem maskInputs {model : HashModel} {params' : @PRE@.Params} {params'' : @ENC@.Params}
+@BINDERS@
+    {r sm : ErrorPoly N} (hr : polyNorm r ≤ 1) (hsm : polyNorm sm ≤ 1)
+    (hpay : pw_9_0 = fun _ _ ↦ reducePoly Q0 N r) (qhm : qw_4_0 = fun _ _ ↦ reducePoly Q0 N sm)
+    (qhp : qw_11_0 = fun _ _ ↦ reducePoly Q0 N r) (q351 : qw_351_0 = 1) (q353 : qw_353_0 = 0)
+    (p58 : pw_58_0 = 1) (p60 : pw_60_0 = 0) (p108 : pw_108_0 = 1) (p110 : pw_110_0 = 0)
+    {GQ7_14 : ExactMatrix Q7 N 1 14} {GQ6_12 : ExactMatrix Q6 N 1 12} {RQ7_12 : ExactMatrix Q7 N 1 12}
+    {GQ5_10 : ExactMatrix Q5 N 1 10} {RQ6_10 : ExactMatrix Q6 N 1 10}
+    {GQ0_8 : ExactMatrix Q0 N 1 8} {RQ5_8 : ExactMatrix Q5 N 1 8}
+    {GQ1_6 : ExactMatrix Q1 N 1 6} {RQ0_6 : ExactMatrix Q0 N 1 6}
+    (hGQ7_14 : gadgetMatrixRuns Backend.backend 32768 14 GQ7_14)
+    (hGQ6_12 : gadgetMatrixRuns Backend.backend 32768 12 GQ6_12) (hRQ7_12 : centeredRebaseRuns GQ6_12 RQ7_12)
+    (hGQ5_10 : gadgetMatrixRuns Backend.backend 32768 10 GQ5_10) (hRQ6_10 : centeredRebaseRuns GQ5_10 RQ6_10)
+    (hGQ0_8 : gadgetMatrixRuns Backend.backend 32768 8 GQ0_8) (hRQ5_8 : centeredRebaseRuns GQ0_8 RQ5_8)
+    (hGQ1_6 : gadgetMatrixRuns Backend.backend 32768 6 GQ1_6) (hRQ0_6 : centeredRebaseRuns GQ1_6 RQ0_6)
+    (hlc : ∀ k, qw_373_0 k * qw_373_0 k = 1)
+    (hlr : ∀ k, qw_374_0 k * 2 + (1 - qw_373_0 k) * 8 = (labelExp k : Int) * 4)
+    (hle : ∀ k, 0 ≤ qw_374_0 k ∧ qw_374_0 k ≤ 7)
+    (hs01 : ∀ i, 0 ≤ pw_32_0 i ∧ pw_32_0 i ≤ 1) (hs01' : ∀ i, 0 ≤ pw_37_0 i ∧ pw_37_0 i ≤ 1)
+    (he0 : ∀ i, pw_33_0 i = 0) (he0' : ∀ i, pw_38_0 i = 0)
+    (hsum : ∀ o : Fin 8, ∑ k : Fin 5, pw_32_0 (cellIndex o k) = 1)
+    (hsum' : ∀ o : Fin 8, ∑ k : Fin 5, pw_37_0 (cellIndex o k) = 1) :
+    Rel sm ![![qw_337_0, qw_338_0], ![qw_339_0, qw_340_0]]
+      (fun j ↦ reducePoly Q7 N (((p6 : Nat) : Int) * 1 * unitPair r j) • RQ7_12) ![qw_359_0, qw_368_0] 26 ∧
+    (∃ eB : Fin 2 → ErrorMatrix N 1 10, (∀ j, CoeffBound (eB j) 26) ∧ ∀ j,
+      reducePoly Q6 N r • ![pw_47_0, pw_81_0] j + ![pw_67_0, pw_92_0] j =
+        reducePoly Q6 N (((p5 : Nat) : Int) * 1 * unitPair r j) • RQ6_10 + reduceMatrix Q6 N 1 10 (eB j)) ∧
+    (∃ eB : Fin 2 → ErrorMatrix N 1 8, (∀ j, CoeffBound (eB j) 26) ∧ ∀ j,
+      reducePoly Q5 N r • ![pw_77_0, pw_126_0] j + ![pw_117_0, pw_137_0] j =
+        reducePoly Q5 N (((p4 : Nat) : Int) * Xe (n := N) (2 * 0) * unitPair r j) • RQ5_8 +
+          reduceMatrix Q5 N 1 8 (eB j)) ∧
+    (∀ i : Fin 4, Rel sm (lutA model qw_376_0 Q5 8 2 (sigma i))
+      (fun j ↦ reducePoly Q5 N (((p4 : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • RQ5_8) ![qw_379_0 i, qw_379_1 i] 26) ∧
+    (∀ i : Fin 4, ∃ e : Fin 2 → ErrorMatrix N 1 6, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
+      reducePoly Q0 N (substitution (sigma i).toNat (sigma_odd i) r) •
+          ![![pw_41_0, pw_41_1], ![pw_41_2, pw_41_3]] 0 j i + ![![pw_41_0, pw_41_1], ![pw_41_2, pw_41_3]] 1 j i =
+        (lutCoefficient Q0 996917851236477127152305493547100497 (fun k ↦ reducePoly Q0 N (readoutTable k))
+          (sigma i).toNat * reducePoly Q0 N ((((q3 : Nat) : Int) : ErrorPoly N) * unitPair r j)) • RQ0_6 +
+            reduceMatrix Q0 N 1 6 (e j)) ∧
+    (∀ i : Fin 4, Rel sm (lutA model qw_376_0 Q0 6 3 (sigma i))
+      (fun j ↦ reducePoly Q0 N (((q3 : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • RQ0_6) ![qw_380_0 i, qw_380_1 i] 26) ∧
+    (∀ k : Fin 5, Rel sm ![![qw_375_0 k, qw_375_1 k], ![qw_375_2 k, qw_375_3 k]]
+      (fun j ↦ reducePoly Q7 N (Xe (n := N) (2 * labelExp k) * unitPair sm j) • GQ7_14)
+      ![qw_375_4 k, qw_375_5 k] 26) ∧
+    (∃ eBm : Fin 40 → Fin 2 → ErrorMatrix N 1 10, (∀ i j, CoeffBound (eBm i j) 26) ∧ ∀ (i : Fin 40) j,
+      reducePoly Q6 N r • rhsTop model pw_26_0 Q6 10 maskRhs0 i j + ![pw_35_6 i, pw_35_7 i] j =
+        reducePoly Q6 N (((p5 : Nat) : Int) * ((pw_32_0 i : Int) : ErrorPoly N) * unitPair r j) • RQ6_10 +
+          reduceMatrix Q6 N 1 10 (eBm i j)) ∧
+    (∃ eBm : Fin 40 → Fin 2 → ErrorMatrix N 1 8, (∀ i j, CoeffBound (eBm i j) 26) ∧ ∀ (i : Fin 40) j,
+      reducePoly Q5 N r • rhsTop model pw_26_0 Q5 8 maskRhs1 i j + ![pw_39_6 i, pw_39_7 i] j =
+        reducePoly Q5 N (((p4 : Nat) : Int) * ((pw_37_0 i : Int) : ErrorPoly N) * unitPair r j) • RQ5_8 +
+          reduceMatrix Q5 N 1 8 (eBm i j)) ∧
+    (∃ sel : Fin 8 → Fin 5, ∀ o k, pw_32_0 (cellIndex o k) = if k = sel o then 1 else 0) ∧
+    (∃ sel : Fin 8 → Fin 5, ∀ o k, pw_37_0 (cellIndex o k) = if k = sel o then 1 else 0) ∧
+    (∀ i : Fin 4, ∃ e : Fin 2 → ErrorMatrix N 1 6, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
+      reducePoly Q1 N (substitution (sigma i).toNat (sigma_odd i) r) •
+          ![![pw_43_0, pw_43_1], ![pw_43_2, pw_43_3]] 0 j i + ![![pw_43_0, pw_43_1], ![pw_43_2, pw_43_3]] 1 j i =
+        (lutCoefficient Q1 928453219666515100085511901 (fun k ↦ reducePoly Q1 N
+          (![((0 : Int) : ErrorPoly N), ((@MASKH@ : Int) : ErrorPoly N), ((0 : Int) : ErrorPoly N),
+            ((@MASKH@ : Int) : ErrorPoly N)] k)) (sigma i).toNat *
+          reducePoly Q1 N (((1 : Int) : ErrorPoly N) * unitPair r j)) • GQ1_6 + reduceMatrix Q1 N 1 6 (e j)) := by
+  have hone : qw_29_0 = 1 := qe_29_0
+  have h1 := encOne_359_0 (model := model) @ARGS(encOne_359_0)@ (hsm := hsm) (hsp := hr)
+    (hsmIn := qhm) (hspIn := qhp) (hone := hone) (hg' := hGQ6_12) (hg := hRQ7_12)
+  rw [q351, q353, message_one_zero] at h1
+  have hsec : pw_31_0 = fun _ _ ↦ reducePoly Q7 N r :=
+    rebase_small (q := Q0) (by norm_num) hr (by rw [← hpay]; exact ph31_0)
+  have h34 : pw_34_0 = 1 := rebase_one (q := Q0) (by norm_num) (by rw [← pe_11_0]; exact ph34_0)
+  rw [gadgetMatrixRuns_unique ph53_0 hGQ5_10] at ph54_0
+  have e54 := centeredRebaseRuns_unique ph54_0 hRQ6_10
+  rw [gadgetMatrixRuns_unique ph103_0 hGQ0_8] at ph104_0
+  have e104 := centeredRebaseRuns_unique ph104_0 hRQ5_8
+  subst e54 e104
+  have hsmQ7 : qw_341_0 = fun _ _ ↦ reducePoly Q7 N sm :=
+    rebase_small (q := Q0) (by norm_num) hsm (by rw [← qhm]; exact qh341_0)
+  have h343 : qw_343_0 = 1 := rebase_one (q := Q0) (by norm_num) (by rw [← qe_7_0]; exact qh343_0)
+  have hread : (fun k ↦ reducePoly Q0 N (readoutTable k)) =
+      fun k ↦ reducePoly Q0 N (![Xe (n := N) 2, Xe (n := N) 2, Xe (n := N) 6, Xe (n := N) 6] k) := by
+    funext k; fin_cases k <;> rfl
+  refine ⟨h1, ?_, ?_, fun i ↦ encHelper379 i (qh379_1 i) hsmQ7 h343 hGQ0_8 hRQ5_8, fun i ↦ ?_,
+    fun i ↦ encHelper380 i (qh380_1 i) hsmQ7 h343 hGQ1_6 hRQ0_6,
+    encLabelRel375 qh375_6 hsmQ7 h343 hGQ7_14 hlc hlr hle, ?_, ?_, ?_, ?_,
+    fun i ↦ ?_⟩
+  · have := offset_rhs (q := Q6) (qs := Q7) (p := p5) (by norm_num) (by norm_num) hsec ph52_0
+      (by rw [← h34]; exact ph85_0) (c := pw_58_0) (e := pw_60_0) (msg := pw_62_0)
+      (by rw [← pe_59_0, ← pe_61_0]; exact ph62_0) ph66_0 ph91_0
+      (top0 := pw_47_0) (top1 := pw_81_0) (G := pw_54_0)
+    rw [p58, p60, message_one_zero] at this
+    simp only [pe_67_0, pe_65_0, pe_63_0, pe_57_0, pe_55_0, pe_56_0, pe_64_0, pe_92_0, pe_90_0, pe_88_0,
+      pe_87_0, pe_86_0, pe_89_0]
+    exact this
+  · have := offset_rhs (q := Q5) (qs := Q7) (p := p4) (by norm_num) (by norm_num) hsec ph102_0
+      (by rw [← h34]; exact ph130_0) (c := pw_108_0) (e := pw_110_0) (msg := pw_112_0)
+      (by rw [← pe_109_0, ← pe_111_0]; exact ph112_0) ph116_0 ph136_0
+      (top0 := pw_77_0) (top1 := pw_126_0) (G := pw_104_0)
+    rw [p108, p110, message_one_zero] at this
+    rw [show Xe (n := N) (2 * 0) = 1 by simp [Xe]]
+    simp only [pe_117_0, pe_115_0, pe_113_0, pe_107_0, pe_105_0, pe_106_0, pe_114_0, pe_137_0, pe_135_0,
+      pe_133_0, pe_132_0, pe_131_0, pe_134_0]
+    exact this
+  · obtain ⟨e, he, hs⟩ := preSwitch41 i (ph41_3 i) hsec h34 hGQ1_6 hRQ0_6
+    refine ⟨e, he, fun j ↦ ?_⟩
+    rw [hread]
+    fin_cases j
+    · exact hs 0
+    · exact hs 1
+  · have hc := fun i : Fin 40 ↦ preRhs35 (ph35_7 i) hsec h34 hGQ5_10 hRQ6_10
+    choose eB heB hrel using hc
+    refine ⟨eB, heB, fun i j ↦ ?_⟩
+    have ht := preTop35 (ph35_7 i)
+    have := hrel i j
+    rw [ht, he0 i, message_zero] at this
+    exact this
+  · have hc := fun i : Fin 40 ↦ preRhs39 (ph39_7 i) hsec h34 hGQ0_8 hRQ5_8
+    choose eB heB hrel using hc
+    refine ⟨eB, heB, fun i j ↦ ?_⟩
+    have ht := preTop39 (ph39_7 i)
+    have := hrel i j
+    rw [ht, he0' i, message_zero] at this
+    exact this
+  · choose sel hsel using fun o : Fin 8 ↦ onehot_of_sum (fun k ↦ hs01 (cellIndex o k)) (hsum o)
+    exact ⟨sel, hsel⟩
+  · choose sel hsel using fun o : Fin 8 ↦ onehot_of_sum (fun k ↦ hs01' (cellIndex o k)) (hsum' o)
+    exact ⟨sel, hsel⟩
+  · obtain ⟨e, he, hs⟩ := preSwitch43 i (ph43_3 i) hsec h34 hGQ1_6
+    refine ⟨e, he, fun j ↦ ?_⟩
+    fin_cases j
+    · exact hs 0
+    · exact hs 1
+
+end RefreshTopProof.Part_@P@

@@ -151,30 +151,55 @@ int gpu_set_last_error(const char *msg);
 #ifdef __cplusplus
 }
 
-template <typename Kernel, typename... Args>
-int mxx_gpu_launch_kernel(GpuContext *ctx, cudaStream_t stream, Kernel kernel,
-    dim3 grid, dim3 block, size_t shared_bytes,
-    const MxxGraphPatch *patches, size_t patch_count, Args... values)
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+template <typename... Values, size_t... Indices>
+int mxx_gpu_dispatch_kernel_values(GpuContext *ctx, cudaStream_t stream,
+    const void *kernel, dim3 grid, dim3 block, size_t shared_bytes,
+    const MxxGraphPatch *patches, size_t patch_count, int cooperative,
+    std::tuple<Values...> &values, std::index_sequence<Indices...>)
 {
-    void *arguments[] = {static_cast<void *>(&values)...};
-    const size_t sizes[] = {sizeof(Args)...};
-    return mxx_gpu_graph_dispatch_kernel(ctx, reinterpret_cast<void *>(stream),
-        reinterpret_cast<const void *>(kernel), grid.x, grid.y, grid.z,
-        block.x, block.y, block.z, shared_bytes, arguments, sizes,
-        sizeof...(Args), patches, patch_count, 0);
+    void *arguments[] = {static_cast<void *>(&std::get<Indices>(values))...};
+    const size_t sizes[] = {sizeof(Values)...};
+    return mxx_gpu_graph_dispatch_kernel(ctx, reinterpret_cast<void *>(stream), kernel,
+        grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_bytes, arguments, sizes,
+        sizeof...(Values), patches, patch_count, cooperative);
+}
+
+// Converts each value to its kernel parameter's type, as a `<<<...>>>` launch
+// does, so the graph node holds exactly the bytes the kernel reads: a narrower
+// value (say a `uint32_t` for a `size_t` parameter) is widened rather than
+// leaving the parameter's upper bytes undefined.
+template <typename... Params, typename... Args>
+int mxx_gpu_dispatch_kernel_arguments(GpuContext *ctx, cudaStream_t stream,
+    void (*kernel)(Params...), dim3 grid, dim3 block, size_t shared_bytes,
+    const MxxGraphPatch *patches, size_t patch_count, int cooperative, Args &&...values)
+{
+    static_assert(sizeof...(Params) == sizeof...(Args), "kernel argument count mismatch");
+    std::tuple<std::decay_t<Params>...> converted(std::forward<Args>(values)...);
+    return mxx_gpu_dispatch_kernel_values(ctx, stream, reinterpret_cast<const void *>(kernel),
+        grid, block, shared_bytes, patches, patch_count, cooperative, converted,
+        std::index_sequence_for<Params...>{});
+}
+
+template <typename... Params, typename... Args>
+int mxx_gpu_launch_kernel(GpuContext *ctx, cudaStream_t stream, void (*kernel)(Params...),
+    dim3 grid, dim3 block, size_t shared_bytes,
+    const MxxGraphPatch *patches, size_t patch_count, Args &&...values)
+{
+    return mxx_gpu_dispatch_kernel_arguments(ctx, stream, kernel, grid, block, shared_bytes,
+        patches, patch_count, 0, std::forward<Args>(values)...);
 }
 
 // As `mxx_gpu_launch_kernel`, launched cooperatively.
-template <typename Kernel, typename... Args>
-int mxx_gpu_launch_cooperative_kernel(GpuContext *ctx, cudaStream_t stream, Kernel kernel,
-    dim3 grid, dim3 block, size_t shared_bytes,
-    const MxxGraphPatch *patches, size_t patch_count, Args... values)
+template <typename... Params, typename... Args>
+int mxx_gpu_launch_cooperative_kernel(GpuContext *ctx, cudaStream_t stream,
+    void (*kernel)(Params...), dim3 grid, dim3 block, size_t shared_bytes,
+    const MxxGraphPatch *patches, size_t patch_count, Args &&...values)
 {
-    void *arguments[] = {static_cast<void *>(&values)...};
-    const size_t sizes[] = {sizeof(Args)...};
-    return mxx_gpu_graph_dispatch_kernel(ctx, reinterpret_cast<void *>(stream),
-        reinterpret_cast<const void *>(kernel), grid.x, grid.y, grid.z,
-        block.x, block.y, block.z, shared_bytes, arguments, sizes,
-        sizeof...(Args), patches, patch_count, 1);
+    return mxx_gpu_dispatch_kernel_arguments(ctx, stream, kernel, grid, block, shared_bytes,
+        patches, patch_count, 1, std::forward<Args>(values)...);
 }
 #endif

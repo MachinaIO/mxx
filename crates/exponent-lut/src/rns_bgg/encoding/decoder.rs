@@ -40,13 +40,12 @@ impl Decoder for RnsBggDecoder<'_, EncodingLowering<'_>> {
 }
 
 impl RnsEncryptBuild<'_> {
-    /// The unmask hint `b = s B + e_b` of `declaration`'s decoder, for the
-    /// stage mask `s` at level `level` of `parameters`, the decoding ring,
-    /// where `B` is the public matrix preprocessing published with the
-    /// preimage.
+    /// The unmask hint `b = s B + e_b` for the stage mask `s` at level
+    /// `level` of `parameters`, the decoding ring, where `B` is the public
+    /// matrix preprocessing published as `public_name` with the preimages.
     pub(super) fn unmask_hint(
         &self,
-        declaration: &DecoderDeclaration,
+        public_name: String,
         parameters: &RnsBggParameters,
         level: usize,
     ) -> Result<Mat, ApiError> {
@@ -68,7 +67,7 @@ impl RnsEncryptBuild<'_> {
             .ok_or_else(|| ApiError::input("the unmask trapdoor width overflows"))?;
         let public = ring.artifact_input(
             production.clone(),
-            decoder_artifact_name(*declaration.commitment(), "unmask-public"),
+            public_name,
             (crate::decoder::unmask::UNMASK_ROWS, columns),
             ArtifactAvailability::Transferred,
         );

@@ -1,0 +1,31 @@
+import Part_@P@_KeysRoot
+import Part_@P@_KeysLuts
+
+/-! The source LUT's keys of the online root of part `@P@` are those the preprocessing computes
+(written by `generator/gen_key_links.py`). -/
+
+namespace RefreshTopProof.Part_@P@
+
+open Mxx.Primitives MxxRuntime MxxExponentLut RefreshTopProof
+
+set_option maxHeartbeats 64000000 in
+set_option maxRecDepth 65536 in
+/-- The source LUT's keys of row `@ROW@`: the online root's are the preprocessing's. -/
+theorem sourceKeyLink {model : HashModel} {params : @ON@.Params} {params' : @PRE@.Params}
+@BINDERS@
+    (hk : w_10_0 = pw_168_0)
+    (ha0 : w_13_0 = pw_180_0) (ha1 : w_14_0 = pw_181_0) (ha2 : w_16_0 = pw_183_0) (ha3 : w_17_0 = pw_184_0)
+    (hf0 : w_1_0 = pw_182_0) (hf1 : w_3_0 = pw_182_1) (hf2 : w_5_0 = pw_182_2) (hf3 : w_7_0 = pw_182_3) :
+    @KX0@ = pw_186_0 ∧ @KX1@ = pw_342_0 := by
+  have a := keyRootLut18 (model := model) @ARGS(keyRootLut18)@
+  have b := preKeyLoop_sequential_generatedRoot_185 (by decide) ph185_3
+  subst hk ha0 ha1 ha2 ha3 hf0 hf1 hf2 hf3 pe_179_0
+  rw [show ((0 : ExactMatrix Q0 N 1 4), (0 : ExactMatrix Q0 N 1 4), (0 : ExactMatrix Q0 N 1 4),
+    (0 : ExactMatrix Q0 N 1 4), ()) = (0 : Keys Q0 4) from rfl, zero_add,
+    show Int.toNat 2 = 2 from rfl] at b
+  rw [← b] at a
+  simp only [keyMap, Prod.mk.injEq] at a
+  rw [blockModSwitchRuns_eq ph186_0, blockModSwitchRuns_eq ph342_0]
+  exact @KXP@
+
+end RefreshTopProof.Part_@P@

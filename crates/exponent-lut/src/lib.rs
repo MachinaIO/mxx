@@ -12,6 +12,7 @@ pub mod nand_circuit;
 pub mod noise_utils;
 pub mod program;
 pub mod program_gadgets;
+pub mod refresh;
 pub mod rns_bgg;
 pub mod utils;
 

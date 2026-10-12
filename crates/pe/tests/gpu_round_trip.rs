@@ -508,7 +508,7 @@ fn test_gpu_pe_round_trip() {
     if let Ok(id) = env::var(variable("LEAN_EXPORT")) {
         let directory = lean_directory().join(&id).join("generated");
         let protocol = pe_protocol(graphs, &parameters, failure_exponent);
-        mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("PE claim export");
+        mxx_ir_core::lean::protocol::export(&protocol, &directory, false).expect("PE claim export");
         eprintln!("exported the PE correctness claim to {}", directory.display());
     }
 }

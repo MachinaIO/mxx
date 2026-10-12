@@ -98,7 +98,7 @@ impl<'a> RnsEncryptBuild<'a> {
             return Err(ApiError::input("an RHS binding is not a setup coordinate"));
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let prefix = super::plaintext_input_prefix();
+        let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "rhs");
         let mut values = BTreeMap::new();
         for (coordinate, shape) in setup.rhs() {
             let value = match rhs.get(coordinate) {

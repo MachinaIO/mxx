@@ -284,7 +284,8 @@ fn test_gpu_bgv_round_trip() {
         ),
     ];
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lean/bgv/generated");
-    mxx_ir_core::lean::protocol::export(&round_trip_protocol(&bgv, stages), &directory).unwrap();
+    mxx_ir_core::lean::protocol::export(&round_trip_protocol(&bgv, stages), &directory, false)
+        .unwrap();
 
     let total_ms = timings.iter().map(|(_, milliseconds)| milliseconds).sum::<f64>();
     println!("BGV_TIMING_SUMMARY total_execute_ms={total_ms:.3} stages={}", timings.len());

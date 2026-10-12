@@ -1,0 +1,24 @@
+name = "MxxExponentLutRefreshTopWorstN8Crt4x30"
+version = "0.1.0"
+defaultTargets = ["RefreshTopGenerated"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxExponentLut"
+path = "../.."
+
+# Modules written by `refresh_top_round_trip` (`tests/refresh_top.rs`) for this parameter set.
+[[lean_lib]]
+name = "RefreshTopGenerated"
+srcDir = "generated"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["Backend", "Claim", "Ideal", "Ideal_Facts", "Requirement_0", "Requirement_0_Facts", "Stage_decode", "Stage_decode_Facts", "Stage_encrypt", "Stage_encrypt_Facts", "Stage_mask", "Stage_mask_Facts", "Stage_online_eval", "Stage_online_eval_Facts", "Stage_payload", "Stage_payload_Facts", "Stage_preprocess", "Stage_preprocess_Facts"]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "RefreshTopProof"
+moreLeanArgs = ["--tstack=1000000"]
+roots = ["Modular_Part_I_Assembly", "Part_I_Cells", "Part_I_Enc", "Part_I_EncFacts", "Part_I_EncRoot", "Part_I_Fresh", "Part_I_FreshCarrier", "Part_I_FreshChain", "Part_I_Inputs", "Part_I_KeyFacts", "Part_I_KeyFresh", "Part_I_KeyMask", "Part_I_KeySmudge", "Part_I_KeySource", "Part_I_KeysCells", "Part_I_KeysLuts", "Part_I_KeysRoot", "Part_I_Labels", "Part_I_Local", "Part_I_Mask", "Part_I_MaskCarrier", "Part_I_Online", "Part_I_OnlineChain", "Part_I_OnlineFinal", "Part_I_PrePlace", "Part_I_PreRhs", "Part_I_PreRootSums", "Part_I_PreSums", "Part_I_PreSwitch", "Part_I_Readout", "Part_I_RootLuts", "Part_I_RootSums", "Part_I_Smudge", "Part_I_SmudgeChain", "Part_I_SmudgeMembers", "Part_I_SmudgeTotal", "Part_I_Sums", "ReqLabel", "ReqSigma", "RequirementFacts", "RequirementRoot", "StageWrappers", "TopAction", "TopAssembly", "TopChain", "TopColumn", "TopCorrect", "TopCrt", "TopDecode", "TopDecodeCrt", "TopDecompose", "TopFinal", "TopFinish", "TopGadgets", "TopGlue", "TopHint", "TopInst", "TopKeyForms", "TopKeys", "TopLabel", "TopLemmas", "TopLink", "TopLinkC", "TopLut", "TopLut2", "TopPlace", "TopPrf", "TopRefresh", "TopRequirement", "TopResidue", "TopRow", "TopSecrets", "TopSetup", "TopSigma", "TopStage", "TopSwitch", "TopTables", "TopTarget", "TopUnpack", "ModularGlue", "Modular_Part_I_AssemblyNodes"]

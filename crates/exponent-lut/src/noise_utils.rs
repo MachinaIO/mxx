@@ -830,6 +830,10 @@ pub enum NoiseDependencyNode {
         input: NoiseNodeId,
         range: FamilyRange,
     },
+    MulSmallConstant {
+        gate: Option<WireId>,
+        input: NoiseNodeId,
+    },
 }
 
 /// Dependencies recorded by a symbolic noise trace.

@@ -10,7 +10,7 @@
 //! tags, as are the Dynamic setup's `A_0`, `H_k`, and companion matrices.
 use crate::{
     PeError, PeParameters,
-    branching_program::{ADD_ATTRIBUTE_COORDINATE, ATTRIBUTE_COORDINATE, INITIAL_STATE_COORDINATE},
+    branching_program::{ATTRIBUTE_COORDINATE, INITIAL_STATE_COORDINATE},
 };
 use mxx_backends::{SessionStore, poly::PolyParams};
 use mxx_dsl::{Bytes, DslContext, HashTag, Mat, Ring, Trapdoor};
@@ -207,21 +207,17 @@ where
                 AttributeKnowledge::PrivatePayload,
             ),
         )]),
-        // The lookup packages and the add packages of every add step
-        // ([`crate::branching_program::StepKind`]) the class reads, whose bottom rows the
-        // encryption prelude exports.
+        // The lookup packages, if a lookup step reads them, whose bottom rows the encryption
+        // prelude exports.
         class
             .has_lookup_packages()
-            .then_some((ATTRIBUTE_COORDINATE, class.attribute_length()))
-            .into_iter()
-            .chain(
-                (ADD_ATTRIBUTE_COORDINATE..)
-                    .take(class.add_step_count())
-                    .map(|coordinate| (coordinate, class.alphabet_size())),
-            )
-            .map(|(coordinate, members)| {
-                (coordinate, InputBinding::Family(IntExpr::constant(members)))
+            .then(|| {
+                (
+                    ATTRIBUTE_COORDINATE,
+                    InputBinding::Family(IntExpr::constant(class.attribute_length())),
+                )
             })
+            .into_iter()
             .collect(),
         class.layout(),
         parameters.distributions(),

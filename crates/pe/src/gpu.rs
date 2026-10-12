@@ -45,30 +45,6 @@ fn equality_programs(class: PeClass, attribute: &[usize]) -> [BranchingProgram; 
     [equals(class, attribute), equals(class, &complement)]
 }
 
-/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] for the Hamming threshold programs over two
-/// symbols of two bits with compact encodings: each add step reads its own family of distance
-/// packages, selected by the template, and the map step compares the distance with the
-/// threshold, which the authorized key's exceeds and the unauthorized key's equals.
-#[test]
-#[ignore = "requires a CUDA GPU"]
-fn test_gpu_hamming_threshold_decrypts_on_the_gpu() {
-    let class = PeClass::hamming(2, 2).unwrap();
-    let parameters = crate::test_support::correct_parameters(class, |parameters| {
-        parameters.with_compact_encodings().unwrap()
-    });
-    authorized_key_decrypts_on_the_gpu(class, parameters, &|_, attribute| {
-        let template =
-            attribute.iter().map(|_| rand::random::<u32>() as usize % 4).collect::<Vec<_>>();
-        let distance = attribute
-            .iter()
-            .zip(&template)
-            .map(|(x, z)| (x ^ z).count_ones() as usize)
-            .sum::<usize>();
-        [distance + 1, distance]
-            .map(|threshold| BranchingProgram::hamming_threshold(2, &template, threshold).unwrap())
-    });
-}
-
 /// [`test_gpu_authorized_key_decrypts_on_the_gpu`] with the LUT radix 2 and compact encodings: the
 /// branch `25 = 17 * 9` of two nonzero digits reads compact helpers and companions in both
 /// switches, all on the GPU with the `q` and `pq` rings registered.

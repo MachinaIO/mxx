@@ -7,10 +7,8 @@
 //! - for every attribute symbol `x_t`, the bottom row `c_t = X^(Bz x_t) s G - s_bar a_t + e_t` of
 //!   the gadget ciphertext `C_t = [a_t; c_t]`, whose top row `a_t` is public and hashed by the
 //!   setup (`RnsBggDynamicSetup::rhs_public_top`), with a fresh `e_t` from `chi`, both `1 x m`, so
-//!   `s C_t = X^(Bz x_t) s G + e_t`, if a lookup step reads it, and the same ciphertexts of the
-//!   distances `X^(popcount(x_t xor z))` to every symbol `z` if an add step does
-//!   ([`crate::branching_program::StepKind`]). Since `a_t` is public, the digit rows of `a_t` need
-//!   no companion, which halves the companions of every package;
+//!   `s C_t = X^(Bz x_t) s G + e_t`, if a lookup step reads it. Since `a_t` is public, the digit
+//!   rows of `a_t` need no companion, which halves the companions of every package;
 //! - the message component `c_m = s d^T + e_m + floor(q/2) m = s_bar d_1 + d_2 + e_m + floor(q/2)
 //!   m` for binary coefficients `m`.
 //!
@@ -43,7 +41,6 @@ pub(crate) const ANCHOR_ENCODING: &str = "mxx-pe/anchor-encoding";
 /// `c_m` in the prelude production.
 pub(crate) const MESSAGE_ENCODING: &str = "mxx-pe/message-encoding";
 const ATTRIBUTE_INPUT: &str = "mxx-pe/attribute-exponents";
-const ADD_ATTRIBUTE_INPUT: &str = "mxx-pe/add-exponents";
 const MESSAGE_INPUT: &str = "mxx-pe/message-coefficients";
 
 /// A ciphertext: the prelude production (`b`, every `C_t`, `c_m`) and the
@@ -169,26 +166,13 @@ where
     secret.bind_runtime(&mut runtime);
     let hash_key = public_key.hash_key_input(&mut runtime)?;
     let context = DslContext::new("mxx-pe/encrypt-prelude");
-    // The exponents of the lookup packages, `Bz x_t`, and of the add packages of the `i`-th add
-    // step, `popcount(x_i xor z)` at member `z`, for the packages the class reads.
+    // The exponents of the lookup packages, `Bz x_t`, if a lookup step reads them.
     let mut families = Vec::new();
     if class.has_lookup_packages() {
         families.push((
             crate::branching_program::ATTRIBUTE_COORDINATE,
             ATTRIBUTE_INPUT.to_owned(),
             attribute.iter().map(|symbol| class.state_width() * symbol).collect::<Vec<_>>(),
-        ));
-    }
-    for (read, coordinate) in
-        (0..class.add_step_count()).zip(crate::branching_program::ADD_ATTRIBUTE_COORDINATE..)
-    {
-        let symbol = attribute[read];
-        families.push((
-            coordinate,
-            format!("{ADD_ATTRIBUTE_INPUT}/{read}"),
-            (0..class.alphabet_size())
-                .map(|template| (symbol ^ template).count_ones() as usize)
-                .collect(),
         ));
     }
     let exponents = families

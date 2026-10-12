@@ -173,17 +173,16 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
 /// lowered, each paired with its reference. Static preprocessing publishes
 /// the bottom row of each compact RHS at the level after its consumer's, and
 /// each member's top row is sampled where the member is read. A Dynamic RHS
-/// is the gadget ciphertext of its setup coordinate's package (both rows):
-/// a sampled scalar is published by the encryption, a family or a supplied
-/// ciphertext by its prelude production. A family RHS is one family per row
-/// port. `name` maps a role to its artifact name.
+/// is the gadget ciphertext of its setup coordinate's package: the setup's
+/// public top row over the bottom row the encryption's prelude production
+/// exports. A family RHS is one family per row port. `name` maps a role to
+/// its artifact name.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn import_rhs_bindings(
     parameters: &RnsBggParameters,
     program: &ExponentLutProgram,
     workload: &RnsBggDerivedWorkload,
     preprocess: &ProductionId,
-    encryption: &ProductionId,
     prelude: Option<&ProductionId>,
     dynamic: Option<(&RnsBggDynamicSetup, &RnsBggDynamicBinding)>,
     hash_key: &Bytes,
@@ -199,55 +198,32 @@ pub(super) fn import_rhs_bindings(
     for (rhs, shape) in program.rhs_inputs() {
         if let Some((setup, mapping)) = dynamic {
             let coordinate = mapping.rhs(*rhs).map_err(ApiError::scheme)?;
-            let source = &setup
-                .rhs()
-                .get(&coordinate)
-                .ok_or_else(|| ApiError::compatibility("RHS coordinate is not in the setup"))?
-                .source;
-            let ring = parameters.ring(0).map_err(ApiError::scheme)?;
-            let columns = parameters.component_columns(0).map_err(ApiError::scheme)?;
-            let binding = match shape {
-                InputBinding::Scalar(()) => {
-                    let production = match source {
-                        RnsBggPackageSource::Sampled => encryption,
-                        RnsBggPackageSource::Supplied { .. } => prelude()?,
-                    };
-                    let role = RnsBggDynamicSetup::rhs_ciphertext_role(coordinate, false);
-                    let ports =
-                        (0..4).map(|port| name(format!("{role}.{port}"))).collect::<Vec<_>>();
-                    InputBinding::Scalar((
-                        super::dynamic::prelude_matrix(&ring, production, &ports, columns),
-                        RhsRef { id: *rhs, index: None },
-                    ))
+            let members = match shape {
+                InputBinding::Scalar(()) => None,
+                InputBinding::Family(count) => Some(count.clone()),
+            };
+            let ciphertexts = super::dynamic::public_top_ciphertexts(
+                parameters,
+                setup,
+                hash_key,
+                prelude()?,
+                coordinate,
+                members,
+                &name,
+            )
+            .map_err(ApiError::scheme)?;
+            let binding = match ciphertexts {
+                super::dynamic::PublicTopCiphertexts::Scalar(ciphertext) => {
+                    InputBinding::Scalar((ciphertext, RhsRef { id: *rhs, index: None }))
                 }
-                InputBinding::Family(count) => {
-                    let role = RnsBggDynamicSetup::rhs_ciphertext_role(coordinate, true);
-                    let production = prelude()?.clone();
-                    let row = |ports: [usize; 2]| {
-                        let families = ports.map(|port| {
-                            ring.family_artifact_input(
-                                production.clone(),
-                                name(format!("{role}.{port}")),
-                                count.clone(),
-                                (1, columns),
-                                ArtifactAvailability::Transferred,
-                            )
-                        });
-                        let element: RnsBggRow =
-                            (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
-                        let fields = families
-                            .iter()
-                            .map(|family| family.value_handle().clone())
-                            .collect::<Vec<_>>();
-                        family_of_fields(&element, count.clone(), &fields).map_err(ApiError::scheme)
-                    };
+                super::dynamic::PublicTopCiphertexts::Family { tops, bottoms } => {
                     InputBinding::Family(OnlineEvalRhsFamily {
                         rhs: *rhs,
                         program: program.id(),
                         level: 0,
                         hash_key: hash_key.clone(),
-                        tops: Some(row([0, 1])?),
-                        bottoms: row([2, 3])?,
+                        tops: Some(tops),
+                        bottoms,
                     })
                 }
             };
@@ -1247,7 +1223,6 @@ mod test {
             &scalar_program,
             &scalar_lowerer.workload,
             &production,
-            &production,
             None,
             None,
             &hash_key,
@@ -1294,7 +1269,6 @@ mod test {
             &parameters,
             &family_program,
             &family_lowerer.workload,
-            &production,
             &production,
             None,
             None,

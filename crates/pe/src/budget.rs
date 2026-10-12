@@ -73,12 +73,12 @@ pub struct BudgetShape {
 }
 
 impl BudgetShape {
-    /// `E = 1 + ℓ 4 D² + |K| 2 D²`: `c_0` and the digit companions of every package. A
-    /// switching package has companions for the `D` private digit rows of `C_k` only, whose top
-    /// row is public.
+    /// `E = 1 + (ℓ + |K|) 2 D²`: `c_0` and the digit companions of every package, which cover
+    /// the `D` private digit rows of its gadget ciphertext only: the top rows of the attribute
+    /// ciphertexts and of the switching ciphertexts `C_k` are public.
     pub fn encodings(&self) -> f64 {
-        1.0 + (self.attribute_length * 4 * self.digits * self.digits +
-            self.switching_packages * 2 * self.digits * self.digits) as f64
+        1.0 + ((self.attribute_length + self.switching_packages) * 2 * self.digits * self.digits)
+            as f64
     }
 
     /// The truncated coefficients `K` of `χ` for an anchor of `m_b` columns: the anchor, the
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn the_budget_splits_epsilon_between_regularity_and_truncation() {
         let shape = recorded_shape();
-        assert_eq!(shape.encodings(), 385.0);
+        assert_eq!(shape.encodings(), 257.0);
         let (modulus, error) = (BigUint::from(1u8) << 168u32, "3.19".parse().unwrap());
         let budget = StatisticalBudget::new(&request(&modulus, &error, 256.0)).unwrap();
         assert!((budget.lhl_bits - 34.0).abs() < 1e-9);
@@ -251,7 +251,7 @@ mod tests {
         let count = shape.truncated_coefficients(budget.anchor_columns);
         let c = budget.cutoff_multiplier;
         assert!((count * 2.0 * (-c * c / 2.0).exp() - 2f64.powf(-31.0)).abs() < 1e-15);
-        assert!((budget.smoothing - 3.65).abs() < 0.1, "η {}", budget.smoothing);
+        assert!((budget.smoothing - 3.55).abs() < 0.05, "η {}", budget.smoothing);
     }
 
     #[test]

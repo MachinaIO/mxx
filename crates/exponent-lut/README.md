@@ -44,6 +44,11 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   the level's own size, and readers expand it to the full gadget width at `q` by
   `ModSwitch_{pq -> q}(c G̃)`. The expansion adds about `B q / p + (n + 3) / 2` to the error, and
   the simulator carries each expanded row as an opaque term. GSW ciphertexts stay at `q`.
+  Every RHS gadget ciphertext `C = [a; c]` has a public top row `a` that the setup hashes
+  (`rhs_public_top`); encryption samples only the bottom row `c` (`rhs_bottom`), in its own
+  prelude from the bound plaintexts or in an enclosing scheme's prelude, and, as for an
+  automorphism package's public top row, the digit rows of `a` need no companion, which halves
+  the package's companions.
   A Dynamic Program may declare integer data families (`ExponentLutProgramBuilder::data_family`)
   whose values are supplied at run time (`ProgramData`) to preprocessing and online evaluation:
   a root-scope private product may read the RHS member at a data entry (`Operand::Selected`),

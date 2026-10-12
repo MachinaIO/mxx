@@ -5,10 +5,12 @@
 //! `s = (s_bar, 1)` and in one encryption session:
 //!
 //! - every input coordinate's encoding, under its setup key;
-//! - one package per RHS coordinate (member): its gadget ciphertext `C` with `s C = nu s G + e_C`
-//!   (sampled here from the plaintext, or supplied by the enclosing scheme through the prelude
-//!   production) and the digit companions `z_{a,j} = s (B_{a,j} - d_{a,j} G) + eps` of `d =
-//!   Dec_G(C)`;
+//! - one package per RHS coordinate (member): its gadget ciphertext `C = [a; c]` with `s C = nu s G
+//!   + e_C`, whose top row `a` is the setup's public row ([`RnsBggDynamicSetup::rhs_public_top`])
+//!   and whose bottom row `c` the prelude production exports ([`RnsBggDynamicSetup::rhs_bottom`]:
+//!   the encryption's own prelude samples it from the bound plaintext, or an enclosing scheme's
+//!   prelude does), and the digit companions `z_{a,j} = s (B_{a,j} - d_{a,j} G) + eps` of the
+//!   private digit rows of `d = Dec_G(C)` (the digits of `a` are public);
 //! - for every nonidentity automorphism `k` of the setup, the helper `h_k = s H_k - s_k G + e_h`
 //!   and the digit companions, under `s_k = (sigma_k(s_bar), 1)`, of the switching ciphertext `C_k`
 //!   that every reader derives from the helper of `k^-1` (see
@@ -70,14 +72,15 @@ impl<'a> RnsEncryptBuild<'a> {
     /// coordinate, and its session identifier, e.g. in the `api::encrypt`
     /// compose callback.
     ///
-    /// Every [`RnsBggPackageSource::Sampled`] coordinate needs a plaintext;
-    /// a [`RnsBggPackageSource::Supplied`] coordinate takes none, and its
-    /// gadget ciphertexts must be exported by the production bound with
-    /// [`EncryptBuild::bind_prelude`] under
-    /// [`RnsBggDynamicSetup::rhs_ciphertext_role`]. `session` is a fresh
-    /// public identifier of this encryption request, retained only to resume
-    /// it: it selects the sampling session, so every encryption under one
-    /// setup draws its own secret-dependent material.
+    /// The encryption's own prelude production samples the bottom row of the
+    /// gadget ciphertext of every bound plaintext
+    /// ([`RnsBggDynamicSetup::rhs_bottom`]). A coordinate without a plaintext
+    /// takes its bottom rows from the prelude production bound with
+    /// [`EncryptBuild::bind_prelude`], which must export them under
+    /// [`RnsBggDynamicSetup::rhs_bottom_role`]. `session` is a fresh public
+    /// identifier of this encryption request, retained only to resume it: it
+    /// selects the sampling session, so every encryption under one setup
+    /// draws its own secret-dependent material.
     pub fn bind_rhs_inputs<P: Poly>(
         &mut self,
         parameters: &ParamEnv,
@@ -97,20 +100,14 @@ impl<'a> RnsEncryptBuild<'a> {
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
         let prefix = super::plaintext_input_prefix();
         let mut values = BTreeMap::new();
-        for (coordinate, specification) in setup.rhs() {
-            let value = match (&specification.source, rhs.get(coordinate)) {
-                (RnsBggPackageSource::Supplied { .. }, None) => DynamicRhsValue::Supplied,
-                (RnsBggPackageSource::Supplied { .. }, Some(_)) => {
-                    return Err(ApiError::input("a supplied RHS coordinate takes no plaintext"));
-                }
-                (RnsBggPackageSource::Sampled, None) => {
-                    return Err(ApiError::input("missing Dynamic RHS plaintext"));
-                }
-                (RnsBggPackageSource::Sampled, Some(value)) => {
-                    match (&specification.shape, value) {
+        for (coordinate, shape) in setup.rhs() {
+            let value = match rhs.get(coordinate) {
+                None => DynamicRhsValue::Prelude,
+                Some(value) => {
+                    match (shape, value) {
                         (InputBinding::Scalar(()), InputBinding::Scalar(_)) => {}
                         (InputBinding::Family(_), InputBinding::Family(members)) => {
-                            if resolved_input_cardinality(&specification.shape, parameters)
+                            if resolved_input_cardinality(shape, parameters)
                                 .map_err(ApiError::scheme)? !=
                                 Some(members.len())
                             {
@@ -144,13 +141,15 @@ impl<'a> RnsEncryptBuild<'a> {
         })
     }
 
-    /// Export the gadget ciphertexts of every sampled RHS family from one
-    /// root `parallel` per family into `graph`, the encryption prelude,
-    /// under `name`. With no in-graph consumer, each family is an
-    /// export-only streamed port. Returns whether any family was exported.
-    pub(super) fn dynamic_family_ciphertexts(
+    /// Export the bottom rows of the gadget ciphertexts of every bound
+    /// plaintext ([`RnsBggDynamicSetup::rhs_bottom`]) into `graph`, the
+    /// encryption prelude, under `name`, a family from one root `parallel`.
+    /// With no in-graph consumer, each family is an export-only streamed port.
+    /// Returns whether any row was exported.
+    pub(super) fn dynamic_rhs_bottoms(
         &self,
         mut graph: DslContext,
+        hash_key: &Bytes,
         name: impl Fn(String) -> String,
     ) -> Result<(DslContext, bool), ApiError> {
         let setup = self.bound_dynamic_setup()?;
@@ -159,52 +158,41 @@ impl<'a> RnsEncryptBuild<'a> {
             .as_ref()
             .ok_or_else(|| ApiError::input("secret is not bound"))?
             .row;
+        let secret = reduce_secret(self.parameters, payload, 0).map_err(ApiError::scheme)?;
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
         let mut exported = false;
         for (coordinate, value) in self.bound_dynamic_rhs()? {
-            let DynamicRhsValue::Plaintext(InputBinding::Family(family)) = value else {
+            let DynamicRhsValue::Plaintext(plaintext) = value else {
                 continue;
             };
-            let ciphertexts = mxx_dsl::parallel(family.count().clone(), |member| {
-                self.sampled_rhs_ciphertext(setup, payload, family.member(&ring, member))
-                    .map_err(|_| DslError::Schema)
-            })
-            .map_err(ApiError::scheme)?;
-            graph = graph
-                .transferred_output(
-                    name(RnsBggDynamicSetup::rhs_ciphertext_role(*coordinate, true)),
-                    ciphertexts,
+            let bottom = |member: Option<IntExpr>, plaintext: Mat| {
+                setup.rhs_bottom(
+                    self.parameters,
+                    hash_key.clone(),
+                    *coordinate,
+                    member,
+                    &secret,
+                    plaintext,
                 )
-                .map_err(ApiError::scheme)?;
+            };
+            graph = match plaintext {
+                InputBinding::Scalar(plaintext) => graph.transferred_output(
+                    name(RnsBggDynamicSetup::rhs_bottom_role(*coordinate, false)),
+                    bottom(None, plaintext.clone()).map_err(ApiError::scheme)?,
+                ),
+                InputBinding::Family(family) => graph.transferred_output(
+                    name(RnsBggDynamicSetup::rhs_bottom_role(*coordinate, true)),
+                    mxx_dsl::parallel(family.count().clone(), |member| {
+                        bottom(Some(member.expression()?), family.member(&ring, member))
+                            .map_err(|_| DslError::Schema)
+                    })
+                    .map_err(ApiError::scheme)?,
+                ),
+            }
+            .map_err(ApiError::scheme)?;
             exported = true;
         }
         Ok((graph, exported))
-    }
-
-    /// The sampled gadget ciphertext `C = [a; nu s_bar G - s_bar a + e_C]`
-    /// of plaintext `nu`, with a uniform top row `a` and its error under the
-    /// setup's ciphertext contract, so `s C = nu s G + e_C`.
-    fn sampled_rhs_ciphertext(
-        &self,
-        setup: &RnsBggDynamicSetup,
-        payload: &RnsBggRow,
-        plaintext: Mat,
-    ) -> Result<RnsBggMatrix, RnsBggError> {
-        let ring = self.parameters.ring(0)?;
-        let columns = self.parameters.component_columns(0)?;
-        let secret = reduce_secret(self.parameters, payload, 0)?;
-        let gadget = self.parameters.public_gadget(0)?;
-        let target =
-            (secret.0.clone() * gadget.clone() * plaintext.clone(), secret.1 * gadget * plaintext);
-        super::ciphertext_matrix(
-            self.parameters,
-            0,
-            columns,
-            secret.0,
-            uniform_row(&ring, columns),
-            target,
-            &setup.distributions().ciphertext,
-        )
     }
 
     /// The Dynamic material of this encryption, added to `graph` under
@@ -224,11 +212,9 @@ impl<'a> RnsEncryptBuild<'a> {
             .row
             .clone();
         graph = self.dynamic_inputs(graph, &setup, hash_key, &name)?;
-        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let columns = self.parameters.component_columns(0).map_err(ApiError::scheme)?;
         let secret = |_: IntExpr| Ok(payload.clone());
-        for (coordinate, value) in self.bound_dynamic_rhs()? {
-            let shape = &setup.rhs()[coordinate].shape;
+        for coordinate in self.bound_dynamic_rhs()?.keys() {
+            let shape = &setup.rhs()[coordinate];
             let members = resolved_input_cardinality(shape, &ParamEnv::default())
                 .map_err(ApiError::scheme)?;
             let family = members.is_some();
@@ -236,37 +222,25 @@ impl<'a> RnsEncryptBuild<'a> {
                 coordinate: *coordinate,
                 member: family.then_some(member),
             };
-            // The gadget ciphertexts: computed here for a sampled scalar,
-            // otherwise read from the prelude production that exports them.
-            let ciphertexts = match value {
-                DynamicRhsValue::Plaintext(InputBinding::Scalar(plaintext)) => {
-                    let ciphertext = self
-                        .sampled_rhs_ciphertext(&setup, &payload, plaintext.clone())
-                        .map_err(ApiError::scheme)?;
-                    graph = graph
-                        .transferred_output(
-                            name(RnsBggDynamicSetup::rhs_ciphertext_role(*coordinate, false)),
-                            ciphertext.clone(),
-                        )
-                        .map_err(ApiError::scheme)?;
-                    PackageCiphertexts::Scalar(ciphertext)
-                }
-                _ => {
-                    let (prelude, _) = self.prelude.as_ref().ok_or_else(|| {
-                        ApiError::input("Dynamic RHS ciphertexts need the prelude production")
-                    })?;
-                    let role = RnsBggDynamicSetup::rhs_ciphertext_role(*coordinate, family);
-                    let ports =
-                        (0..4).map(|port| name(format!("{role}.{port}"))).collect::<Vec<_>>();
-                    match members {
-                        None => PackageCiphertexts::Scalar(prelude_matrix(
-                            &ring, prelude, &ports, columns,
-                        )),
-                        Some(count) => PackageCiphertexts::Family(
-                            prelude_matrix_family(&ring, prelude, &ports, count, columns)
-                                .map_err(ApiError::scheme)?,
-                        ),
-                    }
+            // The gadget ciphertexts: the setup's public top rows over the
+            // bottom rows the prelude production exports.
+            let (prelude, _) = self.prelude.as_ref().ok_or_else(|| {
+                ApiError::input("Dynamic RHS ciphertexts need the prelude production")
+            })?;
+            let ciphertexts = match public_top_ciphertexts(
+                self.parameters,
+                &setup,
+                hash_key,
+                prelude,
+                *coordinate,
+                members.map(IntExpr::constant),
+                &name,
+            )
+            .map_err(ApiError::scheme)?
+            {
+                PublicTopCiphertexts::Scalar(ciphertext) => PackageCiphertexts::Scalar(ciphertext),
+                PublicTopCiphertexts::Family { tops, bottoms } => {
+                    PackageCiphertexts::Rows { tops, bottoms }
                 }
             };
             let companions = self
@@ -277,7 +251,8 @@ impl<'a> RnsEncryptBuild<'a> {
                     &package,
                     &secret,
                     hash_key,
-                    0,
+                    super::automorphism_public_rows(self.parameters, 0)
+                        .map_err(ApiError::scheme)?,
                 )
                 .map_err(ApiError::scheme)?;
             graph = graph
@@ -648,62 +623,81 @@ fn stored_row(
 /// The gadget ciphertexts of one RHS coordinate, read by member.
 enum PackageCiphertexts {
     Scalar(RnsBggMatrix),
-    Family(Family<RnsBggMatrix>),
+    /// A family of top rows and a family of bottom rows.
+    Rows {
+        tops: Family<RnsBggRow>,
+        bottoms: Family<RnsBggRow>,
+    },
 }
 
 impl PackageCiphertexts {
     fn member(&self, member: Int) -> RnsBggMatrix {
         match self {
             Self::Scalar(ciphertext) => ciphertext.clone(),
-            Self::Family(family) => family.at(member),
+            Self::Rows { tops, bottoms } => (tops.at(member.clone()), bottoms.at(member)),
         }
     }
 }
 
-/// A `2 x 2` block matrix imported from four ports of `production`.
-pub(super) fn prelude_matrix(
-    ring: &Ring,
-    production: &ProductionId,
-    ports: &[String],
-    columns: usize,
-) -> RnsBggMatrix {
-    let port = |index: usize| {
-        ring.artifact_input(
-            production.clone(),
-            ports[index].clone(),
-            (1, columns),
-            ArtifactAvailability::Transferred,
-        )
-    };
-    ((port(0), port(1)), (port(2), port(3)))
+/// The gadget ciphertexts of one RHS coordinate as readers import them.
+pub(super) enum PublicTopCiphertexts {
+    Scalar(RnsBggMatrix),
+    /// The setup's public top rows, computed member by member, and the
+    /// imported bottom rows.
+    Family {
+        tops: Family<RnsBggRow>,
+        bottoms: Family<RnsBggRow>,
+    },
 }
 
-/// A family of `2 x 2` block matrices imported from four family ports of
-/// `production`, read member by member.
-pub(super) fn prelude_matrix_family(
-    ring: &Ring,
+/// The gadget ciphertexts of RHS coordinate `coordinate` (a family of
+/// `members` if any): the setup's public top rows
+/// ([`RnsBggDynamicSetup::rhs_public_top`]) over the bottom rows `production`
+/// exports under [`RnsBggDynamicSetup::rhs_bottom_role`], whose ports `name`
+/// maps to artifact names.
+pub(super) fn public_top_ciphertexts(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    hash_key: &Bytes,
     production: &ProductionId,
-    ports: &[String],
-    count: usize,
-    columns: usize,
-) -> Result<Family<RnsBggMatrix>, RnsBggError> {
-    let parts = ports
-        .iter()
-        .map(|port| {
-            ring.family_artifact_input(
+    coordinate: u32,
+    members: Option<IntExpr>,
+    name: &dyn Fn(String) -> String,
+) -> Result<PublicTopCiphertexts, RnsBggError> {
+    let ring = parameters.ring(0)?;
+    let columns = parameters.component_columns(0)?;
+    let role = RnsBggDynamicSetup::rhs_bottom_role(coordinate, members.is_some());
+    let Some(count) = members else {
+        let port = |port: usize| {
+            ring.artifact_input(
                 production.clone(),
-                port.clone(),
-                IntExpr::constant(count),
+                name(format!("{role}.{port}")),
                 (1, columns),
                 ArtifactAvailability::Transferred,
             )
-        })
-        .collect::<Vec<_>>();
-    let first = |part: &Family<Mat>| part.at(Int::constant(0));
-    let element: RnsBggMatrix =
-        ((first(&parts[0]), first(&parts[1])), (first(&parts[2]), first(&parts[3])));
-    let fields = parts.iter().map(|part| part.value_handle().clone()).collect::<Vec<_>>();
-    family_of_fields(&element, IntExpr::constant(count), &fields).map_err(graph)
+        };
+        let top = setup.rhs_public_top(parameters, hash_key.clone(), coordinate, None)?;
+        return Ok(PublicTopCiphertexts::Scalar((top, (port(0), port(1)))));
+    };
+    let families = [0, 1].map(|port| {
+        ring.family_artifact_input(
+            production.clone(),
+            name(format!("{role}.{port}")),
+            count.clone(),
+            (1, columns),
+            ArtifactAvailability::Transferred,
+        )
+    });
+    let element: RnsBggRow = (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
+    let fields = families.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
+    let bottoms = family_of_fields(&element, count.clone(), &fields).map_err(graph)?;
+    let tops = mxx_dsl::parallel(count, |member| {
+        setup
+            .rhs_public_top(parameters, hash_key.clone(), coordinate, Some(member.expression()?))
+            .map_err(|_| DslError::Schema)
+    })
+    .map_err(graph)?;
+    Ok(PublicTopCiphertexts::Family { tops, bottoms })
 }
 
 impl EncodingLowering<'_> {
@@ -753,11 +747,16 @@ impl EncodingLowering<'_> {
     pub(super) fn import_dynamic_packages(&mut self) -> Result<(), RnsBggError> {
         let state = self.dynamic_state()?.clone();
         let columns = self.parameters.component_columns(0)?;
-        let count = companion_count(self.parameters, 0, columns)?;
         let digits = self.parameters.level(0)?.modulus_digits();
         let program = self.program.clone();
         for (rhs, shape) in program.rhs_inputs() {
             let coordinate = state.binding.rhs(*rhs)?;
+            let count = companion_count_without(
+                self.parameters,
+                0,
+                columns,
+                super::automorphism_public_rows(self.parameters, 0)?,
+            )?;
             let members = resolved_input_cardinality(shape, &ParamEnv::default())?.unwrap_or(1);
             let family = self.encryption_row_family(
                 dynamic_companion_role(coordinate),
@@ -824,12 +823,13 @@ impl EncodingLowering<'_> {
             .get(&reference.id)
             .ok_or(RnsBggError::Binding("Dynamic RHS companions are not imported"))?;
         let columns = self.parameters.component_columns(level)?;
-        let count = companion_count(self.parameters, level, columns)?;
+        let public_rows = super::automorphism_public_rows(self.parameters, level)?;
+        let count = companion_count_without(self.parameters, level, columns, public_rows)?;
         let tag =
             state.setup.package_tag(&RnsBggPackage::Rhs { coordinate, member: member.clone() });
         let key_rows =
             [&input.public_key.matrix.0, &input.public_key.matrix.1].map(super::join_row);
-        let offset = member.unwrap_or(IntExpr::constant(0)) * IntExpr::constant(count);
+        let offset = member.clone().unwrap_or(IntExpr::constant(0)) * IntExpr::constant(count);
         let imported = self.imported_public_action(level, 0)?;
         if selected.is_some() && imported.is_none() {
             return Err(RnsBggError::Binding(
@@ -851,6 +851,16 @@ impl EncodingLowering<'_> {
                 j,
             )
         };
+        // The public top row's digit rows have no companion; a key built here
+        // (not imported) absorbs them.
+        let public_top = |_| {
+            Ok(super::join_row(&state.setup.rhs_public_top(
+                self.parameters,
+                self.hash_key.clone(),
+                coordinate,
+                member.clone(),
+            )?))
+        };
         let rows = super::companion_columns(
             self.parameters,
             level,
@@ -859,10 +869,11 @@ impl EncodingLowering<'_> {
             &|_, r, a| Ok(super::row_entry(&key_rows[r], a)),
             imported.is_none().then_some(&companion_key as _),
             Some(&|_, a: IntExpr, j: IntExpr| {
-                let index = a * IntExpr::constant(2 * columns) + j;
+                let index =
+                    (a - IntExpr::constant(public_rows)) * IntExpr::constant(2 * columns) + j;
                 self.read_row(companions.at(companion_index(index)))
             }),
-            None,
+            Some((public_rows, &public_top)),
         )?;
         let product = super::column_action(
             self.parameters,
@@ -1372,12 +1383,6 @@ impl EncodingLowering<'_> {
     }
 }
 
-/// A row of two uniform blocks of `columns` columns over `ring`: the top row
-/// of a ciphertext sampled in the encryption that publishes it.
-pub(super) fn uniform_row(ring: &Ring, columns: usize) -> RnsBggRow {
-    (ring.uniform_residue((1, columns)), ring.uniform_residue((1, columns)))
-}
-
 /// The coordinates of one automorphism switch `Aut_k`: `k`, `k^-1`, and the
 /// helper members of `k^-1` (for `C_k`) and of `k` (for the mask switch).
 struct AutomorphismSwitch {
@@ -1479,7 +1484,7 @@ pub(crate) mod test_support {
         pub(crate) fn new(
             parameters: &RnsBggParameters,
             inputs: BTreeMap<u32, crate::program::ProgramInputDeclaration>,
-            rhs: BTreeMap<u32, RnsBggDynamicRhs>,
+            rhs: BTreeMap<u32, InputShape>,
             layout: ExpLayout,
         ) -> Self {
             let context: [u8; 32] = rand::random();
@@ -2343,20 +2348,8 @@ mod test {
                 ),
             )]),
             BTreeMap::from([
-                (
-                    0,
-                    RnsBggDynamicRhs {
-                        shape: InputBinding::Family(IntExpr::constant(3)),
-                        source: RnsBggPackageSource::Sampled,
-                    },
-                ),
-                (
-                    1,
-                    RnsBggDynamicRhs {
-                        shape: InputBinding::Scalar(()),
-                        source: RnsBggPackageSource::Sampled,
-                    },
-                ),
+                (0, InputBinding::Family(IntExpr::constant(3))),
+                (1, InputBinding::Scalar(())),
             ]),
             ExpLayout { stride_log2: 0, width_log2: 2 },
         )

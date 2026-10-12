@@ -518,12 +518,11 @@ pub(crate) type LutMaterial = (Vec<Family<Mat>>, Vec<usize>, (Family<Mat>, Famil
 /// The bound value of one Dynamic RHS coordinate of an encryption.
 #[derive(Clone)]
 pub(crate) enum DynamicRhsValue {
-    /// The plaintext of a [`RnsBggPackageSource::Sampled`] coordinate, from
-    /// which encryption samples the gadget ciphertext.
+    /// The plaintext of a coordinate, from which the encryption's own
+    /// prelude samples the bottom rows of its gadget ciphertexts.
     Plaintext(InputBinding<Mat, super::PlaintextFamily>),
-    /// A [`RnsBggPackageSource::Supplied`] coordinate, whose gadget
-    /// ciphertexts the bound prelude production exports.
-    Supplied,
+    /// A coordinate whose bottom rows the bound prelude production exports.
+    Prelude,
 }
 
 /// Encryption builder; secrets and plaintexts are stage-local.
@@ -554,9 +553,9 @@ pub struct RnsEncryptBuild<'a> {
     /// Dynamic: the encryption session identifier and the value of every
     /// RHS coordinate of the setup.
     dynamic_rhs: Option<([u8; 32], BTreeMap<u32, DynamicRhsValue>)>,
-    /// Dynamic: the prelude production exporting the RHS family ciphertexts
-    /// encryption samples, or the supplied gadget ciphertexts, with its
-    /// manifest.
+    /// Dynamic: the prelude production exporting the bottom rows of the RHS
+    /// gadget ciphertexts (the encryption's own, or one an enclosing scheme
+    /// binds), with its manifest.
     prelude: Option<(ProductionId, Manifest)>,
 }
 

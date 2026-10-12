@@ -644,7 +644,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                 digest.update(source.execution_nonce);
             }
         }
-        // A Dynamic session selects its own sampling session, and a supplied
+        // A Dynamic session selects its own sampling session, and a bound
         // prelude production is part of the material it encrypts.
         if let Some((session, _)) = &self.dynamic_rhs {
             digest.update(b"session");
@@ -662,36 +662,38 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         if self.parameters.rhs_mode() != RhsMode::Dynamic {
             return Ok(None);
         }
-        // Supplied gadget ciphertexts come from the prelude production the
-        // enclosing scheme bound; sampled families then cannot use it.
+        // A bound prelude production (an enclosing scheme's) exports the
+        // bottom rows of every coordinate; otherwise the encryption's own
+        // prelude samples them from the bound plaintexts.
+        let plaintexts = self
+            .bound_dynamic_rhs()?
+            .values()
+            .any(|value| matches!(value, DynamicRhsValue::Plaintext(_)));
         if self.prelude.is_some() {
-            let sampled_family = self
-                .bound_dynamic_rhs()?
-                .values()
-                .any(|value| matches!(value, DynamicRhsValue::Plaintext(InputBinding::Family(_))));
-            if sampled_family {
+            if plaintexts {
                 return Err(ApiError::input(
-                    "sampled RHS families need the encryption's own prelude production",
+                    "RHS plaintexts need the encryption's own prelude production",
                 ));
             }
             return Ok(None);
         }
-        let supplied = self
-            .bound_dynamic_rhs()?
-            .values()
-            .any(|value| matches!(value, DynamicRhsValue::Supplied));
-        if supplied {
-            return Err(ApiError::input("supplied RHS ciphertexts need a bound prelude production"));
+        if self.bound_dynamic_rhs()?.values().any(|value| matches!(value, DynamicRhsValue::Prelude))
+        {
+            return Err(ApiError::input(
+                "an RHS without a plaintext needs a bound prelude production",
+            ));
         }
+        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let hash_key = ring.bytes_input(super::HASH_KEY_INPUT, self.hash_key.len());
         let graph = DslContext::new("rns-bgg-encrypt-prelude");
-        let (mut graph, mut exported) = self.dynamic_family_ciphertexts(graph, |role| role)?;
+        let (mut graph, mut exported) = self.dynamic_rhs_bottoms(graph, &hash_key, |role| role)?;
         let mut runtime = self.runtime.clone();
         if let (Some(declaration), Some(child)) =
             (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
             let commitment = *declaration.commitment();
-            let (child_graph, child_exported) = child
-                .dynamic_family_ciphertexts(graph, |role| {
+            let (child_graph, child_exported) =
+                child.dynamic_rhs_bottoms(graph, &hash_key, |role| {
                     decoder_smudge_artifact_name(commitment, &role)
                 })?;
             graph = child_graph;
@@ -702,6 +704,12 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             return Ok(None);
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
+        if super::graph_declares_input(&graph, super::HASH_KEY_INPUT) {
+            runtime.insert(
+                super::HASH_KEY_INPUT.to_owned(),
+                RuntimeValue::Bytes(self.hash_key.as_slice().into()),
+            );
+        }
         let runtime = declared_runtime_inputs(&graph, runtime);
         Ok(Some(StageGraph::new(graph, runtime, BTreeMap::new())))
     }

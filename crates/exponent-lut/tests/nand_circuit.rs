@@ -22,7 +22,6 @@ use mxx_dsl::{DslContext, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
     ExpLayout, NandCircuit, api,
     decoder::simulation::{AverageCaseConfig, NoiseModelKind},
-    program::Operand,
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise,
         RnsBggDynamicSetup, RnsBggGaussian, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,
@@ -349,9 +348,7 @@ fn select_candidate(
             }
             if average.is_none() {
                 let outputs_fit = trace.outputs.iter().enumerate().all(|(index, value)| {
-                    let wire = match &compiled.program().outputs()[index] {
-                        Operand::Scalar(wire) | Operand::Member { family: wire, .. } => *wire,
-                    };
+                    let wire = *compiled.program().outputs()[index].source();
                     let level = workload
                         .level(wire)
                         .unwrap_or_else(|error| panic!("NAND output level lookup failed: {error}"));

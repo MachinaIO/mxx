@@ -67,21 +67,9 @@ pub struct RnsBggNoiseBindings {
     pub dynamic: Option<RnsBggDynamicNoise>,
 }
 
-/// The error contract of one RHS package read by a Program.
-#[derive(Clone, Debug)]
-pub struct RnsBggPackageNoise {
-    /// The setup coordinate of the package.
-    pub coordinate: u32,
-    /// Coefficient bound of the gadget ciphertext error `e_C`.
-    pub ciphertext_error: BigUint,
-    /// The Gaussian sigma of `e_C` when encryption samples it; a supplied
-    /// ciphertext has only its bound.
-    pub ciphertext_sigma: Option<BigDecimal>,
-}
-
 /// The Dynamic material contracts of one Program: the setup's sampling
-/// contracts of companions and helpers, each RHS package's ciphertext error
-/// contract, and the setup automorphism group. Built from a setup
+/// contracts of companions, helpers, and RHS ciphertext errors, the setup
+/// coordinate of each RHS package, and the setup automorphism group. Built from a setup
 /// ([`Self::from_setup`]), its contracts are the setup's, so a sampled width
 /// and an analysed bound cannot differ; parameter planning, which precedes
 /// the setup, states them for a Program directly ([`Self::for_program`]).
@@ -93,8 +81,8 @@ pub struct RnsBggDynamicNoise {
     pub namespace: [u8; 32],
     /// The sampling contracts of companions and helpers.
     pub distributions: super::RnsBggDynamicDistributions,
-    /// The package contract of every RHS of the Program.
-    pub rhs: BTreeMap<RhsId, RnsBggPackageNoise>,
+    /// The setup coordinate of the package of every RHS of the Program.
+    pub rhs: BTreeMap<RhsId, u32>,
     /// The setup automorphism group, ascending.
     pub automorphisms: Vec<usize>,
     /// The number of switches of every nonidentity automorphism under the
@@ -120,19 +108,7 @@ impl RnsBggDynamicNoise {
         let rhs = program
             .rhs_inputs()
             .keys()
-            .map(|id| {
-                let coordinate = binding.rhs(*id)?;
-                let (ciphertext_error, ciphertext_sigma) = match &setup.rhs()[&coordinate].source {
-                    super::RnsBggPackageSource::Sampled => (
-                        distributions.ciphertext.cutoff().clone(),
-                        Some(distributions.ciphertext.sigma().clone()),
-                    ),
-                    super::RnsBggPackageSource::Supplied { error_bound } => {
-                        (error_bound.clone(), None)
-                    }
-                };
-                Ok((*id, RnsBggPackageNoise { coordinate, ciphertext_error, ciphertext_sigma }))
-            })
+            .map(|id| Ok((*id, binding.rhs(*id)?)))
             .collect::<Result<_, RnsBggError>>()?;
         Ok(Self {
             namespace: setup.identity(),
@@ -158,20 +134,7 @@ impl RnsBggDynamicNoise {
         let automorphisms = layout
             .automorphism_indices(ring_dimension)
             .map_err(|_| RnsBggError::Parameters("invalid automorphism layout"))?;
-        let rhs = program
-            .rhs_inputs()
-            .keys()
-            .map(|id| {
-                (
-                    *id,
-                    RnsBggPackageNoise {
-                        coordinate: id.0,
-                        ciphertext_error: distributions.ciphertext.cutoff().clone(),
-                        ciphertext_sigma: Some(distributions.ciphertext.sigma().clone()),
-                    },
-                )
-            })
-            .collect();
+        let rhs = program.rhs_inputs().keys().map(|id| (*id, id.0)).collect();
         Ok(Self {
             namespace,
             distributions,

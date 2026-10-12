@@ -17,7 +17,7 @@ use mxx_dsl::{Bytes, DslContext, HashTag, Mat, Ring, Trapdoor};
 use mxx_exponent_lut::{
     api::{self, StageExecution, StageGraph},
     program::{AttributeKnowledge, InputBinding, ProgramInputDeclaration},
-    rns_bgg::{RnsBggDynamicRhs, RnsBggDynamicSetup, RnsBggPackageSource},
+    rns_bgg::RnsBggDynamicSetup,
 };
 use mxx_ir_core::{
     IntExpr, ParamEnv,
@@ -207,30 +207,22 @@ where
                 AttributeKnowledge::PrivatePayload,
             ),
         )]),
-        // The lookup packages and the add packages ([`crate::branching_program::StepKind`]) the
-        // class reads, both supplied by the prelude.
-        [
-            (class.has_lookup_packages(), ATTRIBUTE_COORDINATE, class.attribute_length()),
-            (
-                class.has_add_packages(),
-                ADD_ATTRIBUTE_COORDINATE,
-                class.alphabet_size() * class.attribute_length(),
-            ),
-        ]
-        .into_iter()
-        .filter(|(read, ..)| *read)
-        .map(|(_, coordinate, members)| {
-            (
-                coordinate,
-                RnsBggDynamicRhs {
-                    shape: InputBinding::Family(IntExpr::constant(members)),
-                    source: RnsBggPackageSource::Supplied {
-                        error_bound: parameters.ciphertext_error_bound(),
-                    },
-                },
+        // The lookup packages and the add packages of every add step
+        // ([`crate::branching_program::StepKind`]) the class reads, whose bottom rows the
+        // encryption prelude exports.
+        class
+            .has_lookup_packages()
+            .then_some((ATTRIBUTE_COORDINATE, class.attribute_length()))
+            .into_iter()
+            .chain(
+                (ADD_ATTRIBUTE_COORDINATE..)
+                    .take(class.add_step_count())
+                    .map(|coordinate| (coordinate, class.alphabet_size())),
             )
-        })
-        .collect(),
+            .map(|(coordinate, members)| {
+                (coordinate, InputBinding::Family(IntExpr::constant(members)))
+            })
+            .collect(),
         class.layout(),
         parameters.distributions(),
     )?;

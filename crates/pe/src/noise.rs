@@ -51,8 +51,8 @@ use mxx_exponent_lut::{
     noise_utils::{NoiseMoments, NonnegativeRational},
     rns_bgg::{
         RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise, RnsBggNoiseBindings,
-        RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggPackageNoise, RnsBggParameters,
-        RnsNoiseBuild, RnsOutputUse,
+        RnsBggNoiseRhs, RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsNoiseBuild,
+        RnsOutputUse,
     },
 };
 use num_bigint::{BigInt, BigUint};
@@ -109,15 +109,14 @@ fn squared(sigma: &bigdecimal::BigDecimal) -> NonnegativeRational {
 }
 
 /// The material contracts of `program`'s packages over `rns` for `class`, in the source namespace
-/// `namespace` (a setup identity): `distributions` for the initial state, companions, and
-/// helpers, and `ciphertext_error` for every supplied attribute ciphertext.
+/// `namespace` (a setup identity): `distributions` for the initial state, the companions, the
+/// helpers, and the attribute ciphertexts.
 fn package_contracts(
     rns: &RnsBggParameters,
     class: &PeClass,
     program: &crate::CompiledPredicate,
     namespace: [u8; 32],
     distributions: RnsBggDynamicDistributions,
-    ciphertext_error: &BigUint,
     lut_radix: Option<usize>,
     compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggDynamicNoise, PeError> {
@@ -129,16 +128,7 @@ fn package_contracts(
         .program()
         .rhs_inputs()
         .keys()
-        .map(|id| {
-            Ok((
-                *id,
-                RnsBggPackageNoise {
-                    coordinate: program.binding().rhs(*id)?,
-                    ciphertext_error: ciphertext_error.clone(),
-                    ciphertext_sigma: None,
-                },
-            ))
-        })
+        .map(|id| Ok((*id, program.binding().rhs(*id)?)))
         .collect::<Result<BTreeMap<_, _>, PeError>>()?;
     let depths = mxx_exponent_lut::rns_bgg::radix_depths(
         &automorphisms,
@@ -162,7 +152,6 @@ fn evaluation_trace(
     program: &BranchingProgram,
     namespace: [u8; 32],
     distributions: RnsBggDynamicDistributions,
-    ciphertext_error: &BigUint,
     lut_radix: Option<usize>,
     compact_extension: Option<&[u64]>,
 ) -> Result<RnsBggNoiseTrace, PeError> {
@@ -194,7 +183,6 @@ fn evaluation_trace(
             &compiled,
             namespace,
             distributions,
-            ciphertext_error,
             lut_radix,
             compact_extension,
         )?);
@@ -242,7 +230,6 @@ pub fn simulate(
         program,
         parameters.identity(),
         parameters.distributions(),
-        &parameters.ciphertext_error_bound(),
         parameters.lut_radix(),
         parameters.compact_extension(),
     )?;

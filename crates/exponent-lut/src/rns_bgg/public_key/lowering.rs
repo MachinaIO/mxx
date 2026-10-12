@@ -233,8 +233,8 @@ impl<'a> PublicKeyLowering<'a> {
     /// The product keys `T = sum_a B_{a,j} Dec(A)_{:,a}` of state key `key`
     /// at `level` with the companion keys of `branches` packages, branch `s`
     /// having the key entries `key_entry(s, r, a)` and the package
-    /// `package(s)` (see [`super::companion_columns`]); an automorphism
-    /// package passes its public digit rows (`public_rows`). Returns the two
+    /// `package(s)` (see [`super::companion_columns`]), and the public digit
+    /// rows of its top row (`public_rows`): every package's top row is public. Returns the two
     /// key rows, each `1 x branches m`.
     fn dynamic_product_rows(
         &self,
@@ -276,17 +276,27 @@ impl<'a> PublicKeyLowering<'a> {
         key: &RnsBggMatrix,
         rhs: &RhsRef<Int>,
     ) -> Result<RnsBggMatrix, RnsBggError> {
-        let (_, binding) = self.dynamic_state()?;
+        let (setup, binding) = self.dynamic_state()?;
         let coordinate = binding.rhs(rhs.id)?;
         let rows = [&key.0, &key.1].map(super::join_row);
         let columns = self.parameters.component_columns(level)?;
+        let public_rows = super::automorphism_public_rows(self.parameters, level)?;
         let key_of = |member: Option<IntExpr>| -> Result<RnsBggMatrix, RnsBggError> {
+            // A public top row's digit rows have no companion; the key absorbs them.
+            let public_top = |_| {
+                Ok(super::join_row(&setup.rhs_public_top(
+                    self.parameters,
+                    self.hash_key.clone(),
+                    coordinate,
+                    member.clone(),
+                )?))
+            };
             let product = self.dynamic_product_rows(
                 level,
                 1,
                 &|_, r, a| Ok(super::row_entry(&rows[r], a)),
                 &|_| RnsBggPackage::Rhs { coordinate, member: member.clone() },
-                None,
+                Some((public_rows, &public_top)),
             )?;
             Ok((super::split_row(&product[0], columns), super::split_row(&product[1], columns)))
         };

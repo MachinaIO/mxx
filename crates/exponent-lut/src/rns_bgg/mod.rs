@@ -43,15 +43,14 @@ pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
     RnsBggDecoderNoise, RnsBggDynamicNoise, RnsBggMaskSecretComponent, RnsBggNoiseBindings,
     RnsBggNoiseBound, RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace,
-    RnsBggNoiseValue, RnsBggPackageNoise, RnsBggParameterManifest, RnsBggPlanRequest,
-    RnsNoiseBuild,
+    RnsBggNoiseValue, RnsBggParameterManifest, RnsBggPlanRequest, RnsNoiseBuild,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{
-    RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicRhs, RnsBggDynamicSetup,
-    RnsBggGaussian, RnsBggPackageSource, covering_automorphism_layout, helper_automorphisms,
-    radix_depths, radix_step, switching_automorphisms,
+    RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicSetup, RnsBggGaussian,
+    covering_automorphism_layout, helper_automorphisms, radix_depths, radix_step,
+    switching_automorphisms,
 };
 pub use workload::RnsBggDerivedWorkload;
 
@@ -123,6 +122,19 @@ pub(crate) fn companion_count(
     Ok(4 * parameters.component_columns(level)? * output_columns)
 }
 
+/// Number of digit-companion encodings of one Dynamic package read at
+/// `level` whose leading `public_rows` digit rows are public (a public top row,
+/// see [`automorphism_public_rows`]): one per private digit row and output
+/// column.
+pub(crate) fn companion_count_without(
+    parameters: &RnsBggParameters,
+    level: usize,
+    output_columns: usize,
+    public_rows: usize,
+) -> Result<usize, RnsBggError> {
+    Ok(companion_count(parameters, level, output_columns)? - 2 * public_rows * output_columns)
+}
+
 /// Number `D` of leading digit rows of an automorphism package's switching
 /// ciphertext `C_k` that need no companion: its top row `sigma_k(H^0_{k^-1})`
 /// is public, so the key absorbs `A_{:,a} Dec(C_k)_{a,:}` for those rows (see
@@ -143,8 +155,12 @@ pub(crate) fn automorphism_companion_count(
     level: usize,
     output_columns: usize,
 ) -> Result<usize, RnsBggError> {
-    Ok(companion_count(parameters, level, output_columns)? -
-        2 * automorphism_public_rows(parameters, level)? * output_columns)
+    companion_count_without(
+        parameters,
+        level,
+        output_columns,
+        automorphism_public_rows(parameters, level)?,
+    )
 }
 
 /// Errors raised by the retained RNS-BGG contracts.

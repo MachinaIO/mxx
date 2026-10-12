@@ -26,13 +26,15 @@
 //! adding to the exponent without a table, and a *map* step only applies a table
 //! to the state, reading no attribute. Each kind is fixed by the class because the
 //! Program is one graph for every program; an add step thus saves the noise and
-//! the work of a table. With symbols of `k` bits (`Bx = 2^k`), the add packages of
-//! attribute `t` are `X^(popcount(x_t xor z))` for every template symbol
-//! `z < 2^k`, the Hamming distance of the symbol to `z`, which a program selects
-//! by its read (for `k = 1`, `X^(x_t)` and `X^(1 - x_t)`): encryption knows `x_t`
-//! and publishes the distance to every `z`, so one product adds it. Encryption
-//! publishes them for every attribute, and the lookup packages only if a lookup
-//! step reads them. A program of such a class has exactly `T_max` steps.
+//! the work of a table. Add steps read fixed attributes: the `i`-th add step reads
+//! attribute `i`. With symbols of `k` bits (`Bx = 2^k`), its add packages are
+//! `X^(popcount(x_i xor z))` for every template symbol `z < 2^k`, the Hamming
+//! distance of the symbol to `z`, which a program selects by its template (for
+//! `k = 1`, `X^(x_i)` and `X^(1 - x_i)`): encryption knows `x_i` and publishes the
+//! distance to every `z`, so one product adds it. Each add step has its own family
+//! of packages, read by that step only. Encryption publishes the lookup packages
+//! only if a lookup step reads them. A program of such a class has exactly `T_max`
+//! steps.
 use crate::PeError;
 use mxx_exponent_lut::{
     ExpLayout, ExponentLutProgram,
@@ -50,8 +52,9 @@ use std::collections::BTreeMap;
 pub const INITIAL_STATE_COORDINATE: u32 = 0;
 /// Setup coordinate of the attribute packages: a family of `l` members.
 pub const ATTRIBUTE_COORDINATE: u32 = 0;
-/// Setup coordinate of the add packages: a family of `Bx l` members, member
-/// `t + l z` being the distance package `X^(popcount(x_t xor z))`.
+/// Setup coordinate of the add packages of the `i`-th add step is
+/// `ADD_ATTRIBUTE_COORDINATE + i`: a family of `Bx` members, member `z` being the
+/// distance package `X^(popcount(x_i xor z))`.
 pub const ADD_ATTRIBUTE_COORDINATE: u32 = 1;
 
 /// The kind of one step of a class ([`PeClass::with_steps`]).
@@ -59,7 +62,8 @@ pub const ADD_ATTRIBUTE_COORDINATE: u32 = 1;
 pub enum StepKind {
     /// `z <- f(z + Bz x)`: the product by the package of `X^(Bz x)`, then a table.
     Lookup,
-    /// `z <- z + popcount(x xor t)` for a template symbol `t`: the product by an add package only.
+    /// `z <- z + popcount(x_i xor t)` for the `i`-th add step and a template symbol `t`: the
+    /// product by an add package only.
     Add,
     /// `z <- f(z)`: a table only.
     Map,
@@ -70,9 +74,9 @@ pub enum StepKind {
 pub enum ProgramStep {
     /// Read attribute `read` and apply `table` at `z + Bz x`.
     Lookup { read: usize, table: Vec<usize> },
-    /// Add the Hamming distance `popcount(x xor template)` of attribute `read` to the symbol
-    /// `template` (for binary symbols, `x` or `1 - x`).
-    Add { read: usize, template: usize },
+    /// Add the Hamming distance `popcount(x_i xor template)` of attribute `i` to the symbol
+    /// `template`, for the `i`-th add step (for binary symbols, `x_i` or `1 - x_i`).
+    Add { template: usize },
     /// Apply `table` at `z`.
     Map { table: Vec<usize> },
 }
@@ -141,6 +145,9 @@ impl PeClass {
         if steps.contains(&StepKind::Add) && !alphabet_size.is_power_of_two() {
             return Err(PeError::Class("add steps need symbols of k bits (Bx = 2^k)"));
         }
+        if steps.iter().filter(|step| **step == StepKind::Add).count() > attribute_length {
+            return Err(PeError::Class("the i-th add step reads attribute i"));
+        }
         let mask = |kind| {
             steps
                 .iter()
@@ -191,13 +198,21 @@ impl PeClass {
         (0..self.max_steps).any(|step| self.step_kind(step) == kind)
     }
 
+    /// The number of add steps.
+    pub fn add_step_count(&self) -> usize {
+        (0..self.max_steps).filter(|step| self.step_kind(*step) == StepKind::Add).count()
+    }
+
+    /// The attribute add step `step` reads: its index among the add steps.
+    pub fn add_read(&self, step: usize) -> usize {
+        (0..step).filter(|before| self.step_kind(*before) == StepKind::Add).count()
+    }
+
     /// The RHS packages of a ciphertext: `l` lookup packages if a lookup step
-    /// reads them, and `l Bx` add packages (one per template symbol) if an add
-    /// step reads them.
+    /// reads them, and `Bx` add packages (one per template symbol) per add step.
     pub fn rhs_packages(&self) -> usize {
-        self.attribute_length *
-            (usize::from(self.has(StepKind::Lookup)) +
-                self.alphabet_size * usize::from(self.has(StepKind::Add)))
+        self.attribute_length * usize::from(self.has(StepKind::Lookup)) +
+            self.alphabet_size * self.add_step_count()
     }
 
     /// Whether encryption publishes the lookup packages `X^(Bz x_t)`.
@@ -310,15 +325,15 @@ impl PeClass {
             .then(|| builder.rhs_family(IntExpr::constant(self.attribute_length)))
             .transpose()
             .map_err(invalid)?;
-        let adds = self
-            .has_add_packages()
-            .then(|| {
-                builder.rhs_family(IntExpr::constant(self.alphabet_size * self.attribute_length))
-            })
-            .transpose()
+        // The add packages of the `i`-th add step, at their own coordinate.
+        let adds = (0..self.add_step_count())
+            .map(|_| builder.rhs_family(IntExpr::constant(self.alphabet_size)))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(invalid)?;
         rhs.extend(attributes.map(|id| (id, ATTRIBUTE_COORDINATE)));
-        rhs.extend(adds.map(|id| (id, ADD_ATTRIBUTE_COORDINATE)));
+        rhs.extend(
+            adds.iter().zip(ADD_ATTRIBUTE_COORDINATE..).map(|(id, coordinate)| (*id, coordinate)),
+        );
         let reads = builder.data_family(self.max_steps).map_err(invalid)?;
         let tables = builder.data_family(self.max_steps * width).map_err(invalid)?;
         let mut state = initial;
@@ -328,17 +343,17 @@ impl PeClass {
                 data: reads,
                 position: IntExpr::constant(step),
             };
-            let input = match (self.step_kind(step), attributes, adds) {
-                (StepKind::Add, _, Some(adds)) => {
+            let input = match (self.step_kind(step), attributes) {
+                (StepKind::Add, _) => {
                     state = builder
-                        .mul_private(Operand::Scalar(state), selected(adds))
+                        .mul_private(Operand::Scalar(state), selected(adds[self.add_read(step)]))
                         .map_err(invalid)?;
                     continue;
                 }
-                (StepKind::Lookup, Some(attributes), _) => builder
+                (StepKind::Lookup, Some(attributes)) => builder
                     .mul_private(Operand::Scalar(state), selected(attributes))
                     .map_err(invalid)?,
-                (StepKind::Map, _, _) => state,
+                (StepKind::Map, _) => state,
                 _ => return Err(PeError::Class("a step reads a package the class lacks")),
             };
             let (output_width, representation) = if step + 1 == self.max_steps {
@@ -423,7 +438,7 @@ impl BranchingProgram {
             let last = index + 1 == length;
             let (read, table, template) = match step {
                 ProgramStep::Lookup { read, table } => (Some(read), table, 0),
-                ProgramStep::Add { read, template } => (Some(read), vec![], template),
+                ProgramStep::Add { template } => (Some(class.add_read(position)), vec![], template),
                 ProgramStep::Map { table } => (None, table, 0),
             };
             let kind = match (&read, table.is_empty()) {
@@ -472,8 +487,7 @@ impl BranchingProgram {
         let class = PeClass::hamming(template.len(), symbol_bits)?;
         let mut steps = template
             .iter()
-            .enumerate()
-            .map(|(read, symbol)| ProgramStep::Add { read, template: *symbol })
+            .map(|symbol| ProgramStep::Add { template: *symbol })
             .collect::<Vec<_>>();
         steps.push(ProgramStep::Map {
             table: (0..class.state_width)
@@ -549,7 +563,7 @@ impl BranchingProgram {
     }
 
     /// The Program data of this program ([`PeClass::compile`]): the reads (an
-    /// add step's read `t` of template symbol `z` is member `t + l z` of the add family) and
+    /// add step's template symbol `z`, member `z` of its step's add family) and
     /// the tables, each padded to the lookup width `W` with zeros (an add step's
     /// all zeros), of the `T_max` steps, the first `T_max - T` of them identity
     /// steps.
@@ -561,12 +575,10 @@ impl BranchingProgram {
             .map(|index| index % class.state_width)
             .collect::<Vec<_>>();
         let reads = std::iter::repeat_n(0, padding)
-            .chain(
-                self.reads
-                    .iter()
-                    .enumerate()
-                    .map(|(index, read)| read + class.attribute_length * self.template(index)),
-            )
+            .chain(self.reads.iter().enumerate().map(|(index, read)| match self.kind(index) {
+                StepKind::Add => self.template(index),
+                _ => *read,
+            }))
             .collect();
         let tables = std::iter::repeat_n(&identity, padding)
             .chain(&self.tables)
@@ -710,7 +722,7 @@ mod tests {
             &[StepKind::Add; 4].iter().copied().chain([StepKind::Map]).collect::<Vec<_>>(),
         )
         .unwrap();
-        let adds = (0..4).map(|read| ProgramStep::Add { read, template: 0 });
+        let adds = (0..4).map(|_| ProgramStep::Add { template: 0 });
         let map = ProgramStep::Map { table: vec![0; 4] };
         assert!(BranchingProgram::from_steps(narrow, adds.clone().chain([map]).collect()).is_err());
         let lookup = ProgramStep::Lookup { read: 0, table: vec![0; 10] };
@@ -724,6 +736,10 @@ mod tests {
         );
         assert!(PeClass::with_steps(1, 2, 2, &[StepKind::Map, StepKind::Add]).is_err());
         assert!(PeClass::with_steps(1, 3, 3, &[StepKind::Add, StepKind::Map]).is_err());
+        // The `i`-th add step reads attribute `i`, so a class has at most `l` add steps.
+        assert!(
+            PeClass::with_steps(1, 2, 3, &[StepKind::Add, StepKind::Add, StepKind::Map]).is_err()
+        );
     }
 
     /// With symbols of two bits, a step adds the Hamming distance of a symbol to its template
@@ -748,22 +764,24 @@ mod tests {
         let compiled = class.compile().unwrap();
         let data = program.data(&compiled);
         data.validate(compiled.program()).unwrap();
-        assert_eq!(data.values(compiled.reads()).unwrap(), [6, 4, 11, 0]);
+        // The reads of the add steps are their template symbols.
+        assert_eq!(data.values(compiled.reads()).unwrap(), [2, 1, 3, 0]);
         assert!(BranchingProgram::hamming_threshold(2, &[4, 0, 0], 1).is_err());
     }
 
-    /// The Hamming class compiles to products by the add family and one table, and a program's
-    /// reads select `X^(1 - x_i)` (member `i + l`) for the template bits that are one.
+    /// The Hamming class compiles to products by one add family per step and one table, and a
+    /// program's reads select `X^(1 - x_i)` (member `1` of step `i`'s family) for the template
+    /// bits that are one.
     #[test]
-    fn the_hamming_class_reads_the_add_family() {
+    fn the_hamming_class_reads_one_add_family_per_step() {
         let template = [1, 0, 1];
         let program = BranchingProgram::hamming_threshold(1, &template, 1).unwrap();
         let compiled = program.class().compile().unwrap();
-        assert_eq!(compiled.program().rhs_inputs().len(), 1);
+        assert_eq!(compiled.program().rhs_inputs().len(), 3);
         assert_eq!(compiled.program().encryption_inputs().luts().len(), 1);
         let data = program.data(&compiled);
         data.validate(compiled.program()).unwrap();
-        assert_eq!(data.values(compiled.reads()).unwrap(), [3, 1, 5, 0]);
+        assert_eq!(data.values(compiled.reads()).unwrap(), [1, 0, 1, 0]);
         let width = program.class().lookup_width();
         let tables = data.values(compiled.tables()).unwrap();
         assert_eq!(&tables[3 * width..][..4], [0, 1, 1, 1]);

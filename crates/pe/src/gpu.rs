@@ -36,7 +36,37 @@ fn gpu_rings(parameters: &crate::PeParameters) -> Vec<GpuDCRTPolyParams> {
 #[ignore = "requires a CUDA GPU"]
 fn test_gpu_authorized_key_decrypts_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
-    authorized_key_decrypts_on_the_gpu(class, parameters(class));
+    authorized_key_decrypts_on_the_gpu(class, parameters(class), &equality_programs);
+}
+
+/// The equality predicates of `attribute` (authorized) and of its complement.
+fn equality_programs(class: PeClass, attribute: &[usize]) -> [BranchingProgram; 2] {
+    let complement = attribute.iter().map(|bit| 1 - bit).collect::<Vec<_>>();
+    [equals(class, attribute), equals(class, &complement)]
+}
+
+/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] for the Hamming threshold programs over two
+/// symbols of two bits with compact encodings: each add step reads its own family of distance
+/// packages, selected by the template, and the map step compares the distance with the
+/// threshold, which the authorized key's exceeds and the unauthorized key's equals.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_hamming_threshold_decrypts_on_the_gpu() {
+    let class = PeClass::hamming(2, 2).unwrap();
+    let parameters = crate::test_support::correct_parameters(class, |parameters| {
+        parameters.with_compact_encodings().unwrap()
+    });
+    authorized_key_decrypts_on_the_gpu(class, parameters, &|_, attribute| {
+        let template =
+            attribute.iter().map(|_| rand::random::<u32>() as usize % 4).collect::<Vec<_>>();
+        let distance = attribute
+            .iter()
+            .zip(&template)
+            .map(|(x, z)| (x ^ z).count_ones() as usize)
+            .sum::<usize>();
+        [distance + 1, distance]
+            .map(|threshold| BranchingProgram::hamming_threshold(2, &template, threshold).unwrap())
+    });
 }
 
 /// [`test_gpu_authorized_key_decrypts_on_the_gpu`] with the LUT radix 2 and compact encodings: the
@@ -49,23 +79,29 @@ fn test_gpu_compact_encodings_with_a_radix_decrypt_on_the_gpu() {
     let parameters = crate::test_support::correct_parameters(class, |parameters| {
         parameters.with_lut_radix(2).unwrap().with_compact_encodings().unwrap()
     });
-    authorized_key_decrypts_on_the_gpu(class, parameters);
+    authorized_key_decrypts_on_the_gpu(class, parameters, &equality_programs);
 }
 
-fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParameters) {
+/// One setup, one ciphertext of a random attribute and message, and keys for the programs
+/// `programs(class, attribute)`, the first authorized and the second not, all on the GPU.
+fn authorized_key_decrypts_on_the_gpu(
+    class: PeClass,
+    parameters: crate::PeParameters,
+    programs: &dyn Fn(PeClass, &[usize]) -> [BranchingProgram; 2],
+) {
     let level = parameters.level();
     let mut execution = GpuRuntime::new(gpu_backend(gpu_rings(&parameters))).expect("GPU runtime");
     let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class)).unwrap();
     assert!(bound.decrypts(), "the parameters must guarantee correctness");
     let mut store = MemoryArtifactStore::default();
     let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
-    let attribute = [0; 2].map(|_| rand::random::<u32>() as usize % 2);
+    let attribute = (0..class.attribute_length())
+        .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
+        .collect::<Vec<_>>();
     let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
     let ciphertext =
         encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
-    let complement = attribute.map(|bit| 1 - bit);
-    let predicates: [BranchingProgram; 2] = [equals(class, &attribute), equals(class, &complement)];
-    for (predicate, value) in predicates.iter().zip([0, 1]) {
+    for (predicate, value) in programs(class, &attribute).iter().zip([0, 1]) {
         assert_eq!(predicate.evaluate(&attribute).unwrap(), value);
         let key = keygen(&public_key, &master, predicate, &mut execution, &mut store).unwrap();
         let decrypted =

@@ -569,15 +569,19 @@ impl RnsBggParameters {
         Ok(BigUint::from(current.modulus_digits()) * current.ring_dimension() * &rho * &rho)
     }
 
-    /// The energy `m^2 n rho^2` of the companion sum `sum_a eps_{a,j}
-    /// U_{:,a}` of one package read: `m` independent companion rows of `m`
-    /// entries, each against a digit polynomial of `n` coefficients bounded
-    /// by `rho`.
-    pub(super) fn dynamic_companion_energy(&self, level: usize) -> Result<BigUint, RnsBggError> {
+    /// The energy `(m - p) m n rho^2` of the companion sum `sum_a eps_{a,j}
+    /// U_{:,a}` of one package read with `p` public digit rows: `m - p`
+    /// independent companion rows of `m` entries, each against a digit
+    /// polynomial of `n` coefficients bounded by `rho`.
+    pub(super) fn dynamic_companion_energy(
+        &self,
+        level: usize,
+        public_rows: usize,
+    ) -> Result<BigUint, RnsBggError> {
         let current = self.level(level)?;
-        let m = BigUint::from(2 * self.component_columns(level)?);
+        let m = 2 * self.component_columns(level)?;
         let rho = (BigUint::one() << current.base_bits()) / 2u8;
-        Ok(&m * &m * current.ring_dimension() * &rho * &rho)
+        Ok(BigUint::from(m - public_rows) * m * current.ring_dimension() * &rho * &rho)
     }
 
     /// The energy `D m n rho^2` of the companion sum of one automorphism
@@ -594,20 +598,22 @@ impl RnsBggParameters {
         Ok(&d * &m * current.ring_dimension() * &rho * &rho)
     }
 
-    /// One Dynamic product: `E' <= K E + m K beta + ||mu||_1 B_C` for the
-    /// input error `E`, the companion error bound `beta`, and the gadget
-    /// ciphertext error bound `B_C`; `-mu e_C` is the input payload times
-    /// the ciphertext error.
+    /// One Dynamic product: `E' <= K E + (m - p) K beta + ||mu||_1 B_C` for
+    /// the input error `E`, the companion error bound `beta` of the `m - p`
+    /// private digit rows (`p` public rows have no companion), and the gadget
+    /// ciphertext error bound `B_C`; `-mu e_C` is the input payload times the
+    /// ciphertext error.
     pub fn dynamic_mul_noise_bound(
         &self,
         level: usize,
         input: &RnsBggNoiseBound,
         ciphertext_error: &BigUint,
         companion_error: &BigUint,
+        public_rows: usize,
         output_payload_l1: BigUint,
     ) -> Result<RnsBggNoiseBound, RnsBggError> {
         let k = self.dynamic_decomposition_gain(level)?;
-        let m = BigUint::from(2 * self.component_columns(level)?);
+        let m = BigUint::from(2 * self.component_columns(level)? - public_rows);
         Ok(RnsBggNoiseBound {
             error: &k * &input.error +
                 m * &k * companion_error +

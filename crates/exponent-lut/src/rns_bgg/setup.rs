@@ -90,8 +90,8 @@ pub struct RnsBggDynamicDistributions {
     pub companion: RnsBggGaussian,
     /// Errors of the automorphism helpers `h_k = s H_k - s_k G + e`.
     pub helper: RnsBggGaussian,
-    /// Errors of the RHS gadget ciphertexts encryption samples itself
-    /// ([`RnsBggPackageSource::Sampled`]).
+    /// Errors `e_C` of the bottom rows of the RHS gadget ciphertexts
+    /// ([`RnsBggDynamicSetup::rhs_bottom`]).
     pub ciphertext: RnsBggGaussian,
 }
 
@@ -105,26 +105,6 @@ impl RnsBggDynamicDistributions {
             ciphertext: contract,
         }
     }
-}
-
-/// How the gadget ciphertext of an RHS package is produced.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RnsBggPackageSource {
-    /// Encryption samples `C = [a; t s_bar ... ]` from the RHS plaintext
-    /// with a uniform top row and the setup's ciphertext error contract:
-    /// `s C = nu s G + e_C`.
-    Sampled,
-    /// The enclosing scheme supplies `C` with `s C = nu s G + e_C` under its
-    /// own construction; `error_bound` is its declared coefficient bound on
-    /// `e_C`, which the noise simulation uses.
-    Supplied { error_bound: BigUint },
-}
-
-/// One canonical RHS coordinate of a setup.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RnsBggDynamicRhs {
-    pub shape: InputShape,
-    pub source: RnsBggPackageSource,
 }
 
 /// The kind of a package, which names its public companion keys.
@@ -144,7 +124,8 @@ pub struct RnsBggDynamicSetup {
     parameters: [u8; 32],
     ring_dimension: u32,
     inputs: BTreeMap<u32, ProgramInputDeclaration>,
-    rhs: BTreeMap<u32, RnsBggDynamicRhs>,
+    /// The shape of every RHS coordinate.
+    rhs: BTreeMap<u32, InputShape>,
     automorphism_layout: ExpLayout,
     automorphisms: Vec<usize>,
     /// The radix `B` of the LUT automorphism decomposition (see
@@ -176,7 +157,7 @@ impl RnsBggDynamicSetup {
         context: [u8; 32],
         hash_key: &[u8],
         inputs: BTreeMap<u32, ProgramInputDeclaration>,
-        rhs: BTreeMap<u32, RnsBggDynamicRhs>,
+        rhs: BTreeMap<u32, InputShape>,
         layout: ExpLayout,
         distributions: RnsBggDynamicDistributions,
     ) -> Result<Self, RnsBggError> {
@@ -185,10 +166,7 @@ impl RnsBggDynamicSetup {
         }
         parameters.validate_equal_basis()?;
         let ring_dimension = parameters.level(0)?.ring_dimension();
-        let shapes = inputs
-            .values()
-            .map(ProgramInputDeclaration::shape)
-            .chain(rhs.values().map(|rhs| &rhs.shape));
+        let shapes = inputs.values().map(ProgramInputDeclaration::shape).chain(rhs.values());
         for shape in shapes {
             if let InputBinding::Family(count) = shape {
                 count
@@ -411,16 +389,7 @@ impl RnsBggDynamicSetup {
             .iter()
             .map(|(wire, declaration)| (wire.0, declaration.clone()))
             .collect();
-        let rhs = program
-            .rhs_inputs()
-            .iter()
-            .map(|(id, shape)| {
-                (
-                    id.0,
-                    RnsBggDynamicRhs { shape: shape.clone(), source: RnsBggPackageSource::Sampled },
-                )
-            })
-            .collect();
+        let rhs = program.rhs_inputs().iter().map(|(id, shape)| (id.0, shape.clone())).collect();
         let setup = Self::new(parameters, context, hash_key, inputs, rhs, layout, distributions)?;
         let binding = RnsBggDynamicBinding::new(
             program.inputs().keys().map(|wire| (*wire, wire.0)).collect(),
@@ -447,7 +416,7 @@ impl RnsBggDynamicSetup {
         &self.inputs
     }
 
-    pub fn rhs(&self) -> &BTreeMap<u32, RnsBggDynamicRhs> {
+    pub fn rhs(&self) -> &BTreeMap<u32, InputShape> {
         &self.rhs
     }
 
@@ -496,17 +465,16 @@ impl RnsBggDynamicSetup {
         )
     }
 
-    /// Artifact role of the gadget ciphertexts of RHS coordinate
-    /// `coordinate`: four ports `.0` to `.3` holding the blocks
-    /// `((C_00, C_01), (C_10, C_11))`, as a family for a family coordinate.
-    /// A scheme supplying the ciphertexts of a
-    /// [`RnsBggPackageSource::Supplied`] coordinate exports them under this
-    /// role from the prelude production it binds to the encryption.
-    pub fn rhs_ciphertext_role(coordinate: u32, family: bool) -> String {
+    /// Artifact role of the bottom rows of the gadget ciphertexts of RHS
+    /// coordinate `coordinate` ([`Self::rhs_bottom`]): two ports `.0` and `.1`
+    /// holding `(C_10, C_11)`, as a family for a family coordinate. The
+    /// encryption's prelude production exports them: its own, from the bound
+    /// plaintexts, or one an enclosing scheme binds.
+    pub fn rhs_bottom_role(coordinate: u32, family: bool) -> String {
         if family {
-            format!("dynamic/rhs/{coordinate}/family/ciphertext")
+            format!("dynamic/rhs/{coordinate}/family/bottom")
         } else {
-            format!("dynamic/rhs/{coordinate}/ciphertext")
+            format!("dynamic/rhs/{coordinate}/bottom")
         }
     }
 
@@ -632,6 +600,69 @@ impl RnsBggDynamicSetup {
         Ok(public_key::matrix_from_hash(&ring, hash_key, tag, 1))
     }
 
+    /// The public top row `a` of the gadget ciphertext `C = [a; c]` of RHS
+    /// coordinate `coordinate` (member `member` of a family), a `1 x 2c` row at
+    /// the setup ring hashed under the setup's tag. Every encryption reuses it
+    /// under a fresh secret; its digit rows need no companion, as an
+    /// automorphism package's (see [`super::automorphism_public_rows`]).
+    pub fn rhs_public_top(
+        &self,
+        parameters: &RnsBggParameters,
+        hash_key: mxx_dsl::Bytes,
+        coordinate: u32,
+        member: Option<IntExpr>,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        let mut tag = self.tag("rhs-top");
+        tag.push(IntExpr::constant(coordinate));
+        if let Some(member) = member {
+            tag.push("member");
+            tag.push(member);
+        }
+        let ring = parameters.ring(0)?;
+        let columns = parameters.component_columns(0)?;
+        let half = |index: u64| {
+            let mut tag = tag.clone();
+            tag.push("component");
+            tag.push(IntExpr::constant(index));
+            ring.hash_matrix(hash_key.clone(), tag, (1, columns))
+        };
+        Ok((half(0), half(1)))
+    }
+
+    /// The bottom row `c = nu s G - s_0 a + e_C` of the gadget ciphertext
+    /// `C = [a; c]` of member `member` of RHS coordinate `coordinate` for the
+    /// `1 x 1` plaintext `nu` under the payload secret row `s = (s_0, 1)` at the
+    /// setup ring, with the public top row `a` ([`Self::rhs_public_top`]) and
+    /// `e_C` sampled under the setup's ciphertext contract: `s C = nu s G +
+    /// e_C`. Encryption, or an enclosing scheme's prelude, exports it under
+    /// [`Self::rhs_bottom_role`].
+    pub fn rhs_bottom(
+        &self,
+        parameters: &RnsBggParameters,
+        hash_key: mxx_dsl::Bytes,
+        coordinate: u32,
+        member: Option<IntExpr>,
+        secret: &RnsBggRow,
+        plaintext: mxx_dsl::Mat,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        let gadget = parameters.public_gadget(0)?;
+        let target = (
+            secret.0.clone() * gadget.clone() * plaintext.clone(),
+            secret.1.clone() * gadget * plaintext,
+        );
+        let top = self.rhs_public_top(parameters, hash_key, coordinate, member)?;
+        Ok(super::ciphertext_matrix(
+            parameters,
+            0,
+            parameters.component_columns(0)?,
+            secret.0.clone(),
+            top,
+            target,
+            &self.distributions.ciphertext,
+        )?
+        .1)
+    }
+
     /// The public helper matrix `H_k` of automorphism `k`, a `2 x m` matrix
     /// at the setup ring.
     pub fn helper_key(
@@ -737,7 +768,7 @@ impl RnsBggDynamicBinding {
                 .rhs
                 .get(&self.rhs(*rhs)?)
                 .ok_or(RnsBggError::Binding("RHS coordinate is not in the Dynamic setup"))?;
-            if !same_shape(&coordinate.shape, shape) {
+            if !same_shape(coordinate, shape) {
                 return Err(RnsBggError::Binding("Program RHS does not match its coordinate"));
             }
         }

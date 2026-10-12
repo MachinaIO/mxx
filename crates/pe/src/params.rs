@@ -522,12 +522,6 @@ impl PeParameters {
         w * self.anchor_columns + w * helpers * self.state_columns() + self.state_columns()
     }
 
-    /// The bound `B_C` on the attribute ciphertext error `e_C = e_t`, a fresh `chi` sample: its
-    /// cutoff.
-    pub fn ciphertext_error_bound(&self) -> BigUint {
-        self.error.cutoff().clone()
-    }
-
     /// The sampling contracts of the Dynamic packages, all `chi`. Encryption supplies the
     /// attribute ciphertexts itself.
     pub fn distributions(&self) -> RnsBggDynamicDistributions {

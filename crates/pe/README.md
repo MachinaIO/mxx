@@ -58,11 +58,16 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
   they divide `log2 W` (`W = 4096`: `B = 16`; `W = 2`: direct), and the integration and noise
   tests use it unless `LUT_RADIX` is set (0 selects the direct switching). `B < W` is outside the
   exported Lean correctness claim.
+- **Public top rows of the attribute ciphertexts.** The top row `a_t` of every attribute gadget
+  ciphertext `C_t = [a_t; X^v s G - s_bar a_t + e_t]` is hashed by the setup
+  (`RnsBggDynamicSetup::rhs_public_top`), so a ciphertext carries only the bottom row and the
+  companions of its `D` private digit rows: `m² / 2` per package instead of `m²`, as for the
+  switching packages. Every ciphertext reuses `a_t` under a fresh `s_bar`.
 - **Compact fresh encodings.** `PeParameterRequest::compact_encodings` publishes the digit
   companions, automorphism helpers, and the private input `c_0` as two-column rows
   `s (Ã - p X I_2) + e mod pq`, and decryption expands them to the full gadget width at `q`
-  (see the exponent-lut crate). A package then holds `2 m²` polynomials over `pq` instead of
-  `m³` over `q`. The ring dimension is selected for the lattice estimate at `pq`, and the noise
+  (see the exponent-lut crate). A package then holds `m²` polynomials over `pq` instead of
+  `m³ / 2` over `q`. The ring dimension is selected for the lattice estimate at `pq`, and the noise
   simulation uses the expanded bounds. The Lean claim covers it for the average-case row
   `average-w2-n32768-crt6x30-compact`.
 - **SampleLeft without the family matrix.** Key generation samples the one extension vector shared

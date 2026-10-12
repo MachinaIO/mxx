@@ -5,9 +5,10 @@
 //! The deterministic bounds are the fixed-basis recurrences of
 //! [`RnsBggParameters::dynamic_mul_noise_bound`] and
 //! [`RnsBggParameters::dynamic_lut_noise_bound`]; no operation rounds. Every
-//! package error is bounded by the setup's contract: a sampled gadget
-//! ciphertext's and every companion's and helper's by its Gaussian cutoff, a
-//! supplied gadget ciphertext's by its declared bound.
+//! package error is bounded by the setup's contract: every gadget ciphertext's,
+//! companion's, and helper's by its Gaussian cutoff. Every gadget ciphertext's
+//! top row is public, so a product's companions cover its private digit rows
+//! only.
 //!
 //! Sources are identified by package, never by consuming gate or level: a
 //! package read at several gates, and the same automorphism packages read by
@@ -99,15 +100,9 @@ impl RnsBggNoiseEvaluator<'_> {
         )
     }
 
-    /// The variance of a Gaussian contract, or of a supplied bound `B`
-    /// (`B^2` bounds the variance of any variable bounded by `B`).
-    fn contract_variance(sigma: Option<&BigDecimal>, bound: &BigUint) -> NonnegativeRational {
-        match sigma {
-            Some(sigma) => encoding_variance_from_sigma(sigma),
-            None => {
-                NonnegativeRational::new(bound.pow(2u32), BigUint::one()).expect("unit denominator")
-            }
-        }
+    /// The variance of a Gaussian contract of standard deviation `sigma`.
+    fn contract_variance(sigma: &BigDecimal) -> NonnegativeRational {
+        encoding_variance_from_sigma(sigma)
     }
 
     /// The Dynamic product of `input` by the package of `rhs`.
@@ -121,12 +116,10 @@ impl RnsBggNoiseEvaluator<'_> {
         let wire = self.site()?.output;
         self.parameters.dynamic_route(level)?;
         self.parameters.dynamic_route(self.level(wire)?)?;
-        let package = contracts
+        let coordinate = *contracts
             .rhs
             .get(&rhs.id)
-            .ok_or(RnsBggError::Binding("missing RHS package contract"))?
-            .clone();
-        let coordinate = package.coordinate;
+            .ok_or(RnsBggError::Binding("missing RHS package contract"))?;
         let (contract, sparse_count) = match self
             .bindings
             .rhs
@@ -139,32 +132,36 @@ impl RnsBggNoiseEvaluator<'_> {
             }
         };
         let distributions = &contracts.distributions;
-        let ciphertext_error = package.ciphertext_error.clone();
-        let ciphertext_sigma = package.ciphertext_sigma.as_ref();
+        let ciphertext_error = distributions.ciphertext.cutoff().clone();
+        let ciphertext_sigma = distributions.ciphertext.sigma();
         let companion = &distributions.companion;
         let companion_error = self.package_error(&contracts, companion.cutoff())?;
         let output_l1 = &input.1.bound.payload_l1 * &contract.payload_l1;
+        // The public top row's digit rows have no companion.
+        let public_rows = crate::rns_bgg::automorphism_public_rows(self.parameters, level)?;
         let bound = self.parameters.dynamic_mul_noise_bound(
             level,
             &input.1.bound,
             &ciphertext_error,
             &companion_error,
+            public_rows,
             output_l1,
         )?;
         let compact = contracts.compact_extension.is_some();
-        // The companions' share `m K beta'` of the bound.
-        let companion_share = BigUint::from(2 * self.parameters.component_columns(level)?) *
-            self.parameters.dynamic_decomposition_gain(level)? *
-            &companion_error;
+        // The companions' share `(m - p) K beta'` of the bound.
+        let companion_share =
+            BigUint::from(2 * self.parameters.component_columns(level)? - public_rows) *
+                self.parameters.dynamic_decomposition_gain(level)? *
+                &companion_error;
         let k = self.parameters.dynamic_decomposition_gain(level)?;
         let gain = NonnegativeRational::new(k.clone(), BigUint::one()).expect("unit denominator");
         let k_squared = k.pow(2u32);
         let ciphertext_source = self.package_source("rhs-ciphertext", Some(coordinate))?;
         let companion_source = self.package_source("rhs-companion", Some(coordinate))?;
         let companion_variance = encoding_variance_from_sigma(companion.sigma())
-            .scaled(&self.parameters.dynamic_companion_energy(level)?);
-        let ciphertext_variance = Self::contract_variance(ciphertext_sigma, &ciphertext_error)
-            .scaled(&input.1.payload_l2_squared);
+            .scaled(&self.parameters.dynamic_companion_energy(level, public_rows)?);
+        let ciphertext_variance =
+            Self::contract_variance(ciphertext_sigma).scaled(&input.1.payload_l2_squared);
         let breakdown = input.1.contributions("dynamic-mul-input").map(|input_terms| {
             // `e Dec(C)`: `Dec(C)` depends on the ciphertext, so the input
             // error keeps the squared `l1` gain.

@@ -11,7 +11,7 @@
 //!   [`super::RnsBggParameters::decoder_selection`] (`w = 1` against `g_(L+1)` for a Static source,
 //!   `w = Delta` against the full gadget for a Dynamic one), whose `l1` is the digit sum of `w`;
 //! - the smudge members: the child evaluator lowers the smudge Program with the same member
-//!   transform as the encoding (one finalization, then
+//!   transform as the encoding (one ModDown, without the decryption scale-up, then
 //!   [`super::RnsBggNoiseValue::constant_digit_action`] with the `l1` of the halved weights `w`),
 //!   and its smudge sum aggregates them with their provenance;
 //! - `e_b K`: the unmask hint's fresh error against the unknown preimage, bounded by `N m_B B_e

@@ -23,7 +23,16 @@ pub fn parallel<T: GraphValue>(
     });
     let (scope, output) = result?;
     let schema = output.schema();
-    let family_schema = FamilyType { element: schema, count: count.clone() };
+    // The element schema depends on the member index only if a body type names the loop index.
+    let depends = schema
+        .wire_types()
+        .iter()
+        .any(|ty| ty.substitute_loop_index(index_slot, &IntExpr::constant(0)) != *ty);
+    let family_schema = FamilyType {
+        element: schema,
+        count: count.clone(),
+        member_slot: depends.then_some(index_slot),
+    };
     if family_schema.wire_types().is_empty() {
         return Err(DslError::Schema);
     }
@@ -38,6 +47,7 @@ pub fn parallel<T: GraphValue>(
 
     let arguments = sealed.captures.iter().map(|capture| capture.outer.clone()).collect();
     let modes = sealed.captures.iter().map(|capture| capture.mode.clone()).collect();
+    // Outside the body, a type depending on the loop index depends on the member index.
     let types = family_schema.wire_types();
     let node = NodeHandle::parallel_loop(
         sealed.handle,

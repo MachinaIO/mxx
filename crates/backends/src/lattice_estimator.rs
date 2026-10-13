@@ -50,13 +50,44 @@ fn lattice_security_bits_with_secret(
     if error_sigma <= &BigDecimal::zero() {
         return Err("error sigma must be positive".to_owned());
     }
+    estimate(&[
+        ring_dimension.to_string(),
+        modulus.to_string(),
+        "--s-dist".to_owned(),
+        secret.to_owned(),
+        "--e-dist".to_owned(),
+        format!(r#"{{"name":"DiscreteGaussian","stddev":{error_sigma}}}"#),
+    ])
+}
+
+/// One positive integer estimate for Ring-LWE of dimension `ring_dimension` modulo `modulus` with
+/// a binary secret and a centered binomial error CBD(`eta`), given `samples` published
+/// coefficient equations (the estimator's LWE model, ignoring the ring structure).
+pub fn binary_secret_cbd_security_bits(
+    ring_dimension: u32,
+    modulus: &BigUint,
+    eta: u32,
+    samples: u64,
+) -> Result<u64, String> {
+    if ring_dimension == 0 || modulus.is_zero() || eta == 0 || samples == 0 {
+        return Err("binary-secret CBD parameters must be positive".to_owned());
+    }
+    estimate(&[
+        ring_dimension.to_string(),
+        modulus.to_string(),
+        "--s-dist".to_owned(),
+        r#"{"name":"Binary"}"#.to_owned(),
+        "--e-dist".to_owned(),
+        format!(r#"{{"name":"CenteredBinomial","eta":{eta}}}"#),
+        "--m".to_owned(),
+        samples.to_string(),
+    ])
+}
+
+/// Run `lattice-estimator-cli` with `arguments` and parse the estimate on its last nonempty line.
+fn estimate(arguments: &[String]) -> Result<u64, String> {
     let output = Command::new("lattice-estimator-cli")
-        .arg(ring_dimension.to_string())
-        .arg(modulus.to_string())
-        .arg("--s-dist")
-        .arg(secret)
-        .arg("--e-dist")
-        .arg(format!(r#"{{"name":"DiscreteGaussian","stddev":{error_sigma}}}"#))
+        .args(arguments)
         .output()
         .map_err(|error| format!("failed to start lattice-estimator-cli: {error}"))?;
     if !output.status.success() {

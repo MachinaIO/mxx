@@ -148,7 +148,7 @@ mod tests {
             .join("../../test_data/lean_ir_fixtures/lwe_protocol");
         // The stage layout is part of the fixture; drop modules of an earlier layout.
         let _ = fs::remove_dir_all(&directory);
-        mxx_ir_core::lean::protocol::export(&lwe_protocol().unwrap(), &directory)
+        mxx_ir_core::lean::protocol::export(&lwe_protocol().unwrap(), &directory, false)
             .expect("generic export accepts the exact endpoint");
         fs::write(directory.join("LweProof.lean"), LWE_PROOF).unwrap();
         fs::write(directory.join("Certificate.lean"), LWE_CERTIFICATE).unwrap();

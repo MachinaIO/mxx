@@ -1532,6 +1532,7 @@ impl CpuDcrtBackend {
         gadget_base: &BigInt,
         digit_count: usize,
         instantiation: TrapdoorInstantiation,
+        preimage_sigma: Option<&Rational>,
     ) -> Result<(DCRTPolyMatrix, DCRTTrapdoor), PolyBackendError> {
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
@@ -1541,7 +1542,7 @@ impl CpuDcrtBackend {
             return Err(SmallMatrixError::InvalidConfig.into());
         }
         let sampler = DCRTPolyTrapdoorSampler::new(parameters, sigma, instantiation);
-        let (trapdoor, public) = sampler.trapdoor(parameters, ty.rows);
+        let (trapdoor, public) = sampler.trapdoor(parameters, ty.rows, preimage_sigma)?;
         Ok((public, trapdoor))
     }
 
@@ -2256,7 +2257,8 @@ mod tests {
                 4.578,
                 &base,
                 digits,
-                TrapdoorInstantiation::Computational
+                TrapdoorInstantiation::Computational,
+                None,
             ),
             Err(PolyBackendError::SmallMatrix(SmallMatrixError::InvalidConfig))
         ));

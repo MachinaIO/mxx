@@ -12,14 +12,14 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 
 | Item | What it provides |
 | --- | --- |
-| `branching_program` | `PeClass` (attribute length, alphabet, state width, maximal length) and `BranchingProgram`, checked against its class, evaluated in the clear, and compiled into an Exponent-LUT Program bound to the setup coordinates. |
-| `params` | `PeParameters`: the class, the equal-basis chain of `2 T_max + 2` levels, the trapdoor instantiation, the error, flooding, and programming contracts, and the key width and cutoff; `PeParameters::select` picks the CRT depth from the conditions of the instantiation and the simulated noise. |
-| `budget` | The statistical instantiation's conditions: the split of the statistical-distance target `ε_total` (default `2^-30`), the regularity (leftover hash lemma) column counts `m̄` and `m_B`, the truncation and flooding multipliers, the flooding width, and the SampleRight key width of the `Strict` policy. |
-| `setup` | `setup`: the anchor `B` from TrapGen (computational `[ā \| I \| G - (ā R + E)]` or statistical `[ā \| g - ā T]`), the class's Dynamic setup, and the public message row. `PePublicKey` and `PeMasterSecretKey` keep public and secret material apart. |
-| `encryption` | `encrypt(mpk, x, m)`: the anchor encoding, the attribute gadget ciphertexts `C_t = P Z_t + X^(Bz x_t) G` (with `Z_t` sampled one column at a time), the message component, and the Dynamic packages, under one fresh secret and session. |
-| `keygen` | `keygen(msk, F)`: the predicate's public evaluation, including its output key `A_F`, and a short `k` with `M_F k = d_1 delta_1` for the implicit family matrix `M_F`. |
+| `branching_program` | `PeClass` (attribute length, alphabet, state width, maximal length) and `BranchingProgram`, checked against its class and evaluated in the clear. `PeClass::compile` gives the class's Exponent-LUT Program, bound to the setup coordinates, and `BranchingProgram::data` its runtime data: the attribute index and the table of every step. `PeClass::with_steps` fixes the kind of every step (`StepKind`: lookup or map). |
+| `params` | `PeParameters`: the class, the equal-basis chain of `2 T_max + 2` levels, the statistical trapdoor, the error contract `chi` of every fresh error, and the key width and cutoff; `PeParameters::select` picks the CRT depth from the budget's conditions and the simulated noise. |
+| `budget` | The statistical trapdoor's conditions: the split of the statistical-distance target `ε = 2^-30` between the regularity (leftover hash lemma) of TrapGen, which gives `m̄` and `m_B = m̄ + D`, and the truncation multiplier of `chi`. |
+| `setup` | `setup`: the anchor `B` from the statistical TrapGen `[ā \| g - ā T]`, the class's Dynamic setup, and the public message row. `PePublicKey` and `PeMasterSecretKey` keep public and secret material apart. |
+| `encryption` | `encrypt(mpk, x, m)`: the anchor encoding, the attribute gadget ciphertexts `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz x_t) G` (with a fresh uniform `a_t` and `e_t` from `chi`), the message component, and the Dynamic packages, under one fresh secret and session. |
+| `keygen` | `keygen(msk, F)`: the predicate's public evaluation on its program data, including its output key `A_F`, and a short `k` with `M_F k = d_1 delta_1` for the implicit family matrix `M_F`. |
 | `decryption` | `decrypt(sk_F, ct)`: the predicate evaluated on the ciphertext's packages and the family row contracted with the key, rounded to the message bits. |
-| `noise` | `simulate`: the evaluation bound `E_F` from the exponent-lut simulator, the decryption bound `E_PE`, and the condition `4 E_PE + 2 < q`; `witness_bound`: the bound `B_R̂` of the proof's ledger witness, from the same simulator with witness contracts. |
+| `noise` | `simulate`: the evaluation bound `E_F` from the exponent-lut simulator, the decryption bound `E_PE`, and the condition `4 E_PE + 2 < q`. |
 
 ## Design
 
@@ -31,17 +31,41 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
 - **One ciphertext for every predicate.** Packages are bound to setup coordinates, not to a
   Program, level, or table, so a ciphertext's size depends on the attribute length and the class's
   lookup width but not on the program length or the predicate.
-- **Baby-step giant-step packages.** `PeParameterRequest::lut_baby_steps` splits the lookup group
-  of `W` automorphisms: a ciphertext then carries switching packages for about `2 sqrt W`
-  automorphisms instead of `W - 1`, and a key carries `W |P|` helper blocks for the `|P|`
-  automorphisms with a published helper (the switching ones and their inverses), at one more
-  decomposition gain in the noise of a composed lookup branch.
-- **Compact fresh encodings.** `PeParameterRequest::compact_encodings` publishes the digit
-  companions, automorphism helpers, and the private input `c_0` as two-column rows
-  `s (Ã - p X I_2) + e mod pq`, and decryption expands them to the full gadget width at `q`
-  (see the exponent-lut crate). A package then holds `2 m²` polynomials over `pq` instead of
-  `m³` over `q`. The ring dimension is selected for the lattice estimate at `pq`, and the noise
-  simulation uses the expanded bounds. This option is outside the exported Lean correctness claim.
+- **One graph for every program of a class.** The class compiles into one Program of `T_max` steps
+  whose reads and tables are runtime data families; a shorter program is padded with leading
+  identity steps. The Dynamic product selects the attribute package by the step's read, and the
+  LUT scalars are computed from the step's table, so key generation and decryption run the same
+  graph for every program, and the key's commitment binds its data.
+- **Map steps.** A class may fix each step's kind (`PeClass::with_steps`): a map step applies a
+  table to the state without reading an attribute, so it needs no product. The kinds are the
+  class's because one graph serves every program.
+- **Radix-`B` lookups.** `PeParameterRequest::lut_radix` decomposes the cyclic lookup group of
+  `W = B^r` automorphisms in radix `B` (a power of two; `W <= n / 2` for `B < W`): a ciphertext
+  then carries switching packages for the `(B - 1) log_B W` automorphisms `K_B = {g^(a B^j)}`
+  instead of `W - 1`, and a key carries `W |J_B|` helper blocks for `J_B = K_B u K_B^-1`. A lookup
+  branch is switched once per nonzero radix-`B` digit of its exponent, at most `log_B W` times,
+  and the noise follows those switches. `B = W` (`lut_radix: None`) is the direct
+  switching. Each switch multiplies the noise by a decomposition gain, so a small `B` trades
+  packages for noise (at `W = 4096`, `T = 4`: `log2 E_F` 557 direct, 705 at `B = 64`, 853 at
+  `B = 16`, 2147 at `B = 2`). `PeClass::default_lut_radix` takes 3 or 2 switches per branch when
+  they divide `log2 W` (`W = 4096`: `B = 16`; `W = 2`: direct), and the integration and noise
+  tests use it unless `LUT_RADIX` is set (0 selects the direct switching). `B < W` is outside the
+  exported Lean correctness claim.
+- **Public top rows of the attribute ciphertexts.** The top row `a_t` of every attribute gadget
+  ciphertext `C_t = [a_t; X^v s G - s_bar a_t + e_t]` is hashed by the setup
+  (`RnsBggDynamicSetup::rhs_public_top`), so a ciphertext carries only the bottom row and the
+  companions of its `D` private digit rows: `m² / 2` per package instead of `m²`, as for the
+  switching packages. Every ciphertext reuses `a_t` under a fresh `s_bar`.
+- **Compressed digit encodings.** `PeParameterRequest::compact_encodings` is the manuscript's
+  Appendix C: the digit companions are two-column rows `s (Ã - p d I_2) + e mod pq`, which
+  evaluation decompresses to the full gadget width at `q` (see the exponent-lut crate), so a
+  package holds `m²` polynomials over `pq` instead of `m³ / 2` over `q`. The anchor is defined
+  modulo `pq` (`B_Q = p B + r`, `b_Q = s B_Q + e_Q`), and the key extends the family matrix by the
+  blocks of `B'' = Dc(B_c)` and `I_W`, `W (m_c D + 1)` more short polynomials, with `m_c = 1`
+  under the relaxed uniformity condition. Helpers and `c_0` stay at `q`. The ring dimension is
+  selected for the lattice estimate at `pq`, and the noise simulation uses the decompressed
+  bounds. The Lean row `average-w2-n32768-crt6x30-compact` predates this construction (it
+  compacts the helpers and `c_0` too, with the anchor at `q`).
 - **SampleLeft without the family matrix.** Key generation samples the one extension vector shared
   by every row of `M_F`, then calls the existing preimage sampler once per anchor block. `M_F` is
   never formed; its blocks are contracted where they are used.
@@ -49,43 +73,41 @@ that runs on the CPU or the GPU. It depends on `mxx-exponent-lut`, `mxx-dsl`, `m
   publishes the output key of every Dynamic product and lookup and the product keys of every
   lookup branch. Decryption imports them, so the online evaluation computes only the encoding rows.
 
-## Instantiations and key widths
+## Trapdoor and key widths
 
-| | `Statistical` (the manuscript) | `Computational` (legacy) |
-| --- | --- | --- |
-| TrapGen | `[ā \| g - ā T]`, `m_B = m̄ + D` columns | `[ā \| I \| G - (ā R + E)]`, `m_B = D + 2` |
-| `m_B` | the regularity conditions of `budget` | `D + 2` |
-| `chi_fl` | `σ_fl = 2^s_flood B_coef / √(2π)`, from the flooding condition; the requested sigma when `enforce_flooding` is off (outside the reduction) | the requested sigma |
-| Cutoffs of `chi`, `chi_fl`, `Z_t` | `c` standard deviations from the budget | `6.5` standard deviations |
-| Checked conditions | regularity, flooding (unless `enforce_flooding` is off), budget, key width, numeric range (`PeError::Parameters` otherwise) | none |
-| Ring-LWE estimates | encryption | encryption and TrapGen |
-| Key width | `Strict`: `max(s_min, s_SR)`; `Practical`: `s_min` | the trapdoor's minimum preimage width |
+TrapGen is the manuscript's statistical instantiation `[ā \| g - ā T]` with `m_B = m̄ + D`
+columns. The parameters take the relaxations of the manuscript's implementation section, so they
+are outside its theorem:
 
-- `Statistical` with `Strict` implements every construction and parameter condition of the
-  manuscript and corresponds to its security theorem, under the heuristics stated below.
-- `Statistical` with `Practical` relaxes one condition of the reduction, the width at which
-  SampleRight simulates keys, as in the CP-ABE 1 of Datta et al. (ACM CCS 2026). Benchmarks use
-  this setting.
-- `Computational` keeps the legacy parameters for compatibility. It is heuristic and outside the
-  manuscript's theorem.
+- Every fresh error is a `chi` sample: there is no noise flooding, and the reduction's hybrid
+  `H_1` does not apply.
+- The uniformity conditions on the matrices `R` and `Z_t`, which appear only in the hybrids, are
+  dropped, so `m̄` follows from the regularity of TrapGen alone.
+- Keys are sampled at the trapdoor's minimum preimage width `s_min`, which relaxes the width at
+  which SampleRight simulates keys, as in the CP-ABE 1 of Datta et al. (ACM CCS 2026).
+
+`budget` splits `ε = 2^-30` between the regularity of TrapGen and the truncation of `chi` at `c`
+standard deviations. Selection checks these conditions and the numeric range of the key cutoff
+(below `2^52` and `q / 2`) and returns `PeError::Parameters` otherwise. The Ring-LWE estimate
+covers the encryption secret; TrapGen is uniform by regularity.
 
 The budget bounds statistical distances assuming that every sampler returns its ideal discrete
-Gaussian. The floating-point error of the sampling primitives (as in OpenFHE), the preimage widths
-(the same heuristic singular-value estimate as the existing sampler), and the truncation and
-rejection of preimages and key samples (cutoff `floor(6.5 σ_key)`) are heuristic and not budgeted.
-Flooding is evaluated per coefficient at `2^-s_flood` (default `s_flood = 30`), separately from
-`ε_total`, as in Noah's Ark. The `Strict` key width grows with the witness bound `B_R̂` and is
-rejected when its key cutoff is not below `2^52` and `q / 2`.
+Gaussian. The floating-point error of the sampling primitives (as in OpenFHE), the preimage widths,
+and the truncation and rejection of preimages and key samples (cutoff `floor(6.5 σ_key)`) are
+heuristic and not budgeted. The statistical key width `√(c_G² (1 + ŝ_1²) + r²)` uses the estimate
+`ŝ_1 = σ_T √n (√m̄ + √D + √(ln(n / (2δ))))`, `δ = 2^-10`, of `s_1(T)`; Setup checks it against the
+sampled `T` by factoring the perturbation covariance at every evaluation point, redraws `T` on a
+failure, and fails after 8 draws, so no key is sampled from a trapdoor the estimate does not
+cover. The factors (`(n / 2)(m̄ D + m̄ (m̄ + 1) / 2)` complex values) belong to the master secret key
+and stay in GPU memory.
 
 ## Conventions
 
 - An unauthorized decryption returns the rounded phase, which still contains the term
   `-F(x) (s G)_2 v_F`. It is not a reliable rejection, and toy parameters may reproduce the message
   by chance.
-- The anchor row is the public matrix of TrapGen. In the statistical instantiation it is
-  statistically close to uniform by the regularity conditions. In the computational one it keeps
-  the identity block and its `D + 2` columns, and the manuscript's uniform-anchor and anchor-width
-  requirements are not enforced.
+- The anchor row is the public matrix of TrapGen, statistically close to uniform by the
+  regularity conditions.
 - The setup's other public matrices are expanded from a public hash key and are assumed
   indistinguishable from the manuscript's uniform matrices.
 - Gaussian widths are the sampler's standard deviation `sigma`; the manuscript's width is
@@ -93,21 +115,16 @@ rejected when its key cutoff is not below `2^52` and `q / 2`.
 
 ## Tests
 
-**Unit tests** use small, insecure parameters with zero noise: the errors of `chi` and `chi_fl`
-are zero, so every evaluation is exact and the simulated bounds `E_F` and `E_PE` are zero. Each
+**Unit tests** use small, insecure parameters with zero noise: the errors of `chi` are zero, so every evaluation is exact and the simulated bounds `E_F` and `E_PE` are zero. Each
 round trip asserts that the simulated bound guarantees correctness (`4 E_PE + 2 < q`). The tests
-check exact relations: keys for several predicates decrypt one ciphertext with zero phase error
-(in both instantiations), every block of the family values equals the secret times `M_F` (with
+check exact relations: keys for several predicates decrypt one ciphertext with zero phase error,
+every block of the family values equals the secret times `M_F` (with
 the predicate term for `F(x) = 1`), and keys solve `M_F k = d_1 delta_1`. The statistical
-selection rejects zero widths, so the statistical round trip uses a test fixture with an explicit
-`m̄` and the minimum key width; separate tests check that the selection follows its budget,
-rejects narrow widths and wide anchors, and that `Strict` keys add the SampleRight width or are
-rejected as unrepresentable. The parameters are overridable with
-`MXX_PE_TEST_{RING_DIMENSION,CRT_DEPTH,CRT_BITS,BASE_BITS,TRAPDOOR_SIGMA,ERROR_SIGMA,FLOODING_SIGMA,PROGRAMMING_SIGMA}`,
-the instantiation with `MXX_PE_TEST_TRAPDOOR_INSTANTIATION` (`computational` or `statistical`,
-with `MXX_PE_TEST_M_BAR`), and the selection request with
-`MXX_PE_TEST_{KEY_WIDTH_POLICY,RANDOMNESS_SIGMA}`; nonzero error sigmas need parameters whose
-bound still guarantees correctness.
+selection rejects zero widths, so the tests use a fixture with an explicit `m̄`
+(`MXX_PE_TEST_M_BAR`, default `2 D`) and the minimum key width; separate tests check that the
+selection follows its budget and rejects narrow widths. The parameters are overridable with
+`MXX_PE_TEST_{RING_DIMENSION,CRT_DEPTH,CRT_BITS,BASE_BITS,TRAPDOOR_SIGMA,ERROR_SIGMA}`; nonzero
+error sigmas need parameters whose bound still guarantees correctness.
 
 ```bash
 cargo test -r -p mxx-pe --lib
@@ -123,10 +140,11 @@ cargo test -r -p mxx-pe --lib --features gpu -- --ignored gpu::
 and CRT depths for parameters that the instantiation accepts (by default the statistical one with
 `Practical` keys), whose simulated noise guarantees correctness, and whose Ring-LWE instances
 reach the security target (128 bits by default) according to `lattice-estimator-cli`. It then runs
-setup, encryption, and authorized and unauthorized key generation and decryption on the GPU. By
+on the GPU setup, the encryption of a random attribute, and key generation and decryption for two
+random programs of the class adjusted to output `0` (authorized) and `1` on it. By
 default its matrix artifacts stay in GPU memory (`MXX_PE_ROUND_TRIP_STORAGE=device`); the
 ciphertext's digit companions grow as `m² D n` polynomial coefficients, so large parameters, such
-as the statistical instantiation at `n = 2^14`, need `host` or `file` storage on a 16 GiB GPU. Its
+as `n = 2^14`, need `host` or `file` storage on a 16 GiB GPU. Its
 rustdoc lists the `MXX_PE_ROUND_TRIP_*` variables. The estimator must be on `PATH` with its Sage
 environment:
 
@@ -134,15 +152,14 @@ environment:
 cargo test -r -p mxx-pe --features gpu --test gpu_round_trip
 ```
 
-For the computational instantiation, the integration test checks only correctness and the two
-estimates; the anchor's identity column gives one sample with coefficient `1`, which the estimates
-do not model.
-
 ## Lean proofs
 
 [`lean/`](lean/README.md) proves, in Lean, the correctness claim that the integration test exports
-for a recorded parameter set of `lean/parameters.csv`. For the average-case rows
-`average-w2-n8192-crt5x30` and `average-w2-n8192-crt4x42`, the tapes on which a run meeting the
+(`MXX_PE_ROUND_TRIP_LEAN_EXPORT`) for a parameter set of `lean/parameters.csv`. The claim takes the
+attribute and the branching program as inputs, so it covers every attribute and every program of
+the class with `F(x) = 0`. For the average-case rows
+`average-w2-n8192-crt5x30`, `average-w2-n8192-crt4x42`, and the compact row
+`average-w2-n32768-crt6x30-compact` (of the earlier compact construction), the tapes on which a run meeting the
 input contract and the requirement decrypts a wrong message have measure at most `2^-128`.
 `lean/generator/gen.py` writes the proof of such a row from its exported claim; the proofs reuse the
 exponent-LUT Lean library and depend only on the standard axioms.

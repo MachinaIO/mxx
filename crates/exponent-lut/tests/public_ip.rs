@@ -173,6 +173,7 @@ fn noise_bindings(
                 element: value.independent_family_members(),
                 range: FamilyRange::full(count.clone()).expect("valid input family range"),
                 max_nonzero_payloads: 1u8.into(),
+                row_length: None,
             }),
         );
     }
@@ -462,7 +463,7 @@ fn public_ip_end_to_end() {
             (preprocess.production().clone(), encrypted.production().clone()),
             &row,
         );
-        mxx_ir_core::lean::protocol::export(&protocol, &directory).expect("claim export");
+        mxx_ir_core::lean::protocol::export(&protocol, &directory, false).expect("claim export");
         eprintln!("exported the public inner-product claim to {}", directory.display());
     }
 }
@@ -537,7 +538,11 @@ fn public_ip_protocol(
         .enumerate()
         .filter_map(|(coordinate, bit)| bit.then_some(coordinate))
         .collect::<Vec<_>>();
-    let family = |count: usize| FamilyType { element: IntType, count: IntExpr::constant(count) };
+    let family = |count: usize| FamilyType {
+        element: IntType,
+        count: IntExpr::constant(count),
+        member_slot: None,
+    };
 
     // The ideal residual count is zero, as a runtime integer like the decoded count.
     let ideal = DslContext::new("public-ip-ideal");

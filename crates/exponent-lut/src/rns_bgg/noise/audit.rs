@@ -166,12 +166,13 @@ fn parameter_artifact_bytes(
     }
     // Dynamic encryption publishes one package per RHS member and per
     // nonidentity automorphism of the LUTs, independent of the consuming
-    // gates: a gadget ciphertext of `2 m` polynomials (the automorphism ones
-    // are derived from their helper of `m` polynomials instead) and `m^2`
-    // digit companions of `m` polynomials each, all at the one ring.
+    // gates: a gadget ciphertext of `2 m` polynomials and `m^2` digit
+    // companions of `m` polynomials each; an automorphism package derives its
+    // ciphertext from a helper of `m` polynomials and has companions for the
+    // `m / 2` private digit rows only (`m^2 / 2`), all at the one ring.
     let m = parameters.component_columns(0)? * 2;
-    let package = |ciphertext: usize| -> Result<BigUint, RnsBggError> {
-        Ok(polynomial_bytes(0)? * (ciphertext + m * m * m))
+    let package = |ciphertext: usize, companions: usize| -> Result<BigUint, RnsBggError> {
+        Ok(polynomial_bytes(0)? * (ciphertext + companions * m))
     };
     for shape in program.rhs_inputs().values() {
         let count = match shape {
@@ -182,7 +183,7 @@ fn parameter_artifact_bytes(
                 .and_then(|count| count.to_usize())
                 .ok_or(RnsBggError::Binding("RHS family count is not concrete"))?,
         };
-        bytes += package(2 * m)? * count;
+        bytes += package(2 * m, m * m)? * count;
     }
     let dimension = parameters.level(0)?.ring_dimension() as usize;
     let mut automorphisms = std::collections::BTreeSet::new();
@@ -191,7 +192,7 @@ fn parameter_artifact_bytes(
             table.input_layout().automorphism_indices(dimension).map_err(|_| RnsBggError::Lut)?,
         );
     }
-    bytes += package(m)? * automorphisms.len().saturating_sub(1);
+    bytes += package(m, m * m / 2)? * automorphisms.len().saturating_sub(1);
     Ok(bytes)
 }
 
@@ -262,8 +263,7 @@ impl RnsBggParameters {
         // them, on one basis.
         if request.rhs_mode == RhsMode::Dynamic {
             for output in program.outputs() {
-                let (crate::program::Operand::Scalar(wire) |
-                crate::program::Operand::Member { family: wire, .. }) = output;
+                let wire = output.source();
                 let normalized =
                     workload.level(*wire)? +
                         usize::from(program.wire_is_coefficient_output(*wire).map_err(|_| {
@@ -309,19 +309,21 @@ impl RnsBggParameters {
         Ok(parameters)
     }
 
-    /// Evaluate the selected Program noise contract and terminal envelopes.
-    pub fn audit_program(
+    /// The noise trace of `program` under `bindings` with every wire's
+    /// evaluation budget checked: under the average-case model (when
+    /// `average` allows its acceptance) each wire's moments fit `q/4` of its
+    /// level at the tail of the program's event budget. Decryption outputs
+    /// are not checked (see [`Self::audit_program`]); a child Program whose
+    /// outputs are consumed by another computation uses this check alone.
+    /// Returns the trace and the tail multiplier `z^2` of the average model.
+    pub fn audit_evaluation(
         &self,
         program: &ExponentLutProgram,
         bindings: &RnsBggNoiseBindings,
-        terminal_value_bounds: &[BigUint],
         average: Option<&crate::decoder::simulation::AverageCaseConfig>,
-    ) -> Result<RnsBggNoiseTrace, RnsBggError> {
-        if terminal_value_bounds.len() != program.outputs().len() {
-            return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
-        }
+    ) -> Result<(RnsBggNoiseTrace, Option<NonnegativeRational>), RnsBggError> {
         let started = std::time::Instant::now();
-        let mut trace = trace_program(self, program, bindings).map_err(|error| match error {
+        let trace = trace_program(self, program, bindings).map_err(|error| match error {
             ProgramLowerError::Backend(error) => error,
             ProgramLowerError::Program(error) => RnsBggError::Graph(error.to_string()),
             ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
@@ -401,13 +403,26 @@ impl RnsBggParameters {
             }
         }
 
+        Ok((trace, z_squared))
+    }
+
+    /// Evaluate the selected Program noise contract and terminal envelopes.
+    pub fn audit_program(
+        &self,
+        program: &ExponentLutProgram,
+        bindings: &RnsBggNoiseBindings,
+        terminal_value_bounds: &[BigUint],
+        average: Option<&crate::decoder::simulation::AverageCaseConfig>,
+    ) -> Result<RnsBggNoiseTrace, RnsBggError> {
+        if terminal_value_bounds.len() != program.outputs().len() {
+            return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
+        }
+        let (mut trace, z_squared) = self.audit_evaluation(program, bindings, average)?;
+        let workload = RnsBggDerivedWorkload::from_program_with_parameters(self, program)?;
         for ((index, output), terminal_bound) in
             program.outputs().iter().enumerate().zip(terminal_value_bounds)
         {
-            let wire = match output {
-                crate::program::Operand::Scalar(id) |
-                crate::program::Operand::Member { family: id, .. } => *id,
-            };
+            let wire = *output.source();
             let value = trace
                 .outputs
                 .get(index)

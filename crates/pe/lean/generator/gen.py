@@ -7,8 +7,11 @@ Reads the row of `lean/parameters.csv` and the claim the integration test export
 `lean/<parameter id>/generated`, derives every parameter-dependent constant of the proof (the
 modulus, the digit counts, the gadget base, the cutoffs, the widths, and the hash tags), and fills
 `generator/templates` into `lean/<parameter id>`. The templates are the proof of
-`average-w2-n8192-crt5x30`; they hold for every row of the same class and predicate (one attribute
-bit, `F(x) = x₀`), ring dimension `2^13`, two digits per CRT prime, and the average noise model.
+`average-w2-n8192-crt5x30`; they hold for every row of the same class (one attribute bit and one
+step of width 1, for every attribute and every program of the class), ring dimension `2^13`, two
+digits per CRT prime, and the average noise model.
+A row with `compact_encodings = 1` is filled from `generator/templates_compact`, which proves the
+compact fresh encodings over `PQ` for any power-of-two ring dimension.
 Before writing, the script checks the numeric conditions the proof decides (`numeric_margin`,
 `margin_lt`) so that a row they reject fails here rather than in Lean.
 """
@@ -45,10 +48,10 @@ def one(pattern, text, what):
     return matches.pop()
 
 
-def online_bound(d, m, half, b0, bb, bz, bh):
-    inner = m * N * b0 * half + m * (d * N * bz * half + d * N * bz * half) + 1 * bb
-    return (d * N * inner * half +
-            d * N * (m * N * bh * half + (m * N * inner * half + m * (d * N * bz * half + d * N * bz * half) +
+def online_bound(d, m, half, b0, bb, bz, bh, n=N):
+    inner = m * n * b0 * half + m * (d * n * bz * half + d * n * bz * half) + 1 * bb
+    return (d * n * inner * half +
+            d * n * (m * n * bh * half + (m * n * inner * half + m * (d * n * bz * half + d * n * bz * half) +
                                           1 * bh)) * half)
 
 
@@ -59,17 +62,22 @@ def values(parameter_id):
     # The tail `N 2 exp(-x) <= N 2^(1 - x)` reaches `2^-fail` for `x >= fail + 20` at `N = 2^13`.
     fail = int(row['failure_exponent'])
     tail = fail + 20
-    if (row['attribute_length'], row['alphabet_size'], row['state_width'], row['max_steps'], row['reads'],
-            row['tables']) != ('1', '2', '1', '1', '0', '0:1'):
-        sys.exit('the templates prove the class (1, 2, 1, 1) with the predicate F(x) = x₀')
-    if int(row['ring_dimension']) != N:
+    if (row['attribute_length'], row['alphabet_size'], row['state_width'], row['max_steps']) != (
+            '1', '2', '1', '1'):
+        sys.exit('the templates prove the class (1, 2, 1, 1)')
+    compact = row.get('compact_encodings') == '1'
+    n = int(row['ring_dimension'])
+    if not compact and n != N:
         sys.exit(f'the templates prove the ring dimension {N}')
+    if n & (n - 1) or n < 2:
+        sys.exit('the ring dimension must be a power of two')
     # The templates model the computational TrapGen `[a | I | G - (a R + E)]` (`m_B = D + 2`) and
     # the default cutoffs; a statistical row needs proof templates of its own TrapGen.
     if row['trapdoor_instantiation'] != 'computational' or row['cutoff_multiplier'] != '6.5':
         sys.exit('the templates prove the computational instantiation with the default cutoffs')
     generated = os.path.join(LEAN, parameter_id, 'generated')
     backend = read(generated, 'Backend')
+    encrypt_text = read(generated, 'Stage_encrypt')
     q = int(one(r'RegularLayout (\d+) :=', backend, 'modulus'))
     moduli = [int(x) for x in one(r'def moduli0 : List Nat := \[([0-9, ]+)\]', backend, 'moduli').split(',')]
     base = int(one(r'base := (\d+)', backend, 'gadget base'))
@@ -108,14 +116,35 @@ def values(parameter_id):
     key_cutoff = int(key_cutoff)
     half = base // 2
     mb = d + 2
-    bf = online_bound(d, m, half, cf, mb * N * ce * ce, cf, ce)
-    bias = mb * N * ce * key_cutoff
+    compact_p = None
+    if compact:
+        pq = int(one(r'ExactMatrix (\d+) ' + str(n) + r' 1 1 := MxxRuntime\.matrixMulScalarLeft w_0_0 w_2_0',
+                     encrypt_text, 'compact modulus'))
+        if pq % q:
+            sys.exit('the compact modulus is not a multiple of q')
+        compact_p = pq // q
+        # The bounds of the expanded encodings (`expand_rel`).
+        expf = (cf * (q // 2) + (n + 2) * (compact_p // 2)) // compact_p
+        exph = (ce * (q // 2) + (n + 2) * (compact_p // 2)) // compact_p
+        bf = online_bound(d, m, half, expf, mb * n * ce * ce, expf, exph, n)
+        rowh = exph
+    else:
+        bf = online_bound(d, m, half, cf, mb * n * ce * ce, cf, ce, n)
+        rowh = ce
+    bias = mb * n * ce * key_cutoff
     mt = (q - 8) // 4 - (ce + 2) - 2 * bias
-    energy = m * N * (ce * ce + ce * ce + bf * bf)
+    energy = m * n * (rowh * rowh + rowh * rowh + bf * bf)
     if not (2 * bf < q and 2 * tail * sigma_bound * sigma_bound * energy <= mt * mt and
             4 * (ce + 1 + 2 * bias + mt) + 4 < q):
         sys.exit(f'{parameter_id}: the bounds of the proof do not reach a failure probability of 2^-{fail}')
+    extra = {}
+    if compact:
+        extra = {'P': str(compact_p), 'PQ': str(compact_p * q), 'HALFP': str(compact_p // 2),
+                 'EXPF': str(expf), 'EXPH': str(exph)}
+    extra.update({'N': str(n), 'K': str(n + 1), 'NM1': str(n - 1), 'TWONM1': str(2 * n - 1),
+                  'LOGN': str(n.bit_length() - 1)})
     return {
+        **extra,
         'ID': parameter_id,
         'FAIL': str(fail), 'TAIL': str(tail), 'TAIL2': str(2 * tail),
         'PACKAGE': 'MxxPe' + ''.join(part.capitalize() for part in parameter_id.split('-')),
@@ -135,7 +164,8 @@ def main():
     parameter_id = sys.argv[1]
     subst, log_bf = values(parameter_id)
     out = os.path.join(LEAN, parameter_id)
-    templates = os.path.join(HERE, 'templates')
+    compact = row_of(parameter_id).get('compact_encodings') == '1'
+    templates = os.path.join(HERE, 'templates_compact' if compact else 'templates')
     for name in sorted(os.listdir(templates)):
         with open(os.path.join(templates, name)) as f:
             text = f.read()

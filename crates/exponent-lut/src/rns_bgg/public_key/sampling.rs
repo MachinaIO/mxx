@@ -76,14 +76,14 @@ pub(crate) fn rhs_top(
     let next_level = level.checked_add(1).ok_or(RnsBggError::Parameters("RHS level overflow"))?;
     let ring = parameters.ring(next_level)?;
     let columns = parameters.component_columns(next_level)?;
-    let identity = parameters
-        .parameter_identity()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let mut tag = mxx_dsl::HashTag::from(
-        format!("rns-bgg/rhs/{identity}/{program:?}/{rhs:?}/{level}/{next_level}").into_bytes(),
-    );
+    // The parameter set and the Program are integer components, so chains of one refresh (which
+    // differ in them) differ only in integers.
+    let mut tag =
+        mxx_dsl::HashTag::from(format!("rns-bgg/rhs/{rhs:?}/{level}/{next_level}").into_bytes());
+    tag.push("parameters");
+    crate::rns_bgg::push_digest(&mut tag, &parameters.parameter_identity());
+    tag.push("program");
+    crate::rns_bgg::push_digest(&mut tag, program.as_bytes());
     if let Some(member) = member {
         tag.push("member");
         tag.push(member);

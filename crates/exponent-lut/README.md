@@ -31,16 +31,45 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
   lookup: its output key and its lookup branches' product keys. Online evaluation imports them
   and accumulates only the encoding rows. Products and lookups inside family bodies recompute the
   same action from the setup.
-  A setup may split its cyclic group `H` into baby steps `B` and giant steps `G`
-  (`RnsBggDynamicSetup::with_baby_steps`): encryption then publishes switching packages for
-  `(B u G) \ {1}` only (about `2 sqrt |H|` instead of `|H| - 1`), and a branch `k = g b` is switched
-  as `Aut_g(Aut_b(c))`, which adds one decomposition gain to its noise.
-  A setup may also publish its fresh encodings compactly
-  (`RnsBggDynamicSetup::with_compact_encodings`): each digit companion, automorphism helper, and
-  private scalar input is a two-column row `s (Ã - p X I_2) + e` over `pq` for an extension `p` of
-  the level's own size, and readers expand it to the full gadget width at `q` by
-  `ModSwitch_{pq -> q}(c G̃)`. The expansion adds about `B q / p + (n + 3) / 2` to the error, and
-  the simulator carries each expanded row as an opaque term. GSW ciphertexts stay at `q`.
+  A setup may decompose its cyclic group `H = <g>` of order `B^r` in radix `B`
+  (`RnsBggDynamicSetup::with_lut_radix`): encryption then publishes switching packages for
+  `K_B = {g^(a B^j) : 1 <= a < B, j < r}` only (`(B - 1) log_B |H|` instead of `|H| - 1`) and
+  helpers for `J_B = K_B u K_B^-1`. A branch `k = g^e` is switched once per nonzero radix-`B`
+  digit of `e`, from the branch without its top digit, so a lookup still performs `|H| - 1`
+  switches, in a tree of depth at most `log_B |H|`; each switch adds one decomposition gain to the
+  noise of the branches below it. `B = |H|` is the direct switching.
+  A setup may also publish its digit companions compactly
+  (`RnsBggDynamicSetup::with_compact_encodings`): each is a two-column row `s (Ã - p d I_2) + e`
+  over `pq` for an extension `p` of the level's own size, and readers expand it to the full gadget
+  width at `q` by `ModSwitch_{pq -> q}(c G̃)`. The expansion adds about `B q / p + (n + 3) / 2` to
+  the error, and the simulator carries each expanded row as an opaque term. Helpers, inputs, and
+  GSW ciphertexts stay at `q`.
+  Every RHS gadget ciphertext `C = [a; c]` has a public top row `a` that the setup hashes
+  (`rhs_public_top`); encryption samples only the bottom row `c` (`rhs_bottom`), in its own
+  prelude from the bound plaintexts or in an enclosing scheme's prelude, and, as for an
+  automorphism package's public top row, the digit rows of `a` need no companion, which halves
+  the package's companions.
+  A Dynamic Program may declare integer data families (`ExponentLutProgramBuilder::data_family`)
+  whose values are supplied at run time (`ProgramData`) to preprocessing and online evaluation:
+  a root-scope private product may read the RHS member at a data entry (`Operand::Selected`),
+  and a lookup may take its table from data (`LutTable::from_data`). One graph then serves every
+  value of the data; preprocessing binds the data's commitment, and online evaluation checks it.
+  The noise simulator treats a selected member as member 0.
+
+## LUTs on public payloads
+
+A LUT may read a public input (or any public wire); its output is public, and its payload is
+evaluated in the clear from the table (constants or Program data). Encryption publishes nothing
+new: a public encoding has one secret for its mask and payload, so instead of a switching
+ciphertext each branch `k` is switched by the LUT helpers. The helper of `k^-1`, automorphed by
+`sigma_k`, switches the payload back with a public product that also applies the branch
+coefficient as a bounded scalar action, and the helper of `k` then switches the mask
+(`rns_bgg::public_lut`). Static helpers carry the level's scale, so a public LUT ends with one
+ModDown and its output is a public encoding at the next level in either output representation; a
+Static layout of stride above zero, whose automorphisms are not closed under inverses modulo `2n`,
+bridges each payload switch through a shortest word of the layout's own helpers;
+Dynamic LUTs read no digit companion and follow the setup's radix plan. A public coefficient
+output needs no finalization, but it is still not a LUT input or a product operand.
 
 Sampling contracts (`RnsBggGaussian`) keep their sigma as a `BigDecimal` and their cutoff as a
 `BigUint`, so a contract may be wide: above `2^40` the backends sample by convolution, as for the

@@ -20,26 +20,80 @@
 //! `X^{L(j)}`) is [`super::EncodingLowering::lut_coefficient`], so the table
 //! values enter only these public actions, never encryption.
 //!
-//! With a baby-step split of `H` ([`RnsBggDynamicSetup::with_baby_steps`]),
-//! a branch `k = g b` with a giant step `g != 1` and a baby step `b != 1` is
-//! switched as `Aut_g(Aut_b(c))` ([`composed_branches`]); every other branch
-//! is switched directly. Each switch acts on an encoding whose payload is a
-//! monomial, so the payload term of `C_g` keeps its `l1` norm one; the scalar
-//! actions, whose coefficients carry `W^-1`, are applied last, per branch.
-//! The product keys `T` of the first switches come first in a LUT's
-//! `branches` public action, then those of the composed giant switches.
+//! With a LUT radix `B` ([`RnsBggDynamicSetup::with_lut_radix`]), a branch
+//! `k = g^e` is switched once per nonzero radix-`B` digit of `e`: the branch
+//! `parent(k)` without the top digit is switched by `g^(a_top B^top)`, so the
+//! branches form a tree of depth at most `log_B |H|` whose `|H| - 1` switches
+//! share their intermediate results ([`radix_plan`]). Each switch acts on an
+//! encoding whose payload is a monomial, so the payload term of `C_k` keeps
+//! its `l1` norm one; the scalar actions, whose coefficients carry `W^-1`,
+//! are applied last, per branch. A LUT's `branches` public action holds the
+//! product keys `T` depth by depth, in the order of [`RadixDepth::branches`].
+//!
+//! A LUT on a public payload switches its branches with the helpers alone,
+//! with no digit companion (see [`super::public_lut`]).
 //!
 //! With compact encodings ([`RnsBggDynamicSetup::with_compact_encodings`]),
-//! the fresh encodings are stored in two columns over `pq` and expanded where
+//! the digit companions are stored in two columns over `pq` and expanded where
 //! they are read ([`expand_compact_row`]); their keys are the expansions of
 //! `2 x 2` keys over `R_pq` ([`expand_compact_matrix`]).
 use super::*;
+use mxx_dsl::Int;
 
 /// `Select(selector, values)`: the value at position `selector`.
 pub(crate) fn select(values: &[usize], selector: IntExpr) -> IntExpr {
     IntExpr::Select {
         selector: Box::new(selector),
         branches: values.iter().map(|value| IntExpr::constant(*value)).collect(),
+    }
+}
+
+/// The output values of `table`: its constants, or its window of the Program's integer data
+/// inputs `data`.
+pub(crate) fn lut_entries<'a>(
+    table: &'a crate::program::LutTable,
+    data: &BTreeMap<crate::program::DataId, Family<Int>>,
+) -> Result<LutEntries<'a>, RnsBggError> {
+    if let Some(values) = table.values() {
+        return Ok(LutEntries::Constant(values));
+    }
+    let (family, offset) = table.data_values().ok_or(RnsBggError::Lut)?;
+    let family = data.get(&family).ok_or(RnsBggError::Binding("Program data is not bound"))?;
+    Ok(LutEntries::Graph { family: family.clone(), offset, width: table.input_width() })
+}
+
+/// The output values a LUT branch coefficient is built from: constants, or the `width` members
+/// of a Program data family from `offset` on, which a coefficient reads in a loop.
+#[derive(Clone)]
+pub(crate) enum LutEntries<'a> {
+    Constant(&'a [usize]),
+    Graph { family: Family<Int>, offset: usize, width: usize },
+}
+
+impl<'a> From<&'a [usize]> for LutEntries<'a> {
+    fn from(values: &'a [usize]) -> Self {
+        Self::Constant(values)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [usize; N]> for LutEntries<'a> {
+    fn from(values: &'a [usize; N]) -> Self {
+        Self::Constant(values)
+    }
+}
+
+impl<'a> From<&'a Vec<usize>> for LutEntries<'a> {
+    fn from(values: &'a Vec<usize>) -> Self {
+        Self::Constant(values)
+    }
+}
+
+impl LutEntries<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Constant(values) => values.len(),
+            Self::Graph { width, .. } => *width,
+        }
     }
 }
 
@@ -54,7 +108,7 @@ pub(crate) fn lut_automorphisms(
     table: &crate::program::LutTable,
 ) -> Result<Vec<usize>, RnsBggError> {
     parameters.dynamic_route(level)?;
-    if table.values().is_none() {
+    if !table.has_values() {
         return Err(RnsBggError::Binding("a Dynamic LUT needs its table values"));
     }
     let indices = table
@@ -87,6 +141,22 @@ pub(crate) fn automorphism_ciphertext(
     Ok((routed.0, (routed.1.0 - helper.0, routed.1.1 - helper.1)))
 }
 
+/// The top row `sigma_k(H^0_{k^-1})` of the switching ciphertext `C_k` (see
+/// [`automorphism_ciphertext`]), joined: it is public, so its digit rows need
+/// no companion (see [`super::automorphism_public_rows`]).
+pub(crate) fn automorphism_public_top(
+    parameters: &RnsBggParameters,
+    setup: &RnsBggDynamicSetup,
+    hash_key: mxx_dsl::Bytes,
+    k: IntExpr,
+    inverse: IntExpr,
+) -> Result<mxx_dsl::Mat, RnsBggError> {
+    let routed = map_row(setup.helper_key(parameters, hash_key, inverse)?.0, |entry| {
+        entry.ring_automorphism(k.clone())
+    });
+    Ok(super::join_row(&routed))
+}
+
 /// The `D x D` block `Dec_g(D g)` of the public scalar action
 /// `V_D = Dec_G(D G)` at `level`, for a public coefficient `D` in its ring.
 pub(crate) fn scalar_action(
@@ -102,61 +172,100 @@ pub(crate) fn scalar_action(
 }
 
 /// `row V_D` for a two-block row: each block times the `D x D` block.
-pub(crate) fn scalar_action_row(row: RnsBggRow, action: &Preimage) -> RnsBggRow {
-    map_row(row, |entry| entry.mul_small_rhs(action.clone()))
+pub(crate) fn scalar_action_row<D: RightAction>(row: RnsBggRow, action: &D) -> RnsBggRow {
+    map_row(row, |entry| action.clone().right_multiply(entry))
 }
 
 /// `A V_D` for a `2 x 2` block key.
-pub(crate) fn scalar_action_matrix(matrix: RnsBggMatrix, action: &Preimage) -> RnsBggMatrix {
-    map_matrix(matrix, |entry| entry.mul_small_rhs(action.clone()))
+pub(crate) fn scalar_action_matrix<D: RightAction>(
+    matrix: RnsBggMatrix,
+    action: &D,
+) -> RnsBggMatrix {
+    map_matrix(matrix, |entry| action.clone().right_multiply(entry))
 }
 
-/// The switching plan of a LUT's nonidentity branches under a baby-step
-/// split (see the module documentation).
-pub(crate) struct ComposedBranches {
-    /// The first switches, ascending: every directly switched branch and the
-    /// baby step of every composed branch.
-    pub(crate) first: Vec<usize>,
-    /// Every directly switched branch `k` with its position in `first`.
-    pub(crate) direct: Vec<(usize, usize)>,
-    /// Every composed branch `k = g b`: `(k, g, position of b in first)`.
-    pub(crate) composed: Vec<(usize, usize, usize)>,
+/// The branches of one depth of a LUT's radix plan (see the module
+/// documentation).
+pub(crate) struct RadixDepth {
+    /// The branches switched at this depth: the parents of the next depth
+    /// first, then the others, each ascending.
+    pub(crate) branches: Vec<usize>,
+    /// The automorphism switching each branch from its parent.
+    pub(crate) switches: Vec<usize>,
+    /// The position of each branch's parent among the previous depth's
+    /// branches; zero at the first depth, whose parent is the input.
+    pub(crate) parents: Vec<usize>,
+    /// The number of leading branches that are parents of the next depth.
+    pub(crate) internal: usize,
 }
 
-/// The switching plan of the nonidentity branches `switched` of a LUT.
-pub(crate) fn composed_branches(
+/// The radix plan of the nonidentity branches `switched` of a LUT, depth by
+/// depth. Every parent of a branch is itself a branch (or the identity): the
+/// branches of a LUT form a subgroup of the cyclic `H`, which removing a top
+/// radix digit keeps.
+pub(crate) fn radix_plan(
     setup: &RnsBggDynamicSetup,
     switched: &[usize],
-) -> Result<ComposedBranches, RnsBggError> {
-    let mut first = std::collections::BTreeSet::new();
-    let mut pairs = Vec::with_capacity(switched.len());
+) -> Result<Vec<RadixDepth>, RnsBggError> {
+    let mut steps = BTreeMap::new();
     for k in switched {
-        let (giant, baby) = setup.decomposition(*k)?;
-        let composed = giant != 1 && baby != 1;
-        first.insert(if composed { baby } else { *k });
-        pairs.push((*k, giant, baby, composed));
+        steps.insert(*k, setup.radix_step(*k)?);
     }
-    let first = first.into_iter().collect::<Vec<_>>();
-    let position = |k: usize| first.binary_search(&k).expect("first switch");
-    let direct = pairs
-        .iter()
-        .filter(|(_, _, _, composed)| !composed)
-        .map(|(k, ..)| (*k, position(*k)))
-        .collect();
-    let composed = pairs
-        .iter()
-        .filter(|(_, _, _, composed)| *composed)
-        .map(|(k, giant, baby, _)| (*k, *giant, position(*baby)))
-        .collect();
-    Ok(ComposedBranches { first, direct, composed })
+    let mut depths = BTreeMap::<usize, usize>::new();
+    let depth_of = |k: usize| -> Result<usize, RnsBggError> {
+        let mut depth = 0;
+        let mut current = k;
+        while current != 1 {
+            current = steps
+                .get(&current)
+                .ok_or(RnsBggError::Parameters("a radix parent is not a LUT branch"))?
+                .0;
+            depth += 1;
+        }
+        Ok(depth)
+    };
+    for k in switched {
+        depths.insert(*k, depth_of(*k)?);
+    }
+    let parents =
+        steps.values().map(|(parent, _)| *parent).collect::<std::collections::BTreeSet<_>>();
+    let max_depth = depths.values().copied().max().unwrap_or(0);
+    let mut plan: Vec<RadixDepth> = Vec::with_capacity(max_depth);
+    for depth in 1..=max_depth {
+        let (internal, leaves): (Vec<usize>, Vec<usize>) = depths
+            .iter()
+            .filter(|(_, d)| **d == depth)
+            .map(|(k, _)| *k)
+            .partition(|k| parents.contains(k));
+        let branches = internal.iter().chain(&leaves).copied().collect::<Vec<_>>();
+        let previous = plan.last().map(|depth| depth.branches.as_slice()).unwrap_or(&[]);
+        let parent_positions = branches
+            .iter()
+            .map(|k| match steps[k].0 {
+                1 => Ok(0),
+                parent => previous
+                    .iter()
+                    .position(|candidate| *candidate == parent)
+                    .ok_or(RnsBggError::Parameters("a radix parent is not a LUT branch")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        plan.push(RadixDepth {
+            switches: branches.iter().map(|k| steps[k].1).collect(),
+            parents: parent_positions,
+            internal: internal.len(),
+            branches,
+        });
+    }
+    Ok(plan)
 }
 
 /// `ModSwitch_(pq -> q)(entry G~)` at `level`: the `1 x 1` `entry` over the
 /// compact ring times the lift `G~` of the `1 x D` `gadget` (its centered
-/// integers re-encoded in `R_pq`), rounded to the level ring. For a compact
+/// integers re-encoded in `R_pq`), rounded to the level ring: the
+/// manuscript's decompression `Dc` of one entry. For a compact
 /// encoding `c = s (A - p X I_2) + e`, the expansion of each component is the
 /// component of `s (A' - X G) + e'` (see [`compact_expansion_bound`]).
-pub(crate) fn expand_compact_entry(
+pub fn expand_compact_entry(
     parameters: &RnsBggParameters,
     setup: &RnsBggDynamicSetup,
     level: usize,
@@ -177,32 +286,11 @@ pub(crate) fn expand_compact_row(
     level: usize,
     row: RnsBggRow,
 ) -> Result<RnsBggRow, RnsBggError> {
-    expand_compact_row_with(parameters, setup, level, &parameters.public_gadget(level)?, row)
-}
-
-/// [`expand_compact_row`] under `gadget` (the state gadget for a private input).
-pub(crate) fn expand_compact_row_with(
-    parameters: &RnsBggParameters,
-    setup: &RnsBggDynamicSetup,
-    level: usize,
-    gadget: &Mat,
-    row: RnsBggRow,
-) -> Result<RnsBggRow, RnsBggError> {
+    let gadget = parameters.public_gadget(level)?;
     Ok((
-        expand_compact_entry(parameters, setup, level, gadget, row.0)?,
-        expand_compact_entry(parameters, setup, level, gadget, row.1)?,
+        expand_compact_entry(parameters, setup, level, &gadget, row.0)?,
+        expand_compact_entry(parameters, setup, level, &gadget, row.1)?,
     ))
-}
-
-/// A stored compact companion or helper row (two `1 x 1` entries over `pq`)
-/// expanded at the setup ring under the public gadget, as every reader of the
-/// setup's packages expands it.
-pub fn expand_stored_row(
-    parameters: &RnsBggParameters,
-    setup: &RnsBggDynamicSetup,
-    row: RnsBggRow,
-) -> Result<RnsBggRow, RnsBggError> {
-    expand_compact_row(parameters, setup, 0, row)
 }
 
 /// The expansion `A' = ModSwitch_(pq -> q)(A~ G~)` of a compact `2 x 2` key
@@ -215,8 +303,14 @@ pub(crate) fn expand_compact_matrix(
     matrix: RnsBggMatrix,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     Ok((
-        expand_compact_row_with(parameters, setup, level, gadget, matrix.0)?,
-        expand_compact_row_with(parameters, setup, level, gadget, matrix.1)?,
+        (
+            expand_compact_entry(parameters, setup, level, gadget, matrix.0.0)?,
+            expand_compact_entry(parameters, setup, level, gadget, matrix.0.1)?,
+        ),
+        (
+            expand_compact_entry(parameters, setup, level, gadget, matrix.1.0)?,
+            expand_compact_entry(parameters, setup, level, gadget, matrix.1.1)?,
+        ),
     ))
 }
 

@@ -11,6 +11,8 @@ pub struct Family<T: GraphValue> {
     pub(super) values: Vec<ValueHandle>,
     pub(super) element_schema: T::Schema,
     pub(super) count: IntExpr,
+    /// See [`FamilyType::member_slot`].
+    pub(super) member_slot: Option<u32>,
 }
 
 impl<T: GraphValue> Family<T> {
@@ -51,12 +53,22 @@ impl<T: GraphValue> Family<T> {
                 node.output(0).expect("packed family field")
             })
             .collect();
-        Ok(Self { values, element_schema: schema, count })
+        Ok(Self { values, element_schema: schema, count, member_slot: None })
     }
 
     /// Reads one element. Compile-time and runtime indices have the same surface API.
     #[track_caller]
     pub fn at(&self, index: impl Into<Int>) -> T {
+        if let Some(slot) = self.member_slot {
+            assert!(
+                self.element_schema
+                    .wire_types()
+                    .iter()
+                    .all(|ty| { ty.substitute_loop_index(slot, &IntExpr::constant(0)) == *ty }),
+                "member access of a family whose element types depend on the member index is \
+                 not supported"
+            );
+        }
         let index = index.into();
         let expression =
             index.compile_expression().filter(|expression| !expression.contains_loop_index());
@@ -98,7 +110,12 @@ impl<T: GraphValue> Family<T> {
                     Ok(self.values[position].clone())
                 })
                 .collect::<Result<Vec<_>, DslError>>()?;
-            Ok(Family { values, element_schema: result.schema(), count: self.count.clone() })
+            Ok(Family {
+                values,
+                element_schema: result.schema(),
+                count: self.count.clone(),
+                member_slot: self.member_slot,
+            })
         })
     }
 
@@ -133,7 +150,7 @@ impl<T: GraphValue> Family<T> {
                 .expect("family input field")
             })
             .collect();
-        Self { values, element_schema, count }
+        Self { values, element_schema, count, member_slot: None }
     }
 }
 
@@ -168,6 +185,7 @@ impl Family<Int> {
             values: vec![node.output(0).expect("integer matrix-vector product")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 }
@@ -215,7 +233,12 @@ impl Family<Trapdoor> {
         )
         .output(0)
         .expect("trapdoor family secret input");
-        Self { values: vec![public.values[0].clone(), secret], element_schema, count }
+        Self {
+            values: vec![public.values[0].clone(), secret],
+            element_schema,
+            count,
+            member_slot: None,
+        }
     }
 }
 
@@ -226,7 +249,11 @@ impl<T: GraphValue> GraphValue for Family<T> {
     }
 
     fn schema(&self) -> Self::Schema {
-        FamilyType { element: self.element_schema.clone(), count: self.count.clone() }
+        FamilyType {
+            element: self.element_schema.clone(),
+            count: self.count.clone(),
+            member_slot: self.member_slot,
+        }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         if values.iter().map(|value| value.wire_type().clone()).collect::<Vec<_>>() !=
@@ -238,6 +265,7 @@ impl<T: GraphValue> GraphValue for Family<T> {
             values: values.to_vec(),
             element_schema: schema.element.clone(),
             count: schema.count.clone(),
+            member_slot: schema.member_slot,
         })
     }
 }
@@ -262,14 +290,24 @@ impl<S: GraphValueSchema> GraphValueSchema for FamilyType<S> {
                 .expect("family argument")
             })
             .collect();
-        Family { values, element_schema: self.element.clone(), count: self.count.clone() }
+        Family {
+            values,
+            element_schema: self.element.clone(),
+            count: self.count.clone(),
+            member_slot: self.member_slot,
+        }
     }
     fn wire_types(&self) -> Vec<WireType> {
         self.element
             .wire_types()
             .into_iter()
             .map(|element| WireType::IndexedFamily {
-                element: Box::new(element),
+                element: Box::new(match self.member_slot {
+                    Some(slot) => {
+                        element.substitute_loop_index(slot, &IntExpr::LoopIndex(MEMBER_INDEX))
+                    }
+                    None => element,
+                }),
                 count: self.count.clone(),
             })
             .collect()
@@ -379,6 +417,7 @@ mod tests {
         let schema = FamilyType {
             element: (MatType(ring.matrix_type((1, 1))), IntType, BoolType),
             count: 4.into(),
+            member_slot: None,
         };
         let inputs: Family<(Mat, Int, Bool)> = context.input("records", schema).unwrap();
         let output = parallel(4, |i| Ok(inputs.at(i))).unwrap();

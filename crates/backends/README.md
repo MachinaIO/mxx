@@ -51,7 +51,10 @@ ValidatedGraph --> executor::execute(.., &mut CpuDcrtBackend, ..)   CPU, node by
 - **Multiple GPUs through copies.** A plan spreads matrix products, preimage tiles, and loop
   lanes over its devices, and moves data between devices only with copy nodes.
 - **Two trapdoor instantiations.** A trapdoor's type (`TrapdoorInstantiation` in `mxx-ir-core`)
-  fixes its public width and secret layout. The statistical trapdoor keeps `T` in row chunks; its
-  perturbation sampler never forms `T T*` or `T* T` but evaluates the conditional covariance with
-  a Chebyshev expansion over the Fourier spectra of `T`, on the CPU and in CUDA. The samplers'
+  fixes its public width and secret layout. The statistical trapdoor keeps `T` in row chunks with
+  a precomputation from TrapGen: the Fourier values of `T` and the per-point Cholesky factors of
+  the perturbation covariance for the trapdoor's preimage width (DRTV26), which stay in GPU
+  memory and are serialized with the trapdoor. TrapGen redraws `T` while the factorization fails,
+  which checks the singular-value estimate against the actual `T`, and the perturbation is
+  Peikert's convolution sampler with randomized rounding, on the CPU and in CUDA. The samplers'
   floating-point error is heuristic, as in OpenFHE.

@@ -62,7 +62,7 @@ fn output_wire_carrier(
         .ok_or_else(|| ApiError::input("verification output index is out of range"))?
     {
         Operand::Scalar(wire) => *wire,
-        Operand::Member { family, .. } => program
+        Operand::Member { family, .. } | Operand::Selected { family, .. } => program
             .family_body_outputs()
             .into_iter()
             .find_map(|(output, inner)| (output == *family).then_some(inner))
@@ -299,6 +299,397 @@ where
     if let Some(binding) = &mask.binding {
         binding.bind(&mut runtime);
     }
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
+        execution,
+        store,
+        before_execute,
+    )?;
+    let value = outputs
+        .outputs
+        .get("decoded-residual")
+        .ok_or_else(|| ApiError::input("decoded residual is missing"))?;
+    let [value] = <[BigInt; 1]>::try_from(execution.download_integers(value)?)
+        .map_err(|_| ApiError::input("decoded residual is not one integer"))?;
+    Ok(value)
+}
+
+/// The error `e' = y - (s A' - Delta mu G_Q)` of the refreshed row `y`
+/// (output `refresh` of an [`crate::api::online_eval`] with
+/// `declaration`'s refresh of `source`) for the target plaintext `expected`
+/// (a signed monomial `c X^k`), under the caller's mask (for Dynamic
+/// parameters, the payload secret): per gadget column of `G_Q`, the `n`
+/// coefficients centered modulo `Q`. `A'` is sampled from `hash_key`, and
+/// `Delta` and `G_Q` are those of the target's level. The graph is the one
+/// check of the workflow: its inputs are the row (`refresh-row`), the mask,
+/// the hash key and the plaintext `refresh-expected.coefficient` and
+/// `refresh-expected.exponent`; its output `refresh-error` is the row error.
+#[allow(clippy::too_many_arguments)]
+pub fn refresh_error<E, S, P>(
+    declaration: &crate::refresh::RefreshDeclaration,
+    source: &ExponentLutProgram,
+    result: &StageOutputs,
+    parameters: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    mask: Option<&RnsBggMaskSecret>,
+    expected: &P,
+    hash_key: &[u8],
+    execution: &mut E,
+    store: &mut S,
+) -> Result<Vec<Vec<BigInt>>, ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+    P: Poly,
+{
+    let level = parameters.refresh_level(declaration, source).map_err(ApiError::scheme)?;
+    let ring = parameters.ring(level).map_err(ApiError::scheme)?;
+    let columns = parameters.level(level).map_err(ApiError::scheme)?.modulus_digits();
+    let mut runtime = BTreeMap::new();
+    runtime.insert(
+        "refresh-row".to_owned(),
+        result
+            .outputs
+            .get("refresh")
+            .ok_or_else(|| ApiError::input("the refreshed row is missing"))?
+            .clone(),
+    );
+    runtime.insert(super::HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.into()));
+    let expected = match super::plaintext_inputs(
+        &ring,
+        "refresh-expected",
+        &InputBinding::Scalar(expected.clone()),
+        &mut runtime,
+    )
+    .map_err(ApiError::input)?
+    {
+        InputBinding::Scalar(expected) => expected,
+        InputBinding::Family(_) => unreachable!("a scalar plaintext binds a scalar"),
+    };
+    let mask = &stage_mask(parameters, payload, mask)?;
+    let s = reduce_secret(parameters, &mask.row, level).map_err(ApiError::scheme)?;
+    let a_prime = parameters
+        .refresh_matrix(level, ring.bytes_input(super::HASH_KEY_INPUT, hash_key.len()), declaration)
+        .map_err(ApiError::scheme)?;
+    let a_row = |row: usize| {
+        a_prime.clone().slice(
+            Some(mxx_ir_core::node::IndexRange {
+                start: IntExpr::constant(row),
+                end: IntExpr::constant(row + 1),
+            }),
+            None,
+        )
+    };
+    let delta = parameters
+        .scalar(level, parameters.message_scale(level).map_err(ApiError::scheme)?)
+        .map_err(ApiError::scheme)?;
+    let error = ring.input("refresh-row", (1, columns)) -
+        (s.0 * a_row(0) + s.1 * a_row(1) -
+            delta * expected * parameters.public_gadget(level).map_err(ApiError::scheme)?);
+    let graph = DslContext::new("rns-bgg-refresh-error")
+        .output("refresh-error", error)
+        .map_err(ApiError::scheme)?
+        .build()
+        .map_err(ApiError::scheme)?;
+    if let Some(binding) = &mask.binding {
+        binding.bind(&mut runtime);
+    }
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
+        execution,
+        store,
+        |_| Ok(()),
+    )?;
+    let error = execution.download_matrix(
+        outputs
+            .outputs
+            .get("refresh-error")
+            .ok_or_else(|| ApiError::input("the refresh error is missing"))?,
+    )?;
+    let modulus =
+        BigInt::from(parameters.level(level).map_err(ApiError::scheme)?.modulus().as_ref().clone());
+    Ok((0..columns)
+        .map(|column| {
+            error
+                .entry(0, column)
+                .coeffs_biguints()
+                .into_iter()
+                .map(|value| {
+                    let value = BigInt::from(value);
+                    if &value * 2u8 > modulus { value - &modulus } else { value }
+                })
+                .collect()
+        })
+        .collect())
+}
+
+/// The polynomial `sum_k v_k X^k` of the integer input family `{name}.coefficients` (one member
+/// per coefficient, centered), whose values `value` are inserted into `runtime`. Unlike
+/// [`super::plaintext_inputs`], `value` need not be a monomial.
+fn polynomial_input<P: Poly>(
+    ring: &mxx_dsl::Ring,
+    modulus: &BigUint,
+    name: &str,
+    value: &P,
+    runtime: &mut BTreeMap<String, RuntimeValue>,
+) -> Result<Mat, ApiError> {
+    let modulus = BigInt::from(modulus.clone());
+    let coefficients = value
+        .coeffs_biguints()
+        .into_iter()
+        .map(|value| {
+            let value = BigInt::from(value);
+            if &value * 2u8 > modulus { value - &modulus } else { value }
+        })
+        .collect::<Vec<_>>();
+    let count = coefficients.len();
+    let input = format!("{name}.coefficients");
+    runtime.insert(input.clone(), RuntimeValue::integer_values(coefficients));
+    let family = DslContext::new("polynomial")
+        .input::<mxx_dsl::Family<Int>>(
+            input,
+            mxx_dsl::FamilyType {
+                element: mxx_dsl::IntType,
+                count: IntExpr::constant(count),
+                member_slot: None,
+            },
+        )
+        .map_err(ApiError::scheme)?;
+    (0..count)
+        .map(|k| {
+            crate::rns_bgg::signed_monomial(
+                ring,
+                family.at(Int::constant(k as i64)),
+                Int::constant(k as i64),
+            )
+        })
+        .reduce(|sum, term| sum + term)
+        .ok_or_else(|| ApiError::input("an empty polynomial"))
+}
+
+/// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` (`j = 0, 1`) of the
+/// refresh to the top level, as graph values, and the runtime inputs they read: `y_j` recombines
+/// the residue inputs `residue-{chain}-{j}`; see [`top_refresh_error`].
+#[allow(clippy::too_many_arguments)]
+fn top_refresh_error_rows<P: Poly>(
+    top: &crate::refresh::top::TopRefreshDeclaration,
+    results: Option<&[[&StageOutputs; 2]]>,
+    reference: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    sigma: &P,
+    expected: &P,
+    hash_key: &[u8],
+) -> Result<([Mat; 2], BTreeMap<String, RuntimeValue>), ApiError> {
+    use crate::rns_bgg::refresh::{
+        child_hash_key, hash_key_input_name, top_matrix, top_output_ring, top_refresh_combine,
+    };
+    let declaration = top.reference();
+    let columns = declaration.columns();
+    if results.is_some_and(|results| results.len() != top.chains()) {
+        return Err(ApiError::input("one pair of part results per chain"));
+    }
+    let ring = reference.ring(0).map_err(ApiError::scheme)?;
+    let mut runtime = BTreeMap::new();
+    let namespace = top.matrix_namespace();
+    let key_name = hash_key_input_name(Some(&namespace));
+    let key = child_hash_key(hash_key, &namespace);
+    runtime.insert(key_name.clone(), RuntimeValue::Bytes(key.as_slice().into()));
+    let key = ring.bytes_input(key_name, key.len());
+    let modulus: BigUint = reference.level(0).map_err(ApiError::scheme)?.modulus().as_ref().clone();
+    let sigma = polynomial_input(&ring, &modulus, "top-refresh-sigma", sigma, &mut runtime)?;
+    let expected = match super::plaintext_inputs(
+        &ring,
+        "top-refresh-expected",
+        &InputBinding::Scalar(expected.clone()),
+        &mut runtime,
+    )
+    .map_err(ApiError::input)?
+    {
+        InputBinding::Scalar(value) => value,
+        InputBinding::Family(_) => unreachable!("a scalar plaintext binds a scalar"),
+    };
+    let r = reduce_secret(reference, &payload.row, 0).map_err(ApiError::scheme)?;
+    let delta = reference
+        .scalar(0, reference.message_scale(0).map_err(ApiError::scheme)?)
+        .map_err(ApiError::scheme)?;
+    let gadget = reference.state_gadget(0).map_err(ApiError::scheme)?;
+    let rows = [0, 1].map(|component| -> Result<Mat, ApiError> {
+        let part =
+            top.part(0, component).ok_or_else(|| ApiError::input("the top refresh has no part"))?;
+        let residues = (0..top.chains())
+            .map(|chain| {
+                let name = format!("residue-{chain}-{component}");
+                if let Some(results) = results {
+                    let value = results[chain][component]
+                        .outputs
+                        .get("refresh")
+                        .ok_or_else(|| ApiError::input("a part's residue is missing"))?
+                        .clone();
+                    runtime.insert(name.clone(), value);
+                }
+                let prime = top
+                    .output_prime(chain)
+                    .ok_or_else(|| ApiError::input("the top refresh has no such chain"))?;
+                Ok(mxx_dsl::Ring::from_crt_moduli(
+                    vec![IntExpr::from(prime)],
+                    declaration.ring_dimension,
+                )
+                .input(name, (1, columns)))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let refreshed = top_refresh_combine(top, residues).map_err(ApiError::scheme)?;
+        let a_prime = top_matrix(declaration, key.clone(), part);
+        let a_row = |row: usize| {
+            a_prime.clone().slice(
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(row),
+                    end: IntExpr::constant(row + 1),
+                }),
+                None,
+            )
+        };
+        let payload_secret = if component == 0 { r.0.clone() } else { r.1.clone() };
+        let encoding = sigma.clone() * a_row(0) + a_row(1) -
+            delta.clone() * payload_secret * expected.clone() * gadget.clone();
+        // A refresh of some slots only compares modulo their product `P`.
+        let encoding = if top.chains() == declaration.top.len() {
+            encoding
+        } else {
+            encoding.reduce_modulus(&top_output_ring(top))
+        };
+        Ok(refreshed - encoding)
+    });
+    let [first, second] = rows;
+    let rows = [first?, second?];
+    if let Some(binding) = &payload.binding {
+        binding.bind(&mut runtime);
+    }
+    Ok((rows, runtime))
+}
+
+/// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)`
+/// (`j = 0, 1`) of the refresh to the top level `top`: `y_j` recombines the
+/// output `refresh` of every part `(chain, j)` (`results[chain][j]`, the
+/// residue `y_j mod q`) modulo the product `P` of the refreshed primes (`Q_0` when every slot
+/// is refreshed); `sigma = (sigma_0, 1)` with the mask
+/// child's bit polynomial `sigma`, `x = expected`, `r` the payload secret,
+/// and `Delta_0`, `G^st_0` those of the reference chain `reference`
+/// ([`RnsBggParameters::top_refresh_chain`] with `None`). `A'_(j)` is
+/// sampled under the top refresh's matrix namespace of `hash_key`. Per
+/// column, the `n` coefficients centered modulo `P`.
+#[allow(clippy::too_many_arguments)]
+pub fn top_refresh_error<E, S, P>(
+    top: &crate::refresh::top::TopRefreshDeclaration,
+    results: &[[&StageOutputs; 2]],
+    reference: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    sigma: &P,
+    expected: &P,
+    hash_key: &[u8],
+    execution: &mut E,
+    store: &mut S,
+) -> Result<[Vec<Vec<BigInt>>; 2], ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+    P: Poly,
+{
+    let columns = top.reference().columns();
+    let (rows, runtime) =
+        top_refresh_error_rows(top, Some(results), reference, payload, sigma, expected, hash_key)?;
+    let mut graph = DslContext::new("rns-bgg-top-refresh-error");
+    for (component, row) in rows.into_iter().enumerate() {
+        graph = graph
+            .output(format!("top-refresh-error-{component}"), row)
+            .map_err(ApiError::scheme)?;
+    }
+    let graph = graph.build().map_err(ApiError::scheme)?;
+    let runtime = declared_runtime_inputs(&graph, runtime);
+    let outputs = crate::api::execute_graph(
+        StageGraph::new(graph, runtime, BTreeMap::new()),
+        &mxx_ir_core::ParamEnv::default(),
+        execution,
+        store,
+        |_| Ok(()),
+    )?;
+    let modulus = top.output_primes().into_iter().map(BigInt::from).product::<BigInt>();
+    let mut errors = [Vec::new(), Vec::new()];
+    for (component, rows) in errors.iter_mut().enumerate() {
+        let error = execution.download_matrix(
+            outputs
+                .outputs
+                .get(&format!("top-refresh-error-{component}"))
+                .ok_or_else(|| ApiError::input("the top refresh error is missing"))?,
+        )?;
+        *rows = (0..columns)
+            .map(|column| {
+                error
+                    .entry(0, column)
+                    .coeffs_biguints()
+                    .into_iter()
+                    .map(|value| {
+                        let value = BigInt::from(value);
+                        if &value * 2u8 > modulus { value - &modulus } else { value }
+                    })
+                    .collect()
+            })
+            .collect();
+    }
+    Ok(errors)
+}
+
+/// The decode stage of the refresh to the top level: the number of coefficients of the error
+/// rows of [`top_refresh_error`] that threshold-decode to one modulo 2 (an error of at least
+/// `P / 4`, `P` the product of the refreshed primes); zero when both rows are level-0 encodings
+/// of `expected` under `sigma` modulo `P` with errors below `P / 4`. Without `results` the graph is
+/// built and observed but not executed (its residue inputs `residue-{chain}-{j}` are then unbound),
+/// as the export of its claim needs.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_top_refresh<E, S, P>(
+    top: &crate::refresh::top::TopRefreshDeclaration,
+    results: Option<&[[&StageOutputs; 2]]>,
+    reference: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    sigma: &P,
+    expected: &P,
+    hash_key: &[u8],
+    execution: &mut E,
+    store: &mut S,
+    before_execute: impl FnOnce(&mxx_ir_core::ValidatedGraph) -> Result<(), ApiError>,
+) -> Result<BigInt, ApiError>
+where
+    E: StageExecution<S>,
+    S: SessionStore,
+    P: Poly,
+{
+    let columns = top.reference().columns();
+    let dimension = top.reference().ring_dimension as usize;
+    let (rows, runtime) =
+        top_refresh_error_rows(top, results, reference, payload, sigma, expected, hash_key)?;
+    let mut total = Int::constant(0);
+    for row in rows {
+        for column in 0..columns {
+            let entry = row.clone().slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(column),
+                    end: IntExpr::constant(column + 1),
+                }),
+            );
+            for decoded in entry.threshold_decode_ints(2u8, dimension) {
+                total = total.add(decoded);
+            }
+        }
+    }
+    let graph = DslContext::new("rns-bgg-top-refresh-decode")
+        .output("decoded-residual", total)
+        .map_err(ApiError::scheme)?
+        .build()
+        .map_err(ApiError::scheme)?;
     let runtime = declared_runtime_inputs(&graph, runtime);
     let outputs = crate::api::execute_graph(
         StageGraph::new(graph, runtime, BTreeMap::new()),
@@ -564,8 +955,10 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
+            artifact_prefix: None,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
             output_use: RnsOutputUse::default(),
             dynamic: None,
             current_site: None,
@@ -767,69 +1160,6 @@ mod test {
         RnsBggParameters::new(vec![high, low], sigma, 1).unwrap()
     }
 
-    /// Preprocess, encrypt and evaluate `program` with the private scalar
-    /// input bound to `input` under Static parameters, and return the online
-    /// result with the payload secret and the stage mask. The online
-    /// evaluation receives the Program without its LUT values.
-    fn run_without_rhs(
-        parameters: &RnsBggParameters,
-        program: &ExponentLutProgram,
-        lhs: &crate::api::PlaintextInputs<WireId, DCRTPoly>,
-        execution: &mut mxx_backends::authority::CpuExecution,
-        store: &mut MemoryArtifactStore,
-    ) -> (StageOutputs, RnsBggPayloadSecret, RnsBggMaskSecret) {
-        let hash_key: [u8; 32] = rand::random();
-        let context: [u8; 32] = rand::random();
-        let payload = RnsEncryptBuild::new(parameters, context)
-            .sample_payload_secret(execution, store, |_| Ok(()))
-            .unwrap();
-        let (preprocess, online_eval) = crate::api::preprocess(
-            program,
-            &ParamEnv::default(),
-            &crate::api::PlaintextInputs::<RhsId, DCRTPoly>::new(),
-            Some(&payload),
-            &hash_key,
-            crate::rns_bgg::RnsPreprocessBuild::new(parameters, context),
-            execution,
-            store,
-            |_, outputs| Ok(outputs),
-            |_| Ok(()),
-        )
-        .unwrap();
-        let mask = RnsEncryptBuild::new(parameters, rand::random())
-            .sample_mask_secret(execution, store, |_| Ok(()))
-            .unwrap();
-        let encrypted = crate::api::encrypt(
-            &program.encryption_inputs(),
-            &ParamEnv::default(),
-            lhs,
-            Some(&preprocess),
-            &payload,
-            Some(&mask),
-            &hash_key,
-            RnsEncryptBuild::new(parameters, context),
-            execution,
-            store,
-            |_| Ok(()),
-            |_| Ok(()),
-        )
-        .unwrap();
-        let result = crate::api::online_eval(
-            &program.without_lut_values(),
-            &ParamEnv::default(),
-            &online_eval,
-            &encrypted,
-            &hash_key,
-            RnsOnlineEvalBuild::new(parameters, context),
-            execution,
-            store,
-            |_, outputs| Ok(outputs),
-            |_| Ok(()),
-        )
-        .unwrap();
-        (result, payload, mask)
-    }
-
     /// A coefficient LUT at level 0 of a chain whose adjacent widths differ:
     /// online evaluation finalizes it once to the terminal level 1, scaling
     /// its `v G_1` payload by `G^-1(k)` to `k v`. Its residual
@@ -904,8 +1234,16 @@ mod test {
                 parameters.levels().iter().cloned(),
             ));
             let mut store = MemoryArtifactStore::default();
-            let (result, payload, mask) =
-                run_without_rhs(&parameters, &program, &lhs, &mut execution, &mut store);
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
+                &parameters,
+                &program,
+                &crate::program::ProgramData::new(),
+                true,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |_| (),
+            );
 
             let finalized = 1;
             let ring = parameters.ring(finalized).unwrap();
@@ -998,5 +1336,625 @@ mod test {
             .unwrap();
             assert_eq!(decoded, vec![BigInt::from(value.rem_euclid(t as i64))], "{mode:?}");
         }
+    }
+
+    /// A LUT on a public payload in Static mode (width 4, so that `k^-1 != k`
+    /// for two branches; stride 0 and stride 1, whose automorphism set is not
+    /// closed under inverses), with constant and Program-data table values: the
+    /// output is a public encoding at the next
+    /// (terminal) level in either representation, verification accepts the
+    /// table value for every input entry and both signs of the input
+    /// monomial, and rejects another value; the measured residual is within
+    /// the simulated bound.
+    #[test]
+    fn public_lut_verifies_in_both_representations() {
+        let parameters = unequal_width_parameters();
+        let input_level = &parameters.levels()[0];
+        let output_level = &parameters.levels()[1];
+        let values = vec![3usize, 5, 1, 6];
+        let exponent = crate::program::LutOutputRepresentation::Exponent(ExpLayout {
+            stride_log2: 0,
+            width_log2: 3,
+        });
+        let coefficient = crate::program::LutOutputRepresentation::Coefficient;
+        // Stride 0 has an inverse-closed automorphism set; stride 1 does not,
+        // so some bridges take several helpers.
+        let direct = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let strided = ExpLayout { stride_log2: 1, width_log2: 2 };
+        for (layout, representation, data_backed) in [
+            (direct, exponent, false),
+            (direct, coefficient, false),
+            (direct, exponent, true),
+            (strided, exponent, false),
+            (strided, coefficient, false),
+        ] {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+            let (table, data) = if data_backed {
+                let family = builder.data_family(values.len()).unwrap();
+                (
+                    LutTable::from_data(4, layout, 8, family, 0, representation).unwrap(),
+                    crate::program::ProgramData::new().with(family, values.clone()),
+                )
+            } else {
+                (
+                    LutTable::unary(4, layout, 8, values.clone(), representation).unwrap(),
+                    crate::program::ProgramData::new(),
+                )
+            };
+            let table = builder.register_lut(table).unwrap();
+            let output = builder.lut(Operand::Scalar(input), table).unwrap();
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            assert_eq!(program.wire_knowledge(output).unwrap(), AttributeKnowledge::PublicPayload);
+            assert_eq!(program.wire_coefficient_bound(output).unwrap(), None);
+            let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+            assert_eq!(workload.level(output).unwrap(), 1);
+            let bindings = crate::rns_bgg::RnsBggNoiseBindings::from_inputs(
+                &program,
+                &[crate::rns_bgg::RnsBggNoiseValue::sampled_encoding(
+                    &parameters,
+                    b"public-lut-input",
+                    &[BigInt::from(1u8)],
+                )],
+                &[],
+            )
+            .unwrap();
+            let report = crate::api::noise_simulate(
+                &program,
+                crate::rns_bgg::RnsNoiseBuild::new(&parameters, &program, &workload, &bindings)
+                    .unwrap(),
+                |_, outputs| Ok(outputs),
+            )
+            .unwrap();
+            let bound = report.outputs[0].bound.error.clone();
+            let modulus = parameters.level(1).unwrap().modulus();
+            assert!(&bound * 4u8 < *modulus.as_ref(), "{representation:?}: bound {bound}");
+            let expected = |value: usize, negative: bool| {
+                let plaintext = if representation.is_coefficient() {
+                    DCRTPoly::from_usize_to_constant(output_level, value)
+                } else {
+                    monomial(output_level, value)
+                };
+                if negative { -plaintext } else { plaintext }
+            };
+            for (entry, negative) in [(0, false), (1, true), (2, false), (3, true)] {
+                let plaintext = monomial(input_level, entry << layout.stride_log2);
+                let lhs = BTreeMap::from([(
+                    input,
+                    InputBinding::Scalar(if negative { -plaintext } else { plaintext }),
+                )]);
+                let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+                    parameters.levels().iter().cloned(),
+                ));
+                let mut store = MemoryArtifactStore::default();
+                let (result, payload, mask) = crate::test_support::run_without_rhs(
+                    &parameters,
+                    &program,
+                    &data,
+                    false,
+                    &lhs,
+                    &mut execution,
+                    &mut store,
+                    |_| (),
+                );
+                let verify = |value: usize, execution: &mut _, store: &mut _| {
+                    verify_output(
+                        &program,
+                        &result,
+                        0,
+                        &expected(value, negative),
+                        &parameters,
+                        &payload,
+                        Some(&mask),
+                        RnsOutputUse::DirectDecode,
+                        execution,
+                        store,
+                    )
+                };
+                verify(values[entry], &mut execution, &mut store).unwrap_or_else(|error| {
+                    panic!("{representation:?} entry {entry} negative {negative}: {error}")
+                });
+                // The measured residual `row - s A + s y g` is within the
+                // simulated bound.
+                let ring = parameters.ring(1).unwrap();
+                let columns =
+                    parameters.key_component_columns(1, AttributeKnowledge::PublicPayload).unwrap();
+                let mut runtime = BTreeMap::new();
+                for port in 0..6 {
+                    runtime.insert(
+                        format!("port-{port}"),
+                        result.outputs[&format!("output-0.{port}")].clone(),
+                    );
+                }
+                let port = |index: usize| ring.input(format!("port-{index}"), (1, columns));
+                let stage_mask = stage_mask(&parameters, &payload, Some(&mask)).unwrap();
+                let s = reduce_secret(&parameters, &stage_mask.row, 1).unwrap();
+                let y = plaintext_constant(&ring, &expected(values[entry], negative)) *
+                    parameters.public_gadget(1).unwrap();
+                let residual = |component: usize, s_i: Mat| {
+                    port(4 + component) -
+                        (s.0.clone() * port(component) + s.1.clone() * port(2 + component)) +
+                        s_i * y.clone()
+                };
+                let graph = DslContext::new("public-lut-residual")
+                    .output("residual-0", residual(0, s.0.clone()))
+                    .unwrap()
+                    .output("residual-1", residual(1, s.1.clone()))
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                if let Some(binding) = &stage_mask.binding {
+                    binding.bind(&mut runtime);
+                }
+                let runtime = declared_runtime_inputs(&graph, runtime);
+                let residuals = execute_graph(
+                    StageGraph::new(graph, runtime, BTreeMap::new()),
+                    &ParamEnv::default(),
+                    &mut execution,
+                    &mut store,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                let modulus = BigInt::from(parameters.level(1).unwrap().modulus().as_ref().clone());
+                for name in ["residual-0", "residual-1"] {
+                    let matrix =
+                        <mxx_backends::authority::CpuExecution as crate::api::StageExecution<
+                            MemoryArtifactStore,
+                        >>::download_matrix(
+                            &execution, &residuals.outputs[name]
+                        )
+                        .unwrap();
+                    for column in 0..columns {
+                        for coefficient in matrix.entry(0, column).coeffs_biguints() {
+                            let value = BigInt::from(coefficient);
+                            let centered =
+                                if &value * 2u8 > modulus { value - &modulus } else { value };
+                            assert!(
+                                centered.magnitude() <= &bound,
+                                "{representation:?}: residual {centered} exceeds the simulated \
+                                 bound {bound}"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    verify(values[(entry + 1) % 4], &mut execution, &mut store).is_err(),
+                    "{representation:?}: another value must be rejected"
+                );
+            }
+        }
+    }
+
+    /// A public LUT output is the public left operand of a product with a
+    /// private LUT output of the same table at the same level: the product
+    /// `X^(L(a) + L(b))` verifies, and another exponent is rejected.
+    #[test]
+    fn public_lut_output_multiplies_a_private_lut_output() {
+        let parameters = unequal_width_parameters();
+        let input_level = &parameters.levels()[0];
+        let output_level = &parameters.levels()[1];
+        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let values = vec![3usize, 5, 1, 6];
+        let mut builder = ExponentLutProgramBuilder::new();
+        let table = builder
+            .register_lut(
+                LutTable::unary(
+                    4,
+                    layout,
+                    8,
+                    values.clone(),
+                    crate::program::LutOutputRepresentation::Exponent(ExpLayout {
+                        stride_log2: 0,
+                        width_log2: 3,
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let public = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let public_value = builder.lut(Operand::Scalar(public), table).unwrap();
+        let private_value = builder.lut(Operand::Scalar(private), table).unwrap();
+        let output = builder
+            .mul_public(Operand::Scalar(public_value), Operand::Scalar(private_value))
+            .unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let (a, b) = (rand::random::<u32>() as usize % 4, rand::random::<u32>() as usize % 4);
+        let lhs = BTreeMap::from([
+            (public, InputBinding::Scalar(monomial(input_level, a))),
+            (private, InputBinding::Scalar(monomial(input_level, b))),
+        ]);
+        let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+            parameters.levels().iter().cloned(),
+        ));
+        let mut store = MemoryArtifactStore::default();
+        let (result, payload, mask) = crate::test_support::run_without_rhs(
+            &parameters,
+            &program,
+            &crate::program::ProgramData::new(),
+            false,
+            &lhs,
+            &mut execution,
+            &mut store,
+            |_| (),
+        );
+        let verify = |exponent: usize, execution: &mut _, store: &mut _| {
+            verify_output(
+                &program,
+                &result,
+                0,
+                &monomial(output_level, exponent),
+                &parameters,
+                &payload,
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
+                execution,
+                store,
+            )
+        };
+        verify(values[a] + values[b], &mut execution, &mut store).unwrap();
+        assert!(verify(values[a] + values[b] + 1, &mut execution, &mut store).is_err());
+    }
+
+    /// One LUT applied at one level to public and private payloads, in
+    /// family bodies and at root scope, in several orders: its root-scope
+    /// material holds the switching ciphertexts whenever a body uses it on a
+    /// private payload, a root private use completes a helpers-only entry,
+    /// every output verifies, and the LUT helpers are artifact inputs of the
+    /// root scope only (a family body captures them).
+    #[test]
+    fn public_and_private_uses_of_one_lut_share_its_material() {
+        #[derive(Clone, Copy, Debug)]
+        enum Use {
+            PublicBody,
+            PrivateBody,
+            PublicRoot,
+            PrivateRoot,
+        }
+        let parameters = unequal_width_parameters();
+        let input_level = &parameters.levels()[0];
+        let output_level = &parameters.levels()[1];
+        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let representation = crate::program::LutOutputRepresentation::Exponent(ExpLayout {
+            stride_log2: 0,
+            width_log2: 3,
+        });
+        let values = vec![3usize, 5, 1, 6];
+        let members = [1usize, 2];
+        for uses in [
+            vec![Use::PublicBody],
+            vec![Use::PublicBody, Use::PrivateBody, Use::PrivateRoot, Use::PublicRoot],
+            vec![Use::PublicRoot, Use::PrivateRoot, Use::PrivateBody, Use::PublicBody],
+            vec![Use::PublicBody, Use::PrivateRoot],
+            vec![Use::PrivateBody, Use::PublicRoot],
+        ] {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let table = builder
+                .register_lut(
+                    LutTable::unary(4, layout, 8, values.clone(), representation).unwrap(),
+                )
+                .unwrap();
+            let mut lhs = BTreeMap::new();
+            let mut outputs = Vec::new();
+            let mut expected = Vec::new();
+            for used in &uses {
+                let knowledge = match used {
+                    Use::PublicBody | Use::PublicRoot => AttributeKnowledge::PublicPayload,
+                    Use::PrivateBody | Use::PrivateRoot => AttributeKnowledge::PrivatePayload,
+                };
+                match used {
+                    Use::PublicBody | Use::PrivateBody => {
+                        let family = builder
+                            .input_family(IntExpr::constant(members.len()), knowledge)
+                            .unwrap();
+                        lhs.insert(
+                            family,
+                            InputBinding::Family(
+                                members.iter().map(|e| monomial(input_level, *e)).collect(),
+                            ),
+                        );
+                        let looked_up = builder
+                            .parallel(
+                                crate::program::FamilyRange::full(IntExpr::constant(members.len()))
+                                    .unwrap(),
+                                |b, o| {
+                                    b.lut(Operand::Member { family, index: o }, table)
+                                        .map(Operand::Scalar)
+                                },
+                            )
+                            .unwrap();
+                        outputs.push(Operand::Scalar(builder.sum(looked_up).unwrap()));
+                        expected.push(
+                            members.iter().fold(DCRTPoly::const_zero(output_level), |sum, e| {
+                                sum + monomial(output_level, values[*e])
+                            }),
+                        );
+                    }
+                    Use::PublicRoot | Use::PrivateRoot => {
+                        let input = builder.input(knowledge).unwrap();
+                        lhs.insert(input, InputBinding::Scalar(monomial(input_level, 3)));
+                        outputs.push(Operand::Scalar(
+                            builder.lut(Operand::Scalar(input), table).unwrap(),
+                        ));
+                        expected.push(monomial(output_level, values[3]));
+                    }
+                }
+            }
+            let program = builder.finish(outputs).unwrap();
+            let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+                parameters.levels().iter().cloned(),
+            ));
+            let mut store = MemoryArtifactStore::default();
+            let mut helper_inputs = 0;
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
+                &parameters,
+                &program,
+                &crate::program::ProgramData::new(),
+                false,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |graph| {
+                    // Every helper artifact is imported at root scope; a
+                    // family body only captures it (sealing then gives the
+                    // body its own copy of the captured input).
+                    let root = mxx_ir_core::graph::current_construction_scope();
+                    let mut helpers = BTreeMap::<String, bool>::new();
+                    for scope in graph.source.scopes().values() {
+                        for node in scope.nodes() {
+                            if let mxx_ir_core::node::NodeKind::Input {
+                                artifact: Some(artifact),
+                                ..
+                            } = node.kind() &&
+                                artifact.artifact_name.contains("lut-helper")
+                            {
+                                *helpers.entry(artifact.artifact_name.clone()).or_default() |=
+                                    node.construction_scope() == root;
+                            }
+                        }
+                    }
+                    for (name, at_root) in &helpers {
+                        assert!(at_root, "{uses:?}: LUT helper {name} is not a root-scope input");
+                    }
+                    helper_inputs = helpers.len();
+                },
+            );
+            assert!(helper_inputs > 0, "{uses:?}: the LUT helpers are read");
+            for (index, expected) in expected.iter().enumerate() {
+                verify_output(
+                    &program,
+                    &result,
+                    index,
+                    expected,
+                    &parameters,
+                    &payload,
+                    Some(&mask),
+                    RnsOutputUse::DirectDecode,
+                    &mut execution,
+                    &mut store,
+                )
+                .unwrap_or_else(|error| panic!("{uses:?}: output {index}: {error}"));
+            }
+        }
+    }
+
+    /// `X^k` in the negacyclic ring of `level`.
+    fn monomial(level: &DCRTPolyParams, k: usize) -> DCRTPoly {
+        let n = level.ring_dimension() as usize;
+        let value = DCRTPoly::const_rotate_poly(level, k % n);
+        if (k / n) % 2 == 1 { -value } else { value }
+    }
+
+    /// The private member family `X^(e_o)`, `o < exponents.len()`, and its
+    /// plaintext binding.
+    fn monomial_family(
+        builder: &mut ExponentLutProgramBuilder,
+        level: &DCRTPolyParams,
+        exponents: &[usize],
+    ) -> (WireId, crate::api::PlaintextInputs<WireId, DCRTPoly>) {
+        let input = builder
+            .input_family(IntExpr::constant(exponents.len()), AttributeKnowledge::PrivatePayload)
+            .unwrap();
+        let members = exponents.iter().map(|e| monomial(level, *e)).collect();
+        (input, BTreeMap::from([(input, InputBinding::Family(members))]))
+    }
+
+    /// A family body multiplies member `X^(e_o)` by `c = 2 - X^2` shifted to
+    /// `X^o`, and the members are summed: verification accepts
+    /// `sum_o (2 - X^2) X^(e_o + o)`, including a negacyclic wrap, and
+    /// rejects its successor.
+    #[test]
+    fn small_constant_multiplies_exponent_members_in_place() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let exponents = [1, 5, 14];
+        let mut builder = ExponentLutProgramBuilder::new();
+        let (input, lhs) = monomial_family(&mut builder, &level, &exponents);
+        let placed = builder
+            .parallel(
+                crate::program::FamilyRange::full(IntExpr::constant(exponents.len())).unwrap(),
+                |b, o| {
+                    b.mul_small_constant(
+                        Operand::Member { family: input, index: o.clone() },
+                        vec![2, 0, -1],
+                        o,
+                    )
+                    .map(Operand::Scalar)
+                },
+            )
+            .unwrap();
+        let output = builder.sum(placed).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let expected =
+            exponents.iter().enumerate().fold(DCRTPoly::const_zero(&level), |sum, (o, e)| {
+                let two = DCRTPoly::from_usize_to_constant(&level, 2);
+                sum + two * monomial(&level, e + o) - monomial(&level, e + o + 2)
+            });
+        let mut execution =
+            mxx_backends::authority::CpuExecution::new(cpu_backend([level.clone()]));
+        let mut store = MemoryArtifactStore::default();
+        let (result, payload, mask) = crate::test_support::run_without_rhs(
+            &parameters,
+            &program,
+            &crate::program::ProgramData::new(),
+            true,
+            &lhs,
+            &mut execution,
+            &mut store,
+            |_| (),
+        );
+        let verify = |expected: &DCRTPoly, execution: &mut _, store: &mut _| {
+            verify_output(
+                &program,
+                &result,
+                0,
+                expected,
+                &parameters,
+                &payload,
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
+                execution,
+                store,
+            )
+        };
+        verify(&expected, &mut execution, &mut store).unwrap();
+        let wrong = expected + DCRTPoly::const_one(&level);
+        assert!(verify(&wrong, &mut execution, &mut store).is_err());
+    }
+
+    /// Coefficient LUT samples `T[e_o]` placed at `X^o` by a monomial small
+    /// constant and summed: the finalized output decrypts to `T[e_o]` at
+    /// coefficient `o`, under both RHS modes.
+    #[test]
+    fn small_constant_places_coefficient_samples() {
+        // Without an RHS the run is Static; a Dynamic one needs a setup.
+        for mode in [RhsMode::Static] {
+            let parameters = unequal_width_parameters();
+            let level = parameters.levels()[0].clone();
+            let exponents = [3, 9, 12];
+            let values = (0..16).map(|e| e % 7).collect::<Vec<_>>();
+            let mut builder = ExponentLutProgramBuilder::new();
+            let (input, lhs) = monomial_family(&mut builder, &level, &exponents);
+            let table = builder
+                .register_lut(
+                    LutTable::unary(
+                        16,
+                        ExpLayout { stride_log2: 0, width_log2: 4 },
+                        7,
+                        values.clone(),
+                        crate::program::LutOutputRepresentation::Coefficient,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let placed = builder
+                .parallel(
+                    crate::program::FamilyRange::full(IntExpr::constant(exponents.len())).unwrap(),
+                    |b, o| {
+                        let sample =
+                            b.lut(Operand::Member { family: input, index: o.clone() }, table)?;
+                        b.mul_small_constant(Operand::Scalar(sample), vec![1], o)
+                            .map(Operand::Scalar)
+                    },
+                )
+                .unwrap();
+            let output = builder.sum(placed).unwrap();
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            let terminal = parameters.levels()[1].clone();
+            let mut coefficients = vec![0; 16];
+            for (o, e) in exponents.iter().enumerate() {
+                coefficients[o] = values[*e] as u32;
+            }
+            let expected = DCRTPoly::from_u32s(&terminal, &coefficients);
+            let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+                parameters.levels().iter().cloned(),
+            ));
+            let mut store = MemoryArtifactStore::default();
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
+                &parameters,
+                &program,
+                &crate::program::ProgramData::new(),
+                true,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |_| (),
+            );
+            verify_output(
+                &program,
+                &result,
+                0,
+                &expected,
+                &parameters,
+                &payload,
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
+                &mut execution,
+                &mut store,
+            )
+            .unwrap_or_else(|error| panic!("{mode:?}: {error:?}"));
+            let decoded = decode_output(
+                &program,
+                &result,
+                0,
+                &parameters,
+                &payload,
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
+                &[0, 1, 2, 3],
+                &mut execution,
+                &mut store,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let mut expected =
+                exponents.iter().map(|e| BigInt::from(values[*e])).collect::<Vec<_>>();
+            expected.push(BigInt::from(0u8));
+            assert_eq!(decoded, expected, "{mode:?}");
+        }
+    }
+
+    /// The simulated noise of `input * c` against that of `input`: a monomial
+    /// leaves the bound unchanged and `3 - 2 X^2` multiplies it by five.
+    #[test]
+    fn small_constant_noise_is_exact_for_monomials() {
+        let parameters = unequal_width_parameters();
+        let bound = |coefficients: Option<Vec<i64>>| {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+            let output = match coefficients {
+                Some(coefficients) => builder
+                    .mul_small_constant(Operand::Scalar(input), coefficients, IntExpr::constant(3))
+                    .unwrap(),
+                None => input,
+            };
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+            let bindings = crate::rns_bgg::RnsBggNoiseBindings::from_inputs(
+                &program,
+                &[crate::rns_bgg::RnsBggNoiseValue::sampled_encoding(
+                    &parameters,
+                    b"small-constant-input",
+                    &[BigInt::from(1u8)],
+                )],
+                &[],
+            )
+            .unwrap();
+            crate::api::noise_simulate(
+                &program,
+                crate::rns_bgg::RnsNoiseBuild::new(&parameters, &program, &workload, &bindings)
+                    .unwrap(),
+                |_, outputs| Ok(outputs),
+            )
+            .unwrap()
+            .outputs[0]
+                .bound
+                .clone()
+        };
+        let identity = bound(None);
+        assert_eq!(bound(Some(vec![0, -1])), identity);
+        let scaled = bound(Some(vec![3, 0, -2]));
+        assert_eq!(scaled.error, &identity.error * 5u8);
+        assert_eq!(scaled.payload_l1, &identity.payload_l1 * 5u8);
     }
 }

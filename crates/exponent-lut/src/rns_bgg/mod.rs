@@ -11,12 +11,14 @@ mod encoding;
 pub(crate) mod gpu;
 mod noise;
 mod public_key;
+mod public_lut;
+mod refresh;
 mod setup;
 mod workload;
 
 use bigdecimal::BigDecimal;
 use mxx_backends::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use mxx_dsl::{Family, Mat, Preimage, Ring, SmallMatrix};
+use mxx_dsl::{Bytes, Family, Mat, Preimage, Ring, SmallMatrix};
 use mxx_ir_core::{IntExpr, ring::ConcreteRing};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
@@ -34,24 +36,26 @@ use crate::{
     program_gadgets::prf::PrfError,
 };
 
-pub use dynamic::{compact_expansion_bound, expand_stored_row};
+pub use dynamic::{compact_expansion_bound, expand_compact_entry};
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineEvalBuild, decode_output, decode_public_output, verify_output,
+    RnsOnlineEvalBuild, decode_output, decode_public_output, decode_top_refresh, refresh_error,
+    top_refresh_error, verify_output,
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
     RnsBggDecoderNoise, RnsBggDynamicNoise, RnsBggMaskSecretComponent, RnsBggNoiseBindings,
     RnsBggNoiseBound, RnsBggNoiseEvaluator, RnsBggNoiseFamily, RnsBggNoiseRhs, RnsBggNoiseTrace,
-    RnsBggNoiseValue, RnsBggPackageNoise, RnsBggParameterManifest, RnsBggPlanRequest,
-    RnsNoiseBuild,
+    RnsBggNoiseValue, RnsBggParameterManifest, RnsBggPlanRequest, RnsBggRefreshNoise,
+    RnsNoiseBuild, simulate_refresh_noise,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
+pub use refresh::{refresh_fresh_namespace, refresh_mask_namespace};
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{
-    RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicRhs, RnsBggDynamicSetup,
-    RnsBggGaussian, RnsBggPackageSource, composed_automorphisms, covering_automorphism_layout,
-    helper_automorphisms, switching_automorphisms,
+    RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicSetup, RnsBggGaussian,
+    covering_automorphism_layout, helper_automorphisms, radix_depths, radix_step,
+    switching_automorphisms,
 };
 pub use workload::RnsBggDerivedWorkload;
 
@@ -80,25 +84,27 @@ fn decoder_commitment_hex(commitment: [u8; 32]) -> String {
     commitment.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// `decoder/<commitment>/<role>`: the namespace of every artifact of one
-/// decoder declaration.
-pub(crate) fn decoder_artifact_name(commitment: [u8; 32], role: &str) -> String {
-    format!("decoder/{}/{role}", decoder_commitment_hex(commitment))
+/// `decoder/<key>/<role>`: the namespace of every artifact of one decoder
+/// declaration (`key` its [`DecoderDeclaration::artifact_key`]).
+///
+/// [`DecoderDeclaration::artifact_key`]: crate::decoder::decoding::DecoderDeclaration::artifact_key
+pub(crate) fn decoder_artifact_name(key: &str, role: &str) -> String {
+    format!("decoder/{key}/{role}")
 }
 
-/// `decoder/<commitment>/smudge/<role>`: an artifact of the decoder's smudge
+/// `decoder/<key>/smudge/<role>`: an artifact of the decoder's smudge
 /// Program child.
-pub(crate) fn decoder_smudge_artifact_name(commitment: [u8; 32], role: &str) -> String {
-    decoder_artifact_name(commitment, &format!("smudge/{role}"))
+pub(crate) fn decoder_smudge_artifact_name(key: &str, role: &str) -> String {
+    decoder_artifact_name(key, &format!("smudge/{role}"))
 }
 
 /// The public-key artifact `port` of smudge Program input `wire`.
 pub(crate) fn decoder_smudge_input_key_artifact_name(
-    commitment: [u8; 32],
+    key: &str,
     wire: WireId,
     port: usize,
 ) -> String {
-    decoder_smudge_artifact_name(commitment, &format!("input-key/{wire:?}.{port}"))
+    decoder_smudge_artifact_name(key, &format!("input-key/{wire:?}.{port}"))
 }
 
 /// Build the canonical path of the switching ciphertexts of LUT `lut`
@@ -121,6 +127,47 @@ pub(crate) fn companion_count(
     output_columns: usize,
 ) -> Result<usize, RnsBggError> {
     Ok(4 * parameters.component_columns(level)? * output_columns)
+}
+
+/// Number of digit-companion encodings of one Dynamic package read at
+/// `level` whose leading `public_rows` digit rows are public (a public top row,
+/// see [`automorphism_public_rows`]): one per private digit row and output
+/// column.
+pub(crate) fn companion_count_without(
+    parameters: &RnsBggParameters,
+    level: usize,
+    output_columns: usize,
+    public_rows: usize,
+) -> Result<usize, RnsBggError> {
+    Ok(companion_count(parameters, level, output_columns)? - 2 * public_rows * output_columns)
+}
+
+/// Number `D` of leading digit rows of an automorphism package's switching
+/// ciphertext `C_k` that need no companion: its top row `sigma_k(H^0_{k^-1})`
+/// is public, so the key absorbs `A_{:,a} Dec(C_k)_{a,:}` for those rows (see
+/// [`companion_columns`]). The rows are the digits of the top entry of each
+/// stacked column `[top; bottom]`.
+pub(crate) fn automorphism_public_rows(
+    parameters: &RnsBggParameters,
+    level: usize,
+) -> Result<usize, RnsBggError> {
+    parameters.component_columns(level)
+}
+
+/// Number `m D` of digit-companion encodings of one automorphism package read
+/// at `level`: one per private digit row (the bottom row of `C_k`, see
+/// [`automorphism_public_rows`]) and output column.
+pub(crate) fn automorphism_companion_count(
+    parameters: &RnsBggParameters,
+    level: usize,
+    output_columns: usize,
+) -> Result<usize, RnsBggError> {
+    companion_count_without(
+        parameters,
+        level,
+        output_columns,
+        automorphism_public_rows(parameters, level)?,
+    )
 }
 
 /// Errors raised by the retained RNS-BGG contracts.
@@ -719,33 +766,17 @@ impl RnsBggParameters {
     }
 
     /// The largest `l1` norm of [`Self::gadget_inverse`] over `weights`: the
-    /// sum over towers of the base-`B` digits of `weight mod q_t`.
+    /// balanced digits of each weight, as the runtime decomposes it (see
+    /// [`Self::gadget_inverse_norms`]).
     pub(crate) fn gadget_inverse_l1(
         &self,
         gadget_level: usize,
         weights: &[BigUint],
     ) -> Result<BigUint, RnsBggError> {
-        let parameters = self.level(gadget_level)?;
-        let base = BigUint::from(public_gadget_base(parameters.base_bits())?);
-        let primes = parameters.to_crt().0;
-        Ok(weights
-            .iter()
-            .map(|weight| {
-                primes
-                    .iter()
-                    .map(|prime| {
-                        let mut residue = weight % prime;
-                        let mut sum = BigUint::zero();
-                        while !residue.is_zero() {
-                            sum += &residue % &base;
-                            residue /= &base;
-                        }
-                        sum
-                    })
-                    .sum::<BigUint>()
-            })
-            .max()
-            .unwrap_or_default())
+        weights.iter().try_fold(BigUint::zero(), |largest, weight| {
+            let (l1, _) = self.gadget_inverse_norms(gadget_level, weight)?;
+            Ok(largest.max(l1))
+        })
     }
 
     /// The decryption modulus `t = 2 (W + 1)` of a coefficient output with
@@ -1100,13 +1131,12 @@ impl RnsBggParameters {
         primes_per_drop: usize,
     ) -> Result<Self, RnsBggError> {
         let level = Self::decoder_source_level(declaration, source_program)?;
-        let decoding = self.level(level)?;
         let smudge_level = Self::decoder_smudge_level(declaration)?;
         if self.rhs_mode == RhsMode::Dynamic {
             // The smudge is evaluated at the source modulus itself, with a
             // gadget successor after its normalized members.
             let smudge = Self::new(
-                vec![decoding.clone(); smudge_level + 3],
+                vec![self.level(level)?.clone(); smudge_level + 3],
                 self.encoding_error_sigma.clone(),
                 self.operations_per_drop,
             )?
@@ -1114,19 +1144,42 @@ impl RnsBggParameters {
             self.validate_decoder_smudge_parameters(&smudge, declaration, source_program)?;
             return Ok(smudge);
         }
-        let decoding_primes = decoding.to_crt().0;
+        let smudge = self.child_chain(level, smudge_level, pool, primes_per_drop)?;
+        self.validate_decoder_smudge_parameters(&smudge, declaration, source_program)?;
+        Ok(smudge)
+    }
+
+    /// The chain of a child Program evaluated down to the decoding level
+    /// `level`, whose last LUT input level is `child_level`: `child_level + 2`
+    /// levels `j` whose moduli are the primes of level `level` and the first
+    /// `primes_per_drop * ceil((child_level + 1 - j) / operations_per_drop)`
+    /// other primes of `pool`, in `pool`'s tower order. The last level is
+    /// level `level` itself, entered by a drop.
+    pub(crate) fn child_chain(
+        &self,
+        level: usize,
+        child_level: usize,
+        pool: &DCRTPolyParams,
+        primes_per_drop: usize,
+    ) -> Result<Self, RnsBggError> {
+        let decoding_primes = self.level(level)?.to_crt().0;
         let primes = pool.to_crt().0;
-        if primes_per_drop == 0 || !primes.starts_with(&decoding_primes) {
+        if primes_per_drop == 0 || !decoding_primes.iter().all(|prime| primes.contains(prime)) {
             return Err(RnsBggError::Decoder(DecoderError::InvalidModulusRelation));
         }
-        let levels = (0..smudge_level + 2)
+        let extra = primes
+            .iter()
+            .copied()
+            .filter(|prime| !decoding_primes.contains(prime))
+            .collect::<Vec<_>>();
+        let levels = (0..child_level + 2)
             .map(|j| {
-                let drops = (smudge_level + 1 - j).div_ceil(self.operations_per_drop);
-                let depth = decoding_primes.len() + drops * primes_per_drop;
-                let modulus = primes
-                    .get(..depth)
+                let drops = (child_level + 1 - j).div_ceil(self.operations_per_drop);
+                let modulus = extra
+                    .get(..drops * primes_per_drop)
                     .ok_or(RnsBggError::Decoder(DecoderError::InvalidModulusRelation))?
                     .iter()
+                    .chain(&decoding_primes)
                     .copied()
                     .map(BigUint::from)
                     .product();
@@ -1134,11 +1187,41 @@ impl RnsBggParameters {
                     .ok_or(RnsBggError::Decoder(DecoderError::InvalidModulusRelation))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let smudge =
-            Self::new(levels, self.encoding_error_sigma.clone(), self.operations_per_drop)?
-                .with_rhs_mode(self.rhs_mode);
-        self.validate_decoder_smudge_parameters(&smudge, declaration, source_program)?;
-        Ok(smudge)
+        Ok(Self::new(levels, self.encoding_error_sigma.clone(), self.operations_per_drop)?
+            .with_rhs_mode(self.rhs_mode))
+    }
+
+    /// Check that `child` is a child chain (see [`Self::child_chain`]) of
+    /// `child_level + 2` levels ending at level `level` of these parameters:
+    /// non-increasing moduli, each a CRT sub-basis of the one before, a strict
+    /// drop into the last level, which has level `level`'s CRT basis, and the
+    /// same noise and RHS settings.
+    pub(crate) fn validate_child_chain(
+        &self,
+        child: &Self,
+        level: usize,
+        child_level: usize,
+    ) -> Result<(), RnsBggError> {
+        let relation = RnsBggError::Decoder(DecoderError::InvalidModulusRelation);
+        let decoding = self.level(level)?;
+        let levels = child.levels();
+        let depth = |params: &DCRTPolyParams| params.to_crt().0.len();
+        if levels.len() != child_level + 2 ||
+            !compatible_level_parameters(&levels[child_level + 1], decoding) ||
+            depth(&levels[child_level]) <= depth(decoding) ||
+            child.encoding_error_sigma != self.encoding_error_sigma ||
+            child.rhs_mode != self.rhs_mode
+        {
+            return Err(relation);
+        }
+        for pair in levels.windows(2) {
+            if !compatible_level_parameters_except_basis(&pair[0], &pair[1]) ||
+                !pair[1].to_crt().0.iter().all(|prime| pair[0].to_crt().0.contains(prime))
+            {
+                return Err(relation);
+            }
+        }
+        Ok(())
     }
 
     /// Check that `smudge` is a smudge chain of `declaration`'s decoder of
@@ -1165,14 +1248,11 @@ impl RnsBggParameters {
         if declaration.coefficients() != decoding.ring_dimension() as usize {
             return Err(RnsBggError::Decoder(DecoderError::InvalidSmudgeProgram));
         }
-        let smudge_level = Self::decoder_smudge_level(declaration)?;
-        if smudge.encoding_error_sigma != self.encoding_error_sigma ||
-            smudge.rhs_mode != self.rhs_mode
-        {
-            return Err(relation);
-        }
         if self.rhs_mode == RhsMode::Dynamic {
-            if smudge.levels.len() != smudge_level + 3 ||
+            let smudge_level = Self::decoder_smudge_level(declaration)?;
+            if smudge.encoding_error_sigma != self.encoding_error_sigma ||
+                smudge.rhs_mode != self.rhs_mode ||
+                smudge.levels.len() != smudge_level + 3 ||
                 smudge.levels.iter().any(|level| !compatible_level_parameters(level, decoding))
             {
                 return Err(relation);
@@ -1182,23 +1262,10 @@ impl RnsBggParameters {
         let plaintext = self
             .level(level + 1)
             .map_err(|_| RnsBggError::Decoder(DecoderError::InvalidModulusRelation))?;
-        let levels = smudge.levels();
-        let depth = |params: &DCRTPolyParams| params.to_crt().0.len();
-        if plaintext.modulus() == decoding.modulus() ||
-            levels.len() != smudge_level + 2 ||
-            !compatible_level_parameters(&levels[smudge_level + 1], decoding) ||
-            depth(&levels[smudge_level]) <= depth(decoding)
-        {
+        if plaintext.modulus() == decoding.modulus() {
             return Err(relation);
         }
-        for pair in levels.windows(2) {
-            if !compatible_level_parameters_except_basis(&pair[0], &pair[1]) ||
-                !pair[0].to_crt().0.starts_with(&pair[1].to_crt().0)
-            {
-                return Err(relation);
-            }
-        }
-        Ok(())
+        self.validate_child_chain(smudge, level, Self::decoder_smudge_level(declaration)?)
     }
 
     /// `2^-1 w mod q_level` for every weight numerator `w`: `q_level` is a
@@ -1393,6 +1460,10 @@ pub(crate) struct RnsBggArtifactBinding {
     /// Dynamic preprocessing only: the mapping of the Program's inputs and
     /// RHS to setup coordinates.
     dynamic_binding: Option<RnsBggDynamicBinding>,
+    /// Preprocessing of a Program with integer data: the commitment to the data
+    /// ([`crate::program::ProgramData::commitment`]), which online evaluation must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<[u8; 32]>,
     /// Dynamic encryption only: the prelude production holding every RHS
     /// family's ciphertexts, and its manifest.
     ciphertext_prelude:
@@ -1427,6 +1498,7 @@ impl RnsBggArtifactBinding {
             rhs_mode,
             dynamic_setup: None,
             dynamic_binding: None,
+            data: None,
             output_use: RnsOutputUse::default(),
             output_carriers: Vec::new(),
         };
@@ -1463,6 +1535,17 @@ impl RnsBggArtifactBinding {
         self.rhs_mode
     }
 
+    /// Records the commitment to the preprocessed Program's integer data.
+    pub(crate) fn with_data(mut self, commitment: [u8; 32]) -> Self {
+        self.data = Some(commitment);
+        self
+    }
+
+    /// The commitment to the preprocessed Program's integer data.
+    pub(crate) fn data(&self) -> Option<&[u8; 32]> {
+        self.data.as_ref()
+    }
+
     /// Records the output use and the resolved carrier of every declared
     /// output.
     pub(crate) fn with_outputs(
@@ -1497,12 +1580,11 @@ impl RnsBggArtifactBinding {
     }
 
     /// Binds a decoder declaration to this stage's artifact identity.
-    pub(crate) fn with_decoder(
-        mut self,
-        declaration: &DecoderDeclaration,
-        preimage_bound: BigUint,
-    ) -> Self {
-        self.decoder = Some((*declaration.commitment(), preimage_bound));
+    /// Attach the applied decoder or noise refresh: the decoder declaration
+    /// commitment or the refresh specification commitment, and the
+    /// coefficient bound of its unmask preimages.
+    pub(crate) fn with_decoder(mut self, commitment: [u8; 32], preimage_bound: BigUint) -> Self {
+        self.decoder = Some((commitment, preimage_bound));
         self
     }
 
@@ -1646,6 +1728,34 @@ fn map_row(row: RnsBggRow, mut operation: impl FnMut(Mat) -> Mat) -> RnsBggRow {
     (operation(row.0), operation(row.1))
 }
 
+/// `entry * c(X) X^shift` in `ring` for the small constant of
+/// [`crate::program::ExponentLutProgramBuilder::mul_small_constant`]. A
+/// signed monomial is applied as one monomial product.
+fn mul_small_constant_entry(ring: &Ring, entry: Mat, coefficients: &[i64], shift: &IntExpr) -> Mat {
+    let terms = coefficients
+        .iter()
+        .enumerate()
+        .filter(|(_, coefficient)| **coefficient != 0)
+        .collect::<Vec<_>>();
+    let shifted = |entry: Mat, power: usize| {
+        let exponent = IntExpr::Add(Box::new(shift.clone()), Box::new(IntExpr::constant(power)))
+            .canonicalize();
+        if exponent == IntExpr::constant(0) {
+            entry
+        } else {
+            entry.multiply_monomial(mxx_dsl::Int::from(exponent))
+        }
+    };
+    match terms.as_slice() {
+        [(power, 1)] => shifted(entry, *power),
+        _ => shifted(
+            ring.polynomial(coefficients.iter().map(|coefficient| IntExpr::constant(*coefficient))) *
+                entry,
+            0,
+        ),
+    }
+}
+
 fn map_matrix(matrix: RnsBggMatrix, mut operation: impl FnMut(Mat) -> Mat) -> RnsBggMatrix {
     ((operation(matrix.0.0), operation(matrix.0.1)), (operation(matrix.1.0), operation(matrix.1.1)))
 }
@@ -1750,7 +1860,11 @@ impl PlaintextFamily {
     }
 }
 
-fn signed_monomial(ring: &Ring, coefficient: mxx_dsl::Int, exponent: mxx_dsl::Int) -> Mat {
+pub(crate) fn signed_monomial(
+    ring: &Ring,
+    coefficient: mxx_dsl::Int,
+    exponent: mxx_dsl::Int,
+) -> Mat {
     coefficient.lift_to_constant_polynomial(ring.matrix_type((1, 1))).multiply_monomial(exponent)
 }
 
@@ -1804,9 +1918,18 @@ pub(crate) fn plaintext_inputs<P: mxx_backends::poly::Poly>(
     })
 }
 
-/// A random name prefix for one binding's plaintext inputs.
-pub(crate) fn plaintext_input_prefix() -> String {
-    format!("rns-bgg/plaintext/{:032x}", rand::random::<u128>())
+/// The name prefix of one binding's plaintext inputs: `role` (`input` or `rhs`) of the builder
+/// with hash namespace `namespace` (`None` for a stage's own Program). One stage binds each
+/// (namespace, role) once, so the names are unique in a stage graph and reproducible, and an
+/// exported claim can route each external input by its builder.
+pub fn plaintext_input_prefix(namespace: Option<&[u8; 32]>, role: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"mxx-exponent-lut/plaintext-prefix/v1");
+    digest.update(role.as_bytes());
+    digest.update([u8::from(namespace.is_some())]);
+    digest.update(namespace.copied().unwrap_or([0; 32]));
+    let digest: [u8; 32] = digest.finalize().into();
+    format!("rns-bgg/plaintext/{}", decoder_commitment_hex(digest)[..32].to_owned())
 }
 
 pub(crate) fn concrete_ring(value: &Mat) -> Result<ConcreteRing, RnsBggError> {
@@ -1889,6 +2012,13 @@ pub(crate) fn ciphertext_matrix(
         target.1 - prefix * top.1.clone() + error.1,
     );
     Ok((top, bottom))
+}
+
+/// Push a 32-byte digest to `tag` as one decimal integer component.
+pub(crate) fn push_digest(tag: &mut mxx_dsl::HashTag, digest: &[u8]) {
+    let value = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, digest);
+    tag.push_decimal(mxx_dsl::Int::evaluate(IntExpr::Const(value)))
+        .expect("a constant is a compile-time integer");
 }
 
 /// Artifact role of a Dynamic root site's public action in the
@@ -2004,6 +2134,13 @@ pub(crate) fn join_row(row: &RnsBggRow) -> Mat {
 /// `T_s` depends only on public keys. The caller adds `c_s Dec(C_s)` (see
 /// [`column_action`]).
 ///
+/// With `public_rows` (`public_top(s)` the joined top row of `C_s`, known
+/// when keys are built), the first `public_rows` digit rows, which are the
+/// digits of that row, have no companion: the loop visits only the digit
+/// rows `a >= public_rows`, and the keys add `sum_{a < public_rows} A_{s,:,a}
+/// Dec(C_s)_{a,:}` instead, which `c_s Dec(C_s)` carries as `s A_s Dec(C_s)`
+/// without a companion to cancel it.
+///
 /// An outer loop visits every `(s, a)` and decomposes column `a` of `A_s`
 /// once; its inner loop visits every `j`, holding one key and two
 /// companions (the current one and the next one, read ahead), and
@@ -2024,6 +2161,7 @@ pub(crate) fn companion_columns(
     key_entry: &dyn Fn(IntExpr, usize, IntExpr) -> Result<Mat, RnsBggError>,
     companion_key: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggMatrix, RnsBggError>>,
     companion: Option<&dyn Fn(IntExpr, IntExpr, IntExpr) -> Result<RnsBggRow, RnsBggError>>,
+    public_rows: Option<(usize, &dyn Fn(IntExpr) -> Result<Mat, RnsBggError>)>,
 ) -> Result<Vec<Mat>, RnsBggError> {
     if companion_key.is_none() && companion.is_none() {
         return Err(RnsBggError::Binding("a companion loop accumulates no row"));
@@ -2032,16 +2170,51 @@ pub(crate) fn companion_columns(
     let current = parameters.level(level)?;
     let base = public_gadget_base(current.base_bits())?;
     let digits = current.modulus_digits();
-    let digit_rows = 2 * parameters.component_columns(level)?;
+    let first_row = public_rows.as_ref().map_or(0, |(rows, _)| *rows);
+    if first_row > digits {
+        return Err(RnsBggError::Binding("public digit rows exceed one entry's digits"));
+    }
+    let digit_rows = 2 * parameters.component_columns(level)? - first_row;
     let block = 2 * output_columns;
     let schema = |_| mxx_dsl::DslError::Schema;
     let sums = 2 * usize::from(companion_key.is_some()) + usize::from(companion.is_some());
-    let rows = vec![ring.zero((1, branches * block)); sums];
+    let mut rows = vec![ring.zero((1, branches * block)); sums];
+    // The public rows' keys `A_{s,:,a} Dec(top_s)_{a,:}`: per branch, the top
+    // row is decomposed once and each of its digit rows scales one key entry.
+    if let (Some((count, top)), true) = (&public_rows, companion_key.is_some()) {
+        let count = *count;
+        let public = mxx_dsl::iterate(branches, rows[..2].to_vec(), |branch, rows: Vec<Mat>| {
+            let branch = branch.expression()?;
+            let decomposition =
+                top(branch.clone()).map_err(schema)?.decompose(base, digits).centered_rebase(&ring);
+            let keys =
+                mxx_dsl::iterate(count, vec![ring.zero((1, block)); 2], |a, keys: Vec<Mat>| {
+                    let a = a.expression()?;
+                    let digit =
+                        unit_row(&ring, digits, a.clone()).mul_small_rhs(decomposition.clone());
+                    keys.into_iter()
+                        .enumerate()
+                        .map(|(r, key)| {
+                            Ok(key +
+                                key_entry(branch.clone(), r, a.clone()).map_err(schema)? *
+                                    digit.clone())
+                        })
+                        .collect()
+                })?;
+            let place = unit_row(&ring, branches, branch);
+            Ok(rows
+                .into_iter()
+                .zip(keys)
+                .map(|(row, key)| row + place.clone().tensor(key))
+                .collect())
+        })?;
+        rows.splice(..2, public);
+    }
     Ok(mxx_dsl::iterate(branches * digit_rows, rows, |pair, rows: Vec<Mat>| {
         let pair = Box::new(pair.expression()?);
         let digit_rows = Box::new(IntExpr::constant(digit_rows));
         let branch = IntExpr::FloorDiv(pair.clone(), digit_rows.clone()).canonicalize();
-        let a = IntExpr::Rem(pair, digit_rows).canonicalize();
+        let a = (IntExpr::Rem(pair, digit_rows) + IntExpr::constant(first_row)).canonicalize();
         let [u0, u1] = [0, 1].map(|r| {
             key_entry(branch.clone(), r, a.clone()).map(|entry| entry.decompose(base, digits))
         });

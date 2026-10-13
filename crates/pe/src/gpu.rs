@@ -36,36 +36,69 @@ fn gpu_rings(parameters: &crate::PeParameters) -> Vec<GpuDCRTPolyParams> {
 #[ignore = "requires a CUDA GPU"]
 fn test_gpu_authorized_key_decrypts_on_the_gpu() {
     let class = PeClass::new(2, 2, 2, 2).unwrap();
-    authorized_key_decrypts_on_the_gpu(class, parameters(class));
+    authorized_key_decrypts_on_the_gpu(class, parameters(class), None, &equality_programs);
 }
 
-/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] over a statistical trapdoor with a baby-step
-/// split and compact encodings: the composed branch `25 = 17 * 9` reads compact helpers and
-/// companions in both switches, all on the GPU with the `q` and `pq` rings registered.
+/// The equality predicates of `attribute` (authorized) and of its complement.
+fn equality_programs(class: PeClass, attribute: &[usize]) -> [BranchingProgram; 2] {
+    let complement = attribute.iter().map(|bit| 1 - bit).collect::<Vec<_>>();
+    [equals(class, attribute), equals(class, &complement)]
+}
+
+/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] for the decimal range programs over two
+/// digits (`W = 128`): the key for a range containing the attribute's value decrypts, and the key
+/// for a range above it does not.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_gpu_compact_encodings_with_a_split_decrypt_on_the_gpu() {
-    let class = PeClass::new(2, 2, 2, 2).unwrap();
-    let parameters = crate::test_support::correct_parameters(class, true, |parameters| {
-        parameters.with_baby_steps(2).unwrap().with_compact_encodings().unwrap()
+fn test_gpu_decimal_range_decrypts_on_the_gpu() {
+    let class = PeClass::decimal_range(2).unwrap();
+    let parameters = crate::test_support::correct_parameters(class, |parameters| parameters);
+    // A random two-digit number and the ranges `[value - 3, value + 3]` and just above it.
+    let value = 10 + rand::random::<u64>() % 80;
+    let attribute = vec![(value / 10) as usize, (value % 10) as usize];
+    authorized_key_decrypts_on_the_gpu(class, parameters, Some(attribute), &|_, _| {
+        [(value.max(13) - 3, value + 3), (value + 1, 99)]
+            .map(|(low, high)| BranchingProgram::decimal_range(2, low, high).unwrap())
     });
-    authorized_key_decrypts_on_the_gpu(class, parameters);
 }
 
-fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParameters) {
+/// [`test_gpu_authorized_key_decrypts_on_the_gpu`] with the LUT radix 2 and compact encodings: the
+/// branch `25 = 17 * 9` of two nonzero digits reads compact companions in both
+/// switches, all on the GPU with the `q` and `pq` rings registered.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_compact_encodings_with_a_radix_decrypt_on_the_gpu() {
+    let class = PeClass::new(2, 2, 2, 2).unwrap();
+    let parameters = crate::test_support::correct_parameters(class, |parameters| {
+        parameters.with_lut_radix(2).unwrap().with_compact_encodings().unwrap()
+    });
+    authorized_key_decrypts_on_the_gpu(class, parameters, None, &equality_programs);
+}
+
+/// One setup, one ciphertext of `attribute` (a random one if `None`) and a random message, and
+/// keys for the programs `programs(class, attribute)`, the first authorized and the second not,
+/// all on the GPU.
+fn authorized_key_decrypts_on_the_gpu(
+    class: PeClass,
+    parameters: crate::PeParameters,
+    attribute: Option<Vec<usize>>,
+    programs: &dyn Fn(PeClass, &[usize]) -> [BranchingProgram; 2],
+) {
     let level = parameters.level();
     let mut execution = GpuRuntime::new(gpu_backend(gpu_rings(&parameters))).expect("GPU runtime");
     let bound = crate::noise::simulate(&parameters, &BranchingProgram::longest(class)).unwrap();
     assert!(bound.decrypts(), "the parameters must guarantee correctness");
     let mut store = MemoryArtifactStore::default();
     let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
-    let attribute = [0; 2].map(|_| rand::random::<u32>() as usize % 2);
+    let attribute = attribute.unwrap_or_else(|| {
+        (0..class.attribute_length())
+            .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
+            .collect()
+    });
     let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
     let ciphertext =
         encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
-    let complement = attribute.map(|bit| 1 - bit);
-    let predicates: [BranchingProgram; 2] = [equals(class, &attribute), equals(class, &complement)];
-    for (predicate, value) in predicates.iter().zip([0, 1]) {
+    for (predicate, value) in programs(class, &attribute).iter().zip([0, 1]) {
         assert_eq!(predicate.evaluate(&attribute).unwrap(), value);
         let key = keygen(&public_key, &master, predicate, &mut execution, &mut store).unwrap();
         let decrypted =
@@ -77,10 +110,12 @@ fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParam
 }
 
 /// The measured noise of one authorized decryption against the simulated bounds, at parameters
-/// read from `MXX_PE_NOISE_*` (statistical, average case, no estimator): for each of `TRIALS`
-/// fresh ciphertexts and keys of a random maximal-length program, the evaluation error
-/// `e_F = c_F - A_F^(2) - s_bar A_F^(1)` of the output row (the secret is known to the test) and
-/// the phase error `phase - floor(q/2) m`, each as `log2` of its largest and root-mean-square
+/// read from `MXX_PE_NOISE_*` (statistical, average case, compact encodings unless `COMPACT=0`,
+/// LUT radix [`PeClass::default_lut_radix`] unless `LUT_RADIX` sets it (0 switches directly), no
+/// estimator): for
+/// each of `TRIALS` fresh ciphertexts and keys of a random maximal-length program, the evaluation
+/// error `e_F = c_F - A_F^(2) - s_bar A_F^(1)` of the output row (the secret is known to the test)
+/// and the phase error `phase - floor(q/2) m`, each as `log2` of its largest and root-mean-square
 /// centered coefficient, next to `log2 E_F`, `log2 E_PE`, and the average-case bias and standard
 /// deviation of [`crate::noise::simulate_average`].
 #[test]
@@ -88,10 +123,8 @@ fn authorized_key_decrypts_on_the_gpu(class: PeClass, parameters: crate::PeParam
 fn test_gpu_measured_noise_against_the_bounds() {
     use crate::{
         PeParameterRequest, PeParameters,
-        budget::{DEFAULT_FLOODING_BITS, DEFAULT_STATISTICAL_BITS, KeyWidthPolicy},
         decryption::{OUTPUT_ROW, evaluate, phase_graph},
         encryption::encrypt_with_secret,
-        params::TrapdoorMode,
     };
     use mxx_backends::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -138,20 +171,13 @@ fn test_gpu_measured_noise_against_the_bounds() {
         crt_bits: read("CRT_BITS", 32),
         base_bits: read("BASE_BITS", 16),
         crt_depths: read("MIN_CRT_DEPTH", 1)..=16,
-        trapdoor_instantiation: TrapdoorMode::Statistical,
-        key_width_policy: KeyWidthPolicy::Practical,
         trapdoor_sigma: read("TRAPDOOR_SIGMA", 64.0),
         error_sigma: "3.19".parse().unwrap(),
-        flooding_sigma: "3.19".parse().unwrap(),
-        enforce_flooding: read("FLOODING", "none".to_owned()) == "enforce",
-        programming_sigma: read("PROGRAMMING_SIGMA", "256".to_owned()).parse().unwrap(),
-        randomness_sigma: read("RANDOMNESS_SIGMA", "4096".to_owned()).parse().unwrap(),
-        statistical_security_bits: DEFAULT_STATISTICAL_BITS,
-        flooding_statistical_bits: DEFAULT_FLOODING_BITS,
-        key_queries: 1 << 20,
-        max_anchor_columns: 1024,
-        lut_baby_steps: Some(read("BABY_STEPS", 0usize)).filter(|steps| *steps > 0),
-        compact_encodings: read("COMPACT", 0usize) != 0,
+        lut_radix: match std::env::var("MXX_PE_NOISE_LUT_RADIX") {
+            Err(_) => class.default_lut_radix(),
+            Ok(value) => Some(value.parse::<usize>().unwrap()).filter(|radix| *radix > 0),
+        },
+        compact_encodings: read("COMPACT", 1usize) != 0,
         failure_exponent: Some(128),
         lattice_security_bits: None,
     };

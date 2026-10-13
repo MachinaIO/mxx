@@ -114,6 +114,8 @@ pub struct PublicKeyLowering<'a> {
     pub(crate) output_use: RnsOutputUse,
     /// Dynamic: the setup and the Program's mapping to its coordinates.
     pub(crate) dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+    /// The Program's integer data inputs ([`crate::program::data_inputs`]).
+    pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
     /// RHS plaintexts, read from graph inputs; a family is read member by
     /// member.
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, super::PlaintextFamily>>,
@@ -124,10 +126,10 @@ pub struct PublicKeyLowering<'a> {
     /// identity.  The family member is the concrete automorphism branch.
     pub(crate) lut_material:
         BTreeMap<(usize, usize, crate::program::LutId, ExpLayout), Family<RnsBggMatrix>>,
-    /// The unmasking of the composed decoder: its declaration commitment, the
+    /// The unmasking of the composed decoder: its artifact key, the
     /// preimage `K` of the summed key, and the public `B` it is a preimage
     /// under.
-    pub(crate) unmask: Option<([u8; 32], Preimage, Mat)>,
+    pub(crate) unmask: Option<(String, Preimage, Mat)>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Dynamic: the public action of every root-scope `MulPrivate` and
     /// `Lut` site, its output key and a LUT's product keys `T_k`, which
@@ -165,6 +167,28 @@ pub struct RnsPreprocessBuild<'a> {
     output_use: RnsOutputUse,
     /// Dynamic: the setup and the Program's mapping to its coordinates.
     dynamic: Option<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+    /// The values of the Program's integer data.
+    data: crate::program::ProgramData,
+    /// For a refresh child: the namespace its hash key is derived under (see
+    /// `rns_bgg::refresh::child_hash_key`).
+    hash_namespace: Option<[u8; 32]>,
+    /// The applied noise refresh.
+    refresh: Option<PreparedRefresh<'a>>,
+    /// The graph input name and length of a top refresh's `A'` key.
+    refresh_matrix_key: Option<(String, usize)>,
+}
+
+/// A noise refresh prepared by preprocessing: its lowered children, the
+/// public `B` of the shared unmask trapdoor, one preimage per decoder (in
+/// decoder order) and their coefficient bound.
+struct PreparedRefresh<'a> {
+    declaration: crate::refresh::RefreshDeclaration,
+    mask: Option<PublicKeyLowering<'a>>,
+    fresh: PublicKeyLowering<'a>,
+    smudges: Vec<PublicKeyLowering<'a>>,
+    preimages: Vec<Preimage>,
+    public: Mat,
+    bound: BigUint,
 }
 
 #[cfg(test)]

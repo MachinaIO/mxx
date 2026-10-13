@@ -411,6 +411,7 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     mxx_ir_core::lean::protocol::export(
         &boolean_bgg_protocol(&graphs, &bgg, &bindings),
         &directory,
+        false,
     )
     .unwrap();
     println!("RING_GSW_BGG_CLAIM {}", directory.display());

@@ -299,6 +299,14 @@ mod tests {
         fn lut(&mut self, _: &usize, _: &crate::program::LutTable) -> Result<usize, DepthError> {
             Err(DepthError)
         }
+        fn mul_small_constant(
+            &mut self,
+            _: &usize,
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<usize, DepthError> {
+            Err(DepthError)
+        }
     }
 
     impl ProgramLoweringContext for Depth {
@@ -315,12 +323,21 @@ mod tests {
 
         fn wire_at(
             &mut self,
+            _evaluator: &mut Depth,
             family: &usize,
             _: &IntExpr,
         ) -> Result<usize, ProgramLowerError<DepthError>> {
             Ok(*family)
         }
         fn rhs_at(&mut self, _: &(), _: &IntExpr) -> Result<(), ProgramLowerError<DepthError>> {
+            Err(ProgramLowerError::Backend(DepthError))
+        }
+        fn rhs_selected(
+            &mut self,
+            _: &(),
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<(), ProgramLowerError<DepthError>> {
             Err(ProgramLowerError::Backend(DepthError))
         }
         fn parallel(

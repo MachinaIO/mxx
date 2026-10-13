@@ -1,0 +1,205 @@
+set_option maxHeartbeats 16000000 in
+set_option maxRecDepth 65536 in
+/-- Cell `i` of bucket `0` of the {NAME} PRF: an encoding of `p₅ (α_(i mod 5) μ ν_i)` at `{QB}`. -/
+theorem {NAME}_cell0 {{model : HashModel}} {{key : ByteArray}}
+    {{ca0 ca1 aA00 aA10 aA01 aA11 : Fin 5 → ExactMatrix {QA} N 1 {MA}}}
+    {{apay : Fin 5 → ExactMatrix {QA} N 1 1}} {{As : Fin 2 → Fin 2 → ExactMatrix {QA} N 1 {MB}}}
+    {{cs : Fin 2 → ExactMatrix {QA} N 1 {MB}}} {{bot0 bot1 : Fin {CELLS} → ExactMatrix {QB} N 1 {MC}}} {{i : Fin {CELLS}}}
+    {{params}} {{outputs}}
+    (hcell : @O@.parallel_generatedRoot_{D0} Backend.backend model params i
+      (ca0, aA00, aA10, ca1, aA01, aA11, As 0 0, As 1 0, cs 0, apay, As 0 1, As 1 1, cs 1, key,
+        bot0 i, bot1 i, ()) outputs)
+    {{sm sp μ ν : ErrorPoly N}} {{α : Fin 5 → ErrorPoly N}} (hsm : polyNorm sm ≤ 1)
+    (hαμ : ∀ k, polyNorm (α k * μ) ≤ 1) (hα : ∀ k, polyNorm (α k) ≤ 1)
+    {{G : ExactMatrix {QA} N 1 {MA}}} (hG : gadgetMatrixRuns Backend.backend 32768 {MA} G)
+    {{g' : ExactMatrix {QB} N 1 {MB}}} {{g : ExactMatrix {QA} N 1 {MB}}}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 {MB} g') (hg : centeredRebaseRuns g' g)
+    {{h : ExactMatrix {QB} N 1 {MC}}} {{Ba : Nat}}
+    (ha : ∀ k : Fin 5, Rel sm ![![aA00 k, aA01 k], ![aA10 k, aA11 k]]
+      (fun j ↦ reducePoly {QA} N (α k * unitPair sm j) • G) ![ca0 k, ca1 k] Ba)
+    (hpay : ∀ k : Fin 5, apay k = fun _ _ ↦ reducePoly {QA} N (α k))
+    {{Bs : Nat}} (hs : Rel sm As (fun j ↦ reducePoly {QA} N ((({PA} : Nat) : Int) * μ * unitPair sp j) • g)
+      cs Bs)
+    {{eB : Fin 2 → ErrorMatrix N 1 {MC}}} {{BB : Nat}}
+    (hrhs : ∀ j, reducePoly {QB} N sp • rhsTop model key {QB} {MC} {NAME}Rhs0 i j + ![bot0 i, bot1 i] j =
+      reducePoly {QB} N ((({PB} : Nat) : Int) * ν * unitPair sp j) • h + reduceMatrix {QB} N 1 {MC} (eB j))
+    (heB : ∀ j, CoeffBound (eB j) BB) :
+    Rel sm ![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]]
+      (fun j ↦ reducePoly {QB} N ((({PB} : Nat) : Int) * (α ⟨i.val % 5, Nat.mod_lt _ (by norm_num)⟩ * μ * ν) *
+        unitPair sp j) • h)
+      ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1]
+      (((({MB} + {MB}) * N * (({MA} + {MA}) * N * Ba * 16384 + N * 1 * Bs) * 16384 + (N + 2) * ({PA} / 2)) / {PA}) +
+        N * 1 * BB) := by
+@DESTRUCT(online_eval, parallel_generatedRoot_{D0}, hcell)@
+  -- The coordinate `i mod 5`, the member of `a`, and its public key.
+  have hc : w_1_0 = ((i.val % 5 : Nat) : Int) := select_slot i.val
+  rw [hc] at h2_0 h4_0 h6_0 h9_0 h11_0 h13_0 h25_0
+  obtain ⟨hk, hw2⟩ := familyGet_eq h2_0
+  obtain ⟨_, hw4⟩ := familyGet_eq h4_0
+  obtain ⟨_, hw6⟩ := familyGet_eq h6_0
+  obtain ⟨_, hw9⟩ := familyGet_eq h9_0
+  obtain ⟨_, hw11⟩ := familyGet_eq h11_0
+  obtain ⟨_, hw13⟩ := familyGet_eq h13_0
+  obtain ⟨_, hw25⟩ := familyGet_eq h25_0
+  subst hw2 hw4 hw6 hw9 hw11 hw13 hw25
+  have ha' := ha ⟨i.val % 5, hk⟩
+  -- The public multiplication at `{QA}`.
+  have hpub := mul_public (q := {QA}) (m := {MA}) (m' := {MB}) (bound := 16384) hN (by norm_num)
+    Backend.{LA} {HA} rfl hG (hα _) ha' hs h4_0_1 h7_0 h11_0_1 h14_0 h15_0
+    (Xs := ![w_18_0, w_33_0]) (fun j ↦ by fin_cases j; exacts [h18_0, h33_0])
+    (D' := ![w_19_0, w_34_0]) (fun j ↦ by fin_cases j; exacts [h19_0, h34_0])
+    (D := ![w_20_0, w_35_0]) (fun j ↦ by fin_cases j; exacts [h20_0, h35_0])
+    (hpay _) (Y := ![w_22_0, w_37_0]) (A' := ![![w_28_0, w_41_0], ![w_29_0, w_42_0]])
+    (fun j ↦ by fin_cases j; exacts [h22_0, h37_0]) (fun j ↦ by fin_cases j; exacts [h28_0, h41_0])
+    (fun j ↦ by fin_cases j; exacts [h29_0, h42_0])
+    (c' := ![_, _]) (fun j ↦ by fin_cases j <;> rfl)
+  have hpub' := hpub.target_eq (t' := fun j ↦ reducePoly {QA} N ((({PA} : Nat) : Int) *
+      (α ⟨i.val % 5, hk⟩ * μ) * unitPair sp j) • g) (by
+    funext j
+    rw [smul_smul, ← map_mul]
+    congr 2
+    ring)
+  -- The private multiplication by the selector, dropping `p₆`.
+  have htop : rhsTop model key {QB} {MC} {NAME}Rhs0 i = ![w_46_0, w_54_0] := by
+    funext j
+    fin_cases j
+    · rw [rhsTop_tag]; exact (hashSample_eq h46_0).symm
+    · rw [rhsTop_tag]; exact (hashSample_eq h54_0).symm
+  have hrhs' := hrhs
+  rw [htop] at hrhs'
+  have hpriv := mul_private_down (q := {QA}) (q' := {QB}) (p := {PA}) (m := {MB}) (m' := {MC})
+    (bound := 16384) hN {EA} (by norm_num) (by norm_num) (by norm_num) Backend.{LB} {HB} rfl
+    hg' hg hsm hpub' h28_0_1 h30_0 h41_0_1 h43_0 h44_0 (top := ![w_46_0, w_54_0])
+    (bot := ![bot0 i, bot1 i])
+    (Xb := ![w_48_0, w_56_0]) (fun j ↦ by fin_cases j; exacts [h48_0, h56_0])
+    (D' := ![w_49_0, w_57_0]) (fun j ↦ by fin_cases j; exacts [h49_0, h57_0])
+    (D := ![w_50_0, w_58_0]) (fun j ↦ by fin_cases j; exacts [h50_0, h58_0])
+    hrhs' heB (hαμ _) (X := ![w_66_0, w_68_0]) (M := ![![w_52_0, w_60_0], ![w_62_0, w_64_0]])
+    (fun j ↦ by fin_cases j; exacts [h66_0, h68_0]) (fun j ↦ by fin_cases j; exacts [h52_0, h60_0])
+    (fun j ↦ by fin_cases j; exacts [h62_0, h64_0])
+    (c' := ![w_67_0, w_69_0]) (A' := ![![w_53_0, w_61_0], ![w_63_0, w_65_0]])
+    (fun j ↦ by fin_cases j; exacts [h67_0, h69_0])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h53_0, h61_0, h63_0, h65_0])
+  subst hout
+  convert hpriv using 2 with j
+  rw [smul_smul, ← map_mul]
+  congr 2
+  ring
+
+
+set_option maxHeartbeats 16000000 in
+set_option maxRecDepth 65536 in
+/-- Cell `i` of bucket `1` of the {NAME} PRF: an encoding of `p₄ (α_(i mod 5) μ_(i/5) ν_i)` at `{QC}`. -/
+theorem {NAME}_cell1 {{model : HashModel}} {{key : ByteArray}}
+    {{ca0 ca1 aA00 aA10 aA01 aA11 : Fin 5 → ExactMatrix {QA} N 1 {MA}}}
+    {{apay : Fin 5 → ExactMatrix {QA} N 1 1}} {{As00 As10 As01 As11 cs0 cs1 : Fin {MEMBERS} → ExactMatrix {QB} N 1 {MC}}}
+    {{bot0 bot1 : Fin {CELLS} → ExactMatrix {QC} N 1 {MD}}} {{i : Fin {CELLS}}} {{params}} {{outputs}}
+    (hcell : @O@.parallel_generatedRoot_{D1} Backend.backend model params i
+      (ca0, aA00, aA10, ca1, aA01, aA11, As00, As10, cs0, apay, As01, As11, cs1, key,
+        bot0 i, bot1 i, ()) outputs)
+    {{sm sp ν : ErrorPoly N}} {{μ : Fin {MEMBERS} → ErrorPoly N}} {{α : Fin 5 → ErrorPoly N}}
+    (hsm : polyNorm sm ≤ 1) (hαμ : ∀ k o, polyNorm (α k * μ o) ≤ 1) (hα : ∀ k, polyNorm (α k) ≤ 1)
+    {{G : ExactMatrix {QA} N 1 {MA}}} (hG : gadgetMatrixRuns Backend.backend 32768 {MA} G)
+    {{g' : ExactMatrix {QC} N 1 {MC}}} {{g : ExactMatrix {QB} N 1 {MC}}}
+    (hg' : gadgetMatrixRuns Backend.backend 32768 {MC} g') (hg : centeredRebaseRuns g' g)
+    {{h : ExactMatrix {QC} N 1 {MD}}} {{Ba : Nat}}
+    (ha : ∀ k : Fin 5, Rel sm ![![aA00 k, aA01 k], ![aA10 k, aA11 k]]
+      (fun j ↦ reducePoly {QA} N (α k * unitPair sm j) • G) ![ca0 k, ca1 k] Ba)
+    (hpay : ∀ k : Fin 5, apay k = fun _ _ ↦ reducePoly {QA} N (α k))
+    {{Bs : Nat}} (hs : ∀ o : Fin {MEMBERS}, Rel sm ![![As00 o, As01 o], ![As10 o, As11 o]]
+      (fun j ↦ reducePoly {QB} N ((({PB} : Nat) : Int) * μ o * unitPair sp j) • g) ![cs0 o, cs1 o] Bs)
+    {{eB : Fin 2 → ErrorMatrix N 1 {MD}}} {{BB : Nat}}
+    (hrhs : ∀ j, reducePoly {QC} N sp • rhsTop model key {QC} {MD} {NAME}Rhs1 i j + ![bot0 i, bot1 i] j =
+      reducePoly {QC} N ((({PC} : Nat) : Int) * ν * unitPair sp j) • h + reduceMatrix {QC} N 1 {MD} (eB j))
+    (heB : ∀ j, CoeffBound (eB j) BB) :
+    Rel sm ![![outputs.1, outputs.2.1], ![outputs.2.2.1, outputs.2.2.2.1]]
+      (fun j ↦ reducePoly {QC} N ((({PC} : Nat) : Int) * (α ⟨i.val % 5, Nat.mod_lt _ (by norm_num)⟩ *
+        μ ⟨i.val / 5, by omega⟩ * ν) * unitPair sp j) • h)
+      ![outputs.2.2.2.2.1, outputs.2.2.2.2.2.1]
+      (((({MC} + {MC}) * N * (({MB} + {MB}) * N * (({MA} * N * Ba * (32768 / 2) + (N + 2) * ({PA} / 2)) / {PA}) *
+        16384 + N * 1 * Bs) * 16384 + (N + 2) * ({PB} / 2)) / {PB}) + N * 1 * BB) := by
+@DESTRUCT(online_eval, parallel_generatedRoot_{D1}, hcell)@
+  -- The coordinate `i mod 5`, the member `i / 5`, the member of `a`.
+  have hc : w_1_0 = ((i.val % 5 : Nat) : Int) := select_slot i.val
+  rw [hc] at h2_0 h11_0 h20_0 h25_0 h29_0 h33_0 h51_0
+  have ho : w_39_0 = ((i.val / 5 : Nat) : Int) := fdiv_slot i.val
+  rw [ho] at h40_0 h42_0 h49_0 h59_0 h61_0 h68_0
+  obtain ⟨hk, hw2⟩ := familyGet_eq h2_0
+  obtain ⟨_, hw11⟩ := familyGet_eq h11_0
+  obtain ⟨_, hw20⟩ := familyGet_eq h20_0
+  obtain ⟨_, hw25⟩ := familyGet_eq h25_0
+  obtain ⟨_, hw29⟩ := familyGet_eq h29_0
+  obtain ⟨_, hw33⟩ := familyGet_eq h33_0
+  obtain ⟨_, hw51⟩ := familyGet_eq h51_0
+  obtain ⟨hko, hw40⟩ := familyGet_eq h40_0
+  obtain ⟨_, hw42⟩ := familyGet_eq h42_0
+  obtain ⟨_, hw49⟩ := familyGet_eq h49_0
+  obtain ⟨_, hw59⟩ := familyGet_eq h59_0
+  obtain ⟨_, hw61⟩ := familyGet_eq h61_0
+  obtain ⟨_, hw68⟩ := familyGet_eq h68_0
+  subst hw2 hw11 hw20 hw25 hw29 hw33 hw51 hw40 hw42 hw49 hw59 hw61 hw68
+  have ha' := ha ⟨i.val % 5, hk⟩
+  have hs' := hs ⟨i.val / 5, hko⟩
+  -- The alignment of the member from `{QA}` to `{QB}`; the row and the key share one decomposition.
+  have hg13 := gadgetMatrixRuns_unique h13_0 h4_0
+  subst hg13
+  have hg14 := centeredRebaseRuns_unique h14_0 h5_0
+  subst hg14
+  have hH := gadgetDecomposeRuns_unique h16_0 h7_0
+  subst hH
+  have hal := align_down (q := {QA}) (q' := {QB}) (p := {PA}) (m := {MA}) (m' := {MB}) hN {EA} (by norm_num)
+    (by norm_num) (by norm_num) Backend.{LA} {HA} rfl hG h5_0 hsm ha'
+    (by
+      funext r c
+      obtain rfl : r = 0 := Subsingleton.elim _ _
+      simp (config := {{ zetaDelta := true }}) [Matrix.mul_apply, matrixPolynomial_single, map_ofNat])
+    h16_0 (Y := ![_, _]) (K := ![![_, _], ![_, _]])
+    (fun j ↦ by fin_cases j <;> rfl) (fun k j ↦ by fin_cases k <;> fin_cases j <;> rfl)
+    (c' := ![w_9_0, w_27_0]) (A' := ![![w_18_0, w_31_0], ![w_22_0, w_35_0]])
+    (fun j ↦ by fin_cases j; exacts [h9_0, h27_0])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h18_0, h31_0, h22_0, h35_0])
+  -- The public multiplication at `{QB}`.
+  have hpayb := modulusReduce_poly (q := {QA}) (p := {QB}) (by norm_num) (by norm_num) hN
+    (s := α ⟨i.val % 5, hk⟩)
+    (by rw [← hpay]; exact h52_0)
+  have hpub := mul_public (q := {QB}) (m := {MB}) (m' := {MC}) (bound := 16384) hN (by norm_num)
+    Backend.{LB} {HB} rfl h4_0 (hα _) hal hs' h18_0_1 h23_0 h31_0_1 h36_0 h37_0
+    (Xs := ![w_43_0, w_62_0]) (fun j ↦ by fin_cases j; exacts [h43_0, h62_0])
+    (D' := ![w_44_0, w_63_0]) (fun j ↦ by fin_cases j; exacts [h44_0, h63_0])
+    (D := ![w_45_0, w_64_0]) (fun j ↦ by fin_cases j; exacts [h45_0, h64_0])
+    hpayb (Y := ![w_47_0, w_66_0]) (A' := ![![w_55_0, w_71_0], ![w_56_0, w_72_0]])
+    (fun j ↦ by fin_cases j; exacts [h47_0, h66_0]) (fun j ↦ by fin_cases j; exacts [h55_0, h71_0])
+    (fun j ↦ by fin_cases j; exacts [h56_0, h72_0])
+    (c' := ![_, _]) (fun j ↦ by fin_cases j <;> rfl)
+  have hpub' := hpub.target_eq (t' := fun j ↦ reducePoly {QB} N ((({PB} : Nat) : Int) *
+      (α ⟨i.val % 5, hk⟩ * μ ⟨i.val / 5, hko⟩) * unitPair sp j) • g) (by
+    funext j
+    rw [smul_smul, ← map_mul]
+    congr 2
+    ring)
+  -- The private multiplication by the selector, dropping `p₅`.
+  have htop : rhsTop model key {QC} {MD} {NAME}Rhs1 i = ![w_76_0, w_84_0] := by
+    funext j
+    fin_cases j
+    · rw [rhsTop_tag]; exact (hashSample_eq h76_0).symm
+    · rw [rhsTop_tag]; exact (hashSample_eq h84_0).symm
+  have hrhs' := hrhs
+  rw [htop] at hrhs'
+  have hpriv := mul_private_down (q := {QB}) (q' := {QC}) (p := {PB}) (m := {MC}) (m' := {MD})
+    (bound := 16384) hN {EB} (by norm_num) (by norm_num) (by norm_num) Backend.{LC} {HC} rfl
+    hg' hg hsm hpub' h55_0_1 h57_0 h71_0_1 h73_0 h74_0 (top := ![w_76_0, w_84_0])
+    (bot := ![bot0 i, bot1 i])
+    (Xb := ![w_78_0, w_86_0]) (fun j ↦ by fin_cases j; exacts [h78_0, h86_0])
+    (D' := ![w_79_0, w_87_0]) (fun j ↦ by fin_cases j; exacts [h79_0, h87_0])
+    (D := ![w_80_0, w_88_0]) (fun j ↦ by fin_cases j; exacts [h80_0, h88_0])
+    hrhs' heB (hαμ _ _) (X := ![w_96_0, w_98_0]) (M := ![![w_82_0, w_90_0], ![w_92_0, w_94_0]])
+    (fun j ↦ by fin_cases j; exacts [h96_0, h98_0]) (fun j ↦ by fin_cases j; exacts [h82_0, h90_0])
+    (fun j ↦ by fin_cases j; exacts [h92_0, h94_0])
+    (c' := ![w_97_0, w_99_0]) (A' := ![![w_83_0, w_91_0], ![w_93_0, w_95_0]])
+    (fun j ↦ by fin_cases j; exacts [h97_0, h99_0])
+    (fun k j ↦ by fin_cases k <;> fin_cases j; exacts [h83_0, h91_0, h93_0, h95_0])
+  subst hout
+  convert hpriv using 2 with j
+  rw [smul_smul, ← map_mul]
+  congr 2
+  ring

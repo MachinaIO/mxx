@@ -437,6 +437,15 @@ mod tests {
         ) -> Result<Self::Wire, Self::Error> {
             table.values().and_then(|values| values.get(*input)).copied().ok_or(LogicalError)
         }
+
+        fn mul_small_constant(
+            &mut self,
+            _: &Self::Wire,
+            _: &[i64],
+            _: &mxx_ir_core::IntExpr,
+        ) -> Result<Self::Wire, Self::Error> {
+            Err(LogicalError)
+        }
     }
 
     impl ProgramLoweringContext for LogicalEvaluator {
@@ -454,6 +463,7 @@ mod tests {
 
         fn wire_at(
             &mut self,
+            _evaluator: &mut LogicalEvaluator,
             family: &Self::WireFamily,
             index: &IntExpr,
         ) -> Result<usize, ProgramLowerError<LogicalError>> {
@@ -473,6 +483,17 @@ mod tests {
                 reason: format!(
                     "NAND test has no RHS families (family={family:?}, index={index:?})"
                 ),
+            })
+        }
+
+        fn rhs_selected(
+            &mut self,
+            _: &Self::RhsFamily,
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: "NAND test has no RHS families".into(),
             })
         }
 

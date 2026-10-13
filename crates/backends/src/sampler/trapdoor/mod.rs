@@ -1,6 +1,6 @@
 use crate::{
     matrix::{
-        CompactMatrixDecodeError, PolyMatrix,
+        CompactMatrixDecodeError, PolyMatrix, SmallMatrixError,
         cpp_matrix::CppMatrix,
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
@@ -11,9 +11,14 @@ use crate::{
         PolyParams,
         dcrt::{native::ffi::exact_basis_matrix_coefficients, params::DCRTPolyParams},
     },
-    sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+    sampler::{
+        DistType, PolyUniformSampler,
+        bounds::{gadget_sampler_sigma, trapdoor_singular_value_estimate},
+        uniform::DCRTPolyUniformSampler,
+    },
 };
 use mxx_ir_core::types::TrapdoorInstantiation;
+use num_traits::ToPrimitive;
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
 use std::{
@@ -37,8 +42,10 @@ static SAMPLE_P1_FOR_PERT_MAT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 ///   `b_mat`, and `d_mat` are `R Rᵀ`, `R Eᵀ`, and `E Eᵀ`, and `re` is `[R; E]`, as the OpenFHE
 ///   perturbation sampler consumes them (with the plain, not the ring-adjoint, transpose).
 /// - `Statistical`: `A = [ā | g - ā T]` with the trapdoor `[T; I]` for `T` of `m_bar` rows and `D`
-///   columns. `T` is kept as row chunks of at most [`statistical::ROW_CHUNK`] rows, and every
-///   operation streams over them, so no `m_bar x m_bar` or `D x D` matrix is formed.
+///   columns. `T` is kept as row chunks of at most [`statistical::ROW_CHUNK`] rows, with the
+///   [`statistical::StatisticalPrecomputation`] of TrapGen: the values of `T` and the Cholesky
+///   factors of the perturbation covariance at half of the evaluation points, for the trapdoor's
+///   preimage width.
 // One value per trapdoor; boxing the computational components would only add an indirection.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -54,6 +61,7 @@ pub enum DCRTTrapdoor {
     Statistical {
         /// Row chunks of `T`, in row order.
         t: Vec<DCRTPolyMatrix>,
+        precomputation: statistical::StatisticalPrecomputation,
     },
 }
 
@@ -68,9 +76,10 @@ impl PartialEq for DCRTTrapdoor {
                     self.d_mat_cpu() == other.d_mat_cpu() &&
                     self.re_cpu() == other.re_cpu()
             }
-            (Self::Statistical { t }, Self::Statistical { t: other }) => {
-                statistical::rows_equal(t, other)
-            }
+            (
+                Self::Statistical { t, precomputation },
+                Self::Statistical { t: other, precomputation: other_precomputation },
+            ) => statistical::rows_equal(t, other) && precomputation == other_precomputation,
             _ => false,
         }
     }
@@ -84,13 +93,15 @@ impl Eq for DCRTTrapdoor {}
 pub const TAGGED_MAGIC: [u8; 8] = *b"mxxtrpd\xff";
 /// The tag of a computational trapdoor: the components `R`, `E`, `R Rᵀ`, `R Eᵀ`, `E Eᵀ`, `[R; E]`.
 pub const TAG_COMPUTATIONAL: u8 = 0;
-/// The tag of a statistical trapdoor: the row chunks of `T`.
+/// The tag of a statistical trapdoor: the row chunks of `T`, then the encoding of its
+/// [`statistical::StatisticalPrecomputation`].
 pub const TAG_STATISTICAL: u8 = 1;
 
-/// The `(rows, columns)` of every component of a trapdoor of `rows` public rows and `digits`
-/// digits per row, in encoding order: `R`, `E`, `R Rᵀ`, `R Eᵀ`, `E Eᵀ`, `[R; E]` for the
-/// computational instantiation, the row chunks of `T` for the statistical one. `None` for an
-/// invalid instantiation.
+/// The `(rows, columns)` of every matrix component of a trapdoor of `rows` public rows and
+/// `digits` digits per row, in encoding order: `R`, `E`, `R Rᵀ`, `R Eᵀ`, `E Eᵀ`, `[R; E]` for the
+/// computational instantiation, the row chunks of `T` for the statistical one (whose encoding
+/// ends with its precomputation, [`statistical::precomputation_bytes`]). `None` for an invalid
+/// instantiation.
 pub fn trapdoor_component_shapes(
     rows: usize,
     digits: usize,
@@ -151,8 +162,10 @@ pub fn trapdoor_encoding_parts(bytes: &[u8]) -> Result<(u8, Vec<&[u8]>), Compact
             "a computational trapdoor has six components",
         ));
     }
-    if tag == TAG_STATISTICAL && parts.is_empty() {
-        return Err(CompactMatrixDecodeError::InvalidHeader("a statistical trapdoor has rows"));
+    if tag == TAG_STATISTICAL && parts.len() < 2 {
+        return Err(CompactMatrixDecodeError::InvalidHeader(
+            "a statistical trapdoor has rows and a precomputation",
+        ));
     }
     if tag > TAG_STATISTICAL {
         return Err(CompactMatrixDecodeError::InvalidHeader("unknown trapdoor encoding tag"));
@@ -188,15 +201,18 @@ impl DCRTTrapdoor {
         }
     }
 
-    /// Statistical TrapGen: `ā` uniform `1 x m_bar`, `T` Gaussian `m_bar x D` of width `sigma`
-    /// without truncation, and `A = [ā | g - ā T]`, with `ā T` accumulated over the row chunks of
-    /// `T`. Panics unless `size` is one and `instantiation` is statistical.
+    /// Statistical TrapGen for preimages of width `preimage_sigma`: `ā` uniform `1 x m_bar`, `T`
+    /// Gaussian `m_bar x D` of width `sigma` without truncation, `A = [ā | g - ā T]`, and the
+    /// precomputation of [`statistical::trapgen`], which redraws `T` while the perturbation
+    /// covariance is not positive definite. Panics unless `size` is one and `instantiation` is
+    /// statistical.
     pub fn sample_statistical(
         params: &DCRTPolyParams,
         size: usize,
         sigma: f64,
         instantiation: TrapdoorInstantiation,
-    ) -> (Self, DCRTPolyMatrix) {
+        preimage_sigma: f64,
+    ) -> Result<(Self, DCRTPolyMatrix), SmallMatrixError> {
         let TrapdoorInstantiation::Statistical { m_bar } = instantiation else {
             panic!("statistical TrapGen requires the statistical instantiation");
         };
@@ -206,15 +222,32 @@ impl DCRTTrapdoor {
             0,
             "exact trapdoor sampling requires dropped_moduli = 0"
         );
-        let (t, public) = statistical::trapgen(params, m_bar, sigma);
-        (Self::Statistical { t }, public)
+        let c = gadget_sampler_sigma(1 << params.base_bits(), sigma);
+        let widths = statistical::PerturbationWidths::new(preimage_sigma, c, sigma)
+            .ok_or(SmallMatrixError::InvalidConfig)?;
+        let estimate = trapdoor_singular_value_estimate(
+            params.ring_dimension(),
+            1,
+            params.modulus_digits(),
+            sigma,
+            instantiation,
+        )
+        .and_then(|estimate| estimate.to_f64())
+        .ok_or(SmallMatrixError::InvalidConfig)?;
+        let (t, precomputation, public) =
+            statistical::trapgen(params, m_bar, sigma, preimage_sigma, &widths, estimate).ok_or(
+                SmallMatrixError::StatisticalTrapdoorRejected {
+                    attempts: statistical::TRAPGEN_ATTEMPTS,
+                },
+            )?;
+        Ok((Self::Statistical { t, precomputation }, public))
     }
 
     /// The instantiation of this trapdoor.
     pub fn instantiation(&self) -> TrapdoorInstantiation {
         match self {
             Self::Computational { .. } => TrapdoorInstantiation::Computational,
-            Self::Statistical { t } => TrapdoorInstantiation::Statistical {
+            Self::Statistical { t, .. } => TrapdoorInstantiation::Statistical {
                 m_bar: t.iter().map(|chunk| chunk.row_size()).sum(),
             },
         }
@@ -253,10 +286,18 @@ impl DCRTTrapdoor {
 
     /// The row chunks of `T` of a statistical trapdoor.
     pub fn t_chunks(&self) -> &[DCRTPolyMatrix] {
-        let Self::Statistical { t } = self else {
+        let Self::Statistical { t, .. } = self else {
             panic!("statistical component requested from a computational trapdoor");
         };
         t
+    }
+
+    /// The precomputation of a statistical trapdoor.
+    pub fn statistical_precomputation(&self) -> &statistical::StatisticalPrecomputation {
+        let Self::Statistical { precomputation, .. } = self else {
+            panic!("statistical component requested from a computational trapdoor");
+        };
+        precomputation
     }
 
     /// Every stored matrix: the six computational components, or the row chunks of `T`.
@@ -265,7 +306,7 @@ impl DCRTTrapdoor {
             Self::Computational { r, e, a_mat, b_mat, d_mat, re } => {
                 vec![r, e, a_mat, b_mat, d_mat, re]
             }
-            Self::Statistical { t } => t.iter().collect(),
+            Self::Statistical { t, .. } => t.iter().collect(),
         }
     }
 
@@ -276,17 +317,21 @@ impl DCRTTrapdoor {
         })
     }
 
-    /// The tagged encoding: `TAGGED_MAGIC`, a tag byte, and the length-prefixed compact matrices
-    /// (the six computational components, or the row chunks of `T`). Each chunk is a separate
-    /// record, so the encoding can be written and read one chunk at a time.
+    /// The tagged encoding: `TAGGED_MAGIC`, a tag byte, and the length-prefixed records: the
+    /// compact matrices (the six computational components, or the row chunks of `T`), followed
+    /// for a statistical trapdoor by its precomputation. Each record is separate, so the
+    /// encoding can be written and read one record at a time.
     pub fn to_compact_bytes(&self) -> Vec<u8> {
         let tag = match self {
             Self::Computational { .. } => TAG_COMPUTATIONAL,
             Self::Statistical { .. } => TAG_STATISTICAL,
         };
-        let parts = parallel_iter!(self.matrices())
+        let mut parts = parallel_iter!(self.matrices())
             .map(|matrix| matrix.to_compact_bytes())
             .collect::<Vec<_>>();
+        if let Self::Statistical { precomputation, .. } = self {
+            parts.push(precomputation.to_bytes());
+        }
         let mut out = Vec::with_capacity(
             TAGGED_MAGIC.len() + 1 + parts.iter().map(|bytes| 8 + bytes.len()).sum::<usize>(),
         );
@@ -309,7 +354,8 @@ impl DCRTTrapdoor {
         params: &DCRTPolyParams,
         bytes: &[u8],
     ) -> Result<Self, CompactMatrixDecodeError> {
-        let (tag, parts) = trapdoor_encoding_parts(bytes)?;
+        let (tag, mut parts) = trapdoor_encoding_parts(bytes)?;
+        let precomputation = if tag == TAG_STATISTICAL { parts.pop() } else { None };
         let matrices = parallel_iter!(parts)
             .map(|part| DCRTPolyMatrix::try_from_compact_bytes(params, part))
             .collect::<Result<Vec<_>, _>>()?;
@@ -334,7 +380,20 @@ impl DCRTTrapdoor {
                         "statistical trapdoor chunks must be nonempty with one column per digit",
                     ));
                 }
-                Ok(Self::Statistical { t: matrices })
+                let m_bar = matrices.iter().map(|chunk| chunk.row_size()).sum();
+                let precomputation = precomputation
+                    .and_then(|bytes| {
+                        statistical::StatisticalPrecomputation::from_bytes(
+                            bytes,
+                            params.ring_dimension() as usize,
+                            m_bar,
+                            digits,
+                        )
+                    })
+                    .ok_or(CompactMatrixDecodeError::InvalidHeader(
+                        "statistical trapdoor precomputation does not match its chunks",
+                    ))?;
+                Ok(Self::Statistical { t: matrices, precomputation })
             }
             _ => Err(CompactMatrixDecodeError::InvalidHeader("unknown trapdoor encoding tag")),
         }
@@ -358,14 +417,17 @@ impl DCRTTrapdoor {
             Self::Computational { .. } => {
                 self.sample_pert_square_mat(s, c, dgg, dgg_large_params, peikert, total_ncol)
             }
-            Self::Statistical { t } => {
+            Self::Statistical { t, precomputation } => {
                 let p2z_vec = sample_p2_integers(
                     params.ring_dimension() as usize * params.modulus_digits(),
                     total_ncol,
                     dgg_large_params,
                     peikert,
                 );
-                statistical::perturbation(params, t, p2z_vec, s, c, dgg)
+                let widths = statistical::PerturbationWidths::new(s, c, dgg)
+                    .expect("a checked statistical preimage width");
+                let m_bar = t.iter().map(|chunk| chunk.row_size()).sum();
+                statistical::perturbation(params, m_bar, precomputation, p2z_vec, &widths)
             }
         }
     }
@@ -387,7 +449,7 @@ impl DCRTTrapdoor {
                 let bottom = p_hat.slice_rows(2 * d, p_hat.row_size()) + z_hat;
                 top.concat_rows(&[&bottom])
             }
-            Self::Statistical { t } => statistical::combine(t, p_hat, z_hat),
+            Self::Statistical { t, .. } => statistical::combine(t, p_hat, z_hat),
         }
     }
 

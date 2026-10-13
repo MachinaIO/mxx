@@ -39,12 +39,14 @@ mod build;
 mod decoder;
 mod dynamic;
 mod evaluator;
+mod refresh;
 mod rules;
 
 pub(crate) use self::decoder::simulate_decoder_noise;
 pub use self::{
     audit::{RnsBggNoiseTrace, RnsBggParameterManifest, RnsBggPlanRequest},
     decoder::RnsBggDecoderNoise,
+    refresh::{RnsBggRefreshNoise, simulate_refresh_noise},
 };
 
 /// Evaluator-owned noise contracts for one Program lowering.
@@ -67,21 +69,9 @@ pub struct RnsBggNoiseBindings {
     pub dynamic: Option<RnsBggDynamicNoise>,
 }
 
-/// The error contract of one RHS package read by a Program.
-#[derive(Clone, Debug)]
-pub struct RnsBggPackageNoise {
-    /// The setup coordinate of the package.
-    pub coordinate: u32,
-    /// Coefficient bound of the gadget ciphertext error `e_C`.
-    pub ciphertext_error: BigUint,
-    /// The Gaussian sigma of `e_C` when encryption samples it; a supplied
-    /// ciphertext has only its bound.
-    pub ciphertext_sigma: Option<BigDecimal>,
-}
-
 /// The Dynamic material contracts of one Program: the setup's sampling
-/// contracts of companions and helpers, each RHS package's ciphertext error
-/// contract, and the setup automorphism group. Built from a setup
+/// contracts of companions, helpers, and RHS ciphertext errors, the setup
+/// coordinate of each RHS package, and the setup automorphism group. Built from a setup
 /// ([`Self::from_setup`]), its contracts are the setup's, so a sampled width
 /// and an analysed bound cannot differ; parameter planning, which precedes
 /// the setup, states them for a Program directly ([`Self::for_program`]).
@@ -93,14 +83,14 @@ pub struct RnsBggDynamicNoise {
     pub namespace: [u8; 32],
     /// The sampling contracts of companions and helpers.
     pub distributions: super::RnsBggDynamicDistributions,
-    /// The package contract of every RHS of the Program.
-    pub rhs: BTreeMap<RhsId, RnsBggPackageNoise>,
+    /// The setup coordinate of the package of every RHS of the Program.
+    pub rhs: BTreeMap<RhsId, u32>,
     /// The setup automorphism group, ascending.
     pub automorphisms: Vec<usize>,
-    /// The branches a baby-step split switches as a composition `Aut_g Aut_b`
-    /// ([`super::RnsBggDynamicSetup::composed_automorphisms`]); empty without
-    /// a split.
-    pub composed: std::collections::BTreeSet<usize>,
+    /// The number of switches of every nonidentity automorphism under the
+    /// setup's LUT radix ([`super::RnsBggDynamicSetup::radix_depths`]); an
+    /// automorphism without an entry is switched once.
+    pub depths: BTreeMap<usize, usize>,
     /// The CRT primes of the auxiliary modulus of compact encodings
     /// ([`super::RnsBggDynamicSetup::with_compact_encodings`]): the companion
     /// and helper errors are then the expanded bounds of
@@ -120,26 +110,14 @@ impl RnsBggDynamicNoise {
         let rhs = program
             .rhs_inputs()
             .keys()
-            .map(|id| {
-                let coordinate = binding.rhs(*id)?;
-                let (ciphertext_error, ciphertext_sigma) = match &setup.rhs()[&coordinate].source {
-                    super::RnsBggPackageSource::Sampled => (
-                        distributions.ciphertext.cutoff().clone(),
-                        Some(distributions.ciphertext.sigma().clone()),
-                    ),
-                    super::RnsBggPackageSource::Supplied { error_bound } => {
-                        (error_bound.clone(), None)
-                    }
-                };
-                Ok((*id, RnsBggPackageNoise { coordinate, ciphertext_error, ciphertext_sigma }))
-            })
+            .map(|id| Ok((*id, binding.rhs(*id)?)))
             .collect::<Result<_, RnsBggError>>()?;
         Ok(Self {
             namespace: setup.identity(),
             distributions: distributions.clone(),
             rhs,
             automorphisms: setup.automorphisms().to_vec(),
-            composed: setup.composed_automorphisms(),
+            depths: setup.radix_depths(),
             compact_extension: setup.compact_extension().map(<[u64]>::to_vec),
         })
     }
@@ -158,26 +136,13 @@ impl RnsBggDynamicNoise {
         let automorphisms = layout
             .automorphism_indices(ring_dimension)
             .map_err(|_| RnsBggError::Parameters("invalid automorphism layout"))?;
-        let rhs = program
-            .rhs_inputs()
-            .keys()
-            .map(|id| {
-                (
-                    *id,
-                    RnsBggPackageNoise {
-                        coordinate: id.0,
-                        ciphertext_error: distributions.ciphertext.cutoff().clone(),
-                        ciphertext_sigma: Some(distributions.ciphertext.sigma().clone()),
-                    },
-                )
-            })
-            .collect();
+        let rhs = program.rhs_inputs().keys().map(|id| (*id, id.0)).collect();
         Ok(Self {
             namespace,
             distributions,
             rhs,
             automorphisms,
-            composed: Default::default(),
+            depths: Default::default(),
             compact_extension: None,
         })
     }
@@ -258,6 +223,7 @@ impl RnsBggNoiseBindings {
                                 .ok()
                                 .and_then(|n| n.to_biguint())
                                 .ok_or(RnsBggError::Binding("family count is not concrete"))?,
+                            row_length: None,
                         }),
                     );
                 }
@@ -283,6 +249,7 @@ impl RnsBggNoiseBindings {
                             element: value.clone(),
                             range,
                             max_nonzero_payloads: n,
+                            row_length: None,
                         }),
                     );
                 }
@@ -356,6 +323,21 @@ pub struct RnsBggNoiseValue {
 }
 
 impl RnsBggNoiseValue {
+    /// This value as the trace keeps it: bounds, moments and heuristics,
+    /// without the provenance and contribution breakdown that only later
+    /// combinations read. Keeping them for every wire would hold each wire's
+    /// full source set, quadratic in a long chain of operations.
+    pub(crate) fn traced(&self) -> Self {
+        Self {
+            bound: self.bound.clone(),
+            payload_l2_squared: self.payload_l2_squared.clone(),
+            moments: self.moments.clone(),
+            provenance: BTreeMap::new(),
+            heuristics: self.heuristics.clone(),
+            breakdown: None,
+        }
+    }
+
     #[cfg(test)]
     fn single_provenance(
         provenance: NoiseSourceProvenance,
@@ -604,12 +586,10 @@ impl RnsBggNoiseValue {
             _ => None,
         };
         let mut provenance = self.provenance.clone();
+        // A source already present keeps its first route: appending every
+        // repeated route grows geometrically along chains of sums.
         for (source, right) in &rhs.provenance {
-            if let Some(left) = provenance.get_mut(source) {
-                left.route.extend_from_slice(&right.route);
-            } else {
-                provenance.insert(*source, right.clone());
-            }
+            provenance.entry(*source).or_insert_with(|| right.clone());
         }
         let mut heuristics = self.heuristics.clone();
         for id in rhs.heuristics.ids() {
@@ -640,8 +620,13 @@ pub struct RnsBggNoiseFamily<T = RnsBggNoiseValue> {
     pub element: T,
     /// Active family range.
     pub range: FamilyRange,
-    /// Maximum number of nonzero payload members in this range.
+    /// Maximum number of nonzero payload members in this range, or, with
+    /// `row_length`, in every aligned row `[r k, r (k + 1))` of it.
     pub max_nonzero_payloads: BigUint,
+    /// The row length `r` of a row-wise sparsity contract (for example a
+    /// one-hot row per member of a flattened `members x width` family).
+    #[serde(default)]
+    pub row_length: Option<BigUint>,
 }
 
 impl<T> RnsBggNoiseFamily<T> {
@@ -655,6 +640,11 @@ impl<T> RnsBggNoiseFamily<T> {
             .ok_or(RnsBggError::Parameters("noise family needs a concrete active count"))?;
         if self.max_nonzero_payloads > n {
             return Err(RnsBggError::Binding("family support exceeds active range"));
+        }
+        if let Some(row) = &self.row_length &&
+            (row.is_zero() || self.max_nonzero_payloads > *row)
+        {
+            return Err(RnsBggError::Binding("family row support exceeds its row length"));
         }
         Ok(n)
     }
@@ -683,6 +673,8 @@ pub struct RnsBggNoiseEvaluator<'a> {
     unmask_trapdoor_sigma: Option<f64>,
     /// Lane index of each enclosing parallel family, innermost last.
     lane_indices: Vec<IntExpr>,
+    /// The concrete lane count of each entry of `lane_indices`.
+    lane_counts: Vec<BigUint>,
     /// Wires whose payload is nonzero in at most `count` lanes of the family
     /// at `depth` (the number of enclosing parallel families), because they
     /// are weighted by distinct members of a sparse RHS family.
@@ -695,6 +687,9 @@ pub struct RnsBggNoiseEvaluator<'a> {
 struct PayloadSupport {
     depth: usize,
     count: BigUint,
+    /// With a row length, `count` bounds every aligned row of the lanes
+    /// (the family the body forms inherits it as its row contract).
+    row_length: Option<BigUint>,
 }
 
 /// Common API noise-stage adapter.  It owns only graph handles and the
@@ -743,6 +738,7 @@ mod test {
             element: value(&[1]),
             range,
             max_nonzero_payloads: BigUint::from(3u8),
+            row_length: None,
         };
         assert!(family.validate_support().is_err());
     }
@@ -754,6 +750,7 @@ mod test {
             element: value(&[1]),
             range,
             max_nonzero_payloads: BigUint::from(1u8),
+            row_length: None,
         };
         assert_eq!(family.validate_support().unwrap(), BigUint::from(4u8));
         assert_eq!(family.max_nonzero_payloads, BigUint::from(1u8));

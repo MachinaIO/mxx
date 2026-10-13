@@ -18,6 +18,13 @@
 //! `u_i = y_i - (E v)_i`, and `k_i = sigma_i(k~_i)`. The anchor blocks are
 //! stored in these inverse coordinates; decryption contracts them as
 //! `sigma_i((b - B^(2)) k~_i)`.
+//!
+//! With compact encodings (the manuscript's Appendix C), the family matrix is
+//! `M~_F = [ L | (delta_i (x) sigma_i(B''^(1)))_i | I_W | delta_1 (x) A_F^(1) ]`
+//! for `B'' = Dc(B_c)` (see [`crate::setup`]); both new blocks are extension
+//! coordinates, sampled with `v` at the key width: `v''_i` (`m_c D` per row)
+//! and `v_iota` (one per row). The block `I_W` serves only the security
+//! proof; decryption's row is zero there.
 use crate::{
     BranchingProgram, CompiledPredicate, PeError, PeMasterSecretKey, PePublicKey, setup::digest,
 };
@@ -28,7 +35,7 @@ use mxx_backends::{
 use mxx_dsl::{DslContext, Int, Mat, Preimage, Ring};
 use mxx_exponent_lut::{
     api::{self, PlaintextInputs, StageArtifacts, StageExecution, StageGraph},
-    program::{Operand, RhsId, WireId},
+    program::{Operand, ProgramData, RhsId, WireId},
     rns_bgg::{RnsBggPreprocessOnlineEvalDescriptor, RnsOutputUse, RnsPreprocessBuild},
 };
 use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactAvailability, node::ConcatAxis};
@@ -42,13 +49,19 @@ pub(crate) const ANCHOR_KEY: &str = "mxx-pe/key/anchor";
 pub(crate) const HELPER_KEY: &str = "mxx-pe/key/helper";
 /// The output block `v_F`, stored as a compact bounded matrix.
 pub(crate) const OUTPUT_KEY: &str = "mxx-pe/key/output";
+/// With compact encodings, the blocks `v''_i` of `delta_i (x) sigma_i(B''^(1))` (a family of
+/// `W` members of `m_c D x 1`).
+pub(crate) const COMPRESSED_KEY: &str = "mxx-pe/key/compressed";
+/// With compact encodings, the block `v_iota` of `I_W` (a family of `W` members of `1 x 1`).
+pub(crate) const IDENTITY_KEY: &str = "mxx-pe/key/identity";
 
-/// A key for one predicate: the compiled predicate with its public
-/// evaluation artifacts, and the key production.
+/// A key for one predicate: the class Program with the predicate as its data,
+/// the public evaluation artifacts, and the key production.
 pub struct PePredicateKey {
     public_key: [u8; 32],
     predicate: BranchingProgram,
     compiled: CompiledPredicate,
+    data: ProgramData,
     evaluation: StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
     key: StageArtifacts<()>,
     commitment: [u8; 32],
@@ -65,6 +78,11 @@ impl PePredicateKey {
 
     pub const fn compiled(&self) -> &CompiledPredicate {
         &self.compiled
+    }
+
+    /// The predicate as the class Program's data ([`BranchingProgram::data`]).
+    pub const fn data(&self) -> &ProgramData {
+        &self.data
     }
 
     /// The compiled predicate's public evaluation artifacts, including `A_F`.
@@ -93,7 +111,7 @@ impl PePredicateKey {
 }
 
 /// The canonical group `H` of the class, its inverses, the automorphisms
-/// `P` with a published helper (`H \ {1}`, or fewer under a baby-step split,
+/// `P` with a published helper (`H \ {1}`, or `J_B` under a LUT radix `B`,
 /// see [`mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::helper_automorphisms`]),
 /// and, for row `i` and `k` in `P`, the row `i k^-1` whose helper block
 /// `(i k^-1, k)` places `-G^(1)` in row `i`.
@@ -178,7 +196,8 @@ where
     if predicate.class() != parameters.class() || master.public_key() != public_key.identity() {
         return Err(PeError::Mismatch);
     }
-    let compiled = predicate.compile()?;
+    let compiled = predicate.class().compile()?;
+    let data = predicate.data(&compiled);
     let rns = parameters.rns();
     let (_, evaluation) = api::preprocess(
         compiled.program(),
@@ -188,7 +207,8 @@ where
         public_key.hash_key(),
         RnsPreprocessBuild::new(rns, *public_key.context())
             .with_output_use(RnsOutputUse::Gadget)
-            .with_dynamic_setup(public_key.setup(), compiled.binding().clone())?,
+            .with_dynamic_setup(public_key.setup(), compiled.binding().clone())?
+            .with_data(data.clone()),
         execution,
         store,
         |_, outputs| Ok(outputs),
@@ -221,7 +241,9 @@ where
     let key_sigma = crate::params::real_expr(parameters.key_width())?;
     let key_cutoff = parameters.key_cutoff().clone();
     // The extension blocks are bounded by the key cutoff, so they are stored compactly.
-    let gaussian = || ring.small_gaussian((width, 1), key_sigma.clone(), key_cutoff.clone());
+    let gaussian_of =
+        |rows: usize| ring.small_gaussian((rows, 1), key_sigma.clone(), key_cutoff.clone());
+    let gaussian = || gaussian_of(width);
     // The one extension sample `v`, shared by every row.
     // Each block is stored compactly; the products below read it as a full matrix `I v`.
     let helpers = mxx_dsl::parallel(w * p, |_| {
@@ -232,6 +254,28 @@ where
     let stored_helpers = helpers.field(|(block, _)| block)?;
     let helpers = helpers.field(|(_, full)| full)?;
     let output_block = gaussian();
+    // The extension blocks of `B''` and `I_W` with compact encodings.
+    let compressed_width = parameters.compressed_anchor_width();
+    let compressed = public_key
+        .compressed_anchor_rows(hash_key.clone())?
+        .map(|(first_row, _)| {
+            let blocks = mxx_dsl::parallel(w, |_| {
+                let block = gaussian_of(compressed_width);
+                let full = ring.identity(compressed_width).mul_small_rhs(block.clone());
+                Ok((block, full))
+            })?;
+            let identity = mxx_dsl::parallel(w, |_| {
+                let block = gaussian_of(1);
+                let full = ring.identity(1).mul_small_rhs(block.clone());
+                Ok((block, full))
+            })?;
+            Ok::<_, PeError>((
+                first_row,
+                (blocks.field(|(block, _)| block)?, blocks.field(|(_, full)| full)?),
+                (identity.field(|(block, _)| block)?, identity.field(|(_, full)| full)?),
+            ))
+        })
+        .transpose()?;
     let gadget_first_row = Mat::concat(
         ConcatAxis::Columns,
         vec![parameters.rns().public_gadget(0)?, ring.zero((1, columns))],
@@ -263,6 +307,16 @@ where
                 helpers.at(Int::evaluate((source * IntExpr::constant(p) + k_index).canonicalize()));
             Ok(sum + helper_first_row * own - gadget_first_row.clone() * switched)
         })?;
+        // `sigma_i(B''^(1)) v''_i + v_iota,i` with compact encodings.
+        let residual = match &compressed {
+            Some((first_row, (_, blocks), (_, identity))) => {
+                let own = Int::evaluate(row.clone());
+                residual +
+                    first_row.clone().ring_automorphism(i.clone()) * blocks.at(own.clone()) +
+                    identity.at(own)
+            }
+            None => residual,
+        };
         let indicator = Int::evaluate(IntExpr::Select {
             selector: Box::new(row.clone()),
             branches: (0..w).map(|index| IntExpr::constant(usize::from(index == 0))).collect(),
@@ -276,10 +330,15 @@ where
         let anchor = trapdoor.sample_preimage(targets.at(Int::constant(row)), (m_b, 1));
         graph = graph.transferred_output(format!("{ANCHOR_KEY}/{row}"), anchor)?;
     }
-    let graph = graph
+    let mut graph = graph
         .transferred_output(HELPER_KEY, stored_helpers)?
-        .transferred_output(OUTPUT_KEY, output_block)?
-        .build()?;
+        .transferred_output(OUTPUT_KEY, output_block)?;
+    if let Some((_, (blocks, _), (identity, _))) = compressed {
+        graph = graph
+            .transferred_output(COMPRESSED_KEY, blocks)?
+            .transferred_output(IDENTITY_KEY, identity)?;
+    }
+    let graph = graph.build()?;
     let (trapdoor_production, trapdoor_manifest) = master.trapdoor_production().clone();
     let nonce: [u8; 32] = rand::random();
     let key = api::execute_artifacts(
@@ -289,13 +348,20 @@ where
             BTreeMap::from([
                 (trapdoor_production, trapdoor_manifest),
                 (evaluation.production().clone(), evaluation.manifest().clone()),
+                // `B_Q^(1)`, whose decompression the compact blocks read.
+                public_key.anchor_production().clone(),
             ]),
         ),
         &ParamEnv::default(),
         (),
         digest(
             b"mxx-pe/keygen/v1",
-            &[public_key.identity(), compiled.program().id().as_bytes(), &nonce],
+            &[
+                public_key.identity(),
+                compiled.program().id().as_bytes(),
+                &data.commitment(),
+                &nonce,
+            ],
         ),
         execution,
         store,
@@ -306,6 +372,7 @@ where
         &[
             public_key.identity(),
             compiled.program().id().as_bytes(),
+            &data.commitment(),
             &serde_json::to_vec(compiled.binding())
                 .map_err(|error| PeError::Graph(error.to_string()))?,
             b"gadget-output",
@@ -321,6 +388,7 @@ where
         public_key: *public_key.identity(),
         predicate: predicate.clone(),
         compiled,
+        data,
         evaluation,
         key,
         commitment,
@@ -343,7 +411,26 @@ mod tests {
     #[test]
     fn keys_solve_the_implicit_family_matrix() {
         let class = PeClass::new(2, 2, 2, 2).unwrap();
-        let parameters = parameters(class);
+        keys_solve(class, parameters(class));
+    }
+
+    /// [`keys_solve_the_implicit_family_matrix`] under the LUT radix 2: the helper blocks are
+    /// those of `J_2`, fewer than `W - 1` per row.
+    #[test]
+    fn radix_keys_solve_the_implicit_family_matrix() {
+        let class = PeClass::new(2, 2, 2, 2).unwrap();
+        keys_solve(class, parameters(class).with_lut_radix(2).unwrap());
+    }
+
+    /// [`keys_solve_the_implicit_family_matrix`] with compact encodings: each row also carries
+    /// `sigma_i(B''^(1)) v''_i + v_iota,i`.
+    #[test]
+    fn compact_keys_solve_the_extended_family_matrix() {
+        let class = PeClass::new(2, 2, 2, 2).unwrap();
+        keys_solve(class, parameters(class).with_compact_encodings().unwrap());
+    }
+
+    fn keys_solve(class: PeClass, parameters: crate::PeParameters) {
         let mut execution = execution(&parameters);
         let mut store = MemoryArtifactStore::default();
         let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
@@ -371,12 +458,30 @@ mod tests {
             ArtifactAvailability::Transferred,
         );
         let output_block = ring.small_matrix_artifact_input(
-            production,
+            production.clone(),
             OUTPUT_KEY,
             (width, 1),
-            cutoff,
+            cutoff.clone(),
             ArtifactAvailability::Transferred,
         );
+        let compressed =
+            public_key.compressed_anchor_rows(hash_key.clone()).unwrap().map(|(first_row, _)| {
+                let family = |name: &str, rows: usize| {
+                    ring.small_matrix_family_artifact_input(
+                        production.clone(),
+                        name,
+                        w,
+                        (rows, 1),
+                        cutoff.clone(),
+                        ArtifactAvailability::Transferred,
+                    )
+                };
+                (
+                    first_row,
+                    family(COMPRESSED_KEY, parameters.compressed_anchor_width()),
+                    family(IDENTITY_KEY, 1),
+                )
+            });
         let output = key.output().unwrap();
         let evaluation = key.evaluation().production().clone();
         let output_first_row = Mat::concat(
@@ -419,6 +524,14 @@ mod tests {
                             value - gadget_first_row.clone().mul_small_rhs(helper(source, k_index));
                     }
                 }
+            }
+            if let Some((first_row, blocks, identity)) = &compressed {
+                value = value +
+                    first_row
+                        .clone()
+                        .ring_automorphism(IntExpr::constant(*i))
+                        .mul_small_rhs(blocks.at(Int::constant(row))) +
+                    ring.identity(1).mul_small_rhs(identity.at(Int::constant(row)));
             }
             if row == 0 {
                 value = value + output_first_row.clone().mul_small_rhs(output_block.clone()) -

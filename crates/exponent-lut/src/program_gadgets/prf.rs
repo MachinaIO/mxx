@@ -140,7 +140,11 @@ pub enum PrfOutput {
 pub struct PrfSelectorFamily {
     pub rhs: RhsId,
     pub members: usize,
+    /// The number of one bits in the family, or in each row with
+    /// `row_length`.
     pub max_nonzero: usize,
+    /// The row length of a row-wise one-hot family.
+    pub row_length: Option<usize>,
 }
 
 /// A sparse-key LWR weak PRF added to a Program.
@@ -164,12 +168,16 @@ pub struct PrfSelectorFamily {
 ///
 /// - One member: per bucket, one root `parallel` over the bucket's cells, selector family of one
 ///   bit per cell (one-hot), and a `Sum`; the output is a scalar.
-/// - Several members: one root `parallel` over the members, so the graph does not grow with them. A
-///   cell's coordinate is a `Select` over the member index; the buckets share the largest cell
-///   count `W`, a slot beyond a layout's own cells being padding; the `W` cells of a bucket are
-///   unrolled in the body, each weighted by member `o` of its (bucket, slot) selector family of one
-///   bit per member. No body is nested, so selector members are read at the bare root binder. The
-///   output is the member family.
+/// - Several members: the buckets share the largest cell count `W`, a slot beyond a layout's own
+///   cells being padding. Per bucket, one root `parallel` over the `M W` cells `f = o W + j`
+///   (member `o`, slot `j`) multiplies member `o`'s accumulator by the cell's coordinate (a
+///   `Select` over `f`, or over `j` when every member shares it) and weights it by member `f` of
+///   the bucket's selector family of `M W` bits (member `o`'s one-hot row at `o W`), read at the
+///   bare root binder; then a root `parallel` over the members sums each member's row (a nested
+///   `parallel` over the slots reads the cells through the identity `1 * X^0`). The graph does not
+///   grow with the members, and the noise model lowers each body once: the row contract
+///   ([`PrfSelectorFamily::row_length`]) keeps every row sum's payload support at one. A last root
+///   `parallel` applies the readout LUT; the output is the member family.
 #[derive(Clone, Debug)]
 pub struct SparseLwrPrf {
     profile: SparseLwrPrfProfile,
@@ -178,8 +186,7 @@ pub struct SparseLwrPrf {
     initial_input: WireId,
     input_vector: WireId,
     lut: LutId,
-    /// One member: the family of each bucket. Several: per bucket, the
-    /// family of each slot.
+    /// The family of each bucket (one entry per bucket).
     selectors: Vec<Vec<RhsId>>,
     output: PrfOutput,
 }
@@ -261,46 +268,104 @@ impl SparseLwrPrf {
                 .flat_map(|layout| layout.cells.iter().map(Vec::len))
                 .max()
                 .ok_or(PrfError::InvalidSparseLwrBlock)?;
+            // One selector family per bucket, member `o`'s row of `width` bits
+            // at `o width ..`: each row is one-hot (the key's slot in that
+            // bucket), the row contract of [`PrfSelectorFamily::row_length`].
             let selectors = (0..bucket_count)
                 .map(|_| {
-                    (0..width)
-                        .map(|_| builder.rhs_family(IntExpr::constant(members)))
-                        .collect::<Result<Vec<_>, _>>()
+                    builder.rhs_family(IntExpr::constant(members * width)).map(|rhs| vec![rhs])
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let range = FamilyRange::full(IntExpr::constant(members))?;
-            let family = builder.parallel(range, |builder, member| {
-                let mut state = initial_input;
-                for (bucket, selectors) in selectors.iter().enumerate() {
-                    let mut cells = Vec::with_capacity(width);
-                    for (slot, selector) in selectors.iter().enumerate() {
-                        // A real cell reads its `a` coordinate; dummy,
-                        // padding and missing slots read the zero member.
-                        let coordinate = IntExpr::Select {
-                            selector: Box::new(member.clone()),
-                            branches: layouts
+            let cells_range = FamilyRange::full(IntExpr::constant(members * width))?;
+            let members_range = FamilyRange::full(IntExpr::constant(members))?;
+            let row_range = FamilyRange::full(IntExpr::constant(width))?;
+            // The state of every member, `None` before the first bucket (the
+            // accumulator start `mono(0)` is shared).
+            let mut state = None;
+            for (bucket, selector) in selectors.iter().enumerate() {
+                // A real cell reads its `a` coordinate; dummy, padding and
+                // missing slots read the zero member. A coordinate shared by
+                // every member is selected by the slot `f mod width` alone.
+                let table = layouts
+                    .iter()
+                    .map(|layout| {
+                        (0..width)
+                            .map(|slot| coordinate(layout.cells[bucket].get(slot)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let shared = table.iter().all(|row| *row == table[0]);
+                let constant = shared && table[0].iter().all(|value| *value == table[0][0]);
+                // Cell `f = o width + j` of every member `o` and slot `j`, in one
+                // root loop that reads selector member `f` as its own member.
+                let cells = builder.parallel(cells_range.clone(), |builder, cell| {
+                    let coordinate = if constant {
+                        IntExpr::constant(table[0][0])
+                    } else if shared {
+                        IntExpr::Select {
+                            selector: Box::new(IntExpr::Rem(
+                                Box::new(cell.clone()),
+                                Box::new(IntExpr::constant(width)),
+                            )),
+                            branches: table[0].iter().copied().map(IntExpr::constant).collect(),
+                        }
+                    } else {
+                        IntExpr::Select {
+                            selector: Box::new(cell.clone()),
+                            branches: table
                                 .iter()
-                                .map(|layout| {
-                                    IntExpr::constant(coordinate(layout.cells[bucket].get(slot)))
-                                })
+                                .flatten()
+                                .copied()
+                                .map(IntExpr::constant)
                                 .collect(),
-                        };
-                        let shifted = builder.mul_public(
-                            Operand::Member { family: input_vector, index: coordinate },
-                            Operand::Scalar(state),
-                        )?;
-                        cells.push(builder.mul_private(
-                            Operand::Scalar(shifted),
-                            Operand::Member { family: *selector, index: member.clone() },
-                        )?);
-                    }
-                    let mut cells = cells.into_iter();
-                    let first = cells.next().ok_or(ProgramValidationError::InvalidLut)?;
-                    state = cells.try_fold(first, |sum, cell| {
-                        builder.add(Operand::Scalar(sum), Operand::Scalar(cell))
+                        }
+                    };
+                    let member = IntExpr::FloorDiv(
+                        Box::new(cell.clone()),
+                        Box::new(IntExpr::constant(width)),
+                    );
+                    let state = state.map_or(Operand::Scalar(initial_input), |family| {
+                        Operand::Member { family, index: member }
+                    });
+                    // X^(acc + a_r), then weighted by the cell's selector bit.
+                    let shifted = builder.mul_public(
+                        Operand::Member { family: input_vector, index: coordinate },
+                        state,
+                    )?;
+                    let weighted = builder.mul_private(
+                        Operand::Scalar(shifted),
+                        Operand::Member { family: selector[0], index: cell },
+                    )?;
+                    Ok(Operand::Scalar(weighted))
+                })?;
+                // Each member's state is the sum of its row of cells; a body
+                // returns an operation, so each cell is read by the identity
+                // `1 * X^0`, which keeps its noise.
+                state = Some(builder.parallel(members_range.clone(), |builder, member| {
+                    let row = builder.parallel(row_range.clone(), |builder, slot| {
+                        let cell = IntExpr::Add(
+                            Box::new(IntExpr::Mul(
+                                Box::new(member.clone()),
+                                Box::new(IntExpr::constant(width)),
+                            )),
+                            Box::new(slot),
+                        );
+                        builder
+                            .mul_small_constant(
+                                Operand::Member { family: cells, index: cell },
+                                vec![1],
+                                IntExpr::constant(0),
+                            )
+                            .map(Operand::Scalar)
                     })?;
-                }
-                builder.lut(Operand::Scalar(state), lut).map(Operand::Scalar)
+                    builder.sum(row).map(Operand::Scalar)
+                })?);
+            }
+            let state = state.ok_or(PrfError::InvalidSparseLwrBlock)?;
+            let family = builder.parallel(members_range, |builder, member| {
+                builder
+                    .lut(Operand::Member { family: state, index: member }, lut)
+                    .map(Operand::Scalar)
             })?;
             (selectors, PrfOutput::Family(family))
         };
@@ -341,34 +406,43 @@ impl SparseLwrPrf {
     }
 
     /// Every selector RHS family with its member count and how many of its
-    /// bits may be one: a one-member bucket family is one-hot, a
-    /// member-indexed family holds one bit of every member.
+    /// bits may be one: a one-member bucket family is one-hot; with several
+    /// members, bucket `b`'s family holds member `o`'s one-hot row of
+    /// `width` bits at `o width`, so each aligned row of length `width` has
+    /// one nonzero bit.
     pub fn selector_families(&self) -> Vec<PrfSelectorFamily> {
-        let one_member = self.layouts.len() == 1;
+        let width = self.width();
         self.selectors
             .iter()
             .enumerate()
-            .flat_map(|(bucket, families)| {
-                families.iter().map(move |rhs| {
-                    let members = if one_member {
-                        self.layouts[0].cells[bucket].len()
-                    } else {
-                        self.layouts.len()
-                    };
-                    PrfSelectorFamily {
-                        rhs: *rhs,
-                        members,
-                        max_nonzero: if one_member { 1 } else { members },
-                    }
-                })
+            .map(|(bucket, families)| match self.layouts.as_slice() {
+                [layout] => PrfSelectorFamily {
+                    rhs: families[0],
+                    members: layout.cells[bucket].len(),
+                    max_nonzero: 1,
+                    row_length: None,
+                },
+                layouts => PrfSelectorFamily {
+                    rhs: families[0],
+                    members: layouts.len() * width,
+                    max_nonzero: 1,
+                    row_length: Some(width),
+                },
             })
             .collect()
+    }
+
+    /// The common row width of a multi-member PRF: the widest bucket of any
+    /// member's layout.
+    fn width(&self) -> usize {
+        self.layouts.iter().flat_map(|layout| layout.cells.iter().map(Vec::len)).max().unwrap_or(0)
     }
 
     /// The private selector plaintexts of the generated `keys`, one key per
     /// member on its member's layout: with one member, bit `j` of bucket `b`'s
     /// family is 1 exactly when the key selects slot `j` of bucket `b`; with
-    /// several, member `o` of the family of bucket `b` and slot `j` is.
+    /// several, bit `o width + j` of bucket `b`'s family is 1 exactly when
+    /// member `o`'s key selects slot `j`.
     pub fn selector_plaintexts<P: Poly>(
         &self,
         parameters: &P::Params,
@@ -397,13 +471,16 @@ impl SparseLwrPrf {
                 plaintexts.insert(families[0], InputBinding::Family(bits));
                 continue;
             }
-            for (slot, family) in families.iter().enumerate() {
-                let bits = keys
-                    .iter()
-                    .map(|key| bit(key.private_schedule().selected_slot(bucket) == slot))
-                    .collect();
-                plaintexts.insert(*family, InputBinding::Family(bits));
-            }
+            let width = self.width();
+            let bits = keys
+                .iter()
+                .flat_map(|key| {
+                    let selected = key.private_schedule().selected_slot(bucket);
+                    (0..width).map(move |slot| slot == selected)
+                })
+                .map(bit)
+                .collect();
+            plaintexts.insert(families[0], InputBinding::Family(bits));
         }
         Ok(plaintexts)
     }
@@ -621,7 +698,7 @@ mod tests {
     /// Several members: one member-indexed selector family per bucket and
     /// slot, holding the slot bit of every member's key, and one root loop.
     #[test]
-    fn member_prf_has_member_indexed_selectors_per_bucket_and_slot() {
+    fn member_prf_has_one_row_one_hot_selector_family_per_bucket() {
         let keys = [toy_key(&[0, 3, 5, 9], 0), toy_key(&[1, 2, 6, 7], 100)];
         let (program, prf) = toy_prf(&keys);
         assert!(matches!(prf.output(), PrfOutput::Family(_)));
@@ -629,17 +706,21 @@ mod tests {
             keys.iter().flat_map(|key| key.public_layout.cells.iter().map(Vec::len)).max().unwrap();
         let buckets = keys[0].public_layout.parameters.bucket_count;
         let families = prf.selector_families();
-        assert_eq!(families.len(), buckets * width);
-        assert_eq!(program.rhs_inputs().len(), buckets * width);
-        assert!(families.iter().all(|family| family.members == 2 && family.max_nonzero == 2));
+        assert_eq!(families.len(), buckets);
+        assert_eq!(program.rhs_inputs().len(), buckets);
+        assert!(families.iter().all(|family| family.members == 2 * width &&
+            family.max_nonzero == 1 &&
+            family.row_length == Some(width)));
         let parameters =
             mxx_backends::poly::dcrt::params::DCRTPolyParams::new(32, 1, 17, 4, None, None);
         let plaintexts = prf.selector_plaintexts(&parameters, &keys).unwrap();
-        for (index, family) in families.iter().enumerate() {
-            let (bucket, slot) = (index / width, index % width);
+        for (bucket, family) in families.iter().enumerate() {
             let expected = keys
                 .iter()
-                .map(|key| u64::from(key.private_schedule().selected_slot(bucket) == slot))
+                .flat_map(|key| {
+                    let selected = key.private_schedule().selected_slot(bucket);
+                    (0..width).map(move |slot| u64::from(slot == selected))
+                })
                 .collect::<Vec<_>>();
             assert_eq!(bits(&parameters, &plaintexts, family.rhs), expected);
         }

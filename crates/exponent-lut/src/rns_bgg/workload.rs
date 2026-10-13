@@ -53,7 +53,8 @@ pub struct RnsBggDerivedWorkload {
     /// any number for Dynamic ones, whose packages are setup material read
     /// at every consuming level.
     rhs_levels: BTreeMap<RhsId, BTreeSet<usize>>,
-    /// The input level and identity of every LUT the Program evaluates.
+    /// The input level and identity of every LUT the Program evaluates on a
+    /// private payload.
     luts: BTreeSet<(usize, LutId)>,
 }
 
@@ -121,9 +122,7 @@ impl RnsBggDerivedWorkload {
         };
         // A public input that is itself an output keeps its own level.
         for output in program.outputs() {
-            let (crate::program::Operand::Scalar(wire) |
-            crate::program::Operand::Member { family: wire, .. }) = output;
-            collector.public_input_uses.insert(*wire, None);
+            collector.public_input_uses.insert(*output.source(), None);
         }
         let mut environment = Environment::new();
         for id in program.inputs().keys() {
@@ -215,7 +214,8 @@ impl RnsBggDerivedWorkload {
     pub fn program(&self) -> crate::program::ExponentLutProgramId {
         self.program
     }
-    /// The input level and identity of every LUT the Program evaluates.
+    /// The input level and identity of every LUT the Program evaluates on a
+    /// private payload.
     pub fn luts(&self) -> &BTreeSet<(usize, LutId)> {
         &self.luts
     }
@@ -295,25 +295,41 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         self.levels.insert(output, next);
         Ok((output, next))
     }
+    /// A private LUT moves an exponent output to the next level and keeps a
+    /// coefficient output (finalized once later). A public LUT ends with one
+    /// ModDown in either representation (Static helpers carry the level's
+    /// scale), so its output is at the next level.
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
-        if self
+        let public = self
             .program
             .wire_knowledge(input.0)
             .map_err(|_| RnsBggError::Graph("invalid LUT input metadata".into()))? ==
-            crate::program::AttributeKnowledge::PublicPayload
-        {
-            return Err(RnsBggError::Parameters("RNS-BGG LUT requires a private input"));
-        }
+            crate::program::AttributeKnowledge::PublicPayload;
         self.note_use(input.0, None);
         let output = self.site()?.output;
-        self.luts.insert((input.1, self.program.lut_id_at(output).map_err(|_| RnsBggError::Lut)?));
-        let next = if table.output_representation().is_coefficient() {
+        if !public {
+            self.luts
+                .insert((input.1, self.program.lut_id_at(output).map_err(|_| RnsBggError::Lut)?));
+        }
+        let next = if table.output_representation().is_coefficient() && !public {
             input.1
         } else {
             input.1.checked_add(1).ok_or(RnsBggError::Parameters("logical level overflow"))?
         };
         self.levels.insert(output, next);
         Ok((output, next))
+    }
+    fn mul_small_constant(
+        &mut self,
+        input: &Self::Wire,
+        _: &[i64],
+        _: &IntExpr,
+    ) -> Result<Self::Wire, Self::Error> {
+        // A plaintext factor applies to the carrier in place.
+        self.note_use(input.0, None);
+        let output = self.site()?.output;
+        self.levels.insert(output, input.1);
+        Ok((output, input.1))
     }
 }
 
@@ -332,6 +348,7 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
 
     fn wire_at(
         &mut self,
+        _evaluator: &mut WorkloadCollector<'a>,
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {
@@ -356,6 +373,14 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
                 ),
             ));
         }
+        Ok(family.0)
+    }
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        _: crate::program::DataId,
+        _: &IntExpr,
+    ) -> Result<RhsId, ProgramLowerError<RnsBggError>> {
         Ok(family.0)
     }
     fn parallel(
@@ -507,7 +532,7 @@ mod test {
     }
 
     #[test]
-    fn workload_rejects_public_mul_private_and_lut_inputs() {
+    fn workload_rejects_public_mul_private_and_moves_public_luts_down_a_level() {
         let mut public_mul_builder = crate::program::ExponentLutProgramBuilder::new();
         let public_input =
             public_mul_builder.input(crate::program::AttributeKnowledge::PublicPayload).unwrap();
@@ -555,7 +580,9 @@ mod test {
             public_lut_builder.lut(crate::program::Operand::Scalar(public_input), lut).unwrap();
         let public_lut_program =
             public_lut_builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
-        assert!(RnsBggDerivedWorkload::from_program(&public_lut_program).is_err());
+        let workload = RnsBggDerivedWorkload::from_program(&public_lut_program).unwrap();
+        assert_eq!(workload.level(output).unwrap(), 1);
+        assert!(workload.luts().is_empty(), "a public LUT has no Static switching material");
 
         let mut private_lut_builder = crate::program::ExponentLutProgramBuilder::new();
         let private_input =
@@ -565,7 +592,9 @@ mod test {
             private_lut_builder.lut(crate::program::Operand::Scalar(private_input), lut).unwrap();
         let private_lut_program =
             private_lut_builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
-        assert!(RnsBggDerivedWorkload::from_program(&private_lut_program).is_ok());
+        let workload = RnsBggDerivedWorkload::from_program(&private_lut_program).unwrap();
+        assert_eq!(workload.level(output).unwrap(), 1);
+        assert_eq!(workload.luts().len(), 1);
     }
 
     #[test]

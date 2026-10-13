@@ -1,0 +1,87 @@
+set_option maxHeartbeats 64000000 in
+set_option maxRecDepth 65536 in
+/-- The inputs of the smudge chain of decoder `@K@`. -/
+theorem smudgeInputs@K@ {model : HashModel} {params' : @PRE@.Params} {params'' : @ENC@.Params}
+@BINDERS@
+    {r sm : ErrorPoly N} (hr : polyNorm r ≤ 1) (hsm : polyNorm sm ≤ 1)
+    (hpay : pw_9_0 = fun _ _ ↦ reducePoly Q0 N r) (qhm : qw_4_0 = fun _ _ ↦ reducePoly Q0 N sm)
+    (qhp : qw_11_0 = fun _ _ ↦ reducePoly Q0 N r) (qm1 : @QMC@ = 1) (qm2 : @QME@ = 0)
+    {GQ6_12 : ExactMatrix Q6 N 1 12} {GQ5_10 : ExactMatrix Q5 N 1 10} {RQ6_10 : ExactMatrix Q6 N 1 10}
+    {GQ0_8 : ExactMatrix Q0 N 1 8} {RQ5_8 : ExactMatrix Q5 N 1 8}
+    {GQ1_6 : ExactMatrix Q1 N 1 6} {RQ0_6 : ExactMatrix Q0 N 1 6}
+    (hGQ6_12 : gadgetMatrixRuns Backend.backend 32768 12 GQ6_12)
+    (hGQ5_10 : gadgetMatrixRuns Backend.backend 32768 10 GQ5_10) (hRQ6_10 : centeredRebaseRuns GQ5_10 RQ6_10)
+    (hGQ0_8 : gadgetMatrixRuns Backend.backend 32768 8 GQ0_8) (hRQ5_8 : centeredRebaseRuns GQ0_8 RQ5_8)
+    (hGQ1_6 : gadgetMatrixRuns Backend.backend 32768 6 GQ1_6) (hRQ0_6 : centeredRebaseRuns GQ1_6 RQ0_6)
+    (hlc : ∀ k, @QLC@ k * @QLC@ k = 1)
+    (hlr : ∀ k, @QLE@ k * 2 + (1 - @QLC@ k) * 8 = (labelExp k : Int) * 4)
+    (hle : ∀ k, 0 ≤ @QLE@ k ∧ @QLE@ k ≤ 7)
+    (hs01 : ∀ i, 0 ≤ @PC@ i ∧ @PC@ i ≤ 1) (hs01' : ∀ i, 0 ≤ @PC2@ i ∧ @PC2@ i ≤ 1)
+    (he0 : ∀ i, @PE@ i = 0) (he0' : ∀ i, @PE2@ i = 0)
+    (hsum : ∀ o : Fin 160, ∑ k : Fin 5, @PC@ (cellIndex o k) = 1)
+    (hsum' : ∀ o : Fin 160, ∑ k : Fin 5, @PC2@ (cellIndex o k) = 1) :
+    Rel sm ![![@O00@, @O01@], ![@O10@, @O11@]]
+      (fun j ↦ reducePoly Q6 N (((p5 : Nat) : Int) * 1 * unitPair r j) • RQ6_10) ![@OC0@, @OC1@] 26 ∧
+    (∀ i : Fin 4, Rel sm (lutA model @QKEY@ Q0 6 2 (sigma i))
+      (fun j ↦ reducePoly Q0 N (((q3 : Nat) : Int) *
+        unitPair (substitution (sigma i).toNat (sigma_odd i) sm) j) • RQ0_6) ![qw_@H@_0 i, qw_@H@_1 i] 26) ∧
+    (∀ k : Fin 5, Rel sm ![![qw_@L@_0 k, qw_@L@_1 k], ![qw_@L@_2 k, qw_@L@_3 k]]
+      (fun j ↦ reducePoly Q6 N (Xe (n := N) (2 * labelExp k) * unitPair sm j) • GQ6_12)
+      ![qw_@L@_4 k, qw_@L@_5 k] 26) ∧
+    (∃ eBm : Fin 800 → Fin 2 → ErrorMatrix N 1 8, (∀ i j, CoeffBound (eBm i j) 26) ∧ ∀ (i : Fin 800) j,
+      reducePoly Q5 N r • rhsTop model @PKEY@ Q5 8 smudge@K@Rhs0 i j + ![pw_@C1@_6 i, pw_@C1@_7 i] j =
+        reducePoly Q5 N (((p4 : Nat) : Int) * ((@PC@ i : Int) : ErrorPoly N) * unitPair r j) • RQ5_8 +
+          reduceMatrix Q5 N 1 8 (eBm i j)) ∧
+    (∃ eBm : Fin 800 → Fin 2 → ErrorMatrix N 1 6, (∀ i j, CoeffBound (eBm i j) 26) ∧ ∀ (i : Fin 800) j,
+      reducePoly Q0 N r • rhsTop model @PKEY@ Q0 6 smudge@K@Rhs1 i j + ![pw_@C2@_6 i, pw_@C2@_7 i] j =
+        reducePoly Q0 N (((q3 : Nat) : Int) * ((@PC2@ i : Int) : ErrorPoly N) * unitPair r j) • RQ0_6 +
+          reduceMatrix Q0 N 1 6 (eBm i j)) ∧
+    (∃ sel : Fin 160 → Fin 5, ∀ o k, @PC@ (cellIndex o k) = if k = sel o then 1 else 0) ∧
+    (∃ sel : Fin 160 → Fin 5, ∀ o k, @PC2@ (cellIndex o k) = if k = sel o then 1 else 0) ∧
+    (∀ i : Fin 4, ∃ e : Fin 2 → ErrorMatrix N 1 6, (∀ j, CoeffBound (e j) 26) ∧ ∀ j,
+      reducePoly Q1 N (substitution (sigma i).toNat (sigma_odd i) r) •
+          ![![pw_@S@_0, pw_@S@_1], ![pw_@S@_2, pw_@S@_3]] 0 j i +
+            ![![pw_@S@_0, pw_@S@_1], ![pw_@S@_2, pw_@S@_3]] 1 j i =
+        (lutCoefficient Q1 928453219666515100085511901 (fun k ↦ reducePoly Q1 N (smudgeTable k))
+          (sigma i).toNat * reducePoly Q1 N ((1 : ErrorPoly N) * unitPair r j)) • GQ1_6 +
+            reduceMatrix Q1 N 1 6 (e j)) := by
+  have hone : qw_29_0 = 1 := qe_29_0
+  have h1 := @ONE@ (model := model) @ARGS@ (hsm := hsm) (hsp := hr)
+    (hsmIn := qhm) (hspIn := qhp) (hone := hone) (hg' := hGQ5_10) (hg := hRQ6_10)
+  rw [qm1, qm2, message_one_zero] at h1
+  have hsec : @PSEC@ = fun _ _ ↦ reducePoly Q6 N r :=
+    rebase_small (q := Q0) (by norm_num) hr (by rw [← hpay]; exact @PHSEC@)
+  have h1' : @PONE@ = 1 := rebase_one (q := Q0) (by norm_num) (by rw [← pe_11_0]; exact @PHONE@)
+  have hsmQ6 : @QSM@ = fun _ _ ↦ reducePoly Q6 N sm :=
+    rebase_small (q := Q0) (by norm_num) hsm (by rw [← qhm]; exact @QHSM@)
+  have h343 : @QONE@ = 1 := rebase_one (q := Q0) (by norm_num) (by rw [← qe_7_0]; exact @QHONE@)
+  have htab : (fun k ↦ reducePoly Q1 N (smudgeTable k)) = fun k ↦ reducePoly Q1 N
+      (![((1 : Int) : ErrorPoly N), ((1 : Int) : ErrorPoly N), ((3 : Int) : ErrorPoly N), ((3 : Int) : ErrorPoly N)] k) := by
+    funext k; fin_cases k <;> rfl
+  refine ⟨h1, fun i ↦ encHelper@H@ i (qh@H@_1 i) hsmQ6 h343 hGQ1_6 hRQ0_6,
+    encLabelRel@L@ qh@L@_6 hsmQ6 h343 hGQ6_12 hlc hlr hle, ?_, ?_, ?_, ?_, fun i ↦ ?_⟩
+  · have hc := fun i : Fin 800 ↦ preRhs@C1@ (ph@C1@_7 i) hsec h1' hGQ0_8 hRQ5_8
+    choose eB heB hrel using hc
+    refine ⟨eB, heB, fun i j ↦ ?_⟩
+    have ht := preTop@C1@ (ph@C1@_7 i)
+    have := hrel i j
+    rw [ht, he0 i, message_zero] at this
+    exact this
+  · have hc := fun i : Fin 800 ↦ preRhs@C2@ (ph@C2@_7 i) hsec h1' hGQ1_6 hRQ0_6
+    choose eB heB hrel using hc
+    refine ⟨eB, heB, fun i j ↦ ?_⟩
+    have ht := preTop@C2@ (ph@C2@_7 i)
+    have := hrel i j
+    rw [ht, he0' i, message_zero] at this
+    exact this
+  · choose sel hsel using fun o : Fin 160 ↦ onehot_of_sum (fun k ↦ hs01 (cellIndex o k)) (hsum o)
+    exact ⟨sel, hsel⟩
+  · choose sel hsel using fun o : Fin 160 ↦ onehot_of_sum (fun k ↦ hs01' (cellIndex o k)) (hsum' o)
+    exact ⟨sel, hsel⟩
+  · obtain ⟨e, he, hs⟩ := preSwitch@S@ i (ph@S@_3 i) hsec h1' hGQ1_6
+    refine ⟨e, he, fun j ↦ ?_⟩
+    rw [htab, show (1 : ErrorPoly N) = ((1 : Int) : ErrorPoly N) from Int.cast_one.symm]
+    fin_cases j
+    · exact hs 0
+    · exact hs 1
+

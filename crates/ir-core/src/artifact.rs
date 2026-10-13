@@ -103,6 +103,10 @@ pub enum ArtifactType {
         type_name: String,
         schema_hash: [u8; 32],
     },
+    /// A family stored as one artifact, member `k` of type `members[k]`: a family whose members
+    /// are families, or whose member types depend on the member index (an output family of a
+    /// loop over index-dependent rings, see [`crate::types::MEMBER_INDEX`]).
+    Family(Vec<ArtifactType>),
 }
 
 impl ArtifactType {
@@ -145,11 +149,17 @@ impl ArtifactType {
             ConcreteWireType::TypedBlob { type_name, schema_hash } => {
                 Some(Self::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash })
             }
+            ConcreteWireType::IndexedFamily { element, count } => {
+                let element = Self::from_wire_type(element)?;
+                Some(Self::Family(vec![element; *count]))
+            }
+            ConcreteWireType::DependentFamily { members } => {
+                members.iter().map(Self::from_wire_type).collect::<Option<_>>().map(Self::Family)
+            }
             ConcreteWireType::ConstantReal |
             ConcreteWireType::ConstantBool |
             ConcreteWireType::Real |
-            ConcreteWireType::Bool |
-            ConcreteWireType::IndexedFamily { .. } => None,
+            ConcreteWireType::Bool => None,
         }
     }
 

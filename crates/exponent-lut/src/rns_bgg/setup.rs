@@ -24,7 +24,7 @@
 //! manuscript's setup samples them uniformly, and the seeded expansion is
 //! assumed to be indistinguishable from that distribution.
 use super::*;
-use crate::program::{AttributeKnowledge, ExpLayout, ExponentLutProgram, ProgramInputDeclaration};
+use crate::program::{ExpLayout, ExponentLutProgram, ProgramInputDeclaration};
 
 /// A discrete Gaussian sampling contract: the width `sigma` of the existing
 /// sampler (a standard-deviation parameter) and its hard coefficient cutoff.
@@ -90,8 +90,8 @@ pub struct RnsBggDynamicDistributions {
     pub companion: RnsBggGaussian,
     /// Errors of the automorphism helpers `h_k = s H_k - s_k G + e`.
     pub helper: RnsBggGaussian,
-    /// Errors of the RHS gadget ciphertexts encryption samples itself
-    /// ([`RnsBggPackageSource::Sampled`]).
+    /// Errors `e_C` of the bottom rows of the RHS gadget ciphertexts
+    /// ([`RnsBggDynamicSetup::rhs_bottom`]).
     pub ciphertext: RnsBggGaussian,
 }
 
@@ -105,26 +105,6 @@ impl RnsBggDynamicDistributions {
             ciphertext: contract,
         }
     }
-}
-
-/// How the gadget ciphertext of an RHS package is produced.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RnsBggPackageSource {
-    /// Encryption samples `C = [a; t s_bar ... ]` from the RHS plaintext
-    /// with a uniform top row and the setup's ciphertext error contract:
-    /// `s C = nu s G + e_C`.
-    Sampled,
-    /// The enclosing scheme supplies `C` with `s C = nu s G + e_C` under its
-    /// own construction; `error_bound` is its declared coefficient bound on
-    /// `e_C`, which the noise simulation uses.
-    Supplied { error_bound: BigUint },
-}
-
-/// One canonical RHS coordinate of a setup.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RnsBggDynamicRhs {
-    pub shape: InputShape,
-    pub source: RnsBggPackageSource,
 }
 
 /// The kind of a package, which names its public companion keys.
@@ -144,13 +124,14 @@ pub struct RnsBggDynamicSetup {
     parameters: [u8; 32],
     ring_dimension: u32,
     inputs: BTreeMap<u32, ProgramInputDeclaration>,
-    rhs: BTreeMap<u32, RnsBggDynamicRhs>,
+    /// The shape of every RHS coordinate.
+    rhs: BTreeMap<u32, InputShape>,
     automorphism_layout: ExpLayout,
     automorphisms: Vec<usize>,
-    /// The baby-step count `n_1` of a baby-step giant-step split of `H` (see
-    /// [`Self::with_baby_steps`]); `None` switches every automorphism directly.
+    /// The radix `B` of the LUT automorphism decomposition (see
+    /// [`Self::with_lut_radix`]); `None` switches every automorphism directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    baby_steps: Option<usize>,
+    lut_radix: Option<usize>,
     /// The CRT primes of the auxiliary modulus `p` of compact encodings (see
     /// [`Self::with_compact_encodings`]); `None` publishes every encoding at `q`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,7 +157,7 @@ impl RnsBggDynamicSetup {
         context: [u8; 32],
         hash_key: &[u8],
         inputs: BTreeMap<u32, ProgramInputDeclaration>,
-        rhs: BTreeMap<u32, RnsBggDynamicRhs>,
+        rhs: BTreeMap<u32, InputShape>,
         layout: ExpLayout,
         distributions: RnsBggDynamicDistributions,
     ) -> Result<Self, RnsBggError> {
@@ -185,10 +166,7 @@ impl RnsBggDynamicSetup {
         }
         parameters.validate_equal_basis()?;
         let ring_dimension = parameters.level(0)?.ring_dimension();
-        let shapes = inputs
-            .values()
-            .map(ProgramInputDeclaration::shape)
-            .chain(rhs.values().map(|rhs| &rhs.shape));
+        let shapes = inputs.values().map(ProgramInputDeclaration::shape).chain(rhs.values());
         for shape in shapes {
             if let InputBinding::Family(count) = shape {
                 count
@@ -220,7 +198,7 @@ impl RnsBggDynamicSetup {
             rhs,
             automorphism_layout: layout,
             automorphisms,
-            baby_steps: None,
+            lut_radix: None,
             compact_extension: None,
             distributions,
             schema: [0; 32],
@@ -247,43 +225,48 @@ impl RnsBggDynamicSetup {
         );
     }
 
-    /// Split the cyclic group `H = <g>` (`g = 1 + 2n/|H|`) into baby steps
-    /// `B = {g^i : i < n_1}` and giant steps `G = {g^(n_1 t) : t < |H| / n_1}`:
-    /// every `k = g^(n_1 t + i)` is then switched as `Aut_(g^(n_1 t))` after
-    /// `Aut_(g^i)`, so encryption publishes the switching packages of
-    /// `(B u G) \ {1}` only (about `2 sqrt |H|` instead of `|H| - 1`), and the
-    /// helpers of those automorphisms and their inverses. A composed branch
-    /// adds one decomposition gain to its noise. `n_1 = |H|` (or `1`) is the
-    /// direct switching of every automorphism.
-    pub fn with_baby_steps(mut self, baby_steps: usize) -> Result<Self, RnsBggError> {
+    /// Decompose the cyclic group `H = <g>` (`g = 1 + 2n/|H|`) in radix `B`:
+    /// with `r = ceil(log_B |H|)` rounds, the exponent `e` of a branch `k = g^e`
+    /// has digits `e_j < B` for `j < r - 1` and a last digit below
+    /// `B' = |H| / B^(r - 1)` (`B' = B` when `|H| = B^r`). Encryption publishes
+    /// the switching packages of `K_B = {g^(a B^j)}` for the nonzero digits `a`
+    /// of every round only (`(B - 1)(r - 1) + B' - 1` instead of `|H| - 1`) and
+    /// the helpers of `J_B = K_B u K_B^-1`, and a branch is switched once per
+    /// nonzero digit of `e`: the branch without the top digit, `parent(k)`, is
+    /// switched by `g^(a_top B^top)` ([`Self::radix_step`]). Each switch adds one
+    /// decomposition gain to the noise of the branches below it. `B` is a power
+    /// of two below or equal to `|H|`; `B = |H|` is the direct switching of
+    /// every automorphism.
+    pub fn with_lut_radix(mut self, radix: usize) -> Result<Self, RnsBggError> {
         let order = self.automorphisms.len();
-        if baby_steps == 0 || !order.is_multiple_of(baby_steps) {
-            return Err(RnsBggError::Parameters("baby steps must divide the group order"));
+        if radix < 2 || !radix.is_power_of_two() || radix > order {
+            return Err(RnsBggError::Parameters(
+                "the LUT radix must be a power of two up to the group order",
+            ));
         }
-        self.baby_steps = (baby_steps != 1 && baby_steps != order).then_some(baby_steps);
-        if self.baby_steps.is_some() {
+        self.lut_radix = (radix < order).then_some(radix);
+        if self.lut_radix.is_some() {
             let mut powers = self.generator_powers();
             powers.sort_unstable();
             if powers != self.automorphisms {
-                return Err(RnsBggError::Parameters("a baby-step split needs a cyclic group"));
+                return Err(RnsBggError::Parameters("a radix decomposition needs a cyclic group"));
             }
         }
         self.seal();
         Ok(self)
     }
 
-    /// Publish the fresh encodings of encryption in two columns over `pq`, for
+    /// Publish the digit companions of encryption in two columns over `pq`, for
     /// the auxiliary modulus `p` the product of `extension` (CRT primes
-    /// `1 mod 2n`, distinct and disjoint from the setup ring's): an encoding
-    /// `s (A - X G) + e` mod `q` of width `m` becomes
-    /// `s (A~ - p X I_2) + e` mod `pq` of width two, for a `2 x 2` key `A~`
+    /// `1 mod 2n`, distinct and disjoint from the setup ring's): a companion
+    /// `s (A - d G) + e` mod `q` of width `m` becomes
+    /// `s (A~ - p d I_2) + e` mod `pq` of width two, for a `2 x 2` key `A~`
     /// over `R_pq`, and every reader expands it to
-    /// `ModSwitch_(pq -> q)(c G~) = s (A' - X G) + e'` mod `q` with
+    /// `ModSwitch_(pq -> q)(c G~) = s (A' - d G) + e'` mod `q` with
     /// `A' = ModSwitch_(pq -> q)(A~ G~)` and the integer lift `G~` of the gadget
-    /// (see [`crate::rns_bgg::dynamic::expand_compact_row`]). It applies to every
-    /// digit companion, every automorphism helper (payload `X = s_k`), and every
-    /// private scalar input (payload `Delta x r`, under the state gadget). The
-    /// GSW ciphertexts stay at `q`.
+    /// (see [`crate::rns_bgg::dynamic::expand_compact_row`]): the manuscript's
+    /// compressed digit encodings and their decompression `Dc`. The helpers,
+    /// the inputs, and the GSW ciphertexts stay at `q`.
     pub fn with_compact_encodings(
         mut self,
         parameters: &RnsBggParameters,
@@ -326,20 +309,10 @@ impl RnsBggDynamicSetup {
         Ok(Some(Ring::from_crt_moduli(moduli.map(IntExpr::from).collect(), self.ring_dimension)))
     }
 
-    /// Whether input coordinate `coordinate` is published compactly: a private
-    /// scalar input of a compact setup.
-    pub fn compact_input(&self, coordinate: u32) -> bool {
-        self.compact_extension.is_some() &&
-            self.inputs.get(&coordinate).is_some_and(|declaration| {
-                matches!(declaration.shape(), InputBinding::Scalar(())) &&
-                    !matches!(declaration.knowledge(), AttributeKnowledge::PublicPayload)
-            })
-    }
-
-    /// The baby-step count of the split, `None` if every automorphism is
-    /// switched directly.
-    pub fn baby_steps(&self) -> Option<usize> {
-        self.baby_steps
+    /// The radix of the LUT automorphism decomposition, `None` if every
+    /// automorphism is switched directly.
+    pub fn lut_radix(&self) -> Option<usize> {
+        self.lut_radix
     }
 
     /// `g^e mod 2n` for `e < |H|`, with `g = 1 + 2n/|H|`.
@@ -347,44 +320,31 @@ impl RnsBggDynamicSetup {
         generator_powers(self.ring_dimension as usize, self.automorphisms.len())
     }
 
-    /// The branches switched as a composition `Aut_g Aut_b` (both steps not
-    /// the identity) under the split; empty without one.
-    pub fn composed_automorphisms(&self) -> std::collections::BTreeSet<usize> {
-        composed_automorphisms(
-            self.ring_dimension as usize,
-            self.automorphisms.len(),
-            self.baby_steps,
-        )
+    /// The parent and the switch `(parent(k), g^(a_top B^top))` of a
+    /// nonidentity branch `k = g^e`, for the top nonzero radix-`B` digit
+    /// `a_top` of `e` (see [`Self::with_lut_radix`]); `(1, k)` without a
+    /// radix.
+    pub fn radix_step(&self, k: usize) -> Result<(usize, usize), RnsBggError> {
+        radix_step(&self.automorphisms, self.ring_dimension as usize, self.lut_radix, k)
     }
 
-    /// The giant and baby steps `(g^(n_1 t), g^i)` of `k = g^(n_1 t + i)`;
-    /// `(1, k)` without a split.
-    pub fn decomposition(&self, k: usize) -> Result<(usize, usize), RnsBggError> {
-        let Some(baby_steps) = self.baby_steps else {
-            self.automorphisms
-                .binary_search(&k)
-                .map_err(|_| RnsBggError::Parameters("automorphism is not a setup coordinate"))?;
-            return Ok((1, k));
-        };
-        let powers = self.generator_powers();
-        let exponent = powers
-            .iter()
-            .position(|power| *power == k)
-            .ok_or(RnsBggError::Parameters("automorphism is not a setup coordinate"))?;
-        Ok((powers[exponent - exponent % baby_steps], powers[exponent % baby_steps]))
+    /// The number of switches of every nonidentity automorphism (its nonzero
+    /// radix-`B` digits; one without a radix).
+    pub fn radix_depths(&self) -> BTreeMap<usize, usize> {
+        radix_depths(&self.automorphisms, self.ring_dimension as usize, self.lut_radix)
     }
 
     /// The automorphisms with a switching package, ascending: `H \ {1}`, or
-    /// `(B u G) \ {1}` with a split. The member order of the companion family.
+    /// `K_B` with a radix. The member order of the companion family.
     pub fn switching_automorphisms(&self) -> Vec<usize> {
-        switching_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.baby_steps)
+        switching_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.lut_radix)
     }
 
     /// The automorphisms with a published helper, ascending: the switching
     /// automorphisms and their inverses (`C_k` reads the helper of `k^-1`).
     /// The member order of the helper family.
     pub fn helper_automorphisms(&self) -> Vec<usize> {
-        helper_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.baby_steps)
+        helper_automorphisms(&self.automorphisms, self.ring_dimension as usize, self.lut_radix)
     }
 
     /// The member of `k` in [`Self::switching_automorphisms`].
@@ -421,16 +381,7 @@ impl RnsBggDynamicSetup {
             .iter()
             .map(|(wire, declaration)| (wire.0, declaration.clone()))
             .collect();
-        let rhs = program
-            .rhs_inputs()
-            .iter()
-            .map(|(id, shape)| {
-                (
-                    id.0,
-                    RnsBggDynamicRhs { shape: shape.clone(), source: RnsBggPackageSource::Sampled },
-                )
-            })
-            .collect();
+        let rhs = program.rhs_inputs().iter().map(|(id, shape)| (id.0, shape.clone())).collect();
         let setup = Self::new(parameters, context, hash_key, inputs, rhs, layout, distributions)?;
         let binding = RnsBggDynamicBinding::new(
             program.inputs().keys().map(|wire| (*wire, wire.0)).collect(),
@@ -457,7 +408,7 @@ impl RnsBggDynamicSetup {
         &self.inputs
     }
 
-    pub fn rhs(&self) -> &BTreeMap<u32, RnsBggDynamicRhs> {
+    pub fn rhs(&self) -> &BTreeMap<u32, InputShape> {
         &self.rhs
     }
 
@@ -506,17 +457,16 @@ impl RnsBggDynamicSetup {
         )
     }
 
-    /// Artifact role of the gadget ciphertexts of RHS coordinate
-    /// `coordinate`: four ports `.0` to `.3` holding the blocks
-    /// `((C_00, C_01), (C_10, C_11))`, as a family for a family coordinate.
-    /// A scheme supplying the ciphertexts of a
-    /// [`RnsBggPackageSource::Supplied`] coordinate exports them under this
-    /// role from the prelude production it binds to the encryption.
-    pub fn rhs_ciphertext_role(coordinate: u32, family: bool) -> String {
+    /// Artifact role of the bottom rows of the gadget ciphertexts of RHS
+    /// coordinate `coordinate` ([`Self::rhs_bottom`]): two ports `.0` and `.1`
+    /// holding `(C_10, C_11)`, as a family for a family coordinate. The
+    /// encryption's prelude production exports them: its own, from the bound
+    /// plaintexts, or one an enclosing scheme binds.
+    pub fn rhs_bottom_role(coordinate: u32, family: bool) -> String {
         if family {
-            format!("dynamic/rhs/{coordinate}/family/ciphertext")
+            format!("dynamic/rhs/{coordinate}/family/bottom")
         } else {
-            format!("dynamic/rhs/{coordinate}/ciphertext")
+            format!("dynamic/rhs/{coordinate}/bottom")
         }
     }
 
@@ -596,36 +546,12 @@ impl RnsBggDynamicSetup {
             tag.push("member");
             tag.push(member);
         }
-        if self.compact_input(coordinate) {
-            let compact = self.compact_matrix(parameters, 0, hash_key, tag)?;
-            return crate::rns_bgg::dynamic::expand_compact_matrix(
-                parameters,
-                self,
-                0,
-                &parameters.state_gadget(0)?,
-                compact,
-            );
-        }
         Ok(public_key::matrix_from_hash(
             &parameters.ring(0)?,
             hash_key,
             tag,
             parameters.key_component_columns(0, declaration.knowledge())?,
         ))
-    }
-
-    /// The compact key `A~` of input coordinate `coordinate` (see
-    /// [`Self::with_compact_encodings`]): a `2 x 2` matrix over `R_pq` hashed
-    /// under the tag of [`Self::input_key`].
-    pub fn compact_input_key(
-        &self,
-        parameters: &RnsBggParameters,
-        hash_key: mxx_dsl::Bytes,
-        coordinate: u32,
-    ) -> Result<RnsBggMatrix, RnsBggError> {
-        let mut tag = self.tag("input-key");
-        tag.push(IntExpr::constant(coordinate));
-        self.compact_matrix(parameters, 0, hash_key, tag)
     }
 
     /// A `2 x 2` matrix over the compact ring at `level`, hashed under `tag`.
@@ -642,6 +568,69 @@ impl RnsBggDynamicSetup {
         Ok(public_key::matrix_from_hash(&ring, hash_key, tag, 1))
     }
 
+    /// The public top row `a` of the gadget ciphertext `C = [a; c]` of RHS
+    /// coordinate `coordinate` (member `member` of a family), a `1 x 2c` row at
+    /// the setup ring hashed under the setup's tag. Every encryption reuses it
+    /// under a fresh secret; its digit rows need no companion, as an
+    /// automorphism package's (see [`super::automorphism_public_rows`]).
+    pub fn rhs_public_top(
+        &self,
+        parameters: &RnsBggParameters,
+        hash_key: mxx_dsl::Bytes,
+        coordinate: u32,
+        member: Option<IntExpr>,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        let mut tag = self.tag("rhs-top");
+        tag.push(IntExpr::constant(coordinate));
+        if let Some(member) = member {
+            tag.push("member");
+            tag.push(member);
+        }
+        let ring = parameters.ring(0)?;
+        let columns = parameters.component_columns(0)?;
+        let half = |index: u64| {
+            let mut tag = tag.clone();
+            tag.push("component");
+            tag.push(IntExpr::constant(index));
+            ring.hash_matrix(hash_key.clone(), tag, (1, columns))
+        };
+        Ok((half(0), half(1)))
+    }
+
+    /// The bottom row `c = nu s G - s_0 a + e_C` of the gadget ciphertext
+    /// `C = [a; c]` of member `member` of RHS coordinate `coordinate` for the
+    /// `1 x 1` plaintext `nu` under the payload secret row `s = (s_0, 1)` at the
+    /// setup ring, with the public top row `a` ([`Self::rhs_public_top`]) and
+    /// `e_C` sampled under the setup's ciphertext contract: `s C = nu s G +
+    /// e_C`. Encryption, or an enclosing scheme's prelude, exports it under
+    /// [`Self::rhs_bottom_role`].
+    pub fn rhs_bottom(
+        &self,
+        parameters: &RnsBggParameters,
+        hash_key: mxx_dsl::Bytes,
+        coordinate: u32,
+        member: Option<IntExpr>,
+        secret: &RnsBggRow,
+        plaintext: mxx_dsl::Mat,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        let gadget = parameters.public_gadget(0)?;
+        let target = (
+            secret.0.clone() * gadget.clone() * plaintext.clone(),
+            secret.1.clone() * gadget * plaintext,
+        );
+        let top = self.rhs_public_top(parameters, hash_key, coordinate, member)?;
+        Ok(super::ciphertext_matrix(
+            parameters,
+            0,
+            parameters.component_columns(0)?,
+            secret.0.clone(),
+            top,
+            target,
+            &self.distributions.ciphertext,
+        )?
+        .1)
+    }
+
     /// The public helper matrix `H_k` of automorphism `k`, a `2 x m` matrix
     /// at the setup ring.
     pub fn helper_key(
@@ -652,36 +641,12 @@ impl RnsBggDynamicSetup {
     ) -> Result<RnsBggMatrix, RnsBggError> {
         let mut tag = self.tag("helper-key");
         tag.push(k);
-        if self.compact_extension.is_some() {
-            let compact = self.compact_matrix(parameters, 0, hash_key, tag)?;
-            return crate::rns_bgg::dynamic::expand_compact_matrix(
-                parameters,
-                self,
-                0,
-                &parameters.public_gadget(0)?,
-                compact,
-            );
-        }
         Ok(public_key::matrix_from_hash(
             &parameters.ring(0)?,
             hash_key,
             tag,
             parameters.component_columns(0)?,
         ))
-    }
-
-    /// The compact helper key `H~_k` of automorphism `k` (see
-    /// [`Self::with_compact_encodings`]), hashed under the tag of
-    /// [`Self::helper_key`].
-    pub fn compact_helper_key(
-        &self,
-        parameters: &RnsBggParameters,
-        hash_key: mxx_dsl::Bytes,
-        k: IntExpr,
-    ) -> Result<RnsBggMatrix, RnsBggError> {
-        let mut tag = self.tag("helper-key");
-        tag.push(k);
-        self.compact_matrix(parameters, 0, hash_key, tag)
     }
 }
 
@@ -747,7 +712,7 @@ impl RnsBggDynamicBinding {
                 .rhs
                 .get(&self.rhs(*rhs)?)
                 .ok_or(RnsBggError::Binding("RHS coordinate is not in the Dynamic setup"))?;
-            if !same_shape(&coordinate.shape, shape) {
+            if !same_shape(coordinate, shape) {
                 return Err(RnsBggError::Binding("Program RHS does not match its coordinate"));
             }
         }
@@ -790,46 +755,83 @@ fn generator_powers(ring_dimension: usize, order: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The automorphisms `g^(n_1 t + i)` with `t, i > 0` of the cyclic group of
-/// `order` automorphisms split with `baby_steps = n_1` (see
-/// [`RnsBggDynamicSetup::with_baby_steps`]): the branches switched as a
-/// composition. Empty without a split.
-pub fn composed_automorphisms(
+/// The exponent `e` of `k = g^e` in the cyclic group `automorphisms` of rings
+/// of dimension `ring_dimension` (see [`generator_powers`]).
+fn generator_exponent(
+    automorphisms: &[usize],
     ring_dimension: usize,
-    order: usize,
-    baby_steps: Option<usize>,
-) -> std::collections::BTreeSet<usize> {
-    let Some(baby_steps) = baby_steps.filter(|steps| *steps > 1 && *steps < order) else {
-        return std::collections::BTreeSet::new();
+    k: usize,
+) -> Result<usize, RnsBggError> {
+    generator_powers(ring_dimension, automorphisms.len())
+        .iter()
+        .position(|power| *power == k)
+        .ok_or(RnsBggError::Parameters("automorphism is not a setup coordinate"))
+}
+
+/// The radix-`radix` decomposition step `(parent(k), switch)` of a
+/// nonidentity `k` (see [`RnsBggDynamicSetup::with_lut_radix`]): `(1, k)`
+/// without a radix.
+pub fn radix_step(
+    automorphisms: &[usize],
+    ring_dimension: usize,
+    radix: Option<usize>,
+    k: usize,
+) -> Result<(usize, usize), RnsBggError> {
+    if k == 1 || automorphisms.binary_search(&k).is_err() {
+        return Err(RnsBggError::Parameters("a radix step needs a nonidentity setup automorphism"));
+    }
+    let Some(radix) = radix.filter(|radix| *radix < automorphisms.len()) else {
+        return Ok((1, k));
     };
-    generator_powers(ring_dimension, order)
+    let exponent = generator_exponent(automorphisms, ring_dimension, k)?;
+    let mut top = 1;
+    while top * radix <= exponent {
+        top *= radix;
+    }
+    let switch = exponent - exponent % top;
+    let powers = generator_powers(ring_dimension, automorphisms.len());
+    Ok((powers[exponent - switch], powers[switch]))
+}
+
+/// The number of switches of every nonidentity automorphism of the group
+/// `automorphisms` under the radix `radix`: its exponent's nonzero digits,
+/// or one without a radix.
+pub fn radix_depths(
+    automorphisms: &[usize],
+    ring_dimension: usize,
+    radix: Option<usize>,
+) -> BTreeMap<usize, usize> {
+    let Some(radix) = radix.filter(|radix| *radix < automorphisms.len()) else {
+        return automorphisms.iter().filter(|k| **k != 1).map(|k| (*k, 1)).collect();
+    };
+    generator_powers(ring_dimension, automorphisms.len())
         .into_iter()
         .enumerate()
-        .filter(|(exponent, _)| *exponent >= baby_steps && exponent % baby_steps != 0)
-        .map(|(_, k)| k)
+        .skip(1)
+        .map(|(mut exponent, k)| {
+            let mut depth = 0;
+            while exponent > 0 {
+                depth += usize::from(exponent % radix != 0);
+                exponent /= radix;
+            }
+            (k, depth)
+        })
         .collect()
 }
 
 /// The automorphisms of the group `automorphisms` (ascending, of rings of
-/// dimension `ring_dimension`) with a switching package under the split
-/// `baby_steps` (see [`RnsBggDynamicSetup::with_baby_steps`]), ascending:
-/// `H \ {1}` without a split, else `(B u G) \ {1}`.
+/// dimension `ring_dimension`) with a switching package under the radix
+/// `radix` (see [`RnsBggDynamicSetup::with_lut_radix`]), ascending: `H \ {1}`
+/// without a radix, else `K_B = {g^(a B^j)}`.
 pub fn switching_automorphisms(
     automorphisms: &[usize],
     ring_dimension: usize,
-    baby_steps: Option<usize>,
+    radix: Option<usize>,
 ) -> Vec<usize> {
-    let order = automorphisms.len();
-    let Some(baby_steps) = baby_steps.filter(|steps| *steps > 1 && *steps < order) else {
-        return automorphisms.iter().copied().filter(|k| *k != 1).collect();
-    };
-    let mut switching = generator_powers(ring_dimension, order)
+    let mut switching = radix_depths(automorphisms, ring_dimension, radix)
         .into_iter()
-        .enumerate()
-        .filter(|(exponent, _)| {
-            *exponent != 0 && (*exponent < baby_steps || exponent % baby_steps == 0)
-        })
-        .map(|(_, k)| k)
+        .filter(|(_, depth)| *depth == 1)
+        .map(|(k, _)| k)
         .collect::<Vec<_>>();
     switching.sort_unstable();
     switching
@@ -840,10 +842,10 @@ pub fn switching_automorphisms(
 pub fn helper_automorphisms(
     automorphisms: &[usize],
     ring_dimension: usize,
-    baby_steps: Option<usize>,
+    radix: Option<usize>,
 ) -> Vec<usize> {
     let mut helpers = std::collections::BTreeSet::new();
-    for k in switching_automorphisms(automorphisms, ring_dimension, baby_steps) {
+    for k in switching_automorphisms(automorphisms, ring_dimension, radix) {
         helpers.insert(k);
         helpers.extend(automorphism_inverse(k, ring_dimension));
     }
@@ -874,38 +876,50 @@ fn stable_digest<T: Serialize>(domain: &[u8], value: &T) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    /// A split of the cyclic group of 16 automorphisms of a ring of dimension 64 into 4 baby
-    /// and 4 giant steps publishes 6 switching packages instead of 15; the composed branches are
-    /// the 9 with both steps nonidentity, each the product of a baby and a giant switch; and the
-    /// helpers are the switching automorphisms closed under inversion.
+    /// The cyclic group of 16 automorphisms of a ring of dimension 64 in radix 2 publishes the
+    /// 4 switching packages `g^(2^j)`, in radix 4 the 6 packages `g^(a 4^j)`, and in radix 8 the
+    /// 7 packages `g^a` and, in a last round of radix 2, `g^8`; every branch is
+    /// its parent times its switch, its parent has one switch fewer, and its depth is its
+    /// exponent's nonzero digits. The helpers are the switching automorphisms closed under
+    /// inversion. Radix 16 (the group order) switches every automorphism directly.
     #[test]
-    fn a_baby_step_split_switches_two_square_roots_of_the_group() {
+    fn a_radix_decomposition_switches_each_nonzero_digit() {
         let n = 64;
         let group = ExpLayout { stride_log2: 0, width_log2: 4 }.automorphism_indices(n).unwrap();
-        assert_eq!(switching_automorphisms(&group, n, None), group[1..].to_vec());
-        assert_eq!(helper_automorphisms(&group, n, None), group[1..].to_vec());
-        assert!(composed_automorphisms(n, group.len(), None).is_empty());
-        let switching = switching_automorphisms(&group, n, Some(4));
-        let helpers = helper_automorphisms(&group, n, Some(4));
-        let composed = composed_automorphisms(n, group.len(), Some(4));
-        assert_eq!(switching.len(), 6);
-        assert_eq!(composed.len(), 9);
         let powers = generator_powers(n, group.len());
         let mut sorted = powers.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, group, "the group is cyclic");
-        for k in &group[1..] {
-            let exponent = powers.iter().position(|power| power == k).unwrap();
-            let (giant, baby) = (powers[exponent - exponent % 4], powers[exponent % 4]);
-            assert_eq!(giant * baby % (2 * n), *k);
-            assert_eq!(composed.contains(k), giant != 1 && baby != 1);
-            for step in [giant, baby].into_iter().filter(|step| *step != 1) {
-                assert!(switching.contains(&step), "{step} of {k} has no package");
-            }
+        for radix in [None, Some(16)] {
+            assert_eq!(switching_automorphisms(&group, n, radix), group[1..].to_vec());
+            assert_eq!(helper_automorphisms(&group, n, radix), group[1..].to_vec());
+            assert!(radix_depths(&group, n, radix).values().all(|depth| *depth == 1));
         }
-        for k in &switching {
-            assert!(helpers.contains(k));
-            assert!(helpers.contains(&automorphism_inverse(*k, n).unwrap()));
+        for (radix, digits, packages) in [(2, 4, 4), (4, 2, 6), (8, 2, 8)] {
+            let switching = switching_automorphisms(&group, n, Some(radix));
+            let helpers = helper_automorphisms(&group, n, Some(radix));
+            let depths = radix_depths(&group, n, Some(radix));
+            assert_eq!(switching.len(), packages);
+            assert!(helpers.len() <= 2 * switching.len());
+            assert_eq!(depths.values().max(), Some(&digits));
+            for k in &group[1..] {
+                let (parent, switch) = radix_step(&group, n, Some(radix), *k).unwrap();
+                assert_eq!(parent * switch % (2 * n), *k);
+                assert!(switching.contains(&switch), "{switch} of {k} has no package");
+                let parent_depth = if parent == 1 { 0 } else { depths[&parent] };
+                assert_eq!(parent_depth + 1, depths[k]);
+                let mut exponent = powers.iter().position(|power| power == k).unwrap();
+                let mut nonzero = 0;
+                while exponent > 0 {
+                    nonzero += usize::from(exponent % radix != 0);
+                    exponent /= radix;
+                }
+                assert_eq!(depths[k], nonzero);
+            }
+            for k in &switching {
+                assert!(helpers.contains(k));
+                assert!(helpers.contains(&automorphism_inverse(*k, n).unwrap()));
+            }
         }
     }
 }

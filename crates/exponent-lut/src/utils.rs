@@ -170,9 +170,7 @@ fn plan_chain(
     let output_levels = program
         .outputs()
         .iter()
-        .map(|output| match output {
-            Operand::Scalar(wire) | Operand::Member { family: wire, .. } => *wire,
-        })
+        .map(|output| *output.source())
         .map(|wire| {
             let level = workload.level(wire).map_err(|error| error.to_string())?;
             let coefficient = program
@@ -370,6 +368,7 @@ pub fn select_decoder_at_crt_depth(
             coefficients,
             digits,
             layouts,
+            crate::decoder::decoding::DecoderTarget::Output,
         )
         .map_err(|error| to_string(&error))?;
         match &dynamic_plaintext {

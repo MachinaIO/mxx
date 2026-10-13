@@ -5,9 +5,10 @@
 //! The deterministic bounds are the fixed-basis recurrences of
 //! [`RnsBggParameters::dynamic_mul_noise_bound`] and
 //! [`RnsBggParameters::dynamic_lut_noise_bound`]; no operation rounds. Every
-//! package error is bounded by the setup's contract: a sampled gadget
-//! ciphertext's and every companion's and helper's by its Gaussian cutoff, a
-//! supplied gadget ciphertext's by its declared bound.
+//! package error is bounded by the setup's contract: every gadget ciphertext's,
+//! companion's, and helper's by its Gaussian cutoff. Every gadget ciphertext's
+//! top row is public, so a product's companions cover its private digit rows
+//! only.
 //!
 //! Sources are identified by package, never by consuming gate or level: a
 //! package read at several gates, and the same automorphism packages read by
@@ -99,15 +100,9 @@ impl RnsBggNoiseEvaluator<'_> {
         )
     }
 
-    /// The variance of a Gaussian contract, or of a supplied bound `B`
-    /// (`B^2` bounds the variance of any variable bounded by `B`).
-    fn contract_variance(sigma: Option<&BigDecimal>, bound: &BigUint) -> NonnegativeRational {
-        match sigma {
-            Some(sigma) => encoding_variance_from_sigma(sigma),
-            None => {
-                NonnegativeRational::new(bound.pow(2u32), BigUint::one()).expect("unit denominator")
-            }
-        }
+    /// The variance of a Gaussian contract of standard deviation `sigma`.
+    fn contract_variance(sigma: &BigDecimal) -> NonnegativeRational {
+        encoding_variance_from_sigma(sigma)
     }
 
     /// The Dynamic product of `input` by the package of `rhs`.
@@ -121,12 +116,10 @@ impl RnsBggNoiseEvaluator<'_> {
         let wire = self.site()?.output;
         self.parameters.dynamic_route(level)?;
         self.parameters.dynamic_route(self.level(wire)?)?;
-        let package = contracts
+        let coordinate = *contracts
             .rhs
             .get(&rhs.id)
-            .ok_or(RnsBggError::Binding("missing RHS package contract"))?
-            .clone();
-        let coordinate = package.coordinate;
+            .ok_or(RnsBggError::Binding("missing RHS package contract"))?;
         let (contract, sparse_count) = match self
             .bindings
             .rhs
@@ -139,32 +132,36 @@ impl RnsBggNoiseEvaluator<'_> {
             }
         };
         let distributions = &contracts.distributions;
-        let ciphertext_error = package.ciphertext_error.clone();
-        let ciphertext_sigma = package.ciphertext_sigma.as_ref();
+        let ciphertext_error = distributions.ciphertext.cutoff().clone();
+        let ciphertext_sigma = distributions.ciphertext.sigma();
         let companion = &distributions.companion;
         let companion_error = self.package_error(&contracts, companion.cutoff())?;
         let output_l1 = &input.1.bound.payload_l1 * &contract.payload_l1;
+        // The public top row's digit rows have no companion.
+        let public_rows = crate::rns_bgg::automorphism_public_rows(self.parameters, level)?;
         let bound = self.parameters.dynamic_mul_noise_bound(
             level,
             &input.1.bound,
             &ciphertext_error,
             &companion_error,
+            public_rows,
             output_l1,
         )?;
         let compact = contracts.compact_extension.is_some();
-        // The companions' share `m K beta'` of the bound.
-        let companion_share = BigUint::from(2 * self.parameters.component_columns(level)?) *
-            self.parameters.dynamic_decomposition_gain(level)? *
-            &companion_error;
+        // The companions' share `(m - p) K beta'` of the bound.
+        let companion_share =
+            BigUint::from(2 * self.parameters.component_columns(level)? - public_rows) *
+                self.parameters.dynamic_decomposition_gain(level)? *
+                &companion_error;
         let k = self.parameters.dynamic_decomposition_gain(level)?;
         let gain = NonnegativeRational::new(k.clone(), BigUint::one()).expect("unit denominator");
         let k_squared = k.pow(2u32);
         let ciphertext_source = self.package_source("rhs-ciphertext", Some(coordinate))?;
         let companion_source = self.package_source("rhs-companion", Some(coordinate))?;
         let companion_variance = encoding_variance_from_sigma(companion.sigma())
-            .scaled(&self.parameters.dynamic_companion_energy(level)?);
-        let ciphertext_variance = Self::contract_variance(ciphertext_sigma, &ciphertext_error)
-            .scaled(&input.1.payload_l2_squared);
+            .scaled(&self.parameters.dynamic_companion_energy(level, public_rows)?);
+        let ciphertext_variance =
+            Self::contract_variance(ciphertext_sigma).scaled(&input.1.payload_l2_squared);
         let breakdown = input.1.contributions("dynamic-mul-input").map(|input_terms| {
             // `e Dec(C)`: `Dec(C)` depends on the ciphertext, so the input
             // error keeps the squared `l1` gain.
@@ -219,6 +216,107 @@ impl RnsBggNoiseEvaluator<'_> {
         self.operation_node(wire, value, node)
     }
 
+    /// The Dynamic LUT of a public `input` by `table` (see
+    /// [`RnsBggParameters::dynamic_public_lut_noise_bound`]), term by term
+    /// with the encoding lowering: no companion is read; the helpers form the
+    /// one coherent package source the private LUTs read too.
+    pub(super) fn dynamic_public_lut(
+        &mut self,
+        input: &(WireId, RnsBggNoiseValue),
+        table: &LutTable,
+    ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
+        let contracts = self.dynamic_contracts()?.clone();
+        let level = self.level(input.0)?;
+        let wire = self.site()?.output;
+        let lut = self.program.lut_id_at(wire).map_err(|_| RnsBggError::Lut)?;
+        self.parameters.dynamic_route(level)?;
+        let automorphisms = crate::rns_bgg::dynamic::lut_automorphisms(
+            self.parameters,
+            &contracts.automorphisms,
+            level,
+            table,
+        )?;
+        let branches = automorphisms.len();
+        // `depths[d - 1]` branches are switched `d` times.
+        let mut depths = Vec::new();
+        for k in &automorphisms[1..] {
+            let depth = contracts.depths.get(k).copied().unwrap_or(1);
+            if depths.len() < depth {
+                depths.resize(depth, 0);
+            }
+            depths[depth - 1] += 1;
+        }
+        let output_payload_l1 = match table.output_representation() {
+            crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
+            crate::program::LutOutputRepresentation::Coefficient => {
+                BigUint::from(table.max_output())
+            }
+        };
+        let helper_error = contracts.distributions.helper.cutoff().clone();
+        let bound = self.parameters.dynamic_public_lut_noise_bound(
+            level,
+            &input.1.bound,
+            &depths,
+            &helper_error,
+            output_payload_l1.clone(),
+        )?;
+        let (input_gain, helper_gain) =
+            self.parameters.dynamic_public_lut_gains(level, &depths, &input.1.bound.payload_l1)?;
+        let helper_source = self.package_source("automorphism-helper", None)?;
+        // The branches add coherently: the squared `l1` gains.
+        let mean_gain =
+            NonnegativeRational::new(input_gain.clone(), BigUint::one()).expect("unit denominator");
+        let input_variance_gain = input_gain.pow(2u32);
+        let helper_variance = encoding_variance_from_sigma(contracts.distributions.helper.sigma())
+            .scaled(&helper_gain.pow(2u32));
+        let breakdown = input.1.contributions("dynamic-public-lut-input").map(|input_terms| {
+            let terms = input_terms.transform(|term| {
+                (mean_gain.clone(), term.moments.variance.scaled(&input_variance_gain), false)
+            });
+            if branches == 1 {
+                return terms;
+            }
+            terms.merge(&self.package_term(
+                helper_source,
+                "dynamic-automorphism-helper-error",
+                None,
+                helper_variance.clone(),
+            ))
+        });
+        let sources = if branches == 1 {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(
+                helper_source,
+                NoiseSourceProvenance { source: helper_source, route: vec![level] },
+            )])
+        };
+        let value = self.carry_provenance(
+            RnsBggNoiseValue {
+                bound,
+                payload_l2_squared: output_payload_l1.pow(2u32),
+                moments: None,
+                provenance: BTreeMap::new(),
+                heuristics: input.1.heuristics.clone(),
+                breakdown: None,
+            }
+            .with_breakdown(breakdown),
+            [input.1.provenance.clone(), sources],
+        );
+        let node = crate::noise_utils::NoiseDependencyNode::Lut {
+            gate: Some(wire),
+            table: lut,
+            input: self.node_for_wire(input.0)?,
+            helper: None,
+        };
+        self.operation_node_with_multiplier(
+            wire,
+            value,
+            node,
+            self.event_multiplier.clone() * BigUint::from(branches),
+        )
+    }
+
     /// The Dynamic LUT of `input` by `table`.
     pub(super) fn dynamic_lut(
         &mut self,
@@ -238,7 +336,15 @@ impl RnsBggNoiseEvaluator<'_> {
             table,
         )?;
         let branches = automorphisms.len();
-        let composed = automorphisms.iter().filter(|k| contracts.composed.contains(k)).count();
+        // `depths[d - 1]` branches are switched `d` times.
+        let mut depths = Vec::new();
+        for k in &automorphisms[1..] {
+            let depth = contracts.depths.get(k).copied().unwrap_or(1);
+            if depths.len() < depth {
+                depths.resize(depth, 0);
+            }
+            depths[depth - 1] += 1;
+        }
         let distributions = &contracts.distributions;
         let output_payload_l1 = match table.output_representation() {
             crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
@@ -247,9 +353,10 @@ impl RnsBggNoiseEvaluator<'_> {
             }
         };
         let companion_error = self.package_error(&contracts, distributions.companion.cutoff())?;
-        let helper_error = self.package_error(&contracts, distributions.helper.cutoff())?;
+        // Helpers stay at `q`: only the companions are compact.
+        let helper_error = distributions.helper.cutoff().clone();
         let lut_bound = |companion_error: &BigUint, helper_error: &BigUint| {
-            if composed == 0 {
+            if depths.len() <= 1 {
                 self.parameters.dynamic_lut_noise_bound(
                     level,
                     &input.1.bound,
@@ -259,11 +366,10 @@ impl RnsBggNoiseEvaluator<'_> {
                     output_payload_l1.clone(),
                 )
             } else {
-                self.parameters.dynamic_composed_lut_noise_bound(
+                self.parameters.dynamic_radix_lut_noise_bound(
                     level,
                     &input.1.bound,
-                    branches - 1 - composed,
-                    composed,
+                    &depths,
                     companion_error,
                     helper_error,
                     output_payload_l1.clone(),
@@ -271,26 +377,29 @@ impl RnsBggNoiseEvaluator<'_> {
             }
         };
         let bound = lut_bound(&companion_error, &helper_error)?;
-        // The package errors' share of the bound, for compact encodings.
-        let package_share = contracts
+        // The companion errors' share of the bound, for compact companions.
+        let companion_share = contracts
             .compact_extension
             .is_some()
             .then(|| {
-                lut_bound(&BigUint::zero(), &BigUint::zero())
+                lut_bound(&BigUint::zero(), &helper_error)
                     .map(|without| &bound.error - without.error)
             })
             .transpose()?;
         let k = self.parameters.dynamic_decomposition_gain(level)?;
         let s = self.parameters.dynamic_scalar_action_gain(level)?;
-        let direct = BigUint::from(branches - 1 - composed);
-        let composed = BigUint::from(composed);
-        // The input reaches the output through the identity branch (`S`),
-        // every direct switch (`S K`), and every composed switch (`S K^2`),
-        // coherently.
-        let input_gain = &s + &direct * &s * &k + &composed * &s * &k * &k;
-        // A composed branch's first switch's fresh errors pass the second
-        // switch's decomposition (at most `K` in `l1`) as well.
-        let switched = &direct + &composed * (BigUint::one() + &k);
+        // The input reaches the output through the identity branch (`S`) and
+        // every branch switched `d` times (`S K^d`), coherently.
+        let input_gain = depths.iter().enumerate().fold(s.clone(), |gain, (depth, count)| {
+            gain + BigUint::from(*count) * &s * k.pow(depth as u32 + 1)
+        });
+        // The fresh errors of a branch's `j`-th of `d` switches pass the
+        // decompositions of the `d - j` switches after it (at most `K` each
+        // in `l1`) as well.
+        let switched = depths.iter().enumerate().fold(BigUint::zero(), |sum, (depth, count)| {
+            sum + BigUint::from(*count) *
+                (0..=depth).map(|later| k.pow(later as u32)).sum::<BigUint>()
+        });
         let mean_gain =
             NonnegativeRational::new(input_gain.clone(), BigUint::one()).expect("unit denominator");
         let input_variance_gain = input_gain.pow(2u32);
@@ -300,7 +409,7 @@ impl RnsBggNoiseEvaluator<'_> {
         let energy = self.parameters.dynamic_scalar_action_energy(level)?;
         let coherent = switched.pow(2u32) * &energy;
         let companion_variance = encoding_variance_from_sigma(distributions.companion.sigma())
-            .scaled(&(self.parameters.dynamic_companion_energy(level)? * &coherent));
+            .scaled(&(self.parameters.dynamic_automorphism_companion_energy(level)? * &coherent));
         let decomposition_energy = BigUint::from(2 * self.parameters.component_columns(level)?) *
             self.parameters.level(level)?.ring_dimension() *
             ((BigUint::one() << self.parameters.level(level)?.base_bits()) / 2u8).pow(2u32);
@@ -315,25 +424,23 @@ impl RnsBggNoiseEvaluator<'_> {
             if branches == 1 {
                 return terms;
             }
-            if let Some(share) = &package_share {
-                return terms.merge(&Self::compact_term(
-                    "dynamic-automorphism-compact-package-error",
-                    share,
-                ));
-            }
-            terms
-                .merge(&self.package_term(
+            let companions = match &companion_share {
+                Some(share) => {
+                    Self::compact_term("dynamic-automorphism-compact-companion-error", share)
+                }
+                None => self.package_term(
                     companion_source,
                     "dynamic-automorphism-companion-error",
                     None,
                     companion_variance.clone(),
-                ))
-                .merge(&self.package_term(
-                    helper_source,
-                    "dynamic-automorphism-helper-error",
-                    None,
-                    helper_variance.clone(),
-                ))
+                ),
+            };
+            terms.merge(&companions).merge(&self.package_term(
+                helper_source,
+                "dynamic-automorphism-helper-error",
+                None,
+                helper_variance.clone(),
+            ))
         });
         let sources = if branches == 1 {
             BTreeMap::new()

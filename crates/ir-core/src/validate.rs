@@ -30,8 +30,8 @@ use crate::{
     },
     ring::{ConcreteRing, RingRef, resolve_ring},
     types::{
-        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port,
-        WireRef, WireType,
+        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, MEMBER_INDEX, MatrixType,
+        NodeId, Port, WireRef, WireType,
     },
 };
 use num_bigint::BigInt;
@@ -200,6 +200,11 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
             let mut variables = BTreeSet::new();
             let mut loop_slots = BTreeSet::new();
             collect_serialized_references(node.kind(), &mut variables, &mut loop_slots);
+            // An input's declared type is its output type, checked below (a family input's
+            // element may depend on the member index).
+            if matches!(node.kind(), NodeKind::Input { .. }) {
+                loop_slots.remove(&MEMBER_INDEX);
+            }
             let declared = &declared_by_scope[scope_id];
             if let Some(name) = variables.iter().find(|name| !declared.contains(*name)) {
                 return Err(ValidationError::UndeclaredCompileVariable(name.clone()));
@@ -253,11 +258,17 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                     "loop-dependent family access must use FamilyGetDynamic",
                 );
             }
+            // Types may depend on an enclosing loop's index (one type per instance) and, inside a
+            // family element, on the member index; the node's own loop index is not in scope for
+            // its outputs.
             for wire_type in node.output_types() {
                 let mut ignored = BTreeSet::new();
                 let mut structural_slots = BTreeSet::new();
                 collect_serialized_references(wire_type, &mut ignored, &mut structural_slots);
-                if let Some(slot) = structural_slots.into_iter().next() {
+                if let Some(slot) = structural_slots
+                    .into_iter()
+                    .find(|slot| *slot != MEMBER_INDEX && !allowed_slots.contains(slot))
+                {
                     return Err(ValidationError::StructuralLoopIndex {
                         scope: scope_id.clone(),
                         slot,
@@ -267,6 +278,53 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         }
     }
     Ok(())
+}
+
+/// The declared (symbolic) type of `wire` in `scope`.
+fn symbolic_wire_type(scope: &GraphScope, wire: &WireRef) -> WireType {
+    scope.nodes()[wire.node.0 as usize].output_types()[wire.port.0 as usize].clone()
+}
+
+/// The instance count of a parallel loop.
+fn parallel_instances(
+    spec: &crate::node::ParallelLoop,
+    env: &ParamEnv,
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+) -> Result<usize, ValidationError> {
+    nonnegative_usize(spec.count.evaluate(env)?, "parallel count", scope, node)
+}
+
+/// The environment of instance `index` of a parallel loop's body.
+fn instance_env(
+    env: &ParamEnv,
+    spec: &crate::node::ParallelLoop,
+    index: usize,
+) -> Result<ParamEnv, ValidationError> {
+    let mut loop_env = env.clone();
+    loop_env.loop_indices.insert(spec.index_slot, BigInt::from(index));
+    child_bindings(&loop_env, &spec.bindings)
+}
+
+/// Whether a wire type of `scope` or of a scope nested in it names loop index `slot`.
+pub(crate) fn scope_types_reference_slot(
+    graph: &Graph,
+    scope_id: &FrozenGraphScopeId,
+    slot: u32,
+) -> bool {
+    let Some(scope) = graph.scope(scope_id) else {
+        return false;
+    };
+    scope.nodes().iter().enumerate().any(|(position, node)| {
+        node.output_types().iter().any(|wire_type| {
+            let mut ignored = BTreeSet::new();
+            let mut slots = BTreeSet::new();
+            collect_serialized_references(wire_type, &mut ignored, &mut slots);
+            slots.contains(&slot)
+        }) || graph
+            .child_scope_id(scope_id, NodeId(position as u64))
+            .is_some_and(|child| scope_types_reference_slot(graph, &child, slot))
+    })
 }
 
 fn structural_loop_slots(graph: &Graph, scope: &FrozenGraphScopeId) -> BTreeSet<u32> {
@@ -504,9 +562,26 @@ pub(crate) fn collect_scope_bindings(
         let child_env = match node.kind() {
             NodeKind::SubgraphCall(call) => child_bindings(&env, &call.bindings)?,
             NodeKind::ParallelLoop(loop_spec) => {
-                let mut loop_env = env.clone();
-                loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
-                child_bindings(&loop_env, &loop_spec.bindings)?
+                // A body whose types depend on its index is checked for every instance; any other
+                // body is checked at index zero.
+                let instances =
+                    if scope_types_reference_slot(graph, &child_id, loop_spec.index_slot) {
+                        let count = loop_spec.count.evaluate(&env)?;
+                        count.to_u64().ok_or(ValidationError::Node {
+                            scope: scope_id.clone(),
+                            node: node_id,
+                            message: "parallel count must be a nonnegative integer".to_owned(),
+                        })?
+                    } else {
+                        1
+                    };
+                for index in 0..instances.max(1) {
+                    let mut loop_env = env.clone();
+                    loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::from(index));
+                    let child_env = child_bindings(&loop_env, &loop_spec.bindings)?;
+                    collect_scope_bindings(graph, &child_id, child_env, output)?;
+                }
+                continue;
             }
             NodeKind::SequentialLoop(loop_spec) => {
                 let mut loop_env = env.clone();
@@ -1511,32 +1586,36 @@ fn validate_node(
             if node.args.len() != count || count == 0 {
                 return node_error(scope, node.id, "family pack argument count mismatch");
             }
-            let first = argument(scope, values, node, 0)?.clone();
-            if matches!(first, ConcreteWireType::IndexedFamily { .. }) {
-                return node_error(scope, node.id, "family members must have one non-family type");
+            // Members of one type form an indexed family; members of different types (declared by
+            // an element type naming the member index) form a dependent family.
+            let members = (0..count)
+                .map(|index| argument(scope, values, node, index).cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            if members.iter().all(|member| member == &members[0]) {
+                vec![ConcreteWireType::IndexedFamily {
+                    element: Box::new(members[0].clone()),
+                    count,
+                }]
+            } else {
+                vec![ConcreteWireType::DependentFamily { members }]
             }
-            for index in 1..count {
-                if argument(scope, values, node, index)? != &first {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "family members must have one non-family type",
-                    );
-                }
-            }
-            vec![ConcreteWireType::IndexedFamily { element: Box::new(first), count }]
         }
         NodeKind::FamilyGetStatic { index } => {
             require_arity(scope, node, 1)?;
-            let ConcreteWireType::IndexedFamily { element, count } =
-                argument(scope, values, node, 0)?.clone()
-            else {
-                return node_error(scope, node.id, "family access requires an indexed family");
-            };
-            if nonnegative_usize(index.evaluate(env)?, "family index", scope, node.id)? >= count {
-                return node_error(scope, node.id, "family index is out of range");
+            let index = nonnegative_usize(index.evaluate(env)?, "family index", scope, node.id)?;
+            match argument(scope, values, node, 0)?.clone() {
+                ConcreteWireType::IndexedFamily { element, count } if index < count => {
+                    vec![*element]
+                }
+                ConcreteWireType::DependentFamily { members } if index < members.len() => {
+                    vec![members[index].clone()]
+                }
+                ConcreteWireType::IndexedFamily { .. } |
+                ConcreteWireType::DependentFamily { .. } => {
+                    return node_error(scope, node.id, "family index is out of range");
+                }
+                _ => return node_error(scope, node.id, "family access requires an indexed family"),
             }
-            vec![*element]
         }
         NodeKind::FamilyGetDynamic => {
             require_arity(scope, node, 2)?;
@@ -1710,6 +1789,34 @@ fn validate_structural_boundaries(
                         node: input.node,
                         wire: *input,
                     })?;
+                if let (
+                    ConcreteWireType::DependentFamily { members },
+                    LoopInputMode::Zip | LoopInputMode::ZipOffset { .. },
+                    NodeKind::ParallelLoop(spec),
+                ) = (outer, mode, handle.kind())
+                {
+                    // Instance `k` reads member `k + offset`, at its own type.
+                    let offset = match mode {
+                        LoopInputMode::ZipOffset { offset } => offset,
+                        _ => 0,
+                    };
+                    let symbolic = symbolic_wire_type(child_scope, input);
+                    for index in 0..parallel_instances(spec, env, scope_id, node_id)? {
+                        let member =
+                            members.get(index + offset).ok_or_else(|| ValidationError::Node {
+                                scope: scope_id.clone(),
+                                node: node_id,
+                                message: "zipped family is too short".to_owned(),
+                            })?;
+                        let instance = instance_env(env, spec, index)?;
+                        if member !=
+                            &concretize_wire_type(&symbolic, &instance, &child_id, input.node)?
+                        {
+                            return node_error(scope_id, node_id, "child input type mismatch");
+                        }
+                    }
+                    continue;
+                }
                 let actual = match mode {
                     LoopInputMode::Broadcast => outer,
                     LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
@@ -1769,6 +1876,27 @@ fn validate_structural_boundaries(
                 let child_type = &child.wire_types[output];
                 let call_type =
                     &validated.wire_types[&WireRef { node: node_id, port: Port(port as u32) }];
+                if let (
+                    ConcreteWireType::DependentFamily { members },
+                    NodeKind::ParallelLoop(spec),
+                ) = (call_type, handle.kind())
+                {
+                    // Member `k` is instance `k`'s output, at its own type.
+                    let symbolic = symbolic_wire_type(child_scope, output);
+                    let instances = parallel_instances(spec, env, scope_id, node_id)?;
+                    if members.len() != instances {
+                        return node_error(scope_id, node_id, "child output type mismatch");
+                    }
+                    for (index, member) in members.iter().enumerate() {
+                        let instance = instance_env(env, spec, index)?;
+                        if member !=
+                            &concretize_wire_type(&symbolic, &instance, &child_id, output.node)?
+                        {
+                            return node_error(scope_id, node_id, "child output type mismatch");
+                        }
+                    }
+                    continue;
+                }
                 let expected = if matches!(handle.kind(), NodeKind::ParallelLoop(_)) {
                     let NodeKind::ParallelLoop(spec) = handle.kind() else { unreachable!() };
                     ConcreteWireType::IndexedFamily {
@@ -1967,13 +2095,27 @@ fn concretize_wire_type_inner(
             preimage_sigma: preimage_sigma.as_ref().map(|width| width.close(env)).transpose()?,
         },
         WireType::IndexedFamily { element, count } => {
-            let element = concretize_wire_type(element, env, scope, node)?;
-            if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
-                return node_error(scope, node, "nested indexed families are unsupported");
-            }
-            ConcreteWireType::IndexedFamily {
-                element: Box::new(element),
-                count: nonnegative_usize(count.evaluate(env)?, "family count", scope, node)?,
+            let count = nonnegative_usize(count.evaluate(env)?, "family count", scope, node)?;
+            // An element type naming the member index resolves member by member.
+            let dependent = WireType::family_member(element, &IntExpr::constant(0)) != **element;
+            if !dependent {
+                // A family member may itself be a family only as a parallel loop's output (a
+                // family pack rejects family members).
+                let element = concretize_wire_type(element, env, scope, node)?;
+                ConcreteWireType::IndexedFamily { element: Box::new(element), count }
+            } else {
+                let members = (0..count)
+                    .map(|index| {
+                        let member = WireType::family_member(element, &IntExpr::constant(index));
+                        concretize_wire_type(&member, env, scope, node)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match members.first() {
+                    Some(first) if members.iter().all(|member| member == first) => {
+                        ConcreteWireType::IndexedFamily { element: Box::new(first.clone()), count }
+                    }
+                    _ => ConcreteWireType::DependentFamily { members },
+                }
             }
         }
     })
@@ -3456,15 +3598,15 @@ mod tests {
                 count: IntExpr::constant(2),
             }],
         );
-        assert_eq!(
+        assert!(
             node_message(
                 crate::ring::test_validate(
                     &graph("heterogeneous-family", heterogeneous),
                     &ParamEnv::default()
                 )
                 .unwrap_err()
-            ),
-            "family members must have one non-family type"
+            )
+            .starts_with("declared output types")
         );
 
         let first = input("first", matrix_type(17, 1, 1));

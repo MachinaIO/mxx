@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // State the program's correctness in Lean: for every seed and message bit, the decrypted bit
     // is the message. `lake build` in `crates/dsl/examples/rlwe` checks the proof.
     let lean = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/rlwe/generated");
-    mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean)?;
+    mxx_ir_core::lean::protocol::export(&correctness_protocol(&program, &bindings)?, &lean, false)?;
 
     let program = program.validate(&bindings)?;
 

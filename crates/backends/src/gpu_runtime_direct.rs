@@ -1490,11 +1490,33 @@ fn upload_bytes_inputs(
 fn check_preimage_replays(frame: &PhysicalFrame, body: Option<(u32, u32)>) -> Result<(), String> {
     for (index, replay) in preimage_replays_in(frame, body) {
         let status = replay.status.read().map_err(|error| error.to_string())?;
-        if !status.succeeded() || status.attempts == 0 || status.attempts > replay.planned_max {
-            return Err(format!(
-                "GPU preimage retry {index} failed: attempts={}, accepted={}, error_code={}, max_attempts={}",
-                status.attempts, status.accepted, status.error_code, replay.planned_max
-            ));
+        let failed =
+            !status.succeeded() || status.attempts == 0 || status.attempts > replay.planned_max;
+        match &replay.trapgen {
+            Some(_) if failed => {
+                return Err(format!(
+                    "GPU statistical TrapGen rejected {} trapdoors: the perturbation covariance is not positive definite, so the singular-value estimate is wrong for these parameters",
+                    status.attempts
+                ));
+            }
+            Some(trapgen) => {
+                // The header of the accepted precomputation: the width and the measured `s_1`.
+                let mut header = [0u8; 16];
+                trapgen.precomputation.download(&mut header).map_err(|error| error.to_string())?;
+                tracing::info!(
+                    attempts = status.attempts,
+                    measured_s1 = f64::from_le_bytes(header[8..].try_into().expect("eight bytes")),
+                    estimated_s1 = trapgen.estimate,
+                    "statistical trapdoor accepted"
+                );
+            }
+            None if failed => {
+                return Err(format!(
+                    "GPU preimage retry {index} failed: attempts={}, accepted={}, error_code={}, max_attempts={}",
+                    status.attempts, status.accepted, status.error_code, replay.planned_max
+                ));
+            }
+            None => {}
         }
     }
     Ok(())
@@ -4120,7 +4142,9 @@ fn planned_export_slots(
                 raw_offset: fragment.raw_offset,
                 raw_bytes: fragment.raw_bytes,
                 final_chunk: site.final_chunk,
-                payload_kind: artifact_payload_kind(&site.artifact_type),
+                payload_kind: artifact_payload_kind(&site.artifact_type).ok_or_else(|| {
+                    GpuRuntimeError::Artifact("a nested family artifact has no GPU payload".into())
+                })?,
                 export: Arc::clone(&site.export),
                 commit_to_session: true,
             })
@@ -4212,13 +4236,16 @@ fn streamed_family_outputs(
     Ok(outputs)
 }
 
-fn artifact_payload_kind(artifact: &ArtifactType) -> u8 {
+/// The GPU payload kind of a stored artifact; a nested family has none (GPU lowering rejects
+/// index-dependent families).
+fn artifact_payload_kind(artifact: &ArtifactType) -> Option<u8> {
     match artifact {
-        ArtifactType::Matrix(_) => 0,
-        ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. } => 1,
-        ArtifactType::Int | ArtifactType::Bytes { .. } => 2,
-        ArtifactType::Trapdoor { .. } => 3,
-        ArtifactType::TypedBlob { .. } => 4,
+        ArtifactType::Matrix(_) => Some(0),
+        ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. } => Some(1),
+        ArtifactType::Int | ArtifactType::Bytes { .. } => Some(2),
+        ArtifactType::Trapdoor { .. } => Some(3),
+        ArtifactType::TypedBlob { .. } => Some(4),
+        ArtifactType::Family(_) => None,
     }
 }
 

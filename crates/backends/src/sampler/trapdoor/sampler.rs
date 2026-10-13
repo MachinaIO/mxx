@@ -22,7 +22,7 @@ use crate::{
 };
 use mxx_ir_core::{Rational, types::TrapdoorInstantiation};
 use num_bigint::BigUint;
-use num_traits::ToPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 use rayon::iter::ParallelIterator;
 use std::{
     ops::Range,
@@ -85,12 +85,7 @@ impl DCRTPolyTrapdoorSampler {
             preimage_sigma,
             max_coefficient_bound,
         )?;
-        let width = preimage_sigma.numerator().to_f64().ok_or(SmallMatrixError::InvalidConfig)? /
-            preimage_sigma.denominator().to_f64().ok_or(SmallMatrixError::InvalidConfig)?;
-        if !width.is_finite() {
-            return Err(SmallMatrixError::InvalidConfig);
-        }
-        Ok(width)
+        rational_to_f64(preimage_sigma).ok_or(SmallMatrixError::InvalidConfig)
     }
 
     /// Redraws whole candidates until every coefficient is within `max_coefficient_bound`.
@@ -142,9 +137,21 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         size: usize,
-    ) -> (Self::Trapdoor, Self::M) {
+        preimage_sigma: Option<&Rational>,
+    ) -> Result<(Self::Trapdoor, Self::M), SmallMatrixError> {
         let TrapdoorInstantiation::Computational = self.instantiation else {
-            return DCRTTrapdoor::sample_statistical(params, size, self.sigma, self.instantiation);
+            let width = match preimage_sigma {
+                Some(width) => width.clone(),
+                None => self.minimum_preimage_width(params, size),
+            };
+            let width = rational_to_f64(&width).ok_or(SmallMatrixError::InvalidConfig)?;
+            return DCRTTrapdoor::sample_statistical(
+                params,
+                size,
+                self.sigma,
+                self.instantiation,
+                width,
+            );
         };
         let trapdoor = DCRTTrapdoor::new(params, size, self.sigma);
         debug!("{}", "trapdoor generated");
@@ -162,7 +169,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         debug!("{}", "a1 generated");
         let a = a0.concat_columns(&[&a1]);
         debug!("{}", "public matrix generated");
-        (trapdoor, a)
+        Ok((trapdoor, a))
     }
 
     fn trapdoor_to_bytes(trapdoor: &Self::Trapdoor) -> Vec<u8> {
@@ -192,6 +199,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             preimage_sigma,
             &max_coefficient_bound,
         )?;
+        check_trapdoor_width(trapdoor, width)?;
         let target = target.load_columns(0, target.col_size());
         let preimage = self.bounded_preimage(
             params,
@@ -221,6 +229,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
             preimage_sigma,
             &max_coefficient_bound,
         )?;
+        check_trapdoor_width(trapdoor, width)?;
         let dist = DistType::GaussDist {
             sigma: width,
             max_coefficient_bound: Some(max_coefficient_bound.clone()),
@@ -239,6 +248,27 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         );
         Ok(preimage_left.concat_rows(&[&preimage_right]))
     }
+}
+
+/// The binary64 value of a width, `None` unless finite.
+fn rational_to_f64(width: &Rational) -> Option<f64> {
+    let width = width.numerator().to_f64()? / width.denominator().to_f64()?;
+    width.is_finite().then_some(width)
+}
+
+/// A statistical trapdoor samples only at the width it precomputed for.
+fn check_trapdoor_width(trapdoor: &DCRTTrapdoor, width: f64) -> Result<(), SmallMatrixError> {
+    let DCRTTrapdoor::Statistical { precomputation, .. } = trapdoor else {
+        return Ok(());
+    };
+    if precomputation.preimage_sigma == width {
+        return Ok(());
+    }
+    let decimal = |value: f64| bigdecimal::BigDecimal::from_f64(value).unwrap_or_default();
+    Err(SmallMatrixError::PreimageWidthMismatch {
+        requested: decimal(width),
+        trapdoor: decimal(precomputation.preimage_sigma),
+    })
 }
 
 /// One preimage candidate `[p + T' z; p_2 + z]` of width `s = preimage_sigma`: the perturbation
@@ -406,7 +436,6 @@ mod test {
             uniform::DCRTPolyUniformSampler,
         },
     };
-    use bigdecimal::FromPrimitive;
     use num_bigint::BigUint;
     use std::ops::Range;
 
@@ -446,7 +475,7 @@ mod test {
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
 
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         let expected_rows = size;
         let expected_cols = (&params.modulus_digits() + 2) * size;
@@ -492,7 +521,7 @@ mod test {
             let params = DCRTPolyParams::new(dimension, depth, bits, base_bits, None, None);
             let sampler =
                 DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-            let (trapdoor, public) = sampler.trapdoor(&params, 1);
+            let (trapdoor, public) = sampler.trapdoor(&params, 1, None).unwrap();
             let bound = default_preimage_cutoff(
                 params.ring_dimension(),
                 1,
@@ -538,7 +567,7 @@ mod test {
         let params = DCRTPolyParams::new(n, 2, bits, base, Some(vec![primes[2], primes[0]]), None);
         let sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = sampler.trapdoor(&params, 1);
+        let (trapdoor, public_matrix) = sampler.trapdoor(&params, 1, None).unwrap();
         let target =
             DCRTPolyUniformSampler::new().sample_uniform(&params, 1, 2, DistType::FinRingDist);
         let preimage = sampler
@@ -570,7 +599,7 @@ mod test {
         let params = DCRTPolyParams::default();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         let bytes = <DCRTPolyTrapdoorSampler as PolyTrapdoorSampler>::trapdoor_to_bytes(&trapdoor);
         let decoded =
@@ -588,7 +617,7 @@ mod test {
         let k = params.modulus_digits();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
@@ -635,7 +664,7 @@ mod test {
         let k = params.modulus_digits();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         // Create a non-square target matrix (size x target_cols) such that target_cols < size
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -686,7 +715,7 @@ mod test {
         let k = params.modulus_digits();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         // Create a non-square target matrix (size x target_cols) such that target_cols > size
         // target_cols is a multiple of size
@@ -737,7 +766,7 @@ mod test {
         let k = params.modulus_digits();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         // Create a non-square target matrix (size x target_cols) such that target_cols > size
         // target_cols is not a multiple of size
@@ -788,7 +817,7 @@ mod test {
         let k = params.modulus_digits();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         // Create a non-square target matrix (size x target_cols) such that target_cols > size
         // target_cols is not a multiple of size
@@ -839,7 +868,7 @@ mod test {
         let k = params.modulus_digits();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         // Create a non-square target matrix (size x target_cols) such that target_cols > size
         // target_cols is not a multiple of size
@@ -909,7 +938,7 @@ mod test {
         let size = 2usize;
         let sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = sampler.trapdoor(&params, size, None).unwrap();
         let target =
             DCRTPolyUniformSampler::new().sample_uniform(&params, size, 1, DistType::FinRingDist);
         let width = sampler.minimum_preimage_width(&params, size);
@@ -972,7 +1001,7 @@ mod test {
         let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, sigma, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let minimum = trapdoor_sampler.minimum_preimage_width(&params, size);
         let width =
@@ -1017,7 +1046,7 @@ mod test {
         let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
         let width = trapdoor_sampler.minimum_preimage_width(&params, size);
         let preimage_bound = hard_cutoff_from_rational(&width).unwrap();
         let s = width.numerator().to_f64().unwrap() / width.denominator().to_f64().unwrap();
@@ -1040,7 +1069,7 @@ mod test {
         let m_bar = 11;
         let instantiation = TrapdoorInstantiation::Statistical { m_bar };
         let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA, instantiation);
-        let (trapdoor, public) = sampler.trapdoor(&params, 1);
+        let (trapdoor, public) = sampler.trapdoor(&params, 1, None).unwrap();
         let digits = params.modulus_digits();
         assert_eq!(public.size(), (1, m_bar + digits));
         assert_eq!(trapdoor.instantiation(), instantiation);
@@ -1061,7 +1090,7 @@ mod test {
         let params = DCRTPolyParams::new(16, 2, 30, 15, None, None);
         let instantiation = TrapdoorInstantiation::Statistical { m_bar: 10 };
         let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA, instantiation);
-        let (trapdoor, public) = sampler.trapdoor(&params, 1);
+        let (trapdoor, public) = sampler.trapdoor(&params, 1, None).unwrap();
         let width = sampler.minimum_preimage_width(&params, 1);
         let bound = hard_cutoff_from_rational(&width).unwrap();
         let target =
@@ -1131,7 +1160,7 @@ mod test {
         let m_bar = 11;
         let instantiation = TrapdoorInstantiation::Statistical { m_bar };
         let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA, instantiation);
-        let (trapdoor, public) = sampler.trapdoor(&params, 1);
+        let (trapdoor, public) = sampler.trapdoor(&params, 1, None).unwrap();
         let width = sampler.minimum_preimage_width(&params, 1);
         let s = width.numerator().to_f64().unwrap() / width.denominator().to_f64().unwrap();
         let target =
@@ -1158,7 +1187,7 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn statistical_trapdoor_widths_exceed_the_computational_formula_and_need_one_row() {
+    fn statistical_trapdoor_width_follows_its_estimate_and_needs_one_row() {
         let params = DCRTPolyParams::new(16, 2, 30, 15, None, None);
         let base = 1u32 << params.base_bits();
         let statistical = TrapdoorInstantiation::Statistical { m_bar: 2 };
@@ -1169,19 +1198,10 @@ mod test {
             SIGMA,
             statistical,
         )
+        .unwrap()
+        .to_f64()
         .unwrap();
-        let computational = crate::sampler::bounds::minimum_preimage_sigma(
-            16,
-            1,
-            params.modulus_digits(),
-            base,
-            SIGMA,
-            TrapdoorInstantiation::Computational,
-        )
-        .unwrap();
-        // With m̄ = 2 the singular-value estimates coincide, and the statistical minimum adds the
-        // √2 margin of the matrix-free perturbation sampler.
-        let statistical_width = crate::sampler::bounds::minimum_preimage_sigma(
+        let width = crate::sampler::bounds::minimum_preimage_sigma(
             16,
             1,
             params.modulus_digits(),
@@ -1189,11 +1209,13 @@ mod test {
             SIGMA,
             statistical,
         )
+        .unwrap()
+        .to_f64()
         .unwrap();
-        let c = bigdecimal::BigDecimal::from_f64(gadget_sampler_sigma(base, SIGMA)).unwrap();
-        assert!((&c * &s1 - &computational).abs() < 1u8);
-        let ratio = (statistical_width / computational).to_f64().unwrap();
-        assert!((ratio - 2f64.sqrt()).abs() < 1e-3, "ratio {ratio}");
+        // s² = c_G² (1 + ŝ_1²) + r², with the rounding width r = σ.
+        let c = gadget_sampler_sigma(base, SIGMA);
+        let expected = c * c * (1.0 + s1 * s1) + SIGMA * SIGMA;
+        assert!((width * width - expected).abs() < 1e-9 * expected);
         assert!(
             crate::sampler::bounds::minimum_preimage_sigma(
                 16,
@@ -1215,7 +1237,7 @@ mod test {
             [TrapdoorInstantiation::Computational, TrapdoorInstantiation::Statistical { m_bar: 9 }]
         {
             let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA, instantiation);
-            let (trapdoor, _) = sampler.trapdoor(&params, 1);
+            let (trapdoor, _) = sampler.trapdoor(&params, 1, None).unwrap();
             let bytes = DCRTPolyTrapdoorSampler::trapdoor_to_bytes(&trapdoor);
             let decoded = DCRTPolyTrapdoorSampler::trapdoor_from_bytes(&params, &bytes).unwrap();
             assert_eq!(decoded, trapdoor);
@@ -1223,7 +1245,7 @@ mod test {
         }
         let sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, _) = sampler.trapdoor(&params, 1);
+        let (trapdoor, _) = sampler.trapdoor(&params, 1, None).unwrap();
         let mut legacy = Vec::new();
         for matrix in trapdoor.matrices() {
             let bytes = matrix.to_compact_bytes();
@@ -1241,7 +1263,7 @@ mod test {
         let k = params.modulus_digits();
         let trapdoor_sampler =
             DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
-        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
+        let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size, None).unwrap();
 
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let target = uniform_sampler.sample_uniform(&params, size, 1, DistType::FinRingDist);

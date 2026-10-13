@@ -3,19 +3,23 @@
 //! Under a fresh secret `s = (s_bar, 1)` and encryption session, one prelude
 //! production computes
 //!
-//! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`;
-//! - for every attribute symbol `x_t`, the gadget ciphertext `C_t = P Z_t + X^(Bz x_t) G` with `P =
-//!   [B^(1); B^(2) - b]` and a fresh `Z_t` of shape `m_B x m`, sampled and multiplied one column at
-//!   a time: `s P = -e_b`, so `s C_t = X^(Bz x_t) s G - e_b Z_t`;
+//! - the anchor encoding `b = s B + e_b = s_bar B^(1) + B^(2) + e_b`, or, with compact encodings,
+//!   `b_Q = s B_Q + e_Q` over `R_Q` (`m_B` polynomials over `pq`, see [`crate::setup`]), from which
+//!   decryption rounds `b = round(b_Q / p)`;
+//! - for every attribute symbol `x_t`, the bottom row `c_t = X^(Bz x_t) s G - s_bar a_t + e_t` of
+//!   the gadget ciphertext `C_t = [a_t; c_t]`, whose top row `a_t` is public and hashed by the
+//!   setup (`RnsBggDynamicSetup::rhs_public_top`), with a fresh `e_t` from `chi`, both `1 x m`, so
+//!   `s C_t = X^(Bz x_t) s G + e_t`, if a lookup step reads it. Since `a_t` is public, the digit
+//!   rows of `a_t` need no companion, which halves the companions of every package;
 //! - the message component `c_m = s d^T + e_m + floor(q/2) m = s_bar d_1 + d_2 + e_m + floor(q/2)
 //!   m` for binary coefficients `m`.
 //!
-//! The prelude exports `C_t` under the Dynamic setup's supplied-ciphertext
-//! role, and the exponent-lut Dynamic encryption, bound to the prelude and
-//! to the same secret and session, adds the initial state `c_0 = s (A_0 -
+//! The prelude samples `c_t` with the Dynamic setup's `rhs_bottom` and exports
+//! it under the setup's bottom-row role, and the exponent-lut Dynamic encryption, bound to the
+//! prelude and to the same secret and session, adds the initial state `c_0 = s (A_0 -
 //! G) + e_0`, the attribute packages' digit companions, the helpers `h_k`,
-//! and the companions of the derived `C_k`. Neither production exports `s`,
-//! a `Z_t`, or any sampling transcript.
+//! and the companions of the derived `C_k`. Neither production exports `s`
+//! or any sampling transcript.
 use crate::{PeError, PePublicKey, setup::digest};
 use mxx_backends::{
     RuntimeValue, SessionStore,
@@ -29,7 +33,7 @@ use mxx_exponent_lut::{
         RnsBggDynamicSetup, RnsBggEncryptionDescriptor, RnsBggPayloadSecret, RnsEncryptBuild,
     },
 };
-use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange};
+use mxx_ir_core::{IntExpr, ParamEnv};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::collections::BTreeMap;
@@ -64,37 +68,6 @@ impl PeCiphertext {
     pub const fn packages(&self) -> &StageArtifacts<RnsBggEncryptionDescriptor> {
         &self.packages
     }
-}
-
-/// The first `columns` and the next `columns` columns of a row.
-pub(crate) fn split(row: Mat, columns: usize) -> (Mat, Mat) {
-    let block = |start: usize| {
-        row.clone().slice(
-            None,
-            Some(IndexRange {
-                start: IntExpr::constant(start),
-                end: IntExpr::constant(start + columns),
-            }),
-        )
-    };
-    (block(0), block(columns))
-}
-
-/// The `1 x width` unit row at a loop-dependent `index`: a window of one constant row, so no
-/// constant depends on the loop.
-fn unit_row(ring: &mxx_dsl::Ring, width: usize, index: IntExpr) -> Mat {
-    let start = (IntExpr::constant(width - 1) - index).canonicalize();
-    ring.constant(
-        (1, 2 * width - 1),
-        mxx_ir_core::node::ConstantMatrix::UnitRow { index: IntExpr::constant(width - 1) },
-    )
-    .slice(
-        None,
-        Some(IndexRange {
-            start: start.clone(),
-            end: (start + IntExpr::constant(width)).canonicalize(),
-        }),
-    )
 }
 
 /// `Enc(mpk, x, m)` for an attribute of the class and a message of at most
@@ -189,20 +162,33 @@ where
     let parameters = public_key.parameters();
     let class = parameters.class();
     let ring = public_key.ring()?;
-    let columns = parameters.digits();
     let m_b = parameters.anchor_columns();
     let dimension = parameters.level().ring_dimension() as usize;
     let mut runtime = BTreeMap::new();
     secret.bind_runtime(&mut runtime);
     let hash_key = public_key.hash_key_input(&mut runtime)?;
     let context = DslContext::new("mxx-pe/encrypt-prelude");
-    let exponents = context.int_family_input(ATTRIBUTE_INPUT, attribute.len());
-    runtime.insert(
-        ATTRIBUTE_INPUT.to_owned(),
-        RuntimeValue::integer_values(
-            attribute.iter().map(|symbol| BigInt::from(class.state_width() * symbol)).collect(),
-        ),
-    );
+    // The exponents of the lookup packages, `Bz x_t`, if a lookup step reads them.
+    let mut families = Vec::new();
+    if class.has_lookup_packages() {
+        families.push((
+            crate::branching_program::ATTRIBUTE_COORDINATE,
+            ATTRIBUTE_INPUT.to_owned(),
+            attribute.iter().map(|symbol| class.state_width() * symbol).collect::<Vec<_>>(),
+        ));
+    }
+    let exponents = families
+        .iter()
+        .map(|(coordinate, name, values)| {
+            runtime.insert(
+                name.clone(),
+                RuntimeValue::integer_values(
+                    values.iter().map(|value| BigInt::from(*value)).collect(),
+                ),
+            );
+            (*coordinate, context.int_family_input(name, values.len()))
+        })
+        .collect::<Vec<_>>();
     let coefficients = context.int_family_input(MESSAGE_INPUT, dimension);
     runtime.insert(
         MESSAGE_INPUT.to_owned(),
@@ -213,11 +199,9 @@ where
         ),
     );
     let (s_bar, _) = secret.row().clone();
-    let first = public_key.anchor_row()?;
-    let second = public_key.anchor_second_row(hash_key.clone())?;
-    let (d_1, d_2) = public_key.message_row(hash_key)?;
-    // `chi`; a zero sigma (noise-free parameters) adds no error.
-    let error = |columns: usize| -> Result<Mat, PeError> {
+    let (d_1, d_2) = public_key.message_row(hash_key.clone())?;
+    // `chi` over `ring`; a zero sigma (noise-free parameters) adds no error.
+    let error_over = |ring: &mxx_dsl::Ring, columns: usize| -> Result<Mat, PeError> {
         let contract = parameters.error();
         if contract.sigma().is_zero() {
             return Ok(ring.zero((1, columns)));
@@ -228,44 +212,39 @@ where
             contract.cutoff().clone(),
         ))
     };
-    let anchor = s_bar.clone() * first.clone() + second.clone() + error(m_b)?;
-    let lower = second - anchor.clone();
-    let gadget = parameters.rns().public_gadget(0)?;
-    let programming = parameters.programming();
-    let programming_sigma = crate::params::real_expr(programming.sigma())?;
-    let ciphertexts = mxx_dsl::parallel(attribute.len(), |member| {
-        // `P Z_t` accumulated one column `z_j` of `Z_t` at a time, `P_r Z_t = sum_j (P_r z_j) e_j`
-        // for the unit rows `e_j`, so that one `m_B x 1` column is live.
-        let width = 2 * columns;
-        let zero = ring.zero((1, width));
-        let (top, bottom) = mxx_dsl::iterate(width, (zero.clone(), zero), |j, (top, bottom)| {
-            let unit = unit_row(&ring, width, j.expression()?);
-            let z =
-                ring.gaussian((m_b, 1), programming_sigma.clone(), programming.cutoff().clone());
-            Ok((
-                top + (first.clone() * z.clone()) * unit.clone(),
-                bottom + (lower.clone() * z) * unit,
-            ))
+    let error = |columns: usize| error_over(&ring, columns);
+    // `b_Q = s_bar B_Q^(1) + B_Q^(2) + e_Q` over `R_Q` with compact encodings.
+    let anchor_ring = public_key.anchor_ring()?;
+    let lifted = match public_key.compact_ring()? {
+        Some(compact) => s_bar.clone().centered_rebase(&compact),
+        None => s_bar.clone(),
+    };
+    let anchor = lifted * public_key.published_anchor_row()? +
+        public_key.published_anchor_second_row(hash_key.clone())? +
+        error_over(&anchor_ring, m_b)?;
+    let mut context = context.transferred_output(ANCHOR_ENCODING, anchor)?;
+    let setup = public_key.setup();
+    for (coordinate, family) in exponents {
+        let bottoms = mxx_dsl::parallel(family.count().clone(), |member| {
+            // The bottom row `X^v s G - s_bar a_t + e_t` of `C_t = [a_t; ...]`, whose top row
+            // `a_t` is the setup's: `s C_t = X^v s G + e_t` for `s = (s_bar, 1)`.
+            setup
+                .rhs_bottom(
+                    parameters.rns(),
+                    hash_key.clone(),
+                    coordinate,
+                    Some(member.expression()?),
+                    secret.row(),
+                    ring.identity(1).multiply_monomial(family.at(member)),
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)
         })?;
-        let symbol = ring.identity(1).multiply_monomial(exponents.at(member));
-        let target = symbol * gadget.clone();
-        let (top_left, top_right) = split(top, columns);
-        let (bottom_left, bottom_right) = split(bottom, columns);
-        Ok(((top_left + target.clone(), top_right), (bottom_left, bottom_right + target)))
-    })?;
+        context = context
+            .transferred_output(RnsBggDynamicSetup::rhs_bottom_role(coordinate, true), bottoms)?;
+    }
     let half = ring.polynomial([IntExpr::constant(parameters.modulus() / 2u8)]);
     let message = s_bar * d_1 + d_2 + error(1)? + half * ring.from_coefficients(&coefficients);
-    let graph = context
-        .transferred_output(ANCHOR_ENCODING, anchor)?
-        .transferred_output(
-            RnsBggDynamicSetup::rhs_ciphertext_role(
-                crate::branching_program::ATTRIBUTE_COORDINATE,
-                true,
-            ),
-            ciphertexts,
-        )?
-        .transferred_output(MESSAGE_ENCODING, message)?
-        .build()?;
+    let graph = context.transferred_output(MESSAGE_ENCODING, message)?.build()?;
     let (anchor_production, anchor_manifest) = public_key.anchor_production().clone();
     Ok(api::execute_artifacts(
         StageGraph::new(graph, runtime, BTreeMap::from([(anchor_production, anchor_manifest)])),

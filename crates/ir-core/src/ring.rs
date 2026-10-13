@@ -246,6 +246,38 @@ impl RingRef {
     pub fn contains_loop_index(&self) -> bool {
         self.expression().contains_loop_index()
     }
+
+    /// This ring with every `LoopIndex(slot)` in its basis replaced by `value`.
+    pub fn substitute_loop_index(&self, slot: u32, value: &IntExpr) -> Self {
+        if !self.contains_loop_index() {
+            return self.clone();
+        }
+        let sub = |expression: &IntExpr| expression.substitute_loop_index(slot, value);
+        Self::new(match self.expression() {
+            RingExpr::Generated { crt_bits, crt_depth, ring_dimension } => RingExpr::Generated {
+                crt_bits: sub(crt_bits),
+                crt_depth: sub(crt_depth),
+                ring_dimension: *ring_dimension,
+            },
+            RingExpr::Explicit { crt_moduli, ring_dimension } => RingExpr::Explicit {
+                crt_moduli: crt_moduli.iter().map(sub).collect(),
+                ring_dimension: *ring_dimension,
+            },
+            RingExpr::Slice { source, start, end } => RingExpr::Slice {
+                source: source.substitute_loop_index(slot, value),
+                start: sub(start),
+                end: sub(end),
+            },
+            RingExpr::Select { source, indices } => RingExpr::Select {
+                source: source.substitute_loop_index(slot, value),
+                indices: indices.iter().map(sub).collect(),
+            },
+            RingExpr::Concat { left, right } => RingExpr::Concat {
+                left: left.substitute_loop_index(slot, value),
+                right: right.substitute_loop_index(slot, value),
+            },
+        })
+    }
     pub fn ring_dimension(&self) -> u32 {
         match self.expression() {
             RingExpr::Generated { ring_dimension, .. } |

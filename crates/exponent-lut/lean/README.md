@@ -45,6 +45,49 @@ package requires the package one directory up, and Mathlib and the ir-core Lean 
 | `ExponentDecomp.lean` | The pairings with the cell, alignment and block numerators of `lwr_prf` as sums over their sources |
 | `ExponentCellStep.lean` | The pairing with the error leaving a block of cells and with the finalized LUT error, in site form: the next weight, the residue sites with their coefficients, and the remainder with its bound |
 | `ExponentH2.lean` | The tail of a noise form under H2 (`h2_tail`): Hoeffding on the clamped mask for the key sites, energies with tape-dependent bounds, the block bounds in terms of the `l1` norm of the weight, the one-tower gadget, and the numeric tails |
+| `ExponentRefresh.lean` | The refresh to the top level (`crate::refresh::top`), see below |
+
+### The refresh to the top level (`ExponentRefresh.lean`)
+
+The refresh re-encrypts a level-`L` encoding as the level-0 encoding
+`y = σ A' - Δ₀ r x G^st₀ + e'` under a new mask, decoding `y mod q` on one chain per prime `q` of
+`Q₀` and recombining the residues. The module proves its average-case correctness for every
+parameter set, reusing `ExponentEncoding` (the masked-row form), `RuntimeModulusSwitch` (the
+decoder's rounding), `PrimitivesCrtRadix` (centered lifts), `RuntimeSubGaussian` (sub-Gaussian
+combinations without independence and their tails) and `ExponentH2` (numeric tails):
+
+- `target_weight_congr`: the target action `Δ_L G^st_L G⁻¹(R_q) ≡ Q_q T_q (mod Q)` of the weight
+  `R_q`, for every carry of the decomposition;
+- `mask_projection`: the mask child's payload `(M + 1) σ₀` (`q ∣ M`) acts as `σ₀` after `Q_q`;
+- `decoded_value`: the refresh combination and the unmasking give `ζ = Q_q y + M + N` with the
+  smudge `M` and the explicit noise `N = e_b K_pre - E - e_sm`;
+- `modulusSwitch_residue`: the runtime's modulus switch returns `ŷ mod q` when `2 |ν| < Q_q`;
+- `crt_recombine`, `crt_idempotent`, `top_refresh_coefficient`: the centered residues of every
+  chain, weighted by the CRT idempotents, recombine to the reference value;
+- `refresh_noise_tail`, `top_refresh_average`: when the source errors form a coordinatewise
+  sub-Gaussian vector and every decoder's noise is a combination of them with coefficients
+  independent of their block (the digit actions and the preimages), the output is wrong with
+  probability at most `Σ_c Σ_j 2 exp(-(Q_q/2 - S)² / (2 w²))`;
+- `refresh_top_test_tail`: at the parameters of `tests/refresh_top.rs`, with every noise proxy
+  `w ≤ 2^34`, that probability is below `2^-100`.
+
+The relations of the inputs are hypotheses: the child carriers (mask, CBD and smudge Programs) and
+the target satisfy their row relations with sub-Gaussian errors, the gadget decompositions
+reconstruct their weights, and the preimages satisfy `B Kpre = K`. They are discharged by the
+runtime relations of an exported run and by the noise model's proxies, not by a certificate of
+the exported graphs; that certificate, for one exported parameter set, is in `refresh_top/`.
+
+### The exported claim of `tests/refresh_top.rs` (`refresh_top/`)
+
+`refresh_top/average-n8-crt4x30/proof/RefreshTopCertificate.lean` proves the generated
+`GeneratedClaim.CorrectnessClaim` of the average-case export of the refresh of the first CRT slot
+(`SLOTS = 1` in `parameters.csv`): the bridge (`bridge/`, written by `generator/gen_bridge.py`)
+maps every average-case run to a run of the renamed worst-case relation (`worst/`), and
+`RefreshTopProof.correct`, ported from `worst-n8-crt4x30/` by `generator/gen_port.py`, shows that
+every such run decodes to the ideal output, so the failure set is empty. The per-part proof files
+are written by `generator/gen_all.sh <directory> <part>`; `gen_decode.py`, `gen_requirement.py`
+and `gen_correct.py` write the decode, requirement and final theorems; the `Top*.lean` lemmas are
+hand-written.
 
 ### Program-dependent lemmas
 

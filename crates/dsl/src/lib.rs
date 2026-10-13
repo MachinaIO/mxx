@@ -37,7 +37,7 @@ use mxx_ir_core::{
         ArtifactInput, ConstantMatrix, HashTagComponent, HashVariant, IndexRange, MatrixBinaryOp,
         NodeKind, ParallelLoop, SampleRange, SequentialLoop,
     },
-    types::{MatrixType, WireType},
+    types::{MEMBER_INDEX, MatrixType, WireType},
 };
 mod control;
 mod family;
@@ -225,6 +225,9 @@ pub struct TrapdoorType {
 pub struct FamilyType<S> {
     pub element: S,
     pub count: IntExpr,
+    /// The loop slot that stands for the member index in `element` (a `parallel` body's index),
+    /// if the element schema depends on it; its wire types name the member index instead.
+    pub member_slot: Option<u32>,
 }
 
 /// A ring `Z_Q[X]/(X^N + 1)` given by an ordered CRT basis.
@@ -1698,6 +1701,7 @@ impl Mat {
             values: vec![node.output(0).expect("coefficient family")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 
@@ -1717,6 +1721,7 @@ impl Mat {
             values: vec![node.output(0).expect("evaluation family")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 
@@ -1814,6 +1819,7 @@ impl Mat {
             values: vec![node.output(0).expect("decoded family")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 
@@ -2207,6 +2213,7 @@ impl DslContext {
             values: vec![node.output(0).expect("hash integer family")],
             element_schema: IntType,
             count,
+            member_slot: None,
         }
     }
 
@@ -2216,19 +2223,7 @@ impl DslContext {
         name: impl Into<String>,
         fixed_count: impl Into<IntExpr>,
     ) -> Family<Int> {
-        let count = fixed_count.into();
-        let wire_type =
-            WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
-        let node = NodeHandle::new(
-            NodeKind::Input { name: name.into(), wire_type: wire_type.clone(), artifact: None },
-            Vec::new(),
-            vec![wire_type],
-        );
-        Family {
-            values: vec![node.output(0).expect("integer family input")],
-            element_schema: IntType,
-            count,
-        }
+        int_family_input(name, fixed_count)
     }
 
     pub fn output<V: GraphValue>(
@@ -2474,6 +2469,26 @@ macro_rules! tag {
 }
 
 pub use mxx_ir_core::node::ConcatAxis;
+
+/// A runtime integer family input of `fixed_count` members named `name`, declared where it is
+/// first used: a graph built from values that read it declares the input.
+#[track_caller]
+pub fn int_family_input(name: impl Into<String>, fixed_count: impl Into<IntExpr>) -> Family<Int> {
+    let count = fixed_count.into();
+    let wire_type =
+        WireType::IndexedFamily { element: Box::new(WireType::Int), count: count.clone() };
+    let node = NodeHandle::new(
+        NodeKind::Input { name: name.into(), wire_type: wire_type.clone(), artifact: None },
+        Vec::new(),
+        vec![wire_type],
+    );
+    Family {
+        values: vec![node.output(0).expect("integer family input")],
+        element_schema: IntType,
+        count,
+        member_slot: None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3431,8 +3446,11 @@ mod tests {
     fn define_accepts_a_formal_nonartifact_family() {
         let ring = Ring::from_crt_moduli(vec![17.into()], 8);
         let matrix_type = MatType(ring.matrix_type((1, 1)));
-        let family_type =
-            FamilyType { element: MatType(ring.matrix_type((1, 1))), count: 2.into() };
+        let family_type = FamilyType {
+            element: MatType(ring.matrix_type((1, 1))),
+            count: 2.into(),
+            member_slot: None,
+        };
         let subgraph = Subgraph::<(Mat, Family<Mat>), Mat>::define(
             "formal-matrix-family",
             (matrix_type.clone(), family_type.clone()),

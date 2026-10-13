@@ -5,48 +5,32 @@
 //! Dynamic evaluation step has scale one and no rounding; the chain has
 //! `2 T_max + 2` levels (see [`PeClass::levels`]).
 //!
-//! The sampling contracts are discrete Gaussians in the sampler's
-//! standard-deviation convention with hard cutoffs:
-//!
-//! - `chi` (the error contract) for the anchor `b`, the helpers `h_k`, and the message `c_m`;
-//! - `chi_fl` (the flooding contract) for the initial state `c_0` and every digit companion;
-//! - the programming contract for the entries of every `Z_t`.
+//! Every fresh error is a sample of one contract `chi`, a discrete Gaussian in the sampler's
+//! standard-deviation convention cut at the budget's multiplier: the anchor `b`, the helpers
+//! `h_k`, the message `c_m`, the initial state `c_0`, every digit companion, and the error `e_t`
+//! of every attribute ciphertext `C_t = [a_t; -s_bar a_t + e_t] + X^(Bz x_t) G`.
 //!
 //! The key is sampled at one width `s_key` with one cutoff `B_key = floor(6.5 s_key)` for both the
 //! anchor preimages and the extension coordinates.
 //!
-//! # Instantiations
+//! # The trapdoor
 //!
-//! | | `Statistical` (the manuscript) | `Computational` (legacy) |
-//! |---|---|---|
-//! | TrapGen | `[ā | g - ā T]`, `m_B = m̄ + D` columns | `[ā | I | G - (ā R + E)]`, `m_B = D + 2` |
-//! | `m_B` | the regularity conditions of [`crate::budget`] | `D + 2` |
-//! | `chi_fl` | the flooding width of [`crate::budget`], or the requested width without `enforce_flooding` | the requested width |
-//! | cutoffs of `chi`, `chi_fl`, `Z_t` | `c` standard deviations from the budget | `6.5` |
-//! | conditions | regularity, flooding, budget, key width, numeric range | none |
-//! | Ring-LWE estimates | encryption | encryption and TrapGen |
-//! | key width | [`KeyWidthPolicy`] | the trapdoor's minimum preimage width |
-//!
-//! `Statistical` with [`KeyWidthPolicy::Strict`] implements every construction and parameter
-//! condition of the manuscript, under the heuristics stated in [`crate::budget`] (ideal samplers,
-//! heuristic preimage widths, truncation, and rejection). `Statistical` with
-//! [`KeyWidthPolicy::Practical`] relaxes the key-simulation width of the reduction.
-//! `Statistical` without [`PeParameterRequest::enforce_flooding`] drops the flooding condition, so
-//! the hybrid `H_1` of the reduction no longer applies; it measures the cost of flooding.
-//! `Computational` keeps the legacy, heuristic parameters and is outside the manuscript's theorem.
+//! TrapGen is the manuscript's statistical instantiation `[ā | g - ā T]` with `m_B = m̄ + D`
+//! columns, where `m̄` and the truncation multiplier of `chi` come from the statistical budget of
+//! [`crate::budget`]. The selection takes the manuscript's implementation relaxations: no noise
+//! flooding, no uniformity conditions on the hybrids' `R` and `Z_t`, and keys at the trapdoor's
+//! minimum preimage width. The heuristics are stated in [`crate::budget`] (ideal samplers,
+//! heuristic preimage widths, truncation, and rejection).
 use crate::{
-    BranchingProgram, PeClass, PeError,
-    budget::{BudgetRequest, BudgetShape, KeyWidthPolicy, StatisticalBudget, paper_scale},
+    PeClass, PeError,
+    budget::{BudgetRequest, BudgetShape, StatisticalBudget, paper_scale},
 };
 use bigdecimal::{BigDecimal, ToPrimitive};
 use mxx_backends::{
     poly::{PolyParams, dcrt::params::DCRTPolyParams},
-    sampler::{
-        bounds::{
-            TrapdoorPreimageCutoffPolicy, cutoff_is_representable, gadget_sampler_sigma,
-            minimum_preimage_sigma, rational_from_decimal,
-        },
-        uniform::WIDE_GAUSSIAN_MAX,
+    sampler::bounds::{
+        TrapdoorPreimageCutoffPolicy, cutoff_is_representable, minimum_preimage_sigma,
+        rational_from_decimal,
     },
 };
 use mxx_exponent_lut::rns_bgg::{
@@ -58,18 +42,17 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ops::RangeInclusive;
 
+/// `m_c`: the columns of the anchor whose decompression `B'' = Dc(B_c)` extends the key's family
+/// matrix with compact encodings (the manuscript's Appendix C). The compressed digit matrices
+/// are sampled uniformly; `m_c` enters only the security proof, through the leftover hash lemma
+/// that programs them as `sigma_i(B_c) R + p d I_2`, the uniformity condition on `σ_R` that the
+/// selection relaxes (Subsection 6.2). The relaxation takes `m_c = 1`, the smallest key.
+pub const COMPRESSED_ANCHOR_COLUMNS: usize = 1;
+
 /// The manuscript's Gaussian width `s` (density `exp(-pi |x|^2 / s^2)`) of
 /// the sampler's standard deviation `sigma`: `s = sqrt(2 pi) sigma`.
 pub fn paper_width(sigma: &BigDecimal) -> f64 {
     paper_scale() * sigma.to_f64().unwrap_or(f64::NAN)
-}
-
-/// The trapdoor instantiation a request selects; the statistical one derives `m̄` from the
-/// regularity conditions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub enum TrapdoorMode {
-    Computational,
-    Statistical,
 }
 
 /// A parameter search request. Widths are the samplers' standard deviations.
@@ -83,40 +66,15 @@ pub struct PeParameterRequest {
     pub base_bits: u32,
     /// The CRT depths searched, in order.
     pub crt_depths: RangeInclusive<usize>,
-    /// The trapdoor instantiation.
-    pub trapdoor_instantiation: TrapdoorMode,
-    /// The key width of the statistical instantiation.
-    pub key_width_policy: KeyWidthPolicy,
     /// `σ_T`: the TrapGen sigma (of `R` and `E`, or of `T`), also the gadget sampler's sigma
     /// factor.
     pub trapdoor_sigma: f64,
-    /// Sigma of `chi`.
+    /// Sigma of `chi`, the contract of every fresh error.
     pub error_sigma: BigDecimal,
-    /// Sigma of `chi_fl` of the computational instantiation, and of the statistical one without
-    /// `enforce_flooding`; the statistical instantiation with it derives it from the flooding
-    /// condition.
-    pub flooding_sigma: BigDecimal,
-    /// Whether the statistical instantiation imposes the flooding condition: `chi_fl` of the
-    /// budget's flooding width. Without it, `chi_fl` is `flooding_sigma` with the budget's cutoff,
-    /// and the proof's hybrid `H_1` no longer applies.
-    pub enforce_flooding: bool,
-    /// `σ_Z`: sigma of the entries of `Z_t`.
-    pub programming_sigma: BigDecimal,
-    /// `σ_R`: sigma of the matrix `R` of the proof's hybrids `H_1` and `H_4`. The scheme never
-    /// samples it; it sizes `m_B` and the flooding width.
-    pub randomness_sigma: BigDecimal,
-    /// `log(1 / ε_total)` of the statistical budget ([`crate::budget`]).
-    pub statistical_security_bits: u32,
-    /// The per-coefficient flooding distance exponent `s_flood`.
-    pub flooding_statistical_bits: u32,
-    /// `Q_key`: the key queries of the `Strict` budget.
-    pub key_queries: u64,
-    /// `m_B,max`: the largest anchor accepted, which fixes the truncation multiplier.
-    pub max_anchor_columns: usize,
-    /// The baby-step count of the LUT automorphism split (see
-    /// [`PeParameters::with_baby_steps`]); `None` switches every automorphism directly.
-    pub lut_baby_steps: Option<usize>,
-    /// Publish the ciphertext's fresh encodings in two columns over `pq` (see
+    /// The radix `B` of the LUT automorphism decomposition (see
+    /// [`PeParameters::with_lut_radix`]); `None` switches every automorphism directly (`B = W`).
+    pub lut_radix: Option<usize>,
+    /// Publish the digit companions in two columns over `pq` and the anchor over `pq` (see
     /// [`PeParameters::with_compact_encodings`]).
     pub compact_encodings: bool,
     /// The noise model of the correctness check: `None` for the worst case,
@@ -129,39 +87,6 @@ pub struct PeParameterRequest {
     pub lattice_security_bits: Option<u64>,
 }
 
-/// The selection record of the statistical instantiation: its budget and the key width's parts.
-#[derive(Clone, Debug, Serialize)]
-pub struct StatisticalSelection {
-    pub key_width_policy: KeyWidthPolicy,
-    #[serde(serialize_with = "decimal")]
-    pub randomness_sigma: BigDecimal,
-    pub key_queries: u64,
-    pub max_anchor_columns: usize,
-    /// Whether `chi_fl` is the budget's flooding width (see
-    /// [`PeParameterRequest::enforce_flooding`]).
-    pub flooding_enforced: bool,
-    pub budget: StatisticalBudget,
-    /// The trapdoor's minimum preimage sigma `σ_min`.
-    #[serde(serialize_with = "decimal")]
-    pub minimum_key_sigma: BigDecimal,
-    /// `Strict` only: `B_R`, the witness bound `B_R̂`, and the SampleRight sigma `σ_SR`.
-    pub randomness_bound: Option<BigUint>,
-    pub witness_bound: Option<BigUint>,
-    #[serde(serialize_with = "optional_decimal")]
-    pub sample_right_sigma: Option<BigDecimal>,
-}
-
-fn decimal<S: serde::Serializer>(value: &BigDecimal, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&value.to_string())
-}
-
-fn optional_decimal<S: serde::Serializer>(
-    value: &Option<BigDecimal>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&value.as_ref().map(ToString::to_string).unwrap_or_default())
-}
-
 /// Validated scheme parameters.
 #[derive(Clone, Debug)]
 pub struct PeParameters {
@@ -170,13 +95,11 @@ pub struct PeParameters {
     trapdoor_sigma: f64,
     instantiation: TrapdoorInstantiation,
     error: RnsBggGaussian,
-    flooding: RnsBggGaussian,
-    programming: RnsBggGaussian,
     key_width: BigDecimal,
     key_cutoff: BigUint,
     anchor_columns: usize,
-    statistical: Option<StatisticalSelection>,
-    baby_steps: Option<usize>,
+    budget: Option<StatisticalBudget>,
+    lut_radix: Option<usize>,
     compact_extension: Option<Vec<u64>>,
     identity: [u8; 32],
 }
@@ -188,14 +111,12 @@ struct ParameterIdentity<'a> {
     trapdoor_sigma: u64,
     instantiation: TrapdoorInstantiation,
     error: &'a RnsBggGaussian,
-    flooding: &'a RnsBggGaussian,
-    programming: &'a RnsBggGaussian,
     key_width: String,
     key_cutoff: &'a BigUint,
     anchor_columns: usize,
-    statistical: &'a Option<StatisticalSelection>,
+    budget: &'a Option<StatisticalBudget>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    baby_steps: Option<usize>,
+    lut_radix: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_extension: &'a Option<Vec<u64>>,
 }
@@ -217,7 +138,7 @@ fn level_at(request: &PeParameterRequest, depth: usize) -> Result<DCRTPolyParams
 fn chain(
     class: &PeClass,
     level: &DCRTPolyParams,
-    flooding: &RnsBggGaussian,
+    error: &RnsBggGaussian,
 ) -> Result<RnsBggParameters, PeError> {
     class.validate_ring_dimension(level.ring_dimension() as usize)?;
     if level.dropped_moduli() != 0 {
@@ -225,7 +146,7 @@ fn chain(
     }
     let rns = RnsBggParameters::new(
         vec![level.clone(); class.levels()],
-        flooding.sigma().clone(),
+        error.sigma().clone(),
         class.levels(),
     )?
     .with_rhs_mode(RhsMode::Dynamic);
@@ -238,43 +159,29 @@ fn gadget_base(level: &DCRTPolyParams) -> Result<u32, PeError> {
         .ok_or_else(|| PeError::Parameters("gadget base overflow".into()))
 }
 
-impl PeParameters {
-    /// Computational parameters of `class` over one ring of `level` and the given contracts. The
-    /// key width is the existing sampler's preimage width for the one-row trapdoor of sigma
-    /// `trapdoor_sigma`; `key_cutoff` must not be below its default cutoff.
-    pub fn new(
-        class: PeClass,
-        level: DCRTPolyParams,
-        trapdoor_sigma: f64,
-        error: RnsBggGaussian,
-        flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
-        key_cutoff: TrapdoorPreimageCutoffPolicy,
-    ) -> Result<Self, PeError> {
-        Self::with_minimum_key_width(
-            class,
-            level,
-            trapdoor_sigma,
-            TrapdoorInstantiation::Computational,
-            error,
-            flooding,
-            programming,
-            key_cutoff,
-        )
-    }
+/// `|J_B|`: the helper automorphisms of `class` over rings of dimension `n` under the LUT radix
+/// `radix` (`W - 1` without one).
+fn helper_count(class: &PeClass, n: usize, radix: Option<usize>) -> Result<usize, PeError> {
+    let automorphisms = class
+        .layout()
+        .automorphism_indices(n)
+        .map_err(|error| PeError::Parameters(error.to_string()))?;
+    Ok(mxx_exponent_lut::rns_bgg::helper_automorphisms(&automorphisms, n, radix).len())
+}
 
-    /// Parameters whose key width is the trapdoor's minimum preimage width.
-    #[allow(clippy::too_many_arguments)]
-    fn with_minimum_key_width(
+impl PeParameters {
+    /// Statistical parameters with an explicit `m̄` and the minimum key width, without the
+    /// budget's conditions: for unit tests with noise-free (zero-width) contracts, which the
+    /// selection of [`Self::at_depth`] rejects.
+    #[cfg(test)]
+    pub(crate) fn statistical_unchecked(
         class: PeClass,
         level: DCRTPolyParams,
         trapdoor_sigma: f64,
-        instantiation: TrapdoorInstantiation,
+        m_bar: usize,
         error: RnsBggGaussian,
-        flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
-        key_cutoff: TrapdoorPreimageCutoffPolicy,
     ) -> Result<Self, PeError> {
+        let instantiation = TrapdoorInstantiation::Statistical { m_bar };
         let key_width = minimum_preimage_sigma(
             level.ring_dimension(),
             1,
@@ -284,62 +191,23 @@ impl PeParameters {
             instantiation,
         )
         .ok_or_else(|| PeError::Parameters("invalid trapdoor sampler parameters".into()))?;
-        Self::assemble(
-            class,
-            level,
-            trapdoor_sigma,
-            instantiation,
-            error,
-            flooding,
-            programming,
-            key_width,
-            key_cutoff,
-            None,
-        )
+        Self::assemble(class, level, trapdoor_sigma, instantiation, error, key_width, None)
     }
 
-    /// Statistical parameters with an explicit `m̄` and the minimum key width, without the
-    /// budget's conditions: for unit tests with noise-free (zero-width) contracts, which the
-    /// selection of [`Self::at_depth`] rejects.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn statistical_unchecked(
-        class: PeClass,
-        level: DCRTPolyParams,
-        trapdoor_sigma: f64,
-        m_bar: usize,
-        error: RnsBggGaussian,
-        flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
-    ) -> Result<Self, PeError> {
-        Self::with_minimum_key_width(
-            class,
-            level,
-            trapdoor_sigma,
-            TrapdoorInstantiation::Statistical { m_bar },
-            error,
-            flooding,
-            programming,
-            TrapdoorPreimageCutoffPolicy::Default,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
+    /// The parameters of a TrapGen of `instantiation` and keys of width `key_width`, cut at the
+    /// default preimage cutoff.
     fn assemble(
         class: PeClass,
         level: DCRTPolyParams,
         trapdoor_sigma: f64,
         instantiation: TrapdoorInstantiation,
         error: RnsBggGaussian,
-        flooding: RnsBggGaussian,
-        programming: RnsBggGaussian,
         key_width: BigDecimal,
-        key_cutoff: TrapdoorPreimageCutoffPolicy,
-        statistical: Option<StatisticalSelection>,
+        budget: Option<StatisticalBudget>,
     ) -> Result<Self, PeError> {
         let invalid = |error: &dyn std::fmt::Display| PeError::Parameters(error.to_string());
-        let rns = chain(&class, &level, &flooding)?;
-        let key_cutoff = key_cutoff
+        let rns = chain(&class, &level, &error)?;
+        let key_cutoff = TrapdoorPreimageCutoffPolicy::Default
             .resolve(&rational_from_decimal(&key_width))
             .map_err(|error| invalid(&error))?;
         let anchor_columns = instantiation
@@ -351,13 +219,11 @@ impl PeParameters {
             trapdoor_sigma,
             instantiation,
             error,
-            flooding,
-            programming,
             key_width,
             key_cutoff,
             anchor_columns,
-            statistical,
-            baby_steps: None,
+            budget,
+            lut_radix: None,
             compact_extension: None,
             identity: [0; 32],
         };
@@ -365,40 +231,54 @@ impl PeParameters {
         Ok(parameters)
     }
 
-    /// Split the LUT automorphism group `H` (of order `W`) into `baby_steps`
-    /// baby steps and `W / baby_steps` giant steps: encryption publishes
-    /// switching packages for about `2 sqrt W` automorphisms instead of `W - 1`,
-    /// and a branch `k = g b` is switched twice (see
-    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_baby_steps`).
-    /// `baby_steps` must divide `W`; `1` or `W` keeps the direct switching.
-    pub fn with_baby_steps(mut self, baby_steps: usize) -> Result<Self, PeError> {
+    /// Decompose the LUT automorphism group `H = <g>` (of order `W`) in radix `B`
+    /// (see `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_lut_radix`): with
+    /// `r = ceil(log_B W)` rounds, all of radix `B` but the last, of radix
+    /// `B' = W / B^(r - 1)`, encryption publishes switching packages for the
+    /// `(B - 1)(r - 1) + B' - 1` automorphisms `K_B = {g^(a B^j)}` instead of `W - 1`, the key
+    /// carries helper blocks for `J_B = K_B u K_B^-1`, and a branch is switched once per nonzero
+    /// digit of its exponent, at most `r` times. `B` is a power of two up to `W`; `B = W` keeps
+    /// the direct switching. `B < W` needs the cyclic group of `W <= n / 2`.
+    pub fn with_lut_radix(mut self, radix: usize) -> Result<Self, PeError> {
         let order = self.class.lookup_width();
-        if baby_steps == 0 || !order.is_multiple_of(baby_steps) {
-            return Err(PeError::Parameters("the baby steps must divide the lookup width".into()));
+        if radix < 2 || !radix.is_power_of_two() || radix > order {
+            return Err(PeError::Parameters(
+                "the LUT radix must be a power of two up to the lookup width".into(),
+            ));
         }
-        self.baby_steps = (baby_steps != 1 && baby_steps != order).then_some(baby_steps);
+        if radix < order && 2 * order > self.level().ring_dimension() as usize {
+            return Err(PeError::Parameters(
+                "a LUT radix below the lookup width needs a cyclic group (W <= n / 2)".into(),
+            ));
+        }
+        self.lut_radix = (radix < order).then_some(radix);
         self.identity = self.digest();
         Ok(self)
     }
 
-    /// The baby-step count of the LUT automorphism split, if any.
-    pub const fn baby_steps(&self) -> Option<usize> {
-        self.baby_steps
+    /// The radix of the LUT automorphism decomposition, `None` if every
+    /// automorphism is switched directly.
+    pub const fn lut_radix(&self) -> Option<usize> {
+        self.lut_radix
     }
 
-    /// Publish the ciphertext's fresh encodings (the digit companions, the
-    /// automorphism helpers, and the initial state `c_0`) as
-    /// `s (A~ - p X I_2) + e` mod `pq` instead of `s (A - X G) + e` mod `q`, for
-    /// the auxiliary modulus `p`: the product of as many CRT primes as `q`'s,
-    /// of the same bit size, `1 mod 2n`, and disjoint from `q`'s. Decryption
-    /// expands each to `ModSwitch_(pq -> q)(c G~)` (see
-    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_compact_encodings`).
-    /// The packages shrink from `m^3` polynomials over `q` to `2 m^2` over
-    /// `pq`; the attribute GSW ciphertexts `C_t` stay at `q`, and so does the
-    /// number `m^2` of companions per package, which encrypt the digits of a
-    /// GSW ciphertext over `q`. [`Self::security_bits`] then also estimates
-    /// Ring-LWE at `pq`. The manuscript's reduction programs the package keys
-    /// over `q`, so compact parameters are outside its theorem.
+    /// The manuscript's compressed digit encodings (its Appendix C): publish every digit
+    /// companion as `s (A~ - p d I_2) + e` mod `Q = pq` instead of `s (A - d G) + e` mod `q`,
+    /// for the auxiliary modulus `p`: the product of as many CRT primes as `q`'s, of the same
+    /// bit size, `1 mod 2n`, and disjoint from `q`'s. Evaluation decompresses each to
+    /// `Dc(c) = ModSwitch_(pq -> q)(c G~)` (see
+    /// `mxx_exponent_lut::rns_bgg::RnsBggDynamicSetup::with_compact_encodings`). The packages
+    /// shrink from `m^3` polynomials over `q` to `2 m^2` over `pq`; the helpers, the initial
+    /// state, and the attribute GSW ciphertexts `C_t` stay at `q`.
+    ///
+    /// As the reduction requires, the anchor is defined modulo `Q` (see [`crate::setup`]):
+    /// the ciphertext carries `b_Q` (`m_B` polynomials over `pq`), from which decryption
+    /// rounds `b = round(b_Q / p)` and decompresses `b'' = Dc(b_c)`, and the key extends the
+    /// family matrix by the blocks `delta_i (x) sigma_i(B''^(1))` and `I_W`, `W (m_c D + 1)`
+    /// more short polynomials ([`Self::key_length`]). With the RNS gadget, no column of
+    /// `Dc(B_c)` is a column of `B`, so `B''` takes all `m_c D` of them, where the manuscript's
+    /// binary gadget needs only the `m_c (D - 1)` with `j >= 1`. [`Self::security_bits`] then
+    /// also estimates Ring-LWE at `pq`.
     pub fn with_compact_encodings(mut self) -> Result<Self, PeError> {
         let level = self.level().clone();
         let depth = level.crt_depth();
@@ -432,6 +312,20 @@ impl PeParameters {
         self.compact_extension.as_deref()
     }
 
+    /// The auxiliary modulus `p` of compact encodings.
+    pub fn compact_modulus(&self) -> Result<BigUint, PeError> {
+        self.compact_extension
+            .as_ref()
+            .map(|extension| extension.iter().map(|prime| BigUint::from(*prime)).product())
+            .ok_or_else(|| PeError::Parameters("the encodings are not compact".into()))
+    }
+
+    /// `m_c D`: the columns of `B''` per row of the family matrix with compact encodings, `0`
+    /// without them.
+    pub fn compressed_anchor_width(&self) -> usize {
+        if self.compact_extension.is_some() { COMPRESSED_ANCHOR_COLUMNS * self.digits() } else { 0 }
+    }
+
     /// The ring parameters of `q p` of compact encodings: `q`'s basis followed
     /// by `p`'s.
     pub fn compact_level(&self) -> Result<Option<DCRTPolyParams>, PeError> {
@@ -459,151 +353,72 @@ impl PeParameters {
         Ok(rings)
     }
 
-    /// `|P|`: the automorphisms with a published helper (`W - 1` without a split).
+    /// `|P| = |J_B|`: the automorphisms with a published helper (`W - 1` without a radix).
     pub fn helper_automorphism_count(&self) -> Result<usize, PeError> {
-        let n = self.level().ring_dimension() as usize;
-        let automorphisms = self
-            .class
-            .layout()
-            .automorphism_indices(n)
-            .map_err(|error| PeError::Parameters(error.to_string()))?;
-        Ok(mxx_exponent_lut::rns_bgg::helper_automorphisms(&automorphisms, n, self.baby_steps)
-            .len())
+        helper_count(&self.class, self.level().ring_dimension() as usize, self.lut_radix)
     }
 
-    /// The parameters of `request` at CRT depth `depth`: the legacy contracts with the default
-    /// cutoffs for `Computational`, the budget's selection ([`crate::budget`]) for `Statistical`.
+    /// The parameters of `request` at CRT depth `depth`: the budget's selection
+    /// ([`crate::budget`]).
     pub fn at_depth(request: &PeParameterRequest, depth: usize) -> Result<Self, PeError> {
-        let level = level_at(request, depth)?;
-        let parameters = match request.trapdoor_instantiation {
-            TrapdoorMode::Computational => Self::new(
-                request.class,
-                level,
-                request.trapdoor_sigma,
-                RnsBggGaussian::with_default_cutoff(request.error_sigma.clone())?,
-                RnsBggGaussian::with_default_cutoff(request.flooding_sigma.clone())?,
-                RnsBggGaussian::with_default_cutoff(request.programming_sigma.clone())?,
-                TrapdoorPreimageCutoffPolicy::Default,
-            ),
-            TrapdoorMode::Statistical => Self::statistical_at(request, level),
-        }?;
-        let parameters = match request.lut_baby_steps {
-            Some(baby_steps) => parameters.with_baby_steps(baby_steps)?,
-            None => parameters,
-        };
+        let parameters = Self::statistical_at(request, level_at(request, depth)?)?;
         if request.compact_encodings { parameters.with_compact_encodings() } else { Ok(parameters) }
     }
 
-    /// Steps 1–9 of the statistical selection at one ring level: the budget and `m_B`, the
-    /// contracts with the budget's cutoffs and the flooding width, the key width of the policy,
-    /// and the numeric range of the key and flooding samples.
+    /// The selection at one ring level: the budget and `m_B`, `chi` with the budget's cutoff,
+    /// the trapdoor's minimum preimage width for the key, and the numeric range of the key cutoff.
     fn statistical_at(
         request: &PeParameterRequest,
         level: DCRTPolyParams,
     ) -> Result<Self, PeError> {
         let class = request.class;
         let digits = level.modulus_digits();
-        let base = gadget_base(&level)?;
         let modulus = level.modulus().as_ref().clone();
+        let n = level.ring_dimension() as usize;
+        let automorphisms = class
+            .layout()
+            .automorphism_indices(n)
+            .map_err(|error| PeError::Parameters(error.to_string()))?;
         let shape = BudgetShape {
-            ring_dimension: level.ring_dimension() as usize,
+            ring_dimension: n,
             digits,
-            attribute_length: class.attribute_length(),
-            lookup_width: class.lookup_width(),
+            attribute_length: class.rhs_packages(),
             crt_depth: level.crt_depth(),
+            switching_packages: mxx_exponent_lut::rns_bgg::switching_automorphisms(
+                &automorphisms,
+                n,
+                request.lut_radix,
+            )
+            .len(),
+            helpers: helper_count(&class, n, request.lut_radix)?,
         };
-        let strict = request.key_width_policy == KeyWidthPolicy::Strict;
         let budget = StatisticalBudget::new(&BudgetRequest {
             shape,
             modulus: &modulus,
             smallest_prime: level.to_crt().0.into_iter().min().unwrap_or(0),
-            statistical_bits: request.statistical_security_bits,
-            flooding_bits: request.flooding_statistical_bits,
-            max_anchor_columns: request.max_anchor_columns,
-            key_queries: strict.then_some(request.key_queries),
             trapdoor_sigma: request.trapdoor_sigma,
-            programming_sigma: &request.programming_sigma,
-            randomness_sigma: &request.randomness_sigma,
             error_sigma: &request.error_sigma,
         })?;
-        budget.verify(&shape)?;
-        let contract = |sigma: &BigDecimal| -> Result<RnsBggGaussian, PeError> {
-            Ok(RnsBggGaussian::new(sigma.clone(), budget.cutoff(sigma)?)?)
-        };
-        let error = contract(&request.error_sigma)?;
-        let programming = contract(&request.programming_sigma)?;
-        let flooding_sigma =
-            if request.enforce_flooding { &budget.flooding_sigma } else { &request.flooding_sigma };
-        let flooding = contract(flooding_sigma)?;
-        if flooding_sigma.to_f64().is_none_or(|sigma| sigma > WIDE_GAUSSIAN_MAX) ||
-            flooding.cutoff().bits() > 62
-        {
-            return Err(PeError::Parameters(
-                "the flooding width exceeds the wide Gaussian sampler".into(),
-            ));
-        }
+        let error =
+            RnsBggGaussian::new(request.error_sigma.clone(), budget.cutoff(&request.error_sigma)?)?;
         let instantiation = TrapdoorInstantiation::Statistical { m_bar: budget.m_bar(digits) };
-        let minimum_key_sigma = minimum_preimage_sigma(
+        let key_width = minimum_preimage_sigma(
             level.ring_dimension(),
             1,
             digits,
-            base,
+            gadget_base(&level)?,
             request.trapdoor_sigma,
             instantiation,
         )
         .ok_or_else(|| PeError::Parameters("invalid trapdoor sampler parameters".into()))?;
-        let (key_width, randomness_bound, witness_bound, sample_right_sigma) = if strict {
-            let rns = chain(&class, &level, &flooding)?;
-            let randomness_bound = budget.randomness_bound(&request.randomness_sigma)?;
-            let witness_bound = crate::noise::witness_bound(
-                &rns,
-                &class,
-                &BranchingProgram::longest(class),
-                &request.randomness_sigma,
-                &randomness_bound,
-                programming.cutoff(),
-            )?;
-            let m = 2 * digits;
-            let w = class.lookup_width();
-            let key_length = w * budget.anchor_columns + w * (w - 1) * m + m;
-            let sample_right_sigma = budget.sample_right_sigma(
-                &shape,
-                &witness_bound,
-                key_length,
-                base,
-                gadget_sampler_sigma(base, request.trapdoor_sigma),
-            )?;
-            (
-                minimum_key_sigma.clone().max(sample_right_sigma.clone()),
-                Some(randomness_bound),
-                Some(witness_bound),
-                Some(sample_right_sigma),
-            )
-        } else {
-            (minimum_key_sigma.clone(), None, None, None)
-        };
         let parameters = Self::assemble(
             class,
             level,
             request.trapdoor_sigma,
             instantiation,
             error,
-            flooding,
-            programming,
             key_width,
-            TrapdoorPreimageCutoffPolicy::Default,
-            Some(StatisticalSelection {
-                key_width_policy: request.key_width_policy,
-                randomness_sigma: request.randomness_sigma.clone(),
-                key_queries: request.key_queries,
-                max_anchor_columns: request.max_anchor_columns,
-                flooding_enforced: request.enforce_flooding,
-                budget,
-                minimum_key_sigma,
-                randomness_bound,
-                witness_bound,
-                sample_right_sigma,
-            }),
+            Some(budget),
         )?;
         if !cutoff_is_representable(parameters.key_cutoff(), &modulus) {
             return Err(PeError::Parameters(format!(
@@ -611,7 +426,10 @@ impl PeParameters {
                 parameters.key_cutoff().bits()
             )));
         }
-        Ok(parameters)
+        match request.lut_radix {
+            Some(radix) => parameters.with_lut_radix(radix),
+            None => Ok(parameters),
+        }
     }
 
     fn digest(&self) -> [u8; 32] {
@@ -627,13 +445,11 @@ impl PeParameters {
             trapdoor_sigma: self.trapdoor_sigma.to_bits(),
             instantiation: self.instantiation,
             error: &self.error,
-            flooding: &self.flooding,
-            programming: &self.programming,
             key_width: self.key_width.to_string(),
             key_cutoff: &self.key_cutoff,
             anchor_columns: self.anchor_columns,
-            statistical: &self.statistical,
-            baby_steps: self.baby_steps,
+            budget: &self.budget,
+            lut_radix: self.lut_radix,
             compact_extension: &self.compact_extension,
         };
         let mut digest = Sha256::new();
@@ -669,9 +485,9 @@ impl PeParameters {
         self.instantiation
     }
 
-    /// The statistical selection record; `None` for computational parameters.
-    pub const fn statistical(&self) -> Option<&StatisticalSelection> {
-        self.statistical.as_ref()
+    /// The statistical budget of the selection; `None` for the unit tests' unchecked parameters.
+    pub const fn budget(&self) -> Option<&StatisticalBudget> {
+        self.budget.as_ref()
     }
 
     /// The trapdoor sigma as the exact graph expression every trapdoor node
@@ -681,33 +497,20 @@ impl PeParameters {
             .map_err(|_| PeError::Parameters("the trapdoor sigma is not finite".into()))
     }
 
-    /// The preimage width the trapdoor nodes request: `None` (the trapdoor's minimum, the legacy
-    /// graph) for computational parameters, the key width otherwise.
+    /// The preimage width the trapdoor nodes request: the key width.
     pub(crate) fn preimage_sigma_expr(&self) -> Result<Option<mxx_ir_core::RealExpr>, PeError> {
-        Ok(match self.instantiation {
-            TrapdoorInstantiation::Computational => None,
-            TrapdoorInstantiation::Statistical { .. } => Some(real_expr(&self.key_width)?),
-        })
+        Ok(Some(real_expr(&self.key_width)?))
     }
 
-    /// `chi`: the anchor, helper, and message errors.
+    /// `chi`: every fresh error (the anchor, the helpers, the message, the initial state, the
+    /// digit companions, and the attribute ciphertexts).
     pub const fn error(&self) -> &RnsBggGaussian {
         &self.error
     }
 
-    /// `chi_fl`: the initial-state and digit-companion errors.
-    pub const fn flooding(&self) -> &RnsBggGaussian {
-        &self.flooding
-    }
-
-    /// The entries of every `Z_t`.
-    pub const fn programming(&self) -> &RnsBggGaussian {
-        &self.programming
-    }
-
     /// The key width `σ_key` (a standard deviation): the trapdoor's minimum preimage width
-    /// ([`minimum_preimage_sigma`]; for `Computational`, `1.8 (b + 1) σ_T² (√(n D) + √(2 n) +
-    /// 4.7)`), or for `Strict` the larger of it and the SampleRight width.
+    /// ([`minimum_preimage_sigma`], `√(c_G² (1 + ŝ_1²) + σ_T²)` with
+    /// `ŝ_1 = σ_T √n (√m̄ + √D + √(ln(n / (2δ))))`).
     pub const fn key_width(&self) -> &BigDecimal {
         &self.key_width
     }
@@ -717,7 +520,7 @@ impl PeParameters {
         &self.key_cutoff
     }
 
-    /// `m_B`: the column count of TrapGen's public row (`D + 2` or `m̄ + D`).
+    /// `m_B = m̄ + D`: the column count of TrapGen's public row.
     pub const fn anchor_columns(&self) -> usize {
         self.anchor_columns
     }
@@ -733,29 +536,28 @@ impl PeParameters {
     }
 
     /// The key length `N = W m_B + W |P| m + m` in ring elements, for the `|P|`
-    /// helper automorphisms (`W - 1` without a split).
+    /// helper automorphisms (`W - 1` without a radix); with compact encodings
+    /// `N~ = N + W (m_c D + 1)` for the blocks of `B''` and `I_W`.
     pub fn key_length(&self) -> usize {
         let w = self.class.lookup_width();
         let helpers = self.helper_automorphism_count().unwrap_or(w - 1);
-        w * self.anchor_columns + w * helpers * self.state_columns() + self.state_columns()
+        let compressed = if self.compact_extension.is_some() {
+            w * (self.compressed_anchor_width() + 1)
+        } else {
+            0
+        };
+        w * self.anchor_columns +
+            w * helpers * self.state_columns() +
+            self.state_columns() +
+            compressed
     }
 
-    /// The bound `B_C <= m_B n B_b B_Z` on the attribute ciphertext error
-    /// `e_C = -e_b Z_t`.
-    pub fn ciphertext_error_bound(&self) -> BigUint {
-        BigUint::from(self.anchor_columns) *
-            self.level().ring_dimension() *
-            self.error.cutoff() *
-            self.programming.cutoff()
-    }
-
-    /// The sampling contracts of the Dynamic packages: `chi_fl` for the
-    /// initial state and every companion, `chi` for the helpers. Encryption
-    /// supplies the attribute ciphertexts itself.
+    /// The sampling contracts of the Dynamic packages, all `chi`. Encryption supplies the
+    /// attribute ciphertexts itself.
     pub fn distributions(&self) -> RnsBggDynamicDistributions {
         RnsBggDynamicDistributions {
-            input: self.flooding.clone(),
-            companion: self.flooding.clone(),
+            input: self.error.clone(),
+            companion: self.error.clone(),
             helper: self.error.clone(),
             ciphertext: self.error.clone(),
         }
@@ -766,24 +568,17 @@ impl PeParameters {
         self.level().modulus().as_ref().clone()
     }
 
-    /// The `lattice-estimator-cli` estimates, with unboundedly many samples,
-    /// of the Ring-LWE instances over the ring:
+    /// The `lattice-estimator-cli` estimate, with unboundedly many samples, of the Ring-LWE
+    /// instance of the encryption secret: the uniform ternary `s_bar` with the sigma of `chi`,
+    /// since every published encoding under `s_bar` (the anchor, the helpers, the message, the
+    /// initial state, and the digit companions) is a sample of it. TrapGen is uniform by the
+    /// regularity conditions and has no estimate.
     ///
-    /// - encryption: the uniform ternary secret `s_bar` with the smaller of the sigmas of `chi` and
-    ///   `chi_fl`, since every published encoding under `s_bar` (the anchor, the helpers, the
-    ///   message, the initial state, and the digit companions) is a sample with one of them;
-    /// - `Computational` only: TrapGen's row `a_bar r + e` with `r` and `e` discrete Gaussians of
-    ///   the trapdoor sigma. The statistical TrapGen is uniform by the regularity conditions and
-    ///   has no estimate (`None`).
-    ///
-    /// With compact encodings ([`Self::with_compact_encodings`]), the companions, helpers, and
-    /// initial state are samples over `pq` with the same secret and the same fresh sigmas, so
-    /// the encryption estimate is the smaller of the estimates over `q` and over `pq`.
-    ///
-    /// The computational anchor's identity column gives the sample `s_bar + B^(2)_1 + e_b` with
-    /// the non-uniform coefficient `1`, which these estimates do not model.
-    pub fn security_bits(&self) -> Result<(u64, Option<u64>), PeError> {
-        let error = self.error.sigma().min(self.flooding.sigma()).clone();
+    /// With compact encodings ([`Self::with_compact_encodings`]), the anchor `b_Q` and the
+    /// companions are samples over `pq` with the same secret and the same fresh sigmas, so
+    /// the estimate is the smaller of the estimates over `q` and over `pq`.
+    pub fn security_bits(&self) -> Result<u64, PeError> {
+        let error = self.error.sigma().clone();
         let mut encryption = mxx_backends::lattice_estimator::lattice_security_bits(
             self.level().ring_dimension(),
             self.level().modulus().as_ref(),
@@ -800,23 +595,7 @@ impl PeParameters {
                 .map_err(PeError::Parameters)?,
             );
         }
-        if self.statistical.is_some() || !self.instantiation.is_computational() {
-            return Ok((encryption, None));
-        }
-        // The shortest decimal of the `f64`, as the sampler was configured.
-        let sigma = self
-            .trapdoor_sigma
-            .to_string()
-            .parse::<BigDecimal>()
-            .map_err(|_| PeError::Parameters("the trapdoor sigma is not finite".into()))?;
-        let trapdoor = mxx_backends::lattice_estimator::gaussian_secret_lattice_security_bits(
-            self.level().ring_dimension(),
-            self.level().modulus().as_ref(),
-            &sigma,
-            &sigma,
-        )
-        .map_err(PeError::Parameters)?;
-        Ok((encryption, Some(trapdoor)))
+        Ok(encryption)
     }
 
     /// Search `request`'s CRT depths, in order, for the first candidate that [`Self::at_depth`]
@@ -845,12 +624,9 @@ impl PeParameters {
                 continue;
             }
             if let Some(target) = request.lattice_security_bits {
-                let (encryption, trapdoor) = parameters.security_bits()?;
-                if encryption.min(trapdoor.unwrap_or(u64::MAX)) < target {
-                    rejected.push(format!(
-                        "depth {depth}: {encryption} (encryption) and {trapdoor:?} (trapdoor) \
-                         security bits"
-                    ));
+                let security = parameters.security_bits()?;
+                if security < target {
+                    rejected.push(format!("depth {depth}: {security} security bits"));
                     continue;
                 }
             }
@@ -893,17 +669,11 @@ mod tests {
         let class = PeClass::new(2, 2, 2, 1).unwrap();
         let level = DCRTPolyParams::new(16, 2, 17, 6, None, None);
         let contract = RnsBggGaussian::with_default_cutoff(1.into()).unwrap();
-        let parameters = PeParameters::new(
-            class,
-            level.clone(),
-            4.578,
-            contract.clone(),
-            contract.clone(),
-            contract,
-            TrapdoorPreimageCutoffPolicy::Default,
-        )
-        .unwrap();
-        assert_eq!(parameters.anchor_columns(), level.modulus_digits() + 2);
+        let m_bar = 2 * level.modulus_digits();
+        let parameters =
+            PeParameters::statistical_unchecked(class, level.clone(), 4.578, m_bar, contract)
+                .unwrap();
+        assert_eq!(parameters.anchor_columns(), m_bar + level.modulus_digits());
         assert_eq!(
             parameters.key_cutoff(),
             &mxx_backends::sampler::bounds::default_preimage_cutoff(
@@ -912,7 +682,7 @@ mod tests {
                 level.modulus_digits(),
                 64,
                 4.578,
-                mxx_ir_core::types::TrapdoorInstantiation::Computational,
+                TrapdoorInstantiation::Statistical { m_bar },
             )
             .unwrap()
         );
@@ -925,92 +695,90 @@ mod tests {
         );
     }
 
-    fn statistical_at(depth: usize, policy: KeyWidthPolicy) -> Result<PeParameters, PeError> {
-        let mut request = crate::test_support::statistical_request(PeClass::new(1, 2, 1, 1)?);
-        request.key_width_policy = policy;
-        PeParameters::at_depth(&request, depth)
-    }
-
+    /// The selection's anchor and `chi` follow its budget, and the key takes the trapdoor's
+    /// minimum preimage width with the default cutoff.
     #[test]
     fn the_statistical_selection_follows_its_budget() {
-        let parameters = statistical_at(4, KeyWidthPolicy::Practical).unwrap();
-        let selection = parameters.statistical().unwrap();
-        let budget = &selection.budget;
+        let request = crate::test_support::statistical_request(PeClass::new(1, 2, 1, 1).unwrap());
+        let parameters = PeParameters::at_depth(&request, 4).unwrap();
+        let budget = parameters.budget().unwrap();
         let digits = parameters.digits();
         assert_eq!(parameters.anchor_columns(), budget.anchor_columns);
         assert_eq!(
             parameters.instantiation(),
             TrapdoorInstantiation::Statistical { m_bar: budget.anchor_columns - digits }
         );
-        // Every truncated contract has the budget's cutoff `c σ`, above the default `6.5 σ`.
+        // `chi` has the requested width and the budget's cutoff `c σ`, above the default `6.5 σ`.
         assert!(budget.cutoff_multiplier > 6.5);
-        for contract in [parameters.error(), parameters.programming(), parameters.flooding()] {
-            assert_eq!(contract.cutoff(), &budget.cutoff(contract.sigma()).unwrap());
-        }
-        assert_eq!(parameters.flooding().sigma(), &budget.flooding_sigma);
-        // Practical keys take the trapdoor's minimum width, with the default cutoff.
-        assert_eq!(parameters.key_width(), &selection.minimum_key_sigma);
+        assert_eq!(parameters.error().sigma(), &request.error_sigma);
+        assert_eq!(parameters.error().cutoff(), &budget.cutoff(&request.error_sigma).unwrap());
+        assert_eq!(
+            parameters.key_width(),
+            &minimum_preimage_sigma(
+                16,
+                1,
+                digits,
+                gadget_base(parameters.level()).unwrap(),
+                request.trapdoor_sigma,
+                parameters.instantiation(),
+            )
+            .unwrap()
+        );
         assert_eq!(
             parameters.key_cutoff(),
             &mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound(parameters.key_width())
         );
-        assert!(selection.sample_right_sigma.is_none());
-        let longest = BranchingProgram::longest(*parameters.class());
+        let longest = crate::BranchingProgram::longest(*parameters.class());
         assert!(crate::noise::simulate(&parameters, &longest).is_ok());
     }
 
     #[test]
-    fn statistical_parameters_without_flooding_take_the_requested_width() {
+    fn the_statistical_selection_rejects_a_narrow_chi() {
         let mut request =
             crate::test_support::statistical_request(PeClass::new(1, 2, 1, 1).unwrap());
-        request.enforce_flooding = false;
-        let parameters = PeParameters::at_depth(&request, 4).unwrap();
-        let selection = parameters.statistical().unwrap();
-        assert!(!selection.flooding_enforced);
-        assert_eq!(parameters.flooding().sigma(), &request.flooding_sigma);
-        assert_eq!(
-            parameters.flooding().cutoff(),
-            &selection.budget.cutoff(&request.flooding_sigma).unwrap()
-        );
-        let enforced = statistical_at(4, KeyWidthPolicy::Practical).unwrap();
-        assert_eq!(parameters.anchor_columns(), enforced.anchor_columns());
-        assert_ne!(parameters.identity(), enforced.identity());
-    }
-
-    #[test]
-    fn strict_keys_add_the_sample_right_width_or_are_rejected_as_unrepresentable() {
-        let practical = statistical_at(4, KeyWidthPolicy::Practical).unwrap();
-        match statistical_at(4, KeyWidthPolicy::Strict) {
-            Ok(strict) => {
-                let selection = strict.statistical().unwrap();
-                assert!(selection.witness_bound.is_some());
-                assert!(strict.key_width() >= practical.key_width());
-                assert!(
-                    strict.key_width() == selection.sample_right_sigma.as_ref().unwrap() ||
-                        strict.key_width() == &selection.minimum_key_sigma
-                );
-            }
-            Err(PeError::Parameters(message)) => {
-                assert!(message.contains("key cutoff"), "{message}")
-            }
-            Err(error) => panic!("{error}"),
-        }
-    }
-
-    #[test]
-    fn the_statistical_selection_rejects_what_the_computational_one_accepts() {
-        let class = PeClass::new(1, 2, 1, 1).unwrap();
-        let mut request = crate::test_support::statistical_request(class);
         // A zero `chi` is below the smoothing parameter.
         request.error_sigma = BigDecimal::from(0u8);
         assert!(PeParameters::at_depth(&request, 4).is_err());
-        request.trapdoor_instantiation = TrapdoorMode::Computational;
-        let computational = PeParameters::at_depth(&request, 4).unwrap();
-        assert!(computational.statistical().is_none());
-        assert_eq!(computational.anchor_columns(), computational.digits() + 2);
-        // An anchor wider than `m_B,max` is rejected.
-        let mut request = crate::test_support::statistical_request(class);
-        request.max_anchor_columns = 8;
-        assert!(PeParameters::at_depth(&request, 4).is_err());
+    }
+
+    /// The LUT radix `B` is a power of two up to `W`, whose last round takes the rest: over rings
+    /// of dimension 16, `W = 8` takes `B = 2` (`|K_2| = 3`, so at most 6 helpers), `B = 4` (rounds
+    /// of radix 4 and 2, `|K_4| = 3 + 1`), and `B = 8` (the direct switching, 7 helpers) but not
+    /// `B = 3` or `B = 16`, and `W = 16 = n`, whose group is not cyclic, takes only the direct
+    /// `B = 16`. The key length counts the `|J_B|` helpers.
+    #[test]
+    fn lut_radices_are_powers_of_two_up_to_the_lookup_width() {
+        let width_8 = crate::test_support::parameters(PeClass::new(1, 4, 2, 1).unwrap());
+        assert_eq!(width_8.class().lookup_width(), 8);
+        let radix_2 = width_8.clone().with_lut_radix(2).unwrap();
+        assert_eq!(radix_2.lut_radix(), Some(2));
+        let helpers = radix_2.helper_automorphism_count().unwrap();
+        assert!((3..=6).contains(&helpers), "{helpers}");
+        let m = radix_2.state_columns();
+        assert_eq!(radix_2.key_length(), 8 * radix_2.anchor_columns() + 8 * helpers * m + m);
+        let direct = width_8.clone().with_lut_radix(8).unwrap();
+        assert_eq!(direct.lut_radix(), None);
+        assert_eq!(direct.identity(), width_8.identity());
+        assert_eq!(direct.helper_automorphism_count().unwrap(), 7);
+        assert_ne!(radix_2.identity(), direct.identity());
+        let radix_4 = width_8.clone().with_lut_radix(4).unwrap();
+        let switching = |parameters: &PeParameters| {
+            let n = parameters.level().ring_dimension() as usize;
+            let automorphisms = parameters.class().layout().automorphism_indices(n).unwrap();
+            mxx_exponent_lut::rns_bgg::switching_automorphisms(
+                &automorphisms,
+                n,
+                parameters.lut_radix(),
+            )
+            .len()
+        };
+        assert_eq!((switching(&radix_2), switching(&radix_4), switching(&direct)), (3, 4, 7));
+        for radix in [0, 1, 3, 16] {
+            assert!(width_8.clone().with_lut_radix(radix).is_err(), "radix {radix}");
+        }
+        let width_16 = crate::test_support::parameters(PeClass::new(1, 8, 2, 1).unwrap());
+        assert_eq!(width_16.level().ring_dimension(), 16);
+        assert!(width_16.clone().with_lut_radix(2).is_err());
+        assert_eq!(width_16.with_lut_radix(16).unwrap().lut_radix(), None);
     }
 }

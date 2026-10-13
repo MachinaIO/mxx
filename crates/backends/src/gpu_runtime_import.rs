@@ -21,7 +21,7 @@ use crate::{
         dcrt::gpu::{GpuDeviceMemory, GpuSignedValuesEncoding, strided_copy_on_device},
     },
 };
-use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
+use mxx_ir_core::artifact::ArtifactType;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::{error::Error, sync::Arc};
@@ -95,51 +95,6 @@ fn copy_device_artifact(
         .map_err(|error| error.to_string())?;
     }
     Ok(true)
-}
-
-fn trapdoor_secret_parts(bytes: &[u8]) -> Result<[&[u8]; 6], String> {
-    let mut parts = [&[][..]; 6];
-    let mut offset = 0usize;
-    for part in &mut parts {
-        let header_end =
-            offset.checked_add(8).ok_or("trapdoor secret length overflows host address space")?;
-        let length_bytes: [u8; 8] = bytes
-            .get(offset..header_end)
-            .ok_or("trapdoor secret has a truncated length")?
-            .try_into()
-            .map_err(|_| "trapdoor secret length is malformed")?;
-        let length = usize::try_from(u64::from_le_bytes(length_bytes))
-            .map_err(|_| "trapdoor secret component length overflows host address space")?;
-        offset = header_end;
-        let payload_end = offset
-            .checked_add(length)
-            .ok_or("trapdoor secret component length overflows host address space")?;
-        *part =
-            bytes.get(offset..payload_end).ok_or("trapdoor secret has a truncated component")?;
-        offset = payload_end;
-    }
-    if offset != bytes.len() {
-        return Err("trapdoor secret has trailing bytes".into());
-    }
-    Ok(parts)
-}
-
-fn trapdoor_leaf_types(
-    matrix: &ConcreteMatrixType,
-    digits: usize,
-) -> Result<[ConcreteMatrixType; 6], String> {
-    let rows = matrix.rows;
-    let width = rows.checked_mul(digits).ok_or("trapdoor gadget width overflows")?;
-    let doubled_rows = rows.checked_mul(2).ok_or("trapdoor row count overflows")?;
-    let shape = |rows, columns| ConcreteMatrixType { ring: matrix.ring.clone(), rows, columns };
-    Ok([
-        shape(rows, width),
-        shape(rows, width),
-        shape(rows, rows),
-        shape(rows, rows),
-        shape(rows, rows),
-        shape(doubled_rows, width),
-    ])
 }
 
 /// Fill the preallocated owner selected by one validated artifact descriptor.
@@ -322,16 +277,34 @@ unsafe fn upload_selected_payload(
             Ok(())
         }
         (
-            ArtifactType::Trapdoor { matrix, digit_count, .. },
+            ArtifactType::Trapdoor { matrix, digit_count, instantiation, .. },
             ImportDestination::Trapdoor { public, secret },
             ArtifactPayload::Trapdoor { public_bytes, secret_bytes },
         ) => {
             if &public.1 != matrix {
                 return Err("trapdoor public import has the wrong matrix type".into());
             }
-            let expected_leaves = trapdoor_leaf_types(matrix, *digit_count)?;
-            let secret_parts = trapdoor_secret_parts(&secret_bytes)?;
-            if secret.iter().zip(&expected_leaves).any(|((_, ty), expected)| ty != expected) {
+            let expected_leaves = crate::sampler::trapdoor::trapdoor_component_shapes(
+                matrix.rows,
+                *digit_count,
+                *instantiation,
+            )
+            .ok_or("trapdoor import has an invalid instantiation")?;
+            let (tag, secret_parts) =
+                crate::sampler::trapdoor::trapdoor_encoding_parts(&secret_bytes)
+                    .map_err(|error| error.to_string())?;
+            let expected_tag = if instantiation.is_computational() {
+                crate::sampler::trapdoor::TAG_COMPUTATIONAL
+            } else {
+                crate::sampler::trapdoor::TAG_STATISTICAL
+            };
+            if tag != expected_tag ||
+                secret.len() != expected_leaves.len() ||
+                secret_parts.len() != expected_leaves.len() ||
+                secret.iter().zip(&expected_leaves).any(|((_, ty), (rows, columns))| {
+                    ty.ring != matrix.ring || (ty.rows, ty.columns) != (*rows, *columns)
+                })
+            {
                 return Err("trapdoor secret import has the wrong leaf layout".into());
             }
             // SAFETY: all seven matrices are plan-owned and prior uses have joined.

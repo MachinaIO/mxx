@@ -16,6 +16,7 @@ use mxx_backends::{
     GpuRuntime, RuntimeValue,
     authority::CpuExecution,
     backend::poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+    lattice_estimator::lattice_security_bits,
     matrix::dcrt_poly::DCRTPolyMatrix,
     poly::{
         Poly, PolyParams,
@@ -42,13 +43,14 @@ use mxx_exponent_lut::{
         prf::{PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
     },
     rns_bgg::{
-        RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
+        RhsMode, RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise,
+        RnsBggDynamicSetup, RnsBggGaussian, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
-        RnsNoiseBuild, RnsOnlineEvalBuild, RnsPreprocessBuild, decode_output, verify_output,
+        RnsNoiseBuild, RnsOnlineEvalBuild, RnsOutputUse, RnsPreprocessBuild,
+        covering_automorphism_layout, decode_output, verify_output,
     },
     utils::{
-        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
-        ring_dimension_candidates,
+        audit_program_at_crt_depth, env_usize, noise_model, rhs_mode, ring_dimension_candidates,
     },
 };
 use mxx_ir_core::{
@@ -273,7 +275,11 @@ fn profile_and_program(
     (profile, program, keys)
 }
 
-fn noise_bindings(program: &LwrPrf, sigma: &BigDecimal) -> RnsBggNoiseBindings {
+fn noise_bindings(
+    program: &LwrPrf,
+    sigma: &BigDecimal,
+    ring_dimension: u32,
+) -> RnsBggNoiseBindings {
     let noise_inputs = program
         .program()
         .encryption_inputs()
@@ -333,8 +339,25 @@ fn noise_bindings(program: &LwrPrf, sigma: &BigDecimal) -> RnsBggNoiseBindings {
             )
         })
         .collect();
-    RnsBggNoiseBindings::new(input_bindings, rhs_bindings)
-        .expect("declaration-order noise bindings")
+    let bindings = RnsBggNoiseBindings::new(input_bindings, rhs_bindings)
+        .expect("declaration-order noise bindings");
+    // Dynamic packages are sampled under the encoding sigma, read through
+    // the group covering the PRF's LUTs.
+    match rhs_mode("MXX_EXPONENT_LUT_LWR_PRF_").expect("RHS mode configuration") {
+        RhsMode::Static => bindings,
+        RhsMode::Dynamic => bindings.with_dynamic(
+            RnsBggDynamicNoise::for_program(
+                [0; 32],
+                program.program(),
+                RnsBggDynamicDistributions::uniform(
+                    RnsBggGaussian::with_default_cutoff(sigma.clone()).expect("valid sigma"),
+                ),
+                covering_automorphism_layout(program.program()),
+                ring_dimension as usize,
+            )
+            .expect("Dynamic noise contracts"),
+        ),
+    }
 }
 
 fn terminal_value_bounds(profile: &SparseLwrPrfProfile, program: &LwrPrf) -> Vec<BigUint> {
@@ -451,7 +474,7 @@ fn search_fixture(sigma: &BigDecimal, recorded: Option<&ParameterRow>) -> Search
     let mut failures = Vec::new();
     for ring_dimension in candidates {
         let (profile, program, keys) = profile_and_program(ring_dimension, recorded);
-        let noise = noise_bindings(&program, sigma);
+        let noise = noise_bindings(&program, sigma, ring_dimension);
         let terminal_bounds = terminal_value_bounds(&profile, &program);
         let depth_candidates = match selected {
             Some((_, crt_depth, primes_per_drop)) => vec![(crt_depth, primes_per_drop)],
@@ -476,7 +499,8 @@ fn search_fixture(sigma: &BigDecimal, recorded: Option<&ParameterRow>) -> Search
                 encoding_error_sigma: sigma.clone(),
                 crt_bits,
                 base_bits: expected_base_bits as u32,
-                terminal_depth: 1,
+                // A Dynamic chain keeps every level on one basis.
+                terminal_depth: if rhs_mode == RhsMode::Dynamic { crt_depth } else { 1 },
                 max_crt_depth: crt_depth,
                 terminal_value_bound: terminal_bounds
                     .iter()
@@ -535,7 +559,7 @@ fn search_fixture(sigma: &BigDecimal, recorded: Option<&ParameterRow>) -> Search
                 );
                 required_security
             } else {
-                lattice_security_bits(&source, sigma)
+                lattice_security_bits(source.ring_dimension(), source.modulus().as_ref(), sigma)
                     .expect("lattice security estimator must be available")
             };
             if achieved < required_security {
@@ -797,14 +821,37 @@ fn round_trip(
     // preparation artifacts.  Online evaluation receives artifacts/configuration only;
     // RHS plaintexts never cross this boundary.
     let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
+    // A Dynamic Program is compiled against a setup, here its own with the
+    // identity mapping; encryption then needs the setup only.
+    let setup = dynamic.then(|| {
+        RnsBggDynamicSetup::for_program(
+            &parameters,
+            [7; 32],
+            HASH_KEY,
+            program.program(),
+            covering_automorphism_layout(program.program()),
+            RnsBggDynamicDistributions::uniform(parameters.encoding_contract()),
+        )
+        .expect("Dynamic setup")
+    });
     let no_rhs = BTreeMap::new();
+    let mut preprocess_build = RnsPreprocessBuild::new(&parameters, [7; 32]);
+    let mut encrypt_build = RnsEncryptBuild::new(&parameters, [7; 32]);
+    let mut online_build = RnsOnlineEvalBuild::new(&parameters, [7; 32]);
+    if let Some((setup, binding)) = &setup {
+        preprocess_build =
+            preprocess_build.with_dynamic_setup(setup, binding.clone()).expect("setup binding");
+        encrypt_build = encrypt_build.with_dynamic_setup(setup).expect("setup binding");
+        online_build =
+            online_build.with_dynamic_setup(setup, binding.clone()).expect("setup binding");
+    }
     let (preprocess, online_eval) = api::preprocess(
         program.program(),
         &ParamEnv::default(),
         if dynamic { &no_rhs } else { &rhs },
         payload.as_ref(),
         HASH_KEY,
-        RnsPreprocessBuild::new(&parameters, [7; 32]),
+        preprocess_build,
         runtime,
         &mut store,
         |_, outputs| Ok(outputs),
@@ -822,18 +869,30 @@ fn round_trip(
             .expect("payload secret")
     });
     let encrypted = api::encrypt(
-        &program.program().encryption_inputs(),
+        &setup.as_ref().map_or_else(
+            || program.program().encryption_inputs(),
+            |(setup, _)| setup.encryption_inputs(),
+        ),
         &ParamEnv::default(),
         &lhs,
-        &preprocess,
+        (!dynamic).then_some(&preprocess),
         &payload,
         mask.as_ref(),
         HASH_KEY,
-        RnsEncryptBuild::new(&parameters, [7; 32]),
+        encrypt_build,
         runtime,
         &mut store,
         |build| {
-            if dynamic {
+            if let Some((_, binding)) = &setup {
+                let rhs = rhs
+                    .iter()
+                    .map(|(id, value)| {
+                        let coordinate = binding
+                            .rhs(*id)
+                            .map_err(|error| api::ApiError::Input { message: error.to_string() })?;
+                        Ok((coordinate, value.clone()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, api::ApiError>>()?;
                 build.bind_rhs_inputs(&ParamEnv::default(), &rhs, rand::random())?;
             }
             Ok(())
@@ -844,14 +903,17 @@ fn round_trip(
         },
     )
     .expect("RNS encryption");
-    // The online evaluation receives the Program without its LUT values.
+    // A Static online evaluation receives the Program without its LUT
+    // values; a Dynamic one applies the tables as public actions.
+    let evaluated =
+        if dynamic { program.program().clone() } else { program.program().without_lut_values() };
     let result = api::online_eval(
-        &program.program().without_lut_values(),
+        &evaluated,
         &ParamEnv::default(),
         &online_eval,
         &encrypted,
         HASH_KEY,
-        RnsOnlineEvalBuild::new(&parameters, [7; 32]),
+        online_build,
         runtime,
         &mut store,
         |_, outputs| Ok(outputs),
@@ -892,6 +954,7 @@ fn round_trip(
             &parameters,
             &payload,
             mask.as_ref(),
+            RnsOutputUse::DirectDecode,
             &[0],
             runtime,
             &mut store,
@@ -933,6 +996,7 @@ fn round_trip(
             &parameters,
             &payload,
             mask.as_ref(),
+            RnsOutputUse::DirectDecode,
             runtime,
             &mut store,
         )
@@ -951,6 +1015,7 @@ fn round_trip(
         &parameters,
         &payload,
         mask.as_ref(),
+        RnsOutputUse::DirectDecode,
         &[0],
         runtime,
         &mut store,

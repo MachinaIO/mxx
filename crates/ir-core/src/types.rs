@@ -56,6 +56,73 @@ pub enum CoefficientBoundDomain {
     PerCrtLimb,
 }
 
+/// How a sampled trapdoor relates its public matrix to the gadget matrix.
+///
+/// For `rows` public rows and `digits` gadget digits per row:
+///
+/// - `Computational`: `A = [ā | I | G - (ā R + E)]` with `ā` uniform `rows x rows` and `R`, `E`
+///   Gaussian `rows x rows·digits`, so `A` has `rows·(digits + 2)` columns and the trapdoor is `[R;
+///   E; I]`. Its uniformity rests on the hardness of RLWE with secret `R`.
+/// - `Statistical { m_bar }`: `A = [ā | g - ā T]` with `ā` uniform `1 x m_bar` and `T` Gaussian
+///   `m_bar x digits`, so `A` has `m_bar + digits` columns and the trapdoor is `[T; I]`. With
+///   enough columns `m_bar`, `A` is statistically close to uniform by the regularity lemma. Only
+///   one public row is supported.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
+)]
+pub enum TrapdoorInstantiation {
+    #[default]
+    Computational,
+    Statistical {
+        m_bar: usize,
+    },
+}
+
+impl TrapdoorInstantiation {
+    pub fn is_computational(&self) -> bool {
+        matches!(self, Self::Computational)
+    }
+
+    /// Number of public-matrix columns of a trapdoor with `rows` rows and `digits` gadget digits
+    /// per row, or `None` on overflow, on an empty statistical `m_bar`, or for a statistical
+    /// trapdoor with other than one row.
+    pub fn columns(self, rows: usize, digits: usize) -> Option<usize> {
+        match self {
+            Self::Computational => rows.checked_mul(digits.checked_add(2)?),
+            Self::Statistical { m_bar } if rows == 1 && m_bar > 0 => m_bar.checked_add(digits),
+            Self::Statistical { .. } => None,
+        }
+    }
+
+    /// Symbolic [`Self::columns`] for graph construction.
+    pub fn columns_expr(self, rows: IntExpr, digits: IntExpr) -> IntExpr {
+        match self {
+            Self::Computational => (rows * (digits + IntExpr::constant(2))).canonicalize(),
+            Self::Statistical { m_bar } => (IntExpr::constant(m_bar) + digits).canonicalize(),
+        }
+    }
+
+    /// Number of rows of the top block `T'` of the trapdoor `[T'; I]`: `2·rows` (`[R; E]`) for
+    /// `Computational`, `m_bar` (`T`) for `Statistical`.
+    pub fn top_rows(self, rows: usize) -> usize {
+        match self {
+            Self::Computational => 2 * rows,
+            Self::Statistical { m_bar } => m_bar,
+        }
+    }
+
+    /// Recovers the public row count from a trapdoor-width column count.
+    pub fn rows_from_columns(self, columns: usize, digits: usize) -> Option<usize> {
+        match self {
+            Self::Computational => {
+                let rows = columns.checked_div(digits.checked_add(2)?)?;
+                (rows > 0 && rows * (digits + 2) == columns).then_some(rows)
+            }
+            Self::Statistical { m_bar } => (columns == m_bar.checked_add(digits)?).then_some(1),
+        }
+    }
+}
+
 impl MatrixType<ConcreteRing, usize> {
     pub fn scalar(ring: ConcreteRing) -> Self {
         Self { ring, rows: 1, columns: 1 }
@@ -83,12 +150,19 @@ pub enum WireType {
         schema_hash: [u8; 32],
     },
     Matrix(MatrixType),
+    /// A sampled or gadget trapdoor. `sigma` is the TrapGen width, `preimage_sigma` the width
+    /// every preimage under the trapdoor is sampled with (`None`: the smallest width the trapdoor
+    /// sampler accepts), and `preimage_max_coefficient_bound` their common hard cutoff.
     Trapdoor {
         matrix: MatrixType,
         sigma: crate::expr::RealExpr,
         gadget_base: IntExpr,
         digit_count: IntExpr,
         preimage_max_coefficient_bound: IntExpr,
+        #[serde(default, skip_serializing_if = "TrapdoorInstantiation::is_computational")]
+        instantiation: TrapdoorInstantiation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preimage_sigma: Option<crate::expr::RealExpr>,
     },
     SmallMatrix {
         matrix: MatrixType,
@@ -131,6 +205,10 @@ pub enum ConcreteWireType {
         digit_count: usize,
         #[serde(with = "serde_support::bigint")]
         preimage_max_coefficient_bound: BigInt,
+        #[serde(default, skip_serializing_if = "TrapdoorInstantiation::is_computational")]
+        instantiation: TrapdoorInstantiation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preimage_sigma: Option<RealExpr>,
     },
     SmallMatrix {
         matrix: ConcreteMatrixType,
@@ -174,12 +252,15 @@ impl WireType {
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                preimage_sigma,
+                ..
             } => {
                 matrix(type_) ||
                     sigma.contains_loop_index() ||
                     gadget_base.contains_loop_index() ||
                     digit_count.contains_loop_index() ||
-                    preimage_max_coefficient_bound.contains_loop_index()
+                    preimage_max_coefficient_bound.contains_loop_index() ||
+                    preimage_sigma.as_ref().is_some_and(RealExpr::contains_loop_index)
             }
             Self::SmallMatrix { matrix: type_, max_coefficient_bound, .. } |
             Self::Preimage { matrix: type_, max_coefficient_bound, .. } => {

@@ -289,6 +289,8 @@ impl GraphValue for Trapdoor {
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
             ..
         } = self.value.wire_type()
         else {
@@ -300,6 +302,8 @@ impl GraphValue for Trapdoor {
             gadget_base: gadget_base.clone(),
             digit_count: digit_count.clone(),
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+            instantiation: *instantiation,
+            preimage_sigma: preimage_sigma.clone(),
         }
     }
 
@@ -326,6 +330,8 @@ impl GraphValueSchema for TrapdoorType {
             gadget_base: self.gadget_base.clone(),
             digit_count: self.digit_count.clone(),
             preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            instantiation: self.instantiation,
+            preimage_sigma: self.preimage_sigma.clone(),
         };
         let node = NodeHandle::new(
             NodeKind::Input {
@@ -353,6 +359,8 @@ impl GraphValueSchema for TrapdoorType {
                 gadget_base: self.gadget_base.clone(),
                 digit_count: self.digit_count.clone(),
                 preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+                instantiation: self.instantiation,
+                preimage_sigma: self.preimage_sigma.clone(),
             },
         ]
     }

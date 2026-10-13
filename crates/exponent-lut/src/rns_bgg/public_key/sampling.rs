@@ -120,7 +120,8 @@ pub(super) fn decompose_matrix(
 }
 
 /// The RHS ciphertext `C` of `plaintext` consumed at `level`, sampled at
-/// `q_(level+1)` with top row `top()` under payload row `payload`:
+/// `q_(level+1)` with top row `top()` under payload row `payload` and its
+/// error under `contract`:
 /// `(t_bar, 1) C = Delta_(level+1) y t H_(level+1) + e_C`. The top row is
 /// sampled after the target, so the Static preprocessing graph keeps the
 /// operation order its exported correctness claims state.
@@ -130,6 +131,7 @@ pub(in crate::rns_bgg) fn rhs_ciphertext(
     payload: &RnsBggRow,
     plaintext: Mat,
     top: impl FnOnce() -> Result<RnsBggRow, RnsBggError>,
+    contract: &RnsBggGaussian,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let next_level =
         level.checked_add(1).ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
@@ -146,7 +148,15 @@ pub(in crate::rns_bgg) fn rhs_ciphertext(
     let scale = parameters.scalar(next_level, parameters.message_scale(next_level)?)?;
     let target = (payload.0.clone() * gadget.clone(), payload.1.clone() * gadget);
     let desired = (target.0 * scale.clone() * nu.clone(), target.1 * scale * nu);
-    super::ciphertext_matrix(parameters, next_level, target_columns, payload.0, top()?, desired)
+    super::ciphertext_matrix(
+        parameters,
+        next_level,
+        target_columns,
+        payload.0,
+        top()?,
+        desired,
+        contract,
+    )
 }
 
 /// The LUT switching ciphertext `C_sigma` of branch `sigma` of `table` for

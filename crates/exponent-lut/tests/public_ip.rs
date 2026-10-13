@@ -15,6 +15,7 @@ use bigdecimal::BigDecimal;
 use mxx_backends::{
     GpuRuntime,
     backend::poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+    lattice_estimator::lattice_security_bits,
     poly::{
         PolyParams,
         dcrt::{
@@ -33,13 +34,10 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggMaskSecret, RnsBggNoiseBindings, RnsBggNoiseFamily,
         RnsBggNoiseValue, RnsBggParameters, RnsBggPayloadSecret, RnsBggPlanRequest,
-        RnsEncryptBuild, RnsNoiseBuild, RnsOnlineEvalBuild, RnsPreprocessBuild,
+        RnsEncryptBuild, RnsNoiseBuild, RnsOnlineEvalBuild, RnsOutputUse, RnsPreprocessBuild,
         decode_public_output, verify_output,
     },
-    utils::{
-        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model,
-        ring_dimension_candidates,
-    },
+    utils::{audit_program_at_crt_depth, env_usize, noise_model, ring_dimension_candidates},
 };
 use mxx_ir_core::{
     Graph, IntExpr, ParamEnv, ValidatedGraph,
@@ -270,8 +268,9 @@ fn search(
             .expect("noise simulation");
             assert_eq!(trace.outputs.len(), 1, "noise simulation must finalize the output");
             let source = parameters.level(0).expect("source level").clone();
-            let achieved = lattice_security_bits(&source, sigma)
-                .expect("lattice security estimator must be available");
+            let achieved =
+                lattice_security_bits(source.ring_dimension(), source.modulus().as_ref(), sigma)
+                    .expect("lattice security estimator must be available");
             if let Some(row) = recorded {
                 assert_eq!(
                     achieved,
@@ -363,7 +362,7 @@ fn public_ip_end_to_end() {
         &program.encryption_inputs(),
         &ParamEnv::default(),
         &lhs,
-        &preprocess,
+        Some(&preprocess),
         &payload,
         Some(&mask),
         HASH_KEY,
@@ -403,6 +402,7 @@ fn public_ip_end_to_end() {
         &parameters,
         &payload,
         Some(&mask),
+        RnsOutputUse::DirectDecode,
         runtime,
         &mut store,
     )
@@ -416,6 +416,7 @@ fn public_ip_end_to_end() {
             &parameters,
             &payload,
             Some(&mask),
+            RnsOutputUse::DirectDecode,
             runtime,
             &mut store
         )

@@ -33,10 +33,11 @@ use crate::{
     transcript::DrawSite,
 };
 use mxx_ir_core::{
-    ParamEnv,
+    ParamEnv, Rational,
     artifact::{ArtifactType, SmallMatrixSemanticKind},
     types::{
-        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, InstantiationFrame, WireRef,
+        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, InstantiationFrame,
+        TrapdoorInstantiation, WireRef,
     },
 };
 use num_bigint::BigInt;
@@ -938,9 +939,13 @@ pub struct PreimageRequest<M, T> {
     /// callers leave this absent; fixed executor paths always populate it.
     pub fixed_metadata: Option<PlannedNodeBatchRequest>,
     pub matrix_type: ConcreteMatrixType,
+    /// TrapGen width of the trapdoor.
     pub sigma: f64,
     pub gadget_base: BigInt,
     pub digit_count: usize,
+    pub instantiation: TrapdoorInstantiation,
+    /// Requested preimage width (a standard deviation); `None` for the trapdoor's minimum.
+    pub preimage_sigma: Option<Rational>,
     pub max_coefficient_bound: BigInt,
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,

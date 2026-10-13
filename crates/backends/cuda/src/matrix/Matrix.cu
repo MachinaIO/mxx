@@ -17,6 +17,7 @@
 #include "MatrixDecompose.cu"
 #include "MatrixSampling.cu"
 #include "MatrixTrapdoor.cu"
+#include "MatrixStatisticalTrapdoor.cu"
 #include "MatrixSerde.cu"
 #include "MatrixCrt.cu"
 #include "MatrixRawRns.cu"

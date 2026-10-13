@@ -13,6 +13,7 @@ use mxx_backends::{
     GpuRuntime,
     artifact::MemoryArtifactStore,
     backend::poly_gpu::gpu_backend_on,
+    lattice_estimator::lattice_security_bits,
     poly::{
         Poly, PolyParams,
         dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
@@ -24,13 +25,14 @@ use mxx_exponent_lut::{
     decoder::simulation::{AverageCaseConfig, NoiseModelKind},
     program::Operand,
     rns_bgg::{
-        RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,
+        RhsMode, RnsBggDerivedWorkload, RnsBggDynamicDistributions, RnsBggDynamicNoise,
+        RnsBggDynamicSetup, RnsBggGaussian, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,
         RnsBggParameters, RnsBggPayloadSecret, RnsBggPlanRequest, RnsEncryptBuild, RnsNoiseBuild,
-        RnsOnlineEvalBuild, RnsPreprocessBuild, decode_output, verify_output,
+        RnsOnlineEvalBuild, RnsOutputUse, RnsPreprocessBuild, covering_automorphism_layout,
+        decode_output, verify_output,
     },
     utils::{
-        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
-        ring_dimension_candidates,
+        audit_program_at_crt_depth, env_usize, noise_model, rhs_mode, ring_dimension_candidates,
     },
 };
 use mxx_ir_core::{
@@ -130,17 +132,36 @@ fn gpu_parameters(parameters: &RnsBggParameters) -> Vec<GpuDCRTPolyParams> {
 fn noise_bindings(
     compiled: &mxx_exponent_lut::CompiledNandCircuit,
     sigma: &BigDecimal,
+    rhs_mode: RhsMode,
+    ring_dimension: u32,
 ) -> RnsBggNoiseBindings {
     let input_value =
         RnsBggNoiseValue::sampled_encoding_sigma(sigma, b"nand-input", &[BigInt::from(1u8)])
             .expect("valid NAND encoding sigma");
     let rhs_value = RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
-    RnsBggNoiseBindings::from_inputs(
+    let bindings = RnsBggNoiseBindings::from_inputs(
         compiled.program(),
         &[input_value],
         &vec![rhs_value; compiled.rhs_ids().len()],
     )
-    .expect("NAND noise bindings match the public declarations")
+    .expect("NAND noise bindings match the public declarations");
+    // Dynamic packages are sampled under the encoding sigma, read through
+    // the group covering the circuit's LUTs.
+    match rhs_mode {
+        RhsMode::Static => bindings,
+        RhsMode::Dynamic => bindings.with_dynamic(
+            RnsBggDynamicNoise::for_program(
+                [0; 32],
+                compiled.program(),
+                RnsBggDynamicDistributions::uniform(
+                    RnsBggGaussian::with_default_cutoff(sigma.clone()).expect("valid sigma"),
+                ),
+                covering_automorphism_layout(compiled.program()),
+                ring_dimension as usize,
+            )
+            .expect("Dynamic noise contracts"),
+        ),
+    }
 }
 
 /// Search the configured candidates, or check the recorded parameter set `recorded`, and
@@ -266,7 +287,7 @@ fn select_candidate(
             circuit.compile(layout, ring_dimension as usize, max_lut_rounds).unwrap_or_else(
                 |error| panic!("NAND compilation failed for n={ring_dimension}: {error}"),
             );
-        let bindings = noise_bindings(&compiled, &sigma);
+        let bindings = noise_bindings(&compiled, &sigma, rhs_mode, ring_dimension);
         let terminal_bounds = vec![BigUint::from(1u8); compiled.program().outputs().len()];
         let depth_candidates: Vec<(usize, usize)> = match selected {
             Some((_, crt_depth, primes_per_drop)) => vec![(crt_depth, primes_per_drop)],
@@ -282,7 +303,8 @@ fn select_candidate(
                 encoding_error_sigma: sigma.clone(),
                 crt_bits,
                 base_bits: expected_base_bits,
-                terminal_depth: 1,
+                // A Dynamic chain keeps every level on one basis.
+                terminal_depth: if rhs_mode == RhsMode::Dynamic { crt_depth } else { 1 },
                 max_crt_depth: crt_depth,
                 terminal_value_bound: BigUint::from(1u8),
                 operations_per_drop,
@@ -353,7 +375,7 @@ fn select_candidate(
                 );
                 security_target
             } else {
-                lattice_security_bits(source, &sigma).unwrap_or_else(|error| {
+                lattice_security_bits(source.ring_dimension(), source.modulus().as_ref(), &sigma).unwrap_or_else(|error| {
                     panic!("NAND security estimation failed for n={ring_dimension}, CRT depth {crt_depth}: {error}")
                 })
             };
@@ -452,6 +474,29 @@ fn nand_circuit_end_to_end() {
         .plaintext_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(&poly_parameters, &assignment)
         .expect("NAND plaintext bindings");
     let no_rhs = BTreeMap::new();
+    // A Dynamic Program is compiled against a setup, here its own with the
+    // identity mapping; encryption then needs the setup only.
+    let setup = dynamic.then(|| {
+        RnsBggDynamicSetup::for_program(
+            &parameters,
+            [0x4e; 32],
+            HASH_KEY,
+            compiled.program(),
+            covering_automorphism_layout(compiled.program()),
+            RnsBggDynamicDistributions::uniform(parameters.encoding_contract()),
+        )
+        .expect("Dynamic setup")
+    });
+    let mut preprocess_build = RnsPreprocessBuild::new(&parameters, [0x4e; 32]);
+    let mut encrypt_build = RnsEncryptBuild::new(&parameters, [0x4e; 32]);
+    let mut online_build = RnsOnlineEvalBuild::new(&parameters, [0x4e; 32]);
+    if let Some((setup, binding)) = &setup {
+        preprocess_build =
+            preprocess_build.with_dynamic_setup(setup, binding.clone()).expect("setup binding");
+        encrypt_build = encrypt_build.with_dynamic_setup(setup).expect("setup binding");
+        online_build =
+            online_build.with_dynamic_setup(setup, binding.clone()).expect("setup binding");
+    }
     // Static preprocessing receives the private RHS plaintexts and caller
     // payload; Dynamic preprocessing receives neither. It returns two typed
     // named-session artifacts consumed by later stages.
@@ -461,7 +506,7 @@ fn nand_circuit_end_to_end() {
         if dynamic { &no_rhs } else { &rhs },
         static_payload.as_ref(),
         HASH_KEY,
-        RnsPreprocessBuild::new(&parameters, [0x4e; 32]),
+        preprocess_build,
         &mut runtime,
         &mut store,
         |_, outputs| Ok(outputs),
@@ -481,18 +526,30 @@ fn nand_circuit_end_to_end() {
     // artifact, and in Dynamic mode the RHS plaintexts of a fresh batch.  Its
     // estimate and execution share one graph construction path.
     let encrypted = api::encrypt(
-        &compiled.program().encryption_inputs(),
+        &setup.as_ref().map_or_else(
+            || compiled.program().encryption_inputs(),
+            |(setup, _)| setup.encryption_inputs(),
+        ),
         &ParamEnv::default(),
         &lhs,
-        &preprocess,
+        (!dynamic).then_some(&preprocess),
         &payload,
         mask.as_ref(),
         HASH_KEY,
-        RnsEncryptBuild::new(&parameters, [0x4e; 32]),
+        encrypt_build,
         &mut runtime,
         &mut store,
         |build| {
-            if dynamic {
+            if let Some((_, binding)) = &setup {
+                let rhs = rhs
+                    .iter()
+                    .map(|(id, value)| {
+                        let coordinate = binding
+                            .rhs(*id)
+                            .map_err(|error| api::ApiError::Input { message: error.to_string() })?;
+                        Ok((coordinate, value.clone()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, api::ApiError>>()?;
                 build.bind_rhs_inputs(&ParamEnv::default(), &rhs, rand::random())?;
             }
             Ok(())
@@ -503,13 +560,17 @@ fn nand_circuit_end_to_end() {
     // Online evaluation receives only preparation artifacts and public
     // configuration; preprocessing RHS plaintexts, the mask and the LUT
     // values stay out of this stage.
+    // A Dynamic evaluation applies the tables as public actions, so it reads
+    // their values.
+    let evaluated =
+        if dynamic { compiled.program().clone() } else { compiled.program().without_lut_values() };
     let result = api::online_eval(
-        &compiled.program().without_lut_values(),
+        &evaluated,
         &ParamEnv::default(),
         &online_eval,
         &encrypted,
         HASH_KEY,
-        RnsOnlineEvalBuild::new(&parameters, [0x4e; 32]),
+        online_build,
         &mut runtime,
         &mut store,
         |_, outputs| Ok(outputs),
@@ -531,6 +592,7 @@ fn nand_circuit_end_to_end() {
         &parameters,
         &payload,
         mask.as_ref(),
+        RnsOutputUse::DirectDecode,
         &mut runtime,
         &mut store,
     )
@@ -546,6 +608,7 @@ fn nand_circuit_end_to_end() {
             &parameters,
             &payload,
             mask.as_ref(),
+            RnsOutputUse::DirectDecode,
             &mut runtime,
             &mut store
         )
@@ -561,6 +624,7 @@ fn nand_circuit_end_to_end() {
         &parameters,
         &payload,
         mask.as_ref(),
+        RnsOutputUse::DirectDecode,
         &[1],
         &mut runtime,
         &mut store,

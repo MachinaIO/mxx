@@ -30,7 +30,7 @@ fn family_lane(range: &FamilyRange) -> IntExpr {
 /// Whether distinct lanes of a family read distinct members through
 /// `index`: the lane index itself (up to a constant offset), or a selection
 /// by the lane among pairwise distinct constants.
-fn lane_injective(index: &IntExpr, lane: &IntExpr) -> bool {
+pub(super) fn lane_injective(index: &IntExpr, lane: &IntExpr) -> bool {
     let lane = lane.clone().canonicalize();
     if let IntExpr::Select { selector, branches } = index {
         let mut seen = std::collections::BTreeSet::new();
@@ -60,7 +60,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             trace: RnsBggNoiseTrace::default(),
             current_site: None,
             event_multiplier: BigUint::one(),
-            finalized_coefficient_wires: BTreeMap::new(),
+            finalized_outputs: BTreeMap::new(),
             decoder_smudge: None,
             unmask_trapdoor_sigma: None,
             lane_indices: Vec::new(),
@@ -77,21 +77,21 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             .map(|support| &support.count)
     }
 
-    fn set_lane_support(&mut self, wire: WireId, count: BigUint) {
+    pub(super) fn set_lane_support(&mut self, wire: WireId, count: BigUint) {
         self.payload_support.insert(wire, PayloadSupport { depth: self.lane_indices.len(), count });
     }
 
-    fn site(&self) -> Result<&crate::program::LoweringSite, RnsBggError> {
+    pub(super) fn site(&self) -> Result<&crate::program::LoweringSite, RnsBggError> {
         self.current_site
             .as_ref()
             .ok_or(RnsBggError::Graph("noise lowering site is missing".into()))
     }
 
-    fn level(&self, wire: WireId) -> Result<usize, RnsBggError> {
+    pub(super) fn level(&self, wire: WireId) -> Result<usize, RnsBggError> {
         self.workload.level(wire)
     }
 
-    fn carry_provenance(
+    pub(super) fn carry_provenance(
         &self,
         mut value: RnsBggNoiseValue,
         parents: impl IntoIterator<Item = BTreeMap<[u8; 32], NoiseSourceProvenance>>,
@@ -135,7 +135,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         })
     }
 
-    fn rhs_node(&mut self, rhs: &RhsRef<IntExpr>) -> crate::noise_utils::NoiseNodeId {
+    pub(super) fn rhs_node(&mut self, rhs: &RhsRef<IntExpr>) -> crate::noise_utils::NoiseNodeId {
         let node = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
         let site = self.current_site.as_ref();
         let mut indices = site.map(|site| site.indices.clone()).unwrap_or_default();
@@ -415,7 +415,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             BigUint::from(self.parameters.component_columns(level)?))
     }
 
-    fn operation_node_with_multiplier(
+    pub(super) fn operation_node_with_multiplier(
         &mut self,
         wire: WireId,
         value: RnsBggNoiseValue,
@@ -433,7 +433,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         Ok((wire, value))
     }
 
-    fn operation_node(
+    pub(super) fn operation_node(
         &mut self,
         wire: WireId,
         value: RnsBggNoiseValue,
@@ -679,14 +679,6 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             "lut-rounding",
             units(&terms.internal_rounding),
         ));
-        if self.parameters.rhs_mode() == RhsMode::Dynamic {
-            contributions = contributions.merge(&NoiseBreakdown::sampled(
-                stable_source_id(&(b"rns-bgg/lut/companion".as_slice(), level, lut)),
-                "lut-companion-error",
-                zero_mean_moments(units(&terms.companion.scaled(&branch_squares))),
-                false,
-            ));
-        }
         if !coefficient_output {
             contributions = contributions.merge(&residual(
                 b"rns-bgg/lut/outer-rounding",
@@ -697,15 +689,22 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         Ok(contributions)
     }
 
-    /// Finalize one coefficient-output value: its one scale-and-round by
+    /// Normalize one coefficient-output value: its one scale-and-round by
     /// the source ratio, with the public-key and encoding roundings (or, at
-    /// the terminal level, the terminal encoding error).
-    fn finalize_coefficient(
+    /// the terminal level, the terminal encoding error). On an equal-basis
+    /// level the ratio is one: the ModDown is an identity and adds no
+    /// rounding.
+    fn normalize_coefficient(
         &mut self,
         wire: WireId,
         mut value: RnsBggNoiseValue,
     ) -> Result<RnsBggNoiseValue, RnsBggError> {
         let level = self.level(wire)?;
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            // An equal-basis ModDown is an identity: no rounding is added.
+            self.parameters.dynamic_route(level + 1)?;
+            return Ok(value);
+        }
         let ratio = self.parameters.scale(level)?.clone();
         if ratio == BigUint::one() {
             // The terminal level has no scale-and-round.
@@ -759,27 +758,6 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             });
             value = value.with_breakdown(breakdown);
         }
-        // The scale-up `G^-1(k)` of the finalized carrier (see
-        // `RnsBggParameters::coefficient_output_action`): a fixed right action
-        // with the balanced digits of `k`, whose energy applies only to a
-        // contribution with an established covariance bound.
-        let finalized_level = level
-            .checked_add(1)
-            .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
-        let (_, k, _) =
-            self.parameters.coefficient_output_decoding(&self.program, wire, finalized_level)?;
-        let (l1, l2_squared) = self.parameters.gadget_inverse_norms(finalized_level, &k)?;
-        value.bound.error *= &l1;
-        let mean_gain =
-            NonnegativeRational::new(l1.clone(), BigUint::one()).expect("positive scale-up action");
-        let l1_squared = &l1 * &l1;
-        let breakdown = value.contributions("coefficient-scale").map(|terms| {
-            terms.transform(|term| {
-                let gain = if term.covariance_bounded { &l2_squared } else { &l1_squared };
-                (mean_gain.clone(), term.moments.variance.scaled(gain), false)
-            })
-        });
-        value = value.with_breakdown(breakdown);
         if ratio != BigUint::one() {
             let source = stable_source_id(&(
                 b"rns-bgg/coefficient-final-mod-down".as_slice(),
@@ -797,30 +775,63 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         Ok(value)
     }
 
+    /// The direct-decoding action `G^-1(w)` of a normalized carrier at
+    /// `level` (see [`RnsBggParameters::output_carrier`]): a fixed right
+    /// action with the balanced digits of `w`, whose energy applies only to a
+    /// contribution with an established covariance bound.
+    fn output_action(
+        &self,
+        mut value: RnsBggNoiseValue,
+        level: usize,
+        weight: &BigUint,
+    ) -> Result<RnsBggNoiseValue, RnsBggError> {
+        let (l1, l2_squared) = self.parameters.gadget_inverse_norms(level, weight)?;
+        value.bound.error *= &l1;
+        let mean_gain =
+            NonnegativeRational::new(l1.clone(), BigUint::one()).expect("positive output action");
+        let l1_squared = &l1 * &l1;
+        let breakdown = value.contributions("output-action").map(|terms| {
+            terms.transform(|term| {
+                let gain = if term.covariance_bounded { &l2_squared } else { &l1_squared };
+                (mean_gain.clone(), term.moments.variance.scaled(gain), false)
+            })
+        });
+        Ok(value.with_breakdown(breakdown))
+    }
+
     pub(super) fn finish_outputs(
         &mut self,
         outputs: Vec<(WireId, RnsBggNoiseValue)>,
     ) -> Result<Vec<RnsBggNoiseValue>, RnsBggError> {
         let mut finalized = Vec::with_capacity(outputs.len());
         for (wire, value) in outputs {
-            // Coefficient LUT output is finalized once, after the complete
-            // aggregation topology.  Exponent outputs already carry their
-            // normal next-level result and must not be rounded again.
-            if self
-                .program
-                .wire_is_coefficient_output(wire)
-                .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
-            {
-                if let Some(previous) = self.finalized_coefficient_wires.get(&wire) {
-                    finalized.push(previous.clone());
-                    continue;
-                }
-                let value = self.finalize_coefficient(wire, value)?;
-                self.finalized_coefficient_wires.insert(wire, value.clone());
-                finalized.push(value);
-            } else {
-                finalized.push(value);
+            // Every output is resolved once, after the complete aggregation
+            // topology, through the same carrier as the public-key and
+            // encoding lowerings: a coefficient output is normalized once
+            // (exponent outputs already carry their normal result and must
+            // not be rounded again), then the selected direct-decoding action
+            // adds its gain.
+            if let Some(previous) = self.finalized_outputs.get(&wire) {
+                finalized.push(previous.clone());
+                continue;
             }
+            let level = self.level(wire)?;
+            let carrier = self.parameters.output_carrier(
+                self.program,
+                wire,
+                level,
+                self.bindings.output_use,
+            )?;
+            let mut value = if carrier.level != level {
+                self.normalize_coefficient(wire, value)?
+            } else {
+                value
+            };
+            if let Some(weight) = &carrier.action {
+                value = self.output_action(value, carrier.level, weight)?;
+            }
+            self.finalized_outputs.insert(wire, value.clone());
+            finalized.push(value);
         }
         let counts = &self.reduction_counts;
         tracing::info!(
@@ -1077,6 +1088,9 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         {
             return Err(RnsBggError::Parameters("RNS-BGG MulPrivate requires a private input"));
         }
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            return self.dynamic_mul(input, rhs);
+        }
         let logical_level = self.level(input.0)?;
         let level = logical_level;
         let (contract, sparse_count) = match self
@@ -1136,27 +1150,6 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 ),
                 None => NoiseBreakdown::sampled(rhs_source, "rhs-error", rhs_moments, rhs_bounded),
             };
-            // Dynamic: the RHS package's digit-companion errors, shared by
-            // every gate reading the same RHS member at this level.
-            let companion_source =
-                stable_source_id(&(b"rns-bgg/rhs-companion-error".as_slice(), rhs.id, level));
-            let companion_moments = zero_mean_moments(terms.companion.clone());
-            let companion = match rhs.index.as_ref() {
-                Some(index) => NoiseBreakdown::sampled_member(
-                    companion_source,
-                    "rhs-companion-error",
-                    self.lane_indices.len(),
-                    index.clone(),
-                    companion_moments,
-                    false,
-                ),
-                None => NoiseBreakdown::sampled(
-                    companion_source,
-                    "rhs-companion-error",
-                    companion_moments,
-                    false,
-                ),
-            };
             // Under H2 both remainders are centered uniforms independent per
             // coefficient and of the independent secret, so their images
             // are coefficient-uncorrelated. The remainders are determined by
@@ -1190,12 +1183,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                     zero_mean_moments(terms.rounding.clone()),
                 ),
             };
-            let terms = inherited.merge(&rhs_error).merge(&rounding);
-            if self.parameters.rhs_mode() == RhsMode::Dynamic {
-                terms.merge(&companion)
-            } else {
-                terms
-            }
+            inherited.merge(&rhs_error).merge(&rounding)
         });
         tracing::trace!(
             wire = wire.0,
@@ -1210,11 +1198,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         let mut heuristics = input.1.heuristics.clone();
         heuristics.insert(NoiseHeuristicId::H1StateUncorrelated);
         heuristics.insert(NoiseHeuristicId::H2ResidueUniform);
-        // Dynamic ciphertext digits depend on the secret and the ciphertext
-        // error, so RHS independence is not assumed there.
-        if self.parameters.rhs_mode() == RhsMode::Static {
-            heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
-        }
+        heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
         let value = self.carry_provenance(
             RnsBggNoiseValue {
                 bound,
@@ -1253,6 +1237,10 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         }
         let lut = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let level = self.level(input.0)?;
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            let value = self.dynamic_lut(input, table)?;
+            return self.finish_lut(lut, level, value);
+        }
         let fresh_error_gain = self.fresh_gain(level)?;
         let wire = self.site()?.output;
         // Exponent outputs are signed monomials, irrespective of the
@@ -1325,12 +1313,25 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             input: self.node_for_wire(input.0)?,
             helper: None,
         };
-        let (wire, value) = self.operation_node_with_multiplier(
+        let value = self.operation_node_with_multiplier(
             wire,
             value,
             node,
             self.event_multiplier.clone() * BigUint::from(table.input_width()),
         )?;
+        self.finish_lut(lut, level, value)
+    }
+}
+
+impl RnsBggNoiseEvaluator<'_> {
+    /// The common tail of a LUT at `level`: a decoder smudge member is
+    /// normalized once in its root body, then weighted and placed.
+    fn finish_lut(
+        &mut self,
+        lut: LutId,
+        level: usize,
+        (wire, value): (WireId, RnsBggNoiseValue),
+    ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
         if let Some(declaration) = self.decoder_smudge.clone() &&
             declaration.smudge().lut() == lut
         {
@@ -1339,7 +1340,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             // q`, and placed by a monomial, as the encoding does. The error
             // gain is the largest `l1(G^-1(w))` over the halved weights; the
             // payload `P^digit delta / 2` is bounded by the largest numerator.
-            let value = self.finalize_coefficient(wire, value)?;
+            let value = self.normalize_coefficient(wire, value)?;
             let numerators = declaration.member_weights();
             let weights = self.parameters.halved_weights(level + 1, &numerators)?;
             let l1 = self.parameters.gadget_inverse_l1(level + 1, &weights)?;

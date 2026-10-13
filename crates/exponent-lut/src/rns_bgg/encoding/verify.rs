@@ -10,6 +10,10 @@ use super::*;
 /// verification artifact is exposed. `payload` and `mask` remain
 /// caller-owned, and neither is passed to online evaluation. Dynamic
 /// parameters take no mask: their single secret `payload` is also the mask.
+/// `output_use` is the use the Program was preprocessed with; it selects the
+/// carrier (see [`RnsBggParameters::output_carrier`]) whose relation is
+/// checked.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_output<E, S, P>(
     program: &ExponentLutProgram,
     result: &StageOutputs,
@@ -18,6 +22,7 @@ pub fn verify_output<E, S, P>(
     parameters: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
     mask: Option<&RnsBggMaskSecret>,
+    output_use: RnsOutputUse,
     execution: &mut E,
     store: &mut S,
 ) -> Result<(), ApiError>
@@ -26,14 +31,13 @@ where
     S: SessionStore,
     P: Poly,
 {
-    let (wire, output_level, decoding) = output_wire_level(program, parameters, output_index)?;
-    verify_output_at_level(
+    let (wire, carrier) = output_wire_carrier(program, parameters, output_index, output_use)?;
+    verify_output_carrier(
         program,
         result,
         output_index,
         wire,
-        output_level,
-        decoding,
+        &carrier,
         expected,
         parameters,
         payload,
@@ -43,17 +47,15 @@ where
     )
 }
 
-/// The wire of output `output_index`, the level of its finalized carrier (a
-/// coefficient output is moved down once more by `finish_outputs`), and, for
-/// a coefficient output, its decryption modulus `t` and scale `k` (see
-/// [`RnsBggParameters::coefficient_output_decoding`]). A member of a
-/// `parallel` family is described by its body's output wire, a member of an
-/// input family by the family's own wire.
-fn output_wire_level(
+/// The wire of output `output_index` and its resolved carrier under
+/// `output_use`. A member of a `parallel` family is described by its body's
+/// output wire, a member of an input family by the family's own wire.
+fn output_wire_carrier(
     program: &ExponentLutProgram,
     parameters: &RnsBggParameters,
     output_index: usize,
-) -> Result<(WireId, usize, Option<(u64, BigUint)>), ApiError> {
+    output_use: RnsOutputUse,
+) -> Result<(WireId, RnsOutputCarrier), ApiError> {
     let wire = match program
         .outputs()
         .get(output_index)
@@ -66,20 +68,12 @@ fn output_wire_level(
             .find_map(|(output, inner)| (output == *family).then_some(inner))
             .unwrap_or(*family),
     };
-    let workload = RnsBggDerivedWorkload::from_program(program).map_err(ApiError::scheme)?;
-    let source_level = workload.level(wire).map_err(ApiError::scheme)?;
-    let coefficient_output = program
-        .wire_is_coefficient_output(wire)
-        .map_err(|_| ApiError::input("verification output metadata is invalid"))?;
-    let output_level = source_level
-        .checked_add(usize::from(coefficient_output))
-        .ok_or_else(|| ApiError::input("verification output level overflow"))?;
-    let decoding = coefficient_output
-        .then(|| parameters.coefficient_output_decoding(program, wire, output_level))
-        .transpose()
-        .map_err(ApiError::scheme)?
-        .map(|(t, k, _)| (t, k));
-    Ok((wire, output_level, decoding))
+    let workload = RnsBggDerivedWorkload::from_program_with_parameters(parameters, program)
+        .map_err(ApiError::scheme)?;
+    let level = workload.level(wire).map_err(ApiError::scheme)?;
+    let carrier =
+        parameters.output_carrier(program, wire, level, output_use).map_err(ApiError::scheme)?;
+    Ok((wire, carrier))
 }
 
 /// Decrypt private output `output_index` of [`crate::api::online_eval`] with
@@ -88,11 +82,12 @@ fn output_wire_level(
 /// modulo two for an exponent output, modulo its decryption modulus `t` for
 /// a coefficient output.
 ///
-/// A private output is a terminal-level carrier: the terminal state gadget
-/// is the identity, its message scale is `Delta` (`floor(q / 2)` for an
-/// exponent output, the scale `k` of [`RnsBggParameters::coefficient_output_scale`]
-/// for a coefficient output), and the second component of the payload
-/// secret is one. Its second row component is therefore
+/// A decodable private output carrier (see
+/// [`RnsBggParameters::output_carrier`] under `output_use`) is a scalar
+/// column per component: its message scale is `Delta` (`floor(q / 2)` for an
+/// exponent output, the scale `k` of
+/// [`RnsBggParameters::coefficient_output_scale`] for a coefficient output),
+/// and the second component of the payload secret is one. Its second row component is therefore
 /// `s * A_01 + A_11 - Delta * mu + e` for the mask `s = (s_0, 1)` and the
 /// paired public key `A`, so the phase `row_1 - (s_0 * A_01 + A_11)` is
 /// `-Delta * mu + e`. Threshold decoding modulo two of the phase returns
@@ -112,6 +107,7 @@ pub fn decode_output<E, S>(
     parameters: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
     mask: Option<&RnsBggMaskSecret>,
+    output_use: RnsOutputUse,
     positions: &[usize],
     execution: &mut E,
     store: &mut S,
@@ -121,8 +117,12 @@ where
     E: StageExecution<S>,
     S: SessionStore,
 {
-    let (wire, output_level, decoding) = output_wire_level(program, parameters, output_index)?;
-    if output_level + 1 != parameters.levels().len() {
+    let (wire, carrier) = output_wire_carrier(program, parameters, output_index, output_use)?;
+    let Some(plaintext_modulus) = carrier.plaintext_modulus else {
+        return Err(ApiError::input("the output carrier is not directly decodable"));
+    };
+    let output_level = carrier.level;
+    if parameters.rhs_mode() == RhsMode::Static && output_level + 1 != parameters.levels().len() {
         return Err(ApiError::input("only a terminal-level output can be decoded"));
     }
     if !matches!(
@@ -151,9 +151,12 @@ where
         (mask_row.0 * ring.input("decode-key-01", (1, 1)) +
             mask_row.1 * ring.input("decode-key-11", (1, 1)));
     let mut graph = DslContext::new("rns-bgg-output-decode");
-    let decoded = match &decoding {
-        Some((t, _)) => (-phase).threshold_decode_ints(*t, length),
-        None => phase.threshold_decode_ints(2u8, length),
+    // A coefficient carrier is decoded from `k mu - e`; an exponent carrier's
+    // phase `-floor(q/2) mu + e` decodes modulo two either way.
+    let decoded = if program.wire_is_coefficient_output(wire).map_err(ApiError::scheme)? {
+        (-phase).threshold_decode_ints(plaintext_modulus, length)
+    } else {
+        phase.threshold_decode_ints(plaintext_modulus, length)
     };
     for position in positions {
         graph = graph
@@ -223,7 +226,9 @@ where
     S: SessionStore,
     P: Poly,
 {
-    let (wire, output_level, _) = output_wire_level(program, parameters, output_index)?;
+    let (wire, carrier) =
+        output_wire_carrier(program, parameters, output_index, RnsOutputUse::DirectDecode)?;
+    let output_level = carrier.level;
     if output_level + 1 != parameters.levels().len() {
         return Err(ApiError::input("only a terminal-level output can be decoded"));
     }
@@ -311,13 +316,13 @@ where
     Ok(value)
 }
 
-fn verify_output_at_level<E, S, P>(
+#[allow(clippy::too_many_arguments)]
+fn verify_output_carrier<E, S, P>(
     program: &ExponentLutProgram,
     result: &StageOutputs,
     output_index: usize,
     wire: WireId,
-    output_level: usize,
-    decoding: Option<(u64, BigUint)>,
+    carrier: &RnsOutputCarrier,
     expected: &P,
     parameters: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
@@ -331,21 +336,38 @@ where
     P: Poly,
 {
     let mask = &stage_mask(parameters, payload, mask)?;
-    // Only the terminal relation (identity state gadget, scale floor(q / 2)
-    // or the coefficient scale k) separates plaintexts by more than the
-    // decoding threshold; an intermediate carrier's gadget powers can be
-    // smaller than its noise, so it cannot be verified by decoding.
-    if output_level + 1 != parameters.levels().len() {
+    let output_level = carrier.level;
+    let knowledge = program.wire_knowledge(wire).map_err(ApiError::scheme)?;
+    let private_output = matches!(knowledge, AttributeKnowledge::PrivatePayload);
+    // A carrier separates plaintexts by more than the decoding threshold when
+    // it is decodable (a scalar column with scale `floor(q / 2)` or `k`) or a
+    // full gadget of scale one, whose last gadget column separates them by
+    // about `q / 2`. A Static carrier below the terminal level has a scaled
+    // state gadget whose powers can be smaller than its noise.
+    let full_gadget = carrier.gadget != RnsOutputGadget::Scalar && carrier.scale.is_one();
+    if private_output && carrier.plaintext_modulus.is_none() && !full_gadget {
+        return Err(ApiError::input(format!(
+            "verification output at level {output_level} is neither decodable nor a full gadget"
+        )));
+    }
+    // Static carriers are verified at the terminal level only, where its
+    // identity state gadget and public scale apply; a Dynamic chain keeps a
+    // gadget successor, and its decodable or full-gadget carriers below the
+    // terminal level have scale one or an explicit decoding scale.
+    if (!private_output || parameters.rhs_mode() == RhsMode::Static) &&
+        output_level + 1 != parameters.levels().len()
+    {
         return Err(ApiError::input(format!(
             "verification output is at level {output_level}, not the terminal level {}",
             parameters.levels().len() - 1
         )));
     }
     let output_ring = parameters.ring(output_level).map_err(ApiError::scheme)?;
-    let knowledge = program.wire_knowledge(wire).map_err(ApiError::scheme)?;
-    let private_output = matches!(knowledge, AttributeKnowledge::PrivatePayload);
-    let columns =
-        parameters.key_component_columns(output_level, knowledge).map_err(ApiError::scheme)?;
+    let columns = if private_output {
+        carrier.columns
+    } else {
+        parameters.key_component_columns(output_level, knowledge).map_err(ApiError::scheme)?
+    };
     let expected_ports = if private_output { 6 } else { 7 };
     let prefix = format!("output-{output_index}.");
     let mut ports = BTreeMap::new();
@@ -400,23 +422,16 @@ where
     let public_payload =
         if private_output { None } else { Some(output_ring.input("verification-payload", (1, 1))) };
 
-    // At source level l, the LUT switching target contributes
-    // Delta_l * Delta_(l+1) * mu * r * G_(l+2). The one production
-    // ModDown removes Delta_l. The finalized carrier therefore obeys the
-    // ordinary level-(l+1) relation, with its own scale and gadget width.
-    // Verify that target-ring relation directly; extending a finalized
-    // carrier cannot recover its pre-ModDown representative.
+    // The carrier obeys the relation of its resolved level, scale, and
+    // gadget: verify that relation directly; extending a normalized carrier
+    // cannot recover its pre-ModDown representative.
     let expected = plaintext_constant(&output_ring, expected);
     let public_payload_residual =
         public_payload.as_ref().map(|payload| payload.clone() - expected.clone());
-    let scale = match &decoding {
-        Some((_, k)) => k.clone(),
-        None => parameters.message_scale(output_level).map_err(ApiError::scheme)?,
-    };
-    let plaintext_modulus = BigInt::from(decoding.as_ref().map_or(2, |(t, _)| *t));
+    let plaintext_modulus = BigInt::from(carrier.plaintext_modulus.unwrap_or(2));
     let encoding = RnsBggEncoding::new(key, row, public_payload);
     let residual = encoding
-        .verification_residual(parameters, output_level, payload, mask, expected, &scale)
+        .verification_residual(parameters, carrier, payload, mask, expected)
         .map_err(ApiError::scheme)?;
     // The backend decoder consumes one polynomial (entry 0,0). Check every
     // gadget column, including the high powers which distinguish plaintexts.
@@ -549,9 +564,10 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: None,
         };
         let source_ring = parameters.ring(0).unwrap();
@@ -605,6 +621,7 @@ mod test {
                 parameters,
                 &payload,
                 Some(&mask),
+                RnsOutputUse::DirectDecode,
                 &mut execution,
                 &mut store,
             );
@@ -622,6 +639,7 @@ mod test {
                     parameters,
                     &payload,
                     Some(&mask),
+                    RnsOutputUse::DirectDecode,
                     &mut execution,
                     &mut store
                 )
@@ -687,6 +705,7 @@ mod test {
                 &parameters,
                 &payload,
                 Some(&mask),
+                RnsOutputUse::DirectDecode,
                 &mut execution,
                 &mut store,
             )
@@ -714,25 +733,19 @@ mod test {
             RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)), binding: None };
         let mask = RnsBggMaskSecret { row: (ring.identity(1), ring.identity(1)), binding: None };
         let expected = ring.polynomial([IntExpr::constant(BigInt::from(1u8))]);
+        let carrier = RnsOutputCarrier {
+            level: 0,
+            columns: 1,
+            scale: parameters.message_scale(0).unwrap(),
+            gadget: RnsOutputGadget::Scalar,
+            action: None,
+            plaintext_modulus: Some(2),
+        };
         let residual_a = RnsBggEncoding::new(key_a, row.clone(), None)
-            .verification_residual(
-                &parameters,
-                0,
-                &payload,
-                &mask,
-                expected.clone(),
-                &parameters.message_scale(0).unwrap(),
-            )
+            .verification_residual(&parameters, &carrier, &payload, &mask, expected.clone())
             .unwrap();
         let residual_b = RnsBggEncoding::new(key_b, row, None)
-            .verification_residual(
-                &parameters,
-                0,
-                &payload,
-                &mask,
-                expected,
-                &parameters.message_scale(0).unwrap(),
-            )
+            .verification_residual(&parameters, &carrier, &payload, &mask, expected)
             .unwrap();
         assert_ne!(residual_a.flatten(), residual_b.flatten());
     }
@@ -742,7 +755,7 @@ mod test {
     /// than for an exponent one (`component_columns(1)`, one column at the
     /// terminal level). Ring dimension and sigma are overridable by
     /// `MXX_EXPONENT_LUT_COEFFICIENT_TEST_{RING_DIMENSION,SIGMA}`.
-    fn unequal_width_parameters(mode: RhsMode) -> RnsBggParameters {
+    fn unequal_width_parameters() -> RnsBggParameters {
         let read = |name: &str, default: &str| {
             std::env::var(format!("MXX_EXPONENT_LUT_COEFFICIENT_TEST_{name}"))
                 .unwrap_or_else(|_| default.to_owned())
@@ -751,12 +764,12 @@ mod test {
         let sigma = read("SIGMA", "1").parse::<bigdecimal::BigDecimal>().unwrap();
         let high = DCRTPolyParams::new(ring_dimension, 2, 17, 6, None, None);
         let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
-        RnsBggParameters::new(vec![high, low], sigma, 1).unwrap().with_rhs_mode(mode)
+        RnsBggParameters::new(vec![high, low], sigma, 1).unwrap()
     }
 
     /// Preprocess, encrypt and evaluate `program` with the private scalar
-    /// input bound to `input`, under `parameters`' RHS mode, and return the
-    /// online result with the payload secret and the stage mask. The online
+    /// input bound to `input` under Static parameters, and return the online
+    /// result with the payload secret and the stage mask. The online
     /// evaluation receives the Program without its LUT values.
     fn run_without_rhs(
         parameters: &RnsBggParameters,
@@ -764,22 +777,17 @@ mod test {
         lhs: &crate::api::PlaintextInputs<WireId, DCRTPoly>,
         execution: &mut mxx_backends::authority::CpuExecution,
         store: &mut MemoryArtifactStore,
-    ) -> (StageOutputs, RnsBggPayloadSecret, Option<RnsBggMaskSecret>) {
+    ) -> (StageOutputs, RnsBggPayloadSecret, RnsBggMaskSecret) {
         let hash_key: [u8; 32] = rand::random();
         let context: [u8; 32] = rand::random();
-        let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
-        let sample_payload = |execution: &mut mxx_backends::authority::CpuExecution,
-                              store: &mut MemoryArtifactStore| {
-            RnsEncryptBuild::new(parameters, context)
-                .sample_payload_secret(execution, store, |_| Ok(()))
-                .unwrap()
-        };
-        let static_payload = (!dynamic).then(|| sample_payload(execution, store));
+        let payload = RnsEncryptBuild::new(parameters, context)
+            .sample_payload_secret(execution, store, |_| Ok(()))
+            .unwrap();
         let (preprocess, online_eval) = crate::api::preprocess(
             program,
             &ParamEnv::default(),
             &crate::api::PlaintextInputs::<RhsId, DCRTPoly>::new(),
-            static_payload.as_ref(),
+            Some(&payload),
             &hash_key,
             crate::rns_bgg::RnsPreprocessBuild::new(parameters, context),
             execution,
@@ -788,33 +796,21 @@ mod test {
             |_| Ok(()),
         )
         .unwrap();
-        let payload = static_payload.unwrap_or_else(|| sample_payload(execution, store));
-        let mask = (!dynamic).then(|| {
-            RnsEncryptBuild::new(parameters, rand::random())
-                .sample_mask_secret(execution, store, |_| Ok(()))
-                .unwrap()
-        });
+        let mask = RnsEncryptBuild::new(parameters, rand::random())
+            .sample_mask_secret(execution, store, |_| Ok(()))
+            .unwrap();
         let encrypted = crate::api::encrypt(
             &program.encryption_inputs(),
             &ParamEnv::default(),
             lhs,
-            &preprocess,
+            Some(&preprocess),
             &payload,
-            mask.as_ref(),
+            Some(&mask),
             &hash_key,
             RnsEncryptBuild::new(parameters, context),
             execution,
             store,
-            |build| {
-                if dynamic {
-                    build.bind_rhs_inputs(
-                        &ParamEnv::default(),
-                        &crate::api::PlaintextInputs::<RhsId, DCRTPoly>::new(),
-                        rand::random(),
-                    )?;
-                }
-                Ok(())
-            },
+            |_| Ok(()),
             |_| Ok(()),
         )
         .unwrap();
@@ -839,17 +835,15 @@ mod test {
     /// its `v G_1` payload by `G^-1(k)` to `k v`. Its residual
     /// `row - s A + r k v` is within the noise evaluator's bound for that
     /// output, verification accepts `v` and rejects a wrong plaintext, and
-    /// decryption returns `v mod t`, in Static and Dynamic mode, for both
-    /// table entries (the larger one is the bound `W`) and both signs of the
-    /// input monomial.
+    /// decryption returns `v mod t`, in Static mode (the Dynamic coefficient
+    /// output, on an equal-basis chain, is checked with the Dynamic stages),
+    /// for both table entries (the larger one is the bound `W`) and both
+    /// signs of the input monomial.
     #[test]
     fn coefficient_lut_finalizes_scales_and_decodes() {
-        for (mode, bit, negative) in
-            [RhsMode::Static, RhsMode::Dynamic].into_iter().flat_map(|mode| {
-                [(0, false), (1, false), (0, true), (1, true)].map(|(b, n)| (mode, b, n))
-            })
-        {
-            let parameters = unequal_width_parameters(mode);
+        let mode = RhsMode::Static;
+        for (bit, negative) in [(0, false), (1, false), (0, true), (1, true)] {
+            let parameters = unequal_width_parameters();
             assert_ne!(
                 parameters
                     .lut_output_columns(1, crate::program::LutOutputRepresentation::Coefficient)
@@ -923,7 +917,7 @@ mod test {
                 );
             }
             let port = |index: usize| ring.input(format!("port-{index}"), (1, 1));
-            let stage_mask = stage_mask(&parameters, &payload, mask.as_ref()).unwrap();
+            let stage_mask = stage_mask(&parameters, &payload, Some(&mask)).unwrap();
             let s = reduce_secret(&parameters, &stage_mask.row, finalized).unwrap();
             let r = reduce_secret(&parameters, &payload.row, finalized).unwrap();
             let message = ring.polynomial([IntExpr::constant(BigInt::from(k.clone()) * value)]);
@@ -980,7 +974,8 @@ mod test {
                     &if value < 0 { -plaintext } else { plaintext },
                     &parameters,
                     &payload,
-                    mask.as_ref(),
+                    Some(&mask),
+                    RnsOutputUse::DirectDecode,
                     execution,
                     store,
                 )
@@ -993,7 +988,8 @@ mod test {
                 0,
                 &parameters,
                 &payload,
-                mask.as_ref(),
+                Some(&mask),
+                RnsOutputUse::DirectDecode,
                 &[0],
                 &mut execution,
                 &mut store,

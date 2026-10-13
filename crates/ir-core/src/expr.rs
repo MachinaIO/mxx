@@ -531,6 +531,8 @@ pub enum ExprError {
     NonFiniteReal,
     #[error("ring resolution failed: {0}")]
     RingResolution(String),
+    #[error("an operation count does not fit u128")]
+    CountOverflow,
 }
 
 impl IntExpr {

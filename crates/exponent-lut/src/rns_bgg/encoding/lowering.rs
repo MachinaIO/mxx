@@ -13,8 +13,7 @@ pub enum OnlineEvalWireFamily {
     Stored(Family<RnsBggEncoding>),
     Input {
         wire: WireId,
-        level: usize,
-        knowledge: AttributeKnowledge,
+        key: InputKeySource,
         hash_key: Bytes,
         rows: Family<RnsBggRow>,
         payloads: Option<Family<Mat>>,
@@ -50,15 +49,8 @@ impl OnlineEvalFamilies<'_> {
     ) -> Result<RnsBggEncoding, RnsBggError> {
         match family {
             OnlineEvalWireFamily::Stored(family) => Ok(family.at(Int::evaluate(index))),
-            OnlineEvalWireFamily::Input { wire, level, knowledge, hash_key, rows, payloads } => {
-                let key = super::public_key::sampled_key(
-                    self.parameters,
-                    *level,
-                    hash_key.clone(),
-                    *wire,
-                    *knowledge,
-                    Some(index.clone()),
-                )?;
+            OnlineEvalWireFamily::Input { wire, key, hash_key, rows, payloads } => {
+                let key = key.key(self.parameters, hash_key.clone(), *wire, Some(index.clone()))?;
                 let index = Int::evaluate(index);
                 let payload = payloads.as_ref().map(|payloads| payloads.at(index.clone()));
                 Ok(RnsBggEncoding::new(key, rows.at(index), payload))
@@ -141,9 +133,12 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
 /// Import every RHS of `program`, for binding before the Program is
 /// lowered, each paired with its reference. Static preprocessing publishes
 /// the bottom row of each compact RHS at the level after its consumer's, and
-/// each member's top row is sampled where the member is read; Dynamic
-/// encryption publishes both rows. A family RHS is one family per row port.
-/// `name` maps a role to its artifact name.
+/// each member's top row is sampled where the member is read. A Dynamic RHS
+/// is the gadget ciphertext of its setup coordinate's package (both rows):
+/// a sampled scalar is published by the encryption, a family or a supplied
+/// ciphertext by its prelude production. A family RHS is one family per row
+/// port. `name` maps a role to its artifact name.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn import_rhs_bindings(
     parameters: &RnsBggParameters,
     program: &ExponentLutProgram,
@@ -151,13 +146,75 @@ pub(super) fn import_rhs_bindings(
     preprocess: &ProductionId,
     encryption: &ProductionId,
     prelude: Option<&ProductionId>,
+    dynamic: Option<(&RnsBggDynamicSetup, &RnsBggDynamicBinding)>,
     hash_key: &Bytes,
     name: impl Fn(String) -> String,
 ) -> Result<Vec<(RhsId, InputBinding<(RnsBggMatrix, RhsRef<Int>), OnlineEvalRhsFamily>)>, ApiError>
 {
-    let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
     let mut bindings = Vec::with_capacity(program.rhs_inputs().len());
+    let prelude = || {
+        prelude.ok_or_else(|| {
+            ApiError::compatibility("Dynamic RHS ciphertexts need the encryption prelude")
+        })
+    };
     for (rhs, shape) in program.rhs_inputs() {
+        if let Some((setup, mapping)) = dynamic {
+            let coordinate = mapping.rhs(*rhs).map_err(ApiError::scheme)?;
+            let source = &setup
+                .rhs()
+                .get(&coordinate)
+                .ok_or_else(|| ApiError::compatibility("RHS coordinate is not in the setup"))?
+                .source;
+            let ring = parameters.ring(0).map_err(ApiError::scheme)?;
+            let columns = parameters.component_columns(0).map_err(ApiError::scheme)?;
+            let binding = match shape {
+                InputBinding::Scalar(()) => {
+                    let production = match source {
+                        RnsBggPackageSource::Sampled => encryption,
+                        RnsBggPackageSource::Supplied { .. } => prelude()?,
+                    };
+                    let role = RnsBggDynamicSetup::rhs_ciphertext_role(coordinate, false);
+                    let ports =
+                        (0..4).map(|port| name(format!("{role}.{port}"))).collect::<Vec<_>>();
+                    InputBinding::Scalar((
+                        super::dynamic::prelude_matrix(&ring, production, &ports, columns),
+                        RhsRef { id: *rhs, index: None },
+                    ))
+                }
+                InputBinding::Family(count) => {
+                    let role = RnsBggDynamicSetup::rhs_ciphertext_role(coordinate, true);
+                    let production = prelude()?.clone();
+                    let row = |ports: [usize; 2]| {
+                        let families = ports.map(|port| {
+                            ring.family_artifact_input(
+                                production.clone(),
+                                name(format!("{role}.{port}")),
+                                count.clone(),
+                                (1, columns),
+                                ArtifactAvailability::Transferred,
+                            )
+                        });
+                        let element: RnsBggRow =
+                            (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
+                        let fields = families
+                            .iter()
+                            .map(|family| family.value_handle().clone())
+                            .collect::<Vec<_>>();
+                        family_of_fields(&element, count.clone(), &fields).map_err(ApiError::scheme)
+                    };
+                    InputBinding::Family(OnlineEvalRhsFamily {
+                        rhs: *rhs,
+                        program: program.id(),
+                        level: 0,
+                        hash_key: hash_key.clone(),
+                        tops: Some(row([0, 1])?),
+                        bottoms: row([2, 3])?,
+                    })
+                }
+            };
+            bindings.push((*rhs, binding));
+            continue;
+        }
         let consumer_level = workload.rhs_level(*rhs).map_err(ApiError::scheme)?;
         let level = consumer_level.checked_add(1).ok_or_else(|| {
             ApiError::scheme(RnsBggError::Parameters("RHS target level overflow"))
@@ -167,74 +224,46 @@ pub(super) fn import_rhs_bindings(
         let binding = match shape {
             InputBinding::Scalar(()) => {
                 let port = |port: usize| {
-                    let (production, role) = if dynamic {
-                        (encryption, format!("rhs/{rhs:?}/ciphertext.{port}"))
-                    } else {
-                        (preprocess, format!("rhs/{rhs:?}.{}", port - 2))
-                    };
                     ring.artifact_input(
-                        production.clone(),
-                        name(role),
+                        preprocess.clone(),
+                        name(format!("rhs/{rhs:?}.{port}")),
                         (1, columns),
                         ArtifactAvailability::Transferred,
                     )
                 };
-                let top = if dynamic {
-                    (port(0), port(1))
-                } else {
-                    super::public_key::rhs_top(
-                        parameters,
-                        program.id(),
-                        hash_key.clone(),
-                        *rhs,
-                        consumer_level,
-                        None,
-                    )
-                    .map_err(ApiError::scheme)?
-                };
-                InputBinding::Scalar(((top, (port(2), port(3))), RhsRef { id: *rhs, index: None }))
+                let top = super::public_key::rhs_top(
+                    parameters,
+                    program.id(),
+                    hash_key.clone(),
+                    *rhs,
+                    consumer_level,
+                    None,
+                )
+                .map_err(ApiError::scheme)?;
+                InputBinding::Scalar(((top, (port(0), port(1))), RhsRef { id: *rhs, index: None }))
             }
             InputBinding::Family(count) => {
-                // Dynamic family ciphertexts are the encryption prelude's.
-                let production = if dynamic {
-                    prelude.ok_or_else(|| {
-                        ApiError::compatibility(
-                            "Dynamic RHS family ciphertexts need the encryption prelude",
-                        )
-                    })?
-                } else {
-                    preprocess
-                };
-                let row = |ports: [usize; 2]| {
-                    let families = ports.map(|port| {
-                        let role = if dynamic {
-                            format!("rhs/{rhs:?}/family/ciphertext.{port}")
-                        } else {
-                            format!("rhs/{rhs:?}/family.{}", port - 2)
-                        };
-                        ring.family_artifact_input(
-                            production.clone(),
-                            name(role),
-                            count.clone(),
-                            (1, columns),
-                            ArtifactAvailability::Transferred,
-                        )
-                    });
-                    let element: RnsBggRow =
-                        (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
-                    let fields = families
-                        .iter()
-                        .map(|family| family.value_handle().clone())
-                        .collect::<Vec<_>>();
-                    family_of_fields(&element, count.clone(), &fields).map_err(ApiError::scheme)
-                };
+                let families = [0, 1].map(|port| {
+                    ring.family_artifact_input(
+                        preprocess.clone(),
+                        name(format!("rhs/{rhs:?}/family.{port}")),
+                        count.clone(),
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    )
+                });
+                let element: RnsBggRow =
+                    (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
+                let fields =
+                    families.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
                 InputBinding::Family(OnlineEvalRhsFamily {
                     rhs: *rhs,
                     program: program.id(),
                     level: consumer_level,
                     hash_key: hash_key.clone(),
-                    tops: dynamic.then(|| row([0, 1])).transpose()?,
-                    bottoms: row([2, 3])?,
+                    tops: None,
+                    bottoms: family_of_fields(&element, count.clone(), &fields)
+                        .map_err(ApiError::scheme)?,
                 })
             }
         };
@@ -244,7 +273,7 @@ pub(super) fn import_rhs_bindings(
 }
 
 impl EncodingLowering<'_> {
-    fn preprocess_artifact_name(&self, role: String) -> String {
+    pub(super) fn preprocess_artifact_name(&self, role: String) -> String {
         self.decoder_smudge.as_ref().map_or(role.clone(), |declaration| {
             decoder_smudge_artifact_name(*declaration.commitment(), &role)
         })
@@ -377,7 +406,7 @@ impl EncodingLowering<'_> {
         crate::utils::balanced_sum_family(terms, |lhs, rhs| lhs + rhs).map_err(graph)
     }
 
-    fn site(&self) -> Result<&LoweringSite, RnsBggError> {
+    pub(super) fn site(&self) -> Result<&LoweringSite, RnsBggError> {
         self.current_site.as_ref().ok_or(RnsBggError::Binding("missing lowering site"))
     }
 
@@ -427,9 +456,9 @@ impl EncodingLowering<'_> {
         )
     }
 
-    /// The material of LUT `lut_id` evaluated at `level`: the one imported
-    /// where the Program was bound for a LUT in a family body, otherwise
-    /// imported here.
+    /// The Static material of LUT `lut_id` evaluated at `level`: the one
+    /// imported where the Program was bound for a LUT in a family body,
+    /// otherwise imported here.
     fn lut_material(
         &self,
         level: usize,
@@ -441,28 +470,15 @@ impl EncodingLowering<'_> {
         }
         let (switching, sigmas) = self.lut_switching(level, lut_id, table)?;
         let helper = self.lut_helpers(level, table, sigmas.len())?;
-        let columns = self.parameters.lut_output_columns(
-            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
-            table.output_representation(),
-        )?;
-        // Dynamic: the switching ciphertexts' digit companions, one block
-        // per branch.
-        let companions = (self.parameters.rhs_mode() == RhsMode::Dynamic)
-            .then(|| {
-                self.companion_family(
-                    level,
-                    columns,
-                    lut_switching_role(level, lut_id, table.input_layout(), "/digit-encoding"),
-                    IntExpr::constant(sigmas.len()),
-                )
-            })
-            .transpose()?;
-        Ok((switching, sigmas, helper, companions))
+        Ok((switching, sigmas, helper))
     }
 
-    /// Import, at root scope, the material of every LUT in a family body
-    /// (see [`Self::lut_material`]).
+    /// Import, at root scope, the Static material of every LUT in a family
+    /// body (see [`Self::lut_material`]); Dynamic LUTs read setup packages.
     pub(super) fn import_body_lut_material(&mut self) -> Result<(), RnsBggError> {
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            return Ok(());
+        }
         let luts = self.program.encryption_inputs().luts().to_vec();
         for (input, lut_id) in self.program.family_body_luts() {
             let level = self.workload.level(input)?;
@@ -554,9 +570,11 @@ impl EncodingLowering<'_> {
         Ok((switched_row, switched_key_decomposition))
     }
 
-    /// Finalize declared coefficient outputs once after graph aggregation:
-    /// ModDown to the next level, then the scale-up action `G^-1(k)` (see
-    /// [`RnsBggParameters::coefficient_output_action`]).
+    /// Resolve every declared output once after graph aggregation, exactly
+    /// as the public-key lowering does (see
+    /// [`RnsBggParameters::output_carrier`]): normalize the key and row
+    /// together, then apply the same direct-decoding action to every key
+    /// entry and row component.
     pub(super) fn finish_outputs(
         &mut self,
         outputs: Vec<RnsBggEncoding>,
@@ -564,38 +582,34 @@ impl EncodingLowering<'_> {
         outputs
             .into_iter()
             .map(|output| {
-                if self
-                    .program
-                    .wire_is_coefficient_output(output.wire())
-                    .map_err(|_| RnsBggError::Binding("invalid output wire metadata"))?
-                {
-                    let level = self.workload.level(output.wire())?;
-                    let target = level
-                        .checked_add(1)
-                        .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
-                    let ring = self.parameters.ring(target)?;
-                    let (_, k, _) = self.parameters.coefficient_output_decoding(
-                        &self.program,
-                        output.wire(),
-                        target,
-                    )?;
-                    let action = self.parameters.coefficient_output_action(target, &k)?;
-                    let act = |entry: Mat| action.clone().right_multiply(entry);
-                    let public_key = RnsBggPublicKey::new(
-                        output.public_key.wire,
-                        map_matrix(mod_down_public(output.public_key.matrix, &ring), act),
-                    );
-                    Ok(RnsBggEncoding::new(
-                        public_key,
-                        map_row(mod_down_encoding(output.row, &ring), act),
-                        output
-                            .public_payload
-                            .map(|payload| checked_modulus_convert(payload, &ring))
-                            .transpose()?,
-                    ))
-                } else {
-                    Ok(output)
+                let level = self.workload.level(output.wire())?;
+                let carrier = self.parameters.output_carrier(
+                    &self.program,
+                    output.wire(),
+                    level,
+                    self.output_use,
+                )?;
+                let RnsBggEncoding { public_key, mut row, mut public_payload } = output;
+                let mut matrix = public_key.matrix;
+                if carrier.level != level {
+                    let ring = self.parameters.ring(carrier.level)?;
+                    matrix = mod_down_public(matrix, &ring);
+                    row = mod_down_encoding(row, &ring);
+                    public_payload = public_payload
+                        .map(|payload| checked_modulus_convert(payload, &ring))
+                        .transpose()?;
                 }
+                if let Some(weight) = &carrier.action {
+                    let action = self.parameters.output_action(carrier.level, weight)?;
+                    let act = |entry: Mat| action.clone().right_multiply(entry);
+                    matrix = map_matrix(matrix, act);
+                    row = map_row(row, act);
+                }
+                Ok(RnsBggEncoding::new(
+                    RnsBggPublicKey::new(public_key.wire, matrix),
+                    row,
+                    public_payload,
+                ))
             })
             .collect()
     }
@@ -738,40 +752,8 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 input.public_key.matrix.clone(),
                 self.rhs_decomposition(ciphertext, evaluation_level)?,
             ),
-            // Dynamic: `c Dec(C)` plus the companion row, with the key
-            // fixed in preprocessing from public companion keys (Eq. 049).
-            RhsMode::Dynamic => {
-                let companions = self
-                    .rhs_companions
-                    .get(&reference.id)
-                    .ok_or(RnsBggError::Binding("Dynamic RHS companions are not imported"))?;
-                let member = reference
-                    .index
-                    .as_ref()
-                    .map(Int::expression)
-                    .transpose()
-                    .map_err(|_| RnsBggError::Binding("RHS member index"))?;
-                let columns = self.parameters.component_columns(evaluation_level + 1)?;
-                let rows = self.companion_rows(
-                    evaluation_level,
-                    &input.public_key.matrix,
-                    columns,
-                    format!("rhs/{:?}", reference.id),
-                    member,
-                    None,
-                    companions,
-                )?;
-                let product = super::column_action(
-                    self.parameters,
-                    evaluation_level,
-                    evaluation_level + 1,
-                    ciphertext,
-                    columns,
-                    vec![super::join_row(&input.row)],
-                )?;
-                let split = |row: &Mat| super::split_row(row, columns);
-                (split(&(product[0].clone() + rows[2].clone())), (split(&rows[0]), split(&rows[1])))
-            }
+            // Dynamic: the setup package of the RHS, read at this level.
+            RhsMode::Dynamic => self.dynamic_mul(input, ciphertext, reference)?,
         };
         let public_key = RnsBggPublicKey::new(output, mod_down_public(matrix, &target_ring));
         Ok(RnsBggEncoding::new(
@@ -791,8 +773,28 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         }
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let level = self.workload.level(input.wire())?;
-        let (switching, sigmas, helper, companions) = self.lut_material(level, lut_id, table)?;
         let output = self.site()?.output;
+        let (row, public_key) = if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            self.dynamic_lut(input, table)?
+        } else {
+            self.static_lut(input, lut_id, level, table)?
+        };
+        self.finish_lut(input, table, lut_id, level, output, row, public_key)
+    }
+}
+
+impl EncodingLowering<'_> {
+    /// The Static flat LUT of `input`: per automorphism branch, the routed
+    /// input switched by its setup-fixed switching ciphertext and the mask
+    /// switched by its helper, summed before the one scale-and-round.
+    fn static_lut(
+        &self,
+        input: &RnsBggEncoding,
+        lut_id: crate::program::LutId,
+        level: usize,
+        table: &LutTable,
+    ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let (switching, sigmas, helper) = self.lut_material(level, lut_id, table)?;
         let columns = self.parameters.lut_output_columns(
             level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
             table.output_representation(),
@@ -831,96 +833,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         // and carries it to the next iteration, so that load overlaps this
         // branch's work; the last branch runs after the loop.
         let last = table.input_width().checked_sub(1).ok_or(RnsBggError::Lut)?;
-        let (row, public_key) = if let Some(companions) = companions {
-            // Dynamic: one companion loop first builds every branch's key
-            // rows `T_s` and companion row `E_s` (block `s` of each row), so
-            // the stored companions are read in one loop nest; the branch loop
-            // then adds `sigma(c) Dec(C_sigma) + E_s` and acts with the
-            // rounded `T_s` on the helper and `A_sigma`, one column at a
-            // time.
-            let rows = self.companion_rows(
-                level,
-                &input.public_key.matrix,
-                columns,
-                format!("lut/{lut_id:?}"),
-                None,
-                Some(&sigmas),
-                &companions,
-            )?;
-            let width = 2 * columns;
-            let next = level + 1;
-            let target_ring = self.parameters.ring(next)?;
-            let split = |row: &Mat| super::split_row(row, columns);
-            let schema = |_| DslError::Schema;
-            let count = sigmas.len();
-            let ((row, key), _) = mxx_dsl::iterate(
-                IntExpr::constant(count),
-                (initial, b_at(Int::constant(0))),
-                |index, ((row_sum, key_sum), b_sigma)| {
-                    // Read the next branch's switching ciphertext (the first
-                    // again after the last) while this branch runs.
-                    let b_next = b_at(Int::evaluate(
-                        IntExpr::Rem(
-                            Box::new(index.expression()? + IntExpr::constant(1)),
-                            Box::new(IntExpr::constant(count)),
-                        )
-                        .canonicalize(),
-                    ));
-                    let start = (index.expression()? * IntExpr::constant(width)).canonicalize();
-                    let block = |row: &Mat| {
-                        split(&row.clone().slice(
-                            None,
-                            Some(mxx_ir_core::node::IndexRange {
-                                start: start.clone(),
-                                end: (start.clone() + IntExpr::constant(width)).canonicalize(),
-                            }),
-                        ))
-                    };
-                    let sigma = IntExpr::Select {
-                        selector: Box::new(index.expression()?),
-                        branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
-                    };
-                    let routed_row =
-                        map_row(input.row.clone(), |entry| entry.ring_automorphism(sigma.clone()));
-                    let product = super::column_action(
-                        this.parameters,
-                        level,
-                        next,
-                        &b_sigma,
-                        columns,
-                        vec![super::join_row(&routed_row)],
-                    )
-                    .map_err(schema)?;
-                    let switched_row = add_encoding_rows(split(&product[0]), block(&rows[2]));
-                    let switched_key =
-                        mod_down_public((block(&rows[0]), block(&rows[1])), &target_ring);
-                    let mask = (helper.0.at(index.clone()), helper.1.at(index));
-                    let data = this.lut_public_data(level, Int::from(sigma)).map_err(schema)?;
-                    let actions = super::column_action(
-                        this.parameters,
-                        level,
-                        next,
-                        &switched_key,
-                        columns,
-                        vec![
-                            super::join_row(&mask),
-                            super::join_row(&data.0),
-                            super::join_row(&data.1),
-                        ],
-                    )
-                    .map_err(schema)?;
-                    let row = add_encoding_rows(
-                        row_sum,
-                        add_encoding_rows(split(&actions[0]), switched_row),
-                    );
-                    let key =
-                        add_public_matrices(key_sum, (split(&actions[1]), split(&actions[2])));
-                    Ok(((row, key), b_next))
-                },
-            )
-            .map_err(graph)?;
-            (row, key)
-        } else {
+        let (row, public_key) = {
             let (sums, b_last) = mxx_dsl::iterate(
                 IntExpr::constant(last),
                 (initial, b_at(Int::constant(0))),
@@ -932,6 +845,22 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             .map_err(graph)?;
             branch(Int::constant(last), sums, b_last).map_err(graph)?
         };
+        Ok((row, public_key))
+    }
+
+    /// The common tail of a LUT: a decoder smudge member's transform, the
+    /// ModDown of an exponent output to its level, and a public payload.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_lut(
+        &mut self,
+        input: &RnsBggEncoding,
+        table: &LutTable,
+        lut_id: crate::program::LutId,
+        level: usize,
+        output: WireId,
+        row: RnsBggRow,
+        public_key: RnsBggMatrix,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
         if let Some(declaration) = self.decoder_smudge.clone() &&
             declaration.smudge().lut() == lut_id
         {
@@ -1232,9 +1161,10 @@ mod test {
                 encryption: production,
                 manifests: BTreeMap::new(),
                 decoder_smudge: None,
-                context: [0; 32],
                 rhs_companions: BTreeMap::new(),
                 lut_material: BTreeMap::new(),
+                output_use: RnsOutputUse::default(),
+                dynamic: None,
                 current_site: Some(LoweringSite {
                     output,
                     indices: Vec::new(),
@@ -1299,9 +1229,10 @@ mod test {
             encryption: production.clone(),
             manifests: BTreeMap::new(),
             decoder_smudge: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let assert_compact = |matrix: &RnsBggMatrix| {
@@ -1326,6 +1257,7 @@ mod test {
             &scalar_lowerer.workload,
             &production,
             &production,
+            None,
             None,
             &hash_key,
             |role| role,
@@ -1373,6 +1305,7 @@ mod test {
             &family_lowerer.workload,
             &production,
             &production,
+            None,
             None,
             &hash_key,
             |role| role,
@@ -1444,9 +1377,10 @@ mod test {
             encryption: production.clone(),
             manifests: BTreeMap::new(),
             decoder_smudge: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let ring = parameters.ring(0).unwrap();
@@ -1514,9 +1448,10 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite {
                 output: public_output,
                 indices: Vec::new(),
@@ -1589,9 +1524,10 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let low_ring = parameters.ring(1).unwrap();
@@ -1738,9 +1674,10 @@ mod test {
             },
             manifests: BTreeMap::new(),
             decoder_smudge: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite {
                 output: private_output,
                 indices: Vec::new(),
@@ -1929,9 +1866,10 @@ mod test {
             encryption: production,
             manifests: BTreeMap::new(),
             decoder_smudge: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         assert!(lowerer.program.wire_is_coefficient_output(output).unwrap());

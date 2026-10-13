@@ -164,23 +164,16 @@ fn parameter_artifact_bytes(
     if parameters.rhs_mode() == RhsMode::Static {
         return Ok(bytes);
     }
-    // Dynamic encryption publishes, per RHS member and LUT branch consumed at
-    // level i, the full ciphertext (2 m_(i+1) polynomials at q_(i+1)) and its
-    // N_i = m_i m_(i+1) digit companions of M_i polynomials at q_i (spec
-    // Eq. 066).
-    let workload = RnsBggDerivedWorkload::from_program(program)?;
-    // `output_columns` is the ciphertext's per-component width: the RHS
-    // state width, or a LUT's switching-target width.
-    let material =
-        |level: usize, output_columns: usize, count: usize| -> Result<BigUint, RnsBggError> {
-            let m = parameters.component_columns(level)? * 2;
-            let m_next = output_columns * 2;
-            let public_columns = parameters.level(level)?.modulus_digits() * 2;
-            let ciphertext = polynomial_bytes(level + 1)? * m_next * 2u8;
-            let companions = polynomial_bytes(level)? * m * m_next * public_columns;
-            Ok((ciphertext + companions) * count)
-        };
-    for (rhs, shape) in program.rhs_inputs() {
+    // Dynamic encryption publishes one package per RHS member and per
+    // nonidentity automorphism of the LUTs, independent of the consuming
+    // gates: a gadget ciphertext of `2 m` polynomials (the automorphism ones
+    // are derived from their helper of `m` polynomials instead) and `m^2`
+    // digit companions of `m` polynomials each, all at the one ring.
+    let m = parameters.component_columns(0)? * 2;
+    let package = |ciphertext: usize| -> Result<BigUint, RnsBggError> {
+        Ok(polynomial_bytes(0)? * (ciphertext + m * m * m))
+    };
+    for shape in program.rhs_inputs().values() {
         let count = match shape {
             InputBinding::Scalar(()) => 1,
             InputBinding::Family(count) => count
@@ -189,15 +182,16 @@ fn parameter_artifact_bytes(
                 .and_then(|count| count.to_usize())
                 .ok_or(RnsBggError::Binding("RHS family count is not concrete"))?,
         };
-        let level = workload.rhs_level(*rhs)?;
-        bytes += material(level, parameters.component_columns(level + 1)?, count)?;
+        bytes += package(2 * m)? * count;
     }
-    let tables = program.encryption_inputs();
-    for (level, lut) in workload.luts() {
-        let table = tables.luts().get(lut.0 as usize).ok_or(RnsBggError::Lut)?;
-        let columns = parameters.lut_output_columns(*level + 1, table.output_representation())?;
-        bytes += material(*level, columns, table.input_width())?;
+    let dimension = parameters.level(0)?.ring_dimension() as usize;
+    let mut automorphisms = std::collections::BTreeSet::new();
+    for table in program.encryption_inputs().luts() {
+        automorphisms.extend(
+            table.input_layout().automorphism_indices(dimension).map_err(|_| RnsBggError::Lut)?,
+        );
     }
+    bytes += package(m)? * automorphisms.len().saturating_sub(1);
     Ok(bytes)
 }
 
@@ -262,7 +256,22 @@ impl RnsBggParameters {
             return Err(RnsBggError::Parameters("invalid public parameter request"));
         }
         let workload = RnsBggDerivedWorkload::from_program(program)?;
-        let logical_count = workload.levels.values().copied().max().unwrap_or(0);
+        let mut logical_count = workload.levels.values().copied().max().unwrap_or(0);
+        // A Dynamic chain keeps every evaluated carrier in full-gadget form:
+        // it reaches the normalized outputs and one gadget successor past
+        // them, on one basis.
+        if request.rhs_mode == RhsMode::Dynamic {
+            for output in program.outputs() {
+                let (crate::program::Operand::Scalar(wire) |
+                crate::program::Operand::Member { family: wire, .. }) = output;
+                let normalized =
+                    workload.level(*wire)? +
+                        usize::from(program.wire_is_coefficient_output(*wire).map_err(|_| {
+                            RnsBggError::Graph("invalid coefficient output".into())
+                        })?);
+                logical_count = logical_count.max(normalized + 1);
+            }
+        }
         let pool = DCRTPolyParams::try_new(
             request.ring_dimension,
             request.max_crt_depth,
@@ -288,12 +297,16 @@ impl RnsBggParameters {
                     .ok_or(RnsBggError::Parameters("invalid prime basis"))?,
             );
         }
-        Ok(RnsBggParameters::new(
+        let parameters = RnsBggParameters::new(
             levels,
             request.encoding_error_sigma.clone(),
             request.operations_per_drop,
         )?
-        .with_rhs_mode(request.rhs_mode))
+        .with_rhs_mode(request.rhs_mode);
+        if request.rhs_mode == RhsMode::Dynamic {
+            parameters.validate_equal_basis()?;
+        }
+        Ok(parameters)
     }
 
     /// Evaluate the selected Program noise contract and terminal envelopes.
@@ -399,6 +412,15 @@ impl RnsBggParameters {
                 .outputs
                 .get(index)
                 .ok_or(RnsBggError::Graph("missing audited output".into()))?;
+            // A gadget output is consumed by a further computation, which
+            // applies its own decryption margin to the returned bound; only
+            // its payload bound is checked here.
+            if bindings.output_use == super::super::RnsOutputUse::Gadget {
+                if &value.bound.payload_l1 > terminal_bound {
+                    return Err(RnsBggError::Budget("terminal payload exceeds declared bound"));
+                }
+                continue;
+            }
             if let Some(z_squared) = z_squared.as_ref() {
                 let moments = value
                     .moments

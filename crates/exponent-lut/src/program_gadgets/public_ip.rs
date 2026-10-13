@@ -255,8 +255,8 @@ mod tests {
             ProgramLowerError, ProgramLoweringContext, lower_program,
         },
         rns_bgg::{
-            RnsBggParameters, RnsEncryptBuild, RnsOnlineEvalBuild, RnsPreprocessBuild,
-            decode_public_output, verify_output,
+            RnsBggParameters, RnsEncryptBuild, RnsOnlineEvalBuild, RnsOutputUse,
+            RnsPreprocessBuild, decode_public_output, verify_output,
         },
     };
     use mxx_backends::{
@@ -426,7 +426,7 @@ mod tests {
             &program.encryption_inputs(),
             &ParamEnv::default(),
             &lhs,
-            &preprocess,
+            Some(&preprocess),
             &payload,
             Some(&mask),
             &hash_key,
@@ -460,6 +460,7 @@ mod tests {
             &parameters,
             &payload,
             Some(&mask),
+            RnsOutputUse::DirectDecode,
             &mut execution,
             &mut store,
         )
@@ -474,6 +475,7 @@ mod tests {
                 &parameters,
                 &payload,
                 Some(&mask),
+                RnsOutputUse::DirectDecode,
                 &mut execution,
                 &mut store,
             )

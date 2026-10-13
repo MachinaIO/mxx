@@ -170,11 +170,17 @@ impl PhysicalValue {
                 ConcreteWireType::IndexedFamily { element, .. } => {
                     collect_leaves(element, family_axes + 1, public_gadget, out)
                 }
-                ConcreteWireType::Trapdoor { .. } => {
+                ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
                     if public_gadget {
                         out.push((family_axes + 4, 5));
                     } else {
-                        out.extend(std::iter::repeat_n((family_axes + 4, 0), 6));
+                        let leaves = crate::sampler::trapdoor::trapdoor_component_shapes(
+                            matrix.rows,
+                            *digit_count,
+                            *instantiation,
+                        )
+                        .map_or(0, |shapes| shapes.len());
+                        out.extend(std::iter::repeat_n((family_axes + 4, 0), leaves));
                     }
                 }
                 ConcreteWireType::Matrix(_) |
@@ -465,6 +471,8 @@ pub(crate) enum GpuNativePrimitive {
     ThresholdDecode,
     P1CovarianceRefresh,
     P1Sample,
+    StatisticalSpectra,
+    StatisticalPerturbation,
     GqSample,
     PreimageCorrection,
     PreimageCutoff,
@@ -916,6 +924,34 @@ impl GpuImplementation {
         }
     }
 
+    /// The spectra of one row chunk of a statistical trapdoor's `T` into the prepared
+    /// statistical workspace: resource ID, the coefficient-domain trapdoor and the part of the
+    /// chunk's first limb, the chunk's first row, and the chunk and spectra bindings.
+    pub(crate) fn statistical_spectra() -> Self {
+        use GpuArgumentKind::{U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::StatisticalSpectra,
+            argument_kinds: Box::new([U32, Value, U32, U64, U32, U32]),
+            output_count: 0,
+        }
+    }
+
+    /// The statistical perturbation of one tile: resource ID, the coefficient-domain output and
+    /// its part, the seed and its part, `m_bar`, the sampler's scalars (`p_2` width, center
+    /// scale, `a`, `beta`, `gmax`, isotropic and rounding widths), and the output, seed, and four
+    /// workspace bindings.
+    pub(crate) fn statistical_perturbation() -> Self {
+        use GpuArgumentKind::{F64, U32, U64, Value};
+        Self {
+            primitive: GpuNativePrimitive::StatisticalPerturbation,
+            argument_kinds: Box::new([
+                U32, Value, U32, Value, U32, U64, F64, F64, F64, F64, F64, F64, F64, U32, U32, U32,
+                U32, U32, U32,
+            ]),
+            output_count: 1,
+        }
+    }
+
     pub(crate) fn gq_sample() -> Self {
         use GpuArgumentKind::{F64, U32, Value};
         Self {
@@ -1288,6 +1324,8 @@ pub(crate) enum GpuPreparedWorkspaceKind {
     P1,
     Gq,
     Cutoff,
+    /// The statistical perturbation workspace: spectra, vectors, chunk, and `p_2`.
+    Statistical,
 }
 
 #[cfg(feature = "gpu")]
@@ -1438,6 +1476,7 @@ impl CompiledGpuProgram {
             } else if let GpuBindingSource::PreparedWorkspace { kind, component, .. } = *source {
                 let valid = match kind {
                     GpuPreparedWorkspaceKind::P1 => component < 5,
+                    GpuPreparedWorkspaceKind::Statistical => component < 4,
                     GpuPreparedWorkspaceKind::Gq | GpuPreparedWorkspaceKind::Cutoff => {
                         component == 0
                     }

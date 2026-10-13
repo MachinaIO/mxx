@@ -6,6 +6,7 @@ members = [
     "crates/backends",
     "crates/khe",
     "crates/exponent-lut",
+    "crates/pe",
     "crates/func-enc",
     "crates/io",
     "crates/fhe",
@@ -23,6 +24,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 mxx-backends = { path = "crates/backends" }
 mxx-khe = { path = "crates/khe" }
+mxx-exponent-lut = { path = "crates/exponent-lut" }
 mxx-func-enc = { path = "crates/func-enc" }
 mxx-io = { path = "crates/io" }
 mxx-ir-core = { path = "crates/ir-core" }

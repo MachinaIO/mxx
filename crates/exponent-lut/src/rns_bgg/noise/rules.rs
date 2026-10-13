@@ -85,30 +85,10 @@ impl RnsBggParameters {
         let fresh =
             &j * &input.payload_l1 * fresh_error_gain * self.encoding_error_bound() * p * 2u8;
         let rounding = &j * (&n + 1u8) * (p - 1u8);
-        let companion = &j * self.companion_noise_gain(level)? * self.encoding_error_bound() * 2u8;
         Ok(RnsBggNoiseBound {
-            error: (inherited + fresh + rounding + companion + 1u8) / 2u8,
+            error: (inherited + fresh + rounding + 1u8) / 2u8,
             payload_l1: output_payload_l1,
         })
-    }
-
-    /// Coefficient gain of the Dynamic digit-companion error
-    /// `max_j sum_a eps_{a,j} U_{:,a}` of one product or LUT branch at
-    /// `level` (spec Eq. 075): `m_i` digit rows, each acting through a column
-    /// of `M_i = 2 D_i` key-decomposition digits with `n` coefficients
-    /// bounded by `b/2`, so `m_i M_i n b / 2`. Static products have no
-    /// companions and a zero gain.
-    fn companion_noise_gain(&self, level: usize) -> Result<BigUint, RnsBggError> {
-        if self.rhs_mode() == RhsMode::Static {
-            return Ok(BigUint::zero());
-        }
-        let current = self.level(level)?;
-        let m = BigUint::from(self.component_columns(level)?) * 2u8;
-        let public_columns = BigUint::from(current.modulus_digits()) * 2u8;
-        Ok(
-            m * public_columns * current.ring_dimension() * (BigUint::one() << current.base_bits()) /
-                2u8,
-        )
     }
 
     /// Scale-and-round a level-`level` LUT noise bound once by `p`, adding the
@@ -393,27 +373,12 @@ impl RnsBggParameters {
         // Adding the online remainder gives (2N/3+2)*(p^2-1)/(12*p^2).
         let rounding = NonnegativeRational::new((&n + 3u8) * (&p_squared - 1u8), 18u8 * &p_squared)
             .expect("positive scale");
-        let companion =
-            self.companion_noise_variance(level)?.scaled_ratio(&BigUint::one(), &p_squared);
         Ok(PrivateMulNoiseTerms {
             inherited_variance_gain,
             inherited_mean_gain,
             rhs_error,
             rounding,
-            companion,
         })
-    }
-
-    /// Diagnostic variance of the Dynamic digit-companion error
-    /// `sum_a eps_{a,j} U_{:,a}` of one product or LUT branch at `level`,
-    /// before its scale-and-round: the `m_i` fresh companion errors act
-    /// through key-decomposition columns of energy at most `M_i n (b/2)^2`.
-    /// Acceptance of Dynamic parameters uses the deterministic bound only.
-    fn companion_noise_variance(&self, level: usize) -> Result<NonnegativeRational, RnsBggError> {
-        let base = BigUint::one() << self.level(level)?.base_bits();
-        Ok(self
-            .encoding_error_variance()
-            .scaled_ratio(&(self.companion_noise_gain(level)? * base), &BigUint::from(2u8)))
     }
 
     /// Total variance of the direct product when the input error, the RHS
@@ -427,11 +392,7 @@ impl RnsBggParameters {
         fresh_error_gain: &RightActionNoiseGain,
     ) -> Result<NonnegativeRational, RnsBggError> {
         let terms = self.private_mul_noise_terms(level, payload_gain, fresh_error_gain)?;
-        Ok(terms
-            .inherited_variance(input_variance)
-            .add(&terms.rhs_error)
-            .add(&terms.rounding)
-            .add(&terms.companion))
+        Ok(terms.inherited_variance(input_variance).add(&terms.rhs_error).add(&terms.rounding))
     }
 
     /// Separately identified components of the explicit LUT equation (6.6)
@@ -481,7 +442,6 @@ impl RnsBggParameters {
             input_mean_gain: &j * &branch_l1,
             helper: gaussian.scaled(&branch_energy),
             fresh: gaussian.scaled(&(fresh_gain * &p_squared)),
-            companion: self.companion_noise_variance(level)?,
             internal_rounding: branch_rounding.scaled(&(&j * &j)),
             scale: p,
             outer_rounding,
@@ -522,10 +482,8 @@ impl RnsBggParameters {
         let fresh = &input.payload_l1 * fresh_error_gain * &self.encoding_error_bound * &twice_p;
         // S = ||s_bar||_1 + 1 <= N + 1 for the ternary secret.
         let rounding = (n + 2u8) * (p - 1u8);
-        // Dynamic: the digit companions' error, divided once by p.
-        let companion = self.companion_noise_gain(level)? * &self.encoding_error_bound * 2u8;
         Ok(RnsBggNoiseBound {
-            error: (inherited + fresh + rounding + companion + &twice_p - 1u8) / twice_p,
+            error: (inherited + fresh + rounding + &twice_p - 1u8) / twice_p,
             payload_l1: output_payload_l1,
         })
     }
@@ -542,8 +500,6 @@ pub(crate) struct PrivateMulNoiseTerms {
     pub rhs_error: NonnegativeRational,
     /// Variance of both ModDown remainders.
     pub rounding: NonnegativeRational,
-    /// Variance of the Dynamic digit-companion error; zero when Static.
-    pub companion: NonnegativeRational,
 }
 
 impl PrivateMulNoiseTerms {
@@ -566,15 +522,158 @@ pub(crate) struct LutNoiseTerms {
     pub helper: NonnegativeRational,
     /// Variance of one branch's B-key error image.
     pub fresh: NonnegativeRational,
-    /// Variance of one branch's Dynamic digit-companion error image; zero
-    /// when Static.
-    pub companion: NonnegativeRational,
     /// Coherent variance of the branches' internal public remainders.
     pub internal_rounding: NonnegativeRational,
     /// The scale `p` of the scale-and-round.
     pub scale: BigUint,
     /// Variance of the outer public and encoding remainders, output units.
     pub outer_rounding: NonnegativeRational,
+}
+
+/// Deterministic fixed-basis transfer rules of Dynamic evaluation.
+///
+/// On an equal-basis chain no operation rounds. With `D` digits per row, the
+/// state width `m = 2 D`, ring dimension `n`, and the balanced digit bound
+/// `rho = b / 2`, a full gadget decomposition `Dec_G` multiplies an error by
+/// at most `K = m n rho` (one output coefficient sums `m` digit polynomials
+/// of `n` coefficients), and the block-diagonal public scalar action `V_D =
+/// Dec_G(D G)` by at most `S = D n rho = K / 2`, independently of `D`. These
+/// are the actual actions of [`crate::rns_bgg::dynamic`]; the plan's
+/// reference recurrences use `K` for both, so `S <= K` keeps every bound
+/// below that envelope.
+impl RnsBggParameters {
+    /// `K = m n rho` at `level` (see the impl documentation).
+    pub fn dynamic_decomposition_gain(&self, level: usize) -> Result<BigUint, RnsBggError> {
+        let current = self.level(level)?;
+        let m = BigUint::from(2 * self.component_columns(level)?);
+        Ok(m * current.ring_dimension() * (BigUint::one() << current.base_bits()) / 2u8)
+    }
+
+    /// `S = D n rho`, the gain of the public scalar action at `level`.
+    pub fn dynamic_scalar_action_gain(&self, level: usize) -> Result<BigUint, RnsBggError> {
+        let current = self.level(level)?;
+        Ok(BigUint::from(current.modulus_digits()) *
+            current.ring_dimension() *
+            (BigUint::one() << current.base_bits()) /
+            2u8)
+    }
+
+    /// The energy `D n rho^2` of one column of the scalar action, the
+    /// variance gain of a coefficient-uncorrelated contribution.
+    pub(super) fn dynamic_scalar_action_energy(
+        &self,
+        level: usize,
+    ) -> Result<BigUint, RnsBggError> {
+        let current = self.level(level)?;
+        let rho = (BigUint::one() << current.base_bits()) / 2u8;
+        Ok(BigUint::from(current.modulus_digits()) * current.ring_dimension() * &rho * &rho)
+    }
+
+    /// The energy `m^2 n rho^2` of the companion sum `sum_a eps_{a,j}
+    /// U_{:,a}` of one package read: `m` independent companion rows of `m`
+    /// entries, each against a digit polynomial of `n` coefficients bounded
+    /// by `rho`.
+    pub(super) fn dynamic_companion_energy(&self, level: usize) -> Result<BigUint, RnsBggError> {
+        let current = self.level(level)?;
+        let m = BigUint::from(2 * self.component_columns(level)?);
+        let rho = (BigUint::one() << current.base_bits()) / 2u8;
+        Ok(&m * &m * current.ring_dimension() * &rho * &rho)
+    }
+
+    /// One Dynamic product: `E' <= K E + m K beta + ||mu||_1 B_C` for the
+    /// input error `E`, the companion error bound `beta`, and the gadget
+    /// ciphertext error bound `B_C`; `-mu e_C` is the input payload times
+    /// the ciphertext error.
+    pub fn dynamic_mul_noise_bound(
+        &self,
+        level: usize,
+        input: &RnsBggNoiseBound,
+        ciphertext_error: &BigUint,
+        companion_error: &BigUint,
+        output_payload_l1: BigUint,
+    ) -> Result<RnsBggNoiseBound, RnsBggError> {
+        let k = self.dynamic_decomposition_gain(level)?;
+        let m = BigUint::from(2 * self.component_columns(level)?);
+        Ok(RnsBggNoiseBound {
+            error: &k * &input.error +
+                m * &k * companion_error +
+                &input.payload_l1 * ciphertext_error,
+            payload_l1: output_payload_l1,
+        })
+    }
+
+    /// One nonidentity automorphism: `E_Aut <= K E + m K beta + K B_h +
+    /// ||mu||_1 B_h`, the product with `C_k` (whose error is the automorphed
+    /// inverse helper's) followed by the mask switch `h_k Dec(T_k)`.
+    pub fn dynamic_automorphism_noise_bound(
+        &self,
+        level: usize,
+        input: &RnsBggNoiseBound,
+        companion_error: &BigUint,
+        helper_error: &BigUint,
+    ) -> Result<BigUint, RnsBggError> {
+        let k = self.dynamic_decomposition_gain(level)?;
+        let m = BigUint::from(2 * self.component_columns(level)?);
+        Ok(&k * &input.error +
+            m * &k * companion_error +
+            &k * helper_error +
+            &input.payload_l1 * helper_error)
+    }
+
+    /// One Dynamic LUT whose nonidentity branches are `direct` switches and
+    /// `composed` switches `Aut_g Aut_b` (see [`crate::rns_bgg::dynamic`]):
+    /// `S E + direct S E_Aut(E) + composed S E_Aut(E_Aut(E))`. Both switches
+    /// of a composed branch act on the input payload's automorphism, of the
+    /// same `l1` norm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dynamic_composed_lut_noise_bound(
+        &self,
+        level: usize,
+        input: &RnsBggNoiseBound,
+        direct: usize,
+        composed: usize,
+        companion_error: &BigUint,
+        helper_error: &BigUint,
+        output_payload_l1: BigUint,
+    ) -> Result<RnsBggNoiseBound, RnsBggError> {
+        let s = self.dynamic_scalar_action_gain(level)?;
+        let first =
+            self.dynamic_automorphism_noise_bound(level, input, companion_error, helper_error)?;
+        let switched =
+            RnsBggNoiseBound { error: first.clone(), payload_l1: input.payload_l1.clone() };
+        let second =
+            self.dynamic_automorphism_noise_bound(level, &switched, companion_error, helper_error)?;
+        Ok(RnsBggNoiseBound {
+            error: &s * &input.error +
+                BigUint::from(direct) * &s * first +
+                BigUint::from(composed) * &s * second,
+            payload_l1: output_payload_l1,
+        })
+    }
+
+    /// One Dynamic LUT with `branches` automorphisms (the identity among
+    /// them): `S E + (branches - 1) S E_Aut`, the scalar action of every
+    /// branch summed.
+    pub fn dynamic_lut_noise_bound(
+        &self,
+        level: usize,
+        input: &RnsBggNoiseBound,
+        branches: usize,
+        companion_error: &BigUint,
+        helper_error: &BigUint,
+        output_payload_l1: BigUint,
+    ) -> Result<RnsBggNoiseBound, RnsBggError> {
+        if branches == 0 {
+            return Err(RnsBggError::Parameters("empty branch family"));
+        }
+        let s = self.dynamic_scalar_action_gain(level)?;
+        let automorphism =
+            self.dynamic_automorphism_noise_bound(level, input, companion_error, helper_error)?;
+        Ok(RnsBggNoiseBound {
+            error: &s * &input.error + BigUint::from(branches - 1) * &s * automorphism,
+            payload_l1: output_payload_l1,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -762,54 +861,6 @@ mod test {
             ));
             assert_eq!(second.provenance[&id].route.len(), 6);
         }
-    }
-
-    /// The Dynamic product and LUT bounds are the Static recurrences plus the
-    /// digit-companion term `m_i M_i n b E / 2` per product or branch before
-    /// the single division by `p` (spec Eq. 075, 094-095).
-    #[test]
-    fn dynamic_bounds_add_the_companion_term_to_the_static_recurrence() {
-        let parameters = nested_alignment_parameters();
-        let dynamic = parameters.clone().with_rhs_mode(RhsMode::Dynamic);
-        let input = RnsBggNoiseBound { error: BigUint::from(1000u16), payload_l1: BigUint::one() };
-        let gain = BigUint::from(3u8);
-        let level = 0;
-        let current = parameters.level(level).unwrap();
-        let n = BigUint::from(current.ring_dimension());
-        let b = BigUint::one() << current.base_bits();
-        let m = BigUint::from(2 * parameters.component_columns(level).unwrap());
-        let public_columns = BigUint::from(2 * current.modulus_digits());
-        let p = parameters.scale(level).unwrap().clone();
-        let e = parameters.encoding_error_bound().clone();
-        let numerator = &m * &n * &b * &input.error +
-            &m * &public_columns * &n * &b * &e +
-            &p * 2u8 * &input.payload_l1 * &gain * &e +
-            (&n + 2u8) * (&p - 1u8);
-        let twice_p = &p * 2u8;
-        assert_eq!(
-            dynamic.private_mul_noise_bound(level, &input, &gain, BigUint::one()).unwrap().error,
-            (numerator + &twice_p - 1u8) / twice_p
-        );
-        assert!(
-            parameters.private_mul_noise_bound(level, &input, &gain, BigUint::one()).unwrap().error <
-                dynamic
-                    .private_mul_noise_bound(level, &input, &gain, BigUint::one())
-                    .unwrap()
-                    .error
-        );
-        let branches = 4;
-        let static_lut = parameters
-            .lut_noise_bound_before_mod_down(level, &input, branches, &gain, BigUint::one())
-            .unwrap()
-            .error;
-        let dynamic_lut = dynamic
-            .lut_noise_bound_before_mod_down(level, &input, branches, &gain, BigUint::one())
-            .unwrap()
-            .error;
-        assert_eq!(
-            dynamic_lut - static_lut,
-            BigUint::from(branches) * &m * &public_columns * &n * &b * &e / 2u8
-        );
     }
 
     #[test]

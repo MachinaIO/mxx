@@ -6,6 +6,7 @@ use mxx_backends::{
         uniform::DCRTPolyUniformSampler,
     },
 };
+use mxx_ir_core::types::TrapdoorInstantiation;
 use num_bigint::BigUint;
 use std::{hint::black_box, time::Instant};
 use tracing::info;
@@ -20,7 +21,8 @@ fn bench_cpu_preimage() {
 
     // Keep parameters aligned with the GPU benchmark for a fair comparison.
     let params = DCRTPolyParams::new(16384, 10, 24, 12, None, None);
-    let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+    let trapdoor_sampler =
+        DCRTPolyTrapdoorSampler::new(&params, SIGMA, TrapdoorInstantiation::Computational);
     let uniform_sampler = DCRTPolyUniformSampler::new();
 
     let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, TRAPDOOR_SIZE);
@@ -34,6 +36,7 @@ fn bench_cpu_preimage() {
             &trapdoor,
             &public_matrix,
             &ResidentPolyMatrixColumnSource::new(target),
+            &trapdoor_sampler.minimum_preimage_width(&params, TRAPDOOR_SIZE),
             BigUint::from(1u8) << PREIMAGE_BOUND_BITS,
             rand::random(),
         )

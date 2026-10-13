@@ -782,6 +782,8 @@ pub enum SmallMatrixError {
     BoundMismatch,
     #[error("requested preimage bound {requested} is below the minimum {minimum}")]
     PreimageBoundTooSmall { requested: BigUint, minimum: BigUint },
+    #[error("requested preimage width {requested} is below the trapdoor's minimum {minimum}")]
+    PreimageWidthTooSmall { requested: bigdecimal::BigDecimal, minimum: bigdecimal::BigDecimal },
     #[error("small matrix coefficient exceeds its inclusive bound")]
     BoundExceeded,
     #[error("small matrix coefficient is outside the ring")]

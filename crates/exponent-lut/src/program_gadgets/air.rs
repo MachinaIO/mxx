@@ -1,5 +1,5 @@
 //! One streaming step of an AIR (algebraic intermediate representation)
-//! constraint check, over a packed private state and a public next row.
+//! constraint check, over one public attribute per field.
 //!
 //! An AIR declaration fixes `T >= 2` rows, `W >= 1` columns, a witness bound
 //! `B >= 2` (every cell lies in `[0, B)`), `M >= 0` instance values, and a
@@ -12,31 +12,35 @@
 //!
 //! [`AirConstraintProgram`] evaluates one step `i in [0, T - 1)`: from the
 //! index `i`, the flag `f_i in {0, 1}`, the current row `r_i in Z_B^W`, the
-//! next row `r_{i+1} in Z_B^W`, and the instance `x in Z_B^M`, it outputs
-//! `(r_{i+1}, x)` and `f_{i+1} = f_i` if every constraint gated at `i` holds,
-//! else `0`. The state `(x, r_i, f_i)` has a fixed size, so the AIR is checked
-//! by streaming the rows: starting from `(x, r_0, 1)`, step `i` reads only
-//! `r_{i+1}`, and `f_{T-1} = 1` iff every gated constraint holds at every
-//! step. `f_i` is the acceptance of the completed steps `0..i-1`; the initial
-//! condition is first checked by step `0`.
+//! next row `r_{i+1} in Z_B^W`, and the instance `x in Z_B^M`, it outputs the
+//! next state `(i + 1, f_{i+1}, r_{i+1}, x)`, with `f_{i+1} = f_i` if every
+//! constraint gated at `i` holds, else `0`. The state `(i, f_i, r_i, x)` has a
+//! fixed size, so the AIR is checked by streaming the rows: starting from
+//! `(0, 1, r_0, x)`, step `i` reads only `r_{i+1}`, and `f_{T-1} = 1` iff
+//! every gated constraint holds at every step. `f_i` is the acceptance of the
+//! completed steps `0..i-1`; the initial condition is first checked by step
+//! `0`.
 //!
 //! One step proves only the one-step relation. The streaming driver must
-//! supply the indices `0` through `T - 2` in order, carry each output state
-//! unchanged into the next step, and start from `f_0 = 1`; a step cannot
-//! detect a skipped step, a substituted state, or a reset flag.
+//! feed each output state unchanged into the next step and start from index
+//! `0` and `f_0 = 1`; a step cannot detect a substituted state or a reset
+//! flag.
 //!
 //! # Packing
 //!
-//! The Program has no RHS input, so the private state is one packed
-//! attribute, and every computation on it is a LUT. The bit fields of the
-//! step exponent `E`, least significant first, are the index (`d_0` bits),
-//! the flag (one bit), `current[0..W]`, `next[0..W]`, and `instance[0..M]`
-//! (`b` bits each, the bits of `B - 1`); `P` is their total width, and any
-//! ring with `n >= 2^P` works. The private attribute `X^(E_state)` holds
-//! every field but the next row, whose fields are zero; the public attribute
-//! `X^(E_next)` holds only the next-row fields. The Program multiplies them,
-//! which adds the disjoint exponents: `X^(E_next) X^(E_state) = X^E`. The
-//! input contract is that both exponents only use their own fields, that the
+//! The Program has no RHS input, and every computation after the product of
+//! its inputs is a LUT. The bit fields of the step exponent `E`, least
+//! significant first, are the index (`d_0` bits), the flag (one bit),
+//! `current[0..W]`, `next[0..W]`, and `instance[0..M]` (`b` bits each, the
+//! bits of `B - 1`); `P` is their total width, and any ring with `n >= 2^P`
+//! works. Each of the `F = 2 W + M + 2` fields is its own public attribute
+//! `X^(v 2^(p_f))`, the field value `v` at its position `p_f`. The Program
+//! multiplies them by public products, which add the disjoint exponents, in
+//! a balanced binary tree of depth `ceil(log2 F)`, the least depth of a
+//! product of `F` factors by two-operand products: `prod_f X^(v_f 2^(p_f)) =
+//! X^E`. Every LUT then reads a public payload (see
+//! [`crate::program::LutOutputRepresentation`]), so both outputs are public.
+//! The input contract is that each field value fits its field, that the
 //! index lies in `[0, T - 1)`, the flag in `{0, 1}`, and every digit in
 //! `[0, B)`; the Program does not check it.
 //!
@@ -62,17 +66,21 @@
 //! outside the input contract (an index `>= T - 1`, a digit `>= B`, or an
 //! unused state code) is never read; the tables fill it with `0`.
 //!
-//! # State chain
+//! # State outputs
 //!
-//! A LUT cannot leave bits below its window, so the flag chain cannot
-//! forward fields. A second chain on the same product deletes the index, flag,
-//! and current-row fields with all-zero tables (a zero exponent is
-//! `X^0 = 1`), leaving `X^(2^p R)`, where `p` is the position of `next[0]`
-//! and `R` packs `(r_{i+1}, x)`.
+//! The next state is output in the form of the field inputs, one public
+//! encoding per field but the next row ([`AirConstraintProgram::state_outputs`]),
+//! so that it re-enters the next step as its state inputs
+//! ([`AirConstraintProgram::state_inputs`]) with only the next row fresh:
 //!
-//! The Program outputs are `[state, next_flag]`; the driver unpacks them
-//! ([`AirConstraintProgram::unpack_state`]) and packs the next step's inputs
-//! ([`AirConstraintProgram::pack`]).
+//! - the index `X^((i + 1) 2^(p_0))`, one LUT on the index input (the index field holds `T - 1`);
+//! - the flag `X^(f_{i+1} 2^(p_1))`, the flag chain, whose last LUT writes `ok` at the flag field;
+//! - the current row `X^(r_{i+1}[c] 2^(p_c))`, one LUT on each next-row input that moves its value
+//!   to the current-row field `c`;
+//! - the instance, its input unchanged.
+//!
+//! Each of these LUTs reads one field input, so its window has nothing below
+//! or above it.
 
 use crate::{
     api::PlaintextInputs,
@@ -129,10 +137,10 @@ pub struct AirConstraint {
 
 /// The Program of one streaming AIR step.
 ///
-/// Its inputs are the private scalar `X^(E_state)` and the public scalar
-/// `X^(E_next)` (see the module documentation for the packing); it
-/// multiplies them once and then uses LUTs only. Its outputs, in order, are
-/// the state `X^(2^p R)` and the next flag `X^(f_{i+1})`.
+/// Its inputs are the public scalars `X^(v 2^(p_f))` of the fields (see the
+/// module documentation for the packing); it multiplies them in a balanced
+/// tree of public products and then uses LUTs only. Its outputs, in order,
+/// are the public state `X^(2^p R)` and the public next flag `X^(f_{i+1})`.
 #[derive(Clone, Debug)]
 pub struct AirConstraintProgram {
     program: ExponentLutProgram,
@@ -142,10 +150,10 @@ pub struct AirConstraintProgram {
     instance_count: usize,
     /// The field positions `p_0, ..., p_K`; `p_K = P`.
     positions: Vec<u32>,
-    private_state: WireId,
-    public_next: WireId,
-    state: WireId,
-    next_flag: WireId,
+    /// The public input of every field, in field order.
+    field_inputs: Vec<WireId>,
+    /// The next state, one output per field but the next row, in field order.
+    state_outputs: Vec<WireId>,
 }
 
 impl AirConstraintProgram {
@@ -216,8 +224,9 @@ impl AirConstraintProgram {
             .chain(shapes.iter().map(|shape| bit_width(shape.count - 1)))
             .collect::<Vec<_>>();
         let digit_width = bit_width(bound - 1);
+        // The index field also holds the next index `T - 1` of the last step.
         let index_width =
-            sigma.iter().copied().chain([bit_width(rows - 2), 1]).max().expect("nonempty");
+            sigma.iter().copied().chain([bit_width(rows - 1), 1]).max().expect("nonempty");
         let field_widths = [index_width, 1]
             .into_iter()
             .chain(std::iter::repeat_n(digit_width, fields - 2))
@@ -232,11 +241,24 @@ impl AirConstraintProgram {
         }
 
         let mut builder = ExponentLutProgramBuilder::new();
-        let private_state = builder.input(AttributeKnowledge::PrivatePayload)?;
-        let public_next = builder.input(AttributeKnowledge::PublicPayload)?;
-        // `X^(E_next) X^(E_state) = X^E`, a private wire.
-        let input =
-            builder.mul_public(Operand::Scalar(public_next), Operand::Scalar(private_state))?;
+        let field_inputs = (0..fields)
+            .map(|_| builder.input(AttributeKnowledge::PublicPayload))
+            .collect::<Result<Vec<_>, _>>()?;
+        // `prod_f X^(v_f 2^(p_f)) = X^E` by a balanced tree: each level
+        // multiplies adjacent pairs and carries an unpaired last factor, so
+        // the depth is `ceil(log2 F)`.
+        let mut layer = field_inputs.clone();
+        while layer.len() > 1 {
+            layer = layer
+                .chunks(2)
+                .map(|pair| match pair {
+                    [lhs, rhs] => builder.mul_public(Operand::Scalar(*lhs), Operand::Scalar(*rhs)),
+                    [factor] => Ok(*factor),
+                    _ => unreachable!("chunks of two"),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        let input = layer[0];
         let mut flag = input;
         for field in 0..fields {
             let (state_width, field_width) = (sigma[field], field_widths[field]);
@@ -300,7 +322,8 @@ impl AirConstraintProgram {
                     },
                     shape.count,
                 ),
-                None => (ExpLayout { stride_log2: 0, width_log2: 1 }, 2),
+                // The flag at the flag field, as the flag input.
+                None => (ExpLayout { stride_log2: positions[1], width_log2: 1 }, 2),
             };
             let table = builder.register_lut(LutTable::unary(
                 1 << input_layout.width_log2,
@@ -311,19 +334,43 @@ impl AirConstraintProgram {
             )?)?;
             flag = builder.lut(Operand::Scalar(flag), table)?;
         }
-        let mut state = input;
-        for field in 0..2 + width {
-            let field_width = field_widths[field];
+        // The state outputs in the form of the field inputs: one LUT on the
+        // index input, the flag chain, one LUT moving each next-row input to
+        // its current-row field, and the instance inputs.
+        let mut relocate = |input: WireId,
+                            from: usize,
+                            to: usize,
+                            values: Vec<usize>|
+         -> Result<WireId, AirError> {
+            let width_log2 = field_widths[from];
             let table = builder.register_lut(LutTable::unary(
-                1 << field_width,
-                ExpLayout { stride_log2: positions[field], width_log2: field_width },
-                1,
-                vec![0; 1 << field_width],
-                LutOutputRepresentation::Exponent(ExpLayout { stride_log2: 0, width_log2: 1 }),
+                1 << width_log2,
+                ExpLayout { stride_log2: positions[from], width_log2 },
+                1 << field_widths[to],
+                values,
+                LutOutputRepresentation::Exponent(ExpLayout {
+                    stride_log2: positions[to],
+                    width_log2: field_widths[to],
+                }),
             )?)?;
-            state = builder.lut(Operand::Scalar(state), table)?;
+            Ok(builder.lut(Operand::Scalar(input), table)?)
+        };
+        let index_values =
+            (0..1usize << index_width).map(|i| if i < rows - 1 { i + 1 } else { 0 }).collect();
+        let mut state_outputs = vec![relocate(field_inputs[0], 0, 0, index_values)?, flag];
+        for c in 0..width {
+            let values =
+                (0..1usize << digit_width).map(|v| if v < bound { v } else { 0 }).collect();
+            state_outputs.push(relocate(
+                field_inputs[2 + width + c],
+                2 + width + c,
+                2 + c,
+                values,
+            )?);
         }
-        let program = builder.finish(vec![Operand::Scalar(state), Operand::Scalar(flag)])?;
+        state_outputs.extend_from_slice(&field_inputs[2 + 2 * width..]);
+        let program = builder
+            .finish(state_outputs.iter().map(|output| Operand::Scalar(*output)).collect())?;
         Ok(Self {
             program,
             rows,
@@ -331,10 +378,8 @@ impl AirConstraintProgram {
             bound,
             instance_count,
             positions,
-            private_state,
-            public_next,
-            state,
-            next_flag: flag,
+            field_inputs,
+            state_outputs,
         })
     }
 
@@ -368,29 +413,45 @@ impl AirConstraintProgram {
         *self.positions.last().expect("positions are nonempty")
     }
 
-    /// The private input `X^(E_state)`.
-    pub const fn private_state(&self) -> WireId {
-        self.private_state
+    /// The public input `X^(v 2^(p_f))` of every field, in field order: the
+    /// index, the flag, `current[0..W]`, `next[0..W]`, and `instance[0..M]`.
+    pub fn field_inputs(&self) -> &[WireId] {
+        &self.field_inputs
     }
 
-    /// The public input `X^(E_next)`.
-    pub const fn public_next(&self) -> WireId {
-        self.public_next
+    /// The inputs of the state fields, every field but the next row, in
+    /// field order: the index, the flag, `current[0..W]`, and
+    /// `instance[0..M]`. Output `j` of [`Self::state_outputs`] re-enters the
+    /// next step as input `j` here.
+    pub fn state_inputs(&self) -> Vec<WireId> {
+        self.field_inputs[..2 + self.width]
+            .iter()
+            .chain(&self.field_inputs[2 + 2 * self.width..])
+            .copied()
+            .collect()
     }
 
-    /// The state output `X^(2^p R)`.
-    pub const fn state(&self) -> WireId {
-        self.state
+    /// The inputs of the next-row fields `next[0..W]`, fresh at every step.
+    pub fn next_inputs(&self) -> &[WireId] {
+        &self.field_inputs[2 + self.width..2 + 2 * self.width]
     }
 
-    /// The next-flag output `X^(f_{i+1})`.
-    pub const fn next_flag(&self) -> WireId {
-        self.next_flag
+    /// The Program outputs: the next state in the form of
+    /// [`Self::state_inputs`], `X^((i + 1) 2^(p_0))`, `X^(f_{i+1} 2^(p_1))`,
+    /// the next row at the current-row fields, and the instance.
+    pub fn state_outputs(&self) -> &[WireId] {
+        &self.state_outputs
     }
 
-    /// The packed exponents `(E_state, E_next)` of a step's private and
-    /// public inputs, whose values follow the input contract, with
-    /// `current.len() == next.len() == W` and `instance.len() == M`.
+    /// The next-flag output `X^(f_{i+1} 2^(p_1))`.
+    pub fn next_flag(&self) -> WireId {
+        self.state_outputs[1]
+    }
+
+    /// The exponents `v 2^(p_f)` of a step's field inputs, in the order of
+    /// [`Self::field_inputs`], whose values follow the input contract, with
+    /// `current.len() == next.len() == W` and `instance.len() == M`. Their
+    /// sum is the step exponent `E`.
     pub fn pack(
         &self,
         index: usize,
@@ -398,41 +459,42 @@ impl AirConstraintProgram {
         current: &[usize],
         next: &[usize],
         instance: &[usize],
-    ) -> (usize, usize) {
-        let values =
-            [index, flag].into_iter().chain(current.iter().chain(next).chain(instance).copied());
-        let exponent = values
+    ) -> Vec<usize> {
+        [index, flag]
+            .into_iter()
+            .chain(current.iter().chain(next).chain(instance).copied())
             .zip(&self.positions)
-            .fold(0, |exponent, (value, position)| exponent | value << position);
-        let next = self.next_mask();
-        (exponent & !next, exponent & next)
+            .map(|(value, position)| value << position)
+            .collect()
     }
 
-    /// The bits of the next-row fields.
-    fn next_mask(&self) -> usize {
-        let (low, high) = (self.positions[2 + self.width], self.positions[2 + 2 * self.width]);
-        (1 << high) - (1 << low)
+    /// The field exponents of the next step's inputs, in the order of
+    /// [`Self::field_inputs`], from the exponents of a step's
+    /// [`Self::state_outputs`] and the next step's row `next`.
+    pub fn next_step(&self, state: &[usize], next: &[usize]) -> Vec<usize> {
+        let fields = self.pack(0, 0, &vec![0; self.width], next, &vec![0; self.instance_count]);
+        state[..2 + self.width]
+            .iter()
+            .chain(&fields[2 + self.width..2 + 2 * self.width])
+            .chain(&state[2 + self.width..])
+            .copied()
+            .collect()
     }
 
-    /// The next row and the instance packed in a state output exponent.
-    pub fn unpack_state(&self, exponent: usize) -> (Vec<usize>, Vec<usize>) {
-        let mut values = self.positions[2 + self.width..]
-            .windows(2)
-            .map(|field| (exponent >> field[0]) & ((1 << (field[1] - field[0])) - 1));
-        let next = values.by_ref().take(self.width).collect();
-        (next, values.collect())
-    }
-
-    /// The plaintext bindings `X^(E_state)` and `X^(E_next)` of the inputs,
-    /// over a ring of dimension at least `2^P`.
+    /// The plaintext bindings `X^(v 2^(p_f))` of the field inputs for the
+    /// exponents of [`Self::pack`], over a ring of dimension at least `2^P`.
     pub fn plaintext_inputs<P: Poly>(
         &self,
         parameters: &P::Params,
-        state: usize,
-        next: usize,
+        exponents: &[usize],
     ) -> PlaintextInputs<WireId, P> {
-        let monomial = |exponent| InputBinding::Scalar(P::const_rotate_poly(parameters, exponent));
-        BTreeMap::from([(self.private_state, monomial(state)), (self.public_next, monomial(next))])
+        self.field_inputs
+            .iter()
+            .zip(exponents)
+            .map(|(input, exponent)| {
+                (*input, InputBinding::Scalar(P::const_rotate_poly(parameters, *exponent)))
+            })
+            .collect()
     }
 }
 
@@ -495,21 +557,32 @@ const fn bit_width(max: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::{
-        Environment, ExponentLUTProgramLowering, FamilyExecution, FamilyRange, InputShape,
-        LoweringSite, ProgramLowerError, ProgramLoweringContext, lower_program,
+    use crate::{
+        program::{
+            Environment, ExponentLUTProgramLowering, FamilyExecution, FamilyRange, InputShape,
+            LoweringSite, ProgramLowerError, ProgramLoweringContext, lower_program,
+        },
+        rns_bgg::{RnsBggDerivedWorkload, RnsBggParameters, RnsOutputUse, verify_output},
     };
-    use mxx_backends::poly::dcrt::{params::DCRTPolyParams, poly::DCRTPoly};
+    use mxx_backends::{
+        MemoryArtifactStore,
+        backend::poly::cpu_backend,
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+    };
     use mxx_ir_core::IntExpr;
+    use num_bigint::{BigInt, BigUint};
 
     #[derive(Debug, thiserror::Error)]
     #[error("clear AIR evaluator error: {0}")]
     struct ClearError(&'static str);
 
     /// Evaluates the Program on monomials in the clear: a wire is its
-    /// exponent, a public multiplication adds exponents (here of disjoint
-    /// fields), and a LUT applies the window semantics of
-    /// [`LutOutputRepresentation`], asserting its preconditions.
+    /// exponent and its depth of public products, a public multiplication
+    /// adds exponents (here of disjoint fields), and a LUT applies the window
+    /// semantics of [`LutOutputRepresentation`], asserting its preconditions.
     struct Clear {
         site: Option<LoweringSite>,
         packed_bits: u32,
@@ -517,24 +590,28 @@ mod tests {
         multiplications: usize,
     }
 
+    /// An exponent and its depth of public products.
+    type Monomial = (usize, usize);
+
     impl ExponentLUTProgramLowering for Clear {
-        type Wire = usize;
+        type Wire = Monomial;
         type Rhs = ();
         type Error = ClearError;
 
-        fn add(&mut self, _: &usize, _: &usize) -> Result<usize, ClearError> {
+        fn add(&mut self, _: &Monomial, _: &Monomial) -> Result<Monomial, ClearError> {
             Err(ClearError("the AIR step has no additions"))
         }
-        fn mul_public(&mut self, lhs: &usize, rhs: &usize) -> Result<usize, ClearError> {
-            assert_eq!(lhs & rhs, 0, "the multiplied exponents share a field");
-            assert!(lhs + rhs < 1 << self.packed_bits, "the product leaves the packing");
+        fn mul_public(&mut self, lhs: &Monomial, rhs: &Monomial) -> Result<Monomial, ClearError> {
+            assert_eq!(lhs.0 & rhs.0, 0, "the multiplied exponents share a field");
+            assert!(lhs.0 + rhs.0 < 1 << self.packed_bits, "the product leaves the packing");
             self.multiplications += 1;
-            Ok(lhs + rhs)
+            Ok((lhs.0 + rhs.0, lhs.1.max(rhs.1) + 1))
         }
-        fn mul_private(&mut self, _: &usize, _: &()) -> Result<usize, ClearError> {
+        fn mul_private(&mut self, _: &Monomial, _: &()) -> Result<Monomial, ClearError> {
             Err(ClearError("the AIR step has no private multiplications"))
         }
-        fn lut(&mut self, input: &usize, table: &LutTable) -> Result<usize, ClearError> {
+        fn lut(&mut self, input: &Monomial, table: &LutTable) -> Result<Monomial, ClearError> {
+            let (input, depth) = *input;
             let ExpLayout { stride_log2, width_log2 } = table.input_layout();
             let window = stride_log2 + width_log2;
             assert_eq!(input & ((1 << stride_log2) - 1), 0, "exponent bits below the window");
@@ -548,14 +625,14 @@ mod tests {
             let result = replacement + ((input >> window) << window);
             assert!(result < 1 << self.packed_bits, "exponent {result} leaves the packing");
             self.luts += 1;
-            Ok(result)
+            Ok((result, depth))
         }
         fn mul_small_constant(
             &mut self,
-            _: &usize,
+            _: &Monomial,
             _: &[i64],
             _: &IntExpr,
-        ) -> Result<usize, ClearError> {
+        ) -> Result<Monomial, ClearError> {
             Err(ClearError("the AIR step has no small constants"))
         }
     }
@@ -577,7 +654,7 @@ mod tests {
             _: &mut Clear,
             _: &(),
             _: &IntExpr,
-        ) -> Result<usize, ProgramLowerError<ClearError>> {
+        ) -> Result<Monomial, ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no families")))
         }
         fn rhs_at(&mut self, _: &(), _: &IntExpr) -> Result<(), ProgramLowerError<ClearError>> {
@@ -599,34 +676,49 @@ mod tests {
                 &mut Self,
                 &mut Clear,
                 IntExpr,
-            ) -> Result<usize, ProgramLowerError<ClearError>>,
+            ) -> Result<Monomial, ProgramLowerError<ClearError>>,
         ) -> Result<(), ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no families")))
         }
-        fn sum(&mut self, _: &mut Clear, _: &()) -> Result<usize, ProgramLowerError<ClearError>> {
+        fn sum(
+            &mut self,
+            _: &mut Clear,
+            _: &(),
+        ) -> Result<Monomial, ProgramLowerError<ClearError>> {
             Err(ProgramLowerError::Backend(ClearError("the AIR step has no sums")))
         }
     }
 
-    /// Evaluates one step on `X^(E_state)` and `X^(E_next)`: the state
-    /// exponent, the flag exponent, and the numbers of LUTs and public
-    /// multiplications evaluated.
-    fn step(
-        air: &AirConstraintProgram,
-        (state, next): (usize, usize),
-    ) -> (usize, usize, [usize; 2]) {
+    /// Evaluates one step on the field inputs `X^(v 2^(p_f))` of
+    /// `exponents`: the exponents of the state outputs, and the numbers of
+    /// LUTs and public multiplications evaluated with the product depth of
+    /// the flag.
+    fn step(air: &AirConstraintProgram, exponents: Vec<usize>) -> (Vec<usize>, [usize; 3]) {
         let mut environment = Environment::new();
-        environment.bind_wire(air.private_state(), InputBinding::Scalar(state)).unwrap();
-        environment.bind_wire(air.public_next(), InputBinding::Scalar(next)).unwrap();
+        assert_eq!(exponents.len(), air.field_inputs().len());
+        for (input, exponent) in air.field_inputs().iter().zip(exponents) {
+            environment.bind_wire(*input, InputBinding::Scalar((exponent, 0))).unwrap();
+        }
         let mut clear =
             Clear { site: None, packed_bits: air.packed_bits(), luts: 0, multiplications: 0 };
         let outputs =
             lower_program(air.program(), &mut clear, &mut NoFamilies, &mut environment).unwrap();
-        (outputs[0], outputs[1], [clear.luts, clear.multiplications])
+        let state = outputs.iter().map(|(exponent, _)| *exponent).collect();
+        (state, [clear.luts, clear.multiplications, outputs[1].1])
     }
 
-    /// The next flag of one step, after checking that the state output
-    /// forwards the next row and the instance.
+    /// The state fields of `fields` (every field but the next row).
+    fn state_fields(air: &AirConstraintProgram, fields: &[usize]) -> Vec<usize> {
+        fields[..2 + air.width].iter().chain(&fields[2 + 2 * air.width..]).copied().collect()
+    }
+
+    /// The flag held by a flag field exponent.
+    fn flag_of(air: &AirConstraintProgram, exponent: usize) -> usize {
+        exponent >> air.positions[1]
+    }
+
+    /// The next flag of one step, after checking that the state outputs are
+    /// the field inputs of `(i + 1, f_{i+1}, next, instance)`.
     fn next_flag(
         air: &AirConstraintProgram,
         index: usize,
@@ -635,14 +727,17 @@ mod tests {
         next: &[usize],
         instance: &[usize],
     ) -> usize {
-        let (state, flag, _) = step(air, air.pack(index, flag, current, next, instance));
-        assert_eq!(air.unpack_state(state), (next.to_vec(), instance.to_vec()));
-        assert!(flag <= 1, "flag exponent {flag}");
+        let (state, _) = step(air, air.pack(index, flag, current, next, instance));
+        let flag = flag_of(air, state[1]);
+        assert!(flag <= 1, "flag {flag}");
+        let zeros = vec![0; air.width];
+        assert_eq!(state, state_fields(air, &air.pack(index + 1, flag, next, &zeros, instance)));
         flag
     }
 
-    /// Streams `rows` through the Program from `(instance, rows[0], flag)`,
-    /// carrying the unpacked state, and returns the flag after every step.
+    /// Streams `rows` through the Program from `(0, flag, rows[0], instance)`,
+    /// feeding each step's state outputs into the next step with the next
+    /// row, and returns the flag after every step.
     fn stream(
         air: &AirConstraintProgram,
         instance: &[usize],
@@ -650,15 +745,19 @@ mod tests {
         flag: usize,
     ) -> Vec<usize> {
         assert_eq!(rows.len(), air.rows());
-        let (mut instance, mut current, mut flag) = (instance.to_vec(), rows[0].clone(), flag);
+        let zeros = vec![0; air.width];
+        let mut state = state_fields(air, &air.pack(0, flag, &rows[0], &zeros, instance));
         let mut flags = Vec::new();
         for (index, next) in rows[1..].iter().enumerate() {
-            let inputs = air.pack(index, flag, &current, next, &instance);
-            let (state, next_flag, _) = step(air, inputs);
-            (current, instance) = air.unpack_state(state);
-            assert_eq!(&current, next);
-            flag = next_flag;
-            flags.push(flag);
+            (state, _) = step(air, air.next_step(&state, next));
+            assert_eq!(
+                state,
+                state_fields(
+                    air,
+                    &air.pack(index + 1, flag_of(air, state[1]), next, &zeros, instance)
+                )
+            );
+            flags.push(flag_of(air, state[1]));
         }
         // Once a step rejects, every later step rejects.
         assert!(flags.windows(2).all(|pair| pair[1] <= pair[0]), "flags {flags:?}");
@@ -719,19 +818,27 @@ mod tests {
     fn fibonacci_packing_and_structure() {
         let air = fibonacci(5);
         assert_eq!(air.packed_bits(), 17);
+        // One public input per field: index, flag, two current, two next,
+        // and one instance value.
         let inputs = air.program().inputs();
-        assert_eq!(inputs.len(), 2);
-        for (input, knowledge) in [
-            (air.private_state(), AttributeKnowledge::PrivatePayload),
-            (air.public_next(), AttributeKnowledge::PublicPayload),
-        ] {
-            assert_eq!(inputs[&input].shape(), &InputShape::Scalar(()));
-            assert_eq!(inputs[&input].knowledge(), knowledge);
+        assert_eq!(inputs.len(), 7);
+        assert_eq!(air.field_inputs().len(), 7);
+        for input in air.field_inputs() {
+            assert_eq!(inputs[input].shape(), &InputShape::Scalar(()));
+            assert_eq!(inputs[input].knowledge(), AttributeKnowledge::PublicPayload);
+        }
+        assert_eq!(air.state_outputs().len(), 5);
+        assert_eq!(air.state_inputs().len(), 5);
+        for output in air.state_outputs() {
+            assert_eq!(
+                air.program().wire_knowledge(*output).unwrap(),
+                AttributeKnowledge::PublicPayload
+            );
         }
         assert!(air.program().rhs_inputs().is_empty());
         // Flag chain: windows `2^(sigma_k + d_k)` for sigma = (0, 3, 3, 5, 6,
-        // 6, 4) and d = (6, 1, 2, ...); state chain: the index, flag, and
-        // current-row fields.
+        // 6, 4) and d = (6, 1, 2, ...); state outputs: the index and the two
+        // next-row fields moved to the current row.
         let widths = air
             .program()
             .encryption_inputs()
@@ -739,11 +846,11 @@ mod tests {
             .iter()
             .map(LutTable::input_width)
             .collect::<Vec<_>>();
-        assert_eq!(widths, [64, 16, 32, 128, 256, 256, 64, 64, 2, 4, 4]);
-        // One public multiplication, then LUTs only: the clear evaluator
-        // rejects any other step.
+        assert_eq!(widths, [64, 16, 32, 128, 256, 256, 64, 64, 4, 4]);
+        // Six public multiplications of depth `ceil(log2 7) = 3`, then LUTs
+        // only: the clear evaluator rejects any other step.
         let inputs = air.pack(0, 1, &[0, 1], &[1, 2], &[0]);
-        assert_eq!(step(&air, inputs).2, [widths.len(), 1]);
+        assert_eq!(step(&air, inputs).1, [widths.len(), 6, 3]);
     }
 
     #[test]
@@ -851,15 +958,16 @@ mod tests {
             })
         });
         for (index, flag, current, next, x) in contract {
-            let exponent = index | flag << 7 | current << 8 | next << 10 | x << 12;
+            let fields = vec![index, flag << 7, current << 8, next << 10, x << 12];
+            let exponent = fields.iter().sum::<usize>();
             let expected = flag == 1 &&
                 (index != 0 || current == x) &&
                 next == (current + 1) % B &&
                 (index != rows - 2 || next == (x + 2) % B);
-            // The next-row field, bits [10, 12), is the public input.
-            let next_bits = 0b11 << 10;
-            let (state, next_flag, _) = step(&air, (exponent & !next_bits, exponent & next_bits));
-            assert_eq!(state, exponent & !((1 << 10) - 1), "E = {exponent}");
+            assert_eq!(air.pack(index, flag, &[current], &[next], &[x]), fields);
+            let (state, _) = step(&air, fields);
+            let next_flag = flag_of(&air, state[1]);
+            assert_eq!(state, [index + 1, next_flag << 7, next << 8, x << 12], "E = {exponent}");
             assert_eq!(next_flag, usize::from(expected), "E = {exponent}");
             accepted += next_flag;
         }
@@ -868,16 +976,48 @@ mod tests {
     }
 
     #[test]
-    fn packing_splits_the_next_row_and_round_trips_the_state() {
+    fn packing_places_every_field_and_the_next_step_reuses_the_state() {
         let air = fibonacci(3);
-        let (state, next) = air.pack(1, 1, &[1, 2], &[0, 2], &[1]);
-        assert_eq!((state, next), (1 | 1 << 6 | 1 << 7 | 2 << 9 | 1 << 15, 2 << 13));
-        let forwarded = (state | next) & !((1 << 11) - 1);
-        assert_eq!(air.unpack_state(forwarded), (vec![0, 2], vec![1]));
+        let fields = air.pack(1, 1, &[1, 2], &[0, 2], &[1]);
+        assert_eq!(fields, [1, 1 << 6, 1 << 7, 2 << 9, 0, 2 << 13, 1 << 15]);
+        let state = [2, 1 << 6, 0, 2 << 9, 1 << 15];
+        assert_eq!(air.next_step(&state, &[1, 0]), air.pack(2, 1, &[0, 2], &[1, 0], &[1]));
+        assert_eq!(
+            air.state_inputs(),
+            [0, 1, 2, 3, 6].map(|field| air.field_inputs()[field]).to_vec()
+        );
+        assert_eq!(air.next_inputs(), &air.field_inputs()[4..6]);
+    }
+
+    /// The product of `F = 2 W + M + 2` field inputs uses `F - 1` public
+    /// multiplications of depth `ceil(log2 F)`, the least for two-operand
+    /// products, and the step still evaluates its relation.
+    #[test]
+    fn field_inputs_multiply_in_a_tree_of_least_depth() {
+        for (width, instances) in [(1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (3, 0), (3, 2)] {
+            let constraints = vec![constraint(
+                AirGate::EveryRow,
+                vec![AirCell::Next(0), AirCell::Current(0)],
+                |v| v[0] == v[1],
+            )];
+            let air = AirConstraintProgram::new(2, width, 2, instances, constraints).unwrap();
+            let fields = 2 * width + instances + 2;
+            let depth = fields.next_power_of_two().trailing_zeros() as usize;
+            let row = vec![1; width];
+            let instance = vec![0; instances];
+            let (state, [_, multiplications, product_depth]) =
+                step(&air, air.pack(0, 1, &row, &row, &instance));
+            let flag = flag_of(&air, state[1]);
+            assert_eq!(
+                (flag, multiplications, product_depth),
+                (1, fields - 1, depth),
+                "F = {fields}"
+            );
+        }
     }
 
     #[test]
-    fn plaintext_inputs_are_the_packed_monomials() {
+    fn plaintext_inputs_are_the_field_monomials() {
         // P = 5: index (2 bits), flag, current, next (bit 4).
         let constraints =
             vec![constraint(AirGate::EveryRow, vec![AirCell::Next(0), AirCell::Current(0)], |v| {
@@ -886,19 +1026,129 @@ mod tests {
         let air = AirConstraintProgram::new(2, 1, 2, 0, constraints).unwrap();
         assert_eq!(air.packed_bits(), 5);
         let ring = DCRTPolyParams::new(32, 1, 17, 1, None, None);
-        let (state, next) = air.pack(0, 1, &[1], &[1], &[]);
-        assert_eq!((state, next), (0b1100, 0b10000));
+        let fields = air.pack(0, 1, &[1], &[1], &[]);
+        assert_eq!(fields, [0, 0b100, 0b1000, 0b10000]);
         let monomial =
             |exponent| InputBinding::Scalar(DCRTPoly::const_rotate_poly(&ring, exponent));
         assert_eq!(
-            air.plaintext_inputs::<DCRTPoly>(&ring, state, next),
-            BTreeMap::from([
-                (air.private_state(), monomial(state)),
-                (air.public_next(), monomial(next))
-            ])
+            air.plaintext_inputs::<DCRTPoly>(&ring, &fields),
+            air.field_inputs()
+                .iter()
+                .zip(&fields)
+                .map(|(input, exponent)| (*input, monomial(*exponent)))
+                .collect::<BTreeMap<_, _>>()
         );
         assert_eq!(next_flag(&air, 0, 1, &[1], &[1], &[]), 1);
         assert_eq!(next_flag(&air, 0, 1, &[1], &[0], &[]), 0);
+    }
+
+    /// One step of an AIR whose fields are all public attributes, evaluated
+    /// encrypted in Static mode: the field inputs multiply in a tree of
+    /// public products and every LUT reads a public payload, one level each.
+    /// The public next flag verifies as `X^(2^(p_1))` (the flag field holding
+    /// one) on a satisfying step and as `X^0` on a violating one, and the
+    /// simulated bound of the flag fits its level.
+    #[test]
+    #[ignore = "the encrypted CPU step takes about fifteen minutes; run with --ignored"]
+    fn public_air_step_verifies_its_next_flag() {
+        let air = AirConstraintProgram::new(
+            2,
+            1,
+            2,
+            0,
+            vec![AirConstraint {
+                gate: AirGate::EveryRow,
+                cells: vec![AirCell::Next(0), AirCell::Current(0)],
+                holds: Box::new(|v: &[usize]| v[0] == v[1]),
+            }],
+        )
+        .unwrap();
+        let program = air.program();
+        // The flag chain has one LUT per field, each dropping one prime; the
+        // terminal level keeps two. The gadget base bits are overridable by
+        // `MXX_EXPONENT_LUT_PUBLIC_AIR_TEST_BASE_BITS`.
+        let base_bits = std::env::var("MXX_EXPONENT_LUT_PUBLIC_AIR_TEST_BASE_BITS")
+            .map_or(4, |bits| bits.parse().unwrap());
+        let levels = air.field_inputs().len() + 1;
+        let pool =
+            DCRTPolyParams::new(1 << air.packed_bits(), levels + 1, 17, base_bits, None, None);
+        let primes = pool.to_crt().0;
+        let parameters = RnsBggParameters::new(
+            (0..levels)
+                .map(|level| {
+                    let modulus = primes[..levels + 1 - level]
+                        .iter()
+                        .fold(BigUint::from(1u8), |product, prime| product * BigUint::from(*prime));
+                    pool.select_modulus(&modulus).unwrap()
+                })
+                .collect(),
+            1,
+            1,
+        )
+        .unwrap();
+        let workload = RnsBggDerivedWorkload::from_program(program).unwrap();
+        assert_eq!(workload.level(air.next_flag()).unwrap(), levels - 1);
+        let bindings = crate::rns_bgg::RnsBggNoiseBindings::from_inputs(
+            program,
+            &air.field_inputs()
+                .iter()
+                .map(|_| {
+                    crate::rns_bgg::RnsBggNoiseValue::sampled_encoding(
+                        &parameters,
+                        b"public-air-field",
+                        &[BigInt::from(1u8)],
+                    )
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        )
+        .unwrap();
+        let report = crate::api::noise_simulate(
+            program,
+            crate::rns_bgg::RnsNoiseBuild::new(&parameters, program, &workload, &bindings).unwrap(),
+            |_, outputs| Ok(outputs),
+        )
+        .unwrap();
+        let bound = &report.outputs[1].bound.error;
+        let modulus = parameters.level(levels - 1).unwrap().modulus();
+        assert!(bound * 4u8 < *modulus.as_ref(), "the flag bound {bound} exceeds q / 4");
+        let terminal = &parameters.levels()[levels - 1];
+        for (next, accepted) in [(1, true), (0, false)] {
+            let fields = air.pack(0, 1, &[1], &[next], &[]);
+            let lhs = air.plaintext_inputs::<DCRTPoly>(&parameters.levels()[0], &fields);
+            let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend(
+                parameters.levels().iter().cloned(),
+            ));
+            let mut store = MemoryArtifactStore::default();
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
+                &parameters,
+                program,
+                &crate::program::ProgramData::new(),
+                false,
+                &lhs,
+                &mut execution,
+                &mut store,
+                |_| (),
+            );
+            let verify = |flag: usize, execution: &mut _, store: &mut _| {
+                verify_output(
+                    program,
+                    &result,
+                    1,
+                    &DCRTPoly::const_rotate_poly(terminal, air.pack(0, flag, &[0], &[0], &[])[1]),
+                    &parameters,
+                    &payload,
+                    Some(&mask),
+                    RnsOutputUse::DirectDecode,
+                    execution,
+                    store,
+                )
+            };
+            let flag = usize::from(accepted);
+            verify(flag, &mut execution, &mut store)
+                .unwrap_or_else(|error| panic!("next row {next}: {error}"));
+            assert!(verify(1 - flag, &mut execution, &mut store).is_err(), "next row {next}");
+        }
     }
 
     #[test]

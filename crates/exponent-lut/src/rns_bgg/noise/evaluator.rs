@@ -1577,6 +1577,18 @@ impl RnsBggNoiseEvaluator<'_> {
     ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
         let wire = self.site()?.output;
         let branches = table.input_width();
+        // The bridge length of every nonidentity branch, as the lowering
+        // builds it.
+        let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
+        let sigmas = table
+            .input_layout()
+            .automorphism_indices(ring_dimension)
+            .map_err(|_| RnsBggError::Lut)?;
+        let hops = crate::rns_bgg::public_lut::inverse_words(&sigmas, ring_dimension)?
+            .iter()
+            .skip(1)
+            .map(Vec::len)
+            .collect::<Vec<_>>();
         let output_payload_l1 = match table.output_representation() {
             crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
             crate::program::LutOutputRepresentation::Coefficient => {
@@ -1586,14 +1598,16 @@ impl RnsBggNoiseEvaluator<'_> {
         let bound = self.parameters.public_lut_noise_bound(
             level,
             &input.1.bound,
-            branches,
+            &hops,
             output_payload_l1.clone(),
         )?;
         let (input_gain, helper_gain, _) =
-            self.parameters.public_lut_gains(level, branches, &input.1.bound.payload_l1)?;
+            self.parameters.public_lut_gains(level, &hops, &input.1.bound.payload_l1)?;
+        // Every bridge and final mask switch leaves one remainder; their
+        // coherent sum is counted as that many branches.
         let rounding = self.parameters.lut_noise_terms(
             level,
-            branches,
+            hops.iter().sum::<usize>().max(1),
             &RightActionNoiseGain {
                 l1: input.1.bound.payload_l1.clone(),
                 l2_squared: input.1.payload_l2_squared.clone(),

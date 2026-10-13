@@ -91,40 +91,47 @@ impl RnsBggParameters {
         })
     }
 
-    /// The gains of a Static LUT on a public payload at `level` with
-    /// `branches` automorphisms (see [`crate::rns_bgg::public_lut`]), before
-    /// its one ModDown, term by term with the encoding lowering: the input
-    /// gain `J K_l` (the identity branch and every payload switch decompose
-    /// the input once under the level-`l` public gadget, `K_l = 2 D_l n
-    /// rho_l`), the helper gain `(J - 1) (P S + K')` (the routed helper of
-    /// `k^-1` times the scalar action `V_k` and the payload `sigma_k(x)` of
-    /// `l1` norm `P`, `S = D_(l+1) n rho_(l+1)`, and the mask switch's helper
-    /// times the level-`l+1` decomposition, `K' = 2 D_(l+1) n
-    /// rho_(l+1)`), and the `J - 1` mask remainders `sigma_k(s) (K -
-    /// p ModDown(K))`, each at most `(n + 1)(p - 1) / 2`.
+    /// The gains of a Static LUT on a public payload at `level` (see
+    /// [`crate::rns_bgg::public_lut`]) whose nonidentity branch `k` builds its
+    /// bridge in `hops[k]` helpers (the length of its inverse word), before
+    /// its one ModDown, term by term with the encoding lowering:
+    ///
+    /// - the input gain `J K_l`: the identity branch and every payload switch decompose the input
+    ///   once under the level-`l` public gadget, `K_l = 2 D_l n rho_l`, for `J = hops.len() + 1`
+    ///   branches;
+    /// - the helper gain `sum_k (P (S + (h_k - 1) K') + K')`: the first bridge helper times the
+    ///   scalar action `V_k` (`S = D_(l+1) n rho_(l+1)`), every further bridge helper times one
+    ///   level-`l+1` decomposition (`K' = 2 D_(l+1) n rho_(l+1)`), all carried by the payload
+    ///   `sigma_k(x)` of `l1` norm `P`, and the branch's final mask switch;
+    /// - the remainders `sum_k (P (h_k - 1) + 1) rho` of the bridge and final mask switches
+    ///   `sigma_r(s) (K - p ModDown(K))`, each at most `rho = (n + 1)(p - 1) / 2`.
     pub fn public_lut_gains(
         &self,
         level: usize,
-        branches: usize,
+        hops: &[usize],
         payload_l1: &BigUint,
     ) -> Result<(BigUint, BigUint, BigUint), RnsBggError> {
-        if branches == 0 {
-            return Err(RnsBggError::Parameters("empty branch family"));
+        if hops.contains(&0) {
+            return Err(RnsBggError::Parameters("a nonidentity branch has an empty bridge"));
         }
         let source = self.level(level)?;
         let next = self.level(level + 1)?;
         let p = self.scale(level)?;
         let n = BigUint::from(source.ring_dimension());
-        let switched = BigUint::from(branches - 1);
-        let input_gain = BigUint::from(branches) *
+        let input_gain = BigUint::from(hops.len() + 1) *
             BigUint::from(source.modulus_digits()) *
             &n *
             (BigUint::one() << source.base_bits());
         let scalar =
             BigUint::from(next.modulus_digits()) * &n * (BigUint::one() << next.base_bits()) / 2u8;
         let mask = BigUint::from(next.modulus_digits()) * &n * (BigUint::one() << next.base_bits());
-        let helper_gain = &switched * (payload_l1 * scalar + mask);
-        let rounding = switched * (&n + 1u8) * (p - 1u8) / 2u8;
+        let remainder = (&n + 1u8) * (p - 1u8) / 2u8;
+        let (mut helper_gain, mut rounding) = (BigUint::zero(), BigUint::zero());
+        for hop in hops {
+            let bridge = BigUint::from(hop - 1);
+            helper_gain += payload_l1 * (&scalar + &bridge * &mask) + &mask;
+            rounding += (payload_l1 * &bridge + 1u8) * &remainder;
+        }
         Ok((input_gain, helper_gain, rounding))
     }
 
@@ -136,11 +143,11 @@ impl RnsBggParameters {
         &self,
         level: usize,
         input: &RnsBggNoiseBound,
-        branches: usize,
+        hops: &[usize],
         output_payload_l1: BigUint,
     ) -> Result<RnsBggNoiseBound, RnsBggError> {
         let (input_gain, helper_gain, rounding) =
-            self.public_lut_gains(level, branches, &input.payload_l1)?;
+            self.public_lut_gains(level, hops, &input.payload_l1)?;
         let before =
             input_gain * &input.error + helper_gain * self.encoding_error_bound() + rounding;
         Ok(RnsBggNoiseBound {
@@ -908,8 +915,9 @@ mod test {
             RnsBggParameters::new(vec![high.clone(), low], bigdecimal::BigDecimal::from(1u8), 1)
                 .unwrap();
         let payload_l1 = BigUint::one();
+        let hops = [1, 1, 3];
         let (input_gain, helper_gain, rounding) =
-            parameters.public_lut_gains(0, 4, &payload_l1).unwrap();
+            parameters.public_lut_gains(0, &hops, &payload_l1).unwrap();
         assert_eq!(
             input_gain,
             BigUint::from(4u8) *
@@ -922,7 +930,7 @@ mod test {
                 .public_lut_noise_bound(
                     0,
                     &RnsBggNoiseBound { error: error.into(), payload_l1: payload_l1.clone() },
-                    4,
+                    &hops,
                     1u8.into(),
                 )
                 .unwrap()

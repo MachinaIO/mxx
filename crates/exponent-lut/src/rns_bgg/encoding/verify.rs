@@ -1160,81 +1160,6 @@ mod test {
         RnsBggParameters::new(vec![high, low], sigma, 1).unwrap()
     }
 
-    /// Preprocess, encrypt and evaluate `program` with the private scalar
-    /// input bound to `input` under Static parameters, and return the online
-    /// result with the payload secret and the stage mask. The online
-    /// evaluation receives the Program without its LUT values if
-    /// `withhold_values` (a LUT on a public payload needs them), and
-    /// `observe` sees its graph. Preprocessing and online evaluation are
-    /// given the Program data `data`.
-    #[allow(clippy::too_many_arguments)]
-    fn run_without_rhs(
-        parameters: &RnsBggParameters,
-        program: &ExponentLutProgram,
-        data: &crate::program::ProgramData,
-        withhold_values: bool,
-        lhs: &crate::api::PlaintextInputs<WireId, DCRTPoly>,
-        execution: &mut mxx_backends::authority::CpuExecution,
-        store: &mut MemoryArtifactStore,
-        observe: impl FnOnce(&mxx_ir_core::ValidatedGraph),
-    ) -> (StageOutputs, RnsBggPayloadSecret, RnsBggMaskSecret) {
-        let hash_key: [u8; 32] = rand::random();
-        let context: [u8; 32] = rand::random();
-        let payload = RnsEncryptBuild::new(parameters, context)
-            .sample_payload_secret(execution, store, |_| Ok(()))
-            .unwrap();
-        let (preprocess, online_eval) = crate::api::preprocess(
-            program,
-            &ParamEnv::default(),
-            &crate::api::PlaintextInputs::<RhsId, DCRTPoly>::new(),
-            Some(&payload),
-            &hash_key,
-            crate::rns_bgg::RnsPreprocessBuild::new(parameters, context).with_data(data.clone()),
-            execution,
-            store,
-            |_, outputs| Ok(outputs),
-            |_| Ok(()),
-        )
-        .unwrap();
-        let mask = RnsEncryptBuild::new(parameters, rand::random())
-            .sample_mask_secret(execution, store, |_| Ok(()))
-            .unwrap();
-        let encrypted = crate::api::encrypt(
-            &program.encryption_inputs(),
-            &ParamEnv::default(),
-            lhs,
-            Some(&preprocess),
-            &payload,
-            Some(&mask),
-            &hash_key,
-            RnsEncryptBuild::new(parameters, context),
-            execution,
-            store,
-            |_| Ok(()),
-            |_| Ok(()),
-        )
-        .unwrap();
-        let online_program =
-            if withhold_values { program.without_lut_values() } else { program.clone() };
-        let result = crate::api::online_eval(
-            &online_program,
-            &ParamEnv::default(),
-            &online_eval,
-            &encrypted,
-            &hash_key,
-            RnsOnlineEvalBuild::new(parameters, context).with_data(data.clone()),
-            execution,
-            store,
-            |_, outputs| Ok(outputs),
-            |graph| {
-                observe(graph);
-                Ok(())
-            },
-        )
-        .unwrap();
-        (result, payload, mask)
-    }
-
     /// A coefficient LUT at level 0 of a chain whose adjacent widths differ:
     /// online evaluation finalizes it once to the terminal level 1, scaling
     /// its `v G_1` payload by `G^-1(k)` to `k v`. Its residual
@@ -1309,7 +1234,7 @@ mod test {
                 parameters.levels().iter().cloned(),
             ));
             let mut store = MemoryArtifactStore::default();
-            let (result, payload, mask) = run_without_rhs(
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
                 &parameters,
                 &program,
                 &crate::program::ProgramData::new(),
@@ -1414,7 +1339,8 @@ mod test {
     }
 
     /// A LUT on a public payload in Static mode (width 4, so that `k^-1 != k`
-    /// for two branches), with constant and Program-data table values: the
+    /// for two branches; stride 0 and stride 1, whose automorphism set is not
+    /// closed under inverses), with constant and Program-data table values: the
     /// output is a public encoding at the next
     /// (terminal) level in either representation, verification accepts the
     /// table value for every input entry and both signs of the input
@@ -1425,16 +1351,23 @@ mod test {
         let parameters = unequal_width_parameters();
         let input_level = &parameters.levels()[0];
         let output_level = &parameters.levels()[1];
-        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
         let values = vec![3usize, 5, 1, 6];
         let exponent = crate::program::LutOutputRepresentation::Exponent(ExpLayout {
             stride_log2: 0,
             width_log2: 3,
         });
         let coefficient = crate::program::LutOutputRepresentation::Coefficient;
-        for (representation, data_backed) in
-            [(exponent, false), (coefficient, false), (exponent, true)]
-        {
+        // Stride 0 has an inverse-closed automorphism set; stride 1 does not,
+        // so some bridges take several helpers.
+        let direct = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let strided = ExpLayout { stride_log2: 1, width_log2: 2 };
+        for (layout, representation, data_backed) in [
+            (direct, exponent, false),
+            (direct, coefficient, false),
+            (direct, exponent, true),
+            (strided, exponent, false),
+            (strided, coefficient, false),
+        ] {
             let mut builder = ExponentLutProgramBuilder::new();
             let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
             let (table, data) = if data_backed {
@@ -1485,7 +1418,7 @@ mod test {
                 if negative { -plaintext } else { plaintext }
             };
             for (entry, negative) in [(0, false), (1, true), (2, false), (3, true)] {
-                let plaintext = monomial(input_level, entry);
+                let plaintext = monomial(input_level, entry << layout.stride_log2);
                 let lhs = BTreeMap::from([(
                     input,
                     InputBinding::Scalar(if negative { -plaintext } else { plaintext }),
@@ -1494,7 +1427,7 @@ mod test {
                     parameters.levels().iter().cloned(),
                 ));
                 let mut store = MemoryArtifactStore::default();
-                let (result, payload, mask) = run_without_rhs(
+                let (result, payload, mask) = crate::test_support::run_without_rhs(
                     &parameters,
                     &program,
                     &data,
@@ -1635,7 +1568,7 @@ mod test {
             parameters.levels().iter().cloned(),
         ));
         let mut store = MemoryArtifactStore::default();
-        let (result, payload, mask) = run_without_rhs(
+        let (result, payload, mask) = crate::test_support::run_without_rhs(
             &parameters,
             &program,
             &crate::program::ProgramData::new(),
@@ -1753,7 +1686,7 @@ mod test {
             ));
             let mut store = MemoryArtifactStore::default();
             let mut helper_inputs = 0;
-            let (result, payload, mask) = run_without_rhs(
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
                 &parameters,
                 &program,
                 &crate::program::ProgramData::new(),
@@ -1860,7 +1793,7 @@ mod test {
         let mut execution =
             mxx_backends::authority::CpuExecution::new(cpu_backend([level.clone()]));
         let mut store = MemoryArtifactStore::default();
-        let (result, payload, mask) = run_without_rhs(
+        let (result, payload, mask) = crate::test_support::run_without_rhs(
             &parameters,
             &program,
             &crate::program::ProgramData::new(),
@@ -1937,7 +1870,7 @@ mod test {
                 parameters.levels().iter().cloned(),
             ));
             let mut store = MemoryArtifactStore::default();
-            let (result, payload, mask) = run_without_rhs(
+            let (result, payload, mask) = crate::test_support::run_without_rhs(
                 &parameters,
                 &program,
                 &crate::program::ProgramData::new(),

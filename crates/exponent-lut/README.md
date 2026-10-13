@@ -65,7 +65,9 @@ ciphertext each branch `k` is switched by the LUT helpers. The helper of `k^-1`,
 `sigma_k`, switches the payload back with a public product that also applies the branch
 coefficient as a bounded scalar action, and the helper of `k` then switches the mask
 (`rns_bgg::public_lut`). Static helpers carry the level's scale, so a public LUT ends with one
-ModDown and its output is a public encoding at the next level in either output representation;
+ModDown and its output is a public encoding at the next level in either output representation; a
+Static layout of stride above zero, whose automorphisms are not closed under inverses modulo `2n`,
+bridges each payload switch through a shortest word of the layout's own helpers;
 Dynamic LUTs read no digit companion and follow the setup's radix plan. A public coefficient
 output needs no finalization, but it is still not a LUT input or a product operand.
 

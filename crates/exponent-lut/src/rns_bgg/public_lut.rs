@@ -26,23 +26,56 @@
 //! encoding of the LUT value at `l + 1` in either output representation.
 //! Dynamic helpers have `beta = 1` and the public gadget, so no ModDown is
 //! needed (see [`crate::rns_bgg::dynamic`]).
+//!
+//! A Static layout of stride `s > 0` has an automorphism set `S` that is not
+//! closed under inverses modulo `2n` (only modulo `2n / 2^s`), so the helper
+//! of `k^-1` may not exist. The bridge `c_{k,1} V_k` is then built from
+//! helpers of `S` alone ([`static_public_lut`]): for a shortest word `k^-1 =
+//! j_1 ... j_h` over `S` ([`inverse_words`]) and `r_i = (j_1 ... j_i)^-1`,
+//! `C_1 = sigma_(r_1)(h_(j_1)) V_k` has mask `sigma_(r_1)(s)` and payload
+//! `D_k` under `s`, and each further helper `sigma_(r_i)(h_(j_i))` is a mask
+//! switch from `sigma_(r_(i-1))(s)` to `sigma_(r_i)(s)` ([`public_lut_mask_switch`]),
+//! ending at `sigma_k(s)`. Only public keys are decomposed, so every hop adds
+//! its helper error and mask remainder once, unamplified; `V_k` acts on the
+//! first helper only. A word of length one is the direct switch.
 use super::*;
 use mxx_dsl::{DslError, Int};
+use std::collections::BTreeMap;
 
-/// The position of `k^-1 mod 2n` in `automorphisms` for every `k` of
-/// `automorphisms`, a group of automorphism indices of ring dimension `n`.
-pub(crate) fn inverse_positions(
+/// For every `k` of `automorphisms` (a set of automorphism indices of ring
+/// dimension `n` containing the identity), a shortest word `j_1 ... j_h` of
+/// positions in `automorphisms` whose indices multiply to `k^-1` modulo
+/// `2n`; the identity's word is empty. The words exist because each `k` has
+/// finite order; a breadth-first search over products of the nonidentity
+/// indices finds the shortest.
+pub(crate) fn inverse_words(
     automorphisms: &[usize],
     ring_dimension: usize,
-) -> Result<Vec<usize>, RnsBggError> {
-    let modulus = 2 * ring_dimension as u128;
+) -> Result<Vec<Vec<usize>>, RnsBggError> {
+    let modulus = 2 * ring_dimension;
+    let mut words = BTreeMap::from([(1usize, Vec::new())]);
+    let mut frontier = vec![1usize];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for element in frontier {
+            for (position, j) in automorphisms.iter().enumerate().filter(|(_, j)| **j != 1) {
+                let product = (element as u128 * *j as u128 % modulus as u128) as usize;
+                if !words.contains_key(&product) {
+                    let mut word = words[&element].clone();
+                    word.push(position);
+                    words.insert(product, word);
+                    next.push(product);
+                }
+            }
+        }
+        frontier = next;
+    }
     automorphisms
         .iter()
         .map(|k| {
-            automorphisms
-                .iter()
-                .position(|inverse| (*k as u128 * *inverse as u128) % modulus == 1)
-                .ok_or(RnsBggError::Lut)
+            let inverse =
+                super::setup::automorphism_inverse(*k, ring_dimension).ok_or(RnsBggError::Lut)?;
+            words.get(&inverse).cloned().ok_or(RnsBggError::Lut)
         })
         .collect()
 }
@@ -216,7 +249,7 @@ pub(crate) fn static_public_lut(
     if sigmas.first() != Some(&1) {
         return Err(RnsBggError::Lut);
     }
-    let inverses = inverse_positions(&sigmas, ring_dimension)?;
+    let words = inverse_words(&sigmas, ring_dimension)?;
     let action = |k: IntExpr| {
         let coefficient = EncodingLowering::lut_coefficient(
             parameters,
@@ -248,40 +281,99 @@ pub(crate) fn static_public_lut(
     };
     let schema = |_| DslError::Schema;
     let (row, key) = input;
+    // The nonidentity branches grouped by the length of their inverse word,
+    // so that one loop body per length builds every bridge of the group.
+    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
+    for (position, word) in words.iter().enumerate().skip(1) {
+        groups.entry(word.len()).or_default().push(position);
+    }
     // The loop state holds the row sum as a vector of zero or one row.
-    let initial = (initial.0.into_iter().collect::<Vec<_>>(), initial.1);
-    mxx_dsl::iterate(IntExpr::constant(sigmas.len() - 1), initial, |index, (row_sum, key_sum)| {
-        let position = (index.expression()? + IntExpr::constant(1)).canonicalize();
-        let k = select(&sigmas, position.clone());
-        let inverse_position = select(&inverses, position.clone());
-        let route = |entry: Mat| entry.ring_automorphism(k.clone());
-        let switched = public_lut_switch(
-            parameters,
-            level,
-            (row.clone().map(|row| map_row(row, route)), map_matrix(key.clone(), route)),
-            payload.clone().map(route),
-            (
-                helper_row(inverse_position.clone()).map(|row| map_row(row, route)),
-                map_matrix(public(select(&sigmas, inverse_position)).map_err(schema)?, route),
-            ),
-            Some(&action(k.clone()).map_err(schema)?),
-        )
-        .map_err(schema)?;
-        let (branch_row, branch_key) = public_lut_mask_switch(
-            parameters,
-            level,
-            next_level,
-            switched,
-            (helper_row(position), Some(public(k).map_err(schema)?)),
-        )
-        .map_err(schema)?;
-        Ok((
-            add_optional(row_sum, branch_row, add_encoding_rows)?,
-            add_public_matrices(key_sum, branch_key.ok_or(DslError::Schema)?),
-        ))
-    })
-    .map(|(rows, key)| (rows.into_iter().next(), key))
-    .map_err(|error| RnsBggError::Graph(error.to_string()))
+    let mut sum = (initial.0.into_iter().collect::<Vec<_>>(), initial.1);
+    for (length, positions) in groups {
+        // Per hop `i`: the helper position of `j_i` and `r_i = (j_1 ... j_i)^-1`.
+        let hops = (0..length)
+            .map(|hop| {
+                let members =
+                    positions.iter().map(|branch| words[*branch][hop]).collect::<Vec<_>>();
+                let routes = positions
+                    .iter()
+                    .map(|branch| {
+                        let prefix = words[*branch][..=hop].iter().fold(1u128, |product, member| {
+                            product * sigmas[*member] as u128 % (2 * ring_dimension) as u128
+                        }) as usize;
+                        super::setup::automorphism_inverse(prefix, ring_dimension)
+                            .ok_or(RnsBggError::Lut)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((members, routes))
+            })
+            .collect::<Result<Vec<_>, RnsBggError>>()?;
+        let count = IntExpr::constant(positions.len());
+        sum = mxx_dsl::iterate(count, sum, |index, (row_sum, key_sum)| {
+            let index = index.expression()?;
+            let position = select(&positions, index.clone());
+            let k = select(&sigmas, position.clone());
+            let route = |r: &IntExpr| {
+                let r = r.clone();
+                move |entry: Mat| entry.ring_automorphism(r.clone())
+            };
+            // The routed helper of `j_i` with its public matrix.
+            let hop_helper = |hop: usize| -> Result<(Option<RnsBggRow>, RnsBggMatrix), DslError> {
+                let (members, routes) = &hops[hop];
+                let member = select(members, index.clone());
+                let r = select(routes, index.clone());
+                let j = select(&sigmas, member.clone());
+                Ok((
+                    helper_row(member).map(|row| map_row(row, route(&r))),
+                    map_matrix(public(j).map_err(schema)?, route(&r)),
+                ))
+            };
+            // `C_1 = sigma_(r_1)(h_(j_1)) V_k`, then one mask switch per
+            // further hop, ending under the mask `sigma_k(s)`.
+            let action = action(k.clone()).map_err(schema)?;
+            let (first_row, first_key) = hop_helper(0)?;
+            let mut bridge = (
+                first_row.map(|row| super::dynamic::scalar_action_row(row, &action)),
+                super::dynamic::scalar_action_matrix(first_key, &action),
+            );
+            for hop in 1..length {
+                let (helper_row, helper_key) = hop_helper(hop)?;
+                let (bridge_row, bridge_key) = public_lut_mask_switch(
+                    parameters,
+                    level,
+                    next_level,
+                    bridge,
+                    (helper_row, Some(helper_key)),
+                )
+                .map_err(schema)?;
+                bridge = (bridge_row, bridge_key.ok_or(DslError::Schema)?);
+            }
+            let route_k = route(&k);
+            let switched = public_lut_switch(
+                parameters,
+                level,
+                (row.clone().map(|row| map_row(row, &route_k)), map_matrix(key.clone(), &route_k)),
+                payload.clone().map(&route_k),
+                bridge,
+                None::<&SmallMatrix>,
+            )
+            .map_err(schema)?;
+            let (branch_row, branch_key) = public_lut_mask_switch(
+                parameters,
+                level,
+                next_level,
+                switched,
+                (helper_row(position), Some(public(k).map_err(schema)?)),
+            )
+            .map_err(schema)?;
+            Ok((
+                add_optional(row_sum, branch_row, add_encoding_rows)?,
+                add_public_matrices(key_sum, branch_key.ok_or(DslError::Schema)?),
+            ))
+        })
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+    }
+    Ok((sum.0.into_iter().next(), sum.1))
 }
 
 /// The Dynamic LUT of a public payload at `level` (see the module

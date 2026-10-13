@@ -533,16 +533,19 @@ impl<'a> PublicKeyLowering<'a> {
                 &|branch| RnsBggPackage::Automorphism(select(switches, branch)),
                 Some((super::automorphism_public_rows(self.parameters, level)?, &public_top)),
             )?;
-            let mut keys = Vec::with_capacity(depth.internal);
-            for position in 0..depth.internal {
-                let index = IntExpr::constant(position);
-                keys.push(switched_key(
-                    select(switches, index.clone()),
-                    (block(&product[0], index.clone()), block(&product[1], index)),
-                )?);
-            }
+            // The switched keys of the next depth's parents, in one parallel loop.
             let keys = (depth.internal > 0)
-                .then(|| mxx_dsl::Family::pack(keys).map_err(graph))
+                .then(|| {
+                    mxx_dsl::parallel(depth.internal, |position| {
+                        let index = position.expression()?;
+                        switched_key(
+                            select(switches, index.clone()),
+                            (block(&product[0], index.clone()), block(&product[1], index)),
+                        )
+                        .map_err(schema)
+                    })
+                    .map_err(graph)
+                })
                 .transpose()?;
             let ks = &depth.branches;
             if let Some(keys) = &keys {

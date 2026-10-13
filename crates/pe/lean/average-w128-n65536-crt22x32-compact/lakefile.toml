@@ -1,0 +1,32 @@
+name = "MxxPeAverageW128N65536Crt22x32Compact"
+version = "0.1.0"
+defaultTargets = ["PeGenerated", "PeProof"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxPe"
+path = ".."
+
+# Modules written by `test_gpu_pe_round_trip` (`tests/gpu_round_trip.rs`) for this parameter set.
+[[lean_lib]]
+name = "PeGenerated"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "Ideal", "Requirement_0", "Stage_setup_trapdoor", "Stage_setup_public",
+  "Stage_payload", "Stage_prelude", "Stage_encrypt", "Stage_preprocess", "Stage_keygen",
+  "Stage_online_eval", "Stage_decode", "Ideal_Facts", "Requirement_0_Facts",
+  "Stage_setup_trapdoor_Facts", "Stage_setup_public_Facts", "Stage_payload_Facts",
+  "Stage_prelude_Facts", "Stage_encrypt_Facts", "Stage_preprocess_Facts", "Stage_keygen_Facts",
+  "Stage_online_eval_Facts", "Stage_decode_Facts"
+]
+# The chained constraint fragments of the large stages need a deep elaboration stack.
+moreLeanArgs = ["--tstack=4000000"]
+
+# The proof of the generated claim.
+[[lean_lib]]
+name = "PeProof"
+roots = ["PeSetup", "PeOnlineBase", "PeOnlineStep0", "PeOnlineStep1", "PeOnlineStep2", "PeOnlineStep3", "PeLut", "PeStepRel", "PePrelude", "PeEncrypt", "PePreBase", "PePreKey0_0", "PePreKey0_1", "PePreKey0_2", "PePreKey0_3", "PePreKey1_0", "PePreKey1_1", "PePreKey1_2", "PePreKey1_3", "PePreKey2_0", "PePreKey2_1", "PePreKey2_2", "PePreKey2_3", "PePreKey3_0", "PePreKey3_1", "PePreKey3_2", "PePreKey3_3", "PePreLut0", "PePreLut1", "PePreLut2", "PePreLut3", "PePreInt0", "PePreInt1", "PePreInt2", "PePreInt3", "PePreLut2_0", "PePreLut2_1", "PePreLut2_2", "PePreLut2_3", "PePreSum0", "PePreSum1", "PePreSum2", "PePreSum3", "PeKeygen", "PeKeygenRoot", "PeDecode", "PeDecodeRoot", "PeDigits", "PeCompanions", "PeProduct", "PeBranch", "PeStepSum", "PeStepData", "PeProductGlue", "PeOnlineGlue", "PeOnlineRoot0", "PeOnlineRoot1", "PeOnlineRoot2", "PeOnlineRoot3", "PePreGlue", "PePreRoot0", "PePreRoot1", "PePreRoot2", "PePreRoot3", "PeSlots", "PePhase", "PeAnchor", "PeDecrypt", "PeDecryptBits", "PeNumeric", "PeRequirement", "PeChain0", "PeChain1", "PeChain2", "PeChain3", "PeKeyLink", "PeChainAll", "PeDecodeLink", "PeCertificate"]
+moreLeanArgs = ["--tstack=4000000"]

@@ -56,16 +56,15 @@ pub(crate) fn lut_entries<'a>(
     }
     let (family, offset) = table.data_values().ok_or(RnsBggError::Lut)?;
     let family = data.get(&family).ok_or(RnsBggError::Binding("Program data is not bound"))?;
-    Ok(LutEntries::Graph(
-        (0..table.input_width()).map(|index| family.at(Int::constant(offset + index))).collect(),
-    ))
+    Ok(LutEntries::Graph { family: family.clone(), offset, width: table.input_width() })
 }
 
-/// The output values a LUT branch coefficient is built from: constants, or graph integers.
+/// The output values a LUT branch coefficient is built from: constants, or the `width` members
+/// of a Program data family from `offset` on, which a coefficient reads in a loop.
 #[derive(Clone)]
 pub(crate) enum LutEntries<'a> {
     Constant(&'a [usize]),
-    Graph(Vec<Int>),
+    Graph { family: Family<Int>, offset: usize, width: usize },
 }
 
 impl<'a> From<&'a [usize]> for LutEntries<'a> {
@@ -90,7 +89,7 @@ impl LutEntries<'_> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Constant(values) => values.len(),
-            Self::Graph(values) => values.len(),
+            Self::Graph { width, .. } => *width,
         }
     }
 }

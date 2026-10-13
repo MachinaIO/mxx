@@ -339,6 +339,109 @@ pub struct ScopeProofShape {
     pub constraint_count: usize,
 }
 
+/// The fewest digits of a decimal literal that [`abbreviate_long_literals`] names.
+const LONG_LITERAL_DIGITS: usize = 64;
+
+/// The matrix type constructor whose concrete instances [`abbreviate_long_literals`] names.
+const EXACT_MATRIX: &str = "Mxx.Primitives.ExactMatrix ";
+
+/// `source` with repeated constants after byte `at` replaced by local notations declared at
+/// `at`, in order of first use: every decimal literal of at least [`LONG_LITERAL_DIGITS`] digits
+/// by `mxxNat<k>`, then every matrix type `Mxx.Primitives.ExactMatrix q n r c` whose four
+/// arguments are single tokens by `mxxMat<k>`. Moduli recur in every matrix type and matrix types
+/// in every binder, so naming them keeps a module linear in its size; a notation expands to the
+/// same term, so the elaborated terms are unchanged.
+fn abbreviate_long_literals(source: &str, at: usize) -> String {
+    let (head, body) = source.split_at(at);
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    // The long literals.
+    let bytes = body.as_bytes();
+    let mut literals = Vec::<&str>::new();
+    let mut lookup = BTreeMap::<&str, usize>::new();
+    let mut named = String::with_capacity(body.len());
+    let (mut position, mut copied) = (0, 0);
+    while position < bytes.len() {
+        if !bytes[position].is_ascii_digit() {
+            position += 1;
+            continue;
+        }
+        let start = position;
+        while position < bytes.len() && bytes[position].is_ascii_digit() {
+            position += 1;
+        }
+        if position - start < LONG_LITERAL_DIGITS ||
+            (start > 0 && word(bytes[start - 1])) ||
+            (position < bytes.len() && word(bytes[position]))
+        {
+            continue;
+        }
+        let literal = &body[start..position];
+        let index = *lookup.entry(literal).or_insert_with(|| {
+            literals.push(literal);
+            literals.len() - 1
+        });
+        named.push_str(&body[copied..start]);
+        named.push_str(&format!("mxxNat{index}"));
+        copied = position;
+    }
+    named.push_str(&body[copied..]);
+    // The concrete matrix types.
+    let mut types = Vec::<String>::new();
+    let mut type_lookup = BTreeMap::<String, usize>::new();
+    let mut rewritten = String::with_capacity(named.len());
+    let mut rest = named.as_str();
+    while let Some(found) = rest.find(EXACT_MATRIX) {
+        let (before, from) = rest.split_at(found);
+        rewritten.push_str(before);
+        let arguments = &from[EXACT_MATRIX.len()..];
+        let mut end = 0;
+        let mut tokens = 0;
+        let argument_bytes = arguments.as_bytes();
+        while tokens < 4 {
+            let start = end;
+            while end < argument_bytes.len() && word(argument_bytes[end]) {
+                end += 1;
+            }
+            if end == start {
+                break;
+            }
+            tokens += 1;
+            if tokens < 4 {
+                if argument_bytes.get(end) != Some(&b' ') {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        if tokens == 4 && !argument_bytes.get(end).is_some_and(|byte| word(*byte)) {
+            let ty = &from[..EXACT_MATRIX.len() + end];
+            let index = *type_lookup.entry(ty.to_owned()).or_insert_with(|| {
+                types.push(ty.to_owned());
+                types.len() - 1
+            });
+            rewritten.push_str(&format!("mxxMat{index}"));
+            rest = &from[EXACT_MATRIX.len() + end..];
+        } else {
+            rewritten.push_str(EXACT_MATRIX);
+            rest = arguments;
+        }
+    }
+    rewritten.push_str(rest);
+    let declarations = literals
+        .iter()
+        .enumerate()
+        .map(|(index, literal)| format!("local notation \"mxxNat{index}\" => {literal}\n"))
+        .chain(
+            types
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| format!("local notation \"mxxMat{index}\" => {ty}\n")),
+        )
+        .collect::<String>();
+    let separator = if declarations.is_empty() { "" } else { "\n" };
+    format!("{head}{declarations}{separator}{rewritten}")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeanArtifact {
     pub backend_layouts: Vec<BackendLayout>,
@@ -928,6 +1031,7 @@ impl<'a> Emitter<'a> {
             ));
         }
         self.source.insert_str(tables_at, &tables);
+        self.source = abbreviate_long_literals(&self.source, tables_at);
         self.source.push_str("\nend ");
         self.source.push_str(&self.options.namespace);
         self.source.push('\n');
@@ -1063,10 +1167,13 @@ impl<'a> Emitter<'a> {
             backend_layouts: std::mem::take(&mut self.layouts).into_values().collect(),
             module_name: self.options.module_name.clone(),
             facts_source: self.options.facts.then(|| {
-                format!(
-                    "import {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nset_option linter.unusedVariables false\n\nnoncomputable section\n\nnamespace {}\n\n{}end {}\n\nend\n",
-                    self.options.module_name, self.options.namespace, self.facts, self.options.namespace
-                )
+                let header = format!(
+                    "import {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nset_option linter.unusedVariables false\n\nnoncomputable section\n\nnamespace {}\n\n",
+                    self.options.module_name, self.options.namespace
+                );
+                let source =
+                    format!("{header}{}end {}\n\nend\n", self.facts, self.options.namespace);
+                abbreviate_long_literals(&source, header.len())
             }),
             source: self.source,
             source_map: self.source_map,
@@ -2418,7 +2525,7 @@ impl<'a> Emitter<'a> {
                 self.bind_existential(&decoded, &self.output_type(scope, node_id, 0));
                 relations.push(format!("({}) = {count}", env.expr(length)));
                 relations.push(format!(
-                    "∀ k : Fin {count}, {} ({}) ({}) (k.val : Int) {} ({decoded} k)",
+                    "(∀ k : Fin {count}, {} ({}) ({}) (k.val : Int) {} ({decoded} k))",
                     self.options.primitives.threshold_decode,
                     env.expr(plaintext_modulus),
                     env.expr(length),
@@ -4010,7 +4117,9 @@ mod tests {
         for (index, value) in values.iter().enumerate() {
             assert_eq!(&((&table >> (width as usize * index)) & &mask), value);
         }
-        assert!(artifact.source.contains(&format!("def generatedRoot.table_0 : Nat := {table}")));
+        // The table literal is long enough to be named (see `abbreviate_long_literals`).
+        assert!(artifact.source.contains(&format!("local notation \"mxxNat0\" => {table}")));
+        assert!(artifact.source.contains("def generatedRoot.table_0 : Nat := mxxNat0"));
         assert!(
             artifact.source.contains(&format!(
                 "MxxRuntime.packedPolynomial {width} 128 generatedRoot.table_0"

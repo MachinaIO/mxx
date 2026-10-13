@@ -1215,28 +1215,29 @@ impl EncodingLowering<'_> {
                 Some((_, None)) => Err(RnsBggError::Binding("LUT branch keys are missing")),
                 None => Ok((block(&rows[0], branch.clone()), block(&rows[1], branch))),
             };
-            // The parents of the next depth, switched one by one with their keys.
-            let mut switched_rows = Vec::with_capacity(depth.internal);
-            let mut switched_keys = Vec::with_capacity(depth.internal);
-            for position in 0..depth.internal {
-                let index = IntExpr::constant(position);
-                let pre_key = product_key(index.clone())?;
-                let (row, key) = self.automorphism_branch(
-                    level,
-                    &parent_row(index.clone()),
-                    &switch(switches, index.clone())?,
-                    &|| block(companion_row, index.clone()),
-                    &|| pre_key.clone(),
-                    true,
-                )?;
-                switched_rows.push(row);
-                switched_keys.push((split(&key[0]), split(&key[1])));
-            }
+            // The parents of the next depth, switched with their keys in one
+            // parallel loop.
             let switched = (depth.internal > 0)
                 .then(|| {
+                    let pairs = mxx_dsl::parallel(depth.internal, |position| {
+                        let index = position.expression()?;
+                        let pre_key = product_key(index.clone()).map_err(schema)?;
+                        let (row, key) = self
+                            .automorphism_branch(
+                                level,
+                                &parent_row(index.clone()),
+                                &switch(switches, index.clone()).map_err(schema)?,
+                                &|| block(companion_row, index.clone()),
+                                &|| pre_key.clone(),
+                                true,
+                            )
+                            .map_err(schema)?;
+                        Ok((row, (split(&key[0]), split(&key[1]))))
+                    })
+                    .map_err(graph)?;
                     Ok::<_, RnsBggError>((
-                        Family::pack(switched_rows).map_err(graph)?,
-                        Family::pack(switched_keys).map_err(graph)?,
+                        pairs.field(|(row, _)| row).map_err(graph)?,
+                        pairs.field(|(_, key)| key).map_err(graph)?,
                     ))
                 })
                 .transpose()?;

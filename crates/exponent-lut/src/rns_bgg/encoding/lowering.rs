@@ -336,56 +336,68 @@ impl EncodingLowering<'_> {
             mxx_backends::utils::mod_inverse_biguints(&(BigUint::from(width) % &modulus), &modulus)
                 .ok_or(RnsBggError::Lut)?;
         let sigma = sigma.into();
-        // The output monomial of entry `index`: the constant `v` or `X^(v stride)`.
-        let output_term = |index: usize| -> Result<Mat, RnsBggError> {
-            Ok(match (&values, representation) {
-                (
-                    LutEntries::Constant(values),
-                    crate::program::LutOutputRepresentation::Coefficient,
-                ) => ring.polynomial([IntExpr::constant(BigInt::from(values[index]))]),
-                (
-                    LutEntries::Constant(values),
-                    crate::program::LutOutputRepresentation::Exponent(layout),
-                ) => layout
-                    .mono(&ring, &BigInt::from(values[index]))
-                    .map_err(|_| RnsBggError::Lut)?,
-                (
-                    LutEntries::Graph(values),
-                    crate::program::LutOutputRepresentation::Coefficient,
-                ) => values[index].clone().lift_to_constant_polynomial(ring.matrix_type((1, 1))),
-                (
-                    LutEntries::Graph(values),
-                    crate::program::LutOutputRepresentation::Exponent(layout),
-                ) => {
-                    // `multiply_monomial` reduces the exponent modulo `2n` as `mono` does.
-                    ring.identity(1).multiply_monomial(
-                        values[index].clone().mul(Int::constant(layout.stride() as i64)),
-                    )
+        let inverse = ring.polynomial([IntExpr::constant(BigInt::from(inverse))]);
+        let (family, offset) = match &values {
+            LutEntries::Constant(values) => {
+                // The output monomial of entry `index`: the constant `v` or `X^(v stride)`.
+                let output_term = |index: usize| -> Result<Mat, RnsBggError> {
+                    Ok(match representation {
+                        crate::program::LutOutputRepresentation::Coefficient => {
+                            ring.polynomial([IntExpr::constant(BigInt::from(values[index]))])
+                        }
+                        crate::program::LutOutputRepresentation::Exponent(layout) => layout
+                            .mono(&ring, &BigInt::from(values[index]))
+                            .map_err(|_| RnsBggError::Lut)?,
+                    })
+                };
+                let mut terms = (0..width)
+                    .map(|index| {
+                        let left = output_term(index)?;
+                        let right = input_layout
+                            .mono(&ring, &-BigInt::from(index))
+                            .map_err(|_| RnsBggError::Lut)?
+                            .ring_automorphism(sigma.clone());
+                        Ok(left * right)
+                    })
+                    .collect::<Result<Vec<_>, RnsBggError>>()?;
+                while terms.len() > 1 {
+                    let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+                    let mut iterator = terms.into_iter();
+                    while let Some(left) = iterator.next() {
+                        next.push(match iterator.next() {
+                            Some(right) => left + right,
+                            None => left,
+                        });
+                    }
+                    terms = next;
                 }
-            })
-        };
-        let mut terms = (0..width)
-            .map(|index| {
-                let left = output_term(index)?;
-                let right = input_layout
-                    .mono(&ring, &-BigInt::from(index))
-                    .map_err(|_| RnsBggError::Lut)?
-                    .ring_automorphism(sigma.clone());
-                Ok(left * right)
-            })
-            .collect::<Result<Vec<_>, RnsBggError>>()?;
-        while terms.len() > 1 {
-            let mut next = Vec::with_capacity(terms.len().div_ceil(2));
-            let mut iterator = terms.into_iter();
-            while let Some(left) = iterator.next() {
-                next.push(match iterator.next() {
-                    Some(right) => left + right,
-                    None => left,
-                });
+                return Ok(inverse * terms.pop().unwrap());
             }
-            terms = next;
-        }
-        Ok(ring.polynomial([IntExpr::constant(BigInt::from(inverse))]) * terms.pop().unwrap())
+            LutEntries::Graph { family, offset, .. } => (family, *offset),
+        };
+        // Data entries: one loop over the table, whose entry `index` contributes
+        // `out(index) sigma(X^(stride (2n - index)))`; `multiply_monomial` reduces its exponent
+        // modulo `2n` as `mono` does.
+        let doubled = 2 * parameters.level(level)?.ring_dimension() as i64;
+        let stride = input_layout.stride() as i64;
+        let sum = mxx_dsl::iterate(IntExpr::constant(width), ring.zero((1, 1)), |index, sum| {
+            let value = family.at(Int::constant(offset as i64) + index.clone());
+            let left = match representation {
+                crate::program::LutOutputRepresentation::Coefficient => {
+                    value.lift_to_constant_polynomial(ring.matrix_type((1, 1)))
+                }
+                crate::program::LutOutputRepresentation::Exponent(layout) => ring
+                    .identity(1)
+                    .multiply_monomial(value.mul(Int::constant(layout.stride() as i64))),
+            };
+            let right = ring
+                .identity(1)
+                .multiply_monomial((Int::constant(doubled) - index) * Int::constant(stride))
+                .ring_automorphism(sigma.clone());
+            Ok(sum + left * right)
+        })
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        Ok(inverse * sum)
     }
 
     /// Evaluate a public LUT payload with the same Walsh/automorphism

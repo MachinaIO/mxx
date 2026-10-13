@@ -29,6 +29,7 @@
 //! | Variable (`MXX_PE_ROUND_TRIP_` prefix) | Default | Meaning |
 //! | --- | --- | --- |
 //! | `LEAN_EXPORT` | unset | Export the Lean correctness claim to `lean/<value>/generated` |
+//! | `EXPORT_ONLY` | 0 | With `LEAN_EXPORT`, 1 builds and validates the authorized workflow's graphs without executing them (only the payload secret is sampled, on the CPU) and exports the claim; no GPU is needed |
 //! | `ATTRIBUTE_LENGTH`, `ALPHABET_SIZE`, `STATE_WIDTH`, `MAX_STEPS` | 1, 2, 1, 1 | The class |
 //! | `MIN_LOG_RING_DIMENSION`, `MAX_LOG_RING_DIMENSION` | 12, 15 | Ring-dimension candidates |
 //! | `MAX_CRT_DEPTH` | 12 | CRT-depth candidates `1..=` |
@@ -178,12 +179,12 @@ struct Recorded {
 }
 
 /// An execution that records every graph it runs, in order.
-struct Recording<'a> {
-    inner: &'a mut GpuRuntime,
+struct Recording<'a, E> {
+    inner: &'a mut E,
     graphs: Vec<Recorded>,
 }
 
-impl<S: SessionStore + Send> StageExecution<S> for Recording<'_> {
+impl<S: SessionStore + Send, E: StageExecution<S>> StageExecution<S> for Recording<'_, E> {
     fn produce(
         &mut self,
         validated: ValidatedGraph,
@@ -216,6 +217,61 @@ impl<S: SessionStore + Send> StageExecution<S> for Recording<'_> {
 
     fn download_integers(&self, value: &RuntimeValue) -> Result<Vec<BigInt>, ApiError> {
         StageExecution::<S>::download_integers(&*self.inner, value)
+    }
+}
+
+/// `EXPORT_ONLY=1`: build and export the claim without executing the workflow.
+fn export_only() -> bool {
+    env::var(variable("EXPORT_ONLY")).is_ok_and(|value| value == "1")
+}
+
+/// An execution that runs only the payload secret's sampling, on the CPU. Every other graph is
+/// validated by its caller and not executed: a producing stage returns the production its
+/// execution would have (which depends only on the validated graph and the nonce), and an
+/// evaluated stage returns the integer `0` for each of its outputs, so the stages after it can
+/// build their graphs.
+struct GraphOnly(mxx_backends::authority::CpuExecution);
+
+impl StageExecution<StageStore> for GraphOnly {
+    fn produce(
+        &mut self,
+        validated: ValidatedGraph,
+        _: BTreeMap<String, RuntimeValue>,
+        _: &mut StageStore,
+        execution_nonce: [u8; 32],
+    ) -> Result<ProductionId, ApiError> {
+        let specification =
+            mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
+                .expect("stage specification hash");
+        Ok(mxx_ir_core::artifact::production_id(specification, execution_nonce))
+    }
+
+    fn evaluate(
+        &mut self,
+        validated: ValidatedGraph,
+        inputs: BTreeMap<String, RuntimeValue>,
+        store: &mut StageStore,
+        execution_nonce: [u8; 32],
+    ) -> Result<StageOutputs, ApiError> {
+        if validated.source.name() == "rns-bgg-secret" {
+            return self.0.evaluate(validated, inputs, store, execution_nonce);
+        }
+        Ok(StageOutputs {
+            outputs: validated
+                .source
+                .outputs()
+                .keys()
+                .map(|name| (name.clone(), RuntimeValue::Int(BigInt::from(0))))
+                .collect(),
+        })
+    }
+
+    fn download_matrix(&self, value: &RuntimeValue) -> Result<DCRTPolyMatrix, ApiError> {
+        StageExecution::<StageStore>::download_matrix(&self.0, value)
+    }
+
+    fn download_integers(&self, value: &RuntimeValue) -> Result<Vec<BigInt>, ApiError> {
+        StageExecution::<StageStore>::download_integers(&self.0, value)
     }
 }
 
@@ -349,23 +405,27 @@ fn pe_protocol(
     let family = requirement.int_family_input("exponents", attributes);
     let read_family = requirement.int_family_input("reads", steps);
     let table_family = requirement.int_family_input("tables", steps * lookup);
-    let mut valid = (0..attributes)
-        .map(|index| (family.at(index) % (width as i64)).equal(Int::constant(0)))
-        .reduce(|left, right| left & right)
-        .expect("a class has an attribute");
-    for step in 0..steps {
-        let bound = if step + 1 == steps { 2 } else { width };
-        for entry in 0..lookup {
-            valid =
-                valid & table_family.at(step * lookup + entry).less(Int::constant(bound as i64));
-        }
-    }
-    let mut current = Int::constant(0);
-    for step in 0..steps {
-        let index = current + family.at(read_family.at(step));
-        current = table_family.at(Int::constant((step * lookup) as i64) + index);
-    }
-    valid = valid & current.equal(Int::constant(0));
+    // Each check is one loop, so the requirement does not grow with the class.
+    let all = |count: usize, check: &dyn Fn(Int) -> mxx_dsl::Bool| {
+        mxx_dsl::iterate(count, mxx_dsl::Bool::constant(true), |index, valid| {
+            Ok(valid & check(index))
+        })
+        .unwrap()
+    };
+    let symbols =
+        all(attributes, &|index| (family.at(index) % (width as i64)).equal(Int::constant(0)));
+    let intermediate = all((steps - 1) * lookup, &|entry| {
+        table_family.at(entry).less(Int::constant(width as i64))
+    });
+    let last = all(lookup, &|entry| {
+        table_family.at(Int::constant(((steps - 1) * lookup) as i64) + entry).less(Int::constant(2))
+    });
+    let output = mxx_dsl::iterate(steps, Int::constant(0), |step, current| {
+        let index = current + family.at(read_family.at(step.clone()));
+        Ok(table_family.at(step * Int::constant(lookup as i64) + index))
+    })
+    .unwrap();
+    let valid = symbols & intermediate & last & output.equal(Int::constant(0));
     let requirement =
         PurePredicateSpec::new(requirement.output("valid", valid).unwrap().build().unwrap().graph)
             .unwrap();
@@ -504,11 +564,12 @@ fn test_gpu_pe_round_trip() {
         count("MAX_STEPS", 1),
     )
     .unwrap();
-    let (graphs, parameters, failure_exponent) = round_trip(class, &program);
+    let (graphs, parameters, failure_exponent) =
+        if export_only() { export_graphs(class, &program) } else { round_trip(class, &program) };
     if let Ok(id) = env::var(variable("LEAN_EXPORT")) {
         let directory = lean_directory().join(&id).join("generated");
         let protocol = pe_protocol(graphs, &parameters, failure_exponent);
-        mxx_ir_core::lean::protocol::export(&protocol, &directory, false).expect("PE claim export");
+        mxx_ir_core::lean::protocol::export(&protocol, &directory, true).expect("PE claim export");
         eprintln!("exported the PE correctness claim to {}", directory.display());
     }
 }
@@ -602,4 +663,63 @@ fn round_trip(
     eprintln!("decryption (F(x) = 1): {:?}", stage.elapsed());
     report_device_bytes(&store);
     (graphs, parameters, failure_exponent)
+}
+
+/// [`round_trip`]'s authorized workflow as graphs only (see [`GraphOnly`]): the parameter search,
+/// then setup, the encryption of a random attribute, and key generation and decryption for an
+/// authorized program, none of them executed. The decryption of the placeholder outputs fails
+/// after its graph is recorded.
+fn export_graphs(
+    class: PeClass,
+    program: &dyn Fn(PeClass, &[usize], usize) -> BranchingProgram,
+) -> (Vec<Recorded>, PeParameters, Option<u32>) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+    assert!(
+        env::var(variable("LEAN_EXPORT")).is_ok(),
+        "{} needs {}",
+        variable("EXPORT_ONLY"),
+        variable("LEAN_EXPORT")
+    );
+    let (parameters, report) = search(class);
+    let failure_exponent = report.average.as_ref().map(|(exponent, ..)| *exponent);
+    assert!(report.decrypts(), "the accepted parameters must guarantee correctness");
+    let level = parameters.level();
+    eprintln!(
+        "accepted PE parameters: n = {}, CRT {} x {} bits, base 2^{}, m_B = {}, W = {}, T_max = {}; \
+         log2 E_F = {}, log2 E_PE = {}",
+        level.ring_dimension(),
+        level.to_crt().0.len(),
+        level.crt_bits(),
+        level.base_bits(),
+        parameters.anchor_columns(),
+        class.lookup_width(),
+        class.max_steps(),
+        report.evaluation.bits(),
+        report.decryption.bits(),
+    );
+    let directory = tempfile::tempdir().expect("artifact directory");
+    let mut store = StageStorage::File(directory.path().into()).open().expect("stage storage");
+    let mut graph_only = GraphOnly(mxx_backends::authority::CpuExecution::new(
+        mxx_backends::backend::poly::cpu_backend(parameters.rings().unwrap()),
+    ));
+    let mut execution = Recording { inner: &mut graph_only, graphs: Vec::new() };
+    let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+    let attribute = (0..class.attribute_length())
+        .map(|_| rand::random::<u32>() as usize % class.alphabet_size())
+        .collect::<Vec<_>>();
+    let message = (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+    let ciphertext =
+        encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+    let authorized = program(class, &attribute, 0);
+    let key = keygen(&public_key, &master, &authorized, &mut execution, &mut store).unwrap();
+    assert!(
+        decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).is_err(),
+        "the export-only decryption graph is not executed"
+    );
+    (std::mem::take(&mut execution.graphs), parameters, failure_exponent)
 }

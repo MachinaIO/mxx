@@ -636,7 +636,6 @@ struct Setup {
     keys: Keys,
     reference_chain: RnsBggParameters,
     all_chains: Vec<Chains>,
-    sigma: BigDecimal,
     trapdoor_sigma: BigDecimal,
 }
 
@@ -694,7 +693,7 @@ fn setup(row: Option<&ParameterRow>) -> Setup {
         top.chains(),
         reference.columns()
     );
-    Setup { source, input, top, keys, reference_chain, all_chains, sigma, trapdoor_sigma }
+    Setup { source, input, top, keys, reference_chain, all_chains, trapdoor_sigma }
 }
 
 /// Every part's stages on `runtime`, the decode stage, and, for a recorded set, the export of

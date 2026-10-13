@@ -20,7 +20,7 @@ use mxx_dsl::{Family, GraphValue, Int};
 use mxx_ir_core::{ParamEnv, Rational, RealExpr};
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
-use std::{collections::BTreeMap, env, error::Error, fmt};
+use std::{collections::BTreeMap, env, error::Error, fmt, process::Command};
 
 /// Read an optional unsigned environment setting without accepting malformed values.
 pub fn env_usize(name: &str, default: usize) -> Result<usize, String> {
@@ -119,6 +119,54 @@ pub fn ring_dimension_candidates(
                 .map_err(|_| format!("ring dimension 2^{log} does not fit in u32"))
         })
         .collect()
+}
+
+/// Obtain one positive integer estimate from `lattice-estimator-cli` for the
+/// output of a refresh to the top level ([`crate::refresh::top`]): RLWE in
+/// dimension `ring_dimension` over `modulus` with a binary secret and a
+/// CBD(`eta`) error, given `samples` published coefficient equations (the
+/// estimator's LWE model, ignoring the ring structure as the other gates do).
+pub fn top_refresh_output_security_bits(
+    ring_dimension: u32,
+    modulus: &BigUint,
+    eta: u32,
+    samples: u64,
+) -> Result<u64, String> {
+    if ring_dimension == 0 || modulus.is_zero() || eta == 0 || samples == 0 {
+        return Err("top refresh output parameters must be positive".to_owned());
+    }
+    let output = Command::new("lattice-estimator-cli")
+        .arg(ring_dimension.to_string())
+        .arg(modulus.to_string())
+        .arg("--s-dist")
+        .arg(r#"{"name":"Binary"}"#)
+        .arg("--e-dist")
+        .arg(format!(r#"{{"name":"CenteredBinomial","eta":{eta}}}"#))
+        .arg("--m")
+        .arg(samples.to_string())
+        .output()
+        .map_err(|error| format!("failed to start lattice-estimator-cli: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "lattice-estimator-cli failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let bits = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| "lattice-estimator-cli returned no security estimate".to_owned())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| {
+            format!("lattice-estimator-cli returned a non-integer security estimate: {error}")
+        })?;
+    if bits == 0 {
+        return Err("lattice-estimator-cli returned a non-positive security estimate".to_owned());
+    }
+    Ok(bits)
 }
 
 /// Audit one exact CRT-depth candidate using the same workload and noise path

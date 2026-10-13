@@ -65,6 +65,7 @@ programs adjusted to it, and exports the claim to `<parameter id>/generated`.
 | `average-w2-n8192-crt5x30` | The same class, `n = 2^13`, five 30-bit primes (`Q ≈ 2^150`), 15-bit digits, 160/166-bit security, failure `2^-128` | `average-w2-n8192-crt5x30/PeCertificate.lean` |
 | `average-w2-n8192-crt4x42` | The same class, `n = 2^13`, four 42-bit primes (`Q ≈ 2^168`), 21-bit digits, 137/141-bit security, failure `2^-128` | `average-w2-n8192-crt4x42/PeCertificate.lean` |
 | `average-w2-n32768-crt6x30-compact` | The same class with compact fresh encodings, `n = 2^15`, six 30-bit primes (`Q ≈ 2^180`, `P ≈ 2^180`), 15-bit digits, 318-bit encryption security at `PQ` (the trapdoor estimate saturates at `u32::MAX`), failure `2^-128` | `average-w2-n32768-crt6x30-compact/PeCertificate.lean` |
+| `average-w128-n65536-crt22x32-compact` | The four-digit decimal range class `PeClass::decimal_range(4)` (`(4, 16, 8, 4)`, `W = 128`), which the time window predicate of `test_gpu_pe_time_window` also uses; `n = 2^16`, 22 32-bit primes (`Q ≈ 2^704`, `P ≈ 2^704`), 16-bit digits, LUT radix 16, statistical TrapGen (`m_B = 501`), compact encodings, 128-bit encryption security at `PQ`, failure `2^-128`. Every run meeting the requirement decrypts correctly (the worst-case phase error is below `Q / 4`), so the bad set is empty | `average-w128-n65536-crt22x32-compact/PeCertificate.lean` (written by hand and by the `gen_*.py` scripts of the row, not by `generator/gen.py`) |
 
 ## The claim
 
@@ -175,6 +176,7 @@ MXX_PE_ROUND_TRIP_MIN_LOG_RING_DIMENSION=13 MXX_PE_ROUND_TRIP_MAX_LOG_RING_DIMEN
 | --- | --- |
 | `average-w2-n8192-crt4x42` | `CRT_BITS=42`, `BASE_BITS=21` |
 | `average-w2-n32768-crt6x30-compact` | `MIN_LOG_RING_DIMENSION=15`, `MAX_LOG_RING_DIMENSION=15`, `COMPACT_ENCODINGS=1` |
+| `average-w128-n65536-crt22x32-compact` | `ATTRIBUTE_LENGTH=4`, `ALPHABET_SIZE=16`, `STATE_WIDTH=8`, `MAX_STEPS=4`, `MIN_LOG_RING_DIMENSION=15`, `MAX_LOG_RING_DIMENSION=16`, `CRT_BITS=32`, `BASE_BITS=16`, `MAX_CRT_DEPTH=40`, `LUT_RADIX=16`, `COMPACT_ENCODINGS=1`, no `TRAPDOOR_INSTANTIATION` (statistical), `EXPORT_ONLY=1`; `test_gpu_pe_time_window` exports the same claim (`-- test_gpu_pe_time_window`) |
 
 Write and check the proof of the exported claim:
 

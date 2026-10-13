@@ -8,19 +8,19 @@ def moduli0 : List Nat := [4293918721, 4291952641, 4289462273, 4288806913, 42867
 def layout0 : MxxRuntime.RegularLayout 78079523927896127712009307999974412043135143141543941570119110821624764686494582648421232630165133436275519032254680972082541026053657846674805178959586229420520814546267827301225593318349477307602951695899164673 :=
   { crtModuli := moduli0
     droppedModuli := 0
-    dropped_lt := by decide
-    crtModuli_nonempty := by decide
-    modulus_pos := by decide
-    pairwise_coprime := by unfold Pairwise; decide
-    product_eq := by decide
+    dropped_lt := by decide +kernel
+    crtModuli_nonempty := by decide +kernel
+    modulus_pos := by decide +kernel
+    pairwise_coprime := by unfold Pairwise; decide +kernel
+    product_eq := by decide +kernel
     baseBits := 16
     base := 65536
     base_eq := by norm_num
     base_gt_one := by norm_num
-    base_even := by decide
+    base_even := by decide +kernel
     digitsPerTower := 2
     digits_pos := by norm_num
-    capacity := by decide }
+    capacity := by decide +kernel }
 
 def backend : MxxRuntime.BackendContext where
   regularLayout q n :=

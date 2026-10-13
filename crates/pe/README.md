@@ -152,6 +152,26 @@ environment:
 cargo test -r -p mxx-pe --features gpu --test gpu_round_trip
 ```
 
+`test_gpu_pe_time_window` in the same file runs the time window predicate of the paper's
+evaluation: `BranchingProgram::time_window` accepts the `HHMM` times matching
+`([01][0-9]|2[0-3])[0-5][0-9]` inside a window, over `PeClass::decimal_range(4)` (`W = 128`,
+`T = 4`). It generates one key for `[0900, 1759]` and decrypts one encryption for each test
+vector of the specification (three accepted times and six rejected ones). Like the round trip,
+it exports the Lean claim with `MXX_PE_ROUND_TRIP_LEAN_EXPORT` (from its authorized workflow:
+setup, the window's key, and the first vector, `0900`), and with `MXX_PE_ROUND_TRIP_EXPORT_ONLY=1`
+builds the graphs without a GPU. The class needs
+`n = 2^16`; with the parameters of the Lean row `average-w128-n65536-crt22x32-compact`, one
+ciphertext has about 2.1 TiB of compact digit companions, so it needs `file` storage on a
+volume of that size:
+
+```bash
+MXX_PE_ROUND_TRIP_MIN_LOG_RING_DIMENSION=16 MXX_PE_ROUND_TRIP_MAX_LOG_RING_DIMENSION=16 \
+MXX_PE_ROUND_TRIP_CRT_BITS=32 MXX_PE_ROUND_TRIP_BASE_BITS=16 MXX_PE_ROUND_TRIP_MAX_CRT_DEPTH=22 \
+MXX_PE_ROUND_TRIP_LUT_RADIX=16 MXX_PE_ROUND_TRIP_NOISE_MODEL=average \
+MXX_PE_ROUND_TRIP_STORAGE=file:<directory> \
+cargo test -r -p mxx-pe --features gpu --test gpu_round_trip -- test_gpu_pe_time_window
+```
+
 ## Lean proofs
 
 [`lean/`](lean/README.md) proves, in Lean, the correctness claim that the integration test exports

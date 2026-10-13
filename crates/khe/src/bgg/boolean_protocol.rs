@@ -171,7 +171,23 @@ fn encrypt_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
 /// Inputs `one`, `encodings`, `public_hash_key`, `input_bits`, and the circuit families; outputs
 /// `vector = c D` and `public_key = A D` of the selected output slot.
 fn evaluate_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
-    let (context, params) = context("boolean-bgg-evaluate");
+    evaluation(parameters, "boolean-bgg-evaluate", true)
+}
+
+/// The `evaluate` graph without its final decomposition: it outputs the output slot's encoding
+/// `c` and public matrix `A` as the layers leave them, before `D = G^(-1)(floor(q / 2) e_2)`. It is
+/// not a protocol stage; cost accounting uses it for the circuit evaluation alone.
+pub fn evaluate_layers_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
+    evaluation(parameters, "boolean-bgg-evaluate-layers", false)
+}
+
+/// The circuit evaluation of `evaluate`, with the final decomposition when `decompose`.
+fn evaluation(
+    parameters: &BooleanBggProtocolParameters,
+    name: &str,
+    decompose: bool,
+) -> BuiltGraph {
+    let (context, params) = context(name);
     let width = params.max_layer_width.clone();
     let circuit = BooleanCircuitFamilyInputs::protocol_inputs(&context, &params);
     let ring = &parameters.ring;
@@ -205,6 +221,15 @@ fn evaluate_graph(parameters: &BooleanBggProtocolParameters) -> BuiltGraph {
     )
     .unwrap();
     let output = layers.at(circuit.output_source());
+    if !decompose {
+        return context
+            .output("vector", output.vector)
+            .unwrap()
+            .output("public_key", output.public_key)
+            .unwrap()
+            .build()
+            .unwrap();
+    }
     // D = G^(-1)(floor(q / 2) e_2), so that s G D = floor(q / 2) for s = (s_bar, 1).
     let target = Mat::concat(
         ConcatAxis::Rows,

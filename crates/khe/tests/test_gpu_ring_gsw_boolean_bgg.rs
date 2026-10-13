@@ -14,8 +14,11 @@
 //! (`mxx_khe::noise_simulate`) and selects the smallest ring dimension and CRT depth that decode
 //! and whose Ring-LWE estimate (`lattice-estimator-cli`, which must be on `PATH` with its Sage
 //! environment) reaches the security target, printing the selection as a parameter row and the
-//! GPU work one evaluation of the row would issue, predicted from the evaluate graph without a
-//! device (`mxx_backends::gpu_cost_model`, one `RING_GSW_BGG_GPU_COUNT` line per counter), and the
+//! GPU work of one decryption of the row, predicted without a device from the evaluate graph (which
+//! ends with the decomposition `G^(-1)(floor(q / 2) e_2)`) and the decrypt graph (the rounding)
+//! (`mxx_backends::gpu_cost_model`: one `RING_GSW_BGG_GPU_COUNT stage=..` line per graph, then one
+//! line per counter of their sum, whose `mul64_instructions` and `gadget_decomposed_words` are the
+//! "Mul" and "Decomp." of decryption), and the
 //! sizes of a `1 x log_base q` public key or ciphertext, a `2 x log_base q` matrix, and a
 //! `(log_base q + 2) x 1` key preimage over that ring (`RING_GSW_BGG_SIZE`), with `log2 q`, the
 //! ring dimension, `C = 2 (log_base q)^2`, and `|1 x log_base q| C` in bits (`RING_GSW_BGG_C`).
@@ -65,7 +68,7 @@ use mxx_khe::{
     },
 };
 use num_bigint::{BigInt, BigUint};
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc};
 
 const PREFIX: &str = "MXX_KHE_RING_GSW_BGG_";
 
@@ -371,8 +374,23 @@ fn test_gpu_ring_gsw_boolean_bgg_parameters() {
     };
     let bindings = circuit_bindings(row.instance_width, row.circuit_depth, row.max_layer_width);
     let graphs = BooleanBggProtocolGraphs::new(&bgg);
-    // The GPU work of one evaluation, predicted from the evaluate graph alone.
-    let counts = gpu_operation_counts(&graphs.evaluate.graph, &bindings, None, 4).unwrap();
+    // The GPU work of decryption, predicted from its graphs: `evaluate`, which ends with the
+    // decomposition `G^(-1)(floor(q / 2) e_2)` and its products, and `decrypt`, the rounding of
+    // `c' - s A'`. The totals are the "Mul" (`mul64_instructions`) and "Decomp."
+    // (`gadget_decomposed_words`) of decryption.
+    let mut counts = BTreeMap::<String, u128>::new();
+    for (stage, graph) in [("evaluate", &graphs.evaluate.graph), ("decrypt", &graphs.decrypt.graph)]
+    {
+        let stage_counts = gpu_operation_counts(graph, &bindings, None, 4).unwrap();
+        println!(
+            "RING_GSW_BGG_GPU_COUNT stage={stage} mul64_instructions={} gadget_decomposed_words={}",
+            stage_counts.get("mul64_instructions").copied().unwrap_or(0),
+            stage_counts.get("gadget_decomposed_words").copied().unwrap_or(0),
+        );
+        for (name, count) in stage_counts {
+            *counts.entry(name).or_default() += count;
+        }
+    }
     for (name, count) in &counts {
         println!("RING_GSW_BGG_GPU_COUNT {name}={count}");
     }

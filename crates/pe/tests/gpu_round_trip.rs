@@ -25,7 +25,8 @@
 //! public evaluation part (`PE_SIZE`, packed at `ceil(log2 q)` bits per coefficient and as
 //! stored), and the GPU work of decryption that `mxx_backends::gpu_cost_model` predicts from the
 //! online evaluation and decoding graphs (`PE_DECRYPT_GPU_COUNT`: `mul64_instructions`, the
-//! weighted 64-bit multiplications, `gadget_decompositions`, and the other counters).
+//! weighted 64-bit multiplications, `gadget_decomposed_words`, the RNS residues decomposed into
+//! gadget digits, and the other counters).
 //!
 //! `test_gpu_pe_time_window` runs the time window predicate of the implementation specification
 //! (`BranchingProgram::time_window` for `[0900, 1759]`, class `PeClass::decimal_range(4)`) on its
@@ -402,7 +403,10 @@ fn stage_of(record: &Recorded) -> &'static str {
 /// encryption productions), the key's secret part (the key generation production, preimages in
 /// small matrix form) and its public evaluation part (the preprocessing production), and the GPU
 /// work of decryption (online evaluation and decoding) that [`gpu_operation_counts`] predicts
-/// from the graphs (`MXX_GPU_NTT_RADIX`, 4 by default, one wave per parallel loop).
+/// from the graphs (`MXX_GPU_NTT_RADIX`, 4 by default, one wave per parallel loop). The totals of
+/// `mul64_instructions` and `gadget_decomposed_words` (the 64-bit RNS residues decomposed into
+/// gadget digits: decomposed ring elements times `n` times the RNS primes the decomposition
+/// keeps) are the "Mul" and "Decomp." of decryption.
 fn report_measurements(graphs: &[Recorded]) {
     for (object, stages) in [
         ("public_key", &["setup_public"][..]),
@@ -429,9 +433,11 @@ fn report_measurements(graphs: &[Recorded]) {
         let counts = gpu_operation_counts(&record.graph, &record.bindings, None, radix)
             .unwrap_or_else(|error| panic!("GPU counts of {}: {error}", record.graph.name()));
         eprintln!(
-            "PE_DECRYPT_GPU_COUNT stage={} mul64_instructions={} gadget_decompositions={}",
+            "PE_DECRYPT_GPU_COUNT stage={} mul64_instructions={} gadget_decomposed_words={} \
+             gadget_decompositions={}",
             stage_of(record),
             counts.get("mul64_instructions").copied().unwrap_or(0),
+            counts.get("gadget_decomposed_words").copied().unwrap_or(0),
             counts.get("gadget_decompositions").copied().unwrap_or(0),
         );
         for (name, count) in counts {

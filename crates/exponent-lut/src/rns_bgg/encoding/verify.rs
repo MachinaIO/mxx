@@ -316,117 +316,6 @@ where
     Ok(value)
 }
 
-/// The error `e' = y - (s A' - Delta mu G_Q)` of the refreshed row `y`
-/// (output `refresh` of an [`crate::api::online_eval`] with
-/// `declaration`'s refresh of `source`) for the target plaintext `expected`
-/// (a signed monomial `c X^k`), under the caller's mask (for Dynamic
-/// parameters, the payload secret): per gadget column of `G_Q`, the `n`
-/// coefficients centered modulo `Q`. `A'` is sampled from `hash_key`, and
-/// `Delta` and `G_Q` are those of the target's level. The graph is the one
-/// check of the workflow: its inputs are the row (`refresh-row`), the mask,
-/// the hash key and the plaintext `refresh-expected.coefficient` and
-/// `refresh-expected.exponent`; its output `refresh-error` is the row error.
-#[allow(clippy::too_many_arguments)]
-pub fn refresh_error<E, S, P>(
-    declaration: &crate::refresh::RefreshDeclaration,
-    source: &ExponentLutProgram,
-    result: &StageOutputs,
-    parameters: &RnsBggParameters,
-    payload: &RnsBggPayloadSecret,
-    mask: Option<&RnsBggMaskSecret>,
-    expected: &P,
-    hash_key: &[u8],
-    execution: &mut E,
-    store: &mut S,
-) -> Result<Vec<Vec<BigInt>>, ApiError>
-where
-    E: StageExecution<S>,
-    S: SessionStore,
-    P: Poly,
-{
-    let level = parameters.refresh_level(declaration, source).map_err(ApiError::scheme)?;
-    let ring = parameters.ring(level).map_err(ApiError::scheme)?;
-    let columns = parameters.level(level).map_err(ApiError::scheme)?.modulus_digits();
-    let mut runtime = BTreeMap::new();
-    runtime.insert(
-        "refresh-row".to_owned(),
-        result
-            .outputs
-            .get("refresh")
-            .ok_or_else(|| ApiError::input("the refreshed row is missing"))?
-            .clone(),
-    );
-    runtime.insert(super::HASH_KEY_INPUT.to_owned(), RuntimeValue::Bytes(hash_key.into()));
-    let expected = match super::plaintext_inputs(
-        &ring,
-        "refresh-expected",
-        &InputBinding::Scalar(expected.clone()),
-        &mut runtime,
-    )
-    .map_err(ApiError::input)?
-    {
-        InputBinding::Scalar(expected) => expected,
-        InputBinding::Family(_) => unreachable!("a scalar plaintext binds a scalar"),
-    };
-    let mask = &stage_mask(parameters, payload, mask)?;
-    let s = reduce_secret(parameters, &mask.row, level).map_err(ApiError::scheme)?;
-    let a_prime = parameters
-        .refresh_matrix(level, ring.bytes_input(super::HASH_KEY_INPUT, hash_key.len()), declaration)
-        .map_err(ApiError::scheme)?;
-    let a_row = |row: usize| {
-        a_prime.clone().slice(
-            Some(mxx_ir_core::node::IndexRange {
-                start: IntExpr::constant(row),
-                end: IntExpr::constant(row + 1),
-            }),
-            None,
-        )
-    };
-    let delta = parameters
-        .scalar(level, parameters.message_scale(level).map_err(ApiError::scheme)?)
-        .map_err(ApiError::scheme)?;
-    let error = ring.input("refresh-row", (1, columns)) -
-        (s.0 * a_row(0) + s.1 * a_row(1) -
-            delta * expected * parameters.public_gadget(level).map_err(ApiError::scheme)?);
-    let graph = DslContext::new("rns-bgg-refresh-error")
-        .output("refresh-error", error)
-        .map_err(ApiError::scheme)?
-        .build()
-        .map_err(ApiError::scheme)?;
-    if let Some(binding) = &mask.binding {
-        binding.bind(&mut runtime);
-    }
-    let runtime = declared_runtime_inputs(&graph, runtime);
-    let outputs = crate::api::execute_graph(
-        StageGraph::new(graph, runtime, BTreeMap::new()),
-        &mxx_ir_core::ParamEnv::default(),
-        execution,
-        store,
-        |_| Ok(()),
-    )?;
-    let error = execution.download_matrix(
-        outputs
-            .outputs
-            .get("refresh-error")
-            .ok_or_else(|| ApiError::input("the refresh error is missing"))?,
-    )?;
-    let modulus =
-        BigInt::from(parameters.level(level).map_err(ApiError::scheme)?.modulus().as_ref().clone());
-    Ok((0..columns)
-        .map(|column| {
-            error
-                .entry(0, column)
-                .coeffs_biguints()
-                .into_iter()
-                .map(|value| {
-                    let value = BigInt::from(value);
-                    if &value * 2u8 > modulus { value - &modulus } else { value }
-                })
-                .collect()
-        })
-        .collect())
-}
-
 /// The polynomial `sum_k v_k X^k` of the integer input family `{name}.coefficients` (one member
 /// per coefficient, centered), whose values `value` are inserted into `runtime`: one node
 /// ([`mxx_dsl::Ring::from_coefficients`]), whatever the ring dimension. Unlike
@@ -465,15 +354,15 @@ fn polynomial_input<P: Poly>(
 
 /// The name of the decode stage's family input of the parts' CRT terms: member `2 chain + j`
 /// is the output `refresh` of part `(chain, j)`.
-pub const TOP_REFRESH_TERMS_INPUT: &str = "top-refresh-terms";
+pub const REFRESH_TERMS_INPUT: &str = "top-refresh-terms";
 
 /// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` (`j = 0, 1`) of the
-/// refresh to the top level, as graph values, and the runtime inputs they read: `y_j` sums, in
+/// refresh, as graph values, and the runtime inputs they read: `y_j` sums, in
 /// one loop over the chains, the members `2 chain + j` of the family input
-/// [`TOP_REFRESH_TERMS_INPUT`] (the parts' CRT terms); see [`top_refresh_error`].
+/// [`REFRESH_TERMS_INPUT`] (the parts' CRT terms); see [`refresh_error`].
 #[allow(clippy::too_many_arguments)]
-fn top_refresh_error_rows<P: Poly>(
-    top: &crate::refresh::top::TopRefreshDeclaration,
+fn refresh_error_rows<P: Poly>(
+    top: &RefreshDeclaration,
     results: Option<&[[&StageOutputs; 2]]>,
     reference: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
@@ -539,13 +428,13 @@ fn top_refresh_error_rows<P: Poly>(
                 columns,
             });
         runtime.insert(
-            TOP_REFRESH_TERMS_INPUT.to_owned(),
+            REFRESH_TERMS_INPUT.to_owned(),
             RuntimeValue::IndexedFamily { element_type, values: values.into() },
         );
     }
     let terms = DslContext::new("top-refresh-terms")
         .input::<mxx_dsl::Family<Mat>>(
-            TOP_REFRESH_TERMS_INPUT,
+            REFRESH_TERMS_INPUT,
             mxx_dsl::FamilyType {
                 element: mxx_dsl::MatType(term_type),
                 count: IntExpr::constant(2 * top.chains()),
@@ -555,7 +444,7 @@ fn top_refresh_error_rows<P: Poly>(
         .map_err(ApiError::scheme)?;
     let rows = [0, 1].map(|component| -> Result<Mat, ApiError> {
         let part =
-            top.part(0, component).ok_or_else(|| ApiError::input("the top refresh has no part"))?;
+            top.part((0, component)).ok_or_else(|| ApiError::input("the refresh has no part"))?;
         let first = terms.at(Int::constant(component as i64));
         let refreshed = match top.chains() {
             1 => first,
@@ -594,18 +483,18 @@ fn top_refresh_error_rows<P: Poly>(
 }
 
 /// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)`
-/// (`j = 0, 1`) of the refresh to the top level `top`: `y_j` recombines the
+/// (`j = 0, 1`) of the refresh `top`: `y_j` recombines the
 /// output `refresh` of every part `(chain, j)` (`results[chain][j]`, the
 /// residue `y_j mod q`) modulo the product `P` of the refreshed primes (`Q_0` when every slot
 /// is refreshed); `sigma = (sigma_0, 1)` with the mask
 /// child's bit polynomial `sigma`, `x = expected`, `r` the payload secret,
 /// and `Delta_0`, `G^st_0` those of the reference chain `reference`
-/// ([`RnsBggParameters::top_refresh_chain`] with `None`). `A'_(j)` is
-/// sampled under the top refresh's matrix namespace of `hash_key`. Per
+/// ([`RnsBggParameters::refresh_chain`] with `None`). `A'_(j)` is
+/// sampled under the refresh's matrix namespace of `hash_key`. Per
 /// column, the `n` coefficients centered modulo `P`.
 #[allow(clippy::too_many_arguments)]
-pub fn top_refresh_error<E, S, P>(
-    top: &crate::refresh::top::TopRefreshDeclaration,
+pub fn refresh_error<E, S, P>(
+    top: &RefreshDeclaration,
     results: &[[&StageOutputs; 2]],
     reference: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
@@ -622,7 +511,7 @@ where
 {
     let columns = top.reference().columns();
     let (rows, runtime) =
-        top_refresh_error_rows(top, Some(results), reference, payload, sigma, expected, hash_key)?;
+        refresh_error_rows(top, Some(results), reference, payload, sigma, expected, hash_key)?;
     let mut graph = DslContext::new("rns-bgg-top-refresh-error");
     for (component, row) in rows.into_iter().enumerate() {
         graph = graph
@@ -645,7 +534,7 @@ where
             outputs
                 .outputs
                 .get(&format!("top-refresh-error-{component}"))
-                .ok_or_else(|| ApiError::input("the top refresh error is missing"))?,
+                .ok_or_else(|| ApiError::input("the refresh error is missing"))?,
         )?;
         *rows = (0..columns)
             .map(|column| {
@@ -692,17 +581,17 @@ fn threshold_ones(
     .map_err(ApiError::scheme)
 }
 
-/// The decode stage of the refresh to the top level: the number of coefficients of the error
-/// rows of [`top_refresh_error`] that threshold-decode to one modulo 2 (an error of at least
+/// The decode stage of the refresh: the number of coefficients of the error
+/// rows of [`refresh_error`] that threshold-decode to one modulo 2 (an error of at least
 /// `P / 4`, `P` the product of the refreshed primes); zero when both rows are level-0 encodings
 /// of `expected` under `sigma` modulo `P` with errors below `P / 4`. Without `results` the graph is
-/// built and observed but not executed (its family input [`TOP_REFRESH_TERMS_INPUT`] is then
+/// built and observed but not executed (its family input [`REFRESH_TERMS_INPUT`] is then
 /// unbound), as the export of its claim needs. The graph decodes in loops over the columns and
 /// coefficients and sums the parts' terms in a loop over the chains, so it does not grow with
 /// the ring dimension, the columns or the refreshed slots.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_top_refresh<E, S, P>(
-    top: &crate::refresh::top::TopRefreshDeclaration,
+pub fn decode_refresh<E, S, P>(
+    top: &RefreshDeclaration,
     results: Option<&[[&StageOutputs; 2]]>,
     reference: &RnsBggParameters,
     payload: &RnsBggPayloadSecret,
@@ -721,7 +610,7 @@ where
     let columns = top.reference().columns();
     let dimension = top.reference().ring_dimension as usize;
     let (rows, runtime) =
-        top_refresh_error_rows(top, results, reference, payload, sigma, expected, hash_key)?;
+        refresh_error_rows(top, results, reference, payload, sigma, expected, hash_key)?;
     let modulus = top.output_primes().into_iter().map(BigUint::from).product::<BigUint>();
     let mut total = Int::constant(0);
     for row in rows {

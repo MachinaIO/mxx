@@ -38,9 +38,9 @@ use crate::{
 
 pub use dynamic::{compact_expansion_bound, expand_compact_entry};
 pub use encoding::{
-    EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineEvalBuild, TOP_REFRESH_TERMS_INPUT, decode_output, decode_public_output,
-    decode_top_refresh, refresh_error, top_refresh_error, verify_output,
+    EncodingLowering, REFRESH_TERMS_INPUT, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret,
+    RnsEncryptBuild, RnsOnlineEvalBuild, decode_output, decode_public_output, decode_refresh,
+    refresh_error, verify_output,
 };
 pub(crate) use noise::simulate_decoder_noise;
 pub use noise::{
@@ -50,7 +50,6 @@ pub use noise::{
     RnsNoiseBuild, simulate_refresh_noise,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
-pub use refresh::{refresh_fresh_namespace, refresh_mask_namespace};
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{
     RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicSetup, RnsBggGaussian,

@@ -122,18 +122,18 @@ pub fn ring_dimension_candidates(
 }
 
 /// Obtain one positive integer estimate from `lattice-estimator-cli` for the
-/// output of a refresh to the top level ([`crate::refresh::top`]): RLWE in
+/// output of a refresh ([`crate::refresh`]): RLWE in
 /// dimension `ring_dimension` over `modulus` with a binary secret and a
 /// CBD(`eta`) error, given `samples` published coefficient equations (the
 /// estimator's LWE model, ignoring the ring structure as the other gates do).
-pub fn top_refresh_output_security_bits(
+pub fn refresh_output_security_bits(
     ring_dimension: u32,
     modulus: &BigUint,
     eta: u32,
     samples: u64,
 ) -> Result<u64, String> {
     if ring_dimension == 0 || modulus.is_zero() || eta == 0 || samples == 0 {
-        return Err("top refresh output parameters must be positive".to_owned());
+        return Err("refresh output parameters must be positive".to_owned());
     }
     let output = Command::new("lattice-estimator-cli")
         .arg(ring_dimension.to_string())

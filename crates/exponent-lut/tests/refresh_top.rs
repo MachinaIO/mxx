@@ -2,7 +2,7 @@
 
 //! The refresh to the top level on the GPU runtime.
 //!
-//! The refresh ([`mxx_exponent_lut::refresh::top`]) of an exponent LUT output `x = X^(1 - b)` on
+//! The refresh ([`mxx_exponent_lut::refresh`]) of an exponent LUT output `x = X^(1 - b)` on
 //! the private input `X^b` re-encrypts it as both rows of a level-0 encoding under a new
 //! PRF-derived mask `sigma = (sigma_0, 1)`, in the format of a reference chain. It refreshes the
 //! first `SLOTS` CRT slots of `Q_0`: it evaluates the source Program on one chain per refreshed
@@ -91,18 +91,14 @@ use mxx_exponent_lut::{
         prf::{PrfKeyShape, SparseLwrPrf, SparseLwrPrfProfile},
         prf_sampler::PrfSampler,
     },
-    refresh::{
-        TopReference,
-        top::{TopRefreshDeclaration, TopRefreshKeys},
-    },
+    refresh::{RefreshDeclaration, RefreshKeys, TopReference},
     rns_bgg::{
-        RnsBggMaskSecret, RnsBggNoiseBindings, RnsBggNoiseValue, RnsBggParameters,
-        RnsBggPayloadSecret, RnsBggPreprocessEncryptDescriptor, RnsEncryptBuild,
-        RnsOnlineEvalBuild, RnsPreprocessBuild, TOP_REFRESH_TERMS_INPUT, data_input_name,
-        decode_top_refresh, plaintext_input_prefix, refresh_fresh_namespace,
-        refresh_mask_namespace, simulate_refresh_noise, top_refresh_error,
+        REFRESH_TERMS_INPUT, RnsBggMaskSecret, RnsBggNoiseBindings, RnsBggNoiseValue,
+        RnsBggParameters, RnsBggPayloadSecret, RnsBggPreprocessEncryptDescriptor, RnsEncryptBuild,
+        RnsOnlineEvalBuild, RnsPreprocessBuild, data_input_name, decode_refresh,
+        plaintext_input_prefix, refresh_error, simulate_refresh_noise,
     },
-    utils::{env_usize, top_refresh_output_security_bits},
+    utils::{env_usize, refresh_output_security_bits},
 };
 use mxx_ir_core::{
     Graph, IntExpr, ParamEnv, ValidatedGraph,
@@ -297,7 +293,7 @@ fn top_refresh(
     extension: &[u64],
     digits: usize,
     prf: PrfSettings,
-) -> (TopRefreshDeclaration, Option<Keys>) {
+) -> (RefreshDeclaration, Option<Keys>) {
     let n = reference.ring_dimension as usize;
     let columns = reference.columns();
     let primes = reference.top.len();
@@ -319,7 +315,7 @@ fn top_refresh(
         smudge.borrow_mut().insert((chain, component), generated);
         shape
     };
-    let top = TopRefreshDeclaration::new(
+    let top = RefreshDeclaration::new(
         source,
         output,
         profile(n, prf),
@@ -329,7 +325,7 @@ fn top_refresh(
         (0..slots).collect(),
         extension.to_vec(),
         digits,
-        TopRefreshKeys {
+        RefreshKeys {
             mask: mask.0.clone(),
             fresh: [fresh[0].0.clone(), fresh[1].0.clone()],
             smudge: &mut sample,
@@ -352,19 +348,21 @@ struct Chains {
 }
 
 fn chains(
-    top: &TopRefreshDeclaration,
+    top: &RefreshDeclaration,
     source: &ExponentLutProgram,
     chain: usize,
     sigma: &BigDecimal,
 ) -> Chains {
     let (pool, parameters) =
-        RnsBggParameters::top_refresh_chain(top, Some(chain), sigma.clone(), 1).expect("chain");
-    let part = top.part(chain, 0).expect("part");
+        RnsBggParameters::refresh_chain(top, Some(chain), sigma.clone(), 1).expect("chain");
+    let decoder = top.decoder((chain, 0)).expect("decoder");
     Chains {
-        mask: parameters.refresh_mask_parameters(part, source, &pool, 1).expect("mask chain"),
-        fresh: parameters.refresh_fresh_parameters(part, source, &pool, 1).expect("fresh chain"),
+        mask: parameters.refresh_mask_parameters(top, chain, source, &pool, 1).expect("mask chain"),
+        fresh: parameters
+            .refresh_fresh_parameters(top, chain, source, &pool, 1)
+            .expect("fresh chain"),
         smudge: parameters
-            .decoder_smudge_parameters(&part.decoders()[0], source, &pool, 1)
+            .decoder_smudge_parameters(decoder, source, &pool, 1)
             .expect("smudge chain"),
         source: parameters,
         pool,
@@ -374,7 +372,7 @@ fn chains(
 /// Whether every part's simulated noise fits and hides by `bits` under the average-case noise
 /// model with failure probability `2^-failure_exponent` per accepted bound.
 fn accepted(
-    top: &TopRefreshDeclaration,
+    top: &RefreshDeclaration,
     source: &ExponentLutProgram,
     sigma: &BigDecimal,
     trapdoor_sigma: f64,
@@ -396,16 +394,15 @@ fn accepted(
         )
         .expect("source noise bindings");
         (0..2).all(|component| {
-            let part = top.part(chain, component).expect("part");
-            let smudges = vec![&chains.smudge; part.decoders().len()];
             let noise = simulate_refresh_noise(
                 &chains.source,
-                Some(&chains.mask),
+                &chains.mask,
                 &chains.fresh,
-                &smudges,
+                &chains.smudge,
                 source,
                 &bindings,
-                part,
+                top,
+                (chain, component),
                 0,
                 trapdoor_sigma,
                 Some(&average),
@@ -488,7 +485,7 @@ fn child_encrypt<'p>(
 /// executed.
 #[allow(clippy::too_many_arguments)]
 fn run_part(
-    top: &TopRefreshDeclaration,
+    top: &RefreshDeclaration,
     keys: Option<&Keys>,
     source: &ExponentLutProgram,
     chains: &Chains,
@@ -500,9 +497,11 @@ fn run_part(
     store: &mut api::StageStore,
     graphs: &StageGraphs,
 ) -> (api::StageOutputs, [mxx_ir_core::artifact::ProductionId; 2]) {
-    let part = top.part(chain, component).expect("part");
+    let part = (chain, component);
     let name = |stage: &str| format!("{stage}_{chain}_{component}");
-    let details = part.top().expect("top part");
+    let mask_program = top.mask(chain).expect("mask child");
+    let fresh_program = top.fresh(part).expect("fresh child");
+    let decoder = top.decoder(part).expect("decoder");
     // One preprocessing session per part.
     let mut context = CONTEXT;
     context[30] = chain as u8;
@@ -513,8 +512,8 @@ fn run_part(
     let smudge_level = chains.smudge.levels()[0].clone();
     let chain_namespace = top.chain_namespace(chain);
     let matrix_namespace = top.matrix_namespace();
-    let mask_namespace = refresh_mask_namespace(part);
-    let fresh_namespace = refresh_fresh_namespace(part);
+    let mask_namespace = top.mask_namespace(part).expect("mask namespace");
+    let fresh_namespace = top.fresh_namespace(part).expect("fresh namespace");
 
     let mask_preprocess = child_preprocess(
         context,
@@ -522,9 +521,9 @@ fn run_part(
         hash_key,
         &chains.mask,
         mask_namespace,
-        details.mask().program(),
+        mask_program.program(),
         keys.map(|keys| {
-            details.mask().sampler().key_inputs(&mask_level, &keys.mask).expect("mask RHS")
+            mask_program.sampler().key_inputs(&mask_level, &keys.mask).expect("mask RHS")
         }),
     );
     let fresh_preprocess = child_preprocess(
@@ -533,32 +532,25 @@ fn run_part(
         hash_key,
         &chains.fresh,
         fresh_namespace,
-        part.fresh().program(),
+        fresh_program.program(),
         keys.map(|keys| {
             let fresh = &keys.fresh[component];
-            part.fresh().sampler().key_inputs(&fresh_level, fresh).expect("fresh RHS")
+            fresh_program.sampler().key_inputs(&fresh_level, fresh).expect("fresh RHS")
         }),
     );
-    let smudge_preprocess = part
-        .decoders()
-        .iter()
-        .map(|decoder| {
-            let mut child = child_preprocess(
-                context,
-                payload,
-                hash_key,
-                &chains.smudge,
-                *decoder.commitment(),
-                decoder.smudge().program(),
-                keys.map(|keys| {
-                    let smudge = &keys.smudge[&(chain, component)];
-                    decoder.smudge().prf().key_inputs(&smudge_level, smudge).expect("smudge RHS")
-                }),
-            );
-            child.bind_decoder_smudge(decoder).expect("smudge preprocessing decoder");
-            child
-        })
-        .collect::<Vec<_>>();
+    let mut smudge_preprocess = child_preprocess(
+        context,
+        payload,
+        hash_key,
+        &chains.smudge,
+        *decoder.commitment(),
+        decoder.smudge().program(),
+        keys.map(|keys| {
+            let smudge = &keys.smudge[&(chain, component)];
+            decoder.smudge().prf().key_inputs(&smudge_level, smudge).expect("smudge RHS")
+        }),
+    );
+    smudge_preprocess.bind_decoder_smudge(decoder).expect("smudge preprocessing decoder");
     let no_rhs = PlaintextInputs::<RhsId, DCRTPoly>::new();
     let chain_payload = payload.at_level(&chains.source, 0).expect("chain payload");
     let (preprocess, online_eval) = api::preprocess(
@@ -573,8 +565,9 @@ fn run_part(
         runtime,
         store,
         |build, outputs| {
-            build.apply_top_refresh(
+            build.apply_refresh(
                 0,
+                top,
                 part,
                 outputs[0].clone(),
                 mask_preprocess,
@@ -594,9 +587,9 @@ fn run_part(
         (payload, mask),
         &chains.mask,
         mask_namespace,
-        details.mask().program(),
+        mask_program.program(),
         keys.map(|_| {
-            details.mask().sampler().plaintext_inputs(&mask_level, &a).expect("mask inputs")
+            mask_program.sampler().plaintext_inputs(&mask_level, &a).expect("mask inputs")
         }),
     );
     let fresh_encrypt = child_encrypt(
@@ -604,33 +597,22 @@ fn run_part(
         (payload, mask),
         &chains.fresh,
         fresh_namespace,
-        part.fresh().program(),
+        fresh_program.program(),
         keys.map(|_| {
-            part.fresh().sampler().plaintext_inputs(&fresh_level, &a).expect("fresh inputs")
+            fresh_program.sampler().plaintext_inputs(&fresh_level, &a).expect("fresh inputs")
         }),
     );
-    let smudge_encrypt = part
-        .decoders()
-        .iter()
-        .map(|decoder| {
-            let mut child = child_encrypt(
-                (context, hash_key, &preprocess),
-                (payload, mask),
-                &chains.smudge,
-                *decoder.commitment(),
-                decoder.smudge().program(),
-                keys.map(|_| {
-                    decoder
-                        .smudge()
-                        .prf()
-                        .plaintext_inputs(&smudge_level, &a)
-                        .expect("smudge inputs")
-                }),
-            );
-            child.bind_decoder_smudge(decoder).expect("smudge encryption decoder");
-            child
-        })
-        .collect::<Vec<_>>();
+    let mut smudge_encrypt = child_encrypt(
+        (context, hash_key, &preprocess),
+        (payload, mask),
+        &chains.smudge,
+        *decoder.commitment(),
+        decoder.smudge().program(),
+        keys.map(|_| {
+            decoder.smudge().prf().plaintext_inputs(&smudge_level, &a).expect("smudge inputs")
+        }),
+    );
+    smudge_encrypt.bind_decoder_smudge(decoder).expect("smudge encryption decoder");
     let encrypted = api::encrypt(
         &source.encryption_inputs(),
         &env,
@@ -642,7 +624,7 @@ fn run_part(
         RnsEncryptBuild::new(&chains.source, context).with_hash_namespace(chain_namespace),
         runtime,
         store,
-        |build| build.bind_top_refresh(part, mask_encrypt, fresh_encrypt, smudge_encrypt),
+        |build| build.bind_refresh(top, part, mask_encrypt, fresh_encrypt, smudge_encrypt),
         record(graphs, name("encrypt")),
     )
     .expect("top refresh encryption");
@@ -652,30 +634,16 @@ fn run_part(
     };
     let mut mask_online = child_online(&chains.mask, mask_namespace);
     mask_online
-        .bind_refresh_mask_child(part, label_tag, &online_eval, &encrypted, &hash_key)
+        .bind_refresh_mask_child(top, part, label_tag, &online_eval, &encrypted, &hash_key)
         .expect("mask online evaluation");
     let mut fresh_online = child_online(&chains.fresh, fresh_namespace);
     fresh_online
-        .bind_refresh_child(part, None, label_tag, &online_eval, &encrypted, &hash_key)
+        .bind_refresh_fresh_child(top, part, label_tag, &online_eval, &encrypted, &hash_key)
         .expect("fresh online evaluation");
-    let smudge_online = part
-        .decoders()
-        .iter()
-        .map(|decoder| {
-            let mut child = child_online(&chains.smudge, *decoder.commitment());
-            child
-                .bind_refresh_child(
-                    part,
-                    Some(decoder),
-                    label_tag,
-                    &online_eval,
-                    &encrypted,
-                    &hash_key,
-                )
-                .expect("smudge online evaluation");
-            child
-        })
-        .collect::<Vec<_>>();
+    let mut smudge_online = child_online(&chains.smudge, *decoder.commitment());
+    smudge_online
+        .bind_refresh_smudge_child(top, part, label_tag, &online_eval, &encrypted, &hash_key)
+        .expect("smudge online evaluation");
     let outputs = api::online_eval(
         &source.without_lut_values(),
         &env,
@@ -688,7 +656,7 @@ fn run_part(
         runtime,
         store,
         |build, outputs| {
-            build.apply_top_refresh(0, part, mask_online, fresh_online, smudge_online)?;
+            build.apply_refresh(0, top, part, mask_online, fresh_online, smudge_online)?;
             Ok(outputs)
         },
         record(graphs, name("online_eval")),
@@ -793,7 +761,7 @@ fn record<'a>(
 struct Setup {
     source: ExponentLutProgram,
     input: WireId,
-    top: TopRefreshDeclaration,
+    top: RefreshDeclaration,
     /// The generated keys; `None` for a run that executes no stage.
     keys: Option<Keys>,
     reference_chain: RnsBggParameters,
@@ -837,9 +805,8 @@ fn setup(row: Option<&ParameterRow>) -> Setup {
     let refresh = |digits: usize, generate: bool| {
         top_refresh(seed, generate, &source, output, &reference, slots, &extension, digits, prf)
     };
-    let fits = |top: &TopRefreshDeclaration| {
-        accepted(top, &source, &sigma, trapdoor, bits, failure_exponent)
-    };
+    let fits =
+        |top: &RefreshDeclaration| accepted(top, &source, &sigma, trapdoor, bits, failure_exponent);
     // A recorded set or `DIGITS` fixes the digit count; otherwise the smallest one in
     // `MIN_DIGITS..=MAX_DIGITS` whose simulated noise fits and hides.
     let digits = match (row, setting("DIGITS", 0)) {
@@ -855,7 +822,7 @@ fn setup(row: Option<&ParameterRow>) -> Setup {
     let (top, keys) = refresh(digits, !simulate_only() && (!export_only() || row.is_some()));
     assert!(fits(&top), "the digit count {digits} fits and hides");
     let (_, reference_chain) =
-        RnsBggParameters::top_refresh_chain(&top, None, sigma.clone(), 1).expect("reference chain");
+        RnsBggParameters::refresh_chain(&top, None, sigma.clone(), 1).expect("reference chain");
     let all_chains =
         (0..top.chains()).map(|chain| chains(&top, &source, chain, &sigma)).collect::<Vec<_>>();
     eprintln!(
@@ -872,7 +839,7 @@ fn setup(row: Option<&ParameterRow>) -> Setup {
 /// `SECURITY_BITS > 0`: the estimated security of the encodings on the largest modulus of every
 /// chain and child (ternary secret, Gaussian error of width `sigma`) and of the refreshed output
 /// (binary mask, CBD(1) error, `2 w_0 n` samples over `Q_0`) must reach `target` bits.
-fn security_gate(top: &TopRefreshDeclaration, chains: &[Chains], sigma: &BigDecimal, target: u64) {
+fn security_gate(top: &RefreshDeclaration, chains: &[Chains], sigma: &BigDecimal, target: u64) {
     if target == 0 {
         return;
     }
@@ -891,13 +858,9 @@ fn security_gate(top: &TopRefreshDeclaration, chains: &[Chains], sigma: &BigDeci
     let reference = top.reference();
     let modulus = reference.top.iter().map(|prime| BigUint::from(*prime)).product::<BigUint>();
     let n = reference.ring_dimension;
-    let output = top_refresh_output_security_bits(
-        n,
-        &modulus,
-        1,
-        (2 * reference.columns() * n as usize) as u64,
-    )
-    .expect("output security estimate");
+    let output =
+        refresh_output_security_bits(n, &modulus, 1, (2 * reference.columns() * n as usize) as u64)
+            .expect("output security estimate");
     eprintln!(
         "top refresh security: largest modulus {} bits ({} primes) encoding={encoding} \
          output={output} target={target}",
@@ -963,7 +926,7 @@ fn round_trip(
         .iter()
         .map(|value| *value as u64)
         .collect::<Vec<_>>();
-    let mask_program = top.part(0, 0).expect("part").top().expect("top part").mask();
+    let mask_program = top.mask(0).expect("mask child");
     // The sampler reads `+-h`; the Program adds `h`, so the bit is one exactly for `+h`.
     // Without keys (an export), the decode graph is only recorded, so any `sigma_0` serves.
     let sigma_0 = match &keys {
@@ -982,7 +945,7 @@ fn round_trip(
     let expected = DCRTPoly::const_rotate_poly(&level, 1 - bit);
     let results = results.iter().map(|[first, second]| [first, second]).collect::<Vec<_>>();
     if export_only() {
-        let decoded = decode_top_refresh(
+        let decoded = decode_refresh(
             &top,
             None,
             &reference_chain,
@@ -1009,7 +972,7 @@ fn round_trip(
         return;
     }
     let keys = keys.expect("a round trip generates the keys");
-    let errors = top_refresh_error(
+    let errors = refresh_error(
         &top,
         &results,
         &reference_chain,
@@ -1022,13 +985,13 @@ fn round_trip(
     )
     .expect("top refresh error");
     for (component, rows) in errors.iter().enumerate() {
-        let part = top.part(0, component).expect("part");
+        let fresh = top.fresh((0, component)).expect("fresh child");
         for (column, coefficients) in rows.iter().enumerate() {
             let expected = (0..n)
                 .map(|k| {
                     BigInt::from(sample(
-                        part.fresh().sampler(),
-                        part.fresh().program(),
+                        fresh.sampler(),
+                        fresh.program(),
                         &keys.fresh[component][column * n + k],
                         &a,
                     ))
@@ -1037,7 +1000,7 @@ fn round_trip(
             assert_eq!(coefficients, &expected, "component {component}, column {column}");
         }
     }
-    let decoded = decode_top_refresh(
+    let decoded = decode_refresh(
         &top,
         Some(&results),
         &reference_chain,
@@ -1105,7 +1068,7 @@ fn export_directory(recorded: Option<&(String, ParameterRow)>) -> std::path::Pat
 fn export_claim(
     directory: &std::path::Path,
     row: Option<&ParameterRow>,
-    top: &TopRefreshDeclaration,
+    top: &RefreshDeclaration,
     input: WireId,
     graphs: BTreeMap<String, Graph>,
     productions: &BTreeMap<mxx_ir_core::artifact::ProductionId, String>,
@@ -1446,7 +1409,7 @@ struct Child<'a> {
 /// part 0. The decode stage reads the family of the parts' residue terms. The stages and the
 /// claim thus do not grow with the number of parts or columns.
 fn top_protocol(
-    top: &TopRefreshDeclaration,
+    top: &RefreshDeclaration,
     input: WireId,
     graphs: &BTreeMap<String, Graph>,
     productions: &BTreeMap<mxx_ir_core::artifact::ProductionId, String>,
@@ -1466,7 +1429,7 @@ fn top_protocol(
     let parts = (0..top.chains()).flat_map(|chain| [(chain, 0), (chain, 1)]).collect::<Vec<_>>();
     // The decode stage reads the family of the parts' residue terms: the merged online
     // evaluation's output family `refresh` (part `(chain, j)` at `2 chain + j`).
-    links.insert(TOP_REFRESH_TERMS_INPUT.to_owned(), (id("online_eval_0_0"), "refresh".to_owned()));
+    links.insert(REFRESH_TERMS_INPUT.to_owned(), (id("online_eval_0_0"), "refresh".to_owned()));
     // Online evaluation reads each child data family as a resident input named after the
     // preprocessing output holding it.
     for &(chain, component) in &parts {
@@ -1561,7 +1524,7 @@ fn top_protocol(
     ));
 
     // The PRF children of every part: inputs (the state `X^0` and the label monomials) and RHS.
-    let profile = *top.part(0, 0).expect("part").profile();
+    let profile = *top.profile();
     let q = profile.q().expect("PRF modulus");
     let members = profile.lwr_dimension + 1;
     let mut state_coefficient = Vec::new();
@@ -1573,30 +1536,29 @@ fn top_protocol(
     let mut offset_coefficient = Vec::new();
     let mut zero_exponents = BTreeMap::<usize, Vec<ProtocolInputDestination>>::new();
     for &(chain, component) in &parts {
-        let part = top.part(chain, component).expect("part");
-        let details = part.top().expect("top part");
-        let mut children = vec![
+        let part = (chain, component);
+        let (mask, fresh) = (top.mask(chain).expect("mask"), top.fresh(part).expect("fresh"));
+        let decoder = top.decoder(part).expect("decoder");
+        let children = [
             Child {
-                namespace: refresh_mask_namespace(part),
-                prf: details.mask().sampler().prf(),
-                offsets: details.mask().sampler().offset_rhs(),
+                namespace: top.mask_namespace(part).expect("mask namespace"),
+                prf: mask.sampler().prf(),
+                offsets: mask.sampler().offset_rhs(),
                 selectors: "mask".to_owned(),
             },
             Child {
-                namespace: refresh_fresh_namespace(part),
-                prf: part.fresh().sampler().prf(),
-                offsets: part.fresh().sampler().offset_rhs(),
+                namespace: top.fresh_namespace(part).expect("fresh namespace"),
+                prf: fresh.sampler().prf(),
+                offsets: fresh.sampler().offset_rhs(),
                 selectors: format!("fresh_{component}"),
             },
-        ];
-        for decoder in part.decoders() {
-            children.push(Child {
+            Child {
                 namespace: *decoder.commitment(),
                 prf: decoder.smudge().prf(),
                 offsets: &[],
                 selectors: format!("smudge_{chain}_{component}"),
-            });
-        }
+            },
+        ];
         let encrypt = format!("encrypt_{chain}_{component}");
         let preprocess = format!("preprocess_{chain}_{component}");
         for child in &children {
@@ -1832,7 +1794,7 @@ fn top_protocol(
     // bucket `b`'s mask table (the zero member `v` for a dummy or padding cell). Every part
     // reads the same mask keys (its members are tied), so part 0's stand for all.
     let sigma = requirement.input::<Family<Int>>("sigma", family(n as usize)).unwrap();
-    let mask_prf = top.part(0, 0).expect("part").top().expect("top part").mask().sampler().prf();
+    let mask_prf = top.mask(0).expect("mask child").sampler().prf();
     let mask_buckets = (0..mask_prf.tables().len())
         .map(|bucket| {
             let width = selectors[&format!("mask_selector_{bucket}")].1 as i64;

@@ -1,21 +1,21 @@
-//! Noise of the noise refresh (see [`crate::refresh`]).
+//! Noise of one part of the noise refresh (see [`crate::refresh`]).
 //!
-//! Column `j` of the decoder of prime `i` sees `Q_i y_j + M_ij + N_ij` with
-//! `N_ij = e_b K_ij - E_ij - e^sm_ij` and `E_i = e_1 X_i - e_x Y_i + e_f Z_i`;
-//! its rounding returns `y_j mod q_i` when `|M_ij + N_ij| < Q_i / 2`. Worst-case
-//! coefficient bounds, term by term:
+//! Column `k` of the decoder of the part's output prime `q` sees `Q_q y_k + M_k + N_k` with
+//! `N_k = e_b K_k - E_k - e^sm_k` and `E = e_1 X - e_x Y + e_f Z`; its rounding returns
+//! `y_k mod q` when `|M_k + N_k| < Q_q / 2`. Worst-case coefficient bounds, term by term:
 //!
-//! - `e_1 X_i`: `X_i` has `2m` rows of polynomial digits with coefficients at most `B/2` in
-//!   magnitude (balanced decomposition), so `2 m n (B/2) B_e` for the fresh encoding error bound
-//!   `B_e` of the one encoding;
-//! - `e_x Y_i`: `Y_i` has `w` rows of constant digits of the level-`(l+1)` gadget, at most `w
+//! - `e_1 X`: `X` has `2m` rows of polynomial digits with coefficients at most `B/2` in magnitude
+//!   (balanced decomposition), so `m n (B/2)` per block times the error of the block: the fresh
+//!   encryption error bound `B_e` of the one encoding's second block, and the mask carrier's error
+//!   after its ModDown for the first;
+//! - `e_x Y`: `Y` has `w` rows of constant digits of the level-`(l+1)` gadget, at most `w
 //!   floor(B_(l+1)/2)` in `l1` per column, times the target's simulated error;
-//! - `e_f Z_i`: the exact balanced `l1` of `G_Q^-1(Q_i)` times the largest fresh carrier error
-//!   after its ModDown to `Q` ([`RnsBggParameters::lut_mod_down_bound`] of the child's simulated
-//!   raw coefficient output);
+//! - `e_f Z`: the exact balanced `l1` of `G_Q^-1(Q_q)` times the largest fresh carrier error after
+//!   its ModDown to `Q` ([`RnsBggParameters::lut_mod_down_bound`] of the child's simulated raw
+//!   coefficient output);
 //! - `e_b K`: the unmask hint's error against the preimage, as for the decoder;
-//! - `e^sm_ij`: column `j` of decoder `i`'s simulated smudge row (every column sums its own block
-//!   of the same shape, so one column's sum bounds each).
+//! - `e^sm_k`: column `k` of the decoder's simulated smudge row (every column sums its own block of
+//!   the same shape, so one column's sum bounds each).
 //!
 //! The fresh child's row has one simulated value for every column (its row `Sum` of equal
 //! blocks).
@@ -24,12 +24,12 @@
 use super::*;
 use crate::{api::NoiseBuild, refresh::RefreshDeclaration};
 
-/// The noise of one refresh: per prime `q_i`, the largest decoder noise bound
-/// `F_i` over its columns and the spacing `Q_i`; the smudge magnitude bound
-/// `P^d / 2`; and the fresh noise bound `eta`.
+/// The noise of one part of a refresh: per decoded prime `q_i` (the part's output prime), the
+/// largest decoder noise bound `F_i` over its columns and the spacing `Q_i`; the smudge magnitude
+/// bound `P^d / 2`; and the fresh noise bound `eta`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RnsBggRefreshNoise {
-    /// The refresh specification commitment.
+    /// The part's specification commitment.
     pub refresh: [u8; 32],
     /// The worst-case `F_i >= ||N_ij||` for every column `j`, by prime.
     pub errors: Vec<BigUint>,
@@ -204,20 +204,19 @@ fn digit_action(
     )
 }
 
-/// The noise of `declaration`'s refresh of output `target_index` of
-/// `source` under `bindings`, with the fresh-noise child on `fresh`, a
-/// top-refresh part's mask child on `mask`, the decoders' smudge children on
-/// `smudges` (in decoder order), and the unmask trapdoor sigma
-/// `unmask_sigma`.
+/// The noise of part `part` (`(chain, component)`) of `declaration`'s refresh of output
+/// `target_index` of `source` under `bindings` on the part's chain `parameters`, with the mask
+/// child on `mask`, the fresh-noise child on `fresh`, the decoder's smudge child on `smudge`,
+/// and the unmask trapdoor sigma `unmask_sigma`.
 ///
 /// The worst-case bounds are always computed. With `average` (accepting
 /// average-case acceptance), every child's evaluation budget is audited in
 /// the average-case model ([`RnsBggParameters::audit_evaluation`]) and
-/// [`RnsBggRefreshNoise::average_errors`] bounds each decoder's noise by
+/// [`RnsBggRefreshNoise::average_errors`] bounds the decoder's noise by
 /// `|mean| + z sigma` at the tail of the decoded coefficients. The digits of
-/// `X_i` are uniform in `[-B/2, B/2)` (the decomposition of a uniform
+/// `X` are uniform in `[-B/2, B/2)` (the decomposition of a uniform
 /// matrix) and constant actions scale coherently. The fresh encryption
-/// terms (the public one encoding's blocks and the hint) are independent
+/// terms (the public one encoding's block and the hint) are independent
 /// samples; the evaluated terms (the mask carrier, the target, the fresh
 /// carriers and the smudge sum) share the source secret and their Program's
 /// inputs, so they are added with unknown covariance, to each other and to
@@ -225,19 +224,22 @@ fn digit_action(
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_refresh_noise(
     parameters: &RnsBggParameters,
-    mask: Option<&RnsBggParameters>,
+    mask: &RnsBggParameters,
     fresh: &RnsBggParameters,
-    smudges: &[&RnsBggParameters],
+    smudge: &RnsBggParameters,
     source: &crate::program::ExponentLutProgram,
     bindings: &RnsBggNoiseBindings,
     declaration: &RefreshDeclaration,
+    part: (usize, usize),
     target_index: usize,
     unmask_sigma: f64,
     average: Option<&crate::decoder::simulation::AverageCaseConfig>,
 ) -> Result<RnsBggRefreshNoise, crate::api::ApiError> {
     use crate::api::ApiError;
+    let declaration =
+        crate::rns_bgg::refresh::refresh_part(declaration, part).map_err(ApiError::scheme)?;
     let level = parameters
-        .validate_refresh_children(declaration, source, mask, fresh, smudges)
+        .validate_refresh_children(declaration, source, mask, fresh, smudge)
         .map_err(ApiError::scheme)?;
     if source.outputs().get(target_index) !=
         Some(&crate::program::Operand::Scalar(declaration.target_output()))
@@ -273,62 +275,41 @@ pub fn simulate_refresh_noise(
         .into_iter()
         .next()
         .ok_or_else(|| ApiError::input("the fresh Program has no output"))?;
-    let mask_value = match (declaration.top(), mask) {
-        (Some(part), Some(chain)) => {
-            let value = carriers(chain, part.mask())?
-                .into_iter()
-                .next()
-                .ok_or_else(|| ApiError::input("the mask Program has no output"))?;
-            let level =
-                RnsBggParameters::refresh_mask_level(declaration).map_err(ApiError::scheme)?;
-            Some((chain, level, value))
-        }
-        _ => None,
-    };
-    // Smudge children of one Program share their noise: simulate each
-    // distinct Program once.
-    let mut smudge_values =
-        BTreeMap::<crate::program::ExponentLutProgramId, RnsBggNoiseValue>::new();
-    for (smudge, decoder) in smudges.iter().zip(declaration.decoders()) {
-        let program = decoder.smudge().program();
-        if smudge_values.contains_key(&program.id()) {
-            continue;
-        }
-        let child =
-            child_bindings(smudge, program, decoder.smudge().prf()).map_err(ApiError::scheme)?;
-        if let Some(config) = average {
-            smudge.audit_evaluation(program, &child, Some(config)).map_err(ApiError::scheme)?;
-        }
-        let value = lower_child(smudge, program, &child, Some(decoder))
-            .map_err(ApiError::scheme)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ApiError::input("the smudge Program has no output"))?;
-        smudge_values.insert(program.id(), value);
+    let mask_value = carriers(mask, declaration.mask())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::input("the mask Program has no output"))?;
+    let mask_level = RnsBggParameters::refresh_mask_level(declaration).map_err(ApiError::scheme)?;
+    let decoder = declaration.decoder();
+    let program = decoder.smudge().program();
+    let child =
+        child_bindings(smudge, program, decoder.smudge().prf()).map_err(ApiError::scheme)?;
+    if let Some(config) = average {
+        smudge.audit_evaluation(program, &child, Some(config)).map_err(ApiError::scheme)?;
     }
-    let smudges = declaration
-        .decoders()
-        .iter()
-        .map(|decoder| &smudge_values[&decoder.smudge().program().id()])
-        .collect::<Vec<_>>();
+    let smudge_value = lower_child(smudge, program, &child, Some(decoder))
+        .map_err(ApiError::scheme)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::input("the smudge Program has no output"))?;
     compose_refresh_noise(
         parameters,
         level,
         &target,
-        mask_value.as_ref().map(|(chain, level, value)| (*chain, *level, value)),
+        (mask, mask_level, &mask_value),
         fresh,
         fresh_level,
         (&fresh_value, declaration.columns()),
-        &smudges,
-        &declaration.decoded_primes(),
-        (*declaration.spec(), declaration.decoders()[0].smudge_bound(), declaration.eta()),
+        &[&smudge_value],
+        &[declaration.output_prime()],
+        (*declaration.spec(), decoder.smudge_bound(), declaration.eta()),
         unmask_sigma,
         average,
     )
 }
 
 /// The refresh noise of [`simulate_refresh_noise`] from its lowered parts:
-/// the target's level-`level` value, a top-refresh part's mask carrier (its
+/// the target's level-`level` value, the mask carrier (its
 /// chain, LUT level and raw value), the fresh carrier row's raw value (every
 /// column's) on `fresh` at its LUT level `fresh_level` with its `outputs`
 /// columns, and every decoder's smudge row value (every column's; in decoder
@@ -338,7 +319,7 @@ fn compose_refresh_noise(
     parameters: &RnsBggParameters,
     level: usize,
     target: &RnsBggNoiseValue,
-    mask: Option<(&RnsBggParameters, usize, &RnsBggNoiseValue)>,
+    (mask, mask_level, mask_value): (&RnsBggParameters, usize, &RnsBggNoiseValue),
     fresh: &RnsBggParameters,
     fresh_level: usize,
     (fresh_value, outputs): (&RnsBggNoiseValue, usize),
@@ -363,20 +344,14 @@ fn compose_refresh_noise(
         return Err(ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch)));
     }
     let half_base = |params: &DCRTPolyParams| BigUint::one() << (params.base_bits() - 1);
-    // One block of `e_1 X_i` (`m` rows of polynomial digits): fresh encryption
-    // error, or the mask carrier's error after its ModDown.
+    // One block of `e_1 X` (`m` rows of polynomial digits): fresh encryption
+    // error, and the mask carrier's error after its ModDown.
     let block = BigUint::from(columns) * &n * half_base(level_parameters);
     let fresh_block = &block * parameters.encoding_error_bound();
-    let one_term = match &mask {
-        None => &fresh_block * 2u8,
-        Some((chain, mask_level, value)) => {
-            &fresh_block +
-                &block *
-                    chain
-                        .lut_mod_down_bound(*mask_level, &value.bound.error)
-                        .map_err(ApiError::scheme)?
-        }
-    };
+    let one_term = &fresh_block +
+        &block *
+            mask.lut_mod_down_bound(mask_level, &mask_value.bound.error)
+                .map_err(ApiError::scheme)?;
     let target_l1 = BigUint::from(next.modulus_digits()) * half_base(next);
     let target_term = &target_l1 * &target.bound.error;
     let (_, unmask_digits, preimage_bound) =
@@ -408,23 +383,18 @@ fn compose_refresh_noise(
         value.moments.clone().ok_or_else(|| ApiError::input("average-case moments are missing"))
     };
     // The fresh terms are independent samples; the mask carrier is evaluated.
-    let (fresh_terms, mask_moments) = match &mask {
-        None => (
-            fresh_block_moments
-                .add_with_covariance(&fresh_block_moments, NoiseCorrelation::Independent)
-                .add_with_covariance(&unmask_moments, NoiseCorrelation::Independent),
-            None,
-        ),
-        Some((chain, mask_level, value)) if z_squared.is_some() => (
+    let (fresh_terms, mask_moments) = if z_squared.is_some() {
+        (
             fresh_block_moments.add_with_covariance(&unmask_moments, NoiseCorrelation::Independent),
             Some(digit_action(
-                &mod_down_moments(chain, *mask_level, &moments(value)?)
+                &mod_down_moments(mask, mask_level, &moments(mask_value)?)
                     .map_err(ApiError::scheme)?,
                 &block_count,
                 &digit_variance,
             )),
-        ),
-        Some(_) => (fresh_block_moments.clone(), None),
+        )
+    } else {
+        (fresh_block_moments, None)
     };
     let modulus: BigUint = level_parameters.modulus().as_ref().clone();
     let mut errors = Vec::with_capacity(decoded_primes.len());
@@ -469,7 +439,6 @@ fn compose_refresh_noise(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rns_bgg::refresh::tests::{declaration, identity_source};
 
     #[test]
     fn refresh_noise_fits_iff_smudge_and_error_stay_below_every_half_spacing() {
@@ -487,44 +456,40 @@ mod tests {
         assert!(!noise(&[3, 4], 16).hides(3), "32 does not exceed 4 * 2^3");
     }
 
-    /// Noise-free encodings on two 30-bit primes (`m = 4`) with two primes
-    /// per child drop: the smudge range of some digit count both hides every
-    /// decoder's simulated noise by one bit and keeps it inside the decoding
-    /// margin, and the bound grows with the digit count (the smudge sum has
-    /// more members).
+    /// Noise-free encodings of part `(0, 0)` of a refresh of an exponent LUT output on the
+    /// reference of three 30-bit primes (two decoding primes): the simulated decoder bound grows
+    /// with the digit count (the smudge sum has more members), the smudge bound is `P^d / 2`, and
+    /// the fresh bound is `eta`. (The toy chain's 30-bit spacing is below the mask carrier's
+    /// worst-case term, so fitting and hiding are checked by `tests/refresh_top.rs` at its
+    /// accepted parameters.)
     #[test]
-    fn a_noise_free_refresh_has_a_fitting_and_hiding_digit_count() {
-        let pool = DCRTPolyParams::new(8, 12, 30, 15, None, None);
-        let prefix = |depth: usize| {
-            let modulus =
-                pool.to_crt().0[..depth].iter().map(|prime| BigUint::from(*prime)).product();
-            pool.select_modulus(&modulus).unwrap()
-        };
-        let parameters = RnsBggParameters::new(vec![prefix(2), prefix(1)], 0, 1).unwrap();
-        let (source, input) = identity_source();
+    fn a_noise_free_refresh_bound_grows_with_the_digit_count() {
+        use crate::refresh::tests::{declaration_of, lut_source};
+        let (source, output) = lut_source(false);
         let one = [num_bigint::BigInt::from(1u8)];
-        let bindings = RnsBggNoiseBindings::from_inputs(
-            &source,
-            &[RnsBggNoiseValue::sampled_encoding(&parameters, b"refresh-target", &one)],
-            &[],
-        )
-        .unwrap();
         let report = |digits: usize| {
-            let (declaration, _, _) = declaration(&parameters, &source, input, digits);
-            let fresh =
-                parameters.refresh_fresh_parameters(&declaration, &source, &pool, 2).unwrap();
+            let top = declaration_of(&source, output, vec![3, 2, 1], vec![0], digits).unwrap();
+            let (pool, parameters) = RnsBggParameters::refresh_chain(&top, Some(0), 0, 1).unwrap();
+            let mask = parameters.refresh_mask_parameters(&top, 0, &source, &pool, 1).unwrap();
+            let fresh = parameters.refresh_fresh_parameters(&top, 0, &source, &pool, 1).unwrap();
             let smudge = parameters
-                .decoder_smudge_parameters(&declaration.decoders()[0], &source, &pool, 2)
+                .decoder_smudge_parameters(top.decoder((0, 0)).unwrap(), &source, &pool, 1)
                 .unwrap();
-            let smudges = vec![&smudge; declaration.decoders().len()];
+            let bindings = RnsBggNoiseBindings::from_inputs(
+                &source,
+                &[RnsBggNoiseValue::sampled_encoding(&parameters, b"refresh-target", &one)],
+                &[],
+            )
+            .unwrap();
             simulate_refresh_noise(
                 &parameters,
-                None,
+                &mask,
                 &fresh,
-                &smudges,
+                &smudge,
                 &source,
                 &bindings,
-                &declaration,
+                &top,
+                (0, 0),
                 0,
                 4.578,
                 None,
@@ -533,8 +498,10 @@ mod tests {
         };
         let (small, large) = (report(1), report(14));
         assert!(small.errors[0] < large.errors[0]);
-        assert!(large.fits() && large.hides(1), "{large:?}");
-        assert!(!small.hides(1));
+        // `P = 4`: `P^d / 2 = 2^(2d - 1)`.
+        assert_eq!(small.smudge, BigUint::from(2u8));
+        assert_eq!(large.smudge, BigUint::one() << 27u32);
+        assert_eq!((small.errors.len(), small.spacings.len()), (1, 1));
         assert_eq!(large.fresh, BigUint::one());
     }
 
@@ -703,8 +670,8 @@ mod tests {
         value
     }
 
-    /// Parameter study (CPU only): the smallest source CRT depth `L` at which a refresh of a
-    /// fresh level-0 encoding fits, and the largest per-value hiding exponent it reaches, at
+    /// Parameter study (CPU only): the smallest decoding CRT depth `L` at which one part of a
+    /// refresh of a fresh encoding fits, and the largest per-value hiding exponent it reaches, at
     /// the recorded `lwr_prf.rs` parameters (40-bit primes, base `2^10`, one prime per drop,
     /// `sigma = 4`, average case with failure exponent 100, `Q' = 256`, `P = 32`, `nu = 1024`,
     /// `h = 31`, CBD(1) fresh noise).
@@ -784,7 +751,10 @@ mod tests {
         };
         let real_fresh_level = fresh_level(&fresh_program(0, &real, 1024));
         let proxy_fresh = strides.map(|stride| fresh_program(stride, &proxy, 64));
-        let (source, input) = identity_source();
+        // The identity Program of one private input stands for the source.
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let source = builder.finish(vec![crate::program::Operand::Scalar(input)]).unwrap();
         let smudge_decoder = |stride: u32, layout: &PbcPublicLayout, nu: usize, digits: usize| {
             let c = 1usize << (stride + 7);
             let program =
@@ -801,14 +771,11 @@ mod tests {
             .unwrap()
         };
         let one = [num_bigint::BigInt::from(1u8)];
-        // `REFRESH_STUDY_TOP=1` studies one part of a refresh to the top level
-        // (see `crate::refresh::top`): the decoding level of `L` primes keeps
-        // the output prime and `L - 1` margin primes, the one encoding carries
-        // the mask child's binary polynomial, one prime is decoded over the
-        // reference's `w_0` columns, and the source evaluates
-        // `REFRESH_STUDY_SOURCE_LEVELS` levels (default: the fresh child's
-        // PRF depth) from `Q_0`, so `|Q_0| = L + source levels`.
-        let top = env("REFRESH_STUDY_TOP", 0) == 1;
+        // One part of a refresh (see `crate::refresh`): the decoding level of `L` primes keeps
+        // the output prime and `L - 1` margin primes, the one encoding carries the mask child's
+        // binary polynomial, one prime is decoded over the reference's `w_0` columns, and the
+        // source evaluates `REFRESH_STUDY_SOURCE_LEVELS` levels (default: the fresh child's PRF
+        // depth) from `Q_0`, so `|Q_0| = L + source levels`.
         let source_levels = env("REFRESH_STUDY_SOURCE_LEVELS", real_fresh_level + 1);
         let mask_program = |stride: u32, q: u64| {
             let c = 1usize << (stride + 7);
@@ -890,8 +857,8 @@ mod tests {
                 [&fresh_values[0], &fresh_values[1], &fresh_values[2], &fresh_values[3]],
                 n as f64,
             );
-            // The mask carriers of a top refresh on the proxy chain.
-            let mask = top.then(|| {
+            // The mask carriers on the proxy chain.
+            let mask = {
                 let q = parameters.level(level).unwrap().to_crt().0[0];
                 let mut values = Vec::new();
                 let mut chain = None;
@@ -916,10 +883,10 @@ mod tests {
                 let value =
                     extrapolate(scales, [&values[0], &values[1], &values[2], &values[3]], n as f64);
                 (chain, child_level, value)
-            });
+            };
             let top_primes = depth + source_levels;
-            let output_columns = if top { (top_primes - 1) * 4 } else { columns };
-            let decoded = if top { vec![0] } else { (0..depth).collect::<Vec<_>>() };
+            let output_columns = (top_primes - 1) * 4;
+            let decoded = vec![0];
             let p_bits = fresh.scale(proxy_fresh_level).unwrap().bits();
             let fresh_rounding =
                 fresh.lut_mod_down_bound(proxy_fresh_level, &BigUint::zero()).unwrap().bits();
@@ -957,7 +924,7 @@ mod tests {
                     &parameters,
                     level,
                     &target,
-                    mask.as_ref().map(|(chain, level, value)| (chain, *level, value)),
+                    (&mask.0, mask.1, &mask.2),
                     &fresh,
                     proxy_fresh_level,
                     (&fresh_value, output_columns),
@@ -976,7 +943,7 @@ mod tests {
                 best = Some((digits, bits, noise));
             }
             let events = ((decoded.len() * output_columns * n) as f64).log2().ceil() as i64;
-            if top && let Some((digits, bits, noise)) = &best {
+            if let Some((digits, bits, noise)) = &best {
                 // One chain per prime of `Q_0`; per chain two parts, each with
                 // `w_0` smudges of `n d` members, `w_0 n` CBD and `n` mask members.
                 let chains = top_primes;
@@ -1028,7 +995,7 @@ mod tests {
                      hiding_bits={bits} (100 + log2 count = {}) worst_bits={:?} \
                      average_bits={:?} spacing_bits={:?} smudge_bits={} \
                      fresh_chain_depth={} smudge_chain_depth={} elapsed={:?}",
-                    depth * columns,
+                    decoded.len() * output_columns,
                     100 + events,
                     noise.errors.iter().map(BigUint::bits).collect::<Vec<_>>(),
                     noise.accepted_errors().iter().map(BigUint::bits).collect::<Vec<_>>(),

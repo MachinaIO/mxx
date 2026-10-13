@@ -77,47 +77,27 @@ impl<'a> RnsEncryptBuild<'a> {
         self
     }
 
-    /// Attach `declaration`'s noise refresh children, each bound to its
-    /// inputs (the PRF label and `mono(0)`), the secrets and the source's
-    /// preprocess artifacts: `fresh` the fresh-noise child, `smudges` the
-    /// decoders' smudge children in decoder order. Their encodings, the one
-    /// encoding and the unmask hint are published into this encryption.
+    /// Attach the children of part `part` (`(chain, component)`) of `declaration`'s refresh,
+    /// each bound to its inputs (the PRF label and `mono(0)`), the secrets and the source's
+    /// preprocess artifacts: `mask` the mask child (under
+    /// [`RefreshDeclaration::mask_namespace`]), `fresh` the fresh-noise child (under
+    /// [`RefreshDeclaration::fresh_namespace`]) and `smudge` the decoder's smudge child. Their
+    /// encodings, the one encoding and the unmask hint are published into this encryption.
     pub fn bind_refresh(
         &mut self,
-        declaration: &crate::refresh::RefreshDeclaration,
-        fresh: RnsEncryptBuild<'a>,
-        smudges: Vec<RnsEncryptBuild<'a>>,
-    ) -> Result<(), ApiError> {
-        self.bind_refresh_children(declaration, None, fresh, smudges)
-    }
-
-    /// Attach the top-refresh part `declaration`'s children as
-    /// [`Self::bind_refresh`] does, with its mask child `mask` (bound to the
-    /// shared mask keys' inputs under [`crate::rns_bgg::refresh_mask_namespace`]).
-    pub fn bind_top_refresh(
-        &mut self,
-        declaration: &crate::refresh::RefreshDeclaration,
+        declaration: &RefreshDeclaration,
+        part: (usize, usize),
         mask: RnsEncryptBuild<'a>,
         fresh: RnsEncryptBuild<'a>,
-        smudges: Vec<RnsEncryptBuild<'a>>,
+        smudge: RnsEncryptBuild<'a>,
     ) -> Result<(), ApiError> {
-        self.bind_refresh_children(declaration, Some(mask), fresh, smudges)
-    }
-
-    fn bind_refresh_children(
-        &mut self,
-        declaration: &crate::refresh::RefreshDeclaration,
-        mask: Option<RnsEncryptBuild<'a>>,
-        fresh: RnsEncryptBuild<'a>,
-        smudges: Vec<RnsEncryptBuild<'a>>,
-    ) -> Result<(), ApiError> {
+        let declaration =
+            crate::rns_bgg::refresh::refresh_part(declaration, part).map_err(ApiError::scheme)?;
         let mismatch = || ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch));
         if self.decoder_smudge_child.is_some() || self.refresh.is_some() {
             return Err(ApiError::input("a decoder or refresh was already bound"));
         }
-        if self.parameters.rhs_mode() != RhsMode::Static ||
-            smudges.len() != declaration.decoders().len()
-        {
+        if self.parameters.rhs_mode() != RhsMode::Static {
             return Err(mismatch());
         }
         let bound = |child: &RnsEncryptBuild<'a>, namespace: [u8; 32]| {
@@ -131,29 +111,21 @@ impl<'a> RnsEncryptBuild<'a> {
                 child.mask_secret.is_some() &&
                 child.hash_namespace == Some(namespace)
         };
-        if !bound(&fresh, crate::rns_bgg::refresh::refresh_fresh_namespace(declaration)) ||
+        let decoder = declaration.decoder();
+        if !bound(&fresh, declaration.fresh_namespace()) ||
             fresh.inputs.as_ref().map(|inputs| inputs.inputs()) !=
-                Some(declaration.fresh().program().inputs())
+                Some(declaration.fresh().program().inputs()) ||
+            !bound(&smudge, *decoder.commitment()) ||
+            smudge.decoder_smudge.as_ref().map(|bound| *bound.commitment()) !=
+                Some(*decoder.commitment()) ||
+            !bound(&mask, declaration.mask_namespace()) ||
+            mask.inputs.as_ref().map(|inputs| inputs.inputs()) !=
+                Some(declaration.mask().program().inputs())
         {
             return Err(mismatch());
         }
-        for (child, decoder) in smudges.iter().zip(declaration.decoders()) {
-            if !bound(child, *decoder.commitment()) ||
-                child.decoder_smudge.as_ref().map(|bound| *bound.commitment()) !=
-                    Some(*decoder.commitment())
-            {
-                return Err(mismatch());
-            }
-        }
-        match (declaration.top(), &mask) {
-            (None, None) => {}
-            (Some(part), Some(child))
-                if bound(child, crate::rns_bgg::refresh::refresh_mask_namespace(declaration)) &&
-                    child.inputs.as_ref().map(|inputs| inputs.inputs()) ==
-                        Some(part.mask().program().inputs()) => {}
-            _ => return Err(mismatch()),
-        }
-        self.refresh = Some((declaration.clone(), mask.map(Box::new), Box::new(fresh), smudges));
+        self.refresh =
+            Some((declaration.clone(), Box::new(mask), Box::new(fresh), Box::new(smudge)));
         Ok(())
     }
 
@@ -483,17 +455,17 @@ impl<'a> RnsEncryptBuild<'a> {
         Ok(graph)
     }
 
-    /// Publish `declaration`'s refresh: every child's encodings under its
+    /// Publish the refresh part `declaration`: every child's encodings under its
     /// namespace and hash key, the one encoding `c_1 = s A_1 - s (I_2 ⊗ G_Q) +
     /// e_1` (a public encoding of `1` at the decoding ring) and the unmask
     /// hint `b = s B + e_b`. `hash_key` is the stage hash key.
     #[allow(clippy::too_many_arguments)]
     fn append_refresh(
         &mut self,
-        declaration: &crate::refresh::RefreshDeclaration,
-        mask_child: Option<&RnsEncryptBuild<'a>>,
+        declaration: &RefreshPartDeclaration,
+        mask_child: &RnsEncryptBuild<'a>,
         fresh: &RnsEncryptBuild<'a>,
-        smudges: &[RnsEncryptBuild<'a>],
+        smudge: &RnsEncryptBuild<'a>,
         mut graph: DslContext,
         hash_key: &Bytes,
         mask: &RnsBggMaskSecret,
@@ -529,25 +501,22 @@ impl<'a> RnsEncryptBuild<'a> {
             &|role| refresh_fresh_artifact_name(spec, role),
             &|wire, port| refresh_fresh_input_key_artifact_name(spec, wire, port),
         )?;
-        if let (Some(child), Some(part)) = (mask_child, declaration.top()) {
-            graph = child_graph(
-                graph,
-                child,
-                part.mask().program(),
-                &|role| refresh_mask_artifact_name(spec, role),
-                &|wire, port| refresh_mask_input_key_artifact_name(spec, wire, port),
-            )?;
-        }
-        for (child, decoder) in smudges.iter().zip(declaration.decoders()) {
-            let key = decoder.artifact_key();
-            graph = child_graph(
-                graph,
-                child,
-                decoder.smudge().program(),
-                &|role| decoder_smudge_artifact_name(&key, role),
-                &|wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
-            )?;
-        }
+        graph = child_graph(
+            graph,
+            mask_child,
+            declaration.mask().program(),
+            &|role| refresh_mask_artifact_name(spec, role),
+            &|wire, port| refresh_mask_input_key_artifact_name(spec, wire, port),
+        )?;
+        let decoder = declaration.decoder();
+        let key = decoder.artifact_key();
+        graph = child_graph(
+            graph,
+            smudge,
+            decoder.smudge().program(),
+            &|role| decoder_smudge_artifact_name(&key, role),
+            &|wire, port| decoder_smudge_input_key_artifact_name(&key, wire, port),
+        )?;
         // The decoding ring is the children's last level, with the CRT basis
         // of the target's level (checked at preprocessing).
         let parameters = fresh.parameters;
@@ -989,12 +958,12 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             merge_runtime_inputs(&mut self.runtime, &child.runtime)?;
             self.manifests.extend(child.manifests.clone());
         }
-        if let Some((declaration, mask_child, fresh, smudges)) = self.refresh.take() {
+        if let Some((declaration, mask_child, fresh, smudge)) = self.refresh.take() {
             graph = self.append_refresh(
                 &declaration,
-                mask_child.as_deref(),
+                &mask_child,
                 &fresh,
-                &smudges,
+                &smudge,
                 graph,
                 &hash_key,
                 &mask,

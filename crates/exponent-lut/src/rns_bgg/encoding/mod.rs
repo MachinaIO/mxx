@@ -33,6 +33,8 @@ use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 
+use crate::refresh::{RefreshDeclaration, RefreshPartDeclaration};
+
 mod decoder;
 mod dynamic;
 pub(crate) use self::dynamic::AUTOMORPHISM_HELPER_ROLE;
@@ -43,8 +45,8 @@ mod verify;
 
 pub(super) use self::lowering::*;
 pub use self::verify::{
-    TOP_REFRESH_TERMS_INPUT, decode_output, decode_public_output, decode_top_refresh,
-    refresh_error, top_refresh_error, verify_output,
+    REFRESH_TERMS_INPUT, decode_output, decode_public_output, decode_refresh, refresh_error,
+    verify_output,
 };
 #[cfg(test)]
 use crate::{api::execute_graph, program::ExponentLutProgramBuilder};
@@ -567,14 +569,12 @@ pub struct RnsEncryptBuild<'a> {
     prelude: Option<(ProductionId, Manifest)>,
     /// For a refresh child: the namespace its hash key is derived under.
     hash_namespace: Option<[u8; 32]>,
-    /// The bound noise refresh: its fresh-noise child and its decoders'
-    /// smudge children, in decoder order.
-    /// A top-refresh part also binds its mask child (first).
+    /// The bound refresh part: its declaration, and its mask, fresh-noise and smudge children.
     refresh: Option<(
-        crate::refresh::RefreshDeclaration,
-        Option<Box<RnsEncryptBuild<'a>>>,
+        RefreshPartDeclaration,
         Box<RnsEncryptBuild<'a>>,
-        Vec<RnsEncryptBuild<'a>>,
+        Box<RnsEncryptBuild<'a>>,
+        Box<RnsEncryptBuild<'a>>,
     )>,
 }
 
@@ -609,17 +609,16 @@ pub struct RnsOnlineEvalBuild<'a> {
     data: crate::program::ProgramData,
     /// For a refresh child: the namespace its hash key is derived under.
     hash_namespace: Option<[u8; 32]>,
-    /// The applied noise refresh: its target output index, declaration, and
-    /// fresh-noise and smudge children (in decoder order).
-    /// A top-refresh part also has its mask child (after the declaration).
+    /// The applied refresh part: its target output index, declaration, and mask, fresh-noise
+    /// and smudge children.
     pending_refresh: Option<(
         usize,
-        crate::refresh::RefreshDeclaration,
-        Option<Box<RnsOnlineEvalBuild<'a>>>,
+        RefreshPartDeclaration,
         Box<RnsOnlineEvalBuild<'a>>,
-        Vec<RnsOnlineEvalBuild<'a>>,
+        Box<RnsOnlineEvalBuild<'a>>,
+        Box<RnsOnlineEvalBuild<'a>>,
     )>,
-    /// The namespace and key of a top refresh's `A'`.
+    /// The namespace and key of a refresh's `A'`.
     refresh_matrix_key: Option<([u8; 32], Vec<u8>)>,
     /// The integer data of the Program and of its bound children, by graph
     /// input name: the Program's given data ([`RnsOnlineEvalBuild::with_data`])

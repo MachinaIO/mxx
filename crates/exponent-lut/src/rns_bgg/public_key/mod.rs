@@ -176,21 +176,20 @@ pub struct RnsPreprocessBuild<'a> {
     /// For a refresh child: the namespace its hash key is derived under (see
     /// `rns_bgg::refresh::child_hash_key`).
     hash_namespace: Option<[u8; 32]>,
-    /// The applied noise refresh.
+    /// The applied refresh part.
     refresh: Option<PreparedRefresh<'a>>,
-    /// The graph input name and length of a top refresh's `A'` key.
+    /// The graph input name and length of a refresh's `A'` key.
     refresh_matrix_key: Option<(String, usize)>,
 }
 
-/// A noise refresh prepared by preprocessing: its lowered children, the
-/// public `B` of the shared unmask trapdoor, one preimage per decoder (in
-/// decoder order) and their coefficient bound.
+/// A refresh part prepared by preprocessing: its lowered children, the public `B` of the
+/// unmask trapdoor, the decoder's preimage and its coefficient bound.
 struct PreparedRefresh<'a> {
-    declaration: crate::refresh::RefreshDeclaration,
-    mask: Option<PublicKeyLowering<'a>>,
+    declaration: crate::refresh::RefreshPartDeclaration,
+    mask: PublicKeyLowering<'a>,
     fresh: PublicKeyLowering<'a>,
-    smudges: Vec<PublicKeyLowering<'a>>,
-    preimages: Vec<Preimage>,
+    smudge: PublicKeyLowering<'a>,
+    preimage: Preimage,
     public: Mat,
     bound: BigUint,
 }

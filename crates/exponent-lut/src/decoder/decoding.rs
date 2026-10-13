@@ -182,7 +182,7 @@ pub enum DecoderTarget {
     /// `G_(L+1)^-1(1)`, rounded to the plaintext modulus `q_(L+1)` of the
     /// next level.
     Output,
-    /// The decoded row of a noise refresh for the CRT prime `prime` of the
+    /// The decoded row of one part of a noise refresh for the CRT prime `prime` of the
     /// decoding modulus, every column rounded to that prime (see
     /// [`crate::refresh`]); `spec` is the refresh specification commitment.
     Refresh { spec: [u8; 32], prime: usize },

@@ -29,7 +29,8 @@ use crate::{
     api::PlaintextInputs,
     program::{
         ExpLayout, ExponentLutProgram, ExponentLutProgramBuilder, FamilyRange, InputBinding, LutId,
-        LutOutputRepresentation, LutTable, Operand, ProgramValidationError, RhsId, TableId, WireId,
+        LutOutputRepresentation, LutTable, Operand, ProgramData, ProgramValidationError, RhsId,
+        WireId,
     },
     program_gadgets::{
         pbc::PbcGeneratedKeyLayout,
@@ -38,7 +39,6 @@ use crate::{
 };
 use mxx_backends::poly::Poly;
 use mxx_ir_core::IntExpr;
-use std::collections::BTreeMap;
 
 /// Errors in a PRF sampler declaration or its bindings.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -310,14 +310,14 @@ impl PrfSampler {
         Ok(if z < n_prime { value } else { -value })
     }
 
-    /// The RHS plaintexts and the runtime tables of `keys`: the PRF's (see
+    /// The RHS plaintexts and the Program data (coordinate tables) of `keys`: the PRF's (see
     /// [`SparseLwrPrf::key_inputs`]) and one plaintext for every offset RHS.
     #[allow(clippy::type_complexity)]
     pub fn key_inputs<P: Poly>(
         &self,
         parameters: &P::Params,
         keys: &[PbcGeneratedKeyLayout],
-    ) -> Result<(PlaintextInputs<RhsId, P>, BTreeMap<TableId, Vec<usize>>), PrfSamplerError> {
+    ) -> Result<(PlaintextInputs<RhsId, P>, ProgramData), PrfSamplerError> {
         let (mut plaintexts, tables) = self.prf.key_inputs(parameters, keys)?;
         plaintexts.extend(
             self.offset_rhs
@@ -668,10 +668,9 @@ mod tests {
             &program,
             &ParamEnv::default(),
             &rhs,
-            &tables,
             Some(&payload),
             &hash_key,
-            RnsPreprocessBuild::new(&parameters, context),
+            RnsPreprocessBuild::new(&parameters, context).with_data(tables.clone()),
             &mut execution,
             &mut store,
             |_, outputs| Ok(outputs),
@@ -688,7 +687,7 @@ mod tests {
             &program.encryption_inputs(),
             &ParamEnv::default(),
             &lhs,
-            &preprocess,
+            Some(&preprocess),
             &payload,
             Some(&mask),
             &hash_key,
@@ -705,7 +704,7 @@ mod tests {
             &online_eval,
             &encrypted,
             &hash_key,
-            RnsOnlineEvalBuild::new(&parameters, context),
+            RnsOnlineEvalBuild::new(&parameters, context).with_data(tables),
             &mut execution,
             &mut store,
             |_, outputs| Ok(outputs),
@@ -750,6 +749,7 @@ mod tests {
                     &parameters,
                     &payload,
                     Some(&mask),
+                    crate::rns_bgg::RnsOutputUse::DirectDecode,
                     execution,
                     store,
                 )
@@ -763,6 +763,7 @@ mod tests {
                     &parameters,
                     &payload,
                     Some(&mask),
+                    crate::rns_bgg::RnsOutputUse::DirectDecode,
                     positions,
                     execution,
                     store,

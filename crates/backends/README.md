@@ -13,11 +13,13 @@ CPU and GPU backends, inputs, planning, execution, outputs, and artifact stores.
 | Module or directory | What it provides |
 | --- | --- |
 | `poly`, `matrix`, `element`, `modulus` | Polynomial parameters, polynomials, and matrices over RNS rings. |
-| `sampler` | Uniform, Gaussian, hash-derived, trapdoor, and preimage samplers, and their cutoffs. |
+| `sampler` | Uniform, Gaussian (with a convolution sampler above `2^40`), hash-derived, trapdoor, and preimage samplers, and their widths and cutoffs. Trapdoors come in the computational instantiation `[ā \| I \| G - (ā R + E)]` and the statistical one `[ā \| g - ā T]`; a preimage is sampled at the width its trapdoor requests, at least the trapdoor's minimum. |
 | `openfhe_guard` | CRT basis checks and OpenFHE table initialization. |
+| `lattice_estimator` | Ring-LWE security estimates from the external `lattice-estimator-cli` (on `PATH` with its Sage environment). |
 | `backend` | Runtime values and the CPU and GPU backends. |
 | `executor` | The CPU executor. |
 | `gpu_runtime` (`gpu` feature) | The GPU runtime: planning, execution, options, and limitations. |
+| `gpu_cost_model` | A device-free prediction of the GPU work of a graph (NTTs, modular and wide multiplies, gadget digits), following the GPU lowering; available without the `gpu` feature. |
 | `artifact`, `session`, `transcript`, `authority` | Artifact stores, durable sessions, sampling transcripts, and the prepare-then-run boundary. |
 | `host_control` | Structural node dispatch shared by execution and measurement. |
 | `env` | Environment variables read by native primitives and backends. |
@@ -48,3 +50,11 @@ ValidatedGraph --> executor::execute(.., &mut CpuDcrtBackend, ..)   CPU, node by
   return intact payloads.
 - **Multiple GPUs through copies.** A plan spreads matrix products, preimage tiles, and loop
   lanes over its devices, and moves data between devices only with copy nodes.
+- **Two trapdoor instantiations.** A trapdoor's type (`TrapdoorInstantiation` in `mxx-ir-core`)
+  fixes its public width and secret layout. The statistical trapdoor keeps `T` in row chunks with
+  a precomputation from TrapGen: the Fourier values of `T` and the per-point Cholesky factors of
+  the perturbation covariance for the trapdoor's preimage width (DRTV26), which stay in GPU
+  memory and are serialized with the trapdoor. TrapGen redraws `T` while the factorization fails,
+  which checks the singular-value estimate against the actual `T`, and the perturbation is
+  Peikert's convolution sampler with randomized rounding, on the CPU and in CUDA. The samplers'
+  floating-point error is heuristic, as in OpenFHE.

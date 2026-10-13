@@ -63,6 +63,8 @@ fn render(selected: Geometry) -> String {
                 gadget_base: 32.into(),
                 digit_count: 1.into(),
                 preimage_max_coefficient_bound: 4.into(),
+                instantiation: Default::default(),
+                preimage_sigma: None,
             },
             artifact: None,
         },
@@ -73,6 +75,8 @@ fn render(selected: Geometry) -> String {
             gadget_base: 32.into(),
             digit_count: 1.into(),
             preimage_max_coefficient_bound: 4.into(),
+            instantiation: Default::default(),
+            preimage_sigma: None,
         }],
     )
     .output(0)

@@ -270,6 +270,8 @@ make autoresearch in lattice cryptography, research carried out by AI systems, f
 | [`mxx-backends`](crates/backends/README.md) | Polynomial and matrix arithmetic, samplers, the CPU executor, the GPU runtime and native CUDA, and artifacts. |
 | [`mxx-khe`](crates/khe/README.md) | Key-homomorphic encodings: BGG+ keys, encodings, circuit evaluation, lookups, and slot transfer, with the circuits and gadgets they evaluate, and WEE25 commitments. |
 | [`mxx-fhe`](crates/fhe/README.md) | TFHE with NAND bootstrapping, and leveled BGV with SIMD, rotations, and noise tracking. |
+| [`mxx-exponent-lut`](crates/exponent-lut/README.md) | The shared Exponent-LUT library: programs over exponent-encoded values, their RNS-BGG evaluation with Static and Dynamic RHS packages, decoders, and noise simulation. |
+| [`mxx-pe`](crates/pe/README.md) | Predicate encryption for branching programs, built on the Dynamic RNS-BGG evaluator of `mxx-exponent-lut`. |
 | `mxx-we` | Diamond witness encryption. Temporarily disabled: it is excluded from the workspace until its protocol family is redesigned, and builds only with `--manifest-path crates/we/Cargo.toml`. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces only; their implementations have been removed. |
 
@@ -277,21 +279,25 @@ The crates form a pipeline from protocols to execution. An arrow points from a c
 crate it builds on:
 
 ```text
-  mxx-fhe      mxx-khe        applications: protocols written in the DSL
-       \       /
-        v     v
-        mxx-dsl               records a protocol as a program
-           |
-           v
-      mxx-ir-core             the program: a graph of primitive operations
-           ^
-           |
-      mxx-backends            executes programs on the CPU and GPUs
+                    mxx-pe              predicate encryption for branching programs
+                       |
+                       v
+  mxx-fhe   mxx-khe   mxx-exponent-lut  applications and the shared Exponent-LUT library
+       \       |       /
+        v      v      v
+           mxx-dsl                      records a protocol as a program
+              |
+              v
+         mxx-ir-core                    the program: a graph of primitive operations
+              ^
+              |
+         mxx-backends                   executes programs on the CPU and GPUs
 ```
 
 The backends build on the IR from below: they consume the programs that the layers above
-produce. Applications also call the backends directly to run their programs, and the two
-applications never depend on each other.
+produce. Applications also call the backends directly to run their programs, and applications
+never depend on each other. `mxx-exponent-lut` is a shared library rather than an application:
+`mxx-pe` builds on it, and it depends on no protocol crate.
 
 Each crate's README introduces the crate. The DSL's operations are listed in
 [`crates/dsl/SPEC.md`](crates/dsl/SPEC.md), the API for executing programs in

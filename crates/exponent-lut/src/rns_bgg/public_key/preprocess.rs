@@ -37,12 +37,15 @@ impl<'a> RnsPreprocessBuild<'a> {
             context,
             hash_key_commitment: [0; 32],
             evaluator: None,
-            families: super::encoding::OnlineEvalFamilies { parameters },
+            families: super::encoding::OnlineEvalFamilies::new(parameters),
             environment: Environment::new(),
             runtime: BTreeMap::new(),
             decoder_declaration: None,
             decoder_smudge_child: None,
             unmask_bound: None,
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
+            data: crate::program::ProgramData::new(),
             hash_namespace: None,
             refresh: None,
             refresh_matrix_key: None,
@@ -56,32 +59,65 @@ impl<'a> RnsPreprocessBuild<'a> {
         self
     }
 
-    /// Bind RHS plaintexts and runtime tables `values` for a decoder smudge
-    /// or refresh child without exposing the generic stage trait at
-    /// application call sites. Dynamic children bind no RHS plaintexts and no
-    /// secret.
+    /// This builder for a Program with integer data ([`crate::program::ProgramData`]), which
+    /// preprocessing reads as graph inputs and commits to.
+    pub fn with_data(mut self, data: crate::program::ProgramData) -> Self {
+        self.data = data;
+        self
+    }
+
+    /// This builder for compiling a Program against the Dynamic `setup`,
+    /// with its inputs and RHS mapped to setup coordinates by `binding`.
+    /// The binding records the setup and the mapping, so online evaluation
+    /// accepts only ciphertexts of the same setup.
+    pub fn with_dynamic_setup(
+        mut self,
+        setup: &RnsBggDynamicSetup,
+        binding: RnsBggDynamicBinding,
+    ) -> Result<Self, RnsBggError> {
+        setup.validate_parameters(self.parameters)?;
+        if setup.context() != &self.context {
+            return Err(RnsBggError::Binding("the Dynamic setup has another context"));
+        }
+        self.dynamic = Some((Arc::new(setup.clone()), binding));
+        Ok(self)
+    }
+
+    /// This builder with the output use `output_use` (see [`RnsOutputUse`]).
+    /// The preprocessing binding records it, and online evaluation and noise
+    /// simulation must select the same use.
+    pub fn with_output_use(mut self, output_use: RnsOutputUse) -> Self {
+        self.output_use = output_use;
+        self
+    }
+
+    /// Bind RHS plaintexts `rhs` and the builder's Program data (see
+    /// [`Self::with_data`]) for a decoder smudge or refresh child without
+    /// exposing the generic stage trait at application call sites. Dynamic
+    /// children bind no RHS plaintexts and no secret.
     ///
-    /// `None` binds them by the Program's declared shapes only: the stage
-    /// graph is the one of any plaintexts and tables of those shapes (graph
-    /// inputs of the same names and counts), so it can be validated, recorded
-    /// and exported without materializing one selector plaintext and table
-    /// entry per key member, but not executed (the inputs have no values).
-    /// The tables are then not checked against the key set, and the stage
-    /// exports them without entries (see `RnsBggArtifactBinding::table`).
+    /// `None` binds the RHS plaintexts and the data by the Program's declared
+    /// shapes only: the stage graph is the one of any plaintexts and data of
+    /// those shapes (graph inputs of the same names and counts), so it can be
+    /// validated, recorded and exported without materializing one selector
+    /// plaintext and table entry per key member, but not executed (the inputs
+    /// have no values). The data are then not checked against the key set,
+    /// and the stage exports a child's data without entries (see
+    /// `RnsBggArtifactBinding::child_data`).
     pub fn bind_rhs_inputs<P: Poly>(
         &mut self,
         program: &ExponentLutProgram,
         parameters: &mxx_ir_core::ParamEnv,
-        values: Option<(&PlaintextInputs<RhsId, P>, &BTreeMap<TableId, Vec<usize>>)>,
+        rhs: Option<&PlaintextInputs<RhsId, P>>,
         payload: Option<&RnsBggPayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        self.bind_program_inputs(program, parameters, values, payload, hash_key)
+        self.bind_program_inputs(program, parameters, rhs, payload, hash_key)
     }
 
     /// Bind this builder, on [`RnsBggParameters::decoder_smudge_parameters`],
     /// to lower `declaration`'s smudge Program: its smudge LUT members are
-    /// finalized and transformed in their root bodies. The bound runtime
+    /// finalized and transformed in their root bodies. The bound coordinate
     /// tables must be those of the declaration's smudge key set.
     pub fn bind_decoder_smudge(
         &mut self,
@@ -92,12 +128,12 @@ impl<'a> RnsPreprocessBuild<'a> {
         declaration
             .validate_smudge_program(evaluator.program.id())
             .map_err(|error| ApiError::scheme(RnsBggError::Decoder(error)))?;
-        // Tables bound by shape only have no entries to check.
-        if let Some(entries) = evaluator.table_entries() {
+        // Data bound by shape only have no entries to check.
+        if let Some(data) = &evaluator.data_values {
             declaration
                 .smudge()
                 .prf()
-                .check_tables(&entries)
+                .check_tables(data)
                 .map_err(|_| ApiError::input("the smudge tables are not those of its key set"))?;
         }
         if evaluator.decoder_smudge.is_some() {
@@ -296,14 +332,16 @@ impl<'a> RnsPreprocessBuild<'a> {
         {
             return Err(mismatch());
         }
-        // The children's runtime tables must be those of the committed key
+        // The children's coordinate tables must be those of the committed key
         // sets (the smudge children checked theirs when bound to their
-        // decoders); tables bound by shape only have no entries to check.
+        // decoders); data bound by shape only have no entries to check.
         let check = |prf: &crate::program_gadgets::prf::SparseLwrPrf,
                      child: &RnsPreprocessBuild<'a>| {
-            match child.evaluator.as_ref().map(PublicKeyLowering::table_entries) {
+            match child.evaluator.as_ref().map(|child| child.data_values.as_ref()) {
                 Some(None) => Ok(()),
-                entries => prf.check_tables(&entries.flatten().unwrap_or_default()),
+                data => {
+                    prf.check_tables(data.flatten().unwrap_or(&crate::program::ProgramData::new()))
+                }
             }
         };
         let mask_tables = match (declaration.top(), mask.as_ref()) {
@@ -443,20 +481,21 @@ impl<'a> RnsPreprocessBuild<'a> {
 }
 
 impl RnsPreprocessBuild<'_> {
-    /// The entries of every runtime table this stage exports, by artifact
-    /// name: the Program's (`table/<id>`) and its decoder's or refresh's
-    /// children's (under the child's artifact names); `None` for a table
-    /// bound by shape only.
-    fn published_tables(&self) -> BTreeMap<String, Option<Vec<usize>>> {
-        let mut tables = BTreeMap::new();
+    /// The entries of every integer data family of a decoder's or refresh's
+    /// child Program this stage exports, by artifact name (`data/<id>` under
+    /// the child's artifact names); `None` for a family bound by shape only.
+    /// The stage's own Program data are not exported: online evaluation is
+    /// given them, and the binding commits to them.
+    fn published_child_data(&self) -> BTreeMap<String, Option<Vec<usize>>> {
+        let mut published = BTreeMap::new();
         let mut add = |child: &PublicKeyLowering<'_>, name: &dyn Fn(&str) -> String| {
-            for (id, (_, entries)) in &child.tables {
-                tables.insert(name(&format!("table/{id:?}")), entries.clone());
+            for id in child.data.keys() {
+                published.insert(
+                    name(&format!("data/{id:?}")),
+                    child.data_values.as_ref().and_then(|data| data.values(*id)).map(<[_]>::to_vec),
+                );
             }
         };
-        if let Some(evaluator) = &self.evaluator {
-            add(evaluator, &|role| role.to_owned());
-        }
         if let (Some(declaration), Some(child)) =
             (&self.decoder_declaration, &self.decoder_smudge_child)
         {
@@ -476,7 +515,7 @@ impl RnsPreprocessBuild<'_> {
                 add(child, &|role| decoder_smudge_artifact_name(&key, role));
             }
         }
-        tables
+        published
     }
 }
 
@@ -555,29 +594,30 @@ fn publish_child(
         }
         .map_err(ApiError::scheme)?;
     }
+    graph = publish_public_actions(graph, &child.public_actions, |role| name(&role))?;
     for ((evaluation_level, decomposition_level, lut, layout), material) in &child.lut_material {
         let role =
             format!("lut-switching/{evaluation_level}/{decomposition_level}/{lut:?}/{layout:?}");
         graph =
             graph.transferred_output(name(&role), material.clone()).map_err(ApiError::scheme)?;
     }
-    for (id, (table, _)) in &child.tables {
+    for (id, data) in &child.data {
         graph = graph
-            .transferred_output(name(&format!("table/{id:?}")), table.clone())
+            .transferred_output(name(&format!("data/{id:?}")), data.clone())
             .map_err(ApiError::scheme)?;
     }
     Ok(graph)
 }
 
 impl<'a> RnsPreprocessBuild<'a> {
-    /// Bind `program`'s inputs: its RHS plaintexts and runtime tables are
-    /// `values`, or, for `None`, bound by their declared shapes only (see
-    /// [`Self::bind_rhs_inputs`]).
+    /// Bind `program`'s inputs: its RHS plaintexts are `values` and its data
+    /// the builder's (see [`Self::with_data`]), or, for `None`, both are bound
+    /// by their declared shapes only (see [`Self::bind_rhs_inputs`]).
     fn bind_program_inputs<P: Poly>(
         &mut self,
         program: &ExponentLutProgram,
         parameters: &mxx_ir_core::ParamEnv,
-        values: Option<(&PlaintextInputs<RhsId, P>, &BTreeMap<TableId, Vec<usize>>)>,
+        values: Option<&PlaintextInputs<RhsId, P>>,
         payload: Option<&RnsBggPayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
@@ -591,7 +631,7 @@ impl<'a> RnsPreprocessBuild<'a> {
                 return Err(ApiError::input("Dynamic preprocessing takes no secret"));
             }
         }
-        if let Some((rhs, tables)) = values {
+        if let Some(rhs) = values {
             if dynamic && !rhs.is_empty() {
                 return Err(ApiError::input(
                     "Dynamic preprocessing takes no RHS plaintexts; encryption binds them",
@@ -603,9 +643,15 @@ impl<'a> RnsPreprocessBuild<'a> {
             {
                 return Err(ApiError::input("RHS bindings do not exactly match Program inputs"));
             }
-            if tables.len() != program.tables().len() {
-                return Err(ApiError::input("table bindings do not exactly match Program tables"));
-            }
+        }
+        if dynamic {
+            let (setup, binding) = self.dynamic.as_ref().ok_or_else(|| {
+                ApiError::input("Dynamic preprocessing needs its setup (with_dynamic_setup)")
+            })?;
+            setup
+                .validate_public_seed(&self.context, &hash_key_commitment(hash_key))
+                .map_err(ApiError::scheme)?;
+            binding.validate(setup, program).map_err(ApiError::scheme)?;
         }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
         let hash_key_input =
@@ -616,21 +662,51 @@ impl<'a> RnsPreprocessBuild<'a> {
         };
         let bytes = ring.bytes_input(hash_key_input.clone(), sampling_key.len());
         let program = Arc::new(program.clone());
-        let workload =
-            Arc::new(RnsBggDerivedWorkload::from_program(&program).map_err(ApiError::scheme)?);
+        let workload = Arc::new(
+            RnsBggDerivedWorkload::from_program_with_parameters(self.parameters, &program)
+                .map_err(ApiError::scheme)?,
+        );
         let mut evaluator = PublicKeyLowering::new(
             self.parameters,
             program.clone(),
             workload,
             payload.cloned(),
             bytes,
-            self.context,
         );
+        evaluator.output_use = self.output_use;
+        evaluator.dynamic = self.dynamic.clone();
+        // Every data family is a graph input named under the builder's
+        // namespace, with the builder's values unless bound by shape only.
+        let name = |family| crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family);
+        let data = crate::program::data_inputs(&program, name);
+        if values.is_some() {
+            self.data.validate(&program).map_err(|error| ApiError::input(error.to_string()))?;
+            for family in program.data_families().keys() {
+                let values = self.data.values(*family).expect("validated program data");
+                self.runtime.insert(
+                    name(*family),
+                    RuntimeValue::integer_values(
+                        values.iter().map(|value| (*value).into()).collect(),
+                    ),
+                );
+            }
+            evaluator.data_values = Some(self.data.clone());
+        }
+        self.families.data = data.clone();
+        evaluator.data = data;
         // Static LUT switching material is prepared at root scope, so that
-        // a LUT in a family body only reads it in every member.
+        // a LUT in a family body only reads it in every member. A LUT on a
+        // public payload has none.
         if !dynamic {
             let luts = program.encryption_inputs().luts().to_vec();
             for (input, lut) in program.family_body_luts() {
+                if program
+                    .wire_knowledge(input)
+                    .map_err(|error| ApiError::input(error.to_string()))? ==
+                    crate::program::AttributeKnowledge::PublicPayload
+                {
+                    continue;
+                }
                 let level = evaluator.workload.level(input).map_err(ApiError::scheme)?;
                 let table =
                     luts.get(lut.0 as usize).ok_or_else(|| ApiError::scheme(RnsBggError::Lut))?;
@@ -647,11 +723,9 @@ impl<'a> RnsPreprocessBuild<'a> {
                 // Each member's key is sampled where it is read.
                 InputBinding::Family(count) => InputBinding::Family(PreprocessWireFamily::Input {
                     wire: *wire,
-                    level: evaluator.workload.level(*wire).map_err(ApiError::scheme)?,
-                    knowledge: evaluator
-                        .program
-                        .wire_knowledge(*wire)
-                        .map_err(|_| ApiError::input("input wire knowledge"))?,
+                    key: evaluator
+                        .input_key_source(*wire, declaration.knowledge())
+                        .map_err(ApiError::scheme)?,
                     hash_key: evaluator.hash_key.clone(),
                     count: count.clone(),
                 }),
@@ -663,9 +737,8 @@ impl<'a> RnsPreprocessBuild<'a> {
         let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "rhs");
         for (id, declaration) in program.rhs_inputs() {
             if dynamic {
-                // Only references: every key derives from public companion
-                // keys, and encryption binds the plaintexts.
-                evaluator.workload.rhs_level(*id).map_err(ApiError::scheme)?;
+                // Only references: every key derives from setup matrices, and
+                // encryption binds the plaintexts.
                 let binding = match declaration {
                     InputBinding::Scalar(()) => {
                         InputBinding::Scalar(RhsRef { id: *id, index: None::<Int> })
@@ -691,7 +764,7 @@ impl<'a> RnsPreprocessBuild<'a> {
             }
             let name = format!("{prefix}/rhs/{id:?}");
             let plaintext = match values {
-                Some((rhs, _)) => super::plaintext_inputs(
+                Some(rhs) => super::plaintext_inputs(
                     &ring,
                     &name,
                     rhs.get(id).ok_or_else(|| ApiError::input("missing RHS plaintext"))?,
@@ -755,41 +828,6 @@ impl<'a> RnsPreprocessBuild<'a> {
                 _ => return Err(ApiError::input("RHS plaintext shape does not match Program")),
             }
         }
-        // Every runtime table is a graph input of the key holder's entries
-        // (none when bound by shape); the stage exports it for online
-        // evaluation.
-        let prefix = super::plaintext_input_prefix(self.hash_namespace.as_ref(), "table");
-        for (id, declaration) in program.tables() {
-            let concrete = |value: &IntExpr| {
-                value
-                    .evaluate(parameters)
-                    .ok()
-                    .and_then(|value| value.to_usize())
-                    .ok_or_else(|| ApiError::input("table shape is not concrete"))
-            };
-            let (count, bound) = (concrete(declaration.count())?, concrete(declaration.bound())?);
-            let name = format!("{prefix}/table/{id:?}");
-            let entries = match values {
-                Some((_, tables)) => {
-                    let entries =
-                        tables.get(id).ok_or_else(|| ApiError::input("missing table binding"))?;
-                    if entries.len() != count || entries.iter().any(|entry| *entry >= bound) {
-                        return Err(ApiError::input("table entries do not match the Program table"));
-                    }
-                    self.runtime.insert(
-                        name.clone(),
-                        RuntimeValue::integer_values(
-                            entries.iter().map(|entry| BigInt::from(*entry)).collect(),
-                        ),
-                    );
-                    Some(entries.clone())
-                }
-                None => None,
-            };
-            let table = DslContext::new("table").int_family_input(name, count);
-            evaluator.tables.insert(*id, (table.clone(), entries));
-            self.environment.bind_table(*id, table).map_err(|e| ApiError::input(e.to_string()))?;
-        }
         // Plaintext RHS graph handles stay for lowering: a loop that reads an
         // RHS family member prepares its compact ciphertext there.
         self.runtime.insert(hash_key_input, RuntimeValue::Bytes(sampling_key.as_slice().into()));
@@ -821,7 +859,6 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 RhsRef<Int>,
                 PreprocessWireFamily,
                 Family<RhsRef<Int>>,
-                Family<Int>,
             >,
         ),
         ApiError,
@@ -837,11 +874,10 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         program: &ExponentLutProgram,
         parameters: &mxx_ir_core::ParamEnv,
         rhs: &PlaintextInputs<RhsId, P>,
-        tables: &BTreeMap<TableId, Vec<usize>>,
         payload: Option<&Self::PayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        self.bind_program_inputs(program, parameters, Some((rhs, tables)), payload, hash_key)
+        self.bind_program_inputs(program, parameters, Some(rhs), payload, hash_key)
     }
     fn artifact_identities(&self) -> ([u8; 32], [u8; 32]) {
         let Some(evaluator) = self.evaluator.as_ref() else {
@@ -854,16 +890,29 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         if let Some(declaration) = &self.decoder_declaration {
             digest.update(declaration.commitment());
         }
+        // A compiled Program is bound to its output use and, for Dynamic
+        // parameters, to its setup and its mapping to the setup coordinates.
+        // The default direct decoding of a Static Program keeps its identity.
+        if self.output_use == RnsOutputUse::Gadget {
+            digest.update(b"gadget-output");
+        }
+        if let Some((setup, binding)) = &self.dynamic {
+            digest.update(setup.identity());
+            digest.update(serde_json::to_vec(binding).expect("setup mapping encoding"));
+        }
+        if !evaluator.program.data_families().is_empty() {
+            digest.update(self.data.commitment());
+        }
         if let Some(refresh) = &self.refresh {
             digest.update(refresh.declaration.spec());
         }
-        // The runtime tables, by their artifact names (none for a table-free
-        // stage, whose identity is unchanged).
-        let tables = self.published_tables();
-        if !tables.is_empty() {
-            digest.update(b"tables");
+        // The children's data, by their artifact names (none for a stage
+        // without them, whose identity is unchanged).
+        let child_data = self.published_child_data();
+        if !child_data.is_empty() {
+            digest.update(b"child-data");
             digest.update(
-                serde_json::to_vec(&tables).expect("runtime tables have a canonical encoding"),
+                serde_json::to_vec(&child_data).expect("child data have a canonical encoding"),
             );
         }
         let encryption = digest.clone().finalize().into();
@@ -880,14 +929,25 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
     }
 
     fn build_graph(
-        mut self,
+        self,
         outputs: Vec<RnsBggPublicKey>,
     ) -> Result<(StageGraph, (Self::EncryptDescriptor, Self::OnlineEvalDescriptor)), ApiError> {
-        let tables = self.published_tables();
-        let mut evaluator = self
-            .evaluator
-            .take()
-            .ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
+        let child_data = self.published_child_data();
+        let mut evaluator =
+            self.evaluator.ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
+        let carriers = outputs
+            .iter()
+            .map(|output| {
+                let level = evaluator.workload.level(output.wire)?;
+                self.parameters.output_carrier(
+                    &evaluator.program,
+                    output.wire,
+                    level,
+                    evaluator.output_use,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::scheme)?;
         let outputs =
             deduplicate_outputs(evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?);
         let mut graph = DslContext::new("rns-bgg-preprocess");
@@ -968,12 +1028,6 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 )
                 .map_err(ApiError::scheme)?;
         }
-        // The Program's runtime tables, read by online evaluation.
-        for (id, (table, _)) in &evaluator.tables {
-            graph = graph
-                .transferred_output(format!("table/{id:?}"), table.clone())
-                .map_err(ApiError::scheme)?;
-        }
         // Only the bottom row of each RHS ciphertext is stored; its top row
         // is sampled from the hash key (`rhs_top`).
         for (rhs, prepared) in &evaluator.rhs_material {
@@ -1008,6 +1062,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
                 )
                 .map_err(ApiError::scheme)?;
         }
+        graph = publish_public_actions(graph, &evaluator.public_actions, |role| role)?;
         // The unmasking of the decoder: `K` for online evaluation and `B` for
         // encryption. The trapdoor itself stays in the setup production.
         if let Some((key, preimage, public)) = &evaluator.unmask {
@@ -1027,7 +1082,7 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
             .map_err(ApiError::scheme)?;
         let mut binding = RnsBggArtifactBinding::new(
             self.context,
-            evaluator.program.id(),
+            Some(evaluator.program.id()),
             self.parameters.parameter_identity(),
             self.hash_key_commitment,
             Vec::<ProductionId>::new(),
@@ -1035,16 +1090,13 @@ impl<'a, P: Poly> PreprocessBuild<P> for RnsPreprocessBuild<'a> {
         )
         .map_err(ApiError::scheme)?
         .with_input_levels(input_levels)
-        .with_tables(tables);
-        if self.parameters.rhs_mode() == RhsMode::Dynamic {
-            let rhs = evaluator
-                .program
-                .rhs_inputs()
-                .iter()
-                .map(|(id, shape)| Ok((*id, (shape.clone(), evaluator.workload.rhs_level(*id)?))))
-                .collect::<Result<BTreeMap<_, _>, RnsBggError>>()
-                .map_err(ApiError::scheme)?;
-            binding = binding.with_dynamic_schema(rhs, evaluator.workload.luts().clone());
+        .with_outputs(evaluator.output_use, carriers)
+        .with_child_data(child_data);
+        if !evaluator.program.data_families().is_empty() {
+            binding = binding.with_data(self.data.commitment());
+        }
+        if let Some((setup, mapping)) = &evaluator.dynamic {
+            binding = binding.with_dynamic_setup(setup.identity(), Some(mapping.clone()));
         }
         if let (Some(declaration), Some(bound)) = (&self.decoder_declaration, &self.unmask_bound) {
             binding = binding.with_decoder(*declaration.commitment(), bound.clone());
@@ -1138,18 +1190,29 @@ mod test {
     #[test]
     fn online_evaluation_identity_extends_the_encryption_identity_by_its_domain() {
         let parameters =
-            RnsBggParameters::new(vec![DCRTPolyParams::new(16, 2, 17, 4, None, None)], 1, 1)
+            RnsBggParameters::new(vec![DCRTPolyParams::new(16, 2, 17, 4, None, None); 2], 1, 1)
                 .unwrap()
                 .with_rhs_mode(RhsMode::Dynamic);
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let source = builder.finish(vec![Operand::Scalar(input)]).unwrap();
-        let mut build = RnsPreprocessBuild::new(&parameters, [1; 32]);
+        let (setup, binding) = RnsBggDynamicSetup::for_program(
+            &parameters,
+            [1; 32],
+            &[2; 32],
+            &source,
+            ExpLayout { stride_log2: 0, width_log2: 0 },
+            RnsBggDynamicDistributions::uniform(parameters.encoding_contract()),
+        )
+        .unwrap();
+        let mut build = RnsPreprocessBuild::new(&parameters, [1; 32])
+            .with_dynamic_setup(&setup, binding.clone())
+            .unwrap();
         build
             .bind_rhs_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(
                 &source,
                 &mxx_ir_core::ParamEnv::default(),
-                Some((&BTreeMap::new(), &BTreeMap::new())),
+                Some(&BTreeMap::new()),
                 None,
                 &[2; 32],
             )
@@ -1161,6 +1224,8 @@ mod test {
         digest.update(source.id().as_bytes());
         digest.update(parameters.parameter_identity());
         digest.update(build.hash_key_commitment);
+        digest.update(setup.identity());
+        digest.update(serde_json::to_vec(&binding).unwrap());
         assert_eq!(encryption, <[u8; 32]>::from(digest.clone().finalize()));
         digest.update(b"online-eval");
         assert_eq!(online_eval, <[u8; 32]>::from(digest.finalize()));
@@ -1182,7 +1247,7 @@ mod test {
             crate::decoder::decoding::fixture::declaration(&source, input, 8, 1);
         let smudge_parameters =
             parameters.decoder_smudge_parameters(&declaration, &source, &pool, 1).unwrap();
-        let (selectors, tables) =
+        let (selectors, data) =
             declaration.smudge().prf().key_inputs::<DCRTPoly>(&level, &keys).unwrap();
         let payload = crate::rns_bgg::RnsBggPayloadSecret {
             row: (
@@ -1191,12 +1256,12 @@ mod test {
             ),
             binding: None,
         };
-        let mut child = RnsPreprocessBuild::new(&smudge_parameters, [1; 32]);
+        let mut child = RnsPreprocessBuild::new(&smudge_parameters, [1; 32]).with_data(data);
         child
             .bind_rhs_inputs(
                 declaration.smudge().program(),
                 &mxx_ir_core::ParamEnv::default(),
-                Some((&selectors, &tables)),
+                Some(&selectors),
                 Some(&payload),
                 &[2; 32],
             )
@@ -1267,7 +1332,6 @@ mod test {
             &program,
             &ParamEnv::default(),
             &rhs,
-            &BTreeMap::new(),
             Some(&payload),
             b"later-rhs-levels",
         )
@@ -1284,4 +1348,28 @@ mod test {
             assert_eq!(entry.matrix_type(), &expected_schema);
         }
     }
+}
+
+/// Publish the public actions of Dynamic root sites (see
+/// [`super::public_action_role`]) under the artifact names `name` gives.
+fn publish_public_actions(
+    mut graph: DslContext,
+    actions: &BTreeMap<WireId, (RnsBggMatrix, Option<[Mat; 2]>)>,
+    name: impl Fn(String) -> String,
+) -> Result<DslContext, ApiError> {
+    for (wire, (key, branches)) in actions {
+        let role = super::public_action_role(*wire, "key");
+        for (port, entry) in matrix_entries(key).into_iter().enumerate() {
+            graph = graph
+                .transferred_output(name(format!("{role}.{port}")), entry)
+                .map_err(ApiError::scheme)?;
+        }
+        let role = super::public_action_role(*wire, "branches");
+        for (port, row) in branches.iter().flatten().enumerate() {
+            graph = graph
+                .transferred_output(name(format!("{role}.{port}")), row.clone())
+                .map_err(ApiError::scheme)?;
+        }
+    }
+    Ok(graph)
 }

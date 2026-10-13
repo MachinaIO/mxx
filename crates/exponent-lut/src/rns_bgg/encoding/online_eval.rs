@@ -77,10 +77,14 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             hash_key_commitment: [0; 32],
             hash_key: Vec::new(),
             evaluator: None,
-            families: OnlineEvalFamilies { parameters },
+            families: OnlineEvalFamilies::new(parameters),
             environment: Environment::new(),
             pending_decoder: None,
             unmask_preimage_bound: None,
+            output_use: RnsOutputUse::default(),
+            output_carriers: Vec::new(),
+            dynamic: None,
+            data: crate::program::ProgramData::new(),
             hash_namespace: None,
             pending_refresh: None,
             refresh_matrix_key: None,
@@ -88,58 +92,52 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         }
     }
 
-    /// Bind every runtime table of `program` to the entries preprocessing
-    /// exported under `name("table/<id>")` (recorded in its binding
-    /// `preprocess`), as a resident graph input of the same name: a protocol
-    /// links the input to that artifact. A `prf`'s tables must be those of
-    /// its committed key set. A table preprocessing bound by shape only is
-    /// bound with its declared count and no value.
-    fn bind_tables(
+    /// Bind every integer data family of the child Program `program` to the
+    /// entries preprocessing exported under `name("data/<id>")` (recorded in
+    /// its binding `preprocess`), as a resident graph input of the same name:
+    /// a protocol links the input to that artifact. The coordinate tables of
+    /// `prf` must be those of its committed key set. A family preprocessing
+    /// bound by shape only is bound with its declared count and no value.
+    /// Returns the data inputs, which the child's lowering reads.
+    fn bind_child_data(
         &mut self,
         program: &ExponentLutProgram,
         preprocess: &RnsBggArtifactBinding,
-        prf: Option<&crate::program_gadgets::prf::SparseLwrPrf>,
+        prf: &crate::program_gadgets::prf::SparseLwrPrf,
         name: impl Fn(&str) -> String,
-    ) -> Result<(), ApiError> {
-        let mut bound = BTreeMap::new();
-        for (id, declaration) in program.tables() {
-            let name = name(&format!("table/{id:?}"));
+    ) -> Result<BTreeMap<crate::program::DataId, Family<Int>>, ApiError> {
+        let mut bound = crate::program::ProgramData::new();
+        let mut shape_only = false;
+        let mut inputs = BTreeMap::new();
+        for (id, declaration) in program.data_families() {
+            let name = name(&format!("data/{id:?}"));
             let entries = preprocess
-                .table(&name)
-                .ok_or_else(|| ApiError::compatibility("preprocessing exported no such table"))?;
-            let count = match entries {
-                Some(entries) => entries.len(),
-                None => declaration
-                    .count()
-                    .evaluate(&mxx_ir_core::ParamEnv::default())
-                    .ok()
-                    .and_then(|count| count.to_usize())
-                    .ok_or_else(|| ApiError::compatibility("table count is not concrete"))?,
-            };
-            if IntExpr::constant(count) != *declaration.count() {
-                return Err(ApiError::compatibility("table entries do not match the Program"));
+                .child_data(&name)
+                .ok_or_else(|| ApiError::compatibility("preprocessing exported no such data"))?;
+            match entries {
+                Some(entries) => {
+                    self.runtime.insert(
+                        name.clone(),
+                        RuntimeValue::integer_values(
+                            entries.iter().map(|entry| BigInt::from(*entry)).collect(),
+                        ),
+                    );
+                    bound = bound.with(*id, entries.to_vec());
+                }
+                None => shape_only = true,
             }
-            if let Some(entries) = entries {
-                self.runtime.insert(
-                    name.clone(),
-                    RuntimeValue::integer_values(
-                        entries.iter().map(|entry| BigInt::from(*entry)).collect(),
-                    ),
-                );
-                bound.insert(*id, entries.to_vec());
-            }
-            self.environment
-                .bind_table(*id, DslContext::new("table").int_family_input(name, count))
-                .map_err(|error| ApiError::input(error.to_string()))?;
+            inputs.insert(*id, mxx_dsl::int_family_input(name, declaration.count()));
         }
-        // Tables bound by shape only have no entries to check (a mixture
-        // fails the check).
-        if let Some(prf) = prf.filter(|_| !bound.is_empty() || program.tables().is_empty()) {
+        // Data bound by shape only have no entries to check.
+        if !shape_only {
+            bound.validate(program).map_err(|_| {
+                ApiError::compatibility("the exported data do not match the Program")
+            })?;
             prf.check_tables(&bound).map_err(|_| {
-                ApiError::compatibility("the exported tables are not those of the key set")
+                ApiError::compatibility("the exported data are not those of the key set")
             })?;
         }
-        Ok(())
+        Ok(inputs)
     }
 
     /// Sample a top refresh's `A'` from the stage key `hash_key` derived
@@ -147,6 +145,76 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     pub fn with_refresh_matrix_key(mut self, namespace: [u8; 32], hash_key: &[u8]) -> Self {
         self.refresh_matrix_key =
             Some((namespace, crate::rns_bgg::refresh::child_hash_key(hash_key, &namespace)));
+        self
+    }
+
+    /// This builder for a Program with integer data ([`crate::program::ProgramData`]): the
+    /// data its preprocessing was given.
+    pub fn with_data(mut self, data: crate::program::ProgramData) -> Self {
+        self.data = data;
+        self
+    }
+
+    /// This builder for a Program bound to the Dynamic `setup` through
+    /// `binding`, which must be the setup and mapping it was preprocessed
+    /// with; the encryption must belong to the same setup.
+    pub fn with_dynamic_setup(
+        mut self,
+        setup: &RnsBggDynamicSetup,
+        binding: RnsBggDynamicBinding,
+    ) -> Result<Self, RnsBggError> {
+        setup.validate_parameters(self.parameters)?;
+        if setup.context() != &self.context {
+            return Err(RnsBggError::Binding("the Dynamic setup has another context"));
+        }
+        self.dynamic = Some((Arc::new(setup.clone()), binding));
+        Ok(self)
+    }
+
+    /// Check the Dynamic compatibility of `preprocess` (the compiled
+    /// Program) and `encryption` (the ciphertext): both belong to the bound
+    /// setup, the Program was compiled with the bound mapping, and the
+    /// ciphertext names no Program unless it carries a decoder, whose
+    /// unmask hint the Program's preprocessing fixes.
+    fn validate_dynamic_stages(
+        &self,
+        program: &ExponentLutProgram,
+        preprocess: &StageArtifacts<RnsBggPreprocessOnlineEvalDescriptor>,
+        encryption: &StageArtifacts<RnsBggEncryptionDescriptor>,
+    ) -> Result<(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding), ApiError> {
+        let (setup, binding) = self.dynamic.clone().ok_or_else(|| {
+            ApiError::input("Dynamic evaluation needs its setup (with_dynamic_setup)")
+        })?;
+        binding.validate(&setup, program).map_err(ApiError::scheme)?;
+        let preprocess_binding = preprocess.descriptor().binding();
+        let encryption_binding = encryption.descriptor().binding();
+        if preprocess_binding.dynamic_setup() != Some(&setup.identity()) ||
+            encryption_binding.dynamic_setup() != Some(&setup.identity())
+        {
+            return Err(ApiError::compatibility("the stages belong to another Dynamic setup"));
+        }
+        if preprocess_binding.dynamic_binding() != Some(&binding) {
+            return Err(ApiError::compatibility(
+                "the Program was compiled with another setup mapping",
+            ));
+        }
+        let decoded = preprocess_binding.decoder_commitment().is_some();
+        let expected_sources: &[ProductionId] =
+            if decoded { std::slice::from_ref(preprocess.production()) } else { &[] };
+        if encryption_binding.sources() != expected_sources ||
+            (!decoded && encryption_binding.program().is_some())
+        {
+            return Err(ApiError::compatibility(
+                "a Dynamic ciphertext names a Program it was not encrypted for",
+            ));
+        }
+        Ok((setup, binding))
+    }
+
+    /// This builder with the output use `output_use`, which must be the one
+    /// the Program was preprocessed with.
+    pub fn with_output_use(mut self, output_use: RnsOutputUse) -> Self {
+        self.output_use = output_use;
         self
     }
 
@@ -323,8 +391,9 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// `name(role)`; a `decoder_smudge` child transforms its smudge members;
     /// `label`, the PRF's public input family with its label values and
     /// exponent layout, replaces that family's encrypted public payload;
-    /// the runtime tables of `prf`, the child's PRF, are bound from the
-    /// entries preprocessing exported under `name("table/<id>")`.
+    /// the integer data of `prepared` (the coordinate tables of `prf`, the
+    /// child's PRF) are bound from the entries preprocessing exported under
+    /// `name("data/<id>")`.
     #[allow(clippy::too_many_arguments)]
     fn bind_child(
         &mut self,
@@ -352,10 +421,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 ));
             }
         }
-        if decoder_smudge
-            .as_ref()
-            .is_some_and(|decoder| preprocess_binding.program() != decoder.source_program())
-        {
+        // A Dynamic ciphertext names no Program.
+        if decoder_smudge.as_ref().is_some_and(|decoder| {
+            [preprocess_binding, encryption_binding].iter().any(|binding| {
+                binding.program().is_some_and(|program| program != decoder.source_program())
+            })
+        }) {
             return Err(ApiError::compatibility(
                 "decoder smudge artifacts do not match the source declaration",
             ));
@@ -377,8 +448,10 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             manifests.insert(production.clone(), manifest.clone());
             production.clone()
         });
-        let workload =
-            Arc::new(RnsBggDerivedWorkload::from_program(prepared).map_err(ApiError::scheme)?);
+        let workload = Arc::new(
+            RnsBggDerivedWorkload::from_program_with_parameters(self.parameters, prepared)
+                .map_err(ApiError::scheme)?,
+        );
         self.hash_key_commitment = expected_hash_key;
         self.hash_key = match &self.hash_namespace {
             Some(namespace) => crate::rns_bgg::refresh::child_hash_key(hash_key, namespace),
@@ -387,79 +460,98 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         // The child's encryption publishes each input at its logical level
         // with its public key, under the child's namespace.
         self.environment = Environment::new();
-        for (wire, input) in prepared.inputs() {
-            let public = matches!(input.knowledge(), AttributeKnowledge::PublicPayload);
-            let level = workload.level(*wire).map_err(ApiError::scheme)?;
-            let ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
-            let columns = self
-                .parameters
-                .key_component_columns(level, input.knowledge())
-                .map_err(ApiError::scheme)?;
-            let port = |port: usize, columns: usize| {
-                ring.artifact_input(
-                    encryption_production.clone(),
-                    name(&format!("input-{wire:?}.{port}")),
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                )
-            };
-            let family_port = |port: usize, count: &IntExpr, columns: usize| {
-                ring.family_artifact_input(
-                    encryption_production.clone(),
-                    name(&format!("input-{wire:?}.{port}")),
-                    count.clone(),
-                    (1, columns),
-                    ArtifactAvailability::Transferred,
-                )
-            };
-            let binding = match input.shape() {
-                InputBinding::Scalar(()) => InputBinding::Scalar(RnsBggEncoding::new(
-                    RnsBggPublicKey::new(
-                        *wire,
-                        (
-                            (port(0, columns), port(1, columns)),
-                            (port(2, columns), port(3, columns)),
-                        ),
-                    ),
-                    (port(4, columns), port(5, columns)),
-                    public.then(|| port(6, 1)),
-                )),
-                InputBinding::Family(count) => {
-                    let key_parts =
-                        (0..4).map(|index| family_port(index, count, columns)).collect::<Vec<_>>();
-                    let rows =
-                        (4..6).map(|index| family_port(index, count, columns)).collect::<Vec<_>>();
-                    let payload = match &label {
-                        Some((label_wire, values, layout)) if label_wire == wire => {
-                            Some(label_payloads(&ring, values, *layout, count)?)
-                        }
-                        _ => public.then(|| family_port(6, count, 1)),
-                    };
-                    InputBinding::Family(OnlineEvalWireFamily::Stored(encoding_family(
-                        *wire,
-                        &key_parts,
-                        &rows,
-                        payload.as_ref(),
-                        count.clone(),
-                    )?))
-                }
-            };
-            self.environment
-                .bind_wire(*wire, binding)
-                .map_err(|error| ApiError::input(error.to_string()))?;
-        }
-        self.bind_tables(prepared, preprocess_binding, Some(prf), |role| name(role))?;
         let hash_key = self.parameters.ring(0).map_err(ApiError::scheme)?.bytes_input(
             crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
             self.hash_key.len(),
         );
+        // A Dynamic child's inputs are encodings of its setup's coordinates
+        // published under the child's namespace; a Static child's keys are
+        // published by the encryption as well.
+        let dynamic = self.dynamic.clone();
+        if dynamic.is_some() {
+            self.bind_encrypted_inputs(
+                prepared,
+                &workload,
+                &encryption_production,
+                &hash_key,
+                dynamic.as_ref(),
+                label.as_ref(),
+                |role| name(&role),
+            )?;
+        } else {
+            for (wire, input) in prepared.inputs() {
+                let public = matches!(input.knowledge(), AttributeKnowledge::PublicPayload);
+                let level = workload.level(*wire).map_err(ApiError::scheme)?;
+                let ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
+                let columns = self
+                    .parameters
+                    .key_component_columns(level, input.knowledge())
+                    .map_err(ApiError::scheme)?;
+                let port = |port: usize, columns: usize| {
+                    ring.artifact_input(
+                        encryption_production.clone(),
+                        name(&format!("input-{wire:?}.{port}")),
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    )
+                };
+                let family_port = |port: usize, count: &IntExpr, columns: usize| {
+                    ring.family_artifact_input(
+                        encryption_production.clone(),
+                        name(&format!("input-{wire:?}.{port}")),
+                        count.clone(),
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    )
+                };
+                let binding = match input.shape() {
+                    InputBinding::Scalar(()) => InputBinding::Scalar(RnsBggEncoding::new(
+                        RnsBggPublicKey::new(
+                            *wire,
+                            (
+                                (port(0, columns), port(1, columns)),
+                                (port(2, columns), port(3, columns)),
+                            ),
+                        ),
+                        (port(4, columns), port(5, columns)),
+                        public.then(|| port(6, 1)),
+                    )),
+                    InputBinding::Family(count) => {
+                        let key_parts = (0..4)
+                            .map(|index| family_port(index, count, columns))
+                            .collect::<Vec<_>>();
+                        let rows = (4..6)
+                            .map(|index| family_port(index, count, columns))
+                            .collect::<Vec<_>>();
+                        let payload = match &label {
+                            Some((label_wire, values, layout)) if label_wire == wire => {
+                                Some(label_payloads(&ring, values, *layout, count)?)
+                            }
+                            _ => public.then(|| family_port(6, count, 1)),
+                        };
+                        InputBinding::Family(OnlineEvalWireFamily::Stored(encoding_family(
+                            *wire,
+                            &key_parts,
+                            &rows,
+                            payload.as_ref(),
+                            count.clone(),
+                        )?))
+                    }
+                };
+                self.environment
+                    .bind_wire(*wire, binding)
+                    .map_err(|error| ApiError::input(error.to_string()))?;
+            }
+        }
+        let data = self.bind_child_data(prepared, preprocess_binding, prf, name)?;
+        self.families.data = data.clone();
         for (rhs, binding) in import_rhs_bindings(
             self.parameters,
             prepared,
             &workload,
             &preprocess_production,
-            &encryption_production,
             prelude.as_ref(),
+            dynamic.as_ref().map(|(setup, binding)| (setup.as_ref(), binding)),
             &hash_key,
             |role: String| name(&role),
         )? {
@@ -467,7 +559,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 .bind_rhs(rhs, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
-        self.evaluator = Some(EncodingLowering {
+        let mut evaluator = EncodingLowering {
             parameters: self.parameters,
             program: Arc::new(prepared.clone()),
             workload,
@@ -478,20 +570,22 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             artifact_prefix: Some(prefix),
             current_site: None,
             hash_key,
-            context: self.context,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
-        });
-        self.evaluator
-            .as_mut()
-            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
-            .import_rhs_companions()
-            .map_err(ApiError::scheme)?;
-        self.evaluator
-            .as_mut()
-            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
-            .import_body_lut_material()
-            .map_err(ApiError::scheme)?;
+            data,
+            output_use: RnsOutputUse::default(),
+            dynamic: dynamic.map(|(setup, binding)| DynamicEvaluation {
+                setup,
+                binding,
+                automorphisms: None,
+            }),
+        };
+        if evaluator.dynamic.is_some() {
+            evaluator.import_dynamic_packages().map_err(ApiError::scheme)?;
+        } else {
+            evaluator.import_body_lut_material().map_err(ApiError::scheme)?;
+        }
+        self.evaluator = Some(evaluator);
         Ok(())
     }
 
@@ -567,8 +661,12 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         evaluator.manifests.extend(child_manifests);
         let key = declaration.artifact_key();
         let ring = self.parameters.ring(level)?;
-        let columns = crate::decoder::unmask::UNMASK_ROWS *
-            (self.parameters.level(level)?.modulus_digits() + 2);
+        let columns = mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns(
+                crate::decoder::unmask::UNMASK_ROWS,
+                self.parameters.level(level)?.modulus_digits(),
+            )
+            .ok_or(RnsBggError::Parameters("the unmask trapdoor width overflows"))?;
         let bound = self
             .unmask_preimage_bound
             .clone()
@@ -592,7 +690,109 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let half = IntExpr::constant((modulus + 1u8) / 2u8);
         let decoded = crate::decoder::unmask::unmask(hint, preimage, encoding) -
             ring.all_coefficients((1, 1), half);
-        Ok(decoded.modulus_switch(&self.parameters.ring(level + 1)?))
+        let plaintext = self.parameters.decoder_plaintext_ring(declaration, &evaluator.program)?;
+        Ok(decoded.modulus_switch(&plaintext))
+    }
+
+    /// Bind every input of `program` from the encryption production
+    /// `encryption`, which stores each input's row (and public payload); its
+    /// public key is derived from the hash key here, or where a family
+    /// member is read. A Static input is stored at its logical level under
+    /// its wire; a Dynamic one at the setup ring under its setup coordinate.
+    /// `label`, a public input family with its label values and exponent
+    /// layout, replaces that family's encrypted public payload (see
+    /// [`Self::bind_refresh_child`]). `name` maps a role to its artifact name.
+    fn bind_encrypted_inputs(
+        &mut self,
+        program: &ExponentLutProgram,
+        workload: &RnsBggDerivedWorkload,
+        encryption: &ProductionId,
+        hash_key: &Bytes,
+        dynamic: Option<&(Arc<RnsBggDynamicSetup>, RnsBggDynamicBinding)>,
+        label: Option<&(WireId, Vec<usize>, ExpLayout)>,
+        name: impl Fn(String) -> String,
+    ) -> Result<(), ApiError> {
+        for (wire, declaration) in program.inputs() {
+            let level = workload.level(*wire).map_err(ApiError::scheme)?;
+            let knowledge = declaration.knowledge();
+            let (key, role, ring_level) = match dynamic {
+                Some((setup, binding)) => {
+                    // The encoding at the setup ring is valid at every
+                    // logical level of an equal-basis chain below its last.
+                    self.parameters.dynamic_route(level).map_err(ApiError::scheme)?;
+                    let coordinate = binding.input(*wire).map_err(ApiError::scheme)?;
+                    (
+                        InputKeySource::Dynamic { setup: setup.clone(), coordinate },
+                        super::dynamic::dynamic_input_role(coordinate),
+                        0,
+                    )
+                }
+                None => {
+                    (InputKeySource::Static { level, knowledge }, format!("input-{wire:?}"), level)
+                }
+            };
+            let ring = self.parameters.ring(ring_level).map_err(ApiError::scheme)?;
+            let columns = self
+                .parameters
+                .key_component_columns(ring_level, knowledge)
+                .map_err(ApiError::scheme)?;
+            let public = matches!(knowledge, AttributeKnowledge::PublicPayload);
+            let binding = match declaration.shape() {
+                InputBinding::Scalar(()) => {
+                    let port = |port: usize, columns: usize| {
+                        ring.artifact_input(
+                            encryption.clone(),
+                            name(format!("{role}.{port}")),
+                            (1, columns),
+                            ArtifactAvailability::Transferred,
+                        )
+                    };
+                    let key = key
+                        .key(self.parameters, hash_key.clone(), *wire, None)
+                        .map_err(ApiError::scheme)?;
+                    InputBinding::Scalar(RnsBggEncoding::new(
+                        key,
+                        (port(0, columns), port(1, columns)),
+                        public.then(|| port(2, 1)),
+                    ))
+                }
+                InputBinding::Family(count) => {
+                    let port = |port: usize, columns: usize| {
+                        ring.family_artifact_input(
+                            encryption.clone(),
+                            name(format!("{role}.{port}")),
+                            count.clone(),
+                            (1, columns),
+                            ArtifactAvailability::Transferred,
+                        )
+                    };
+                    let row_ports = [port(0, columns), port(1, columns)];
+                    let element: RnsBggRow =
+                        (row_ports[0].at(Int::constant(0)), row_ports[1].at(Int::constant(0)));
+                    let fields = row_ports
+                        .iter()
+                        .map(|family| family.value_handle().clone())
+                        .collect::<Vec<_>>();
+                    InputBinding::Family(OnlineEvalWireFamily::Input {
+                        wire: *wire,
+                        key,
+                        hash_key: hash_key.clone(),
+                        rows: family_of_fields(&element, count.clone(), &fields)
+                            .map_err(ApiError::scheme)?,
+                        payloads: match label {
+                            Some((label_wire, values, layout)) if label_wire == wire => {
+                                Some(label_payloads(&ring, values, *layout, count)?)
+                            }
+                            _ => public.then(|| port(2, 1)),
+                        },
+                    })
+                }
+            };
+            self.environment
+                .bind_wire(*wire, binding)
+                .map_err(|error| ApiError::input(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Apply `declaration`'s noise refresh to output `target_index` when the
@@ -881,7 +1081,6 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 (RnsBggMatrix, RhsRef<Int>),
                 OnlineEvalWireFamily,
                 OnlineEvalRhsFamily,
-                Family<Int>,
             >,
         ),
         ApiError,
@@ -913,7 +1112,6 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 (RnsBggMatrix, RhsRef<Int>),
                 OnlineEvalWireFamily,
                 OnlineEvalRhsFamily,
-                Family<Int>,
             >,
         ),
         ApiError,
@@ -950,32 +1148,72 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             if binding.context() != &self.context ||
                 binding.parameters() != &expected_parameters ||
                 binding.rhs_mode() != self.parameters.rhs_mode() ||
-                binding.program() != program.id() ||
                 binding.hash_key_commitment() != &expected_hash_key
             {
                 return Err(ApiError::compatibility(
-                    "RNS-BGG artifact binding does not match the online evaluation Program",
+                    "RNS-BGG artifact binding does not match the online evaluation",
                 ));
             }
         }
+        if preprocess_binding.program() != Some(program.id()) {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess binding does not match the online evaluation Program",
+            ));
+        }
+        self.data.validate(program).map_err(|error| ApiError::input(error.to_string()))?;
+        let expected_data = (!program.data_families().is_empty()).then(|| self.data.commitment());
+        if preprocess_binding.data() != expected_data.as_ref() {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess binding has other Program data than the online evaluation",
+            ));
+        }
+        // The data are graph inputs whose values this builder was given.
+        let data = crate::program::data_inputs(program, |family| {
+            crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), family)
+        });
+        for family in program.data_families().keys() {
+            let values = self.data.values(*family).expect("validated program data");
+            self.runtime.insert(
+                crate::rns_bgg::data_input_name(self.hash_namespace.as_ref(), *family),
+                RuntimeValue::integer_values(values.iter().map(|value| (*value).into()).collect()),
+            );
+        }
+        self.families.data = data.clone();
         if !preprocess_binding.sources().is_empty() {
             return Err(ApiError::compatibility(
                 "RNS-BGG preprocess root unexpectedly declares sources",
             ));
         }
-        if encryption_binding.sources().len() != 1 ||
-            !encryption_binding.sources().contains(&preprocess_production)
-        {
-            return Err(ApiError::compatibility(
-                "RNS-BGG encryption source is not the preprocess production",
-            ));
-        }
+        // A Static ciphertext is encrypted for one compiled Program; a
+        // Dynamic one for the setup the compiled Program belongs to.
+        let dynamic = match self.parameters.rhs_mode() {
+            RhsMode::Static => {
+                if encryption_binding.program() != Some(program.id()) ||
+                    encryption_binding.sources().len() != 1 ||
+                    !encryption_binding.sources().contains(&preprocess_production)
+                {
+                    return Err(ApiError::compatibility(
+                        "RNS-BGG encryption source is not the preprocess production",
+                    ));
+                }
+                None
+            }
+            RhsMode::Dynamic => {
+                Some(self.validate_dynamic_stages(program, preprocess, encryption)?)
+            }
+        };
         if preprocess_binding.decoder_commitment() != encryption_binding.decoder_commitment() {
             return Err(ApiError::compatibility(
                 "RNS-BGG decoder declaration commitment differs between stages",
             ));
         }
+        if preprocess_binding.output_use() != self.output_use {
+            return Err(ApiError::compatibility(
+                "RNS-BGG output use differs from the preprocessed Program",
+            ));
+        }
         self.unmask_preimage_bound = preprocess_binding.unmask_preimage_bound().cloned();
+        self.output_carriers = preprocess_binding.output_carriers().to_vec();
         let mut manifests = BTreeMap::new();
         manifests.insert(preprocess_production.clone(), preprocess.manifest().clone());
         manifests.insert(encryption_production.clone(), encryption.manifest().clone());
@@ -983,91 +1221,32 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             manifests.insert(production.clone(), manifest.clone());
             production.clone()
         });
-        let workload =
-            Arc::new(RnsBggDerivedWorkload::from_program(program).map_err(ApiError::scheme)?);
+        let workload = Arc::new(
+            RnsBggDerivedWorkload::from_program_with_parameters(self.parameters, program)
+                .map_err(ApiError::scheme)?,
+        );
         self.hash_key_commitment = expected_hash_key;
         self.hash_key = hash_key.to_vec();
-        // Encryption stores each input's row (and public payload) at its
-        // logical level; its public key is sampled from the hash key here, or
-        // where a family member is read.
         let hash_key = self.parameters.ring(0).map_err(ApiError::scheme)?.bytes_input(
             crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
             self.hash_key.len(),
         );
-        for (wire, declaration) in program.inputs() {
-            let level = workload.level(*wire).map_err(ApiError::scheme)?;
-            let ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
-            let knowledge = declaration.knowledge();
-            let columns = self
-                .parameters
-                .key_component_columns(level, knowledge)
-                .map_err(ApiError::scheme)?;
-            let public = matches!(knowledge, AttributeKnowledge::PublicPayload);
-            let binding = match declaration.shape() {
-                InputBinding::Scalar(()) => {
-                    let port = |port: usize, columns: usize| {
-                        ring.artifact_input(
-                            encryption_production.clone(),
-                            format!("input-{wire:?}.{port}"),
-                            (1, columns),
-                            ArtifactAvailability::Transferred,
-                        )
-                    };
-                    let key = super::public_key::sampled_key(
-                        self.parameters,
-                        level,
-                        hash_key.clone(),
-                        *wire,
-                        knowledge,
-                        None,
-                    )
-                    .map_err(ApiError::scheme)?;
-                    InputBinding::Scalar(RnsBggEncoding::new(
-                        key,
-                        (port(0, columns), port(1, columns)),
-                        public.then(|| port(2, 1)),
-                    ))
-                }
-                InputBinding::Family(count) => {
-                    let port = |port: usize, columns: usize| {
-                        ring.family_artifact_input(
-                            encryption_production.clone(),
-                            format!("input-{wire:?}.{port}"),
-                            count.clone(),
-                            (1, columns),
-                            ArtifactAvailability::Transferred,
-                        )
-                    };
-                    let row_ports = [port(0, columns), port(1, columns)];
-                    let element: RnsBggRow =
-                        (row_ports[0].at(Int::constant(0)), row_ports[1].at(Int::constant(0)));
-                    let fields = row_ports
-                        .iter()
-                        .map(|family| family.value_handle().clone())
-                        .collect::<Vec<_>>();
-                    InputBinding::Family(OnlineEvalWireFamily::Input {
-                        wire: *wire,
-                        level,
-                        knowledge,
-                        hash_key: hash_key.clone(),
-                        rows: family_of_fields(&element, count.clone(), &fields)
-                            .map_err(ApiError::scheme)?,
-                        payloads: public.then(|| port(2, 1)),
-                    })
-                }
-            };
-            self.environment
-                .bind_wire(*wire, binding)
-                .map_err(|error| ApiError::input(error.to_string()))?;
-        }
-        self.bind_tables(program, preprocess_binding, None, str::to_owned)?;
+        self.bind_encrypted_inputs(
+            program,
+            &workload,
+            &encryption_production,
+            &hash_key,
+            dynamic.as_ref(),
+            None,
+            |role| role,
+        )?;
         for (rhs, binding) in import_rhs_bindings(
             self.parameters,
             program,
             &workload,
             &preprocess_production,
-            &encryption_production,
             prelude.as_ref(),
+            dynamic.as_ref().map(|(setup, binding)| (setup.as_ref(), binding)),
             &hash_key,
             |role| role,
         )? {
@@ -1075,7 +1254,7 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 .bind_rhs(rhs, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
-        self.evaluator = Some(EncodingLowering {
+        let mut evaluator = EncodingLowering {
             parameters: self.parameters,
             program: Arc::new(program.clone()),
             workload,
@@ -1086,20 +1265,22 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             artifact_prefix: None,
             current_site: None,
             hash_key,
-            context: self.context,
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
-        });
-        self.evaluator
-            .as_mut()
-            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
-            .import_rhs_companions()
-            .map_err(ApiError::scheme)?;
-        self.evaluator
-            .as_mut()
-            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?
-            .import_body_lut_material()
-            .map_err(ApiError::scheme)?;
+            data,
+            output_use: self.output_use,
+            dynamic: dynamic.map(|(setup, binding)| DynamicEvaluation {
+                setup,
+                binding,
+                automorphisms: None,
+            }),
+        };
+        if evaluator.dynamic.is_some() {
+            evaluator.import_dynamic_packages().map_err(ApiError::scheme)?;
+        } else {
+            evaluator.import_body_lut_material().map_err(ApiError::scheme)?;
+        }
+        self.evaluator = Some(evaluator);
         Ok(())
     }
 
@@ -1130,6 +1311,24 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             .evaluator
             .as_mut()
             .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?;
+        let carriers = outputs
+            .iter()
+            .map(|output| {
+                let level = evaluator.workload.level(output.wire())?;
+                self.parameters.output_carrier(
+                    &evaluator.program,
+                    output.wire(),
+                    level,
+                    evaluator.output_use,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::scheme)?;
+        if carriers != self.output_carriers {
+            return Err(ApiError::compatibility(
+                "online evaluation output carriers differ from the preprocessed ones",
+            ));
+        }
         let outputs = evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?;
         let mut graph = DslContext::new("rns-bgg-online-eval");
         let mut hash_keys = vec![(
@@ -1158,10 +1357,6 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 runtime.insert(name, RuntimeValue::Bytes(key.as_slice().into()));
             }
         }
-        let evaluator = self
-            .evaluator
-            .as_ref()
-            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?;
         Ok(StageGraph::new(graph, runtime, evaluator.manifests.clone()))
     }
 }

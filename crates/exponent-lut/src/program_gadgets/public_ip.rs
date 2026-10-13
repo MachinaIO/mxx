@@ -255,8 +255,8 @@ mod tests {
             ProgramLowerError, ProgramLoweringContext, lower_program,
         },
         rns_bgg::{
-            RnsBggParameters, RnsEncryptBuild, RnsOnlineEvalBuild, RnsPreprocessBuild,
-            decode_public_output, verify_output,
+            RnsBggParameters, RnsEncryptBuild, RnsOnlineEvalBuild, RnsOutputUse,
+            RnsPreprocessBuild, decode_public_output, verify_output,
         },
     };
     use mxx_backends::{
@@ -320,13 +320,12 @@ mod tests {
     impl FamilyExecution<Depth> for DepthFamilies {
         type WireFamily = usize;
         type RhsFamily = ();
-        type Table = ();
 
-        fn wire_at_table(
+        fn wire_selected(
             &mut self,
             _evaluator: &mut Depth,
             family: &usize,
-            _: &(),
+            _: crate::program::DataId,
             _: &IntExpr,
         ) -> Result<usize, ProgramLowerError<DepthError>> {
             Ok(*family)
@@ -341,6 +340,14 @@ mod tests {
             Ok(*family)
         }
         fn rhs_at(&mut self, _: &(), _: &IntExpr) -> Result<(), ProgramLowerError<DepthError>> {
+            Err(ProgramLowerError::Backend(DepthError))
+        }
+        fn rhs_selected(
+            &mut self,
+            _: &(),
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<(), ProgramLowerError<DepthError>> {
             Err(ProgramLowerError::Backend(DepthError))
         }
         fn parallel(
@@ -430,7 +437,6 @@ mod tests {
             program,
             &ParamEnv::default(),
             &PlaintextInputs::<_, DCRTPoly>::new(),
-            &BTreeMap::new(),
             Some(&payload),
             &hash_key,
             RnsPreprocessBuild::new(&parameters, context),
@@ -448,7 +454,7 @@ mod tests {
             &program.encryption_inputs(),
             &ParamEnv::default(),
             &lhs,
-            &preprocess,
+            Some(&preprocess),
             &payload,
             Some(&mask),
             &hash_key,
@@ -482,6 +488,7 @@ mod tests {
             &parameters,
             &payload,
             Some(&mask),
+            RnsOutputUse::DirectDecode,
             &mut execution,
             &mut store,
         )
@@ -496,6 +503,7 @@ mod tests {
                 &parameters,
                 &payload,
                 Some(&mask),
+                RnsOutputUse::DirectDecode,
                 &mut execution,
                 &mut store,
             )

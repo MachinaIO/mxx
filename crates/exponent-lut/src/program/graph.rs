@@ -73,8 +73,33 @@ pub fn family_of_fields<T: mxx_dsl::GraphValue>(
 }
 
 /// Graph-valued execution adapter shared by all graph lowerers.
-/// Graph-valued family execution used by the built-in scheme adapters.
-pub struct GraphFamilyExecution;
+/// Graph-valued family execution used by the built-in scheme adapters. It
+/// reads a selected member through the Program's integer data inputs, when
+/// they are given ([`Self::with_data`]).
+#[derive(Default)]
+pub struct GraphFamilyExecution {
+    data: std::collections::BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>,
+}
+
+impl GraphFamilyExecution {
+    /// An execution that reads the integer data families `data`, each a
+    /// graph input family of its declared count.
+    pub fn with_data(
+        data: std::collections::BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>>,
+    ) -> Self {
+        Self { data }
+    }
+
+    /// Entry `position` of the data family `data`, a member index.
+    fn entry<Error: std::error::Error + Send + Sync + 'static>(
+        &self,
+        data: DataId,
+        position: &IntExpr,
+    ) -> Result<mxx_dsl::Int, ProgramLowerError<Error>> {
+        let family = self.data.get(&data).ok_or(ProgramValidationError::MissingBinding)?;
+        Ok(family.at(mxx_dsl::Int::evaluate(position.clone())))
+    }
+}
 
 /// Optional transport used by graph lowerers to retain artifacts created by a
 /// parallel body.  The hook is deliberately on the graph adapter boundary:
@@ -104,7 +129,6 @@ where
 {
     type WireFamily = mxx_dsl::Family<E::Wire>;
     type RhsFamily = mxx_dsl::Family<E::Rhs>;
-    type Table = mxx_dsl::Family<mxx_dsl::Int>;
 
     fn wire_at(
         &mut self,
@@ -115,17 +139,17 @@ where
         Ok(family.at(mxx_dsl::Int::evaluate(index.clone())))
     }
 
-    /// `family.at(table.at(index))`: a dynamic member read whose index is a
-    /// table entry. In a loop over the table's entries, an artifact family
-    /// read this way lowers to a gather by the table.
-    fn wire_at_table(
+    /// `family.at(data.at(position))`: a dynamic member read whose index is a
+    /// data entry. In a loop over the data's entries, an artifact family read
+    /// this way lowers to a gather by the data.
+    fn wire_selected(
         &mut self,
         _evaluator: &mut E,
         family: &Self::WireFamily,
-        table: &Self::Table,
-        index: &IntExpr,
+        data: DataId,
+        position: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
-        Ok(family.at(table.at(mxx_dsl::Int::evaluate(index.clone()))))
+        Ok(family.at(self.entry(data, position)?))
     }
 
     fn rhs_at(
@@ -134,6 +158,15 @@ where
         index: &IntExpr,
     ) -> Result<E::Rhs, ProgramLowerError<E::Error>> {
         Ok(family.at(mxx_dsl::Int::evaluate(index.clone())))
+    }
+
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        data: DataId,
+        position: &IntExpr,
+    ) -> Result<E::Rhs, ProgramLowerError<E::Error>> {
+        Ok(family.at(self.entry(data, position)?))
     }
 
     fn parallel(
@@ -495,14 +528,14 @@ mod tests {
     fn graph_parallel_lifts_tuple_side_outputs_with_scope() {
         use mxx_dsl::{DslContext, Int};
 
-        let mut families = GraphFamilyExecution;
+        let mut families = GraphFamilyExecution::default();
         let mut evaluator = GraphEvaluator::default();
         let range =
             FamilyRange::bounded(IntExpr::constant(2), IntExpr::constant(2), IntExpr::constant(3))
                 .unwrap();
         let (wires, actions) = families
             .parallel_with_side_outputs(&mut evaluator, &range, |families, evaluator, index| {
-                assert!(matches!(families, GraphFamilyExecution));
+                assert!(matches!(families, GraphFamilyExecution { .. }));
                 assert!(evaluator.site.is_none());
                 let value = Int::evaluate(index);
                 let side = (value.clone(), value.clone().add(Int::constant(1)));
@@ -521,10 +554,10 @@ mod tests {
         graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
     }
 
-    /// A lookup in a loop over the table's entries reads the artifact family
-    /// at each entry: the loop gathers the family by the table.
+    /// A wire selection in a loop over the data's entries reads the artifact
+    /// family at each entry: the loop gathers the family by the data.
     #[test]
-    fn graph_lookup_gathers_an_artifact_family_by_the_table() {
+    fn graph_selection_gathers_an_artifact_family_by_the_data() {
         use crate::program::{
             AttributeKnowledge, Environment, ExponentLutProgramBuilder, InputBinding, Operand,
         };
@@ -537,12 +570,12 @@ mod tests {
         let mut builder = ExponentLutProgramBuilder::new();
         let input =
             builder.input_family(IntExpr::constant(3), AttributeKnowledge::PrivatePayload).unwrap();
-        let table = builder.table(IntExpr::constant(5), IntExpr::constant(3)).unwrap();
+        let data = builder.data_family(5, Some(3)).unwrap();
         let reads = builder
             .parallel(FamilyRange::full(IntExpr::constant(5)).unwrap(), |builder, index| {
                 builder
                     .mul_small_constant(
-                        Operand::Lookup { family: input, table, index },
+                        Operand::Selected { family: input, data, position: index },
                         vec![1],
                         IntExpr::constant(0),
                     )
@@ -564,11 +597,12 @@ mod tests {
             .unwrap();
         let mut environment = Environment::new();
         environment.bind_wire(input, InputBinding::Family(members)).unwrap();
-        environment.bind_table(table, context.int_family_input("table", 5)).unwrap();
         let outputs = crate::program::lower_program(
             &program,
             &mut GraphEvaluator::default(),
-            &mut GraphFamilyExecution,
+            &mut GraphFamilyExecution::with_data(crate::program::data_inputs(&program, |_| {
+                "data".to_owned()
+            })),
             &mut environment,
         )
         .unwrap();
@@ -584,7 +618,7 @@ mod tests {
             })
             .unwrap();
         let index_argument =
-            modes.iter().position(|mode| *mode == LoopInputMode::Zip).expect("table entries");
+            modes.iter().position(|mode| *mode == LoopInputMode::Zip).expect("data entries");
         assert!(modes.contains(&LoopInputMode::Gather { index_argument }), "{modes:?}");
     }
 
@@ -663,7 +697,7 @@ mod tests {
     #[test]
     fn graph_parallel_preserves_nonzero_nested_indices() {
         use mxx_dsl::DslContext;
-        let mut families = GraphFamilyExecution;
+        let mut families = GraphFamilyExecution::default();
         let mut evaluator = GraphEvaluator::default();
         let outer =
             FamilyRange::bounded(IntExpr::constant(2), IntExpr::constant(2), IntExpr::constant(3))

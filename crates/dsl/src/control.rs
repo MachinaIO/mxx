@@ -373,4 +373,29 @@ mod tests {
         assert!((Int::constant(7) / -3).expression().is_err());
         assert!((Int::constant(7) % -3).expression().is_err());
     }
+
+    fn multiplications(built: &crate::BuiltGraph) -> u128 {
+        built.operation_counts().unwrap().get("MatrixBinary(Multiply)").copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn index_invariant_loops_are_counted_without_enumeration() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let (a, b) = (ring.input("a", (1, 1)), ring.input("b", (1, 1)));
+        let output = iterate(1_000_000_000_000u64, a.clone(), |_, state| {
+            Ok(parallel(1_000_000_000_000u64, |_| Ok(&state * &b))?.at(0))
+        })
+        .unwrap();
+        let built = DslContext::new("invariant").output("result", output).unwrap().build().unwrap();
+        assert_eq!(multiplications(&built), 1_000_000_000_000u128 * 1_000_000_000_000);
+    }
+
+    #[test]
+    fn empty_loops_count_nothing() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let (a, b) = (ring.input("a", (1, 1)), ring.input("b", (1, 1)));
+        let output = iterate(0, a, |_, state| Ok(&state * &b)).unwrap();
+        let built = DslContext::new("empty").output("result", output).unwrap().build().unwrap();
+        assert_eq!(multiplications(&built), 0);
+    }
 }

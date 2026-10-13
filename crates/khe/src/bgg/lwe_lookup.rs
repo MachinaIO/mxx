@@ -904,9 +904,8 @@ impl LweLookupCompiler {
     fn validate_layout(&self) -> Result<(), LweLookupCompileError> {
         let expected_public_columns =
             (&self.public_key_type.rows * &self.digit_count).canonicalize();
-        let expected_high_rows = (&self.public_key_type.rows *
-            (&self.digit_count + IntExpr::constant(2)))
-        .canonicalize();
+        let expected_high_rows = mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns_expr(self.public_key_type.rows.clone(), self.digit_count.clone());
         let types = [&self.low_matrix_type, &self.high_matrix_type];
         if types.iter().any(|ty| ty.ring != self.public_key_type.ring) ||
             self.public_key_type.columns.canonicalize() != expected_public_columns ||
@@ -1000,7 +999,8 @@ fn lookup_compiler_for_table<P: Poly>(
     preimage_max_coefficient_bound: IntExpr,
 ) -> Result<LweLookupCompiler, LweLookupCompileError> {
     let public_columns = public_key_type.columns.clone();
-    let high_rows = (&public_key_type.rows * (&digit_count + IntExpr::constant(2))).canonicalize();
+    let high_rows = mxx_ir_core::types::TrapdoorInstantiation::Computational
+        .columns_expr(public_key_type.rows.clone(), digit_count.clone());
     let low_matrix_type = MatrixType {
         rows: public_columns.clone(),
         columns: public_columns.clone(),

@@ -1490,11 +1490,33 @@ fn upload_bytes_inputs(
 fn check_preimage_replays(frame: &PhysicalFrame, body: Option<(u32, u32)>) -> Result<(), String> {
     for (index, replay) in preimage_replays_in(frame, body) {
         let status = replay.status.read().map_err(|error| error.to_string())?;
-        if !status.succeeded() || status.attempts == 0 || status.attempts > replay.planned_max {
-            return Err(format!(
-                "GPU preimage retry {index} failed: attempts={}, accepted={}, error_code={}, max_attempts={}",
-                status.attempts, status.accepted, status.error_code, replay.planned_max
-            ));
+        let failed =
+            !status.succeeded() || status.attempts == 0 || status.attempts > replay.planned_max;
+        match &replay.trapgen {
+            Some(_) if failed => {
+                return Err(format!(
+                    "GPU statistical TrapGen rejected {} trapdoors: the perturbation covariance is not positive definite, so the singular-value estimate is wrong for these parameters",
+                    status.attempts
+                ));
+            }
+            Some(trapgen) => {
+                // The header of the accepted precomputation: the width and the measured `s_1`.
+                let mut header = [0u8; 16];
+                trapgen.precomputation.download(&mut header).map_err(|error| error.to_string())?;
+                tracing::info!(
+                    attempts = status.attempts,
+                    measured_s1 = f64::from_le_bytes(header[8..].try_into().expect("eight bytes")),
+                    estimated_s1 = trapgen.estimate,
+                    "statistical trapdoor accepted"
+                );
+            }
+            None if failed => {
+                return Err(format!(
+                    "GPU preimage retry {index} failed: attempts={}, accepted={}, error_code={}, max_attempts={}",
+                    status.attempts, status.accepted, status.error_code, replay.planned_max
+                ));
+            }
+            None => {}
         }
     }
     Ok(())

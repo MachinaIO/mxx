@@ -2,10 +2,11 @@
 //! [`crate::decoder`]).
 //!
 //! The decoded column is component 1 of the source output (its payload
-//! secret component is 1) under the selection `G_(L+1)^-1(1)`, whose payload
-//! is `Delta_L mu`, plus the smudge sum, whose members were
-//! finalized and weighted in their root bodies. Its key is the `2 x 1`
-//! matrix `A = (A_01; A_11) G_(L+1)^-1(1) + sum (A_01; A_11)_smudge`.
+//! secret component is 1) under the source selection `v` of
+//! [`RnsBggParameters::decoder_selection`], whose payload is `Delta mu`,
+//! plus the smudge sum, whose members were normalized and weighted in their
+//! root bodies. Its key is the `2 x 1` matrix
+//! `A = (A_01; A_11) v + sum (A_01; A_11)_smudge`.
 use super::*;
 use crate::decoder::decoding::DecoderDeclaration;
 
@@ -63,12 +64,7 @@ impl Decoder for RnsBggDecoder<'_, PublicKeyLowering<'_>> {
             return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
         let ring = parameters.ring(level)?;
-        let plaintext = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
-        let selection = parameters.gadget_inverse(
-            plaintext,
-            level,
-            parameters.ring(plaintext)?.polynomial([IntExpr::constant(1)]),
-        )?;
+        let (selection, _, _) = parameters.decoder_selection(declaration, &self.lowerer.program)?;
         let (top, bottom) = decoded_key_column(&self.source.matrix);
         let (mut top, mut bottom) =
             (top.mul_small_rhs(selection.clone()), bottom.mul_small_rhs(selection));

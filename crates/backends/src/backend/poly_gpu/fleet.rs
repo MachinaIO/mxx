@@ -46,8 +46,10 @@ use crate::{
                 GpuRawControlStatusView, GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb,
                 GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
                 GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
-                GpuRawSmallMatrixView, GpuSignedValuesEncoding, GpuStridedCopy,
-                gpu_device_identity, gpu_device_memory_usage, gpu_device_sync,
+                GpuRawSmallMatrixView, GpuRawStatisticalWorkspace, GpuSignedValuesEncoding,
+                GpuStatisticalBindings, GpuStatisticalFactor, GpuStatisticalPerturbation,
+                GpuStatisticalTrapGenOperands, GpuStridedCopy, gpu_device_identity,
+                gpu_device_memory_usage, gpu_device_sync,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
             params::DCRTPolyParams,
@@ -104,23 +106,14 @@ fn compiled_raw_matrix_part_inner(
         {
             matrix.clone()
         }
-        ConcreteWireType::Trapdoor { matrix, digit_count, .. } => {
-            let secret_columns = matrix
-                .rows
-                .checked_mul(*digit_count)
-                .ok_or_else(|| invalid("trapdoor secret column count overflows"))?;
-            let (rows, columns) = match part.leaf {
-                0 | 1 => (matrix.rows, secret_columns),
-                2..=4 => (matrix.rows, matrix.rows),
-                5 => (
-                    matrix
-                        .rows
-                        .checked_mul(2)
-                        .ok_or_else(|| invalid("trapdoor stacked row count overflows"))?,
-                    secret_columns,
-                ),
-                _ => return Err(invalid("raw trapdoor part references an unknown leaf")),
-            };
+        ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
+            let (rows, columns) = crate::sampler::trapdoor::trapdoor_component_shapes(
+                matrix.rows,
+                *digit_count,
+                *instantiation,
+            )
+            .and_then(|shapes| shapes.get(part.leaf as usize).copied())
+            .ok_or_else(|| invalid("raw trapdoor part references an unknown leaf"))?;
             ConcreteMatrixType { ring: matrix.ring.clone(), rows, columns }
         }
         _ => return Err(invalid("raw matrix operation requires a matrix or trapdoor leaf")),
@@ -439,6 +432,23 @@ fn compiled_bytes_part(
     compiled_contiguous_part(owner, part_index, bytes, device)
 }
 
+/// The owner and `(address, bytes)` of a whole Bytes operand of a statistical trapdoor
+/// operation: the precomputation or a scratch.
+fn statistical_bytes_operand<'a>(
+    owners: &'a BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    id: &PhysicalValueId,
+    part: u32,
+    device: i32,
+) -> Result<(&'a Arc<GpuResidentValue>, (u64, usize)), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let owner = owners.get(id).ok_or_else(|| invalid("statistical bytes operand is missing"))?;
+    let ConcreteWireType::Bytes { length } = owner.wire_type() else {
+        return Err(invalid("statistical bytes operand is not a Bytes value"));
+    };
+    let address = compiled_bytes_part(owner, part, *length as u64, device)?;
+    Ok((owner, (address, *length)))
+}
+
 fn compiled_raw_integer_part(
     owner: &GpuResidentValue,
     part_index: u32,
@@ -658,13 +668,16 @@ fn compiled_raw_small_matrix_part(
 /// compiled executable. Indexes refer to the immutable operation sequence.
 #[derive(Clone)]
 pub(crate) struct GpuPreparedNativeResources {
-    modulus_conversions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
+    /// Keyed by the address of the operation in the prepared program, which
+    /// is unique across loop bodies, whose indices are body-local.
+    modulus_conversions: BTreeMap<usize, (i32, Arc<GpuModulusConversionPlan>)>,
     rns_conversions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     crt_recompositions: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     compact_packs: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     hash_samples: BTreeMap<u32, (i32, Arc<GpuHashSamplePlan>, Box<[(PhysicalValueId, u32, u32)]>)>,
     dynamic_round_divides: BTreeMap<u32, (i32, Arc<GpuModulusConversionPlan>)>,
     p1: BTreeMap<u32, (i32, Arc<GpuRawP1Workspace>)>,
+    statistical: BTreeMap<u32, (i32, Arc<GpuRawStatisticalWorkspace>)>,
     gq: BTreeMap<u32, (i32, Arc<GpuRawGqWorkspace>)>,
     cutoff: BTreeMap<u32, (i32, Arc<GpuRawPreimageCutoffPlan>)>,
     indexed_matrices: BTreeMap<u32, Arc<GpuIndexedMatrixTable>>,
@@ -705,6 +718,14 @@ impl GpuPreparedNativeResources {
                     .map(|(address, bytes)| (*device, address, bytes)),
             );
         }
+        for (device, workspace) in self.statistical.values() {
+            ranges.extend(
+                workspace
+                    .binding_ranges()
+                    .into_iter()
+                    .map(|(address, bytes)| (*device, address, bytes)),
+            );
+        }
         for (device, workspace) in self.gq.values() {
             ranges.push((*device, workspace.sampled_address(), workspace.sampled_bytes()));
         }
@@ -732,6 +753,11 @@ impl GpuPreparedNativeResources {
         match kind {
             GpuPreparedWorkspaceKind::P1 => {
                 let (device, workspace) = self.p1.get(&resource_id)?;
+                let (address, bytes) = *workspace.binding_ranges().get(component as usize)?;
+                Some((*device, address, bytes))
+            }
+            GpuPreparedWorkspaceKind::Statistical => {
+                let (device, workspace) = self.statistical.get(&resource_id)?;
                 let (address, bytes) = *workspace.binding_ranges().get(component as usize)?;
                 Some((*device, address, bytes))
             }
@@ -773,6 +799,11 @@ impl GpuPreparedNativeResources {
             }
         }
         for (device, workspace) in self.p1.values() {
+            if *device == physical_device {
+                workspace.prepare_graph_launch(stream)?;
+            }
+        }
+        for (device, workspace) in self.statistical.values() {
             if *device == physical_device {
                 workspace.prepare_graph_launch(stream)?;
             }
@@ -862,6 +893,11 @@ impl GpuPreparedNativeResources {
                 workspace.protect_compiled_submission(completion)?;
             }
         }
+        for (device, workspace) in self.statistical.values() {
+            if *device == physical_device {
+                workspace.protect_compiled_submission(completion)?;
+            }
+        }
         for (device, workspace) in self.gq.values() {
             if *device == physical_device {
                 workspace.protect_compiled_submission(completion)?;
@@ -876,6 +912,12 @@ impl GpuPreparedNativeResources {
     }
 }
 
+/// The key of `operation` in [`GpuPreparedNativeResources`] maps that cover
+/// loop bodies: its address in the program that is both prepared and emitted.
+fn operation_key(operation: &CompiledGpuOp) -> usize {
+    std::ptr::from_ref(operation) as usize
+}
+
 pub(crate) fn prepare_compiled_gpu_program(
     backend: &GpuDcrtBackend,
     program: &CompiledGpuProgram,
@@ -885,7 +927,11 @@ pub(crate) fn prepare_compiled_gpu_program(
 ) -> Result<GpuPreparedNativeResources, GpuNativeGraphError> {
     let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
     let mut modulus_conversions = BTreeMap::new();
-    for (index, operation) in program.operations.iter().enumerate() {
+    let mut pending = program.operations.iter().collect::<Vec<_>>();
+    while let Some(operation) = pending.pop() {
+        if let Some(body) = operation.body.as_ref() {
+            pending.extend(body.iter());
+        }
         let implementation = program
             .implementations
             .resolve(operation.implementation)
@@ -1042,12 +1088,10 @@ pub(crate) fn prepare_compiled_gpu_program(
             )?,
             (Some(_), Some(_)) => return Err(invalid("ambiguous CRT conversion plan")),
         };
-        modulus_conversions.insert(
-            u32::try_from(index).map_err(|_| invalid("too many compiled operations"))?,
-            (operation.device, Arc::new(plan)),
-        );
+        modulus_conversions.insert(operation_key(operation), (operation.device, Arc::new(plan)));
     }
     let mut p1 = BTreeMap::new();
+    let mut statistical = BTreeMap::new();
     let mut rns_conversions = BTreeMap::new();
     let mut crt_recompositions = BTreeMap::new();
     let mut compact_packs = BTreeMap::new();
@@ -1651,6 +1695,55 @@ pub(crate) fn prepare_compiled_gpu_program(
                 )?;
                 p1.insert(*resource_id, (operation.device, Arc::new(workspace)));
             }
+            GpuNativePrimitive::StatisticalPerturbation => {
+                let [
+                    KernelArg::U32(resource_id),
+                    KernelArg::Value(output_id),
+                    KernelArg::U32(output_part),
+                    KernelArg::Value(_),
+                    KernelArg::U32(_),
+                    KernelArg::Value(_),
+                    KernelArg::U32(_),
+                    KernelArg::U64(m_bar),
+                    ..,
+                ] = operation.arguments.as_ref()
+                else {
+                    return Err(invalid("statistical perturbation has invalid arguments"));
+                };
+                if !resource_ids.insert(*resource_id) {
+                    return Err(invalid("statistical workspace resource ID is duplicated"));
+                }
+                let output_owner = owners
+                    .get(output_id)
+                    .ok_or_else(|| invalid("statistical perturbation output owner is missing"))?;
+                let (output_ty, output, _) = compiled_raw_matrix_part(
+                    output_owner,
+                    *output_part,
+                    PhysicalEncoding::FullCoeff,
+                )?;
+                let m_bar = usize::try_from(*m_bar)
+                    .map_err(|_| invalid("statistical m_bar exceeds usize"))?;
+                if output.physical_device != operation.device ||
+                    output.row_origin != 0 ||
+                    output.column_origin != 0 ||
+                    output.rows <= m_bar as u64
+                {
+                    return Err(invalid("statistical perturbation output is not a packed tile"));
+                }
+                let params = backend
+                    .parameters_on_physical_device(operation.device, &output_ty)
+                    .map_err(|error| invalid(&error))?;
+                let stream = params.native_launch_stream(operation.device)?;
+                let workspace = GpuRawStatisticalWorkspace::new(
+                    params,
+                    &stream,
+                    m_bar,
+                    output.rows as usize - m_bar,
+                    usize::try_from(output.columns)
+                        .map_err(|_| invalid("statistical columns exceed usize"))?,
+                )?;
+                statistical.insert(*resource_id, (operation.device, Arc::new(workspace)));
+            }
             GpuNativePrimitive::GqSample => {
                 let [
                     KernelArg::U32(resource_id),
@@ -1756,6 +1849,7 @@ pub(crate) fn prepare_compiled_gpu_program(
         hash_samples,
         dynamic_round_divides,
         p1,
+        statistical,
         gq,
         cutoff,
         indexed_matrices: indexed_matrices.clone(),
@@ -4096,7 +4190,7 @@ pub(crate) fn emit_compiled_gpu_op(
             bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
             let (device, plan) = resources
                 .modulus_conversions
-                .get(&index)
+                .get(&operation_key(op))
                 .ok_or_else(|| invalid("compiled modulus switch has no prepared native plan"))?;
             if *device != op.device {
                 return Err(invalid(
@@ -4202,7 +4296,7 @@ pub(crate) fn emit_compiled_gpu_op(
             bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
             let (device, plan) = resources
                 .modulus_conversions
-                .get(&index)
+                .get(&operation_key(op))
                 .ok_or_else(|| invalid("compiled CRT conversion has no prepared native plan"))?;
             if *device != op.device {
                 return Err(invalid("compiled CRT conversion plan belongs to another device"));
@@ -4916,6 +5010,244 @@ pub(crate) fn emit_compiled_gpu_op(
             builder.retain_owner(Arc::clone(tp2_owner));
             builder.retain_owner(Arc::clone(output_owner));
             builder.retain_owner(Arc::clone(seed_owner));
+            builder.retain_owner(Arc::clone(workspace));
+        }
+        GpuNativePrimitive::StatisticalSpectra => {
+            let [
+                KernelArg::Value(chunk_id),
+                KernelArg::U32(chunk_part),
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::Value(scratch_id),
+                KernelArg::U32(scratch_part),
+                KernelArg::U64(m_bar),
+                KernelArg::U64(row_offset),
+                KernelArg::U32(chunk_binding),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(scratch_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical spectra has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*precomputation_id] {
+                return Err(invalid(
+                    "compiled statistical spectra output is not its precomputation",
+                ));
+            }
+            let chunk_owner = owners
+                .get(chunk_id)
+                .ok_or_else(|| invalid("statistical spectra chunk owner is missing"))?;
+            let (chunk_ty, chunk, chunk_bindings) =
+                compiled_raw_matrix_part(chunk_owner, *chunk_part, PhysicalEncoding::FullCoeff)?;
+            if chunk.physical_device != op.device {
+                return Err(invalid("statistical spectra physical contract is inconsistent"));
+            }
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let (scratch_owner, scratch) =
+                statistical_bytes_operand(owners, scratch_id, *scratch_part, op.device)?;
+            bind_raw_matrix_part(builder, *chunk_binding, &chunk_bindings)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            builder.bind_resident_address(scratch.0, scratch.1, *scratch_binding)?;
+            let params = backend
+                .parameters_on_physical_device(op.device, &chunk_ty)
+                .map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_spectra(
+                builder.launch_stream(),
+                &chunk,
+                usize::try_from(*m_bar).map_err(|_| invalid("statistical m_bar exceeds usize"))?,
+                usize::try_from(*row_offset)
+                    .map_err(|_| invalid("statistical spectra row exceeds usize"))?,
+                GpuStatisticalTrapGenOperands {
+                    precomputation,
+                    precomputation_binding: *precomputation_binding,
+                    auxiliary: scratch,
+                    auxiliary_binding: *scratch_binding,
+                },
+                *chunk_binding,
+            )?;
+            builder.retain_owner(Arc::clone(chunk_owner));
+            builder.retain_owner(Arc::clone(precomputation_owner));
+            builder.retain_owner(Arc::clone(scratch_owner));
+        }
+        GpuNativePrimitive::StatisticalFactor => {
+            let [
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::Value(attempt_id),
+                KernelArg::U32(attempt_part),
+                KernelArg::Value(status_id),
+                KernelArg::U32(status_part),
+                KernelArg::U64(m_bar),
+                KernelArg::U64(digits),
+                KernelArg::U64(degree),
+                KernelArg::F64(preimage_sigma),
+                KernelArg::F64(variance),
+                KernelArg::F64(alpha),
+                KernelArg::F64(pivot_floor),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(attempt_binding),
+                KernelArg::U32(status_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical factor has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*status_id] ||
+                [preimage_sigma, variance, alpha, pivot_floor]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            {
+                return Err(invalid("compiled statistical factor output or scalars are invalid"));
+            }
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let attempt_owner = owners
+                .get(attempt_id)
+                .ok_or_else(|| invalid("statistical factor attempt owner is missing"))?;
+            let status_owner = owners
+                .get(status_id)
+                .ok_or_else(|| invalid("statistical factor status owner is missing"))?;
+            let attempt_address = compiled_bytes_part(attempt_owner, *attempt_part, 8, op.device)?;
+            let status_address = compiled_bytes_part(status_owner, *status_part, 16, op.device)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            builder.bind_resident_address(attempt_address, 8, *attempt_binding)?;
+            builder.bind_resident_address(status_address, 16, *status_binding)?;
+            let m_bar =
+                usize::try_from(*m_bar).map_err(|_| invalid("statistical m_bar exceeds usize"))?;
+            let digits =
+                usize::try_from(*digits).map_err(|_| invalid("statistical digits exceed usize"))?;
+            let degree = u32::try_from(*degree)
+                .map_err(|_| invalid("statistical ring dimension exceeds u32"))?;
+            let params =
+                backend.control_parameters_on_device(op.device).map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_factor(
+                builder.launch_stream(),
+                m_bar,
+                digits,
+                GpuStatisticalFactor {
+                    degree,
+                    preimage_sigma: *preimage_sigma,
+                    variance: *variance,
+                    alpha: *alpha,
+                    pivot_floor: *pivot_floor,
+                },
+                GpuStatisticalTrapGenOperands {
+                    precomputation,
+                    precomputation_binding: *precomputation_binding,
+                    auxiliary: (attempt_address, 8),
+                    auxiliary_binding: *attempt_binding,
+                },
+                (status_address, *status_binding),
+            )?;
+            builder.retain_owner(Arc::clone(precomputation_owner));
+            builder.retain_owner(Arc::clone(attempt_owner));
+            builder.retain_owner(Arc::clone(status_owner));
+        }
+        GpuNativePrimitive::StatisticalPerturbation => {
+            let [
+                KernelArg::U32(resource_id),
+                KernelArg::Value(output_id),
+                KernelArg::U32(output_part),
+                KernelArg::Value(seed_id),
+                KernelArg::U32(seed_part),
+                KernelArg::Value(precomputation_id),
+                KernelArg::U32(precomputation_part),
+                KernelArg::U64(_),
+                KernelArg::F64(p2_sigma),
+                KernelArg::F64(center_scale),
+                KernelArg::F64(rounding),
+                KernelArg::U32(output_binding),
+                KernelArg::U32(seed_binding),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(centers_binding),
+                KernelArg::U32(buffer_binding),
+                KernelArg::U32(p2_binding),
+            ] = op.arguments.as_ref()
+            else {
+                return Err(invalid("compiled statistical perturbation has the wrong arguments"));
+            };
+            if op.outputs.as_ref() != [*output_id] {
+                return Err(invalid("compiled statistical perturbation output is not its tile"));
+            }
+            let output_owner = owners
+                .get(output_id)
+                .ok_or_else(|| invalid("statistical perturbation output owner is missing"))?;
+            let seed_owner = owners
+                .get(seed_id)
+                .ok_or_else(|| invalid("statistical perturbation seed owner is missing"))?;
+            let (output_ty, output, output_bindings) =
+                compiled_raw_matrix_part(output_owner, *output_part, PhysicalEncoding::FullCoeff)?;
+            let seed_address = compiled_bytes_part(seed_owner, *seed_part, 32, op.device)?;
+            let (precomputation_owner, precomputation) = statistical_bytes_operand(
+                owners,
+                precomputation_id,
+                *precomputation_part,
+                op.device,
+            )?;
+            let (device, workspace) = resources
+                .statistical
+                .get(resource_id)
+                .ok_or_else(|| invalid("statistical perturbation has no prepared workspace"))?;
+            if *device != op.device ||
+                [p2_sigma, center_scale, rounding].iter().any(|value| !value.is_finite())
+            {
+                return Err(invalid("statistical perturbation physical contract is inconsistent"));
+            }
+            bind_raw_matrix_part(builder, *output_binding, &output_bindings)?;
+            builder.bind_resident_address(seed_address, 32, *seed_binding)?;
+            builder.bind_resident_address(
+                precomputation.0,
+                precomputation.1,
+                *precomputation_binding,
+            )?;
+            let ranges = workspace.binding_ranges();
+            for ((address, bytes), binding) in
+                ranges.into_iter().zip([centers_binding, buffer_binding, p2_binding])
+            {
+                builder.bind_resident_address(address, bytes, *binding)?;
+            }
+            let params = backend
+                .parameters_on_physical_device(op.device, &output_ty)
+                .map_err(|error| invalid(&error))?;
+            params.emit_raw_statistical_perturbation(
+                builder.launch_stream(),
+                &output,
+                seed_address,
+                precomputation,
+                GpuStatisticalPerturbation {
+                    p2_sigma: *p2_sigma,
+                    center_scale: *center_scale,
+                    rounding: *rounding,
+                },
+                workspace,
+                GpuStatisticalBindings {
+                    output_base: *output_binding,
+                    seed: *seed_binding,
+                    precomputation: *precomputation_binding,
+                    centers: *centers_binding,
+                    buffer: *buffer_binding,
+                    p2: *p2_binding,
+                },
+            )?;
+            builder.retain_owner(Arc::clone(output_owner));
+            builder.retain_owner(Arc::clone(seed_owner));
+            builder.retain_owner(Arc::clone(precomputation_owner));
             builder.retain_owner(Arc::clone(workspace));
         }
         GpuNativePrimitive::GqSample => {
@@ -6660,26 +6992,20 @@ fn transcode_raw_full_matrix<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     Ok(written)
 }
 
+/// Stream a trapdoor into its artifact: the public matrix and the tagged secret encoding of
+/// `DCRTTrapdoor::to_compact_bytes`, one component (a leaf) at a time.
 fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
     layout: &PhysicalExport,
     source: &mut R,
     sink: &mut W,
     public_matrix: &ConcreteMatrixType,
     digit_count: usize,
+    instantiation: mxx_ir_core::types::TrapdoorInstantiation,
 ) -> Result<u64, String> {
     let public = layout.public.as_ref().ok_or("trapdoor export has no public value")?;
     if public.ty != ConcreteWireType::Matrix(public_matrix.clone()) {
         return Err("trapdoor public value has the wrong matrix type".into());
     }
-    let secret_columns = public_matrix
-        .rows
-        .checked_mul(digit_count)
-        .ok_or("trapdoor secret column count overflows")?;
-    let secret_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows,
-        columns: secret_columns,
-    };
     let mut public_file = tempfile::tempfile().map_err(|error| error.to_string())?;
     let public_len = transcode_raw_eval_matrix(
         layout,
@@ -6688,27 +7014,28 @@ fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
         public_matrix,
         RawExportLeaf::TrapdoorPublic,
     )?;
-    let square_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows,
-        columns: public_matrix.rows,
-    };
-    let stacked_matrix = ConcreteMatrixType {
-        ring: public_matrix.ring.clone(),
-        rows: public_matrix.rows.checked_mul(2).ok_or("trapdoor stacked row count overflows")?,
-        columns: secret_columns,
-    };
-    let secret_shapes = [
-        &secret_matrix,
-        &secret_matrix,
-        &square_matrix,
-        &square_matrix,
-        &square_matrix,
-        &stacked_matrix,
-    ];
+    let secret_shapes = crate::sampler::trapdoor::trapdoor_component_shapes(
+        public_matrix.rows,
+        digit_count,
+        instantiation,
+    )
+    .ok_or("trapdoor export has an invalid instantiation")?
+    .into_iter()
+    .map(|(rows, columns)| ConcreteMatrixType { ring: public_matrix.ring.clone(), rows, columns })
+    .collect::<Vec<_>>();
     let mut secret_file = tempfile::tempfile().map_err(|error| error.to_string())?;
-    let mut secret_len = 0u64;
-    for (leaf, shape) in secret_shapes.into_iter().enumerate() {
+    secret_file
+        .write_all(&crate::sampler::trapdoor::TAGGED_MAGIC)
+        .map_err(|error| error.to_string())?;
+    secret_file
+        .write_all(&[if instantiation.is_computational() {
+            crate::sampler::trapdoor::TAG_COMPUTATIONAL
+        } else {
+            crate::sampler::trapdoor::TAG_STATISTICAL
+        }])
+        .map_err(|error| error.to_string())?;
+    let mut secret_len = crate::sampler::trapdoor::TAGGED_MAGIC.len() as u64 + 1;
+    for (leaf, shape) in secret_shapes.iter().enumerate() {
         let mut part_file = tempfile::tempfile().map_err(|error| error.to_string())?;
         let part_len = transcode_raw_full_matrix(
             layout,
@@ -6724,6 +7051,36 @@ fn transcode_raw_trapdoor<R: Read + Seek + ?Sized, W: Write + ?Sized>(
             .checked_add(8)
             .and_then(|length| length.checked_add(part_len))
             .ok_or("trapdoor secret payload length overflows")?;
+    }
+    // A statistical trapdoor's last leaf is its precomputation, a dense byte range.
+    if let mxx_ir_core::types::TrapdoorInstantiation::Statistical { m_bar } = instantiation {
+        let bytes = crate::sampler::trapdoor::statistical::precomputation_bytes(
+            public_matrix.ring.ring_dimension() as usize,
+            m_bar,
+            digit_count,
+        )
+        .ok_or("trapdoor precomputation length overflows")? as u64;
+        let leaf = RawExportLeaf::Value(secret_shapes.len() as u32);
+        let [fragment] = layout
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.leaf == leaf)
+            .collect::<Vec<_>>()[..]
+        else {
+            return Err("trapdoor precomputation export must be one fragment".into());
+        };
+        if fragment.raw_bytes != bytes {
+            return Err("trapdoor precomputation export has the wrong length".into());
+        }
+        source.seek(SeekFrom::Start(fragment.raw_offset)).map_err(|error| error.to_string())?;
+        secret_file.write_all(&bytes.to_le_bytes()).map_err(|error| error.to_string())?;
+        let copied = std::io::copy(&mut Read::take(&mut *source, bytes), &mut secret_file)
+            .map_err(|error| error.to_string())?;
+        if copied != bytes {
+            return Err("trapdoor precomputation export is truncated".into());
+        }
+        secret_len =
+            secret_len.checked_add(8 + bytes).ok_or("trapdoor secret payload length overflows")?;
     }
     sink.write_all(&public_len.to_le_bytes()).map_err(|error| error.to_string())?;
     public_file.rewind().map_err(|error| error.to_string())?;
@@ -6778,8 +7135,8 @@ pub(crate) fn transcode_raw_artifact<R: Read + Seek + ?Sized, W: Write + ?Sized>
             transcode_raw_bytes(layout, source, sink, *length as u64)
         }
         ConcreteWireType::TypedBlob { .. } => transcode_raw_typed_blob(layout, source, sink),
-        ConcreteWireType::Trapdoor { matrix, digit_count, .. } => {
-            transcode_raw_trapdoor(layout, source, sink, matrix, *digit_count)
+        ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } => {
+            transcode_raw_trapdoor(layout, source, sink, matrix, *digit_count, *instantiation)
         }
         _ => Err("raw artifact transcode does not support this wire type yet".into()),
     }

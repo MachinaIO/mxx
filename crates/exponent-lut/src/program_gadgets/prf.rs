@@ -3,8 +3,9 @@
 use crate::{
     api::PlaintextInputs,
     program::{
-        AttributeKnowledge, ExpLayout, ExponentLutProgramBuilder, FamilyRange, InputBinding, LutId,
-        LutOutputRepresentation, LutTable, Operand, ProgramValidationError, RhsId, TableId, WireId,
+        AttributeKnowledge, DataId, ExpLayout, ExponentLutProgramBuilder, FamilyRange,
+        InputBinding, LutId, LutOutputRepresentation, LutTable, Operand, ProgramData,
+        ProgramValidationError, RhsId, WireId,
     },
     program_gadgets::pbc::{PbcCell, PbcGeneratedKeyLayout, PbcParameters, PbcPublicLayout},
 };
@@ -285,7 +286,7 @@ fn tables_digest<'a>(tables: impl ExactSizeIterator<Item = &'a [usize]>) -> [u8;
 pub enum PrfKeys {
     /// One member, whose public layout is a constant of the Program.
     Layout(PbcPublicLayout),
-    /// Several members of the key shape, whose layouts are runtime tables.
+    /// Several members of the key shape, whose layouts are runtime integer data.
     Shape(PrfKeyShape),
 }
 
@@ -327,13 +328,14 @@ impl PrfKeys {
 ///   cell's coordinate and weights it by member `f` of the bucket's selector family of `M W` bits
 ///   (member `o`'s one-hot row at `o W`), read at the bare root binder; then a root `parallel` over
 ///   the members sums each member's row (a nested `parallel` over the slots reads the cells through
-///   the identity `1 * X^0`). The coordinate of cell `f` is entry `f` of the bucket's runtime table
-///   ([`Operand::Lookup`] of the input vector; `M W` entries in `[0, nu]`, the zero member for a
-///   dummy, padding or missing slot), so the Program depends on the key shape only and the stages
-///   bind the layouts as tables ([`Self::key_inputs`]). The graph does not grow with the members,
-///   and the noise model lowers each body once: the row contract
-///   ([`PrfSelectorFamily::row_length`]) keeps every row sum's payload support at one. A last root
-///   `parallel` applies the readout LUT; the output is the member family.
+///   the identity `1 * X^0`). The coordinate of cell `f` is entry `f` of the bucket's coordinate
+///   table ([`Operand::Selected`] of the input vector by the bucket's bounded integer data family;
+///   `M W` entries in `[0, nu]`, the zero member for a dummy, padding or missing slot), so the
+///   Program depends on the key shape only and the stages bind the layouts as Program data
+///   ([`Self::key_inputs`]). The graph does not grow with the members, and the noise model lowers
+///   each body once: the row contract ([`PrfSelectorFamily::row_length`]) keeps every row sum's
+///   payload support at one. A last root `parallel` applies the readout LUT; the output is the
+///   member family.
 #[derive(Clone, Debug)]
 pub struct SparseLwrPrf {
     profile: SparseLwrPrfProfile,
@@ -343,8 +345,9 @@ pub struct SparseLwrPrf {
     lut: LutId,
     /// The family of each bucket (one entry per bucket).
     selectors: Vec<Vec<RhsId>>,
-    /// The runtime table of each bucket of a multi-member PRF.
-    tables: Vec<TableId>,
+    /// The coordinate table of each bucket of a multi-member PRF: a bounded
+    /// integer data family.
+    tables: Vec<DataId>,
     output: PrfOutput,
 }
 
@@ -443,12 +446,7 @@ impl SparseLwrPrf {
                 // One table per bucket: the coordinate of every cell, a member
                 // of the input vector.
                 let tables = (0..shape.bucket_count())
-                    .map(|_| {
-                        builder.table(
-                            IntExpr::constant(members * width),
-                            IntExpr::constant(zero_member + 1),
-                        )
-                    })
+                    .map(|_| builder.data_family(members * width, Some(zero_member + 1)))
                     .collect::<Result<Vec<_>, _>>()?;
                 let cells_range = FamilyRange::full(IntExpr::constant(members * width))?;
                 let members_range = FamilyRange::full(IntExpr::constant(members))?;
@@ -470,10 +468,10 @@ impl SparseLwrPrf {
                         });
                         // X^(acc + a_r), then weighted by the cell's selector bit.
                         let shifted = builder.mul_public(
-                            Operand::Lookup {
+                            Operand::Selected {
                                 family: input_vector,
-                                table: *table,
-                                index: cell.clone(),
+                                data: *table,
+                                position: cell.clone(),
                             },
                             state,
                         )?;
@@ -548,9 +546,9 @@ impl SparseLwrPrf {
         self.selectors.len()
     }
 
-    /// The runtime table of each bucket of a multi-member PRF, in bucket
-    /// order; empty for one member.
-    pub fn tables(&self) -> &[TableId] {
+    /// The coordinate table (an integer data family) of each bucket of a
+    /// multi-member PRF, in bucket order; empty for one member.
+    pub fn tables(&self) -> &[DataId] {
         &self.tables
     }
 
@@ -599,7 +597,7 @@ impl SparseLwrPrf {
             .collect()
     }
 
-    /// The private selector plaintexts and the runtime tables of the
+    /// The private selector plaintexts and the coordinate tables (Program data) of the
     /// generated `keys`, one key per member: with one member (on the PRF's
     /// layout), bit `j` of bucket `b`'s family is 1 exactly when the key
     /// selects slot `j` of bucket `b`, and there are no tables; with several
@@ -612,11 +610,11 @@ impl SparseLwrPrf {
         &self,
         parameters: &P::Params,
         keys: &[PbcGeneratedKeyLayout],
-    ) -> Result<(PlaintextInputs<RhsId, P>, BTreeMap<TableId, Vec<usize>>), PrfError> {
+    ) -> Result<(PlaintextInputs<RhsId, P>, ProgramData), PrfError> {
         let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
         let (width, tables) = match (&self.keys, layouts.as_slice()) {
             (PrfKeys::Layout(layout), [key]) if key.layout_id == layout.layout_id => {
-                (layout.bucket_width, BTreeMap::new())
+                (layout.bucket_width, ProgramData::new())
             }
             (PrfKeys::Shape(shape), _) if PrfKeyShape::new(&layouts).as_ref() == Ok(shape) => (
                 shape.width(),
@@ -624,7 +622,7 @@ impl SparseLwrPrf {
                     .iter()
                     .copied()
                     .zip(layout_tables(&layouts, shape.bucket_count(), shape.width()))
-                    .collect(),
+                    .fold(ProgramData::new(), |data, (id, table)| data.with(id, table)),
             ),
             _ => return Err(PrfError::KeyShapeMismatch),
         };
@@ -654,22 +652,18 @@ impl SparseLwrPrf {
         Ok((plaintexts, tables))
     }
 
-    /// Check runtime `tables` bound to this PRF's Program against its keys:
-    /// none for one member; for several, one per bucket whose digest is the
-    /// key shape's table digest.
-    pub fn check_tables(&self, tables: &BTreeMap<TableId, Vec<usize>>) -> Result<(), PrfError> {
+    /// Check the Program `data` bound to this PRF's Program against its
+    /// keys: no coordinate table for one member; for several, one per bucket
+    /// whose digest is the key shape's table digest.
+    pub fn check_tables(&self, data: &ProgramData) -> Result<(), PrfError> {
         let matches = match &self.keys {
-            PrfKeys::Layout(_) => tables.is_empty(),
-            PrfKeys::Shape(shape) => {
-                tables.len() == self.tables.len() &&
-                    self.tables
-                        .iter()
-                        .map(|id| tables.get(id).map(Vec::as_slice))
-                        .collect::<Option<Vec<_>>>()
-                        .is_some_and(|ordered| {
-                            tables_digest(ordered.into_iter()) == shape.tables
-                        })
-            }
+            PrfKeys::Layout(_) => true,
+            PrfKeys::Shape(shape) => self
+                .tables
+                .iter()
+                .map(|id| data.values(*id))
+                .collect::<Option<Vec<_>>>()
+                .is_some_and(|ordered| tables_digest(ordered.into_iter()) == shape.tables),
         };
         if matches { Ok(()) } else { Err(PrfError::KeyShapeMismatch) }
     }
@@ -842,13 +836,13 @@ mod tests {
 
     /// One member: one one-hot selector family per bucket, consumed at the
     /// bucket's level, whose selected coordinates sum to the key inner
-    /// product, and no runtime tables.
+    /// product, and no coordinate tables.
     #[test]
     fn one_member_prf_has_one_hot_bucket_selectors_of_the_key_inner_product() {
         let key = toy_key(&[0, 3, 5, 9], 0);
         let (program, prf) = toy_prf(std::slice::from_ref(&key));
         assert!(matches!(prf.output(), PrfOutput::Scalar(_)));
-        assert!(program.tables().is_empty() && prf.tables().is_empty());
+        assert!(program.data_families().is_empty() && prf.tables().is_empty());
         let workload = crate::rns_bgg::RnsBggDerivedWorkload::from_program(&program).unwrap();
         let families = prf.selector_families();
         assert_eq!(families.len(), key.public_layout.parameters.bucket_count);
@@ -860,7 +854,8 @@ mod tests {
                 std::slice::from_ref(&key),
             )
             .unwrap();
-        assert!(tables.is_empty());
+        assert_eq!(tables, crate::program::ProgramData::new());
+        tables.validate(&program).unwrap();
         prf.check_tables(&tables).unwrap();
         let q = toy_profile().q().unwrap() as u64;
         let a = (0..10_u64).map(|coordinate| (7 * coordinate + 3) % q).collect::<Vec<_>>();
@@ -895,7 +890,7 @@ mod tests {
 
     /// Several members: one member-indexed selector family per bucket,
     /// holding the slot bit of every member's key in a row of the width
-    /// limit, and one runtime table per bucket holding every cell's
+    /// limit, and one coordinate table per bucket holding every cell's
     /// coordinate; the Program depends on the key shape only, and keys or
     /// tables of another key set are rejected.
     #[test]
@@ -908,13 +903,12 @@ mod tests {
         let families = prf.selector_families();
         assert_eq!(families.len(), buckets);
         assert_eq!(program.rhs_inputs().len(), buckets);
-        assert_eq!(program.tables().len(), buckets);
+        assert_eq!(program.data_families().len(), buckets);
         assert!(
             program
-                .tables()
+                .data_families()
                 .values()
-                .all(|table| *table.count() == IntExpr::constant(2 * width) &&
-                    *table.bound() == IntExpr::constant(11))
+                .all(|table| table.count() == 2 * width && table.bound() == Some(11))
         );
         assert!(families.iter().all(|family| family.members == 2 * width &&
             family.max_nonzero == 1 &&
@@ -923,6 +917,7 @@ mod tests {
             mxx_backends::poly::dcrt::params::DCRTPolyParams::new(32, 1, 17, 4, None, None);
         let (plaintexts, tables) =
             prf.key_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(&parameters, &keys).unwrap();
+        tables.validate(&program).unwrap();
         prf.check_tables(&tables).unwrap();
         for (bucket, (family, table)) in families.iter().zip(prf.tables()).enumerate() {
             let expected = keys
@@ -942,7 +937,7 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(tables[table], coordinates);
+            assert_eq!(tables.values(*table).unwrap(), coordinates);
         }
         let others = [toy_key(&[0, 3, 5, 9], 50), toy_key(&[1, 2, 6, 7], 150)];
         let (other_program, _) = toy_prf(&others);

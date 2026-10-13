@@ -6,10 +6,18 @@
 //! - `hash::DCRTPolyHashSampler` derives matrices from `H(key || tag)` with per-entry and
 //!   per-column framing, so a column window matches whole-matrix sampling. Hash integer families
 //!   come from the entry `(0, 0)` coefficient streams of the same transcript.
-//! - `trapdoor::DCRTPolyTrapdoorSampler` samples gadget trapdoors and preimages. Preimage sampling
-//!   redraws a whole candidate that exceeds its cutoff, so the preimage equation always holds.
-//! - `bounds` defines the authoritative cutoffs: `hard_cutoff_from_sigma_bound` is `floor(6.5 *
-//!   sigma)`, and `default_preimage_cutoff` gives the minimum preimage cutoff.
+//! - `trapdoor::DCRTPolyTrapdoorSampler` samples gadget trapdoors in the computational or the
+//!   statistical instantiation (`TrapdoorInstantiation`) and preimages of a caller-requested width.
+//!   A statistical trapdoor precomputes for the preimage width of its TrapGen and samples only at
+//!   that width (`trapdoor::statistical`). Preimage sampling redraws a whole candidate that exceeds
+//!   its cutoff, so the preimage equation always holds.
+//! - `bounds` defines the authoritative widths and cutoffs: `minimum_preimage_sigma` is the
+//!   smallest preimage width a trapdoor accepts, `hard_cutoff_from_sigma_bound` is `floor(6.5 *
+//!   sigma)`, and `default_preimage_cutoff` is the cutoff of the minimum width.
+//!
+//! The floating-point error of the sampling primitives (uniform and normal draws, Peikert's table,
+//! Karney's sampler, the gadget samplers) is treated heuristically, as in OpenFHE: a sampler is
+//! modeled as returning its ideal distribution.
 //!
 //! Deterministic correctness claims use these enforced cutoffs and worst-case bounds; probabilistic
 //! claims model each coefficient as an independent draw from the truncated distribution the
@@ -153,13 +161,22 @@ pub trait PolyTrapdoorSampler {
     type M: PolyMatrixSmallRhs;
     type Trapdoor: Send + Sync;
 
-    fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self;
+    /// A sampler of trapdoors of TrapGen width `sigma` in the given instantiation.
+    fn new(
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        sigma: f64,
+        instantiation: mxx_ir_core::types::TrapdoorInstantiation,
+    ) -> Self;
 
+    /// TrapGen of a trapdoor of `size` public rows whose preimages are sampled with width
+    /// `preimage_sigma` (`None`: the minimum width). The statistical instantiation precomputes
+    /// for that width and fails if its covariance check rejects every draw.
     fn trapdoor(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         size: usize,
-    ) -> (Self::Trapdoor, Self::M);
+        preimage_sigma: Option<&mxx_ir_core::Rational>,
+    ) -> Result<(Self::Trapdoor, Self::M), SmallMatrixError>;
 
     fn trapdoor_to_bytes(trapdoor: &Self::Trapdoor) -> Vec<u8>;
 
@@ -168,18 +185,26 @@ pub trait PolyTrapdoorSampler {
         bytes: &[u8],
     ) -> Option<Self::Trapdoor>;
 
+    /// Samples a preimage of `target` under `public_matrix` with width `preimage_sigma` (a
+    /// standard deviation), rejecting candidates with a coefficient above
+    /// `max_coefficient_bound`. The width must be at least the trapdoor's
+    /// [`bounds::minimum_preimage_sigma`] and the bound at least `floor(6.5 preimage_sigma)`.
+    #[allow(clippy::too_many_arguments)]
     fn preimage(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         trapdoor: &Self::Trapdoor,
         public_matrix: &Self::M,
         target: &dyn PolyMatrixColumnSource<Self::M>,
+        preimage_sigma: &mxx_ir_core::Rational,
         max_coefficient_bound: BigUint,
         randomness_seed: [u8; 32],
     ) -> Result<<Self::M as PolyMatrixSmallRhs>::SmallMatrix, SmallMatrixError>;
 
-    // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.
-    // [B,C]D = U.
+    /// Given a trapdoor of `B`, an extension matrix `C`, and a target `U`, returns a preimage `D`
+    /// with `[B, C] D = U`. Both parts of `D` are sampled with width `preimage_sigma` and
+    /// bounded by `max_coefficient_bound`, under the conditions of [`Self::preimage`].
+    #[allow(clippy::too_many_arguments)]
     fn preimage_extend(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
@@ -187,5 +212,7 @@ pub trait PolyTrapdoorSampler {
         public_matrix: &Self::M,
         ext_matrix: &Self::M,
         target: &Self::M,
-    ) -> Self::M;
+        preimage_sigma: &mxx_ir_core::Rational,
+        max_coefficient_bound: BigUint,
+    ) -> Result<Self::M, SmallMatrixError>;
 }

@@ -268,6 +268,9 @@ class Cx:
         wir = open(f'{self.pdir}/Gen_Wiring.lean').read()
         sw = re.search(r'^theorem switch_%s .*?:= by' % ta['field'], wir, re.S | re.M).group(0)
         psec = re.search(r'\(F : \S+ ctx outputs\)\s*(.*?)\s*\{g0 :', sw, re.S).group(1)
+        # the preprocess wire hypotheses are named apart from the encrypt ones (`esec`), whose
+        # wire numbers may coincide
+        psec = re.sub(r'\((h_w_\d+_\d+) : ', r'(p\1 : ', psec)
         psec_names = re.findall(r'\((\w+) : ', psec)
         cf = re.search(r'\(\(fun \(i : Fin 2\) ↦ (\(\(keyTableG .*?\) 0 0\))\) k \*', sw).group(1)
         ab = re.search(r'keyTableG \(\(\[\((.*?)\)\]\) : List Int\) \(\(\[\((.*?)\)\]\) : List Int\)', cf)

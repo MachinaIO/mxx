@@ -40,6 +40,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use mxx_backends::{
     GpuRuntime,
     backend::poly_gpu::gpu_backend_on,
+    lattice_estimator::lattice_security_bits,
     poly::{
         Poly, PolyParams,
         dcrt::{
@@ -65,8 +66,8 @@ use mxx_exponent_lut::{
         RnsOnlineEvalBuild, RnsPreprocessBuild,
     },
     utils::{
-        DecoderRequest, DecoderSelection, env_usize, lattice_security_bits, noise_model,
-        ring_dimension_candidates, ring_dimension_stride_log2, select_decoder_at_crt_depth,
+        DecoderRequest, DecoderSelection, env_usize, noise_model, ring_dimension_candidates,
+        ring_dimension_stride_log2, select_decoder_at_crt_depth,
     },
 };
 use mxx_ir_core::ParamEnv;
@@ -219,8 +220,12 @@ fn search(source: &ExponentLutProgram, input: WireId) -> Accepted {
                 let achieved = [&selection.parameters, &selection.smudge_parameters]
                     .into_iter()
                     .map(|parameters| {
-                        lattice_security_bits(&parameters.levels()[0], &error_sigma)
-                            .expect("lattice security estimator must be available")
+                        lattice_security_bits(
+                            parameters.levels()[0].ring_dimension(),
+                            parameters.levels()[0].modulus().as_ref(),
+                            &error_sigma,
+                        )
+                        .expect("lattice security estimator must be available")
                     })
                     .min()
                     .expect("two chains");
@@ -319,12 +324,13 @@ fn decoder_round_trip() {
     let payload = RnsEncryptBuild::new(&parameters, context)
         .sample_payload_secret(&mut runtime, &mut store, |_| Ok(()))
         .expect("payload secret");
-    let mut smudge_preprocess = RnsPreprocessBuild::new(&smudge_parameters, context);
+    let mut smudge_preprocess =
+        RnsPreprocessBuild::new(&smudge_parameters, context).with_data(tables);
     smudge_preprocess
         .bind_rhs_inputs(
             smudge_program,
             &env,
-            Some((&selectors, &tables)),
+            Some(&selectors),
             Some(&payload.at_level(&smudge_parameters, 0).expect("smudge payload")),
             &hash_key,
         )
@@ -334,7 +340,6 @@ fn decoder_round_trip() {
         &source,
         &env,
         &no_rhs,
-        &BTreeMap::new(),
         Some(&payload),
         &hash_key,
         RnsPreprocessBuild::new(&parameters, context),
@@ -378,7 +383,7 @@ fn decoder_round_trip() {
         &source.encryption_inputs(),
         &env,
         &lhs,
-        &preprocess,
+        Some(&preprocess),
         &payload,
         Some(&mask),
         &hash_key,

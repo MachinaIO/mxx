@@ -73,6 +73,7 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixStatisticalTrapdoor.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixPreimageRaw.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixPolynomialValues.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixRawRemaining.cu");

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build every Lean module of a pipeline directory in dependency order.
 
-Usage: build.py <out dir> [--jobs 2] [--mem-gb 20] [--threads 4] [--only M,M] [--timeout 7200] [--keep]
+Usage: build.py <out dir> [--export DIR] [--jobs 2] [--mem-gb 20] [--threads 4] [--only M,M]
+                [--timeout 7200] [--keep]
 
-Modules are the `.lean` files of `<out>/generated` (the export) and `<out>` (generic, adapters,
+Modules are the `.lean` files of the export (`--export`, default `<out>/generated`) and `<out>` (generic, adapters,
 bridges, generated proof modules). Imports not found there must come from the lake package
 (LEAN_PATH, given in the environment); an import found nowhere is reported. Each module is
 compiled with `lean -o <out>/olean/<M>.olean`, at most `--jobs` at a time, each under an address
@@ -20,6 +21,7 @@ import time
 
 ap = argparse.ArgumentParser()
 ap.add_argument('out')
+ap.add_argument('--export', help='the directory of the exported modules (default <out>/generated)')
 ap.add_argument('--jobs', type=int, default=2)
 ap.add_argument('--mem-gb', type=int, default=20)
 ap.add_argument('--only')
@@ -33,7 +35,7 @@ os.makedirs(f'{out}/olean', exist_ok=True)
 os.makedirs(f'{out}/logs', exist_ok=True)
 
 src = {}
-for d in (f'{out}/generated', out):
+for d in (os.path.abspath(a.export) if a.export else f'{out}/generated', out):
     for f in sorted(os.listdir(d)):
         if f.endswith('.lean'):
             src[f[:-5]] = os.path.join(d, f)

@@ -204,6 +204,9 @@ pub struct DecoderDeclaration {
     digits: usize,
     target: DecoderTarget,
     smudge: DecoderSmudgeProgram,
+    /// The explicit plaintext modulus `p` of the decoded output, if any; see
+    /// [`Self::with_plaintext_modulus`].
+    plaintext_modulus: Option<BigUint>,
     commitment: [u8; 32],
 }
 
@@ -287,8 +290,38 @@ impl DecoderDeclaration {
             digits,
             target,
             smudge,
+            plaintext_modulus: None,
             commitment,
         })
+    }
+
+    /// This declaration with the explicit plaintext modulus `p`, committed
+    /// with it. Without one, the plaintext modulus is the modulus of the
+    /// level after the source (a Static chain drops to it). A Dynamic chain
+    /// keeps one modulus `q`, so its decoder names an odd proper CRT divisor
+    /// `p` of `q`; the decoder then reads the source at the spacing `q / p`
+    /// and rounds the decoded row to `R_p`.
+    pub fn with_plaintext_modulus(
+        mut self,
+        plaintext_modulus: BigUint,
+    ) -> Result<Self, DecoderError> {
+        self.commitment = commitment(&(
+            b"mxx-exponent-lut/decoder/v1".as_slice(),
+            self.source_program,
+            self.source_output,
+            &self.profile,
+            self.coefficients,
+            self.digits,
+            self.smudge.id(),
+            &plaintext_modulus,
+        ))?;
+        self.plaintext_modulus = Some(plaintext_modulus);
+        Ok(self)
+    }
+
+    /// The explicit plaintext modulus, if any.
+    pub fn plaintext_modulus(&self) -> Option<&BigUint> {
+        self.plaintext_modulus.as_ref()
     }
 
     pub const fn source_program(&self) -> ExponentLutProgramId {
@@ -658,12 +691,12 @@ mod tests {
         // Every selector member is one bit of one key, one-hot per bucket.
         let parameters =
             mxx_backends::poly::dcrt::params::DCRTPolyParams::new(16, 1, 17, 4, None, None);
-        let (selectors, tables) = smudge
+        let (selectors, data) = smudge
             .prf()
             .key_inputs::<mxx_backends::poly::dcrt::poly::DCRTPoly>(&parameters, &member_keys)
             .unwrap();
         assert_eq!(selectors.len(), program.rhs_inputs().len());
-        assert_eq!(tables.len(), program.tables().len());
+        data.validate(program).unwrap();
         let others = keys(6, 101);
         assert!(
             smudge
@@ -731,7 +764,6 @@ mod tests {
     impl crate::program::FamilyExecution<Counter> for Families {
         type WireFamily = ();
         type RhsFamily = ();
-        type Table = ();
         fn wire_at(
             &mut self,
             _evaluator: &mut Counter,
@@ -740,11 +772,11 @@ mod tests {
         ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
             Ok(())
         }
-        fn wire_at_table(
+        fn wire_selected(
             &mut self,
             _evaluator: &mut Counter,
             _: &(),
-            _: &(),
+            _: crate::program::DataId,
             _: &IntExpr,
         ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
             Ok(())
@@ -752,6 +784,14 @@ mod tests {
         fn rhs_at(
             &mut self,
             _: &(),
+            _: &IntExpr,
+        ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
+            Ok(())
+        }
+        fn rhs_selected(
+            &mut self,
+            _: &(),
+            _: crate::program::DataId,
             _: &IntExpr,
         ) -> Result<(), crate::program::ProgramLowerError<CounterError>> {
             Ok(())
@@ -795,9 +835,6 @@ mod tests {
                 InputBinding::Family(_) => InputBinding::Family(()),
             };
             environment.bind_rhs(*rhs, binding).unwrap();
-        }
-        for table in program.tables().keys() {
-            environment.bind_table(*table, ()).unwrap();
         }
         let mut counter = Counter::default();
         crate::program::lower_program(program, &mut counter, &mut Families, &mut environment)

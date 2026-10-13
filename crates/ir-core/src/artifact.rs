@@ -91,6 +91,13 @@ pub enum ArtifactType {
         digit_count: usize,
         #[serde(with = "serde_support::bigint")]
         preimage_max_coefficient_bound: BigInt,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::TrapdoorInstantiation::is_computational"
+        )]
+        instantiation: crate::types::TrapdoorInstantiation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preimage_sigma: Option<crate::expr::RealExpr>,
     },
     TypedBlob {
         type_name: String,
@@ -134,12 +141,16 @@ impl ArtifactType {
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
+                preimage_sigma,
             } => Some(Self::Trapdoor {
                 matrix: matrix.clone(),
                 sigma: sigma.clone(),
                 gadget_base: gadget_base.clone(),
                 digit_count: *digit_count,
                 preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                instantiation: *instantiation,
+                preimage_sigma: preimage_sigma.clone(),
             }),
             ConcreteWireType::TypedBlob { type_name, schema_hash } => {
                 Some(Self::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash })

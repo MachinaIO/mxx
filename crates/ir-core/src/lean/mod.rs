@@ -27,7 +27,10 @@
 //! By default a sampler relation admits any value within the sampler's support, so a claim holds
 //! for every execution. With [`ExportOptions::sampling_tape`], each sampled coefficient is instead
 //! a sampling-tape entry keyed by its occurrence, which a claim with a failure probability
-//! (`ProtocolDecl::failure_probability_log2`) measures under the ideal sampler laws.
+//! (`ProtocolDecl::failure_probability_log2`) measures under the ideal sampler laws. A trapdoor
+//! sampler then draws its public matrix `[ā | I | G - (ā r + e)]` from the tape as well, while a
+//! preimage sampler stays an existential relation: an execution may return any preimage within
+//! its cutoff, so a claim bounds the tapes on which some admissible preimage fails.
 
 mod backend;
 pub mod claim;
@@ -92,11 +95,15 @@ pub struct PrimitiveNames {
     pub uniform_residue_sample: String,
     pub uniform_interval_sample: String,
     pub gaussian_sample: String,
-    /// Tape-reading forms of the three samplers, used when [`ExportOptions::sampling_tape`] is
-    /// set: each takes the sampling tape and the occurrence's site before its usual arguments.
+    /// Tape-reading forms of the three samplers and of the trapdoor sampler, used when
+    /// [`ExportOptions::sampling_tape`] is set: each takes the sampling tape and the occurrence's
+    /// site before its usual arguments.
     pub uniform_residue_sample_at: String,
     pub uniform_interval_sample_at: String,
     pub gaussian_sample_at: String,
+    pub trapdoor_sample_at: String,
+    /// Tape-reading form of the statistical trapdoor sampler.
+    pub stat_trapdoor_sample_at: String,
     pub hash_sample: String,
     pub gadget_trapdoor: String,
     pub gadget_decompose: String,
@@ -158,6 +165,8 @@ impl Default for PrimitiveNames {
             uniform_residue_sample_at: "MxxRuntime.uniformResidueSampleAt".into(),
             uniform_interval_sample_at: "MxxRuntime.uniformIntervalSampleAt".into(),
             gaussian_sample_at: "MxxRuntime.gaussianSampleAt".into(),
+            trapdoor_sample_at: "MxxRuntime.trapdoorSampleAt".into(),
+            stat_trapdoor_sample_at: "MxxRuntime.statTrapdoorSampleAt".into(),
             hash_sample: "MxxRuntime.hashSample".into(),
             gadget_trapdoor: "MxxRuntime.gadgetTrapdoorRuns".into(),
             gadget_decompose: "MxxRuntime.gadgetDecomposeRuns".into(),
@@ -241,9 +250,8 @@ pub struct ExportOptions {
     /// within the sampler's support. Each relation then takes `tape` and its call `path`; a
     /// sampler at node `k` reads site `path ++ [k]`, a subgraph call extends the path with its
     /// node, and a loop body with its node and iteration, so distinct occurrences read disjoint
-    /// tape keys. Trapdoor and preimage samplers read no tape: their outputs stay existential
-    /// within the relation's support, so a tape claim quantifies them adversarially (its failure
-    /// event contains every run whose trapdoor and preimages fail).
+    /// tape keys. A trapdoor sampler reads its public matrix from the tape; a preimage sampler
+    /// remains existential (see the module documentation).
     pub sampling_tape: bool,
     /// Also render the facts declarations of every record scope ([`LeanArtifact::facts_source`],
     /// see `facts.rs`): wire constants, per-fragment fact records and their extraction theorems.
@@ -341,6 +349,126 @@ pub struct ScopeProofShape {
     /// including its guards. The final output equation is at `constraint_count`.
     pub node_constraints: BTreeMap<NodeId, std::ops::Range<usize>>,
     pub constraint_count: usize,
+}
+
+/// The fewest digits of a decimal literal that [`abbreviate_long_literals`] names.
+const LONG_LITERAL_DIGITS: usize = 64;
+
+/// The matrix type constructor whose concrete instances [`abbreviate_long_literals`] names.
+const EXACT_MATRIX: &str = "Mxx.Primitives.ExactMatrix ";
+
+/// `source` with repeated constants after byte `at` replaced by local notations, in order of
+/// first use: every decimal literal of at least [`LONG_LITERAL_DIGITS`] digits after `at` by
+/// `mxxNat<k>`, declared at `at`, then every matrix type `Mxx.Primitives.ExactMatrix q n r c`
+/// after `types_at` (at least `at`, at a line start) whose four arguments are single tokens by
+/// `mxxMat<k>`, declared at `types_at`, so that a type's arguments (the `modulus_<k>`
+/// abbreviations of a module's tables) are declared before it. Moduli recur in every matrix type
+/// and matrix types in every binder, so naming them keeps a module linear in its size; a notation
+/// expands to the same term, so the elaborated terms are unchanged.
+fn abbreviate_long_literals<'a>(source: &'a str, at: usize, types_at: usize) -> String {
+    let (head, body) = source.split_at(at);
+    let (tables, body) = body.split_at(types_at - at);
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    // The long literals, named in both parts with one numbering.
+    let mut literals = Vec::<&str>::new();
+    let mut lookup = BTreeMap::<&str, usize>::new();
+    let mut name_literals = |text: &'a str| {
+        let bytes = text.as_bytes();
+        let mut named = String::with_capacity(text.len());
+        let (mut position, mut copied) = (0, 0);
+        while position < bytes.len() {
+            if !bytes[position].is_ascii_digit() {
+                position += 1;
+                continue;
+            }
+            let start = position;
+            while position < bytes.len() && bytes[position].is_ascii_digit() {
+                position += 1;
+            }
+            if position - start < LONG_LITERAL_DIGITS ||
+                (start > 0 && word(bytes[start - 1])) ||
+                (position < bytes.len() && word(bytes[position]))
+            {
+                continue;
+            }
+            let literal = &text[start..position];
+            let index = *lookup.entry(literal).or_insert_with(|| {
+                literals.push(literal);
+                literals.len() - 1
+            });
+            named.push_str(&text[copied..start]);
+            named.push_str(&format!("mxxNat{index}"));
+            copied = position;
+        }
+        named.push_str(&text[copied..]);
+        named
+    };
+    let named_tables = name_literals(tables);
+    let named = name_literals(body);
+    // The concrete matrix types.
+    let mut types = Vec::<String>::new();
+    let mut type_lookup = BTreeMap::<String, usize>::new();
+    let mut rewritten = String::with_capacity(named.len());
+    let mut rest = named.as_str();
+    while let Some(found) = rest.find(EXACT_MATRIX) {
+        let (before, from) = rest.split_at(found);
+        rewritten.push_str(before);
+        let arguments = &from[EXACT_MATRIX.len()..];
+        let mut end = 0;
+        let mut tokens = 0;
+        let argument_bytes = arguments.as_bytes();
+        while tokens < 4 {
+            let start = end;
+            while end < argument_bytes.len() && word(argument_bytes[end]) {
+                end += 1;
+            }
+            if end == start {
+                break;
+            }
+            tokens += 1;
+            if tokens < 4 {
+                if argument_bytes.get(end) != Some(&b' ') {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        if tokens == 4 && !argument_bytes.get(end).is_some_and(|byte| word(*byte)) {
+            let ty = &from[..EXACT_MATRIX.len() + end];
+            let index = *type_lookup.entry(ty.to_owned()).or_insert_with(|| {
+                types.push(ty.to_owned());
+                types.len() - 1
+            });
+            rewritten.push_str(&format!("mxxMat{index}"));
+            rest = &from[EXACT_MATRIX.len() + end..];
+        } else {
+            rewritten.push_str(EXACT_MATRIX);
+            rest = arguments;
+        }
+    }
+    rewritten.push_str(rest);
+    // A block of declarations is followed by a blank line.
+    let block = |declarations: String| {
+        if declarations.is_empty() { declarations } else { declarations + "\n" }
+    };
+    let literal_declarations = literals
+        .iter()
+        .enumerate()
+        .map(|(index, literal)| format!("local notation \"mxxNat{index}\" => {literal}\n"))
+        .collect::<String>();
+    let type_declarations = types
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| format!("local notation \"mxxMat{index}\" => {ty}\n"))
+        .collect::<String>();
+    if named_tables.is_empty() {
+        let declarations = block(literal_declarations + &type_declarations);
+        format!("{head}{declarations}{rewritten}")
+    } else {
+        let (literal_declarations, type_declarations) =
+            (block(literal_declarations), block(type_declarations));
+        format!("{head}{literal_declarations}{named_tables}{type_declarations}{rewritten}")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -950,6 +1078,9 @@ impl<'a> Emitter<'a> {
         }
         self.abbreviate_moduli.set(false);
         self.source.insert_str(tables_at, &tables);
+        // The literals are named from the tables on and the matrix types after them, so the
+        // imports keep their offsets.
+        self.source = abbreviate_long_literals(&self.source, tables_at, tables_at + tables.len());
         if self.all_coefficients {
             let imports_end =
                 format!("import MxxIR\nimport {}\n", self.options.runtime_import).len();
@@ -1090,10 +1221,13 @@ impl<'a> Emitter<'a> {
             backend_layouts: std::mem::take(&mut self.layouts).into_values().collect(),
             module_name: self.options.module_name.clone(),
             facts_source: self.options.facts.then(|| {
-                format!(
-                    "import {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nset_option linter.unusedVariables false\n\n-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a\n-- projection against its field type expands it at the ring dimension.\nattribute [local irreducible] Mxx.Primitives.negacyclicModulus\n\nnoncomputable section\n\nnamespace {}\n\n{}end {}\n\nend\n",
-                    self.options.module_name, self.options.namespace, self.facts, self.options.namespace
-                )
+                let header = format!(
+                    "import {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nset_option linter.unusedVariables false\n\n-- The wire types repeat the ring modulus `X ^ n + 1`; unfolding it while checking a\n-- projection against its field type expands it at the ring dimension.\nattribute [local irreducible] Mxx.Primitives.negacyclicModulus\n\nnoncomputable section\n\nnamespace {}\n\n",
+                    self.options.module_name, self.options.namespace
+                );
+                let source =
+                    format!("{header}{}end {}\n\nend\n", self.facts, self.options.namespace);
+                abbreviate_long_literals(&source, header.len(), header.len())
             }),
             source: self.source,
             source_map: self.source_map,
@@ -1948,10 +2082,9 @@ impl<'a> Emitter<'a> {
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound,
+                instantiation,
                 ..
             } => {
-                // No tape read: within a tape claim the trapdoor is any value of the relation's
-                // support, chosen adversarially inside the failure event.
                 self.require_layout(
                     scope_id,
                     WireRef { node: node_id, port: crate::types::Port(1) },
@@ -1969,9 +2102,23 @@ impl<'a> Emitter<'a> {
                 self.bind_existential(&p, &ty0);
                 existentials.push((t.clone(), ty1));
                 existentials.push((p.clone(), ty0));
+                let relation = if self.requires_tape {
+                    self.current_uses_tape = true;
+                    match instantiation {
+                        crate::types::TrapdoorInstantiation::Computational => format!(
+                            "{} backend tape (path ++ [{}])",
+                            self.options.primitives.trapdoor_sample_at, node_id.0
+                        ),
+                        crate::types::TrapdoorInstantiation::Statistical { m_bar } => format!(
+                            "{} backend tape (path ++ [{}]) {m_bar}",
+                            self.options.primitives.stat_trapdoor_sample_at, node_id.0
+                        ),
+                    }
+                } else {
+                    format!("{} backend", self.options.primitives.trapdoor_sample)
+                };
                 relations.push(format!(
-                    "{} backend {} {} {} {} {} {}",
-                    self.options.primitives.trapdoor_sample,
+                    "{relation} {} {} {} {} {} {}",
                     env.real_expr(sigma),
                     env.expr(gadget_base),
                     env.expr(digit_count),
@@ -1981,7 +2128,6 @@ impl<'a> Emitter<'a> {
                 ));
             }
             NodeKind::PreimageSample { max_coefficient_bound, .. } => {
-                // No tape read, as for the trapdoor: any preimage within the cutoff.
                 self.require_layout(scope_id, args[1], None, None)?;
                 append_expression_guards(max_coefficient_bound, env, relations);
                 let k = output(0);
@@ -2441,7 +2587,33 @@ impl<'a> Emitter<'a> {
                     output(0)
                 ));
             }
-            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+            NodeKind::ThresholdDecode { plaintext_modulus, length, family: true, .. } => {
+                append_expression_guards(plaintext_modulus, env, relations);
+                append_expression_guards(length, env, relations);
+                let output_wire = WireRef { node: node_id, port: crate::types::Port(0) };
+                let count = match self.validated.scopes[scope_id].wire_types.get(&output_wire) {
+                    Some(crate::types::ConcreteWireType::IndexedFamily { count, .. }) => *count,
+                    _ => {
+                        return self.unsupported(
+                            scope_id,
+                            node_id,
+                            kind,
+                            "a family decoder returns an indexed family",
+                        )
+                    }
+                };
+                let decoded = output(0);
+                self.bind_existential(&decoded, &self.output_type(scope, node_id, 0));
+                relations.push(format!("({}) = {count}", env.expr(length)));
+                relations.push(format!(
+                    "(∀ k : Fin {count}, {} ({}) ({}) (k.val : Int) {} ({decoded} k))",
+                    self.options.primitives.threshold_decode,
+                    env.expr(plaintext_modulus),
+                    env.expr(length),
+                    arg(0)?,
+                ));
+            }
+            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool, .. } => {
                 append_expression_guards(plaintext_modulus, env, relations);
                 append_expression_guards(length, env, relations);
                 let count = scope.node(node_id).expect("decoder node").output_types().len();
@@ -3637,6 +3809,30 @@ mod tests {
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
+    /// Literals are named from `at` on and declared there; matrix types are named after the
+    /// tables and declared after them, so a type naming a table abbreviation follows it.
+    #[test]
+    fn abbreviated_matrix_types_follow_the_tables_they_name() {
+        let literal = "1".repeat(LONG_LITERAL_DIGITS);
+        let head = "import MxxIR\n\n";
+        let tables = format!("abbrev modulus_0 : Nat := {literal}\n\n");
+        let body = format!(
+            "def x : Mxx.Primitives.ExactMatrix modulus_0 8 1 1 := y\n\
+             def z : Mxx.Primitives.ExactMatrix modulus_0 8 1 1 := {literal}\n"
+        );
+        let source = format!("{head}{tables}{body}");
+        let abbreviated = abbreviate_long_literals(&source, head.len(), head.len() + tables.len());
+        assert_eq!(
+            abbreviated,
+            format!(
+                "{head}local notation \"mxxNat0\" => {literal}\n\n\
+                 abbrev modulus_0 : Nat := mxxNat0\n\n\
+                 local notation \"mxxMat0\" => Mxx.Primitives.ExactMatrix modulus_0 8 1 1\n\n\
+                 def x : mxxMat0 := y\ndef z : mxxMat0 := mxxNat0\n"
+            )
+        );
+    }
+
     #[test]
     fn ring_property_exports_resolved_crt_value() {
         let ring = crate::ring::test_ring(17 * 97, 8);
@@ -4079,7 +4275,9 @@ mod tests {
         for (index, value) in values.iter().enumerate() {
             assert_eq!(&((&table >> (width as usize * index)) & &mask), value);
         }
-        assert!(artifact.source.contains(&format!("def generatedRoot.table_0 : Nat := {table}")));
+        // The table literal is long enough to be named (see `abbreviate_long_literals`).
+        assert!(artifact.source.contains(&format!("local notation \"mxxNat0\" => {table}")));
+        assert!(artifact.source.contains("def generatedRoot.table_0 : Nat := mxxNat0"));
         assert!(
             artifact.source.contains(&format!(
                 "MxxRuntime.packedPolynomial {width} 128 generatedRoot.table_0"
@@ -4099,6 +4297,7 @@ mod tests {
                 matrix_type: matrix.clone(),
                 sigma: crate::expr::RealExpr::from_f64_exact(3.0).unwrap(),
                 max_coefficient_bound: IntExpr::constant(48),
+                compact: false,
             },
             vec![],
             vec![WireType::Matrix(matrix)],
@@ -5447,6 +5646,8 @@ mod tests {
                 gadget_base: IntExpr::constant(32),
                 digit_count: IntExpr::constant(1),
                 preimage_max_coefficient_bound: IntExpr::constant(4),
+                instantiation: Default::default(),
+                preimage_sigma: None,
             },
             vec![],
             vec![
@@ -5457,6 +5658,8 @@ mod tests {
                     gadget_base: IntExpr::constant(32),
                     digit_count: IntExpr::constant(1),
                     preimage_max_coefficient_bound: IntExpr::constant(4),
+                    instantiation: Default::default(),
+                    preimage_sigma: None,
                 },
             ],
         );
@@ -5517,6 +5720,19 @@ mod tests {
                 .source
                 .contains("preimageRunsDispatched backend w_0_0 w_0_1 w_1_0 (Int.toNat (4)) w_2_0")
         );
+        // With a sampling tape, the trapdoor draws its public matrix at its own site, and the
+        // preimage keeps its existential relation.
+        let taped =
+            export(&validated, &ExportOptions { sampling_tape: true, ..Default::default() })
+                .unwrap();
+        assert!(taped.root.requires_sampling_tape);
+        assert!(taped.source.contains("MxxRuntime.trapdoorSampleAt backend tape (path ++ [0])"));
+        assert!(!taped.source.contains("trapdoorSample backend"));
+        assert!(
+            taped
+                .source
+                .contains("preimageRunsDispatched backend w_0_0 w_0_1 w_1_0 (Int.toNat (4)) w_2_0")
+        );
     }
 
     #[test]
@@ -5534,6 +5750,8 @@ mod tests {
                 gadget_base: IntExpr::constant(2),
                 digit_count: IntExpr::constant(1),
                 preimage_max_coefficient_bound: IntExpr::constant(4),
+                instantiation: Default::default(),
+                preimage_sigma: None,
             },
             vec![],
             vec![
@@ -5544,6 +5762,8 @@ mod tests {
                     gadget_base: IntExpr::constant(2),
                     digit_count: IntExpr::constant(1),
                     preimage_max_coefficient_bound: IntExpr::constant(4),
+                    instantiation: Default::default(),
+                    preimage_sigma: None,
                 },
             ],
         );

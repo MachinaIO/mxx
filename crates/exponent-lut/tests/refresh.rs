@@ -274,18 +274,19 @@ fn refresh_round_trip() {
     let payload = RnsEncryptBuild::new(&parameters, context)
         .sample_payload_secret(&mut runtime, &mut store, |_| Ok(()))
         .expect("payload secret");
-    let mut fresh_preprocess =
-        RnsPreprocessBuild::new(&fresh, context).with_hash_namespace(fresh_namespace);
     let (fresh_rhs, fresh_tables) = declaration
         .fresh()
         .sampler()
         .key_inputs::<DCRTPoly>(&fresh_level, &fresh_keys)
         .expect("fresh selectors and tables");
+    let mut fresh_preprocess = RnsPreprocessBuild::new(&fresh, context)
+        .with_hash_namespace(fresh_namespace)
+        .with_data(fresh_tables);
     fresh_preprocess
         .bind_rhs_inputs(
             fresh_program,
             &env,
-            Some((&fresh_rhs, &fresh_tables)),
+            Some(&fresh_rhs),
             Some(&payload.at_level(&fresh, 0).expect("fresh payload")),
             &hash_key,
         )
@@ -295,18 +296,19 @@ fn refresh_round_trip() {
         .iter()
         .zip(&smudge_keys)
         .map(|(decoder, keys)| {
-            let mut child = RnsPreprocessBuild::new(&smudge, context)
-                .with_hash_namespace(*decoder.commitment());
             let (rhs, tables) = decoder
                 .smudge()
                 .prf()
                 .key_inputs::<DCRTPoly>(&smudge_level, keys)
                 .expect("smudge selectors and tables");
+            let mut child = RnsPreprocessBuild::new(&smudge, context)
+                .with_hash_namespace(*decoder.commitment())
+                .with_data(tables);
             child
                 .bind_rhs_inputs(
                     decoder.smudge().program(),
                     &env,
-                    Some((&rhs, &tables)),
+                    Some(&rhs),
                     Some(&payload.at_level(&smudge, 0).expect("smudge payload")),
                     &hash_key,
                 )
@@ -320,7 +322,6 @@ fn refresh_round_trip() {
         &source,
         &env,
         &no_rhs,
-        &BTreeMap::new(),
         Some(&payload),
         &hash_key,
         RnsPreprocessBuild::new(&parameters, context),
@@ -403,7 +404,7 @@ fn refresh_round_trip() {
         &source.encryption_inputs(),
         &env,
         &lhs,
-        &preprocess,
+        Some(&preprocess),
         &payload,
         Some(&mask),
         &hash_key,

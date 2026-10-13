@@ -45,6 +45,8 @@ pub enum TrapdoorInputContractField {
     GadgetBase,
     DigitCount,
     PreimageMaxCoefficientBound,
+    Instantiation,
+    PreimageSigma,
 }
 
 /// Closed values carried by a trapdoor-contract mismatch.
@@ -60,6 +62,7 @@ pub enum TrapdoorContractValue {
     Sigma(Option<crate::RealExpr>),
     IntegerExpression(Option<IntExpr>),
     WireType(Option<WireType>),
+    Instantiation(Option<crate::types::TrapdoorInstantiation>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +145,13 @@ pub enum InputValueContract {
         gadget_base: IntExpr,
         digit_count: IntExpr,
         preimage_max_coefficient_bound: IntExpr,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::TrapdoorInstantiation::is_computational"
+        )]
+        instantiation: crate::types::TrapdoorInstantiation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preimage_sigma: Option<crate::RealExpr>,
         public_input: ProtocolInputId,
     },
     IntegerRange {
@@ -674,6 +684,7 @@ impl ClosedProtocolBundle {
                     NodeKind::ThresholdDecode {
                         plaintext_modulus: decoder_plaintext_modulus,
                         output_bool: true,
+                        family: false,
                         ..
                     },
                 ) => {
@@ -916,28 +927,9 @@ fn contract_matches_wire(contract: &InputValueContract, wire_type: &WireType) ->
             InputValueContract::MatrixLarge { matrix_type },
             WireType::Matrix(actual),
         ) => matrix_type == actual,
-        (
-            InputValueContract::Trapdoor {
-                matrix_type,
-                sigma,
-                gadget_base,
-                digit_count,
-                preimage_max_coefficient_bound,
-                ..
-            },
-            WireType::Trapdoor {
-                matrix: actual_matrix_type,
-                sigma: actual_sigma,
-                gadget_base: actual_gadget_base,
-                digit_count: actual_digit_count,
-                preimage_max_coefficient_bound: actual_preimage_max_coefficient_bound,
-            },
-        ) => {
-            matrix_type == actual_matrix_type &&
-                sigma == actual_sigma &&
-                gadget_base == actual_gadget_base &&
-                digit_count == actual_digit_count &&
-                preimage_max_coefficient_bound == actual_preimage_max_coefficient_bound
+        (InputValueContract::Trapdoor { .. }, WireType::Trapdoor { .. }) => {
+            trapdoor_contract_binding_shape(contract)
+                .is_some_and(|(_, element, _)| &element == wire_type)
         }
         (InputValueContract::IntegerRange { .. }, WireType::Int) => true,
         (InputValueContract::Boolean, WireType::Bool) => true,
@@ -955,57 +947,50 @@ fn contract_matches_wire(contract: &InputValueContract, wire_type: &WireType) ->
 fn trapdoor_contract_shape(
     contract: &InputValueContract,
 ) -> Option<(Option<&IntExpr>, &MatrixType, &ProtocolInputId)> {
-    trapdoor_contract_binding_shape(contract)
-        .map(|(count, matrix_type, _, _, _, _, public)| (count, matrix_type, public))
+    let (count, element) = match contract {
+        InputValueContract::Family { count, element } => (Some(count), element.as_ref()),
+        element => (None, element),
+    };
+    match element {
+        InputValueContract::Trapdoor { matrix_type, public_input, .. } => {
+            Some((count, matrix_type, public_input))
+        }
+        _ => None,
+    }
 }
 
+/// The family count, the trapdoor wire type of one element, and the public input of a trapdoor
+/// contract.
 fn trapdoor_contract_binding_shape(
     contract: &InputValueContract,
-) -> Option<(
-    Option<&IntExpr>,
-    &MatrixType,
-    &crate::RealExpr,
-    &IntExpr,
-    &IntExpr,
-    &IntExpr,
-    &ProtocolInputId,
-)> {
-    match contract {
+) -> Option<(Option<&IntExpr>, WireType, &ProtocolInputId)> {
+    let (count, element) = match contract {
+        InputValueContract::Family { count, element } => (Some(count), element.as_ref()),
+        element => (None, element),
+    };
+    match element {
         InputValueContract::Trapdoor {
             matrix_type,
             sigma,
             gadget_base,
             digit_count,
             preimage_max_coefficient_bound,
+            instantiation,
+            preimage_sigma,
             public_input,
         } => Some((
-            None,
-            matrix_type,
-            sigma,
-            gadget_base,
-            digit_count,
-            preimage_max_coefficient_bound,
+            count,
+            WireType::Trapdoor {
+                matrix: matrix_type.clone(),
+                sigma: sigma.clone(),
+                gadget_base: gadget_base.clone(),
+                digit_count: digit_count.clone(),
+                preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
+                instantiation: *instantiation,
+                preimage_sigma: preimage_sigma.clone(),
+            },
             public_input,
         )),
-        InputValueContract::Family { count, element } => match element.as_ref() {
-            InputValueContract::Trapdoor {
-                matrix_type,
-                sigma,
-                gadget_base,
-                digit_count,
-                preimage_max_coefficient_bound,
-                public_input,
-            } => Some((
-                Some(count),
-                matrix_type,
-                sigma,
-                gadget_base,
-                digit_count,
-                preimage_max_coefficient_bound,
-                public_input,
-            )),
-            _ => None,
-        },
         _ => None,
     }
 }
@@ -1069,34 +1054,60 @@ fn trapdoor_binding_mismatch<'a>(
     contract: &'a InputValueContract,
     wire_type: &WireType,
 ) -> Option<(&'a ProtocolInputId, TrapdoorContractMismatch)> {
+    let (contract_count, contract_element, public_input) =
+        trapdoor_contract_binding_shape(contract)?;
+    let (wire_count, wire_element) = match wire_type {
+        WireType::IndexedFamily { count, element } => (Some(count), element.as_ref()),
+        element => (None, element),
+    };
     let (
-        contract_count,
-        contract_matrix,
-        contract_sigma,
-        contract_base,
-        contract_digits,
-        contract_cutoff,
-        public_input,
-    ) = trapdoor_contract_binding_shape(contract)?;
-    let Some((wire_count, wire_matrix, wire_sigma, wire_base, wire_digits, wire_cutoff)) =
-        trapdoor_wire_contract_shape(wire_type)
+        WireType::Trapdoor {
+            matrix: contract_matrix,
+            sigma: contract_sigma,
+            gadget_base: contract_base,
+            digit_count: contract_digits,
+            preimage_max_coefficient_bound: contract_cutoff,
+            instantiation: contract_instantiation,
+            preimage_sigma: contract_preimage_sigma,
+        },
+        WireType::Trapdoor {
+            matrix: wire_matrix,
+            sigma: wire_sigma,
+            gadget_base: wire_base,
+            digit_count: wire_digits,
+            preimage_max_coefficient_bound: wire_cutoff,
+            instantiation: wire_instantiation,
+            preimage_sigma: wire_preimage_sigma,
+        },
+    ) = (&contract_element, wire_element)
     else {
+        let expected = match contract_count {
+            Some(count) => WireType::IndexedFamily {
+                element: Box::new(contract_element),
+                count: count.clone(),
+            },
+            None => contract_element,
+        };
         return Some((
             public_input,
             TrapdoorContractMismatch {
                 field: TrapdoorInputContractField::TrapdoorWireType,
-                expected: TrapdoorContractValue::WireType(Some(trapdoor_contract_wire_type(
-                    contract_count,
-                    contract_matrix,
-                    contract_sigma,
-                    contract_base,
-                    contract_digits,
-                    contract_cutoff,
-                ))),
+                expected: TrapdoorContractValue::WireType(Some(expected)),
                 actual: TrapdoorContractValue::WireType(Some(wire_type.clone())),
             },
         ));
     };
+    let integer = |field, expected: &IntExpr, actual: &IntExpr| TrapdoorContractMismatch {
+        field,
+        expected: TrapdoorContractValue::IntegerExpression(Some(expected.clone())),
+        actual: TrapdoorContractValue::IntegerExpression(Some(actual.clone())),
+    };
+    let real =
+        |field, expected: &crate::RealExpr, actual: &crate::RealExpr| TrapdoorContractMismatch {
+            field,
+            expected: TrapdoorContractValue::Sigma(Some(expected.clone())),
+            actual: TrapdoorContractValue::Sigma(Some(actual.clone())),
+        };
     let mismatch = if contract_count != wire_count {
         TrapdoorContractMismatch {
             field: TrapdoorInputContractField::FamilyCount,
@@ -1110,84 +1121,31 @@ fn trapdoor_binding_mismatch<'a>(
             actual: TrapdoorContractValue::MatrixType(Some(wire_matrix.clone())),
         }
     } else if contract_sigma != wire_sigma {
-        TrapdoorContractMismatch {
-            field: TrapdoorInputContractField::Sigma,
-            expected: TrapdoorContractValue::Sigma(Some(contract_sigma.clone())),
-            actual: TrapdoorContractValue::Sigma(Some(wire_sigma.clone())),
-        }
+        real(TrapdoorInputContractField::Sigma, contract_sigma, wire_sigma)
     } else if contract_base != wire_base {
-        TrapdoorContractMismatch {
-            field: TrapdoorInputContractField::GadgetBase,
-            expected: TrapdoorContractValue::IntegerExpression(Some(contract_base.clone())),
-            actual: TrapdoorContractValue::IntegerExpression(Some(wire_base.clone())),
-        }
+        integer(TrapdoorInputContractField::GadgetBase, contract_base, wire_base)
     } else if contract_digits != wire_digits {
+        integer(TrapdoorInputContractField::DigitCount, contract_digits, wire_digits)
+    } else if contract_instantiation != wire_instantiation {
         TrapdoorContractMismatch {
-            field: TrapdoorInputContractField::DigitCount,
-            expected: TrapdoorContractValue::IntegerExpression(Some(contract_digits.clone())),
-            actual: TrapdoorContractValue::IntegerExpression(Some(wire_digits.clone())),
+            field: TrapdoorInputContractField::Instantiation,
+            expected: TrapdoorContractValue::Instantiation(Some(*contract_instantiation)),
+            actual: TrapdoorContractValue::Instantiation(Some(*wire_instantiation)),
+        }
+    } else if contract_preimage_sigma != wire_preimage_sigma {
+        TrapdoorContractMismatch {
+            field: TrapdoorInputContractField::PreimageSigma,
+            expected: TrapdoorContractValue::Sigma(contract_preimage_sigma.clone()),
+            actual: TrapdoorContractValue::Sigma(wire_preimage_sigma.clone()),
         }
     } else {
-        TrapdoorContractMismatch {
-            field: TrapdoorInputContractField::PreimageMaxCoefficientBound,
-            expected: TrapdoorContractValue::IntegerExpression(Some(contract_cutoff.clone())),
-            actual: TrapdoorContractValue::IntegerExpression(Some(wire_cutoff.clone())),
-        }
+        integer(
+            TrapdoorInputContractField::PreimageMaxCoefficientBound,
+            contract_cutoff,
+            wire_cutoff,
+        )
     };
     Some((public_input, mismatch))
-}
-
-fn trapdoor_contract_wire_type(
-    count: Option<&IntExpr>,
-    matrix: &MatrixType,
-    sigma: &crate::RealExpr,
-    gadget_base: &IntExpr,
-    digit_count: &IntExpr,
-    cutoff: &IntExpr,
-) -> WireType {
-    let element = WireType::Trapdoor {
-        matrix: matrix.clone(),
-        sigma: sigma.clone(),
-        gadget_base: gadget_base.clone(),
-        digit_count: digit_count.clone(),
-        preimage_max_coefficient_bound: cutoff.clone(),
-    };
-    count.map_or(element.clone(), |count| WireType::IndexedFamily {
-        element: Box::new(element),
-        count: count.clone(),
-    })
-}
-
-fn trapdoor_wire_contract_shape(
-    wire_type: &WireType,
-) -> Option<(Option<&IntExpr>, &MatrixType, &crate::RealExpr, &IntExpr, &IntExpr, &IntExpr)> {
-    match wire_type {
-        WireType::Trapdoor {
-            matrix,
-            sigma,
-            gadget_base,
-            digit_count,
-            preimage_max_coefficient_bound,
-        } => Some((None, matrix, sigma, gadget_base, digit_count, preimage_max_coefficient_bound)),
-        WireType::IndexedFamily { count, element } => match element.as_ref() {
-            WireType::Trapdoor {
-                matrix,
-                sigma,
-                gadget_base,
-                digit_count,
-                preimage_max_coefficient_bound,
-            } => Some((
-                Some(count),
-                matrix,
-                sigma,
-                gadget_base,
-                digit_count,
-                preimage_max_coefficient_bound,
-            )),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1323,6 +1281,8 @@ mod tests {
             gadget_base: IntExpr::constant(2),
             digit_count: IntExpr::constant(4),
             preimage_max_coefficient_bound: IntExpr::constant(9),
+            instantiation: Default::default(),
+            preimage_sigma: None,
             public_input: public_input.into(),
         }
     }
@@ -1414,6 +1374,8 @@ mod tests {
             gadget_base: IntExpr::constant(2),
             digit_count: IntExpr::constant(4),
             preimage_max_coefficient_bound: IntExpr::constant(10),
+            instantiation: Default::default(),
+            preimage_sigma: None,
         };
 
         let Some((public_input, mismatch)) = trapdoor_binding_mismatch(&contract, &actual_wire)

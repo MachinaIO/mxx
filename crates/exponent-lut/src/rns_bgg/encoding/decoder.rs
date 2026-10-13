@@ -2,9 +2,11 @@
 //! [`crate::decoder`]).
 //!
 //! Encryption publishes the unmask hint `b = s B + e_b` for the stage mask
-//! `s = (s_bar, 1)` at the decoding level `L`. Online evaluation decodes component
-//! 1 of the source output under the column selection `G_(L+1)^-1(1)` plus the
-//! smudge sum: after the public `-2^-1` its payload is `Delta_L mu + m`.
+//! `s = (s_bar, 1)` at the decoding level `L`. Online evaluation decodes
+//! component 1 of the source output under the source selection of
+//! [`RnsBggParameters::decoder_selection`] plus the smudge sum: after the
+//! public `-2^-1` its payload is `Delta mu + m` for the spacing
+//! `Delta = q_L / p`.
 use super::*;
 
 /// The online stage's decoder: the summed decode row `c`.
@@ -28,12 +30,7 @@ impl Decoder for RnsBggDecoder<'_, EncodingLowering<'_>> {
         }
         let level = self.lowerer.workload.level(wire)?;
         let ring = parameters.ring(level)?;
-        let plaintext = level.checked_add(1).ok_or(RnsBggError::Parameters("level overflow"))?;
-        let selection = parameters.gadget_inverse(
-            plaintext,
-            level,
-            parameters.ring(plaintext)?.polynomial([IntExpr::constant(1)]),
-        )?;
+        let (selection, _, _) = parameters.decoder_selection(declaration, &self.lowerer.program)?;
         let mut row = self.source.row.1.clone().mul_small_rhs(selection);
         for member in smudge {
             row = row + checked_modulus_convert(member.row.1, &ring)?;
@@ -62,8 +59,12 @@ impl RnsEncryptBuild<'_> {
             .as_ref()
             .ok_or_else(|| ApiError::input("the stage mask secret is not bound"))?;
         let ring = parameters.ring(level).map_err(ApiError::scheme)?;
-        let columns = crate::decoder::unmask::UNMASK_ROWS *
-            (parameters.level(level).map_err(ApiError::scheme)?.modulus_digits() + 2);
+        let columns = mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns(
+                crate::decoder::unmask::UNMASK_ROWS,
+                parameters.level(level).map_err(ApiError::scheme)?.modulus_digits(),
+            )
+            .ok_or_else(|| ApiError::input("the unmask trapdoor width overflows"))?;
         let public = ring.artifact_input(
             production.clone(),
             public_name,
@@ -72,7 +73,8 @@ impl RnsEncryptBuild<'_> {
         );
         let secret = reduce_secret(parameters, &mask.row, level).map_err(ApiError::scheme)?;
         let secret = Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![secret.0, secret.1]);
-        let error = encoding_error_row(parameters, &ring, columns).map_err(ApiError::scheme)?.0;
+        let error =
+            parameters.encoding_contract().sample_row(&ring, columns).map_err(ApiError::scheme)?.0;
         Ok(crate::decoder::unmask::unmask_hint(secret, public, error))
     }
 }
@@ -142,13 +144,27 @@ mod tests {
             unmask_sigma: 4.578,
         };
         let one = [BigInt::from(1u8)];
-        let bindings = RnsBggNoiseBindings::from_inputs(
+        let mut bindings = RnsBggNoiseBindings::from_inputs(
             source,
             &[RnsBggNoiseValue::sampled_encoding_sigma(&1.into(), b"decoder-source", &one)
                 .unwrap()],
             &[],
         )
         .unwrap();
+        if mode == RhsMode::Dynamic {
+            bindings = bindings.with_dynamic(
+                crate::rns_bgg::RnsBggDynamicNoise::for_program(
+                    [0; 32],
+                    source,
+                    crate::rns_bgg::RnsBggDynamicDistributions::uniform(
+                        crate::rns_bgg::RnsBggGaussian::with_default_cutoff(1.into()).unwrap(),
+                    ),
+                    crate::rns_bgg::covering_automorphism_layout(source),
+                    8,
+                )
+                .unwrap(),
+            );
+        }
         let mut rejected = Vec::new();
         for primes_per_drop in 1..=read("MAX_PRIMES_PER_DROP", 4) {
             for max_crt_depth in 2..=read("MAX_PRIMES", 40) {
@@ -225,7 +241,9 @@ mod tests {
     /// of the identity Program on a private input `X^b`, in Static and
     /// Dynamic mode. The simulated noise must fit the decoding margin, and
     /// `round((p/q) x) mod p` of the decoded `x = (q/p) X^b + m + E` must be
-    /// the plaintext `X^b` modulo the plaintext level.
+    /// the plaintext `X^b` modulo the plaintext modulus `p`: the next level's
+    /// for Static, the declaration's explicit CRT divisor of `q` for Dynamic,
+    /// whose source and smudge each read the packages of their own setup.
     #[test]
     #[ignore = "the CPU round trip of both modes takes about five hours"]
     fn decoder_round_trip_returns_the_source_plaintext() {
@@ -255,14 +273,48 @@ mod tests {
             let a = (0..4).map(|_| rand::random::<u32>() as usize % 8).collect::<Vec<_>>();
             let smudge_lhs =
                 declaration.smudge().prf().plaintext_inputs::<DCRTPoly>(&smudge_level, &a).unwrap();
+            let (plaintext_modulus, _, _) =
+                parameters.decoder_plaintext(&declaration, &source).unwrap();
+            let plaintext_level = level.select_modulus(&plaintext_modulus).unwrap();
 
             let mut execution = CpuExecution::new(cpu_backend(
-                parameters.levels().iter().chain(smudge_parameters.levels()).cloned(),
+                parameters
+                    .distinct_levels()
+                    .into_iter()
+                    .chain(smudge_parameters.distinct_levels())
+                    .chain([&plaintext_level])
+                    .cloned(),
             ));
             let mut store = MemoryArtifactStore::default();
             let hash_key: [u8; 32] = rand::random();
             let context: [u8; 32] = rand::random();
             let env = ParamEnv::default();
+            // Dynamic: the source's and the smudge child's setups, each with
+            // the identity mapping.
+            let distributions = || {
+                crate::rns_bgg::RnsBggDynamicDistributions::uniform(parameters.encoding_contract())
+            };
+            let setups = dynamic.then(|| {
+                let source_setup = crate::rns_bgg::RnsBggDynamicSetup::for_program(
+                    &parameters,
+                    context,
+                    &hash_key,
+                    &source,
+                    crate::rns_bgg::covering_automorphism_layout(&source),
+                    distributions(),
+                )
+                .unwrap();
+                let smudge_setup = crate::rns_bgg::RnsBggDynamicSetup::for_program(
+                    &smudge_parameters,
+                    context,
+                    &hash_key,
+                    smudge_program,
+                    crate::rns_bgg::covering_automorphism_layout(smudge_program),
+                    distributions(),
+                )
+                .unwrap();
+                (source_setup, smudge_setup)
+            });
             let sample_payload = |execution: &mut CpuExecution, store: &mut MemoryArtifactStore| {
                 RnsEncryptBuild::new(&parameters, context)
                     .sample_payload_secret(execution, store, |_| Ok(()))
@@ -271,12 +323,23 @@ mod tests {
             let static_payload = (!dynamic).then(|| sample_payload(&mut execution, &mut store));
 
             let no_rhs = PlaintextInputs::<RhsId, DCRTPoly>::new();
-            let mut smudge_preprocess = RnsPreprocessBuild::new(&smudge_parameters, context);
+            let mut smudge_preprocess =
+                RnsPreprocessBuild::new(&smudge_parameters, context).with_data(tables.clone());
+            let mut source_preprocess = RnsPreprocessBuild::new(&parameters, context);
+            if let Some(((source_setup, source_binding), (smudge_setup, smudge_binding))) = &setups
+            {
+                smudge_preprocess = smudge_preprocess
+                    .with_dynamic_setup(smudge_setup, smudge_binding.clone())
+                    .unwrap();
+                source_preprocess = source_preprocess
+                    .with_dynamic_setup(source_setup, source_binding.clone())
+                    .unwrap();
+            }
             smudge_preprocess
                 .bind_rhs_inputs(
                     smudge_program,
                     &env,
-                    Some((if dynamic { &no_rhs } else { &selectors }, &tables)),
+                    Some(if dynamic { &no_rhs } else { &selectors }),
                     static_payload
                         .as_ref()
                         .map(|payload| payload.at_level(&smudge_parameters, 0).unwrap())
@@ -289,10 +352,9 @@ mod tests {
                 &source,
                 &env,
                 &no_rhs,
-                &BTreeMap::new(),
                 static_payload.as_ref(),
                 &hash_key,
-                RnsPreprocessBuild::new(&parameters, context),
+                source_preprocess,
                 &mut execution,
                 &mut store,
                 |build, outputs| {
@@ -316,11 +378,20 @@ mod tests {
                     .sample_mask_secret(&mut execution, &mut store, |_| Ok(()))
                     .unwrap()
             });
-            let batch: [u8; 32] = rand::random();
+            let session: [u8; 32] = rand::random();
             let mut smudge_encrypt = RnsEncryptBuild::new(&smudge_parameters, context);
+            let mut source_encrypt = RnsEncryptBuild::new(&parameters, context);
+            let (source_inputs, smudge_inputs) = match &setups {
+                Some(((source_setup, _), (smudge_setup, _))) => {
+                    smudge_encrypt = smudge_encrypt.with_dynamic_setup(smudge_setup).unwrap();
+                    source_encrypt = source_encrypt.with_dynamic_setup(source_setup).unwrap();
+                    (source_setup.encryption_inputs(), smudge_setup.encryption_inputs())
+                }
+                None => (source.encryption_inputs(), smudge_program.encryption_inputs()),
+            };
             smudge_encrypt
                 .bind_lhs_inputs(
-                    &smudge_program.encryption_inputs(),
+                    &smudge_inputs,
                     &env,
                     Some(&smudge_lhs),
                     &payload.at_level(&smudge_parameters, 0).unwrap(),
@@ -333,7 +404,8 @@ mod tests {
             smudge_encrypt.bind_decoder_smudge(&declaration).unwrap();
             smudge_encrypt.bind_preprocess_artifacts(&preprocess).unwrap();
             if dynamic {
-                smudge_encrypt.bind_rhs_inputs(&env, &selectors, batch).unwrap();
+                let selectors = selectors.iter().map(|(id, value)| (id.0, value.clone())).collect();
+                smudge_encrypt.bind_rhs_inputs(&env, &selectors, session).unwrap();
             }
             let bit = rand::random::<u32>() as usize % 8;
             let lhs = BTreeMap::from([(
@@ -341,19 +413,23 @@ mod tests {
                 InputBinding::Scalar(DCRTPoly::const_rotate_poly(&level, bit)),
             )]);
             let encrypted = crate::api::encrypt(
-                &source.encryption_inputs(),
+                &source_inputs,
                 &env,
                 &lhs,
-                &preprocess,
+                Some(&preprocess),
                 &payload,
                 mask.as_ref(),
                 &hash_key,
-                RnsEncryptBuild::new(&parameters, context),
+                source_encrypt,
                 &mut execution,
                 &mut store,
                 |build| {
                     if dynamic {
-                        build.bind_rhs_inputs(&env, &no_rhs, batch)?;
+                        build.bind_rhs_inputs(
+                            &env,
+                            &PlaintextInputs::<u32, DCRTPoly>::new(),
+                            session,
+                        )?;
                     }
                     build.bind_decoder(&declaration, smudge_encrypt)
                 },
@@ -378,6 +454,14 @@ mod tests {
             .unwrap();
 
             let mut smudge_online = RnsOnlineEvalBuild::new(&smudge_parameters, context);
+            let mut source_online = RnsOnlineEvalBuild::new(&parameters, context);
+            if let Some(((source_setup, source_binding), (smudge_setup, smudge_binding))) = &setups
+            {
+                smudge_online =
+                    smudge_online.with_dynamic_setup(smudge_setup, smudge_binding.clone()).unwrap();
+                source_online =
+                    source_online.with_dynamic_setup(source_setup, source_binding.clone()).unwrap();
+            }
             smudge_online
                 .bind_decoder_smudge(&declaration, &online_eval, &encrypted, &hash_key)
                 .unwrap();
@@ -387,7 +471,7 @@ mod tests {
                 &online_eval,
                 &encrypted,
                 &hash_key,
-                RnsOnlineEvalBuild::new(&parameters, context),
+                source_online,
                 &mut execution,
                 &mut store,
                 |build, outputs| {
@@ -402,7 +486,9 @@ mod tests {
                     let selectors = loop_imports(&validated.source)
                         .into_iter()
                         .filter(|(name, _)| {
-                            name.contains("/smudge/rhs/") && !name.contains("/digit-encoding.")
+                            name.contains("/smudge/") &&
+                                name.contains("/rhs/") &&
+                                !name.contains("/digit-encoding.")
                         })
                         .collect::<Vec<_>>();
                     assert!(!selectors.is_empty());
@@ -422,7 +508,7 @@ mod tests {
             )
             .unwrap();
             // Final check: `round((p/q) x) mod p` recovers the payload.
-            let expected = DCRTPoly::const_rotate_poly(&parameters.levels()[1], bit);
+            let expected = DCRTPoly::const_rotate_poly(&plaintext_level, bit);
             assert_eq!(plaintext.entry(0, 0), expected, "{mode:?}");
         }
     }

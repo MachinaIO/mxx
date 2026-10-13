@@ -13,17 +13,20 @@ use crate::{
     },
     sampler::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        bounds::default_preimage_cutoff,
+        bounds::{
+            TrapdoorPreimageCutoffError, minimum_preimage_sigma, rational_from_decimal,
+            validate_preimage_width,
+        },
         hash::DCRTPolyHashSampler,
         trapdoor::{DCRTPolyTrapdoorSampler, DCRTTrapdoor},
         uniform::DCRTPolyUniformSampler,
     },
 };
 use mxx_ir_core::{
-    ParamEnv,
+    ParamEnv, Rational,
     artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
     node::{ConcatAxis, ConstantMatrix},
-    types::{CoefficientBoundDomain, ConcreteMatrixType},
+    types::{CoefficientBoundDomain, ConcreteMatrixType, TrapdoorInstantiation},
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
@@ -300,6 +303,8 @@ impl RingKey {
 pub enum PolyBackendError {
     #[error("requested preimage bound {requested} is below minimum {minimum}")]
     PreimageBoundTooSmall { requested: BigInt, minimum: BigInt },
+    #[error(transparent)]
+    PreimageWidth(TrapdoorPreimageCutoffError),
     #[error("no concrete polynomial parameters registered for {0:?}")]
     MissingParameters(RingKey),
     #[error("uniform range [{minimum}, {maximum}] is not supported by existing samplers")]
@@ -377,14 +382,47 @@ where
     )?;
     let max_coefficient_bound =
         request.max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
-    Ok(T::new(parameters, request.sigma).preimage(
+    let sampler = T::new(parameters, request.sigma, request.instantiation);
+    let preimage_sigma = match request.preimage_sigma {
+        Some(width) => width,
+        None => resolved_preimage_sigma(
+            parameters,
+            request.public.row_size(),
+            &request.gadget_base,
+            request.sigma,
+            request.instantiation,
+        )?,
+    };
+    Ok(sampler.preimage(
         parameters,
         request.trapdoor.as_ref(),
         request.public.as_ref(),
         request.target.as_ref(),
+        &preimage_sigma,
         max_coefficient_bound,
         request.randomness_seed,
     )?)
+}
+
+/// The minimum preimage width of a trapdoor with `public_rows` rows, the width of a trapdoor that
+/// requests none.
+fn resolved_preimage_sigma<P: PolyParams>(
+    parameters: &P,
+    public_rows: usize,
+    gadget_base: &BigInt,
+    sigma: f64,
+    instantiation: TrapdoorInstantiation,
+) -> Result<Rational, PolyBackendError> {
+    minimum_preimage_sigma(
+        parameters.ring_dimension(),
+        public_rows,
+        parameters.modulus_digits(),
+        gadget_base.to_u32().ok_or(PolyBackendError::InvalidInteger)?,
+        sigma,
+        instantiation,
+    )
+    .map(|width| rational_from_decimal(&width))
+    .ok_or(PolyBackendError::InvalidInteger)
 }
 
 pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
@@ -1247,38 +1285,60 @@ impl CpuDcrtBackend {
         Ok(Arc::new(PreimageTarget::staged(params, rows, columns, bytes)))
     }
 
+    /// Checks a preimage of type `ty` (`columns(rows, digits) x targets`) against the trapdoor
+    /// that samples it: the requested width is at least the trapdoor's minimum and the cutoff at
+    /// least `floor(6.5 preimage_sigma)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn validate_preimage_bound(
         &self,
         ty: &ConcreteMatrixType,
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        instantiation: TrapdoorInstantiation,
+        preimage_sigma: Option<&Rational>,
         max_coefficient_bound: &BigInt,
     ) -> Result<(), PolyBackendError> {
         let parameters = self.parameters(ty)?;
         let base = gadget_base.to_u32().ok_or(PolyBackendError::InvalidInteger)?;
-        let public_rows = ty
-            .rows
-            .checked_div(digit_count.checked_add(2).ok_or(PolyBackendError::InvalidInteger)?)
-            .filter(|rows| *rows > 0)
+        let public_rows = instantiation
+            .rows_from_columns(ty.rows, digit_count)
             .ok_or(PolyBackendError::InvalidInteger)?;
-        let minimum = default_preimage_cutoff(
+        let minimum;
+        let preimage_sigma = match preimage_sigma {
+            Some(width) => width,
+            None => {
+                minimum = resolved_preimage_sigma(
+                    parameters,
+                    public_rows,
+                    gadget_base,
+                    sigma,
+                    instantiation,
+                )?;
+                &minimum
+            }
+        };
+        let requested =
+            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
+        match validate_preimage_width(
             parameters.ring_dimension(),
             public_rows,
             parameters.modulus_digits(),
             base,
             sigma,
-        )
-        .ok_or(PolyBackendError::InvalidInteger)?;
-        let requested =
-            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
-        if requested < minimum {
-            return Err(PolyBackendError::PreimageBoundTooSmall {
-                requested: max_coefficient_bound.clone(),
-                minimum: BigInt::from_biguint(Sign::Plus, minimum),
-            });
+            instantiation,
+            preimage_sigma,
+            &requested,
+        ) {
+            Ok(()) => Ok(()),
+            Err(TrapdoorPreimageCutoffError::ExplicitBelowDefault { minimum, .. }) => {
+                Err(PolyBackendError::PreimageBoundTooSmall {
+                    requested: max_coefficient_bound.clone(),
+                    minimum: BigInt::from_biguint(Sign::Plus, minimum),
+                })
+            }
+            Err(error) => Err(PolyBackendError::PreimageWidth(error)),
         }
-        Ok(())
     }
 
     pub fn transpose(
@@ -1484,14 +1544,18 @@ impl CpuDcrtBackend {
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        instantiation: TrapdoorInstantiation,
+        preimage_sigma: Option<&Rational>,
     ) -> Result<(DCRTPolyMatrix, DCRTTrapdoor), PolyBackendError> {
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
-        if parameters.dropped_moduli() != 0 {
+        if parameters.dropped_moduli() != 0 ||
+            instantiation.columns(ty.rows, digit_count) != Some(ty.columns)
+        {
             return Err(SmallMatrixError::InvalidConfig.into());
         }
-        let sampler = DCRTPolyTrapdoorSampler::new(parameters, sigma);
-        let (trapdoor, public) = sampler.trapdoor(parameters, ty.rows);
+        let sampler = DCRTPolyTrapdoorSampler::new(parameters, sigma, instantiation);
+        let (trapdoor, public) = sampler.trapdoor(parameters, ty.rows, preimage_sigma)?;
         Ok((public, trapdoor))
     }
 
@@ -1501,26 +1565,47 @@ impl CpuDcrtBackend {
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
+        instantiation: TrapdoorInstantiation,
+        preimage_sigma: Option<&Rational>,
         max_coefficient_bound: &BigInt,
         trapdoor: &DCRTTrapdoor,
         public: &DCRTPolyMatrix,
         target: &dyn PolyMatrixColumnSource<DCRTPolyMatrix>,
         randomness_seed: [u8; 32],
     ) -> Result<CpuSmallMatrix<DCRTPolyMatrix>, PolyBackendError> {
-        self.validate_preimage_bound(ty, sigma, gadget_base, digit_count, max_coefficient_bound)?;
+        self.validate_preimage_bound(
+            ty,
+            sigma,
+            gadget_base,
+            digit_count,
+            instantiation,
+            preimage_sigma,
+            max_coefficient_bound,
+        )?;
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
-        if parameters.dropped_moduli() != 0 {
+        if parameters.dropped_moduli() != 0 || trapdoor.instantiation() != instantiation {
             return Err(SmallMatrixError::InvalidConfig.into());
         }
         let max_coefficient_bound =
             max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
-        let sampler = DCRTPolyTrapdoorSampler::new(parameters, sigma);
+        let sampler = DCRTPolyTrapdoorSampler::new(parameters, sigma, instantiation);
+        let preimage_sigma = match preimage_sigma {
+            Some(width) => width.clone(),
+            None => resolved_preimage_sigma(
+                parameters,
+                public.row_size(),
+                gadget_base,
+                sigma,
+                instantiation,
+            )?,
+        };
         Ok(sampler.preimage(
             parameters,
             trapdoor,
             public,
             target,
+            &preimage_sigma,
             max_coefficient_bound,
             randomness_seed,
         )?)
@@ -2207,7 +2292,14 @@ mod tests {
         let base = BigInt::from(1u8) << parameters.base_bits();
         let mut backend = cpu_backend([parameters]);
         assert!(matches!(
-            backend.sample_trapdoor(&ty, 4.578, &base, digits),
+            backend.sample_trapdoor(
+                &ty,
+                4.578,
+                &base,
+                digits,
+                TrapdoorInstantiation::Computational,
+                None,
+            ),
             Err(PolyBackendError::SmallMatrix(SmallMatrixError::InvalidConfig))
         ));
     }

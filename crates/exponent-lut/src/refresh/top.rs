@@ -64,8 +64,8 @@ pub(super) fn label_hash_tag(top: &[u8; 32], label_tag: &[u8]) -> Vec<u8> {
 }
 
 /// The key shapes of a top refresh's PRF keys. Each shape commits to its
-/// key set (see [`PrfKeyShape`]); the keys' layouts are runtime tables of
-/// the stages.
+/// key set (see [`PrfKeyShape`]); the keys' layouts are the stages'
+/// integer data (coordinate tables, see [`crate::program::ProgramData`]).
 pub struct TopRefreshKeys<'a> {
     /// The mask child's `n` keys, shared by every chain and component.
     pub mask: PrfKeyShape,

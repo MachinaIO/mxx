@@ -81,7 +81,7 @@ use mxx_exponent_lut::{
     decoder::simulation::AverageCaseConfig,
     program::{
         AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, InputBinding,
-        LutOutputRepresentation, LutTable, Operand, RhsId, TableId, WireId,
+        LutOutputRepresentation, LutTable, Operand, ProgramData, RhsId, WireId,
     },
     program_gadgets::{
         pbc::{
@@ -98,11 +98,11 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RnsBggMaskSecret, RnsBggNoiseBindings, RnsBggNoiseValue, RnsBggParameters,
         RnsBggPayloadSecret, RnsBggPreprocessEncryptDescriptor, RnsEncryptBuild,
-        RnsOnlineEvalBuild, RnsPreprocessBuild, TOP_REFRESH_TERMS_INPUT, decode_top_refresh,
-        plaintext_input_prefix, refresh_fresh_namespace, refresh_mask_namespace,
-        simulate_refresh_noise, top_refresh_error,
+        RnsOnlineEvalBuild, RnsPreprocessBuild, TOP_REFRESH_TERMS_INPUT, data_input_name,
+        decode_top_refresh, plaintext_input_prefix, refresh_fresh_namespace,
+        refresh_mask_namespace, simulate_refresh_noise, top_refresh_error,
     },
-    utils::{env_usize, lattice_security_bits, top_refresh_output_security_bits},
+    utils::{env_usize, top_refresh_output_security_bits},
 };
 use mxx_ir_core::{
     Graph, IntExpr, ParamEnv, ValidatedGraph,
@@ -429,7 +429,7 @@ fn sample(
     sampler.sample_at(program, z as usize).expect("sample")
 }
 
-/// A child's preprocessing, bound to its RHS plaintexts and runtime tables `(rhs, tables)`, or,
+/// A child's preprocessing, bound to its RHS plaintexts and coordinate tables `(rhs, data)`, or,
 /// without keys, to their shapes only.
 fn child_preprocess<'p>(
     context: [u8; 32],
@@ -438,14 +438,17 @@ fn child_preprocess<'p>(
     parameters: &'p RnsBggParameters,
     namespace: [u8; 32],
     program: &ExponentLutProgram,
-    values: Option<(PlaintextInputs<RhsId, DCRTPoly>, BTreeMap<TableId, Vec<usize>>)>,
+    values: Option<(PlaintextInputs<RhsId, DCRTPoly>, ProgramData)>,
 ) -> RnsPreprocessBuild<'p> {
-    let mut child = RnsPreprocessBuild::new(parameters, context).with_hash_namespace(namespace);
+    let (rhs, data) = values.unzip();
+    let mut child = RnsPreprocessBuild::new(parameters, context)
+        .with_hash_namespace(namespace)
+        .with_data(data.unwrap_or_default());
     child
         .bind_rhs_inputs(
             program,
             &ParamEnv::default(),
-            values.as_ref().map(|(rhs, tables)| (rhs, tables)),
+            rhs.as_ref(),
             Some(&payload.at_level(parameters, 0).expect("child payload")),
             &hash_key,
         )
@@ -562,7 +565,6 @@ fn run_part(
         source,
         &env,
         &no_rhs,
-        &BTreeMap::new(),
         Some(&chain_payload),
         &hash_key,
         RnsPreprocessBuild::new(&chains.source, context)
@@ -633,7 +635,7 @@ fn run_part(
         &source.encryption_inputs(),
         &env,
         lhs,
-        &preprocess,
+        Some(&preprocess),
         &chain_payload,
         Some(&mask.at_level(&chains.source, 0).expect("chain mask")),
         &hash_key,
@@ -880,7 +882,12 @@ fn security_gate(top: &TopRefreshDeclaration, chains: &[Chains], sigma: &BigDeci
         .map(|parameters| parameters.level(0).expect("level 0").clone())
         .max_by_key(|level| level.modulus().bits())
         .expect("a chain");
-    let encoding = lattice_security_bits(&largest, sigma).expect("encoding security estimate");
+    let encoding = mxx_backends::lattice_estimator::lattice_security_bits(
+        largest.ring_dimension(),
+        largest.modulus().as_ref(),
+        sigma,
+    )
+    .expect("encoding security estimate");
     let reference = top.reference();
     let modulus = reference.top.iter().map(|prime| BigUint::from(*prime)).product::<BigUint>();
     let n = reference.ring_dimension;
@@ -1423,7 +1430,7 @@ struct Child<'a> {
 /// one (an error of at least `P / 4`, `P` the product of the refreshed primes); the ideal count
 /// is zero. External inputs are the hash
 /// keys, the source input `X^b` and the expected `X^(1 - b)`, the label `a` and its monomials,
-/// the selector bits and the runtime tables (the cell coordinates of the key layouts, one per
+/// the selector bits and the coordinate tables (the cell coordinates of the key layouts, one per
 /// PBC bucket, which every preprocessing stage receives and its online evaluation reads from it)
 /// of every PRF (the mask keys shared by every part, the fresh-noise keys of component `j` by
 /// every chain, each decoder's own), the unit offsets, and the mask polynomial `sigma_0`. The
@@ -1460,14 +1467,14 @@ fn top_protocol(
     // The decode stage reads the family of the parts' residue terms: the merged online
     // evaluation's output family `refresh` (part `(chain, j)` at `2 chain + j`).
     links.insert(TOP_REFRESH_TERMS_INPUT.to_owned(), (id("online_eval_0_0"), "refresh".to_owned()));
-    // Online evaluation reads each runtime table as a resident input named after the preprocessing
-    // output holding it.
+    // Online evaluation reads each child data family as a resident input named after the
+    // preprocessing output holding it.
     for &(chain, component) in &parts {
         let preprocess = id(&format!("preprocess_{chain}_{component}"));
         for name in
             common::inputs_ending_with(&graphs[&format!("online_eval_{chain}_{component}")], "")
         {
-            if name.contains("table/TableId(") {
+            if name.contains("data/DataId(") {
                 links.insert(name.clone(), (preprocess.clone(), name));
             }
         }
@@ -1618,16 +1625,18 @@ fn top_protocol(
                 offset_coefficient.push(rhs(*offset, "coefficient"));
                 zero_exponents.entry(0).or_default().push(rhs(*offset, "exponent"));
             }
-            // Bucket `b`'s runtime table: the cell coordinates of every key's layout, a row of
+            // Bucket `b`'s coordinate table: the cell coordinates of every key's layout, a row of
             // `W` entries per key, as long as the bucket's selector family.
-            let prefix = plaintext_input_prefix(Some(&child.namespace), "table");
             let families = child.prf.selector_families();
             for (bucket, table) in child.prf.tables().iter().enumerate() {
                 let entry = tables
                     .entry(format!("{}_table_{bucket}", child.selectors))
                     .or_insert_with(|| (families[bucket].members, Vec::new()));
                 assert_eq!(entry.0, families[bucket].members);
-                entry.1.push(common::to_stage(&preprocess, &format!("{prefix}/table/{table:?}")));
+                entry.1.push(common::to_stage(
+                    &preprocess,
+                    &data_input_name(Some(&child.namespace), *table),
+                ));
             }
         }
     }

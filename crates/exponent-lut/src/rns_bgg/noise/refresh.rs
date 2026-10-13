@@ -591,11 +591,7 @@ mod tests {
             let program = builder.finish(vec![output]).unwrap();
             let levels = RnsBggDerivedWorkload::from_program(&program)
                 .unwrap()
-                .level(match program.outputs()[0] {
-                    Operand::Scalar(wire) |
-                    Operand::Member { family: wire, .. } |
-                    Operand::Lookup { family: wire, .. } => wire,
-                })
+                .level(*program.outputs()[0].source())
                 .unwrap();
             let pool = DCRTPolyParams::new(128, levels + 8, 40, 10, None, None);
             let parameters = RnsBggParameters::new(
@@ -1008,14 +1004,16 @@ mod tests {
                             .map(|prime| BigUint::from(*prime))
                             .product()
                     };
-                    let output = crate::utils::top_refresh_output_security_bits(
+                    let output = mxx_backends::lattice_estimator::binary_secret_cbd_security_bits(
                         n as u32,
                         &modulus(top_primes),
                         1,
                         (2 * output_columns * n) as u64,
                     );
-                    let encoding = crate::utils::lattice_security_bits(
-                        &pool.select_modulus(&modulus(top_primes.max(child_depth))).unwrap(),
+                    let level = pool.select_modulus(&modulus(top_primes.max(child_depth))).unwrap();
+                    let encoding = mxx_backends::lattice_estimator::lattice_security_bits(
+                        level.ring_dimension(),
+                        level.modulus().as_ref(),
                         &sigma,
                     );
                     eprintln!(

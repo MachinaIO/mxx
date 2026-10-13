@@ -1247,6 +1247,7 @@ mod tests {
             digit_count,
             1u32 << parameters.base_bits(),
             4.578,
+            mxx_ir_core::types::TrapdoorInstantiation::Computational,
         )
         .expect("default preimage cutoff should be computable");
         let mut circuit = PolyCircuit::<DCRTPoly>::new();

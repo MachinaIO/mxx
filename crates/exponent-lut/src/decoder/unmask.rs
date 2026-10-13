@@ -93,9 +93,15 @@ mod tests {
         let trapdoor_sigma = crate::utils::decimal_to_real_expr(&"4.578".parse().unwrap()).unwrap();
         let base = 1u32 << parameters.base_bits();
         let digits = parameters.modulus_digits();
-        let bound =
-            default_preimage_cutoff(parameters.ring_dimension(), UNMASK_ROWS, digits, base, sigma)
-                .unwrap();
+        let bound = default_preimage_cutoff(
+            parameters.ring_dimension(),
+            UNMASK_ROWS,
+            digits,
+            base,
+            sigma,
+            mxx_ir_core::types::TrapdoorInstantiation::Computational,
+        )
+        .unwrap();
         let trapdoor =
             sample_trapdoor(&ring, trapdoor_sigma, base, digits, BigInt::from(bound.clone()));
         let key = ring.uniform_residue((UNMASK_ROWS, width));
@@ -141,7 +147,9 @@ mod tests {
             }
         }
         // |e_b K - e_c| <= N m_B B_e B_K + B_e.
-        let m_b = UNMASK_ROWS * (digits + 2);
+        let m_b = mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns(UNMASK_ROWS, digits)
+            .unwrap();
         let limit = BigInt::from(parameters.ring_dimension()) *
             BigInt::from(m_b) *
             BigInt::from(error_bound) *

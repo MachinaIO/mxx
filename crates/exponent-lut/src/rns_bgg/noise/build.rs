@@ -52,12 +52,6 @@ impl<'a> RnsNoiseBuild<'a> {
                 )
                 .map_err(|_| RnsBggError::Binding("invalid RHS binding"))?;
         }
-        // A lookup reads an unknown member whatever the table's entries are.
-        for id in program.tables().keys() {
-            environment
-                .bind_table(*id, *id)
-                .map_err(|_| RnsBggError::Binding("invalid table binding"))?;
-        }
         let mut evaluator = RnsBggNoiseEvaluator::new(parameters, program, workload, bindings);
         for (wire, binding) in &bindings.inputs {
             let value = match binding {
@@ -181,7 +175,6 @@ impl<'a> crate::api::NoiseBuild for RnsNoiseBuild<'a> {
                 RhsRef<IntExpr>,
                 (WireId, RnsBggNoiseFamily),
                 (RhsId, FamilyRange),
-                crate::program::TableId,
             >,
         ),
         crate::api::ApiError,

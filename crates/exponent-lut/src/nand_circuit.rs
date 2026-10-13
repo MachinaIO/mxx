@@ -460,19 +460,18 @@ mod tests {
     impl FamilyExecution<LogicalEvaluator> for NoFamilies {
         type WireFamily = ();
         type RhsFamily = ();
-        type Table = ();
 
-        fn wire_at_table(
+        fn wire_selected(
             &mut self,
             _evaluator: &mut LogicalEvaluator,
             family: &Self::WireFamily,
-            table: &Self::Table,
-            index: &IntExpr,
+            data: crate::program::DataId,
+            position: &IntExpr,
         ) -> Result<usize, ProgramLowerError<LogicalError>> {
             Err(ProgramLowerError::UnsupportedStructure {
                 reason: format!(
-                    "NAND test has no wire families (family={family:?}, table={table:?}, \
-                     index={index:?})"
+                    "NAND test has no wire families (family={family:?}, data={data:?}, \
+                     position={position:?})"
                 ),
             })
         }
@@ -499,6 +498,17 @@ mod tests {
                 reason: format!(
                     "NAND test has no RHS families (family={family:?}, index={index:?})"
                 ),
+            })
+        }
+
+        fn rhs_selected(
+            &mut self,
+            _: &Self::RhsFamily,
+            _: crate::program::DataId,
+            _: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: "NAND test has no RHS families".into(),
             })
         }
 

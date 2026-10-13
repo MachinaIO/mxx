@@ -724,6 +724,7 @@ fn root_trapdoor_import_samples_and_publishes_a_preimage() {
         digits,
         base,
         4.0,
+        mxx_ir_core::types::TrapdoorInstantiation::Computational,
     )
     .unwrap();
     let bound = BigInt::from(bound);
@@ -982,6 +983,7 @@ fn root_preimage_retry_is_not_checked_by_the_waves_of_another_loop() {
             digits,
             base,
             4.0,
+            mxx_ir_core::types::TrapdoorInstantiation::Computational,
         )
         .unwrap(),
     );

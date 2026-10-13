@@ -24,6 +24,8 @@ fn export_sampler_fixture() {
             gadget_base: 32.into(),
             digit_count: 1.into(),
             preimage_max_coefficient_bound: 4.into(),
+            instantiation: Default::default(),
+            preimage_sigma: None,
         },
         vec![],
         vec![
@@ -34,6 +36,8 @@ fn export_sampler_fixture() {
                 gadget_base: 32.into(),
                 digit_count: 1.into(),
                 preimage_max_coefficient_bound: 4.into(),
+                instantiation: Default::default(),
+                preimage_sigma: None,
             },
         ],
     );

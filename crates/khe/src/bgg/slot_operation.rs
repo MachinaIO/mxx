@@ -1224,10 +1224,14 @@ mod artifact {
             self.secret_size * self.digit_count
         }
         pub(crate) fn b0_public_columns(&self) -> usize {
-            self.secret_size * (self.digit_count + 2)
+            mxx_ir_core::types::TrapdoorInstantiation::Computational
+                .columns(self.secret_size, self.digit_count)
+                .expect("slot transfer trapdoor width fits usize")
         }
         pub(crate) fn b1_public_columns(&self) -> usize {
-            self.secret_size * 2 * (self.digit_count + 2)
+            mxx_ir_core::types::TrapdoorInstantiation::Computational
+                .columns(self.secret_size * 2, self.digit_count)
+                .expect("slot transfer trapdoor width fits usize")
         }
         pub(crate) fn chunks(&self, columns: usize) -> Vec<IndexRange> {
             (0..columns)
@@ -1285,8 +1289,15 @@ mod artifact {
         }
 
         fn compiler() -> BggSlotTransferArtifactCompiler {
-            let preimage_max_coefficient_bound = default_preimage_cutoff(8, 4, 4, 4, 5.0)
-                .expect("default preimage cutoff should be computable");
+            let preimage_max_coefficient_bound = default_preimage_cutoff(
+                8,
+                4,
+                4,
+                4,
+                5.0,
+                mxx_ir_core::types::TrapdoorInstantiation::Computational,
+            )
+            .expect("default preimage cutoff should be computable");
             BggSlotTransferArtifactCompiler {
                 ring: Ring::from_crt_moduli(vec![65_537.into()], 8),
                 secret_size: 2,
@@ -1323,6 +1334,7 @@ mod artifact {
                 parameters.modulus_digits(),
                 1u32 << parameters.base_bits(),
                 trapdoor_sigma,
+                mxx_ir_core::types::TrapdoorInstantiation::Computational,
             )
             .expect("default preimage cutoff should be computable");
             let compiler = BggSlotTransferArtifactCompiler {

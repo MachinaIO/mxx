@@ -9,7 +9,6 @@ use crate::{
     program::ExponentLutProgram,
     refresh::{RefreshDeclaration, TopReference, top::TopRefreshDeclaration},
 };
-
 /// `refresh/<spec>/<role>`: the namespace of every refresh artifact.
 pub(crate) fn refresh_artifact_name(spec: [u8; 32], role: &str) -> String {
     format!("refresh/{}/{role}", decoder_commitment_hex(spec))
@@ -536,6 +535,7 @@ pub(crate) mod tests {
     };
     use mxx_backends::{RuntimeValue, matrix::PolyMatrix, poly::Poly};
     use mxx_dsl::DslContext;
+    use std::collections::BTreeSet;
 
     /// The identity Program of one private input, and that input.
     pub(crate) fn identity_source() -> (ExponentLutProgram, WireId) {

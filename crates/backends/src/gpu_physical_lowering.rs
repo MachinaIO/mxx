@@ -43,6 +43,7 @@ use crate::{
         BoundStorage, GpuResidentValue, PolyMatrix, RuntimeValue,
         poly_gpu::{GpuDcrtBackend, PhysicalExport, RawExportLeaf},
     },
+    gpu_cost_model::{gadget_origin, lazy_gadget},
     gpu_execution_plan::{
         ColumnRange, CompiledGpuOp, CompiledGpuProgram, FrozenGpuPlan, GpuBindingSource,
         GpuExecutionSiteKey, GpuHashResourceSpec, GpuImplementation, GpuImplementationRegistry,
@@ -70,6 +71,7 @@ use crate::{
             gpu_real::{GpuDeviceReal, GpuRealOperation},
         },
     },
+    sampler::bounds::{checked_preimage_sigma, gadget_sampler_sigma},
 };
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
@@ -79,7 +81,10 @@ use mxx_ir_core::{
     node::{
         ConstantMatrix, HashTagComponent, HashVariant, LoopInputMode, MatrixBinaryOp, NodeKind,
     },
-    types::{CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port, WireRef},
+    types::{
+        CoefficientBoundDomain, ConcreteMatrixType, ConcreteWireType, NodeId, Port,
+        TrapdoorInstantiation, WireRef,
+    },
 };
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
@@ -130,7 +135,10 @@ pub(crate) enum ImportDestination {
     },
     Trapdoor {
         public: (Arc<GpuDCRTPolyMatrix>, ConcreteMatrixType),
-        secret: [(Arc<GpuDCRTPolyMatrix>, ConcreteMatrixType); 6],
+        /// One owner per matrix component (see `trapdoor_leaf_types`).
+        secret: Vec<(Arc<GpuDCRTPolyMatrix>, ConcreteMatrixType)>,
+        /// The precomputation of a statistical trapdoor.
+        precomputation: Option<Arc<GpuDeviceBytes>>,
     },
     /// An evaluation matrix held in plan scratch placed for the import's
     /// live span, from its load site to its last use; the upload writes the
@@ -211,6 +219,16 @@ pub(crate) struct PreimageReplay {
     /// The operation index at which the retry loop is emitted: a wave group
     /// whose body range contains it runs the retry once per wave.
     pub operation: u32,
+    /// A statistical TrapGen's retry, whose accepted precomputation records its measured
+    /// singular value; `None` for a preimage tile.
+    pub trapgen: Option<StatisticalTrapGenReplay>,
+}
+
+/// The precomputation of a statistical TrapGen retry and the estimate `ŝ_1` its measured
+/// singular value is logged next to.
+pub(crate) struct StatisticalTrapGenReplay {
+    pub precomputation: Arc<GpuDeviceBytes>,
+    pub estimate: f64,
 }
 
 pub(crate) struct IndexedMatrixTableReplay {
@@ -1654,8 +1672,8 @@ pub(super) fn allocate_typed_import_destination(
         let (public_eval, public_owner, before_operation) =
             allocate_matrix_import_destination(ctx, matrix, PhysicalEncoding::FullEval)?;
         let leaf_types = trapdoor_leaf_types(ty)?;
-        let mut coefficient_leaves = Vec::with_capacity(6);
-        let mut secret_owners = Vec::with_capacity(6);
+        let mut coefficient_leaves = Vec::with_capacity(leaf_types.len());
+        let mut secret_owners = Vec::with_capacity(leaf_types.len());
         for leaf_ty in leaf_types {
             let (coefficient, owner, _) =
                 allocate_matrix_import_destination(ctx, &leaf_ty, PhysicalEncoding::FullCoeff)?;
@@ -1663,18 +1681,21 @@ pub(super) fn allocate_typed_import_destination(
             secret_owners.push((owner, leaf_ty));
         }
         // Trapdoor leaves are consumed by evaluation-domain preimage kernels.
-        let evaluation_leaves = coefficient_leaves
+        let mut evaluation_leaves = coefficient_leaves
             .iter()
             .map(|&coefficient| full_eval_value(ctx, coefficient))
             .collect::<Result<Vec<_>, _>>()?;
-        let leaves: [PhysicalValueId; 6] = evaluation_leaves
-            .try_into()
-            .map_err(|_| "GPU trapdoor import has the wrong leaf count")?;
-        let secret = pack_trapdoor_leaves(ctx, ty.clone(), leaves, PhysicalEncoding::FullEval)?;
+        let precomputation = match trapdoor_precomputation_bytes(ty)? {
+            Some(bytes) => {
+                let (leaf, owner) = allocate_trapdoor_bytes(ctx, bytes)?;
+                evaluation_leaves.push(leaf);
+                Some(owner)
+            }
+            None => None,
+        };
+        let secret =
+            pack_trapdoor_leaves(ctx, ty.clone(), evaluation_leaves, PhysicalEncoding::FullEval)?;
         ctx.trapdoor_public_ids.insert(secret, public_eval);
-        let secret_owners: [(Arc<GpuDCRTPolyMatrix>, ConcreteMatrixType); 6] = secret_owners
-            .try_into()
-            .map_err(|_| "GPU trapdoor import has the wrong owner count")?;
         let destination = coefficient_leaves.into_iter().next().unwrap_or(public_eval);
         return Ok((
             destination,
@@ -1682,6 +1703,7 @@ pub(super) fn allocate_typed_import_destination(
             ImportDestination::Trapdoor {
                 public: (public_owner, matrix.clone()),
                 secret: secret_owners,
+                precomputation,
             },
             before_operation,
         ));
@@ -2080,96 +2102,6 @@ pub(super) fn matrix_columns_on_device(
         dense
     };
     replicate_to_device(ctx, dense, device)
-}
-
-/// The gadget constant a lazy gadget read through `wire` comes from, and
-/// whether a centered rebase lifts it into `wire`'s ring.
-fn gadget_origin(scope: &mxx_ir_core::graph::GraphScope, wire: WireRef) -> Option<(WireRef, bool)> {
-    let is_gadget = |wire: WireRef| {
-        scope.nodes().get(wire.node.0 as usize).is_some_and(|node| {
-            matches!(
-                node.kind(),
-                NodeKind::ConstantMatrix { value: ConstantMatrix::Gadget { .. }, .. }
-            )
-        })
-    };
-    if is_gadget(wire) {
-        return Some((wire, false));
-    }
-    let node = scope.nodes().get(wire.node.0 as usize)?;
-    match (node.kind(), scope.arguments(node)?.as_slice()) {
-        (NodeKind::CenteredRebase { .. }, [source]) if is_gadget(*source) => Some((*source, true)),
-        _ => None,
-    }
-}
-
-/// Whether `wire` has readers in `scope`, each using it as the right factor
-/// of a product with a one-row left factor, and is not a scope output.
-fn read_by_row_products(
-    scope: &mxx_ir_core::graph::GraphScope,
-    wire: WireRef,
-    wire_types: &BTreeMap<WireRef, ConcreteWireType>,
-) -> bool {
-    let Some(right) = wire_types.get(&wire).and_then(ConcreteWireType::matrix_type) else {
-        return false;
-    };
-    if scope.outputs().contains(&wire) {
-        return false;
-    }
-    let mut read = false;
-    for consumer in scope.nodes() {
-        let Some(arguments) = scope.arguments(consumer) else { return false };
-        if !arguments.contains(&wire) {
-            continue;
-        }
-        read = true;
-        let row_product = matches!(
-            consumer.kind(),
-            NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)
-        ) && matches!(arguments.as_slice(), [left, right_wire] if *right_wire == wire && *left != wire &&
-        wire_types.get(left).and_then(ConcreteWireType::matrix_type).is_some_and(|left| {
-            left.rows == 1 && left.columns == right.rows && left.ring == right.ring
-        }));
-        if !row_product {
-            return false;
-        }
-    }
-    read
-}
-
-/// Whether `wire`, a gadget constant or its centered rebase, is never stored:
-/// every product reading it scales its row by the gadget's entries (see
-/// `lower_gadget_product`). A gadget constant qualifies when each reader is
-/// such a product or a rebase that qualifies.
-fn lazy_gadget(
-    scope: &mxx_ir_core::graph::GraphScope,
-    wire: WireRef,
-    wire_types: &BTreeMap<WireRef, ConcreteWireType>,
-) -> bool {
-    match gadget_origin(scope, wire) {
-        Some((_, true)) => read_by_row_products(scope, wire, wire_types),
-        Some((_, false)) => {
-            if scope.outputs().contains(&wire) {
-                return false;
-            }
-            let mut read = false;
-            for (index, consumer) in scope.nodes().iter().enumerate() {
-                let Some(arguments) = scope.arguments(consumer) else { return false };
-                if !arguments.contains(&wire) {
-                    continue;
-                }
-                read = true;
-                let rebase = WireRef { node: NodeId(index as u64), port: Port(0) };
-                let lazy_rebase = matches!(consumer.kind(), NodeKind::CenteredRebase { .. }) &&
-                    read_by_row_products(scope, rebase, wire_types);
-                if !lazy_rebase && !read_by_row_products(scope, wire, wire_types) {
-                    return false;
-                }
-            }
-            read
-        }
-        None => false,
-    }
 }
 
 /// The product `left * G` of a one-row `left` and a gadget `G = I_r (x) g`
@@ -2725,6 +2657,11 @@ pub(super) fn lower_sample_matrix_node(
     });
     ctx.producer
         .insert(coefficient, vec![(ColumnRange { start: 0, end: ty.columns }, sample_index)]);
+    // A compact Gaussian sample is packed into the bounded compact layout of its wire.
+    if let Some(output_type @ ConcreteWireType::SmallMatrix { .. }) = wire_types.get(&wire) {
+        let output = emit_compact_pack(ctx, coefficient, output_type.clone(), ty.columns)?;
+        ctx.wire_ids.insert(wire, output);
+    }
     Ok(())
 }
 
@@ -3492,62 +3429,8 @@ pub(super) fn lower_centered_rebase_node(
         allocate_scratch_matrix(ctx, &destination_ty, PhysicalEncoding::FullCoeff)?;
     emit_crt_convert_coefficients(ctx, source_coefficient, destination_coefficient)?;
     if matches!(output_type, ConcreteWireType::SmallMatrix { .. }) {
-        let bound = match &output_type {
-            ConcreteWireType::SmallMatrix { max_coefficient_bound, .. } => max_coefficient_bound,
-            _ => unreachable!("matched small matrix"),
-        };
-        let mut bound_words = bound
-            .to_biguint()
-            .ok_or_else(|| "GPU compact centered rebase bound is negative".to_owned())?
-            .to_u64_digits();
-        if bound_words.is_empty() {
-            bound_words.push(0);
-        }
-        let (output, _) = allocate_compact_value(ctx, output_type, true)?;
-        let control_params = ctx.backend.control_parameters_on_device(ctx.device)?;
-        let status = Arc::new(
-            GpuExportStatus::new(&control_params, ctx.device).map_err(|error| error.to_string())?,
-        );
-        let status_id = allocate_preimage_control(
-            ctx,
-            4,
-            BoundStorage::from_export_status(Arc::clone(&status))?,
-        )?;
-        ctx.control_resets.push(ControlReset::IntegerStatus(status));
-        let source_binding = register_bindings(ctx.bindings, ctx.values, destination_coefficient)?;
-        let output_binding = register_preimage_control_binding(ctx, output)?;
-        let status_binding = register_preimage_control_binding(ctx, status_id)?;
-        let implementation = ctx
-            .implementations
-            .register(GpuImplementation::compact_pack())
-            .map_err(str::to_owned)?;
-        let index = u32::try_from(ctx.operations.len())
-            .map_err(|_| "too many GPU compact pack operations".to_owned())?;
-        ctx.operations.push(CompiledGpuOp {
-            implementation,
-            arguments: Box::new([
-                KernelArg::U32(output.0),
-                KernelArg::Value(destination_coefficient),
-                KernelArg::U32(0),
-                KernelArg::Value(output),
-                KernelArg::U32(0),
-                KernelArg::Value(status_id),
-                KernelArg::U32(0),
-                KernelArg::U64List(bound_words.into_boxed_slice()),
-                KernelArg::U32(source_binding),
-                KernelArg::U32(output_binding),
-                KernelArg::U32(status_binding),
-            ]),
-            outputs: Box::new([output]),
-            device: ctx.device,
-            grid: [1; 3],
-            block: [1; 3],
-            shared_bytes: 0,
-            predecessors: all_predecessors(ctx.producer, destination_coefficient),
-            body: None,
-        });
-        ctx.producer
-            .insert(output, vec![(ColumnRange { start: 0, end: destination_ty.columns }, index)]);
+        let output =
+            emit_compact_pack(ctx, destination_coefficient, output_type, destination_ty.columns)?;
         ctx.wire_ids.insert(output_wire, output);
         return Ok(());
     }
@@ -3556,6 +3439,66 @@ pub(super) fn lower_centered_rebase_node(
     }
     ctx.wire_ids.insert(output_wire, destination_coefficient);
     Ok(())
+}
+
+/// Pack the full-coefficient matrix `coefficient` into a new compact value of the bounded
+/// `output_type`, checking every coefficient against its bound.
+fn emit_compact_pack(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    coefficient: PhysicalValueId,
+    output_type: ConcreteWireType,
+    columns: usize,
+) -> Result<PhysicalValueId, String> {
+    let ConcreteWireType::SmallMatrix { max_coefficient_bound: bound, .. } = &output_type else {
+        return Err("GPU compact pack output is not a bounded small matrix".into());
+    };
+    let mut bound_words = bound
+        .to_biguint()
+        .ok_or_else(|| "GPU compact pack bound is negative".to_owned())?
+        .to_u64_digits();
+    if bound_words.is_empty() {
+        bound_words.push(0);
+    }
+    let (output, _) = allocate_compact_value(ctx, output_type, true)?;
+    let control_params = ctx.backend.control_parameters_on_device(ctx.device)?;
+    let status = Arc::new(
+        GpuExportStatus::new(&control_params, ctx.device).map_err(|error| error.to_string())?,
+    );
+    let status_id =
+        allocate_preimage_control(ctx, 4, BoundStorage::from_export_status(Arc::clone(&status))?)?;
+    ctx.control_resets.push(ControlReset::IntegerStatus(status));
+    let source_binding = register_bindings(ctx.bindings, ctx.values, coefficient)?;
+    let output_binding = register_preimage_control_binding(ctx, output)?;
+    let status_binding = register_preimage_control_binding(ctx, status_id)?;
+    let implementation =
+        ctx.implementations.register(GpuImplementation::compact_pack()).map_err(str::to_owned)?;
+    let index = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU compact pack operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: Box::new([
+            KernelArg::U32(output.0),
+            KernelArg::Value(coefficient),
+            KernelArg::U32(0),
+            KernelArg::Value(output),
+            KernelArg::U32(0),
+            KernelArg::Value(status_id),
+            KernelArg::U32(0),
+            KernelArg::U64List(bound_words.into_boxed_slice()),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(output_binding),
+            KernelArg::U32(status_binding),
+        ]),
+        outputs: Box::new([output]),
+        device: ctx.device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors: all_predecessors(ctx.producer, coefficient),
+        body: None,
+    });
+    ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: columns }, index)]);
+    Ok(output)
 }
 
 fn emit_crt_convert_coefficients(
@@ -4252,12 +4195,21 @@ fn emit_matrix_fill(
     Ok(index)
 }
 
+/// Packs a trapdoor from its leaves: the matrix leaves in `encoding`, then, for a statistical
+/// trapdoor, its precomputation as a Bytes value.
 pub(super) fn pack_trapdoor_leaves(
     ctx: &mut PhysicalLoweringContext<'_>,
     ty: ConcreteWireType,
-    leaves: [PhysicalValueId; 6],
+    leaves: Vec<PhysicalValueId>,
     encoding: PhysicalEncoding,
 ) -> Result<PhysicalValueId, String> {
+    let leaf_count = leaves.len();
+    let matrix_leaves = trapdoor_leaf_types(&ty)?.len();
+    if leaf_count != matrix_leaves + usize::from(trapdoor_precomputation_bytes(&ty)?.is_some()) {
+        return Err("GPU trapdoor has the wrong leaf count".into());
+    }
+    let leaf_encoding =
+        |leaf: usize| if leaf < matrix_leaves { encoding.clone() } else { PhysicalEncoding::Bytes };
     let mut parts = Vec::new();
     let mut storage = BTreeMap::new();
     let mut predecessors = BTreeSet::new();
@@ -4266,7 +4218,7 @@ pub(super) fn pack_trapdoor_leaves(
             .values
             .get(source.0 as usize)
             .ok_or_else(|| "GPU trapdoor leaf is absent".to_owned())?;
-        if physical.encodings.as_ref() != [encoding.clone()] {
+        if physical.encodings.as_ref() != [leaf_encoding(leaf)] {
             return Err("GPU trapdoor leaves have mixed physical encodings".into());
         }
         let owner = ctx
@@ -4289,7 +4241,7 @@ pub(super) fn pack_trapdoor_leaves(
     }
     let physical = PhysicalValue {
         ty,
-        encodings: vec![encoding; 6].into_boxed_slice(),
+        encodings: (0..leaf_count).map(leaf_encoding).collect(),
         parts: parts.into_boxed_slice(),
         integer_ranges: BTreeMap::new(),
     };
@@ -4305,18 +4257,129 @@ pub(super) fn pack_trapdoor_leaves(
     Ok(id)
 }
 
+/// The matrix types of a trapdoor's matrix leaves: `R`, `E`, `R Rᵀ`, `R Eᵀ`, `E Eᵀ`, `[R; E]` for
+/// the computational instantiation, the row chunks of `T` for the statistical one
+/// ([`crate::sampler::trapdoor::trapdoor_component_shapes`]), whose precomputation is one more
+/// leaf ([`trapdoor_precomputation_bytes`]).
 pub(super) fn trapdoor_leaf_types(
     ty: &ConcreteWireType,
-) -> Result<[ConcreteMatrixType; 6], String> {
-    let ConcreteWireType::Trapdoor { matrix, digit_count, .. } = ty else {
+) -> Result<Vec<ConcreteMatrixType>, String> {
+    let ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } = ty else {
         return Err("GPU trapdoor leaf layout requires a trapdoor type".into());
     };
-    let d = matrix.rows;
-    let dk = d
-        .checked_mul(*digit_count)
-        .ok_or_else(|| "GPU trapdoor leaf width overflows".to_owned())?;
-    let shape = |rows, columns| ConcreteMatrixType { ring: matrix.ring.clone(), rows, columns };
-    Ok([shape(d, dk), shape(d, dk), shape(d, d), shape(d, d), shape(d, d), shape(2 * d, dk)])
+    Ok(crate::sampler::trapdoor::trapdoor_component_shapes(
+        matrix.rows,
+        *digit_count,
+        *instantiation,
+    )
+    .ok_or_else(|| "GPU trapdoor leaf layout is invalid".to_owned())?
+    .into_iter()
+    .map(|(rows, columns)| ConcreteMatrixType { ring: matrix.ring.clone(), rows, columns })
+    .collect())
+}
+
+/// The byte length of a statistical trapdoor's last leaf, its precomputation
+/// ([`crate::sampler::trapdoor::statistical::StatisticalPrecomputation`]); `None` for a
+/// computational trapdoor.
+pub(super) fn trapdoor_precomputation_bytes(
+    ty: &ConcreteWireType,
+) -> Result<Option<usize>, String> {
+    let ConcreteWireType::Trapdoor { matrix, digit_count, instantiation, .. } = ty else {
+        return Err("GPU trapdoor leaf layout requires a trapdoor type".into());
+    };
+    match *instantiation {
+        TrapdoorInstantiation::Computational => Ok(None),
+        TrapdoorInstantiation::Statistical { m_bar } => {
+            crate::sampler::trapdoor::statistical::precomputation_bytes(
+                matrix.ring.ring_dimension() as usize,
+                m_bar,
+                *digit_count,
+            )
+            .map(Some)
+            .ok_or_else(|| "GPU statistical precomputation size overflows".to_owned())
+        }
+    }
+}
+
+/// A Bytes view of the precomputation leaf of the statistical trapdoor `secret`.
+fn trapdoor_precomputation_view(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    secret: PhysicalValueId,
+) -> Result<PhysicalValueId, String> {
+    let secret_physical = ctx
+        .values
+        .get(secret.0 as usize)
+        .ok_or_else(|| "GPU trapdoor precomputation source is missing".to_owned())?;
+    let bytes = trapdoor_precomputation_bytes(&secret_physical.ty)?
+        .ok_or_else(|| "GPU computational trapdoor has no precomputation".to_owned())?;
+    let leaf = trapdoor_leaf_types(&secret_physical.ty)?.len() as u32;
+    let parts = secret_physical
+        .parts
+        .iter()
+        .filter(|part| part.leaf == leaf)
+        .map(|part| PhysicalPart { leaf: 0, ..part.clone() })
+        .collect::<Vec<_>>();
+    let Ok([part]) = <[PhysicalPart; 1]>::try_from(parts) else {
+        return Err("GPU trapdoor precomputation must be one physical part".into());
+    };
+    if part.view.extent.as_ref() != [bytes as u64] {
+        return Err("GPU trapdoor precomputation has the wrong length".into());
+    }
+    let physical = PhysicalValue {
+        ty: ConcreteWireType::Bytes { length: bytes },
+        encodings: Box::new([PhysicalEncoding::Bytes]),
+        parts: Box::new([part]),
+        integer_ranges: BTreeMap::new(),
+    };
+    let source = ctx
+        .owners
+        .get(&secret)
+        .ok_or_else(|| "GPU trapdoor precomputation owner is missing".to_owned())?;
+    let resident = source.with_physical_view(Arc::new(physical.clone())).map_err(str::to_owned)?;
+    let id = value_id(ctx.values.len())?;
+    ctx.values.push(physical);
+    ctx.owners.insert(id, Arc::new(resident));
+    if let Some(writers) = ctx.producer.get(&secret).cloned() {
+        ctx.producer.insert(id, writers);
+    }
+    Ok(id)
+}
+
+/// Persistent device bytes for a statistical trapdoor's precomputation or a TrapGen scratch.
+fn allocate_trapdoor_bytes(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    bytes: usize,
+) -> Result<(PhysicalValueId, Arc<GpuDeviceBytes>), String> {
+    let params = ctx.backend.control_parameters_on_device(ctx.device)?;
+    let owner = Arc::new(
+        GpuDeviceBytes::new(&params, ctx.device, bytes).map_err(|error| error.to_string())?,
+    );
+    let id = allocate_preimage_control(
+        ctx,
+        bytes,
+        BoundStorage::from_device_bytes(Arc::clone(&owner))?,
+    )?;
+    Ok((id, owner))
+}
+
+/// The leaves of a returned copy of the evaluation-domain trapdoor `source`: fresh scratch
+/// matrices for its matrix leaves (which [`emit_trapdoor_leaf_copies`] fills), then the
+/// precomputation of a statistical trapdoor, shared with `source`. The precomputation has its own
+/// plan allocation, outside the scratch pool, that nothing writes after TrapGen, so a copy would
+/// only double its memory.
+fn returned_trapdoor_leaves(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+) -> Result<Vec<PhysicalValueId>, String> {
+    let ty = ctx.values[source.0 as usize].ty.clone();
+    let mut leaves = trapdoor_leaf_types(&ty)?
+        .iter()
+        .map(|leaf_ty| allocate_scratch_matrix(ctx, leaf_ty, PhysicalEncoding::FullEval))
+        .collect::<Result<Vec<_>, _>>()?;
+    if trapdoor_precomputation_bytes(&ty)?.is_some() {
+        leaves.push(trapdoor_precomputation_view(ctx, source)?);
+    }
+    Ok(leaves)
 }
 
 fn register_all_parts(
@@ -4353,22 +4416,28 @@ fn emit_trapdoor_leaf_copies(
         .ok_or_else(|| "GPU trapdoor has no matrix type".to_owned())?
         .ring
         .crt_depth();
-    if ctx.values[source.0 as usize].parts.len() != 6 * depth ||
-        ctx.values[destination.0 as usize].parts.len() != 6 * depth
+    let leaf_count = trapdoor_leaf_types(&source_ty)?.len();
+    // The matrix leaves are copied; a precomputation is shared (`returned_trapdoor_leaves`).
+    let part_count =
+        leaf_count * depth + usize::from(trapdoor_precomputation_bytes(&source_ty)?.is_some());
+    if ctx.values[source.0 as usize].parts.len() != part_count ||
+        ctx.values[destination.0 as usize].parts.len() != part_count
     {
-        return Err("GPU trapdoor copy does not cover six ordered CRT leaves".into());
+        return Err("GPU trapdoor copy does not cover every ordered CRT leaf".into());
     }
     let source_base = register_all_parts(ctx.bindings, ctx.values, source)?;
-    let destination_base = register_all_parts(ctx.bindings, ctx.values, destination)?;
     let implementation = ctx
         .implementations
         .register(GpuImplementation::matrix_copy_view())
         .map_err(str::to_owned)?;
     let predecessors = all_predecessors(ctx.producer, source);
     let mut writers = Vec::new();
-    for leaf in 0..6 {
+    for leaf in 0..leaf_count {
         let part = u32::try_from(leaf * depth)
             .map_err(|_| "GPU trapdoor copy part index exceeds u32".to_owned())?;
+        // Each copy writes only its leaf, so the shared precomputation is never a copy output.
+        let leaf_destination = trapdoor_leaf_view(ctx, destination, leaf)?;
+        let destination_base = register_bindings(ctx.bindings, ctx.values, leaf_destination)?;
         let index = u32::try_from(ctx.operations.len())
             .map_err(|_| "too many GPU trapdoor copy operations".to_owned())?;
         ctx.operations.push(CompiledGpuOp {
@@ -4376,12 +4445,12 @@ fn emit_trapdoor_leaf_copies(
             arguments: Box::new([
                 KernelArg::Value(source),
                 KernelArg::U32(part),
-                KernelArg::Value(destination),
-                KernelArg::U32(part),
+                KernelArg::Value(leaf_destination),
+                KernelArg::U32(0),
                 KernelArg::U32(source_base + part),
-                KernelArg::U32(destination_base + part),
+                KernelArg::U32(destination_base),
             ]),
-            outputs: Box::new([destination]),
+            outputs: Box::new([leaf_destination]),
             device: ctx.device,
             grid: [1; 3],
             block: [1; 3],
@@ -4442,8 +4511,10 @@ fn inverse_trapdoor_for_export(
             .insert(coefficient, vec![(ColumnRange { start: 0, end: leaf_ty.columns }, index)]);
         leaves.push(coefficient);
     }
-    let leaves: [PhysicalValueId; 6] =
-        leaves.try_into().map_err(|_| "GPU trapdoor iNTT has wrong leaf count".to_owned())?;
+    // The precomputation has no evaluation form; both forms share it.
+    if trapdoor_precomputation_bytes(&ty)?.is_some() {
+        leaves.push(trapdoor_precomputation_view(ctx, source)?);
+    }
     let coefficient = pack_trapdoor_leaves(ctx, ty, leaves, PhysicalEncoding::FullCoeff)?;
     ctx.converted.insert(source, coefficient);
     ctx.converted.insert(coefficient, source);
@@ -4524,6 +4595,173 @@ fn trapdoor_leaf_view(
         ctx.producer.insert(id, writers);
     }
     Ok(id)
+}
+
+/// The context of a retry loop's device body: its own operation list, producers, and
+/// conversions over the values and resources of `ctx`.
+fn retry_body_context<'b>(
+    ctx: &'b mut PhysicalLoweringContext<'_>,
+    operations: &'b mut Vec<CompiledGpuOp>,
+    producer: &'b mut BTreeMap<PhysicalValueId, Vec<(ColumnRange, u32)>>,
+    converted: &'b mut BTreeMap<PhysicalValueId, PhysicalValueId>,
+) -> PhysicalLoweringContext<'b> {
+    PhysicalLoweringContext {
+        validated: ctx.validated,
+        integer_input_ranges: ctx.integer_input_ranges,
+        artifact_payload_sizes: ctx.artifact_payload_sizes,
+        device_artifact_exports: ctx.device_artifact_exports,
+        backend: ctx.backend,
+        logical: ctx.logical,
+        device: ctx.device,
+        values: &mut *ctx.values,
+        owners: &mut *ctx.owners,
+        wire_ids: &mut *ctx.wire_ids,
+        implementations: &mut *ctx.implementations,
+        operations,
+        bindings: &mut *ctx.bindings,
+        producer,
+        family_member_producers: &mut *ctx.family_member_producers,
+        control_resets: &mut *ctx.control_resets,
+        sample_seeds: &mut *ctx.sample_seeds,
+        hash_resources: &mut *ctx.hash_resources,
+        real_owners: &mut *ctx.real_owners,
+        indexed_tables: &mut *ctx.indexed_tables,
+        device_loop_indices: ctx.device_loop_indices.clone(),
+        lanes: ctx.lanes,
+        active_parallel_template: ctx.active_parallel_template,
+        active_parallel_instances: ctx.active_parallel_instances.clone(),
+        device_body: true,
+        host_loops: None,
+        preimage_replays: &mut *ctx.preimage_replays,
+        trapdoor_public_ids: &mut *ctx.trapdoor_public_ids,
+        waves: &mut *ctx.waves,
+        import_templates: &mut *ctx.import_templates,
+        external_io_loops: &mut *ctx.external_io_loops,
+        external_io_imports: &mut *ctx.external_io_imports,
+        ahead_imports: ctx
+            .ahead_imports
+            .as_mut()
+            .map(|(slot, count, imports)| (*slot, *count, &mut **imports)),
+        slots: &mut *ctx.slots,
+        export_templates: &mut *ctx.export_templates,
+        fused_nodes: &mut *ctx.fused_nodes,
+        parallel_lanes: &mut *ctx.parallel_lanes,
+        node_operations: None,
+        crt_resource_next: &mut *ctx.crt_resource_next,
+        converted,
+        integer_status: &mut *ctx.integer_status,
+        subgraph_kernels: ctx.subgraph_kernels,
+    }
+}
+
+/// The device controls of a retry loop: the attempt counter, the status record, the attempt
+/// limit, and the status latch its condition reads, with their bindings. The replay record
+/// checks the status after execution.
+struct RetryControls {
+    attempt_id: PhysicalValueId,
+    status_id: PhysicalValueId,
+    limit_id: PhysicalValueId,
+    latch_id: PhysicalValueId,
+    attempt_binding: u32,
+    status_binding: u32,
+    limit_binding: u32,
+    latch_binding: u32,
+    max_attempts: u32,
+}
+
+/// Allocates the controls of a retry loop of at most `max_attempts` attempts whose loop
+/// operation is the next one of `ctx`. `trapgen` names a statistical TrapGen.
+fn allocate_retry_controls(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    max_attempts: u32,
+    trapgen: Option<StatisticalTrapGenReplay>,
+) -> Result<RetryControls, String> {
+    let control_params = ctx.backend.control_parameters_on_device(ctx.device)?;
+    let attempt = Arc::new(
+        GpuPreimageAttempt::new(&control_params, ctx.device).map_err(|error| error.to_string())?,
+    );
+    let status = Arc::new(
+        GpuPreimageStatus::new(&control_params, ctx.device).map_err(|error| error.to_string())?,
+    );
+    let limit = Arc::new(
+        GpuSignedValues::from_canonical_u64(&control_params, ctx.device, &[max_attempts as u64])
+            .map_err(|error| error.to_string())?,
+    );
+    let attempt_id = allocate_preimage_control(
+        ctx,
+        8,
+        BoundStorage::from_preimage_attempt(Arc::clone(&attempt))?,
+    )?;
+    let status_id = allocate_preimage_control(
+        ctx,
+        16,
+        BoundStorage::from_preimage_status(Arc::clone(&status))?,
+    )?;
+    let limit_id = allocate_preimage_control(ctx, 8, BoundStorage::from_signed_values(limit)?)?;
+    // The retry WHILE continues only while the status latch word
+    // (`MxxPreimageStatus::reserved`, byte 12) is zero, so the first
+    // accepted attempt ends the loop instead of resampling until the bound.
+    let latch_id = {
+        let mut latch = ctx.values[status_id.0 as usize].clone();
+        latch.ty = ConcreteWireType::Bytes { length: 4 };
+        latch.parts[0].view.byte_offset = 12;
+        latch.parts[0].view.extent = Box::new([4]);
+        let owner = ctx.owners.get(&status_id).ok_or("GPU retry status owner is absent")?;
+        let resident = owner.with_physical_view(Arc::new(latch.clone())).map_err(str::to_owned)?;
+        let id = value_id(ctx.values.len())?;
+        ctx.values.push(latch);
+        ctx.owners.insert(id, Arc::new(resident));
+        id
+    };
+    let operation =
+        u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
+    ctx.preimage_replays.push(PreimageReplay {
+        attempt,
+        status,
+        planned_max: max_attempts,
+        operation,
+        trapgen,
+    });
+    Ok(RetryControls {
+        attempt_binding: register_preimage_control_binding(ctx, attempt_id)?,
+        status_binding: register_preimage_control_binding(ctx, status_id)?,
+        limit_binding: register_preimage_control_binding(ctx, limit_id)?,
+        latch_binding: register_preimage_control_binding(ctx, latch_id)?,
+        attempt_id,
+        status_id,
+        limit_id,
+        latch_id,
+        max_attempts,
+    })
+}
+
+/// The retry loop of `controls` over `body`, after `predecessors`.
+fn emit_retry_loop(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    controls: &RetryControls,
+    predecessors: Box<[u32]>,
+    body: Vec<CompiledGpuOp>,
+) -> Result<u32, String> {
+    let loop_op = push_preimage_op(
+        ctx,
+        GpuImplementation::loop_while(),
+        Box::new([
+            KernelArg::Value(controls.attempt_id),
+            KernelArg::U32(0),
+            KernelArg::Value(controls.limit_id),
+            KernelArg::U32(0),
+            KernelArg::Value(controls.latch_id),
+            KernelArg::U32(0),
+            KernelArg::U64(controls.max_attempts as u64),
+            KernelArg::U32(controls.attempt_binding),
+            KernelArg::U32(controls.limit_binding),
+            KernelArg::U32(controls.latch_binding),
+        ]),
+        Box::new([]),
+        predecessors,
+    )?;
+    ctx.operations[loop_op as usize].body = Some(body.into_boxed_slice());
+    Ok(loop_op)
 }
 
 fn push_preimage_op(
@@ -4910,7 +5148,9 @@ pub(super) fn lower_trapdoor_sample_node(
     env: &ParamEnv,
     wire_types: &BTreeMap<WireRef, ConcreteWireType>,
 ) -> Result<(), String> {
-    let NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } = node.kind() else {
+    let NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, instantiation, .. } =
+        node.kind()
+    else {
         return Err("GPU trapdoor lowerer received another node".into());
     };
     let public_wire = WireRef { node: node_id, port: Port(0) };
@@ -4942,13 +5182,19 @@ pub(super) fn lower_trapdoor_sample_node(
         digits != params.modulus_digits() ||
         params.dropped_moduli() != 0 ||
         !digits.is_multiple_of(depth) ||
-        public_ty.columns !=
-            public_ty
-                .rows
-                .checked_mul(digits + 2)
-                .ok_or_else(|| "GPU trapdoor width overflows".to_owned())?
+        instantiation.columns(public_ty.rows, digits) != Some(public_ty.columns)
     {
         return Err("GPU trapdoor requires the exact regular gadget layout and sigma".into());
+    }
+    if let TrapdoorInstantiation::Statistical { m_bar } = *instantiation {
+        return lower_statistical_trapdoor_sample(
+            ctx,
+            scope_id,
+            node_id,
+            StatisticalTrapGen { public_ty, secret_ty, sigma, base, digits, m_bar },
+            public_wire,
+            secret_wire,
+        );
     }
     let d = public_ty.rows;
     let dk = d.checked_mul(digits).ok_or_else(|| "GPU trapdoor R width overflows".to_owned())?;
@@ -5044,9 +5290,271 @@ pub(super) fn lower_trapdoor_sample_node(
     let secret = pack_trapdoor_leaves(
         ctx,
         secret_ty,
-        [r, e, a_cov, b_cov, d_cov, re],
+        vec![r, e, a_cov, b_cov, d_cov, re],
         PhysicalEncoding::FullEval,
     )?;
+    ctx.wire_ids.insert(public_wire, public);
+    ctx.wire_ids.insert(secret_wire, secret);
+    ctx.trapdoor_public_ids.insert(secret, public);
+    Ok(())
+}
+
+struct StatisticalTrapGen {
+    public_ty: ConcreteMatrixType,
+    secret_ty: ConcreteWireType,
+    sigma: f64,
+    base: BigInt,
+    digits: usize,
+    m_bar: usize,
+}
+
+/// Statistical TrapGen (see `sampler::trapdoor::statistical`): a retry loop that draws the row
+/// chunks of `T` Gaussian without truncation (attempt-derived seeds) and precomputes their
+/// spectra and the Cholesky factors of the perturbation covariance for the trapdoor's preimage
+/// width, until the factorization accepts; then `ā` uniform (label 2) and `A = [ā | g - ā T]`,
+/// with `ā T` accumulated chunk by chunk. The precomputation stays on the device as the
+/// trapdoor's last leaf.
+fn lower_statistical_trapdoor_sample(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    trapgen: StatisticalTrapGen,
+    public_wire: WireRef,
+    secret_wire: WireRef,
+) -> Result<(), String> {
+    let StatisticalTrapGen { public_ty, secret_ty, sigma, base, digits, m_bar } = trapgen;
+    if public_ty.rows != 1 {
+        return Err("GPU statistical TrapGen has one public row".into());
+    }
+    let depth = public_ty.ring.crt_depth();
+    let n = public_ty.ring.ring_dimension();
+    let shape = |rows, columns| ConcreteMatrixType { ring: public_ty.ring.clone(), rows, columns };
+    let instantiation = TrapdoorInstantiation::Statistical { m_bar };
+    let base_u32 = base.to_u32().ok_or("GPU gadget base exceeds u32")?;
+    let ConcreteWireType::Trapdoor { preimage_sigma, .. } = &secret_ty else {
+        return Err("GPU statistical TrapGen secret is not a trapdoor".into());
+    };
+    let preimage_sigma = match preimage_sigma {
+        Some(width) => {
+            width.evaluate_f64(&ParamEnv::default()).map_err(|error| error.to_string())?
+        }
+        None => crate::sampler::bounds::minimum_preimage_sigma(
+            n,
+            1,
+            digits,
+            base_u32,
+            sigma,
+            instantiation,
+        )
+        .and_then(|width| width.to_f64())
+        .ok_or("GPU statistical minimum preimage width is invalid")?,
+    };
+    let widths = crate::sampler::trapdoor::statistical::PerturbationWidths::new(
+        preimage_sigma,
+        gadget_sampler_sigma(base_u32, sigma),
+        sigma,
+    )
+    .ok_or("GPU statistical preimage widths are invalid")?;
+    let estimate = crate::sampler::bounds::trapdoor_singular_value_estimate(
+        n,
+        1,
+        digits,
+        sigma,
+        instantiation,
+    )
+    .and_then(|estimate| estimate.to_f64())
+    .ok_or("GPU statistical singular-value estimate is invalid")?;
+    let precomputation_bytes = trapdoor_precomputation_bytes(&secret_ty)?
+        .ok_or("GPU statistical trapdoor has no precomputation")?;
+    // The precomputation stays on the device with the trapdoor.
+    let budget = (crate::poly::dcrt::gpu::gpu_device_memory_usage(ctx.device)?.total as f64 *
+        crate::env::gpu_memory_fraction()?) as u64;
+    if precomputation_bytes as u64 > budget {
+        return Err(format!(
+            "the statistical trapdoor's precomputation needs {precomputation_bytes} bytes, over the {budget}-byte budget of GPU {}",
+            ctx.device
+        ));
+    }
+    let chunk_rows = crate::sampler::trapdoor::statistical::chunk_row_counts(m_bar);
+    // The seed domains of the chunks are labels below 128 (`derive_preimage_stage_seed`).
+    if chunk_rows.len() > 100 {
+        return Err("GPU statistical TrapGen has too many row chunks".into());
+    }
+    let (precomputation, precomputation_owner) =
+        allocate_trapdoor_bytes(ctx, precomputation_bytes)?;
+    let scratch_bytes = crate::sampler::trapdoor::statistical::ROW_CHUNK
+        .checked_mul(digits)
+        .and_then(|count| count.checked_mul(n as usize * 16))
+        .ok_or("GPU statistical spectra scratch overflows")?;
+    let (scratch, _) = allocate_trapdoor_bytes(ctx, scratch_bytes)?;
+    let controls = allocate_retry_controls(
+        ctx,
+        crate::sampler::trapdoor::statistical::TRAPGEN_ATTEMPTS as u32,
+        Some(StatisticalTrapGenReplay { precomputation: precomputation_owner, estimate }),
+    )?;
+    let mut body = Vec::<CompiledGpuOp>::new();
+    let mut body_producer = BTreeMap::<PhysicalValueId, Vec<(ColumnRange, u32)>>::new();
+    let mut body_converted = BTreeMap::new();
+    let mut chunks = Vec::with_capacity(chunk_rows.len());
+    {
+        let mut child = retry_body_context(ctx, &mut body, &mut body_producer, &mut body_converted);
+        let precomputation_binding = register_preimage_control_binding(&mut child, precomputation)?;
+        let scratch_binding = register_preimage_control_binding(&mut child, scratch)?;
+        let mut row = 0u64;
+        for (index, &rows) in chunk_rows.iter().enumerate() {
+            let seed = derive_preimage_stage_seed(
+                &mut child,
+                scope_id,
+                node_id,
+                controls.attempt_id,
+                index as u64,
+            )?;
+            let (coefficient, evaluation) = emit_fresh_matrix_sample_parts(
+                &mut child,
+                scope_id,
+                node_id,
+                0,
+                &shape(rows, digits),
+                Some(sigma),
+                Some(seed),
+            )?;
+            let coefficient_binding = register_bindings(child.bindings, child.values, coefficient)?;
+            push_preimage_op(
+                &mut child,
+                GpuImplementation::statistical_spectra(),
+                Box::new([
+                    KernelArg::Value(coefficient),
+                    KernelArg::U32(0),
+                    KernelArg::Value(precomputation),
+                    KernelArg::U32(0),
+                    KernelArg::Value(scratch),
+                    KernelArg::U32(0),
+                    KernelArg::U64(m_bar as u64),
+                    KernelArg::U64(row),
+                    KernelArg::U32(coefficient_binding),
+                    KernelArg::U32(precomputation_binding),
+                    KernelArg::U32(scratch_binding),
+                ]),
+                Box::new([precomputation]),
+                Box::new([]),
+            )?;
+            chunks.push(evaluation);
+            row += rows as u64;
+        }
+        push_preimage_op(
+            &mut child,
+            GpuImplementation::statistical_factor(),
+            Box::new([
+                KernelArg::Value(precomputation),
+                KernelArg::U32(0),
+                KernelArg::Value(controls.attempt_id),
+                KernelArg::U32(0),
+                KernelArg::Value(controls.status_id),
+                KernelArg::U32(0),
+                KernelArg::U64(m_bar as u64),
+                KernelArg::U64(digits as u64),
+                KernelArg::U64(n as u64),
+                KernelArg::F64(preimage_sigma),
+                KernelArg::F64(widths.variance),
+                KernelArg::F64(widths.alpha),
+                KernelArg::F64(widths.pivot_floor),
+                KernelArg::U32(precomputation_binding),
+                KernelArg::U32(controls.attempt_binding),
+                KernelArg::U32(controls.status_binding),
+            ]),
+            Box::new([controls.status_id]),
+            Box::new([]),
+        )?;
+    }
+    // One attempt is a chain: the scratch and the precomputation are rewritten in order.
+    for index in 1..body.len() {
+        body[index].predecessors =
+            Box::new([u32::try_from(index - 1).map_err(|_| "GPU TrapGen body index exceeds u32")?]);
+    }
+    let loop_op = emit_retry_loop(ctx, &controls, Box::new([]), body)?;
+    for &chunk in &chunks {
+        ctx.producer.insert(chunk, vec![(ColumnRange { start: 0, end: digits }, loop_op)]);
+    }
+    ctx.producer.insert(precomputation, vec![(ColumnRange { start: 0, end: 1 }, loop_op)]);
+    let a_bar = emit_fresh_matrix_sample(ctx, scope_id, node_id, 2, &shape(1, m_bar), None)?;
+    let mut accumulated: Option<PhysicalValueId> = None;
+    let mut start = 0;
+    for (&chunk, &rows) in chunks.iter().zip(&chunk_rows) {
+        let a_window = matrix_view(ctx, a_bar, 0, 1, start, rows)?;
+        let a_local = allocate_scratch_matrix(ctx, &shape(1, rows), PhysicalEncoding::FullEval)?;
+        emit_matrix_operation(ctx, GpuImplementation::matrix_copy_view(), &[a_window], a_local)?;
+        let product = allocate_scratch_matrix(ctx, &shape(1, digits), PhysicalEncoding::FullEval)?;
+        emit_matrix_operation(
+            ctx,
+            GpuImplementation::matrix_mul(false),
+            &[a_local, chunk],
+            product,
+        )?;
+        accumulated = Some(match accumulated {
+            None => product,
+            Some(previous) => {
+                let sum =
+                    allocate_scratch_matrix(ctx, &shape(1, digits), PhysicalEncoding::FullEval)?;
+                emit_matrix_operation(
+                    ctx,
+                    GpuImplementation::matrix_add_sub(false),
+                    &[previous, product],
+                    sum,
+                )?;
+                sum
+            }
+        });
+        start += rows;
+    }
+    let a_bar_t = accumulated.ok_or("GPU statistical TrapGen has no rows")?;
+    let gadget = allocate_scratch_matrix(ctx, &shape(1, digits), PhysicalEncoding::FullEval)?;
+    let gadget_binding = register_bindings(ctx.bindings, ctx.values, gadget)?;
+    let residues = public_ty
+        .ring
+        .crt_moduli()
+        .iter()
+        .map(|modulus| {
+            let modulus = BigInt::from(*modulus);
+            ((&base % &modulus + &modulus) % &modulus)
+                .to_u64()
+                .ok_or_else(|| "GPU gadget residue exceeds u64".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_matrix_fill(
+        ctx,
+        gadget,
+        GpuImplementation::gadget_fill(),
+        Box::new([
+            KernelArg::Value(gadget),
+            KernelArg::U32(0),
+            KernelArg::U64(1),
+            KernelArg::U32(
+                u32::try_from(digits / depth)
+                    .map_err(|_| "GPU digits per CRT tower exceeds u32".to_owned())?,
+            ),
+            KernelArg::U64List(residues.into_boxed_slice()),
+            KernelArg::U64(0),
+            KernelArg::U32(gadget_binding),
+        ]),
+    )?;
+    let a1 = allocate_scratch_matrix(ctx, &shape(1, digits), PhysicalEncoding::FullEval)?;
+    emit_matrix_operation(ctx, GpuImplementation::matrix_add_sub(true), &[gadget, a_bar_t], a1)?;
+    let public = allocate_scratch_matrix(ctx, &public_ty, PhysicalEncoding::FullEval)?;
+    let a_view = matrix_view(ctx, public, 0, 1, 0, m_bar)?;
+    let a1_view = matrix_view(ctx, public, 0, 1, m_bar, digits)?;
+    let a_copy =
+        emit_matrix_operation(ctx, GpuImplementation::matrix_copy_view(), &[a_bar], a_view)?;
+    let a1_copy =
+        emit_matrix_operation(ctx, GpuImplementation::matrix_copy_view(), &[a1], a1_view)?;
+    ctx.producer.insert(
+        public,
+        vec![
+            (ColumnRange { start: 0, end: m_bar }, a_copy),
+            (ColumnRange { start: m_bar, end: m_bar + digits }, a1_copy),
+        ],
+    );
+    chunks.push(precomputation);
+    let secret = pack_trapdoor_leaves(ctx, secret_ty, chunks, PhysicalEncoding::FullEval)?;
     ctx.wire_ids.insert(public_wire, public);
     ctx.wire_ids.insert(secret_wire, secret);
     ctx.trapdoor_public_ids.insert(secret, public);
@@ -5267,11 +5775,23 @@ pub(super) fn lower_preimage_sample_node(
         .ok_or("GPU preimage target input is not a matrix")?
         .clone();
     let ConcreteWireType::Trapdoor {
-        matrix: trapdoor_matrix, sigma, gadget_base, digit_count, ..
+        matrix: trapdoor_matrix,
+        sigma,
+        gadget_base,
+        digit_count,
+        instantiation,
+        preimage_sigma,
+        ..
     } = &ctx.values[secret.0 as usize].ty
     else {
         return Err("GPU preimage secret input is not a typed trapdoor".into());
     };
+    let instantiation = *instantiation;
+    let preimage_sigma = preimage_sigma
+        .as_ref()
+        .map(|width| width.evaluate_rational(env))
+        .transpose()
+        .map_err(|error| error.to_string())?;
     if *trapdoor_matrix != public_ty ||
         target_ty.ring != public_ty.ring ||
         target_ty.rows != public_ty.rows
@@ -5286,9 +5806,12 @@ pub(super) fn lower_preimage_sample_node(
         .get(&output_wire)
         .ok_or_else(|| "GPU preimage output has no validated type".to_owned())?
         .clone();
-    let ConcreteWireType::Preimage { matrix: output_matrix, bound_domain, .. } = &output_ty else {
+    let ConcreteWireType::Preimage { matrix: output_matrix, bound_domain, max_coefficient_bound } =
+        &output_ty
+    else {
         return Err("GPU preimage output is not bounded".into());
     };
+    let max_coefficient_bound = max_coefficient_bound.clone();
     if ctx.values[secret.0 as usize].encodings.as_ref() == [PhysicalEncoding::PublicGadgetEval] {
         return lower_public_gadget_preimage(
             ctx,
@@ -5320,7 +5843,7 @@ pub(super) fn lower_preimage_sample_node(
         gadget_base != (BigInt::from(1u8) << params.base_bits()) ||
         digits != params.modulus_digits() ||
         params.dropped_moduli() != 0 ||
-        public_ty.columns != d.checked_mul(digits + 2).ok_or("GPU preimage width overflows")? ||
+        instantiation.columns(d, digits) != Some(public_ty.columns) ||
         output_matrix.ring != public_ty.ring ||
         output_matrix.rows != public_ty.columns ||
         output_matrix.columns != t ||
@@ -5388,22 +5911,42 @@ pub(super) fn lower_preimage_sample_node(
         let block = blocks.entry(device).or_insert(ColumnRange { start, end: start + width });
         *block = ColumnRange { start: block.start.min(start), end: block.end.max(start + width) };
     }
-    let c = (gadget_base.to_f64().ok_or("GPU gadget base exceeds f64")? + 1.0) * sigma;
-    let n = public_ty.ring.ring_dimension() as usize;
-    let s = 1.8 *
-        (gadget_base.to_f64().ok_or("GPU gadget base exceeds f64")? + 1.0) *
-        sigma *
-        sigma *
-        (((d * n * digits) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7);
+    let base = gadget_base.to_u32().ok_or("GPU gadget base exceeds u32")?;
+    let c = gadget_sampler_sigma(base, sigma);
+    let s = checked_preimage_sigma(
+        public_ty.ring.ring_dimension(),
+        d,
+        digits,
+        base,
+        sigma,
+        instantiation,
+        preimage_sigma.as_ref(),
+        &max_coefficient_bound.to_biguint().ok_or("GPU preimage bound is negative")?,
+    )
+    .map_err(|error| error.to_string())?;
     let dgg_stddev = (s * s - c * c).sqrt();
     if !c.is_finite() || !s.is_finite() || !dgg_stddev.is_finite() || !(s > c) || dgg_stddev <= 0.0
     {
         return Err("GPU preimage covariance parameters are invalid".into());
     }
     let shape = |rows, columns| ConcreteMatrixType { ring: public_ty.ring.clone(), rows, columns };
-    let r = trapdoor_leaf_view(ctx, secret, 0)?;
-    let e = trapdoor_leaf_view(ctx, secret, 1)?;
-    let re = trapdoor_leaf_view(ctx, secret, 5)?;
+    // The evaluation-domain trapdoor leaves the tile reads: `R`, `E`, and `[R; E]`, or the row
+    // chunks of `T`.
+    let statistical = match instantiation {
+        TrapdoorInstantiation::Computational => None,
+        TrapdoorInstantiation::Statistical { m_bar } => Some((
+            m_bar,
+            crate::sampler::trapdoor::statistical::PerturbationWidths::new(s, c, sigma)
+                .ok_or("GPU statistical preimage widths are invalid")?,
+        )),
+    };
+    let leaf_inputs = match statistical {
+        None => vec![0, 1, 5],
+        Some(_) => (0..trapdoor_leaf_types(&ctx.values[secret.0 as usize].ty)?.len()).collect(),
+    }
+    .into_iter()
+    .map(|leaf| trapdoor_leaf_view(ctx, secret, leaf))
+    .collect::<Result<Vec<_>, _>>()?;
     let secret_coeff = inverse_trapdoor_for_export(ctx, secret)?;
     let depth = public_ty.ring.crt_depth();
     let secret_coeff_bindings = register_all_parts(ctx.bindings, ctx.values, secret_coeff)?;
@@ -5412,11 +5955,16 @@ pub(super) fn lower_preimage_sample_node(
     // bindings of its inverse trapdoor, and its output block.
     let mut remote = BTreeMap::new();
     for (&device, block) in &blocks {
-        let copies = [public, r, e, re, secret_coeff]
-            .into_iter()
+        let copies = std::iter::once(public)
+            .chain(leaf_inputs.iter().copied())
+            .chain(std::iter::once(secret_coeff))
             .map(|id| replicate_to_device(ctx, id, device))
             .collect::<Result<Vec<_>, _>>()?;
-        let coeff_bindings = register_all_parts(ctx.bindings, ctx.values, copies[4])?;
+        let coeff_bindings = register_all_parts(
+            ctx.bindings,
+            ctx.values,
+            *copies.last().ok_or("GPU preimage device inputs are incomplete")?,
+        )?;
         let mut block_ty = output_ty.clone();
         if let ConcreteWireType::Preimage { matrix, .. } = &mut block_ty {
             matrix.columns = block.end - block.start;
@@ -5447,20 +5995,32 @@ pub(super) fn lower_preimage_sample_node(
         let mut target_local =
             allocate_scratch_matrix(ctx, &tile_target_ty, PhysicalEncoding::FullEval)?;
         emit_matrix_operation(ctx, GpuImplementation::matrix_copy_view(), &[target], target_local)?;
-        let (public, r, e, re, secret_coeff, secret_coeff_bindings, tile_owner, tile_column) =
+        let (public, leaves, secret_coeff, secret_coeff_bindings, tile_owner, tile_column) =
             match remote.get(&tile_device) {
                 Some((copies, coeff_bindings, block_output, block)) => {
                     target_local = replicate_to_device(ctx, target_local, tile_device)?;
                     ctx.device = tile_device;
-                    let [public, r, e, re, secret_coeff] = copies[..] else {
+                    let [public, leaves @ .., secret_coeff] = &copies[..] else {
                         return Err("GPU preimage device inputs are incomplete".into());
                     };
                     let column = tile_start - block.start;
-                    (public, r, e, re, secret_coeff, *coeff_bindings, *block_output, column)
+                    (
+                        *public,
+                        leaves.to_vec(),
+                        *secret_coeff,
+                        *coeff_bindings,
+                        *block_output,
+                        column,
+                    )
                 }
-                None => {
-                    (public, r, e, re, secret_coeff, secret_coeff_bindings, full_output, tile_start)
-                }
+                None => (
+                    public,
+                    leaf_inputs.clone(),
+                    secret_coeff,
+                    secret_coeff_bindings,
+                    full_output,
+                    tile_start,
+                ),
             };
         let output = compact_column_view(ctx, tile_owner, tile_column, tile_width)?;
         let resource_base = u32::try_from(ctx.values.len())
@@ -5470,91 +6030,60 @@ pub(super) fn lower_preimage_sample_node(
         let p1_resource = resource_base;
         let gq_resource = resource_base + 1;
         let cutoff_resource = resource_base + 2;
-        let p1_workspace = register_preimage_workspace(
-            ctx.bindings,
-            GpuPreparedWorkspaceKind::P1,
-            p1_resource,
-            5,
-        )?;
-        let refresh = push_preimage_op(
-            ctx,
-            GpuImplementation::p1_covariance_refresh(),
-            Box::new([
-                KernelArg::U32(p1_resource),
-                KernelArg::Value(secret_coeff),
-                KernelArg::U32((2 * depth) as u32),
-                KernelArg::Value(secret_coeff),
-                KernelArg::U32((3 * depth) as u32),
-                KernelArg::Value(secret_coeff),
-                KernelArg::U32((4 * depth) as u32),
-                KernelArg::F64(c),
-                KernelArg::F64(s),
-                KernelArg::F64(dgg_stddev),
-                KernelArg::U64(t as u64),
-                KernelArg::U32(secret_coeff_bindings + (2 * depth) as u32),
-                KernelArg::U32(secret_coeff_bindings + (3 * depth) as u32),
-                KernelArg::U32(secret_coeff_bindings + (4 * depth) as u32),
-                KernelArg::U32(p1_workspace),
-                KernelArg::U32(p1_workspace + 1),
-                KernelArg::U32(p1_workspace + 2),
-                KernelArg::U32(p1_workspace + 3),
-                KernelArg::U32(p1_workspace + 4),
-            ]),
-            Box::new([]),
-            all_predecessors(ctx.producer, secret_coeff),
-        )?;
-        let control_params = ctx.backend.control_parameters_on_device(ctx.device)?;
-        let attempt = Arc::new(
-            GpuPreimageAttempt::new(&control_params, ctx.device)
-                .map_err(|error| error.to_string())?,
-        );
-        let status = Arc::new(
-            GpuPreimageStatus::new(&control_params, ctx.device)
-                .map_err(|error| error.to_string())?,
-        );
-        let limit = Arc::new(
-            GpuSignedValues::from_canonical_u64(
-                &control_params,
-                ctx.device,
-                &[max_attempts as u64],
-            )
-            .map_err(|error| error.to_string())?,
-        );
-        let attempt_id = allocate_preimage_control(
-            ctx,
-            8,
-            BoundStorage::from_preimage_attempt(Arc::clone(&attempt))?,
-        )?;
-        let status_id = allocate_preimage_control(
-            ctx,
-            16,
-            BoundStorage::from_preimage_status(Arc::clone(&status))?,
-        )?;
-        let limit_id = allocate_preimage_control(ctx, 8, BoundStorage::from_signed_values(limit)?)?;
-        // The retry WHILE continues only while the status latch word
-        // (`MxxPreimageStatus::reserved`, byte 12) is zero, so the first
-        // accepted attempt ends the loop instead of resampling until the bound.
-        let latch_id = {
-            let mut latch = ctx.values[status_id.0 as usize].clone();
-            latch.ty = ConcreteWireType::Bytes { length: 4 };
-            latch.parts[0].view.byte_offset = 12;
-            latch.parts[0].view.extent = Box::new([4]);
-            let owner = ctx.owners.get(&status_id).ok_or("GPU preimage status owner is absent")?;
-            let resident =
-                owner.with_physical_view(Arc::new(latch.clone())).map_err(str::to_owned)?;
-            let id = value_id(ctx.values.len())?;
-            ctx.values.push(latch);
-            ctx.owners.insert(id, Arc::new(resident));
-            id
+        // The statistical sampler reads the trapdoor's precomputation on the tile's device.
+        let (p1_workspace, precomputation) = match statistical {
+            Some(_) => (
+                register_preimage_workspace(
+                    ctx.bindings,
+                    GpuPreparedWorkspaceKind::Statistical,
+                    p1_resource,
+                    3,
+                )?,
+                Some(trapdoor_precomputation_view(ctx, secret_coeff)?),
+            ),
+            None => (
+                register_preimage_workspace(
+                    ctx.bindings,
+                    GpuPreparedWorkspaceKind::P1,
+                    p1_resource,
+                    5,
+                )?,
+                None,
+            ),
         };
-        let operation = u32::try_from(ctx.operations.len())
-            .map_err(|_| "too many GPU operations".to_owned())?;
-        ctx.preimage_replays.push(PreimageReplay {
-            attempt,
-            status,
-            planned_max: max_attempts,
-            operation,
-        });
+        let refresh = if statistical.is_some() {
+            None
+        } else {
+            Some(push_preimage_op(
+                ctx,
+                GpuImplementation::p1_covariance_refresh(),
+                Box::new([
+                    KernelArg::U32(p1_resource),
+                    KernelArg::Value(secret_coeff),
+                    KernelArg::U32((2 * depth) as u32),
+                    KernelArg::Value(secret_coeff),
+                    KernelArg::U32((3 * depth) as u32),
+                    KernelArg::Value(secret_coeff),
+                    KernelArg::U32((4 * depth) as u32),
+                    KernelArg::F64(c),
+                    KernelArg::F64(s),
+                    KernelArg::F64(dgg_stddev),
+                    KernelArg::U64(t as u64),
+                    KernelArg::U32(secret_coeff_bindings + (2 * depth) as u32),
+                    KernelArg::U32(secret_coeff_bindings + (3 * depth) as u32),
+                    KernelArg::U32(secret_coeff_bindings + (4 * depth) as u32),
+                    KernelArg::U32(p1_workspace),
+                    KernelArg::U32(p1_workspace + 1),
+                    KernelArg::U32(p1_workspace + 2),
+                    KernelArg::U32(p1_workspace + 3),
+                    KernelArg::U32(p1_workspace + 4),
+                ]),
+                Box::new([]),
+                all_predecessors(ctx.producer, secret_coeff),
+            )?)
+        };
+        let controls = allocate_retry_controls(ctx, max_attempts, None)?;
+        let RetryControls { attempt_id, status_id, attempt_binding, status_binding, .. } = controls;
         let gq_workspace = register_preimage_workspace(
             ctx.bindings,
             GpuPreparedWorkspaceKind::Gq,
@@ -5567,143 +6096,163 @@ pub(super) fn lower_preimage_sample_node(
             cutoff_resource,
             1,
         )?;
-        let attempt_binding = register_preimage_control_binding(ctx, attempt_id)?;
-        let status_binding = register_preimage_control_binding(ctx, status_id)?;
         let output_binding = register_preimage_control_binding(ctx, output)?;
-        let limit_binding = register_preimage_control_binding(ctx, limit_id)?;
-        let latch_binding = register_preimage_control_binding(ctx, latch_id)?;
         let mut body = Vec::<CompiledGpuOp>::new();
         let mut body_producer = BTreeMap::<PhysicalValueId, Vec<(ColumnRange, u32)>>::new();
+        let mut body_converted = BTreeMap::new();
         {
-            let mut child = PhysicalLoweringContext {
-                validated: ctx.validated,
-                integer_input_ranges: ctx.integer_input_ranges,
-                artifact_payload_sizes: ctx.artifact_payload_sizes,
-                device_artifact_exports: ctx.device_artifact_exports,
-                backend: ctx.backend,
-                logical: ctx.logical,
-                device: ctx.device,
-                values: &mut *ctx.values,
-                owners: &mut *ctx.owners,
-                wire_ids: &mut *ctx.wire_ids,
-                implementations: &mut *ctx.implementations,
-                operations: &mut body,
-                bindings: &mut *ctx.bindings,
-                producer: &mut body_producer,
-                family_member_producers: &mut *ctx.family_member_producers,
-                control_resets: &mut *ctx.control_resets,
-                sample_seeds: &mut *ctx.sample_seeds,
-                hash_resources: &mut *ctx.hash_resources,
-                real_owners: &mut *ctx.real_owners,
-                indexed_tables: &mut *ctx.indexed_tables,
-                device_loop_indices: ctx.device_loop_indices.clone(),
-                lanes: ctx.lanes,
-                active_parallel_template: ctx.active_parallel_template,
-                active_parallel_instances: ctx.active_parallel_instances.clone(),
-                device_body: true,
-                host_loops: None,
-                preimage_replays: &mut *ctx.preimage_replays,
-                trapdoor_public_ids: &mut *ctx.trapdoor_public_ids,
-                waves: &mut *ctx.waves,
-                import_templates: &mut *ctx.import_templates,
-                external_io_loops: &mut *ctx.external_io_loops,
-                external_io_imports: &mut *ctx.external_io_imports,
-                ahead_imports: ctx
-                    .ahead_imports
-                    .as_mut()
-                    .map(|(slot, count, imports)| (*slot, *count, &mut **imports)),
-                slots: &mut *ctx.slots,
-                export_templates: &mut *ctx.export_templates,
-                fused_nodes: &mut *ctx.fused_nodes,
-                parallel_lanes: &mut *ctx.parallel_lanes,
-                node_operations: None,
-                crt_resource_next: &mut *ctx.crt_resource_next,
-                converted: &mut BTreeMap::new(),
-                integer_status: &mut *ctx.integer_status,
-                subgraph_kernels: ctx.subgraph_kernels,
+            let mut child =
+                retry_body_context(ctx, &mut body, &mut body_producer, &mut body_converted);
+            let perturb_coeff = match statistical {
+                None => {
+                    let p2_seed =
+                        derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 0)?;
+                    let (p2_coeff, p2_eval) = emit_fresh_matrix_sample_parts(
+                        &mut child,
+                        scope_id,
+                        node_id,
+                        3,
+                        &shape(dk, t),
+                        Some(dgg_stddev),
+                        Some(p2_seed),
+                    )?;
+                    let tp2_eval = allocate_scratch_matrix(
+                        &mut child,
+                        &shape(2 * d, t),
+                        PhysicalEncoding::FullEval,
+                    )?;
+                    emit_matrix_operation(
+                        &mut child,
+                        GpuImplementation::matrix_mul(false),
+                        &[leaves[2], p2_eval],
+                        tp2_eval,
+                    )?;
+                    let tp2_coeff = allocate_scratch_matrix(
+                        &mut child,
+                        &shape(2 * d, t),
+                        PhysicalEncoding::FullCoeff,
+                    )?;
+                    emit_matrix_operation(
+                        &mut child,
+                        GpuImplementation::ntt(true),
+                        &[tp2_eval],
+                        tp2_coeff,
+                    )?;
+                    let p1_coeff = allocate_scratch_matrix(
+                        &mut child,
+                        &shape(2 * d, t),
+                        PhysicalEncoding::FullCoeff,
+                    )?;
+                    let p1_seed =
+                        derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 1)?;
+                    let tp2_binding = register_bindings(child.bindings, child.values, tp2_coeff)?;
+                    let p1_binding = register_bindings(child.bindings, child.values, p1_coeff)?;
+                    let p1_seed_binding = register_preimage_control_binding(&mut child, p1_seed)?;
+                    let tp2_predecessors = all_predecessors(child.producer, tp2_coeff);
+                    let p1_index = push_preimage_op(
+                        &mut child,
+                        GpuImplementation::p1_sample(),
+                        Box::new([
+                            KernelArg::U32(p1_resource),
+                            KernelArg::Value(tp2_coeff),
+                            KernelArg::U32(0),
+                            KernelArg::Value(p1_coeff),
+                            KernelArg::U32(0),
+                            KernelArg::Value(p1_seed),
+                            KernelArg::U32(0),
+                            KernelArg::F64(c),
+                            KernelArg::F64(s),
+                            KernelArg::U32(tp2_binding),
+                            KernelArg::U32(p1_binding),
+                            KernelArg::U32(p1_seed_binding),
+                            KernelArg::U32(p1_workspace),
+                            KernelArg::U32(p1_workspace + 1),
+                            KernelArg::U32(p1_workspace + 2),
+                            KernelArg::U32(p1_workspace + 3),
+                            KernelArg::U32(p1_workspace + 4),
+                        ]),
+                        Box::new([p1_coeff]),
+                        tp2_predecessors,
+                    )?;
+                    child
+                        .producer
+                        .insert(p1_coeff, vec![(ColumnRange { start: 0, end: t }, p1_index)]);
+                    let perturb_coeff = allocate_scratch_matrix(
+                        &mut child,
+                        &output_matrix,
+                        PhysicalEncoding::FullCoeff,
+                    )?;
+                    let p1_dest = matrix_view(&mut child, perturb_coeff, 0, 2 * d, 0, t)?;
+                    let p2_dest = matrix_view(&mut child, perturb_coeff, 2 * d, dk, 0, t)?;
+                    let p1_copy = emit_matrix_operation(
+                        &mut child,
+                        GpuImplementation::matrix_copy_view(),
+                        &[p1_coeff],
+                        p1_dest,
+                    )?;
+                    let p2_copy = emit_matrix_operation(
+                        &mut child,
+                        GpuImplementation::matrix_copy_view(),
+                        &[p2_coeff],
+                        p2_dest,
+                    )?;
+                    child.producer.insert(
+                        perturb_coeff,
+                        vec![
+                            (ColumnRange { start: 0, end: t }, p1_copy),
+                            (ColumnRange { start: 0, end: t }, p2_copy),
+                        ],
+                    );
+                    perturb_coeff
+                }
+                Some((m_bar, widths)) => {
+                    // The statistical perturbation `[p_1; p_2]`, sampled whole by one native
+                    // operation from the trapdoor's precomputation.
+                    let precomputation =
+                        precomputation.ok_or("GPU statistical preimage has no precomputation")?;
+                    let precomputation_binding =
+                        register_preimage_control_binding(&mut child, precomputation)?;
+                    let perturb_coeff = allocate_scratch_matrix(
+                        &mut child,
+                        &output_matrix,
+                        PhysicalEncoding::FullCoeff,
+                    )?;
+                    let seed =
+                        derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 0)?;
+                    let output_binding =
+                        register_bindings(child.bindings, child.values, perturb_coeff)?;
+                    let seed_binding = register_preimage_control_binding(&mut child, seed)?;
+                    let index = push_preimage_op(
+                        &mut child,
+                        GpuImplementation::statistical_perturbation(),
+                        Box::new([
+                            KernelArg::U32(p1_resource),
+                            KernelArg::Value(perturb_coeff),
+                            KernelArg::U32(0),
+                            KernelArg::Value(seed),
+                            KernelArg::U32(0),
+                            KernelArg::Value(precomputation),
+                            KernelArg::U32(0),
+                            KernelArg::U64(m_bar as u64),
+                            KernelArg::F64(dgg_stddev),
+                            KernelArg::F64(widths.center_scale),
+                            KernelArg::F64(widths.rounding),
+                            KernelArg::U32(output_binding),
+                            KernelArg::U32(seed_binding),
+                            KernelArg::U32(precomputation_binding),
+                            KernelArg::U32(p1_workspace),
+                            KernelArg::U32(p1_workspace + 1),
+                            KernelArg::U32(p1_workspace + 2),
+                        ]),
+                        Box::new([perturb_coeff]),
+                        Box::new([]),
+                    )?;
+                    child
+                        .producer
+                        .insert(perturb_coeff, vec![(ColumnRange { start: 0, end: t }, index)]);
+                    perturb_coeff
+                }
             };
-            let p2_seed = derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 0)?;
-            let (p2_coeff, p2_eval) = emit_fresh_matrix_sample_parts(
-                &mut child,
-                scope_id,
-                node_id,
-                3,
-                &shape(dk, t),
-                Some(dgg_stddev),
-                Some(p2_seed),
-            )?;
-            let tp2_eval =
-                allocate_scratch_matrix(&mut child, &shape(2 * d, t), PhysicalEncoding::FullEval)?;
-            emit_matrix_operation(
-                &mut child,
-                GpuImplementation::matrix_mul(false),
-                &[re, p2_eval],
-                tp2_eval,
-            )?;
-            let tp2_coeff =
-                allocate_scratch_matrix(&mut child, &shape(2 * d, t), PhysicalEncoding::FullCoeff)?;
-            emit_matrix_operation(
-                &mut child,
-                GpuImplementation::ntt(true),
-                &[tp2_eval],
-                tp2_coeff,
-            )?;
-            let p1_coeff =
-                allocate_scratch_matrix(&mut child, &shape(2 * d, t), PhysicalEncoding::FullCoeff)?;
-            let p1_seed = derive_preimage_stage_seed(&mut child, scope_id, node_id, attempt_id, 1)?;
-            let tp2_binding = register_bindings(child.bindings, child.values, tp2_coeff)?;
-            let p1_binding = register_bindings(child.bindings, child.values, p1_coeff)?;
-            let p1_seed_binding = register_preimage_control_binding(&mut child, p1_seed)?;
-            let tp2_predecessors = all_predecessors(child.producer, tp2_coeff);
-            let p1_index = push_preimage_op(
-                &mut child,
-                GpuImplementation::p1_sample(),
-                Box::new([
-                    KernelArg::U32(p1_resource),
-                    KernelArg::Value(tp2_coeff),
-                    KernelArg::U32(0),
-                    KernelArg::Value(p1_coeff),
-                    KernelArg::U32(0),
-                    KernelArg::Value(p1_seed),
-                    KernelArg::U32(0),
-                    KernelArg::F64(c),
-                    KernelArg::F64(s),
-                    KernelArg::U32(tp2_binding),
-                    KernelArg::U32(p1_binding),
-                    KernelArg::U32(p1_seed_binding),
-                    KernelArg::U32(p1_workspace),
-                    KernelArg::U32(p1_workspace + 1),
-                    KernelArg::U32(p1_workspace + 2),
-                    KernelArg::U32(p1_workspace + 3),
-                    KernelArg::U32(p1_workspace + 4),
-                ]),
-                Box::new([p1_coeff]),
-                tp2_predecessors,
-            )?;
-            child.producer.insert(p1_coeff, vec![(ColumnRange { start: 0, end: t }, p1_index)]);
-            let perturb_coeff =
-                allocate_scratch_matrix(&mut child, &output_matrix, PhysicalEncoding::FullCoeff)?;
-            let p1_dest = matrix_view(&mut child, perturb_coeff, 0, 2 * d, 0, t)?;
-            let p2_dest = matrix_view(&mut child, perturb_coeff, 2 * d, dk, 0, t)?;
-            let p1_copy = emit_matrix_operation(
-                &mut child,
-                GpuImplementation::matrix_copy_view(),
-                &[p1_coeff],
-                p1_dest,
-            )?;
-            let p2_copy = emit_matrix_operation(
-                &mut child,
-                GpuImplementation::matrix_copy_view(),
-                &[p2_coeff],
-                p2_dest,
-            )?;
-            child.producer.insert(
-                perturb_coeff,
-                vec![
-                    (ColumnRange { start: 0, end: t }, p1_copy),
-                    (ColumnRange { start: 0, end: t }, p2_copy),
-                ],
-            );
             let perturb_eval =
                 allocate_scratch_matrix(&mut child, &output_matrix, PhysicalEncoding::FullEval)?;
             emit_matrix_operation(
@@ -5768,41 +6317,111 @@ pub(super) fn lower_preimage_sample_node(
             let z_eval =
                 allocate_scratch_matrix(&mut child, &shape(dk, t), PhysicalEncoding::FullEval)?;
             emit_matrix_operation(&mut child, GpuImplementation::ntt(false), &[z_coeff], z_eval)?;
-            // The correction updates the perturbation in place. Its other
-            // reader, the public product, precedes it through z's residual.
-            let candidate_eval = perturb_eval;
-            let candidate_binding =
-                register_bindings(child.bindings, child.values, candidate_eval)?;
-            let r_binding = register_bindings(child.bindings, child.values, r)?;
-            let e_binding = register_bindings(child.bindings, child.values, e)?;
-            let z_eval_binding = register_bindings(child.bindings, child.values, z_eval)?;
-            let mut correction_predecessors = all_predecessors(child.producer, z_eval).into_vec();
-            correction_predecessors.extend(all_predecessors(child.producer, candidate_eval));
-            correction_predecessors.sort_unstable();
-            correction_predecessors.dedup();
-            let correction = push_preimage_op(
-                &mut child,
-                GpuImplementation::preimage_correction(),
-                Box::new([
-                    KernelArg::Value(candidate_eval),
-                    KernelArg::U32(0),
-                    KernelArg::Value(r),
-                    KernelArg::U32(0),
-                    KernelArg::Value(e),
-                    KernelArg::U32(0),
-                    KernelArg::Value(z_eval),
-                    KernelArg::U32(0),
-                    KernelArg::U32(candidate_binding),
-                    KernelArg::U32(r_binding),
-                    KernelArg::U32(e_binding),
-                    KernelArg::U32(z_eval_binding),
-                ]),
-                Box::new([candidate_eval]),
-                correction_predecessors.into_boxed_slice(),
-            )?;
-            child
-                .producer
-                .insert(candidate_eval, vec![(ColumnRange { start: 0, end: t }, correction)]);
+            let candidate_eval = match statistical {
+                None => {
+                    // The correction updates the perturbation in place. Its other
+                    // reader, the public product, precedes it through z's residual.
+                    let candidate_eval = perturb_eval;
+                    let candidate_binding =
+                        register_bindings(child.bindings, child.values, candidate_eval)?;
+                    let r_binding = register_bindings(child.bindings, child.values, leaves[0])?;
+                    let e_binding = register_bindings(child.bindings, child.values, leaves[1])?;
+                    let z_eval_binding = register_bindings(child.bindings, child.values, z_eval)?;
+                    let mut correction_predecessors =
+                        all_predecessors(child.producer, z_eval).into_vec();
+                    correction_predecessors
+                        .extend(all_predecessors(child.producer, candidate_eval));
+                    correction_predecessors.sort_unstable();
+                    correction_predecessors.dedup();
+                    let correction = push_preimage_op(
+                        &mut child,
+                        GpuImplementation::preimage_correction(),
+                        Box::new([
+                            KernelArg::Value(candidate_eval),
+                            KernelArg::U32(0),
+                            KernelArg::Value(leaves[0]),
+                            KernelArg::U32(0),
+                            KernelArg::Value(leaves[1]),
+                            KernelArg::U32(0),
+                            KernelArg::Value(z_eval),
+                            KernelArg::U32(0),
+                            KernelArg::U32(candidate_binding),
+                            KernelArg::U32(r_binding),
+                            KernelArg::U32(e_binding),
+                            KernelArg::U32(z_eval_binding),
+                        ]),
+                        Box::new([candidate_eval]),
+                        correction_predecessors.into_boxed_slice(),
+                    )?;
+                    child.producer.insert(
+                        candidate_eval,
+                        vec![(ColumnRange { start: 0, end: t }, correction)],
+                    );
+                    candidate_eval
+                }
+                Some((m_bar, _)) => {
+                    // The candidate `p + [T z; z]`, with `T z` one row chunk at a time.
+                    let correction = allocate_scratch_matrix(
+                        &mut child,
+                        &output_matrix,
+                        PhysicalEncoding::FullEval,
+                    )?;
+                    let mut writers = Vec::new();
+                    let mut row = 0;
+                    for &leaf in &leaves {
+                        let rows = child.values[leaf.0 as usize]
+                            .ty
+                            .matrix_type()
+                            .ok_or("GPU statistical chunk is not a matrix")?
+                            .rows;
+                        let product = allocate_scratch_matrix(
+                            &mut child,
+                            &shape(rows, t),
+                            PhysicalEncoding::FullEval,
+                        )?;
+                        emit_matrix_operation(
+                            &mut child,
+                            GpuImplementation::matrix_mul(false),
+                            &[leaf, z_eval],
+                            product,
+                        )?;
+                        let view = matrix_view(&mut child, correction, row, rows, 0, t)?;
+                        writers.push((
+                            ColumnRange { start: 0, end: t },
+                            emit_matrix_operation(
+                                &mut child,
+                                GpuImplementation::matrix_copy_view(),
+                                &[product],
+                                view,
+                            )?,
+                        ));
+                        row += rows;
+                    }
+                    let bottom = matrix_view(&mut child, correction, m_bar, dk, 0, t)?;
+                    writers.push((
+                        ColumnRange { start: 0, end: t },
+                        emit_matrix_operation(
+                            &mut child,
+                            GpuImplementation::matrix_copy_view(),
+                            &[z_eval],
+                            bottom,
+                        )?,
+                    ));
+                    child.producer.insert(correction, writers);
+                    let candidate = allocate_scratch_matrix(
+                        &mut child,
+                        &output_matrix,
+                        PhysicalEncoding::FullEval,
+                    )?;
+                    emit_matrix_operation(
+                        &mut child,
+                        GpuImplementation::matrix_add_sub(false),
+                        &[perturb_eval, correction],
+                        candidate,
+                    )?;
+                    candidate
+                }
+            };
             let candidate_coeff =
                 allocate_scratch_matrix(&mut child, &output_matrix, PhysicalEncoding::FullCoeff)?;
             emit_matrix_operation(
@@ -5879,28 +6498,13 @@ pub(super) fn lower_preimage_sample_node(
         // The retry body reads the tile-local copy of the target, not the
         // source window: the loop must follow that copy.
         predecessors.extend(all_predecessors(ctx.producer, target_local));
-        predecessors.push(refresh);
+        predecessors.extend(refresh);
+        if let Some(precomputation) = precomputation {
+            predecessors.extend(all_predecessors(ctx.producer, precomputation));
+        }
         predecessors.sort_unstable();
         predecessors.dedup();
-        let loop_op = push_preimage_op(
-            ctx,
-            GpuImplementation::loop_while(),
-            Box::new([
-                KernelArg::Value(attempt_id),
-                KernelArg::U32(0),
-                KernelArg::Value(limit_id),
-                KernelArg::U32(0),
-                KernelArg::Value(latch_id),
-                KernelArg::U32(0),
-                KernelArg::U64(max_attempts as u64),
-                KernelArg::U32(attempt_binding),
-                KernelArg::U32(limit_binding),
-                KernelArg::U32(latch_binding),
-            ]),
-            Box::new([]),
-            predecessors.into_boxed_slice(),
-        )?;
-        ctx.operations[loop_op as usize].body = Some(body.into_boxed_slice());
+        let loop_op = emit_retry_loop(ctx, &controls, predecessors.into_boxed_slice(), body)?;
         ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: t }, loop_op)]);
         ctx.producer
             .entry(tile_owner)
@@ -7574,15 +8178,8 @@ pub(crate) fn plan_physical_graph(
             output_root.availability.is_none()
         {
             let trapdoor_ty = values[source.0 as usize].ty.clone();
-            let leaf_types = trapdoor_leaf_types(&trapdoor_ty)?;
             let mut ctx = root_context!();
-            let mut leaves = Vec::with_capacity(6);
-            for ty in &leaf_types {
-                leaves.push(allocate_scratch_matrix(&mut ctx, ty, PhysicalEncoding::FullEval)?);
-            }
-            let leaves: [PhysicalValueId; 6] = leaves
-                .try_into()
-                .map_err(|_| "GPU trapdoor return has a wrong leaf count".to_owned())?;
+            let leaves = returned_trapdoor_leaves(&mut ctx, source)?;
             let returned =
                 pack_trapdoor_leaves(&mut ctx, trapdoor_ty, leaves, PhysicalEncoding::FullEval)?;
             emit_trapdoor_leaf_copies(&mut ctx, source, returned)?;
@@ -7639,15 +8236,8 @@ pub(crate) fn plan_physical_graph(
         }
         if matches!(values[source.0 as usize].ty, ConcreteWireType::Trapdoor { .. }) {
             let trapdoor_ty = values[source.0 as usize].ty.clone();
-            let leaf_types = trapdoor_leaf_types(&trapdoor_ty)?;
             let mut ctx = root_context!();
-            let mut leaves = Vec::with_capacity(6);
-            for ty in &leaf_types {
-                leaves.push(allocate_scratch_matrix(&mut ctx, ty, PhysicalEncoding::FullEval)?);
-            }
-            let leaves: [PhysicalValueId; 6] = leaves
-                .try_into()
-                .map_err(|_| "GPU trapdoor return has wrong leaf count".to_owned())?;
+            let leaves = returned_trapdoor_leaves(&mut ctx, source)?;
             let returned =
                 pack_trapdoor_leaves(&mut ctx, trapdoor_ty, leaves, PhysicalEncoding::FullEval)?;
             emit_trapdoor_leaf_copies(&mut ctx, source, returned)?;
@@ -9007,7 +9597,8 @@ mod tests {
         let download_parameters = parameters.clone();
         let digits = parameters.modulus_digits();
         let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
-        let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000);
+        // The cutoff is above the default `floor(6.5 σ_min)` (about 1.16e6) of this trapdoor.
+        let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 2_000_000);
         let preimage = trapdoor.sample_preimage(ring.zero((1, 1)), (digits + 2, 1));
         let validated = DslContext::new("direct-preimage-retry")
             .output("public", trapdoor.public_matrix())
@@ -9096,7 +9687,7 @@ mod tests {
             device,
             &cpu,
             first_owner,
-            1_000_000,
+            2_000_000,
         );
         assert_eq!(&public * &decoded, DCRTPolyMatrix::zero(&cpu, 1, 1));
         let second = runtime
@@ -9117,7 +9708,7 @@ mod tests {
             device,
             &cpu,
             second_owner,
-            1_000_000,
+            2_000_000,
         );
         let second_public =
             runtime.download_matrix(second.output_value_for_test("public").unwrap()).unwrap();
@@ -9137,7 +9728,7 @@ mod tests {
         let download_parameters = parameters.clone();
         let digits = parameters.modulus_digits();
         let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
-        let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 1_000_000);
+        let trapdoor = ring.sample_trapdoor(1, 4, 1u64 << 8, digits, 2_000_000);
         // A uniform target: a zero one is solved by a zero column, which hides
         // a tile published at another tile's columns.
         let target = ring.uniform_residue((1, 2));
@@ -9178,7 +9769,7 @@ mod tests {
             device,
             &cpu,
             &first_owner,
-            1_000_000,
+            2_000_000,
         );
         drop(first);
         let frame = plan.physical_frame_for_test();
@@ -9235,7 +9826,7 @@ mod tests {
             device,
             &cpu,
             second_owner,
-            1_000_000,
+            2_000_000,
         );
         // The replay samples a new trapdoor from its new nonce.
         let second_public =
@@ -9244,6 +9835,320 @@ mod tests {
             runtime.download_matrix(second.output_value_for_test("target").unwrap()).unwrap();
         assert_eq!(&second_public * &second_decoded, second_target);
         assert_eq!(plan.compiled_launch_count(), 2);
+    }
+
+    /// A Gaussian of width `2^45`, above the convolution threshold, keeps its cutoff and width on
+    /// the GPU.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_wide_gaussian_keeps_its_width_and_cutoff() {
+        use crate::{element::PolyElem, poly::Poly};
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(256, 2, 30, 15, None, None);
+        let moduli = cpu.to_crt().0;
+        let parameters = GpuDCRTPolyParams::new(256, moduli.clone(), 15, None);
+        let ring = Ring::from_crt_moduli(moduli.iter().map(|m| IntExpr::from(*m)).collect(), 256);
+        let sigma = 1u64 << 45;
+        let cutoff = 3 * sigma;
+        let sample = ring.gaussian((1, 40), IntExpr::from(sigma), IntExpr::from(cutoff));
+        let validated = DslContext::new("direct-wide-gaussian")
+            .output("sample", sample)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], vec![device])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
+        let sample =
+            runtime.download_matrix(result.output_value_for_test("sample").unwrap()).unwrap();
+        let modulus = cpu.modulus();
+        let (mut moment, mut count) = (0.0, 0usize);
+        for column in 0..40 {
+            for coefficient in sample.entry(0, column).coeffs() {
+                let value = coefficient.value().clone();
+                let negative = modulus.as_ref() - &value;
+                let magnitude = value.min(negative);
+                assert!(magnitude <= num_bigint::BigUint::from(cutoff));
+                let x = magnitude.to_f64().unwrap() / sigma as f64;
+                moment += x * x;
+                count += 1;
+            }
+        }
+        // A Gaussian truncated at 3σ has variance 0.9733 σ².
+        let variance = moment / count as f64;
+        assert!((variance - 0.9733).abs() < 0.06, "variance {variance}");
+    }
+
+    /// A statistical TrapGen and preimage on the GPU: the public matrix is `[ā | g - ā T]` of
+    /// `m̄ + D` columns over two row chunks of `T`, TrapGen precomputes the spectra and the
+    /// Cholesky factors in its retry loop, the preimage's retry body samples the perturbation
+    /// with the statistical primitive, and the published preimage solves the public relation
+    /// within its cutoff.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_statistical_preimage_matches_public_relation() {
+        use crate::sampler::bounds::{default_preimage_cutoff, minimum_preimage_sigma_expr};
+        let read = |name: &str, default: usize| {
+            std::env::var(format!("MXX_TEST_STATISTICAL_{name}"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let (n, depth, crt_bits, base_bits) = (
+            read("RING_DIMENSION", 32),
+            read("CRT_DEPTH", 1),
+            read("CRT_BITS", 40),
+            read("BASE_BITS", 10),
+        );
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(n as u32, depth, crt_bits, base_bits as u32, None, None);
+        let moduli = cpu.to_crt().0;
+        let parameters = GpuDCRTPolyParams::new(n as u32, moduli.clone(), base_bits as u32, None);
+        let download_parameters = parameters.clone();
+        let digits = parameters.modulus_digits();
+        let m_bar = read("M_BAR", 11);
+        let base = 1u32 << base_bits;
+        let instantiation = TrapdoorInstantiation::Statistical { m_bar };
+        let width =
+            minimum_preimage_sigma_expr(n as u32, 1, digits, base, 4.0, instantiation).unwrap();
+        let bound = default_preimage_cutoff(n as u32, 1, digits, base, 4.0, instantiation).unwrap();
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), n as u32);
+        let trapdoor = ring.sample_trapdoor_with_width(
+            1,
+            instantiation,
+            4,
+            base as u64,
+            digits,
+            Some(width),
+            BigInt::from(bound.clone()),
+        );
+        let target = ring.uniform_residue((1, 3));
+        let preimage = trapdoor.sample_preimage(target.clone(), (m_bar + digits, 3));
+        let validated = DslContext::new("direct-statistical-preimage")
+            .output("public", trapdoor.public_matrix())
+            .unwrap()
+            .output("target", target)
+            .unwrap()
+            .output("preimage", preimage)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], vec![device])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let frame = plan.physical_frame_for_test();
+        let primitives = frame
+            .program
+            .operations
+            .iter()
+            .flat_map(|op| std::iter::once(op).chain(op.body.iter().flatten()))
+            .map(|op| frame.program.implementations.resolve(op.implementation).unwrap().primitive)
+            .collect::<Vec<_>>();
+        for primitive in [
+            crate::gpu_execution_plan::GpuNativePrimitive::StatisticalSpectra,
+            crate::gpu_execution_plan::GpuNativePrimitive::StatisticalFactor,
+            crate::gpu_execution_plan::GpuNativePrimitive::StatisticalPerturbation,
+        ] {
+            assert!(primitives.contains(&primitive), "the plan must contain {primitive:?}");
+        }
+        assert!(!primitives.contains(&crate::gpu_execution_plan::GpuNativePrimitive::P1Sample));
+        let mut store = MemoryArtifactStore::default();
+        let result = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .unwrap();
+        let public =
+            runtime.download_matrix(result.output_value_for_test("public").unwrap()).unwrap();
+        let target =
+            runtime.download_matrix(result.output_value_for_test("target").unwrap()).unwrap();
+        assert_eq!(public.size(), (1, m_bar + digits));
+        let RuntimeValue::Resident(owner) = result.output_value_for_test("preimage").unwrap()
+        else {
+            panic!("preimage output is not resident");
+        };
+        let decoded = download_compact_preimage_for_oracle(
+            &download_parameters,
+            device,
+            &cpu,
+            owner,
+            bound.to_u32().unwrap(),
+        );
+        assert_eq!(&public * &decoded, target);
+    }
+
+    /// A statistical TrapGen whose preimage width is far below the trapdoor's minimum (just above
+    /// the gadget sampler's width) rejects every draw of `T` in its covariance check and fails
+    /// after the retry limit.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_statistical_trapgen_fails_when_the_covariance_is_never_positive_definite() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 1, 40, 10, None, None);
+        let modulus = cpu.to_crt().0[0];
+        let parameters = GpuDCRTPolyParams::new(32, vec![modulus], 10, None);
+        let digits = parameters.modulus_digits();
+        let instantiation = TrapdoorInstantiation::Statistical { m_bar: 11 };
+        let width = crate::sampler::bounds::gadget_sampler_sigma(1 << 10, 4.0) * 1.01;
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
+        let trapdoor = ring.sample_trapdoor_with_width(
+            1,
+            instantiation,
+            4,
+            1u64 << 10,
+            digits,
+            Some(mxx_ir_core::RealExpr::Rational(crate::sampler::bounds::rational_from_decimal(
+                &bigdecimal::BigDecimal::try_from(width).unwrap(),
+            ))),
+            BigInt::from(1u64 << 40),
+        );
+        let validated = DslContext::new("direct-statistical-trapgen-rejection")
+            .output("public", trapdoor.public_matrix())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], vec![device])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let error = runtime
+            .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+            .err()
+            .expect("TrapGen must reject every draw")
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "rejected {} trapdoors",
+                crate::sampler::trapdoor::statistical::TRAPGEN_ATTEMPTS
+            )),
+            "{error}"
+        );
+    }
+
+    /// GPU Gaussian samples have independent entries: the width of every coefficient and the
+    /// largest singular value of a `42 x 21` sample over seven CRT limbs match the CPU sampler's.
+    /// (A random stream that ran past one ChaCha block into the next column's stream made
+    /// adjacent columns correlated and the singular value about `√2` times too large.)
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_gaussian_samples_have_the_singular_values_of_the_cpu_sampler() {
+        use crate::sampler::{
+            DistType, PolyUniformSampler,
+            trapdoor::statistical::{NegacyclicFft, half_spectra, measured_singular_value},
+            uniform::DCRTPolyUniformSampler,
+        };
+        let device = detected_gpu_device_ids()[0];
+        let (n, rows, columns, sigma) = (16usize, 42usize, 21usize, 4.0);
+        let cpu = DCRTPolyParams::new(n as u32, 7, 30, 10, None, None);
+        let moduli = cpu.to_crt().0;
+        let parameters = GpuDCRTPolyParams::new(n as u32, moduli.clone(), 10, None);
+        let ring = Ring::from_crt_moduli(moduli.into_iter().map(IntExpr::from).collect(), n as u32);
+        let fft = NegacyclicFft::new(n);
+        let singular_value = |matrix: &DCRTPolyMatrix| {
+            measured_singular_value(
+                &half_spectra(&fft, std::slice::from_ref(matrix)),
+                n,
+                rows,
+                columns,
+            )
+        };
+        let samples = 8;
+        let cpu_mean = (0..samples)
+            .map(|_| {
+                singular_value(&DCRTPolyUniformSampler::new().sample_uniform(
+                    &cpu,
+                    rows,
+                    columns,
+                    DistType::GaussDist { sigma, max_coefficient_bound: None },
+                ))
+            })
+            .sum::<f64>() /
+            samples as f64;
+        let validated = DslContext::new("direct-gaussian-singular-values")
+            .output("sample", ring.gaussian((rows, columns), 4, BigInt::from(1u64 << 40)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], vec![device])).unwrap();
+        let mut plan = runtime.plan(validated, &BTreeMap::new()).unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let modulus = cpu.modulus();
+        let half = modulus.as_ref() / 2u8;
+        let mut gpu_mean = 0.0;
+        for _ in 0..samples {
+            let result = runtime
+                .execute_with_artifacts(&mut plan, BTreeMap::new(), &mut store, rand::random())
+                .unwrap();
+            let sample =
+                runtime.download_matrix(result.output_value_for_test("sample").unwrap()).unwrap();
+            let (mut energy, mut count) = (0.0, 0.0);
+            for row in 0..rows {
+                for column in 0..columns {
+                    for value in sample.entry(row, column).coeffs_biguints() {
+                        let x = if value > half {
+                            -(modulus.as_ref() - &value).to_f64().unwrap()
+                        } else {
+                            value.to_f64().unwrap()
+                        };
+                        energy += x * x;
+                        count += 1.0;
+                    }
+                }
+            }
+            let width = (energy / count).sqrt();
+            assert!((width / sigma - 1.0).abs() < 0.05, "width {width}");
+            gpu_mean += singular_value(&sample) / samples as f64;
+        }
+        assert!((gpu_mean / cpu_mean - 1.0).abs() < 0.05, "GPU s_1 {gpu_mean}, CPU s_1 {cpu_mean}");
+    }
+
+    /// A statistical TrapGen whose precomputation exceeds the GPU budget fails at planning.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn direct_statistical_trapgen_rejects_a_precomputation_over_the_budget() {
+        let device = detected_gpu_device_ids()[0];
+        let cpu = DCRTPolyParams::new(32, 1, 40, 10, None, None);
+        let modulus = cpu.to_crt().0[0];
+        let parameters = GpuDCRTPolyParams::new(32, vec![modulus], 10, None);
+        let digits = parameters.modulus_digits();
+        let instantiation = TrapdoorInstantiation::Statistical { m_bar: 11 };
+        let ring = Ring::from_crt_moduli(vec![IntExpr::from(modulus)], 32);
+        let trapdoor = ring.sample_trapdoor_with_width(
+            1,
+            instantiation,
+            4,
+            1u64 << 10,
+            digits,
+            None,
+            BigInt::from(1u64 << 40),
+        );
+        let validated = DslContext::new("direct-statistical-trapgen-budget")
+            .output("public", trapdoor.public_matrix())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], vec![device])).unwrap();
+        // A budget of a few hundred bytes on any GPU of at most 1 TiB.
+        // SAFETY: the test is serialized with every GPU test, the only readers of the variable.
+        unsafe { std::env::set_var("MXX_GPU_MEMORY_FRACTION", "1e-10") };
+        let planned = runtime.plan(validated, &BTreeMap::new());
+        unsafe { std::env::remove_var("MXX_GPU_MEMORY_FRACTION") };
+        let error = planned.err().expect("the precomputation is over the budget").to_string();
+        assert!(error.contains("precomputation needs"), "{error}");
     }
 
     #[test]

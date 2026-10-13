@@ -13,8 +13,7 @@ pub enum OnlineEvalWireFamily {
     Stored(Family<RnsBggEncoding>),
     Input {
         wire: WireId,
-        level: usize,
-        knowledge: AttributeKnowledge,
+        key: InputKeySource,
         hash_key: Bytes,
         rows: Family<RnsBggRow>,
         payloads: Option<Family<Mat>>,
@@ -40,10 +39,31 @@ pub struct OnlineEvalRhsFamily {
 /// preprocessing both use it.
 pub struct OnlineEvalFamilies<'a> {
     pub(crate) parameters: &'a RnsBggParameters,
+    /// The Program's integer data inputs ([`crate::program::data_inputs`]).
+    pub(crate) data: BTreeMap<crate::program::DataId, Family<Int>>,
+}
+
+impl<'a> OnlineEvalFamilies<'a> {
+    pub(crate) fn new(parameters: &'a RnsBggParameters) -> Self {
+        Self { parameters, data: BTreeMap::new() }
+    }
+
+    /// The member index entry `position` of data family `data` selects.
+    pub(crate) fn selected_member(
+        &self,
+        data: crate::program::DataId,
+        position: &IntExpr,
+    ) -> Result<Int, RnsBggError> {
+        Ok(self
+            .data
+            .get(&data)
+            .ok_or(RnsBggError::Binding("Program data is not bound"))?
+            .at(Int::evaluate(position.clone())))
+    }
 }
 
 impl OnlineEvalFamilies<'_> {
-    /// Read member `index`, a static index or a runtime table entry: an
+    /// Read member `index`, a static index or a runtime data entry: an
     /// input member's key is sampled from the hash key, and its row and
     /// payload are read at the same member.
     fn member(
@@ -53,15 +73,8 @@ impl OnlineEvalFamilies<'_> {
     ) -> Result<RnsBggEncoding, RnsBggError> {
         match family {
             OnlineEvalWireFamily::Stored(family) => Ok(family.at(index)),
-            OnlineEvalWireFamily::Input { wire, level, knowledge, hash_key, rows, payloads } => {
-                let key = super::public_key::sampled_key(
-                    self.parameters,
-                    *level,
-                    hash_key.clone(),
-                    *wire,
-                    *knowledge,
-                    Some(index.clone()),
-                )?;
+            OnlineEvalWireFamily::Input { wire, key, hash_key, rows, payloads } => {
+                let key = key.key(self.parameters, hash_key.clone(), *wire, Some(index.clone()))?;
                 let payload = payloads.as_ref().map(|payloads| payloads.at(index.clone()));
                 Ok(RnsBggEncoding::new(key, rows.at(index), payload))
             }
@@ -79,21 +92,21 @@ impl OnlineEvalFamilies<'_> {
 impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEvalFamilies<'b> {
     type WireFamily = OnlineEvalWireFamily;
     type RhsFamily = OnlineEvalRhsFamily;
-    type Table = Family<Int>;
 
-    /// The member at the table entry: a stored member is read there, and an
+    /// The member at the data entry: a stored member is read there, and an
     /// input member's key is sampled under the entry (a runtime hash
     /// argument hashing as the static index encryption sampled it under)
     /// next to its row and payload at the entry.
-    fn wire_at_table(
+    fn wire_selected(
         &mut self,
         _evaluator: &mut EncodingLowering<'a>,
         family: &Self::WireFamily,
-        table: &Self::Table,
-        index: &IntExpr,
+        data: crate::program::DataId,
+        position: &IntExpr,
     ) -> Result<RnsBggEncoding, crate::program::ProgramLowerError<RnsBggError>> {
-        self.member(family, table.at(Int::evaluate(index.clone())))
-            .map_err(crate::program::ProgramLowerError::Backend)
+        use crate::program::ProgramLowerError;
+        let member = self.selected_member(data, position).map_err(ProgramLowerError::Backend)?;
+        self.member(family, member).map_err(ProgramLowerError::Backend)
     }
 
     fn wire_at(
@@ -126,6 +139,24 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
         };
         Ok((
             (top, family.bottoms.at(member.clone())),
+            RhsRef { id: family.rhs, index: Some(member) },
+        ))
+    }
+
+    /// A Dynamic RHS family stores both halves of every member, which a runtime index reads.
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        data: crate::program::DataId,
+        position: &IntExpr,
+    ) -> Result<(RnsBggMatrix, RhsRef<Int>), crate::program::ProgramLowerError<RnsBggError>> {
+        use crate::program::ProgramLowerError;
+        let member = self.selected_member(data, position).map_err(ProgramLowerError::Backend)?;
+        let tops = family.tops.as_ref().ok_or(ProgramLowerError::Backend(RnsBggError::Binding(
+            "an RHS member selected at run time needs the Dynamic RHS mode",
+        )))?;
+        Ok((
+            (tops.at(member.clone()), family.bottoms.at(member.clone())),
             RhsRef { id: family.rhs, index: Some(member) },
         ))
     }
@@ -179,23 +210,64 @@ impl<'a, 'b> crate::program::FamilyExecution<EncodingLowering<'a>> for OnlineEva
 /// Import every RHS of `program`, for binding before the Program is
 /// lowered, each paired with its reference. Static preprocessing publishes
 /// the bottom row of each compact RHS at the level after its consumer's, and
-/// each member's top row is sampled where the member is read; Dynamic
-/// encryption publishes both rows. A family RHS is one family per row port.
-/// `name` maps a role to its artifact name.
+/// each member's top row is sampled where the member is read. A Dynamic RHS
+/// is the gadget ciphertext of its setup coordinate's package: the setup's
+/// public top row over the bottom row the encryption's prelude production
+/// exports. A family RHS is one family per row port. `name` maps a role to
+/// its artifact name.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn import_rhs_bindings(
     parameters: &RnsBggParameters,
     program: &ExponentLutProgram,
     workload: &RnsBggDerivedWorkload,
     preprocess: &ProductionId,
-    encryption: &ProductionId,
     prelude: Option<&ProductionId>,
+    dynamic: Option<(&RnsBggDynamicSetup, &RnsBggDynamicBinding)>,
     hash_key: &Bytes,
     name: impl Fn(String) -> String,
 ) -> Result<Vec<(RhsId, InputBinding<(RnsBggMatrix, RhsRef<Int>), OnlineEvalRhsFamily>)>, ApiError>
 {
-    let dynamic = parameters.rhs_mode() == RhsMode::Dynamic;
     let mut bindings = Vec::with_capacity(program.rhs_inputs().len());
+    let prelude = || {
+        prelude.ok_or_else(|| {
+            ApiError::compatibility("Dynamic RHS ciphertexts need the encryption prelude")
+        })
+    };
     for (rhs, shape) in program.rhs_inputs() {
+        if let Some((setup, mapping)) = dynamic {
+            let coordinate = mapping.rhs(*rhs).map_err(ApiError::scheme)?;
+            let members = match shape {
+                InputBinding::Scalar(()) => None,
+                InputBinding::Family(count) => Some(count.clone()),
+            };
+            let ciphertexts = super::dynamic::public_top_ciphertexts(
+                parameters,
+                setup,
+                hash_key,
+                prelude()?,
+                coordinate,
+                members,
+                &name,
+            )
+            .map_err(ApiError::scheme)?;
+            let binding = match ciphertexts {
+                super::dynamic::PublicTopCiphertexts::Scalar(ciphertext) => {
+                    InputBinding::Scalar((ciphertext, RhsRef { id: *rhs, index: None }))
+                }
+                super::dynamic::PublicTopCiphertexts::Family { tops, bottoms } => {
+                    InputBinding::Family(OnlineEvalRhsFamily {
+                        rhs: *rhs,
+                        program: program.id(),
+                        level: 0,
+                        hash_key: hash_key.clone(),
+                        tops: Some(tops),
+                        bottoms,
+                    })
+                }
+            };
+            bindings.push((*rhs, binding));
+            continue;
+        }
         let consumer_level = workload.rhs_level(*rhs).map_err(ApiError::scheme)?;
         let level = consumer_level.checked_add(1).ok_or_else(|| {
             ApiError::scheme(RnsBggError::Parameters("RHS target level overflow"))
@@ -205,74 +277,46 @@ pub(super) fn import_rhs_bindings(
         let binding = match shape {
             InputBinding::Scalar(()) => {
                 let port = |port: usize| {
-                    let (production, role) = if dynamic {
-                        (encryption, format!("rhs/{rhs:?}/ciphertext.{port}"))
-                    } else {
-                        (preprocess, format!("rhs/{rhs:?}.{}", port - 2))
-                    };
                     ring.artifact_input(
-                        production.clone(),
-                        name(role),
+                        preprocess.clone(),
+                        name(format!("rhs/{rhs:?}.{port}")),
                         (1, columns),
                         ArtifactAvailability::Transferred,
                     )
                 };
-                let top = if dynamic {
-                    (port(0), port(1))
-                } else {
-                    super::public_key::rhs_top(
-                        parameters,
-                        program.id(),
-                        hash_key.clone(),
-                        *rhs,
-                        consumer_level,
-                        None,
-                    )
-                    .map_err(ApiError::scheme)?
-                };
-                InputBinding::Scalar(((top, (port(2), port(3))), RhsRef { id: *rhs, index: None }))
+                let top = super::public_key::rhs_top(
+                    parameters,
+                    program.id(),
+                    hash_key.clone(),
+                    *rhs,
+                    consumer_level,
+                    None,
+                )
+                .map_err(ApiError::scheme)?;
+                InputBinding::Scalar(((top, (port(0), port(1))), RhsRef { id: *rhs, index: None }))
             }
             InputBinding::Family(count) => {
-                // Dynamic family ciphertexts are the encryption prelude's.
-                let production = if dynamic {
-                    prelude.ok_or_else(|| {
-                        ApiError::compatibility(
-                            "Dynamic RHS family ciphertexts need the encryption prelude",
-                        )
-                    })?
-                } else {
-                    preprocess
-                };
-                let row = |ports: [usize; 2]| {
-                    let families = ports.map(|port| {
-                        let role = if dynamic {
-                            format!("rhs/{rhs:?}/family/ciphertext.{port}")
-                        } else {
-                            format!("rhs/{rhs:?}/family.{}", port - 2)
-                        };
-                        ring.family_artifact_input(
-                            production.clone(),
-                            name(role),
-                            count.clone(),
-                            (1, columns),
-                            ArtifactAvailability::Transferred,
-                        )
-                    });
-                    let element: RnsBggRow =
-                        (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
-                    let fields = families
-                        .iter()
-                        .map(|family| family.value_handle().clone())
-                        .collect::<Vec<_>>();
-                    family_of_fields(&element, count.clone(), &fields).map_err(ApiError::scheme)
-                };
+                let families = [0, 1].map(|port| {
+                    ring.family_artifact_input(
+                        preprocess.clone(),
+                        name(format!("rhs/{rhs:?}/family.{port}")),
+                        count.clone(),
+                        (1, columns),
+                        ArtifactAvailability::Transferred,
+                    )
+                });
+                let element: RnsBggRow =
+                    (families[0].at(Int::constant(0)), families[1].at(Int::constant(0)));
+                let fields =
+                    families.iter().map(|family| family.value_handle().clone()).collect::<Vec<_>>();
                 InputBinding::Family(OnlineEvalRhsFamily {
                     rhs: *rhs,
                     program: program.id(),
                     level: consumer_level,
                     hash_key: hash_key.clone(),
-                    tops: dynamic.then(|| row([0, 1])).transpose()?,
-                    bottoms: row([2, 3])?,
+                    tops: None,
+                    bottoms: family_of_fields(&element, count.clone(), &fields)
+                        .map_err(ApiError::scheme)?,
                 })
             }
         };
@@ -282,7 +326,7 @@ pub(super) fn import_rhs_bindings(
 }
 
 impl EncodingLowering<'_> {
-    fn preprocess_artifact_name(&self, role: String) -> String {
+    pub(super) fn preprocess_artifact_name(&self, role: String) -> String {
         self.encryption_artifact_name(role)
     }
 
@@ -303,14 +347,16 @@ impl EncodingLowering<'_> {
     /// Compute the native Walsh/automorphism branch polynomial for one unary
     /// LUT branch.  The coefficient depends on the complete table, not only
     /// its width; public-key preparation uses this same helper.
-    pub(crate) fn lut_coefficient(
+    pub(crate) fn lut_coefficient<'v>(
         parameters: &RnsBggParameters,
         level: usize,
         input_layout: ExpLayout,
         representation: crate::program::LutOutputRepresentation,
         sigma: impl Into<IntExpr>,
-        values: &[usize],
+        values: impl Into<crate::rns_bgg::dynamic::LutEntries<'v>>,
     ) -> Result<Mat, RnsBggError> {
+        use crate::rns_bgg::dynamic::LutEntries;
+        let values = values.into();
         let width = values.len();
         if width == 0 || !width.is_power_of_two() {
             return Err(RnsBggError::Lut);
@@ -327,45 +373,78 @@ impl EncodingLowering<'_> {
             mxx_backends::utils::mod_inverse_biguints(&(BigUint::from(width) % &modulus), &modulus)
                 .ok_or(RnsBggError::Lut)?;
         let sigma = sigma.into();
-        // Term `j` is `left(values[j]) * sigma(X^(-j stride))`. The values are read from one
-        // scalar index family (a `parallel` of `Int::evaluate`), and the terms are summed by one
-        // sequential loop over `j` whose monomials are products by runtime exponents, so the
-        // graph does not grow with the table width.
-        let outputs = mxx_dsl::parallel(IntExpr::constant(width), |index| {
-            Ok(mxx_dsl::Int::evaluate(IntExpr::Select {
-                selector: Box::new(index.expression()?),
-                branches: values.iter().map(|value| IntExpr::constant(*value)).collect(),
-            }))
-        })
-        .map_err(|_| RnsBggError::Lut)?;
-        let one = ring.polynomial([IntExpr::constant(1)]);
-        let input_stride = mxx_dsl::Int::constant(-BigInt::from(input_layout.stride()));
+        let inverse = ring.polynomial([IntExpr::constant(BigInt::from(inverse))]);
+        let (family, offset) = match &values {
+            LutEntries::Constant(values) => {
+                // Term `j` is `left(values[j]) * sigma(X^(-j stride))`. The values are read from
+                // one scalar index family (a `parallel` of `Int::evaluate`), and the terms are
+                // summed by one sequential loop over `j` whose monomials are products by runtime
+                // exponents, so the graph does not grow with the table width.
+                let outputs = mxx_dsl::parallel(IntExpr::constant(width), |index| {
+                    Ok(mxx_dsl::Int::evaluate(IntExpr::Select {
+                        selector: Box::new(index.expression()?),
+                        branches: values.iter().map(|value| IntExpr::constant(*value)).collect(),
+                    }))
+                })
+                .map_err(|_| RnsBggError::Lut)?;
+                let one = ring.polynomial([IntExpr::constant(1)]);
+                let input_stride = mxx_dsl::Int::constant(-BigInt::from(input_layout.stride()));
+                let sum =
+                    mxx_dsl::iterate(IntExpr::constant(width), ring.zero((1, 1)), |index, sum| {
+                        let output = outputs.at(index.clone());
+                        let right = one
+                            .clone()
+                            .multiply_monomial(index.mul(input_stride.clone()))
+                            .ring_automorphism(sigma.clone());
+                        let term = match representation {
+                            crate::program::LutOutputRepresentation::Coefficient => {
+                                output.lift_to_constant_polynomial(ring.matrix_type((1, 1))) * right
+                            }
+                            crate::program::LutOutputRepresentation::Exponent(layout) => right
+                                .multiply_monomial(
+                                    output
+                                        .mul(mxx_dsl::Int::constant(BigInt::from(layout.stride()))),
+                                ),
+                        };
+                        Ok(sum + term)
+                    })
+                    .map_err(|_| RnsBggError::Lut)?;
+                return Ok(inverse * sum);
+            }
+            LutEntries::Graph { family, offset, .. } => (family, *offset),
+        };
+        // Data entries: one loop over the table, whose entry `index` contributes
+        // `out(index) sigma(X^(stride (2n - index)))`; `multiply_monomial` reduces its exponent
+        // modulo `2n` as `mono` does.
+        let doubled = 2 * parameters.level(level)?.ring_dimension() as i64;
+        let stride = input_layout.stride() as i64;
         let sum = mxx_dsl::iterate(IntExpr::constant(width), ring.zero((1, 1)), |index, sum| {
-            let output = outputs.at(index.clone());
-            let right = one
-                .clone()
-                .multiply_monomial(index.mul(input_stride.clone()))
-                .ring_automorphism(sigma.clone());
-            let term = match representation {
+            let value = family.at(Int::constant(offset as i64) + index.clone());
+            let left = match representation {
                 crate::program::LutOutputRepresentation::Coefficient => {
-                    output.lift_to_constant_polynomial(ring.matrix_type((1, 1))) * right
+                    value.lift_to_constant_polynomial(ring.matrix_type((1, 1)))
                 }
-                crate::program::LutOutputRepresentation::Exponent(layout) => right
-                    .multiply_monomial(
-                        output.mul(mxx_dsl::Int::constant(BigInt::from(layout.stride()))),
-                    ),
+                crate::program::LutOutputRepresentation::Exponent(layout) => ring
+                    .identity(1)
+                    .multiply_monomial(value.mul(Int::constant(layout.stride() as i64))),
             };
-            Ok(sum + term)
+            let right = ring
+                .identity(1)
+                .multiply_monomial((Int::constant(doubled) - index) * Int::constant(stride))
+                .ring_automorphism(sigma.clone());
+            Ok(sum + left * right)
         })
-        .map_err(|_| RnsBggError::Lut)?;
-        Ok(ring.polynomial([IntExpr::constant(BigInt::from(inverse))]) * sum)
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        Ok(inverse * sum)
     }
 
     /// Evaluate a public LUT payload with the same Walsh/automorphism
     /// coefficients used by the online evaluation encoding.  The payload is public, so
     /// the complete evaluation can remain a graph expression; private and
-    /// unknown payloads never enter this path. It is the one step of the
-    /// online evaluation that reads the table's values.
+    /// unknown payloads never enter this path. With the branch coefficients
+    /// of the public LUT itself, it is what the online evaluation reads the
+    /// table's values (constants or Program data) for. A public LUT's output
+    /// is at the next level in either representation.
     fn lut_public_payload(
         &self,
         level: usize,
@@ -375,19 +454,14 @@ impl EncodingLowering<'_> {
         let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
         let input_layout = table.input_layout();
         input_layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
-        let output_level = if table.output_representation().is_coefficient() {
-            level
-        } else {
-            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?
-        };
+        let output_level =
+            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let output_ring = self.parameters.ring(output_level)?;
         let payload = checked_modulus_convert(payload, &output_ring)?;
         let sigmas =
             input_layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
         // The output payload is computed in the clear, from the values.
-        let values = table
-            .values()
-            .ok_or(RnsBggError::Binding("the values of a LUT on a public payload are withheld"))?;
+        let values = self.public_lut_entries(table)?;
         // One loop body over the automorphism indices, as preprocessing builds
         // its switching ciphertexts, so the graph does not grow with the
         // square of the table width.
@@ -402,7 +476,7 @@ impl EncodingLowering<'_> {
                 input_layout,
                 table.output_representation(),
                 sigma.clone(),
-                values,
+                values.clone(),
             )
             .map_err(|_| DslError::Schema)?;
             Ok(coefficient * payload.clone().ring_automorphism(sigma))
@@ -411,7 +485,21 @@ impl EncodingLowering<'_> {
         crate::utils::balanced_sum_family(terms, |lhs, rhs| lhs + rhs).map_err(graph)
     }
 
-    fn site(&self) -> Result<&LoweringSite, RnsBggError> {
+    /// The output values of a LUT on a public payload: its constants or its
+    /// window of the bound Program data. Withheld constants are rejected.
+    pub(super) fn public_lut_entries<'t>(
+        &self,
+        table: &'t LutTable,
+    ) -> Result<crate::rns_bgg::dynamic::LutEntries<'t>, RnsBggError> {
+        if !table.has_values() {
+            return Err(RnsBggError::Binding(
+                "the values of a LUT on a public payload are withheld",
+            ));
+        }
+        crate::rns_bgg::dynamic::lut_entries(table, &self.data)
+    }
+
+    pub(super) fn site(&self) -> Result<&LoweringSite, RnsBggError> {
         self.current_site.as_ref().ok_or(RnsBggError::Binding("missing lowering site"))
     }
 
@@ -461,47 +549,67 @@ impl EncodingLowering<'_> {
         )
     }
 
-    /// The material of LUT `lut_id` evaluated at `level`: the one imported
-    /// where the Program was bound for a LUT in a family body, otherwise
-    /// imported here.
+    /// The Static material of LUT `lut_id` evaluated at `level`: the one
+    /// imported where the Program was bound for a LUT in a family body,
+    /// otherwise imported here. A LUT on a public payload reads only the
+    /// helpers (`switching` false), so its material may hold no switching
+    /// ciphertexts; a private use of such a cached entry imports them in its
+    /// own scope, which is the root scope (a private use in a family body
+    /// makes the root import complete, see [`Self::import_body_lut_material`]).
     fn lut_material(
         &self,
         level: usize,
         lut_id: crate::program::LutId,
         table: &LutTable,
+        switching: bool,
     ) -> Result<super::LutMaterial, RnsBggError> {
         if let Some(material) = self.lut_material.get(&(level, lut_id)) {
-            return Ok(material.clone());
+            if !switching || !material.0.is_empty() {
+                return Ok(material.clone());
+            }
+            let (switching, _) = self.lut_switching(level, lut_id, table)?;
+            return Ok((switching, material.1.clone(), material.2.clone()));
         }
-        let (switching, sigmas) = self.lut_switching(level, lut_id, table)?;
+        let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
+        let sigmas = table
+            .input_layout()
+            .automorphism_indices(ring_dimension)
+            .map_err(|_| RnsBggError::Lut)?;
+        let switching =
+            if switching { self.lut_switching(level, lut_id, table)?.0 } else { Vec::new() };
         let helper = self.lut_helpers(level, table, sigmas.len())?;
-        let columns = self.parameters.lut_output_columns(
-            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
-            table.output_representation(),
-        )?;
-        // Dynamic: the switching ciphertexts' digit companions, one block
-        // per branch.
-        let companions = (self.parameters.rhs_mode() == RhsMode::Dynamic)
-            .then(|| {
-                self.companion_family(
-                    level,
-                    columns,
-                    lut_switching_role(level, lut_id, table.input_layout(), "/digit-encoding"),
-                    IntExpr::constant(sigmas.len()),
-                )
-            })
-            .transpose()?;
-        Ok((switching, sigmas, helper, companions))
+        Ok((switching, sigmas, helper))
     }
 
-    /// Import, at root scope, the material of every LUT in a family body
-    /// (see [`Self::lut_material`]).
+    /// Import, at root scope, the Static material of every LUT in a family
+    /// body (see [`Self::lut_material`]); Dynamic LUTs read setup packages.
+    /// One entry serves every use of a LUT at a level, so the uses are
+    /// folded first: the entry holds the switching ciphertexts if any use
+    /// has a private payload, and only the helpers otherwise.
     pub(super) fn import_body_lut_material(&mut self) -> Result<(), RnsBggError> {
+        if self.parameters.rhs_mode() == RhsMode::Dynamic {
+            return Ok(());
+        }
         let luts = self.program.encryption_inputs().luts().to_vec();
+        let mut order = Vec::new();
+        let mut uses = BTreeMap::<(usize, crate::program::LutId), bool>::new();
         for (input, lut_id) in self.program.family_body_luts() {
             let level = self.workload.level(input)?;
+            let private = self
+                .program
+                .wire_knowledge(input)
+                .map_err(|_| RnsBggError::Binding("LUT input metadata"))? ==
+                AttributeKnowledge::PrivatePayload;
+            let switching = uses.entry((level, lut_id)).or_insert_with(|| {
+                order.push((level, lut_id));
+                false
+            });
+            *switching |= private;
+        }
+        // Import in body order, once per LUT and level.
+        for (level, lut_id) in order {
             let table = luts.get(lut_id.0 as usize).ok_or(RnsBggError::Lut)?;
-            let material = self.lut_material(level, lut_id, table)?;
+            let material = self.lut_material(level, lut_id, table, uses[&(level, lut_id)])?;
             self.lut_material.insert((level, lut_id), material);
         }
         Ok(())
@@ -588,9 +696,11 @@ impl EncodingLowering<'_> {
         Ok((switched_row, switched_key_decomposition))
     }
 
-    /// Finalize declared coefficient outputs once after graph aggregation:
-    /// ModDown to the next level, then the scale-up action `G^-1(k)` (see
-    /// [`RnsBggParameters::coefficient_output_action`]).
+    /// Resolve every declared output once after graph aggregation, exactly
+    /// as the public-key lowering does (see
+    /// [`RnsBggParameters::output_carrier`]): normalize the key and row
+    /// together, then apply the same direct-decoding action to every key
+    /// entry and row component.
     pub(super) fn finish_outputs(
         &mut self,
         outputs: Vec<RnsBggEncoding>,
@@ -598,38 +708,34 @@ impl EncodingLowering<'_> {
         outputs
             .into_iter()
             .map(|output| {
-                if self
-                    .program
-                    .wire_is_coefficient_output(output.wire())
-                    .map_err(|_| RnsBggError::Binding("invalid output wire metadata"))?
-                {
-                    let level = self.workload.level(output.wire())?;
-                    let target = level
-                        .checked_add(1)
-                        .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
-                    let ring = self.parameters.ring(target)?;
-                    let (_, k, _) = self.parameters.coefficient_output_decoding(
-                        &self.program,
-                        output.wire(),
-                        target,
-                    )?;
-                    let action = self.parameters.coefficient_output_action(target, &k)?;
-                    let act = |entry: Mat| action.clone().right_multiply(entry);
-                    let public_key = RnsBggPublicKey::new(
-                        output.public_key.wire,
-                        map_matrix(mod_down_public(output.public_key.matrix, &ring), act),
-                    );
-                    Ok(RnsBggEncoding::new(
-                        public_key,
-                        map_row(mod_down_encoding(output.row, &ring), act),
-                        output
-                            .public_payload
-                            .map(|payload| checked_modulus_convert(payload, &ring))
-                            .transpose()?,
-                    ))
-                } else {
-                    Ok(output)
+                let level = self.workload.level(output.wire())?;
+                let carrier = self.parameters.output_carrier(
+                    &self.program,
+                    output.wire(),
+                    level,
+                    self.output_use,
+                )?;
+                let RnsBggEncoding { public_key, mut row, mut public_payload } = output;
+                let mut matrix = public_key.matrix;
+                if carrier.level != level {
+                    let ring = self.parameters.ring(carrier.level)?;
+                    matrix = mod_down_public(matrix, &ring);
+                    row = mod_down_encoding(row, &ring);
+                    public_payload = public_payload
+                        .map(|payload| checked_modulus_convert(payload, &ring))
+                        .transpose()?;
                 }
+                if let Some(weight) = &carrier.action {
+                    let action = self.parameters.output_action(carrier.level, weight)?;
+                    let act = |entry: Mat| action.clone().right_multiply(entry);
+                    matrix = map_matrix(matrix, act);
+                    row = map_row(row, act);
+                }
+                Ok(RnsBggEncoding::new(
+                    RnsBggPublicKey::new(public_key.wire, matrix),
+                    row,
+                    public_payload,
+                ))
             })
             .collect()
     }
@@ -794,40 +900,8 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 input.public_key.matrix.clone(),
                 self.rhs_decomposition(ciphertext, evaluation_level)?,
             ),
-            // Dynamic: `c Dec(C)` plus the companion row, with the key
-            // fixed in preprocessing from public companion keys (Eq. 049).
-            RhsMode::Dynamic => {
-                let companions = self
-                    .rhs_companions
-                    .get(&reference.id)
-                    .ok_or(RnsBggError::Binding("Dynamic RHS companions are not imported"))?;
-                let member = reference
-                    .index
-                    .as_ref()
-                    .map(Int::expression)
-                    .transpose()
-                    .map_err(|_| RnsBggError::Binding("RHS member index"))?;
-                let columns = self.parameters.component_columns(evaluation_level + 1)?;
-                let rows = self.companion_rows(
-                    evaluation_level,
-                    &input.public_key.matrix,
-                    columns,
-                    format!("rhs/{:?}", reference.id),
-                    member,
-                    None,
-                    companions,
-                )?;
-                let product = super::column_action(
-                    self.parameters,
-                    evaluation_level,
-                    evaluation_level + 1,
-                    ciphertext,
-                    columns,
-                    vec![super::join_row(&input.row)],
-                )?;
-                let split = |row: &Mat| super::split_row(row, columns);
-                (split(&(product[0].clone() + rows[2].clone())), (split(&rows[0]), split(&rows[1])))
-            }
+            // Dynamic: the setup package of the RHS, read at this level.
+            RhsMode::Dynamic => self.dynamic_mul(input, ciphertext, reference)?,
         };
         let public_key = RnsBggPublicKey::new(output, mod_down_public(matrix, &target_ring));
         Ok(RnsBggEncoding::new(
@@ -837,18 +911,43 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         ))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
-        if self
+        let public = self
             .program
             .wire_knowledge(input.wire())
             .map_err(|_| RnsBggError::Binding("LUT input metadata"))? ==
-            AttributeKnowledge::PublicPayload
-        {
-            return Err(RnsBggError::Binding("RNS-BGG LUT requires a private input"));
-        }
+            AttributeKnowledge::PublicPayload;
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
+        if public &&
+            self.decoder_smudge
+                .as_ref()
+                .is_some_and(|declaration| declaration.smudge().lut() == lut_id)
+        {
+            return Err(RnsBggError::Binding("a decoder smudge LUT needs a private input"));
+        }
         let level = self.workload.level(input.wire())?;
-        let (switching, sigmas, helper, companions) = self.lut_material(level, lut_id, table)?;
         let output = self.site()?.output;
+        let (row, public_key) = match (self.parameters.rhs_mode(), public) {
+            (RhsMode::Dynamic, false) => self.dynamic_lut(input, table)?,
+            (RhsMode::Dynamic, true) => self.dynamic_public_lut(input, table)?,
+            (RhsMode::Static, false) => self.static_lut(input, lut_id, level, table)?,
+            (RhsMode::Static, true) => self.static_public_lut(input, lut_id, level, table)?,
+        };
+        self.finish_lut(input, table, lut_id, level, output, row, public_key)
+    }
+}
+
+impl EncodingLowering<'_> {
+    /// The Static flat LUT of `input`: per automorphism branch, the routed
+    /// input switched by its setup-fixed switching ciphertext and the mask
+    /// switched by its helper, summed before the one scale-and-round.
+    fn static_lut(
+        &self,
+        input: &RnsBggEncoding,
+        lut_id: crate::program::LutId,
+        level: usize,
+        table: &LutTable,
+    ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let (switching, sigmas, helper) = self.lut_material(level, lut_id, table, true)?;
         let columns = self.parameters.lut_output_columns(
             level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?,
             table.output_representation(),
@@ -887,96 +986,7 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         // and carries it to the next iteration, so that load overlaps this
         // branch's work; the last branch runs after the loop.
         let last = table.input_width().checked_sub(1).ok_or(RnsBggError::Lut)?;
-        let (row, public_key) = if let Some(companions) = companions {
-            // Dynamic: one companion loop first builds every branch's key
-            // rows `T_s` and companion row `E_s` (block `s` of each row), so
-            // the stored companions are read in one loop nest; the branch loop
-            // then adds `sigma(c) Dec(C_sigma) + E_s` and acts with the
-            // rounded `T_s` on the helper and `A_sigma`, one column at a
-            // time.
-            let rows = self.companion_rows(
-                level,
-                &input.public_key.matrix,
-                columns,
-                format!("lut/{lut_id:?}"),
-                None,
-                Some(&sigmas),
-                &companions,
-            )?;
-            let width = 2 * columns;
-            let next = level + 1;
-            let target_ring = self.parameters.ring(next)?;
-            let split = |row: &Mat| super::split_row(row, columns);
-            let schema = |_| DslError::Schema;
-            let count = sigmas.len();
-            let ((row, key), _) = mxx_dsl::iterate(
-                IntExpr::constant(count),
-                (initial, b_at(Int::constant(0))),
-                |index, ((row_sum, key_sum), b_sigma)| {
-                    // Read the next branch's switching ciphertext (the first
-                    // again after the last) while this branch runs.
-                    let b_next = b_at(Int::evaluate(
-                        IntExpr::Rem(
-                            Box::new(index.expression()? + IntExpr::constant(1)),
-                            Box::new(IntExpr::constant(count)),
-                        )
-                        .canonicalize(),
-                    ));
-                    let start = (index.expression()? * IntExpr::constant(width)).canonicalize();
-                    let block = |row: &Mat| {
-                        split(&row.clone().slice(
-                            None,
-                            Some(mxx_ir_core::node::IndexRange {
-                                start: start.clone(),
-                                end: (start.clone() + IntExpr::constant(width)).canonicalize(),
-                            }),
-                        ))
-                    };
-                    let sigma = IntExpr::Select {
-                        selector: Box::new(index.expression()?),
-                        branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
-                    };
-                    let routed_row =
-                        map_row(input.row.clone(), |entry| entry.ring_automorphism(sigma.clone()));
-                    let product = super::column_action(
-                        this.parameters,
-                        level,
-                        next,
-                        &b_sigma,
-                        columns,
-                        vec![super::join_row(&routed_row)],
-                    )
-                    .map_err(schema)?;
-                    let switched_row = add_encoding_rows(split(&product[0]), block(&rows[2]));
-                    let switched_key =
-                        mod_down_public((block(&rows[0]), block(&rows[1])), &target_ring);
-                    let mask = (helper.0.at(index.clone()), helper.1.at(index));
-                    let data = this.lut_public_data(level, Int::from(sigma)).map_err(schema)?;
-                    let actions = super::column_action(
-                        this.parameters,
-                        level,
-                        next,
-                        &switched_key,
-                        columns,
-                        vec![
-                            super::join_row(&mask),
-                            super::join_row(&data.0),
-                            super::join_row(&data.1),
-                        ],
-                    )
-                    .map_err(schema)?;
-                    let row = add_encoding_rows(
-                        row_sum,
-                        add_encoding_rows(split(&actions[0]), switched_row),
-                    );
-                    let key =
-                        add_public_matrices(key_sum, (split(&actions[1]), split(&actions[2])));
-                    Ok(((row, key), b_next))
-                },
-            )
-            .map_err(graph)?;
-            (row, key)
-        } else {
+        let (row, public_key) = {
             let (sums, b_last) = mxx_dsl::iterate(
                 IntExpr::constant(last),
                 (initial, b_at(Int::constant(0))),
@@ -988,6 +998,62 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             .map_err(graph)?;
             branch(Int::constant(last), sums, b_last).map_err(graph)?
         };
+        Ok((row, public_key))
+    }
+
+    /// The Static LUT of a public `input` (see
+    /// [`crate::rns_bgg::public_lut::static_public_lut`]), before the one
+    /// ModDown in [`Self::finish_lut`]. Only the helpers are read; there is
+    /// no switching ciphertext.
+    fn static_public_lut(
+        &self,
+        input: &RnsBggEncoding,
+        lut_id: crate::program::LutId,
+        level: usize,
+        table: &LutTable,
+    ) -> Result<(RnsBggRow, RnsBggMatrix), RnsBggError> {
+        let (_, _, helpers) = self.lut_material(level, lut_id, table, false)?;
+        let (row, key) = crate::rns_bgg::public_lut::static_public_lut(
+            self.parameters,
+            self.hash_key.clone(),
+            level,
+            table,
+            self.public_lut_entries(table)?,
+            (Some(input.row.clone()), input.public_key.matrix.clone()),
+            Some(self.public_lut_payload_input(input, level)?),
+            Some(&helpers),
+        )?;
+        Ok((row.ok_or(RnsBggError::Lut)?, key))
+    }
+
+    /// The public payload of a public LUT `input` in the ring of `level`.
+    pub(super) fn public_lut_payload_input(
+        &self,
+        input: &RnsBggEncoding,
+        level: usize,
+    ) -> Result<Mat, RnsBggError> {
+        checked_modulus_convert(
+            input
+                .public_payload
+                .clone()
+                .ok_or(RnsBggError::Binding("public LUT input payload missing"))?,
+            &self.parameters.ring(level)?,
+        )
+    }
+
+    /// The common tail of a LUT: a decoder smudge member's transform, the
+    /// ModDown of an exponent output to its level, and a public payload.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_lut(
+        &mut self,
+        input: &RnsBggEncoding,
+        table: &LutTable,
+        lut_id: crate::program::LutId,
+        level: usize,
+        output: WireId,
+        row: RnsBggRow,
+        public_key: RnsBggMatrix,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
         if let Some(declaration) = self.decoder_smudge.clone() &&
             declaration.smudge().lut() == lut_id
         {
@@ -1146,6 +1212,74 @@ mod test {
         }
     }
 
+    /// A LUT reads the bit window of its input layout and keeps the exponent
+    /// bits above it: `X^(2^s e + N0 q)` maps to `X^(s' T[e] + N0 q)`, for a
+    /// window below the ring (`N0 < n`) and one reaching it (`N0 = n`), with
+    /// signed inputs and outputs.
+    #[test]
+    fn lut_coefficients_keep_the_exponent_bits_above_the_window() {
+        let level = DCRTPolyParams::new(16, 1, 17, 2, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let exponent = ExpLayout { stride_log2: 0, width_log2: 4 };
+        let output_layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let values = [1usize, 0, 3, 2];
+        let mut graph = DslContext::new("lut-window-arithmetic");
+        for input_layout in [
+            ExpLayout { stride_log2: 1, width_log2: 2 },
+            ExpLayout { stride_log2: 2, width_log2: 2 },
+        ] {
+            let window = 1usize << (input_layout.stride_log2 + input_layout.width_log2);
+            let sigmas = input_layout.automorphism_indices(16).unwrap();
+            for (e, output) in values.iter().copied().enumerate() {
+                for q in 0..32 / window {
+                    let m = (e << input_layout.stride_log2) + window * q;
+                    let monomial = exponent.mono(&ring, &BigInt::from(m)).unwrap();
+                    let mut actual = ring.zero((1, 1));
+                    for sigma in &sigmas {
+                        let coefficient = EncodingLowering::lut_coefficient(
+                            &parameters,
+                            0,
+                            input_layout,
+                            crate::program::LutOutputRepresentation::Exponent(output_layout),
+                            IntExpr::constant(*sigma),
+                            &values,
+                        )
+                        .unwrap();
+                        actual = actual + coefficient * monomial.clone().ring_automorphism(*sigma);
+                    }
+                    let expected =
+                        exponent.mono(&ring, &BigInt::from(output + window * q)).unwrap();
+                    graph = graph
+                        .output(format!("difference-{window}-{m}"), actual - expected)
+                        .unwrap();
+                }
+            }
+        }
+        let mut execution = mxx_backends::authority::CpuExecution::new(cpu_backend([level]));
+        let mut store = MemoryArtifactStore::default();
+        let result = execute_graph(
+            StageGraph::new(graph.build().unwrap(), BTreeMap::new(), BTreeMap::new()),
+            &ParamEnv::default(),
+            &mut execution,
+            &mut store,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result.outputs.len(), 4 * (32 / 8 + 32 / 16));
+        for (name, output) in &result.outputs {
+            let matrix = crate::test_support::full(output);
+            assert!(
+                matrix
+                    .entry(0, 0)
+                    .coeffs_biguints()
+                    .iter()
+                    .all(|value| *value == BigUint::from(0u8)),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn lut_coefficients_depend_on_values_not_only_width() {
         let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
@@ -1221,9 +1355,11 @@ mod test {
                 manifests: BTreeMap::new(),
                 decoder_smudge: None,
                 artifact_prefix: None,
-                context: [0; 32],
                 rhs_companions: BTreeMap::new(),
                 lut_material: BTreeMap::new(),
+                data: BTreeMap::new(),
+                output_use: RnsOutputUse::default(),
+                dynamic: None,
                 current_site: Some(LoweringSite {
                     output,
                     indices: Vec::new(),
@@ -1289,9 +1425,11 @@ mod test {
             manifests: BTreeMap::new(),
             decoder_smudge: None,
             artifact_prefix: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let assert_compact = |matrix: &RnsBggMatrix| {
@@ -1315,7 +1453,7 @@ mod test {
             &scalar_program,
             &scalar_lowerer.workload,
             &production,
-            &production,
+            None,
             None,
             &hash_key,
             |role| role,
@@ -1362,7 +1500,7 @@ mod test {
             &family_program,
             &family_lowerer.workload,
             &production,
-            &production,
+            None,
             None,
             &hash_key,
             |role| role,
@@ -1379,7 +1517,7 @@ mod test {
             value.node().kind(),
             mxx_ir_core::node::NodeKind::Input { artifact: Some(_), .. }
         )));
-        let mut families = OnlineEvalFamilies { parameters: &parameters };
+        let mut families = OnlineEvalFamilies::new(&parameters);
         let mut member_at = |index: IntExpr| {
             <OnlineEvalFamilies<'_> as crate::program::FamilyExecution<EncodingLowering<'_>>>::rhs_at(
                 &mut families,
@@ -1435,9 +1573,11 @@ mod test {
             manifests: BTreeMap::new(),
             decoder_smudge: None,
             artifact_prefix: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let ring = parameters.ring(0).unwrap();
@@ -1506,9 +1646,11 @@ mod test {
             manifests: BTreeMap::new(),
             decoder_smudge: None,
             artifact_prefix: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite {
                 output: public_output,
                 indices: Vec::new(),
@@ -1582,9 +1724,11 @@ mod test {
             manifests: BTreeMap::new(),
             decoder_smudge: None,
             artifact_prefix: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let low_ring = parameters.ring(1).unwrap();
@@ -1732,9 +1876,11 @@ mod test {
             manifests: BTreeMap::new(),
             decoder_smudge: None,
             artifact_prefix: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite {
                 output: private_output,
                 indices: Vec::new(),
@@ -1924,9 +2070,11 @@ mod test {
             manifests: BTreeMap::new(),
             decoder_smudge: None,
             artifact_prefix: None,
-            context: [0; 32],
             rhs_companions: BTreeMap::new(),
             lut_material: BTreeMap::new(),
+            data: BTreeMap::new(),
+            output_use: RnsOutputUse::default(),
+            dynamic: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         assert!(lowerer.program.wire_is_coefficient_output(output).unwrap());
@@ -1954,20 +2102,31 @@ mod test {
     }
 
     #[test]
-    fn public_lut_input_is_rejected_before_payload_propagation() {
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
-        let table = LutTable::unary(
-            2,
-            ExpLayout { stride_log2: 0, width_log2: 1 },
-            2,
-            vec![0, 1],
-            crate::program::LutOutputRepresentation::Coefficient,
-        )
-        .unwrap();
-        let lut = builder.register_lut(table.clone()).unwrap();
-        let output = builder.lut(Operand::Scalar(input), lut).unwrap();
-        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
-        assert!(RnsBggDerivedWorkload::from_program(&program).is_err());
+    fn coefficient_lut_level_follows_input_knowledge() {
+        // A private coefficient output stays at its level until it is
+        // finalized; a public one is a finished encoding at the next level.
+        for (knowledge, level) in
+            [(AttributeKnowledge::PrivatePayload, 0), (AttributeKnowledge::PublicPayload, 1)]
+        {
+            let mut builder = crate::program::ExponentLutProgramBuilder::new();
+            let input = builder.input(knowledge).unwrap();
+            let table = LutTable::unary(
+                2,
+                ExpLayout { stride_log2: 0, width_log2: 1 },
+                2,
+                vec![0, 1],
+                crate::program::LutOutputRepresentation::Coefficient,
+            )
+            .unwrap();
+            let lut = builder.register_lut(table).unwrap();
+            let output = builder.lut(Operand::Scalar(input), lut).unwrap();
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+            assert_eq!(workload.level(output).unwrap(), level, "{knowledge:?}");
+            assert_eq!(
+                program.wire_is_coefficient_output(output).unwrap(),
+                knowledge == AttributeKnowledge::PrivatePayload
+            );
+        }
     }
 }

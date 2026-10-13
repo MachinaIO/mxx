@@ -62,7 +62,7 @@ impl<'a> RnsEncryptBuild<'a> {
             runtime: BTreeMap::new(),
             decoder_smudge_child: None,
             decoder_smudge: None,
-            dynamic_schema: None,
+            dynamic_setup: None,
             dynamic_rhs: None,
             prelude: None,
             hash_namespace: None,
@@ -124,7 +124,7 @@ impl<'a> RnsEncryptBuild<'a> {
             child.binding.as_ref().is_some_and(|binding| {
                 binding.context() == &self.context &&
                     binding.hash_key_commitment() == &self.hash_key_commitment &&
-                    binding.program() == declaration.source_program() &&
+                    binding.program() == Some(declaration.source_program()) &&
                     binding.decoder_commitment() == Some(declaration.spec())
             }) && child.inputs.is_some() &&
                 child.payload_secret.is_some() &&
@@ -179,8 +179,35 @@ impl<'a> RnsEncryptBuild<'a> {
 
     fn bind_preprocess_artifacts_inner(
         &mut self,
-        preprocess: &StageArtifacts<RnsBggPreprocessEncryptDescriptor>,
+        preprocess: Option<&StageArtifacts<RnsBggPreprocessEncryptDescriptor>>,
     ) -> Result<(), ApiError> {
+        if self.inputs.is_none() {
+            return Err(ApiError::input("encryption inputs are not bound"));
+        }
+        let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
+        let Some(preprocess) = preprocess else {
+            // A Dynamic encryption belongs to its setup, not to a Program.
+            if !dynamic {
+                return Err(ApiError::input("Static encryption needs its preprocess artifacts"));
+            }
+            let setup = self.bound_dynamic_setup()?;
+            setup
+                .validate_public_seed(&self.context, &self.hash_key_commitment)
+                .map_err(ApiError::scheme)?;
+            self.binding = Some(
+                RnsBggArtifactBinding::new(
+                    self.context,
+                    None,
+                    self.parameters.parameter_identity(),
+                    self.hash_key_commitment,
+                    Vec::new(),
+                    RhsMode::Dynamic,
+                )
+                .map_err(ApiError::scheme)?
+                .with_dynamic_setup(setup.identity(), None),
+            );
+            return Ok(());
+        };
         let binding = preprocess.descriptor().binding().clone();
         // A child encrypts on its own chain, so only the root checks the
         // parameter identity.
@@ -200,16 +227,15 @@ impl<'a> RnsEncryptBuild<'a> {
                 "RNS-BGG preprocess production is not a declared source",
             ));
         }
+        // A Dynamic encryption reads a preprocessing production only for an
+        // applied decoder, whose unmask matrix that production samples.
+        if dynamic && self.decoder_smudge.is_none() && binding.decoder_commitment().is_none() {
+            return Err(ApiError::compatibility(
+                "Dynamic encryption binds no Program preprocessing",
+            ));
+        }
         self.preprocess = Some(production.clone());
         self.manifests = BTreeMap::from([(production.clone(), preprocess.manifest().clone())]);
-        if self.inputs.is_none() {
-            return Err(ApiError::input("encryption inputs are not bound"));
-        }
-        // A decoder smudge child's schema is its own Program's, bound with it.
-        if self.parameters.rhs_mode() == RhsMode::Dynamic && self.decoder_smudge.is_none() {
-            self.dynamic_schema =
-                Some((binding.dynamic_rhs().clone(), binding.dynamic_luts().clone()));
-        }
         self.binding = Some(binding);
         Ok(())
     }
@@ -219,7 +245,7 @@ impl<'a> RnsEncryptBuild<'a> {
         &mut self,
         preprocess: &StageArtifacts<RnsBggPreprocessEncryptDescriptor>,
     ) -> Result<(), ApiError> {
-        self.bind_preprocess_artifacts_inner(preprocess)
+        self.bind_preprocess_artifacts_inner(Some(preprocess))
     }
 
     /// Bind this encryption child, on
@@ -242,14 +268,9 @@ impl<'a> RnsEncryptBuild<'a> {
         if self.decoder_smudge.is_some() {
             return Err(RnsBggError::Binding("decoder smudge child is already bound"));
         }
-        if self.parameters.rhs_mode() == RhsMode::Dynamic {
-            let workload = RnsBggDerivedWorkload::from_program(program)?;
-            let rhs = program
-                .rhs_inputs()
-                .iter()
-                .map(|(id, shape)| Ok((*id, (shape.clone(), workload.rhs_level(*id)?))))
-                .collect::<Result<BTreeMap<_, _>, RnsBggError>>()?;
-            self.dynamic_schema = Some((rhs, workload.luts().clone()));
+        // A Dynamic child encrypts the packages of its own setup.
+        if self.parameters.rhs_mode() == RhsMode::Dynamic && self.dynamic_setup.is_none() {
+            return Err(RnsBggError::Binding("a Dynamic decoder smudge child needs its setup"));
         }
         self.decoder_smudge = Some(declaration.clone());
         Ok(())
@@ -280,7 +301,7 @@ impl<'a> RnsEncryptBuild<'a> {
         if binding.context() != &self.context ||
             binding.parameters() != &self.parameters.parameter_identity() ||
             binding.hash_key_commitment() != &self.hash_key_commitment ||
-            binding.program() != declaration.source_program() ||
+            binding.program() != Some(declaration.source_program()) ||
             binding.decoder_commitment() != Some(declaration.commitment()) ||
             child.inputs.is_none() ||
             child.payload_secret.is_none() ||
@@ -290,19 +311,23 @@ impl<'a> RnsEncryptBuild<'a> {
         {
             return Err(RnsBggError::Decoder(DecoderError::TargetMismatch));
         }
-        validate_decoder_smudge_input_key_artifacts(
-            &child.manifests,
-            child
-                .preprocess
-                .as_ref()
-                .ok_or(RnsBggError::Binding("decoder smudge child preprocess is not bound"))?,
-            child.parameters,
-            child
-                .inputs
-                .as_ref()
-                .ok_or(RnsBggError::Binding("decoder smudge child inputs are not bound"))?,
-            &declaration.artifact_key(),
-        )?;
+        // A Static child's input keys are published by preprocessing; a
+        // Dynamic child's are its setup's.
+        if self.parameters.rhs_mode() == RhsMode::Static {
+            validate_decoder_smudge_input_key_artifacts(
+                &child.manifests,
+                child
+                    .preprocess
+                    .as_ref()
+                    .ok_or(RnsBggError::Binding("decoder smudge child preprocess is not bound"))?,
+                child.parameters,
+                child
+                    .inputs
+                    .as_ref()
+                    .ok_or(RnsBggError::Binding("decoder smudge child inputs are not bound"))?,
+                &declaration.artifact_key(),
+            )?;
+        }
         // A Dynamic child encrypts under the parent's single secret, in the
         // parent's batch.
         let secret = |build: &RnsEncryptBuild<'a>| {
@@ -339,6 +364,9 @@ impl<'a> RnsEncryptBuild<'a> {
         mut graph: DslContext,
         hash_key: &Bytes,
     ) -> Result<DslContext, ApiError> {
+        if child.parameters.rhs_mode() == RhsMode::Dynamic {
+            return child.dynamic_material(graph, hash_key, |role| name(&role));
+        }
         let inputs = child
             .inputs
             .as_ref()
@@ -452,19 +480,6 @@ impl<'a> RnsEncryptBuild<'a> {
                 }
             };
         }
-        if child.parameters.rhs_mode() == RhsMode::Dynamic {
-            let decoder = child
-                .decoder_smudge
-                .as_ref()
-                .ok_or_else(|| ApiError::input("a Dynamic child must be a decoder smudge"))?;
-            graph = child.dynamic_material(
-                graph,
-                hash_key,
-                program.id(),
-                Some(*decoder.commitment()),
-                |role| name(&role),
-            )?;
-        }
         Ok(graph)
     }
 
@@ -546,6 +561,7 @@ impl<'a> RnsEncryptBuild<'a> {
             mask,
             parameters.scalar(decoding, 1).map_err(ApiError::scheme)?,
             decoding,
+            &parameters.encoding_contract(),
         )
         .map_err(ApiError::scheme)?;
         let hint =
@@ -604,7 +620,15 @@ impl<'a> RnsEncryptBuild<'a> {
         mask: &RnsBggMaskSecret,
         plaintext: Mat,
     ) -> Result<RnsBggEncoding, RnsBggError> {
-        encode_private_inner(self.parameters, key, payload, mask, plaintext, level)
+        encode_private_inner(
+            self.parameters,
+            key,
+            payload,
+            mask,
+            plaintext,
+            level,
+            &self.parameters.encoding_contract(),
+        )
     }
 
     fn encode_public(
@@ -614,7 +638,14 @@ impl<'a> RnsEncryptBuild<'a> {
         mask: &RnsBggMaskSecret,
         plaintext: Mat,
     ) -> Result<RnsBggEncoding, RnsBggError> {
-        encode_public_inner(self.parameters, key, mask, plaintext, level)
+        encode_public_inner(
+            self.parameters,
+            key,
+            mask,
+            plaintext,
+            level,
+            &self.parameters.encoding_contract(),
+        )
     }
 
     /// The LUT helpers, one family per level and LUT input layout, whose
@@ -699,6 +730,13 @@ impl RnsEncryptBuild<'_> {
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
         let mask = stage_mask(self.parameters, payload, mask)?;
+        // A Dynamic encryption's inputs are its setup's input coordinates
+        // (see [`RnsBggDynamicSetup::encryption_inputs`]).
+        if self.parameters.rhs_mode() == RhsMode::Dynamic &&
+            self.bound_dynamic_setup()?.encryption_inputs() != *inputs
+        {
+            return Err(ApiError::input("Dynamic encryption inputs are not the setup's"));
+        }
         if let Some(lhs) = lhs &&
             (lhs.len() != inputs.inputs().len() ||
                 lhs.keys().any(|wire| !inputs.inputs().contains_key(wire)))
@@ -748,10 +786,13 @@ impl RnsEncryptBuild<'_> {
             self.plaintexts.insert(*wire, plaintext);
         }
         self.inputs = Some(inputs.clone());
-        self.projection_identity = Some(
-            encryption_projection_identity(inputs, parameters, self.parameters)
+        // The projection a Static encryption is bound to includes the LUT
+        // values; a Dynamic one is its setup, which names no table.
+        self.projection_identity = Some(match &self.dynamic_setup {
+            Some(setup) => setup.identity(),
+            None => encryption_projection_identity(inputs, parameters, self.parameters)
                 .map_err(ApiError::scheme)?,
-        );
+        });
         for binding in [&payload.binding, &mask.binding].into_iter().flatten() {
             binding.bind(&mut self.runtime);
         }
@@ -788,7 +829,7 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
 
     fn bind_artifacts(
         &mut self,
-        preprocess: &StageArtifacts<Self::PreprocessDescriptor>,
+        preprocess: Option<&StageArtifacts<Self::PreprocessDescriptor>>,
     ) -> Result<(), ApiError> {
         self.bind_preprocess_artifacts_inner(preprocess)
     }
@@ -817,10 +858,16 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                 digest.update(source.execution_nonce);
             }
         }
-        // A Dynamic batch selects its own sampling session.
-        if let Some((batch, _)) = &self.dynamic_rhs {
-            digest.update(b"batch");
-            digest.update(batch);
+        // A Dynamic session selects its own sampling session, and a bound
+        // prelude production is part of the material it encrypts.
+        if let Some((session, _)) = &self.dynamic_rhs {
+            digest.update(b"session");
+            digest.update(session);
+        }
+        if let Some((production, _)) = &self.prelude {
+            digest.update(b"prelude");
+            digest.update(production.spec_hash.0);
+            digest.update(production.execution_nonce);
         }
         digest.finalize().into()
     }
@@ -829,15 +876,38 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
         if self.parameters.rhs_mode() != RhsMode::Dynamic {
             return Ok(None);
         }
+        // A bound prelude production (an enclosing scheme's) exports the
+        // bottom rows of every coordinate; otherwise the encryption's own
+        // prelude samples them from the bound plaintexts.
+        let plaintexts = self
+            .bound_dynamic_rhs()?
+            .values()
+            .any(|value| matches!(value, DynamicRhsValue::Plaintext(_)));
+        if self.prelude.is_some() {
+            if plaintexts {
+                return Err(ApiError::input(
+                    "RHS plaintexts need the encryption's own prelude production",
+                ));
+            }
+            return Ok(None);
+        }
+        if self.bound_dynamic_rhs()?.values().any(|value| matches!(value, DynamicRhsValue::Prelude))
+        {
+            return Err(ApiError::input(
+                "an RHS without a plaintext needs a bound prelude production",
+            ));
+        }
+        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let hash_key = ring.bytes_input(super::HASH_KEY_INPUT, self.hash_key.len());
         let graph = DslContext::new("rns-bgg-encrypt-prelude");
-        let (mut graph, mut exported) = self.dynamic_family_ciphertexts(graph, |role| role)?;
+        let (mut graph, mut exported) = self.dynamic_rhs_bottoms(graph, &hash_key, |role| role)?;
         let mut runtime = self.runtime.clone();
         if let (Some(declaration), Some(child)) =
             (self.decoder_declaration.as_ref(), self.decoder_smudge_child.as_ref())
         {
             let key = declaration.artifact_key();
-            let (child_graph, child_exported) = child
-                .dynamic_family_ciphertexts(graph, |role| {
+            let (child_graph, child_exported) =
+                child.dynamic_rhs_bottoms(graph, &hash_key, |role| {
                     decoder_smudge_artifact_name(&key, &role)
                 })?;
             graph = child_graph;
@@ -848,6 +918,12 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             return Ok(None);
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
+        if super::graph_declares_input(&graph, super::HASH_KEY_INPUT) {
+            runtime.insert(
+                super::HASH_KEY_INPUT.to_owned(),
+                RuntimeValue::Bytes(self.hash_key.as_slice().into()),
+            );
+        }
         let runtime = declared_runtime_inputs(&graph, runtime);
         Ok(Some(StageGraph::new(graph, runtime, BTreeMap::new())))
     }
@@ -869,7 +945,8 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
             .inputs
             .clone()
             .ok_or_else(|| ApiError::input("encryption inputs are not bound"))?;
-        if self.preprocess.is_none() {
+        let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
+        if self.binding.is_none() || (!dynamic && self.preprocess.is_none()) {
             return Err(ApiError::input("preprocess artifacts are not bound"));
         }
         let payload = self
@@ -923,84 +1000,83 @@ impl<'a, P: Poly> EncryptBuild<P> for RnsEncryptBuild<'a> {
                 &mask,
             )?;
         }
-        for (name, family) in
-            self.lut_helper_families(&mask, &hash_key, &inputs).map_err(ApiError::scheme)?
-        {
-            graph = graph.transferred_output(name, family).map_err(ApiError::scheme)?;
-        }
-        // Each input is encoded at its logical level under a public key
-        // sampled from the hash key; only the row and, for a public input, the
-        // payload are stored, and every later stage samples the key again.
-        let binding =
-            self.binding.as_ref().ok_or_else(|| ApiError::input("preprocess is not bound"))?;
-        for (wire, declaration) in inputs.inputs() {
-            let level = binding.input_levels().get(wire).copied().unwrap_or(0);
-            let input_ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
-            // Plaintexts are bound in the natural input ring, level zero.
-            let plaintext_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-            let knowledge = declaration.knowledge();
-            let public = matches!(knowledge, AttributeKnowledge::PublicPayload);
-            let value = self
-                .plaintexts
-                .get(wire)
-                .ok_or_else(|| ApiError::input("missing encryption plaintext"))?;
-            let encode = |member: Option<Int>, plaintext: Mat| {
-                let key = super::public_key::sampled_key(
-                    self.parameters,
-                    level,
-                    hash_key.clone(),
-                    *wire,
-                    knowledge,
-                    member,
-                )?;
-                let plaintext = checked_modulus_convert(plaintext, &input_ring)?;
-                if public {
-                    self.encode_public(&key, level, &mask, plaintext)
-                } else {
-                    self.encode_private(&key, level, &payload, &mask, plaintext)
-                }
-            };
-            let name = format!("input-{wire:?}");
-            graph = match (value, public) {
-                (InputBinding::Scalar(value), true) => {
-                    let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
-                    let payload = encoding
-                        .public_payload
-                        .ok_or_else(|| ApiError::input("public encoding has no payload"))?;
-                    graph.transferred_output(name, (encoding.row.0, encoding.row.1, payload))
-                }
-                (InputBinding::Scalar(value), false) => {
-                    let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
-                    graph.transferred_output(name, encoding.row)
-                }
-                (InputBinding::Family(plaintexts), true) => {
-                    let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
-                        let plaintext = plaintexts.member(&plaintext_ring, index.clone());
-                        let encoding =
-                            encode(Some(index.clone()), plaintext).map_err(|_| DslError::Schema)?;
-                        let payload = encoding.public_payload.ok_or(DslError::Schema)?;
-                        Ok((encoding.row.0, encoding.row.1, payload))
-                    })
-                    .map_err(ApiError::scheme)?;
-                    graph.transferred_output(name, stored)
-                }
-                (InputBinding::Family(plaintexts), false) => {
-                    let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
-                        let plaintext = plaintexts.member(&plaintext_ring, index.clone());
-                        encode(Some(index.clone()), plaintext)
-                            .map(|encoding| encoding.row)
-                            .map_err(|_| DslError::Schema)
-                    })
-                    .map_err(ApiError::scheme)?;
-                    graph.transferred_output(name, stored)
-                }
-            }
-            .map_err(ApiError::scheme)?;
-        }
-        let dynamic = self.parameters.rhs_mode() == RhsMode::Dynamic;
         if dynamic {
-            graph =
-                self.dynamic_material(graph, &hash_key, binding.program(), None, |role| role)?;
+            graph = self.dynamic_material(graph, &hash_key, |role| role)?;
+        } else {
+            for (name, family) in
+                self.lut_helper_families(&mask, &hash_key, &inputs).map_err(ApiError::scheme)?
+            {
+                graph = graph.transferred_output(name, family).map_err(ApiError::scheme)?;
+            }
+            // Each input is encoded at its logical level under a public key
+            // sampled from the hash key; only the row and, for a public input, the
+            // payload are stored, and every later stage samples the key again.
+            let binding =
+                self.binding.as_ref().ok_or_else(|| ApiError::input("preprocess is not bound"))?;
+            for (wire, declaration) in inputs.inputs() {
+                let level = binding.input_levels().get(wire).copied().unwrap_or(0);
+                let input_ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
+                // Plaintexts are bound in the natural input ring, level zero.
+                let plaintext_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+                let knowledge = declaration.knowledge();
+                let public = matches!(knowledge, AttributeKnowledge::PublicPayload);
+                let value = self
+                    .plaintexts
+                    .get(wire)
+                    .ok_or_else(|| ApiError::input("missing encryption plaintext"))?;
+                let encode = |member: Option<Int>, plaintext: Mat| {
+                    let key = super::public_key::sampled_key(
+                        self.parameters,
+                        level,
+                        hash_key.clone(),
+                        *wire,
+                        knowledge,
+                        member,
+                    )?;
+                    let plaintext = checked_modulus_convert(plaintext, &input_ring)?;
+                    if public {
+                        self.encode_public(&key, level, &mask, plaintext)
+                    } else {
+                        self.encode_private(&key, level, &payload, &mask, plaintext)
+                    }
+                };
+                let name = format!("input-{wire:?}");
+                graph = match (value, public) {
+                    (InputBinding::Scalar(value), true) => {
+                        let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
+                        let payload = encoding
+                            .public_payload
+                            .ok_or_else(|| ApiError::input("public encoding has no payload"))?;
+                        graph.transferred_output(name, (encoding.row.0, encoding.row.1, payload))
+                    }
+                    (InputBinding::Scalar(value), false) => {
+                        let encoding = encode(None, value.clone()).map_err(ApiError::scheme)?;
+                        graph.transferred_output(name, encoding.row)
+                    }
+                    (InputBinding::Family(plaintexts), true) => {
+                        let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
+                            let plaintext = plaintexts.member(&plaintext_ring, index.clone());
+                            let encoding = encode(Some(index.clone()), plaintext)
+                                .map_err(|_| DslError::Schema)?;
+                            let payload = encoding.public_payload.ok_or(DslError::Schema)?;
+                            Ok((encoding.row.0, encoding.row.1, payload))
+                        })
+                        .map_err(ApiError::scheme)?;
+                        graph.transferred_output(name, stored)
+                    }
+                    (InputBinding::Family(plaintexts), false) => {
+                        let stored = mxx_dsl::parallel(plaintexts.count().clone(), |index| {
+                            let plaintext = plaintexts.member(&plaintext_ring, index.clone());
+                            encode(Some(index.clone()), plaintext)
+                                .map(|encoding| encoding.row)
+                                .map_err(|_| DslError::Schema)
+                        })
+                        .map_err(ApiError::scheme)?;
+                        graph.transferred_output(name, stored)
+                    }
+                }
+                .map_err(ApiError::scheme)?;
+            }
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
         if super::graph_declares_input(&graph, &hash_key_input) {

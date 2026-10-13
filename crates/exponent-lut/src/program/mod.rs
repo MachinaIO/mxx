@@ -2,7 +2,8 @@
 //!
 //! This module deliberately contains no scheme-specific carrier types.  A
 //! program describes scalar operations, indexed bodies, literal LUTs, and the
-//! shapes of runtime integer tables whose entries name family members;
+//! shapes of integer data families supplied at run time, whose entries name
+//! family members or hold LUT values;
 //! The internal program walker supplies the only execution path and delegates
 //! each scalar operation to a scheme evaluator.
 
@@ -186,7 +187,7 @@ macro_rules! id_type {
 id_type!(WireId);
 id_type!(RhsId);
 id_type!(LutId);
-id_type!(TableId);
+id_type!(DataId);
 
 /// A scalar or an indexed member of a family in a validated Program body.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -196,35 +197,26 @@ pub enum Operand<I> {
         family: I,
         index: IntExpr,
     },
-    /// Member `table[index]` of `family`, where `table` is a runtime integer
-    /// table the Program declares ([`TableDecl`]) and its stage binds. Only
-    /// a wire operand may be a lookup, wherever a member read is valid; the
-    /// read member is unknown until the table is bound.
-    Lookup {
+    /// The member of `family` selected at run time: its index is entry `position` of the
+    /// Program's integer data family `data` ([`ExponentLutProgramBuilder::data_family`]). The
+    /// RHS of a private product may be selected this way, and so may a wire operand wherever a
+    /// member read is valid (not a root output), from a family of data bounded by the wire
+    /// family's member count; the read member is unknown until the data are bound.
+    Selected {
         family: I,
-        table: TableId,
-        index: IntExpr,
+        data: DataId,
+        position: IntExpr,
     },
 }
 
-/// A runtime integer table: `count` entries, each a member index in
-/// `[0, bound)`. The entries are not part of the Program; the stage that
-/// lowers it binds them ([`Environment::bind_table`]), so one Program serves
-/// every table of this shape.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TableDecl {
-    count: IntExpr,
-    bound: IntExpr,
-}
-
-impl TableDecl {
-    /// The number of entries.
-    pub fn count(&self) -> &IntExpr {
-        &self.count
-    }
-    /// The exclusive upper bound of every entry.
-    pub fn bound(&self) -> &IntExpr {
-        &self.bound
+impl<I> Operand<I> {
+    /// The scalar, or the family a member is read from.
+    pub fn source(&self) -> &I {
+        match self {
+            Self::Scalar(id) |
+            Self::Member { family: id, .. } |
+            Self::Selected { family: id, .. } => id,
+        }
     }
 }
 
@@ -250,6 +242,9 @@ pub struct ProgramInputDeclaration {
 }
 
 impl ProgramInputDeclaration {
+    pub fn new(shape: InputShape, knowledge: AttributeKnowledge) -> Self {
+        Self { shape, knowledge }
+    }
     pub fn shape(&self) -> &InputShape {
         &self.shape
     }
@@ -421,10 +416,24 @@ impl FamilyRange {
 /// constant coefficient. A root coefficient output is scaled for decryption
 /// only when it is finalized; a decoder adds unfinalized ones as its smudge.
 ///
+/// A LUT on a public payload returns a public wire at the next level in
+/// either representation; a public coefficient output is finished (see
+/// [`ExponentLutProgram::wire_coefficient_bound`]).
+///
 /// A LUT reads one signed monomial `±X^(stride e)` of its input layout and
-/// returns `±T[e]`. The LUT is linear in its input, so any other input (for
-/// example `Add(x, x)`) is outside this contract; it is a plaintext property
-/// that Program validation cannot see, and callers guarantee it.
+/// returns `±T[e]`. More generally it reads a bit window of a monomial
+/// exponent: for the input layout `(s, width_log2)`, `N0 = 2^(s + width_log2)`
+/// and an input `X^(2^s e + N0 q)` with `e < 2^width_log2` and `q >= 0` (no
+/// exponent bits below `s`), the output is the table output times
+/// `X^(N0 q)`, the negacyclic sign included. The automorphism indices are,
+/// modulo `2n / 2^s`, exactly `1 + t 2n / N0` for `t < 2^width_log2`, so
+/// their sum over `X^(2^s l)` is `2^width_log2 X^(2^s l)` when
+/// `2^width_log2 | l` and `0` otherwise, which selects `e`. An exponent output
+/// below `N0` therefore replaces the window and keeps the higher bits. The
+/// LUT is linear in its input, so any other input (for example `Add(x, x)`,
+/// or a monomial with bits below `s`) is outside this contract; it is a
+/// plaintext property that Program validation cannot see, and callers
+/// guarantee it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LutOutputRepresentation {
     Exponent(ExpLayout),
@@ -440,22 +449,36 @@ impl LutOutputRepresentation {
 
 /// A LUT: its input and output shape and its output values.
 ///
-/// The values enter the Program identity only through their digest, so a
-/// table whose values are withheld ([`LutTable::without_values`]) keeps the
-/// identity of the full table. Preprocessing embeds the values in the LUT
-/// switching ciphertexts and needs them; the online evaluation of a LUT on a
-/// private payload reads only the shape and the largest output value, which
-/// bounds a coefficient output.
+/// The values are constants, or a window of the Program's integer data supplied at run time
+/// ([`LutTable::from_data`]), so that one Program serves every table of a shape. Constant
+/// values enter the Program identity only through their digest, so a table whose values are
+/// withheld ([`LutTable::without_values`]) keeps the identity of the full table. Preprocessing
+/// embeds the values in the LUT switching ciphertexts and needs them; the online evaluation of
+/// a LUT on a private payload reads only the shape and the largest output value, which bounds a
+/// coefficient output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LutTable {
     input_width: usize,
     input_layout: ExpLayout,
     output_width: usize,
     #[serde(skip)]
-    values: Option<Vec<usize>>,
+    values: LutValues,
     values_digest: [u8; 32],
     max_output: usize,
     output_representation: LutOutputRepresentation,
+}
+
+/// The output values of a [`LutTable`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LutValues {
+    Constant(Vec<usize>),
+    /// Constant values withheld from this copy of the table.
+    Withheld,
+    /// Entries `offset..offset + input_width` of the integer data family `family`.
+    Data {
+        family: DataId,
+        offset: usize,
+    },
 }
 
 impl LutTable {
@@ -482,7 +505,7 @@ impl LutTable {
             input_width,
             input_layout,
             output_width,
-            values: Some(values),
+            values: LutValues::Constant(values),
             values_digest,
             max_output,
             output_representation,
@@ -491,10 +514,41 @@ impl LutTable {
         Ok(table)
     }
 
-    /// The same table with its values withheld; the Program identity is
-    /// unchanged.
+    /// A unary table whose values are entries `offset..offset + input_width` of the integer
+    /// data family `family`, each below `output_width`, so its largest output is bounded by
+    /// `output_width - 1`. The Program validates the window against the family.
+    pub fn from_data(
+        input_width: usize,
+        input_layout: ExpLayout,
+        output_width: usize,
+        family: DataId,
+        offset: usize,
+        output_representation: LutOutputRepresentation,
+    ) -> Result<Self, ProgramValidationError> {
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/lut-data/v1");
+        digest.update(family.0.to_le_bytes());
+        digest.update((offset as u64).to_le_bytes());
+        let table = Self {
+            input_width,
+            input_layout,
+            output_width,
+            values: LutValues::Data { family, offset },
+            values_digest: digest.finalize().into(),
+            max_output: output_width.checked_sub(1).ok_or(ProgramValidationError::InvalidLut)?,
+            output_representation,
+        };
+        validate_table(&table)?;
+        Ok(table)
+    }
+
+    /// The same table with its constant values withheld; the Program identity is
+    /// unchanged. A table of data values is unchanged.
     pub fn without_values(&self) -> Self {
-        Self { values: None, ..self.clone() }
+        match self.values {
+            LutValues::Constant(_) => Self { values: LutValues::Withheld, ..self.clone() },
+            LutValues::Withheld | LutValues::Data { .. } => self.clone(),
+        }
     }
 
     pub fn input_width(&self) -> usize {
@@ -506,9 +560,23 @@ impl LutTable {
     pub fn output_width(&self) -> usize {
         self.output_width
     }
-    /// The output values, or `None` when they are withheld.
+    /// The constant output values, or `None` when they are withheld or data.
     pub fn values(&self) -> Option<&[usize]> {
-        self.values.as_deref()
+        match &self.values {
+            LutValues::Constant(values) => Some(values),
+            LutValues::Withheld | LutValues::Data { .. } => None,
+        }
+    }
+    /// The integer data family and the offset of the values of a data table.
+    pub fn data_values(&self) -> Option<(DataId, usize)> {
+        match self.values {
+            LutValues::Data { family, offset } => Some((family, offset)),
+            LutValues::Constant(_) | LutValues::Withheld => None,
+        }
+    }
+    /// Whether the values are available to a lowering: constant, or data.
+    pub fn has_values(&self) -> bool {
+        !matches!(self.values, LutValues::Withheld)
     }
     /// The largest output value, kept when the values are withheld.
     pub fn max_output(&self) -> usize {
@@ -589,8 +657,6 @@ pub enum ProgramValidationError {
     UndefinedWire(WireId),
     #[error("undefined RHS {0:?}")]
     UndefinedRhs(RhsId),
-    #[error("undefined table {0:?}")]
-    UndefinedTable(TableId),
     #[error("duplicate wire {0:?}")]
     DuplicateWire(WireId),
     #[error("duplicate RHS {0:?}")]
@@ -627,6 +693,154 @@ pub enum ProgramValidationError {
     InvalidStructure(String),
 }
 
+/// The declaration of an integer data family ([`ExponentLutProgramBuilder::data_family`]):
+/// `count` entries, each below `bound` when the family is bounded. A bounded family may select
+/// wire members ([`Operand::Selected`]); the noise model and the export read the bound as the
+/// range of every entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataFamily {
+    count: usize,
+    bound: Option<usize>,
+}
+
+impl DataFamily {
+    /// The number of entries.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+    /// The exclusive upper bound of every entry, when the family is bounded.
+    pub fn bound(&self) -> Option<usize> {
+        self.bound
+    }
+}
+
+/// The canonical encoding of a declaration: the count of an unbounded family, which keeps the
+/// identity of a Program without bounded families, else the pair of the count and the bound.
+impl Serialize for DataFamily {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.bound {
+            None => self.count.serialize(serializer),
+            Some(bound) => (self.count, bound).serialize(serializer),
+        }
+    }
+}
+
+/// The run-time values of a Program's integer data families
+/// ([`ExponentLutProgramBuilder::data_family`]). A preprocessing and the online evaluation that
+/// consumes it must be given the same data; the preprocessing records its
+/// [`commitment`](Self::commitment).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramData(BTreeMap<DataId, Vec<usize>>);
+
+impl ProgramData {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// These data with family `family` set to `values`.
+    pub fn with(mut self, family: DataId, values: Vec<usize>) -> Self {
+        self.0.insert(family, values);
+        self
+    }
+
+    /// The values of family `family`.
+    pub fn values(&self, family: DataId) -> Option<&[usize]> {
+        self.0.get(&family).map(Vec::as_slice)
+    }
+
+    /// The graph input name of family `family`.
+    pub fn input_name(family: DataId) -> String {
+        format!("exponent-lut/data.{}", family.0)
+    }
+
+    /// The commitment to the data: the digest of every family's values.
+    pub fn commitment(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/program-data/v1");
+        digest.update(serde_json::to_vec(&self.0).expect("program data encoding"));
+        digest.finalize().into()
+    }
+
+    /// Checks the data against `program`: one value per member of each declared family, every
+    /// entry of a bounded family below its bound, every selected RHS member below its family's
+    /// count, and every LUT value below its output width.
+    pub fn validate(&self, program: &ExponentLutProgram) -> Result<(), ProgramValidationError> {
+        let invalid = |reason: &str| ProgramValidationError::InvalidStructure(reason.into());
+        if self.0.keys().ne(program.data.keys()) ||
+            self.0.iter().any(|(family, values)| {
+                program.data.get(family).map(DataFamily::count) != Some(values.len())
+            })
+        {
+            return Err(invalid("program data does not match the declared families"));
+        }
+        // A bounded family's entries (each wire member it selects, by the static check that
+        // the bound is at most the family's member count).
+        if program.data.iter().any(|(family, declaration)| {
+            declaration
+                .bound
+                .is_some_and(|bound| self.0[family].iter().any(|value| *value >= bound))
+        }) {
+            return Err(ProgramValidationError::MemberOutOfBounds);
+        }
+        for table in &program.luts {
+            if let Some((family, offset)) = table.data_values() &&
+                self.0[&family][offset..offset + table.input_width]
+                    .iter()
+                    .any(|value| *value >= table.output_width)
+            {
+                return Err(ProgramValidationError::InvalidLut);
+            }
+        }
+        fn selections(body: &Body, out: &mut Vec<(RhsId, DataId, IntExpr)>) {
+            for step in &body.steps {
+                match step {
+                    Step::MulPrivate {
+                        rhs: Operand::Selected { family, data, position }, ..
+                    } => out.push((*family, *data, position.clone())),
+                    Step::Parallel { body, .. } => selections(body, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut selected = Vec::new();
+        selections(&program.body, &mut selected);
+        let env = ParamEnv::default();
+        for (family, data, position) in selected {
+            let count = match program.rhs_inputs.get(&family) {
+                Some(InputBinding::Family(count)) => count.evaluate(&env).ok(),
+                _ => None,
+            }
+            .and_then(|count| count.to_usize())
+            .ok_or_else(|| invalid("a selected RHS family has no concrete count"))?;
+            // A position in a family body selects through every member's entry.
+            let positions = match position.evaluate(&env).ok().and_then(|value| value.to_usize()) {
+                Some(position) => position..position + 1,
+                None => 0..self.0[&data].len(),
+            };
+            if self.0[&data][positions].iter().any(|member| *member >= count) {
+                return Err(ProgramValidationError::MemberOutOfBounds);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The integer data families of `program` as graph inputs named by `name`
+/// ([`ProgramData::input_name`] for a Program's own data; a stage lowering a child Program
+/// next to another names its data under the child's namespace).
+pub(crate) fn data_inputs(
+    program: &ExponentLutProgram,
+    name: impl Fn(DataId) -> String,
+) -> BTreeMap<DataId, mxx_dsl::Family<mxx_dsl::Int>> {
+    program
+        .data
+        .iter()
+        .map(|(family, declaration)| {
+            (*family, mxx_dsl::int_family_input(name(*family), declaration.count))
+        })
+        .collect()
+}
+
 /// Input-only projection used by the encryption stage.  It intentionally
 /// excludes body, RHS declarations, and the program identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -636,6 +850,13 @@ pub struct EncryptionInputs {
 }
 
 impl EncryptionInputs {
+    /// The input-only projection of a Dynamic setup: its input coordinates,
+    /// keyed by `WireId(coordinate)` in the setup's namespace, and no LUT.
+    pub(crate) fn from_setup(
+        inputs: impl IntoIterator<Item = (WireId, ProgramInputDeclaration)>,
+    ) -> Self {
+        Self { inputs: inputs.into_iter().collect(), luts: Vec::new() }
+    }
     pub fn inputs(&self) -> &BTreeMap<WireId, ProgramInputDeclaration> {
         &self.inputs
     }
@@ -649,9 +870,10 @@ impl EncryptionInputs {
 pub struct ExponentLutProgram {
     id: ExponentLutProgramId,
     inputs: BTreeMap<WireId, ProgramInputDeclaration>,
+    /// The integer data families supplied at run time.
+    data: BTreeMap<DataId, DataFamily>,
     rhs_inputs: BTreeMap<RhsId, InputShape>,
     luts: Vec<LutTable>,
-    tables: BTreeMap<TableId, TableDecl>,
     body: Body,
     metadata_cache: OnceLock<BTreeMap<WireId, WireMetadata>>,
 }
@@ -671,15 +893,17 @@ impl ExponentLutProgram {
         debug_assert_eq!(canonical_program_id(&program), self.id);
         program
     }
-    pub(crate) fn inputs(&self) -> &BTreeMap<WireId, ProgramInputDeclaration> {
+    /// The declared inputs.
+    pub fn inputs(&self) -> &BTreeMap<WireId, ProgramInputDeclaration> {
         &self.inputs
     }
-    pub(crate) fn rhs_inputs(&self) -> &BTreeMap<RhsId, InputShape> {
+    /// The declared RHS inputs.
+    pub fn rhs_inputs(&self) -> &BTreeMap<RhsId, InputShape> {
         &self.rhs_inputs
     }
-    /// The runtime integer tables a stage binds before lowering.
-    pub fn tables(&self) -> &BTreeMap<TableId, TableDecl> {
-        &self.tables
+    /// The declared integer data families.
+    pub fn data_families(&self) -> &BTreeMap<DataId, DataFamily> {
+        &self.data
     }
     /// Resolve a LUT registration by its validated instruction output, including
     /// instructions nested in parallel bodies. Identity is independent of table
@@ -720,6 +944,18 @@ impl ExponentLutProgram {
         visit(&self.body, &mut pairs);
         pairs
     }
+    /// The outputs of the root-scope `MulPrivate` and `Lut` steps: one
+    /// value each, outside every family body.
+    pub(crate) fn root_private_sites(&self) -> std::collections::BTreeSet<WireId> {
+        self.body
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::MulPrivate { output, .. } | Step::Lut { output, .. } => Some(*output),
+                _ => None,
+            })
+            .collect()
+    }
     /// The `(input, table)` of every LUT inside a family body, in body
     /// order; a member input is named by its family, whose level is its
     /// members'. Lowerings prepare their material at root scope, where every
@@ -728,15 +964,8 @@ impl ExponentLutProgram {
         fn visit(body: &Body, nested: bool, luts: &mut Vec<(WireId, LutId)>) {
             for step in &body.steps {
                 match step {
-                    Step::Lut {
-                        input:
-                            Operand::Scalar(input) |
-                            Operand::Member { family: input, .. } |
-                            Operand::Lookup { family: input, .. },
-                        table,
-                        ..
-                    } if nested => {
-                        luts.push((*input, *table));
+                    Step::Lut { input, table, .. } if nested => {
+                        luts.push((*input.source(), *table));
                     }
                     Step::Parallel { body, .. } => visit(body, true, luts),
                     _ => {}
@@ -785,26 +1014,34 @@ impl ExponentLutProgram {
         Ok(None)
     }
 
-    /// Return whether a validated wire is the raw output of a coefficient LUT
-    /// lineage.  Input declarations intentionally have no inferred layout.
+    /// Return whether a validated wire is the raw output of a private
+    /// coefficient LUT lineage, a carrier finalized once at its output (see
+    /// [`Self::wire_coefficient_bound`]). Input declarations intentionally
+    /// have no inferred layout.
     pub fn wire_is_coefficient_output(&self, wire: WireId) -> Result<bool, ProgramValidationError> {
         Ok(self.wire_coefficient_bound(wire)?.is_some())
     }
 
-    /// The payload bound `W` of a coefficient wire (`|v| <= W` for every
-    /// coefficient of its payload under the LUT input contract of
+    /// The payload bound `W` of a private coefficient wire (`|v| <= W` for
+    /// every coefficient of its payload under the LUT input contract of
     /// [`LutOutputRepresentation`]), or `None` for an exponent wire: the
     /// largest table value of a coefficient LUT, the sum of the bounds of an
     /// `Add`, and `n W` for the `Sum` of `n` members.
+    ///
+    /// A public wire is `None` as well: a coefficient LUT on a public payload
+    /// yields an ordinary public encoding of its (public) value, which needs no
+    /// finalization. Program validation still treats such a wire as a
+    /// coefficient wire, so it cannot be the input of a LUT or a product.
     pub fn wire_coefficient_bound(
         &self,
         wire: WireId,
     ) -> Result<Option<u64>, ProgramValidationError> {
-        let metadata = self.metadata()?;
-        metadata
-            .get(&wire)
-            .map(|metadata| metadata.coefficient_bound)
-            .ok_or(ProgramValidationError::UndefinedWire(wire))
+        let metadata =
+            self.metadata()?.get(&wire).ok_or(ProgramValidationError::UndefinedWire(wire))?;
+        Ok(match metadata.knowledge {
+            AttributeKnowledge::PrivatePayload => metadata.coefficient_bound,
+            AttributeKnowledge::PublicPayload => None,
+        })
     }
 
     /// Wire metadata of the immutable program. The structure is validated
@@ -852,7 +1089,7 @@ pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationEr
     {
         return Err(ProgramValidationError::InvalidLut);
     }
-    if let Some(values) = &table.values &&
+    if let LutValues::Constant(values) = &table.values &&
         (values.len() != table.input_width ||
             values.iter().any(|value| *value >= table.output_width))
     {
@@ -873,23 +1110,17 @@ fn lut_values_digest(values: &[usize]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/// The Program identity: the digest of its inputs, RHS inputs, LUT tables
-/// (each with its values by their digest), body and runtime table
-/// declarations. A Program without runtime tables omits the empty
-/// declarations, so its identity is the one it had before Programs could
-/// declare them.
+/// The Program identity: the digest of its inputs, data families (their counts and bounds, see
+/// [`DataFamily`]'s encoding), RHS inputs, LUT tables (each with its values by their digest)
+/// and body. Data values are not part of it.
 pub(crate) fn canonical_program_id(program: &ExponentLutProgram) -> ExponentLutProgramId {
-    let bytes = if program.tables.is_empty() {
-        serde_json::to_vec(&(&program.inputs, &program.rhs_inputs, &program.luts, &program.body))
-    } else {
-        serde_json::to_vec(&(
-            &program.inputs,
-            &program.rhs_inputs,
-            &program.luts,
-            &program.body,
-            &program.tables,
-        ))
-    }
+    let bytes = serde_json::to_vec(&(
+        &program.inputs,
+        &program.data,
+        &program.rhs_inputs,
+        &program.luts,
+        &program.body,
+    ))
     .expect("program canonical encoding");
     let mut digest = Sha256::new();
     digest.update(b"mxx-exponent-lut/program/v1");
@@ -912,10 +1143,19 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
     // Validate nested operations before validating the root output contract.
     // This makes a malformed member used inside a nested body observable even
     // when the fixture's eventual root output is itself not a scalar.
+    for table in &program.luts {
+        if let Some((family, offset)) = table.data_values() &&
+            !program.data.get(&family).is_some_and(|declaration| {
+                offset.checked_add(table.input_width).is_some_and(|end| end <= declaration.count)
+            })
+        {
+            return Err(ProgramValidationError::InvalidLut);
+        }
+    }
     validate_body(
         &program.body,
         &program.luts,
-        &program.tables,
+        &program.data,
         &mut visible,
         &mut all_wires,
         &mut rhs,
@@ -938,7 +1178,7 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
                 _ => true,
             },
             // A root output names a fixed member.
-            Operand::Lookup { .. } => true,
+            Operand::Selected { .. } => true,
         })
     {
         return Err(ProgramValidationError::InvalidOutputCount);
@@ -1101,7 +1341,7 @@ fn metadata_for_operand(
     let wire = match operand {
         Operand::Scalar(wire) |
         Operand::Member { family: wire, .. } |
-        Operand::Lookup { family: wire, .. } => wire,
+        Operand::Selected { family: wire, .. } => wire,
     };
     metadata.get(wire).copied().ok_or(ProgramValidationError::UndefinedWire(*wire))
 }
@@ -1124,7 +1364,7 @@ impl VisibleKind {
 fn validate_body(
     body: &Body,
     luts: &[LutTable],
-    tables: &BTreeMap<TableId, TableDecl>,
+    data: &BTreeMap<DataId, DataFamily>,
     visible: &mut BTreeMap<WireId, VisibleKind>,
     all_wires: &mut BTreeSet<WireId>,
     rhs: &mut BTreeMap<RhsId, VisibleKind>,
@@ -1137,29 +1377,29 @@ fn validate_body(
     for step in &body.steps {
         let (output, kind) = match step {
             Step::Add { lhs, rhs: right, output } => {
-                check_wire_operand(lhs, visible, tables, false, depth, loop_bounds)?;
-                check_wire_operand(right, visible, tables, false, depth, loop_bounds)?;
+                check_wire_operand(lhs, visible, data, false, depth, loop_bounds)?;
+                check_wire_operand(right, visible, data, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::MulPublic { lhs, rhs, output } => {
-                check_wire_operand(lhs, visible, tables, false, depth, loop_bounds)?;
-                check_wire_operand(rhs, visible, tables, false, depth, loop_bounds)?;
+                check_wire_operand(lhs, visible, data, false, depth, loop_bounds)?;
+                check_wire_operand(rhs, visible, data, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::MulPrivate { input, rhs: right, output } => {
-                check_wire_operand(input, visible, tables, false, depth, loop_bounds)?;
-                check_rhs_operand(right, rhs, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, data, false, depth, loop_bounds)?;
+                check_rhs_operand(right, rhs, data, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::Lut { input, table, output } => {
-                check_wire_operand(input, visible, tables, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, data, false, depth, loop_bounds)?;
                 if (*table).0 as usize >= luts.len() {
                     return Err(ProgramValidationError::InvalidLutId(*table));
                 }
                 (*output, VisibleKind::Scalar)
             }
             Step::MulSmallConstant { input, coefficients, shift, output } => {
-                check_wire_operand(input, visible, tables, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, data, false, depth, loop_bounds)?;
                 check_small_constant(coefficients, shift, depth)?;
                 (*output, VisibleKind::Scalar)
             }
@@ -1174,7 +1414,7 @@ fn validate_body(
                 validate_body(
                     body,
                     luts,
-                    tables,
+                    data,
                     &mut child_visible,
                     all_wires,
                     rhs,
@@ -1194,7 +1434,7 @@ fn validate_body(
                 check_wire_operand(
                     &Operand::Scalar(*family),
                     visible,
-                    tables,
+                    data,
                     true,
                     depth,
                     loop_bounds,
@@ -1232,7 +1472,7 @@ fn validate_body(
     }
     if check_outputs {
         for output in &body.outputs {
-            check_wire_operand(output, visible, tables, false, depth, loop_bounds)?;
+            check_wire_operand(output, visible, data, false, depth, loop_bounds)?;
         }
     }
     if !root {
@@ -1297,7 +1537,7 @@ fn validate_range_with_bounds(
 fn check_wire_operand(
     operand: &Operand<WireId>,
     visible: &BTreeMap<WireId, VisibleKind>,
-    tables: &BTreeMap<TableId, TableDecl>,
+    data: &BTreeMap<DataId, DataFamily>,
     family: bool,
     depth: u32,
     loop_bounds: &BTreeMap<u32, IntInterval>,
@@ -1325,37 +1565,41 @@ fn check_wire_operand(
             check_member_bounds(index, count, loop_bounds)?;
             Ok(())
         }
-        Operand::Lookup { family: id, table, index } => {
+        Operand::Selected { family: id, data: data_id, position } => {
             if family {
                 return Err(ProgramValidationError::ExpectedFamilyWire(*id));
             }
             let Some(VisibleKind::Family(count)) = visible.get(id) else {
                 return Err(ProgramValidationError::ExpectedFamilyWire(*id));
             };
-            let declaration =
-                tables.get(table).ok_or(ProgramValidationError::UndefinedTable(*table))?;
-            if let Some(slot) = invalid_loop_slot(index, depth) {
+            let declaration = data.get(data_id).ok_or(ProgramValidationError::InvalidStructure(
+                "undeclared integer data family".into(),
+            ))?;
+            // Every entry must address a member, which only a bounded family guarantees.
+            let bound = declaration.bound.ok_or(ProgramValidationError::InvalidStructure(
+                "a wire member is selected by a bounded integer data family".into(),
+            ))?;
+            if let Some(slot) = invalid_loop_slot(position, depth) {
                 return Err(ProgramValidationError::InvalidLoopIndex(slot));
             }
-            // The index addresses an entry, and every entry a member.
-            check_member_bounds(index, &declaration.count, loop_bounds)?;
-            check_table_bound(&declaration.bound, count, loop_bounds)
+            // The position addresses an entry, and every entry a member.
+            check_member_bounds(position, &IntExpr::constant(declaration.count), loop_bounds)?;
+            check_data_bound(bound, count, loop_bounds)
         }
     }
 }
 
-/// Every entry of a table, in `[0, bound)`, addresses a member of a family of
-/// `count` members: `bound <= count`. As for a member index, the largest
-/// known bound is checked against the smallest known count.
-fn check_table_bound(
-    bound: &IntExpr,
+/// Every entry of a bounded data family, in `[0, bound)`, addresses a member
+/// of a family of `count` members: `bound <= count`. As for a member index,
+/// the bound is checked against the smallest known count.
+fn check_data_bound(
+    bound: usize,
     count: &IntExpr,
     loop_bounds: &BTreeMap<u32, IntInterval>,
 ) -> Result<(), ProgramValidationError> {
-    let bound = interval_of(bound, loop_bounds);
     let count = interval_of(count, loop_bounds);
-    if let (Some(bound_max), Some(count_min)) = (&bound.maximum, &count.minimum) &&
-        bound_max > count_min
+    if let Some(count_min) = &count.minimum &&
+        num_bigint::BigInt::from(bound) > *count_min
     {
         return Err(ProgramValidationError::MemberOutOfBounds);
     }
@@ -1365,24 +1609,17 @@ fn check_table_bound(
 fn check_rhs_operand(
     operand: &Operand<RhsId>,
     rhs: &BTreeMap<RhsId, VisibleKind>,
-    family: bool,
+    data: &BTreeMap<DataId, DataFamily>,
     depth: u32,
     loop_bounds: &BTreeMap<u32, IntInterval>,
 ) -> Result<(), ProgramValidationError> {
     match operand {
         Operand::Scalar(id) => match rhs.get(id) {
-            Some(VisibleKind::Family(_)) if family => Ok(()),
-            Some(VisibleKind::Scalar) if family => {
-                Err(ProgramValidationError::ExpectedFamilyRhs(*id))
-            }
             Some(VisibleKind::Family(_)) => Err(ProgramValidationError::ExpectedScalarRhs(*id)),
             Some(VisibleKind::Scalar) => Ok(()),
             None => Err(ProgramValidationError::UndefinedRhs(*id)),
         },
         Operand::Member { family: id, index } => {
-            if family {
-                return Err(ProgramValidationError::ExpectedFamilyRhs(*id));
-            }
             let Some(VisibleKind::Family(count)) = rhs.get(id) else {
                 return Err(ProgramValidationError::ExpectedFamilyRhs(*id));
             };
@@ -1392,9 +1629,23 @@ fn check_rhs_operand(
             check_member_bounds(index, count, loop_bounds)?;
             Ok(())
         }
-        Operand::Lookup { .. } => Err(ProgramValidationError::InvalidStructure(
-            "an RHS operand cannot be a table lookup".into(),
-        )),
+        Operand::Selected { family: id, data: data_id, position } => {
+            let Some(VisibleKind::Family(count)) = rhs.get(id) else {
+                return Err(ProgramValidationError::ExpectedFamilyRhs(*id));
+            };
+            let declaration = data.get(data_id).ok_or(ProgramValidationError::InvalidStructure(
+                "undeclared integer data family".into(),
+            ))?;
+            if let Some(slot) = invalid_loop_slot(position, depth) {
+                return Err(ProgramValidationError::InvalidLoopIndex(slot));
+            }
+            check_member_bounds(position, &IntExpr::constant(declaration.count), loop_bounds)?;
+            // An unbounded family's entries are checked with the data ([`ProgramData::validate`]).
+            match declaration.bound {
+                Some(bound) => check_data_bound(bound, count, loop_bounds),
+                None => Ok(()),
+            }
+        }
     }
 }
 
@@ -1922,6 +2173,44 @@ mod tests {
         );
     }
 
+    /// A coefficient LUT on a public payload is a finished public wire, with
+    /// no coefficient bound to finalize, but validation still treats it as a
+    /// coefficient wire: it is neither a LUT input nor a product operand.
+    #[test]
+    fn public_coefficient_lut_output_is_finished_but_still_a_coefficient_wire() {
+        let program = |next: Option<bool>| {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+            let table = builder
+                .register_lut(
+                    LutTable::unary(
+                        2,
+                        ExpLayout { stride_log2: 0, width_log2: 1 },
+                        2,
+                        vec![0, 1],
+                        LutOutputRepresentation::Coefficient,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let output = builder.lut(Operand::Scalar(input), table).unwrap();
+            let output = match next {
+                None => output,
+                Some(true) => builder.lut(Operand::Scalar(output), table).unwrap(),
+                Some(false) => {
+                    builder.mul_public(Operand::Scalar(output), Operand::Scalar(input)).unwrap()
+                }
+            };
+            builder.finish(vec![Operand::Scalar(output)]).map(|program| (program, output))
+        };
+        let (finished, output) = program(None).unwrap();
+        assert_eq!(finished.wire_knowledge(output).unwrap(), AttributeKnowledge::PublicPayload);
+        assert_eq!(finished.wire_coefficient_bound(output).unwrap(), None);
+        assert!(!finished.wire_is_coefficient_output(output).unwrap());
+        assert!(program(Some(true)).is_err(), "a coefficient wire is not a LUT input");
+        assert!(program(Some(false)).is_err(), "a coefficient wire is not a product operand");
+    }
+
     #[test]
     fn metadata_validation_rejects_mixed_add_operands() {
         let mut builder = ExponentLutProgramBuilder::new();
@@ -2280,11 +2569,11 @@ mod tests {
         assert_eq!(canonical_program_id(&changed.without_lut_values()), changed.id());
     }
 
-    /// A table-free Program keeps the identity it had before Programs could
-    /// declare runtime tables: the pinned digest covers inputs, RHS inputs,
-    /// a LUT, a parallel member read and a sum.
+    /// A Program without integer data has a pinned identity: the digest
+    /// covers inputs, (no) data families, RHS inputs, a LUT, a parallel
+    /// member read and a sum.
     #[test]
-    fn canonical_identity_of_a_table_free_program_is_pinned() {
+    fn canonical_identity_of_a_data_free_program_is_pinned() {
         let mut builder = ExponentLutProgramBuilder::new();
         let inputs =
             builder.input_family(IntExpr::constant(3), AttributeKnowledge::PrivatePayload).unwrap();
@@ -2314,13 +2603,13 @@ mod tests {
         let program = builder.finish(vec![Operand::Scalar(sum)]).unwrap();
         assert_eq!(
             program.id().hex(),
-            "3e928f983af1a62ca50ca3eea6e67e2d728ccc14130a8e2628eeacebede1dc5c"
+            "850f9cae505a863d3d3c9d1815711561634c1938d1ed1b678032d1baef3ecc51"
         );
     }
 
-    /// A Program reading `family` (of `members`) through a table of
+    /// A Program reading `family` (of `members`) through a data family of
     /// `entries` entries in `[0, bound)`, in a loop over `reads` entries.
-    fn lookup_program(
+    fn selection_program(
         members: usize,
         entries: usize,
         bound: usize,
@@ -2330,12 +2619,12 @@ mod tests {
         let family = builder
             .input_family(IntExpr::constant(members), AttributeKnowledge::PublicPayload)
             .unwrap();
-        let table = builder.table(IntExpr::constant(entries), IntExpr::constant(bound))?;
+        let data = builder.data_family(entries, Some(bound))?;
         let products = builder.parallel(FamilyRange::full(IntExpr::constant(reads))?, {
             |builder, index| {
                 builder
                     .add(
-                        Operand::Lookup { family, table, index: index.clone() },
+                        Operand::Selected { family, data, position: index.clone() },
                         Operand::Member { family, index: IntExpr::constant(0) },
                     )
                     .map(Operand::Scalar)
@@ -2345,71 +2634,79 @@ mod tests {
         Ok((builder.finish(vec![Operand::Scalar(output)])?, products))
     }
 
-    /// A lookup reads a member of its family: its index stays within the
-    /// table, the table's bound within the family, and its metadata is the
-    /// family's.
+    /// A wire selection reads a member of its family: its position stays
+    /// within the data, the data's bound within the family, and its metadata
+    /// is the family's.
     #[test]
-    fn lookup_validation_bounds_the_index_by_the_table_and_the_table_by_the_family() {
-        let (program, products) = lookup_program(4, 6, 4, 6).unwrap();
+    fn wire_selection_bounds_the_position_by_the_data_and_the_data_by_the_family() {
+        let (program, products) = selection_program(4, 6, 4, 6).unwrap();
         assert_eq!(program.wire_knowledge(products).unwrap(), AttributeKnowledge::PublicPayload);
         assert_eq!(
-            program.tables().values().map(|table| table.count().clone()).collect::<Vec<_>>(),
-            [IntExpr::constant(6)]
+            program.data_families().values().copied().collect::<Vec<_>>(),
+            [DataFamily { count: 6, bound: Some(4) }]
         );
         assert_eq!(
-            lookup_program(4, 6, 4, 7).unwrap_err(),
+            selection_program(4, 6, 4, 7).unwrap_err(),
             ProgramValidationError::MemberOutOfBounds
         );
         assert_eq!(
-            lookup_program(4, 6, 5, 6).unwrap_err(),
+            selection_program(4, 6, 5, 6).unwrap_err(),
             ProgramValidationError::MemberOutOfBounds
         );
-        assert!(lookup_program(4, 0, 4, 1).is_err());
-        assert!(lookup_program(4, 6, 0, 1).is_err());
+        assert!(selection_program(4, 0, 4, 1).is_err());
+        assert!(selection_program(4, 6, 0, 1).is_err());
     }
 
-    /// A lookup is a wire member read only: an undeclared table, an RHS
-    /// lookup, a root output lookup and a table declared in a body are
-    /// rejected.
+    /// A wire selection reads through a declared, bounded data family, and
+    /// never at a root output; data are declared at root scope only.
     #[test]
-    fn lookup_is_only_a_wire_member_read_of_a_declared_table() {
+    fn wire_selection_reads_a_declared_bounded_data_family() {
         let mut builder = ExponentLutProgramBuilder::new();
         let family =
             builder.input_family(IntExpr::constant(2), AttributeKnowledge::PublicPayload).unwrap();
         let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
-        let table = builder.table(IntExpr::constant(2), IntExpr::constant(2)).unwrap();
-        let read = |table| Operand::Lookup { family, table, index: IntExpr::constant(0) };
-        assert_eq!(
-            builder.add(read(TableId(7)), read(table)),
-            Err(ProgramValidationError::UndefinedTable(TableId(7)))
-        );
+        let data = builder.data_family(2, Some(2)).unwrap();
+        let unbounded = builder.data_family(2, None).unwrap();
+        let read = |data| Operand::Selected { family, data, position: IntExpr::constant(0) };
         assert!(matches!(
-            builder.mul_private(
-                read(table),
-                Operand::Lookup { family: rhs, table, index: IntExpr::constant(0) }
-            ),
+            builder.add(read(DataId(7)), read(data)),
             Err(ProgramValidationError::InvalidStructure(_))
         ));
+        assert!(matches!(
+            builder.add(read(unbounded), read(data)),
+            Err(ProgramValidationError::InvalidStructure(_))
+        ));
+        builder
+            .mul_private(
+                read(data),
+                Operand::Selected { family: rhs, data, position: IntExpr::constant(0) },
+            )
+            .unwrap();
         assert_eq!(
             builder.parallel(FamilyRange::full(IntExpr::constant(1)).unwrap(), |builder, _| {
-                builder.table(IntExpr::constant(1), IntExpr::constant(1))?;
-                Ok(read(table))
+                builder.data_family(1, Some(1))?;
+                Ok(read(data))
             }),
             Err(ProgramValidationError::InputInNestedBody)
         );
         assert_eq!(
-            builder.finish(vec![read(table)]),
+            builder.finish(vec![read(data)]),
             Err(ProgramValidationError::InvalidOutputCount)
         );
     }
 
-    /// Table declarations enter the identity of a Program that has them.
+    /// Data declarations, bounds included, enter the Program identity; an
+    /// unbounded declaration is encoded by its count alone.
     #[test]
-    fn canonical_identity_commits_table_declarations() {
-        let id = |entries, bound| lookup_program(4, entries, bound, 2).unwrap().0.id();
+    fn canonical_identity_commits_data_declarations() {
+        let id = |entries, bound| selection_program(4, entries, bound, 2).unwrap().0.id();
         assert_eq!(id(6, 4), id(6, 4));
         assert_ne!(id(6, 4), id(7, 4));
         assert_ne!(id(6, 4), id(6, 3));
+        assert_eq!(
+            serde_json::to_string(&DataFamily { count: 3, bound: None }).unwrap(),
+            serde_json::to_string(&3usize).unwrap()
+        );
     }
 
     #[test]
@@ -2464,9 +2761,9 @@ mod tests {
                     knowledge: AttributeKnowledge::PrivatePayload,
                 },
             )]),
+            data: std::collections::BTreeMap::new(),
             rhs_inputs: std::collections::BTreeMap::new(),
             luts: Vec::new(),
-            tables: std::collections::BTreeMap::new(),
             body: Body {
                 steps: vec![
                     Step::Parallel {
@@ -2522,9 +2819,9 @@ mod tests {
                     knowledge: AttributeKnowledge::PrivatePayload,
                 },
             )]),
+            data: std::collections::BTreeMap::new(),
             rhs_inputs: std::collections::BTreeMap::new(),
             luts: Vec::new(),
-            tables: std::collections::BTreeMap::new(),
             body: Body {
                 steps: vec![
                     Step::Parallel {
@@ -2579,6 +2876,105 @@ mod tests {
                 .unwrap();
         assert_eq!(
             FamilyScope::new(vec![range], vec![IntExpr::constant(2)]),
+            Err(ProgramValidationError::MemberOutOfBounds)
+        );
+    }
+
+    /// A Program that multiplies its input by the RHS member at `reads[0]` and looks the product
+    /// up in the table `tables[0..2]`.
+    fn data_program() -> (ExponentLutProgram, DataId, DataId) {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let reads = builder.data_family(1, None).unwrap();
+        let tables = builder.data_family(2, None).unwrap();
+        let product = builder
+            .mul_private(
+                Operand::Scalar(input),
+                Operand::Selected { family: rhs, data: reads, position: IntExpr::constant(0) },
+            )
+            .unwrap();
+        let table = builder
+            .register_lut(
+                LutTable::from_data(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    2,
+                    tables,
+                    0,
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let output = builder.lut(Operand::Scalar(product), table).unwrap();
+        (builder.finish(vec![Operand::Scalar(output)]).unwrap(), reads, tables)
+    }
+
+    #[test]
+    fn program_data_is_checked_against_the_declared_families() {
+        let (program, reads, tables) = data_program();
+        assert_eq!(
+            program
+                .data_families()
+                .iter()
+                .map(|(id, family)| (*id, family.count()))
+                .collect::<Vec<_>>(),
+            [(reads, 1), (tables, 2)]
+        );
+        let data = |read: usize, table: Vec<usize>| {
+            ProgramData::new().with(reads, vec![read]).with(tables, table)
+        };
+        data(1, vec![0, 1]).validate(&program).unwrap();
+        assert_eq!(
+            data(2, vec![0, 1]).validate(&program),
+            Err(ProgramValidationError::MemberOutOfBounds)
+        );
+        assert_eq!(data(0, vec![0, 2]).validate(&program), Err(ProgramValidationError::InvalidLut));
+        assert!(matches!(
+            data(0, vec![0]).validate(&program),
+            Err(ProgramValidationError::InvalidStructure(_))
+        ));
+        assert!(matches!(
+            ProgramData::new().with(reads, vec![0]).validate(&program),
+            Err(ProgramValidationError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn program_data_leaves_the_program_identity_and_moves_the_commitment() {
+        let (program, reads, tables) = data_program();
+        let (again, ..) = data_program();
+        assert_eq!(program.id(), again.id());
+        assert!(program.luts.iter().all(|table| table.values().is_none() && table.has_values()));
+        let first = ProgramData::new().with(reads, vec![0]).with(tables, vec![0, 1]);
+        let second = ProgramData::new().with(reads, vec![1]).with(tables, vec![0, 1]);
+        assert_eq!(first.commitment(), first.clone().commitment());
+        assert_ne!(first.commitment(), second.commitment());
+    }
+
+    /// An unbounded data family selects only RHS members.
+    #[test]
+    fn unbounded_selected_operands_are_only_private_product_rhs() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let inputs =
+            builder.input_family(IntExpr::constant(2), AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let reads = builder.data_family(1, None).unwrap();
+        let selected =
+            Operand::Selected { family: inputs, data: reads, position: IntExpr::constant(0) };
+        assert!(builder.add(selected.clone(), selected.clone()).is_err());
+        assert!(builder.mul_private(selected, Operand::Scalar(rhs)).is_err());
+    }
+
+    /// The entries of a bounded data family stay below its bound.
+    #[test]
+    fn program_data_checks_bounded_entries() {
+        let (program, _) = selection_program(4, 2, 3, 2).unwrap();
+        let data = *program.data_families().keys().next().unwrap();
+        ProgramData::new().with(data, vec![2, 0]).validate(&program).unwrap();
+        assert_eq!(
+            ProgramData::new().with(data, vec![3, 0]).validate(&program),
             Err(ProgramValidationError::MemberOutOfBounds)
         );
     }

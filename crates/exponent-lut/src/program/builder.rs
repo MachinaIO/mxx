@@ -20,8 +20,8 @@ use super::*;
 pub struct ExponentLutProgramBuilder {
     pub(crate) inputs: BTreeMap<WireId, ProgramInputDeclaration>,
     pub(crate) rhs_inputs: BTreeMap<RhsId, InputShape>,
+    pub(crate) data: BTreeMap<DataId, DataFamily>,
     pub(crate) luts: Vec<LutTable>,
-    tables: BTreeMap<TableId, TableDecl>,
     pub(crate) bodies: Vec<Body>,
     pub(crate) wire_kinds: BTreeMap<WireId, bool>,
     pub(crate) rhs_kinds: BTreeMap<RhsId, bool>,
@@ -35,8 +35,8 @@ impl ExponentLutProgramBuilder {
         Self {
             inputs: BTreeMap::new(),
             rhs_inputs: BTreeMap::new(),
+            data: BTreeMap::new(),
             luts: Vec::new(),
-            tables: BTreeMap::new(),
             bodies: vec![Body { steps: Vec::new(), outputs: Vec::new() }],
             wire_kinds: BTreeMap::new(),
             rhs_kinds: BTreeMap::new(),
@@ -116,27 +116,26 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    /// Declare a runtime integer table of `count` entries, each in
-    /// `[0, bound)`, read by [`Operand::Lookup`]. Tables are root
-    /// declarations: their shape is fixed for the whole Program, and the
-    /// lowering stage binds their entries.
-    pub fn table(
+    /// Declare a family of `count` integers supplied at run time, which selects RHS members
+    /// ([`Operand::Selected`]) and holds LUT values ([`LutTable::from_data`]). Lowerings read it
+    /// as an integer family input; the Program identity covers its count and bound, not its
+    /// values. With a `bound`, every entry is below it, and the family may also select members
+    /// of a wire family of at least `bound` members.
+    pub fn data_family(
         &mut self,
-        count: IntExpr,
-        bound: IntExpr,
-    ) -> Result<TableId, ProgramValidationError> {
+        count: usize,
+        bound: Option<usize>,
+    ) -> Result<DataId, ProgramValidationError> {
         if self.bodies.len() != 1 {
             return Err(ProgramValidationError::InputInNestedBody);
         }
-        if let Some(slot) = invalid_loop_slot(&count, 0).or_else(|| invalid_loop_slot(&bound, 0)) {
-            return Err(ProgramValidationError::InvalidLoopIndex(slot));
+        if count == 0 || bound == Some(0) {
+            return Err(ProgramValidationError::InvalidFamilyRange);
         }
-        FamilyRange::full(count.clone())?;
-        FamilyRange::full(bound.clone())?;
-        let id = TableId(
-            u32::try_from(self.tables.len()).map_err(|_| ProgramValidationError::IdExhausted)?,
+        let id = DataId(
+            u32::try_from(self.data.len()).map_err(|_| ProgramValidationError::IdExhausted)?,
         );
-        self.tables.insert(id, TableDecl { count, bound });
+        self.data.insert(id, DataFamily { count, bound });
         Ok(id)
     }
 
@@ -183,14 +182,16 @@ impl ExponentLutProgramBuilder {
                 invalid_loop_slot(index, (self.bodies.len() - 1) as u32)
                     .map_or(Ok(false), |slot| Err(ProgramValidationError::InvalidLoopIndex(slot)))
             }
-            Operand::Lookup { family, table, index } => {
+            Operand::Selected { family, data, position } => {
                 if self.wire_kinds.get(family) != Some(&true) {
                     return Err(ProgramValidationError::ExpectedFamilyWire(*family));
                 }
-                if !self.tables.contains_key(table) {
-                    return Err(ProgramValidationError::UndefinedTable(*table));
+                if self.data.get(data).and_then(DataFamily::bound).is_none() {
+                    return Err(ProgramValidationError::InvalidStructure(
+                        "a wire member is selected by a bounded integer data family".into(),
+                    ));
                 }
-                invalid_loop_slot(index, (self.bodies.len() - 1) as u32)
+                invalid_loop_slot(position, (self.bodies.len() - 1) as u32)
                     .map_or(Ok(false), |slot| Err(ProgramValidationError::InvalidLoopIndex(slot)))
             }
         }
@@ -201,16 +202,21 @@ impl ExponentLutProgramBuilder {
             Operand::Scalar(id) => {
                 self.rhs_kinds.get(id).copied().ok_or(ProgramValidationError::UndefinedRhs(*id))
             }
-            Operand::Member { family, index } => {
+            Operand::Member { family, index: position } |
+            Operand::Selected { family, position, .. } => {
                 if self.rhs_kinds.get(family) != Some(&true) {
                     return Err(ProgramValidationError::ExpectedFamilyRhs(*family));
                 }
-                invalid_loop_slot(index, (self.bodies.len() - 1) as u32)
+                if let Operand::Selected { data, .. } = operand &&
+                    !self.data.contains_key(data)
+                {
+                    return Err(ProgramValidationError::InvalidStructure(
+                        "undeclared integer data family".into(),
+                    ));
+                }
+                invalid_loop_slot(position, (self.bodies.len() - 1) as u32)
                     .map_or(Ok(false), |slot| Err(ProgramValidationError::InvalidLoopIndex(slot)))
             }
-            Operand::Lookup { .. } => Err(ProgramValidationError::InvalidStructure(
-                "an RHS operand cannot be a table lookup".into(),
-            )),
         }
     }
 
@@ -218,11 +224,7 @@ impl ExponentLutProgramBuilder {
         &self,
         operand: &Operand<WireId>,
     ) -> Result<AttributeKnowledge, ProgramValidationError> {
-        let wire = match operand {
-            Operand::Scalar(wire) |
-            Operand::Member { family: wire, .. } |
-            Operand::Lookup { family: wire, .. } => wire,
-        };
+        let wire = operand.source();
         self.wire_knowledge.get(wire).copied().ok_or(ProgramValidationError::UndefinedWire(*wire))
     }
 
@@ -366,7 +368,7 @@ impl ExponentLutProgramBuilder {
         let result = body(self, IntExpr::LoopIndex(depth));
         let result = match result {
             Ok(Operand::Scalar(id)) => id,
-            Ok(Operand::Member { family, .. } | Operand::Lookup { family, .. }) => {
+            Ok(Operand::Member { family, .. } | Operand::Selected { family, .. }) => {
                 self.rollback(snapshot);
                 return Err(ProgramValidationError::ExpectedScalarWire(family));
             }
@@ -452,9 +454,9 @@ impl ExponentLutProgramBuilder {
         let mut program = ExponentLutProgram {
             id: ExponentLutProgramId::from_digest([0; 32]),
             inputs: self.inputs,
+            data: self.data,
             rhs_inputs: self.rhs_inputs,
             luts: self.luts,
-            tables: self.tables,
             body: self.bodies.remove(0),
             metadata_cache: std::sync::OnceLock::new(),
         };

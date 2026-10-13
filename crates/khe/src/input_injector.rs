@@ -137,10 +137,8 @@ impl DiamondInputConfig {
     }
 
     pub fn state_columns(&self) -> Result<usize, DiamondInputConfigError> {
-        self.state_rows()
-            .checked_mul(
-                self.digit_count.checked_add(2).ok_or(DiamondInputConfigError::LayoutOverflow)?,
-            )
+        mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns(self.state_rows(), self.digit_count)
             .ok_or(DiamondInputConfigError::LayoutOverflow)
     }
 
@@ -201,7 +199,8 @@ impl DiamondInputParams {
     }
 
     pub fn state_columns(&self) -> IntExpr {
-        (self.state_rows() * (&self.digit_count + IntExpr::constant(2))).canonicalize()
+        mxx_ir_core::types::TrapdoorInstantiation::Computational
+            .columns_expr(self.state_rows(), self.digit_count.clone())
     }
 
     pub fn max_state_count(&self) -> IntExpr {

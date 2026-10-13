@@ -22,6 +22,8 @@
 #include "MatrixRawRns.cu"
 #include "MatrixSmallRhs.cu" // compact bounded RHS implementation and staged kernels
 #include "MatrixPreimageRaw.cu"
+// After the preimage status kernels, which the statistical TrapGen retry reuses.
+#include "MatrixStatisticalTrapdoor.cu"
 #include "MatrixPolynomialValues.cu"
 #include "MatrixRawRemaining.cu"
 #include "MatrixIndexed.cu"

@@ -71,12 +71,11 @@ pub trait ProgramLoweringContext: ExponentLUTProgramLowering {
     fn replace_site(&mut self, site: Option<LoweringSite>) -> Option<LoweringSite>;
 }
 
-/// The values bound to a Program's inputs, RHS inputs and runtime tables
-/// while it is lowered. `T` is the family execution's table representation.
-pub struct Environment<W, R, WF, RF, T> {
+/// The values bound to a Program's inputs and RHS inputs while it is lowered.
+/// Its integer data are the family execution's ([`FamilyExecution::wire_selected`]).
+pub struct Environment<W, R, WF, RF> {
     pub(crate) wires: BTreeMap<WireId, InputBinding<W, WF>>,
     pub(crate) rhs: BTreeMap<RhsId, InputBinding<R, RF>>,
-    pub(crate) tables: BTreeMap<TableId, T>,
 }
 
 enum LoweredValue<W, F> {
@@ -84,9 +83,9 @@ enum LoweredValue<W, F> {
     Family(F),
 }
 
-impl<W, R, WF, RF, T> Environment<W, R, WF, RF, T> {
+impl<W, R, WF, RF> Environment<W, R, WF, RF> {
     pub fn new() -> Self {
-        Self { wires: BTreeMap::new(), rhs: BTreeMap::new(), tables: BTreeMap::new() }
+        Self { wires: BTreeMap::new(), rhs: BTreeMap::new() }
     }
     pub fn bind_wire(
         &mut self,
@@ -108,13 +107,6 @@ impl<W, R, WF, RF, T> Environment<W, R, WF, RF, T> {
         }
         Ok(())
     }
-    /// Bind the entries of a declared runtime table.
-    pub fn bind_table(&mut self, id: TableId, value: T) -> Result<(), ProgramValidationError> {
-        if self.tables.insert(id, value).is_some() {
-            return Err(ProgramValidationError::DuplicateBinding);
-        }
-        Ok(())
-    }
 }
 
 pub trait FamilyExecution<E>
@@ -123,8 +115,6 @@ where
 {
     type WireFamily: Clone;
     type RhsFamily: Clone;
-    /// A bound runtime integer table.
-    type Table: Clone;
     /// Member `index` of `family`. The evaluator observes the read (the noise
     /// evaluator records the read's payload support).
     fn wire_at(
@@ -133,20 +123,28 @@ where
         family: &Self::WireFamily,
         index: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>>;
-    /// Member `table[index]` of `family` ([`Operand::Lookup`]): the member
-    /// is a runtime value, so an execution that needs the member statically
-    /// treats it as unknown.
-    fn wire_at_table(
+    /// The member of `family` whose index is entry `position` of the bounded integer data
+    /// family `data` ([`Operand::Selected`]): the member is a runtime value, so an execution
+    /// that needs the member statically treats it as unknown.
+    fn wire_selected(
         &mut self,
         evaluator: &mut E,
         family: &Self::WireFamily,
-        table: &Self::Table,
-        index: &IntExpr,
+        data: DataId,
+        position: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>>;
     fn rhs_at(
         &mut self,
         family: &Self::RhsFamily,
         index: &IntExpr,
+    ) -> Result<E::Rhs, ProgramLowerError<E::Error>>;
+    /// The member of `family` whose index is entry `position` of the integer data family `data`
+    /// ([`Operand::Selected`]).
+    fn rhs_selected(
+        &mut self,
+        family: &Self::RhsFamily,
+        data: DataId,
+        position: &IntExpr,
     ) -> Result<E::Rhs, ProgramLowerError<E::Error>>;
     fn parallel(
         &mut self,
@@ -180,7 +178,7 @@ pub(crate) fn lower_program<E, F>(
     program: &ExponentLutProgram,
     evaluator: &mut E,
     families: &mut F,
-    environment: &mut Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily, F::Table>,
+    environment: &mut Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily>,
 ) -> Result<Vec<E::Wire>, ProgramLowerError<E::Error>>
 where
     E: ExponentLUTProgramLowering + ProgramLoweringContext,
@@ -190,9 +188,7 @@ where
     if program.inputs.keys().any(|id| !environment.wires.contains_key(id)) ||
         program.rhs_inputs.keys().any(|id| !environment.rhs.contains_key(id)) ||
         environment.wires.keys().any(|id| !program.inputs.contains_key(id)) ||
-        environment.rhs.keys().any(|id| !program.rhs_inputs.contains_key(id)) ||
-        program.tables.keys().any(|id| !environment.tables.contains_key(id)) ||
-        environment.tables.keys().any(|id| !program.tables.contains_key(id))
+        environment.rhs.keys().any(|id| !program.rhs_inputs.contains_key(id))
     {
         return Err(ProgramLowerError::Program(ProgramValidationError::MissingBinding));
     }
@@ -245,7 +241,7 @@ fn lower_body<E, F>(
     body: &Body,
     evaluator: &mut E,
     families: &mut F,
-    environment: &mut Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily, F::Table>,
+    environment: &mut Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily>,
     indices: &mut Vec<IntExpr>,
     ranges: &mut Vec<FamilyRange>,
     progress: &mut LoweringProgress,
@@ -400,7 +396,7 @@ fn last_reads(body: &Body) -> Vec<Vec<WireId>> {
         let operand = |operand: &Operand<WireId>, into: &mut Vec<WireId>| match operand {
             Operand::Scalar(id) |
             Operand::Member { family: id, .. } |
-            Operand::Lookup { family: id, .. } => into.push(*id),
+            Operand::Selected { family: id, .. } => into.push(*id),
         };
         match step {
             Step::Add { lhs, rhs, .. } | Step::MulPublic { lhs, rhs, .. } => {
@@ -439,7 +435,7 @@ fn last_reads(body: &Body) -> Vec<Vec<WireId>> {
         match output {
             Operand::Scalar(id) |
             Operand::Member { family: id, .. } |
-            Operand::Lookup { family: id, .. } => {
+            Operand::Selected { family: id, .. } => {
                 last.remove(id);
             }
         }
@@ -467,7 +463,7 @@ fn resolve_wire<E, F>(
     operand: &Operand<WireId>,
     evaluator: &mut E,
     families: &mut F,
-    environment: &Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily, F::Table>,
+    environment: &Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily>,
     indices: &[IntExpr],
 ) -> Result<E::Wire, ProgramLowerError<E::Error>>
 where
@@ -491,33 +487,25 @@ where
             }
             None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedWire(*family))),
         },
-        Operand::Lookup { family, table, index } => {
-            let table = environment
-                .tables
-                .get(table)
-                .ok_or(ProgramValidationError::UndefinedTable(*table))?;
-            match environment.wires.get(family) {
-                Some(InputBinding::Family(value)) => families.wire_at_table(
-                    evaluator,
-                    value,
-                    table,
-                    &substitute_indices(index, indices)?,
-                ),
-                Some(InputBinding::Scalar(_)) => Err(ProgramLowerError::Program(
-                    ProgramValidationError::ExpectedFamilyWire(*family),
-                )),
-                None => {
-                    Err(ProgramLowerError::Program(ProgramValidationError::UndefinedWire(*family)))
-                }
+        Operand::Selected { family, data, position } => match environment.wires.get(family) {
+            Some(InputBinding::Family(value)) => families.wire_selected(
+                evaluator,
+                value,
+                *data,
+                &substitute_indices(position, indices)?,
+            ),
+            Some(InputBinding::Scalar(_)) => {
+                Err(ProgramLowerError::Program(ProgramValidationError::ExpectedFamilyWire(*family)))
             }
-        }
+            None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedWire(*family))),
+        },
     }
 }
 
 fn resolve_rhs<E, F>(
     operand: &Operand<RhsId>,
     families: &mut F,
-    environment: &Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily, F::Table>,
+    environment: &Environment<E::Wire, E::Rhs, F::WireFamily, F::RhsFamily>,
     indices: &[IntExpr],
 ) -> Result<E::Rhs, ProgramLowerError<E::Error>>
 where
@@ -541,11 +529,15 @@ where
             }
             None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedRhs(*family))),
         },
-        Operand::Lookup { .. } => {
-            Err(ProgramLowerError::Program(ProgramValidationError::InvalidStructure(
-                "an RHS operand cannot be a table lookup".into(),
-            )))
-        }
+        Operand::Selected { family, data, position } => match environment.rhs.get(family) {
+            Some(InputBinding::Family(value)) => {
+                families.rhs_selected(value, *data, &substitute_indices(position, indices)?)
+            }
+            Some(InputBinding::Scalar(_)) => {
+                Err(ProgramLowerError::Program(ProgramValidationError::ExpectedFamilyRhs(*family)))
+            }
+            None => Err(ProgramLowerError::Program(ProgramValidationError::UndefinedRhs(*family))),
+        },
     }
 }
 
@@ -680,25 +672,30 @@ mod tests {
         }
     }
 
-    struct MockFamilies;
+    /// The family adapter of the mock, with the Program data its selections read.
+    #[derive(Default)]
+    struct MockFamilies(crate::program::ProgramData);
     impl FamilyExecution<MockEvaluator> for MockFamilies {
         type WireFamily = Vec<i32>;
         type RhsFamily = Vec<i32>;
-        type Table = Vec<usize>;
 
-        fn wire_at_table(
+        fn wire_selected(
             &mut self,
             evaluator: &mut MockEvaluator,
             family: &Self::WireFamily,
-            table: &Self::Table,
-            index: &IntExpr,
+            data: DataId,
+            position: &IntExpr,
         ) -> Result<i32, ProgramLowerError<MockError>> {
-            let index = index
+            let position = position
                 .evaluate(&ParamEnv::default())
                 .map_err(|_| ProgramValidationError::MemberOutOfBounds)?;
-            let index = index.to_usize().ok_or(ProgramValidationError::MemberOutOfBounds)?;
-            let member = table.get(index).ok_or(ProgramValidationError::MemberOutOfBounds)?;
-            self.wire_at(evaluator, family, &IntExpr::constant(*member))
+            let position = position.to_usize().ok_or(ProgramValidationError::MemberOutOfBounds)?;
+            let member = self
+                .0
+                .values(data)
+                .and_then(|values| values.get(position).copied())
+                .ok_or(ProgramValidationError::MissingBinding)?;
+            self.wire_at(evaluator, family, &IntExpr::constant(member))
         }
 
         fn wire_at(
@@ -723,6 +720,14 @@ mod tests {
                 .map_err(|_| ProgramValidationError::MemberOutOfBounds)?;
             let index = index.to_usize().ok_or(ProgramValidationError::MemberOutOfBounds)?;
             family.get(index).copied().ok_or(ProgramValidationError::MemberOutOfBounds.into())
+        }
+        fn rhs_selected(
+            &mut self,
+            _: &Self::RhsFamily,
+            _: DataId,
+            _: &IntExpr,
+        ) -> Result<i32, ProgramLowerError<MockError>> {
+            Err(ProgramLowerError::UnsupportedStructure { reason: "mock has no data".into() })
         }
         fn parallel(
             &mut self,
@@ -782,11 +787,11 @@ mod tests {
         let sum = builder.sum(products).unwrap();
         let program = builder.finish(vec![Operand::Scalar(sum)]).unwrap();
 
-        let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>, Vec<usize>>::new();
+        let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>>::new();
         environment.bind_wire(input, InputBinding::Family(vec![1, 2, 3, 4])).unwrap();
         environment.bind_rhs(rhs, InputBinding::Family(vec![4, 5, 6, 7])).unwrap();
         let mut evaluator = MockEvaluator::default();
-        let mut families = MockFamilies;
+        let mut families = MockFamilies::default();
         let outputs =
             lower_program(&program, &mut evaluator, &mut families, &mut environment).unwrap();
         assert_eq!(outputs, vec![10]);
@@ -816,11 +821,11 @@ mod tests {
         let output = builder.lut(Operand::Scalar(product), lut).unwrap();
         let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
 
-        let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>, Vec<usize>>::new();
+        let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>>::new();
         environment.bind_wire(input, InputBinding::Scalar(3)).unwrap();
         environment.bind_rhs(rhs, InputBinding::Scalar(5)).unwrap();
         let mut evaluator = MockEvaluator::default();
-        let mut families = MockFamilies;
+        let mut families = MockFamilies::default();
         let outputs =
             lower_program(&program, &mut evaluator, &mut families, &mut environment).unwrap();
 
@@ -830,38 +835,40 @@ mod tests {
         assert!(evaluator.site.is_none());
     }
 
-    /// A lookup reads the member its bound table names; a declared table
-    /// must be bound.
+    /// A wire selection reads the member its bound data name; a declared data
+    /// family must be bound.
     #[test]
-    fn lower_program_reads_lookups_through_the_bound_table() {
+    fn lower_program_reads_wire_selections_through_the_bound_data() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input =
             builder.input_family(IntExpr::constant(4), AttributeKnowledge::PrivatePayload).unwrap();
-        let table = builder.table(IntExpr::constant(2), IntExpr::constant(4)).unwrap();
+        let data = builder.data_family(2, Some(4)).unwrap();
         let output = builder
             .add(
-                Operand::Lookup { family: input, table, index: IntExpr::constant(0) },
-                Operand::Lookup { family: input, table, index: IntExpr::constant(1) },
+                Operand::Selected { family: input, data, position: IntExpr::constant(0) },
+                Operand::Selected { family: input, data, position: IntExpr::constant(1) },
             )
             .unwrap();
         let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
 
         let environment = || {
-            let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>, Vec<usize>>::new();
+            let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>>::new();
             environment.bind_wire(input, InputBinding::Family(vec![10, 20, 30, 40])).unwrap();
             environment
         };
-        let mut bound = environment();
-        bound.bind_table(table, vec![3, 1]).unwrap();
-        let outputs =
-            lower_program(&program, &mut MockEvaluator::default(), &mut MockFamilies, &mut bound)
-                .unwrap();
+        let outputs = lower_program(
+            &program,
+            &mut MockEvaluator::default(),
+            &mut MockFamilies(crate::program::ProgramData::new().with(data, vec![3, 1])),
+            &mut environment(),
+        )
+        .unwrap();
         assert_eq!(outputs, vec![60]);
         assert!(matches!(
             lower_program(
                 &program,
                 &mut MockEvaluator::default(),
-                &mut MockFamilies,
+                &mut MockFamilies::default(),
                 &mut environment()
             ),
             Err(ProgramLowerError::Program(ProgramValidationError::MissingBinding))
@@ -892,11 +899,11 @@ mod tests {
             .finish(vec![Operand::Scalar(first_output), Operand::Scalar(second_output)])
             .unwrap();
 
-        let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>, Vec<usize>>::new();
+        let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>>::new();
         environment.bind_wire(first_input, InputBinding::Scalar(0)).unwrap();
         environment.bind_wire(second_input, InputBinding::Scalar(1)).unwrap();
         let mut evaluator = MockEvaluator::default();
-        let mut families = MockFamilies;
+        let mut families = MockFamilies::default();
         let outputs =
             lower_program(&program, &mut evaluator, &mut families, &mut environment).unwrap();
 

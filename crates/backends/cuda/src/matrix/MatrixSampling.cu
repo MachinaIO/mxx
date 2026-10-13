@@ -146,6 +146,28 @@ __device__ __forceinline__ int64_t sample_integer_karney(DeviceChaChaRng &rng, d
     return static_cast<int64_t>(llround(mean + stddev * sample_standard_normal(rng)));
 }
 
+// Widths above 2^40 are sampled by the convolution `y_0 + B y_1` with `B = 2^32`, `y_0` of
+// width `4 B`, and `y_1` of width `sqrt(sigma^2 - (4 B)^2) / B`, split recursively; the CPU sampler
+// (`sampler::uniform::wide_gaussian_split`) uses the same constants. Widths up to 2^58 keep every
+// sample within 13 widths below 2^63.
+constexpr double kWideGaussianThreshold = 1099511627776.0; // 2^40
+constexpr int kWideGaussianBaseBits = 32;
+
+__device__ __forceinline__ int64_t sample_wide_gaussian(DeviceChaChaRng &rng, double sigma)
+{
+    const double base = static_cast<double>(1ULL << kWideGaussianBaseBits);
+    const double low = 4.0 * base;
+    int64_t scale = 1;
+    int64_t sum = 0;
+    while (sigma > kWideGaussianThreshold)
+    {
+        sum += scale * sample_integer_karney(rng, 0.0, low);
+        sigma = sqrt(sigma * sigma - low * low) / base;
+        scale <<= kWideGaussianBaseBits;
+    }
+    return sum + scale * sample_integer_karney(rng, 0.0, sigma);
+}
+
 __device__ __forceinline__ void get_base_digits_u64(
     uint64_t value,
     uint64_t base,
@@ -300,7 +322,9 @@ namespace
             {
                 do
                 {
-                    signed_sample = sample_integer_karney(rng, 0.0, sigma);
+                    signed_sample = sigma > kWideGaussianThreshold ?
+                        sample_wide_gaussian(rng, sigma) :
+                        sample_integer_karney(rng, 0.0, sigma);
                 } while (centered_sample_abs_i64(signed_sample, coefficient_modulus) >
                     max_coefficient_bound);
             }
@@ -330,7 +354,7 @@ extern "C" int gpu_raw_matrix_sample(GpuContext *ctx, void *stream_raw,
         (distribution != GPU_MATRIX_DIST_UNIFORM && distribution != GPU_MATRIX_DIST_GAUSS &&
             distribution != GPU_MATRIX_DIST_INTERVAL) ||
         (distribution == GPU_MATRIX_DIST_INTERVAL && interval_minimum > interval_maximum) ||
-        (distribution == GPU_MATRIX_DIST_GAUSS && !(sigma > 0.0)) ||
+        (distribution == GPU_MATRIX_DIST_GAUSS && !(sigma > 0.0 && sigma <= 288230376151711744.0)) ||
         destination->column_origin > full_columns ||
         destination->columns > full_columns - destination->column_origin ||
         destination_binding_base > UINT32_MAX - destination->limb_count)

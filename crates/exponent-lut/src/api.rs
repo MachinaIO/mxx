@@ -536,22 +536,19 @@ pub trait PreprocessBuild<P: Poly> {
                 <Self::Evaluator as ExponentLUTProgramLowering>::Rhs,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::WireFamily,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::RhsFamily,
-                <Self::Families as FamilyExecution<Self::Evaluator>>::Table,
             >,
         ),
         ApiError,
     >;
 
-    /// Bind the Program, its RHS plaintexts, the entries of its runtime
-    /// tables ([`crate::program::ExponentLutProgram::tables`]), and the payload
-    /// secret. A scheme whose RHS values are chosen only at encryption
-    /// receives no RHS and no secret here; the tables are always bound here.
+    /// Bind the Program, its RHS plaintexts, and the payload secret. A scheme
+    /// whose RHS values are chosen only at encryption receives no RHS and no
+    /// secret here. A Program's integer data are the builder's.
     fn bind_inputs(
         &mut self,
         program: &ExponentLutProgram,
         parameters: &ParamEnv,
         rhs: &PlaintextInputs<RhsId, P>,
-        tables: &BTreeMap<crate::program::TableId, Vec<usize>>,
         payload: Option<&Self::PayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError>;
@@ -591,9 +588,12 @@ pub trait EncryptBuild<P: Poly> {
         hash_key: &[u8],
     ) -> Result<(), ApiError>;
 
+    /// Bind the preprocessing artifacts the encryption reads. A scheme whose
+    /// encryption belongs to a setup rather than to a Program (an RNS-BGG
+    /// Dynamic setup) binds none.
     fn bind_artifacts(
         &mut self,
-        preprocess: &StageArtifacts<Self::PreprocessDescriptor>,
+        preprocess: Option<&StageArtifacts<Self::PreprocessDescriptor>>,
     ) -> Result<(), ApiError>;
 
     fn artifact_identity(&self) -> [u8; 32];
@@ -638,7 +638,6 @@ pub trait OnlineEvalBuild {
                 <Self::Evaluator as ExponentLUTProgramLowering>::Rhs,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::WireFamily,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::RhsFamily,
-                <Self::Families as FamilyExecution<Self::Evaluator>>::Table,
             >,
         ),
         ApiError,
@@ -676,7 +675,6 @@ pub trait NoiseBuild {
                 <Self::Evaluator as ExponentLUTProgramLowering>::Rhs,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::WireFamily,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::RhsFamily,
-                <Self::Families as FamilyExecution<Self::Evaluator>>::Table,
             >,
         ),
         ApiError,
@@ -695,7 +693,7 @@ pub trait NoiseBuild {
 /// resume through the normal `StageArtifacts` lifecycle. It does not create a
 /// second executor or bypass graph validation or observers. `identity` selects
 /// the named session of the stage.
-pub(crate) fn execute_artifacts<E, S, D>(
+pub fn execute_artifacts<E, S, D>(
     graph: StageGraph,
     parameters: &ParamEnv,
     descriptor: D,
@@ -793,7 +791,7 @@ where
 /// The graph is validated against its manifest map and the observer runs
 /// before execution. The returned outputs are owned copies, so callers can
 /// download verification residuals or bind them into a later graph.
-pub(crate) fn execute_graph<E, S>(
+pub fn execute_graph<E, S>(
     graph: StageGraph,
     parameters: &ParamEnv,
     execution: &mut E,
@@ -870,13 +868,11 @@ fn fresh_execution_session<S: SessionStore>(
 /// Build and execute preprocessing once, then publish two typed stage records
 /// over that same finalized production: encryption preparation first and
 /// online evaluation preparation second. `rhs` and `payload` are absent when the scheme
-/// chooses RHS values and the secret only at encryption; `tables` holds the
-/// entries of every runtime table of the Program (empty for a table-free one).
+/// chooses RHS values and the secret only at encryption.
 pub fn preprocess<E, S, P, T>(
     program: &ExponentLutProgram,
     parameters: &ParamEnv,
     rhs: &PlaintextInputs<RhsId, P>,
-    tables: &BTreeMap<crate::program::TableId, Vec<usize>>,
     payload: Option<&T::PayloadSecret>,
     hash_key: &[u8],
     mut build: T,
@@ -897,7 +893,7 @@ where
 {
     let started = std::time::Instant::now();
     validate_hash_key(hash_key)?;
-    build.bind_inputs(program, parameters, rhs, tables, payload, hash_key)?;
+    build.bind_inputs(program, parameters, rhs, payload, hash_key)?;
     let bound_at = std::time::Instant::now();
     let outputs = {
         let (evaluator, families, environment) = build.lowering_state()?;
@@ -948,12 +944,13 @@ where
 }
 
 /// Build and execute the input-only encryption graph. `mask` is absent when
-/// the scheme encrypts under the single secret `payload`.
+/// the scheme encrypts under the single secret `payload`; `preprocess` is
+/// absent when the encryption belongs to a setup rather than to a Program.
 pub fn encrypt<E, S, P, T>(
     inputs: &crate::program::EncryptionInputs,
     parameters: &ParamEnv,
     lhs: &PlaintextInputs<WireId, P>,
-    preprocess: &StageArtifacts<T::PreprocessDescriptor>,
+    preprocess: Option<&StageArtifacts<T::PreprocessDescriptor>>,
     payload: &T::PayloadSecret,
     mask: Option<&T::MaskSecret>,
     hash_key: &[u8],

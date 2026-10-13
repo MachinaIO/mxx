@@ -153,6 +153,36 @@ impl RnsBggNoiseBindings {
         }
         Ok(bindings)
     }
+
+    /// Bind the selector RHS families of a sparse-LWR PRF by their payload
+    /// contract ([`crate::program_gadgets::prf::SparseLwrPrf::selector_families`]):
+    /// at most `max_nonzero` one bits in the family, or in every aligned row
+    /// of `row_length` bits. [`crate::program_gadgets::prf::SparseLwrPrf::key_inputs`]
+    /// is the producer of these plaintexts and sets exactly the selected slot
+    /// of every key's row, so the contract holds for every bound key set.
+    /// It bounds payloads only: the evaluator still sums every member's
+    /// sampled errors and residuals.
+    ///
+    /// Without it, a family is bound with full support, and every row sum of a
+    /// multi-member PRF multiplies the state's payload bound by the row width
+    /// `W`, once per bucket (`W^buckets` overall).
+    pub fn with_selector_families(
+        mut self,
+        families: &[crate::program_gadgets::prf::PrfSelectorFamily],
+    ) -> Result<Self, RnsBggError> {
+        for selector in families {
+            let Some(InputBinding::Family(family)) = self.rhs.get_mut(&selector.rhs) else {
+                return Err(RnsBggError::Binding("PRF selector is not an RHS family"));
+            };
+            if family.validate_support()? != BigUint::from(selector.members) {
+                return Err(RnsBggError::Binding("PRF selector family size mismatch"));
+            }
+            family.max_nonzero_payloads = selector.max_nonzero.into();
+            family.row_length = selector.row_length.map(BigUint::from);
+            family.validate_support()?;
+        }
+        Ok(self)
+    }
 }
 
 /// Deterministic coefficient-error and payload envelope.
@@ -584,6 +614,7 @@ pub struct RnsNoiseBuild<'a> {
         RhsRef<IntExpr>,
         (WireId, RnsBggNoiseFamily),
         (RhsId, FamilyRange),
+        crate::program::TableId,
     >,
     pending_decoder: Option<RnsBggDecoderNoise>,
 }

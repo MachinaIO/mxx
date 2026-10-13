@@ -41,6 +41,15 @@ fn export_constant_fixture() {
                 GraphOutput { value: constant(ConstantMatrix::Identity), availability: None },
             ),
             ("polynomial".into(), GraphOutput { value: polynomial.clone(), availability: None }),
+            (
+                "all".into(),
+                GraphOutput {
+                    value: constant(ConstantMatrix::AllCoefficients {
+                        value: IntExpr::constant(5),
+                    }),
+                    availability: None,
+                },
+            ),
             ("alias".into(), GraphOutput { value: polynomial, availability: None }),
         ]),
         vec![constant(ConstantMatrix::Polynomial { coefficients: vec![] })],
@@ -60,6 +69,11 @@ fn export_constant_fixture() {
             "polynomial",
             "fun _ _ ↦ (2 : Mxx.Primitives.ExactPoly 17 2) + AdjoinRoot.root (Mxx.Primitives.negacyclicModulus 2 (ZMod 17)) * (-3)",
             "rw [h]\n  funext i j\n  simp [MxxRuntime.matrixPolynomial]",
+        ),
+        (
+            "all",
+            "MxxRuntime.matrixPolynomial (List.replicate 2 5)",
+            "rw [h]\n  funext i j\n  exact (MxxRuntime.matrixPolynomial_replicate 5 i j).symm",
         ),
     ] {
         proof.push_str(&format!(

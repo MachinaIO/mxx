@@ -1,6 +1,6 @@
 //! Noise of the noise refresh (see [`crate::refresh`]).
 //!
-//! Decoder `(i, j)` sees `Q_i y_j + M_ij + N_ij` with
+//! Column `j` of the decoder of prime `i` sees `Q_i y_j + M_ij + N_ij` with
 //! `N_ij = e_b K_ij - E_ij - e^sm_ij` and `E_i = e_1 X_i - e_x Y_i + e_f Z_i`;
 //! its rounding returns `y_j mod q_i` when `|M_ij + N_ij| < Q_i / 2`. Worst-case
 //! coefficient bounds, term by term:
@@ -14,7 +14,11 @@
 //!   after its ModDown to `Q` ([`RnsBggParameters::lut_mod_down_bound`] of the child's simulated
 //!   raw coefficient output);
 //! - `e_b K`: the unmask hint's error against the preimage, as for the decoder;
-//! - `e^sm_ij`: decoder `(i, j)`'s simulated smudge sum.
+//! - `e^sm_ij`: column `j` of decoder `i`'s simulated smudge row (every column sums its own block
+//!   of the same shape, so one column's sum bounds each).
+//!
+//! The fresh child's row has one simulated value for every column (its row `Sum` of equal
+//! blocks).
 //!
 //! The parts are added coherently.
 use super::*;
@@ -87,10 +91,13 @@ fn lower_child(
 
 /// The child noise contract of a PRF Program on `parameters`: the
 /// accumulator start and the label are fresh monomial encodings, every
-/// label member a separate encryption, and every RHS input a bit.
+/// label member a separate encryption, and every RHS input a bit; the
+/// selector families of `prf` keep their one-hot row contract
+/// ([`RnsBggNoiseBindings::with_selector_families`]).
 fn child_bindings(
     parameters: &RnsBggParameters,
     program: &crate::program::ExponentLutProgram,
+    prf: &crate::program_gadgets::prf::SparseLwrPrf,
 ) -> Result<RnsBggNoiseBindings, RnsBggError> {
     let one = [num_bigint::BigInt::from(1u8)];
     let inputs = program
@@ -115,7 +122,8 @@ fn child_bindings(
             RnsBggNoiseRhs { payload_l1: BigUint::one(), payload_l2_squared: BigUint::one() };
             program.rhs_inputs().len()
         ],
-    )
+    )?
+    .with_selector_families(&prf.selector_families())
 }
 
 /// The moments `M` of a coefficient carrier after one ModDown by the scale
@@ -249,8 +257,10 @@ pub fn simulate_refresh_noise(
         .ok_or_else(|| ApiError::input("refresh target output is out of range"))?
         .clone();
     // A raw coefficient child's outputs, audited when average-case.
-    let carriers = |chain: &RnsBggParameters, program: &crate::program::ExponentLutProgram| {
-        let bindings = child_bindings(chain, program).map_err(ApiError::scheme)?;
+    let carriers = |chain: &RnsBggParameters, child: &crate::refresh::FreshNoiseProgram| {
+        let program = child.program();
+        let bindings =
+            child_bindings(chain, program, child.sampler().prf()).map_err(ApiError::scheme)?;
         if let Some(config) = average {
             chain.audit_evaluation(program, &bindings, Some(config)).map_err(ApiError::scheme)?;
         }
@@ -259,10 +269,13 @@ pub fn simulate_refresh_noise(
     // Fresh carriers: the raw coefficient outputs moved down once to `Q`.
     let fresh_level =
         RnsBggParameters::refresh_fresh_level(declaration).map_err(ApiError::scheme)?;
-    let fresh_values = carriers(fresh, declaration.fresh().program())?;
+    let fresh_value = carriers(fresh, declaration.fresh())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::input("the fresh Program has no output"))?;
     let mask_value = match (declaration.top(), mask) {
         (Some(part), Some(chain)) => {
-            let value = carriers(chain, part.mask().program())?
+            let value = carriers(chain, part.mask())?
                 .into_iter()
                 .next()
                 .ok_or_else(|| ApiError::input("the mask Program has no output"))?;
@@ -281,7 +294,8 @@ pub fn simulate_refresh_noise(
         if smudge_values.contains_key(&program.id()) {
             continue;
         }
-        let child = child_bindings(smudge, program).map_err(ApiError::scheme)?;
+        let child =
+            child_bindings(smudge, program, decoder.smudge().prf()).map_err(ApiError::scheme)?;
         if let Some(config) = average {
             smudge.audit_evaluation(program, &child, Some(config)).map_err(ApiError::scheme)?;
         }
@@ -304,7 +318,7 @@ pub fn simulate_refresh_noise(
         mask_value.as_ref().map(|(chain, level, value)| (*chain, *level, value)),
         fresh,
         fresh_level,
-        &fresh_values,
+        (&fresh_value, declaration.columns()),
         &smudges,
         &declaration.decoded_primes(),
         (*declaration.spec(), declaration.decoders()[0].smudge_bound(), declaration.eta()),
@@ -315,10 +329,10 @@ pub fn simulate_refresh_noise(
 
 /// The refresh noise of [`simulate_refresh_noise`] from its lowered parts:
 /// the target's level-`level` value, a top-refresh part's mask carrier (its
-/// chain, LUT level and raw value), the fresh carriers' raw values (one per
-/// output column) on `fresh` at its LUT level `fresh_level`, and every
-/// decoder's smudge sum (in decoder order: position in `decoded_primes`
-/// major over the output columns), for the refresh `(spec, P^d / 2, eta)`.
+/// chain, LUT level and raw value), the fresh carrier row's raw value (every
+/// column's) on `fresh` at its LUT level `fresh_level` with its `outputs`
+/// columns, and every decoder's smudge row value (every column's; in decoder
+/// order, one per decoded prime), for the refresh `(spec, P^d / 2, eta)`.
 #[allow(clippy::too_many_arguments)]
 fn compose_refresh_noise(
     parameters: &RnsBggParameters,
@@ -327,7 +341,7 @@ fn compose_refresh_noise(
     mask: Option<(&RnsBggParameters, usize, &RnsBggNoiseValue)>,
     fresh: &RnsBggParameters,
     fresh_level: usize,
-    fresh_values: &[RnsBggNoiseValue],
+    (fresh_value, outputs): (&RnsBggNoiseValue, usize),
     smudges: &[&RnsBggNoiseValue],
     decoded_primes: &[usize],
     (refresh, smudge_bound, eta): ([u8; 32], BigUint, u32),
@@ -335,23 +349,19 @@ fn compose_refresh_noise(
     average: Option<&crate::decoder::simulation::AverageCaseConfig>,
 ) -> Result<RnsBggRefreshNoise, crate::api::ApiError> {
     use crate::api::ApiError;
-    let fresh_error = fresh_values
-        .iter()
-        .map(|value| fresh.lut_mod_down_bound(fresh_level, &value.bound.error))
-        .try_fold(BigUint::zero(), |largest, error| error.map(|error| largest.max(error)))
+    let fresh_error = fresh
+        .lut_mod_down_bound(fresh_level, &fresh_value.bound.error)
         .map_err(ApiError::scheme)?;
     let level_parameters = parameters.level(level).map_err(ApiError::scheme)?;
     let next = parameters.level(level + 1).map_err(ApiError::scheme)?;
     let n = BigUint::from(level_parameters.ring_dimension());
     let columns = level_parameters.modulus_digits();
-    let outputs = fresh_values.len();
     let level_primes = level_parameters.to_crt().0;
-    if smudges.len() != decoded_primes.len() * outputs ||
+    if smudges.len() != decoded_primes.len() ||
         decoded_primes.iter().any(|prime| *prime >= level_primes.len())
     {
         return Err(ApiError::scheme(RnsBggError::Decoder(DecoderError::TargetMismatch)));
     }
-    let smudge_of = |position: usize, column: usize| smudges[position * outputs + column];
     let half_base = |params: &DCRTPolyParams| BigUint::one() << (params.base_bits() - 1);
     // One block of `e_1 X_i` (`m` rows of polynomial digits): fresh encryption
     // error, or the mask carrier's error after its ModDown.
@@ -425,33 +435,24 @@ fn compose_refresh_noise(
         let (z_l1, _) =
             parameters.gadget_inverse_norms(level, &cofactor).map_err(ApiError::scheme)?;
         let common = &one_term + &target_term + &z_l1 * &fresh_error + &unmask_term;
-        let smudge = (0..outputs)
-            .map(|column| smudge_of(position, column).bound.error.clone())
-            .max()
-            .unwrap_or_default();
-        errors.push(common + smudge);
+        errors.push(common + &smudges[position].bound.error);
         if let Some(z_squared) = &z_squared {
+            // Every column has the same moments: the target's, the fresh row's
+            // and the smudge row's are those of each of their columns.
             let target = constant_action(&moments(target)?, &target_l1);
-            let mut largest = BigUint::zero();
-            for (column, value) in fresh_values.iter().enumerate() {
-                let fresh = constant_action(
-                    &mod_down_moments(fresh, fresh_level, &moments(value)?)
-                        .map_err(ApiError::scheme)?,
-                    &z_l1,
-                );
-                let mut evaluated = target
-                    .add_with_covariance(&fresh, NoiseCorrelation::Unknown)
-                    .add_with_covariance(
-                        &moments(smudge_of(position, column))?,
-                        NoiseCorrelation::Unknown,
-                    );
-                if let Some(mask) = &mask_moments {
-                    evaluated = evaluated.add_with_covariance(mask, NoiseCorrelation::Unknown);
-                }
-                let total = evaluated.add_with_covariance(&fresh_terms, NoiseCorrelation::Unknown);
-                largest = largest.max(tail_bound(&total, z_squared));
+            let fresh = constant_action(
+                &mod_down_moments(fresh, fresh_level, &moments(fresh_value)?)
+                    .map_err(ApiError::scheme)?,
+                &z_l1,
+            );
+            let mut evaluated = target
+                .add_with_covariance(&fresh, NoiseCorrelation::Unknown)
+                .add_with_covariance(&moments(smudges[position])?, NoiseCorrelation::Unknown);
+            if let Some(mask) = &mask_moments {
+                evaluated = evaluated.add_with_covariance(mask, NoiseCorrelation::Unknown);
             }
-            average_errors.push(largest);
+            let total = evaluated.add_with_covariance(&fresh_terms, NoiseCorrelation::Unknown);
+            average_errors.push(tail_bound(&total, z_squared));
         }
         spacings.push(cofactor);
     }
@@ -541,7 +542,8 @@ mod tests {
     /// noise of the one-member PRF: the one-hot selector rows keep the
     /// payload support of each row sum at one, and its noise is simulated
     /// once per loop body, so a `nu = 1024` layout (34 buckets of about 90
-    /// cells) lowers at once.
+    /// cells) lowers at once. Without the selector contract, every row sum
+    /// multiplies the payload bound by the row width.
     #[test]
     fn multi_member_prf_noise_matches_one_member() {
         use crate::{
@@ -549,27 +551,34 @@ mod tests {
             program::{ExponentLutProgramBuilder, LutOutputRepresentation, Operand},
             program_gadgets::{
                 pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
-                prf::{PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
+                prf::{PrfKeys, PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
             },
         };
         let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
         let support = rand::seq::index::sample(&mut rng, 1024, 31).into_vec();
+        let root = PbcRootSeed(rand::Rng::random(&mut rng));
+        // The members' rows have the layout's own width, its width limit: the same root seed
+        // accepts the same layout under that limit.
+        let unlimited = PbcParameters::paper_evaluation(1024, 31);
+        let width =
+            generate_key_layout(&unlimited, root, &support).unwrap().public_layout.bucket_width;
         let layout = generate_key_layout(
-            &PbcParameters::paper_evaluation(1024, 31),
-            PbcRootSeed(rand::Rng::random(&mut rng)),
+            &PbcParameters { bucket_width_limit: Some(width), ..unlimited },
+            root,
             &support,
         )
         .unwrap()
         .public_layout;
+        assert_eq!(layout.bucket_width, width);
         let profile =
             SparseLwrPrfProfile::new(ExpLayout { stride_log2: 0, width_log2: 7 }, 32, 1024)
                 .unwrap();
-        let noise = |members: usize| {
+        let noise = |members: usize, contract: bool| {
             let mut builder = ExponentLutProgramBuilder::new();
             let prf = SparseLwrPrf::build(
                 &mut builder,
                 profile,
-                vec![layout.clone(); members],
+                PrfKeys::new(&vec![layout.clone(); members]).unwrap(),
                 LutOutputRepresentation::Coefficient,
             )
             .unwrap();
@@ -583,7 +592,9 @@ mod tests {
             let levels = RnsBggDerivedWorkload::from_program(&program)
                 .unwrap()
                 .level(match program.outputs()[0] {
-                    Operand::Scalar(wire) | Operand::Member { family: wire, .. } => wire,
+                    Operand::Scalar(wire) |
+                    Operand::Member { family: wire, .. } |
+                    Operand::Lookup { family: wire, .. } => wire,
                 })
                 .unwrap();
             let pool = DCRTPolyParams::new(128, levels + 8, 40, 10, None, None);
@@ -600,10 +611,25 @@ mod tests {
                 1,
             )
             .unwrap();
-            let bindings = child_bindings(&parameters, &program).unwrap();
+            let mut bindings = child_bindings(&parameters, &program, &prf).unwrap();
+            if !contract {
+                for binding in bindings.rhs.values_mut() {
+                    if let InputBinding::Family(family) = binding {
+                        family.max_nonzero_payloads = family.validate_support().unwrap();
+                        family.row_length = None;
+                    }
+                }
+            }
             lower_child(&parameters, &program, &bindings, None).unwrap().remove(0)
         };
-        let (one, many) = (noise(1), noise(3));
+        let (one, many) = (noise(1, true), noise(3, true));
+        let full_support = noise(3, false);
+        assert!(
+            full_support.bound.error > &many.bound.error << 100,
+            "{} vs {}",
+            full_support.bound.error.bits(),
+            many.bound.error.bits()
+        );
         assert_eq!(one.bound.error, many.bound.error);
         assert_eq!(one.bound.payload_l1, many.bound.payload_l1);
         let variance = |value: &RnsBggNoiseValue| {
@@ -710,7 +736,7 @@ mod tests {
             },
             program_gadgets::{
                 pbc::{PbcParameters, PbcPublicLayout, PbcRootSeed, generate_key_layout},
-                prf::SparseLwrPrfProfile,
+                prf::{PrfKeyShape, SparseLwrPrfProfile},
             },
             refresh::FreshNoiseProgram,
         };
@@ -727,17 +753,24 @@ mod tests {
         let sigma = bigdecimal::BigDecimal::from(4);
         let mut rng =
             <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(10187170744214484787);
-        let mut layout_of = |nu: usize, h: usize| {
+        // The width limits leave the bucket loads (`3 nu / (h + 3)` on average) a wide margin.
+        let mut layout_of = |nu: usize, h: usize, width: usize| {
             let support = rand::seq::index::sample(&mut rng, nu, h).into_vec();
             generate_key_layout(
-                &PbcParameters::paper_evaluation(nu, h),
+                &PbcParameters {
+                    bucket_width_limit: Some(width),
+                    ..PbcParameters::paper_evaluation(nu, h)
+                },
                 PbcRootSeed(rand::Rng::random(&mut rng)),
                 &support,
             )
             .unwrap()
             .public_layout
         };
-        let (real, proxy) = (layout_of(1024, 31), layout_of(64, 4));
+        let (real, proxy) = (layout_of(1024, 31, 160), layout_of(64, 4, 48));
+        let shape = |layout: &PbcPublicLayout, members: usize| {
+            PrfKeyShape::new(&vec![layout.clone(); members]).unwrap()
+        };
         let profile = |stride_log2: u32, nu: usize| {
             SparseLwrPrfProfile::new(ExpLayout { stride_log2, width_log2: 7 }, 32, nu).unwrap()
         };
@@ -745,12 +778,12 @@ mod tests {
         let scales = strides.map(|stride| (1u64 << (stride + 7)) as f64);
         let fresh_program = |stride: u32, layout: &PbcPublicLayout, nu: usize| {
             let c = 1usize << (stride + 7);
-            FreshNoiseProgram::new(profile(stride, nu), 1, 1, c, vec![layout.clone(); c]).unwrap()
+            FreshNoiseProgram::new(profile(stride, nu), 1, 1, c, shape(layout, c)).unwrap()
         };
         let fresh_level = |program: &FreshNoiseProgram| {
             RnsBggDerivedWorkload::from_program(program.program())
                 .unwrap()
-                .level(program.outputs()[0])
+                .level(program.output())
                 .unwrap()
         };
         let real_fresh_level = fresh_level(&fresh_program(0, &real, 1024));
@@ -759,14 +792,13 @@ mod tests {
         let smudge_decoder = |stride: u32, layout: &PbcPublicLayout, nu: usize, digits: usize| {
             let c = 1usize << (stride + 7);
             let program =
-                DecoderSmudgeProgram::new(&profile(stride, nu), vec![layout.clone(); c * digits])
+                DecoderSmudgeProgram::new(&profile(stride, nu), shape(layout, c * digits), 1)
                     .unwrap();
             DecoderDeclaration::from_smudge(
                 &source,
                 input,
                 profile(stride, nu),
-                c,
-                digits,
+                (1, c, digits),
                 program,
                 DecoderTarget::Output,
             )
@@ -789,7 +821,7 @@ mod tests {
                 crate::program_gadgets::prf_sampler::PrfDistribution::Binary { q_min: q },
                 1,
                 c,
-                vec![proxy.clone(); c],
+                shape(&proxy, c),
             )
             .unwrap()
         };
@@ -849,7 +881,8 @@ mod tests {
             for program in &proxy_fresh {
                 let child_level = fresh_level(program);
                 let chain = parameters.child_chain(level, child_level, &pool, 1).unwrap();
-                let child = child_bindings(&chain, program.program()).unwrap();
+                let child =
+                    child_bindings(&chain, program.program(), program.sampler().prf()).unwrap();
                 chain.audit_evaluation(program.program(), &child, Some(&average)).unwrap();
                 let value = lower_child(&chain, program.program(), &child, None).unwrap().remove(0);
                 fresh_values.push(value);
@@ -870,7 +903,9 @@ mod tests {
                     let program = mask_program(stride, q);
                     let child_level = fresh_level(&program);
                     let child_chain = parameters.child_chain(level, child_level, &pool, 1).unwrap();
-                    let child = child_bindings(&child_chain, program.program()).unwrap();
+                    let child =
+                        child_bindings(&child_chain, program.program(), program.sampler().prf())
+                            .unwrap();
                     child_chain
                         .audit_evaluation(program.program(), &child, Some(&average))
                         .unwrap();
@@ -910,7 +945,7 @@ mod tests {
                     let smudge_level = RnsBggParameters::decoder_smudge_level(&decoder).unwrap();
                     let chain = parameters.child_chain(level, smudge_level, &pool, 1).unwrap();
                     let program = decoder.smudge().program();
-                    let child = child_bindings(&chain, program).unwrap();
+                    let child = child_bindings(&chain, program, decoder.smudge().prf()).unwrap();
                     chain.audit_evaluation(program, &child, Some(&average)).unwrap();
                     let value =
                         lower_child(&chain, program, &child, Some(&decoder)).unwrap().remove(0);
@@ -921,7 +956,7 @@ mod tests {
                     [&values[0].0, &values[1].0, &values[2].0, &values[3].0],
                     n as f64,
                 );
-                let smudges = vec![&smudge; decoded.len() * output_columns];
+                let smudges = vec![&smudge; decoded.len()];
                 let noise = compose_refresh_noise(
                     &parameters,
                     level,
@@ -929,7 +964,7 @@ mod tests {
                     mask.as_ref().map(|(chain, level, value)| (chain, *level, value)),
                     &fresh,
                     proxy_fresh_level,
-                    &vec![fresh_value.clone(); output_columns],
+                    (&fresh_value, output_columns),
                     &smudges,
                     &decoded,
                     ([0; 32], values[0].1.clone(), 1),

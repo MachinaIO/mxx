@@ -1077,6 +1077,25 @@ impl NoiseBreakdown {
     /// otherwise they are no longer related to the reading lane and become
     /// unknown.
     pub(crate) fn member(&self, depth: usize, index: &IntExpr, identity: bool) -> Self {
+        self.read_member(
+            depth,
+            SampleCoordinate::Index { depth, index: Arc::new(index.clone()) },
+            identity,
+        )
+    }
+
+    /// The contributions of one member read at a runtime index (a table
+    /// lookup) inside `depth` enclosing families. The read member is unknown:
+    /// a per-member sample takes the unknown coordinate, and a produced
+    /// family's lane coordinates are unrelated to the reading lane, so no
+    /// later reduction treats lanes of this read as distinct members.
+    pub(crate) fn member_unknown(&self, depth: usize) -> Self {
+        self.read_member(depth, SampleCoordinate::Unknown, false)
+    }
+
+    /// A member read whose per-member samples take `coordinate`; see
+    /// [`Self::member`].
+    fn read_member(&self, depth: usize, coordinate: SampleCoordinate, identity: bool) -> Self {
         let lane_depth = self.lane_depth;
         let related = |d: usize| match lane_depth {
             Some(lane_depth) => d < lane_depth || (d == depth && lane_depth == depth && identity),
@@ -1094,8 +1113,7 @@ impl NoiseBreakdown {
                     }
                 }
                 if term.per_member {
-                    term.sample
-                        .push(SampleCoordinate::Index { depth, index: Arc::new(index.clone()) });
+                    term.sample.push(coordinate.clone());
                     term.per_member = false;
                 }
                 term

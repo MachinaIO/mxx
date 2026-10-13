@@ -536,19 +536,22 @@ pub trait PreprocessBuild<P: Poly> {
                 <Self::Evaluator as ExponentLUTProgramLowering>::Rhs,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::WireFamily,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::RhsFamily,
+                <Self::Families as FamilyExecution<Self::Evaluator>>::Table,
             >,
         ),
         ApiError,
     >;
 
-    /// Bind the Program, its RHS plaintexts, and the payload secret. A scheme
-    /// whose RHS values are chosen only at encryption receives no RHS and no
-    /// secret here.
+    /// Bind the Program, its RHS plaintexts, the entries of its runtime
+    /// tables ([`crate::program::ExponentLutProgram::tables`]), and the payload
+    /// secret. A scheme whose RHS values are chosen only at encryption
+    /// receives no RHS and no secret here; the tables are always bound here.
     fn bind_inputs(
         &mut self,
         program: &ExponentLutProgram,
         parameters: &ParamEnv,
         rhs: &PlaintextInputs<RhsId, P>,
+        tables: &BTreeMap<crate::program::TableId, Vec<usize>>,
         payload: Option<&Self::PayloadSecret>,
         hash_key: &[u8],
     ) -> Result<(), ApiError>;
@@ -635,6 +638,7 @@ pub trait OnlineEvalBuild {
                 <Self::Evaluator as ExponentLUTProgramLowering>::Rhs,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::WireFamily,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::RhsFamily,
+                <Self::Families as FamilyExecution<Self::Evaluator>>::Table,
             >,
         ),
         ApiError,
@@ -672,6 +676,7 @@ pub trait NoiseBuild {
                 <Self::Evaluator as ExponentLUTProgramLowering>::Rhs,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::WireFamily,
                 <Self::Families as FamilyExecution<Self::Evaluator>>::RhsFamily,
+                <Self::Families as FamilyExecution<Self::Evaluator>>::Table,
             >,
         ),
         ApiError,
@@ -865,11 +870,13 @@ fn fresh_execution_session<S: SessionStore>(
 /// Build and execute preprocessing once, then publish two typed stage records
 /// over that same finalized production: encryption preparation first and
 /// online evaluation preparation second. `rhs` and `payload` are absent when the scheme
-/// chooses RHS values and the secret only at encryption.
+/// chooses RHS values and the secret only at encryption; `tables` holds the
+/// entries of every runtime table of the Program (empty for a table-free one).
 pub fn preprocess<E, S, P, T>(
     program: &ExponentLutProgram,
     parameters: &ParamEnv,
     rhs: &PlaintextInputs<RhsId, P>,
+    tables: &BTreeMap<crate::program::TableId, Vec<usize>>,
     payload: Option<&T::PayloadSecret>,
     hash_key: &[u8],
     mut build: T,
@@ -890,7 +897,7 @@ where
 {
     let started = std::time::Instant::now();
     validate_hash_key(hash_key)?;
-    build.bind_inputs(program, parameters, rhs, payload, hash_key)?;
+    build.bind_inputs(program, parameters, rhs, tables, payload, hash_key)?;
     let bound_at = std::time::Instant::now();
     let outputs = {
         let (evaluator, families, environment) = build.lowering_state()?;

@@ -47,6 +47,9 @@ pub(super) struct RecordScope<'a> {
     /// Per fragment `S.constraints_k`: its call and its relations. The output equation follows
     /// the relations of the last fragment.
     pub fragments: Vec<(String, Vec<String>)>,
+    /// Whether the fragments are independent (the body is their conjunction) rather than each
+    /// ending in the call of the next (see [`super::ExportOptions::facts`]).
+    pub independent: bool,
     pub output_tuple: String,
     pub loops: Vec<ChildLoop>,
 }
@@ -247,12 +250,14 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
             fragment_fields.iter().map(|(f, s)| format!("  {f} : {s}\n")).collect::<String>()
         ));
         let count = fragment_fields.len();
+        // An independent fragment holds its conjuncts only, so its last one is no `.1`.
+        let ends = is_last || scope.independent;
         let projection = |j: usize| {
             let mut term = "h".to_owned();
             for _ in 0..j {
                 term.push_str(".2");
             }
-            if !(is_last && j + 1 == count) {
+            if !(ends && j + 1 == count) {
                 term.push_str(".1");
             }
             term
@@ -260,6 +265,8 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
         let record = format!("⟨{}⟩", (0..count).map(projection).collect::<Vec<_>>().join(", "));
         let (conclusion, proof) = if is_last {
             (format!("{name}.Facts_{k} ctx outputs"), record)
+        } else if scope.independent {
+            (format!("{name}.Facts_{k} ctx"), record)
         } else {
             (
                 format!("{name}.Facts_{k} ctx ∧ {}", constants(&scope.fragments[k + 1].0)),
@@ -280,16 +287,35 @@ pub(super) fn render(scope: &RecordScope<'_>, records: &BTreeSet<String>) -> Str
         "structure {name}.Facts {implicit} (ctx : {ctx_type}) {outputs_binder} : Prop where\n{}\n",
         fields.concat()
     ));
-    let mut proof = format!("  have r0 := {name}.facts_0 (ctx := ctx) (outputs := outputs) h\n");
-    for k in 1..=last {
+    let mut proof = String::new();
+    let parts = if scope.independent {
+        // The body is `constraints_0 … ∧ … ∧ constraints_last …`: fragment `k` is its `k`-th
+        // conjunct. Each tail `t<k>` is named once, so no projection chain grows with `k`.
+        proof.push_str("  have t0 := h\n");
+        for k in 0..=last {
+            let conjunct = if k == last { format!("t{k}") } else { format!("t{k}.1") };
+            proof.push_str(&format!(
+                "  have r{k} := {name}.facts_{k} (ctx := ctx) (outputs := outputs) {conjunct}\n"
+            ));
+            if k != last {
+                proof.push_str(&format!("  have t{} := t{k}.2\n", k + 1));
+            }
+        }
+        (0..=last).map(|k| format!("r{k}")).collect::<Vec<_>>()
+    } else {
         proof.push_str(&format!(
-            "  have r{k} := {name}.facts_{k} (ctx := ctx) (outputs := outputs) r{}.2\n",
-            k - 1
+            "  have r0 := {name}.facts_0 (ctx := ctx) (outputs := outputs) h\n"
         ));
-    }
-    let parts = (0..=last)
-        .map(|k| if k == last { format!("r{k}") } else { format!("r{k}.1") })
-        .collect::<Vec<_>>();
+        for k in 1..=last {
+            proof.push_str(&format!(
+                "  have r{k} := {name}.facts_{k} (ctx := ctx) (outputs := outputs) r{}.2\n",
+                k - 1
+            ));
+        }
+        (0..=last)
+            .map(|k| if k == last { format!("r{k}") } else { format!("r{k}.1") })
+            .collect::<Vec<_>>()
+    };
     proof.push_str(&format!("  ⟨{}⟩", parts.join(", ")));
     out.push_str(&format!(
         "theorem {name}.facts {implicit} (ctx : {ctx_type}) {{outputs : {}}}\n    (h : {name}.body {env_names} ctx.inputs outputs ctx.witness) :\n    {name}.Facts ctx outputs :=\n{proof}\n\n",

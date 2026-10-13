@@ -901,6 +901,17 @@ impl PbcParameters {
         }
     }
 
+    /// A bucket width limit that a layout of these parameters meets with
+    /// high probability within its retry budget: the mean bucket load `m =
+    /// hash_count * universe_size / bucket_count` plus four standard
+    /// deviations `4 sqrt(m)`, rounded up, plus the dummy cell (at least two).
+    /// A multi-member PRF's rows have this width (see
+    /// [`crate::program_gadgets::prf::PrfKeyShape`]).
+    pub fn default_bucket_width_limit(&self) -> usize {
+        let mean = (self.hash_count * self.universe_size) as f64 / self.bucket_count.max(1) as f64;
+        ((mean + 4.0 * mean.sqrt()).ceil() as usize + 1).max(2)
+    }
+
     /// Checks dimensions, overflow limits, and profile-specific invariants.
     pub fn validate(&self) -> Result<(), PbcError> {
         if self.universe_size == 0 {

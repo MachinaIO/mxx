@@ -2794,6 +2794,9 @@ pub(super) fn encode_static_matrix(
     // at most one per entry, so a large constant never materializes one
     // integer per coefficient on the host.
     let mut coefficients = Vec::<(usize, BigInt)>::new();
+    // An all-coefficients constant holds its one value at position 0 and
+    // writes it to every position of the payload.
+    let mut broadcast = false;
     let mut set_constant = |row: usize, column: usize, coefficient: BigInt| {
         coefficients.push(((row * ty.columns + column) * degree, coefficient));
     };
@@ -2860,6 +2863,10 @@ pub(super) fn encode_static_matrix(
                 coefficients.push((index, evaluate(expression)?));
             }
         }
+        ConstantMatrix::AllCoefficients { value } => {
+            coefficients.push((0, evaluate(value)?));
+            broadcast = true;
+        }
         _ => return Err("GPU static constant has an unsupported shape or gadget layout".into()),
     }
     let modulus = ty.ring.modulus();
@@ -2887,18 +2894,20 @@ pub(super) fn encode_static_matrix(
         .ok_or_else(|| "GPU constant payload size overflows".to_owned())?;
     let mut payload = vec![0u8; total_bits.div_ceil(8)];
     for (index, negative, magnitude) in &centered {
-        let (index, negative) = (*index, *negative);
         let bytes = magnitude.to_bytes_le();
-        let base = index * bit_width as usize;
-        for bit in 0..bit_width.saturating_sub(1) as usize {
-            if bytes.get(bit / 8).is_some_and(|byte| byte & (1 << (bit % 8)) != 0) {
-                let position = base + bit;
+        let indices = if broadcast { 0..count } else { *index..*index + 1 };
+        for index in indices {
+            let base = index * bit_width as usize;
+            for bit in 0..bit_width.saturating_sub(1) as usize {
+                if bytes.get(bit / 8).is_some_and(|byte| byte & (1 << (bit % 8)) != 0) {
+                    let position = base + bit;
+                    payload[position / 8] |= 1 << (position % 8);
+                }
+            }
+            if *negative {
+                let position = base + bit_width as usize - 1;
                 payload[position / 8] |= 1 << (position % 8);
             }
-        }
-        if negative {
-            let position = base + bit_width as usize - 1;
-            payload[position / 8] |= 1 << (position % 8);
         }
     }
     bincode::encode_to_vec(
@@ -4652,7 +4661,7 @@ pub(super) fn hash_tag_resource(
                     .ok_or("GPU hash U64Le component exceeds u64")?;
                 GpuHashTagPart::u64_le_constant(value)
             }
-            HashTagComponent::Operand(index) => {
+            HashTagComponent::Operand(index) | HashTagComponent::OperandU64Le(index) => {
                 let wire = arguments
                     .get(*index)
                     .ok_or("GPU hash operand index is outside its arguments")?;
@@ -4667,7 +4676,12 @@ pub(super) fn hash_tag_resource(
                 let binding = register_preimage_control_binding(ctx, id)?;
                 let operand_index = operands.len();
                 operands.push((id, 0, binding));
-                GpuHashTagPart::Integer(operand_index)
+                // The device rejects a negative or wider-than-u64 `U64Le` operand.
+                if matches!(component, HashTagComponent::OperandU64Le(_)) {
+                    GpuHashTagPart::U64Le(operand_index)
+                } else {
+                    GpuHashTagPart::Integer(operand_index)
+                }
             }
         };
         parts.push(part);
@@ -8036,6 +8050,33 @@ mod tests {
             };
             assert_eq!(actual, expected.to_compact_bytes());
         }
+    }
+
+    #[test]
+    fn direct_static_all_coefficients_matches_cpu_canonical_matrix() {
+        let parameters = DCRTPolyParams::new(8, 2, 17, 2, None, None);
+        let ring = mxx_ir_core::RingRef::new(mxx_ir_core::RingExpr::Explicit {
+            crt_moduli: parameters.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            ring_dimension: 8,
+        })
+        .resolve(&ParamEnv::default())
+        .expect("explicit ring");
+        let modulus = ring.modulus();
+        let value = BigInt::from(rand::random::<i64>()) % &modulus;
+        let ty = ConcreteMatrixType { ring, rows: 2, columns: 3 };
+        let actual = encode_static_matrix(
+            &ty,
+            &ConstantMatrix::AllCoefficients { value: IntExpr::constant(value.clone()) },
+            &ParamEnv::default(),
+            None,
+        )
+        .expect("direct all-coefficients encoding");
+        let residue = num_integer::Integer::mod_floor(&value, &modulus)
+            .to_biguint()
+            .expect("canonical residue");
+        let entry = DCRTPoly::from_biguints(&parameters, &vec![residue; 8]);
+        let expected = DCRTPolyMatrix::from_poly_vec(&parameters, vec![vec![entry; 3]; 2]);
+        assert_eq!(actual, expected.to_compact_bytes());
     }
 
     #[test]

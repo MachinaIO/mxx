@@ -20,14 +20,15 @@ pub enum PreprocessWireFamily {
 }
 
 impl PreprocessWireFamily {
-    /// Read one member: an input member's key is sampled from the hash key.
+    /// Read member `index`, a static index or a runtime table entry: an
+    /// input member's key is sampled from the hash key.
     fn member(
         &self,
         parameters: &RnsBggParameters,
-        index: IntExpr,
+        index: Int,
     ) -> Result<RnsBggPublicKey, RnsBggError> {
         match self {
-            Self::Stored(family) => Ok(family.at(Int::evaluate(index))),
+            Self::Stored(family) => Ok(family.at(index)),
             Self::Input { wire, level, knowledge, hash_key, .. } => {
                 sampled_key(parameters, *level, hash_key.clone(), *wire, *knowledge, Some(index))
             }
@@ -49,6 +50,22 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
 {
     type WireFamily = PreprocessWireFamily;
     type RhsFamily = Family<RhsRef<Int>>;
+    type Table = Family<Int>;
+
+    /// The member at the table entry: a stored member is read there, and an
+    /// input member's key is sampled under the entry, a runtime hash
+    /// argument hashing as the static index encryption sampled it under.
+    fn wire_at_table(
+        &mut self,
+        _evaluator: &mut PublicKeyLowering<'a>,
+        family: &Self::WireFamily,
+        table: &Self::Table,
+        index: &IntExpr,
+    ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
+        family
+            .member(self.parameters, table.at(Int::evaluate(index.clone())))
+            .map_err(crate::program::ProgramLowerError::Backend)
+    }
 
     fn wire_at(
         &mut self,
@@ -57,7 +74,7 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
         index: &IntExpr,
     ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
         family
-            .member(self.parameters, index.clone())
+            .member(self.parameters, Int::evaluate(index.clone()))
             .map_err(crate::program::ProgramLowerError::Backend)
     }
 
@@ -93,17 +110,39 @@ impl<'a, 'b> crate::program::FamilyExecution<PublicKeyLowering<'a>>
         &mut self,
         evaluator: &mut PublicKeyLowering<'a>,
         family: &Self::WireFamily,
+        columns: usize,
     ) -> Result<RnsBggPublicKey, crate::program::ProgramLowerError<RnsBggError>> {
         use crate::program::ProgramLowerError;
         let parameters = self.parameters;
-        crate::program::graph_sum(evaluator, family.count(), |index| {
+        let member = |index: Int| {
             let index = index.expression().map_err(ProgramLowerError::Dsl)?;
-            family.member(parameters, index).map_err(ProgramLowerError::Backend)
-        })
+            family.member(parameters, Int::evaluate(index)).map_err(ProgramLowerError::Backend)
+        };
+        if columns == 1 {
+            return crate::program::graph_sum(evaluator, family.count(), member);
+        }
+        let per_column = super::row_sum_block(&family.count(), columns)?;
+        crate::program::graph_column_sums(
+            evaluator,
+            (columns, per_column),
+            member,
+            |sum, column| {
+                RnsBggPublicKey::new(
+                    sum.wire,
+                    map_matrix(sum.matrix, |entry| super::place_in_column(entry, columns, column)),
+                )
+            },
+        )
     }
 }
 
 impl<'a> PublicKeyLowering<'a> {
+    /// The entries of every bound runtime table; `None` when the tables are
+    /// bound by shape only.
+    pub(crate) fn table_entries(&self) -> Option<BTreeMap<crate::program::TableId, Vec<usize>>> {
+        self.tables.iter().map(|(id, (_, entries))| Some((*id, entries.clone()?))).collect()
+    }
+
     /// Construct a public-key lowerer for one immutable Program/workload pair.
     pub(crate) fn new(
         parameters: &'a RnsBggParameters,
@@ -125,6 +164,7 @@ impl<'a> PublicKeyLowering<'a> {
             rhs_material: BTreeMap::new(),
             lut_material: BTreeMap::new(),
             unmask: None,
+            tables: BTreeMap::new(),
             current_site: None,
             parallel_bodies: Vec::new(),
             finished_bodies: Vec::new(),
@@ -277,10 +317,6 @@ impl<'a> PublicKeyLowering<'a> {
             .program
             .wire_knowledge(wire)
             .map_err(|_| RnsBggError::Binding("wire knowledge"))?;
-        let member =
-            member.as_ref().map(Int::expression).transpose().map_err(|_| {
-                RnsBggError::Binding("input member index is not an index expression")
-            })?;
         sampled_key(
             self.parameters,
             self.workload.level(wire)?,

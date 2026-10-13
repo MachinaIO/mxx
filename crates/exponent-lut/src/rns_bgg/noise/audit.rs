@@ -69,6 +69,10 @@ pub fn trace_program(
             ));
         }
     }
+    // A lookup reads an unknown member whatever the table's entries are.
+    for id in program.tables().keys() {
+        environment.bind_table(*id, *id).map_err(ProgramLowerError::Program)?;
+    }
     let mut evaluator = RnsBggNoiseEvaluator::new(parameters, program, &workload, bindings);
     for (wire, binding) in bindings.inputs.iter() {
         let value = match binding {
@@ -411,7 +415,8 @@ impl RnsBggParameters {
         {
             let wire = match output {
                 crate::program::Operand::Scalar(id) |
-                crate::program::Operand::Member { family: id, .. } => *id,
+                crate::program::Operand::Member { family: id, .. } |
+                crate::program::Operand::Lookup { family: id, .. } => *id,
             };
             let value = trace
                 .outputs

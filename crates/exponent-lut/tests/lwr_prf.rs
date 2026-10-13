@@ -39,7 +39,7 @@ use mxx_exponent_lut::{
             PbcCell, PbcGeneratedKeyLayout, PbcParameters, PbcRootSeed, clear_pbc_inner_product,
             generate_key_layout,
         },
-        prf::{PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
+        prf::{PrfKeys, PrfOutput, SparseLwrPrf, SparseLwrPrfProfile},
     },
     rns_bgg::{
         RhsMode, RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
@@ -168,6 +168,8 @@ struct Fixture {
     payload: Option<mxx_exponent_lut::rns_bgg::RnsBggPayloadSecret>,
     mask: Option<mxx_exponent_lut::rns_bgg::RnsBggMaskSecret>,
     rhs: BTreeMap<mxx_exponent_lut::program::RhsId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
+    /// The layouts of several outputs' keys, as the PRF's runtime tables.
+    tables: BTreeMap<mxx_exponent_lut::program::TableId, Vec<usize>>,
     lhs: BTreeMap<WireId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
     trace: RnsBggNoiseTrace,
     keys: Vec<PbcGeneratedKeyLayout>,
@@ -231,6 +233,15 @@ fn profile_and_program(
     // Every output evaluates the same public vector `a` under its own sparse
     // key of weight h, placed by its own PBC layout with h' = h + 3 blocks.
     let parameters = PbcParameters::paper_evaluation(lwr_dimension, support_weight);
+    // Several outputs read their layouts as runtime tables of one row width, the layouts' width
+    // limit; one output keeps the unlimited layout, a constant of its Program.
+    let parameters = match output_count {
+        1 => parameters,
+        _ => PbcParameters {
+            bucket_width_limit: Some(parameters.default_bucket_width_limit()),
+            ..parameters
+        },
+    };
     // The keys are sampled from the recorded seed, `MXX_EXPONENT_LUT_LWR_PRF_KEY_SEED`, or a
     // fresh seed that is reported, so that any run can be repeated.
     let key_seed = match (recorded, env::var("MXX_EXPONENT_LUT_LWR_PRF_KEY_SEED")) {
@@ -252,10 +263,11 @@ fn profile_and_program(
         })
         .collect::<Vec<_>>();
     let mut builder = ExponentLutProgramBuilder::new();
+    let layouts = keys.iter().map(|key| key.public_layout.clone()).collect::<Vec<_>>();
     let prf = SparseLwrPrf::build(
         &mut builder,
         profile,
-        keys.iter().map(|key| key.public_layout.clone()).collect(),
+        PrfKeys::new(&layouts).expect("PRF keys"),
         LutOutputRepresentation::Coefficient,
     )
     .expect("sparse-LWR PRF");
@@ -631,12 +643,24 @@ fn fixture(
 
     // Selectors are fixed private RHS plaintexts: each output's key selects
     // one cell per block of its layout.
-    let rhs = program
+    let (rhs, tables) = program
         .prf
-        .selector_plaintexts::<DCRTPoly>(&poly_parameters, &keys)
-        .expect("selector plaintexts");
+        .key_inputs::<DCRTPoly>(&poly_parameters, &keys)
+        .expect("selector plaintexts and tables");
 
-    Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, keys, a_exponents }
+    Fixture {
+        parameters,
+        profile,
+        program,
+        payload,
+        mask,
+        rhs,
+        tables,
+        lhs,
+        trace,
+        keys,
+        a_exponents,
+    }
 }
 
 fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBackend {
@@ -779,18 +803,29 @@ fn round_trip(
     recorded: Option<(String, ParameterRow)>,
 ) {
     let graphs = StageGraphs::default();
-    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, keys, a_exponents } =
-        fixture(
-            parameters,
-            poly_parameters,
-            profile,
-            program,
-            keys,
-            trace,
-            runtime,
-            &mut store,
-            &graphs,
-        );
+    let Fixture {
+        parameters,
+        profile,
+        program,
+        payload,
+        mask,
+        rhs,
+        tables,
+        lhs,
+        trace,
+        keys,
+        a_exponents,
+    } = fixture(
+        parameters,
+        poly_parameters,
+        profile,
+        program,
+        keys,
+        trace,
+        runtime,
+        &mut store,
+        &graphs,
+    );
     assert!(!trace.wires.is_empty(), "noise simulation must visit the PRF gates");
     let observed = RefCell::new(Vec::<&'static str>::new());
     let observe = |name: &'static str| observed.borrow_mut().push(name);
@@ -804,6 +839,7 @@ fn round_trip(
         program.program(),
         &ParamEnv::default(),
         if dynamic { &no_rhs } else { &rhs },
+        &tables,
         payload.as_ref(),
         HASH_KEY,
         RnsPreprocessBuild::new(&parameters, [7; 32]),
@@ -1047,7 +1083,10 @@ fn lwr_protocol(
     // Block `j` of output 0 reads coordinate `cells[j][c]` of `a`; dummy and padding cells read
     // the last member.
     assert_eq!(program.prf.members(), 1, "the exported claim covers one key");
-    let blocks = program.prf.layouts()[0]
+    let mxx_exponent_lut::program_gadgets::prf::PrfKeys::Layout(layout) = program.prf.keys() else {
+        unreachable!("one key has a layout")
+    };
+    let blocks = layout
         .cells
         .iter()
         .map(|cells| {

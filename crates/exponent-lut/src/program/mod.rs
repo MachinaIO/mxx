@@ -1,7 +1,8 @@
 //! Immutable Exponent-LUT programs and their structural execution model.
 //!
 //! This module deliberately contains no scheme-specific carrier types.  A
-//! program describes scalar operations, indexed bodies, and literal LUTs;
+//! program describes scalar operations, indexed bodies, literal LUTs, and the
+//! shapes of runtime integer tables whose entries name family members;
 //! The internal program walker supplies the only execution path and delegates
 //! each scalar operation to a scheme evaluator.
 
@@ -25,7 +26,7 @@ use thiserror::Error;
 
 pub use builder::ExponentLutProgramBuilder;
 pub use graph::{GraphFamilyExecution, RhsRef, family_of_fields};
-pub(crate) use graph::{GraphParallelLowering, graph_parallel, graph_sum};
+pub(crate) use graph::{GraphParallelLowering, graph_column_sums, graph_parallel, graph_sum};
 pub(crate) use lowering::lower_program;
 pub use lowering::{
     Environment, FamilyExecution, LoweringSite, ProgramLowerError, ProgramLoweringContext,
@@ -185,12 +186,46 @@ macro_rules! id_type {
 id_type!(WireId);
 id_type!(RhsId);
 id_type!(LutId);
+id_type!(TableId);
 
 /// A scalar or an indexed member of a family in a validated Program body.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Operand<I> {
     Scalar(I),
-    Member { family: I, index: IntExpr },
+    Member {
+        family: I,
+        index: IntExpr,
+    },
+    /// Member `table[index]` of `family`, where `table` is a runtime integer
+    /// table the Program declares ([`TableDecl`]) and its stage binds. Only
+    /// a wire operand may be a lookup, wherever a member read is valid; the
+    /// read member is unknown until the table is bound.
+    Lookup {
+        family: I,
+        table: TableId,
+        index: IntExpr,
+    },
+}
+
+/// A runtime integer table: `count` entries, each a member index in
+/// `[0, bound)`. The entries are not part of the Program; the stage that
+/// lowers it binds them ([`Environment::bind_table`]), so one Program serves
+/// every table of this shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TableDecl {
+    count: IntExpr,
+    bound: IntExpr,
+}
+
+impl TableDecl {
+    /// The number of entries.
+    pub fn count(&self) -> &IntExpr {
+        &self.count
+    }
+    /// The exclusive upper bound of every entry.
+    pub fn bound(&self) -> &IntExpr {
+        &self.bound
+    }
 }
 
 /// Reused shape representation for declarations and runtime values.
@@ -520,10 +555,26 @@ pub(crate) enum Step {
         body: Box<Body>,
         output: WireId,
     },
+    /// The sum of the members of `family`; with `columns = w > 1`, the `1 x
+    /// w` row of the block sums of a family of `w b` members: column `j`
+    /// sums the `b` members from `j b`, placed in column `j` (each carrier
+    /// entry `E` of a column sum becomes `e_j ⊗ E`, `e_j` the unit row of
+    /// column `j`). Folding `w` sums into one row keeps a lowered graph
+    /// independent of `w`.
     Sum {
         family: WireId,
         output: WireId,
+        #[serde(default = "one_column", skip_serializing_if = "is_one_column")]
+        columns: usize,
     },
+}
+
+const fn one_column() -> usize {
+    1
+}
+
+fn is_one_column(columns: &usize) -> bool {
+    *columns == 1
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -538,6 +589,8 @@ pub enum ProgramValidationError {
     UndefinedWire(WireId),
     #[error("undefined RHS {0:?}")]
     UndefinedRhs(RhsId),
+    #[error("undefined table {0:?}")]
+    UndefinedTable(TableId),
     #[error("duplicate wire {0:?}")]
     DuplicateWire(WireId),
     #[error("duplicate RHS {0:?}")]
@@ -598,6 +651,7 @@ pub struct ExponentLutProgram {
     inputs: BTreeMap<WireId, ProgramInputDeclaration>,
     rhs_inputs: BTreeMap<RhsId, InputShape>,
     luts: Vec<LutTable>,
+    tables: BTreeMap<TableId, TableDecl>,
     body: Body,
     metadata_cache: OnceLock<BTreeMap<WireId, WireMetadata>>,
 }
@@ -622,6 +676,10 @@ impl ExponentLutProgram {
     }
     pub(crate) fn rhs_inputs(&self) -> &BTreeMap<RhsId, InputShape> {
         &self.rhs_inputs
+    }
+    /// The runtime integer tables a stage binds before lowering.
+    pub fn tables(&self) -> &BTreeMap<TableId, TableDecl> {
+        &self.tables
     }
     /// Resolve a LUT registration by its validated instruction output, including
     /// instructions nested in parallel bodies. Identity is independent of table
@@ -671,7 +729,10 @@ impl ExponentLutProgram {
             for step in &body.steps {
                 match step {
                     Step::Lut {
-                        input: Operand::Scalar(input) | Operand::Member { family: input, .. },
+                        input:
+                            Operand::Scalar(input) |
+                            Operand::Member { family: input, .. } |
+                            Operand::Lookup { family: input, .. },
                         table,
                         ..
                     } if nested => {
@@ -813,11 +874,23 @@ fn lut_values_digest(values: &[usize]) -> [u8; 32] {
 }
 
 /// The Program identity: the digest of its inputs, RHS inputs, LUT tables
-/// (each with its values by their digest) and body.
+/// (each with its values by their digest), body and runtime table
+/// declarations. A Program without runtime tables omits the empty
+/// declarations, so its identity is the one it had before Programs could
+/// declare them.
 pub(crate) fn canonical_program_id(program: &ExponentLutProgram) -> ExponentLutProgramId {
-    let bytes =
+    let bytes = if program.tables.is_empty() {
         serde_json::to_vec(&(&program.inputs, &program.rhs_inputs, &program.luts, &program.body))
-            .expect("program canonical encoding");
+    } else {
+        serde_json::to_vec(&(
+            &program.inputs,
+            &program.rhs_inputs,
+            &program.luts,
+            &program.body,
+            &program.tables,
+        ))
+    }
+    .expect("program canonical encoding");
     let mut digest = Sha256::new();
     digest.update(b"mxx-exponent-lut/program/v1");
     digest.update(bytes);
@@ -842,6 +915,7 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
     validate_body(
         &program.body,
         &program.luts,
+        &program.tables,
         &mut visible,
         &mut all_wires,
         &mut rhs,
@@ -863,6 +937,8 @@ fn validate_program_structure(program: &ExponentLutProgram) -> Result<(), Progra
                 ),
                 _ => true,
             },
+            // A root output names a fixed member.
+            Operand::Lookup { .. } => true,
         })
     {
         return Err(ProgramValidationError::InvalidOutputCount);
@@ -978,7 +1054,7 @@ fn derive_body_metadata(
                     .ok_or(ProgramValidationError::InvalidOutputCount)
                     .and_then(|operand| metadata_for_operand(operand, metadata))?
             }
-            Step::Sum { family, .. } => {
+            Step::Sum { family, columns, .. } => {
                 let member = metadata
                     .get(family)
                     .copied()
@@ -995,6 +1071,8 @@ fn derive_body_metadata(
                                 "a coefficient Sum needs a constant member count".into(),
                             )
                         })?;
+                        // Every column of a row sum adds its own block of members.
+                        let count = count / *columns as u64;
                         Some(bound.checked_mul(count).ok_or_else(overflow)?)
                     }
                 };
@@ -1019,8 +1097,11 @@ fn metadata_for_operand(
     operand: &Operand<WireId>,
     metadata: &BTreeMap<WireId, WireMetadata>,
 ) -> Result<WireMetadata, ProgramValidationError> {
+    // A lookup reads a member of its family, like a member read.
     let wire = match operand {
-        Operand::Scalar(wire) | Operand::Member { family: wire, .. } => wire,
+        Operand::Scalar(wire) |
+        Operand::Member { family: wire, .. } |
+        Operand::Lookup { family: wire, .. } => wire,
     };
     metadata.get(wire).copied().ok_or(ProgramValidationError::UndefinedWire(*wire))
 }
@@ -1043,6 +1124,7 @@ impl VisibleKind {
 fn validate_body(
     body: &Body,
     luts: &[LutTable],
+    tables: &BTreeMap<TableId, TableDecl>,
     visible: &mut BTreeMap<WireId, VisibleKind>,
     all_wires: &mut BTreeSet<WireId>,
     rhs: &mut BTreeMap<RhsId, VisibleKind>,
@@ -1055,29 +1137,29 @@ fn validate_body(
     for step in &body.steps {
         let (output, kind) = match step {
             Step::Add { lhs, rhs: right, output } => {
-                check_wire_operand(lhs, visible, false, depth, loop_bounds)?;
-                check_wire_operand(right, visible, false, depth, loop_bounds)?;
+                check_wire_operand(lhs, visible, tables, false, depth, loop_bounds)?;
+                check_wire_operand(right, visible, tables, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::MulPublic { lhs, rhs, output } => {
-                check_wire_operand(lhs, visible, false, depth, loop_bounds)?;
-                check_wire_operand(rhs, visible, false, depth, loop_bounds)?;
+                check_wire_operand(lhs, visible, tables, false, depth, loop_bounds)?;
+                check_wire_operand(rhs, visible, tables, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::MulPrivate { input, rhs: right, output } => {
-                check_wire_operand(input, visible, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, tables, false, depth, loop_bounds)?;
                 check_rhs_operand(right, rhs, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::Lut { input, table, output } => {
-                check_wire_operand(input, visible, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, tables, false, depth, loop_bounds)?;
                 if (*table).0 as usize >= luts.len() {
                     return Err(ProgramValidationError::InvalidLutId(*table));
                 }
                 (*output, VisibleKind::Scalar)
             }
             Step::MulSmallConstant { input, coefficients, shift, output } => {
-                check_wire_operand(input, visible, false, depth, loop_bounds)?;
+                check_wire_operand(input, visible, tables, false, depth, loop_bounds)?;
                 check_small_constant(coefficients, shift, depth)?;
                 (*output, VisibleKind::Scalar)
             }
@@ -1092,6 +1174,7 @@ fn validate_body(
                 validate_body(
                     body,
                     luts,
+                    tables,
                     &mut child_visible,
                     all_wires,
                     rhs,
@@ -1100,15 +1183,45 @@ fn validate_body(
                     false,
                     true,
                 )?;
-                if body.outputs.len() != 1 || matches!(body.outputs[0], Operand::Member { .. }) {
+                if body.outputs.len() != 1 || !matches!(body.outputs[0], Operand::Scalar(_)) {
                     return Err(ProgramValidationError::InvalidStructure(
                         "parallel body must return one scalar".into(),
                     ));
                 }
                 (*output, VisibleKind::Family(range.count.clone()))
             }
-            Step::Sum { family, output } => {
-                check_wire_operand(&Operand::Scalar(*family), visible, true, depth, loop_bounds)?;
+            Step::Sum { family, output, columns } => {
+                check_wire_operand(
+                    &Operand::Scalar(*family),
+                    visible,
+                    tables,
+                    true,
+                    depth,
+                    loop_bounds,
+                )?;
+                if *columns == 0 {
+                    return Err(ProgramValidationError::InvalidStructure(
+                        "a Sum needs at least one column".into(),
+                    ));
+                }
+                if *columns > 1 {
+                    let count = match visible.get(family) {
+                        Some(VisibleKind::Family(count)) => count.canonicalize(),
+                        _ => return Err(ProgramValidationError::ExpectedFamilyWire(*family)),
+                    };
+                    let IntExpr::Const(count) = count else {
+                        return Err(ProgramValidationError::InvalidStructure(
+                            "a row Sum needs a constant member count".into(),
+                        ));
+                    };
+                    let columns = num_bigint::BigInt::from(*columns);
+                    if count < columns.clone() * 2u8 || !(count % columns).is_zero() {
+                        return Err(ProgramValidationError::InvalidStructure(
+                            "a row Sum needs at least two members per column, as many in each"
+                                .into(),
+                        ));
+                    }
+                }
                 (*output, VisibleKind::Scalar)
             }
         };
@@ -1119,7 +1232,7 @@ fn validate_body(
     }
     if check_outputs {
         for output in &body.outputs {
-            check_wire_operand(output, visible, false, depth, loop_bounds)?;
+            check_wire_operand(output, visible, tables, false, depth, loop_bounds)?;
         }
     }
     if !root {
@@ -1184,6 +1297,7 @@ fn validate_range_with_bounds(
 fn check_wire_operand(
     operand: &Operand<WireId>,
     visible: &BTreeMap<WireId, VisibleKind>,
+    tables: &BTreeMap<TableId, TableDecl>,
     family: bool,
     depth: u32,
     loop_bounds: &BTreeMap<u32, IntInterval>,
@@ -1211,7 +1325,41 @@ fn check_wire_operand(
             check_member_bounds(index, count, loop_bounds)?;
             Ok(())
         }
+        Operand::Lookup { family: id, table, index } => {
+            if family {
+                return Err(ProgramValidationError::ExpectedFamilyWire(*id));
+            }
+            let Some(VisibleKind::Family(count)) = visible.get(id) else {
+                return Err(ProgramValidationError::ExpectedFamilyWire(*id));
+            };
+            let declaration =
+                tables.get(table).ok_or(ProgramValidationError::UndefinedTable(*table))?;
+            if let Some(slot) = invalid_loop_slot(index, depth) {
+                return Err(ProgramValidationError::InvalidLoopIndex(slot));
+            }
+            // The index addresses an entry, and every entry a member.
+            check_member_bounds(index, &declaration.count, loop_bounds)?;
+            check_table_bound(&declaration.bound, count, loop_bounds)
+        }
     }
+}
+
+/// Every entry of a table, in `[0, bound)`, addresses a member of a family of
+/// `count` members: `bound <= count`. As for a member index, the largest
+/// known bound is checked against the smallest known count.
+fn check_table_bound(
+    bound: &IntExpr,
+    count: &IntExpr,
+    loop_bounds: &BTreeMap<u32, IntInterval>,
+) -> Result<(), ProgramValidationError> {
+    let bound = interval_of(bound, loop_bounds);
+    let count = interval_of(count, loop_bounds);
+    if let (Some(bound_max), Some(count_min)) = (&bound.maximum, &count.minimum) &&
+        bound_max > count_min
+    {
+        return Err(ProgramValidationError::MemberOutOfBounds);
+    }
+    Ok(())
 }
 
 fn check_rhs_operand(
@@ -1244,6 +1392,9 @@ fn check_rhs_operand(
             check_member_bounds(index, count, loop_bounds)?;
             Ok(())
         }
+        Operand::Lookup { .. } => Err(ProgramValidationError::InvalidStructure(
+            "an RHS operand cannot be a table lookup".into(),
+        )),
     }
 }
 
@@ -2129,6 +2280,138 @@ mod tests {
         assert_eq!(canonical_program_id(&changed.without_lut_values()), changed.id());
     }
 
+    /// A table-free Program keeps the identity it had before Programs could
+    /// declare runtime tables: the pinned digest covers inputs, RHS inputs,
+    /// a LUT, a parallel member read and a sum.
+    #[test]
+    fn canonical_identity_of_a_table_free_program_is_pinned() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let inputs =
+            builder.input_family(IntExpr::constant(3), AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(3)).unwrap();
+        let lut = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    4,
+                    vec![1, 3],
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let products = builder
+            .parallel(FamilyRange::full(IntExpr::constant(3)).unwrap(), |builder, index| {
+                let product = builder.mul_private(
+                    Operand::Member { family: inputs, index: index.clone() },
+                    Operand::Member { family: rhs, index },
+                )?;
+                builder.lut(Operand::Scalar(product), lut).map(Operand::Scalar)
+            })
+            .unwrap();
+        let sum = builder.sum(products).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(sum)]).unwrap();
+        assert_eq!(
+            program.id().hex(),
+            "3e928f983af1a62ca50ca3eea6e67e2d728ccc14130a8e2628eeacebede1dc5c"
+        );
+    }
+
+    /// A Program reading `family` (of `members`) through a table of
+    /// `entries` entries in `[0, bound)`, in a loop over `reads` entries.
+    fn lookup_program(
+        members: usize,
+        entries: usize,
+        bound: usize,
+        reads: usize,
+    ) -> Result<(ExponentLutProgram, WireId), ProgramValidationError> {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let family = builder
+            .input_family(IntExpr::constant(members), AttributeKnowledge::PublicPayload)
+            .unwrap();
+        let table = builder.table(IntExpr::constant(entries), IntExpr::constant(bound))?;
+        let products = builder.parallel(FamilyRange::full(IntExpr::constant(reads))?, {
+            |builder, index| {
+                builder
+                    .add(
+                        Operand::Lookup { family, table, index: index.clone() },
+                        Operand::Member { family, index: IntExpr::constant(0) },
+                    )
+                    .map(Operand::Scalar)
+            }
+        })?;
+        let output = builder.sum(products)?;
+        Ok((builder.finish(vec![Operand::Scalar(output)])?, products))
+    }
+
+    /// A lookup reads a member of its family: its index stays within the
+    /// table, the table's bound within the family, and its metadata is the
+    /// family's.
+    #[test]
+    fn lookup_validation_bounds_the_index_by_the_table_and_the_table_by_the_family() {
+        let (program, products) = lookup_program(4, 6, 4, 6).unwrap();
+        assert_eq!(program.wire_knowledge(products).unwrap(), AttributeKnowledge::PublicPayload);
+        assert_eq!(
+            program.tables().values().map(|table| table.count().clone()).collect::<Vec<_>>(),
+            [IntExpr::constant(6)]
+        );
+        assert_eq!(
+            lookup_program(4, 6, 4, 7).unwrap_err(),
+            ProgramValidationError::MemberOutOfBounds
+        );
+        assert_eq!(
+            lookup_program(4, 6, 5, 6).unwrap_err(),
+            ProgramValidationError::MemberOutOfBounds
+        );
+        assert!(lookup_program(4, 0, 4, 1).is_err());
+        assert!(lookup_program(4, 6, 0, 1).is_err());
+    }
+
+    /// A lookup is a wire member read only: an undeclared table, an RHS
+    /// lookup, a root output lookup and a table declared in a body are
+    /// rejected.
+    #[test]
+    fn lookup_is_only_a_wire_member_read_of_a_declared_table() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let family =
+            builder.input_family(IntExpr::constant(2), AttributeKnowledge::PublicPayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let table = builder.table(IntExpr::constant(2), IntExpr::constant(2)).unwrap();
+        let read = |table| Operand::Lookup { family, table, index: IntExpr::constant(0) };
+        assert_eq!(
+            builder.add(read(TableId(7)), read(table)),
+            Err(ProgramValidationError::UndefinedTable(TableId(7)))
+        );
+        assert!(matches!(
+            builder.mul_private(
+                read(table),
+                Operand::Lookup { family: rhs, table, index: IntExpr::constant(0) }
+            ),
+            Err(ProgramValidationError::InvalidStructure(_))
+        ));
+        assert_eq!(
+            builder.parallel(FamilyRange::full(IntExpr::constant(1)).unwrap(), |builder, _| {
+                builder.table(IntExpr::constant(1), IntExpr::constant(1))?;
+                Ok(read(table))
+            }),
+            Err(ProgramValidationError::InputInNestedBody)
+        );
+        assert_eq!(
+            builder.finish(vec![read(table)]),
+            Err(ProgramValidationError::InvalidOutputCount)
+        );
+    }
+
+    /// Table declarations enter the identity of a Program that has them.
+    #[test]
+    fn canonical_identity_commits_table_declarations() {
+        let id = |entries, bound| lookup_program(4, entries, bound, 2).unwrap().0.id();
+        assert_eq!(id(6, 4), id(6, 4));
+        assert_ne!(id(6, 4), id(7, 4));
+        assert_ne!(id(6, 4), id(6, 3));
+    }
+
     #[test]
     fn canonical_identity_commits_lut_ids_when_equal_tables_are_registered() {
         fn build(swapped: bool) -> ExponentLutProgram {
@@ -2183,6 +2466,7 @@ mod tests {
             )]),
             rhs_inputs: std::collections::BTreeMap::new(),
             luts: Vec::new(),
+            tables: std::collections::BTreeMap::new(),
             body: Body {
                 steps: vec![
                     Step::Parallel {
@@ -2225,7 +2509,7 @@ mod tests {
                     }),
                     output: WireId(2),
                 },
-                Step::Sum { family: WireId(2), output: WireId(3) },
+                Step::Sum { family: WireId(2), output: WireId(3), columns: 1 },
             ],
             outputs: vec![Operand::Scalar(WireId(3))],
         };
@@ -2240,6 +2524,7 @@ mod tests {
             )]),
             rhs_inputs: std::collections::BTreeMap::new(),
             luts: Vec::new(),
+            tables: std::collections::BTreeMap::new(),
             body: Body {
                 steps: vec![
                     Step::Parallel {

@@ -863,6 +863,14 @@ impl Ring {
         )
     }
 
+    /// A `shape` matrix whose entries are all the polynomial with every
+    /// coefficient equal to `value`; its size does not grow with the ring
+    /// dimension, unlike [`Self::polynomial`] with repeated coefficients.
+    #[track_caller]
+    pub fn all_coefficients(&self, shape: impl IntoShape, value: impl Into<IntExpr>) -> Mat {
+        self.constant(shape, ConstantMatrix::AllCoefficients { value: value.into() })
+    }
+
     /// Reconstructs one polynomial from canonical coefficient bits.
     ///
     /// Bits are coefficient-major and little-endian within each coefficient.
@@ -1233,6 +1241,22 @@ impl HashTag {
         ));
 
         Ok(())
+    }
+
+    /// Append `index` as a `u64` little-endian component (`[3]` and eight bytes).
+    ///
+    /// An index known when the graph is built (a constant, parameter, or loop-index expression)
+    /// becomes a static [`HashTagComponent::U64Le`]; any other runtime integer becomes a hash
+    /// sampler argument read through [`HashTagComponent::OperandU64Le`]. Both forms hash the same
+    /// bytes for the same value, and the value must lie in `[0, 2^64)`.
+    pub fn push_u64_le(&mut self, index: Int) {
+        match index.compile_expression() {
+            Some(expression) => self.components.push(HashTagComponent::U64Le(expression)),
+            None => {
+                self.components.push(HashTagComponent::OperandU64Le(self.dynamic.len() + 1));
+                self.dynamic.push(index.value);
+            }
+        }
     }
 }
 
@@ -2759,6 +2783,34 @@ mod tests {
                 HashTagComponent::Bytes(b"after".to_vec()),
             ]
         );
+        built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn push_u64_le_is_static_for_compile_time_indices_and_an_operand_otherwise() {
+        let ring = Ring::from_crt_moduli(vec![17.into()], 8);
+        let key = ring.bytes_input("key", 32);
+        let runtime = ring.input("row", (1, 1)).extract_coefficient(0);
+        let mut tag = HashTag::from(b"u64-le-tag:".as_slice());
+        tag.push_u64_le(Int::constant(5).add(Int::constant(2)));
+        tag.push_u64_le(runtime);
+        let sample = ring.hash_matrix(key, tag, (1, 1));
+        let built =
+            DslContext::new("u64-le-tags").output("sample", sample).unwrap().build().unwrap();
+        let hash = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            .unwrap();
+        let NodeKind::HashSample { tag_components, .. } = hash.kind() else { unreachable!() };
+        assert_eq!(
+            tag_components,
+            &vec![HashTagComponent::U64Le(IntExpr::constant(7)), HashTagComponent::OperandU64Le(1),]
+        );
+        assert_eq!(hash.arguments().len(), 2);
+        assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
         built.validate(&ParamEnv::default()).unwrap();
     }
 

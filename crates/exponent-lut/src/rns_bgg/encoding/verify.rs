@@ -60,7 +60,7 @@ fn output_wire_level(
         .ok_or_else(|| ApiError::input("verification output index is out of range"))?
     {
         Operand::Scalar(wire) => *wire,
-        Operand::Member { family, .. } => program
+        Operand::Member { family, .. } | Operand::Lookup { family, .. } => program
             .family_body_outputs()
             .into_iter()
             .find_map(|(output, inner)| (output == *family).then_some(inner))
@@ -423,7 +423,8 @@ where
 }
 
 /// The polynomial `sum_k v_k X^k` of the integer input family `{name}.coefficients` (one member
-/// per coefficient, centered), whose values `value` are inserted into `runtime`. Unlike
+/// per coefficient, centered), whose values `value` are inserted into `runtime`: one node
+/// ([`mxx_dsl::Ring::from_coefficients`]), whatever the ring dimension. Unlike
 /// [`super::plaintext_inputs`], `value` need not be a monomial.
 fn polynomial_input<P: Poly>(
     ring: &mxx_dsl::Ring,
@@ -454,21 +455,17 @@ fn polynomial_input<P: Poly>(
             },
         )
         .map_err(ApiError::scheme)?;
-    (0..count)
-        .map(|k| {
-            crate::rns_bgg::signed_monomial(
-                ring,
-                family.at(Int::constant(k as i64)),
-                Int::constant(k as i64),
-            )
-        })
-        .reduce(|sum, term| sum + term)
-        .ok_or_else(|| ApiError::input("an empty polynomial"))
+    Ok(ring.from_coefficients(&family))
 }
 
+/// The name of the decode stage's family input of the parts' CRT terms: member `2 chain + j`
+/// is the output `refresh` of part `(chain, j)`.
+pub const TOP_REFRESH_TERMS_INPUT: &str = "top-refresh-terms";
+
 /// The error rows `e'_j = y_j - (sigma A'_(j) - Delta_0 r_j x G^st_0)` (`j = 0, 1`) of the
-/// refresh to the top level, as graph values, and the runtime inputs they read: `y_j` recombines
-/// the residue inputs `residue-{chain}-{j}`; see [`top_refresh_error`].
+/// refresh to the top level, as graph values, and the runtime inputs they read: `y_j` sums, in
+/// one loop over the chains, the members `2 chain + j` of the family input
+/// [`TOP_REFRESH_TERMS_INPUT`] (the parts' CRT terms); see [`top_refresh_error`].
 #[allow(clippy::too_many_arguments)]
 fn top_refresh_error_rows<P: Poly>(
     top: &crate::refresh::top::TopRefreshDeclaration,
@@ -480,7 +477,7 @@ fn top_refresh_error_rows<P: Poly>(
     hash_key: &[u8],
 ) -> Result<([Mat; 2], BTreeMap<String, RuntimeValue>), ApiError> {
     use crate::rns_bgg::refresh::{
-        child_hash_key, hash_key_input_name, top_matrix, top_output_ring, top_refresh_combine,
+        child_hash_key, hash_key_input_name, top_matrix, top_output_ring,
     };
     let declaration = top.reference();
     let columns = declaration.columns();
@@ -512,31 +509,56 @@ fn top_refresh_error_rows<P: Poly>(
         .scalar(0, reference.message_scale(0).map_err(ApiError::scheme)?)
         .map_err(ApiError::scheme)?;
     let gadget = reference.state_gadget(0).map_err(ApiError::scheme)?;
+    // The parts' CRT terms, part `(chain, j)` at `2 chain + j`.
+    let output_ring = top_output_ring(top);
+    let term_type = output_ring.matrix_type((1, columns));
+    if let Some(results) = results {
+        let values = results
+            .iter()
+            .flat_map(|parts| parts.iter())
+            .map(|part| {
+                part.outputs
+                    .get("refresh")
+                    .cloned()
+                    .ok_or_else(|| ApiError::input("a part's residue term is missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ring = term_type
+            .ring
+            .resolve(&mxx_ir_core::ParamEnv::default())
+            .map_err(|error| ApiError::input(error.to_string()))?;
+        let element_type =
+            mxx_ir_core::types::ConcreteWireType::Matrix(mxx_ir_core::types::ConcreteMatrixType {
+                ring,
+                rows: 1,
+                columns,
+            });
+        runtime.insert(
+            TOP_REFRESH_TERMS_INPUT.to_owned(),
+            RuntimeValue::IndexedFamily { element_type, values: values.into() },
+        );
+    }
+    let terms = DslContext::new("top-refresh-terms")
+        .input::<mxx_dsl::Family<Mat>>(
+            TOP_REFRESH_TERMS_INPUT,
+            mxx_dsl::FamilyType {
+                element: mxx_dsl::MatType(term_type),
+                count: IntExpr::constant(2 * top.chains()),
+                member_slot: None,
+            },
+        )
+        .map_err(ApiError::scheme)?;
     let rows = [0, 1].map(|component| -> Result<Mat, ApiError> {
         let part =
             top.part(0, component).ok_or_else(|| ApiError::input("the top refresh has no part"))?;
-        let residues = (0..top.chains())
-            .map(|chain| {
-                let name = format!("residue-{chain}-{component}");
-                if let Some(results) = results {
-                    let value = results[chain][component]
-                        .outputs
-                        .get("refresh")
-                        .ok_or_else(|| ApiError::input("a part's residue is missing"))?
-                        .clone();
-                    runtime.insert(name.clone(), value);
-                }
-                let prime = top
-                    .output_prime(chain)
-                    .ok_or_else(|| ApiError::input("the top refresh has no such chain"))?;
-                Ok(mxx_dsl::Ring::from_crt_moduli(
-                    vec![IntExpr::from(prime)],
-                    declaration.ring_dimension,
-                )
-                .input(name, (1, columns)))
+        let first = terms.at(Int::constant(component as i64));
+        let refreshed = match top.chains() {
+            1 => first,
+            chains => mxx_dsl::iterate(chains - 1, first, |chain, sum| {
+                Ok(sum + terms.at(chain.add(1usize).mul(2usize).add(component)))
             })
-            .collect::<Result<Vec<_>, ApiError>>()?;
-        let refreshed = top_refresh_combine(top, residues).map_err(ApiError::scheme)?;
+            .map_err(ApiError::scheme)?,
+        };
         let a_prime = top_matrix(declaration, key.clone(), part);
         let a_row = |row: usize| {
             a_prime.clone().slice(
@@ -637,12 +659,42 @@ where
     Ok(errors)
 }
 
+/// The number of the canonical coefficients `v` of the `1 x columns` `row` (ring dimension
+/// `dimension`, modulus `modulus`) that threshold-decode to one modulo two, `floor((2 v +
+/// floor(q / 2)) / q) mod 2` as the runtime's threshold decoding: one loop over the columns and
+/// one over the coefficients, so the graph does not grow with either.
+fn threshold_ones(
+    row: Mat,
+    columns: usize,
+    dimension: usize,
+    modulus: &BigUint,
+) -> Result<Int, ApiError> {
+    let half = Int::evaluate(IntExpr::constant(modulus / 2u8));
+    let modulus = Int::evaluate(IntExpr::constant(modulus.clone()));
+    mxx_dsl::iterate(columns, Int::constant(0), |column, total| {
+        let start = column.expression()?;
+        let end =
+            IntExpr::Add(Box::new(start.clone()), Box::new(IntExpr::constant(1))).canonicalize();
+        let coefficients = row
+            .clone()
+            .slice(None, Some(mxx_ir_core::node::IndexRange { start, end }))
+            .coefficients();
+        mxx_dsl::iterate(dimension, total, |coefficient, total| {
+            let value = coefficients.at(coefficient);
+            Ok(total.add(value.mul(2).add(half.clone()).div(modulus.clone()).rem(2)))
+        })
+    })
+    .map_err(ApiError::scheme)
+}
+
 /// The decode stage of the refresh to the top level: the number of coefficients of the error
 /// rows of [`top_refresh_error`] that threshold-decode to one modulo 2 (an error of at least
 /// `P / 4`, `P` the product of the refreshed primes); zero when both rows are level-0 encodings
 /// of `expected` under `sigma` modulo `P` with errors below `P / 4`. Without `results` the graph is
-/// built and observed but not executed (its residue inputs `residue-{chain}-{j}` are then unbound),
-/// as the export of its claim needs.
+/// built and observed but not executed (its family input [`TOP_REFRESH_TERMS_INPUT`] is then
+/// unbound), as the export of its claim needs. The graph decodes in loops over the columns and
+/// coefficients and sums the parts' terms in a loop over the chains, so it does not grow with
+/// the ring dimension, the columns or the refreshed slots.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_top_refresh<E, S, P>(
     top: &crate::refresh::top::TopRefreshDeclaration,
@@ -665,20 +717,10 @@ where
     let dimension = top.reference().ring_dimension as usize;
     let (rows, runtime) =
         top_refresh_error_rows(top, results, reference, payload, sigma, expected, hash_key)?;
+    let modulus = top.output_primes().into_iter().map(BigUint::from).product::<BigUint>();
     let mut total = Int::constant(0);
     for row in rows {
-        for column in 0..columns {
-            let entry = row.clone().slice(
-                None,
-                Some(mxx_ir_core::node::IndexRange {
-                    start: IntExpr::constant(column),
-                    end: IntExpr::constant(column + 1),
-                }),
-            );
-            for decoded in entry.threshold_decode_ints(2u8, dimension) {
-                total = total.add(decoded);
-            }
-        }
+        total = total.add(threshold_ones(row, columns, dimension, &modulus)?);
     }
     let graph = DslContext::new("rns-bgg-top-refresh-decode")
         .output("decoded-residual", total)
@@ -1171,6 +1213,7 @@ mod test {
             program,
             &ParamEnv::default(),
             &crate::api::PlaintextInputs::<RhsId, DCRTPoly>::new(),
+            &BTreeMap::new(),
             static_payload.as_ref(),
             &hash_key,
             crate::rns_bgg::RnsPreprocessBuild::new(parameters, context),
@@ -1469,6 +1512,51 @@ mod test {
         verify(&expected, &mut execution, &mut store).unwrap();
         let wrong = expected + DCRTPoly::const_one(&level);
         assert!(verify(&wrong, &mut execution, &mut store).is_err());
+    }
+
+    /// The loop count of [`super::threshold_ones`] equals the sum of the runtime's threshold
+    /// decodings modulo two of every coefficient of a random row.
+    #[test]
+    fn threshold_ones_counts_the_runtime_threshold_decodings() {
+        let parameters =
+            mxx_backends::poly::dcrt::params::DCRTPolyParams::new(8, 2, 30, 15, None, None);
+        let ring = crate::test_support::ring_of(&parameters);
+        let modulus: BigUint = parameters.modulus().as_ref().clone();
+        let row = ring.hash_matrix(ring.bytes_input("hash-key", 32), b"threshold".to_vec(), (1, 3));
+        let looped = super::threshold_ones(row.clone(), 3, 8, &modulus).unwrap();
+        let mut unrolled = Int::constant(0);
+        for column in 0..3 {
+            let entry = row.clone().slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(column),
+                    end: IntExpr::constant(column + 1),
+                }),
+            );
+            for decoded in entry.threshold_decode_ints(2u8, 8) {
+                unrolled = unrolled.add(decoded);
+            }
+        }
+        let graph = DslContext::new("threshold-ones")
+            .output("looped", looped)
+            .unwrap()
+            .output("unrolled", unrolled)
+            .unwrap()
+            .build()
+            .unwrap();
+        let result = crate::test_support::execute_cpu(
+            &crate::test_support::validate(&graph),
+            [parameters],
+            BTreeMap::from([(
+                "hash-key".to_owned(),
+                RuntimeValue::Bytes(rand::random::<[u8; 32]>().as_slice().into()),
+            )]),
+        );
+        let value = |name: &str| match &result.outputs[name] {
+            RuntimeValue::Int(value) => value.clone(),
+            other => panic!("{name} is not an integer: {other:?}"),
+        };
+        assert_eq!(value("looped"), value("unrolled"));
     }
 
     /// Coefficient LUT samples `T[e_o]` placed at `X^o` by a monomial small

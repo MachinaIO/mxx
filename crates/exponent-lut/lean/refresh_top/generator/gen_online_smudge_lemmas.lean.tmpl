@@ -1,0 +1,369 @@
+section Lemmas
+variable {n : Nat}
+
+/-- A `1 × m` block placed at block column `c` of a `1 × C m` row (explicit form of `colPlace`). -/
+def placeColG {α : Type} [Zero α] (C m c : Nat) (x : Matrix (Fin 1) (Fin m) α) :
+    Matrix (Fin (1 * 1)) (Fin (C * m)) α :=
+  fun _ p ↦ if (p : Nat) / m = c then
+    x 0 ⟨(p : Nat) % m, Nat.mod_lt _ (Nat.pos_of_ne_zero fun h0 ↦ by
+      subst h0; exact absurd (lt_of_lt_of_eq p.isLt (Nat.mul_zero C)) (Nat.not_lt_zero _))⟩ else 0
+
+theorem tensor_place {q C m c : Nat} (x : ExactMatrix q n 1 m) :
+    tensorRuns (unitRow (c : Int) : ExactMatrix q n 1 C) x (placeColG C m c x) := by
+  intro i1 i2 j1 j2
+  obtain rfl : i1 = 0 := Subsingleton.elim _ _
+  obtain rfl : i2 = 0 := Subsingleton.elim _ _
+  have hm : 0 < m := lt_of_le_of_lt (Nat.zero_le _) j2.isLt
+  have hd : ((j1 : Nat) * m + j2) / m = j1 := by
+    rw [Nat.add_comm, Nat.add_mul_div_right _ _ hm, Nat.div_eq_of_lt j2.isLt, zero_add]
+  have hmod : ((j1 : Nat) * m + j2) % m = j2 := by
+    rw [Nat.add_comm, Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt j2.isLt]
+  simp only [placeColG, unitRow]
+  by_cases hj : (j1 : Nat) = c
+  · rw [if_pos (by simpa [hd] using hj),
+      if_pos (by simp [hj]), one_mul]
+    exact congrArg _ (Fin.ext (by simp [hmod]))
+  · rw [if_neg (by simpa [hd] using hj),
+      if_neg (by simpa using hj), zero_mul]
+
+theorem colPlace_eq_place {q C m c : Nat} (x : ExactMatrix q n 1 m) :
+    colPlace q n C m c x = placeColG C m c x :=
+  (colPlace_eq (tensor_place x)).symm
+
+theorem place_add {α : Type} [AddZeroClass α] {C m c : Nat} (x y : Matrix (Fin 1) (Fin m) α) :
+    placeColG C m c (x + y) = placeColG C m c x + placeColG C m c y := by
+  funext r p; unfold placeColG; by_cases h : (p : Nat) / m = c <;> simp [h]
+
+theorem place_sub {α : Type} [AddGroup α] {C m c : Nat} (x y : Matrix (Fin 1) (Fin m) α) :
+    placeColG C m c (x - y) = placeColG C m c x - placeColG C m c y := by
+  funext r p; unfold placeColG; by_cases h : (p : Nat) / m = c <;> simp [h]
+
+theorem place_zero {α : Type} [Zero α] {C m c : Nat} :
+    placeColG C m c (0 : Matrix (Fin 1) (Fin m) α) = 0 := by
+  funext r p; simp only [placeColG, Matrix.zero_apply]; split_ifs <;> rfl
+
+theorem place_smul {q C m c : Nat} (s : ExactPoly q n) (x : ExactMatrix q n 1 m) :
+    placeColG C m c (s • x) = s • placeColG C m c x := by
+  funext r p; simp only [placeColG, Matrix.smul_apply]; split_ifs <;> simp
+
+theorem place_sum {α : Type} [AddCommMonoid α] {ι : Type} {C m c : Nat} (s : Finset ι)
+    (f : ι → Matrix (Fin 1) (Fin m) α) :
+    placeColG C m c (∑ i ∈ s, f i) = ∑ i ∈ s, placeColG C m c (f i) := by
+  classical
+  induction s using Finset.induction_on with
+  | empty => simpa using place_zero
+  | @insert i s hi ih => rw [Finset.sum_insert hi, Finset.sum_insert hi, place_add, ih]
+
+theorem place_reduce {q C m c : Nat} (e : ErrorMatrix n 1 m) :
+    placeColG C m c (reduceMatrix q n 1 m e) = reduceMatrix q n (1 * 1) (C * m) (placeColG C m c e) := by
+  funext r p; simp only [placeColG, reduceMatrix]; split_ifs <;> simp
+
+theorem reduce_sum {q rows cols : Nat} {ι : Type} (s : Finset ι) (f : ι → ErrorMatrix n rows cols) :
+    ∑ i ∈ s, reduceMatrix q n rows cols (f i) = reduceMatrix q n rows cols (∑ i ∈ s, f i) := by
+  funext r c; simp only [Matrix.sum_apply, reduceMatrix, map_sum]
+
+/-- Entry of a sum of blocks placed at distinct columns. -/
+theorem place_sum_apply {α : Type} [AddCommMonoid α] {C m cnt : Nat}
+    (y : Nat → Matrix (Fin 1) (Fin m) α) (r : Fin (1 * 1)) (p : Fin (C * m)) :
+    (∑ i ∈ Finset.range cnt, placeColG C m i (y i)) r p =
+      if (p : Nat) / m ∈ Finset.range cnt then placeColG C m ((p : Nat) / m) (y ((p : Nat) / m)) r p else 0 := by
+  rw [Finset.sum_apply, Finset.sum_apply]
+  simp only [placeColG]
+  rw [Finset.sum_ite_eq]
+  split_ifs <;> simp_all
+
+theorem coeffBound_placed_sum {C m cnt : Nat} {y : Nat → ErrorMatrix n 1 m} {B : Nat}
+    (h : ∀ i, CoeffBound (y i) B) :
+    CoeffBound (∑ i ∈ Finset.range cnt, placeColG C m i (y i)) B := by
+  intro r p k
+  rw [place_sum_apply]
+  split_ifs
+  · simp only [placeColG, if_pos]; exact h _ _ _ _
+  · simp
+
+/-- **The smudge sum**: column `i` of the member sums of three families (`A01`, `A11`, `c1`)
+whose members satisfy `c1 = s A01 + A11 - t + e` with `|e| ≤ B`: the summed `c1` is
+`s X01 + X11 - T + es` with `|es| ≤ W B` (blocks never overlap). -/
+theorem smudge_sum_gen {q C m F W cnt : Nat} {s : ExactPoly q n}
+    {a0 a1 c1 t : Fin F → ExactMatrix q n 1 m} {e : Fin F → ErrorMatrix n 1 m} {B : Nat}
+    (hmem : ∀ k, c1 k = s • a0 k + a1 k - t k + reduceMatrix q n 1 m (e k))
+    (heB : ∀ k, CoeffBound (e k) B)
+    {X0 X1 Xc : ExactMatrix q n (1 * 1) (C * m)}
+    (h0 : X0 = ∑ i ∈ Finset.range cnt, colPlace q n C m i (∑ j ∈ Finset.range W, famAt a0 (W * i + j)))
+    (h1 : X1 = ∑ i ∈ Finset.range cnt, colPlace q n C m i (∑ j ∈ Finset.range W, famAt a1 (W * i + j)))
+    (hc : Xc = ∑ i ∈ Finset.range cnt, colPlace q n C m i (∑ j ∈ Finset.range W, famAt c1 (W * i + j))) :
+    ∃ es : ErrorMatrix n (1 * 1) (C * m), CoeffBound es (W * B) ∧
+      Xc = s • X0 + X1 - ∑ i ∈ Finset.range cnt,
+        colPlace q n C m i (∑ j ∈ Finset.range W, famAt t (W * i + j)) +
+        reduceMatrix q n (1 * 1) (C * m) es := by
+  have hpt : ∀ idx, famAt c1 idx = s • famAt a0 idx + famAt a1 idx - famAt t idx +
+      reduceMatrix q n 1 m (famAt e idx) := by
+    intro idx
+    unfold famAt
+    split_ifs
+    · exact hmem _
+    · funext r c; simp [reduceMatrix]
+  refine ⟨∑ i ∈ Finset.range cnt, placeColG C m i (∑ j ∈ Finset.range W, famAt e (W * i + j)),
+    coeffBound_placed_sum fun i ↦ ?_, ?_⟩
+  · have := coeffBound_sum (n := n) (Finset.range W) (e := fun j ↦ famAt e (W * i + j)) (b := fun _ ↦ B)
+      (fun j _ ↦ by dsimp only; unfold famAt; split_ifs; exact heB _; exact coeffBound_mono coeffBound_zero (Nat.zero_le _))
+    simpa [Finset.sum_const, Finset.card_range] using this
+  · simp only [h0, h1, hc, colPlace_eq_place, hpt, Finset.sum_add_distrib, Finset.sum_sub_distrib,
+      ← Finset.smul_sum, place_add, place_sub, place_smul, reduce_sum, place_reduce]
+
+end Lemmas
+
+section Half
+variable {n : Nat}
+
+/-- Integers congruent modulo `q` reduce to the same constant. -/
+theorem reduce_intCast_modEq {q : Nat} {a b : Int} (h : a ≡ b [ZMOD q]) :
+    reducePoly q n (a : ErrorPoly n) = reducePoly q n (b : ErrorPoly n) := by
+  rw [map_intCast, map_intCast]
+  obtain ⟨k, hk⟩ := (Int.ModEq.dvd h.symm)
+  have hq : ((q : Int) : ExactPoly q n) = 0 := by
+    rw [Int.cast_natCast, ← map_natCast (algebraMap (ZMod q) (ExactPoly q n)), ZMod.natCast_self, map_zero]
+  have : (a : ExactPoly q n) = (b : ExactPoly q n) + ((q : Int) : ExactPoly q n) * (k : ExactPoly q n) := by
+    rw [← Int.cast_mul, ← Int.cast_add, ← hk]; push_cast; ring
+  rw [this, hq, zero_mul, add_zero]
+
+/-- A sum over `N d` indices as `N` blocks of `d`. -/
+theorem sum_range_blocks {M : Type} [AddCommMonoid M] (N d : Nat) (f : Nat → M) :
+    ∑ j ∈ Finset.range (N * d), f j = ∑ k ∈ Finset.range N, ∑ e ∈ Finset.range d, f (k * d + e) := by
+  induction N with
+  | zero => simp
+  | succ N ih => rw [Nat.succ_mul, Finset.sum_range_add, ih, Finset.sum_range_succ]
+
+/-- **The smudge digits** (`crate::decoder::decoding`): digits `δ_e = 2 u_e - (P - 1)` weighted by
+`w_e ≡ h P^e` with `2 h ≡ 1 (mod q)` sum to `U - P^d/2 + h`, `U = Σ P^e u_e`. -/
+theorem smudge_digits {q : Nat} {P P' h : Int} (hP : P = 2 * P') (h2 : 2 * h ≡ 1 [ZMOD q]) {d : Nat}
+    (hd : 0 < d) {w u : Nat → Int} (hw : ∀ e < d, w e ≡ h * P ^ e [ZMOD q]) :
+    reducePoly q n ((∑ e ∈ Finset.range d, w e * (2 * u e - (P - 1)) : Int) : ErrorPoly n) =
+      reducePoly q n ((∑ e ∈ Finset.range d, P ^ e * u e - P' * P ^ (d - 1) + h : Int) : ErrorPoly n) := by
+  apply reduce_intCast_modEq
+  have hgeom : (∑ e ∈ Finset.range d, P ^ e) * (P - 1) = P ^ d - 1 := geom_sum_mul P d
+  have hPd : P ^ d = 2 * (P' * P ^ (d - 1)) := by
+    obtain ⟨d', rfl⟩ : ∃ d', d = d' + 1 := ⟨d - 1, by omega⟩
+    rw [pow_succ, Nat.add_sub_cancel, hP]; ring
+  calc ∑ e ∈ Finset.range d, w e * (2 * u e - (P - 1))
+      ≡ ∑ e ∈ Finset.range d, h * P ^ e * (2 * u e - (P - 1)) [ZMOD q] :=
+        Int.ModEq.sum fun e he ↦ (hw e (Finset.mem_range.1 he)).mul_right _
+    _ = (2 * h) * ∑ e ∈ Finset.range d, P ^ e * u e - h * (P ^ d - 1) := by
+        rw [← hgeom, Finset.mul_sum, Finset.sum_mul, Finset.mul_sum, ← Finset.sum_sub_distrib]
+        exact Finset.sum_congr rfl fun e _ ↦ by ring
+    _ ≡ 1 * ∑ e ∈ Finset.range d, P ^ e * u e - (2 * h) * (P' * P ^ (d - 1)) + h [ZMOD q] := by
+        rw [hPd]
+        have : (2 * h) * ∑ e ∈ Finset.range d, P ^ e * u e - h * (2 * (P' * P ^ (d - 1)) - 1) =
+          (2 * h) * ∑ e ∈ Finset.range d, P ^ e * u e - (2 * h) * (P' * P ^ (d - 1)) + h := by ring
+        rw [this]
+        exact ((h2.mul_right _).sub_right _).add_right _
+    _ ≡ _ [ZMOD q] := by
+        rw [one_mul]
+        exact ((Int.ModEq.refl _).sub (h2.mul_right _)).add_right _ |>.trans (by rw [one_mul])
+
+theorem sum_Xe_range (a : Nat → Int) :
+    ∑ k ∈ Finset.range n, Xe (n := n) k * ((a k : Int) : ErrorPoly n) = intPoly (fun k : Fin n ↦ a k) := by
+  rw [Finset.sum_range (fun k ↦ Xe (n := n) k * ((a k : Int) : ErrorPoly n))]
+  unfold intPoly
+  exact Finset.sum_congr rfl fun o _ ↦ mul_comm _ _
+
+/-- **One smudge column**: members `j < N d` (`N = n` coefficients, `d` digits) with payloads
+`X^(j/d) w_(j%d) (2 u_j - (P-1))` sum to `U - P^d/2` per coefficient plus the constant `h` in
+every coefficient. -/
+theorem smudge_column {q d : Nat} {P P' h : Int} (hP : P = 2 * P')
+    (h2 : 2 * h ≡ 1 [ZMOD q]) (hd : 0 < d) {w : Nat → Int} (hw : ∀ e < d, w e ≡ h * P ^ e [ZMOD q])
+    {g : Nat → ExactPoly q n} {u : Nat → Int}
+    (hg : ∀ j < n * d, g j = reducePoly q n (Xe (j / d) * ((w (j % d) * (2 * u j - (P - 1)) : Int) : ErrorPoly n))) :
+    ∑ j ∈ Finset.range (n * d), g j =
+      reducePoly q n (intPoly (fun k : Fin n ↦ ∑ e ∈ Finset.range d, P ^ e * u ((k : Nat) * d + e) - P' * P ^ (d - 1))) +
+        reducePoly q n (intPoly (fun _ ↦ h)) := by
+  rw [Finset.sum_congr rfl fun j hj ↦ hg j (Finset.mem_range.1 hj), sum_range_blocks]
+  have hk : ∀ k e, e < d → (k * d + e) / d = k ∧ (k * d + e) % d = e := fun k e he ↦
+    ⟨by rw [Nat.add_comm, Nat.add_mul_div_right _ _ hd, Nat.div_eq_of_lt he, zero_add],
+     by rw [Nat.add_comm, Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt he]⟩
+  have hcol : ∀ k, ∑ e ∈ Finset.range d, reducePoly q n (Xe ((k * d + e) / d) *
+      ((w ((k * d + e) % d) * (2 * u (k * d + e) - (P - 1)) : Int) : ErrorPoly n)) =
+      reducePoly q n (Xe k * ((∑ e ∈ Finset.range d, P ^ e * u (k * d + e) - P' * P ^ (d - 1) : Int) : ErrorPoly n)) +
+      reducePoly q n (Xe k * ((h : Int) : ErrorPoly n)) := by
+    intro k
+    rw [Finset.sum_congr rfl fun e he ↦ by rw [(hk k e (Finset.mem_range.1 he)).1, (hk k e (Finset.mem_range.1 he)).2],
+      ← map_sum, ← Finset.mul_sum, ← map_add, ← mul_add, map_mul, map_mul]
+    congr 1
+    have := smudge_digits (n := n) (u := fun e ↦ u (k * d + e)) hP h2 hd hw
+    push_cast at this ⊢
+    rw [this]
+  rw [Finset.sum_congr rfl fun k _ ↦ hcol k, Finset.sum_add_distrib, ← map_sum, ← map_sum,
+    sum_Xe_range, sum_Xe_range (fun _ ↦ h)]
+
+/-- `U - P^d/2` of `d` digits in `[0, P)` lies in `[-P^d/2, P^d/2)`. -/
+theorem digits_centered {P P' : Int} (hP : P = 2 * P') (hP0 : 0 < P') {d : Nat} (hd : 0 < d)
+    {u : Nat → Int} (hu : ∀ e < d, 0 ≤ u e ∧ u e < P) :
+    (∑ e ∈ Finset.range d, P ^ e * u e - P' * P ^ (d - 1)).natAbs ≤ (P' * P ^ (d - 1)).toNat := by
+  have hgeom : (∑ e ∈ Finset.range d, P ^ e) * (P - 1) = P ^ d - 1 := geom_sum_mul P d
+  have hPd : P ^ d = 2 * (P' * P ^ (d - 1)) := by
+    obtain ⟨d', rfl⟩ : ∃ d', d = d' + 1 := ⟨d - 1, by omega⟩
+    rw [pow_succ, Nat.add_sub_cancel, hP]; ring
+  have hPpos : 0 < P := by omega
+  have hlo : 0 ≤ ∑ e ∈ Finset.range d, P ^ e * u e :=
+    Finset.sum_nonneg fun e he ↦ mul_nonneg (pow_nonneg hPpos.le _) (hu e (Finset.mem_range.1 he)).1
+  have hhi : ∑ e ∈ Finset.range d, P ^ e * u e ≤ P ^ d - 1 := by
+    rw [← hgeom, Finset.sum_mul]
+    exact Finset.sum_le_sum fun e he ↦ mul_le_mul_of_nonneg_left (by have := (hu e (Finset.mem_range.1 he)).2; omega)
+      (pow_nonneg hPpos.le _)
+  have hK : 0 ≤ P' * P ^ (d - 1) := mul_nonneg hP0.le (pow_nonneg hPpos.le _)
+  omega
+
+/-- **The smudge half** (`final_inst`'s `hTH`): the placed column sums `Tsm` of members with payload
+`X^((o/d) mod n) w_(o mod d) (2 u_o - (P-1))` (`u_o ∈ [0, P)`, `w_e ≡ h P^e`, `2 h ≡ 1`) minus the
+half row `H` (every coefficient `h`) is a reduced matrix with coefficients in `[-P^d/2, P^d/2)`:
+the centred smudge of `crate::decoder::decoding`. -/
+theorem smudge_half_gen (hn : 0 < n) {q C d F : Nat} {P P' h : Int} (hP : P = 2 * P') (hP0 : 0 < P')
+    (h2 : 2 * h ≡ 1 [ZMOD q]) (hd : 0 < d) (hF : C * (n * d) ≤ F)
+    {w : Nat → Int} (hw : ∀ e < d, w e ≡ h * P ^ e [ZMOD q])
+    {u : Nat → Int} (hu : ∀ o < F, 0 ≤ u o ∧ u o < P)
+    {t : Fin F → ExactMatrix q n 1 1}
+    (ht : ∀ o : Fin F, t o = fun _ _ ↦ reducePoly q n (Xe ((o : Nat) / d % n) *
+      ((w ((o : Nat) % d) * (2 * u o - (P - 1)) : Int) : ErrorPoly n)))
+    {H : ExactMatrix q n (1 * 1) (C * 1)}
+    (hH : ∀ r p, H r p = reducePoly q n (intPoly (fun _ ↦ h))) :
+    ∃ M : ErrorMatrix n (1 * 1) (C * 1), CoeffBound M (P' * P ^ (d - 1)).toNat ∧
+      (∑ c ∈ Finset.range C, colPlace q n C 1 c (∑ j ∈ Finset.range (n * d), famAt t (n * d * c + j))) - H =
+        reduceMatrix q n (1 * 1) (C * 1) M := by
+  set K := P' * P ^ (d - 1)
+  let u' : Nat → Int := fun o ↦ if o < F then u o else 0
+  have hu' : ∀ o, 0 ≤ u' o ∧ u' o < P := fun o ↦ by
+    simp only [u']; split_ifs with ho
+    · exact hu o ho
+    · omega
+  let A : Nat → ErrorMatrix n 1 1 := fun c _ _ ↦
+    intPoly (fun k : Fin n ↦ ∑ e ∈ Finset.range d, P ^ e * u' (n * d * c + ((k : Nat) * d + e)) - K)
+  let B : ExactMatrix q n 1 1 := fun _ _ ↦ reducePoly q n (intPoly (fun _ ↦ h))
+  have hcol : ∀ c ∈ Finset.range C, ∑ j ∈ Finset.range (n * d), famAt t (n * d * c + j) =
+      reduceMatrix q n 1 1 (A c) + B := by
+    intro c hc
+    have hc' := Finset.mem_range.1 hc
+    funext r s
+    obtain rfl : r = 0 := Subsingleton.elim _ _
+    obtain rfl : s = 0 := Subsingleton.elim _ _
+    rw [Matrix.sum_apply]
+    have := smudge_column (n := n) (q := q) hP h2 hd hw (u := fun j ↦ u' (n * d * c + j))
+      (g := fun j ↦ famAt t (n * d * c + j) 0 0) (fun j hj ↦ by
+        have hlt : n * d * c + j < F := by nlinarith
+        simp only [famAt, dif_pos hlt, ht, u', if_pos hlt]
+        congr 3
+        · rw [show n * d * c + j = j + (n * c) * d by ring, Nat.add_mul_div_right _ _ hd,
+            Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt (Nat.div_lt_of_lt_mul (by rw [Nat.mul_comm]; exact hj))]
+        · rw [show n * d * c + j = j + (n * c) * d by ring, Nat.add_mul_mod_self_right])
+    simp only [Matrix.add_apply, reduceMatrix, A, B]
+    rw [this]
+  refine ⟨∑ c ∈ Finset.range C, placeColG C 1 c (A c), coeffBound_placed_sum fun c r s k ↦ ?_, ?_⟩
+  · simp only [A]
+    rw [intPoly_coeff hn]
+    exact digits_centered hP hP0 hd fun e _ ↦ hu' _
+  · have hB : ∑ c ∈ Finset.range C, placeColG C 1 c B = H := by
+      funext r p
+      rw [place_sum_apply, if_pos (Finset.mem_range.2 (by have := p.isLt; simpa using this)), hH]
+      simp only [placeColG, B, if_true]
+    rw [Finset.sum_congr rfl fun c hc ↦ by rw [hcol c hc], Finset.sum_congr rfl fun c _ ↦ colPlace_eq_place _,
+      Finset.sum_congr rfl fun c _ ↦ place_add _ _, Finset.sum_add_distrib, hB, add_sub_cancel_right,
+      Finset.sum_congr rfl fun c _ ↦ place_reduce _, reduce_sum]
+
+/-- A `concatColumns` of two matrices with all entries `x` has all entries `x`. -/
+theorem concat_const {q rows a b : Nat} {l : ExactMatrix q n rows a} {r : ExactMatrix q n rows b}
+    {out : ExactMatrix q n rows (a + b)} {x : ExactPoly q n} (h : concatColumns l r out)
+    (hl : ∀ i j, l i j = x) (hr : ∀ i j, r i j = x) : ∀ i j, out i j = x := by
+  intro i j
+  rw [h i j]; split_ifs
+  · exact hl _ _
+  · exact hr _ _
+
+/-- Every entry of `allCoefficients h` is the reduction of the integer polynomial with all coefficients `h`. -/
+theorem allCoefficients_entry {q rows cols : Nat} (h : Int) (i : Fin rows) (j : Fin cols) :
+    (allCoefficients h : ExactMatrix q n rows cols) i j = reducePoly q n (intPoly (fun _ ↦ h)) := by
+  simp only [allCoefficients]
+  exact polynomialOfCoefficients_eq_reduce _
+
+/-- A member target `X • (w y u_1) • 1` (`SmudgeMember.rel`, component `1`) as a polynomial. -/
+theorem target_payload {q : Nat} (X w y sp : ErrorPoly n) :
+    (reducePoly q n X • reducePoly q n (w * y * unitPair sp 1) • (1 : ExactMatrix q n 1 1)) =
+      fun _ _ ↦ reducePoly q n (X * (w * y)) := by
+  funext r c
+  obtain rfl : r = 0 := Subsingleton.elim _ _
+  obtain rfl : c = 0 := Subsingleton.elim _ _
+  simp [unitPair, map_mul]
+
+end Half
+
+section Digits
+variable {n : Nat}
+
+/-- The half-integer smudge table `T k = 2 f(k) - 1`, `f(k) = ⌊p' k / n'⌋ + 1` (`n' = 2^log`). -/
+def halfTable (p' n' k : Nat) : Int := 2 * ((p' * k / n' : Nat) + 1 : Int) - 1
+
+/-- The digit of the negacyclic coefficient LUT on input `z`: `(-1)^(z / n') T (z mod n')`. -/
+def halfDigit (p' n' z : Nat) : Int := (-1) ^ (z / n') * halfTable p' n' (z % n')
+
+/-- Its offset value `u = (δ + (2 p' - 1)) / 2 ∈ [0, 2 p')`: `δ = 2 u - (2 p' - 1)`. -/
+def halfU (p' n' z : Nat) : Int := (halfDigit p' n' z + (2 * p' - 1)) / 2
+
+theorem halfU_spec {p' n' : Nat} (hp : 0 < p') (hn' : 0 < n') (z : Nat) :
+    halfDigit p' n' z = 2 * halfU p' n' z - (2 * p' - 1) ∧ 0 ≤ halfU p' n' z ∧ halfU p' n' z < 2 * p' := by
+  have hf : p' * (z % n') / n' < p' := Nat.div_lt_of_lt_mul (by
+    have := Nat.mod_lt z hn'
+    calc p' * (z % n') < p' * n' := Nat.mul_lt_mul_of_pos_left this hp
+      _ = n' * p' := Nat.mul_comm _ _)
+  have hsign : (-1 : Int) ^ (z / n') = 1 ∨ (-1 : Int) ^ (z / n') = -1 := by
+    rcases Nat.even_or_odd (z / n') with h | h
+    · exact Or.inl h.neg_one_pow
+    · exact Or.inr h.neg_one_pow
+  unfold halfU halfDigit halfTable
+  obtain ⟨f, hfd⟩ : ∃ f, p' * (z % n') / n' = f := ⟨_, rfl⟩
+  rw [hfd]
+  rw [hfd] at hf
+  rcases hsign with hs | hs <;> rw [hs] <;> omega
+
+/-- **The smudge digit** of a member: the coefficient LUT with the half-integer table
+(Walsh coefficients `C`, `hC` — G's `keyTableC_walsh` form) on a PRF output `X^(s z)` (`hμ` — G's
+`prf_z_gen` form), scaled by `Δ' ≡ 1`, is `2 u - (P - 1)`, `u = halfU p' n' z ∈ [0, P)`, `P = 2 p'`. -/
+theorem smudge_digit_gen {q inverse s log p' : Nat} (hn : n = s * 2 ^ log) (hnpos : 0 < n)
+    (hinverse : (inverse : ExactPoly q n) * ((2 ^ log : Nat) : ExactPoly q n) = 1)
+    (index : Fin (2 ^ log) → Nat) (hodd : ∀ i, Odd (index i)) (perm : Fin (2 ^ log) ≃ Fin (2 ^ log))
+    (hindex : ∀ i, index i % (2 * 2 ^ log) = 1 + 2 * 1 * (perm i).val)
+    {C : Fin (2 ^ log) → ExactPoly q n}
+    (hC : ∀ i, C i = lutFourierCoefficient (2 ^ log) (X q ^ s) (inverse : ExactPoly q n)
+      (fun k : Fin (2 ^ log) ↦ reducePoly q n ((halfTable p' (2 ^ log) k : Int) : ErrorPoly n)) (index i))
+    {μ ν Δ' : ErrorPoly n} {z : Nat} (hμ : reducePoly q n μ = reducePoly q n (Xe (n := n) (s * z)))
+    (hwalsh : ∑ i, reducePoly q n (substitution (index i) (hodd i) μ) * C i = reducePoly q n ν)
+    (hΔ : reducePoly q n Δ' = 1) (hp : 0 < p') :
+    reducePoly q n (Δ' * ν) = reducePoly q n ((2 * halfU p' (2 ^ log) z - (2 * p' - 1) : Int) : ErrorPoly n) ∧
+      0 ≤ halfU p' (2 ^ log) z ∧ halfU p' (2 ^ log) z < 2 * p' := by
+  have hv := lut_value_of_walsh hn hnpos (fun k ↦ ((halfTable p' (2 ^ log) k : Int) : ErrorPoly n)) hinverse index
+    hodd perm hindex hC hμ hwalsh
+  obtain ⟨hd, h0, h1⟩ := halfU_spec hp (pow_pos (by norm_num) log : 0 < 2 ^ log) z
+  refine ⟨?_, h0, h1⟩
+  rw [map_mul, hΔ, one_mul, hv, ← hd]
+  unfold halfDigit
+  push_cast
+  rfl
+
+
+theorem ht_of_digit {n q : Nat} {X Δ' ν sp : ErrorPoly n} {v : Int}
+    (h : reducePoly q n (Δ' * ν) = reducePoly q n (v : ErrorPoly n)) (W : Int) :
+    (reducePoly q n X • reducePoly q n ((W : ErrorPoly n) * (Δ' * ν) * unitPair sp 1) • (1 : ExactMatrix q n 1 1)) =
+      fun _ _ ↦ reducePoly q n (X * ((W * v : Int) : ErrorPoly n)) := by
+  rw [target_payload]
+  funext r c
+  rw [map_mul, map_mul, h, ← map_mul, ← map_mul]
+  push_cast; rfl
+
+
+/-- A Walsh coefficient of an exported table (`G`'s `keyTableC_walsh` form, values `tv`) equal pointwise to
+the half-integer table is that of the half-integer table. -/
+theorem walsh_halfTable {q W : Nat} {p' : Nat} (root inv : ExactPoly q n) (tv : Fin W → Int)
+    (htv : ∀ k, tv k = halfTable p' W k) (index : Nat) :
+    lutFourierCoefficient W root inv (fun k ↦ ((tv k : Int) : ExactPoly q n)) index =
+      lutFourierCoefficient W root inv (fun k : Fin W ↦ reducePoly q n ((halfTable p' W k : Int) : ErrorPoly n)) index := by
+  congr 1
+  funext k
+  rw [htv k, map_intCast]
+end Digits

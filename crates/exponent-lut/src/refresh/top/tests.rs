@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     ExpLayout,
-    decoder::decoding::fixture::{keys, profile},
+    decoder::decoding::fixture::{keys, profile, shape},
     program::{AttributeKnowledge, LutOutputRepresentation, LutTable},
 };
 use std::collections::BTreeSet;
@@ -25,8 +25,9 @@ pub(crate) fn lut_source(coefficient: bool) -> (ExponentLutProgram, WireId) {
     (builder.finish(vec![Operand::Scalar(output)]).unwrap(), output)
 }
 
-fn layouts(count: usize) -> Vec<PbcPublicLayout> {
-    keys(count).into_iter().map(|key| key.public_layout).collect()
+/// The key shape of `count` fresh keys.
+fn key_shape(count: usize) -> crate::program_gadgets::prf::PrfKeyShape {
+    shape(&keys(count))
 }
 
 /// Sixteen 30-bit NTT primes of the ring of dimension eight: the
@@ -66,7 +67,7 @@ fn declaration_of(
 ) -> Result<TopRefreshDeclaration, RefreshError> {
     let n = profile().ring_dimension().unwrap();
     let columns = reference().columns();
-    let mut smudge = |_: usize, _: usize, _: usize| layouts(n);
+    let mut smudge = |_: usize, _: usize| key_shape(columns * n);
     TopRefreshDeclaration::new(
         source,
         target,
@@ -77,9 +78,9 @@ fn declaration_of(
         slots,
         primes()[3..].to_vec(),
         1,
-        TopRefreshLayouts {
-            mask: layouts(n),
-            fresh: [layouts(columns * n), layouts(columns * n)],
+        TopRefreshKeys {
+            mask: key_shape(n),
+            fresh: [key_shape(columns * n), key_shape(columns * n)],
             smudge: &mut smudge,
         },
         b"top".to_vec(),
@@ -111,11 +112,9 @@ fn top_refresh_lays_out_one_chain_per_prime() {
             assert_eq!((details.component(), details.output_prime()), (component, position));
             assert_eq!(part.component(), component);
             assert_eq!(part.decoded_primes(), vec![position]);
-            assert_eq!(part.decoders().len(), columns);
-            assert!(
-                part.decoder(position, columns - 1).is_some() &&
-                    part.decoder(1 - position, 0).is_none()
-            );
+            assert_eq!(part.decoders().len(), 1);
+            assert_eq!(part.decoders()[0].columns(), columns);
+            assert!(part.decoder(position).is_some() && part.decoder(1 - position).is_none());
             assert_eq!(part.label([3; 32], b"nu").unwrap(), top.label([3; 32], b"nu").unwrap());
         }
         // The components share the matrix tag; `A'` separates them by the component index.

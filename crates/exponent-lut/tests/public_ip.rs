@@ -351,6 +351,7 @@ fn public_ip_end_to_end() {
         program,
         &ParamEnv::default(),
         &api::PlaintextInputs::<_, DCRTPoly>::new(),
+        &BTreeMap::new(),
         Some(&payload),
         HASH_KEY,
         RnsPreprocessBuild::new(&parameters, [7; 32]),

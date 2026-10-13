@@ -118,7 +118,8 @@ impl RnsBggDerivedWorkload {
         // A public input that is itself an output keeps its own level.
         for output in program.outputs() {
             let (crate::program::Operand::Scalar(wire) |
-            crate::program::Operand::Member { family: wire, .. }) = output;
+            crate::program::Operand::Member { family: wire, .. } |
+            crate::program::Operand::Lookup { family: wire, .. }) = output;
             collector.public_input_uses.insert(*wire, None);
         }
         let mut environment = Environment::new();
@@ -152,6 +153,12 @@ impl RnsBggDerivedWorkload {
                 ),
             }
             .map_err(|_| RnsBggError::Binding("invalid workload RHS binding"))?;
+        }
+        // A lookup's workload does not depend on the table's entries.
+        for id in program.tables().keys() {
+            environment
+                .bind_table(*id, *id)
+                .map_err(|_| RnsBggError::Binding("invalid workload table binding"))?;
         }
         let mut families = RnsBggNoiseFamilies::default();
         crate::program::lower_program(program, &mut collector, &mut families, &mut environment)
@@ -325,6 +332,19 @@ impl<'a> ProgramLoweringContext for WorkloadCollector<'a> {
 impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
     type WireFamily = (WireId, usize, FamilyRange);
     type RhsFamily = (RhsId, FamilyRange);
+    type Table = crate::program::TableId;
+
+    /// Every member of a family has the family's level, so a lookup reads
+    /// the same workload as a member read.
+    fn wire_at_table(
+        &mut self,
+        _evaluator: &mut WorkloadCollector<'a>,
+        family: &Self::WireFamily,
+        _table: &Self::Table,
+        _index: &IntExpr,
+    ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {
+        Ok((family.0, family.1))
+    }
 
     fn wire_at(
         &mut self,
@@ -374,6 +394,7 @@ impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
         &mut self,
         evaluator: &mut WorkloadCollector<'a>,
         family: &Self::WireFamily,
+        _: usize,
     ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {
         let output = evaluator.site().map_err(ProgramLowerError::Backend)?.output;
         evaluator.levels.insert(output, family.1);

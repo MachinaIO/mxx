@@ -51,6 +51,10 @@ pub enum HashTagComponent {
     U64Le(IntExpr),
     /// Index into hash sampler arguments, including the key at index zero.
     Operand(usize),
+    /// Index into hash sampler arguments of a runtime integer scalar, encoded like
+    /// [`HashTagComponent::U64Le`] of its value (`[3]` followed by the value as eight
+    /// little-endian bytes); the value must lie in `[0, 2^64)` at run time.
+    OperandU64Le(usize),
 }
 
 /// Executable operation represented by a declarative graph node.
@@ -270,6 +274,9 @@ pub struct ArtifactInput {
     pub availability: ArtifactAvailability,
 }
 
+/// A constant matrix payload. `AllCoefficients` makes every entry the
+/// polynomial whose `ring_dimension` coefficients all equal `value`, so the
+/// graph stays independent of the ring dimension.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub enum ConstantMatrix {
@@ -281,6 +288,7 @@ pub enum ConstantMatrix {
     PowerOfBase { base: IntExpr, exponent: IntExpr },
     Rotation { exponent: IntExpr },
     Polynomial { coefficients: Vec<IntExpr> },
+    AllCoefficients { value: IntExpr },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

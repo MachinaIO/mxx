@@ -9,7 +9,8 @@ proof package imports it. It has four libraries:
 - `MxxPrimitives` (`Primitives*.lean`): bounds, CRT decomposition, radix digits, negacyclic
   arithmetic, and preimage and sampling facts.
 - `MxxRuntime` (`Runtime*.lean`): the relations generated modules use, the sampling tape and its
-  measure, and lemmas about them.
+  measure, and lemmas about them. `RuntimeAllCoefficients.lean` (the all-coefficients constant) is
+  not imported by `MxxRuntime.lean`; a generated module imports it only when it uses the constant.
 - `RuntimeExamples` (`RuntimeLayoutExamples.lean`): concrete regular gadget layouts, one of them
   with a dropped tower, checking the runtime facts generated relations rely on.
 

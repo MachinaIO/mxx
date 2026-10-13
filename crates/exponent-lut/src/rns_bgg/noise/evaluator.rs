@@ -971,6 +971,23 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
 impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
     type WireFamily = (WireId, RnsBggNoiseFamily);
     type RhsFamily = (RhsId, FamilyRange);
+    type Table = crate::program::TableId;
+    /// A lookup reads a member the noise model cannot name: its payload
+    /// support is unknown (no row contract holds) and its per-member samples
+    /// take the unknown coordinate, so reductions over it stay coherent.
+    fn wire_at_table(
+        &mut self,
+        evaluator: &mut RnsBggNoiseEvaluator<'a>,
+        family: &Self::WireFamily,
+        _table: &Self::Table,
+        index: &IntExpr,
+    ) -> Result<(WireId, RnsBggNoiseValue), ProgramLowerError<RnsBggError>> {
+        evaluator.observe_family_read(family.0, index, None);
+        let element = &family.1.element;
+        let member =
+            element.breakdown.as_ref().map(|breakdown| breakdown.member_unknown(self.depth));
+        Ok((family.0, element.clone().with_breakdown(member)))
+    }
     fn wire_at(
         &mut self,
         evaluator: &mut RnsBggNoiseEvaluator<'a>,
@@ -1073,9 +1090,30 @@ impl<'a> FamilyExecution<RnsBggNoiseEvaluator<'a>> for RnsBggNoiseFamilies {
         &mut self,
         evaluator: &mut RnsBggNoiseEvaluator<'a>,
         family: &Self::WireFamily,
+        columns: usize,
     ) -> Result<(WireId, RnsBggNoiseValue), ProgramLowerError<RnsBggError>> {
         let output = evaluator.site().map_err(ProgramLowerError::Backend)?.output;
-        evaluator.reduce_add(output, family.0, &family.1).map_err(ProgramLowerError::Backend)
+        // Every entry of a row Sum is the sum of one column's block: the
+        // first block stands for every column, whose members have the same
+        // noise.
+        let mut block = family.1.clone();
+        if columns > 1 {
+            let count = block
+                .range
+                .count()
+                .evaluate(&ParamEnv::default())
+                .ok()
+                .and_then(|count| count.to_usize())
+                .ok_or(ProgramLowerError::Backend(RnsBggError::Parameters(
+                    "a row Sum needs a constant member count",
+                )))?;
+            let per_column = IntExpr::constant(count / columns);
+            block.range =
+                FamilyRange::bounded(block.range.start().clone(), per_column.clone(), per_column)?;
+            block.max_nonzero_payloads =
+                block.max_nonzero_payloads.min(BigUint::from(count / columns));
+        }
+        evaluator.reduce_add(output, family.0, &block).map_err(ProgramLowerError::Backend)
     }
 }
 
@@ -1967,6 +2005,71 @@ mod test {
             BTreeMap::new(),
         );
         assert_eq!(shared, v.scaled(&(&gain.l2_squared * 16u8)).add(&v.scaled(&16u8.into())));
+    }
+
+    /// A table lookup reads an unknown member: the sum of products over
+    /// independent members stays coherent, as for a family whose members are
+    /// one sample, where member reads by the lane are independent.
+    #[test]
+    fn table_lookup_reads_an_unknown_member() {
+        fn program(lookup: bool) -> (ExponentLutProgram, WireId, WireId) {
+            use crate::program::Operand;
+            let mut builder = crate::program::ExponentLutProgramBuilder::new();
+            let state = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+            let public = builder
+                .input_family(
+                    IntExpr::constant(4),
+                    crate::program::AttributeKnowledge::PublicPayload,
+                )
+                .unwrap();
+            let table = builder.table(IntExpr::constant(4), IntExpr::constant(4)).unwrap();
+            let products = builder
+                .parallel(FamilyRange::full(IntExpr::constant(4)).unwrap(), |builder, index| {
+                    let read = if lookup {
+                        Operand::Lookup { family: public, table, index }
+                    } else {
+                        Operand::Member { family: public, index }
+                    };
+                    builder.mul_public(read, Operand::Scalar(state)).map(Operand::Scalar)
+                })
+                .unwrap();
+            let output = builder.sum(products).unwrap();
+            let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+            (program, state, public)
+        }
+        let parameters = nested_alignment_parameters();
+        let encoding =
+            |label: &[u8]| RnsBggNoiseValue::sampled_encoding(&parameters, label, &[BigInt::one()]);
+        let v = parameters.encoding_error_variance();
+        let gain = parameters.mul_public_action_gain(0).unwrap();
+        let variance = |lookup: bool| {
+            let (program, state, public) = program(lookup);
+            output_variance(
+                &program,
+                &parameters,
+                BTreeMap::from([
+                    (state, InputBinding::Scalar(encoding(b"state"))),
+                    (
+                        public,
+                        InputBinding::Family(RnsBggNoiseFamily {
+                            element: encoding(b"a").independent_family_members(),
+                            range: FamilyRange::full(IntExpr::constant(4)).unwrap(),
+                            max_nonzero_payloads: 4u8.into(),
+                            row_length: None,
+                        }),
+                    ),
+                ]),
+                BTreeMap::new(),
+            )
+        };
+        assert_eq!(
+            variance(false),
+            v.scaled(&(&gain.l2_squared * 4u8)).add(&v.scaled(&16u8.into()))
+        );
+        assert_eq!(
+            variance(true),
+            v.scaled(&(&gain.l2_squared * 16u8)).add(&v.scaled(&16u8.into()))
+        );
     }
 
     #[test]

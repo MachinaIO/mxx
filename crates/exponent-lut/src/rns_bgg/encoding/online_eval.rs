@@ -84,7 +84,62 @@ impl<'a> RnsOnlineEvalBuild<'a> {
             hash_namespace: None,
             pending_refresh: None,
             refresh_matrix_key: None,
+            runtime: BTreeMap::new(),
         }
+    }
+
+    /// Bind every runtime table of `program` to the entries preprocessing
+    /// exported under `name("table/<id>")` (recorded in its binding
+    /// `preprocess`), as a resident graph input of the same name: a protocol
+    /// links the input to that artifact. A `prf`'s tables must be those of
+    /// its committed key set. A table preprocessing bound by shape only is
+    /// bound with its declared count and no value.
+    fn bind_tables(
+        &mut self,
+        program: &ExponentLutProgram,
+        preprocess: &RnsBggArtifactBinding,
+        prf: Option<&crate::program_gadgets::prf::SparseLwrPrf>,
+        name: impl Fn(&str) -> String,
+    ) -> Result<(), ApiError> {
+        let mut bound = BTreeMap::new();
+        for (id, declaration) in program.tables() {
+            let name = name(&format!("table/{id:?}"));
+            let entries = preprocess
+                .table(&name)
+                .ok_or_else(|| ApiError::compatibility("preprocessing exported no such table"))?;
+            let count = match entries {
+                Some(entries) => entries.len(),
+                None => declaration
+                    .count()
+                    .evaluate(&mxx_ir_core::ParamEnv::default())
+                    .ok()
+                    .and_then(|count| count.to_usize())
+                    .ok_or_else(|| ApiError::compatibility("table count is not concrete"))?,
+            };
+            if IntExpr::constant(count) != *declaration.count() {
+                return Err(ApiError::compatibility("table entries do not match the Program"));
+            }
+            if let Some(entries) = entries {
+                self.runtime.insert(
+                    name.clone(),
+                    RuntimeValue::integer_values(
+                        entries.iter().map(|entry| BigInt::from(*entry)).collect(),
+                    ),
+                );
+                bound.insert(*id, entries.to_vec());
+            }
+            self.environment
+                .bind_table(*id, DslContext::new("table").int_family_input(name, count))
+                .map_err(|error| ApiError::input(error.to_string()))?;
+        }
+        // Tables bound by shape only have no entries to check (a mixture
+        // fails the check).
+        if let Some(prf) = prf.filter(|_| !bound.is_empty() || program.tables().is_empty()) {
+            prf.check_tables(&bound).map_err(|_| {
+                ApiError::compatibility("the exported tables are not those of the key set")
+            })?;
+        }
+        Ok(())
     }
 
     /// Sample a top refresh's `A'` from the stage key `hash_key` derived
@@ -114,6 +169,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let key = declaration.artifact_key();
         self.bind_child(
             declaration.smudge().program(),
+            declaration.smudge().prf(),
             commitment,
             Some(declaration.clone()),
             decoder_artifact_name(&key, "smudge"),
@@ -225,6 +281,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         match decoder {
             None => self.bind_child(
                 program,
+                prf,
                 spec,
                 None,
                 crate::rns_bgg::refresh::refresh_artifact_name(
@@ -240,6 +297,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 let key = decoder.artifact_key();
                 self.bind_child(
                     program,
+                    prf,
                     spec,
                     Some(decoder.clone()),
                     decoder_artifact_name(&key, "smudge"),
@@ -264,11 +322,14 @@ impl<'a> RnsOnlineEvalBuild<'a> {
     /// under `name("input-<wire>.<port>")` and its RHS material under
     /// `name(role)`; a `decoder_smudge` child transforms its smudge members;
     /// `label`, the PRF's public input family with its label values and
-    /// exponent layout, replaces that family's encrypted public payload.
+    /// exponent layout, replaces that family's encrypted public payload;
+    /// the runtime tables of `prf`, the child's PRF, are bound from the
+    /// entries preprocessing exported under `name("table/<id>")`.
     #[allow(clippy::too_many_arguments)]
     fn bind_child(
         &mut self,
         prepared: &ExponentLutProgram,
+        prf: &crate::program_gadgets::prf::SparseLwrPrf,
         commitment: [u8; 32],
         decoder_smudge: Option<DecoderDeclaration>,
         prefix: String,
@@ -387,6 +448,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 .bind_wire(*wire, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
+        self.bind_tables(prepared, preprocess_binding, Some(prf), |role| name(role))?;
         let hash_key = self.parameters.ring(0).map_err(ApiError::scheme)?.bytes_input(
             crate::rns_bgg::refresh::hash_key_input_name(self.hash_namespace.as_ref()),
             self.hash_key.len(),
@@ -497,6 +559,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         })?;
         let child_manifests =
             smudge.evaluator.as_ref().map(|child| child.manifests.clone()).unwrap_or_default();
+        self.runtime.append(&mut smudge.runtime);
         let evaluator = self
             .evaluator
             .as_mut()
@@ -527,9 +590,8 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         // `crate::decoder::decoding`); removing it centers the smudge.
         let modulus: BigUint = self.parameters.level(level)?.modulus().as_ref().clone();
         let half = IntExpr::constant((modulus + 1u8) / 2u8);
-        let dimension = self.parameters.level(level)?.ring_dimension() as usize;
         let decoded = crate::decoder::unmask::unmask(hint, preimage, encoding) -
-            ring.polynomial(std::iter::repeat_n(half, dimension));
+            ring.all_coefficients((1, 1), half);
         Ok(decoded.modulus_switch(&self.parameters.ring(level + 1)?))
     }
 
@@ -549,8 +611,10 @@ impl<'a> RnsOnlineEvalBuild<'a> {
 
     /// Apply the top-refresh part `declaration` as [`Self::apply_refresh`]
     /// does, with its bound mask child `mask`: the graph output `refresh` is
-    /// the part's residue `y_j mod q` of its output prime `q`, a `1 x w_0`
-    /// row in the ring of `q` (see [`crate::refresh::top`]).
+    /// the CRT term of the part's residue `y_j mod q` of its output prime
+    /// `q`, a `1 x w_0` row in the ring of the product `P` of the refreshed
+    /// primes (the residue itself when `P = q`); the terms of every chain sum
+    /// to `y_j mod P` (see [`crate::refresh::top`]).
     pub fn apply_top_refresh(
         &mut self,
         target_index: usize,
@@ -638,7 +702,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         outputs: &[RnsBggEncoding],
     ) -> Result<(Mat, HashKeyInputs), RnsBggError> {
         use crate::rns_bgg::refresh::{
-            hash_key_input_name, refresh_artifact_name, refresh_column, refresh_combination,
+            hash_key_input_name, refresh_artifact_name, refresh_combination,
         };
         let target = outputs
             .get(target_index)
@@ -661,12 +725,13 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         let level = evaluator.workload.level(target.wire())?;
         let ring = self.parameters.ring(level)?;
         let (fresh_outputs, mut manifests) = lower(&mut fresh)?;
-        // The fresh carriers' component-1 rows, moved down once to the
+        // The fresh carrier row's component-1 row, moved down once to the
         // decoding ring and never finalized for decryption.
-        let fresh_rows = fresh_outputs
+        let fresh_row = fresh_outputs
             .into_iter()
-            .map(|encoding| mod_down_encoding(encoding.row, &ring).1)
-            .collect::<Vec<_>>();
+            .next()
+            .map(|encoding| (mod_down_encoding(encoding.row, &ring).1, declaration.columns()))
+            .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
         let spec = *declaration.spec();
         let columns = self.parameters.level(level)?.modulus_digits();
         let encryption = evaluator.encryption.clone();
@@ -726,41 +791,40 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         // The halved smudge weights leave `2^-1` in every coefficient (see
         // `crate::decoder::decoding`); removing it centers the smudge.
         let modulus: BigUint = self.parameters.level(level)?.modulus().as_ref().clone();
-        let dimension = self.parameters.level(level)?.ring_dimension() as usize;
-        let half = ring
-            .polynomial(std::iter::repeat_n(IntExpr::constant((modulus + 1u8) / 2u8), dimension));
+        // The columns concatenate one scalar constant, keeping the graph's
+        // node numbering, which the Lean proofs of the export name.
+        let half = ring.all_coefficients((1, 1), IntExpr::constant((modulus + 1u8) / 2u8));
+        let half = match output_columns {
+            1 => half,
+            columns => Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![half; columns]),
+        };
         let mut unmasked = Vec::with_capacity(declaration.primes());
-        for (position, prime) in declaration.decoded_primes().into_iter().enumerate() {
+        // Every decoded prime's row is decoded at once: its smudge child sums
+        // each column's members into its column, and the preimage has one
+        // column per decoded column.
+        let decoders = declaration.decoded_primes().into_iter().zip(declaration.decoders());
+        for ((prime, decoder), child) in decoders.zip(&mut smudges) {
             let actions =
                 self.parameters.refresh_actions(level, prime, a_prime.clone(), declaration)?;
             let decoded =
-                refresh_combination(one.clone(), target_row.clone(), &fresh_rows, &actions);
-            let mut row = Vec::with_capacity(output_columns);
-            for column in 0..output_columns {
-                let decoder = declaration
-                    .decoder(prime, column)
-                    .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
-                let (smudge, child_manifests) =
-                    lower(&mut smudges[position * output_columns + column])?;
-                manifests.extend(child_manifests);
-                let smudge = smudge
-                    .into_iter()
-                    .next()
-                    .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
-                let encoding = refresh_column(decoded.clone(), column) +
-                    checked_modulus_convert(smudge.row.1, &ring)?;
-                let preimage = ring.preimage_artifact_input(
-                    preprocess.clone(),
-                    decoder_artifact_name(&decoder.artifact_key(), "unmask-preimage"),
-                    (hint_columns, 1),
-                    BigInt::from(bound.clone()),
-                    ArtifactAvailability::Transferred,
-                );
-                row.push(
-                    crate::decoder::unmask::unmask(hint.clone(), preimage, encoding) - half.clone(),
-                );
-            }
-            unmasked.push(Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, row));
+                refresh_combination(one.clone(), target_row.clone(), fresh_row.clone(), &actions)?;
+            let (smudge, child_manifests) = lower(child)?;
+            manifests.extend(child_manifests);
+            let smudge = smudge
+                .into_iter()
+                .next()
+                .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?;
+            let encoding = decoded + checked_modulus_convert(smudge.row.1, &ring)?;
+            let preimage = ring.preimage_artifact_input(
+                preprocess.clone(),
+                decoder_artifact_name(&decoder.artifact_key(), "unmask-preimage"),
+                (hint_columns, output_columns),
+                BigInt::from(bound.clone()),
+                ArtifactAvailability::Transferred,
+            );
+            unmasked.push(
+                crate::decoder::unmask::unmask(hint.clone(), preimage, encoding) - half.clone(),
+            );
         }
         let refreshed = match declaration.top() {
             // `crt_recompose` rounds every `Q_i y + M + N` to `y mod q_i` and
@@ -770,15 +834,19 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 Mat::crt_recompose(unmasked, primes, coefficients, &ring)
             }
             // A top-refresh part rounds `Q_q y + M + N` to its residue
-            // `y mod q`; the chains' residues are recombined modulo `Q_0`.
-            Some(part) => unmasked
-                .into_iter()
-                .next()
-                .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?
-                .modulus_switch(&Ring::from_crt_moduli(
-                    vec![IntExpr::from(part.output_modulus())],
-                    self.parameters.level(level)?.ring_dimension(),
-                )),
+            // `y mod q` and outputs its CRT term modulo the product `P` of
+            // the refreshed primes; the chains' terms sum to `y mod P`.
+            Some(part) => crate::rns_bgg::refresh::top_residue_term(
+                part,
+                unmasked
+                    .into_iter()
+                    .next()
+                    .ok_or(RnsBggError::Decoder(DecoderError::TargetMismatch))?
+                    .modulus_switch(&Ring::from_crt_moduli(
+                        vec![IntExpr::from(part.output_modulus())],
+                        self.parameters.level(level)?.ring_dimension(),
+                    )),
+            )?,
         };
         let evaluator = self
             .evaluator
@@ -796,6 +864,9 @@ impl<'a> RnsOnlineEvalBuild<'a> {
         if let Some((namespace, key)) = &self.refresh_matrix_key {
             hash_keys.push((hash_key_input_name(Some(namespace)), key.clone()));
         }
+        for child in mask.iter_mut().chain(std::iter::once(&mut fresh)).chain(&mut smudges) {
+            self.runtime.append(&mut child.runtime);
+        }
         Ok((refreshed, hash_keys))
     }
 
@@ -810,6 +881,7 @@ impl<'a> RnsOnlineEvalBuild<'a> {
                 (RnsBggMatrix, RhsRef<Int>),
                 OnlineEvalWireFamily,
                 OnlineEvalRhsFamily,
+                Family<Int>,
             >,
         ),
         ApiError,
@@ -841,6 +913,7 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 (RnsBggMatrix, RhsRef<Int>),
                 OnlineEvalWireFamily,
                 OnlineEvalRhsFamily,
+                Family<Int>,
             >,
         ),
         ApiError,
@@ -987,6 +1060,7 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
                 .bind_wire(*wire, binding)
                 .map_err(|error| ApiError::input(error.to_string()))?;
         }
+        self.bind_tables(program, preprocess_binding, None, str::to_owned)?;
         for (rhs, binding) in import_rhs_bindings(
             self.parameters,
             program,
@@ -1078,12 +1152,16 @@ impl<'a> OnlineEvalBuild for RnsOnlineEvalBuild<'a> {
             .map_err(ApiError::scheme)?;
         }
         let graph = graph.build().map_err(ApiError::scheme)?;
-        let mut runtime = BTreeMap::new();
+        let mut runtime = super::declared_runtime_inputs(&graph, std::mem::take(&mut self.runtime));
         for (name, key) in hash_keys {
             if super::graph_declares_input(&graph, &name) {
                 runtime.insert(name, RuntimeValue::Bytes(key.as_slice().into()));
             }
         }
+        let evaluator = self
+            .evaluator
+            .as_ref()
+            .ok_or_else(|| ApiError::input("online evaluation artifacts are not bound"))?;
         Ok(StageGraph::new(graph, runtime, evaluator.manifests.clone()))
     }
 }

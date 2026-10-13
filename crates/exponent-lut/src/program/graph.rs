@@ -104,6 +104,7 @@ where
 {
     type WireFamily = mxx_dsl::Family<E::Wire>;
     type RhsFamily = mxx_dsl::Family<E::Rhs>;
+    type Table = mxx_dsl::Family<mxx_dsl::Int>;
 
     fn wire_at(
         &mut self,
@@ -112,6 +113,19 @@ where
         index: &IntExpr,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
         Ok(family.at(mxx_dsl::Int::evaluate(index.clone())))
+    }
+
+    /// `family.at(table.at(index))`: a dynamic member read whose index is a
+    /// table entry. In a loop over the table's entries, an artifact family
+    /// read this way lowers to a gather by the table.
+    fn wire_at_table(
+        &mut self,
+        _evaluator: &mut E,
+        family: &Self::WireFamily,
+        table: &Self::Table,
+        index: &IntExpr,
+    ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
+        Ok(family.at(table.at(mxx_dsl::Int::evaluate(index.clone()))))
     }
 
     fn rhs_at(
@@ -135,7 +149,15 @@ where
         &mut self,
         evaluator: &mut E,
         family: &Self::WireFamily,
+        columns: usize,
     ) -> Result<E::Wire, ProgramLowerError<E::Error>> {
+        // A generic wire has no column placement; the scheme families place
+        // the columns of a row sum.
+        if columns != 1 {
+            return Err(ProgramLowerError::UnsupportedStructure {
+                reason: "a row Sum needs a scheme family execution".into(),
+            });
+        }
         graph_sum(evaluator, family.count().clone(), |index| Ok(family.at(index)))
     }
 }
@@ -231,6 +253,55 @@ where
                 Err(mxx_dsl::DslError::Schema)
             }
         }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    result.map_err(ProgramLowerError::Dsl)
+}
+
+/// The row of the column sums of a family whose column `j < columns` is the
+/// `per_column` members from `j per_column` that `member` reads by index:
+/// each column is one graph reduction ([`graph_sum`]), `place` puts a column
+/// sum (`1 x 1` entries) in its column of a `1 x columns` row, and one
+/// sequential loop over the columns adds the placed sums. The graph does not
+/// grow with `columns`.
+pub(crate) fn graph_column_sums<E>(
+    evaluator: &mut E,
+    (columns, per_column): (usize, usize),
+    mut member: impl FnMut(mxx_dsl::Int) -> Result<E::Wire, ProgramLowerError<E::Error>>,
+    place: impl Fn(E::Wire, &IntExpr) -> E::Wire,
+) -> Result<E::Wire, ProgramLowerError<E::Error>>
+where
+    E: ExponentLUTProgramLowering,
+    E::Wire: mxx_dsl::GraphValue,
+{
+    if columns < 2 {
+        return Err(ProgramLowerError::UnsupportedStructure {
+            reason: "a column sum row needs at least two columns".into(),
+        });
+    }
+    let first = graph_sum(evaluator, IntExpr::constant(per_column), |index| member(index))?;
+    let initial = place(first, &IntExpr::constant(0));
+    let mut failure = None;
+    let result = mxx_dsl::iterate(columns - 1, initial, |column, row| {
+        if failure.is_some() {
+            return Err(mxx_dsl::DslError::Schema);
+        }
+        let column = column.add(1usize);
+        let start = column.clone().mul(per_column);
+        let sum = graph_sum(evaluator, IntExpr::constant(per_column), |index| {
+            member(start.clone().add(index))
+        })
+        .and_then(|sum| {
+            let column = column.expression().map_err(ProgramLowerError::Dsl)?;
+            let placed = place(sum, &column);
+            evaluator.add(&row, &placed).map_err(ProgramLowerError::Backend)
+        });
+        sum.map_err(|error| {
+            failure = Some(error);
+            mxx_dsl::DslError::Schema
+        })
     });
     if let Some(error) = failure {
         return Err(error);
@@ -448,6 +519,145 @@ mod tests {
             .build()
             .unwrap();
         graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+    }
+
+    /// A lookup in a loop over the table's entries reads the artifact family
+    /// at each entry: the loop gathers the family by the table.
+    #[test]
+    fn graph_lookup_gathers_an_artifact_family_by_the_table() {
+        use crate::program::{
+            AttributeKnowledge, Environment, ExponentLutProgramBuilder, InputBinding, Operand,
+        };
+        use mxx_dsl::{DslContext, Family, FamilyType, IntType};
+        use mxx_ir_core::{
+            artifact::{ArtifactAvailability, ProductionId, SpecHash},
+            node::{LoopInputMode, NodeKind},
+        };
+
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input =
+            builder.input_family(IntExpr::constant(3), AttributeKnowledge::PrivatePayload).unwrap();
+        let table = builder.table(IntExpr::constant(5), IntExpr::constant(3)).unwrap();
+        let reads = builder
+            .parallel(FamilyRange::full(IntExpr::constant(5)).unwrap(), |builder, index| {
+                builder
+                    .mul_small_constant(
+                        Operand::Lookup { family: input, table, index },
+                        vec![1],
+                        IntExpr::constant(0),
+                    )
+                    .map(Operand::Scalar)
+            })
+            .unwrap();
+        let output = builder.sum(reads).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+
+        let context = DslContext::new("lookup-gather");
+        let production = ProductionId { spec_hash: SpecHash([3; 32]), execution_nonce: [4; 32] };
+        let members: Family<Int> = context
+            .artifact_input(
+                production,
+                "members",
+                FamilyType { element: IntType, count: IntExpr::constant(3), member_slot: None },
+                ArtifactAvailability::Transferred,
+            )
+            .unwrap();
+        let mut environment = Environment::new();
+        environment.bind_wire(input, InputBinding::Family(members)).unwrap();
+        environment.bind_table(table, context.int_family_input("table", 5)).unwrap();
+        let outputs = crate::program::lower_program(
+            &program,
+            &mut GraphEvaluator::default(),
+            &mut GraphFamilyExecution,
+            &mut environment,
+        )
+        .unwrap();
+        let built = context.output("sum", outputs[0].clone()).unwrap().build().unwrap();
+        let modes = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .find_map(|node| match node.kind() {
+                NodeKind::ParallelLoop(spec) => Some(spec.input_modes.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let index_argument =
+            modes.iter().position(|mode| *mode == LoopInputMode::Zip).expect("table entries");
+        assert!(modes.contains(&LoopInputMode::Gather { index_argument }), "{modes:?}");
+    }
+
+    /// An evaluator of plain matrices: the column sums of a row `Sum`.
+    struct MatEvaluator;
+
+    impl ExponentLUTProgramLowering for MatEvaluator {
+        type Wire = mxx_dsl::Mat;
+        type Rhs = mxx_dsl::Mat;
+        type Error = GraphError;
+
+        fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
+            Ok(lhs.clone() + rhs.clone())
+        }
+        fn mul_public(&mut self, _: &Self::Wire, _: &Self::Wire) -> Result<Self::Wire, GraphError> {
+            Err(GraphError)
+        }
+        fn mul_private(&mut self, _: &Self::Wire, _: &Self::Rhs) -> Result<Self::Wire, GraphError> {
+            Err(GraphError)
+        }
+        fn lut(
+            &mut self,
+            _: &Self::Wire,
+            _: &crate::program::LutTable,
+        ) -> Result<Self::Wire, GraphError> {
+            Err(GraphError)
+        }
+        fn mul_small_constant(
+            &mut self,
+            _: &Self::Wire,
+            _: &[i64],
+            _: &IntExpr,
+        ) -> Result<Self::Wire, GraphError> {
+            Err(GraphError)
+        }
+    }
+
+    /// Three columns of two members `m_i = i + 1`: the row of column sums is
+    /// `[3, 7, 11]`, each sum placed in its column by the unit row tensor.
+    #[test]
+    fn graph_column_sums_place_each_block_sum_in_its_column() {
+        use mxx_dsl::DslContext;
+        use mxx_ir_core::node::ConstantMatrix;
+        let parameters =
+            mxx_backends::poly::dcrt::params::DCRTPolyParams::new(8, 1, 30, 15, None, None);
+        let ring = crate::test_support::ring_of(&parameters);
+        let members = mxx_dsl::parallel(IntExpr::constant(6), |index| {
+            let value = IntExpr::Add(Box::new(index.expression()?), Box::new(IntExpr::constant(1)));
+            Ok(ring.polynomial([value.canonicalize()]))
+        })
+        .unwrap();
+        let row = super::graph_column_sums(
+            &mut MatEvaluator,
+            (3, 2),
+            |index| Ok(members.at(index)),
+            |sum, column| {
+                ring.constant((1, 3), ConstantMatrix::UnitRow { index: column.clone() }).tensor(sum)
+            },
+        )
+        .unwrap();
+        let graph = DslContext::new("column-sums").output("row", row).unwrap().build().unwrap();
+        let result = crate::test_support::execute_cpu(
+            &crate::test_support::validate(&graph),
+            [parameters],
+            Default::default(),
+        );
+        let row = crate::test_support::full(&result.outputs["row"]);
+        let sums = (0..3)
+            .map(|column| {
+                mxx_backends::poly::Poly::coeffs_biguints(&row.entry(0, column))[0].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sums, [3u8, 7, 11].map(num_bigint::BigUint::from));
     }
 
     #[test]

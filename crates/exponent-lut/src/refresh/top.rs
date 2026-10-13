@@ -36,8 +36,8 @@
 //! The mask and the CBD children of every chain use the same keys (one mask
 //! key set, one CBD key set per component) and the same label, so all chains
 //! compute the same `sigma_0` and `e'_j`; every decoder has its own smudge
-//! keys. The stages of chain `q` run under the hash namespace
-//! [`TopRefreshDeclaration::chain_namespace`], so no two chains share a
+//! keys, one key set per column (one family over the columns). The stages of chain `q` run under
+//! the hash namespace [`TopRefreshDeclaration::chain_namespace`], so no two chains share a
 //! hash-derived public matrix (with a shared mask, two input rows under one
 //! key would cancel it). `A'_(j)` and the label are sampled under the top
 //! refresh's own namespaces, identical for every chain.
@@ -63,15 +63,18 @@ pub(super) fn label_hash_tag(top: &[u8; 32], label_tag: &[u8]) -> Vec<u8> {
     [b"refresh-top/v1/label".as_slice(), top.as_slice(), label_tag].concat()
 }
 
-/// The layouts of a top refresh's PRF keys.
-pub struct TopRefreshLayouts<'a> {
+/// The key shapes of a top refresh's PRF keys. Each shape commits to its
+/// key set (see [`PrfKeyShape`]); the keys' layouts are runtime tables of
+/// the stages.
+pub struct TopRefreshKeys<'a> {
     /// The mask child's `n` keys, shared by every chain and component.
-    pub mask: Vec<PbcPublicLayout>,
+    pub mask: PrfKeyShape,
     /// Component `j`'s CBD child keys (`w_0 n`), shared by every chain.
-    pub fresh: [Vec<PbcPublicLayout>; 2],
-    /// The `n d` smudge keys of decoder `(chain, component, column)`; every
-    /// call must return fresh keys.
-    pub smudge: &'a mut dyn FnMut(usize, usize, usize) -> Vec<PbcPublicLayout>,
+    pub fresh: [PrfKeyShape; 2],
+    /// The `w_0 n d` smudge keys of the decoder of part `(chain,
+    /// component)`, column `j` the keys from `j n d`; every call must return
+    /// fresh keys.
+    pub smudge: &'a mut dyn FnMut(usize, usize) -> PrfKeyShape,
 }
 
 /// Immutable, committed declaration of a refresh to the top level.
@@ -94,8 +97,11 @@ impl TopRefreshDeclaration {
     /// chains have `depths[l]` primes at level `l` (`depths[0]` the primes of
     /// `reference.top`, `depths[1]` those of `reference.next`), the children
     /// extend them with primes of `extension`, the fresh noise is CBD(`eta`)
-    /// and every decoder smudges with `digits` digits. `slots` lists the
-    /// refreshed primes of `reference.top` by increasing index, one chain each.
+    /// and every decoder smudges with `digits` digits, on the keys of `keys`.
+    /// `slots` lists the refreshed primes of `reference.top` by increasing
+    /// index, one chain each. The specification commits to the mask and CBD
+    /// key sets, and every part's to its smudge key sets, so refreshes of
+    /// distinct key sets share no hash namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_program: &ExponentLutProgram,
@@ -107,7 +113,7 @@ impl TopRefreshDeclaration {
         slots: Vec<usize>,
         extension: Vec<u64>,
         digits: usize,
-        layouts: TopRefreshLayouts<'_>,
+        keys: TopRefreshKeys<'_>,
         matrix_tag: Vec<u8>,
     ) -> Result<Self, RefreshError> {
         let invalid = RefreshError::InvalidDeclaration;
@@ -130,7 +136,7 @@ impl TopRefreshDeclaration {
         }
         target_admission(source_program, target_output)?;
         let spec = commitment(&(
-            b"mxx-exponent-lut/refresh-top/spec/v1".as_slice(),
+            b"mxx-exponent-lut/refresh-top/spec/v2".as_slice(),
             source_program.id(),
             target_output,
             &profile,
@@ -141,14 +147,11 @@ impl TopRefreshDeclaration {
             &extension,
             digits,
             &matrix_tag,
-            layouts.mask.iter().map(|layout| layout.layout_id).collect::<Vec<_>>(),
-            layouts
-                .fresh
-                .iter()
-                .map(|keys| keys.iter().map(|layout| layout.layout_id).collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
+            &keys.mask,
+            &keys.fresh,
         ))?;
         let primes = depths[level];
+        let outputs = slots.iter().map(|slot| reference.top[*slot]).collect::<Vec<_>>();
         let mut parts = Vec::with_capacity(2 * slots.len());
         for (chain, prime) in slots.iter().map(|slot| &reference.top[*slot]).enumerate() {
             // The decoding level keeps the output prime and the first `primes - 1` other
@@ -162,9 +165,7 @@ impl TopRefreshDeclaration {
                 .filter(|other| kept.contains(other))
                 .count();
             for component in 0..2 {
-                let smudges = (0..reference.columns())
-                    .map(|column| (layouts.smudge)(chain, component, column))
-                    .collect();
+                let smudges = vec![(keys.smudge)(chain, component)];
                 parts.push(RefreshDeclaration::top_part(
                     source_program,
                     target_output,
@@ -172,11 +173,12 @@ impl TopRefreshDeclaration {
                     eta,
                     primes,
                     (position, *prime),
+                    outputs.clone(),
                     component,
                     digits,
                     reference.clone(),
-                    layouts.mask.clone(),
-                    layouts.fresh[component].clone(),
+                    keys.mask.clone(),
+                    keys.fresh[component].clone(),
                     smudges,
                     matrix_tag.clone(),
                     spec,

@@ -4223,7 +4223,7 @@ fn artifact_payload_kind(artifact: &ArtifactType) -> Option<u8> {
         ArtifactType::Int | ArtifactType::Bytes { .. } => Some(2),
         ArtifactType::Trapdoor { .. } => Some(3),
         ArtifactType::TypedBlob { .. } => Some(4),
-        ArtifactType::Family(_) => None,
+        ArtifactType::IndexedFamily { .. } | ArtifactType::DependentFamily(_) => None,
     }
 }
 

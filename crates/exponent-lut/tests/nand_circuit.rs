@@ -328,7 +328,9 @@ fn select_candidate(
             if average.is_none() {
                 let outputs_fit = trace.outputs.iter().enumerate().all(|(index, value)| {
                     let wire = match &compiled.program().outputs()[index] {
-                        Operand::Scalar(wire) | Operand::Member { family: wire, .. } => *wire,
+                        Operand::Scalar(wire) |
+                        Operand::Member { family: wire, .. } |
+                        Operand::Lookup { family: wire, .. } => *wire,
                     };
                     let level = workload
                         .level(wire)
@@ -459,6 +461,7 @@ fn nand_circuit_end_to_end() {
         compiled.program(),
         &ParamEnv::default(),
         if dynamic { &no_rhs } else { &rhs },
+        &BTreeMap::new(),
         static_payload.as_ref(),
         HASH_KEY,
         RnsPreprocessBuild::new(&parameters, [0x4e; 32]),

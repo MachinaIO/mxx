@@ -8,7 +8,7 @@ use crate::{
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
         GraphParallelLowering, InputBinding, LoweringSite, LutId, LutTable, Operand,
-        ProgramLoweringContext, RhsId, RhsRef, WireId, lower_program,
+        ProgramLoweringContext, RhsId, RhsRef, TableId, WireId, lower_program,
     },
 };
 use mxx_backends::{RuntimeValue, poly::Poly};
@@ -126,6 +126,11 @@ pub struct PublicKeyLowering<'a> {
     /// preimage `K` of the summed key, and the public `B` it is a preimage
     /// under.
     pub(crate) unmask: Option<(String, Preimage, Mat)>,
+    /// The Program's runtime tables: each one's graph input and entries
+    /// (`None` when bound by shape only, see
+    /// [`super::RnsPreprocessBuild::bind_rhs_inputs`]). The stage exports
+    /// each one (`table/<id>`) for online evaluation.
+    pub(crate) tables: BTreeMap<crate::program::TableId, (Family<Int>, Option<Vec<usize>>)>,
     pub(crate) current_site: Option<LoweringSite>,
     /// Open parallel bodies, outermost first: each one's instance count and
     /// member index, and the RHS family members it prepared.
@@ -146,8 +151,13 @@ pub struct RnsPreprocessBuild<'a> {
     hash_key_commitment: [u8; 32],
     evaluator: Option<PublicKeyLowering<'a>>,
     families: super::encoding::OnlineEvalFamilies<'a>,
-    environment:
-        Environment<RnsBggPublicKey, RhsRef<Int>, PreprocessWireFamily, Family<RhsRef<Int>>>,
+    environment: Environment<
+        RnsBggPublicKey,
+        RhsRef<Int>,
+        PreprocessWireFamily,
+        Family<RhsRef<Int>>,
+        Family<Int>,
+    >,
     runtime: BTreeMap<String, RuntimeValue>,
     decoder_declaration: Option<crate::decoder::decoding::DecoderDeclaration>,
     /// The lowered smudge Program child of the applied decoder, whose public

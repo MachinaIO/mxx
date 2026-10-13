@@ -593,6 +593,7 @@ mod test {
             program,
             &ParamEnv::default(),
             &PlaintextInputs::<RhsId, DCRTPoly>::new(),
+            &BTreeMap::new(),
             None,
             &hash_key,
             super::RnsPreprocessBuild::new(parameters, context),
@@ -891,6 +892,7 @@ mod test {
                 &program,
                 &ParamEnv::default(),
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 Some(&secret),
                 &[0; 32],
             )
@@ -904,6 +906,7 @@ mod test {
                 &program,
                 &ParamEnv::default(),
                 &rhs_values,
+                &BTreeMap::new(),
                 None,
                 &[0; 32],
             )
@@ -929,6 +932,7 @@ mod test {
             &program,
             &ParamEnv::default(),
             &PlaintextInputs::<RhsId, DCRTPoly>::new(),
+            &BTreeMap::new(),
             None,
             &[0; 32],
             super::RnsPreprocessBuild::new(&parameters, [1; 32]),

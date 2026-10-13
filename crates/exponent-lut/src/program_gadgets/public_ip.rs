@@ -320,6 +320,17 @@ mod tests {
     impl FamilyExecution<Depth> for DepthFamilies {
         type WireFamily = usize;
         type RhsFamily = ();
+        type Table = ();
+
+        fn wire_at_table(
+            &mut self,
+            _evaluator: &mut Depth,
+            family: &usize,
+            _: &(),
+            _: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<DepthError>> {
+            Ok(*family)
+        }
 
         fn wire_at(
             &mut self,
@@ -349,6 +360,7 @@ mod tests {
             &mut self,
             _: &mut Depth,
             _: &usize,
+            _: usize,
         ) -> Result<usize, ProgramLowerError<DepthError>> {
             Err(ProgramLowerError::Backend(DepthError))
         }
@@ -418,6 +430,7 @@ mod tests {
             program,
             &ParamEnv::default(),
             &PlaintextInputs::<_, DCRTPoly>::new(),
+            &BTreeMap::new(),
             Some(&payload),
             &hash_key,
             RnsPreprocessBuild::new(&parameters, context),

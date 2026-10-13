@@ -740,6 +740,16 @@ impl<S: SessionStore> Executor<'_, S> {
                     tag.push(1);
                     append_tag_integer(&mut tag, &self.int(values, node.args[*index])?);
                 }
+                HashTagComponent::OperandU64Le(index) => {
+                    let value = self.int(values, node.args[*index])?.to_u64().ok_or_else(|| {
+                        ExecutionError::Expression {
+                            node: node.id,
+                            message: "little-endian hash tag operand must fit in u64".to_owned(),
+                        }
+                    })?;
+                    tag.push(3);
+                    tag.extend_from_slice(&value.to_le_bytes());
+                }
             }
         }
         Ok((key, tag))
@@ -2579,6 +2589,52 @@ mod tests {
                 &((&base + 1u8) / 2u8).to_biguint().unwrap()
             );
         }
+    }
+
+    /// A runtime `OperandU64Le` tag hashes the same bytes as the static `U64Le` of its value, and
+    /// a negative operand is rejected.
+    #[test]
+    fn runtime_u64_le_hash_tag_matches_static_u64_le() {
+        use mxx_dsl::{HashTag, IntType};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = ring(&parameters);
+        let value = rand::random::<u64>();
+        let context = DslContext::new("cpu-u64-le-operand");
+        let row = context.input::<Int>("row", IntType).unwrap();
+        let key = ring.bytes_input("key", 32);
+        let sample = |index: Int| {
+            let mut tag = HashTag::from(b"u64-le:".as_slice());
+            tag.push_u64_le(index);
+            ring.hash_matrix(key.clone(), tag, (1, 2))
+        };
+        let graph = context
+            .output("static", sample(Int::constant(value)))
+            .unwrap()
+            .output("runtime", sample(row))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let key_bytes: [u8; 32] = rand::random();
+        let mut run = |row: BigInt| {
+            execute(
+                &graph,
+                &mut backend,
+                BTreeMap::from([
+                    ("row".to_owned(), RuntimeValue::Int(row)),
+                    ("key".to_owned(), RuntimeValue::Bytes(key_bytes.to_vec().into())),
+                ]),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+        };
+        let result = run(BigInt::from(value)).unwrap();
+        assert_eq!(matrix_output(&result, "static"), matrix_output(&result, "runtime"));
+        assert!(run(BigInt::from(-1)).is_err());
     }
 
     #[test]

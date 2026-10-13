@@ -25,11 +25,14 @@
 //! - `w_i = [f_j G_Q^-1(Q_i)]_j = s K_f Z_i - Q_i e' + e_f Z_i`;
 //! - `d_i = u_i - v_i + w_i = s K_i - Q_i y + E_i`.
 //!
-//! Column `j` of `d_i` is decoded by its own smudged trapdoor decoder
-//! ([`crate::decoder`], target [`DecoderTarget::Refresh`]) to `y_j mod q_i`,
-//! and a CRT recomposition over the primes returns `y_j`. Preprocessing
-//! computes the decoded keys `K_i` by the same steps on the public keys to
-//! sample the decoders' preimages; the output key `A'` is public.
+//! The row `d_i` is decoded by one smudged trapdoor decoder per prime
+//! ([`crate::decoder`], target [`DecoderTarget::Refresh`]) to `y mod q_i`:
+//! every column `j` has its own smudge keys and its own preimage column, so
+//! the columns are decoded independently, but as one `1 x m` row (one
+//! smudge family over the columns, one preimage of `m` columns). A CRT
+//! recomposition over the primes returns `y`. Preprocessing computes the
+//! decoded keys `K_i` by the same steps on the public keys to sample the
+//! decoders' preimages; the output key `A'` is public.
 //!
 //! # Caller responsibilities
 //!
@@ -55,8 +58,7 @@ use crate::{
         ProgramValidationError, WireId,
     },
     program_gadgets::{
-        pbc::PbcPublicLayout,
-        prf::SparseLwrPrfProfile,
+        prf::{PrfKeyShape, PrfKeys, SparseLwrPrfProfile},
         prf_sampler::{PrfDistribution, PrfSampler, PrfSamplerError},
     },
 };
@@ -81,35 +83,34 @@ pub enum RefreshError {
     Program(#[from] ProgramValidationError),
 }
 
-/// The fresh-noise child Program: `m` outputs, output `j` the polynomial
-/// `sum_k e'_(j n + k) X^k` of `n` CBD samples of one PRF member and key each
-/// (`m n` members in one [`PrfSampler`] family). Its coefficient outputs are
-/// raw carriers with payload `e'_j G` (scale 1); the refresh moves them down
-/// to the decoding ring once and never finalizes them for decryption.
+/// The fresh-noise child Program: one output, the row of `m` column blocks
+/// whose block `j` is the polynomial `sum_k e'_(j n + k) X^k` of `n` CBD
+/// samples of one PRF member and key each (`m n` members in one
+/// [`PrfSampler`] family, the row `Sum` of
+/// [`ExponentLutProgramBuilder::sum_columns`] over the `m` columns). Its
+/// coefficient output is a raw carrier row with payload blocks `e'_j G`
+/// (scale 1); the refresh moves it down to the decoding ring once and never
+/// finalizes it for decryption.
 #[derive(Clone, Debug)]
 pub struct FreshNoiseProgram {
     program: ExponentLutProgram,
     sampler: PrfSampler,
-    outputs: Vec<WireId>,
+    columns: usize,
+    output: WireId,
 }
 
 impl FreshNoiseProgram {
     /// The `columns` polynomials of `coefficients` CBD(`eta`) samples on
-    /// `profile`, member `j coefficients + k` on `layouts[j coefficients + k]`.
+    /// `profile`, member `j coefficients + k` on key `j coefficients + k` of
+    /// the shape `keys`.
     pub fn new(
         profile: SparseLwrPrfProfile,
         eta: u32,
         columns: usize,
         coefficients: usize,
-        layouts: Vec<PbcPublicLayout>,
+        keys: PrfKeyShape,
     ) -> Result<Self, RefreshError> {
-        Self::with_distribution(
-            profile,
-            PrfDistribution::Cbd { eta },
-            columns,
-            coefficients,
-            layouts,
-        )
+        Self::with_distribution(profile, PrfDistribution::Cbd { eta }, columns, coefficients, keys)
     }
 
     /// The `columns` polynomials of `coefficients` samples of `distribution`
@@ -120,44 +121,39 @@ impl FreshNoiseProgram {
         distribution: PrfDistribution,
         columns: usize,
         coefficients: usize,
-        layouts: Vec<PbcPublicLayout>,
+        keys: PrfKeyShape,
     ) -> Result<Self, RefreshError> {
         let members = columns.checked_mul(coefficients).ok_or(RefreshError::InvalidDeclaration)?;
         if columns == 0 ||
             coefficients == 0 ||
             members < 2 ||
-            layouts.len() != members ||
+            keys.members() != members ||
             Some(coefficients) != profile.ring_dimension().ok()
         {
             return Err(RefreshError::InvalidDeclaration);
         }
         let mut builder = ExponentLutProgramBuilder::new();
-        let sampler = PrfSampler::build(&mut builder, profile, layouts, distribution)?;
+        let sampler = PrfSampler::build(&mut builder, profile, PrfKeys::Shape(keys), distribution)?;
         let crate::program_gadgets::prf::PrfOutput::Family(samples) = sampler.output() else {
             return Err(RefreshError::InvalidDeclaration);
         };
-        let outputs = (0..columns)
-            .map(|column| {
-                let range = FamilyRange::full(IntExpr::constant(coefficients))?;
-                let placed = builder.parallel(range, |builder, coefficient| {
-                    let member = IntExpr::Add(
-                        Box::new(IntExpr::constant(column * coefficients)),
-                        Box::new(coefficient.clone()),
-                    )
+        // Member `j n + k` lands at `X^k` of column `j`.
+        let range = FamilyRange::full(IntExpr::constant(members))?;
+        let placed = builder.parallel(range, |builder, member| {
+            let coefficient =
+                IntExpr::Rem(Box::new(member.clone()), Box::new(IntExpr::constant(coefficients)))
                     .canonicalize();
-                    builder
-                        .mul_small_constant(
-                            Operand::Member { family: samples, index: member },
-                            vec![1],
-                            coefficient,
-                        )
-                        .map(Operand::Scalar)
-                })?;
-                builder.sum(placed)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let program = builder.finish(outputs.iter().copied().map(Operand::Scalar).collect())?;
-        Ok(Self { program, sampler, outputs })
+            builder
+                .mul_small_constant(
+                    Operand::Member { family: samples, index: member },
+                    vec![1],
+                    coefficient,
+                )
+                .map(Operand::Scalar)
+        })?;
+        let output = builder.sum_columns(placed, columns)?;
+        let program = builder.finish(vec![Operand::Scalar(output)])?;
+        Ok(Self { program, sampler, columns, output })
     }
 
     pub fn program(&self) -> &ExponentLutProgram {
@@ -173,9 +169,19 @@ impl FreshNoiseProgram {
         &self.sampler
     }
 
-    /// The polynomial outputs, one per column.
-    pub fn outputs(&self) -> &[WireId] {
-        &self.outputs
+    /// The key shape of the members, which commits to their key set.
+    pub fn keys(&self) -> Result<&PrfKeyShape, RefreshError> {
+        self.sampler.prf().key_shape().ok_or(RefreshError::InvalidDeclaration)
+    }
+
+    /// The output: the row of the column polynomials.
+    pub const fn output(&self) -> WireId {
+        self.output
+    }
+
+    /// The number of columns of the output row.
+    pub const fn columns(&self) -> usize {
+        self.columns
     }
 }
 
@@ -217,6 +223,7 @@ pub struct TopRefreshPart {
     component: usize,
     output_prime: usize,
     output_modulus: u64,
+    output_moduli: Vec<u64>,
     reference: TopReference,
     mask: FreshNoiseProgram,
 }
@@ -238,6 +245,13 @@ impl TopRefreshPart {
     /// The output prime `q` itself.
     pub const fn output_modulus(&self) -> u64 {
         self.output_modulus
+    }
+
+    /// The refreshed primes of the top refresh, in canonical order: their
+    /// product `P` is the modulus of the recombined rows, to which every
+    /// part contributes its residue's CRT term.
+    pub fn output_moduli(&self) -> &[u64] {
+        &self.output_moduli
     }
 
     pub const fn reference(&self) -> &TopReference {
@@ -262,8 +276,8 @@ pub struct RefreshDeclaration {
     digits: usize,
     matrix_tag: Vec<u8>,
     fresh: FreshNoiseProgram,
-    /// Decoder `(prime, column)` at `prime * columns + column`, over the
-    /// decoded primes ([`Self::decoded_primes`]) in order.
+    /// One decoder of the whole row per decoded prime
+    /// ([`Self::decoded_primes`]), in order.
     decoders: Vec<DecoderDeclaration>,
     spec: [u8; 32],
     top: Option<TopRefreshPart>,
@@ -273,11 +287,13 @@ impl RefreshDeclaration {
     /// Check and freeze the refresh of `target_output` of `source_program`
     /// over a decoding modulus of `primes` CRT primes (`>= 2`) and a gadget of
     /// `columns` digits, in a ring of dimension `coefficients`: the fresh noise
-    /// is CBD(`eta`) on `fresh_layouts` (`columns * coefficients` members),
-    /// decoder `(i, j)` smudges with `digits` digits on
-    /// `smudge_layouts[i * columns + j]` (`coefficients * digits` members),
-    /// and `A'` is sampled under `matrix_tag`. Every layout carries its own
-    /// key; the keys must be pairwise distinct.
+    /// is CBD(`eta`) on the keys of shape `fresh_keys` (`columns *
+    /// coefficients` members), the decoder of prime `i` smudges every column
+    /// with `digits` digits on the keys of shape `smudge_keys[i]` (`columns *
+    /// coefficients * digits` members, column `j` the members from `j
+    /// coefficients digits`), and `A'` is sampled under `matrix_tag`. The
+    /// keys must be pairwise distinct; the specification commits to every key
+    /// set.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_program: &ExponentLutProgram,
@@ -287,8 +303,8 @@ impl RefreshDeclaration {
         primes: usize,
         columns: usize,
         digits: usize,
-        fresh_layouts: Vec<PbcPublicLayout>,
-        smudge_layouts: Vec<Vec<PbcPublicLayout>>,
+        fresh_keys: PrfKeyShape,
+        smudge_keys: Vec<PrfKeyShape>,
         matrix_tag: Vec<u8>,
     ) -> Result<Self, RefreshError> {
         Self::build(
@@ -299,8 +315,8 @@ impl RefreshDeclaration {
             primes,
             columns,
             digits,
-            fresh_layouts,
-            smudge_layouts,
+            fresh_keys,
+            smudge_keys,
             matrix_tag,
             None,
         )
@@ -309,10 +325,12 @@ impl RefreshDeclaration {
     /// Part `(output_prime, component)` of the refresh to the top level
     /// committed by `top` (see [`top::TopRefreshDeclaration`]): the decoding
     /// level has `primes` primes, the refreshed row has the `columns()` of
-    /// `reference`, CBD(`eta`) noise on `fresh_layouts` (one polynomial per
-    /// column), decoder `(output_prime, j)` on `smudge_layouts[j]`, the mask
-    /// child's binary samples on `mask_layouts` (`n` members, the bit modulo
-    /// the output prime `q_min`), and `A'` under `matrix_tag`.
+    /// `reference`, CBD(`eta`) noise on the keys of shape `fresh_keys` (one
+    /// polynomial per column), the decoder of `output_prime` on the keys of
+    /// shape `smudge_keys[0]`, the mask child's binary samples on the keys of
+    /// shape `mask_keys` (`n` members, the bit modulo the output prime
+    /// `q_min`), and `A'` under `matrix_tag`; `output_moduli` are the
+    /// refreshed primes (the output prime among them).
     #[allow(clippy::too_many_arguments)]
     pub fn top_part(
         source_program: &ExponentLutProgram,
@@ -321,18 +339,19 @@ impl RefreshDeclaration {
         eta: u32,
         primes: usize,
         output_prime: (usize, u64),
+        output_moduli: Vec<u64>,
         component: usize,
         digits: usize,
         reference: TopReference,
-        mask_layouts: Vec<PbcPublicLayout>,
-        fresh_layouts: Vec<PbcPublicLayout>,
-        smudge_layouts: Vec<Vec<PbcPublicLayout>>,
+        mask_keys: PrfKeyShape,
+        fresh_keys: PrfKeyShape,
+        smudge_keys: Vec<PrfKeyShape>,
         matrix_tag: Vec<u8>,
         top: [u8; 32],
     ) -> Result<Self, RefreshError> {
         let coefficients =
             profile.ring_dimension().map_err(|_| RefreshError::InvalidDeclaration)?;
-        if component > 1 || output_prime.0 >= primes {
+        if component > 1 || output_prime.0 >= primes || !output_moduli.contains(&output_prime.1) {
             return Err(RefreshError::InvalidDeclaration);
         }
         // One polynomial of `n` bits `h (1 +- 1)`, `h = 2^-1 mod q`.
@@ -341,7 +360,7 @@ impl RefreshDeclaration {
             PrfDistribution::Binary { q_min: output_prime.1 },
             1,
             coefficients,
-            mask_layouts,
+            mask_keys,
         )?;
         let columns = reference.columns();
         Self::build(
@@ -352,14 +371,15 @@ impl RefreshDeclaration {
             primes,
             columns,
             digits,
-            fresh_layouts,
-            smudge_layouts,
+            fresh_keys,
+            smudge_keys,
             matrix_tag,
             Some(TopRefreshPart {
                 top,
                 component,
                 output_prime: output_prime.0,
                 output_modulus: output_prime.1,
+                output_moduli,
                 reference,
                 mask,
             }),
@@ -375,29 +395,34 @@ impl RefreshDeclaration {
         primes: usize,
         columns: usize,
         digits: usize,
-        fresh_layouts: Vec<PbcPublicLayout>,
-        smudge_layouts: Vec<Vec<PbcPublicLayout>>,
+        fresh_keys: PrfKeyShape,
+        smudge_keys: Vec<PrfKeyShape>,
         matrix_tag: Vec<u8>,
         top: Option<TopRefreshPart>,
     ) -> Result<Self, RefreshError> {
         let coefficients =
             profile.ring_dimension().map_err(|_| RefreshError::InvalidDeclaration)?;
         let decoded = top.as_ref().map_or(primes, |_| 1);
-        if primes < 2 || Some(smudge_layouts.len()) != decoded.checked_mul(columns) {
+        if primes < 2 || smudge_keys.len() != decoded {
             return Err(RefreshError::InvalidDeclaration);
         }
-        let fresh = FreshNoiseProgram::new(profile, eta, columns, coefficients, fresh_layouts)?;
-        let smudges = smudge_layouts
+        let fresh = FreshNoiseProgram::new(profile, eta, columns, coefficients, fresh_keys)?;
+        let smudges = smudge_keys
             .into_iter()
-            .map(|layouts| {
-                if layouts.len() != coefficients * digits {
+            .map(|keys| {
+                if Some(keys.members()) != columns.checked_mul(coefficients * digits) {
                     return Err(RefreshError::InvalidDeclaration);
                 }
-                Ok(DecoderSmudgeProgram::new(&profile, layouts)?)
+                Ok(DecoderSmudgeProgram::new(&profile, keys, columns)?)
             })
             .collect::<Result<Vec<_>, RefreshError>>()?;
+        // The children's Programs depend on their key shapes only; the
+        // shapes' key-set commitments bind the specification, and so every
+        // hash namespace derived from it, to the key sets (the decoders'
+        // commitments cover their smudge keys).
+        let mask_keys = top.as_ref().map(|part| part.mask.keys()).transpose()?;
         let spec = commitment(&(
-            b"mxx-exponent-lut/refresh/spec/v1".as_slice(),
+            b"mxx-exponent-lut/refresh/spec/v2".as_slice(),
             source_program.id(),
             target_output,
             &profile,
@@ -408,13 +433,21 @@ impl RefreshDeclaration {
             digits,
             &matrix_tag,
             fresh.id(),
+            fresh.keys()?,
             smudges.iter().map(DecoderSmudgeProgram::id).collect::<Vec<_>>(),
+            smudges
+                .iter()
+                .map(|smudge| smudge.prf().key_shape())
+                .collect::<Option<Vec<_>>>()
+                .ok_or(RefreshError::InvalidDeclaration)?,
+            mask_keys,
             top.as_ref().map(|part| {
                 (
                     part.top,
                     part.component,
                     part.output_prime,
                     part.output_modulus,
+                    &part.output_moduli,
                     &part.reference,
                     part.mask.id(),
                 )
@@ -424,20 +457,15 @@ impl RefreshDeclaration {
             top.as_ref().map_or_else(|| (0..primes).collect(), |part| vec![part.output_prime]);
         let decoders = smudges
             .into_iter()
-            .enumerate()
-            .map(|(index, smudge)| {
+            .zip(decoded_primes)
+            .map(|(smudge, prime)| {
                 Ok(DecoderDeclaration::from_smudge(
                     source_program,
                     target_output,
                     profile,
-                    coefficients,
-                    digits,
+                    (columns, coefficients, digits),
                     smudge,
-                    DecoderTarget::Refresh {
-                        spec,
-                        prime: decoded_primes[index / columns],
-                        column: index % columns,
-                    },
+                    DecoderTarget::Refresh { spec, prime },
                 )?)
             })
             .collect::<Result<Vec<_>, RefreshError>>()?;
@@ -521,16 +549,14 @@ impl RefreshDeclaration {
         &self.fresh
     }
 
-    /// Decoder `(prime, column)` of a decoded prime.
-    pub fn decoder(&self, prime: usize, column: usize) -> Option<&DecoderDeclaration> {
+    /// The decoder of a decoded prime.
+    pub fn decoder(&self, prime: usize) -> Option<&DecoderDeclaration> {
         let position = self.decoded_primes().iter().position(|decoded| *decoded == prime)?;
-        (column < self.columns)
-            .then(|| self.decoders.get(position * self.columns + column))
-            .flatten()
+        self.decoders.get(position)
     }
 
-    /// Every decoder, `(prime, column)` at `position * columns + column` for
-    /// the position of `prime` among [`Self::decoded_primes`].
+    /// Every decoder, the decoder of `prime` at the position of `prime`
+    /// among [`Self::decoded_primes`].
     pub fn decoders(&self) -> &[DecoderDeclaration] {
         &self.decoders
     }
@@ -590,7 +616,7 @@ fn commitment(value: &impl Serialize) -> Result<[u8; 32], RefreshError> {
 mod tests {
     use super::*;
     use crate::{
-        decoder::decoding::fixture::{keys, profile},
+        decoder::decoding::fixture::{keys, profile, shape},
         program::AttributeKnowledge,
     };
 
@@ -600,13 +626,15 @@ mod tests {
         (builder.finish(vec![Operand::Scalar(input)]).unwrap(), input)
     }
 
-    fn layouts(count: usize) -> Vec<PbcPublicLayout> {
-        keys(count).into_iter().map(|key| key.public_layout).collect()
+    /// The key shape of `count` fresh keys.
+    fn key_shape(count: usize) -> PrfKeyShape {
+        shape(&keys(count))
     }
 
     /// Two primes, two columns, one digit: the fresh program has two outputs
-    /// of `n` members each, and decoder `(i, j)` targets prime `i` and column
-    /// `j` under the specification commitment; labels are reproducible.
+    /// of `n` members each, and decoder `i` targets prime `i` under the
+    /// specification commitment with `2 n` smudge members over both columns;
+    /// labels are reproducible.
     #[test]
     fn declaration_lays_out_fresh_outputs_and_decoders() {
         let (source, input) = identity();
@@ -619,24 +647,22 @@ mod tests {
             2,
             2,
             1,
-            layouts(2 * n),
-            (0..4).map(|_| layouts(n)).collect(),
+            key_shape(2 * n),
+            (0..2).map(|_| key_shape(2 * n)).collect(),
             b"tag".to_vec(),
         )
         .unwrap();
-        assert_eq!(declaration.fresh().outputs().len(), 2);
+        assert_eq!(declaration.fresh().columns(), 2);
         assert_eq!(declaration.fresh().sampler().prf().members(), 2 * n);
         for prime in 0..2 {
-            for column in 0..2 {
-                let decoder = declaration.decoder(prime, column).unwrap();
-                assert_eq!(
-                    decoder.target(),
-                    DecoderTarget::Refresh { spec: *declaration.spec(), prime, column }
-                );
-                assert_eq!(decoder.smudge().members(), n);
-            }
+            let decoder = declaration.decoder(prime).unwrap();
+            assert_eq!(
+                decoder.target(),
+                DecoderTarget::Refresh { spec: *declaration.spec(), prime }
+            );
+            assert_eq!((decoder.columns(), decoder.smudge().members()), (2, 2 * n));
         }
-        assert!(declaration.decoder(0, 2).is_none() && declaration.decoder(2, 0).is_none());
+        assert!(declaration.decoder(2).is_none());
         let label = declaration.label([7; 32], b"nu").unwrap();
         assert_eq!(label, declaration.label([7; 32], b"nu").unwrap());
         assert_ne!(label, declaration.label([7; 32], b"other").unwrap());
@@ -644,7 +670,7 @@ mod tests {
         assert!(label.len() == profile().lwr_dimension && label.iter().all(|value| *value < q));
     }
 
-    /// One prime, a missing smudge layout set, a short fresh layout set or a
+    /// One prime, a missing smudge key set, a short fresh key set or a
     /// smudge set of the wrong size is rejected; so is a coefficient target.
     #[test]
     fn declaration_rejects_malformed_refreshes() {
@@ -659,8 +685,8 @@ mod tests {
                 primes,
                 1,
                 1,
-                layouts(fresh),
-                (0..smudges).map(|_| layouts(smudge)).collect(),
+                key_shape(fresh),
+                (0..smudges).map(|_| key_shape(smudge)).collect(),
                 Vec::new(),
             )
         };

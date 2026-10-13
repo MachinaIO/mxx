@@ -119,7 +119,8 @@ impl super::super::RnsBggDecoder<'_, RnsBggNoiseEvaluator<'_>> {
 /// `source` under `bindings`, with the smudge child on `smudge_parameters` and
 /// the unmask trapdoor sigma `unmask_sigma`. The smudge inputs are bound by
 /// their contract: the accumulator start and the public vector `a` are
-/// monomials and the selectors are bits.
+/// monomials and the selectors are bits, one-hot in every row
+/// ([`RnsBggNoiseBindings::with_selector_families`]).
 pub(crate) fn simulate_decoder_noise(
     parameters: &RnsBggParameters,
     smudge_parameters: &RnsBggParameters,
@@ -147,6 +148,9 @@ pub(crate) fn simulate_decoder_noise(
             smudge_program.rhs_inputs().len()
         ],
     )
+    .and_then(|bindings| {
+        bindings.with_selector_families(&declaration.smudge().prf().selector_families())
+    })
     .map_err(ApiError::scheme)?;
     let mut smudge =
         RnsNoiseBuild::new(smudge_parameters, smudge_program, &smudge_workload, &smudge_bindings)

@@ -45,8 +45,8 @@ mod verify;
 
 pub(super) use self::lowering::*;
 pub use self::verify::{
-    decode_output, decode_public_output, decode_top_refresh, refresh_error, top_refresh_error,
-    verify_output,
+    TOP_REFRESH_TERMS_INPUT, decode_output, decode_public_output, decode_top_refresh,
+    refresh_error, top_refresh_error, verify_output,
 };
 #[cfg(test)]
 use crate::{api::execute_graph, program::ExponentLutProgramBuilder};
@@ -563,6 +563,7 @@ pub struct RnsOnlineEvalBuild<'a> {
         (RnsBggMatrix, RhsRef<Int>),
         OnlineEvalWireFamily,
         OnlineEvalRhsFamily,
+        Family<Int>,
     >,
     /// The applied decoder: its output index, declaration and smudge child.
     pending_decoder: Option<(usize, DecoderDeclaration, Box<RnsOnlineEvalBuild<'a>>)>,
@@ -583,4 +584,8 @@ pub struct RnsOnlineEvalBuild<'a> {
     )>,
     /// The namespace and key of a top refresh's `A'`.
     refresh_matrix_key: Option<([u8; 32], Vec<u8>)>,
+    /// The runtime tables of the Program and of its bound children, by
+    /// graph input name: resident inputs holding the entries preprocessing
+    /// exported under the same artifact names.
+    runtime: BTreeMap<String, RuntimeValue>,
 }

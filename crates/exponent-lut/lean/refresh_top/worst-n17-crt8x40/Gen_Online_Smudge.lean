@@ -676,8 +676,8 @@ theorem smudge_keys_h1849_5 {backend : BackendContext} {hashModel : HashModel} {
   have h3 : Stage_online_eval.parallel_generatedRoot_456.w_1818_3 octx = Stage_preprocess.parallel_generatedRoot_380.w_2343_3 pctx := funext fun i ↦ (hkeys i).2
   exact ⟨by rw [ho.2.1, hp.2.1, h1], by rw [ho.2.2.2.1, hp.2.2.2, h3]⟩
 
-/-- The smudge LUT table (`parallel_parallel_generatedRoot_380_13`, the values of `table_h13_3`) is the half-integer table. -/
-theorem smudge_table_h13_3 :
+/-- The smudge LUT table (`parallel_parallel_generatedRoot_380_47`, the values of `table_h47_3`) is the half-integer table. -/
+theorem smudge_table_h47_3 :
     ∀ k : Fin 128, (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) k = halfTable 16 128 k := by
   decide
 

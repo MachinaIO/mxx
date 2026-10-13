@@ -23,7 +23,7 @@ def port(text):
     text = re.sub(r'\bGeneratedClaim\.(Runs|stage_\d+_params|requirement_0_params|ideal_params)\b',
                   r'W_GeneratedClaim.\1', text)
     # the stage parameters also appear unqualified under `open GeneratedClaim`
-    text = re.sub(r'(?<![.\w])(stage_\d+_params|requirement_0_params|ideal_params)\b',
+    text = re.sub(r'(?<![.\w`])(Runs|stage_\d+_params|requirement_0_params|ideal_params)\b',
                   r'W_GeneratedClaim.\1', text)
     text = re.sub(r'^import Claim$', 'import W_Claim', text, flags=re.M)
     text = re.sub(r'^import (Ideal|Requirement_0)$', r'import W_\1', text, flags=re.M)

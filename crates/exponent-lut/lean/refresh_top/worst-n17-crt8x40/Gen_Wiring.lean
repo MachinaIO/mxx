@@ -100,9 +100,9 @@ end
 
 /-! ## One-hot selector rows -/
 
-/-- The one-hot selector rows of the PRF with key cells `keys_h21_7`, `keys_h26_7`, `keys_h39_7`, `keys_h43_7`, `keys_h47_7`, `keys_h51_7`, `keys_h55_7`, `keys_h59_7`, `keys_h63_7`, `keys_h67_7`, `keys_h71_7`, `keys_h76_7`, `keys_h81_7`, `keys_h86_7`, `keys_h91_7`, `keys_h96_7`, `keys_h101_7`, `keys_h106_7`, `keys_h111_7`, `keys_h116_7`, `keys_h121_7`, `keys_h126_7`, `keys_h131_7`, `keys_h136_7`, `keys_h141_7`, `keys_h146_7`, `keys_h151_7`, `keys_h156_7`, `keys_h161_7`, `keys_h166_7`, `keys_h171_7`, `keys_h176_7`, `keys_h181_7`, `keys_h186_7` (buckets in that
+/-- The one-hot selector rows of the PRF with key cells `keys_h54_7`, `keys_h58_7`, `keys_h62_7`, `keys_h66_7`, `keys_h70_7`, `keys_h74_7`, `keys_h78_7`, `keys_h82_7`, `keys_h86_7`, `keys_h90_7`, `keys_h94_7`, `keys_h98_7`, `keys_h102_7`, `keys_h106_7`, `keys_h110_7`, `keys_h114_7`, `keys_h118_7`, `keys_h122_7`, `keys_h126_7`, `keys_h130_7`, `keys_h134_7`, `keys_h138_7`, `keys_h142_7`, `keys_h146_7`, `keys_h150_7`, `keys_h154_7`, `keys_h158_7`, `keys_h162_7`, `keys_h166_7`, `keys_h170_7`, `keys_h174_7`, `keys_h178_7`, `keys_h182_7`, `keys_h186_7` (buckets in that
 order; `130` cells per member, `154140672` members): `hsum0` = `hreq.loop_239`, `hsum1` = `hreq.loop_241`, `hsum2` = `hreq.loop_263`, `hsum3` = `hreq.loop_285`, `hsum4` = `hreq.loop_295`, `hsum5` = `hreq.loop_297`, `hsum6` = `hreq.loop_299`, `hsum7` = `hreq.loop_301`, `hsum8` = `hreq.loop_303`, `hsum9` = `hreq.loop_305`, `hsum10` = `hreq.loop_243`, `hsum11` = `hreq.loop_245`, `hsum12` = `hreq.loop_247`, `hsum13` = `hreq.loop_249`, `hsum14` = `hreq.loop_251`, `hsum15` = `hreq.loop_253`, `hsum16` = `hreq.loop_255`, `hsum17` = `hreq.loop_257`, `hsum18` = `hreq.loop_259`, `hsum19` = `hreq.loop_261`, `hsum20` = `hreq.loop_265`, `hsum21` = `hreq.loop_267`, `hsum22` = `hreq.loop_269`, `hsum23` = `hreq.loop_271`, `hsum24` = `hreq.loop_273`, `hsum25` = `hreq.loop_275`, `hsum26` = `hreq.loop_277`, `hsum27` = `hreq.loop_279`, `hsum28` = `hreq.loop_281`, `hsum29` = `hreq.loop_283`, `hsum30` = `hreq.loop_287`, `hsum31` = `hreq.loop_289`, `hsum32` = `hreq.loop_291`, `hsum33` = `hreq.loop_293` (`GenRequirement.Facts`). -/
-theorem onehot_h21_7 {external : ExternalInputs} (hv : ValidExternals external)
+theorem onehot_h54_7 {external : ExternalInputs} (hv : ValidExternals external)
     (hsum0 : ∀ n350 < 16, ∀ n349 < 154140672, (0 + ∑ n348 ∈ Finset.range 130, (famAt (famAt external.input_86 n350) (((Int.ofNat n349) * 130) + (Int.ofNat n348)).toNat)) = 1)
     (hsum1 : ∀ n353 < 16, ∀ n352 < 154140672, (0 + ∑ n351 ∈ Finset.range 130, (famAt (famAt external.input_87 n353) (((Int.ofNat n352) * 130) + (Int.ofNat n351)).toNat)) = 1)
     (hsum2 : ∀ n386 < 16, ∀ n385 < 154140672, (0 + ∑ n384 ∈ Finset.range 130, (famAt (famAt external.input_98 n386) (((Int.ofNat n385) * 130) + (Int.ofNat n384)).toNat)) = 1)
@@ -176,236 +176,236 @@ theorem onehot_h21_7 {external : ExternalInputs} (hv : ValidExternals external)
       (Fin.cons (onehot_bucket (W := 130) _ hv.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 hsum33 hj ho)
       finZeroElim))))))))))))))))))))))))))))))))))
 
-/-- The message coefficients of `keys_h21_7` are the selector family `external.input_86` of the member. -/
-theorem cellsel_h21_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h54_7` are the selector family `external.input_86` of the member. -/
+theorem cellsel_h54_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_19_0 cM) = famAt (famAt external.input_86 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_19_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_52_0 cM) = famAt (famAt external.input_86 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_52_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h26_7` are the selector family `external.input_87` of the member. -/
-theorem cellsel_h26_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h58_7` are the selector family `external.input_87` of the member. -/
+theorem cellsel_h58_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_24_0 cM) = famAt (famAt external.input_87 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_24_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_56_0 cM) = famAt (famAt external.input_87 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_56_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h39_7` are the selector family `external.input_98` of the member. -/
-theorem cellsel_h39_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h62_7` are the selector family `external.input_98` of the member. -/
+theorem cellsel_h62_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_37_0 cM) = famAt (famAt external.input_98 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_37_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_60_0 cM) = famAt (famAt external.input_98 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_60_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h43_7` are the selector family `external.input_109` of the member. -/
-theorem cellsel_h43_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h66_7` are the selector family `external.input_109` of the member. -/
+theorem cellsel_h66_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_41_0 cM) = famAt (famAt external.input_109 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_41_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_64_0 cM) = famAt (famAt external.input_109 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_64_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h47_7` are the selector family `external.input_114` of the member. -/
-theorem cellsel_h47_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h70_7` are the selector family `external.input_114` of the member. -/
+theorem cellsel_h70_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_45_0 cM) = famAt (famAt external.input_114 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_45_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_68_0 cM) = famAt (famAt external.input_114 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_68_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h51_7` are the selector family `external.input_115` of the member. -/
-theorem cellsel_h51_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h74_7` are the selector family `external.input_115` of the member. -/
+theorem cellsel_h74_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_49_0 cM) = famAt (famAt external.input_115 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_49_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_72_0 cM) = famAt (famAt external.input_115 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_72_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h55_7` are the selector family `external.input_116` of the member. -/
-theorem cellsel_h55_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h78_7` are the selector family `external.input_116` of the member. -/
+theorem cellsel_h78_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_53_0 cM) = famAt (famAt external.input_116 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_53_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_76_0 cM) = famAt (famAt external.input_116 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_76_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h59_7` are the selector family `external.input_117` of the member. -/
-theorem cellsel_h59_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h82_7` are the selector family `external.input_117` of the member. -/
+theorem cellsel_h82_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_57_0 cM) = famAt (famAt external.input_117 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_57_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_80_0 cM) = famAt (famAt external.input_117 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_80_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h63_7` are the selector family `external.input_118` of the member. -/
-theorem cellsel_h63_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
-    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
-    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_61_0 cM) = famAt (famAt external.input_118 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_61_0 hin hroot)).trans (famAt_member _ i)
-
-/-- The message coefficients of `keys_h67_7` are the selector family `external.input_119` of the member. -/
-theorem cellsel_h67_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
-    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
-    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_65_0 cM) = famAt (famAt external.input_119 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_65_0 hin hroot)).trans (famAt_member _ i)
-
-/-- The message coefficients of `keys_h71_7` are the selector family `external.input_88` of the member. -/
-theorem cellsel_h71_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
-    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
-    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_69_0 cM) = famAt (famAt external.input_88 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_69_0 hin hroot)).trans (famAt_member _ i)
-
-/-- The message coefficients of `keys_h76_7` are the selector family `external.input_89` of the member. -/
-theorem cellsel_h76_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
-    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
-    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_74_0 cM) = famAt (famAt external.input_89 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_74_0 hin hroot)).trans (famAt_member _ i)
-
-/-- The message coefficients of `keys_h81_7` are the selector family `external.input_90` of the member. -/
-theorem cellsel_h81_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
-    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
-    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_79_0 cM) = famAt (famAt external.input_90 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_79_0 hin hroot)).trans (famAt_member _ i)
-
-/-- The message coefficients of `keys_h86_7` are the selector family `external.input_91` of the member. -/
+/-- The message coefficients of `keys_h86_7` are the selector family `external.input_118` of the member. -/
 theorem cellsel_h86_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_84_0 cM) = famAt (famAt external.input_91 (i : Nat)) :=
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_84_0 cM) = famAt (famAt external.input_118 (i : Nat)) :=
   (congrArg famAt (StageLinks.src_Stage_preprocess_w_84_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h91_7` are the selector family `external.input_92` of the member. -/
-theorem cellsel_h91_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h90_7` are the selector family `external.input_119` of the member. -/
+theorem cellsel_h90_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_89_0 cM) = famAt (famAt external.input_92 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_89_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_88_0 cM) = famAt (famAt external.input_119 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_88_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h96_7` are the selector family `external.input_93` of the member. -/
-theorem cellsel_h96_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h94_7` are the selector family `external.input_88` of the member. -/
+theorem cellsel_h94_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_94_0 cM) = famAt (famAt external.input_93 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_94_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_92_0 cM) = famAt (famAt external.input_88 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_92_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h101_7` are the selector family `external.input_94` of the member. -/
-theorem cellsel_h101_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h98_7` are the selector family `external.input_89` of the member. -/
+theorem cellsel_h98_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_99_0 cM) = famAt (famAt external.input_94 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_99_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_96_0 cM) = famAt (famAt external.input_89 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_96_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h106_7` are the selector family `external.input_95` of the member. -/
+/-- The message coefficients of `keys_h102_7` are the selector family `external.input_90` of the member. -/
+theorem cellsel_h102_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
+    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_100_0 cM) = famAt (famAt external.input_90 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_100_0 hin hroot)).trans (famAt_member _ i)
+
+/-- The message coefficients of `keys_h106_7` are the selector family `external.input_91` of the member. -/
 theorem cellsel_h106_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_104_0 cM) = famAt (famAt external.input_95 (i : Nat)) :=
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_104_0 cM) = famAt (famAt external.input_91 (i : Nat)) :=
   (congrArg famAt (StageLinks.src_Stage_preprocess_w_104_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h111_7` are the selector family `external.input_96` of the member. -/
-theorem cellsel_h111_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h110_7` are the selector family `external.input_92` of the member. -/
+theorem cellsel_h110_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_109_0 cM) = famAt (famAt external.input_96 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_109_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_108_0 cM) = famAt (famAt external.input_92 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_108_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h116_7` are the selector family `external.input_97` of the member. -/
-theorem cellsel_h116_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h114_7` are the selector family `external.input_93` of the member. -/
+theorem cellsel_h114_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_114_0 cM) = famAt (famAt external.input_97 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_114_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_112_0 cM) = famAt (famAt external.input_93 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_112_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h121_7` are the selector family `external.input_99` of the member. -/
-theorem cellsel_h121_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h118_7` are the selector family `external.input_94` of the member. -/
+theorem cellsel_h118_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_119_0 cM) = famAt (famAt external.input_99 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_119_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_116_0 cM) = famAt (famAt external.input_94 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_116_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h126_7` are the selector family `external.input_100` of the member. -/
+/-- The message coefficients of `keys_h122_7` are the selector family `external.input_95` of the member. -/
+theorem cellsel_h122_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
+    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_120_0 cM) = famAt (famAt external.input_95 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_120_0 hin hroot)).trans (famAt_member _ i)
+
+/-- The message coefficients of `keys_h126_7` are the selector family `external.input_96` of the member. -/
 theorem cellsel_h126_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_124_0 cM) = famAt (famAt external.input_100 (i : Nat)) :=
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_124_0 cM) = famAt (famAt external.input_96 (i : Nat)) :=
   (congrArg famAt (StageLinks.src_Stage_preprocess_w_124_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h131_7` are the selector family `external.input_101` of the member. -/
-theorem cellsel_h131_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h130_7` are the selector family `external.input_97` of the member. -/
+theorem cellsel_h130_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_129_0 cM) = famAt (famAt external.input_101 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_129_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_128_0 cM) = famAt (famAt external.input_97 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_128_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h136_7` are the selector family `external.input_102` of the member. -/
-theorem cellsel_h136_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h134_7` are the selector family `external.input_99` of the member. -/
+theorem cellsel_h134_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_134_0 cM) = famAt (famAt external.input_102 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_134_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_132_0 cM) = famAt (famAt external.input_99 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_132_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h141_7` are the selector family `external.input_103` of the member. -/
-theorem cellsel_h141_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h138_7` are the selector family `external.input_100` of the member. -/
+theorem cellsel_h138_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_139_0 cM) = famAt (famAt external.input_103 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_139_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_136_0 cM) = famAt (famAt external.input_100 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_136_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h146_7` are the selector family `external.input_104` of the member. -/
+/-- The message coefficients of `keys_h142_7` are the selector family `external.input_101` of the member. -/
+theorem cellsel_h142_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
+    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_140_0 cM) = famAt (famAt external.input_101 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_140_0 hin hroot)).trans (famAt_member _ i)
+
+/-- The message coefficients of `keys_h146_7` are the selector family `external.input_102` of the member. -/
 theorem cellsel_h146_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_144_0 cM) = famAt (famAt external.input_104 (i : Nat)) :=
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_144_0 cM) = famAt (famAt external.input_102 (i : Nat)) :=
   (congrArg famAt (StageLinks.src_Stage_preprocess_w_144_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h151_7` are the selector family `external.input_105` of the member. -/
-theorem cellsel_h151_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h150_7` are the selector family `external.input_103` of the member. -/
+theorem cellsel_h150_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_149_0 cM) = famAt (famAt external.input_105 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_149_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_148_0 cM) = famAt (famAt external.input_103 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_148_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h156_7` are the selector family `external.input_106` of the member. -/
-theorem cellsel_h156_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h154_7` are the selector family `external.input_104` of the member. -/
+theorem cellsel_h154_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_154_0 cM) = famAt (famAt external.input_106 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_154_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_152_0 cM) = famAt (famAt external.input_104 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_152_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h161_7` are the selector family `external.input_107` of the member. -/
-theorem cellsel_h161_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h158_7` are the selector family `external.input_105` of the member. -/
+theorem cellsel_h158_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_159_0 cM) = famAt (famAt external.input_107 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_159_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_156_0 cM) = famAt (famAt external.input_105 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_156_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h166_7` are the selector family `external.input_108` of the member. -/
+/-- The message coefficients of `keys_h162_7` are the selector family `external.input_106` of the member. -/
+theorem cellsel_h162_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
+    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_160_0 cM) = famAt (famAt external.input_106 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_160_0 hin hroot)).trans (famAt_member _ i)
+
+/-- The message coefficients of `keys_h166_7` are the selector family `external.input_107` of the member. -/
 theorem cellsel_h166_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_164_0 cM) = famAt (famAt external.input_108 (i : Nat)) :=
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_164_0 cM) = famAt (famAt external.input_107 (i : Nat)) :=
   (congrArg famAt (StageLinks.src_Stage_preprocess_w_164_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h171_7` are the selector family `external.input_110` of the member. -/
-theorem cellsel_h171_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h170_7` are the selector family `external.input_108` of the member. -/
+theorem cellsel_h170_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_169_0 cM) = famAt (famAt external.input_110 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_169_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_168_0 cM) = famAt (famAt external.input_108 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_168_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h176_7` are the selector family `external.input_111` of the member. -/
-theorem cellsel_h176_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h174_7` are the selector family `external.input_110` of the member. -/
+theorem cellsel_h174_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_174_0 cM) = famAt (famAt external.input_111 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_174_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_172_0 cM) = famAt (famAt external.input_110 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_172_0 hin hroot)).trans (famAt_member _ i)
 
-/-- The message coefficients of `keys_h181_7` are the selector family `external.input_112` of the member. -/
-theorem cellsel_h181_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+/-- The message coefficients of `keys_h178_7` are the selector family `external.input_111` of the member. -/
+theorem cellsel_h178_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
     {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
     (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
-    famAt (Stage_preprocess.parallel_generatedRoot_380.w_179_0 cM) = famAt (famAt external.input_112 (i : Nat)) :=
-  (congrArg famAt (StageLinks.src_Stage_preprocess_w_179_0 hin hroot)).trans (famAt_member _ i)
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_176_0 cM) = famAt (famAt external.input_111 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_176_0 hin hroot)).trans (famAt_member _ i)
+
+/-- The message coefficients of `keys_h182_7` are the selector family `external.input_112` of the member. -/
+theorem cellsel_h182_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
+    {rM : Stage_preprocess.generatedRoot.Ctx backend hashModel stage_2_params} {cM : Stage_preprocess.parallel_generatedRoot_380.Ctx backend hashModel stage_2_params (i : Nat)}
+    (hin : cM.inputs = StageLinks.Stage_preprocess.rootArgs rM i) (hroot : rM.inputs = StageLinks.Stage_preprocess.claimArgs external execution) :
+    famAt (Stage_preprocess.parallel_generatedRoot_380.w_180_0 cM) = famAt (famAt external.input_112 (i : Nat)) :=
+  (congrArg famAt (StageLinks.src_Stage_preprocess_w_180_0 hin hroot)).trans (famAt_member _ i)
 
 /-- The message coefficients of `keys_h186_7` are the selector family `external.input_113` of the member. -/
 theorem cellsel_h186_7 {backend : MxxRuntime.BackendContext} {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution} {i : Fin StageLinks.S}
@@ -1967,37 +1967,37 @@ theorem fam_Stage_online_eval_w_1674_0 {backend : MxxRuntime.BackendContext} {ha
 section Tables
 open Stage_preprocess
 
-/-- `table_h13_3`: its automorphisms are odd. -/
-theorem odd_h13_3 : ∀ k : Fin 128, Odd ((fun (i : Fin 128) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))) k).toNat := by
+/-- `table_h47_3`: its automorphisms are odd. -/
+theorem odd_h47_3 : ∀ k : Fin 128, Odd ((fun (i : Fin 128) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))) k).toNat := by
   decide
 
-/-- `table_h13_3`: the key coefficient of branch `i` as its Walsh coefficient (`GenFinal.keyTableC_walsh`). -/
-theorem coef_h13_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 128) :
+/-- `table_h47_3`: the key coefficient of branch `i` as its Walsh coefficient (`GenFinal.keyTableC_walsh`). -/
+theorem coef_h47_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 128) :
     ((keyTableG (([(1)]) : List Int) (([((sel_1 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0) =
       ((1 : Int) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072) * lutFourierCoefficient 128 (X (mod_0 ((Int.ofNat i_0))) ^ 1024) ((sel_1 ((Int.ofNat i_0)) : Int) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072)
         (fun k ↦ ((((fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int))) k : Int) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072)) ((MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))).toNat :=
-  keyTableC_walsh' (s := 1024) (W := 128) (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (by norm_num) (odd_h13_3 i) (by norm_num) _ _ _
+  keyTableC_walsh' (s := 1024) (W := 128) (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (by norm_num) (odd_h47_3 i) (by norm_num) _ _ _
 
-/-- `table_h13_3` for all branches in the `hswitch` / `heB` shape (`fam = fam4` of the table, `Cw k` its
-`keyTableG` coefficient, `coef_h13_3`). -/
-theorem switch_h13_3 {backend : BackendContext} {hashModel : HashModel} {params : Params} {i_0 : Nat}
+/-- `table_h47_3` for all branches in the `hswitch` / `heB` shape (`fam = fam4` of the table, `Cw k` its
+`keyTableG` coefficient, `coef_h47_3`). -/
+theorem switch_h47_3 {backend : BackendContext} {hashModel : HashModel} {params : Params} {i_0 : Nat}
     [Fact (i_0 < 16)] {ctx : parallel_generatedRoot_380.Ctx backend hashModel params i_0} {outputs}
     (F : parallel_generatedRoot_380.Facts ctx outputs)
-    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_9_0 : parallel_generatedRoot_380.w_9_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
+    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_43_0 : parallel_generatedRoot_380.w_43_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
     {g' : ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28} (hg' : gadgetMatrixRuns backend ((1024) : Int) ((28) : Int) g') :
     ∃ eB : Fin 128 → Fin 2 → ErrorMatrix 131072 1 28, (∀ k j, CoeffBound (eB k j) ((26) : Int).toNat) ∧
-      ∀ (k : Fin 128) (j : Fin 2), reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (substitution ((fun (i : Fin 128) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))) k).toNat (odd_h13_3 k) sp) •
-          fam4 (parallel_generatedRoot_380.w_13_0 ctx) (parallel_generatedRoot_380.w_13_1 ctx) (parallel_generatedRoot_380.w_13_2 ctx) (parallel_generatedRoot_380.w_13_3 ctx) 0 j k +
-          fam4 (parallel_generatedRoot_380.w_13_0 ctx) (parallel_generatedRoot_380.w_13_1 ctx) (parallel_generatedRoot_380.w_13_2 ctx) (parallel_generatedRoot_380.w_13_3 ctx) 1 j k =
+      ∀ (k : Fin 128) (j : Fin 2), reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (substitution ((fun (i : Fin 128) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))) k).toNat (odd_h47_3 k) sp) •
+          fam4 (parallel_generatedRoot_380.w_47_0 ctx) (parallel_generatedRoot_380.w_47_1 ctx) (parallel_generatedRoot_380.w_47_2 ctx) (parallel_generatedRoot_380.w_47_3 ctx) 0 j k +
+          fam4 (parallel_generatedRoot_380.w_47_0 ctx) (parallel_generatedRoot_380.w_47_1 ctx) (parallel_generatedRoot_380.w_47_2 ctx) (parallel_generatedRoot_380.w_47_3 ctx) 1 j k =
         ((fun (i : Fin 128) ↦ ((keyTableG (([(1)]) : List Int) (([((sel_1 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) k *
           reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (1 * unitPair sp j)) • g' + reduceMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 (eB k j) := by
   have ex : ∀ k : Fin 128, ∃ eB : Fin 2 → ErrorMatrix 131072 1 28, (∀ j, CoeffBound (eB j) ((26) : Int).toNat) ∧
-      ∀ (j : Fin 2), reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (substitution ((fun (i : Fin 128) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))) k).toNat (odd_h13_3 k) sp) •
-          fam4 (parallel_generatedRoot_380.w_13_0 ctx) (parallel_generatedRoot_380.w_13_1 ctx) (parallel_generatedRoot_380.w_13_2 ctx) (parallel_generatedRoot_380.w_13_3 ctx) 0 j k +
-          fam4 (parallel_generatedRoot_380.w_13_0 ctx) (parallel_generatedRoot_380.w_13_1 ctx) (parallel_generatedRoot_380.w_13_2 ctx) (parallel_generatedRoot_380.w_13_3 ctx) 1 j k =
+      ∀ (j : Fin 2), reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (substitution ((fun (i : Fin 128) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))) k).toNat (odd_h47_3 k) sp) •
+          fam4 (parallel_generatedRoot_380.w_47_0 ctx) (parallel_generatedRoot_380.w_47_1 ctx) (parallel_generatedRoot_380.w_47_2 ctx) (parallel_generatedRoot_380.w_47_3 ctx) 0 j k +
+          fam4 (parallel_generatedRoot_380.w_47_0 ctx) (parallel_generatedRoot_380.w_47_1 ctx) (parallel_generatedRoot_380.w_47_2 ctx) (parallel_generatedRoot_380.w_47_3 ctx) 1 j k =
         ((fun (i : Fin 128) ↦ ((keyTableG (([(1)]) : List Int) (([((sel_1 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) k *
           reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (1 * unitPair sp j)) • g' + reduceMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 (eB j) := fun k ↦ by
-    obtain ⟨-, -, G, hG, hodd, eB, hb, he⟩ := table_h13_3 F hspsmall h_w_9_0 k
+    obtain ⟨-, -, G, hG, hodd, eB, hb, he⟩ := table_h47_3 F hspsmall h_w_43_0 k
     obtain rfl := gadgetMatrixRuns_unique hG hg'
     refine ⟨eB, hb, fun j ↦ ?_⟩
     rw [one_mul]
@@ -2023,7 +2023,7 @@ theorem coef_h365_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 128) :
 theorem switch_h365_3 {backend : BackendContext} {hashModel : HashModel} {params : Params} {i_0 : Nat}
     [Fact (i_0 < 16)] {ctx : parallel_generatedRoot_380.Ctx backend hashModel params i_0} {outputs}
     (F : parallel_generatedRoot_380.Facts ctx outputs)
-    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_9_0 : parallel_generatedRoot_380.w_9_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
+    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_43_0 : parallel_generatedRoot_380.w_43_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
     {g0 : ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28} {g' : ExactMatrix (modulus_34) 131072 1 28}
     (hg0 : gadgetMatrixRuns backend ((1024) : Int) ((28) : Int) g0) (hg' : centeredRebaseRuns g0 g') :
     ∃ eB : Fin 128 → Fin 2 → ErrorMatrix 131072 1 28, (∀ k j, CoeffBound (eB k j) ((26) : Int).toNat) ∧
@@ -2038,7 +2038,7 @@ theorem switch_h365_3 {backend : BackendContext} {hashModel : HashModel} {params
           fam4 (parallel_generatedRoot_380.w_365_0 ctx) (parallel_generatedRoot_380.w_365_1 ctx) (parallel_generatedRoot_380.w_365_2 ctx) (parallel_generatedRoot_380.w_365_3 ctx) 1 j k =
         ((fun (i : Fin 128) ↦ ((keyTableG (([((sel_3 ((Int.ofNat i_0))))]) : List Int) (([(2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193)]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermE (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) ((4096) : Int) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (modulus_34) (131072) 1 1) 0 0)) k *
           reducePoly (modulus_34) 131072 (1 * unitPair sp j)) • g' + reduceMatrix (modulus_34) 131072 1 28 (eB j) := fun k ↦ by
-    obtain ⟨-, -, G0, G, hG0, hG, hodd, eB, hb, he⟩ := table_h365_3 F hspsmall h_w_9_0 k
+    obtain ⟨-, -, G0, G, hG0, hG, hodd, eB, hb, he⟩ := table_h365_3 F hspsmall h_w_43_0 k
     obtain rfl := gadgetMatrixRuns_unique hG0 hg0
     obtain rfl : G = g' := hG.2.trans hg'.2.symm
     refine ⟨eB, hb, fun j ↦ ?_⟩
@@ -2065,7 +2065,7 @@ theorem coef_h367_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 32) :
 theorem switch_h367_3 {backend : BackendContext} {hashModel : HashModel} {params : Params} {i_0 : Nat}
     [Fact (i_0 < 16)] {ctx : parallel_generatedRoot_380.Ctx backend hashModel params i_0} {outputs}
     (F : parallel_generatedRoot_380.Facts ctx outputs)
-    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_9_0 : parallel_generatedRoot_380.w_9_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
+    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_43_0 : parallel_generatedRoot_380.w_43_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
     {g' : ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28} (hg' : gadgetMatrixRuns backend ((1024) : Int) ((28) : Int) g') :
     ∃ eB : Fin 32 → Fin 2 → ErrorMatrix 131072 1 28, (∀ k j, CoeffBound (eB k j) ((26) : Int).toNat) ∧
       ∀ (k : Fin 32) (j : Fin 2), reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (substitution ((fun (i : Fin 32) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int))) k).toNat (odd_h367_3 k) sp) •
@@ -2079,7 +2079,7 @@ theorem switch_h367_3 {backend : BackendContext} {hashModel : HashModel} {params
           fam4 (parallel_generatedRoot_380.w_367_0 ctx) (parallel_generatedRoot_380.w_367_1 ctx) (parallel_generatedRoot_380.w_367_2 ctx) (parallel_generatedRoot_380.w_367_3 ctx) 1 j k =
         ((fun (i : Fin 32) ↦ ((keyTableG (([(1)]) : List Int) (([((sel_7 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((32) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int)) (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0)))), (0), ((sel_6 ((Int.ofNat i_0))))]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((4096) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) k *
           reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (1 * unitPair sp j)) • g' + reduceMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 (eB j) := fun k ↦ by
-    obtain ⟨-, -, G, hG, hodd, eB, hb, he⟩ := table_h367_3 F hspsmall h_w_9_0 k
+    obtain ⟨-, -, G, hG, hodd, eB, hb, he⟩ := table_h367_3 F hspsmall h_w_43_0 k
     obtain rfl := gadgetMatrixRuns_unique hG hg'
     refine ⟨eB, hb, fun j ↦ ?_⟩
     rw [one_mul]
@@ -2100,7 +2100,7 @@ theorem odd_h2107_3 : ∀ k : Fin 2, Odd ((fun (i : Fin 2) ↦ (MxxIR.selectInt 
 theorem switch_h2107_3 {backend : BackendContext} {hashModel : HashModel} {params : Params} {i_0 : Nat}
     [Fact (i_0 < 16)] {ctx : parallel_generatedRoot_380.Ctx backend hashModel params i_0} {outputs}
     (F : parallel_generatedRoot_380.Facts ctx outputs)
-    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_9_0 : parallel_generatedRoot_380.w_9_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
+    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_43_0 : parallel_generatedRoot_380.w_43_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
     {g0 : ExactMatrix (mod_1 ((Int.ofNat i_0))) 131072 1 24} {g' : ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24}
     (hg0 : gadgetMatrixRuns backend ((1024) : Int) ((24) : Int) g0) (hg' : centeredRebaseRuns g0 g') :
     ∃ eB : Fin 2 → Fin 2 → ErrorMatrix 131072 1 24, (∀ k j, CoeffBound (eB k j) ((26) : Int).toNat) ∧
@@ -2115,7 +2115,7 @@ theorem switch_h2107_3 {backend : BackendContext} {hashModel : HashModel} {param
           fam4 (parallel_generatedRoot_380.w_2107_0 ctx) (parallel_generatedRoot_380.w_2107_1 ctx) (parallel_generatedRoot_380.w_2107_2 ctx) (parallel_generatedRoot_380.w_2107_3 ctx) 1 j k =
         ((fun (i : Fin 2) ↦ ((keyTableG (([((sel_9 ((Int.ofNat i_0))))]) : List Int) (([((sel_10 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((2) : Int).toNat, (keyTermE (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (131073)]) : List Int)) ((1) : Int) (fun (j : Fin (2)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (0)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) k *
           reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (1 * unitPair sp j)) • g' + reduceMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 24 (eB j) := fun k ↦ by
-    obtain ⟨-, -, G0, G, hG0, hG, hodd, eB, hb, he⟩ := table_h2107_3 F hspsmall h_w_9_0 k
+    obtain ⟨-, -, G0, G, hG0, hG, hodd, eB, hb, he⟩ := table_h2107_3 F hspsmall h_w_43_0 k
     obtain rfl := gadgetMatrixRuns_unique hG0 hg0
     obtain rfl : G = g' := hG.2.trans hg'.2.symm
     refine ⟨eB, hb, fun j ↦ ?_⟩
@@ -2142,7 +2142,7 @@ theorem coef_h2306_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 128) :
 theorem switch_h2306_3 {backend : BackendContext} {hashModel : HashModel} {params : Params} {i_0 : Nat}
     [Fact (i_0 < 16)] {ctx : parallel_generatedRoot_380.Ctx backend hashModel params i_0} {outputs}
     (F : parallel_generatedRoot_380.Facts ctx outputs)
-    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_9_0 : parallel_generatedRoot_380.w_9_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
+    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_43_0 : parallel_generatedRoot_380.w_43_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
     {g0 : ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28} {g' : ExactMatrix (modulus_34) 131072 1 28}
     (hg0 : gadgetMatrixRuns backend ((1024) : Int) ((28) : Int) g0) (hg' : centeredRebaseRuns g0 g') :
     ∃ eB : Fin 128 → Fin 2 → ErrorMatrix 131072 1 28, (∀ k j, CoeffBound (eB k j) ((26) : Int).toNat) ∧
@@ -2157,7 +2157,7 @@ theorem switch_h2306_3 {backend : BackendContext} {hashModel : HashModel} {param
           fam4 (parallel_generatedRoot_380.w_2306_0 ctx) (parallel_generatedRoot_380.w_2306_1 ctx) (parallel_generatedRoot_380.w_2306_2 ctx) (parallel_generatedRoot_380.w_2306_3 ctx) 1 j k =
         ((fun (i : Fin 128) ↦ ((keyTableG (([((sel_3 ((Int.ofNat i_0))))]) : List Int) (([(2119145531352249142381457572838939868058166340596904112943653958261119605906267502454703649032193)]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermE (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) ((4096) : Int) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (modulus_34) (131072) 1 1) 0 0)) k *
           reducePoly (modulus_34) 131072 (1 * unitPair sp j)) • g' + reduceMatrix (modulus_34) 131072 1 28 (eB j) := fun k ↦ by
-    obtain ⟨-, -, G0, G, hG0, hG, hodd, eB, hb, he⟩ := table_h2306_3 F hspsmall h_w_9_0 k
+    obtain ⟨-, -, G0, G, hG0, hG, hodd, eB, hb, he⟩ := table_h2306_3 F hspsmall h_w_43_0 k
     obtain rfl := gadgetMatrixRuns_unique hG0 hg0
     obtain rfl : G = g' := hG.2.trans hg'.2.symm
     refine ⟨eB, hb, fun j ↦ ?_⟩
@@ -2184,7 +2184,7 @@ theorem coef_h2308_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 32) :
 theorem switch_h2308_3 {backend : BackendContext} {hashModel : HashModel} {params : Params} {i_0 : Nat}
     [Fact (i_0 < 16)] {ctx : parallel_generatedRoot_380.Ctx backend hashModel params i_0} {outputs}
     (F : parallel_generatedRoot_380.Facts ctx outputs)
-    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_9_0 : parallel_generatedRoot_380.w_9_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
+    {sp : ErrorPoly 131072} (hspsmall : polyNorm sp ≤ 1) (h_w_43_0 : parallel_generatedRoot_380.w_43_0 ctx = fun _ _ ↦ reducePoly modulus_34 131072 sp) 
     {g' : ExactMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28} (hg' : gadgetMatrixRuns backend ((1024) : Int) ((28) : Int) g') :
     ∃ eB : Fin 32 → Fin 2 → ErrorMatrix 131072 1 28, (∀ k j, CoeffBound (eB k j) ((26) : Int).toNat) ∧
       ∀ (k : Fin 32) (j : Fin 2), reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (substitution ((fun (i : Fin 32) ↦ (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int))) k).toNat (odd_h2308_3 k) sp) •
@@ -2198,7 +2198,7 @@ theorem switch_h2308_3 {backend : BackendContext} {hashModel : HashModel} {param
           fam4 (parallel_generatedRoot_380.w_2308_0 ctx) (parallel_generatedRoot_380.w_2308_1 ctx) (parallel_generatedRoot_380.w_2308_2 ctx) (parallel_generatedRoot_380.w_2308_3 ctx) 1 j k =
         ((fun (i : Fin 32) ↦ ((keyTableG (([(1)]) : List Int) (([((sel_7 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((32) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (85), (99), (135), (153), (165), (255), (297), (459), (495), (561), (765), (891), (1485), (1683), (2295), (2805), (4455), (5049), (8415), (15147), (25245), (75735)]) : List Int)) (fun (j : Fin (32)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1), (0), (1)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((4096) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) k *
           reducePoly (mod_0 ((Int.ofNat i_0))) 131072 (1 * unitPair sp j)) • g' + reduceMatrix (mod_0 ((Int.ofNat i_0))) 131072 1 28 (eB j) := fun k ↦ by
-    obtain ⟨-, -, G, hG, hodd, eB, hb, he⟩ := table_h2308_3 F hspsmall h_w_9_0 k
+    obtain ⟨-, -, G, hG, hodd, eB, hb, he⟩ := table_h2308_3 F hspsmall h_w_43_0 k
     obtain rfl := gadgetMatrixRuns_unique hG hg'
     refine ⟨eB, hb, fun j ↦ ?_⟩
     rw [one_mul]
@@ -2209,41 +2209,41 @@ theorem switch_h2308_3 {backend : BackendContext} {hashModel : HashModel} {param
   exact ⟨eB, hb, he⟩
 
 /-- The smudge table's inverse width is nonnegative. -/
-theorem nonneg_h13_3 (i_0 : Nat) [Fact (i_0 < 16)] : 0 ≤ ((sel_1 ((Int.ofNat i_0)) : Int)) := by
+theorem nonneg_h47_3 (i_0 : Nat) [Fact (i_0 < 16)] : 0 ≤ ((sel_1 ((Int.ofNat i_0)) : Int)) := by
   have := (Fact.out : i_0 < 16)
   interval_cases i_0 <;> decide
 
 set_option maxRecDepth 65536 in
 /-- The smudge table's inverse width: `b 2^log ≡ 1`. -/
-theorem inv_h13_3 (i_0 : Nat) [Fact (i_0 < 16)] : (((sel_1 ((Int.ofNat i_0)) : Int)).toNat * 2 ^ 7) % (mod_0 ((Int.ofNat i_0))) = 1 := by
+theorem inv_h47_3 (i_0 : Nat) [Fact (i_0 < 16)] : (((sel_1 ((Int.ofNat i_0)) : Int)).toNat * 2 ^ 7) % (mod_0 ((Int.ofNat i_0))) = 1 := by
   have := (Fact.out : i_0 < 16)
   interval_cases i_0 <;> decide
 
 /-- `smudge_digits`' `hinverse`. -/
-theorem smudge_hinverse_h13_3 (i_0 : Nat) [Fact (i_0 < 16)] :
+theorem smudge_hinverse_h47_3 (i_0 : Nat) [Fact (i_0 < 16)] :
     ((((sel_1 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072) * ((2 ^ 7 : Nat) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072) = 1 :=
-  cast_inverse (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (inv_h13_3 i_0)
+  cast_inverse (RefreshTopProof.GenInst.Certs.Stage_preprocess.mod_0_gt i_0) (inv_h47_3 i_0)
 
 /-- `smudge_digits`' `hC` with `C i` the smudge table's `keyTableG` coefficient. -/
-theorem smudge_hC_h13_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 128) :
+theorem smudge_hC_h47_3 (i_0 : Nat) [Fact (i_0 < 16)] (i : Fin 128) :
     ((keyTableG (([(1)]) : List Int) (([((sel_1 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0) =
       lutFourierCoefficient (2 ^ 7) (X (mod_0 ((Int.ofNat i_0))) ^ 1024) ((((sel_1 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072)
         (fun k : Fin (2 ^ 7) ↦ reducePoly (mod_0 ((Int.ofNat i_0))) 131072 ((halfTable 16 (2 ^ 7) k : Int) : ErrorPoly 131072)) ((MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int))).toNat := by
   have hb : ((((sel_1 ((Int.ofNat i_0)) : Int)).toNat : Nat) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072) = ((sel_1 ((Int.ofNat i_0)) : Int) : ExactPoly (mod_0 ((Int.ofNat i_0))) 131072) := by
-    rw [← Int.cast_natCast, Int.toNat_of_nonneg (nonneg_h13_3 i_0)]
-  rw [coef_h13_3 i_0 i, Int.cast_one, one_mul, hb]
-  exact walsh_halfTable (p' := 16) _ _ _ smudge_table_h13_3 _
+    rw [← Int.cast_natCast, Int.toNat_of_nonneg (nonneg_h47_3 i_0)]
+  rw [coef_h47_3 i_0 i, Int.cast_one, one_mul, hb]
+  exact walsh_halfTable (p' := 16) _ _ _ smudge_table_h47_3 _
 
-/-- `smudge_digits_h1849_5` with the smudge table's coefficients (`C i` = `table_h13_3`'s `keyTableG` coefficient):
-`hinverse`, `hodd`, `hC` discharged (`smudge_hinverse_h13_3`, `odd_h13_3`, `smudge_hC_h13_3`). -/
+/-- `smudge_digits_h1849_5` with the smudge table's coefficients (`C i` = `table_h47_3`'s `keyTableG` coefficient):
+`hinverse`, `hodd`, `hC` discharged (`smudge_hinverse_h47_3`, `odd_h47_3`, `smudge_hC_h47_3`). -/
 theorem smudge_digits_keys_h1849_5 (i_0 : Nat) [Fact (i_0 < 16)] {μ ν : Fin 154140672 → ErrorPoly 131072} {Δ' : ErrorPoly 131072}
     {z : Nat → Nat}
     (hμ : ∀ o, reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 (μ o) = reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 (Xe (n := 131072) (1024 * z o)))
-    (hwalsh : ∀ o, ∑ k, reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 (substitution (sig (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int) (128) k).toNat (odd_h13_3 k) (μ o)) * (fun (i : Fin 128) ↦ ((keyTableG (([(1)]) : List Int) (([((sel_1 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) k = reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 (ν o))
+    (hwalsh : ∀ o, ∑ k, reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 (substitution (sig (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int) (128) k).toNat (odd_h47_3 k) (μ o)) * (fun (i : Fin 128) ↦ ((keyTableG (([(1)]) : List Int) (([((sel_1 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((128) : Int).toNat, (keyTermC (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (3), (5), (9), (15), (17), (27), (33), (45), (51), (65), (85), (99), (129), (135), (153), (165), (195), (255), (297), (325), (387), (459), (495), (561), (585), (645), (765), (891), (975), (1105), (1161), (1485), (1683), (1755), (1935), (2145), (2193), (2295), (2805), (2925), (3315), (3483), (4257), (4455), (5049), (5525), (5805), (6435), (6579), (8385), (8415), (8775), (9945), (10725), (10965), (12771), (14561), (15147), (16575), (17415), (19305), (19737), (21285), (22687), (25155), (25245), (27431), (29835), (32175), (32895), (33911), (36465), (36959), (38313), (41023), (41925), (43039), (43683), (49725), (50407), (57915), (59211), (63855), (66041), (68061), (70487), (72369), (72805), (75465), (75735), (83399), (96525), (98685), (99701), (107063), (109395), (110877), (114939), (115181), (118955), (123069), (125207), (125775), (127033), (129117), (129899), (130681), (130727), (130957), (131003), (131049), (142545), (149175), (165491), (178699), (182325), (188437), (189109), (191565), (198123), (204183), (217107), (218323), (218415), (226395), (234329), (247537)]) : List Int)) (fun (j : Fin (128)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (1), (1), (1), (1), (1), (1), (1), (3), (3), (3), (3), (3), (3), (3), (3), (5), (5), (5), (5), (5), (5), (5), (5), (7), (7), (7), (7), (7), (7), (7), (7), (9), (9), (9), (9), (9), (9), (9), (9), (11), (11), (11), (11), (11), (11), (11), (11), (13), (13), (13), (13), (13), (13), (13), (13), (15), (15), (15), (15), (15), (15), (15), (15), (17), (17), (17), (17), (17), (17), (17), (17), (19), (19), (19), (19), (19), (19), (19), (19), (21), (21), (21), (21), (21), (21), (21), (21), (23), (23), (23), (23), (23), (23), (23), (23), (25), (25), (25), (25), (25), (25), (25), (25), (27), (27), (27), (27), (27), (27), (27), (27), (29), (29), (29), (29), (29), (29), (29), (29), (31), (31), (31), (31), (31), (31), (31), (31)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1024) : Int)) k)) : ExactMatrix (mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)) k = reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 (ν o))
     (hΔ : reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 Δ' = 1) :
     ∀ o, reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 (Δ' * ν o) = reducePoly (Stage_online_eval.mod_0 ((Int.ofNat i_0))) 131072 ((2 * halfU 16 (2 ^ 7) (z o) - (2 * 16 - 1) : Int) : ErrorPoly 131072) ∧
       0 ≤ halfU 16 (2 ^ 7) (z o) ∧ halfU 16 (2 ^ 7) (z o) < 2 * 16 :=
-  smudge_digits_h1849_5 (smudge_hinverse_h13_3 i_0) odd_h13_3 (smudge_hC_h13_3 i_0) hμ hwalsh hΔ
+  smudge_digits_h1849_5 (smudge_hinverse_h47_3 i_0) odd_h47_3 (smudge_hC_h47_3 i_0) hμ hwalsh hΔ
 
 end Tables
 

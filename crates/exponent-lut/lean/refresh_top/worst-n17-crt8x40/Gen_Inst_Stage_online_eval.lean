@@ -1574,7 +1574,7 @@ theorem seg_h1450_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_2 131072 1 164}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 164} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_2 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_2 164 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 48, 41, 47, 48, 47, 49]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1448_0 ctx i, parallel_generatedRoot_456.w_1449_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1448_0 ctx i, parallel_generatedRoot_456.w_1449_0 ctx i] j =
       reducePoly modulus_2 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_2 131072 1 164 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1610,7 +1610,7 @@ theorem seg_h1454_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_3 131072 1 160}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 160} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_3 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_3 160 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 41, 47, 49, 47, 50]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1452_0 ctx i, parallel_generatedRoot_456.w_1453_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1452_0 ctx i, parallel_generatedRoot_456.w_1453_0 ctx i] j =
       reducePoly modulus_3 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_3 131072 1 160 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1648,7 +1648,7 @@ theorem seg_h1458_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_4 131072 1 156}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 156} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_4 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_4 156 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 41, 47, 50, 47, 51]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1456_0 ctx i, parallel_generatedRoot_456.w_1457_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1456_0 ctx i, parallel_generatedRoot_456.w_1457_0 ctx i] j =
       reducePoly modulus_4 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_4 131072 1 156 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1686,7 +1686,7 @@ theorem seg_h1462_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_5 131072 1 152}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 152} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_5 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_5 152 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 41, 47, 51, 47, 52]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1460_0 ctx i, parallel_generatedRoot_456.w_1461_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1460_0 ctx i, parallel_generatedRoot_456.w_1461_0 ctx i] j =
       reducePoly modulus_5 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_5 131072 1 152 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1724,7 +1724,7 @@ theorem seg_h1466_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_6 131072 1 148}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 148} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_6 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_6 148 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 52, 41, 47, 52, 47, 53]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1464_0 ctx i, parallel_generatedRoot_456.w_1465_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1464_0 ctx i, parallel_generatedRoot_456.w_1465_0 ctx i] j =
       reducePoly modulus_6 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_6 131072 1 148 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1762,7 +1762,7 @@ theorem seg_h1470_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_7 131072 1 144}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 144} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_7 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_7 144 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 53, 41, 47, 53, 47, 54]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1468_0 ctx i, parallel_generatedRoot_456.w_1469_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1468_0 ctx i, parallel_generatedRoot_456.w_1469_0 ctx i] j =
       reducePoly modulus_7 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_7 131072 1 144 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1800,7 +1800,7 @@ theorem seg_h1474_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_8 131072 1 140}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 140} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_8 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_8 140 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 54, 41, 47, 54, 47, 55]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1472_0 ctx i, parallel_generatedRoot_456.w_1473_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1472_0 ctx i, parallel_generatedRoot_456.w_1473_0 ctx i] j =
       reducePoly modulus_8 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_8 131072 1 140 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1838,7 +1838,7 @@ theorem seg_h1478_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_9 131072 1 136}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 136} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_9 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_9 136 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 55, 41, 47, 55, 47, 56]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1476_0 ctx i, parallel_generatedRoot_456.w_1477_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1476_0 ctx i, parallel_generatedRoot_456.w_1477_0 ctx i] j =
       reducePoly modulus_9 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_9 131072 1 136 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1876,7 +1876,7 @@ theorem seg_h1482_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_10 131072 1 132}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 132} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_10 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_10 132 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 56, 41, 47, 56, 47, 57]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1480_0 ctx i, parallel_generatedRoot_456.w_1481_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1480_0 ctx i, parallel_generatedRoot_456.w_1481_0 ctx i] j =
       reducePoly modulus_10 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_10 131072 1 132 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1914,7 +1914,7 @@ theorem seg_h1486_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_11 131072 1 128}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 128} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_11 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_11 128 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 57, 41, 47, 57, 47, 49, 48]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1484_0 ctx i, parallel_generatedRoot_456.w_1485_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1484_0 ctx i, parallel_generatedRoot_456.w_1485_0 ctx i] j =
       reducePoly modulus_11 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_11 131072 1 128 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1952,7 +1952,7 @@ theorem seg_h1490_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_12 131072 1 124}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 124} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_12 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_12 124 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 48, 41, 47, 49, 48, 47, 49, 49]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1488_0 ctx i, parallel_generatedRoot_456.w_1489_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1488_0 ctx i, parallel_generatedRoot_456.w_1489_0 ctx i] j =
       reducePoly modulus_12 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_12 131072 1 124 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -1990,7 +1990,7 @@ theorem seg_h1494_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_13 131072 1 120}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 120} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_13 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_13 120 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 49, 41, 47, 49, 49, 47, 49, 50]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1492_0 ctx i, parallel_generatedRoot_456.w_1493_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1492_0 ctx i, parallel_generatedRoot_456.w_1493_0 ctx i] j =
       reducePoly modulus_13 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_13 131072 1 120 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2028,7 +2028,7 @@ theorem seg_h1498_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_14 131072 1 116}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 116} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_14 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_14 116 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 50, 41, 47, 49, 50, 47, 49, 51]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1496_0 ctx i, parallel_generatedRoot_456.w_1497_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1496_0 ctx i, parallel_generatedRoot_456.w_1497_0 ctx i] j =
       reducePoly modulus_14 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_14 131072 1 116 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2066,7 +2066,7 @@ theorem seg_h1502_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_15 131072 1 112}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 112} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_15 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_15 112 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 51, 41, 47, 49, 51, 47, 49, 52]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1500_0 ctx i, parallel_generatedRoot_456.w_1501_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1500_0 ctx i, parallel_generatedRoot_456.w_1501_0 ctx i] j =
       reducePoly modulus_15 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_15 131072 1 112 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2104,7 +2104,7 @@ theorem seg_h1506_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_16 131072 1 108}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 108} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_16 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_16 108 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 52, 41, 47, 49, 52, 47, 49, 53]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1504_0 ctx i, parallel_generatedRoot_456.w_1505_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1504_0 ctx i, parallel_generatedRoot_456.w_1505_0 ctx i] j =
       reducePoly modulus_16 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_16 131072 1 108 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2142,7 +2142,7 @@ theorem seg_h1510_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_17 131072 1 104}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 104} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_17 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_17 104 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 53, 41, 47, 49, 53, 47, 49, 54]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1508_0 ctx i, parallel_generatedRoot_456.w_1509_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1508_0 ctx i, parallel_generatedRoot_456.w_1509_0 ctx i] j =
       reducePoly modulus_17 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_17 131072 1 104 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2180,7 +2180,7 @@ theorem seg_h1514_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_18 131072 1 100}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 100} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_18 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_18 100 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 54, 41, 47, 49, 54, 47, 49, 55]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1512_0 ctx i, parallel_generatedRoot_456.w_1513_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1512_0 ctx i, parallel_generatedRoot_456.w_1513_0 ctx i] j =
       reducePoly modulus_18 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_18 131072 1 100 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2218,7 +2218,7 @@ theorem seg_h1518_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_19 131072 1 96}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 96} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_19 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_19 96 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 55, 41, 47, 49, 55, 47, 49, 56]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1516_0 ctx i, parallel_generatedRoot_456.w_1517_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1516_0 ctx i, parallel_generatedRoot_456.w_1517_0 ctx i] j =
       reducePoly modulus_19 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_19 131072 1 96 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2256,7 +2256,7 @@ theorem seg_h1522_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_20 131072 1 92}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 92} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_20 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_20 92 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 56, 41, 47, 49, 56, 47, 49, 57]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1520_0 ctx i, parallel_generatedRoot_456.w_1521_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1520_0 ctx i, parallel_generatedRoot_456.w_1521_0 ctx i] j =
       reducePoly modulus_20 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_20 131072 1 92 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2294,7 +2294,7 @@ theorem seg_h1526_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_21 131072 1 88}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 88} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_21 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_21 88 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 57, 41, 47, 49, 57, 47, 50, 48]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1524_0 ctx i, parallel_generatedRoot_456.w_1525_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1524_0 ctx i, parallel_generatedRoot_456.w_1525_0 ctx i] j =
       reducePoly modulus_21 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_21 131072 1 88 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2332,7 +2332,7 @@ theorem seg_h1530_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_22 131072 1 84}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 84} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_22 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_22 84 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 48, 41, 47, 50, 48, 47, 50, 49]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1528_0 ctx i, parallel_generatedRoot_456.w_1529_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1528_0 ctx i, parallel_generatedRoot_456.w_1529_0 ctx i] j =
       reducePoly modulus_22 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_22 131072 1 84 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2370,7 +2370,7 @@ theorem seg_h1534_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_23 131072 1 80}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 80} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_23 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_23 80 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 49, 41, 47, 50, 49, 47, 50, 50]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1532_0 ctx i, parallel_generatedRoot_456.w_1533_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1532_0 ctx i, parallel_generatedRoot_456.w_1533_0 ctx i] j =
       reducePoly modulus_23 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_23 131072 1 80 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2408,7 +2408,7 @@ theorem seg_h1538_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_24 131072 1 76}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 76} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_24 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_24 76 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 50, 41, 47, 50, 50, 47, 50, 51]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1536_0 ctx i, parallel_generatedRoot_456.w_1537_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1536_0 ctx i, parallel_generatedRoot_456.w_1537_0 ctx i] j =
       reducePoly modulus_24 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_24 131072 1 76 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2446,7 +2446,7 @@ theorem seg_h1542_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_25 131072 1 72}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 72} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_25 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_25 72 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 51, 41, 47, 50, 51, 47, 50, 52]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1540_0 ctx i, parallel_generatedRoot_456.w_1541_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1540_0 ctx i, parallel_generatedRoot_456.w_1541_0 ctx i] j =
       reducePoly modulus_25 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_25 131072 1 72 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2484,7 +2484,7 @@ theorem seg_h1546_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_26 131072 1 68}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 68} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_26 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_26 68 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 52, 41, 47, 50, 52, 47, 50, 53]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1544_0 ctx i, parallel_generatedRoot_456.w_1545_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1544_0 ctx i, parallel_generatedRoot_456.w_1545_0 ctx i] j =
       reducePoly modulus_26 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_26 131072 1 68 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2522,7 +2522,7 @@ theorem seg_h1550_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_27 131072 1 64}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 64} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_27 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_27 64 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 53, 41, 47, 50, 53, 47, 50, 54]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1548_0 ctx i, parallel_generatedRoot_456.w_1549_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1548_0 ctx i, parallel_generatedRoot_456.w_1549_0 ctx i] j =
       reducePoly modulus_27 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_27 131072 1 64 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2560,7 +2560,7 @@ theorem seg_h1554_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_28 131072 1 60}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 60} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_28 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_28 60 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 54, 41, 47, 50, 54, 47, 50, 55]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1552_0 ctx i, parallel_generatedRoot_456.w_1553_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1552_0 ctx i, parallel_generatedRoot_456.w_1553_0 ctx i] j =
       reducePoly modulus_28 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_28 131072 1 60 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2598,7 +2598,7 @@ theorem seg_h1558_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_29 131072 1 56}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 56} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_29 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_29 56 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 55, 41, 47, 50, 55, 47, 50, 56]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1556_0 ctx i, parallel_generatedRoot_456.w_1557_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1556_0 ctx i, parallel_generatedRoot_456.w_1557_0 ctx i] j =
       reducePoly modulus_29 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_29 131072 1 56 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2636,7 +2636,7 @@ theorem seg_h1562_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_30 131072 1 52}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 52} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_30 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_30 52 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 56, 41, 47, 50, 56, 47, 50, 57]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1560_0 ctx i, parallel_generatedRoot_456.w_1561_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1560_0 ctx i, parallel_generatedRoot_456.w_1561_0 ctx i] j =
       reducePoly modulus_30 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_30 131072 1 52 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2674,7 +2674,7 @@ theorem seg_h1566_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_31 131072 1 48}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 48} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_31 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_31 48 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 57, 41, 47, 50, 57, 47, 51, 48]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1564_0 ctx i, parallel_generatedRoot_456.w_1565_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1564_0 ctx i, parallel_generatedRoot_456.w_1565_0 ctx i] j =
       reducePoly modulus_31 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_31 131072 1 48 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2712,7 +2712,7 @@ theorem seg_h1570_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_32 131072 1 44}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 44} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_32 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_32 44 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 48, 41, 47, 51, 48, 47, 51, 49]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1568_0 ctx i, parallel_generatedRoot_456.w_1569_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1568_0 ctx i, parallel_generatedRoot_456.w_1569_0 ctx i] j =
       reducePoly modulus_32 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_32 131072 1 44 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2750,7 +2750,7 @@ theorem seg_h1574_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_33 131072 1 40}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 40} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_33 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_33 40 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 49, 41, 47, 51, 49, 47, 51, 50]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1572_0 ctx i, parallel_generatedRoot_456.w_1573_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1572_0 ctx i, parallel_generatedRoot_456.w_1573_0 ctx i] j =
       reducePoly modulus_33 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_33 131072 1 40 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2788,7 +2788,7 @@ theorem seg_h1578_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_34 131072 1 36}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 36} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_34 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_34 36 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 50, 41, 47, 51, 50, 47, 51, 51]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1576_0 ctx i, parallel_generatedRoot_456.w_1577_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1576_0 ctx i, parallel_generatedRoot_456.w_1577_0 ctx i] j =
       reducePoly modulus_34 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_34 131072 1 36 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2826,7 +2826,7 @@ theorem seg_h1582_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 477102080 → ErrorPoly 131072} {hT : ExactMatrix modulus_35 131072 1 32}
     {eB : Fin 477102080 → Fin 2 → ErrorMatrix 131072 1 32} {BB : Nat}
     (hrhs : ∀ (i : Fin 477102080) j, reducePoly modulus_35 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1393_0 ctx) modulus_35 32 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 51, 41, 47, 51, 51, 47, 51, 52]
-        (prfTopTags (sel_1 (Int.ofNat i_0)) (114598193020973428321722978943611058736210222786195197838232662946925095205851) i) j + ![parallel_generatedRoot_456.w_1580_0 ctx i, parallel_generatedRoot_456.w_1581_0 ctx i] j =
+        (prfTopTags (sel_1 (Int.ofNat i_0)) (35395289467055024936854086353798569434330286565467104183629233014527874648120) i) j + ![parallel_generatedRoot_456.w_1580_0 ctx i, parallel_generatedRoot_456.w_1581_0 ctx i] j =
       reducePoly modulus_35 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_35 131072 1 32 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2919,7 +2919,7 @@ theorem seg_h1684_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_3 131072 1 160}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 160} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_3 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_3 160 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 48, 41, 47, 48, 47, 49]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1682_0 ctx i, parallel_generatedRoot_456.w_1683_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1682_0 ctx i, parallel_generatedRoot_456.w_1683_0 ctx i] j =
       reducePoly modulus_3 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_3 131072 1 160 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2955,7 +2955,7 @@ theorem seg_h1688_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_4 131072 1 156}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 156} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_4 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_4 156 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 41, 47, 49, 47, 50]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1686_0 ctx i, parallel_generatedRoot_456.w_1687_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1686_0 ctx i, parallel_generatedRoot_456.w_1687_0 ctx i] j =
       reducePoly modulus_4 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_4 131072 1 156 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -2993,7 +2993,7 @@ theorem seg_h1692_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_5 131072 1 152}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 152} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_5 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_5 152 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 41, 47, 50, 47, 51]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1690_0 ctx i, parallel_generatedRoot_456.w_1691_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1690_0 ctx i, parallel_generatedRoot_456.w_1691_0 ctx i] j =
       reducePoly modulus_5 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_5 131072 1 152 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3031,7 +3031,7 @@ theorem seg_h1696_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_6 131072 1 148}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 148} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_6 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_6 148 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 41, 47, 51, 47, 52]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1694_0 ctx i, parallel_generatedRoot_456.w_1695_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1694_0 ctx i, parallel_generatedRoot_456.w_1695_0 ctx i] j =
       reducePoly modulus_6 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_6 131072 1 148 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3069,7 +3069,7 @@ theorem seg_h1700_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_7 131072 1 144}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 144} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_7 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_7 144 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 52, 41, 47, 52, 47, 53]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1698_0 ctx i, parallel_generatedRoot_456.w_1699_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1698_0 ctx i, parallel_generatedRoot_456.w_1699_0 ctx i] j =
       reducePoly modulus_7 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_7 131072 1 144 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3107,7 +3107,7 @@ theorem seg_h1704_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_8 131072 1 140}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 140} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_8 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_8 140 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 53, 41, 47, 53, 47, 54]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1702_0 ctx i, parallel_generatedRoot_456.w_1703_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1702_0 ctx i, parallel_generatedRoot_456.w_1703_0 ctx i] j =
       reducePoly modulus_8 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_8 131072 1 140 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3145,7 +3145,7 @@ theorem seg_h1708_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_9 131072 1 136}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 136} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_9 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_9 136 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 54, 41, 47, 54, 47, 55]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1706_0 ctx i, parallel_generatedRoot_456.w_1707_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1706_0 ctx i, parallel_generatedRoot_456.w_1707_0 ctx i] j =
       reducePoly modulus_9 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_9 131072 1 136 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3183,7 +3183,7 @@ theorem seg_h1712_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_10 131072 1 132}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 132} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_10 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_10 132 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 55, 41, 47, 55, 47, 56]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1710_0 ctx i, parallel_generatedRoot_456.w_1711_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1710_0 ctx i, parallel_generatedRoot_456.w_1711_0 ctx i] j =
       reducePoly modulus_10 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_10 131072 1 132 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3221,7 +3221,7 @@ theorem seg_h1716_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_11 131072 1 128}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 128} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_11 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_11 128 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 56, 41, 47, 56, 47, 57]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1714_0 ctx i, parallel_generatedRoot_456.w_1715_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1714_0 ctx i, parallel_generatedRoot_456.w_1715_0 ctx i] j =
       reducePoly modulus_11 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_11 131072 1 128 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3259,7 +3259,7 @@ theorem seg_h1720_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_12 131072 1 124}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 124} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_12 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_12 124 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 57, 41, 47, 57, 47, 49, 48]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1718_0 ctx i, parallel_generatedRoot_456.w_1719_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1718_0 ctx i, parallel_generatedRoot_456.w_1719_0 ctx i] j =
       reducePoly modulus_12 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_12 131072 1 124 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3297,7 +3297,7 @@ theorem seg_h1724_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_13 131072 1 120}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 120} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_13 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_13 120 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 48, 41, 47, 49, 48, 47, 49, 49]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1722_0 ctx i, parallel_generatedRoot_456.w_1723_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1722_0 ctx i, parallel_generatedRoot_456.w_1723_0 ctx i] j =
       reducePoly modulus_13 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_13 131072 1 120 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3335,7 +3335,7 @@ theorem seg_h1728_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_14 131072 1 116}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 116} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_14 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_14 116 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 49, 41, 47, 49, 49, 47, 49, 50]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1726_0 ctx i, parallel_generatedRoot_456.w_1727_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1726_0 ctx i, parallel_generatedRoot_456.w_1727_0 ctx i] j =
       reducePoly modulus_14 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_14 131072 1 116 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3373,7 +3373,7 @@ theorem seg_h1732_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_15 131072 1 112}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 112} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_15 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_15 112 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 50, 41, 47, 49, 50, 47, 49, 51]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1730_0 ctx i, parallel_generatedRoot_456.w_1731_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1730_0 ctx i, parallel_generatedRoot_456.w_1731_0 ctx i] j =
       reducePoly modulus_15 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_15 131072 1 112 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3411,7 +3411,7 @@ theorem seg_h1736_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_16 131072 1 108}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 108} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_16 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_16 108 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 51, 41, 47, 49, 51, 47, 49, 52]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1734_0 ctx i, parallel_generatedRoot_456.w_1735_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1734_0 ctx i, parallel_generatedRoot_456.w_1735_0 ctx i] j =
       reducePoly modulus_16 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_16 131072 1 108 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3449,7 +3449,7 @@ theorem seg_h1740_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_17 131072 1 104}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 104} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_17 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_17 104 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 52, 41, 47, 49, 52, 47, 49, 53]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1738_0 ctx i, parallel_generatedRoot_456.w_1739_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1738_0 ctx i, parallel_generatedRoot_456.w_1739_0 ctx i] j =
       reducePoly modulus_17 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_17 131072 1 104 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3487,7 +3487,7 @@ theorem seg_h1744_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_18 131072 1 100}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 100} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_18 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_18 100 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 53, 41, 47, 49, 53, 47, 49, 54]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1742_0 ctx i, parallel_generatedRoot_456.w_1743_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1742_0 ctx i, parallel_generatedRoot_456.w_1743_0 ctx i] j =
       reducePoly modulus_18 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_18 131072 1 100 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3525,7 +3525,7 @@ theorem seg_h1748_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_19 131072 1 96}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 96} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_19 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_19 96 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 54, 41, 47, 49, 54, 47, 49, 55]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1746_0 ctx i, parallel_generatedRoot_456.w_1747_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1746_0 ctx i, parallel_generatedRoot_456.w_1747_0 ctx i] j =
       reducePoly modulus_19 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_19 131072 1 96 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3563,7 +3563,7 @@ theorem seg_h1752_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_20 131072 1 92}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 92} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_20 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_20 92 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 55, 41, 47, 49, 55, 47, 49, 56]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1750_0 ctx i, parallel_generatedRoot_456.w_1751_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1750_0 ctx i, parallel_generatedRoot_456.w_1751_0 ctx i] j =
       reducePoly modulus_20 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_20 131072 1 92 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3601,7 +3601,7 @@ theorem seg_h1756_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_21 131072 1 88}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 88} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_21 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_21 88 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 56, 41, 47, 49, 56, 47, 49, 57]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1754_0 ctx i, parallel_generatedRoot_456.w_1755_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1754_0 ctx i, parallel_generatedRoot_456.w_1755_0 ctx i] j =
       reducePoly modulus_21 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_21 131072 1 88 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3639,7 +3639,7 @@ theorem seg_h1760_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_22 131072 1 84}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 84} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_22 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_22 84 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 49, 57, 41, 47, 49, 57, 47, 50, 48]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1758_0 ctx i, parallel_generatedRoot_456.w_1759_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1758_0 ctx i, parallel_generatedRoot_456.w_1759_0 ctx i] j =
       reducePoly modulus_22 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_22 131072 1 84 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3677,7 +3677,7 @@ theorem seg_h1764_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_23 131072 1 80}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 80} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_23 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_23 80 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 48, 41, 47, 50, 48, 47, 50, 49]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1762_0 ctx i, parallel_generatedRoot_456.w_1763_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1762_0 ctx i, parallel_generatedRoot_456.w_1763_0 ctx i] j =
       reducePoly modulus_23 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_23 131072 1 80 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3715,7 +3715,7 @@ theorem seg_h1768_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_24 131072 1 76}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 76} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_24 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_24 76 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 49, 41, 47, 50, 49, 47, 50, 50]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1766_0 ctx i, parallel_generatedRoot_456.w_1767_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1766_0 ctx i, parallel_generatedRoot_456.w_1767_0 ctx i] j =
       reducePoly modulus_24 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_24 131072 1 76 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3753,7 +3753,7 @@ theorem seg_h1772_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_25 131072 1 72}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 72} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_25 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_25 72 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 50, 41, 47, 50, 50, 47, 50, 51]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1770_0 ctx i, parallel_generatedRoot_456.w_1771_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1770_0 ctx i, parallel_generatedRoot_456.w_1771_0 ctx i] j =
       reducePoly modulus_25 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_25 131072 1 72 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3791,7 +3791,7 @@ theorem seg_h1776_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_26 131072 1 68}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 68} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_26 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_26 68 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 51, 41, 47, 50, 51, 47, 50, 52]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1774_0 ctx i, parallel_generatedRoot_456.w_1775_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1774_0 ctx i, parallel_generatedRoot_456.w_1775_0 ctx i] j =
       reducePoly modulus_26 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_26 131072 1 68 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3829,7 +3829,7 @@ theorem seg_h1780_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_27 131072 1 64}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 64} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_27 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_27 64 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 52, 41, 47, 50, 52, 47, 50, 53]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1778_0 ctx i, parallel_generatedRoot_456.w_1779_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1778_0 ctx i, parallel_generatedRoot_456.w_1779_0 ctx i] j =
       reducePoly modulus_27 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_27 131072 1 64 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3867,7 +3867,7 @@ theorem seg_h1784_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_28 131072 1 60}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 60} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_28 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_28 60 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 53, 41, 47, 50, 53, 47, 50, 54]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1782_0 ctx i, parallel_generatedRoot_456.w_1783_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1782_0 ctx i, parallel_generatedRoot_456.w_1783_0 ctx i] j =
       reducePoly modulus_28 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_28 131072 1 60 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3905,7 +3905,7 @@ theorem seg_h1788_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_29 131072 1 56}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 56} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_29 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_29 56 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 54, 41, 47, 50, 54, 47, 50, 55]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1786_0 ctx i, parallel_generatedRoot_456.w_1787_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1786_0 ctx i, parallel_generatedRoot_456.w_1787_0 ctx i] j =
       reducePoly modulus_29 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_29 131072 1 56 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3943,7 +3943,7 @@ theorem seg_h1792_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_30 131072 1 52}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 52} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_30 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_30 52 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 55, 41, 47, 50, 55, 47, 50, 56]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1790_0 ctx i, parallel_generatedRoot_456.w_1791_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1790_0 ctx i, parallel_generatedRoot_456.w_1791_0 ctx i] j =
       reducePoly modulus_30 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_30 131072 1 52 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -3981,7 +3981,7 @@ theorem seg_h1796_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_31 131072 1 48}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 48} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_31 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_31 48 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 56, 41, 47, 50, 56, 47, 50, 57]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1794_0 ctx i, parallel_generatedRoot_456.w_1795_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1794_0 ctx i, parallel_generatedRoot_456.w_1795_0 ctx i] j =
       reducePoly modulus_31 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_31 131072 1 48 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -4019,7 +4019,7 @@ theorem seg_h1800_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_32 131072 1 44}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 44} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_32 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_32 44 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 50, 57, 41, 47, 50, 57, 47, 51, 48]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1798_0 ctx i, parallel_generatedRoot_456.w_1799_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1798_0 ctx i, parallel_generatedRoot_456.w_1799_0 ctx i] j =
       reducePoly modulus_32 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_32 131072 1 44 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -4057,7 +4057,7 @@ theorem seg_h1804_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_33 131072 1 40}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 40} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_33 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_33 40 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 48, 41, 47, 51, 48, 47, 51, 49]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1802_0 ctx i, parallel_generatedRoot_456.w_1803_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1802_0 ctx i, parallel_generatedRoot_456.w_1803_0 ctx i] j =
       reducePoly modulus_33 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_33 131072 1 40 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -4095,7 +4095,7 @@ theorem seg_h1808_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_34 131072 1 36}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 36} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_34 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_34 36 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 49, 41, 47, 51, 49, 47, 51, 50]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1806_0 ctx i, parallel_generatedRoot_456.w_1807_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1806_0 ctx i, parallel_generatedRoot_456.w_1807_0 ctx i] j =
       reducePoly modulus_34 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_34 131072 1 36 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -4133,7 +4133,7 @@ theorem seg_h1812_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_35 131072 1 32}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 32} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_35 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_35 32 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 50, 41, 47, 51, 50, 47, 51, 51]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1810_0 ctx i, parallel_generatedRoot_456.w_1811_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1810_0 ctx i, parallel_generatedRoot_456.w_1811_0 ctx i] j =
       reducePoly modulus_35 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_35 131072 1 32 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :
@@ -4171,7 +4171,7 @@ theorem seg_h1816_5 {backend : BackendContext} {hashModel : HashModel} {params :
     {p' : Nat} {ν : Fin 20038287360 → ErrorPoly 131072} {hT : ExactMatrix modulus_0 131072 1 28}
     {eB : Fin 20038287360 → Fin 2 → ErrorMatrix 131072 1 28} {BB : Nat}
     (hrhs : ∀ (i : Fin 20038287360) j, reducePoly modulus_0 131072 sp • topPairG hashModel (parallel_generatedRoot_456.w_1633_0 ctx) modulus_0 28 [114, 110, 115, 45, 98, 103, 103, 47, 114, 104, 115, 47, 82, 104, 115, 73, 100, 40, 51, 51, 41, 47, 51, 51, 47, 51, 52]
-        (prfTopTags (sel_3 (Int.ofNat i_0)) (111352751985785493718927585097636134881644465179285687915084023569238365545991) i) j + ![parallel_generatedRoot_456.w_1814_0 ctx i, parallel_generatedRoot_456.w_1815_0 ctx i] j =
+        (prfTopTags (sel_3 (Int.ofNat i_0)) (103989090481960054745771538562146087323490486945507853282275167998067985630830) i) j + ![parallel_generatedRoot_456.w_1814_0 ctx i, parallel_generatedRoot_456.w_1815_0 ctx i] j =
       reducePoly modulus_0 131072 ((p' : Int) * ν i * unitPair sp j) • hT +
         reduceMatrix modulus_0 131072 1 28 (eB i j))
     (heB : ∀ i j, CoeffBound (eB i j) BB) :

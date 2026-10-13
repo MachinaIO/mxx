@@ -12,31 +12,33 @@ noncomputable section
 
 namespace Stage_mask
 
+local notation "mxxMat0" => Mxx.Primitives.ExactMatrix modulus_0 131072 1 1
+
 set_option genInjectivity false in
 set_option genSizeOf false in
 structure generatedRoot.Ctx (params : Params) where
   inputs : Unit
   witness : generatedRoot.Witness
 
-def generatedRoot.w_0_0 {params : Params} (ctx : generatedRoot.Ctx params) : Mxx.Primitives.ExactMatrix modulus_0 131072 1 1 :=
+def generatedRoot.w_0_0 {params : Params} (ctx : generatedRoot.Ctx params) : mxxMat0 :=
   ctx.witness.w_0_0
 
-def generatedRoot.outs {params : Params} (ctx : generatedRoot.Ctx params) : Mxx.Primitives.ExactMatrix modulus_0 131072 1 1 :=
+def generatedRoot.outs {params : Params} (ctx : generatedRoot.Ctx params) : mxxMat0 :=
   (generatedRoot.w_0_0 ctx)
 
-structure generatedRoot.Facts_0 {params : Params} (ctx : generatedRoot.Ctx params) (outputs : Mxx.Primitives.ExactMatrix modulus_0 131072 1 1) : Prop where
+structure generatedRoot.Facts_0 {params : Params} (ctx : generatedRoot.Ctx params) (outputs : mxxMat0) : Prop where
   h0_0 : MxxRuntime.uniformIntervalSample (-1) (1) (generatedRoot.w_0_0 ctx)
   hout : outputs = generatedRoot.outs ctx
 
-theorem generatedRoot.facts_0 {params : Params} {ctx : generatedRoot.Ctx params} {outputs : Mxx.Primitives.ExactMatrix modulus_0 131072 1 1}
+theorem generatedRoot.facts_0 {params : Params} {ctx : generatedRoot.Ctx params} {outputs : mxxMat0}
     (h : generatedRoot.constraints_0 (generatedRoot.w_0_0 ctx) outputs) :
     generatedRoot.Facts_0 ctx outputs :=
   ⟨h.1, h.2⟩
 
-structure generatedRoot.Facts {params : Params} (ctx : generatedRoot.Ctx params) (outputs : Mxx.Primitives.ExactMatrix modulus_0 131072 1 1) : Prop where
+structure generatedRoot.Facts {params : Params} (ctx : generatedRoot.Ctx params) (outputs : mxxMat0) : Prop where
   c0 : generatedRoot.Facts_0 ctx outputs
 
-theorem generatedRoot.facts {params : Params} (ctx : generatedRoot.Ctx params) {outputs : Mxx.Primitives.ExactMatrix modulus_0 131072 1 1}
+theorem generatedRoot.facts {params : Params} (ctx : generatedRoot.Ctx params) {outputs : mxxMat0}
     (h : generatedRoot.body params ctx.inputs outputs ctx.witness) :
     generatedRoot.Facts ctx outputs :=
   have t0 := h

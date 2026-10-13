@@ -55,7 +55,7 @@ theorem cx_w_1371_0 {hashModel : HashModel}
     (FO : Stage_online_eval.parallel_generatedRoot_456.Facts octx oout)
     {sm sp : ErrorPoly 131072} (hsmsmall : polyNorm sm ≤ 1) (hspsmall : polyNorm sp ≤ 1)
     (h_w_4_0 : (Stage_encrypt.parallel_generatedRoot_45.w_4_0 ectx) = fun _ _ ↦ reducePoly Stage_encrypt.modulus_29 131072 sm) (h_w_11_0 : (Stage_encrypt.parallel_generatedRoot_45.w_11_0 ectx) = fun _ _ ↦ reducePoly Stage_encrypt.modulus_29 131072 sp)
-    (h_w_9_0 : (Stage_preprocess.parallel_generatedRoot_380.w_9_0 pctx) = fun _ _ ↦ reducePoly Stage_preprocess.modulus_34 131072 sp)
+    (ph_w_43_0 : (Stage_preprocess.parallel_generatedRoot_380.w_43_0 pctx) = fun _ _ ↦ reducePoly Stage_preprocess.modulus_34 131072 sp)
     (hc : (Stage_encrypt.parallel_generatedRoot_45.w_89_0 ectx) = 1) (he : (Stage_encrypt.parallel_generatedRoot_45.w_91_0 ectx) = 0 ∨ (Stage_encrypt.parallel_generatedRoot_45.w_91_0 ectx) = 1)
     (lO_w_12_0 : (Stage_online_eval.parallel_generatedRoot_456.w_12_0 octx) = (Stage_encrypt.parallel_generatedRoot_45.w_97_0 ectx))
     (lO_w_15_0 : (Stage_online_eval.parallel_generatedRoot_456.w_15_0 octx) = (Stage_encrypt.parallel_generatedRoot_45.w_107_0 ectx))
@@ -102,7 +102,7 @@ theorem cx_w_1371_0 {hashModel : HashModel}
     rw [lO_w_10_0, lO_w_9_0, lO_w_11_0, ← pc_cert i_0]
     exact hr
   obtain ⟨g0, hg0⟩ := gx_cert i_0
-  obtain ⟨eB, heB, hsw⟩ := RefreshTopProof.Wiring.switch_h2107_3 FP hspsmall h_w_9_0
+  obtain ⟨eB, heB, hsw⟩ := RefreshTopProof.Wiring.switch_h2107_3 FP hspsmall ph_w_43_0
     (gadgetOf_runs ⟨g0, hg0⟩) (rebasedGadget_runs (q := (Stage_online_eval.mod_0 (Int.ofNat i_0))) hR0)
   let Cf : Fin 2 → ExactPoly (Stage_online_eval.mod_0 (Int.ofNat i_0)) 131072 := fun i ↦ ((keyTableG (([((Stage_preprocess.sel_9 ((Int.ofNat i_0))))]) : List Int) (([((Stage_preprocess.sel_10 ((Int.ofNat i_0))))]) : List Int) (∑ k ∈ Finset.range ((2) : Int).toNat, (keyTermE (MxxIR.selectInt (Int.ofNat ((i : Nat))) (([(1), (131073)]) : List Int)) ((1) : Int) (fun (j : Fin (2)) ↦ MxxIR.selectInt (Int.ofNat ((j : Nat))) (([(1), (0)]) : List Int) + ((0) : Int)) (matrixPolynomial (([(1)]) : List Int)) (-((1) : Int)) k)) : ExactMatrix (Stage_preprocess.mod_0 ((Int.ofNat i_0))) (131072) 1 1) 0 0)
   have hswitch : ∀ k : Fin 2, ∃ e : Fin 2 → ErrorMatrix 131072 1 24, (∀ j, CoeffBound (e j) ((26) : Int).toNat) ∧ ∀ j,

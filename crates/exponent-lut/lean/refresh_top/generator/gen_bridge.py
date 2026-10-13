@@ -240,6 +240,8 @@ theorem {m}.iterRuns_mono {{State : Type}} {{f g : Nat → State → State → P
             return f'(MxxExponentLut.gaussianSampleAt_sample (by decide) {h})'
         if e.startswith('MxxRuntime.uniformIntervalSampleAt tape'):
             return f'(MxxExponentLut.uniformIntervalSampleAt_sample (by decide) {h})'
+        if e.startswith('MxxRuntime.trapdoorSampleAt '):
+            return f'(MxxRuntime.trapdoorSampleAt_sample {h})'
         if e.startswith('MxxIR.IterRuns (fun'):
             s = e[len('MxxIR.IterRuns '):]
             d = depths(s)

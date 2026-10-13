@@ -16,6 +16,7 @@ use mxx_backends::{
     GpuRuntime, RuntimeValue,
     authority::CpuExecution,
     backend::poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+    lattice_estimator::lattice_security_bits,
     matrix::dcrt_poly::DCRTPolyMatrix,
     poly::{
         Poly, PolyParams,
@@ -49,8 +50,7 @@ use mxx_exponent_lut::{
         covering_automorphism_layout, decode_output, verify_output,
     },
     utils::{
-        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
-        ring_dimension_candidates,
+        audit_program_at_crt_depth, env_usize, noise_model, rhs_mode, ring_dimension_candidates,
     },
 };
 use mxx_ir_core::{
@@ -561,7 +561,7 @@ fn search_fixture(sigma: &BigDecimal, recorded: Option<&ParameterRow>) -> Search
                 );
                 required_security
             } else {
-                lattice_security_bits(&source, sigma)
+                lattice_security_bits(source.ring_dimension(), source.modulus().as_ref(), sigma)
                     .expect("lattice security estimator must be available")
             };
             if achieved < required_security {

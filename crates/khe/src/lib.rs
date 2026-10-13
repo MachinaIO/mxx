@@ -4,7 +4,8 @@
 //! implements, independently of any scheme. [`bgg`] is the BGG+ key-homomorphic encoding built on
 //! it: public keys, encodings, circuit evaluation, lookups, and slot operations. [`wee25`] holds
 //! WEE25 commitments. [`circuit_gadgets`] provides reusable gadgets written as circuits or DSL
-//! graphs.
+//! graphs. [`noise_simulate`] bounds the errors of BGG+ evaluations and selects parameters from
+//! these bounds.
 //! [`ring_from_params`] converts backend parameters into a DSL ring with the same ordered basis,
 //! and the `test-support` feature exposes `test_utils` to dependent crates' tests.
 
@@ -17,6 +18,7 @@ pub mod circuit_gadgets;
 pub mod decoder;
 pub mod input_injector;
 pub mod noise_refresh;
+pub mod noise_simulate;
 pub mod utils;
 pub mod wee25;
 

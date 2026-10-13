@@ -957,37 +957,41 @@ impl Graph {
     /// under `env`: a loop body counts once per iteration and a subgraph once
     /// per call, each evaluated in its own environment. A kind whose payload
     /// is a plain operator is keyed with it, as in `MatrixBinary(Multiply)`.
+    ///
+    /// A loop whose body is [`loop_body_is_index_invariant`] is counted once and
+    /// multiplied by its count, so the cost does not grow with the iteration count.
     pub fn operation_counts(
         &self,
         env: &crate::ParamEnv,
     ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
+        let dependencies = self.shape_dependencies();
         let mut memo = BTreeMap::new();
-        self.scope_operation_counts(&FrozenGraphScopeId::Root, env, &mut memo)
+        self.scope_operation_counts(&FrozenGraphScopeId::Root, env, &dependencies, &mut memo)
     }
 
     fn scope_operation_counts(
         &self,
         scope_id: &FrozenGraphScopeId,
         env: &crate::ParamEnv,
+        dependencies: &BTreeMap<FrozenGraphScopeId, ShapeDependencies>,
         memo: &mut BTreeMap<(FrozenGraphScopeId, crate::ParamEnv), BTreeMap<String, u128>>,
     ) -> Result<BTreeMap<String, u128>, crate::expr::ExprError> {
-        let key = (scope_id.clone(), env.clone());
+        let key = (scope_id.clone(), shape_env(env, &dependencies[scope_id]));
         if let Some(counts) = memo.get(&key) {
             return Ok(counts.clone());
         }
-        let bound = |parent: &crate::ParamEnv, bindings: &[(String, crate::IntExpr)]| {
-            let mut child = parent.clone();
-            for (name, expression) in bindings {
-                child.integers.insert(name.clone(), expression.evaluate(parent)?);
-            }
-            Ok::<_, crate::expr::ExprError>(child)
-        };
         let mut counts = BTreeMap::<String, u128>::new();
-        let add = |counts: &mut BTreeMap<String, u128>, inner: BTreeMap<String, u128>| {
-            for (name, count) in inner {
-                *counts.entry(name).or_insert(0) += count;
-            }
-        };
+        let add =
+            |counts: &mut BTreeMap<String, u128>, inner: BTreeMap<String, u128>, times: u128| {
+                for (name, count) in inner {
+                    let total = counts.entry(name).or_insert(0);
+                    *total = count
+                        .checked_mul(times)
+                        .and_then(|count| total.checked_add(count))
+                        .ok_or(crate::expr::ExprError::CountOverflow)?;
+                }
+                Ok::<_, crate::expr::ExprError>(())
+            };
         let scope = self.scope(scope_id).expect("a child scope id names a frozen scope");
         for (position, node) in scope.nodes.iter().enumerate() {
             let kind = serde_json::to_value(node.kind()).unwrap_or_default();
@@ -1005,25 +1009,38 @@ impl Graph {
             };
             match node.kind() {
                 NodeKind::SubgraphCall(call) => {
-                    let inner =
-                        self.scope_operation_counts(&child(), &bound(env, &call.bindings)?, memo)?;
-                    add(&mut counts, inner);
+                    let inner = self.scope_operation_counts(
+                        &child(),
+                        &bind_integers(env, &call.bindings)?,
+                        dependencies,
+                        memo,
+                    )?;
+                    add(&mut counts, inner, 1)?;
                 }
                 NodeKind::ParallelLoop(ParallelLoop { count, index_slot, bindings, .. }) |
                 NodeKind::SequentialLoop(SequentialLoop {
                     count, index_slot, bindings, ..
                 }) => {
                     let (child, iterations) = (child(), count.evaluate(env)?);
+                    let invariant =
+                        loop_body_is_index_invariant(&dependencies[&child], *index_slot, bindings);
                     let mut index = num_bigint::BigInt::from(0u8);
                     while index < iterations {
                         let mut loop_env = env.clone();
                         loop_env.loop_indices.insert(*index_slot, index.clone());
                         let inner = self.scope_operation_counts(
                             &child,
-                            &bound(&loop_env, bindings)?,
+                            &bind_integers(&loop_env, bindings)?,
+                            dependencies,
                             memo,
                         )?;
-                        add(&mut counts, inner);
+                        if invariant {
+                            let times = u128::try_from(&iterations)
+                                .map_err(|_| crate::expr::ExprError::CountOverflow)?;
+                            add(&mut counts, inner, times)?;
+                            break;
+                        }
+                        add(&mut counts, inner, 1)?;
                         index += 1u8;
                     }
                 }
@@ -1032,6 +1049,71 @@ impl Graph {
         }
         memo.insert(key, counts.clone());
         Ok(counts)
+    }
+
+    /// The loop-index slots and integer parameters each scope's shapes and amount of work can
+    /// read, transitively through its child scopes.
+    ///
+    /// Only the declared output types of the nodes and the loop counts are read: node payloads
+    /// (slice offsets, scalars, family indices) choose data, not shapes or how many operations
+    /// run. A child scope contributes its dependencies minus its own loop slot, with each name
+    /// its call or loop rebinds replaced by the references of that binding.
+    pub fn shape_dependencies(&self) -> BTreeMap<FrozenGraphScopeId, ShapeDependencies> {
+        let mut memo = BTreeMap::new();
+        for scope_id in self.inner.scopes.keys() {
+            self.scope_shape_dependencies(scope_id, &mut memo);
+        }
+        memo
+    }
+
+    fn scope_shape_dependencies(
+        &self,
+        scope_id: &FrozenGraphScopeId,
+        memo: &mut BTreeMap<FrozenGraphScopeId, ShapeDependencies>,
+    ) -> ShapeDependencies {
+        if let Some(dependencies) = memo.get(scope_id) {
+            return dependencies.clone();
+        }
+        let scope = self.scope(scope_id).expect("a child scope id names a frozen scope");
+        let (mut slots, mut names) = (BTreeSet::new(), BTreeSet::new());
+        for (position, node) in scope.nodes.iter().enumerate() {
+            crate::validate::collect_serialized_references(
+                &node.output_types(),
+                &mut names,
+                &mut slots,
+            );
+            let (child_slot, bindings) = match node.kind() {
+                NodeKind::SubgraphCall(call) => (None, &call.bindings),
+                NodeKind::ParallelLoop(ParallelLoop { count, index_slot, bindings, .. }) |
+                NodeKind::SequentialLoop(SequentialLoop {
+                    count, index_slot, bindings, ..
+                }) => {
+                    crate::validate::collect_serialized_references(count, &mut names, &mut slots);
+                    (Some(*index_slot), bindings)
+                }
+                _ => continue,
+            };
+            let child = self
+                .child_scope_id(scope_id, NodeId(position as u64))
+                .expect("a structural node has a child scope");
+            let (mut child_slots, mut child_names) = self.scope_shape_dependencies(&child, memo);
+            for (name, expression) in bindings {
+                if child_names.remove(name) {
+                    crate::validate::collect_serialized_references(
+                        expression,
+                        &mut child_names,
+                        &mut child_slots,
+                    );
+                }
+            }
+            if let Some(slot) = child_slot {
+                child_slots.remove(&slot);
+            }
+            slots.extend(child_slots);
+            names.extend(child_names);
+        }
+        memo.insert(scope_id.clone(), (slots.clone(), names.clone()));
+        (slots, names)
     }
 
     pub fn real_constants(&self) -> &BTreeMap<String, RealExpr> {
@@ -1523,6 +1605,65 @@ struct SerializedNode {
     output_types: Vec<WireType>,
 }
 
+/// The loop-index slots and integer parameters a scope's shapes can read (see
+/// [`Graph::shape_dependencies`]).
+pub type ShapeDependencies = (BTreeSet<u32>, BTreeSet<String>);
+
+/// Whether every iteration of a loop over `index_slot` lowers to the same shapes and work.
+///
+/// `body` is the loop body's [`Graph::shape_dependencies`]. The body is invariant when its shapes
+/// read neither the loop's index directly nor a binding that reads it.
+pub fn loop_body_is_index_invariant(
+    body: &ShapeDependencies,
+    index_slot: u32,
+    bindings: &[(String, crate::IntExpr)],
+) -> bool {
+    let (slots, names) = body;
+    !slots.contains(&index_slot) &&
+        bindings.iter().filter(|(name, _)| names.contains(name)).all(|(_, expression)| {
+            let (mut binding_names, mut binding_slots) = (BTreeSet::new(), BTreeSet::new());
+            crate::validate::collect_serialized_references(
+                expression,
+                &mut binding_names,
+                &mut binding_slots,
+            );
+            !binding_slots.contains(&index_slot)
+        })
+}
+
+/// `env` restricted to the integers and loop indices in `dependencies`: two environments with
+/// the same restriction lower a scope to the same shapes.
+pub fn shape_env(env: &crate::ParamEnv, dependencies: &ShapeDependencies) -> crate::ParamEnv {
+    let (slots, names) = dependencies;
+    crate::ParamEnv {
+        integers: env
+            .integers
+            .iter()
+            .filter(|(name, _)| names.contains(*name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        reals: env.reals.clone(),
+        loop_indices: env
+            .loop_indices
+            .iter()
+            .filter(|(slot, _)| slots.contains(*slot))
+            .map(|(slot, value)| (*slot, value.clone()))
+            .collect(),
+    }
+}
+
+/// `parent` extended with `bindings`, each evaluated in `parent`.
+pub fn bind_integers(
+    parent: &crate::ParamEnv,
+    bindings: &[(String, crate::IntExpr)],
+) -> Result<crate::ParamEnv, crate::expr::ExprError> {
+    let mut child = parent.clone();
+    for (name, expression) in bindings {
+        child.integers.insert(name.clone(), expression.evaluate(parent)?);
+    }
+    Ok(child)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1575,6 +1716,27 @@ mod tests {
         )
         .output(0)
         .unwrap()
+    }
+
+    #[test]
+    fn loop_bodies_are_invariant_unless_their_shapes_read_the_index() {
+        let index = || IntExpr::LoopIndex(3);
+        // b = 1 + i * (2 - i) takes the values 1, 2, 1: equal ends do not imply invariance.
+        let binding = IntExpr::Add(
+            Box::new(IntExpr::constant(1)),
+            Box::new(IntExpr::Mul(
+                Box::new(index()),
+                Box::new(IntExpr::Sub(Box::new(IntExpr::constant(2)), Box::new(index()))),
+            )),
+        );
+        let bindings = vec![("b".to_owned(), binding)];
+        let reads = |slots: &[u32], names: &[&str]| -> ShapeDependencies {
+            (slots.iter().copied().collect(), names.iter().map(|name| (*name).to_owned()).collect())
+        };
+        assert!(!loop_body_is_index_invariant(&reads(&[], &["b"]), 3, &bindings));
+        assert!(loop_body_is_index_invariant(&reads(&[], &["c"]), 3, &bindings));
+        assert!(!loop_body_is_index_invariant(&reads(&[3], &[]), 3, &[]));
+        assert!(loop_body_is_index_invariant(&reads(&[2], &["b"]), 3, &[]));
     }
 
     #[test]

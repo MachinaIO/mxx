@@ -981,8 +981,10 @@ mod tests {
                         1,
                         (2 * output_columns * n) as u64,
                     );
-                    let encoding = crate::utils::lattice_security_bits(
-                        &pool.select_modulus(&modulus(top_primes.max(child_depth))).unwrap(),
+                    let level = pool.select_modulus(&modulus(top_primes.max(child_depth))).unwrap();
+                    let encoding = mxx_backends::lattice_estimator::lattice_security_bits(
+                        level.ring_dimension(),
+                        level.modulus().as_ref(),
                         &sigma,
                     );
                     eprintln!(

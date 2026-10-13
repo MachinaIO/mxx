@@ -378,13 +378,26 @@ impl<P: Poly> PolyCircuit<P> {
         total
     }
 
+    /// Registers `sub_circuit`. A sub-circuit that already shares this circuit's registries, such
+    /// as one built from [`Self::fresh_sub_circuit`], is registered without copying it.
     pub fn register_sub_circuit<T>(&mut self, sub_circuit: T) -> usize
     where
         T: Into<Arc<Self>>,
     {
         let mut sub_circuit = sub_circuit.into();
-        Arc::make_mut(&mut sub_circuit).inherit_registries_from_parent(self);
+        if !sub_circuit.shares_registries_with(self) {
+            Arc::make_mut(&mut sub_circuit).inherit_registries_from_parent(self);
+        }
         self.sub_circuit_registry.register_arc(sub_circuit)
+    }
+
+    /// Whether inheriting `parent`'s registries would leave this circuit unchanged.
+    fn shares_registries_with(&self, parent: &Self) -> bool {
+        !self.allow_register_lookup &&
+            Arc::ptr_eq(&self.lookup_registry, &parent.lookup_registry) &&
+            Arc::ptr_eq(&self.binding_registry, &parent.binding_registry) &&
+            Arc::ptr_eq(&self.input_set_registry, &parent.input_set_registry) &&
+            Arc::ptr_eq(&self.sub_circuit_registry, &parent.sub_circuit_registry)
     }
 
     pub fn register_sub_circuit_with_max_plaintext_norms<T, I>(

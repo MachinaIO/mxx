@@ -413,9 +413,19 @@ impl FamilyRange {
 /// only when it is finalized; a decoder adds unfinalized ones as its smudge.
 ///
 /// A LUT reads one signed monomial `±X^(stride e)` of its input layout and
-/// returns `±T[e]`. The LUT is linear in its input, so any other input (for
-/// example `Add(x, x)`) is outside this contract; it is a plaintext property
-/// that Program validation cannot see, and callers guarantee it.
+/// returns `±T[e]`. More generally it reads a bit window of a monomial
+/// exponent: for the input layout `(s, width_log2)`, `N0 = 2^(s + width_log2)`
+/// and an input `X^(2^s e + N0 q)` with `e < 2^width_log2` and `q >= 0` (no
+/// exponent bits below `s`), the output is the table output times
+/// `X^(N0 q)`, the negacyclic sign included. The automorphism indices are,
+/// modulo `2n / 2^s`, exactly `1 + t 2n / N0` for `t < 2^width_log2`, so
+/// their sum over `X^(2^s l)` is `2^width_log2 X^(2^s l)` when
+/// `2^width_log2 | l` and `0` otherwise, which selects `e`. An exponent output
+/// below `N0` therefore replaces the window and keeps the higher bits. The
+/// LUT is linear in its input, so any other input (for example `Add(x, x)`,
+/// or a monomial with bits below `s`) is outside this contract; it is a
+/// plaintext property that Program validation cannot see, and callers
+/// guarantee it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LutOutputRepresentation {
     Exponent(ExpLayout),

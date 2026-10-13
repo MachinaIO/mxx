@@ -13,6 +13,7 @@ use mxx_backends::{
     GpuRuntime,
     artifact::MemoryArtifactStore,
     backend::poly_gpu::gpu_backend_on,
+    lattice_estimator::lattice_security_bits,
     poly::{
         Poly, PolyParams,
         dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
@@ -30,8 +31,7 @@ use mxx_exponent_lut::{
         decode_output, verify_output,
     },
     utils::{
-        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model, rhs_mode,
-        ring_dimension_candidates,
+        audit_program_at_crt_depth, env_usize, noise_model, rhs_mode, ring_dimension_candidates,
     },
 };
 use mxx_ir_core::{
@@ -372,7 +372,7 @@ fn select_candidate(
                 );
                 security_target
             } else {
-                lattice_security_bits(source, &sigma).unwrap_or_else(|error| {
+                lattice_security_bits(source.ring_dimension(), source.modulus().as_ref(), &sigma).unwrap_or_else(|error| {
                     panic!("NAND security estimation failed for n={ring_dimension}, CRT depth {crt_depth}: {error}")
                 })
             };

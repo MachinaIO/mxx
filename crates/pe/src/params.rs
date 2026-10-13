@@ -579,12 +579,20 @@ impl PeParameters {
     /// the estimate is the smaller of the estimates over `q` and over `pq`.
     pub fn security_bits(&self) -> Result<u64, PeError> {
         let error = self.error.sigma().clone();
-        let mut encryption = mxx_exponent_lut::utils::lattice_security_bits(self.level(), &error)
-            .map_err(PeError::Parameters)?;
+        let mut encryption = mxx_backends::lattice_estimator::lattice_security_bits(
+            self.level().ring_dimension(),
+            self.level().modulus().as_ref(),
+            &error,
+        )
+        .map_err(PeError::Parameters)?;
         if let Some(compact) = self.compact_level()? {
             encryption = encryption.min(
-                mxx_exponent_lut::utils::lattice_security_bits(&compact, &error)
-                    .map_err(PeError::Parameters)?,
+                mxx_backends::lattice_estimator::lattice_security_bits(
+                    compact.ring_dimension(),
+                    compact.modulus().as_ref(),
+                    &error,
+                )
+                .map_err(PeError::Parameters)?,
             );
         }
         Ok(encryption)

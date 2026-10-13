@@ -50,6 +50,9 @@ pub use noise::{
     RnsNoiseBuild, simulate_refresh_noise,
 };
 pub use public_key::{PublicKeyLowering, RnsBggPublicKey, RnsPreprocessBuild};
+pub use refresh::{
+    RefreshChain, RefreshRun, RefreshSecurity, RnsBggRefresh, refresh_noise_accepted,
+};
 pub(crate) use setup::RnsBggPackage;
 pub use setup::{
     RnsBggDynamicBinding, RnsBggDynamicDistributions, RnsBggDynamicSetup, RnsBggGaussian,

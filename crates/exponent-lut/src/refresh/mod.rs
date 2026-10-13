@@ -37,6 +37,13 @@
 //! one key would cancel it). `A'_(j)` and the label are sampled under the refresh's own
 //! namespaces, identical for every chain.
 //!
+//! # Declaring and running a refresh
+//!
+//! [`PrfSettings::declare_refresh`] declares a refresh from the settings of its sparse-LWR PRF and
+//! a key seed, generating the keys ([`RefreshKeyLayouts`]) or only declaring their shapes (the
+//! noise and the stage graphs depend on the shapes only). [`crate::rns_bgg::RnsBggRefresh`] runs
+//! it on RNS-BGG stages and states the claim of a run for the source [`bit_flip_source`].
+//!
 //! # Caller responsibilities and preconditions
 //!
 //! - The target must be the output of an exponent LUT, whose plaintext is one signed table monomial
@@ -70,7 +77,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 mod part;
+mod setup;
 pub(crate) use part::RefreshPartDeclaration;
+pub use setup::{PrfSettings, RefreshKeyLayouts, bit_flip_source};
 
 /// Errors in a refresh declaration.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -83,6 +92,10 @@ pub enum RefreshError {
     Sampler(#[from] PrfSamplerError),
     #[error(transparent)]
     Program(#[from] ProgramValidationError),
+    #[error(transparent)]
+    Prf(#[from] crate::program_gadgets::prf::PrfError),
+    #[error(transparent)]
+    Pbc(#[from] crate::program_gadgets::pbc::PbcError),
 }
 
 /// The fresh-noise child Program: one output, the row of `m` column blocks

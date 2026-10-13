@@ -15,9 +15,11 @@ built on it, such as [`mxx-pe`](../pe/README.md), depend on it as a library. It 
 | `rns_bgg` | The RNS-BGG evaluator: parameters and level chains, public-key preprocessing, encryption, online evaluation, output verification, and the noise simulator. |
 | `rns_bgg::setup`, `rns_bgg::dynamic` | The Dynamic setup schema and its shared packages, automorphism helpers, and public scalar actions. |
 | `decoder` | Decoders of program outputs, including the smudged decoder. |
+| `refresh`, `rns_bgg::RnsBggRefresh` | The noise refresh of an exponent LUT output to a level-0 encoding: its declaration from PRF settings, and its RNS-BGG chains, noise acceptance, security estimate, run and claim. |
+| `claim` | Building blocks of the closed-protocol claim of recorded stage graphs. |
 | `nand_circuit`, `program_gadgets` | NAND circuits compiled to programs, and gadgets such as the sparse LWR PRF and public inner products. |
 | `lean/` | Lean proofs of the evaluator's correctness claims. |
-| `tests/` | Integration tests: NAND circuits, the LWR PRF, decoders, and public inner products. |
+| `tests/` | Integration tests: NAND circuits, the LWR PRF, decoders, public inner products, and the noise refresh. |
 
 ## RHS modes
 

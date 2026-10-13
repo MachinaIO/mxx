@@ -27,7 +27,7 @@ use mxx_backends::{
 };
 use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
-    ExpLayout, api,
+    ExpLayout, api, claim,
     decoder::simulation::AverageCaseConfig,
     program::{AttributeKnowledge, FamilyRange, InputBinding},
     program_gadgets::public_ip::PublicInnerProductProgram,
@@ -508,7 +508,12 @@ fn public_ip_protocol(
     // preprocessing artifact, and no stage reads the payload secret.
     let all = ["payload", "mask", "preprocess", "encrypt", "online_eval", "decode"]
         .into_iter()
-        .map(|name| (id(name), common::stage(name, graph(name), &productions, &links)))
+        .map(|name| {
+            (
+                id(name),
+                claim::stage(name, graph(name), &productions, &links).expect("protocol stage"),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let mut reached = std::collections::BTreeSet::new();
     let mut pending = vec![id("decode")];
@@ -582,7 +587,7 @@ fn public_ip_protocol(
             .unwrap();
 
     let only = |stage: &str, suffix: String| -> String {
-        let [name] = <[String; 1]>::try_from(common::inputs_ending_with(graph(stage), &suffix))
+        let [name] = <[String; 1]>::try_from(claim::inputs_ending_with(graph(stage), &suffix))
             .unwrap_or_else(|_| panic!("{stage} must declare one input ending with {suffix}"));
         name
     };
@@ -596,42 +601,42 @@ fn public_ip_protocol(
     };
     let vector = public_ip.input_vector();
     let encrypt_input = |field: &str| {
-        common::to_stage("encrypt", &only("encrypt", format!("/input/{vector:?}.{field}")))
+        claim::to_stage("encrypt", &only("encrypt", format!("/input/{vector:?}.{field}")))
     };
     let requirement_input =
         |input: &str| ProtocolInputDestination::Requirement { requirement: 0, input: input.into() };
     let hash_key = stages
         .iter()
         .map(|stage| stage.id.0.as_str())
-        .filter(|stage| !common::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
-        .map(|stage| common::to_stage(stage, "rns-bgg/hash-key"))
+        .filter(|stage| !claim::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
+        .map(|stage| claim::to_stage(stage, "rns-bgg/hash-key"))
         .collect();
     let externals = vec![
-        common::external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
-        common::external("a", family_range(members, 0, q - 1), vec![requirement_input("a")]),
-        common::external(
+        claim::external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
+        claim::external("a", family_range(members, 0, q - 1), vec![requirement_input("a")]),
+        claim::external(
             "a_coefficient",
             family_range(members, -1, 1),
             vec![encrypt_input("coefficient"), requirement_input("a_coefficient")],
         ),
-        common::external(
+        claim::external(
             "a_exponent",
             family_range(members, 0, ring_dimension - 1),
             vec![encrypt_input("exponent"), requirement_input("a_exponent")],
         ),
-        common::external(
+        claim::external(
             "expected_coefficient",
             range(-1, 1),
             vec![
-                common::to_stage("decode", "decode-expected.coefficient"),
+                claim::to_stage("decode", "decode-expected.coefficient"),
                 requirement_input("expected_coefficient"),
             ],
         ),
-        common::external(
+        claim::external(
             "expected_exponent",
             range(0, ring_dimension - 1),
             vec![
-                common::to_stage("decode", "decode-expected.exponent"),
+                claim::to_stage("decode", "decode-expected.exponent"),
                 requirement_input("expected_exponent"),
             ],
         ),

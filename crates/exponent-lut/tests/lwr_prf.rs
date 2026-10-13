@@ -29,7 +29,7 @@ use mxx_backends::{
 };
 use mxx_dsl::{DslContext, Family, FamilyType, IdealSpec, Int, IntType};
 use mxx_exponent_lut::{
-    ExpLayout, api,
+    ExpLayout, api, claim,
     decoder::simulation::AverageCaseConfig,
     program::{
         AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, FamilyRange,
@@ -1132,7 +1132,7 @@ fn lwr_protocol(
     let graph = |name: &str| &graphs[name];
     let stages = ["payload", "mask", "preprocess", "encrypt", "online_eval", "decode"]
         .into_iter()
-        .map(|name| common::stage(name, graph(name), &productions, &links))
+        .map(|name| claim::stage(name, graph(name), &productions, &links).expect("protocol stage"))
         .collect::<Vec<_>>();
 
     let ring_dimension = profile.ring_dimension().expect("LWR ring dimension");
@@ -1234,7 +1234,7 @@ fn lwr_protocol(
             .unwrap();
 
     let only = |stage: &str, suffix: String| -> String {
-        let [name] = <[String; 1]>::try_from(common::inputs_ending_with(graph(stage), &suffix))
+        let [name] = <[String; 1]>::try_from(claim::inputs_ending_with(graph(stage), &suffix))
             .unwrap_or_else(|_| panic!("{stage} must declare one input ending with {suffix}"));
         name
     };
@@ -1247,36 +1247,32 @@ fn lwr_protocol(
         element: Box::new(range(lower, upper)),
     };
     let encrypt_input = |wire, field: &str| {
-        common::to_stage("encrypt", &only("encrypt", format!("/input/{wire:?}.{field}")))
+        claim::to_stage("encrypt", &only("encrypt", format!("/input/{wire:?}.{field}")))
     };
     let requirement_input =
         |input: &str| ProtocolInputDestination::Requirement { requirement: 0, input: input.into() };
     let hash_key = ["preprocess", "encrypt", "online_eval"]
         .into_iter()
-        .filter(|stage| !common::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
-        .map(|stage| common::to_stage(stage, "rns-bgg/hash-key"))
+        .filter(|stage| !claim::inputs_ending_with(graph(stage), "rns-bgg/hash-key").is_empty())
+        .map(|stage| claim::to_stage(stage, "rns-bgg/hash-key"))
         .collect();
     let state = program.prf.initial_input();
     let vector = program.prf.input_vector();
     let mut externals = vec![
-        common::external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
-        common::external(
-            "unit_coefficient",
-            range(1, 1),
-            vec![encrypt_input(state, "coefficient")],
-        ),
-        common::external("state_exponent", range(0, 0), vec![encrypt_input(state, "exponent")]),
-        common::external(
+        claim::external("hash_key", InputValueContract::Bytes { length: 32.into() }, hash_key),
+        claim::external("unit_coefficient", range(1, 1), vec![encrypt_input(state, "coefficient")]),
+        claim::external("state_exponent", range(0, 0), vec![encrypt_input(state, "exponent")]),
+        claim::external(
             "a",
             family_range(members, 0, q as i64 - 1),
             vec![ProtocolInputDestination::Ideal { input: "a".into() }, requirement_input("a")],
         ),
-        common::external(
+        claim::external(
             "a_coefficient",
             family_range(members, -1, 1),
             vec![encrypt_input(vector, "coefficient"), requirement_input("a_coefficient")],
         ),
-        common::external(
+        claim::external(
             "a_exponent",
             family_range(members, 0, ring_dimension as i64 - 1),
             vec![encrypt_input(vector, "exponent"), requirement_input("a_exponent")],
@@ -1284,13 +1280,13 @@ fn lwr_protocol(
     ];
     for (block, family) in selector_families.iter().enumerate() {
         let rhs = |field: &str| {
-            common::to_stage(
+            claim::to_stage(
                 "preprocess",
                 &only("preprocess", format!("/rhs/{:?}.{field}", family.rhs)),
             )
         };
         let name = format!("selector_{block}");
-        externals.push(common::external(
+        externals.push(claim::external(
             &name,
             family_range(family.members, 0, 1),
             vec![
@@ -1299,7 +1295,7 @@ fn lwr_protocol(
                 requirement_input(&name),
             ],
         ));
-        externals.push(common::external(
+        externals.push(claim::external(
             &format!("selector_exponent_{block}"),
             family_range(family.members, 0, 0),
             vec![rhs("exponent")],

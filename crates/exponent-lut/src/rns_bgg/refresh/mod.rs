@@ -4,11 +4,18 @@
 //! one-encoding key, the digit actions `X, Y, z` of the output prime, the combination `d` (the
 //! same on keys and rows), the CRT term of the part's residue, and the refresh's chains, child
 //! hash keys and artifact names.
+//!
+//! [`run`] runs a declared refresh on its chains and records its stage graphs, and [`claim`]
+//! states the claim of a recorded run.
 use super::*;
 use crate::{
     program::ExponentLutProgram,
     refresh::{RefreshDeclaration, RefreshPartDeclaration, TopReference},
 };
+
+mod claim;
+mod run;
+pub use run::{RefreshChain, RefreshRun, RefreshSecurity, RnsBggRefresh, refresh_noise_accepted};
 /// `refresh/<spec>/<role>`: the namespace of every refresh artifact.
 pub(crate) fn refresh_artifact_name(spec: [u8; 32], role: &str) -> String {
     format!("refresh/{}/{role}", decoder_commitment_hex(spec))

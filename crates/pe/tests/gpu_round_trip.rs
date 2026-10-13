@@ -20,6 +20,11 @@
 //! authorized key must decrypt the message; the unauthorized decryption must complete, and its
 //! rounded phase is not constrained.
 //!
+//! `test_gpu_pe_time_window` runs the time window predicate of the implementation specification
+//! (`BranchingProgram::time_window` for `[0900, 1759]`, class `PeClass::decimal_range(4)`) on its
+//! test vectors with the same parameter search, and exports the same claim with `LEAN_EXPORT`
+//! (and `EXPORT_ONLY`).
+//!
 //! With `MXX_PE_ROUND_TRIP_LEAN_EXPORT=<parameter id>`, `test_gpu_pe_round_trip` exports the Lean
 //! correctness claim of the executed graphs to `lean/<parameter id>/generated`. The claim does not
 //! depend on the predicate: the program is an external input of key generation (preprocessing) and
@@ -572,6 +577,129 @@ fn test_gpu_pe_round_trip() {
         mxx_ir_core::lean::protocol::export(&protocol, &directory, true).expect("PE claim export");
         eprintln!("exported the PE correctness claim to {}", directory.display());
     }
+}
+
+/// The time window predicate of the implementation specification (`impl-spec-time-bp.md`): the key
+/// of [`BranchingProgram::time_window`] for `[0900, 1759]` over [`PeClass::decimal_range`] with
+/// four digits, and one encryption of a random message under each of the specification's test
+/// vectors (see [`time_window_round_trip`]). The class is fixed, so the class variables are
+/// ignored; the parameter variables apply. With `LEAN_EXPORT`, it exports the Lean correctness
+/// claim of the authorized workflow (setup, the window's key generation, and the encryption and
+/// decryption of the first vector, `0900`), as [`test_gpu_pe_round_trip`] does; with
+/// `EXPORT_ONLY`, it builds the graphs without executing them.
+#[test]
+#[sequential(dcrt_runtime)]
+fn test_gpu_pe_time_window() {
+    let window = BranchingProgram::time_window(900, 1759).unwrap();
+    for (attribute, expected) in TIME_VECTORS {
+        assert_eq!(window.evaluate(&attribute).unwrap(), expected, "{attribute:?}");
+    }
+    let (graphs, parameters, failure_exponent) = if export_only() {
+        export_graphs(*window.class(), &|_, _, _| window.clone())
+    } else {
+        time_window_round_trip(&window)
+    };
+    if let Ok(id) = env::var(variable("LEAN_EXPORT")) {
+        let directory = lean_directory().join(&id).join("generated");
+        let protocol = pe_protocol(graphs, &parameters, failure_exponent);
+        mxx_ir_core::lean::protocol::export(&protocol, &directory, true).expect("PE claim export");
+        eprintln!("exported the PE correctness claim to {}", directory.display());
+    }
+}
+
+/// The test vectors of the time window `[0900, 1759]` and their outputs `F(x)`: three accepted
+/// times, then times below and above the window, minutes `60` and `75`, the symbol `A`, and hour
+/// `24`.
+const TIME_VECTORS: [([usize; 4], usize); 9] = [
+    ([0, 9, 0, 0], 0),
+    ([1, 7, 5, 9], 0),
+    ([1, 2, 3, 0], 0),
+    ([0, 8, 5, 9], 1),
+    ([1, 8, 0, 0], 1),
+    ([1, 2, 6, 0], 1),
+    ([1, 0, 7, 5], 1),
+    ([1, 10, 0, 0], 1),
+    ([2, 4, 0, 0], 1),
+];
+
+/// Search the parameters of `window`'s class, then run on the GPU setup, key generation for
+/// `window`, and one encryption of a random message under each vector of [`TIME_VECTORS`] with
+/// its decryption. The accepted times must decrypt their messages; the rejected ones must
+/// complete, and their rounded phases are not constrained. Returns the first execution of every
+/// stage graph (setup, key generation, and the first vector's encryption and decryption: the
+/// authorized workflow), the parameters, and the failure exponent of the noise model.
+fn time_window_round_trip(window: &BranchingProgram) -> (Vec<Recorded>, PeParameters, Option<u32>) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+    let class = *window.class();
+    let devices = detected_gpu_device_ids();
+    assert!(!devices.is_empty(), "the PE time window round trip needs a CUDA device");
+    let started = Instant::now();
+    let (parameters, report) = search(class);
+    let failure_exponent = report.average.as_ref().map(|(exponent, ..)| *exponent);
+    assert!(report.decrypts(), "the accepted parameters must guarantee correctness");
+    let level = parameters.level();
+    eprintln!(
+        "accepted PE parameters in {:?}: n = {}, CRT {} x {} bits, base 2^{}, m_B = {}, W = {}, \
+         T_max = {}; noise model {}; log2 E_F = {}, log2 E_PE = {}",
+        started.elapsed(),
+        level.ring_dimension(),
+        level.to_crt().0.len(),
+        level.crt_bits(),
+        level.base_bits(),
+        parameters.anchor_columns(),
+        class.lookup_width(),
+        class.max_steps(),
+        failure_exponent.map_or("worst".to_owned(), |exponent| format!("average 2^-{exponent}")),
+        report.evaluation.bits(),
+        report.decryption.bits(),
+    );
+    let mut runtime = GpuRuntime::new(gpu_backend_on(
+        parameters.rings().unwrap().into_iter().map(|ring| {
+            GpuDCRTPolyParams::new(ring.ring_dimension(), ring.to_crt().0, ring.base_bits(), None)
+        }),
+        devices,
+    ))
+    .expect("GPU runtime");
+    let (storage, _directory) = storage();
+    let mut store = storage.open().expect("stage storage");
+    let mut execution = Recording { inner: &mut runtime, graphs: Vec::new() };
+
+    let stage = Instant::now();
+    let (public_key, master) = setup(&parameters, &mut execution, &mut store).unwrap();
+    eprintln!("setup: {:?}", stage.elapsed());
+    report_device_bytes(&store);
+    let stage = Instant::now();
+    let key = keygen(&public_key, &master, window, &mut execution, &mut store).unwrap();
+    eprintln!("key generation ([0900, 1759]): {:?}", stage.elapsed());
+    report_device_bytes(&store);
+    for (attribute, expected) in TIME_VECTORS {
+        let message =
+            (0..level.ring_dimension()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
+        let stage = Instant::now();
+        let ciphertext =
+            encrypt(&public_key, &attribute, &message, &mut execution, &mut store).unwrap();
+        eprintln!("encryption of {attribute:?}: {:?}", stage.elapsed());
+        let stage = Instant::now();
+        let decrypted =
+            decrypt(&public_key, &key, &ciphertext, &mut execution, &mut store).unwrap();
+        eprintln!("decryption of {attribute:?} (F(x) = {expected}): {:?}", stage.elapsed());
+        report_device_bytes(&store);
+        if expected == 0 {
+            assert_eq!(decrypted, message, "the time {attribute:?} must decrypt the message");
+        }
+    }
+    // The first execution of every graph: the later vectors repeat encryption and decryption.
+    let mut seen = std::collections::BTreeSet::new();
+    let graphs = std::mem::take(&mut execution.graphs)
+        .into_iter()
+        .filter(|record| seen.insert(record.graph.name().to_owned()))
+        .collect();
+    (graphs, parameters, failure_exponent)
 }
 
 /// Search the parameters of `class`, then run setup, the encryption of a random attribute, and

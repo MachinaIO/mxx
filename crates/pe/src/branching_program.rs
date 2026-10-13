@@ -368,6 +368,64 @@ impl BranchingProgram {
         Self::new(class, (0..digits).collect(), tables)
     }
 
+    /// The program of [`PeClass::decimal_range`] with `D = 4` that accepts (`F(x) = 0`) exactly
+    /// the times `x = (H1, H2, M1, M2)`, most significant digit first, that match
+    /// `([01][0-9]|2[0-3])[0-5][0-9]` and whose value `N(x)` satisfies `low <= N(x) <= high`, for
+    /// times `low <= high` in `HHMM` form (a window that crosses midnight is two keys).
+    ///
+    /// The states are those of [`Self::decimal_range`]. Step `i` also checks the notation: digit
+    /// `i` lies in `{0, 1, 2}`, `{0, ..., 9}`, `{0, ..., 5}`, `{0, ..., 9}`, and the hour stays
+    /// at most `23`. A prefix equal to `low`'s or `high`'s fixes `H1` to `low`'s or `high`'s first
+    /// digit, and in `(GT, LT)` it lies strictly between them, so below `2`: the states need not
+    /// record `H1`. For valid endpoints the hour check is implied by the range; the minute check
+    /// is not (`0875` lies in `[0800, 1959]`).
+    pub fn time_window(low: u64, high: u64) -> Result<Self, PeError> {
+        let valid = |time: u64| time / 100 < 24 && time % 100 < 60;
+        if !valid(low) || !valid(high) || low > high {
+            return Err(PeError::Predicate("the window is not of HHMM times low <= high"));
+        }
+        let class = PeClass::decimal_range(4)?;
+        let digit = |value: u64, i: usize| (value / 10u64.pow(3 - i as u32) % 10) as usize;
+        let largest = [2, 9, 5, 9];
+        let step = |i: usize, z: usize, x: usize| -> usize {
+            if z >= DECIMAL_REJECT || x > largest[i] {
+                return DECIMAL_REJECT;
+            }
+            let (mut above, mut below) = (z & 1 == 1, z & 2 == 2);
+            // `H1 = 2` needs `H2 <= 3`; a prefix equal to an endpoint's has its `H1`.
+            if i == 1 &&
+                x > 3 &&
+                ((!above && digit(low, 0) == 2) || (!below && digit(high, 0) == 2))
+            {
+                return DECIMAL_REJECT;
+            }
+            if !above {
+                if x < digit(low, i) {
+                    return DECIMAL_REJECT;
+                }
+                above = x > digit(low, i);
+            }
+            if !below {
+                if x > digit(high, i) {
+                    return DECIMAL_REJECT;
+                }
+                below = x < digit(high, i);
+            }
+            usize::from(above) + 2 * usize::from(below)
+        };
+        let tables = (0..4)
+            .map(|i| {
+                (0..DECIMAL_STATES * DECIMAL_ALPHABET)
+                    .map(|u| {
+                        let next = step(i, u % DECIMAL_STATES, u / DECIMAL_STATES);
+                        if i == 3 { usize::from(next == DECIMAL_REJECT) } else { next }
+                    })
+                    .collect()
+            })
+            .collect();
+        Self::new(class, (0..4).collect(), tables)
+    }
+
     /// Check a program of lookup steps of `class`: `1 <= T <= T_max` steps,
     /// every read an attribute index, every table of `Bz Bx` entries,
     /// intermediate outputs below `Bz`, and final outputs in `{0, 1}`.
@@ -678,6 +736,69 @@ mod tests {
         assert_eq!(accepted, [3, 4, 5]);
         for (low, high) in [(999, 2000), (2000, 1999), (2000, 10_000)] {
             assert!(BranchingProgram::decimal_range(4, low, high).is_err(), "{low} {high}");
+        }
+    }
+
+    /// The time window program of the specification's test vectors (`[0900, 1759]`), in the
+    /// clear and through the Program data, and every 4-symbol attribute for windows at the edges
+    /// and at random against the notation and the range directly.
+    #[test]
+    fn time_window_programs_check_the_notation_and_the_window() {
+        let accepts = |low: u64, high: u64, attribute: &[usize]| {
+            let number = attribute.iter().fold(0, |number, x| 10 * number + *x as u64);
+            attribute.iter().all(|x| *x < 10) &&
+                (attribute[0] < 2 || (attribute[0] == 2 && attribute[1] <= 3)) &&
+                attribute[2] <= 5 &&
+                (low..=high).contains(&number)
+        };
+        let program = BranchingProgram::time_window(900, 1759).unwrap();
+        let class = *program.class();
+        assert_eq!(class, PeClass::decimal_range(4).unwrap());
+        let compiled = class.compile().unwrap();
+        let data = program.data(&compiled);
+        data.validate(compiled.program()).unwrap();
+        let tables = data.values(compiled.tables()).unwrap();
+        let through_luts = |attribute: &[usize]| {
+            attribute.iter().enumerate().fold(0, |z, (i, x)| tables[i * 128 + z + 8 * x])
+        };
+        for (attribute, expected) in [
+            ([0, 9, 0, 0], 0),
+            ([1, 7, 5, 9], 0),
+            ([1, 2, 3, 0], 0),
+            ([0, 8, 5, 9], 1),
+            ([1, 8, 0, 0], 1),
+            ([1, 2, 6, 0], 1),
+            ([1, 0, 7, 5], 1),
+            ([1, 10, 0, 0], 1),
+            ([2, 4, 0, 0], 1),
+        ] {
+            assert_eq!(program.evaluate(&attribute).unwrap(), expected, "{attribute:?}");
+            assert_eq!(through_luts(&attribute), expected, "{attribute:?}");
+        }
+        let mut windows =
+            vec![(0, 2359), (0, 0), (2359, 2359), (800, 1959), (2000, 2359), (1959, 2000)];
+        let mut seed = 0x2026_u64;
+        let mut time = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % 24 * 100 + (seed >> 13) % 60
+        };
+        windows.extend((0..20).map(|_| {
+            let (a, b) = (time(), time());
+            (a.min(b), a.max(b))
+        }));
+        for (low, high) in windows {
+            let program = BranchingProgram::time_window(low, high).unwrap();
+            for value in 0..1 << 16 {
+                let attribute = (0..4).map(|i| value >> (12 - 4 * i) & 15).collect::<Vec<usize>>();
+                assert_eq!(
+                    program.evaluate(&attribute).unwrap(),
+                    usize::from(!accepts(low, high, &attribute)),
+                    "[{low}, {high}] {attribute:?}"
+                );
+            }
+        }
+        for (low, high) in [(1200, 1100), (2400, 2400), (960, 1000), (0, 2360)] {
+            assert!(BranchingProgram::time_window(low, high).is_err(), "{low} {high}");
         }
     }
 }
